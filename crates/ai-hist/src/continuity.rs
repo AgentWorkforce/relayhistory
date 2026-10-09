@@ -98,15 +98,18 @@ impl ContinuityEvidence {
     /// from it: a file named after the session it contains is an ordinary
     /// session, not a branch of anything.
     pub fn origin_session_id(&self) -> Option<String> {
-        if let Some(explicit) = self
-            .explicit_source_session_id
-            .as_deref()
-            .filter(|id| !id.is_empty() && *id != self.session_id)
-        {
+        if let Some(explicit) = self.explicit_origin() {
             return Some(explicit.to_string());
         }
         let file_session_id = self.file_session_id.as_deref()?;
         (file_session_id != self.session_id).then(|| self.session_id.clone())
+    }
+
+    /// An explicit `sourceSessionId` naming a session other than this one.
+    fn explicit_origin(&self) -> Option<&str> {
+        self.explicit_source_session_id
+            .as_deref()
+            .filter(|id| !id.is_empty() && *id != self.session_id)
     }
 
     /// How this transcript is told apart from a sibling sharing its origin.
@@ -130,18 +133,17 @@ impl ContinuityEvidence {
     }
 }
 
-/// Read one newline-delimited record into `raw`; `false` at end of file.
+/// Read one newline-delimited record into `raw`; `None` at end of file, else
+/// the bytes it consumed.
 ///
 /// Bounded by [`crate::ingest::transcript_cursor::MAX_RECORD_BYTES`]: a record that runs
 /// past the ceiling is walked to its newline in fixed-size chunks and `raw` is
 /// left empty, so one pathological line cannot cost this walk the file's size
 /// in memory. `raw` is reused across calls, so the buffer is grown once.
-/// Read one record; `None` at end of file, else the bytes it consumed.
 ///
 /// The count is what the reader *spent*, not what `raw` ends up holding:
 /// `raw` loses the delimiter, and an oversized record is drained and dropped
-/// entirely. Measuring the buffer instead reported a 16 MiB record as zero
-/// bytes read, and every ordinary record one or two bytes short.
+/// entirely.
 fn next_record(
     reader: &mut impl std::io::BufRead,
     raw: &mut Vec<u8>,
@@ -152,64 +154,62 @@ fn next_record(
     // The cap is on the reader rather than a check around it: `read_until`
     // extends `raw` until it finds a newline, so a budget consulted afterwards
     // can only observe an allocation that already happened.
-    let mut consumed = reader.take(CEILING).read_until(b'\n', raw)? as u64;
+    let consumed = reader.take(CEILING).read_until(b'\n', raw)? as u64;
     if consumed == 0 {
         return Ok(None);
     }
-    let read = consumed;
+    if raw.last() == Some(&b'\n') {
+        raw.pop();
+        if raw.last() == Some(&b'\r') {
+            raw.pop();
+        }
+        return Ok(Some(consumed));
+    }
+    if consumed < CEILING {
+        // A genuine tail: the file ends here, under the ceiling.
+        return Ok(Some(consumed));
+    }
     // The limited read stops at the ceiling whether the record ends there or
     // runs past it, so the ceiling alone cannot tell them apart. The same
     // boundary rule as the ingest reader: one byte decides, and a record that
     // ends exactly on the ceiling is an ordinary record.
-    if raw.last() != Some(&b'\n') && read == CEILING {
-        match reader.fill_buf()?.first().copied() {
-            // The file ends here: a complete tail, exactly on the ceiling.
-            None => return Ok(Some(consumed)),
-            Some(b'\n') => {
-                reader.consume(1);
-                return Ok(Some(consumed + 1));
-            }
-            Some(_) => {}
+    match reader.fill_buf()?.first().copied() {
+        // The file ends here: a complete tail, exactly on the ceiling.
+        None => Ok(Some(consumed)),
+        Some(b'\n') => {
+            reader.consume(1);
+            Ok(Some(consumed + 1))
         }
-    }
-    if raw.last() != Some(&b'\n') {
-        if read == CEILING {
-            // Over the ceiling. Drop what was read and walk to the newline
-            // through the buffer, consuming only up to it: anything after it
-            // is the next record and must still be there to read.
+        // Over the ceiling. Drop what was read and walk to the newline.
+        Some(_) => {
             raw.clear();
-            loop {
-                let available = match reader.fill_buf() {
-                    Ok(bytes) => bytes,
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(error) => return Err(error),
-                };
-                if available.is_empty() {
-                    break;
-                }
-                match available.iter().position(|byte| *byte == b'\n') {
-                    Some(at) => {
-                        reader.consume(at + 1);
-                        consumed += at as u64 + 1;
-                        break;
-                    }
-                    None => {
-                        let all = available.len();
-                        reader.consume(all);
-                        consumed += all as u64;
-                    }
-                }
-            }
-            return Ok(Some(consumed));
+            Ok(Some(consumed + skip_past_newline(reader)?))
         }
-        // A genuine tail: the file ends here, under the ceiling.
-        return Ok(Some(consumed));
     }
-    raw.pop();
-    if raw.last() == Some(&b'\r') {
-        raw.pop();
+}
+
+/// Walk to the next newline through the reader's buffer, consuming only up to
+/// it: anything after it is the next record and must still be there to read.
+/// The bytes consumed, newline included.
+fn skip_past_newline(reader: &mut impl std::io::BufRead) -> std::io::Result<u64> {
+    let mut consumed = 0;
+    loop {
+        let available = match reader.fill_buf() {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        if available.is_empty() {
+            return Ok(consumed);
+        }
+        if let Some(at) = available.iter().position(|byte| *byte == b'\n') {
+            reader.consume(at + 1);
+            return Ok(consumed + at as u64 + 1);
+        }
+        let all = available.len();
+        reader.consume(all);
+        consumed += all as u64;
     }
-    Ok(Some(consumed))
 }
 
 /// Read one Claude transcript's continuity evidence in a single pass.
@@ -240,16 +240,22 @@ pub fn scan_claude_transcript(path: &Path) -> Result<Option<ContinuityEvidence>>
         let Ok(line) = std::str::from_utf8(&raw) else {
             continue;
         };
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        let Some(object) = value.as_object() else {
-            continue;
-        };
-        any = true;
-        fold_claude_record(&mut evidence, &mut first_user_seen, object);
+        any |= fold_claude_line(&mut evidence, &mut first_user_seen, line);
     }
     Ok(finish_claude_fold(evidence, any, path))
+}
+
+/// Fold one transcript line that is a JSON object; whether it was one.
+fn fold_claude_line(
+    evidence: &mut ContinuityEvidence,
+    first_user_seen: &mut bool,
+    line: &str,
+) -> bool {
+    let Ok(Value::Object(object)) = serde_json::from_str::<Value>(line) else {
+        return false;
+    };
+    fold_claude_record(evidence, first_user_seen, &object);
+    true
 }
 
 /// Settle a folded evidence set into the row it should record, or `None`.
@@ -474,16 +480,21 @@ fn codex_thread_spawn_parent(payload: &serde_json::Map<String, Value>) -> Option
 /// fork synced before the upgrade would never gain its edge. Re-reading the
 /// one `session_meta` line clears it: the new row always carries the key.
 pub(crate) fn codex_evidence_is_current(conn: &Connection, locator: &str) -> Result<bool> {
+    evidence_flag(
+        conn,
+        "SELECT instr(explicit_targets_json, '\"fork_refs\"') > 0 \
+         FROM session_continuity_evidence \
+         WHERE source = 'codex' AND locator = ? LIMIT 1",
+        locator,
+    )
+}
+
+/// A yes/no question about one locator's banked evidence row; `false` when
+/// none is banked.
+fn evidence_flag(conn: &Connection, sql: &str, locator: &str) -> Result<bool> {
     Ok(conn
-        .prepare_cached(
-            "SELECT instr(explicit_targets_json, '\"fork_refs\"') > 0 \
-             FROM session_continuity_evidence \
-             WHERE source = 'codex' AND locator = ? LIMIT 1",
-        )?
-        .query_row(
-            [locator],
-            |row| row.get::<_, bool>(0),
-        )
+        .prepare_cached(sql)?
+        .query_row([locator], |row| row.get::<_, bool>(0))
         .optional()?
         .unwrap_or(false))
 }
@@ -491,18 +502,16 @@ pub(crate) fn codex_evidence_is_current(conn: &Connection, locator: &str) -> Res
 /// Whether a Claude transcript's banked evidence names an explicit target but
 /// was banked before the naming records' timestamps were recorded.
 pub(crate) fn claude_evidence_lacks_naming_times(conn: &Connection, path: &Path) -> Result<bool> {
-    Ok(conn
-        .prepare_cached(
-            "SELECT json_type(explicit_targets_json, '$.continuation_ts_ms') IS NULL \
-                AND (json_array_length(explicit_targets_json, '$.continuation') > 0 \
-                     OR json_array_length(explicit_targets_json, '$.fork') > 0) \
-             FROM session_continuity_evidence \
-             WHERE source = 'claude' AND locator = ? AND json_valid(explicit_targets_json) \
-             LIMIT 1",
-        )?
-        .query_row([path.to_string_lossy().as_ref()], |row| row.get::<_, bool>(0))
-        .optional()?
-        .unwrap_or(false))
+    evidence_flag(
+        conn,
+        "SELECT json_type(explicit_targets_json, '$.continuation_ts_ms') IS NULL \
+            AND (json_array_length(explicit_targets_json, '$.continuation') > 0 \
+                 OR json_array_length(explicit_targets_json, '$.fork') > 0) \
+         FROM session_continuity_evidence \
+         WHERE source = 'claude' AND locator = ? AND json_valid(explicit_targets_json) \
+         LIMIT 1",
+        &path.to_string_lossy(),
+    )
 }
 
 /// Whether a Codex rollout's banked evidence names a parent in one of Codex's
@@ -511,19 +520,14 @@ pub(crate) fn claude_evidence_lacks_naming_times(conn: &Connection, path: &Path)
 /// These are the only rollouts the fork replay gate can apply to, so they are
 /// the only unchanged rollouts the one-time replay repair has to re-read.
 pub(crate) fn codex_evidence_names_fork(conn: &Connection, locator: &str) -> Result<bool> {
-    Ok(conn
-        .prepare_cached(
-            "SELECT EXISTS(SELECT 1 FROM json_each(explicit_targets_json, '$.fork_refs')) \
-             FROM session_continuity_evidence \
-             WHERE source = 'codex' AND locator = ? AND json_valid(explicit_targets_json) \
-             LIMIT 1",
-        )?
-        .query_row(
-            [locator],
-            |row| row.get::<_, bool>(0),
-        )
-        .optional()?
-        .unwrap_or(false))
+    evidence_flag(
+        conn,
+        "SELECT EXISTS(SELECT 1 FROM json_each(explicit_targets_json, '$.fork_refs')) \
+         FROM session_continuity_evidence \
+         WHERE source = 'codex' AND locator = ? AND json_valid(explicit_targets_json) \
+         LIMIT 1",
+        locator,
+    )
 }
 
 /// Persist one transcript's evidence, replacing whatever the last read of the
@@ -672,14 +676,7 @@ pub(crate) fn scan_claude_transcript_text(
     let mut any = false;
     for line in text.lines() {
         crate::ingest::check_capture_cancelled()?;
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        let Some(object) = value.as_object() else {
-            continue;
-        };
-        any = true;
-        fold_claude_record(&mut evidence, &mut first_user_seen, object);
+        any |= fold_claude_line(&mut evidence, &mut first_user_seen, line);
     }
     Ok(finish_claude_fold(evidence, any, path))
 }
@@ -840,27 +837,11 @@ pub fn pending_diagnostics(
     source: &str,
     session_id: &str,
 ) -> Result<Vec<RelationshipDiagnostic>> {
-    // A database that predates continuity has no table to read.
-    if !table_exists(conn, "session_continuity_evidence")? {
-        return Ok(Vec::new());
-    }
-    Ok(conn
-        .prepare(
-            "SELECT locator, pending_reason FROM session_continuity_evidence \
-             WHERE source = ? AND session_id = ? AND pending_reason IS NOT NULL \
-             ORDER BY locator ASC",
-        )?
-        .query_map(params![source, session_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?
+    Ok(pending_reasons(conn, source, session_id)?
         .into_iter()
         .map(|(locator, reason)| RelationshipDiagnostic {
             code: CONTINUITY_UNRESOLVED.to_string(),
-            message: format!(
-                "{source} continuity evidence at {locator} is unresolved: {}",
-                reason.as_deref().unwrap_or("unreconciled")
-            ),
+            message: format!("{source} continuity evidence at {locator} is unresolved: {reason}"),
             relationship_uid: None,
         })
         .collect())
@@ -872,6 +853,7 @@ pub fn pending_reasons(
     source: &str,
     session_id: &str,
 ) -> Result<Vec<(String, String)>> {
+    // A database that predates continuity has no table to read.
     if !table_exists(conn, "session_continuity_evidence")? {
         return Ok(Vec::new());
     }
@@ -970,11 +952,7 @@ fn resolve_explicit_source(
     if !written.is_empty() {
         return Ok(());
     }
-    let Some(origin) = evidence
-        .explicit_source_session_id
-        .as_deref()
-        .filter(|id| !id.is_empty() && *id != evidence.session_id)
-    else {
+    let Some(origin) = evidence.explicit_origin() else {
         return Ok(());
     };
     written.push(write_edge(
@@ -1024,11 +1002,7 @@ fn resolve_resume(
             evidence_ref: REF_RESUME_MARKER,
             // The explicit origin when the file names one, so skipping the
             // source-only fork never loses it.
-            origin_session_id: evidence
-            .explicit_source_session_id
-            .as_deref()
-            .filter(|id| !id.is_empty() && *id != evidence.session_id)
-            .or(Some(target)),
+            origin_session_id: evidence.explicit_origin().or(Some(target)),
             spawned_at_ms: evidence.first_ts_ms,
         },
     )?);
@@ -1112,12 +1086,7 @@ fn resolve_fork_group(
     // An explicit field already established the branch — `forkSessionId`, or
     // a `sourceSessionId` naming an origin of its own. The group inference is
     // only ever the fallback for a transcript with no explicit lineage.
-    if !evidence.explicit_fork_targets.is_empty()
-        || evidence
-            .explicit_source_session_id
-            .as_deref()
-            .is_some_and(|id| !id.is_empty() && id != evidence.session_id)
-    {
+    if !evidence.explicit_fork_targets.is_empty() || evidence.explicit_origin().is_some() {
         return Ok(());
     }
     let group = fork_group(conn, &evidence.source, &origin)?;
