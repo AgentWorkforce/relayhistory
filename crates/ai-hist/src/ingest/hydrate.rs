@@ -118,7 +118,8 @@ pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 3;
 /// captures that previous parsers skipped.
 ///
 /// Version 16 stores every Codex `token_count` as a `usage_snapshot` marker
-/// and every `turn_context` as a `turn_context` marker. A checkpoint at 15
+/// and each `turn_context` that changes the configuration as a
+/// `turn_context` marker. A checkpoint at 15
 /// re-parses once, so an embedder that only hydrates gets the records sync's
 /// `codex_state_markers_v1` backfill captures.
 const HYDRATION_PARSER_VERSION: i64 = 16;

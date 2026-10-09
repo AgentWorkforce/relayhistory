@@ -2791,6 +2791,13 @@ impl FileEdit {
 /// characters, every container at 32 entries — never the bytes of an image.
 /// A Codex `usage_snapshot` carries its counters typed in `usage_snapshot`
 /// instead, and has no `payload`.
+///
+/// A Codex `turn_context` marker is stored only where the configuration
+/// changes: the configuration of a turn is the latest `turn_context` marker
+/// at or before that turn's start in rollout order -- the marker carrying the
+/// turn's `turn_id` when there is one, else the latest earlier one. Its
+/// `turn_id` is the turn it took effect at, and every other payload field, `root_turn_id`
+/// included, is the configuration of each turn up to the next marker.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Marker {

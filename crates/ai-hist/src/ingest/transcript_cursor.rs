@@ -302,6 +302,13 @@ pub(crate) struct CodexCursorState {
     /// would stamp the rest of the turn with nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
+    /// The configuration digest of the last `turn_context` marker stored for
+    /// the session. A `turn_context` is stored only when it changes the
+    /// configuration, and a pass that resumes mid-session cannot see the
+    /// marker it would compare against; without this it would store the
+    /// first record it reads whether or not anything changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_context_digest: Option<String>,
     /// The adjacent-mirror deduper's one-record memory, as
     /// `(is_response_item, text)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]

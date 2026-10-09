@@ -734,6 +734,35 @@ snapshots, and the folded slash-command triad.
 | `payload` | `Option<serde_json::Value>`: a bounded projection, parsed — strings cut at 128 characters, containers at 32 entries, recursively; numbers are never altered. Where this parser classifies the record it keeps an allowlist of fields; where the payload is the provider's own document (Codex `turn_context`, Grok `signals`, a compaction checkpoint) the document is bounded whole. Never the bytes of an image. `raw_payload()` is the stored string. `None` for a `usage_snapshot` |
 | `usage_snapshot` | `Option<Box<UsageSnapshot>>`: a Codex `usage_snapshot`'s `info` object, bounded the same way, typed — `total_token_usage` / `last_token_usage` as `TokenUsage` (each counter the value as written, so `u64` above `i64::MAX` and a malformed fractional or negative counter are exact; `None` absent, `Some(Null)` written as `null`; other keys in `other`), `model_context_window`, and every other key in `other`. Nothing is parsed into a `Value` to read it, and `UsageSnapshot::to_value()` is the object as written. Stored in `payload_json` positionally (`[total, last, window, other]`, see the crate's `usage_snapshot` module). `None` for the `info: null` snapshot and for every other kind |
 
+A Codex `turn_context` marker is stored only where the configuration changes:
+Codex restates its whole configuration on every turn, and a record that repeats
+the previous one apart from its `turn_id` stores nothing. **The configuration
+of a turn is the latest `turn_context` marker at or before that turn's start in
+rollout order**, a turn's start being its own `turn_context` record (Codex
+writes it just after the turn's `task_started`): the marker carrying the turn's
+`turn_id` when there is one, else the latest earlier one. Every stored marker
+is the record whole; its `turn_id` is the turn it took effect at, and every
+other field — `root_turn_id`, `model`, `effort`, `cwd`, `current_date`, the
+approval and sandbox policy — is the configuration of each turn up to the next
+marker. A session's first `turn_context` is always stored, and so is a fork
+child's first own one: the replayed parent history is the parent's, so a
+child's markers alone configure its turns.
+
+```rust
+// turn id -> the turn_context payload it ran under, walking `markers` in read order.
+let mut current: Option<&serde_json::Value> = None;
+let mut configs: HashMap<&str, Option<&serde_json::Value>> = HashMap::new();
+for marker in &evidence.markers {
+    let Some(turn) = marker.turn_id.as_deref() else { continue };
+    if marker.kind == "turn_context" {
+        current = marker.payload.as_ref();
+        configs.insert(turn, current);
+    } else {
+        configs.entry(turn).or_insert(current);
+    }
+}
+```
+
 A compaction marker is where a session's token baseline resets. Cost attribution
 across one without it is wrong, which is why the table exists. A slash command's
 caveat, invocation and output records are folded into one `slash_command` marker
