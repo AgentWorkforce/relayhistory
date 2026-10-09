@@ -581,7 +581,6 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
             snapshot.claude_transcript.as_ref(),
             snapshot.devin_session.as_ref(),
             &mut cursor,
-            reparse,
             parser_upgrade,
             records_parsed,
             snapshot.opencode_layout,
@@ -2476,12 +2475,9 @@ pub(crate) struct SelectedIngest<'a> {
     pub(crate) claude_snapshot: Option<&'a ClaudeTranscriptSnapshot>,
     pub(crate) devin_session: Option<&'a crate::ingest::devin::DevinSession>,
     pub(crate) cursor: &'a mut TranscriptCursorState,
-    /// The checkpoint was written by another parser generation, so every
-    /// stored position — the root's and its related transcripts' — is read
-    /// again from byte zero.
-    pub(crate) reparse: bool,
-    /// A checkpoint exists and another parser generation wrote it, so
-    /// Claude subagent sidecars are read again from byte zero too.
+    /// A checkpoint exists and another parser generation wrote it, so the
+    /// related transcripts' stored positions -- Claude subagent sidecars,
+    /// Codex child rollouts -- are read again from byte zero too.
     pub(crate) parser_upgrade: bool,
     pub(crate) records: i64,
     pub(crate) opencode_layout: Option<OpencodeIngestLayout>,
@@ -2532,7 +2528,6 @@ fn ingest_selected(
     claude_snapshot: Option<&ClaudeTranscriptSnapshot>,
     devin_session: Option<&crate::ingest::devin::DevinSession>,
     cursor: &mut TranscriptCursorState,
-    reparse: bool,
     parser_upgrade: bool,
     records: i64,
     opencode_layout: Option<OpencodeIngestLayout>,
@@ -2552,7 +2547,6 @@ fn ingest_selected(
         claude_snapshot,
         devin_session,
         cursor,
-        reparse,
         parser_upgrade,
         records,
         opencode_layout,
@@ -5136,7 +5130,6 @@ mod tests {
             snapshot.claude_transcript.as_ref(),
             snapshot.devin_session.as_ref(),
             &mut cursor,
-            false,
             false,
             records,
             snapshot.opencode_layout,
