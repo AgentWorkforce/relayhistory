@@ -702,6 +702,31 @@ fn read_capped_record(reader: &mut impl BufRead, raw: &mut Vec<u8>) -> Result<Ca
     Ok(CappedRead::Record(read))
 }
 
+/// Consume the rest of an [`CappedRead::Oversized`] record through its
+/// newline, without holding it. Returns the bytes consumed and whether the
+/// newline was found before the reader ran out.
+fn skip_oversized_tail(reader: &mut impl BufRead) -> Result<(u64, bool)> {
+    let mut skipped = 0u64;
+    loop {
+        super::check_capture_cancelled()?;
+        let buffered = reader.fill_buf()?;
+        if buffered.is_empty() {
+            return Ok((skipped, false));
+        }
+        match buffered.iter().position(|byte| *byte == b'\n') {
+            Some(index) => {
+                reader.consume(index + 1);
+                return Ok((skipped + index as u64 + 1, true));
+            }
+            None => {
+                let len = buffered.len();
+                reader.consume(len);
+                skipped += len as u64;
+            }
+        }
+    }
+}
+
 fn prefix_window_digest(file: &mut fs::File, offset: u64) -> Result<String> {
     Ok(prefix_window_digest_counted(file, offset)?.0)
 }
@@ -1559,24 +1584,10 @@ impl TranscriptReader {
                     }
                     CappedRead::Oversized => {
                         read_total += MAX_RECORD_BYTES;
-                        loop {
-                            super::check_capture_cancelled()?;
-                            let buffered = span.fill_buf()?;
-                            if buffered.is_empty() {
-                                return Ok(read_total);
-                            }
-                            match buffered.iter().position(|byte| *byte == b'\n') {
-                                Some(index) => {
-                                    span.consume(index + 1);
-                                    read_total += index as u64 + 1;
-                                    break;
-                                }
-                                None => {
-                                    let len = buffered.len();
-                                    span.consume(len);
-                                    read_total += len as u64;
-                                }
-                            }
+                        let (skipped, terminated) = skip_oversized_tail(&mut span)?;
+                        read_total += skipped;
+                        if !terminated {
+                            return Ok(read_total);
                         }
                     }
                 }

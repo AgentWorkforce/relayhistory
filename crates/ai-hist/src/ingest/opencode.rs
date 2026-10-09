@@ -33,7 +33,7 @@ use crate::relationship_capture::{
 };
 use crate::{insert_history, prompt_hash, HistoryEntry};
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Statement};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -163,6 +163,17 @@ pub(crate) fn load_from_sqlite(
     session_id: &str,
 ) -> Result<Option<OpencodeSession>> {
     super::check_capture_cancelled()?;
+    let Some(info) = read_session_info(src, session_id)? else {
+        return Ok(None);
+    };
+    let messages = read_session_messages(src, session_id)?;
+    let parts_by_message = read_session_parts(src, session_id, &messages)?;
+    Ok(Some(finish(info, messages, parts_by_message)))
+}
+
+/// The `session` row for `session_id`, or `None` when the store has no such
+/// session (or no `session.id` column to find it by).
+fn read_session_info(src: &Connection, session_id: &str) -> Result<Option<OpencodeSessionInfo>> {
     let session_columns = table_columns(src, "session")?;
     if !session_columns.contains("id") {
         return Ok(None);
@@ -196,7 +207,11 @@ pub(crate) fn load_from_sqlite(
         return Ok(None);
     };
     info.parent_id = info.parent_id.filter(|value| !value.is_empty());
+    Ok(Some(info))
+}
 
+/// This session's messages that parse, in the store's row order.
+fn read_session_messages(src: &Connection, session_id: &str) -> Result<Vec<OpencodeMessage>> {
     let message_columns = table_columns(src, "message")?;
     let mut messages = Vec::new();
     if message_columns.contains("id")
@@ -227,7 +242,15 @@ pub(crate) fn load_from_sqlite(
             }
         }
     }
+    Ok(messages)
+}
 
+/// This session's parts that parse, grouped by the message they belong to.
+fn read_session_parts(
+    src: &Connection,
+    session_id: &str,
+    messages: &[OpencodeMessage],
+) -> Result<BTreeMap<String, Vec<OpencodePart>>> {
     let part_columns = table_columns(src, "part")?;
     let mut parts_by_message: BTreeMap<String, Vec<OpencodePart>> = BTreeMap::new();
     if part_columns.contains("id")
@@ -237,24 +260,7 @@ pub(crate) fn load_from_sqlite(
         // Seek by session when the provider indexes it, otherwise by the
         // message ids this session's own messages already named. Both stay
         // session-keyed; neither scans the provider's whole `part` table.
-        let mut push = |id: String, message_id: String, data: String| {
-            let Ok(Value::Object(object)) = serde_json::from_str::<Value>(&data) else {
-                return;
-            };
-            let kind = object
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            parts_by_message
-                .entry(message_id)
-                .or_default()
-                .push(OpencodePart {
-                    id,
-                    kind,
-                    raw: object,
-                });
-        };
+        //
         // Seek by whichever column the provider actually indexes. Choosing on
         // column *presence* alone picks a predicate SQLite can only answer by
         // scanning `part`, which for one session is merely slow but for the
@@ -266,43 +272,56 @@ pub(crate) fn load_from_sqlite(
             let mut stmt = src.prepare(
                 "SELECT id, message_id, data FROM part WHERE session_id = ? AND json_valid(data)",
             )?;
-            let rows = stmt
-                .query_map([session_id], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            for (id, message_id, data) in rows {
-                super::check_capture_cancelled()?;
-                push(id, message_id, data);
-            }
+            collect_parts(&mut stmt, session_id, &mut parts_by_message)?;
         } else {
             let mut stmt = src.prepare(
                 "SELECT id, message_id, data FROM part WHERE message_id = ? AND json_valid(data)",
             )?;
-            for message in &messages {
+            for message in messages {
                 super::check_capture_cancelled()?;
-                let rows = stmt
-                    .query_map([&message.id], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                        ))
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                for (id, message_id, data) in rows {
-                    super::check_capture_cancelled()?;
-                    push(id, message_id, data);
-                }
+                collect_parts(&mut stmt, &message.id, &mut parts_by_message)?;
             }
         }
     }
+    Ok(parts_by_message)
+}
 
-    Ok(Some(finish(info, messages, parts_by_message)))
+/// Run a `SELECT id, message_id, data FROM part` statement keyed on `key`
+/// and group the parts that parse under their message.
+fn collect_parts(
+    stmt: &mut Statement<'_>,
+    key: &str,
+    parts_by_message: &mut BTreeMap<String, Vec<OpencodePart>>,
+) -> Result<()> {
+    let rows = stmt
+        .query_map([key], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (id, message_id, data) in rows {
+        super::check_capture_cancelled()?;
+        let Ok(Value::Object(object)) = serde_json::from_str::<Value>(&data) else {
+            continue;
+        };
+        let kind = object
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        parts_by_message
+            .entry(message_id)
+            .or_default()
+            .push(OpencodePart {
+                id,
+                kind,
+                raw: object,
+            });
+    }
+    Ok(())
 }
 
 /// How global sync should read a provider store.

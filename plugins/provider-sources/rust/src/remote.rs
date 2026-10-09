@@ -438,14 +438,7 @@ fn acquire_claude_remote_session_at(
     // so parser failures are explicit rather than treated as empty evidence.
     let profile_url = format!("{base_url}/api/oauth/profile");
     let profile = transport.get_with_headers(&profile_url, &oauth.access_token, &[])?;
-    match profile.status {
-        200 => {}
-        401 | 403 => anyhow::bail!(
-            "AUTHENTICATION_EXPIRED: claude.ai rejected the stored OAuth token (HTTP {})",
-            profile.status
-        ),
-        status => anyhow::bail!("CONNECTOR_FAILURE: Claude OAuth profile failed (HTTP {status})"),
-    }
+    ensure_claude_profile_status(profile.status)?;
     anyhow::ensure!(
         profile.body.len() <= MAX_REMOTE_EVIDENCE_BYTES,
         "CONNECTOR_FAILURE: Claude OAuth profile exceeded the response-size limit"
@@ -474,20 +467,7 @@ fn acquire_claude_remote_session_at(
             &oauth.access_token,
             &[("x-organization-uuid", org_uuid)],
         )?;
-        match response.status {
-            200 => {}
-            401 => anyhow::bail!(
-                "AUTHENTICATION_EXPIRED: Claude teleport evidence was rejected (HTTP {})",
-                response.status
-            ),
-            403 => anyhow::bail!(
-                "CONNECTOR_FAILURE: Claude teleport evidence was denied; the session may require trusted-device enrollment"
-            ),
-            404 => anyhow::bail!("SESSION_NOT_FOUND: remote Claude session no longer exists"),
-            status => anyhow::bail!(
-                "CONNECTOR_FAILURE: Claude teleport evidence failed (HTTP {status})"
-            ),
-        }
+        ensure_claude_teleport_status(response.status)?;
         source_bytes = source_bytes.saturating_add(response.body.len());
         anyhow::ensure!(
             source_bytes <= MAX_REMOTE_EVIDENCE_BYTES,
@@ -520,6 +500,38 @@ fn acquire_claude_remote_session_at(
         }
     }
     anyhow::bail!("EVIDENCE_PARTIAL: Claude teleport evidence exceeded the 100-page bound")
+}
+
+/// The Claude OAuth profile response status, as the connector error it
+/// stands for.
+fn ensure_claude_profile_status(status: u16) -> Result<()> {
+    match status {
+        200 => Ok(()),
+        401 | 403 => anyhow::bail!(
+            "AUTHENTICATION_EXPIRED: claude.ai rejected the stored OAuth token (HTTP {})",
+            status
+        ),
+        status => anyhow::bail!("CONNECTOR_FAILURE: Claude OAuth profile failed (HTTP {status})"),
+    }
+}
+
+/// A Claude teleport-events response status, as the connector error it
+/// stands for.
+fn ensure_claude_teleport_status(status: u16) -> Result<()> {
+    match status {
+        200 => Ok(()),
+        401 => anyhow::bail!(
+            "AUTHENTICATION_EXPIRED: Claude teleport evidence was rejected (HTTP {})",
+            status
+        ),
+        403 => anyhow::bail!(
+            "CONNECTOR_FAILURE: Claude teleport evidence was denied; the session may require trusted-device enrollment"
+        ),
+        404 => anyhow::bail!("SESSION_NOT_FOUND: remote Claude session no longer exists"),
+        status => anyhow::bail!(
+            "CONNECTOR_FAILURE: Claude teleport evidence failed (HTTP {status})"
+        ),
+    }
 }
 
 fn claude_api_base_url() -> String {
@@ -831,11 +843,7 @@ fn acquire_codex_remote_session_with_command_timeout(
     command: &OsStr,
     timeout: Duration,
 ) -> Result<RemoteSessionEvidence> {
-    if !session_id.starts_with("task_")
-        || !session_id
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
-    {
+    if !is_codex_task_id(session_id) {
         anyhow::bail!("INVALID_ARGUMENT: remote Codex task id is malformed");
     }
     let mut child = std::process::Command::new(command)
@@ -859,42 +867,10 @@ fn acquire_codex_remote_session_with_command_timeout(
         .stderr
         .take()
         .context("CONNECTOR_FAILURE: no Codex stderr pipe")?;
-    let read_bounded = |mut stream: Box<dyn Read + Send>| {
-        let (sender, receiver) = mpsc::sync_channel(1);
-        std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let mut buffer = [0u8; 64 * 1024];
-            let result = loop {
-                match stream.read(&mut buffer) {
-                    Ok(0) => break Ok(bytes),
-                    Ok(read) => {
-                        // Retain only enough to detect the limit, but keep
-                        // draining so an oversized child cannot block on a
-                        // full pipe and masquerade as a command timeout.
-                        let remaining = (MAX_REMOTE_EVIDENCE_BYTES + 1).saturating_sub(bytes.len());
-                        bytes.extend_from_slice(&buffer[..read.min(remaining)]);
-                    }
-                    Err(error) => break Err(error),
-                }
-            };
-            let _ = sender.send(result);
-        });
-        receiver
-    };
     let stdout_reader = read_bounded(Box::new(stdout));
     let stderr_reader = read_bounded(Box::new(stderr));
     let started = Instant::now();
-    let status = loop {
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if started.elapsed() >= timeout {
-            let _ = child.kill();
-            let _ = child.wait();
-            anyhow::bail!("CONNECTOR_FAILURE: `codex cloud diff` exceeded the 30 second timeout");
-        }
-        std::thread::sleep(Duration::from_millis(25));
-    };
+    let status = wait_for_codex_child(&mut child, started, timeout)?;
     let receive = |reader: mpsc::Receiver<std::io::Result<Vec<u8>>>, name: &str| {
         let remaining = timeout.checked_sub(started.elapsed()).unwrap_or_default();
         reader
@@ -913,15 +889,7 @@ fn acquire_codex_remote_session_with_command_timeout(
         "CONNECTOR_FAILURE: `codex cloud diff` exceeded the 16 MiB response-size limit"
     );
     if !status.success() {
-        let detail = excerpt_one_line(&String::from_utf8_lossy(&stderr));
-        let lower = detail.to_ascii_lowercase();
-        if lower.contains("login") || lower.contains("unauthorized") || lower.contains("expired") {
-            anyhow::bail!("AUTHENTICATION_EXPIRED: Codex CLI authentication was rejected");
-        }
-        if lower.contains("not found") || lower.contains("no task") {
-            anyhow::bail!("SESSION_NOT_FOUND: remote Codex task no longer exists");
-        }
-        anyhow::bail!("CONNECTOR_FAILURE: `codex cloud diff` failed ({status}): {detail}");
+        return Err(codex_diff_failure(status, &stderr));
     }
     let diff = String::from_utf8(stdout)
         .context("CONNECTOR_FAILURE: `codex cloud diff` returned non-UTF-8 output")?;
@@ -938,6 +906,74 @@ fn acquire_codex_remote_session_with_command_timeout(
         diff,
         source_stamp,
     })
+}
+
+/// Whether `session_id` has the shape of a Codex cloud task id.
+fn is_codex_task_id(session_id: &str) -> bool {
+    session_id.starts_with("task_")
+        && session_id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+}
+
+/// Drain `stream` on its own thread, retaining at most one byte past
+/// [`MAX_REMOTE_EVIDENCE_BYTES`], and deliver the result on the returned
+/// channel.
+fn read_bounded(mut stream: Box<dyn Read + Send>) -> mpsc::Receiver<std::io::Result<Vec<u8>>> {
+    let (sender, receiver) = mpsc::sync_channel(1);
+    std::thread::spawn(move || {
+        let mut bytes = Vec::new();
+        let mut buffer = [0u8; 64 * 1024];
+        let result = loop {
+            match stream.read(&mut buffer) {
+                Ok(0) => break Ok(bytes),
+                Ok(read) => {
+                    // Retain only enough to detect the limit, but keep
+                    // draining so an oversized child cannot block on a
+                    // full pipe and masquerade as a command timeout.
+                    let remaining = (MAX_REMOTE_EVIDENCE_BYTES + 1).saturating_sub(bytes.len());
+                    bytes.extend_from_slice(&buffer[..read.min(remaining)]);
+                }
+                Err(error) => break Err(error),
+            }
+        };
+        let _ = sender.send(result);
+    });
+    receiver
+}
+
+/// Wait for `codex cloud diff` to exit, killing it once `timeout` has passed
+/// since `started`.
+fn wait_for_codex_child(
+    child: &mut std::process::Child,
+    started: Instant,
+    timeout: Duration,
+) -> Result<std::process::ExitStatus> {
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status);
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            anyhow::bail!("CONNECTOR_FAILURE: `codex cloud diff` exceeded the 30 second timeout");
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// The connector error a failed `codex cloud diff` stands for, read from its
+/// stderr.
+fn codex_diff_failure(status: std::process::ExitStatus, stderr: &[u8]) -> anyhow::Error {
+    let detail = excerpt_one_line(&String::from_utf8_lossy(stderr));
+    let lower = detail.to_ascii_lowercase();
+    if lower.contains("login") || lower.contains("unauthorized") || lower.contains("expired") {
+        return anyhow::anyhow!("AUTHENTICATION_EXPIRED: Codex CLI authentication was rejected");
+    }
+    if lower.contains("not found") || lower.contains("no task") {
+        return anyhow::anyhow!("SESSION_NOT_FOUND: remote Codex task no longer exists");
+    }
+    anyhow::anyhow!("CONNECTOR_FAILURE: `codex cloud diff` failed ({status}): {detail}")
 }
 
 // ---------------------------------------------------------------------------

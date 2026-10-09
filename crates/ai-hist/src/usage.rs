@@ -776,73 +776,8 @@ pub fn attribute_usage_to_prompts(
     let messages: HashMap<String, UsageMessage> = groups
         .into_iter()
         .filter_map(|(id, rows)| {
-            let first = rows[0];
-            if rows.iter().any(|r| {
-                r.ts_ms != first.ts_ms || r.role != first.role || r.parent_id != first.parent_id
-            }) {
-                return None;
-            }
-            // Rows sharing a record id come from one provider record, so they
-            // report one request. Disagreement means the row layout is not
-            // what it claims, and a measurement built on it is not evidence.
-            let request = request_key(first);
-            if rows.iter().any(|r| request_key(r) != request) {
-                return None;
-            }
-            // Claude copies message.usage onto every content block. Counting
-            // rows would multiply one model request by its thinking/text/tool
-            // block count.
-            let raw: Vec<&str> = rows
-                .iter()
-                .filter_map(|r| r.token_json.as_deref())
-                .collect();
-            let parsed: Option<Vec<Value>> = raw
-                .iter()
-                .map(|raw| serde_json::from_str(raw).ok())
-                .collect();
-            let usage = match parsed.as_deref() {
-                None => RecordUsage::Unreadable,
-                Some([]) => RecordUsage::Absent,
-                // One record reports one measurement. Rows that disagree about
-                // it are not evidence of either reading.
-                Some([first, rest @ ..]) if rest.iter().all(|value| value == first) => {
-                    match normalize_usage(source, first) {
-                        Ok(Some(usage)) if !usage.is_zero() => RecordUsage::Measured(usage),
-                        // `{}` and a record with no recognized counter are
-                        // silence, not a contradiction.
-                        Ok(_) => RecordUsage::Absent,
-                        Err(_) => RecordUsage::Unreadable,
-                    }
-                }
-                Some(_) => RecordUsage::Unreadable,
-            };
-            // A `<system-reminder>` row shares its prompt's record id and is
-            // not the human's text; leaving it out is what keeps this key
-            // equal to the `history` prompt the row was stored beside.
-            let text = rows
-                .iter()
-                .filter(|r| r.kind == "text" && r.control_kind.is_none())
-                .filter_map(|r| r.text.as_deref())
-                .map(str::trim)
-                .filter(|text| !text.is_empty())
-                .collect::<Vec<_>>()
-                .join("\n");
-            let control = first.role == "user" && rows.iter().all(|r| r.control_kind.is_some());
-            let sidechain = first.role == "user" && rows.iter().any(|r| r.is_sidechain == Some(1));
-            Some((
-                id.to_string(),
-                UsageMessage {
-                    id: id.to_string(),
-                    parent: first.parent_id.clone(),
-                    ts: first.ts_ms,
-                    role: first.role.clone(),
-                    text,
-                    usage,
-                    request,
-                    control,
-                    sidechain,
-                },
-            ))
+            let message = usage_message(id, &rows, source)?;
+            Some((id.to_string(), message))
         })
         .collect();
     // Keep even unidentifiable user events as boundaries; dropping one would
@@ -876,11 +811,6 @@ pub fn attribute_usage_to_prompts(
     // the request's record count, which is the same defect the
     // `session_requests` view exists to prevent, and it must not survive in
     // the path that feeds prompt costs.
-    //
-    // `None` marks a request whose records contradict each other. The inner
-    // `Option` is the measurement, which a request may not have yet even once
-    // its owner is known.
-    type RequestState<'a> = Option<(PromptKey, Option<&'a NormalizedUsage>)>;
     let mut requests: HashMap<&str, RequestState<'_>> = HashMap::new();
     for message in messages.values().filter(|m| m.role == "assistant") {
         let contribution = contribution_of(
@@ -891,50 +821,146 @@ pub fn attribute_usage_to_prompts(
             timestamps_known,
             &prompt_counts,
         );
-        match contribution {
-            // A record that says nothing leaves the request as it found it.
-            // A broken ancestry is silence, not contradiction: Claude chains a
-            // request's records through each other and the parser stores no
-            // row for an empty block, so a mid-chain gap is ordinary. Refusing
-            // the request over it would drop measurements that a sibling
-            // establishes outright.
-            Contribution::Silent => {}
-            Contribution::Contradictory => {
-                requests.insert(message.request.as_str(), None);
-            }
-            // The copies of one request must agree on both the measurement and
-            // the prompt that caused it. If they do not, the evidence does not
-            // say which reading is real, so the request contributes nothing
-            // rather than one of them.
-            Contribution::Owned(key) => match requests.entry(message.request.as_str()) {
-                Entry::Vacant(slot) => {
-                    slot.insert(Some((key, None)));
-                }
-                Entry::Occupied(mut slot) => {
-                    let agrees = slot.get().as_ref().is_some_and(|(owner, _)| *owner == key);
-                    if !agrees {
-                        slot.insert(None);
-                    }
-                }
-            },
-            Contribution::Measured(key, usage) => match requests.entry(message.request.as_str()) {
-                Entry::Vacant(slot) => {
-                    slot.insert(Some((key, Some(usage))));
-                }
-                Entry::Occupied(mut slot) => {
-                    let agrees = slot.get().as_ref().is_some_and(|(owner, seen)| {
-                        *owner == key && seen.is_none_or(|seen| seen == usage)
-                    });
-                    if agrees {
-                        slot.insert(Some((key, Some(usage))));
-                    } else {
-                        slot.insert(None);
-                    }
-                }
-            },
-        }
+        record_contribution(&mut requests, message.request.as_str(), contribution);
     }
+    sum_requests_by_prompt(requests)
+}
 
+/// What a request's records establish so far. `None` marks a request whose
+/// records contradict each other. The inner `Option` is the measurement,
+/// which a request may not have yet even once its owner is known.
+type RequestState<'a> = Option<(PromptKey, Option<&'a NormalizedUsage>)>;
+
+/// Rebuild one record from the content-block rows sharing its id, or `None`
+/// when the rows do not agree on what record they are.
+fn usage_message(id: &str, rows: &[&SessionEvent], source: &str) -> Option<UsageMessage> {
+    let first = rows[0];
+    if rows
+        .iter()
+        .any(|r| r.ts_ms != first.ts_ms || r.role != first.role || r.parent_id != first.parent_id)
+    {
+        return None;
+    }
+    // Rows sharing a record id come from one provider record, so they
+    // report one request. Disagreement means the row layout is not
+    // what it claims, and a measurement built on it is not evidence.
+    let request = request_key(first);
+    if rows.iter().any(|r| request_key(r) != request) {
+        return None;
+    }
+    let usage = record_usage(rows, source);
+    // A `<system-reminder>` row shares its prompt's record id and is
+    // not the human's text; leaving it out is what keeps this key
+    // equal to the `history` prompt the row was stored beside.
+    let text = rows
+        .iter()
+        .filter(|r| r.kind == "text" && r.control_kind.is_none())
+        .filter_map(|r| r.text.as_deref())
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let control = first.role == "user" && rows.iter().all(|r| r.control_kind.is_some());
+    let sidechain = first.role == "user" && rows.iter().any(|r| r.is_sidechain == Some(1));
+    Some(UsageMessage {
+        id: id.to_string(),
+        parent: first.parent_id.clone(),
+        ts: first.ts_ms,
+        role: first.role.clone(),
+        text,
+        usage,
+        request,
+        control,
+        sidechain,
+    })
+}
+
+/// The one measurement a record's rows report.
+fn record_usage(rows: &[&SessionEvent], source: &str) -> RecordUsage {
+    // Claude copies message.usage onto every content block. Counting
+    // rows would multiply one model request by its thinking/text/tool
+    // block count.
+    let raw: Vec<&str> = rows
+        .iter()
+        .filter_map(|r| r.token_json.as_deref())
+        .collect();
+    let parsed: Option<Vec<Value>> = raw
+        .iter()
+        .map(|raw| serde_json::from_str(raw).ok())
+        .collect();
+    match parsed.as_deref() {
+        None => RecordUsage::Unreadable,
+        Some([]) => RecordUsage::Absent,
+        // One record reports one measurement. Rows that disagree about
+        // it are not evidence of either reading.
+        Some([first, rest @ ..]) if rest.iter().all(|value| value == first) => {
+            match normalize_usage(source, first) {
+                Ok(Some(usage)) if !usage.is_zero() => RecordUsage::Measured(usage),
+                // `{}` and a record with no recognized counter are
+                // silence, not a contradiction.
+                Ok(_) => RecordUsage::Absent,
+                Err(_) => RecordUsage::Unreadable,
+            }
+        }
+        Some(_) => RecordUsage::Unreadable,
+    }
+}
+
+/// Fold one record's contribution into the state of the request it belongs
+/// to.
+fn record_contribution<'a>(
+    requests: &mut HashMap<&'a str, RequestState<'a>>,
+    request: &'a str,
+    contribution: Contribution<'a>,
+) {
+    match contribution {
+        // A record that says nothing leaves the request as it found it.
+        // A broken ancestry is silence, not contradiction: Claude chains a
+        // request's records through each other and the parser stores no
+        // row for an empty block, so a mid-chain gap is ordinary. Refusing
+        // the request over it would drop measurements that a sibling
+        // establishes outright.
+        Contribution::Silent => {}
+        Contribution::Contradictory => {
+            requests.insert(request, None);
+        }
+        // The copies of one request must agree on both the measurement and
+        // the prompt that caused it. If they do not, the evidence does not
+        // say which reading is real, so the request contributes nothing
+        // rather than one of them.
+        Contribution::Owned(key) => match requests.entry(request) {
+            Entry::Vacant(slot) => {
+                slot.insert(Some((key, None)));
+            }
+            Entry::Occupied(mut slot) => {
+                let agrees = slot.get().as_ref().is_some_and(|(owner, _)| *owner == key);
+                if !agrees {
+                    slot.insert(None);
+                }
+            }
+        },
+        Contribution::Measured(key, usage) => match requests.entry(request) {
+            Entry::Vacant(slot) => {
+                slot.insert(Some((key, Some(usage))));
+            }
+            Entry::Occupied(mut slot) => {
+                let agrees = slot.get().as_ref().is_some_and(|(owner, seen)| {
+                    *owner == key && seen.is_none_or(|seen| seen == usage)
+                });
+                if agrees {
+                    slot.insert(Some((key, Some(usage))));
+                } else {
+                    slot.insert(None);
+                }
+            }
+        },
+    }
+}
+
+/// Add each agreed request's measurement, once, to the prompt that owns it.
+fn sum_requests_by_prompt(
+    requests: HashMap<&str, RequestState<'_>>,
+) -> HashMap<PromptKey, NormalizedUsage> {
     let mut attributed: HashMap<PromptKey, Option<NormalizedUsage>> = HashMap::new();
     for (key, usage) in requests
         .into_values()
