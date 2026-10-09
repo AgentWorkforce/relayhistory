@@ -398,33 +398,40 @@ function isJsonObject(value: JsonValue | undefined): value is { [key: string]: J
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 
-function storedTokenUsage(slots: JsonValue | undefined): { [key: string]: JsonValue } | null {
-  if (!Array.isArray(slots)) return null;
-  const usage: { [key: string]: JsonValue } = {};
+/** A stored token usage array, or `undefined` when `slots` is not one. */
+function storedTokenUsage(slots: JsonValue): { [key: string]: JsonValue } | undefined {
+  if (!Array.isArray(slots) || slots.length > 7) return undefined;
+  const rest = slots[6];
+  if (rest !== undefined && !isJsonObject(rest)) return undefined;
+  // Spread defines every key as an own property, `__proto__` included.
+  const usage: { [key: string]: JsonValue } = rest ? { ...rest } : {};
   USAGE_COUNTERS.forEach((name, index) => {
     const counter = slots[index];
     if (counter !== undefined && counter !== null) usage[name] = counter;
   });
-  if (isJsonObject(slots[6])) Object.assign(usage, slots[6]);
   return usage;
 }
 
 /**
- * A Codex `usage_snapshot` stores its `info` object compactly, as
- * `[total, last, window, other, info]` (see the crate's `usage_snapshot`
- * module); this is the object it was stored from. A payload already an
- * object is returned as is.
+ * A Codex `usage_snapshot` stores its `info` object -- bounded like every
+ * marker payload (strings at 128 characters, containers at 32 entries,
+ * numbers never altered) -- compactly, as `[total, last, window, other]`
+ * (see the crate's `usage_snapshot` module); this is the object it was
+ * stored from. A payload that is not that form is returned as stored, as the
+ * Rust reader does.
  */
 export function usageSnapshotInfo(stored: JsonValue | null): JsonValue | null {
-  if (!Array.isArray(stored)) return stored;
-  const [total, last, window, other, info] = stored;
-  if (info !== undefined && info !== null) return info;
-  const object: { [key: string]: JsonValue } = isJsonObject(other) ? { ...other } : {};
-  const totalUsage = storedTokenUsage(total);
+  if (!Array.isArray(stored) || stored.length > 5) return stored;
+  const [total = null, last = null, window = null, other = null, info = null] = stored;
+  if (other !== null && !isJsonObject(other)) return stored;
+  const totalUsage = total === null ? null : storedTokenUsage(total);
+  const lastUsage = last === null ? null : storedTokenUsage(last);
+  if (totalUsage === undefined || lastUsage === undefined) return stored;
+  if (info !== null) return info;
+  const object: { [key: string]: JsonValue } = other ? { ...other } : {};
   if (totalUsage) object.total_token_usage = totalUsage;
-  const lastUsage = storedTokenUsage(last);
   if (lastUsage) object.last_token_usage = lastUsage;
-  if (window !== undefined && window !== null) object.model_context_window = window;
+  if (window !== null) object.model_context_window = window;
   return object;
 }
 

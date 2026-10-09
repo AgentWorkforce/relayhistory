@@ -192,4 +192,12 @@ test('a Codex usage snapshot payload is the info object it was stored from', () 
   assert.deepEqual(row('[null,null,null,null,[1,2]]').payload, [1, 2]);
   assert.deepEqual(row('{"total_token_usage":{"input_tokens":1}}').payload, { total_token_usage: { input_tokens: 1 } });
   assert.equal(row(null).payload, null);
+  // Not the stored form: kept as stored, as the Rust reader keeps it.
+  assert.deepEqual(row('[1,2,3]').payload, [1, 2, 3]);
+  assert.deepEqual(row('[[1],null,null,7]').payload, [[1], null, null, 7]);
+  // Every key is data, `__proto__` included.
+  const proto = row('[[1,null,null,null,null,null,{"__proto__":{"x":1}}],null,null,{"__proto__":2}]').payload as Record<string, unknown>;
+  assert.equal(Object.getPrototypeOf(proto), Object.prototype);
+  assert.deepEqual(Object.keys(proto).sort(), ['__proto__', 'total_token_usage']);
+  assert.deepEqual(Object.keys(proto.total_token_usage as object).sort(), ['__proto__', 'input_tokens']);
 });

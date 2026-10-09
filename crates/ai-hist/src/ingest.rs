@@ -5912,10 +5912,11 @@ fn bounded_marker_json(document: &Value) -> Result<String> {
 /// Store one Codex `token_count` as a `usage_snapshot` marker.
 ///
 /// The payload is the provider's `info` (`total_token_usage`,
-/// `last_token_usage`, `model_context_window`, anything else it writes),
-/// bounded whole like any provider document in `payload_json` and stored in
-/// the compact form [`crate::usage_snapshot`] describes; neither the bound
-/// nor the encoding alters a number, so counters are never truncated. The
+/// `last_token_usage`, `model_context_window`, any other key it writes),
+/// bounded whole like any provider document in `payload_json` -- strings at
+/// 128 characters, containers at 32 entries -- and stored in the compact form
+/// [`crate::usage_snapshot`] describes; neither the bound nor the encoding
+/// alters a number, so counters are never truncated. The
 /// `info: null` snapshot Codex emits before a turn has spent anything stores
 /// no payload.
 ///
