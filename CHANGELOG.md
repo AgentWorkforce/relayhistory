@@ -6,12 +6,11 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased - Minor]
 
-### Added
-
 ### Changed
 
 - `Message::raw_usage` returns the usage blob of the message's own record, so each streamed copy of one Claude response keeps its own snapshot (and a copy that carried none has none); `Message::usage` and `SessionEvidence::requests` still read the request's settled usage. The first `sync` after upgrading fills it through a one-time raw-facts re-read of Claude and Codex transcripts.
 - Session events carry `recordTokenJson` natively and `recordTokenUsage` in the TypeScript SDK; the session evidence contract is version 4.
+- `SessionStore::session` with `include_text: false`, and the user-turn pages, measure stored text from SQLite's record header instead of reading each body, so a text-free read of a session with large tool results no longer loads them.
 
 ### Fixed
 

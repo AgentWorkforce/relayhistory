@@ -3234,7 +3234,8 @@ pub fn session_events(
 
 /// Every normalized event for one session, oldest first, with the UTF-8
 /// length of its `text` column beside it — and, when `include_text` is
-/// false, without moving the text column out of SQLite at all.
+/// false, without moving the text column out of SQLite at all (the length is
+/// an `octet_length`; see [`USER_TURN_BYTE_LEN`]).
 ///
 /// For [`crate::SessionStore::session`]: a hash-only consumer must not pay
 /// to carry transcript text, and dropping it after the row was materialized
@@ -3265,7 +3266,7 @@ pub(crate) fn session_events_sized(
 /// [`session_events_sized`]'s statement, shared with its query-plan test.
 fn session_events_sized_sql(columns: &str) -> String {
     format!(
-        "SELECT {columns}, LENGTH(CAST(text AS BLOB)) FROM session_events \
+        "SELECT {columns}, octet_length(text) FROM session_events \
          WHERE source = ? AND session_id = ? {SESSION_EVENT_ORDER}"
     )
 }
@@ -3293,7 +3294,7 @@ pub(crate) fn session_prompts_sized(
 ) -> Result<Vec<PromptRow>> {
     let prompt = if include_text { "prompt" } else { "NULL" };
     let sql = format!(
-        "SELECT project, timestamp_ms, prompt_hash, LENGTH(CAST(prompt AS BLOB)), {prompt} \
+        "SELECT project, timestamp_ms, prompt_hash, octet_length(prompt), {prompt} \
          FROM history WHERE source = ? AND session_id = ? ORDER BY timestamp_ms ASC, id ASC"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -3770,7 +3771,14 @@ pub struct SessionUserTurnPage {
 
 /// Byte length of a stored `text` column, counted in bytes rather than
 /// characters so it is comparable with a measured `payload_bytes`.
-const USER_TURN_BYTE_LEN: &str = "COALESCE(payload_bytes, LENGTH(CAST(text AS BLOB)), 0)";
+///
+/// Every sized read measures with `octet_length(x)`: for a column argument
+/// SQLite answers it from the record header's serial type, so a text-free
+/// read never pulls a large body off its overflow pages.
+/// `LENGTH(CAST(x AS BLOB))` returns the same number but materializes the
+/// whole value first. `octet_length` needs SQLite 3.43+, which the bundled
+/// `libsqlite3-sys` provides.
+const USER_TURN_BYTE_LEN: &str = "COALESCE(payload_bytes, octet_length(text), 0)";
 
 /// The grouping key for a user turn: a provider message id when the row has
 /// one, otherwise the row's own identity, so an unattributed event becomes a
@@ -9011,6 +9019,101 @@ mod tests {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap()
             .join(" | ")
+    }
+
+    /// The sized reads measure with `octet_length`, which must report exactly
+    /// the bytes `LENGTH(CAST(x AS BLOB))` does for every value a column can
+    /// hold -- multibyte UTF-8, empty, NULL, BLOB-typed, numeric, and a body
+    /// large enough to spill onto overflow pages.
+    #[test]
+    fn sized_reads_report_the_stored_byte_length_of_every_value() {
+        let (major, minor) = (
+            rusqlite::version_number() / 1_000_000,
+            rusqlite::version_number() / 1_000 % 1_000,
+        );
+        assert!(
+            (major, minor) >= (3, 43),
+            "octet_length needs SQLite 3.43+, bundled is {}",
+            rusqlite::version()
+        );
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let large = "λ→🦀".repeat(20_000);
+        let texts: [Option<&str>; 5] = [
+            Some("plain ascii"),
+            Some("λ→🦀 mixed ünïcödé"),
+            Some(""),
+            None,
+            Some(&large),
+        ];
+        for (n, text) in texts.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO session_events (source, session_id, ts_ms, role, kind, text, event_uid) \
+                 VALUES ('codex', 's', ?1, 'user', 'text', ?2, ?3)",
+                params![n as i64, text, format!("e{n}")],
+            )
+            .unwrap();
+            if let Some(text) = text {
+                conn.execute(
+                    "INSERT INTO history (source, session_id, prompt, timestamp_ms) \
+                     VALUES ('codex', 's', ?1, ?2)",
+                    params![text, n as i64],
+                )
+                .unwrap();
+            }
+        }
+        // Values of every other storage class in the TEXT-affinity column.
+        for (n, sql_value) in ["X'00FF00'", "X''", "42", "1.5"].iter().enumerate() {
+            conn.execute(
+                &format!(
+                    "INSERT INTO session_events (source, session_id, ts_ms, role, kind, text, event_uid) \
+                     VALUES ('codex', 'typed', {n}, 'user', 'text', {sql_value}, 't{n}')"
+                ),
+                [],
+            )
+            .unwrap();
+        }
+        let disagreements: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM session_events \
+                     WHERE octet_length(text) IS NOT LENGTH(CAST(text AS BLOB)) \
+                        OR {USER_TURN_BYTE_LEN} \
+                           IS NOT COALESCE(payload_bytes, LENGTH(CAST(text AS BLOB)), 0)"
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(disagreements, 0);
+
+        let expected: Vec<Option<i64>> = texts
+            .iter()
+            .map(|text| text.map(|text| text.len() as i64))
+            .collect();
+        for include_text in [true, false] {
+            let sized = session_events_sized(&conn, "codex", "s", include_text).unwrap();
+            assert_eq!(
+                sized.iter().map(|(_, bytes)| *bytes).collect::<Vec<_>>(),
+                expected,
+                "include_text={include_text}"
+            );
+            let prompts = session_prompts_sized(&conn, "codex", "s", include_text).unwrap();
+            assert_eq!(
+                prompts
+                    .iter()
+                    .map(|row| row.prompt_bytes)
+                    .collect::<Vec<_>>(),
+                expected.iter().flatten().copied().collect::<Vec<_>>(),
+                "include_text={include_text}"
+            );
+        }
+        let typed = session_events_sized(&conn, "codex", "typed", false).unwrap();
+        assert_eq!(
+            typed.iter().map(|(_, bytes)| *bytes).collect::<Vec<_>>(),
+            vec![Some(3), Some(0), Some(2), Some(3)]
+        );
     }
 
     /// A whole-session event read is delivered in order by the page index
