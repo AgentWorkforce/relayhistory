@@ -3204,8 +3204,8 @@ const RAW_MESSAGE_FACTS_GENERATION: i64 = 4;
 const CLAUDE_RAW_MESSAGE_FACTS_KEY: &str = "claude_raw_message_facts";
 
 /// One-time pass over indexed Claude transcripts for what earlier parsers
-/// left out: the event of a signed, empty `thinking` block (its signature
-/// marker is stored, the event is not) and the timestamps of the records
+/// left out: the request identity on the signature marker of a signed, empty
+/// `thinking` block (which stores no event) and the timestamps of the records
 /// naming explicit continuity targets. Only transcripts the probes select are
 /// re-read or re-captured, and the probes run only while the pass is pending
 /// and only for transcripts already indexed, so a fresh store and every later
@@ -11068,7 +11068,8 @@ fn claude_marker_for_record(
 /// first in a response, so its timestamp is when the request started. It
 /// stores no event, so its marker carries the record's request identity --
 /// `request_id` and `provider_message_id` -- which is what places it in its
-/// request (`session_requests` folds these markers in).
+/// request. Each is stored whole or not at all: an id longer than the marker
+/// field bound is left out, because a truncated id would name no request.
 fn claude_markers_for_block(
     block_type: &str,
     block: &Value,
@@ -11091,7 +11092,10 @@ fn claude_markers_for_block(
                 if text.is_none_or(|text| text.trim().is_empty()) {
                     let id = |value: Option<&str>| {
                         value
-                            .filter(|value| !value.is_empty())
+                            .filter(|value| {
+                                !value.is_empty()
+                                    && value.chars().count() <= MARKER_PAYLOAD_FIELD_LIMIT
+                            })
                             .map(|value| Value::String(value.to_string()))
                             .unwrap_or(Value::Null)
                     };
@@ -37804,6 +37808,22 @@ mod codex_fork_replay_tests {
         assert_eq!(closed["inherited_snapshot"], usage(1000)["info"]);
         // 1600 cumulative, 1000 of it inherited from the parent.
         assert_eq!(token_totals(&conn, CHILD), vec![600]);
+    }
+
+    /// A signature marker's request identity is stored whole or not at all.
+    #[test]
+    fn a_signature_marker_never_stores_a_truncated_request_identity() {
+        let block = json!({"type": "thinking", "thinking": "", "signature": "sig"});
+        let long = "r".repeat(MARKER_PAYLOAD_FIELD_LIMIT + 1);
+        let payload = |request_id: &str| -> Value {
+            let markers =
+                claude_markers_for_block("thinking", &block, Some(request_id), Some("msg_1"));
+            serde_json::from_str(markers[0].1.payload_json.as_deref().unwrap()).unwrap()
+        };
+        assert_eq!(payload("req_1")["request_id"], json!("req_1"));
+        let over = payload(&long);
+        assert!(over.get("request_id").is_none(), "{over}");
+        assert_eq!(over["provider_message_id"], json!("msg_1"));
     }
 
     /// Keys that sort ahead of the measured ones cannot push a counter out
