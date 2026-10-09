@@ -431,10 +431,10 @@ Lines inside the span write nothing under the child. One
 `fork_replay_boundary` marker, keyed by the replayed `session_meta`'s line,
 accounts for them (`first_line`, `last_line`, `replayed_lines`, the closing
 turn and the rule that closed it). The last readable `token_count` inside the
-span is kept on it as `inherited_snapshot`, as written, bounded per the marker contract (counters are never truncated), and becomes the child's
-inherited baseline, so the child's first request is
-charged only what it spent beyond the parent's total. codex-rs seeds a fork's
-usage from the copied history (`record_initial_history` on
+span is kept on it as `inherited_snapshot`, bounded per the marker contract
+(counters are never truncated), and becomes the child's inherited baseline,
+so the child's first request is charged only what it spent beyond the
+parent's total. codex-rs seeds a fork's usage from the copied history (`record_initial_history` on
 `InitialHistory::Forked` calls `last_token_info_from_rollout`), and each request
 then grows `total_token_usage` by exactly `last_token_usage`; the child's first
 readable snapshot is checked against that: `total == last` means its counter

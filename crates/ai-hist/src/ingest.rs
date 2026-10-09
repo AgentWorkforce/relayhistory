@@ -9366,24 +9366,14 @@ pub(crate) fn ingest_claude_transcript(conn: &Connection, path: &Path) -> Result
     ingest_claude_transcript_as(conn, path, None)
 }
 
-/// Remove everything a single transcript record produced under one session id.
-///
-/// `message_uuid` is the same identity insertion derives event uids from and
-/// stamps on the rows it derives from a record's tool use, so this reaches the
-/// record's events, its tool calls and its file edits together — including
-/// records with no `uuid` of their own, which fall back to the message id or
-/// the file position. Leaving the derived rows behind would keep a parent
-/// exposing a delegated thread's actions as its own long after the events
-/// moved to the child. The event prefix is compared with `substr` rather than
-/// `LIKE` because a provider id may contain `_` or `%`.
 /// The rows one Claude record produced, per table, as `(table, condition)`
 /// over `(session_id, message_uuid)`. Event and marker uids are the record's
 /// uuid plus `:`-suffixes, so the prefix is a range on the uid -- `:` and `;`
 /// are adjacent bytes -- which the `(source, session_id, uid)` unique index
-/// answers; `substr()` there scanned every row of the session. The parser
+/// answers, and a `_` or `%` in a provider id is a literal byte. The parser
 /// retires a record's rows under the parent for every sidechain record it
-/// moves onto its child, so a scan made each re-read of a sidecar quadratic
-/// in the size of the parent session.
+/// moves onto its child, so a scan of the session here would make each
+/// re-read of a sidecar quadratic in the size of the parent session.
 const CLAUDE_RECORD_ROWS: [(&str, &str); 4] = [
     (
         "session_events",
@@ -9407,6 +9397,15 @@ const CLAUDE_RECORD_ROWS: [(&str, &str); 4] = [
     ),
 ];
 
+/// Remove everything a single transcript record produced under one session id.
+///
+/// `message_uuid` is the same identity insertion derives event uids from and
+/// stamps on the rows it derives from a record's tool use, so this reaches the
+/// record's events, its tool calls, its file edits and its markers together —
+/// including records with no `uuid` of their own, which fall back to the
+/// message id or a hash of the record. Leaving the derived rows behind would
+/// keep a parent exposing a delegated thread's actions as its own long after
+/// the events moved to the child.
 fn delete_claude_record_rows(
     conn: &Connection,
     session_id: &str,
