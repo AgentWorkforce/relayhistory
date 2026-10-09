@@ -736,17 +736,20 @@ snapshots, and the folded slash-command triad.
 
 A Codex `turn_context` marker is stored only where the configuration changes:
 Codex restates its whole configuration on every turn, and a record that repeats
-the previous one apart from its `turn_id` stores nothing. **The configuration
-of a turn is the latest `turn_context` marker at or before that turn's start in
-rollout order**, a turn's start being its own `turn_context` record (Codex
-writes it just after the turn's `task_started`): the marker carrying the turn's
-`turn_id` when there is one, else the latest earlier one. Every stored marker
-is the record whole; its `turn_id` is the turn it took effect at, and every
-other field — `root_turn_id`, `model`, `effort`, `cwd`, `current_date`, the
-approval and sandbox policy — is the configuration of each turn up to the next
-marker. A session's first `turn_context` is always stored, and so is a fork
-child's first own one: the replayed parent history is the parent's, so a
-child's markers alone configure its turns.
+the previous one apart from the fields naming its turn stores nothing. **The
+configuration of a turn is the latest `turn_context` marker at or before that
+turn's start in rollout order**, a turn's start being its own `turn_context`
+record (Codex writes it just after the turn's `task_started`): the marker
+carrying the turn's `turn_id` when there is one, else the latest earlier one.
+Every stored marker is the record whole. Its `turn_id` is the turn it took
+effect at; `root_turn_id` — the root thread's turn a delegated thread's turn
+works for — is the turn's own on its `task_started` marker's payload when Codex
+wrote it there, and is then left out of the comparison; every other field —
+`model`, `effort`, `cwd`, `current_date`, the approval and sandbox policy, and
+`root_turn_id` where `task_started` does not carry it — is the configuration of
+each turn up to the next marker. A session's first `turn_context` is always
+stored, and so is a fork child's first own one: the replayed parent history is
+the parent's, so a child's markers alone configure its turns.
 
 ```rust
 // turn id -> the turn_context payload it ran under, walking `markers` in read order.

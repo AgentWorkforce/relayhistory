@@ -9,7 +9,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - Codex sessions keep every `token_count` snapshot outside a fork's replayed parent history as a `usage_snapshot` marker, bounded per the marker contract (counters are never truncated) and typed as `Marker::usage_snapshot`, on `SessionEvidence::markers`, with its `turn_id` and in read order, including turns that wrote no assistant message; a fork's `fork_replay_boundary` marker carries the inherited snapshot as `inherited_snapshot`. Existing stores re-read their Codex rollouts once on the next sync or hydration to capture them.
-- Codex sessions keep each `turn_context` record that changes the session's configuration (any field but `turn_id`) as a `turn_context` marker, as written, bounded per the marker contract, with the `turn_id` it took effect at; a turn's configuration — model, effort, cwd, approval/sandbox policy — is the latest `turn_context` marker at or before its start in rollout order, readable even when it wrote no assistant message.
+- Codex sessions keep each `turn_context` record that changes the session's configuration (any field but `turn_id`, and `root_turn_id` when the turn's `task_started` marker carries it) as a `turn_context` marker, as written, bounded per the marker contract, with the `turn_id` it took effect at; a turn's configuration — model, effort, cwd, approval/sandbox policy — is the latest `turn_context` marker at or before its start in rollout order, readable even when it wrote no assistant message.
+- Codex `task_started` markers carry the turn's `root_turn_id` in their payload when Codex writes it.
 
 ### Fixed
 

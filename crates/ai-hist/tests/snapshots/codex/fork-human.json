@@ -296,19 +296,6 @@
       "turn_id": "019da830-2220-7000-8000-000000000002"
     },
     {
-      "kind": "turn_context",
-      "marker_uid": "8:marker",
-      "message_id": null,
-      "parent_id": null,
-      "payload_json": "{\"cwd\":\"/tmp/project\",\"model\":\"gpt-5.4\",\"turn_id\":\"019da830-2220-7000-8000-000000000002\"}",
-      "session_id": "019da82f-d400-7000-8000-00000000000a",
-      "source": "codex",
-      "subkind": "turn_context",
-      "text": null,
-      "ts_ms": 1776643220001,
-      "turn_id": "019da830-2220-7000-8000-000000000002"
-    },
-    {
       "kind": "usage_snapshot",
       "marker_uid": "11:marker",
       "message_id": null,

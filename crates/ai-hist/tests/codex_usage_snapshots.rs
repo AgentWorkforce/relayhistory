@@ -328,8 +328,15 @@ fn an_info_object_payload_reads_back_typed() {
 }
 
 /// A rollout whose `turn_context` records are the `configs` given, one turn
-/// each, every turn closed, with Codex's own turn ids.
+/// each, every turn closed, with Codex's own turn ids. Its `task_started`
+/// records write no `root_turn_id`, as older Codex builds do.
 fn configured_rollout(session_id: &str, configs: &[Value]) -> String {
+    rollout_with_roots(session_id, configs, false)
+}
+
+/// As [`configured_rollout`], with `task_started` writing the turn's
+/// `root_turn_id` when `rooted`, as current Codex does.
+fn rollout_with_roots(session_id: &str, configs: &[Value], rooted: bool) -> String {
     let mut lines = vec![
         json!({"timestamp":"2026-04-20T00:00:00.000Z","type":"session_meta","payload":{"id":session_id,"cwd":"/tmp/project"}}),
     ];
@@ -338,7 +345,11 @@ fn configured_rollout(session_id: &str, configs: &[Value]) -> String {
         let at = |second: usize| format!("2026-04-20T00:{n:02}:{second:02}.000Z");
         let mut context = config.clone();
         context["turn_id"] = json!(turn);
-        lines.push(json!({"timestamp":at(0),"type":"event_msg","payload":{"type":"task_started","turn_id":turn}}));
+        let mut started = json!({"type":"task_started","turn_id":turn});
+        if rooted {
+            started["root_turn_id"] = context["root_turn_id"].clone();
+        }
+        lines.push(json!({"timestamp":at(0),"type":"event_msg","payload":started}));
         lines.push(json!({"timestamp":at(1),"type":"turn_context","payload":context}));
         lines.push(json!({"timestamp":at(2),"type":"event_msg","payload":{"type":"user_message","message":format!("prompt {n}")}}));
         lines.push(json!({"timestamp":at(3),"type":"event_msg","payload":{"type":"task_complete","turn_id":turn}}));
@@ -406,8 +417,9 @@ fn unchanged_turn_contexts_store_one_marker() {
 }
 
 /// Any change other than the turn id is a new configuration and a new
-/// marker -- model, effort, cwd, the date, the root turn, a nested setting --
-/// and returning to an earlier configuration is a change too.
+/// marker -- model, effort, cwd, the date, a nested setting, and the root
+/// turn when the turn's `task_started` does not keep it -- and returning to an
+/// earlier configuration is a change too.
 #[test]
 fn a_changed_setting_stores_a_new_marker() {
     let configs = vec![
@@ -451,6 +463,53 @@ fn a_changed_setting_stores_a_new_marker() {
     let encoded = serde_json::to_string(&evidence.markers).unwrap();
     let decoded: Vec<Marker> = serde_json::from_str(&encoded).unwrap();
     assert_eq!(decoded, evidence.markers);
+}
+
+/// Current Codex writes `root_turn_id` on `task_started` too, and that marker
+/// keeps it: a delegated thread whose root moved to its next turn, with
+/// nothing else changed, stores no new `turn_context`, and every turn still
+/// reads its own root.
+#[test]
+fn a_root_kept_by_task_started_is_not_a_configuration_change() {
+    let configs = vec![
+        base_config(),
+        with("root_turn_id", json!("root_b")),
+        with("root_turn_id", json!("root_c")),
+        {
+            let mut config = with("root_turn_id", json!("root_c"));
+            config["model"] = json!("gpt-5.5");
+            config
+        },
+    ];
+    let rollout = rollout_with_roots("sess_roots", &configs, true);
+    let (_dir, evidence) = synced(&rollout, "sess_roots");
+    assert_eq!(
+        turn_contexts(&evidence)
+            .iter()
+            .map(|(turn, config)| (turn.as_str(), config["root_turn_id"].as_str().unwrap()))
+            .collect::<Vec<_>>(),
+        vec![("turn_0", "root_a"), ("turn_3", "root_c")]
+    );
+    let roots: Vec<(&str, Value)> = evidence
+        .markers
+        .iter()
+        .filter(|marker| marker.kind == "task_started")
+        .map(|marker| {
+            (
+                marker.turn_id.as_deref().unwrap(),
+                marker.payload.clone().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        roots,
+        vec![
+            ("turn_0", json!({"root_turn_id": "root_a"})),
+            ("turn_1", json!({"root_turn_id": "root_b"})),
+            ("turn_2", json!({"root_turn_id": "root_c"})),
+            ("turn_3", json!({"root_turn_id": "root_c"})),
+        ]
+    );
 }
 
 /// `sync`, `hydrate` and the change feed agree on which `turn_context`

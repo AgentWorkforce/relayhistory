@@ -5897,42 +5897,55 @@ fn surviving_refusals(
     refused
 }
 
-/// The `turn_context` fields that name the turn rather than configure it.
-///
-/// `turn_id` is the only one: it is new on every turn, and the marker keeps
-/// it in its own `turn_id` column, which is the turn the configuration took
-/// effect at. Every other field -- `root_turn_id` included -- is part of the
-/// configuration a later turn inherits. `root_turn_id` is the turn of the
-/// root thread a delegated thread is working for: it changes when the root
-/// moves to its next turn, and older Codex builds write it on `turn_context`
-/// alone, so a turn that inherited it from an earlier marker would read
-/// another turn's root.
-const TURN_CONTEXT_IDENTITY_FIELDS: &[&str] = &["turn_id"];
-
 /// One `turn_context` payload, bounded per the marker contract, and the digest
 /// of the configuration it carries.
 ///
-/// The digest covers every field but [`TURN_CONTEXT_IDENTITY_FIELDS`], in the
-/// order the provider wrote them, so two records with the same digest describe
-/// the same configuration. It is persisted on the Codex cursor, so its form
-/// is fixed: SHA-256 of the bounded payload's compact JSON without those
-/// fields, lowercase hex.
+/// The digest covers every field but the ones that name the turn rather than
+/// configure it, in the order the provider wrote them, so two records with the
+/// same digest describe the same configuration:
+///
+/// - `turn_id`, always: it is new on every turn, the marker keeps it in its
+///   own `turn_id` column as the turn the configuration took effect at, and
+///   the turn's `task_started` marker names it too.
+/// - `root_turn_id` -- the root thread's turn a delegated thread is working
+///   for, which moves with the root's turns -- only when the turn's own
+///   `task_started` wrote the same value, because that marker keeps it. Older
+///   Codex builds write it on `turn_context` alone, and there it is part of
+///   the configuration, or a turn inheriting an earlier marker would read
+///   another turn's root.
+///
+/// It is persisted on the Codex cursor, so its form is fixed: SHA-256 of the
+/// bounded payload's compact JSON without those fields, lowercase hex.
 struct CodexTurnContext<'a> {
     payload: std::borrow::Cow<'a, Value>,
     digest: String,
 }
 
 impl<'a> CodexTurnContext<'a> {
-    /// A payload is almost always within the bound already, so it is checked
-    /// in place and copied only when something actually has to be cut.
-    fn read(payload: &'a Value) -> Result<Self> {
+    /// `started` is the `(turn_id, root_turn_id)` of the last `task_started`
+    /// that wrote both. A payload is almost always within the bound already,
+    /// so it is checked in place and copied only when something actually has
+    /// to be cut.
+    fn read(payload: &'a Value, started: Option<&(String, String)>) -> Result<Self> {
+        let field = |key: &str| payload.get(key).and_then(Value::as_str);
+        let root_is_the_turns = started.is_some_and(|(turn, root)| {
+            field("turn_id") == Some(turn.as_str()) && field("root_turn_id") == Some(root.as_str())
+        });
+        let identity: &[&str] = if root_is_the_turns {
+            &["turn_id", "root_turn_id"]
+        } else {
+            &["turn_id"]
+        };
         let payload = if marker_payload_is_bounded(payload) {
             std::borrow::Cow::Borrowed(payload)
         } else {
             std::borrow::Cow::Owned(bound_marker_value(payload.clone()))
         };
         let mut hasher = Sha256::new();
-        serde_json::to_writer(&mut hasher, &ConfigurationFields(payload.as_ref()))?;
+        serde_json::to_writer(
+            &mut hasher,
+            &ConfigurationFields(payload.as_ref(), identity),
+        )?;
         Ok(Self {
             payload,
             digest: format!("{:x}", hasher.finalize()),
@@ -5941,7 +5954,7 @@ impl<'a> CodexTurnContext<'a> {
 }
 
 /// A `turn_context` payload without its identity fields, serialized as is.
-struct ConfigurationFields<'a>(&'a Value);
+struct ConfigurationFields<'a>(&'a Value, &'a [&'a str]);
 
 impl Serialize for ConfigurationFields<'_> {
     fn serialize<S: serde::Serializer>(
@@ -5954,7 +5967,7 @@ impl Serialize for ConfigurationFields<'_> {
         };
         let mut out = serializer.serialize_map(None)?;
         for (key, value) in map {
-            if !TURN_CONTEXT_IDENTITY_FIELDS.contains(&key.as_str()) {
+            if !self.1.contains(&key.as_str()) {
                 out.serialize_entry(key, value)?;
             }
         }
@@ -6266,6 +6279,11 @@ fn ingest_codex_rollout_incremental(
     // (see `CodexTurnContext`). Carried across passes, so a resumed pass
     // stores a record only if it changes what the stored markers say.
     let mut turn_context_digest: Option<String> = resume.turn_context_digest.clone();
+    // `(turn_id, root_turn_id)` of the last `task_started` that wrote both,
+    // whose marker keeps the root (see `CodexTurnContext`). Needs no resume
+    // state: a pass commits only at `task_complete`, before the next turn's
+    // `task_started`.
+    let mut started_turn: Option<(String, String)> = None;
     let mut saw_model_output = resume.saw_model_output;
     // Mirrors are adjacent physical records. Keep the index too so malformed
     // or oversized lines cannot make two separate equal replies look adjacent.
@@ -6414,6 +6432,11 @@ fn ingest_codex_rollout_incremental(
         // Lifecycle, compaction, streaming-failure and begin-side tool lines
         // are not messages, so none of the arms below can hold them. Classify
         // every line once, here, and keep whatever the event model drops.
+        if line_type == "event_msg" && payload_type == "task_started" {
+            started_turn = payload_str("turn_id")
+                .zip(payload_str("root_turn_id"))
+                .map(|(turn, root)| (turn.to_string(), root.to_string()));
+        }
         if let Some(draft) = codex_marker_for_event(line_type, payload_type, payload) {
             let marker_uid = format!("{index}:marker");
             insert_session_marker(
@@ -6597,7 +6620,7 @@ fn ingest_codex_rollout_incremental(
                 // configured by the marker already stored: a turn's
                 // configuration is the latest `turn_context` marker at or
                 // before its start.
-                let context = CodexTurnContext::read(&value["payload"])?;
+                let context = CodexTurnContext::read(&value["payload"], started_turn.as_ref())?;
                 if turn_context_digest.as_deref() == Some(context.digest.as_str()) {
                     // Accounted for by the marker it repeats.
                     unwritten_line = None;
@@ -10881,7 +10904,15 @@ fn codex_marker_for_payload(
         };
     }
     match payload_type {
-        "task_started" => MarkerDraft::new("task_started", Some("task_started")),
+        // The root thread's turn a delegated thread's turn works for: a
+        // `turn_context` that repeats everything else is not stored, so the
+        // turn keeps its root here.
+        "task_started" => {
+            MarkerDraft::new("task_started", Some("task_started")).with_payload(vec![(
+                "root_turn_id",
+                payload.get("root_turn_id").cloned().unwrap_or(Value::Null),
+            )])
+        }
         "task_complete" => {
             MarkerDraft::new("task_complete", Some("task_complete")).with_payload(vec![(
                 "duration_ms",

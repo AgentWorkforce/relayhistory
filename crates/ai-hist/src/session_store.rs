@@ -2796,8 +2796,10 @@ impl FileEdit {
 /// changes: the configuration of a turn is the latest `turn_context` marker
 /// at or before that turn's start in rollout order -- the marker carrying the
 /// turn's `turn_id` when there is one, else the latest earlier one. Its
-/// `turn_id` is the turn it took effect at, and every other payload field, `root_turn_id`
-/// included, is the configuration of each turn up to the next marker.
+/// `turn_id` is the turn it took effect at, and every other payload field is
+/// the configuration of each turn up to the next marker -- except
+/// `root_turn_id` where the turn's `task_started` marker carries its own,
+/// which is then that turn's root.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Marker {
