@@ -148,6 +148,10 @@ pub(crate) struct TranscriptFileCursor {
     pub prefix_hash: String,
 }
 
+fn is_zero(value: &i64) -> bool {
+    *value == 0
+}
+
 /// Claude's per-source resume state.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct ClaudeCursorState {
@@ -2351,8 +2355,4 @@ mod tests {
         assert!(stored.settled.is_none());
         assert_eq!(stored.file.unwrap().unchanged_since_ms, 12_345);
     }
-}
-
-fn is_zero(value: &i64) -> bool {
-    *value == 0
 }
