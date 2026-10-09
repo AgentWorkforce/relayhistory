@@ -84,7 +84,7 @@ pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 4;
 /// invalidates every stored stamp, so a scanner that learns to extract a new
 /// field re-reads sources whose bytes never changed. `parser_version` keeps its
 /// existing meaning (full-ingest parser generation) and is untouched.
-pub const SHALLOW_SCANNER_VERSION: u32 = 9;
+pub const SHALLOW_SCANNER_VERSION: u32 = 10;
 
 /// Version 2 shipped the classification that hid standalone guardians (see
 /// [`crate::codex_is_subagent`]). Their rollouts never change on disk, so the
@@ -143,6 +143,15 @@ const _: () = assert!(SHALLOW_SCANNER_VERSION > 7);
 /// database does not change when the reader is upgraded, so only this bump
 /// forces unchanged Devin sessions through the corrected shallow reader.
 const _: () = assert!(SHALLOW_SCANNER_VERSION > 8);
+
+/// Version 9 classified a Claude transcript as a subagent sidecar by content
+/// alone, so a primary `<sessionId>.jsonl` made only of `isSidechain` rows was
+/// recorded as a known non-session. Version 10 also requires the sidecar
+/// layout (`agent-*.jsonl`). Such a transcript never changes on disk, so only
+/// this bump clears its stored `discovery_skips` row and moves the sweep
+/// generation, sending the first `sync` after the upgrade through the walk
+/// that catalogs it.
+const _: () = assert!(SHALLOW_SCANNER_VERSION > 9);
 
 /// Most bytes a shallow head read may consume from one transcript.
 pub const HEAD_SCAN_MAX_BYTES: u64 = 256 * 1024;
@@ -1557,6 +1566,7 @@ fn read_claude_shallow(
         // as a session would emit the parent twice per run and let the two
         // files fight over one row's raw_path/source_stamp, so the stamp never
         // matched again and one of them was re-read forever.
+        let sidecar_layout = crate::ingest::is_claude_sidecar_file(path);
         let mut primary_record_seen = false;
         let mut sidechain_records = 0usize;
         let mut identified_records = 0usize;
@@ -1605,11 +1615,12 @@ fn read_claude_shallow(
             if session.first_prompt.is_none() {
                 session.first_prompt = claude_substantive_prompt(&value);
             }
-            // Every observed field is settled, a model has been seen, and a
-            // primary record proves this is not a sidecar: nothing further in
-            // the head can change the row (additional models stay
-            // best-effort), so stop paying to parse it.
-            if primary_record_seen
+            // Every observed field is settled, a model has been seen, and the
+            // file is not a sidecar -- by its layout, or by a primary record
+            // in one laid out as a sidecar: nothing further in the head can
+            // change the row (additional models stay best-effort), so stop
+            // paying to parse it.
+            if (primary_record_seen || !sidecar_layout)
                 && !models.is_empty()
                 && session.cwd.is_some()
                 && session.git_branch.is_some()
@@ -1642,11 +1653,17 @@ fn read_claude_shallow(
                 }
             }
         }
-        // Every identified record in the head belongs to a sidechain: this is a
-        // sidecar for a session whose own transcript is enumerated separately.
-        // A session's primary transcript always opens with non-sidechain turns,
-        // because a subagent can only be spawned by one.
-        if identified_records > 0 && sidechain_records == identified_records {
+        // A file laid out as a sidecar whose every identified head record is a
+        // sidechain row is a subagent's transcript, for a session whose own
+        // transcript is enumerated separately. A primary transcript of only
+        // sidechain rows -- inline Task traffic from Claude Code versions that
+        // wrote it there -- is still that session's transcript.
+        if sidecar_layout
+            && crate::ingest::claude_records_are_all_sidechain(
+                identified_records,
+                sidechain_records,
+            )
+        {
             return Ok(None);
         }
         // A file with complete records that parse as nothing is corrupt, not a

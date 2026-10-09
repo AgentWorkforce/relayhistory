@@ -320,6 +320,12 @@ export interface SessionEvent {
   model: string | null;
   tokenUsage: Record<string, unknown> | null;
   /**
+   * The usage this one record carried. For Claude, `tokenUsage` is the blob a
+   * streamed request's copies settle into, so the two differ on an earlier
+   * copy, and this is null on a copy that carried none.
+   */
+  recordTokenUsage: Record<string, unknown> | null;
+  /**
    * The upstream inference provider, when the harness records one of its own
    * (OpenCode's `providerID`). Null for harnesses that do not name one — it is
    * never inferred from `model`.
@@ -380,7 +386,8 @@ export type ControlKind =
   | 'system_reminder'
   | 'codex_context_wrapper'
   | 'meta'
-  | 'resume_marker';
+  | 'resume_marker'
+  | 'synthetic';
 
 export type ToolResultStatus = 'running' | 'completed' | 'errored' | 'cancelled' | 'unknown';
 
@@ -678,7 +685,13 @@ export interface SessionMarker {
   subkind: string | null;
   /** The provider's own readable text for this marker, when it wrote one. */
   text: string | null;
-  /** Parsed bounded payload projection, or null when absent or unparseable. */
+  /**
+   * Parsed bounded payload projection, or null when absent or unparseable.
+   * For a Codex `usage_snapshot`, the provider's `info` object -- bounded like
+   * every payload (strings at 128 characters, containers at 32 entries,
+   * numbers, and so every counter, never altered) -- expanded from the compact
+   * form `payloadJson` stores.
+   */
   payload: JsonValue | null;
   /** The stored payload string exactly as indexed, parseable or not. */
   payloadJson: string | null;

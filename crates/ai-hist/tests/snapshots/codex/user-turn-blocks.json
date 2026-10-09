@@ -353,6 +353,19 @@
   ],
   "session_markers": [
     {
+      "kind": "turn_context",
+      "marker_uid": "1:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "{\"cwd\":\"/tmp/project\",\"model\":\"gpt-5.4\",\"turn_id\":\"turn_utb_1\"}",
+      "session_id": "sess_codex_utb",
+      "source": "codex",
+      "subkind": "turn_context",
+      "text": null,
+      "ts_ms": 1776729600050,
+      "turn_id": "turn_utb_1"
+    },
+    {
       "kind": "task_started",
       "marker_uid": "3:marker",
       "message_id": null,
@@ -363,6 +376,19 @@
       "subkind": "task_started",
       "text": null,
       "ts_ms": 1776729600200,
+      "turn_id": "turn_utb_1"
+    },
+    {
+      "kind": "usage_snapshot",
+      "marker_uid": "7:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "[[100,0,null,50]]",
+      "session_id": "sess_codex_utb",
+      "source": "codex",
+      "subkind": "token_count",
+      "text": null,
+      "ts_ms": 1776729600900,
       "turn_id": "turn_utb_1"
     },
     {
@@ -392,6 +418,19 @@
       "turn_id": "turn_utb_2"
     },
     {
+      "kind": "usage_snapshot",
+      "marker_uid": "18:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "[[155,0,null,85]]",
+      "session_id": "sess_codex_utb",
+      "source": "codex",
+      "subkind": "token_count",
+      "text": null,
+      "ts_ms": 1776729601900,
+      "turn_id": "turn_utb_2"
+    },
+    {
       "kind": "task_complete",
       "marker_uid": "19:marker",
       "message_id": null,
@@ -415,6 +454,19 @@
       "subkind": "task_started",
       "text": null,
       "ts_ms": 1776729602200,
+      "turn_id": "turn_utb_3"
+    },
+    {
+      "kind": "usage_snapshot",
+      "marker_uid": "25:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "[[198,0,null,110]]",
+      "session_id": "sess_codex_utb",
+      "source": "codex",
+      "subkind": "token_count",
+      "text": null,
+      "ts_ms": 1776729602900,
       "turn_id": "turn_utb_3"
     },
     {

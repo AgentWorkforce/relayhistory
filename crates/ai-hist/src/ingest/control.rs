@@ -59,6 +59,11 @@ pub enum ControlKind {
     Meta,
     /// Claude: a bare `/resume <id>` or `/continue <id>` the human typed.
     ResumeMarker,
+    /// OpenCode: a user text part flagged `synthetic: true` — content the
+    /// harness wrote into the turn on the human's behalf, such as the output
+    /// of a tool it ran for an `@file` mention. The model reads it; the human
+    /// did not type it.
+    Synthetic,
 }
 
 impl ControlKind {
@@ -76,6 +81,7 @@ impl ControlKind {
         ControlKind::CodexContextWrapper,
         ControlKind::Meta,
         ControlKind::ResumeMarker,
+        ControlKind::Synthetic,
     ];
 
     /// The inverse of [`Self::as_str`]: `None` for any spelling not in the
@@ -102,6 +108,7 @@ impl ControlKind {
             ControlKind::CodexContextWrapper => "codex_context_wrapper",
             ControlKind::Meta => "meta",
             ControlKind::ResumeMarker => "resume_marker",
+            ControlKind::Synthetic => "synthetic",
         }
     }
 }
@@ -568,6 +575,7 @@ mod tests {
                 "codex_context_wrapper",
                 "meta",
                 "resume_marker",
+                "synthetic",
             ]
         );
         for kind in ControlKind::ALL {

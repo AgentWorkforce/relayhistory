@@ -120,6 +120,19 @@
   ],
   "session_markers": [
     {
+      "kind": "turn_context",
+      "marker_uid": "1:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "{\"cwd\":\"/tmp/project\",\"model\":\"gpt-5.4\",\"turn_id\":\"turn_regressed_1\"}",
+      "session_id": "sess_codex_regressed",
+      "source": "codex",
+      "subkind": "turn_context",
+      "text": null,
+      "ts_ms": 1776657600100,
+      "turn_id": "turn_regressed_1"
+    },
+    {
       "kind": "task_started",
       "marker_uid": "2:marker",
       "message_id": null,
@@ -130,6 +143,32 @@
       "subkind": "task_started",
       "text": null,
       "ts_ms": 1776657600200,
+      "turn_id": "turn_regressed_1"
+    },
+    {
+      "kind": "usage_snapshot",
+      "marker_uid": "5:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "[[3000,1000,null,200,50,3200]]",
+      "session_id": "sess_codex_regressed",
+      "source": "codex",
+      "subkind": "token_count",
+      "text": null,
+      "ts_ms": 1776657601000,
+      "turn_id": "turn_regressed_1"
+    },
+    {
+      "kind": "usage_snapshot",
+      "marker_uid": "7:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "[[3100,1500,null,250,60,3410]]",
+      "session_id": "sess_codex_regressed",
+      "source": "codex",
+      "subkind": "token_count",
+      "text": null,
+      "ts_ms": 1776657602000,
       "turn_id": "turn_regressed_1"
     },
     {

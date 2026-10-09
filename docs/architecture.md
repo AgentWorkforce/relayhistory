@@ -32,9 +32,9 @@ Rust owns provider discovery/parsing, schema creation and migration, direct
 SQLite connections, catalog queries, history/event queries, search,
 statistics, and sync. Blocking filesystem and SQLite work is dispatched away
 from Node's event loop. TypeScript validates inputs, validates native contract
-version 25, catalog contract version 4, hydration contract version 3,
+version 26, catalog contract version 4, hydration contract version 3,
 session-relationship contract version 2, and session evidence contract version
-3 and session usage contract version 3, normalizes nullable fields, maps native
+4 and session usage contract version 3, normalizes nullable fields, maps native
 errors, and supplies pagination
 helpers.
 
@@ -334,7 +334,10 @@ explicit fields a provider writes (`continuedFromSessionId`, `forkSessionId`,
 `sourceSessionId`), a `/resume <id>` or `/continue <id>` the human typed, a
 transcript's first `parentUuid` resolved against the session that actually
 holds that record, and two or more transcripts carrying one in-log session id.
-`evidence_ref` names which one produced the row.
+`evidence_ref` names which one produced the row. A `continuedFromSessionId` or
+`forkSessionId` edge's `spawned_at_ms` is the timestamp of the record that
+first named its target (the transcript's first record when that record has
+no timestamp); every other edge is dated by the transcript's first record.
 
 A `/resume` is read in both forms Claude writes: the bare `/resume <id>` a
 human types, and the control wrapper Claude Code actually stores —
@@ -428,10 +431,12 @@ Lines inside the span write nothing under the child. One
 `fork_replay_boundary` marker, keyed by the replayed `session_meta`'s line,
 accounts for them (`first_line`, `last_line`, `replayed_lines`, the closing
 turn and the rule that closed it). The last readable `token_count` inside the
-span becomes the child's inherited baseline, so the child's first request is
-charged only what it spent beyond the parent's total. codex-rs seeds a fork's
-usage from the copied history (`record_initial_history` on
-`InitialHistory::Forked` calls `last_token_info_from_rollout`), and each request
+span is kept on it as `inherited_snapshot`, bounded per the marker contract
+(counters are never truncated), and becomes the child's inherited baseline,
+so the child's first request is charged only what it spent beyond the
+parent's total. codex-rs seeds a fork's usage from the copied history
+(`record_initial_history` on `InitialHistory::Forked` calls
+`last_token_info_from_rollout`), and each request
 then grows `total_token_usage` by exactly `last_token_usage`; the child's first
 readable snapshot is checked against that: `total == last` means its counter
 restarted and the baseline is dropped, `total == inherited + last` confirms it,

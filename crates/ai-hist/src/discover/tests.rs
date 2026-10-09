@@ -469,6 +469,33 @@ fn a_subagent_sidecar_is_not_a_second_copy_of_its_parent_session() {
     );
 }
 
+/// Claude Code versions that wrote Task traffic inline put it in the primary
+/// transcript as `isSidechain` rows, so a `<sessionId>.jsonl` can hold nothing
+/// else. Only a file laid out as a sidecar (`agent-*.jsonl`) is one; this
+/// transcript is its session's, and is catalogued.
+#[test]
+fn a_primary_transcript_of_only_sidechain_rows_is_a_session() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    claude_session(
+        home.path(),
+        "claude-inline",
+        concat!(
+            r#"{"type":"user","uuid":"su1","sessionId":"claude-inline","isSidechain":true,"cwd":"/work/app","timestamp":"2026-06-20T10:02:00.000Z","message":{"role":"user","content":"Research the repo."}}"#,
+            "\n",
+            r#"{"type":"assistant","uuid":"sa1","sessionId":"claude-inline","isSidechain":true,"cwd":"/work/app","timestamp":"2026-06-20T10:03:00.000Z","message":{"role":"assistant","model":"claude-haiku-4-5","content":[{"type":"text","text":"Report."}],"usage":{"input_tokens":50,"output_tokens":10}}}"#,
+            "\n"
+        ),
+        1_750_000_050_000,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["claude"]));
+    assert_eq!(found.ids(), vec!["claude:claude-inline"]);
+    let row = found.row("claude-inline");
+    assert_eq!(row.models, vec!["claude-haiku-4-5".to_string()]);
+    assert_eq!(row.first_prompt, None, "a sidechain prompt is not a human one");
+}
+
 /// The same defect class as the claude sidecar: a codex subagent thread is a
 /// real rollout that is not a session, so "no catalog row" left nothing for the
 /// stamp check to match and it was re-read on every run.

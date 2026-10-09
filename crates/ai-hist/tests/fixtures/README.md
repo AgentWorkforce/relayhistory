@@ -109,7 +109,7 @@ source without deciding which one fails the test.
 | `claude/missing-output-tokens` | burn | `claude/missing-output-tokens.jsonl` | usage carries `input_tokens` only — `output_tokens` is absent, which is not the same as zero |
 | `claude/user-turn-blocks` | burn | `claude/user-turn-blocks.jsonl` | user records carrying tool_result blocks of very different sizes, one of them errored |
 | `claude/compact-boundary` | burn | `claude/compact-boundary.jsonl` | a `system` record with `subtype: compact_boundary` splits the transcript |
-| `claude/sidechain-turn` | burn | `claude/sidechain-turn.jsonl` | every record is `isSidechain: true` — a subagent sidecar, not a session of its own |
+| `claude/sidechain-turn` | burn | `claude/sidechain-turn.jsonl` | every record is `isSidechain: true` in a primary `<session>.jsonl` — inline Task traffic, still its session's transcript |
 | `claude/sidechain-leading-then-main` | burn | `claude/sidechain-leading-then-main.jsonl` | sidechain records precede the first main-chain record in the same file |
 | `claude/nested-subagent` | burn | `claude/nested-subagent.jsonl` | a subagent spawns a subagent, in one file, joined by `agentId` |
 | `claude/system-subagent-notification` | burn | `claude/system-subagent-notification.jsonl` | a `system`/`subagent_completed` record reports a child session id the transcript never contains |
@@ -129,6 +129,7 @@ source without deciding which one fails the test.
 | `claude/system-reminder` | relayhistory | `claude/system-reminder.jsonl` | `<system-reminder>` blocks injected into user content, as a block of their own, inline in a string prompt, and alone on an `isMeta` record |
 | `claude/hook-and-passthrough` | relayhistory | `claude/hook-and-passthrough.jsonl` | a `<user-prompt-submit-hook>` row flagged `isMeta`, a `<bash-input>` / `<bash-stdout>` pass-through pair, and a bare `isMeta` bookkeeping row between two prompts |
 | `claude/sidecar-subagent` | relayhistory | `claude/sidecar-subagent` | a subagent transcript in `<sessionId>/subagents/agent-<id>.jsonl` with its `agent-<id>.meta.json` sidecar, carrying the PARENT's sessionId |
+| `claude/nested-sidecars` | burn | `claude/nested-sidecars` | two `subagents/` sidecars whose meta files name no model: `a1` spawned from the main transcript, `a2` spawned by a tool use inside `a1` (`spawnDepth` 2); the spawn results carry `toolUseResult.agentId` on the record |
 
 ### `codex`
 
@@ -139,6 +140,7 @@ source without deciding which one fails the test.
 | `codex/with-tool-call` | burn | `codex/with-tool-call.jsonl` | function calls and their outputs as `response_item` records |
 | `codex/with-spawn-agent` | burn | `codex/with-spawn-agent.jsonl` | a `spawn_agent` function call: delegation stated in the tool call, not in session metadata |
 | `codex/compaction` | burn | `codex/compaction.jsonl` | a `compacted` record with `replacement_history`, followed by `context_compacted` and a fresh turn |
+| `codex/compaction-usage-only` | burn | `codex/compaction-usage-only.jsonl` | burn's `compaction.jsonl` with its session id renamed so it does not collide with this corpus's `compaction.jsonl`, which adds message records: two turns either side of a `compacted` record whose only usage evidence is their cumulative `token_count`s, with no assistant message |
 | `codex/session-meta-relationships` | burn | `codex/session-meta-relationships.jsonl` | `sourceSessionId` / `forkSessionId` / `continuedFromSessionId` on a repeated `session_meta` |
 | `codex/user-turn-blocks` | burn | `codex/user-turn-blocks.jsonl` | user input arriving as `response_item` message blocks rather than `event_msg` |
 | `codex/oversized-shell-output` | burn | `codex/oversized-shell-output.jsonl` | an 80 KB shell function-call output |

@@ -767,17 +767,44 @@ fn destination_head(conn: &Connection) -> Result<String> {
 ///
 /// Add the new key here in the same change that introduces it; the old one
 /// stays in [`RETIRED_SYNC_STATE_KEYS`] for the migration, but only live
-/// generations belong in the stamp.
+/// generations belong in the stamp. OpenCode keeps no per-file sync state --
+/// every sweep re-normalizes every session -- so its entry is a generation name
+/// alone, [`OPENCODE_NORMALIZER_GENERATION`].
+///
+/// Claude transcripts are skipped on their byte cursors rather than a stamp
+/// map, so their entries name the one-time Claude passes that are pending:
+/// `CLAUDE_RECORD_ATTRIBUTION_KEY` at its generation and
+/// [`CLAUDE_DELEGATION_CAPTURE_KEY`].
 const SWEEP_PARSER_GENERATIONS: &[&str] = &[
-    "claude_sessions_v3",
+    "claude_record_attribution_1",
+    CLAUDE_DELEGATION_CAPTURE_KEY,
     "codex_rollouts_v7",
+    CODEX_STATE_MARKER_KEY,
     GROK_SYNC_STATE_KEY,
+    OPENCODE_NORMALIZER_GENERATION,
 ];
+
+/// What the OpenCode normalizer produces from an unchanged store. Bumped when
+/// that output changes, so the first sweep after an upgrade re-reads stores
+/// the source fingerprint would otherwise call unchanged. `v2` makes every
+/// assistant message evidence (step-only and reasoning-only messages, thinking
+/// blocks, `synthetic` control rows).
+const OPENCODE_NORMALIZER_GENERATION: &str = "opencode_normalizer_v2";
 
 /// The generation half of a stored fingerprint: what this build of the sweep
 /// would produce from a given tree, independent of the tree itself.
+///
+/// The one-time backfill generations are part of it for the same reason as
+/// the keys above: each is recorded in sync state and re-reads unchanged
+/// sources when it moves, which it can only do if the sweep runs.
 fn sweep_generation() -> String {
-    let parts = SWEEP_PARSER_GENERATIONS.join("|");
+    let parts = format!(
+        "{}|tool_result_fidelity={TOOL_RESULT_FIDELITY_GENERATION}\
+         |raw_message_facts={RAW_MESSAGE_FACTS_GENERATION}\
+         |codex_fork_replay={CODEX_FORK_REPLAY_GENERATION}\
+         |codex_metadata_backfill={CODEX_METADATA_BACKFILL_GENERATION}",
+        SWEEP_PARSER_GENERATIONS.join("|")
+    );
     format!(
         "g{:016x}",
         discover::fingerprint_hash(
@@ -3131,6 +3158,14 @@ impl Drop for SyncStateLock {
 /// Recording the generation per provider makes the pass happen exactly once.
 const TOOL_RESULT_FIDELITY_GENERATION: i64 = 1;
 const CLAUDE_FIDELITY_GENERATION_KEY: &str = "claude_tool_result_fidelity";
+
+/// One-time pass that re-reads every primary transcript an earlier build
+/// classified as a subagent sidecar by content alone, before the sidecar rule
+/// required the `agent-*.jsonl` layout. Recorded only after a walk that
+/// reached every known root, like the other backfills; from then on the sync
+/// walk does not probe for it.
+const CLAUDE_SIDECAR_LAYOUT_GENERATION: i64 = 1;
+const CLAUDE_SIDECAR_LAYOUT_KEY: &str = "claude_sidecar_layout";
 const CODEX_FIDELITY_GENERATION_KEY: &str = "codex_tool_result_fidelity";
 
 /// Whether this provider still owes a one-time fidelity backfill pass.
@@ -3165,8 +3200,18 @@ fn record_fidelity_backfill(state: &mut Map<String, Value>, key: &str) {
 /// repairing the rows the bump was for — a change that reads as done and does
 /// nothing, for exactly the installs that needed it.
 /// `the_raw_facts_version_and_generation_are_bumped_together` is the guard.
-const RAW_MESSAGE_FACTS_GENERATION: i64 = 3;
+const RAW_MESSAGE_FACTS_GENERATION: i64 = 4;
 const CLAUDE_RAW_MESSAGE_FACTS_KEY: &str = "claude_raw_message_facts";
+
+/// One-time pass over indexed Claude transcripts for what earlier parsers
+/// left out: the request identity on the signature marker of a signed, empty
+/// `thinking` block (which stores no event) and the timestamps of the records
+/// naming explicit continuity targets. Only transcripts the probes select are
+/// re-read or re-captured, and the probes run only while the pass is pending
+/// and only for transcripts already indexed, so a fresh store and every later
+/// sync pay nothing.
+const CLAUDE_RECORD_ATTRIBUTION_GENERATION: i64 = 1;
+const CLAUDE_RECORD_ATTRIBUTION_KEY: &str = "claude_record_attribution";
 const CODEX_RAW_MESSAGE_FACTS_KEY: &str = "codex_raw_message_facts";
 
 /// One-time re-read of every Codex fork rollout, so the fork replay gate
@@ -3177,6 +3222,54 @@ const CODEX_RAW_MESSAGE_FACTS_KEY: &str = "codex_raw_message_facts";
 /// backfills.
 const CODEX_FORK_REPLAY_GENERATION: i64 = 1;
 const CODEX_FORK_REPLAY_KEY: &str = "codex_fork_replay_gate";
+
+/// One-time re-read of the Claude transcripts whose delegation evidence an
+/// earlier parser recorded thinner than the provider wrote it: a spawn result
+/// without the record's `toolUseResult.agentId`, and a sidecar edge without
+/// its child's model or hung on a parent that does not hold the tool use that
+/// started it. Finished transcripts never change again, so without the pass an
+/// upgraded install that only syncs keeps the old edges for good. The name is
+/// in [`SWEEP_PARSER_GENERATIONS`], so the sweep fingerprint an earlier build
+/// stored cannot skip the pass; it is recorded only after a walk that reached
+/// every known root, like the other backfills.
+const CLAUDE_DELEGATION_CAPTURE_KEY: &str = "claude_delegation_capture_v1";
+
+/// Whether the Claude delegation backfill pass is still owed.
+fn delegation_backfill_pending(state: &Map<String, Value>) -> bool {
+    !state.contains_key(CLAUDE_DELEGATION_CAPTURE_KEY)
+}
+
+/// One-time re-read of every Codex rollout indexed before its state records
+/// were stored: `token_count` as `usage_snapshot` markers and `turn_context`
+/// as `turn_context` markers. A finished rollout's stamp never changes, so
+/// without this its counters and turn settings would stay unread for the life
+/// of the install. Each rollout's stamp record says which generation last read
+/// it, so a rollout is re-read once however long the pass stays open; the pass
+/// itself is recorded only after a walk that reached every known root, like
+/// the other backfills.
+///
+/// The key is in [`SWEEP_PARSER_GENERATIONS`], so the first sync after the
+/// upgrade cannot honour the source fingerprint the previous build stored and
+/// skip the sweep this backfill runs in. Raising the generation means renaming
+/// the key, for the same reason.
+const CODEX_STATE_MARKER_GENERATION: i64 = 1;
+const CODEX_STATE_MARKER_KEY: &str = "codex_state_markers_v1";
+
+/// Whether the rollout behind a stamp-map record was last read by a parser
+/// older than the state-marker generation.
+///
+/// Recorded on the rollout's own stamp record, not inferred from the markers
+/// a session holds: a rollout with no `token_count` legitimately has no
+/// `usage_snapshot`, a marker observed only remotely says nothing about the
+/// local file, and either would make a marker probe re-read the rollout on
+/// every sync for as long as the backfill stays open.
+fn rollout_owes_state_markers(record: Option<&Map<String, Value>>) -> bool {
+    record
+        .and_then(|r| r.get("state_markers"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        < CODEX_STATE_MARKER_GENERATION
+}
 
 /// Whether this provider still owes a one-time raw-facts backfill pass.
 fn raw_facts_backfill_pending(state: &Map<String, Value>, key: &str) -> bool {
@@ -4760,6 +4853,11 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
         .and_then(Value::as_i64)
         .unwrap_or(0)
         < CODEX_FORK_REPLAY_GENERATION;
+    let backfill_state_markers = state
+        .get(CODEX_STATE_MARKER_KEY)
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        < CODEX_STATE_MARKER_GENERATION;
     // A root the stamp map has entries for but whose rollouts this run cannot
     // see is an archive we could not read, not an archive that is gone.
     // Walking it vacuously and then recording the generation would retire the
@@ -4889,6 +4987,9 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                     Some(_)
                         if backfill_fork_replay
                             && crate::continuity::codex_evidence_names_fork(conn, &key)? => {}
+                    // Indexed before its state records were stored: re-read
+                    // once so its counters and turn settings are captured.
+                    Some(_) if backfill_state_markers && rollout_owes_state_markers(record) => {}
                     Some(id)
                         if codex_session_evidence_exists(conn, id)?
                             && !(backfill_fidelity
@@ -5062,7 +5163,12 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
             write.commit()?;
             seen.insert(
                 key,
-                json!({ "stamp": stamp, "session": meta.session_id, "subagent": meta.is_subagent }),
+                json!({
+                    "stamp": stamp,
+                    "session": meta.session_id,
+                    "subagent": meta.is_subagent,
+                    "state_markers": CODEX_STATE_MARKER_GENERATION,
+                }),
             );
         }
     }
@@ -5100,6 +5206,10 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
         state.insert(
             CODEX_FORK_REPLAY_KEY.to_string(),
             json!(CODEX_FORK_REPLAY_GENERATION),
+        );
+        state.insert(
+            CODEX_STATE_MARKER_KEY.to_string(),
+            json!(CODEX_STATE_MARKER_GENERATION),
         );
     }
     if repairs.repairs_all() && !walked_every_known_root {
@@ -5847,6 +5957,183 @@ fn surviving_refusals(
     refused
 }
 
+/// One `turn_context` payload, bounded per the marker contract, and the digest
+/// of the configuration it carries.
+///
+/// The digest covers every field but the ones that name the turn rather than
+/// configure it, in the order the provider wrote them, so two records with the
+/// same digest describe the same configuration:
+///
+/// - `turn_id`, always: it is new on every turn, the marker keeps it in its
+///   own `turn_id` column as the turn the configuration took effect at, and
+///   the turn's `task_started` marker names it too.
+/// - `root_turn_id` -- the root thread's turn a delegated thread is working
+///   for, which moves with the root's turns -- only when the turn's own
+///   `task_started` wrote the same value, because that marker keeps it. Older
+///   Codex builds write it on `turn_context` alone, and there it is part of
+///   the configuration, or a turn inheriting an earlier marker would read
+///   another turn's root.
+///
+/// It is persisted on the Codex cursor, so its form is fixed: SHA-256 of the
+/// bounded payload's compact JSON without those fields, lowercase hex.
+struct CodexTurnContext<'a> {
+    payload: std::borrow::Cow<'a, Value>,
+    digest: String,
+}
+
+impl<'a> CodexTurnContext<'a> {
+    /// `started` is the `(turn_id, root_turn_id)` of the last `task_started`
+    /// that wrote both. A payload is almost always within the bound already,
+    /// so it is checked in place and copied only when something actually has
+    /// to be cut.
+    fn read(payload: &'a Value, started: Option<&(String, String)>) -> Result<Self> {
+        let field = |key: &str| payload.get(key).and_then(Value::as_str);
+        let root_is_the_turns = started.is_some_and(|(turn, root)| {
+            field("turn_id") == Some(turn.as_str()) && field("root_turn_id") == Some(root.as_str())
+        });
+        let identity: &[&str] = if root_is_the_turns {
+            &["turn_id", "root_turn_id"]
+        } else {
+            &["turn_id"]
+        };
+        let payload = if marker_payload_is_bounded(payload) {
+            std::borrow::Cow::Borrowed(payload)
+        } else {
+            std::borrow::Cow::Owned(bound_marker_value(payload.clone()))
+        };
+        let mut hasher = Sha256::new();
+        serde_json::to_writer(
+            &mut hasher,
+            &ConfigurationFields(payload.as_ref(), identity),
+        )?;
+        Ok(Self {
+            payload,
+            digest: format!("{:x}", hasher.finalize()),
+        })
+    }
+}
+
+/// A `turn_context` payload without its identity fields, serialized as is.
+struct ConfigurationFields<'a>(&'a Value, &'a [&'a str]);
+
+impl Serialize for ConfigurationFields<'_> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
+        use serde::ser::SerializeMap;
+        let Value::Object(map) = self.0 else {
+            return self.0.serialize(serializer);
+        };
+        let mut out = serializer.serialize_map(None)?;
+        for (key, value) in map {
+            if !self.1.contains(&key.as_str()) {
+                out.serialize_entry(key, value)?;
+            }
+        }
+        out.end()
+    }
+}
+
+/// Store one Codex `token_count` as a `usage_snapshot` marker.
+///
+/// The payload is the provider's `info` (`total_token_usage`,
+/// `last_token_usage`, `model_context_window`, any other key it writes),
+/// bounded by [`bound_usage_info`] -- strings at 128 characters, containers at
+/// 32 entries, with every counter kept -- and stored in the compact form
+/// [`crate::usage_snapshot`] describes; neither the bound nor the encoding
+/// alters a number, so counters are never truncated. The
+/// `info: null` snapshot Codex emits before a turn has spent anything stores
+/// no payload.
+///
+/// It is a cumulative snapshot, not a per-request delta: per-request usage
+/// stays on the assistant events' `token_json`, and nothing reads these
+/// markers into `session_requests`, so a turn's spend is never counted twice.
+/// What it adds is the counter itself, for every snapshot the provider wrote,
+/// including those of a turn that produced no assistant event to carry a
+/// delta.
+/// [`bound_marker_value`] for a Codex `token_count` `info`, keeping what it
+/// measures whole: `total_token_usage` and `last_token_usage` keep every
+/// counter, and `model_context_window` is kept, however many other keys sort
+/// ahead of them. Only the remaining keys are cut at the entry limit.
+fn bound_usage_info(info: Value) -> Value {
+    const MEASURED: [&str; 3] = [
+        "total_token_usage",
+        "last_token_usage",
+        "model_context_window",
+    ];
+    fn keep_whole(fields: &mut Map<String, Value>, keys: &[&str]) -> Map<String, Value> {
+        keys.iter()
+            .filter_map(|key| Some((key.to_string(), fields.remove(*key)?)))
+            .collect()
+    }
+    fn merge(kept: Map<String, Value>, rest: Map<String, Value>) -> Value {
+        let mut merged = match bound_marker_value(Value::Object(rest)) {
+            Value::Object(rest) => rest,
+            _ => Map::new(),
+        };
+        merged.extend(kept);
+        Value::Object(merged)
+    }
+    let Value::Object(mut fields) = info else {
+        return bound_marker_value(info);
+    };
+    let kept = keep_whole(&mut fields, &MEASURED)
+        .into_iter()
+        .map(|(key, value)| {
+            let value = match value {
+                Value::Object(mut usage) if key != "model_context_window" => {
+                    let counters = keep_whole(&mut usage, &crate::usage_snapshot::COUNTERS)
+                        .into_iter()
+                        .map(|(name, counter)| (name, bound_marker_value(counter)))
+                        .collect();
+                    merge(counters, usage)
+                }
+                value => bound_marker_value(value),
+            };
+            (key, value)
+        })
+        .collect();
+    merge(kept, fields)
+}
+
+fn record_codex_usage_snapshot(
+    conn: &Connection,
+    session_id: &str,
+    index: usize,
+    ts_ms: i64,
+    turn_id: Option<&str>,
+    info: &Value,
+) -> Result<()> {
+    // `info: null` carries no counters and stores no payload, like every
+    // other marker with nothing to say: a stored `"null"` would read back as
+    // `Some(Null)` here and `None` after a serde round trip.
+    let payload_json = match info {
+        Value::Null => None,
+        info if marker_payload_is_bounded(info) => Some(crate::usage_snapshot::encode(info)?),
+        info => Some(crate::usage_snapshot::encode(&bound_usage_info(
+            info.clone(),
+        ))?),
+    };
+    insert_session_marker(
+        conn,
+        "codex",
+        session_id,
+        &NewSessionMarker {
+            marker_uid: &format!("{index}:marker"),
+            ts_ms: (ts_ms != 0).then_some(ts_ms),
+            message_id: None,
+            parent_id: None,
+            turn_id,
+            kind: "usage_snapshot",
+            subkind: Some("token_count"),
+            text: None,
+            payload_json: payload_json.as_deref(),
+        },
+    )?;
+    Ok(())
+}
+
 /// Attach measured usage to the assistant event that earned it, or hold it
 /// until one appears.
 fn attach_codex_usage(
@@ -6008,6 +6295,15 @@ fn ingest_codex_rollout_incremental(
     let cwd = Some(meta.cwd.as_str());
     let branch = meta.git_branch.as_deref();
     let mut outcome = CodexIngestOutcome::default();
+    // A position an older parser committed sits past records whose state
+    // markers it never wrote: read the rollout again from byte zero.
+    if cursor
+        .codex
+        .as_ref()
+        .is_some_and(|codex| codex.state_markers < CODEX_STATE_MARKER_GENERATION)
+    {
+        *cursor = transcript_cursor::TranscriptCursorState::default();
+    }
     // Codex keeps its existing rule for a trailing line with no newline: it
     // is the half-written tail of a live rollout and the next pass re-reads
     // it. Unlike Claude, no Codex writer leaves its last line unterminated.
@@ -6084,6 +6380,15 @@ fn ingest_codex_rollout_incremental(
     // boundaries recoverable downstream — and carrying it *across passes* is
     // why it is part of the resume state rather than a plain local.
     let mut turn_id: Option<String> = resume.turn_id.clone();
+    // The configuration of the last `turn_context` stored for this session
+    // (see `CodexTurnContext`). Carried across passes, so a resumed pass
+    // stores a record only if it changes what the stored markers say.
+    let mut turn_context_digest: Option<String> = resume.turn_context_digest.clone();
+    // `(turn_id, root_turn_id)` of the last `task_started` that wrote both,
+    // whose marker keeps the root (see `CodexTurnContext`). Needs no resume
+    // state: a pass commits only at `task_complete`, before the next turn's
+    // `task_started`.
+    let mut started_turn: Option<(String, String)> = None;
     let mut saw_model_output = resume.saw_model_output;
     // Mirrors are adjacent physical records. Keep the index too so malformed
     // or oversized lines cannot make two separate equal replies look adjacent.
@@ -6232,6 +6537,11 @@ fn ingest_codex_rollout_incremental(
         // Lifecycle, compaction, streaming-failure and begin-side tool lines
         // are not messages, so none of the arms below can hold them. Classify
         // every line once, here, and keep whatever the event model drops.
+        if line_type == "event_msg" && payload_type == "task_started" {
+            started_turn = payload_str("turn_id")
+                .zip(payload_str("root_turn_id"))
+                .map(|(turn, root)| (turn.to_string(), root.to_string()));
+        }
         if let Some(draft) = codex_marker_for_event(line_type, payload_type, payload) {
             let marker_uid = format!("{index}:marker");
             insert_session_marker(
@@ -6405,6 +6715,39 @@ fn ingest_codex_rollout_incremental(
         previous_assistant = None;
         match line_type {
             "turn_context" => {
+                // The turn's settings as the provider wrote them: the model
+                // is otherwise only stamped onto the turn's messages, and a
+                // turn that wrote none would have no model at all.
+                //
+                // Stored only when they change. Codex restates its whole
+                // configuration on every turn, and a turn whose record
+                // repeats the previous one apart from its turn id is
+                // configured by the marker already stored: a turn's
+                // configuration is the latest `turn_context` marker at or
+                // before its start.
+                let context = CodexTurnContext::read(&value["payload"], started_turn.as_ref())?;
+                if turn_context_digest.as_deref() == Some(context.digest.as_str()) {
+                    // Accounted for by the marker it repeats.
+                    unwritten_line = None;
+                } else {
+                    insert_session_marker(
+                        conn,
+                        "codex",
+                        session_id,
+                        &NewSessionMarker {
+                            marker_uid: &format!("{index}:marker"),
+                            ts_ms: (ts_ms != 0).then_some(ts_ms),
+                            message_id: None,
+                            parent_id: None,
+                            turn_id: payload_str("turn_id"),
+                            kind: "turn_context",
+                            subkind: Some("turn_context"),
+                            text: None,
+                            payload_json: Some(&serde_json::to_string(context.payload.as_ref())?),
+                        },
+                    )?;
+                    turn_context_digest = Some(context.digest);
+                }
                 if let Some(m) = payload_str("model") {
                     model = Some(m.to_string());
                 }
@@ -6443,10 +6786,20 @@ fn ingest_codex_rollout_incremental(
                     }
                 }
                 "token_count" => {
-                    let Some(usage) = payload
-                        .get("info")
-                        .and_then(|info| info.get("total_token_usage"))
-                    else {
+                    // The provider's counters, kept as written whatever the
+                    // differencing below makes of them: a turn with no
+                    // assistant event has nowhere to attach a delta, and its
+                    // snapshot is still the only record of what it billed.
+                    let info = payload.get("info").unwrap_or(&Value::Null);
+                    record_codex_usage_snapshot(
+                        conn,
+                        session_id,
+                        index,
+                        ts_ms,
+                        turn_id.as_deref(),
+                        info,
+                    )?;
+                    let Some(usage) = info.get("total_token_usage") else {
                         continue;
                     };
                     // The provider reported a call here, so the rows written
@@ -6640,9 +6993,11 @@ fn ingest_codex_rollout_incremental(
                                 untokened_assistant_uid: untokened_assistant_uid.clone(),
                                 tool_results: indexer.clone(),
                                 turn_id: turn_id.clone(),
+                                turn_context_digest: turn_context_digest.clone(),
                                 saw_model_output,
                                 previous_human_message: human_messages.remembered(),
                                 inherited_baseline_marker: inherited_baseline_marker.clone(),
+                                state_markers: CODEX_STATE_MARKER_GENERATION,
                             },
                         );
                     }
@@ -7015,6 +7370,9 @@ struct ForkReplaySpan {
     prompts: Vec<(i64, String)>,
     /// The last readable cumulative snapshot inside the replay.
     inherited: Option<CodexTokenTotals>,
+    /// The provider's `info` object that `inherited` was read from, as
+    /// written.
+    inherited_snapshot: Option<Value>,
 }
 
 impl ForkReplaySpan {
@@ -7026,6 +7384,7 @@ impl ForkReplaySpan {
             call_ids: Vec::new(),
             prompts: Vec::new(),
             inherited: None,
+            inherited_snapshot: None,
         }
     }
 
@@ -7055,12 +7414,13 @@ impl ForkReplaySpan {
             self.prompts.push((ts_ms, message.text));
         }
         if payload.get("type").and_then(Value::as_str) == Some("token_count") {
-            if let Some(totals) = payload
-                .get("info")
+            let info = payload.get("info");
+            if let Some(totals) = info
                 .and_then(|info| info.get("total_token_usage"))
                 .and_then(CodexTokenTotals::from_usage)
             {
                 self.inherited = Some(totals);
+                self.inherited_snapshot = info.cloned().map(bound_usage_info);
             }
         }
     }
@@ -7129,6 +7489,9 @@ fn record_codex_fork_replay(
         "closed_by_turn_id": closed_by.and_then(|(turn, _)| turn),
         "closed_by": closed_by.map(|(_, basis)| basis),
         "inherited_total_tokens": span.inherited.map(|totals| totals.total),
+        // The replayed `token_count` `info` that total came from, as written,
+        // bounded by `bound_usage_info` (counters are never truncated).
+        "inherited_snapshot": span.inherited_snapshot,
         // `pending` until the child's first readable snapshot, then
         // `applied` or `dropped` with `inherited_baseline_basis` (see
         // `inherited_baseline_verdict`); null when nothing was inherited or
@@ -7250,8 +7613,7 @@ fn flush_unwritten_codex_line(
 /// Codex lines that legitimately write no row of their own.
 ///
 /// These are state updates, not records, and their information is stored
-/// elsewhere: `session_meta` and `turn_context` populate the session catalog,
-/// `token_count` is folded into the adjacent assistant event's `token_json`,
+/// elsewhere: `session_meta` populates the session catalog,
 /// `thread_settings_applied` only carries the model forward, a `*_delta` is a
 /// fragment of an event recorded whole, while assistant messages are stored above (including desktop-only replies).
 ///
@@ -7271,10 +7633,9 @@ fn codex_line_is_state_only(
     _payload: &Map<String, Value>,
 ) -> bool {
     match line_type {
-        "session_meta" | "turn_context" => true,
+        "session_meta" => true,
         "event_msg" => {
-            matches!(payload_type, "token_count" | "thread_settings_applied")
-                || payload_type.ends_with("_delta")
+            payload_type == "thread_settings_applied" || payload_type.ends_with("_delta")
         }
         "response_item" => payload_type.ends_with("_delta"),
         _ => false,
@@ -7569,6 +7930,17 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
     }
     let backfill_fidelity = fidelity_backfill_pending(state, CLAUDE_FIDELITY_GENERATION_KEY);
     let backfill_raw_facts = raw_facts_backfill_pending(state, CLAUDE_RAW_MESSAGE_FACTS_KEY);
+    let reclassify_sidecars = state
+        .get(CLAUDE_SIDECAR_LAYOUT_KEY)
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        < CLAUDE_SIDECAR_LAYOUT_GENERATION;
+    let backfill_attribution = state
+        .get(CLAUDE_RECORD_ATTRIBUTION_KEY)
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        < CLAUDE_RECORD_ATTRIBUTION_GENERATION;
+    let backfill_delegation = delegation_backfill_pending(state);
     // The first read failure, returned once everything else has been indexed.
     // Continuing past it indexes the rest of the tree, but the run did omit a
     // transcript it discovered, and a caller told the sync completed would
@@ -7614,20 +7986,41 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
         check_capture_cancelled()?;
         let transcript_events = claude_transcript_events_exist(conn, &path)?;
         let indexed = transcript_events || claude_sidecar_evidence_exists(conn, &path)?;
+        // A primary transcript an earlier build read as a sidecar -- every
+        // record a sidechain row -- is still cited as delegation evidence,
+        // whether or not discovery has since catalogued it. Its cursor says
+        // nothing about that, so it is re-read as the session it is, which
+        // retracts the delegation. Asked only during the one-time pass: the
+        // current classification never cites a primary transcript, so once
+        // every root has been walked there is nothing left to find.
+        let misread_as_sidecar = reclassify_sidecars
+            && !is_claude_sidecar_file(&path)
+            && claude_delegation_cites(conn, &path)?;
         // During the one-time backfill passes, an unchanged transcript whose
         // rows predate either additive evidence shape is re-read to populate
         // it. Outside those passes the cursor alone decides, so a row this
         // transcript does not own cannot pin the file off the fast path.
         let backfill = (backfill_fidelity
             && claude_transcript_lacks_tool_result_fidelity(conn, &path)?)
-            || (backfill_raw_facts && claude_transcript_lacks_raw_facts(conn, &path)?);
+            || (backfill_raw_facts && claude_transcript_lacks_raw_facts(conn, &path)?)
+            || (backfill_attribution
+                && indexed
+                && claude_transcript_lacks_signed_thinking(conn, &path)?)
+            || (backfill_delegation
+                && indexed
+                && claude_transcript_lacks_delegation_capture(conn, &path)?);
         // Present but short: the destination marker says this transcript's
         // session lost rows. A cursor cannot answer that — it describes bytes,
         // not evidence — and the transcript's bytes will never move again to
         // reopen it, so an unchanged cursor does not license a skip here.
         // Re-reading is idempotent.
         let needs_repair = claude_transcript_needs_repair(conn, &path, repairs)?;
-        if indexed && !backfill && !needs_repair && claude_transcript_unchanged(conn, &path)? {
+        if indexed
+            && !backfill
+            && !needs_repair
+            && !misread_as_sidecar
+            && claude_transcript_unchanged(conn, &path)?
+        {
             // A transcript registered as a session and indexed before
             // continuity existed still owes its evidence. Reading it here
             // rather than falling through keeps the skip's promise: continuity
@@ -7638,7 +8031,11 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
             // Gated on `transcript_events` because a subagent sidecar reaches
             // this skip through its delegation evidence instead, and a sidecar
             // is not a session: it has no row to owe and must not be re-read.
-            if transcript_events && claude_transcript_lacks_continuity_evidence(conn, &path)? {
+            if transcript_events
+                && (claude_transcript_lacks_continuity_evidence(conn, &path)?
+                    || (backfill_attribution
+                        && crate::continuity::claude_evidence_lacks_naming_times(conn, &path)?))
+            {
                 crate::continuity::capture_claude_transcript(conn, &path)?;
             }
             continue;
@@ -7667,7 +8064,7 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
             );
             continue;
         }
-        if !indexed || backfill || needs_repair {
+        if !indexed || backfill || needs_repair || misread_as_sidecar {
             // Either the cursor claims these bytes already produced rows and
             // the rows are not there — a wiped database, or evidence a repair
             // removed — or a backfill pass needs the whole file read again for
@@ -7756,6 +8153,16 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
                 write.commit()?;
                 continue;
             }
+            // A primary transcript is no delegation's evidence. An earlier
+            // build read one made only of sidechain rows as a sidecar of its
+            // own session; that delegation is retracted here. Asked of every
+            // transcript this walk re-reads, not only those the one-time pass
+            // found, so a file that was away while the pass ran is healed when
+            // it returns; the walk is reading the whole file already, and the
+            // probe is one indexed lookup.
+            if misread_as_sidecar || claude_delegation_cites(conn, &path)? {
+                retract_claude_delegation_evidence(conn, &path)?;
+            }
             upsert_session(
                 conn,
                 &meta.session_id,
@@ -7811,9 +8218,20 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
 
     if walked_every_known_root {
         record_fidelity_backfill(state, CLAUDE_FIDELITY_GENERATION_KEY);
+        state.insert(
+            CLAUDE_SIDECAR_LAYOUT_KEY.to_string(),
+            json!(CLAUDE_SIDECAR_LAYOUT_GENERATION),
+        );
+        state.insert(CLAUDE_DELEGATION_CAPTURE_KEY.to_string(), json!(1));
     }
     crate::continuity::reconcile(conn, "claude")?;
     record_raw_facts_backfill(state, CLAUDE_RAW_MESSAGE_FACTS_KEY, walked_every_known_root);
+    if walked_every_known_root {
+        state.insert(
+            CLAUDE_RECORD_ATTRIBUTION_KEY.to_string(),
+            json!(CLAUDE_RECORD_ATTRIBUTION_GENERATION),
+        );
+    }
     if repairs.repairs_all() && !walked_every_known_root {
         coverage.note_unread();
     }
@@ -7893,6 +8311,64 @@ where
     F: FnOnce(&rusqlite::Row<'_>) -> rusqlite::Result<T>,
 {
     conn.prepare_cached(sql)?.query_row(params, f)
+}
+
+/// Whether a `delegated` row cites the transcript at `path` as its evidence.
+pub(crate) fn claude_delegation_cites(conn: &Connection, path: &Path) -> Result<bool> {
+    let cites: i64 = cached_query_row(
+        conn,
+        "SELECT EXISTS(SELECT 1 FROM session_relationships \
+           WHERE source = 'claude' AND evidence_locator = ? AND relationship = 'delegated')",
+        [path.to_string_lossy().as_ref()],
+        |row| row.get(0),
+    )?;
+    Ok(cites != 0)
+}
+
+/// Undo what reading the transcript at `path` as a sidecar recorded.
+///
+/// Called for a transcript read as a primary session, by the sync walk and by
+/// hydration alike. The only `delegated` rows citing one as evidence are those
+/// an earlier build recorded when it read a primary transcript of nothing but
+/// sidechain rows as a sidecar. When its records carried an `agentId`, that
+/// build also indexed them under the child id; a child no other evidence names
+/// existed only through this misreading, so its local share of evidence is
+/// retired before the transcript's records are indexed under their session.
+pub(crate) fn retract_claude_delegation_evidence(conn: &Connection, path: &Path) -> Result<()> {
+    let locator = path.to_string_lossy();
+    let children = conn
+        .prepare_cached(
+            "SELECT DISTINCT r.child_session_id FROM session_relationships r \
+             WHERE r.source = 'claude' AND r.relationship = 'delegated' \
+               AND r.evidence_locator = ?1 AND r.child_session_id IS NOT NULL \
+               AND NOT EXISTS (SELECT 1 FROM session_relationships o \
+                 WHERE o.source = 'claude' AND o.child_session_id = r.child_session_id \
+                   AND o.evidence_locator IS NOT ?1)",
+        )?
+        .query_map([locator.as_ref()], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for child in &children {
+        for table in [
+            "session_events",
+            "tool_calls",
+            "file_edits",
+            "session_markers",
+        ] {
+            crate::store::retire_evidence_share(
+                conn,
+                table,
+                "source = 'claude' AND session_id = ?1",
+                &[child],
+                SessionLocation::Local,
+            )?;
+        }
+    }
+    conn.prepare_cached(
+        "DELETE FROM session_relationships \
+         WHERE source = 'claude' AND relationship = 'delegated' AND evidence_locator = ?",
+    )?
+    .execute([locator.as_ref()])?;
+    Ok(())
 }
 
 /// Whether an unchanged subagent sidecar has already been ingested.
@@ -8142,6 +8618,53 @@ const CLAUDE_LACKS_RAW_FACTS_SQL: &str = "SELECT
                 LIMIT 1
         )";
 
+/// A thinking-signature marker whose record has no `thinking` event and that
+/// names no request: what a parser before signature markers carried the
+/// request identity left for a signed, empty `thinking` block. Reached by
+/// the same two routes as [`CLAUDE_LACKS_RAW_FACTS_SQL`].
+const CLAUDE_LACKS_SIGNED_THINKING_SQL: &str = "SELECT
+            EXISTS(
+                SELECT 1
+                FROM sessions s
+                CROSS JOIN session_markers m ON m.source = s.source AND m.session_id = s.session_id
+                WHERE s.source = 'claude' AND s.raw_path = ?1
+                  AND m.subkind = 'thinking_signature'
+                  AND json_type(m.payload_json, '$.request_id') IS NULL
+                  AND json_type(m.payload_json, '$.provider_message_id') IS NULL
+                  AND NOT EXISTS(
+                    SELECT 1 FROM session_events e
+                    WHERE e.source = 'claude' AND e.message_id = m.message_id
+                      AND e.kind = 'thinking')
+                LIMIT 1
+            )
+            OR EXISTS(
+                SELECT 1
+                FROM session_relationships r
+                CROSS JOIN session_markers m
+                  ON m.source = 'claude'
+                 AND m.session_id = COALESCE(r.child_session_id, r.parent_session_id)
+                WHERE r.source = 'claude' AND r.evidence_locator = ?1
+                  AND m.subkind = 'thinking_signature'
+                  AND json_type(m.payload_json, '$.request_id') IS NULL
+                  AND json_type(m.payload_json, '$.provider_message_id') IS NULL
+                  AND NOT EXISTS(
+                    SELECT 1 FROM session_events e
+                    WHERE e.source = 'claude' AND e.message_id = m.message_id
+                      AND e.kind = 'thinking')
+                LIMIT 1
+        )";
+
+fn claude_transcript_lacks_signed_thinking(conn: &Connection, path: &Path) -> Result<bool> {
+    let raw_path = path.to_string_lossy();
+    let lacking: i64 = cached_query_row(
+        conn,
+        CLAUDE_LACKS_SIGNED_THINKING_SQL,
+        [raw_path.as_ref()],
+        |row| row.get(0),
+    )?;
+    Ok(lacking != 0)
+}
+
 /// The raw-facts question for a Claude transcript.
 ///
 /// A file reaches its rows by one of two routes, matching the two ways the
@@ -8158,6 +8681,49 @@ fn claude_transcript_lacks_raw_facts(conn: &Connection, path: &Path) -> Result<b
         conn,
         CLAUDE_LACKS_RAW_FACTS_SQL,
         params![raw_path.as_ref(), RAW_MESSAGE_FACTS_VERSION],
+        |row| row.get(0),
+    )?;
+    Ok(lacking != 0)
+}
+
+/// [`claude_transcript_lacks_delegation_capture`]'s probe: a session
+/// transcript holding an Agent/Task result with no `agent_id`, or a sidecar
+/// whose edge has no child model or hangs on a parent whose transcript does
+/// not hold the tool use that started it.
+/// `CROSS JOIN` pins the join order for the reason
+/// [`CLAUDE_TRANSCRIPT_EVENTS_SQL`] gives.
+const CLAUDE_LACKS_DELEGATION_CAPTURE_SQL: &str = "SELECT
+            EXISTS(
+                SELECT 1
+                FROM sessions s
+                CROSS JOIN session_events e ON e.source = s.source AND e.session_id = s.session_id
+                CROSS JOIN tool_calls t ON t.source = e.source AND t.session_id = e.session_id
+                  AND t.tool_use_id = e.tool_use_id
+                WHERE s.source = 'claude' AND s.raw_path = ?1
+                  AND e.kind = 'tool_result' AND e.agent_id IS NULL
+                  AND t.name IN ('Agent', 'Task')
+                LIMIT 1
+            )
+            OR EXISTS(
+                SELECT 1
+                FROM session_relationships r
+                WHERE r.source = 'claude' AND r.evidence_locator = ?1
+                  AND r.relationship = 'delegated' AND r.child_session_id IS NOT NULL
+                  AND (r.child_model IS NULL
+                    OR (r.evidence_ref IS NOT NULL AND NOT EXISTS(
+                          SELECT 1 FROM tool_calls t
+                          WHERE t.source = 'claude' AND t.session_id = r.parent_session_id
+                            AND t.tool_use_id = r.evidence_ref)))
+                LIMIT 1
+            )";
+
+/// Whether the delegation backfill pass has to re-read this transcript.
+fn claude_transcript_lacks_delegation_capture(conn: &Connection, path: &Path) -> Result<bool> {
+    let raw_path = path.to_string_lossy();
+    let lacking: i64 = cached_query_row(
+        conn,
+        CLAUDE_LACKS_DELEGATION_CAPTURE_SQL,
+        [raw_path.as_ref()],
         |row| row.get(0),
     )?;
     Ok(lacking != 0)
@@ -8219,9 +8785,10 @@ pub(crate) struct ClaudeSessionMeta {
     /// `None` is the whole file's answer, not a gap: a transcript of nothing
     /// but control rows has no first prompt, and the catalog says so.
     first_prompt: Option<String>,
-    /// Every identified record is a sidechain row, so this file is a delegated
-    /// sidecar rather than a session of its own — the same rule discovery uses
-    /// to keep sidecars out of the catalog.
+    /// This file is a delegated sidecar rather than a session of its own: it
+    /// is named as one ([`is_claude_sidecar_file`]) and every identified
+    /// record is a sidechain row — the same rule discovery uses to keep
+    /// sidecars out of the catalog.
     subagent: bool,
     /// The child identity the provider recorded, read from the records and
     /// never from the file name. Absent on versions that do not emit it.
@@ -8389,9 +8956,9 @@ impl ClaudeMetaFold {
         }
     }
 
-    /// The session this transcript describes, or `None` when no record named
-    /// one.
-    pub(crate) fn finish(&self) -> Option<ClaudeSessionMeta> {
+    /// The session the transcript at `path` describes, or `None` when no
+    /// record named one.
+    pub(crate) fn finish(&self, path: &Path) -> Option<ClaudeSessionMeta> {
         let session_id = self.session_id.clone()?;
         let first = self.first_ts.unwrap_or(0);
         Some(ClaudeSessionMeta {
@@ -8403,11 +8970,42 @@ impl ClaudeMetaFold {
             last_ts: self.last_ts.unwrap_or(first),
             last_assistant_text: self.last_assistant_text.clone(),
             first_prompt: self.first_prompt.clone(),
-            subagent: self.identified_records > 0
-                && self.sidechain_records == self.identified_records,
+            subagent: is_claude_sidecar_file(path)
+                && claude_records_are_all_sidechain(
+                    self.identified_records,
+                    self.sidechain_records,
+                ),
             agent_id: self.agent_id.clone(),
         })
     }
+}
+
+/// The file-name prefix Claude Code gives a subagent sidecar transcript, in
+/// both layouts it has written: flat `agent-<id>.jsonl` beside the parent and
+/// `<parentSessionId>/subagents/agent-<id>.jsonl`. A primary transcript is
+/// `<sessionId>.jsonl`.
+pub(crate) const CLAUDE_SIDECAR_PREFIX: &str = "agent-";
+
+/// Whether `path` is laid out as a subagent sidecar transcript.
+///
+/// The layout decides which *role* a file plays, never whose identity it
+/// carries: a sidecar's child id still comes from its records' `agentId`.
+/// Content alone cannot decide the role. Claude Code versions that wrote Task
+/// traffic inline put it in the primary transcript as `isSidechain` rows, so
+/// a primary transcript can consist of nothing else — and its billable turns
+/// are that session's evidence, not a delegation of some other session.
+pub(crate) fn is_claude_sidecar_file(path: &Path) -> bool {
+    path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(CLAUDE_SIDECAR_PREFIX))
+}
+
+/// Every record that names a session is a sidechain row — what a sidecar's
+/// records look like, and the half of the sidecar rule content can answer.
+pub(crate) fn claude_records_are_all_sidechain(identified: usize, sidechain: usize) -> bool {
+    identified > 0 && sidechain == identified
 }
 
 /// Walk only the records that have arrived since `state` was written.
@@ -8543,7 +9141,7 @@ fn scan_claude_session_text(path: &Path, text: &str) -> Result<Option<ClaudeSess
         "conflicting sessionId values in Claude transcript {}",
         path.display()
     );
-    Ok(fold.finish())
+    Ok(fold.finish(path))
 }
 
 /// Index the records in bytes the hook captured.
@@ -8665,7 +9263,7 @@ pub(crate) fn scan_claude_session_file_resumed(
     let continuity =
         crate::continuity::finish_claude_fold(fold.continuity.clone(), fold.continuity_any, path);
     Ok(ClaudeScanPass {
-        meta: fold.finish(),
+        meta: fold.finish(path),
         bytes_read,
         validation_bytes,
         superseded,
@@ -8768,53 +9366,60 @@ pub(crate) fn ingest_claude_transcript(conn: &Connection, path: &Path) -> Result
     ingest_claude_transcript_as(conn, path, None)
 }
 
+/// The rows one Claude record produced, per table, as `(table, condition)`
+/// over `(session_id, message_uuid)`. Event and marker uids are the record's
+/// uuid plus `:`-suffixes, so the prefix is a range on the uid -- `:` and `;`
+/// are adjacent bytes -- which the `(source, session_id, uid)` unique index
+/// answers, and a `_` or `%` in a provider id is a literal byte. The parser
+/// retires a record's rows under the parent for every sidechain record it
+/// moves onto its child, so a scan of the session here would make each
+/// re-read of a sidecar quadratic in the size of the parent session.
+const CLAUDE_RECORD_ROWS: [(&str, &str); 4] = [
+    (
+        "session_events",
+        "source = 'claude' AND session_id = ?1 \
+         AND event_uid >= ?2 || ':' AND event_uid < ?2 || ';'",
+    ),
+    (
+        "tool_calls",
+        "source = 'claude' AND session_id = ?1 AND message_id = ?2",
+    ),
+    (
+        "file_edits",
+        "source = 'claude' AND session_id = ?1 AND message_id = ?2",
+    ),
+    // Markers are derived from the same record and keyed on the same prefix,
+    // so they move with it rather than outliving it under the old identity.
+    (
+        "session_markers",
+        "source = 'claude' AND session_id = ?1 \
+         AND marker_uid >= ?2 || ':' AND marker_uid < ?2 || ';'",
+    ),
+];
+
 /// Remove everything a single transcript record produced under one session id.
 ///
 /// `message_uuid` is the same identity insertion derives event uids from and
 /// stamps on the rows it derives from a record's tool use, so this reaches the
-/// record's events, its tool calls and its file edits together — including
-/// records with no `uuid` of their own, which fall back to the message id or
-/// the file position. Leaving the derived rows behind would keep a parent
-/// exposing a delegated thread's actions as its own long after the events
-/// moved to the child. The event prefix is compared with `substr` rather than
-/// `LIKE` because a provider id may contain `_` or `%`.
+/// record's events, its tool calls, its file edits and its markers together —
+/// including records with no `uuid` of their own, which fall back to the
+/// message id or a hash of the record. Leaving the derived rows behind would
+/// keep a parent exposing a delegated thread's actions as its own long after
+/// the events moved to the child.
 fn delete_claude_record_rows(
     conn: &Connection,
     session_id: &str,
     message_uuid: &str,
 ) -> Result<()> {
-    crate::store::retire_evidence_share(
-        conn,
-        "session_events",
-        "source = 'claude' AND session_id = ? \
-         AND substr(event_uid, 1, length(?) + 1) = ? || ':'",
-        params![session_id, message_uuid, message_uuid],
-        SessionLocation::Local,
-    )?;
-    crate::store::retire_evidence_share(
-        conn,
-        "tool_calls",
-        "source = 'claude' AND session_id = ? AND message_id = ?",
-        params![session_id, message_uuid],
-        SessionLocation::Local,
-    )?;
-    crate::store::retire_evidence_share(
-        conn,
-        "file_edits",
-        "source = 'claude' AND session_id = ? AND message_id = ?",
-        params![session_id, message_uuid],
-        SessionLocation::Local,
-    )?;
-    // Markers are derived from the same record and keyed on the same prefix,
-    // so they move with it rather than outliving it under the old identity.
-    crate::store::retire_evidence_share(
-        conn,
-        "session_markers",
-        "source = 'claude' AND session_id = ? \
-         AND substr(marker_uid, 1, length(?) + 1) = ? || ':'",
-        params![session_id, message_uuid, message_uuid],
-        SessionLocation::Local,
-    )?;
+    for (table, condition) in CLAUDE_RECORD_ROWS {
+        crate::store::retire_evidence_share(
+            conn,
+            table,
+            condition,
+            params![session_id, message_uuid],
+            SessionLocation::Local,
+        )?;
+    }
     Ok(())
 }
 
@@ -9273,19 +9878,13 @@ fn ingest_claude_record(
         }
     };
     let session_id = attributed_session_id.unwrap_or(record_session_id);
-    // Subagent sidecar transcripts share the parent's sessionId with
-    // isSidechain rows. The subagent's assistant output is real session
-    // activity (text and token spend), but its user-role rows are the
-    // parent agent's own prompts and tool results — ingesting those
-    // manufactures fake human turns.
+    // A sidechain row is delegated traffic: the subagent's output, and the
+    // parent agent's prompts and tool results to it. Every one is stored --
+    // its event rows with `is_sidechain` set -- so the delegated thread's
+    // parent chain and tool results are whole; its user-role rows are the delegating agent's, not a
+    // human's, so they never become `history`, a prompt or a control row.
     let is_sidechain = obj.get("isSidechain").and_then(Value::as_bool);
     let sidechain = is_sidechain.unwrap_or(false);
-    let skipped_sidechain = sidechain
-        && obj
-            .get("message")
-            .and_then(|m| m.get("role"))
-            .and_then(Value::as_str)
-            != Some("assistant");
     let uuid = obj.get("uuid").and_then(Value::as_str);
     let message = obj.get("message").and_then(Value::as_object);
     // Records without provider identity fall back to a content hash, never
@@ -9363,6 +9962,8 @@ fn ingest_claude_record(
         request_span: None,
         // Decided per text row below, once the record is classified.
         control_kind: None,
+        // Set below, once the request's usage is settled.
+        record_token_json: None,
     };
     // A notice Claude Code wrote itself, not model output; see
     // `is_claude_synthetic_placeholder_model`.
@@ -9385,10 +9986,10 @@ fn ingest_claude_record(
         }
     }
     // Heal what an earlier parser version wrote for this record: it
-    // attributed every sidechain row to the parent, and stored the rows
-    // this guard now skips. Re-reading the file removes the stale rows
-    // under the identity they were written with, so a re-parse moves them
-    // onto the child instead of duplicating them across both.
+    // attributed every sidechain row to the parent. Re-reading the file
+    // removes the stale rows under the identity they were written with, so a
+    // re-parse moves them onto the child instead of duplicating them across
+    // both.
     // Pre-upgrade positional leftovers match by full stored record,
     // unique or preserved: the live index cannot identify them after a
     // rewrite.
@@ -9445,6 +10046,7 @@ fn ingest_claude_record(
         )?;
         return Ok(());
     }
+    let mut record_token_json: Option<String> = None;
     if message_role == "assistant" {
         if let Some(provider_message_id) = identity.provider_message_id {
             // The request id exactly as the row stores it, so the rows settled
@@ -9454,15 +10056,25 @@ fn ingest_claude_record(
                 .request_id
                 .or(raw_facts.request_id)
                 .filter(|id| !id.is_empty());
-            token_json = settle_claude_request_usage(
+            let settled = settle_claude_request_usage(
                 conn,
                 session_id,
                 request_id,
                 provider_message_id,
                 token_json.as_deref(),
             )?;
+            // The record's own usage is kept only where settlement replaced
+            // it: JSON `null` for a copy that carried none.
+            let own = std::mem::replace(&mut token_json, settled);
+            if own != token_json {
+                record_token_json = Some(own.unwrap_or_else(|| "null".to_string()));
+            }
         }
     }
+    let raw_facts = RawMessageFacts {
+        record_token_json: record_token_json.as_deref(),
+        ..raw_facts
+    };
     // How many rows this record produced, counted rather than predicted.
     //
     // Every record must leave at least one row behind, and the only
@@ -9477,15 +10089,8 @@ fn ingest_claude_record(
     // message body, are dropped further down, and a marker written after
     // that point would never be reached for exactly the records this table
     // exists to keep.
-    //
-    // A skipped sidechain record is deliberately excluded. Its rows are
-    // deleted rather than stored, so a marker would be the one trace left
-    // of a record the parser has decided not to keep.
-    let record_draft = if skipped_sidechain {
-        None
-    } else {
-        claude_marker_for_record(obj, last_assistant_cache_read.get(session_id).copied())
-    };
+    let record_draft =
+        claude_marker_for_record(obj, last_assistant_cache_read.get(session_id).copied());
     if let Some(draft) = &record_draft {
         record_rows += 1;
         let marker_uid = format!("{message_uuid}:marker");
@@ -9509,17 +10114,10 @@ fn ingest_claude_record(
     // Claude reports a finished subagent as a `type: "system"` line with
     // no message body, so the block walk below never sees it. It is the
     // only record that ties a delegated child back to the Agent call that
-    // spawned it, which makes it a tool result in everything but shape.
-    //
-    // This runs before the sidechain guard, and has to. A system line
-    // carries no `message`, so `skipped_sidechain` is true for every one
-    // of them that is marked `isSidechain` -- and a nested Agent call
-    // writes its completion line inside the child's sidecar, where every
-    // record is a sidechain. Skipping those would drop the only record of
-    // the nested spawn while keeping the rows for the spawns that happen
-    // to sit on the parent transcript. The guard below still owns every
-    // other sidechain row; a system line that names no child falls
-    // through to it.
+    // spawned it, which makes it a tool result in everything but shape. A
+    // nested Agent call writes its completion line inside the child's
+    // sidecar, where every record is a sidechain, and it is read the same
+    // way there.
     let system_record = obj.get("type").and_then(Value::as_str) == Some("system");
     if system_record {
         if let Some(tool_facts) = tool_result_facts::claude_subagent_notification_facts(obj) {
@@ -9561,22 +10159,6 @@ fn ingest_claude_record(
             )?;
             return Ok(());
         }
-    }
-    if skipped_sidechain {
-        delete_claude_record_rows(conn, session_id, message_uuid)?;
-        if id_less {
-            heal_legacy_positional_record(
-                conn,
-                session_id,
-                stem,
-                ts_ms,
-                message,
-                message_role,
-                model,
-                token_json.as_deref(),
-            )?;
-        }
-        return Ok(());
     }
     // A system line that names no delegated child has nothing else this
     // parser stores -- it carries no `message` body to walk -- and is
@@ -9623,7 +10205,8 @@ fn ingest_claude_record(
     // the record is a prompt or one of the harness's own rows; the envelope
     // (`origin.kind`, `attachment.commandMode`, `isMeta`) is read in the same
     // call. Model output is never control, and a sidechain user row is the
-    // parent agent's, which the guard above already settled. The one answer
+    // delegating agent's rather than a human's, so it is never classified as
+    // either. The one answer
     // is what `history`, the event rows and the triad walk all act on, so a
     // row cannot be kept out of `history` and still read back as a prompt.
     let user_record = message_role == "user" && !sidechain;
@@ -9704,6 +10287,18 @@ fn ingest_claude_record(
             &mut first_text_event_uid,
         )?;
     }
+    // Claude Code writes a tool's structured result beside the message, as
+    // the record's `toolUseResult`, one result per record. It describes the
+    // record's tool_result block only when there is exactly one to describe.
+    let record_tool_use_result = obj.get("toolUseResult").filter(|_| {
+        content
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("tool_result"))
+            .count()
+            == 1
+    });
     for (block_index, block) in content.as_array().into_iter().flatten().enumerate() {
         let block_type = block.get("type").and_then(Value::as_str).unwrap_or("");
         let event_uid = format!("{message_uuid}:{block_index}");
@@ -9711,7 +10306,10 @@ fn ingest_claude_record(
         // block — an unsupported block type, a thinking signature, tool
         // replacement metadata, a delegated result's agent id — is
         // recorded here, before the arms that handle what it can.
-        for (suffix, draft) in claude_markers_for_block(block_type, block) {
+        let request_id = identity.request_id.or(raw_facts.request_id);
+        for (suffix, draft) in
+            claude_markers_for_block(block_type, block, request_id, identity.provider_message_id)
+        {
             let marker_uid = format!("{event_uid}:{suffix}");
             insert_session_marker(
                 conn,
@@ -9748,6 +10346,9 @@ fn ingest_claude_record(
                     .get("thinking")
                     .or_else(|| block.get("text"))
                     .and_then(Value::as_str);
+                // A signed block with no display text is carried by its
+                // `thinking_signature` marker, which names the record's
+                // request; it has no content to store as an event.
                 if text.is_some_and(|s| !s.trim().is_empty()) {
                     insert_session_event(
                         conn,
@@ -9845,8 +10446,15 @@ fn ingest_claude_record(
                 // actually returned, which a post-processed string can no
                 // longer answer.
                 let (call_index, event_index) = indexer.next(tool_use_id);
-                let facts = tool_result_facts::claude_tool_result_facts(block)
+                let mut facts = tool_result_facts::claude_tool_result_facts(block)
                     .with_ordering(call_index, event_index);
+                // The delegated child an Agent/Task result reports on.
+                facts.agent_id = find_tool_use_result(block)
+                    .or(record_tool_use_result)
+                    .and_then(|result| result.get("agentId"))
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty())
+                    .map(str::to_string);
                 let text = materialize_tool_result_text(content);
                 insert_session_event_with_provenance(
                     conn,
@@ -10454,20 +11062,49 @@ fn claude_marker_for_record(
 /// tool-replacement metadata, and the `agentId` a delegated tool result
 /// carries. Several can apply to one block, so each marker brings the suffix
 /// that keys it.
-fn claude_markers_for_block(block_type: &str, block: &Value) -> Vec<(&'static str, MarkerDraft)> {
+///
+/// A signed `thinking` block with no display text is the record Claude streams
+/// first in a response, so its timestamp is when the request started. It
+/// stores no event, so its marker carries the record's request identity --
+/// `request_id` and `provider_message_id` -- which is what places it in its
+/// request. Each is stored whole or not at all: an id longer than the marker
+/// field bound is left out, because a truncated id would name no request.
+fn claude_markers_for_block(
+    block_type: &str,
+    block: &Value,
+    request_id: Option<&str>,
+    provider_message_id: Option<&str>,
+) -> Vec<(&'static str, MarkerDraft)> {
     let mut markers = Vec::new();
     match block_type {
         "text" | "tool_use" => {}
         "thinking" => {
             if let Some(signature) = block.get("signature").and_then(Value::as_str) {
+                let mut payload = vec![
+                    ("bytes", Value::from(signature.len())),
+                    ("has_signature", Value::Bool(true)),
+                ];
+                let text = block
+                    .get("thinking")
+                    .or_else(|| block.get("text"))
+                    .and_then(Value::as_str);
+                if text.is_none_or(|text| text.trim().is_empty()) {
+                    let id = |value: Option<&str>| {
+                        value
+                            .filter(|value| {
+                                !value.is_empty()
+                                    && value.chars().count() <= MARKER_PAYLOAD_FIELD_LIMIT
+                            })
+                            .map(|value| Value::String(value.to_string()))
+                            .unwrap_or(Value::Null)
+                    };
+                    payload.push(("request_id", id(request_id)));
+                    payload.push(("provider_message_id", id(provider_message_id)));
+                }
                 markers.push((
                     "signature",
-                    MarkerDraft::new("unsupported_block", Some("thinking_signature")).with_payload(
-                        vec![
-                            ("bytes", Value::from(signature.len())),
-                            ("has_signature", Value::Bool(true)),
-                        ],
-                    ),
+                    MarkerDraft::new("unsupported_block", Some("thinking_signature"))
+                        .with_payload(payload),
                 ));
             }
         }
@@ -10648,7 +11285,16 @@ fn codex_marker_for_payload(
         };
     }
     match payload_type {
-        "task_started" => MarkerDraft::new("task_started", Some("task_started")),
+        // The turn of the root thread that the delegated thread is working
+        // for: a
+        // `turn_context` that repeats everything else is not stored, so the
+        // turn keeps its root here.
+        "task_started" => {
+            MarkerDraft::new("task_started", Some("task_started")).with_payload(vec![(
+                "root_turn_id",
+                payload.get("root_turn_id").cloned().unwrap_or(Value::Null),
+            )])
+        }
         "task_complete" => {
             MarkerDraft::new("task_complete", Some("task_complete")).with_payload(vec![(
                 "duration_ms",
@@ -10910,7 +11556,8 @@ fn settle_claude_request_usage(
         return Ok(token_json.map(str::to_string));
     };
     conn.execute(
-        "UPDATE session_events SET token_json = ?4 \
+        "UPDATE session_events SET token_json = ?4, \
+           record_token_json = COALESCE(record_token_json, token_json) \
          WHERE source = 'claude' AND session_id = ?1 AND provider_message_id = ?3 \
            AND (request_id = ?2 OR (?2 IS NULL AND NULLIF(request_id, '') IS NULL)) \
            AND role = 'assistant' AND token_json IS NOT NULL AND token_json <> ?4",
@@ -11135,7 +11782,10 @@ fn heal_claude_synthetic_session_summaries(conn: &Connection) -> Result<()> {
 /// indexed before it existed is indistinguishable from a prompt -- which is
 /// exactly the reading the column exists to prevent -- so the backfill this
 /// version drives is the one that repairs it.
-const RAW_MESSAGE_FACTS_VERSION: i64 = 3;
+/// Generation 4 is the one capture re-read of the release after 0.36.0: a row
+/// stamped below it predates evidence that release's parsers store, and a
+/// finished transcript never changes on disk, so only this re-read stores it.
+const RAW_MESSAGE_FACTS_VERSION: i64 = 4;
 
 #[derive(Debug, Default, Clone, Copy)]
 struct RawMessageFacts<'a> {
@@ -11154,6 +11804,10 @@ struct RawMessageFacts<'a> {
     /// The one derived fact carried here, because every insert already
     /// threads this struct and the column is stamped per row like the rest.
     control_kind: Option<&'a str>,
+    /// Claude: the record's own usage blob where settlement replaced it in
+    /// `token_json` -- JSON `null` for a copy that carried none. `None` where
+    /// `token_json` already is the record's own, and for every other source.
+    record_token_json: Option<&'a str>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11340,7 +11994,7 @@ fn insert_session_event_with_provenance(
           tool_use_id, payload_bytes, payload_truncated, payload_hash, call_index, event_index, result_status, event_source, \
           error_signal, subagent_session_id, agent_id, \
           request_id, provider_message_id, stop_reason, agent_version, is_sidechain, is_meta, turn_id, request_span, raw_facts_version, raw_kind, \
-          control_kind) \
+          control_kind, record_token_json) \
          VALUES (?1, ?2, ?3, \
            COALESCE((SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2), ?16), \
            CASE WHEN (SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2) IS NOT NULL \
@@ -11348,7 +12002,7 @@ fn insert_session_event_with_provenance(
                 ELSE ?17 END, \
            ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, \
            ?14, ?15, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, \
-           ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39) \
+           ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40) \
          ON CONFLICT(source, session_id, event_uid) DO UPDATE SET \
          project=excluded.project, \
          project_key=COALESCE((SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2), session_events.project_key, ?16), \
@@ -11371,7 +12025,7 @@ fn insert_session_event_with_provenance(
          is_sidechain=excluded.is_sidechain, is_meta=excluded.is_meta, turn_id=excluded.turn_id, \
          request_span=excluded.request_span, \
          raw_facts_version=excluded.raw_facts_version, raw_kind=excluded.raw_kind, \
-         control_kind=excluded.control_kind, \
+         control_kind=excluded.control_kind, record_token_json=excluded.record_token_json, \
          location=CASE WHEN session_events.location = excluded.location \
            THEN session_events.location ELSE 'both' END",
     )?.execute(
@@ -11415,6 +12069,7 @@ fn insert_session_event_with_provenance(
             RAW_MESSAGE_FACTS_VERSION,
             raw_kind,
             raw_facts.control_kind,
+            raw_facts.record_token_json,
         ],
     )?;
     Ok(())
@@ -17490,6 +18145,51 @@ mod tests {
     use rusqlite::Connection;
     use serde_json::{json, Map, Value};
     use std::{fs, io::Write as _, time::Duration};
+
+    /// Retiring one record's rows is a keyed search in every table, and the
+    /// uid range takes exactly the record's own `uuid:`-prefixed rows. The
+    /// parser runs it for every sidechain record it moves onto its child, so
+    /// a scan here makes a sidecar re-read quadratic in the parent's size.
+    #[test]
+    fn retiring_a_claude_record_reads_only_its_own_rows() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for (table, condition) in CLAUDE_RECORD_ROWS {
+            let plan: Vec<String> = conn
+                .prepare(&format!(
+                    "EXPLAIN QUERY PLAN DELETE FROM {table} WHERE ({condition}) AND location = 'local'"
+                ))
+                .unwrap()
+                .query_map(params!["parent", "m"], |row| row.get::<_, String>(3))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            let keyed = plan
+                .iter()
+                .any(|step| step.contains("_uid>?") || step.contains("message_id=?"));
+            assert!(
+                keyed,
+                "{table} retirement is not keyed on the record: {plan:?}"
+            );
+        }
+        for uid in ["m:0", "m:1:marker", "m", "mx:0", "l:0", "m;0"] {
+            conn.execute(
+                "INSERT INTO session_events (source, session_id, ts_ms, role, kind, text, event_uid) \
+                 VALUES ('claude', 'parent', 1, 'assistant', 'text', 't', ?1)",
+                [uid],
+            )
+            .unwrap();
+        }
+        delete_claude_record_rows(&conn, "parent", "m").unwrap();
+        let left: Vec<String> = conn
+            .prepare("SELECT event_uid FROM session_events ORDER BY event_uid")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(left, ["l:0", "m", "m;0", "mx:0"]);
+    }
 
     /// The walk's per-transcript probes are asked of every Claude file on
     /// every sweep, so each must be a keyed search whatever the planner knows.
@@ -27202,9 +27902,9 @@ mod tests {
             super::parse_iso_ms("2026-08-31T11:00:02Z")
         );
 
-        // The child's output is addressable under the child, its delegated
-        // instruction is nobody's human prompt, and a delegated thread never
-        // becomes a session of its own.
+        // The child's output and its delegated instruction are addressable
+        // under the child, the instruction is nobody's human prompt, and a
+        // delegated thread never becomes a session of its own.
         let counts: (i64, i64, i64, i64) = conn
             .query_row(
                 "SELECT \
@@ -27216,7 +27916,7 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
             )
             .unwrap();
-        assert_eq!(counts, (1, 0, 0, 0));
+        assert_eq!(counts, (2, 0, 0, 0));
     }
 
     #[test]
@@ -27260,6 +27960,207 @@ mod tests {
             )
             .unwrap();
         assert_eq!(placement, (0, 1));
+    }
+
+    /// Inline Task traffic from older Claude Code versions: a primary
+    /// `<sessionId>.jsonl` whose every record is an `isSidechain` row, naming
+    /// the delegated agent when `agent_id` is given.
+    fn write_claude_sidechain_only_transcript(root: &Path, agent_id: Option<&str>) -> PathBuf {
+        let project = root.join("-tmp-project");
+        fs::create_dir_all(&project).unwrap();
+        let path = project.join("44444444-4444-4444-4444-444444444444.jsonl");
+        let agent = agent_id
+            .map(|id| format!(r#""agentId":"{id}","#))
+            .unwrap_or_default();
+        fs::write(
+            &path,
+            format!(
+                concat!(
+                    r#"{{{0}"parentUuid":null,"isSidechain":true,"type":"user","message":{{"role":"user","content":"subagent prompt"}},"uuid":"u-sidechain-user","timestamp":"2026-04-20T00:00:00.000Z","cwd":"/tmp/project","sessionId":"44444444-4444-4444-4444-444444444444"}}"#, "\n",
+                    r#"{{{0}"parentUuid":"u-sidechain-user","isSidechain":true,"message":{{"model":"claude-haiku-4-5","id":"msg_side_1","type":"message","role":"assistant","content":[{{"type":"text","text":"working on it"}}],"stop_reason":"end_turn","usage":{{"input_tokens":50,"output_tokens":10,"cache_read_input_tokens":0,"cache_creation_input_tokens":0}}}},"requestId":"req_side","type":"assistant","uuid":"u-asst-side","timestamp":"2026-04-20T00:00:01.000Z","cwd":"/tmp/project","sessionId":"44444444-4444-4444-4444-444444444444"}}"#, "\n",
+                ),
+                agent
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    /// `(catalog rows naming the transcript, delegated rows citing it,
+    /// sidechain assistant rows with usage under the session, event rows
+    /// under any other session)`.
+    fn sidechain_only_placement(conn: &Connection, path: &Path) -> (i64, i64, i64, i64) {
+        conn.query_row(
+            "SELECT \
+               (SELECT COUNT(*) FROM sessions WHERE source = 'claude' \
+                  AND session_id = '44444444-4444-4444-4444-444444444444' AND raw_path = ?1), \
+               (SELECT COUNT(*) FROM session_relationships WHERE evidence_locator = ?1), \
+               (SELECT COUNT(*) FROM session_events WHERE source = 'claude' \
+                  AND session_id = '44444444-4444-4444-4444-444444444444' \
+                  AND role = 'assistant' AND is_sidechain = 1 AND token_json IS NOT NULL), \
+               (SELECT COUNT(*) FROM session_events WHERE source = 'claude' \
+                  AND session_id <> '44444444-4444-4444-4444-444444444444')",
+            [path.to_string_lossy().as_ref()],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn plain_claude_sync_catalogs_a_primary_transcript_of_only_sidechain_rows() {
+        for agent_id in [None, Some("child-1")] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = write_claude_sidechain_only_transcript(dir.path(), agent_id);
+            let conn = Connection::open_in_memory().unwrap();
+            init_db(&conn).unwrap();
+            let mut state = Map::new();
+
+            sync_claude_session_metadata_with_repairs(
+                &conn,
+                &mut state,
+                dir.path(),
+                &Default::default(),
+            )
+            .unwrap();
+
+            assert_eq!(
+                sidechain_only_placement(&conn, &path),
+                (1, 0, 1, 0),
+                "{agent_id:?}"
+            );
+        }
+    }
+
+    /// A store an earlier build synced read this transcript as a sidecar of
+    /// its own session: the events (under the session, or under the child the
+    /// records named) and a delegation row citing the file, and a cursor that
+    /// says the file is unchanged -- with or without discovery having since
+    /// catalogued the transcript. The next sync, or a hydration of the
+    /// catalogued session, indexes it as the session's own, retracts the
+    /// delegation and retires the child evidence the misreading invented.
+    #[test]
+    fn claude_heals_a_sidechain_only_transcript_read_as_a_sidecar() {
+        for agent_id in [None, Some("child-1")] {
+            for catalogued in [false, true] {
+                for heal_by_hydration in [false, true] {
+                    if heal_by_hydration && !catalogued {
+                        continue;
+                    }
+                    let case = format!(
+                        "agent_id={agent_id:?} catalogued={catalogued} hydration={heal_by_hydration}"
+                    );
+                    let home = tempfile::tempdir().unwrap();
+                    let projects = home.path().join(".claude/projects");
+                    let path = write_claude_sidechain_only_transcript(&projects, agent_id);
+                    let db_path = home.path().join("ai-history.db");
+                    let conn = crate::open_db(&db_path).unwrap();
+                    let mut scan = None;
+                    let meta = scan_claude_session_file_resumed(&path, &mut scan)
+                        .unwrap()
+                        .meta
+                        .unwrap();
+                    let (evidence, _) = hydrate::claude_subagent_evidence(path.clone(), &meta);
+                    hydrate::ingest_claude_subagent(&conn, &meta.session_id, &evidence).unwrap();
+                    let locator = path.to_string_lossy().to_string();
+                    let key = transcript_cursor::CursorKey::Locator {
+                        source: "claude",
+                        locator: &locator,
+                    };
+                    let mut cursor = transcript_cursor::load_cursor(&conn, &key).unwrap();
+                    cursor.claude.get_or_insert_with(Default::default).scan = scan;
+                    transcript_cursor::store_cursor(&conn, &key, &cursor).unwrap();
+                    if catalogued {
+                        upsert_session(
+                            &conn,
+                            &meta.session_id,
+                            "claude",
+                            meta.cwd.as_deref(),
+                            None,
+                            meta.first_ts,
+                            meta.last_ts,
+                            None,
+                            Some(&locator),
+                        )
+                        .unwrap();
+                    }
+                    let before = sidechain_only_placement(&conn, &path);
+                    assert_eq!(before.1, 1, "{case}");
+                    assert_eq!(
+                        (before.2, before.3),
+                        // The child holds the sidechain prompt and the
+                        // subagent's output.
+                        if agent_id.is_some() { (0, 2) } else { (1, 0) },
+                        "{case}"
+                    );
+                    assert!(claude_transcript_unchanged(&conn, &path).unwrap(), "{case}");
+
+                    if heal_by_hydration {
+                        hydrate::hydrate_session_at_with_home(
+                            &db_path,
+                            &HydrateSessionOptions {
+                                source: "claude".into(),
+                                session_id: meta.session_id.clone(),
+                                scope: SessionScope::Local,
+                                include_related: true,
+                            },
+                            home.path(),
+                        )
+                        .unwrap();
+                    } else {
+                        let mut state = Map::new();
+                        sync_claude_session_metadata_with_repairs(
+                            &conn,
+                            &mut state,
+                            &projects,
+                            &Default::default(),
+                        )
+                        .unwrap();
+                    }
+
+                    assert_eq!(
+                        sidechain_only_placement(&conn, &path),
+                        (1, 0, 1, 0),
+                        "{case}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// A transcript that was away while the one-time pass ran -- its cursor
+    /// forgotten, so it never held the pass open -- still carries the earlier
+    /// build's delegation and child evidence when it returns. The walk reads
+    /// it as a new file and heals it then, after the pass is recorded.
+    #[test]
+    fn claude_sync_heals_a_misread_transcript_that_returns_after_the_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = write_claude_sidechain_only_transcript(dir.path(), Some("child-1"));
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let meta = scan_claude_session_file_resumed(&path, &mut None)
+            .unwrap()
+            .meta
+            .unwrap();
+        let (evidence, _) = hydrate::claude_subagent_evidence(path.clone(), &meta);
+        hydrate::ingest_claude_subagent(&conn, &meta.session_id, &evidence).unwrap();
+        transcript_cursor::forget_locator(&conn, "claude", &path.to_string_lossy()).unwrap();
+        // The child holds the sidechain prompt and the subagent's output.
+        assert_eq!(sidechain_only_placement(&conn, &path), (0, 1, 0, 2));
+        let mut state = Map::new();
+        state.insert(
+            CLAUDE_SIDECAR_LAYOUT_KEY.to_string(),
+            json!(CLAUDE_SIDECAR_LAYOUT_GENERATION),
+        );
+
+        sync_claude_session_metadata_with_repairs(
+            &conn,
+            &mut state,
+            dir.path(),
+            &Default::default(),
+        )
+        .unwrap();
+
+        assert_eq!(sidechain_only_placement(&conn, &path), (1, 0, 1, 0));
     }
 
     #[test]
@@ -27310,7 +28211,8 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(child_events, 1);
+        // The delegated prompt and the child's output, once each.
+        assert_eq!(child_events, 2);
     }
 
     /// Reproduce what a release without the per-message raw facts left behind:
@@ -27327,7 +28229,8 @@ mod tests {
         conn.execute(
             "UPDATE session_events SET request_id = NULL, stop_reason = NULL, \
              agent_version = NULL, is_sidechain = NULL, is_meta = NULL, turn_id = NULL, \
-             request_span = NULL, raw_facts_version = NULL WHERE source = ?",
+             request_span = NULL, record_token_json = NULL, raw_facts_version = NULL \
+             WHERE source = ?",
             [source],
         )
         .unwrap();
@@ -27349,6 +28252,58 @@ mod tests {
             super::RAW_MESSAGE_FACTS_GENERATION,
             "bump both, or the backfill it exists to trigger never runs"
         );
+    }
+
+    /// One streamed Claude response as two records whose usage snapshots
+    /// grow. `token_json` settles to the merged blob on both rows;
+    /// `record_token_json` keeps a record's own where it differs, including on a store
+    /// indexed before the column existed, which the raw-facts backfill fills.
+    #[test]
+    fn claude_rows_keep_each_records_own_usage_beside_the_settled_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess-stream.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","uuid":"u1","sessionId":"sess-stream","cwd":"/tmp/project","timestamp":"2026-04-20T00:00:00.000Z","message":{"role":"user","content":"run it"}}"#, "\n",
+                r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"sess-stream","cwd":"/tmp/project","requestId":"req_1","timestamp":"2026-04-20T00:00:01.000Z","message":{"id":"msg_1","role":"assistant","model":"claude-opus-5","content":[{"type":"text","text":"Looking."}],"usage":{"input_tokens":10,"output_tokens":1}}}"#, "\n",
+                r#"{"type":"assistant","uuid":"a2","parentUuid":"a1","sessionId":"sess-stream","cwd":"/tmp/project","requestId":"req_1","timestamp":"2026-04-20T00:00:02.000Z","message":{"id":"msg_1","role":"assistant","model":"claude-opus-5","stop_reason":"end_turn","content":[{"type":"text","text":"Done."}],"usage":{"input_tokens":10,"output_tokens":7}}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let usage = |conn: &Connection| -> Vec<(String, String, Option<String>)> {
+            conn.prepare(
+                "SELECT event_uid, token_json, record_token_json FROM session_events \
+                 WHERE source = 'claude' AND role = 'assistant' ORDER BY event_uid",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        };
+        let settled = r#"{"input_tokens":10,"output_tokens":7}"#.to_string();
+        let expected = vec![
+            (
+                "a1:0".to_string(),
+                settled.clone(),
+                Some(r#"{"input_tokens":10,"output_tokens":1}"#.to_string()),
+            ),
+            // The last copy's own usage is the settled blob, so nothing is
+            // stored beside it.
+            ("a2:0".to_string(), settled.clone(), None),
+        ];
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(usage(&conn), expected);
+
+        blank_raw_message_facts(&conn, "claude");
+        blank_raw_message_facts_state(&mut state);
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(usage(&conn), expected);
     }
 
     #[test]
@@ -30127,13 +31082,20 @@ mod tests {
                 .iter()
                 .map(|(kind, subkind, _)| (kind.as_str(), subkind.as_str()))
                 .collect::<Vec<_>>(),
-            vec![("unknown", "message"), ("unknown", "user_message")],
+            vec![
+                ("turn_context", "turn_context"),
+                ("unknown", "message"),
+                ("unknown", "user_message")
+            ],
             "every user line nothing stored must leave a row: {markers:?}"
         );
         // No marker payload carries the image or the wrapper text, only the
         // fact that the line was there.
         assert!(
-            markers.iter().all(|(_, _, payload)| payload.is_empty()),
+            markers
+                .iter()
+                .filter(|(kind, _, _)| kind != "turn_context")
+                .all(|(_, _, payload)| payload.is_empty()),
             "the marker records that the line existed, not its contents"
         );
     }
@@ -30182,9 +31144,11 @@ mod tests {
             vec!["fix the importer".to_string(), "done".to_string()],
             "one row per turn, not one per representation"
         );
+        // The turn's own `turn_context` is its marker; the mirrored twin adds
+        // none.
         let markers = markers_of(&conn, "codex", "sess-mirror");
         assert!(
-            markers.is_empty(),
+            markers.iter().all(|(kind, _, _)| kind == "turn_context"),
             "a mirrored twin wrote through its partner, so it earns its silence: {markers:?}"
         );
     }
@@ -30261,11 +31225,10 @@ mod tests {
         }
         // Session metadata is a state update, not a record: it populates the
         // catalog rather than the ledger, and must stay silent or every
-        // rollout gains two markers it does not need.
+        // rollout gains markers it does not need. A `turn_context` is the
+        // turn's settings and is stored as its own `turn_context` marker.
         assert!(
-            !subkinds
-                .iter()
-                .any(|s| s == "session_meta" || s == "turn_context"),
+            !subkinds.iter().any(|s| s == "session_meta"),
             "state-only lines must not produce markers: {subkinds:?}"
         );
     }
@@ -31001,6 +31964,7 @@ mod tests {
             "subagent_notification",
             "compaction_boundary",
             "task_complete",
+            "turn_context",
         ] {
             assert!(
                 kinds.iter().any(|kind| kind == expected),
@@ -31009,9 +31973,9 @@ mod tests {
         }
         assert_eq!(
             kinds.len(),
-            10,
+            11,
             "a streaming delta is a fragment of an event that is already \
-             recorded whole, and turn_context is modeled: {markers:?}"
+             recorded whole: {markers:?}"
         );
 
         let unknown = markers
@@ -31052,7 +32016,7 @@ mod tests {
 
         // Idempotent under a re-parse: uids are derived from file position.
         super::ingest_codex_rollout(&conn, &path, &codex_meta(&path)).unwrap();
-        assert_eq!(marker_kinds(&conn, "codex", "sess-markers").len(), 10);
+        assert_eq!(marker_kinds(&conn, "codex", "sess-markers").len(), 11);
     }
 
     /// The tool-result row answering one call, whatever its position. A
@@ -31354,9 +32318,8 @@ mod tests {
         );
         assert_eq!(rows[0].tool_use_id.as_deref(), Some("toolu_nested"));
 
-        // Every other sidechain record is still skipped: the guard below the
-        // notification handler is unchanged, and a sidechain user row is the
-        // parent's own prompt rather than a human turn of the child's.
+        // A sidechain user row is the delegating agent's prompt: stored as
+        // flagged evidence, never as a human prompt.
         let sidechain_user = dir.path().join("sidecar-user.jsonl");
         fs::write(
             &sidechain_user,
@@ -31371,14 +32334,21 @@ mod tests {
         )
         .unwrap();
         ingest_claude_transcript(&conn, &sidechain_user).unwrap();
-        let events: i64 = conn
+        let (events, history): (i64, i64) = conn
             .query_row(
-                "SELECT COUNT(*) FROM session_events WHERE source = 'claude' AND session_id = ?",
+                "SELECT \
+                   (SELECT COUNT(*) FROM session_events WHERE source = 'claude' \
+                      AND session_id = ?1 AND is_sidechain = 1 AND control_kind IS NULL), \
+                   (SELECT COUNT(*) FROM history WHERE source = 'claude' AND session_id = ?1)",
                 params!["sidecar-user-session"],
-                |row| row.get(0),
+                |row| Ok((row.get(0)?, row.get(1)?)),
             )
             .unwrap();
-        assert_eq!(events, 0, "a sidechain user row is not the child's turn");
+        assert_eq!(
+            (events, history),
+            (1, 0),
+            "a sidechain user row is evidence, not a human prompt"
+        );
     }
 
     #[test]
@@ -31900,6 +32870,119 @@ mod tests {
         );
     }
 
+    /// A store the previous parser indexed has no event for the signed, empty
+    /// `thinking` record that opens a streamed response, continuity evidence
+    /// without naming timestamps, a fork edge dated by the transcript's first
+    /// record, cursors at end of file, no attribution pass recorded and a
+    /// fingerprint that vouches for all of it. One plain sync repairs every
+    /// part, then the fast path resumes.
+    #[test]
+    fn unchanged_claude_transcripts_gain_opening_records_and_naming_times_after_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join(".claude/projects/-tmp-project");
+        fs::create_dir_all(&project).unwrap();
+        for name in [
+            "multi-block-turn.jsonl",
+            "explicit-line-relationships.jsonl",
+        ] {
+            fs::copy(
+                corpus_fixture(&format!("claude/{name}")),
+                project.join(name),
+            )
+            .unwrap();
+        }
+        let db = dir.path().join("history.db");
+        let roots = crate::ProviderRoots::from_home(
+            dir.path().to_path_buf(),
+            dir.path().join("opencode.db"),
+        );
+        super::sync_exclusive_with_roots(&db, &roots, false).unwrap();
+        let conn = open_db(&db).unwrap();
+        let state_path = dir.path().join(".sync-state.json");
+        let mut state = load_sync_state(&state_path).unwrap();
+        conn.execute_batch(
+            "UPDATE session_markers SET payload_json = '{\"bytes\":3,\"has_signature\":true}'
+              WHERE subkind = 'thinking_signature';
+             UPDATE session_continuity_evidence
+                SET explicit_targets_json = json_remove(explicit_targets_json,
+                      '$.continuation_ts_ms', '$.fork_ts_ms');
+             UPDATE session_relationships SET spawned_at_ms = 1776996000000
+              WHERE relationship = 'fork';",
+        )
+        .unwrap();
+        state.remove(super::CLAUDE_RECORD_ATTRIBUTION_KEY);
+        // The previous build's fingerprint and a destination proof taken over
+        // what it stored, so nothing but the generation can force the sweep.
+        let source_part = state[super::SOURCE_FINGERPRINT_KEY]
+            .as_str()
+            .unwrap()
+            .split_once('/')
+            .unwrap()
+            .1
+            .to_string();
+        let old_generations = [
+            "claude_sessions_v3",
+            "codex_rollouts_v7",
+            super::GROK_SYNC_STATE_KEY,
+        ]
+        .join("|");
+        let old_generation = format!(
+            "g{:016x}",
+            crate::discover::fingerprint_hash(
+                "sweep-generation",
+                &crate::discover::SHALLOW_SCANNER_VERSION.to_string(),
+                &old_generations,
+            )
+        );
+        let old_fingerprint = format!("{old_generation}/{source_part}");
+        state.insert(super::SOURCE_FINGERPRINT_KEY.into(), json!(old_fingerprint));
+        state.insert(
+            super::DESTINATION_GENERATION_KEY.into(),
+            json!(super::destination_generation(&conn).unwrap()),
+        );
+        state.insert(
+            super::DESTINATION_HEAD_KEY.into(),
+            json!(super::destination_head(&conn).unwrap()),
+        );
+        assert!(super::sources_unchanged(&conn, &state, &old_fingerprint));
+        fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+
+        assert!(
+            super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept
+        );
+        // The opening record's marker names its request again, at the time
+        // the request started.
+        let (ts, request, provider): (i64, String, String) = conn
+            .query_row(
+                "SELECT ts_ms, json_extract(payload_json, '$.request_id'), \
+                        json_extract(payload_json, '$.provider_message_id') \
+                 FROM session_markers \
+                 WHERE subkind = 'thinking_signature' AND message_id = 'u-asst-1a'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (ts, request.as_str(), provider.as_str()),
+            (1_776_643_201_000, "req_1", "msg_multi_1")
+        );
+        let forked_at: i64 = conn
+            .query_row(
+                "SELECT spawned_at_ms FROM session_relationships WHERE relationship = 'fork'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(forked_at, 1_776_996_001_000);
+        assert!(
+            !super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept
+        );
+    }
+
     #[test]
     fn unchanged_desktop_rollout_recovers_replies_after_parser_upgrade() {
         let dir = tempfile::tempdir().unwrap();
@@ -31971,6 +33054,104 @@ mod tests {
                 .swept
         );
         assert_eq!(conn.query_row("SELECT count(*) FROM session_events WHERE session_id='desktop-upgrade' AND text='Recovered reply'", [], |r| r.get::<_, i64>(0)).unwrap(), 1);
+        assert!(
+            !super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept
+        );
+    }
+
+    /// OpenCode keeps no per-file sync state, so the only thing that tells an
+    /// upgraded sweep to re-normalize an unchanged store is the generation in
+    /// the source fingerprint. Without it a step-only assistant message the
+    /// previous build never captured stays missing until OpenCode writes again.
+    #[test]
+    fn unchanged_opencode_store_gains_step_only_messages_after_parser_upgrade() {
+        fn copy_tree(from: &Path, to: &Path) {
+            fs::create_dir_all(to).unwrap();
+            for entry in fs::read_dir(from).unwrap() {
+                let entry = entry.unwrap();
+                let target = to.join(entry.file_name());
+                if entry.file_type().unwrap().is_dir() {
+                    copy_tree(&entry.path(), &target);
+                } else {
+                    fs::copy(entry.path(), target).unwrap();
+                }
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let share = dir.path().join(".local/share/opencode");
+        copy_tree(
+            &Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("tests/fixtures/opencode/legacy-json-multi-turn/storage"),
+            &share.join("storage"),
+        );
+        let db = dir.path().join("history.db");
+        let roots =
+            crate::ProviderRoots::from_home(dir.path().to_path_buf(), share.join("opencode.db"));
+        super::sync_exclusive_with_roots(&db, &roots, false).unwrap();
+        let conn = open_db(&db).unwrap();
+        let envelope = |conn: &Connection| {
+            conn.query_row(
+                "SELECT count(*) FROM session_events WHERE source='opencode' \
+                 AND session_id='ses_multi' AND event_uid='message:msg_multi_a1'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(envelope(&conn), 1);
+
+        // The previous build's output: no envelope for the step-only message,
+        // under that build's fingerprint and destination proof.
+        conn.execute(
+            "DELETE FROM session_events WHERE event_uid='message:msg_multi_a1'",
+            [],
+        )
+        .unwrap();
+        let state_path = dir.path().join(".sync-state.json");
+        let mut state = load_sync_state(&state_path).unwrap();
+        let source_part = state[super::SOURCE_FINGERPRINT_KEY]
+            .as_str()
+            .unwrap()
+            .split_once('/')
+            .unwrap()
+            .1
+            .to_string();
+        let old_generations = [
+            "claude_sessions_v3",
+            "codex_rollouts_v7",
+            super::GROK_SYNC_STATE_KEY,
+        ]
+        .join("|");
+        let old_generation = format!(
+            "g{:016x}",
+            crate::discover::fingerprint_hash(
+                "sweep-generation",
+                &crate::discover::SHALLOW_SCANNER_VERSION.to_string(),
+                &old_generations,
+            )
+        );
+        let old_fingerprint = format!("{old_generation}/{source_part}");
+        state.insert(super::SOURCE_FINGERPRINT_KEY.into(), json!(old_fingerprint));
+        state.insert(
+            super::DESTINATION_GENERATION_KEY.into(),
+            json!(super::destination_generation(&conn).unwrap()),
+        );
+        state.insert(
+            super::DESTINATION_HEAD_KEY.into(),
+            json!(super::destination_head(&conn).unwrap()),
+        );
+        assert!(super::sources_unchanged(&conn, &state, &old_fingerprint));
+        fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+
+        assert!(
+            super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept,
+            "the generation bump must cross the previous build's fingerprint"
+        );
+        assert_eq!(envelope(&conn), 1);
         assert!(
             !super::sync_exclusive_with_roots(&db, &roots, false)
                 .unwrap()
@@ -32596,6 +33777,12 @@ mod tests {
             "codex_session_branches".into(),
             json!({"sess-unchanged-sub": "main"}),
         );
+        // An install that has already run the usage-snapshot backfill, so the
+        // stamp-unchanged fast path is what this exercises.
+        state.insert(
+            super::CODEX_STATE_MARKER_KEY.into(),
+            json!(super::CODEX_STATE_MARKER_GENERATION),
+        );
 
         let (cwds, branches, inserted) = super::sync_codex_rollouts_with_repairs(
             &conn,
@@ -32642,6 +33829,10 @@ mod tests {
                     "subagent": true
                 }
             }),
+        );
+        state.insert(
+            CODEX_STATE_MARKER_KEY.into(),
+            json!(CODEX_STATE_MARKER_GENERATION),
         );
         state
     }
@@ -33296,8 +34487,140 @@ mod tests {
         assert_eq!(before, after);
     }
 
+    /// An install synced before sidechain user rows were captured holds the
+    /// subagent's output and not the delegated prompt or tool result its
+    /// parent chain names. The transcript is unchanged on disk, so the
+    /// raw-facts generation is what re-reads it and stores them.
     #[test]
-    fn sidechain_rows_keep_assistant_output_but_drop_fake_user_turns() {
+    fn plain_claude_sync_backfills_sidechain_user_rows_an_earlier_parser_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("sess-inline.jsonl"),
+            concat!(
+                r#"{"type":"user","uuid":"u1","sessionId":"sess-inline","cwd":"/tmp/project","isSidechain":false,"timestamp":"2026-04-20T00:00:00.000Z","message":{"role":"user","content":"explore"}}"#, "\n",
+                r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"sess-inline","cwd":"/tmp/project","isSidechain":false,"timestamp":"2026-04-20T00:00:01.000Z","message":{"id":"m1","role":"assistant","model":"claude-opus-5","content":[{"type":"tool_use","id":"toolu_task","name":"Task","input":{"prompt":"Research"}}]}}"#, "\n",
+                r#"{"type":"user","uuid":"s1","parentUuid":"a1","sessionId":"sess-inline","cwd":"/tmp/project","isSidechain":true,"timestamp":"2026-04-20T00:00:02.000Z","message":{"role":"user","content":"Research"}}"#, "\n",
+                r#"{"type":"assistant","uuid":"s2","parentUuid":"s1","sessionId":"sess-inline","cwd":"/tmp/project","isSidechain":true,"timestamp":"2026-04-20T00:00:03.000Z","message":{"id":"m2","role":"assistant","model":"claude-haiku-4-5","content":[{"type":"tool_use","id":"toolu_read","name":"Read","input":{"file_path":"/tmp/project/a.rs"}}],"usage":{"input_tokens":5,"output_tokens":2}}}"#, "\n",
+                r#"{"type":"user","uuid":"s3","parentUuid":"s2","sessionId":"sess-inline","cwd":"/tmp/project","isSidechain":true,"timestamp":"2026-04-20T00:00:04.000Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_read","content":"fn main() {}"}]}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let sidechain_rows = |conn: &Connection| -> Vec<(String, String, String)> {
+            conn.prepare(
+                "SELECT message_id, kind, COALESCE(parent_id, '') FROM session_events \
+                 WHERE source = 'claude' AND is_sidechain = 1 ORDER BY ts_ms, id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        };
+        let expected = vec![
+            ("s1".to_string(), "text".to_string(), "a1".to_string()),
+            ("s2".to_string(), "tool_use".to_string(), "s1".to_string()),
+            (
+                "s3".to_string(),
+                "tool_result".to_string(),
+                "s2".to_string(),
+            ),
+        ];
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(sidechain_rows(&conn), expected);
+        let history: Vec<String> = conn
+            .prepare("SELECT prompt FROM history WHERE source = 'claude'")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(history, vec!["explore".to_string()]);
+        // The delegated prompt and the tool result the subagent received are
+        // the delegated thread's evidence: neither is a turn of the session's
+        // human, and the subagent's usage is charged to no prompt.
+        let turns: Vec<Option<String>> =
+            crate::store::session_user_turns_all(&conn, "claude", "sess-inline")
+                .unwrap()
+                .into_iter()
+                .map(|turn| turn.message_id)
+                .collect();
+        assert_eq!(turns, vec![Some("u1".to_string())]);
+        let events = crate::session_events(&conn, "sess-inline", Some("claude")).unwrap();
+        assert!(crate::usage::attribute_usage_to_prompts(&events, "claude").is_empty());
+
+        // What an earlier parser left: no sidechain user rows, and rows
+        // stamped with the generation before this one.
+        conn.execute(
+            "DELETE FROM session_events WHERE source = 'claude' AND message_id IN ('s1', 's3')",
+            [],
+        )
+        .unwrap();
+        blank_raw_message_facts(&conn, "claude");
+        blank_raw_message_facts_state(&mut state);
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(sidechain_rows(&conn), expected);
+    }
+
+    /// A named sidecar whose only record is the delegated prompt -- a child
+    /// interrupted before it replied -- left an earlier parser a delegation
+    /// row and no child events. That is not delegation evidence the fast path
+    /// accepts (`claude_sidecar_evidence_exists` asks for the child's rows),
+    /// so the next sync re-reads the sidecar and stores the prompt.
+    #[test]
+    fn plain_claude_sync_rereads_a_sidecar_an_earlier_parser_left_without_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("app");
+        let subagents = project.join("root-1/subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        fs::write(
+            project.join("root-1.jsonl"),
+            concat!(
+                r#"{"type":"user","uuid":"u1","sessionId":"root-1","cwd":"/work/app","timestamp":"2026-08-31T11:00:00Z","message":{"role":"user","content":"start"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let sidecar = subagents.join("agent-child.jsonl");
+        fs::write(
+            &sidecar,
+            concat!(
+                r#"{"type":"user","uuid":"c1","sessionId":"root-1","agentId":"child","isSidechain":true,"cwd":"/work/app","timestamp":"2026-08-31T11:00:01Z","message":{"role":"user","content":"delegated instruction"}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let child_rows = |conn: &Connection| -> (i64, i64) {
+            conn.query_row(
+                "SELECT \
+                   (SELECT COUNT(*) FROM session_events WHERE source = 'claude' \
+                      AND session_id = 'child' AND is_sidechain = 1), \
+                   (SELECT COUNT(*) FROM session_relationships WHERE source = 'claude' \
+                      AND child_session_id = 'child')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(child_rows(&conn), (1, 1));
+
+        conn.execute(
+            "DELETE FROM session_events WHERE source = 'claude' AND session_id = 'child'",
+            [],
+        )
+        .unwrap();
+        assert!(!claude_sidecar_evidence_exists(&conn, &sidecar).unwrap());
+        sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
+        assert_eq!(child_rows(&conn), (1, 1));
+    }
+
+    #[test]
+    fn sidechain_rows_are_flagged_evidence_and_never_human_prompts() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("agent-sub.jsonl");
         fs::write(
@@ -33311,17 +34634,28 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         ingest_claude_transcript(&conn, &path).unwrap();
-        let rows: Vec<(String, String)> = conn
-            .prepare("SELECT role, text FROM session_events ORDER BY id")
+        let rows: Vec<(String, String, Option<i64>)> = conn
+            .prepare("SELECT role, text, is_sidechain FROM session_events ORDER BY id")
             .unwrap()
-            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
             .unwrap()
             .collect::<rusqlite::Result<_>>()
             .unwrap();
         assert_eq!(
             rows,
-            vec![("assistant".into(), "Here is the report.".into())]
+            vec![
+                (
+                    "user".into(),
+                    "Research the repo thoroughly.".into(),
+                    Some(1)
+                ),
+                ("assistant".into(), "Here is the report.".into(), Some(1)),
+            ]
         );
+        let history: i64 = conn
+            .query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(history, 0, "a delegated prompt is not a human prompt");
     }
 
     /// Group N. A replacement that lands *while the scan is reading* must not
@@ -36469,8 +37803,65 @@ mod codex_fork_replay_tests {
         let closed = replay_marker(&conn, CHILD).expect("closed replay marker");
         assert_eq!(closed["closed_by_turn_id"], CHILD_TURN);
         assert_eq!(closed["inherited_total_tokens"], 1000);
+        // The replayed snapshot itself, as the parent's rollout wrote it.
+        assert_eq!(closed["inherited_snapshot"], usage(1000)["info"]);
         // 1600 cumulative, 1000 of it inherited from the parent.
         assert_eq!(token_totals(&conn, CHILD), vec![600]);
+    }
+
+    /// A signature marker's request identity is stored whole or not at all.
+    #[test]
+    fn a_signature_marker_never_stores_a_truncated_request_identity() {
+        let block = json!({"type": "thinking", "thinking": "", "signature": "sig"});
+        let long = "r".repeat(MARKER_PAYLOAD_FIELD_LIMIT + 1);
+        let payload = |request_id: &str| -> Value {
+            let markers =
+                claude_markers_for_block("thinking", &block, Some(request_id), Some("msg_1"));
+            serde_json::from_str(markers[0].1.payload_json.as_deref().unwrap()).unwrap()
+        };
+        assert_eq!(payload("req_1")["request_id"], json!("req_1"));
+        let over = payload(&long);
+        assert!(over.get("request_id").is_none(), "{over}");
+        assert_eq!(over["provider_message_id"], json!("msg_1"));
+    }
+
+    /// Keys that sort ahead of the measured ones cannot push a counter out
+    /// of the bounded `info`, at the top level or inside a usage object.
+    #[test]
+    fn the_usage_info_bound_keeps_every_counter() {
+        let mut usage = Map::new();
+        let mut info = Map::new();
+        for index in 0..40 {
+            usage.insert(format!("a{index:02}"), json!(index));
+            info.insert(format!("a{index:02}"), json!(index));
+        }
+        for (position, counter) in crate::usage_snapshot::COUNTERS.iter().enumerate() {
+            usage.insert(counter.to_string(), json!(u64::MAX - position as u64));
+        }
+        info.insert("total_token_usage".into(), Value::Object(usage.clone()));
+        info.insert("last_token_usage".into(), Value::Object(usage));
+        info.insert("model_context_window".into(), json!(258_400));
+
+        let bounded = bound_usage_info(Value::Object(info));
+
+        for key in ["total_token_usage", "last_token_usage"] {
+            for (position, counter) in crate::usage_snapshot::COUNTERS.iter().enumerate() {
+                assert_eq!(
+                    bounded[key][counter],
+                    json!(u64::MAX - position as u64),
+                    "{key}.{counter}"
+                );
+            }
+            assert_eq!(
+                bounded[key].as_object().unwrap().len(),
+                MARKER_PAYLOAD_ARRAY_LIMIT + crate::usage_snapshot::COUNTERS.len()
+            );
+        }
+        assert_eq!(bounded["model_context_window"], json!(258_400));
+        assert_eq!(
+            bounded.as_object().unwrap().len(),
+            MARKER_PAYLOAD_ARRAY_LIMIT + 3
+        );
     }
 
     /// Rows an earlier parser indexed under the child for replayed lines are
@@ -36628,6 +38019,434 @@ mod codex_fork_replay_tests {
         );
     }
 
+    /// Local `usage_snapshot` and `turn_context` markers for `PARENT`.
+    fn state_marker_uids(conn: &Connection) -> Vec<String> {
+        conn.prepare(
+            "SELECT marker_uid FROM session_markers WHERE source = 'codex' \
+             AND session_id = ? AND kind IN ('usage_snapshot', 'turn_context') \
+             AND location IN ('local', 'both') ORDER BY marker_uid",
+        )
+        .unwrap()
+        .query_map([PARENT], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    fn forget_state_markers(conn: &Connection) {
+        conn.execute(
+            "DELETE FROM session_markers WHERE kind IN ('usage_snapshot', 'turn_context')",
+            [],
+        )
+        .unwrap();
+    }
+
+    /// The sync state an older build left: no state-marker pass recorded,
+    /// and no rollout stamped with the generation that read it.
+    fn as_older_build(state: &mut Map<String, Value>) {
+        state.remove(CODEX_STATE_MARKER_KEY);
+        if let Some(seen) = state
+            .get_mut("codex_rollouts_v7")
+            .and_then(Value::as_object_mut)
+        {
+            for record in seen.values_mut().filter_map(Value::as_object_mut) {
+                record.remove("state_markers");
+            }
+        }
+    }
+
+    /// A one-turn rollout whose turn closed, so sync commits a cursor at its
+    /// end.
+    fn closed_turn_rollout(path: &std::path::Path, with_usage: bool) {
+        let mut lines = vec![
+            line(
+                "2026-04-20T00:00:00.000Z",
+                "session_meta",
+                json!({"id": PARENT, "cwd": "/tmp/project"}),
+            ),
+            line(
+                "2026-04-20T00:00:00.100Z",
+                "turn_context",
+                json!({"turn_id": PARENT_TURN, "cwd": "/tmp/project", "model": "gpt-5.4"}),
+            ),
+        ];
+        if with_usage {
+            lines.push(line("2026-04-20T00:00:02.000Z", "event_msg", usage(1000)));
+        }
+        lines.push(line(
+            "2026-04-20T00:00:03.000Z",
+            "event_msg",
+            json!({"type": "task_complete", "turn_id": PARENT_TURN}),
+        ));
+        fs::write(path, lines.concat()).unwrap();
+    }
+
+    /// A rollout an older build indexed has an unchanged stamp, so only the
+    /// one-time backfill re-reads it for its state markers. Once recorded,
+    /// the backfill is spent.
+    #[test]
+    fn an_unchanged_rollout_is_re_read_once_for_its_state_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        closed_turn_rollout(&day.join("rollout-plain.jsonl"), true);
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+        assert_eq!(state_marker_uids(&conn), vec!["1:marker", "2:marker"]);
+        assert_eq!(
+            state.get(CODEX_STATE_MARKER_KEY),
+            Some(&json!(CODEX_STATE_MARKER_GENERATION))
+        );
+
+        // With the backfill spent, an unchanged rollout is not re-read.
+        forget_state_markers(&conn);
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+        assert!(state_marker_uids(&conn).is_empty());
+
+        // An install that predates the markers owes the backfill.
+        as_older_build(&mut state);
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+        assert_eq!(state_marker_uids(&conn), vec!["1:marker", "2:marker"]);
+        assert_eq!(
+            state.get(CODEX_STATE_MARKER_KEY),
+            Some(&json!(CODEX_STATE_MARKER_GENERATION))
+        );
+    }
+
+    /// A rollout that grew since the last sync would normally resume from its
+    /// cursor. A cursor an older parser committed names no state-marker
+    /// generation, so the rollout is read from byte zero, or the records
+    /// before the cursor would never gain their markers.
+    #[test]
+    fn the_state_marker_backfill_reads_a_grown_rollout_from_the_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-grown.jsonl");
+        closed_turn_rollout(&rollout, true);
+        let append = |at: &str, message: &str| {
+            let mut file = fs::OpenOptions::new().append(true).open(&rollout).unwrap();
+            std::io::Write::write_all(
+                &mut file,
+                line(
+                    at,
+                    "event_msg",
+                    json!({"type": "user_message", "message": message}),
+                )
+                .as_bytes(),
+            )
+            .unwrap();
+        };
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+        // A grown rollout resumes, and that pass leaves a cursor committed at
+        // the closed turn.
+        append("2026-04-20T00:00:04.000Z", "again");
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+
+        forget_state_markers(&conn);
+        as_older_build(&mut state);
+        conn.execute(
+            "UPDATE transcript_cursors \
+             SET parser_state_json = json_remove(parser_state_json, '$.codex.state_markers') \
+             WHERE source = 'codex'",
+            [],
+        )
+        .unwrap();
+        append("2026-04-20T00:00:05.000Z", "and again");
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+        assert_eq!(state_marker_uids(&conn), vec!["1:marker", "2:marker"]);
+    }
+
+    /// Markers observed only remotely say nothing about the local rollout,
+    /// which an older build still owes a read.
+    #[test]
+    fn remote_state_markers_do_not_spend_a_local_rollouts_backfill() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        closed_turn_rollout(&day.join("rollout-remote.jsonl"), true);
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+
+        forget_state_markers(&conn);
+        conn.execute(
+            "INSERT INTO session_markers (source, session_id, marker_uid, kind, subkind, location) \
+             VALUES ('codex', ?1, 'remote:1', 'usage_snapshot', 'token_count', 'remote'), \
+                    ('codex', ?1, 'remote:2', 'turn_context', 'turn_context', 'remote')",
+            [PARENT],
+        )
+        .unwrap();
+        as_older_build(&mut state);
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+        assert_eq!(state_marker_uids(&conn), vec!["1:marker", "2:marker"]);
+    }
+
+    /// The backfill is spent per rollout. A rollout with no `token_count`
+    /// holds only a `turn_context` marker after its re-read, and while the
+    /// pass stays open (an unreadable root holds it back) it is not re-read
+    /// again on every sync.
+    #[test]
+    fn a_rollout_is_re_read_once_while_the_backfill_stays_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        closed_turn_rollout(&day.join("rollout-no-usage.jsonl"), false);
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+
+        as_older_build(&mut state);
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+        assert_eq!(state_marker_uids(&conn), vec!["1:marker"]);
+
+        // The pass is still open, but this rollout has been read by this
+        // generation: dropping its markers shows it is not read again.
+        state.remove(CODEX_STATE_MARKER_KEY);
+        forget_state_markers(&conn);
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+        assert!(state_marker_uids(&conn).is_empty());
+    }
+
+    /// A store synced by the previous build has a source fingerprint that
+    /// matches this build's sources; only the generation half of it can force
+    /// the sweep the state-marker backfill runs in.
+    #[test]
+    fn the_state_marker_backfill_moves_the_sweep_generation() {
+        assert!(SWEEP_PARSER_GENERATIONS.contains(&CODEX_STATE_MARKER_KEY));
+    }
+
+    /// `(marker_uid, turn_id, model)` of every local `turn_context` marker of
+    /// `session`, in rollout order.
+    fn turn_contexts(conn: &Connection, session: &str) -> Vec<(String, String, String)> {
+        conn.prepare(
+            "SELECT marker_uid, turn_id, json_extract(payload_json, '$.model') \
+             FROM session_markers WHERE source = 'codex' AND session_id = ? \
+             AND kind = 'turn_context' AND location IN ('local', 'both') \
+             ORDER BY CAST(marker_uid AS INTEGER)",
+        )
+        .unwrap()
+        .query_map([session], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    /// One closed turn of `PARENT` configured with `model`: four lines.
+    fn configured_turn(turn: &str, model: &str, minute: u32) -> String {
+        let at = |second: u32| format!("2026-04-20T00:{minute:02}:{second:02}.000Z");
+        [
+            line(
+                &at(0),
+                "event_msg",
+                json!({"type": "task_started", "turn_id": turn}),
+            ),
+            line(
+                &at(1),
+                "turn_context",
+                json!({"turn_id": turn, "cwd": "/tmp/project", "model": model}),
+            ),
+            line(
+                &at(2),
+                "event_msg",
+                json!({"type": "user_message", "message": format!("prompt {turn}")}),
+            ),
+            line(
+                &at(3),
+                "event_msg",
+                json!({"type": "task_complete", "turn_id": turn}),
+            ),
+        ]
+        .concat()
+    }
+
+    fn parent_meta_line() -> String {
+        line(
+            "2026-04-20T00:00:00.000Z",
+            "session_meta",
+            json!({"id": PARENT, "cwd": "/tmp/project"}),
+        )
+    }
+
+    fn append_to(path: &std::path::Path, text: &str) {
+        let mut file = fs::OpenOptions::new().append(true).open(path).unwrap();
+        std::io::Write::write_all(&mut file, text.as_bytes()).unwrap();
+    }
+
+    /// The configuration digest the committed Codex cursor carries.
+    fn cursor_digest(conn: &Connection) -> Option<String> {
+        conn.query_row(
+            "SELECT json_extract(parser_state_json, '$.codex.turn_context_digest') \
+             FROM transcript_cursors WHERE source = 'codex'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// A sync that resumes mid-session compares against the configuration
+    /// the committed cursor carries, not against nothing: an appended turn
+    /// that repeats it stores no marker, and one that changes it does.
+    #[test]
+    fn a_resumed_pass_stores_a_turn_context_only_when_it_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-resume.jsonl");
+        fs::write(
+            &rollout,
+            parent_meta_line() + &configured_turn("t1", "gpt-5.4", 1),
+        )
+        .unwrap();
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        let codex = dir.path().join(".codex");
+        sync_codex(&conn, &mut state, &codex).unwrap();
+        // The first sync re-reads under the one-time repairs; the next one
+        // to see the rollout grow commits a cursor at its last closed turn.
+        append_to(&rollout, &configured_turn("t2", "gpt-5.4", 2));
+        sync_codex(&conn, &mut state, &codex).unwrap();
+        assert_eq!(
+            turn_contexts(&conn, PARENT),
+            vec![("2:marker".into(), "t1".into(), "gpt-5.4".into())],
+            "t2 repeats t1's configuration"
+        );
+        let digest = cursor_digest(&conn).expect("the cursor carries the digest");
+
+        // Dropped so the next pass shows it resumed: a read from byte zero
+        // would store t1's marker again.
+        let t1 = turn_contexts(&conn, PARENT);
+        conn.execute(
+            "DELETE FROM session_markers WHERE kind = 'turn_context'",
+            [],
+        )
+        .unwrap();
+        append_to(&rollout, &configured_turn("t3", "gpt-5.4", 3));
+        sync_codex(&conn, &mut state, &codex).unwrap();
+        assert!(
+            turn_contexts(&conn, PARENT).is_empty(),
+            "the resumed pass stores nothing for a repeat"
+        );
+        assert_eq!(cursor_digest(&conn).as_deref(), Some(digest.as_str()));
+
+        append_to(&rollout, &configured_turn("t4", "gpt-5.5", 4));
+        sync_codex(&conn, &mut state, &codex).unwrap();
+        assert_eq!(
+            turn_contexts(&conn, PARENT),
+            vec![("14:marker".into(), "t4".into(), "gpt-5.5".into())]
+        );
+        assert_ne!(cursor_digest(&conn), Some(digest));
+
+        // A full re-read from byte zero makes the same decisions.
+        conn.execute("DELETE FROM session_markers", []).unwrap();
+        let meta = read_codex_session_meta(&rollout).unwrap().unwrap();
+        ingest_codex_rollout(&conn, &rollout, &meta).unwrap();
+        let mut expected = t1;
+        expected.push(("14:marker".into(), "t4".into(), "gpt-5.5".into()));
+        assert_eq!(turn_contexts(&conn, PARENT), expected);
+    }
+
+    /// A repeated `turn_context` writes no row, and the line is accounted
+    /// for by the marker it repeats: it does not fall back to an `unknown`
+    /// marker.
+    #[test]
+    fn a_repeated_turn_context_leaves_no_unknown_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-repeat.jsonl");
+        fs::write(
+            &rollout,
+            parent_meta_line()
+                + &configured_turn("t1", "gpt-5.4", 1)
+                + &configured_turn("t2", "gpt-5.4", 2),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let meta = read_codex_session_meta(&rollout).unwrap().unwrap();
+        ingest_codex_rollout(&conn, &rollout, &meta).unwrap();
+        assert_eq!(turn_contexts(&conn, PARENT).len(), 1);
+        let unknown: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_markers WHERE kind = 'unknown'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unknown, 0);
+    }
+
+    /// A fork child's configuration chain starts at its own first
+    /// `turn_context`. The replayed parent records are the parent's, not the
+    /// child's, so the child's first own record is stored even when it
+    /// repeats the configuration it inherited -- the child's markers alone
+    /// configure every child turn -- and its later repeats are not.
+    #[test]
+    fn a_fork_childs_first_turn_context_is_stored_even_when_it_repeats_the_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-child.jsonl");
+        let second = "019da830-d1e8-7000-8000-0000000000c2";
+        let changed = "019da830-d1e8-7000-8000-0000000000c3";
+        fs::write(
+            &rollout,
+            forked_prefix(human_fork_meta(), PARENT_TURN)
+                + &child_turn(CHILD_TURN, 1100)
+                + &child_turn(second, 1200)
+                + &child_turn(changed, 1300).replace("gpt-5.4", "gpt-5.5"),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let meta = read_codex_session_meta(&rollout).unwrap().unwrap();
+        ingest_codex_rollout(&conn, &rollout, &meta).unwrap();
+        let contexts = turn_contexts(&conn, CHILD);
+        assert_eq!(
+            contexts
+                .iter()
+                .map(|(_, turn, model)| (turn.as_str(), model.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(CHILD_TURN, "gpt-5.4"), (changed, "gpt-5.5")],
+            "the replayed parent context is not the child's, and the repeat is inherited"
+        );
+        assert!(replay_marker(&conn, CHILD).is_some());
+    }
+
+    /// The one-time state-marker backfill over a rollout an older build
+    /// indexed stores the same changed-only markers a fresh read does.
+    #[test]
+    fn the_state_marker_backfill_stores_only_changed_turn_contexts() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(
+            day.join("rollout-backfill.jsonl"),
+            parent_meta_line()
+                + &configured_turn("t1", "gpt-5.4", 1)
+                + &configured_turn("t2", "gpt-5.4", 2)
+                + &configured_turn("t3", "gpt-5.5", 3)
+                + &configured_turn("t4", "gpt-5.5", 4),
+        )
+        .unwrap();
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        let codex = dir.path().join(".codex");
+        sync_codex(&conn, &mut state, &codex).unwrap();
+        let fresh = turn_contexts(&conn, PARENT);
+        assert_eq!(
+            fresh
+                .iter()
+                .map(|(_, turn, _)| turn.as_str())
+                .collect::<Vec<_>>(),
+            vec!["t1", "t3"]
+        );
+
+        forget_state_markers(&conn);
+        as_older_build(&mut state);
+        sync_codex(&conn, &mut state, &codex).unwrap();
+        assert_eq!(turn_contexts(&conn, PARENT), fresh);
+    }
     /// A child turn whose snapshot carries `last_token_usage`, as codex-rs
     /// writes it.
     fn child_turn_with_last(turn: &str, total: u64, last: u64) -> String {

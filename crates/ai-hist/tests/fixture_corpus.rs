@@ -228,7 +228,7 @@ const CORPUS: &[Fixture] = &[
         layout: Layout::ClaudeTranscript,
         origin: Origin::Burn,
         files: &["claude/sidechain-turn.jsonl"],
-        quirk: "every record is `isSidechain: true` — a subagent sidecar, not a session of its own",
+        quirk: "every record is `isSidechain: true` in a primary `<session>.jsonl` — inline Task traffic, still its session's transcript",
     },
     Fixture {
         source: "claude",
@@ -393,6 +393,14 @@ const CORPUS: &[Fixture] = &[
         files: &["claude/sidecar-subagent"],
         quirk: "a subagent transcript in `<sessionId>/subagents/agent-<id>.jsonl` with its `agent-<id>.meta.json` sidecar, carrying the PARENT's sessionId",
     },
+    Fixture {
+        source: "claude",
+        name: "nested-sidecars",
+        layout: Layout::HomeTree,
+        origin: Origin::Burn,
+        files: &["claude/nested-sidecars"],
+        quirk: "two `subagents/` sidecars whose meta files name no model: `a1` spawned from the main transcript, `a2` spawned by a tool use inside `a1` (`spawnDepth` 2); the spawn results carry `toolUseResult.agentId` on the record",
+    },
     // -- codex, from burn --------------------------------------------------
     Fixture {
         source: "codex",
@@ -433,6 +441,14 @@ const CORPUS: &[Fixture] = &[
         origin: Origin::Burn,
         files: &["codex/compaction.jsonl"],
         quirk: "a `compacted` record with `replacement_history`, followed by `context_compacted` and a fresh turn",
+    },
+    Fixture {
+        source: "codex",
+        name: "compaction-usage-only",
+        layout: Layout::CodexRollout,
+        origin: Origin::Burn,
+        files: &["codex/compaction-usage-only.jsonl"],
+        quirk: "burn's `compaction.jsonl` with its session id renamed so it does not collide with this corpus's `compaction.jsonl`, which adds message records: two turns either side of a `compacted` record whose only usage evidence is their cumulative `token_count`s, with no assistant message",
     },
     Fixture {
         source: "codex",
@@ -1760,25 +1776,33 @@ fn claude_oversized_bash_output_records_the_call() {
     assert_eq!(text(&calls[0], "tool_use_id"), "tu_bash_big");
 }
 
-/// A sidecar transcript whose every record is `isSidechain: true` is evidence
-/// about somebody else's session, never a session of its own. It still records
-/// an *unlinked* delegation edge: the work happened, but the file names no
-/// child identity.
+/// A primary transcript whose every record is `isSidechain: true` — inline
+/// Task traffic from Claude Code versions that wrote it there — is its
+/// session's transcript: catalogued under the records' `sessionId`, its
+/// sidechain assistant turn and usage kept with `is_sidechain` set, and no
+/// delegation edge, because the file is not laid out as a sidecar.
 #[test]
-fn claude_sidechain_only_transcript_is_evidence_not_a_session() {
-    assert!(
-        rows("claude/sidechain-turn", "sessions").is_empty(),
-        "a sidechain-only file must not enter the catalog"
-    );
-    let relationships = rows("claude/sidechain-turn", "session_relationships");
-    assert_eq!(relationships.len(), 1, "{relationships:?}");
-    let edge = &relationships[0];
+fn claude_sidechain_only_primary_transcript_is_a_session() {
+    let sessions = rows("claude/sidechain-turn", "sessions");
+    assert_eq!(sessions.len(), 1, "{sessions:?}");
     assert_eq!(
-        text(edge, "parent_session_id"),
+        text(&sessions[0], "session_id"),
         "44444444-4444-4444-4444-444444444444"
     );
-    assert_eq!(text(edge, "identity_status"), "unlinked");
-    assert_eq!(text(edge, "evidence_kind"), "claude_sidechain_records");
+    // The sidechain prompt and the assistant turn that answered it, both
+    // flagged as sidechain evidence of this session.
+    let events = rows("claude/sidechain-turn", "session_events");
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert_eq!(text(&events[0], "role"), "user");
+    assert_eq!(text(&events[1], "role"), "assistant");
+    let usage: Value =
+        serde_json::from_str(text(&events[1], "token_json")).expect("token payload is JSON");
+    assert_eq!(usage.get("input_tokens").and_then(Value::as_i64), Some(50));
+    assert_eq!(usage.get("output_tokens").and_then(Value::as_i64), Some(10));
+    assert!(
+        rows("claude/sidechain-turn", "session_relationships").is_empty(),
+        "a primary transcript is no delegation's evidence"
+    );
 }
 
 /// The same file becomes a session as soon as one main-chain record appears.
@@ -1820,7 +1844,7 @@ fn claude_sidecar_subagent_usage_lands_under_the_child_thread() {
     let events = rows("claude/sidecar-subagent", "session_events");
     let child = events
         .iter()
-        .filter(|event| text(event, "session_id") == "plan01")
+        .filter(|event| text(event, "session_id") == "plan01" && text(event, "role") == "assistant")
         .collect::<Vec<_>>();
     assert_eq!(child.len(), 1, "{events:?}");
     let usage: Value =
@@ -1834,6 +1858,56 @@ fn claude_sidecar_subagent_usage_lands_under_the_child_thread() {
             .all(|event| text(event, "message_id") != "u-agent-asst-1"),
         "the child's output is not re-attributed to the parent: {events:?}"
     );
+}
+
+/// burn: `nested-subagent`. Sidechain rows are delegated traffic, and every
+/// one is captured: the delegating agent's prompts and the subagent's tool
+/// results sit beside the subagent's output, so each sidechain row's parent
+/// chain resolves to a captured row back to the Agent call that spawned it.
+/// None of them is a human prompt.
+#[test]
+fn claude_sidechain_user_rows_keep_the_delegated_parent_chain_whole() {
+    let events = rows("claude/nested-subagent", "session_events");
+    let ids: BTreeSet<&str> = events
+        .iter()
+        .map(|event| text(event, "message_id"))
+        .collect();
+    for id in ["u-sub1-user", "u-sub2-user", "u-sub1-toolresult"] {
+        assert!(ids.contains(id), "{id} is captured: {ids:?}");
+    }
+    for event in events {
+        if let Some(parent) = field(event, "parent_id").as_str() {
+            assert!(
+                ids.contains(parent),
+                "{} names parent {parent}, which is not captured",
+                text(event, "message_id")
+            );
+        }
+    }
+    let results: BTreeSet<&str> = events
+        .iter()
+        .filter(|event| text(event, "kind") == "tool_result")
+        .map(|event| text(event, "tool_use_id"))
+        .collect();
+    assert_eq!(results, BTreeSet::from(["toolu_inner", "toolu_outer"]));
+    let prompts: Vec<&str> = rows("claude/nested-subagent", "history")
+        .iter()
+        .map(|row| text(row, "prompt"))
+        .collect();
+    assert_eq!(prompts, vec!["explore"]);
+
+    let leading = rows("claude/sidechain-leading-then-main", "session_events");
+    assert!(
+        leading
+            .iter()
+            .any(|event| text(event, "message_id") == "u-side-1"),
+        "{leading:?}"
+    );
+    let prompts: Vec<&str> = rows("claude/sidechain-leading-then-main", "history")
+        .iter()
+        .map(|row| text(row, "prompt"))
+        .collect();
+    assert_eq!(prompts, vec!["continue from elsewhere"]);
 }
 
 /// burn: `parent_chain_groups_out_of_order_rows_for_classification`. The raw

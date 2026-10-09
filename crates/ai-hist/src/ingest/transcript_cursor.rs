@@ -148,6 +148,10 @@ pub(crate) struct TranscriptFileCursor {
     pub prefix_hash: String,
 }
 
+fn is_zero(value: &i64) -> bool {
+    *value == 0
+}
+
 /// Claude's per-source resume state.
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
 pub(crate) struct ClaudeCursorState {
@@ -184,6 +188,12 @@ pub(crate) struct ClaudeCursorState {
     /// as long as the transcript keeps an unterminated tail.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resume_tool_results: Option<super::tool_result_facts::ToolResultIndexer>,
+    /// The hydration parser generation whose record walk committed this
+    /// position; 0 for one an earlier build committed. A position another
+    /// generation committed skips records the current parser stores, so
+    /// hydration restarts such a sidecar's record walk from byte zero.
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub records_parser: i64,
     /// The metadata walk's position and fold over the same file.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scan: Option<ClaudeScanState>,
@@ -302,6 +312,13 @@ pub(crate) struct CodexCursorState {
     /// would stamp the rest of the turn with nothing.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
+    /// The configuration digest of the last `turn_context` marker stored for
+    /// the session. A `turn_context` is stored only when it changes the
+    /// configuration, and a pass that resumes mid-session cannot see the
+    /// marker it would compare against; without this it would store the
+    /// first record it reads whether or not anything changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_context_digest: Option<String>,
     /// The adjacent-mirror deduper's one-record memory, as
     /// `(is_response_item, text)`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -312,6 +329,13 @@ pub(crate) struct CodexCursorState {
     /// re-reading the whole replay until it does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inherited_baseline_marker: Option<String>,
+    /// The state-marker generation of the parser that indexed the rows behind
+    /// this position. A cursor from an older one sits past records whose
+    /// `usage_snapshot` and `turn_context` markers it never wrote, so it is
+    /// not resumed from — whether sync or a related-session hydration loads
+    /// it.
+    #[serde(default)]
+    pub state_markers: i64,
 }
 
 /// A stat under which a cursor's positions were proven by their digests.

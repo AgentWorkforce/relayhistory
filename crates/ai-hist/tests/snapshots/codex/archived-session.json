@@ -88,7 +88,21 @@
       "ts_ms": 1776643202000
     }
   ],
-  "session_markers": [],
+  "session_markers": [
+    {
+      "kind": "turn_context",
+      "marker_uid": "1:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "{\"cwd\":\"/tmp/project\",\"model\":\"gpt-5.4\",\"turn_id\":\"turn_archived_1\"}",
+      "session_id": "sess_archived_1",
+      "source": "codex",
+      "subkind": "turn_context",
+      "text": null,
+      "ts_ms": 1776643200100,
+      "turn_id": "turn_archived_1"
+    }
+  ],
   "session_relationships": [],
   "sessions": [
     {

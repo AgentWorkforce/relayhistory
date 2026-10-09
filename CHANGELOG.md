@@ -4,12 +4,49 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased - Patch]
+## [Unreleased - Minor]
+
+### Breaking Changes
+
+- `SessionEvent` has a new public field, `record_token_json`; code constructing a `SessionEvent` with a struct literal must set it.
+- `SESSION_EVIDENCE_CONTRACT_VERSION` is 4 in Rust and TypeScript: `control_kind` may be `synthetic` and session events carry `record_token_json`, so an SDK built against contract 3 rejects a native addon that returns contract 4.
+
+### Added
+
+- `SessionStore::session` reads a delegated child the catalog leaves out (a Claude subagent, a Codex child thread) by its own id, with `discovery_state` `Delegated`, so each `delegated_descendants` entry's messages, usage and tool calls are readable.
+- Text-bearing OpenCode `reasoning` parts are thinking blocks and an encrypted-only one is an `encrypted_reasoning` marker; synthetic user text (harness-written context such as an `@file` read) is a user text block with `control_kind = "synthetic"`, never a prompt.
+- Codex sessions keep every `token_count` snapshot outside a fork's replayed parent history as a `usage_snapshot` marker, bounded per the marker contract (counters are never truncated) and typed as `Marker::usage_snapshot`, on `SessionEvidence::markers`, with its `turn_id` and in read order, including turns that wrote no assistant message; a `usage_snapshot` marker has no `payload` or `raw_payload()`, and the `info: null` snapshot Codex writes before a turn has spent anything has no `usage_snapshot` either. A fork's `fork_replay_boundary` marker carries the inherited snapshot as `inherited_snapshot`. The TypeScript SDK's `SessionMarker.payload` of a `usage_snapshot` is the expanded `info` object.
+- Codex sessions keep each `turn_context` record outside a fork's replayed parent history that changes the session's configuration as a `turn_context` marker (every field but `turn_id` counts, and so does `root_turn_id` unless the turn's own `task_started` marker carries it), as written, bounded per the marker contract, with the `turn_id` it took effect at; a turn's configuration — model, effort, cwd, approval/sandbox policy — is the latest `turn_context` marker at or before its start in rollout order, readable even when it wrote no assistant message.
+- Codex `task_started` markers carry the turn's `root_turn_id` in their payload when Codex writes it.
+- Session events carry a Claude record's own usage as `record_token_json` (`recordTokenJson` natively, parsed as `recordTokenUsage` in the TypeScript SDK).
+
+### Changed
+
+- `Message::raw_usage` is the usage blob of the message's own record, so each streamed copy of one Claude response keeps its own snapshot (and a copy that carried none has none); `Message::usage` and `SessionEvidence::requests` read the request's settled usage.
+- `SessionStore::session` with `include_text: false`, and the user-turn pages, measure stored text with `octet_length` from SQLite's record header instead of reading each body, so a text-free read of a session with large tool results does not load them.
+- `sync` re-indexes a full-text entry only when the row's text, role or project changes: a sweep that re-reads the OpenCode store, or re-parses a transcript, writes no index pages for unchanged rows and stops fragmenting the full-text index searches read. Fragmentation an existing store already has stays until FTS5's own merges or `ai-hist compact` (which runs `optimize`) consolidate it.
+- Writing a marker reuses its prepared statement instead of compiling it, and the change-feed triggers it fires, once per marker: cold sync and hydration of marker-heavy transcripts are ~10% faster, hydrating an 8 MB Codex rollout ~20%.
+- Re-reading a Claude subagent transcript is linear in its own records: retiring a sidechain record's rows under the parent session is an indexed lookup instead of a scan of the parent's events, tool calls, edits and markers.
 
 ### Fixed
 
-- `sync` no longer rewrites the full-text index entry of a row it re-reads unchanged: a sweep that re-reads the OpenCode store, or re-parses a transcript, re-indexes only rows whose text, role or project changed, so walking syncs write less and stop fragmenting the full-text index searches read. Fragmentation an existing store already has stays until FTS5's own merges or `ai-hist compact` (which runs `optimize`) consolidate it.
-- Writing a marker reuses its prepared statement instead of compiling it, and the change-feed triggers it fires, once per marker: cold sync and hydration of marker-heavy transcripts are ~10% faster.
+- A Claude transcript made only of `isSidechain` rows (inline Task traffic from older Claude Code) is catalogued as its own session, with its sidechain turns' usage in `SessionEvidence::requests`; only an `agent-*.jsonl` file is read as a subagent sidecar.
+- Claude sidechain user rows — a subagent's delegated prompts and the tool results it received — are `is_sidechain` evidence in messages and tool results, so a delegated thread's parent chain is whole; they never become prompts, user turns or `history`, and a subagent's usage is charged to no prompt.
+- A Claude record's signed `thinking` block with empty text stores no event row; its `thinking_signature` marker carries the record's `request_id` and `provider_message_id`, so the record that opens a streamed response is placed in its request, and the marker's `ts_ms` is when the request started.
+- Claude `continuation` and `fork` edges from `continuedFromSessionId` / `forkSessionId` carry the timestamp of the record that named them in `spawned_at_ms`, not the transcript's first record.
+- A Claude subagent spawned from inside another subagent is delegated by that subagent rather than by the root session; a delegation's `child_model` names the model the subagent's own records used when its `agent-*.meta.json` names none; a spawn tool result carries the child's `agent_id` from the record's `toolUseResult.agentId`.
+- Every OpenCode assistant message is a `Message` and a request in `SessionStore::session`, with its `tokens` verbatim as `raw_usage`, model, provider and stop reason, including messages made only of `step-start` / `step-finish` / `reasoning` parts, in both the `opencode.db` and legacy `storage/` layouts.
+- An OpenCode message's stop reason is its final `step-finish` reason, else the message's own `finish`; a final step with no reason, or an empty one, does not report an earlier step's reason.
+- Hydrating a session with related sessions after a parser upgrade re-reads its Codex child rollouts and Claude subagent sidecars from the start instead of resuming from cursors the older parser committed.
+- Existing stores gain all of the above on the first `sync` after upgrading, through one-time passes that re-read the Codex rollouts once and only the Claude transcripts each change affects; an embedder that only hydrates re-parses each session once.
+
+### Rust API
+
+- Added `Marker::usage_snapshot: Option<Box<UsageSnapshot>>` and the `#[non_exhaustive]` `UsageSnapshot` (`total_token_usage`, `last_token_usage`, `model_context_window`, `other`) and `TokenUsage` (`input_tokens`, `cached_input_tokens`, `cache_write_input_tokens`, `output_tokens`, `reasoning_output_tokens`, `total_tokens`, `other`) types, each with `to_value()` giving the provider's object and serde in that object's shape.
+- Added `DiscoveryState::Delegated`, the `discovery_state` of a delegated child that `SessionStore::session` read without a catalog row.
+- Added `ControlKind::Synthetic` (`"synthetic"`).
+- Added `SessionEvent::record_token_json: Option<String>`.
+- `SESSION_EVIDENCE_CONTRACT_VERSION` is 4.
 
 ## [0.36.0] - 2026-10-07
 

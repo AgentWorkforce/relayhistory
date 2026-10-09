@@ -157,6 +157,32 @@
   ],
   "session_markers": [
     {
+      "kind": "turn_context",
+      "marker_uid": "1:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "{\"cwd\":\"/tmp/project\",\"model\":\"gpt-5.4\",\"turn_id\":\"t1\"}",
+      "session_id": "sess_codex_overwrite",
+      "source": "codex",
+      "subkind": "turn_context",
+      "text": null,
+      "ts_ms": 1776686400100,
+      "turn_id": "t1"
+    },
+    {
+      "kind": "usage_snapshot",
+      "marker_uid": "2:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "[[-1,0,null,9000,0,8999]]",
+      "session_id": "sess_codex_overwrite",
+      "source": "codex",
+      "subkind": "token_count",
+      "text": null,
+      "ts_ms": 1776686400150,
+      "turn_id": "t1"
+    },
+    {
       "kind": "task_started",
       "marker_uid": "3:marker",
       "message_id": null,
@@ -167,6 +193,58 @@
       "subkind": "task_started",
       "text": null,
       "ts_ms": 1776686400200,
+      "turn_id": "t1"
+    },
+    {
+      "kind": "usage_snapshot",
+      "marker_uid": "6:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "[[900,0,null,55.5,0,955]]",
+      "session_id": "sess_codex_overwrite",
+      "source": "codex",
+      "subkind": "token_count",
+      "text": null,
+      "ts_ms": 1776686401000,
+      "turn_id": "t1"
+    },
+    {
+      "kind": "usage_snapshot",
+      "marker_uid": "7:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "[[1000,0,null,300,0,1300]]",
+      "session_id": "sess_codex_overwrite",
+      "source": "codex",
+      "subkind": "token_count",
+      "text": null,
+      "ts_ms": 1776686401500,
+      "turn_id": "t1"
+    },
+    {
+      "kind": "usage_snapshot",
+      "marker_uid": "8:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "[[-7,0,null,310,0,303]]",
+      "session_id": "sess_codex_overwrite",
+      "source": "codex",
+      "subkind": "token_count",
+      "text": null,
+      "ts_ms": 1776686401800,
+      "turn_id": "t1"
+    },
+    {
+      "kind": "usage_snapshot",
+      "marker_uid": "11:marker",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "[[1400,0,null,440,0,1840]]",
+      "session_id": "sess_codex_overwrite",
+      "source": "codex",
+      "subkind": "token_count",
+      "text": null,
+      "ts_ms": 1776686403000,
       "turn_id": "t1"
     },
     {

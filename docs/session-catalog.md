@@ -103,7 +103,20 @@ session id rather than flattened into the parent, and delegated task prompts
 are not stored as human prompt history. Claude evidence from a provider
 version that does not name the child is recorded as an unlinked relationship —
 never as a synthesized identity — and its output stays attributed to the
-parent. The hydration stamp covers every file that evidence came from — the
+parent. A Claude sidecar's records name the session at the root of its
+delegation tree, so the edge's parent is the session whose tool call has the
+`toolUseId` the `agent-<agentId>.meta.json` names: a subagent spawned from
+inside another subagent hangs under that subagent (`spawnDepth` 2 under
+depth 1). The root is the parent when the call is in the root's own
+transcript, and also when no stored call matches the meta's `toolUseId` yet.
+A sidecar whose meta names no `toolUseId` (or disappeared) keeps the parent
+its edge already names, else the root; an edge recorded before its spawning
+subagent's calls were stored moves under that subagent when they are.
+Claude Code's meta files name no model, so `child_model` is the model the
+sidecar's first assistant record names when the meta has none. A catalog-less
+child's evidence is read by its own id through `SessionStore::session`, which
+reports it as `DiscoveryState::Delegated`; it never becomes a catalog row.
+The hydration stamp covers every file that evidence came from — the
 selected transcript, each subagent transcript, and the
 `agent-<agentId>.meta.json` describing it — so a metadata sidecar that arrives
 or changes on its own still re-hydrates the session. Set
@@ -383,7 +396,7 @@ contract:
 | `workspace_roots` | observed | extra workspace roots, when the provider records them |
 | `raw_path` | observed | provider file this row came from; the session/task URL for remote rows; `null` for database-backed sources |
 | `source_stamp` | internal | change marker; see [rescan behaviour](#rescans-and-source-stamps) |
-| `discovery_state` | internal | `"shallow"` or `"full"` |
+| `discovery_state` | internal | `"shallow"` or `"full"`; `"delegated"` only on a delegated child `SessionStore::session` read without a catalog row |
 | `locations` | derived | sorted presences from `session_presences`: `"local"`, `"remote"`, or both |
 | `from_cache` | per-response | `true` when the row was served without re-reading the source |
 
@@ -504,14 +517,16 @@ it holds for every kind.
 | `compaction_boundary` | ✓ `type:"system"`, `subtype:"compact_boundary"` | ✓ top-level `compacted`, `context_compacted` | ✓ | – | ✓ node `metadata.summarized_from` | `compact_boundary`, `compacted` |
 | `summary` | ✓ `type:"summary"` | – | – | – | – | `summary` |
 | `subagent_notification` | ✓ system rows with `parent_tool_use_id`; tool results carrying `toolUseResult.agentId` | ✓ `subagent_*` | – | – | – | `subagent_completed`, `tool_use_result_agent_id`, `subagent_message_complete` |
-| `task_started` | – | ✓ | – | – | – | `task_started` |
+| `task_started` | – | ✓ `payload_json` carries `root_turn_id` when Codex wrote one: the turn of the root thread that the delegated thread is working for | – | – | – | `task_started` |
 | `task_complete` | – | ✓ | – | – | – | `task_complete` |
 | `turn_diff` | – | ✓ | – | – | – | `turn_diff` |
 | `stream_error` | – | ✓ | – | – | – | `stream_error` |
 | `tool_begin` | – | ✓ any `*_begin` | – | – | – | `exec_command_begin`, `patch_apply_begin`, `mcp_tool_call_begin` |
 | `review_mode` | – | ✓ | – | – | – | `entered_review_mode`, `exited_review_mode` |
-| `fork_replay_boundary` | – | ✓ one per replayed span in a forked rollout: `parent_id` is the fork parent, `turn_id` the child turn that closed it, `payload_json` carries `first_line`, `last_line`, `replayed_lines`, `closed_by` (`turn_id`, `task_started.started_at`, `undecided`, or null while the span is still open), `inherited_total_tokens`, and `inherited_baseline` (`pending`, `applied`, `dropped`) with `inherited_baseline_basis` (`last_token_usage`, `regression`, `no_evidence`) | – | – | – | `session_meta` |
+| `fork_replay_boundary` | – | ✓ one per replayed span in a forked rollout: `parent_id` is the fork parent, `turn_id` the child turn that closed it, `payload_json` carries `first_line`, `last_line`, `replayed_lines`, `closed_by` (`turn_id`, `task_started.started_at`, `undecided`, or null while the span is still open), `inherited_total_tokens` with `inherited_snapshot` (the replayed `token_count` `info` it was read from, as written, bounded per the marker contract (counters are never truncated)), and `inherited_baseline` (`pending`, `applied`, `dropped`) with `inherited_baseline_basis` (`last_token_usage`, `regression`, `no_evidence`) | – | – | – | `session_meta` |
 | `unsupported_block` | ✓ any content block with no event `kind`, plus thinking signatures | – | – | – | ✓ a human `user` node whose `content` holds no readable text; its JSON type in `payload_json`, never the payload | `image`, `document`, `redacted_thinking`, `server_tool_use`, `thinking_signature`, `user_content` |
+| `usage_snapshot` | – | ✓ every `event_msg/token_count` outside a fork's replayed parent history (the `fork_replay_boundary` marker stands for that span, and keeps its last snapshot as `inherited_snapshot`), in read order: `payload_json` is the provider's `info`, bounded per the marker contract (counters are never truncated), stored positionally as `[total, last, window, other]` — each usage object as `[input, cached_input, cache_write_input, output, reasoning_output, total, rest]` with `null` for an absent counter, every other key kept in `rest` / `other`, trailing `null`s left out (no payload for an `info: null` snapshot); read back typed as `Marker::usage_snapshot`, `turn_id` the turn it fell inside (null before the first `turn_context`, or after one that names no turn). A cumulative snapshot, never added into `session_requests` | – | – | – | `token_count` |
+| `turn_context` | – | ✓ each `turn_context` outside a fork's replayed parent history (the `fork_replay_boundary` marker stands for that span) whose payload differs from the session's previous one in any field but `turn_id` (and `root_turn_id` when the turn's `task_started` wrote the same one, which that marker keeps) — the session's first is always stored, a fork child's first own one included: `payload_json` is the record's payload as written, bounded per the marker contract (`turn_id`, `root_turn_id`, `model`, `effort`, `cwd`, `current_date`, approval and sandbox policy, …; strings at 128 characters, containers at 32 entries — in practice only instruction text is long enough to reach the bound), `turn_id` the turn it took effect at. The configuration of a turn is the latest `turn_context` marker at or before that turn's start in rollout order — the turn's model even when it wrote no assistant message | – | – | – | `turn_context` |
 | `encrypted_reasoning` | – | ✓ `response_item/reasoning` | ✓ an opaque reasoning trace with no summary | ✓ `reasoning_committed` with only `encrypted_content` | – | `reasoning` |
 | `tool_replacement` | ✓ `_meta.replaces` / `_meta.collapsedCalls` | – | – | – | – | `tool_result` |
 | `system` | – | – | ✓ a system preamble, in `text` | – | ✓ a `role:"system"` node, in `text` | – |
@@ -567,8 +582,7 @@ rule.
 
 Codex keeps one explicit exception list, for lines that are state updates
 rather than records and whose information is stored elsewhere: `session_meta`
-and `turn_context` populate the catalog, `token_count` is folded into the
-adjacent assistant event's `token_json`, `thread_settings_applied` carries the
+populates the catalog, `thread_settings_applied` carries the
 model forward, a `*_delta` is a fragment of an event recorded whole, and an
 assistant `message` is the mirrored twin of the `agent_message` that stores the
 text.
@@ -620,7 +634,7 @@ status, because a fabricated measurement reads exactly like a real one:
 
 | Source | `payload_bytes` / `payload_hash` | `payload_truncated` | `call_index` / `event_index` | `result_status` | `event_source` | `error_signal` | `subagent_session_id` / `agent_id` |
 |---|---|---|---|---|---|---|---|
-| **claude** | ✓ (raw `content`) | ✓ (harness markers) | ✓ | ✓ | `tool_result`, `subagent_notification` | `tool_result.is_error`, `subagent_status` | ✓ (system subagent notifications) |
+| **claude** | ✓ (raw `content`) | ✓ (harness markers) | ✓ | ✓ | `tool_result`, `subagent_notification` | `tool_result.is_error`, `subagent_status` | ✓ (system subagent notifications; `agent_id` from a parent transcript's spawn result `toolUseResult.agentId`; sidechain user rows are not ingested) |
 | **codex** | ✓ (raw `output`) | ✓ (harness markers) | ✓ | ✓ (settled at `task_complete`) | `function_call_output` | `exit_code`, `patch_apply`, `mcp_err` | – (no notification rail) |
 | **cursor** | ✓ (raw block `content`) | ✓ (harness markers) | ✓ | ✓ | `tool_result` | `tool_result.is_error` | – (no notification rail) |
 | **grok** | ✓ (raw line `content`) | ✓ (harness markers) | ✓ | ✓ (`unknown` with neither signal) | `function_call_output` | `tool_result.is_error`, `tool_status` | – (no notification rail) |
@@ -645,6 +659,15 @@ Codex reports how a call ended out of band (`exec_command_end`,
 turn can still receive the `exec_command_end` that fails one of its calls after
 the bytes a sync read, so a partial read records the failures it saw and leaves
 anything else `unknown`. Only `task_complete` can call a result a success.
+
+Claude sidechain (`isSidechain`) rows are delegated traffic and every one is
+captured, its event rows with `is_sidechain = 1`: the subagent's output, the
+delegating agent's prompts to it, and the tool results it received. Its
+`tool_result` blocks are tool results like any other, so a delegated thread's
+parent chain and its tool calls' results are whole. Its user rows are the
+delegating agent's rather than a human's, so they never become `history`, a
+prompt, `first_prompt`, a control row or a user turn, and a subagent's usage
+is charged to no prompt.
 
 Cursor, Grok and OpenCode measure through the same
 `ToolResultFacts::from_payload` helper, so the columns mean the same thing for
@@ -727,7 +750,7 @@ in flight.
 |---|---|---|---|---|---|---|
 | **claude** | ✓ (`requestId`) | ✓ (`message.stop_reason`) | ✓ (`version` / `sourceVersion`) | ✓ (`isSidechain`) | ✓ (`isMeta`) | – |
 | **codex** | – | – | – | – | – | ✓ (`turn_context.turn_id`, carried to the next `turn_context`) |
-| **opencode** | – | ✓ (`step-finish.reason`, pending event-level parity) | – | – | – | – |
+| **opencode** | – | ✓ (last `step-finish.reason`, else message `finish`) | – | – | – | – |
 | **muse** | ✓ (`response_id`) | ✓ (the step's `finish_reason`) | ✓ (`build.semver`) | – | – | ✓ (the run's `run_id`) |
 | **devin** | ✓ (`metadata.request_id`) | ✓ (`metadata.finish_reason`) | ✓ (transcript `agent.version`) | – | – | – |
 | **cursor**, **grok**, **relay** | – | – | – | – | – | – |
@@ -735,6 +758,14 @@ in flight.
 A null is "the provider did not record it", which is not the same as `false`
 or as an empty string: a Claude record with no `isSidechain` key stores null,
 while `"isSidechain": false` stores `0`.
+
+Usage is kept the same way. Claude writes one streamed response as several
+records, each carrying the usage snapshot current when it was written;
+`token_json` holds the request's settled blob on every one of its rows, and
+`record_token_json` keeps a record's own `message.usage` only where settlement
+replaced it (JSON `null` for a copy that carried none), so the bytes are spent
+only on the copies that differ. `Message::raw_usage` returns the record's own
+blob: `record_token_json` where it is set, else `token_json`.
 
 Because of that, none of the six can answer "was this row indexed before the
 facts existed?" -- a real record legitimately has no `request_id`, no
@@ -828,10 +859,16 @@ How each adapter works:
   branch, `version`, models and the first human prompt; tail for the last
   timestamp and the final branch. Meta rows, slash-command wrappers, bash
   wrappers and sidechain (subagent) turns are skipped when picking
-  `first_prompt`. A subagent *sidecar* — a separate file whose records all
-  carry the parent's `sessionId` — is not a session of its own: it is detected
-  in the head read and skipped, so a session is emitted once per run and its
-  row keeps pointing at its own transcript. A transcript whose complete records
+  `first_prompt`. A subagent *sidecar* — an `agent-*.jsonl` file (flat beside
+  the parent, or under `<session>/subagents/`) whose records all carry the
+  parent's `sessionId` as `isSidechain` rows — is not a session of its own: it
+  is detected in the head read and skipped, so a session is emitted once per
+  run and its row keeps pointing at its own transcript. The layout decides the
+  file's role, never an identity. A primary `<sessionId>.jsonl` made only of
+  `isSidechain` rows — inline Task traffic from Claude Code versions that wrote
+  it there — is that session's transcript: catalogued under the records'
+  `sessionId`, with its sidechain assistant turns, `is_sidechain` and usage
+  kept as evidence of it. A transcript whose complete records
   parse as nothing is reported as a diagnostic rather than published under its
   file name; an empty one is simply not a session yet. The subagent workflow
   journal, `<session>/subagents/**/journal.jsonl`, is excluded by name before
@@ -1779,16 +1816,27 @@ How each adapter works:
   every row apart from the provenance path.
 
   A hydrated OpenCode session yields, per assistant message: `session_events`
-  of kind `text` for each non-synthetic `text` part, `tool_use` plus a
-  `tool_calls` row for each `tool` part (`tool_use_id` = `callID`, `is_error`
-  from `state.status == "error"` or `state.metadata.exit != 0`), a
-  `tool_result` event from `state.output`, and a `file_edits` row for
-  `write`/`edit`/`patch`. Each event carries `model` as
+  of kind `thinking` for each `reasoning` part with text (`event_uid`
+  `reasoning:<partId>`; an encrypted-only one, blank text with a non-empty
+  encrypted or redacted payload in its provider `metadata`, is an
+  `encrypted_reasoning` marker instead), `text` for
+  each non-synthetic `text` part, `tool_use` plus a `tool_calls` row for each
+  `tool` part (`tool_use_id` = `callID`, `is_error` from
+  `state.status == "error"` or `state.metadata.exit != 0`), a `tool_result`
+  event from `state.output`, and a `file_edits` row for `write`/`edit`/`patch`.
+  Every assistant message is a request whatever its parts: one that yields none
+  of these — only `step-start` / `step-finish` parts, or encrypted reasoning —
+  is carried by one `text` event with no text (`event_uid`
+  `message:<messageId>`). Each event carries `model` as
   `"<providerID>/<modelID>"`, `provider` as the bare `providerID`, `token_json`
   as the message's `tokens` object verbatim
   (`{input, output, reasoning, cache:{read, write}}`), and `stop_reason` from
-  the message's last `step-finish.reason`. A `compaction` part records a
-  `session_markers` row of kind `compaction_boundary`.
+  the message's final `step-finish` part's `reason`, else the message's own
+  `finish`.
+  Per user message: a `text` event for each `text` part, those flagged
+  `synthetic: true` with `control_kind = "synthetic"` and kept out of
+  `history`. A `compaction` part records a `session_markers` row of kind
+  `compaction_boundary`.
 
   Global sync reads the live store with session-keyed queries and copies
   nothing. The old whole-database `Connection::backup` is now opt-in at both

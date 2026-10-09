@@ -62,7 +62,13 @@ Claude is duplicated across every content block of a message.
 ## 2. Content blocks — `ContentRecord`
 
 `role` × `kind` (`text`, `thinking`, `tool_use`, `tool_result`) plus the block
-payload. `session_events` already stores exactly this shape. Two obligations:
+payload. `session_events` already stores exactly this shape. A Claude
+`thinking` block carrying a `signature` but no text stores no event: its
+`unsupported_block` / `thinking_signature` marker carries the record's
+`ts_ms`, `message_id` (the record uuid) and, in its payload, the record's
+`request_id` and `provider_message_id`, so a consumer places the record that
+opens a streamed response in its request and dates the request by it. Two
+obligations:
 
 - `SessionQuery.include_text` must be honoured, mapping onto burn's
   `ContentStoreMode::{full, hash-only, off}`. A hash-only consumer must not pay
@@ -100,6 +106,7 @@ harness writes into the user role that is not a human prompt keeps
 | `codex_context_wrapper`    | codex  | `<environment_context>`, `<permissions instructions>`, `# AGENTS.md`, …                    |
 | `meta`                     | claude | `isMeta: true` and nothing above applies                                                   |
 | `resume_marker`            | claude | a bare `/resume <id>` or `/continue <id>`                                                  |
+| `synthetic`                | opencode | a user `text` part flagged `synthetic: true` (harness-written context, e.g. an `@file` read) |
 
 A `control_kind` is only ever set on a `role = "user"`, `kind = "text"` row,
 and only to one of the spellings above; the source-evidence validation a

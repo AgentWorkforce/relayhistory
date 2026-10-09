@@ -55,11 +55,12 @@ use crate::source_evidence::EvidenceKind;
 use crate::store::{
     default_db_path, open_db, open_db_readonly, prompt_hash, schema_is_event_read_current,
     schema_is_evidence_read_current, schema_is_relationship_read_current,
-    schema_is_usage_read_current, session_events_sized, session_file_edits, session_markers_sized,
-    session_prompts_sized, session_tool_calls, session_user_turns_all, PromptRow, SessionEvent,
-    SessionFileEdit, SessionMarker, SessionScope, SessionToolCall, SessionUserTurn,
+    schema_is_usage_read_current, session_events_sized, session_file_edits, session_prompts_sized,
+    session_tool_calls, session_user_turns_all, PromptRow, SessionEvent, SessionFileEdit,
+    SessionScope, SessionToolCall, SessionUserTurn,
 };
 use crate::usage::{normalize_usage_str, source_accounting, NormalizedUsage, UsageAccounting};
+use crate::usage_snapshot::{self, UsageSnapshot};
 use crate::watch::{TickOutcome, TickTrigger, WatchDriver, WatchLoop};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -1158,7 +1159,17 @@ impl SessionStore {
     // -- one session --------------------------------------------------------
 
     /// Everything the store holds about one session, typed, or `None` when
-    /// the catalog has no such session.
+    /// the store has no such session.
+    ///
+    /// A [`SessionRef::Id`] names a catalogued session or a delegated child
+    /// the catalog leaves out — a Claude subagent, a Codex child thread —
+    /// whose evidence is stored under its own id. A child's `session` is
+    /// [`DiscoveryState::Delegated`], described from its stored evidence,
+    /// and its `relationships` carry the [`RelationshipSide::Child`] edge
+    /// naming the session that spawned it. Read every child of a session by
+    /// passing it to [`SessionStore::delegated_descendants`] and each id
+    /// returned here; an id only a delegation edge names, with nothing stored
+    /// under it, is `None`.
     ///
     /// Every table is read on one SQLite snapshot, so a sync landing halfway
     /// through cannot hand back tool calls from a newer version of the
@@ -1190,10 +1201,20 @@ impl SessionStore {
             }
         }
         .map_err(Error::query)?;
-        let Some(row) = row else {
-            return Ok(None);
+        let session = match (row, r) {
+            (Some(row), _) => CatalogSession::from_row(row)?,
+            // A delegated child — a Claude subagent sidecar, a Codex child
+            // thread — is kept out of the catalog because it is part of its
+            // parent's work, but its evidence is stored under its own id.
+            (None, SessionRef::Id { session_id, .. }) => {
+                match delegated_child_session(&tx, source, session_id)? {
+                    Some(session) => session,
+                    None => return Ok(None),
+                }
+            }
+            (None, SessionRef::Path { .. }) => return Ok(None),
         };
-        let session_id = row.session_id.clone();
+        let session_id = session.session_id.clone();
         // What this read fetches is the source's declared coverage narrowed
         // by the query, in the coverage's canonical order — never a kind the
         // source cannot produce, so `loaded` is always within `coverage` and
@@ -1208,7 +1229,7 @@ impl SessionStore {
         let mut diagnostics = Vec::new();
 
         let mut evidence = SessionEvidence {
-            session: CatalogSession::from_row(row)?,
+            session,
             prompts: Vec::new(),
             messages: Vec::new(),
             tool_calls: Vec::new(),
@@ -1269,11 +1290,8 @@ impl SessionStore {
                 .collect();
         }
         if wants(EvidenceKind::SessionMarker) {
-            evidence.markers = session_markers_sized(&tx, name, &session_id, include_text)
-                .map_err(Error::query)?
-                .into_iter()
-                .map(Marker::from_row)
-                .collect();
+            evidence.markers =
+                session_markers(&tx, name, &session_id, include_text).map_err(Error::query)?;
         }
         if wants(EvidenceKind::Relationship) {
             let graph = relationship_graph::session_relationships(&tx, name, &session_id)
@@ -1367,6 +1385,139 @@ fn path_names_one_session(source: Source) -> Result<(), Error> {
         HOOK_HARNESSES.join(", ")
     )))
 }
+
+/// `session_id` as a delegated child: its catalog-shaped description, read
+/// from the evidence stored under it, or `None` unless some session
+/// delegated to it and the store holds something under it.
+///
+/// Reached only when the catalog has no row for the id, so a catalogued
+/// session's read never pays for it, and answered by one statement.
+///
+/// Every field is one the child's own rows recorded. The catalog's derived
+/// excerpts (`first_prompt`, `last_assistant_text`) and source stamp have no
+/// counterpart and stay empty; `locations` is empty because a child has no
+/// presence apart from its parents; `raw_path` is the transcript the
+/// delegation evidence names.
+fn delegated_child_session(
+    conn: &Connection,
+    source: Source,
+    session_id: &str,
+) -> Result<Option<CatalogSession>, Error> {
+    let name = source.as_str();
+    let row = conn
+        .prepare_cached(DELEGATED_CHILD_SQL)
+        .and_then(|mut statement| {
+            rusqlite::OptionalExtension::optional(statement.query_row(
+                rusqlite::params![
+                    name,
+                    session_id,
+                    crate::relationships::RELATIONSHIP_DELEGATED
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, Option<i64>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, Option<String>>(6)?,
+                        row.get::<_, Option<String>>(7)?,
+                        row.get::<_, Option<String>>(8)?,
+                    ))
+                },
+            ))
+        })
+        .map_err(Error::sql)?;
+    let Some((
+        first_activity_ms,
+        last_activity_ms,
+        cwd,
+        git_branch,
+        agent_version,
+        project_key,
+        project_key_method,
+        models,
+        raw_path,
+    )) = row
+    else {
+        return Ok(None);
+    };
+    let models = match models {
+        Some(json) => serde_json::from_str::<Vec<String>>(&json)
+            .map_err(|error| Error::Query(format!("delegated child models: {error}")))?,
+        None => Vec::new(),
+    };
+    Ok(Some(CatalogSession {
+        source,
+        session_id: session_id.to_string(),
+        cwd,
+        git_branch,
+        first_activity_ms,
+        last_activity_ms,
+        first_prompt: None,
+        last_assistant_text: None,
+        models,
+        originator: None,
+        agent_version,
+        repo_url: None,
+        initial_commit: None,
+        workspace_roots: Vec::new(),
+        project_key,
+        project_key_method,
+        raw_path: raw_path.map(PathBuf::from),
+        source_stamp: None,
+        discovery_state: DiscoveryState::Delegated,
+        locations: Vec::new(),
+    }))
+}
+
+/// [`delegated_child_session`]'s one statement, `?1`/`?2` the child and `?3`
+/// the delegated kind. No row unless a delegation edge names the child and
+/// one of the tables a child's evidence lands in holds a row under it; each
+/// probe and field is a seek on an index leading with `(source, session)`.
+///
+/// The fields: the activity window; the first recorded working directory;
+/// the last recorded branch and agent version; the project identity the first
+/// keyed event resolved to, with its method; the models in order of first use
+/// (`<synthetic>` is the placeholder Claude Code writes on its own notices,
+/// not a model, and the catalog leaves it out the same way); and the
+/// transcript a delegation edge names (ordered with `+` so the lookup stays
+/// on the child index rather than walking the primary key or locator index).
+const DELEGATED_CHILD_SQL: &str = "SELECT \
+     (SELECT MIN(ts_ms) FROM session_events WHERE source = ?1 AND session_id = ?2), \
+     (SELECT MAX(ts_ms) FROM session_events WHERE source = ?1 AND session_id = ?2), \
+     (SELECT cwd FROM session_events WHERE source = ?1 AND session_id = ?2 \
+        AND cwd IS NOT NULL AND cwd <> '' ORDER BY ts_ms, id LIMIT 1), \
+     (SELECT git_branch FROM session_events WHERE source = ?1 AND session_id = ?2 \
+        AND git_branch IS NOT NULL AND git_branch <> '' ORDER BY ts_ms DESC, id DESC LIMIT 1), \
+     (SELECT agent_version FROM session_events WHERE source = ?1 AND session_id = ?2 \
+        AND agent_version IS NOT NULL AND agent_version <> '' ORDER BY ts_ms DESC, id DESC LIMIT 1), \
+     (SELECT project_key FROM session_events WHERE source = ?1 AND session_id = ?2 \
+        AND project_key IS NOT NULL AND project_key <> '' ORDER BY ts_ms, id LIMIT 1), \
+     (SELECT project_key_method FROM session_events WHERE source = ?1 AND session_id = ?2 \
+        AND project_key IS NOT NULL AND project_key <> '' ORDER BY ts_ms, id LIMIT 1), \
+     (SELECT json_group_array(model) FROM ( \
+        SELECT model FROM ( \
+          SELECT model, ts_ms, id, \
+            ROW_NUMBER() OVER (PARTITION BY model ORDER BY ts_ms, id) AS nth \
+          FROM session_events WHERE source = ?1 AND session_id = ?2 \
+            AND model IS NOT NULL AND model <> '' AND lower(trim(model)) <> '<synthetic>' \
+        ) WHERE nth = 1 ORDER BY ts_ms, id)), \
+     (SELECT evidence_locator FROM session_relationships \
+        WHERE source = ?1 AND child_session_id = ?2 AND relationship = ?3 \
+          AND +evidence_locator IS NOT NULL AND +evidence_locator <> '' \
+        ORDER BY +parent_session_id, +relationship_uid LIMIT 1) \
+     WHERE EXISTS(SELECT 1 FROM session_relationships WHERE source = ?1 \
+             AND child_session_id = ?2 AND relationship = ?3 \
+             AND +parent_session_id <> +child_session_id) \
+       AND (EXISTS(SELECT 1 FROM session_events WHERE source = ?1 AND session_id = ?2) \
+         OR EXISTS(SELECT 1 FROM tool_calls WHERE source = ?1 AND session_id = ?2) \
+         OR EXISTS(SELECT 1 FROM session_markers WHERE source = ?1 AND session_id = ?2) \
+         OR EXISTS(SELECT 1 FROM file_edits WHERE source = ?1 AND session_id = ?2) \
+         OR EXISTS(SELECT 1 FROM history WHERE source = ?1 AND session_id = ?2) \
+         OR EXISTS(SELECT 1 FROM session_relationships \
+                   WHERE source = ?1 AND parent_session_id = ?2))";
 
 /// How often a held sync lock is re-tried while a caller's timeout runs.
 const SYNC_LOCK_RETRY: Duration = Duration::from_millis(100);
@@ -2122,6 +2273,11 @@ impl Default for CatalogQuery {
 pub enum DiscoveryState {
     Shallow,
     Full,
+    /// No catalog row of its own: a subagent or child thread whose evidence
+    /// is stored as part of the work of the sessions that delegated to it.
+    /// Only [`SessionStore::session`] returns it, describing the child from
+    /// that evidence.
+    Delegated,
 }
 
 /// One catalog row. The fields are the provider's observed session metadata
@@ -2484,13 +2640,17 @@ pub struct Message {
     pub usage_error: Option<String>,
     pub blocks: Vec<Block>,
     #[serde(rename = "raw_usage", default, skip_serializing_if = "Option::is_none")]
-    token_json: Option<String>,
+    raw_usage: Option<String>,
 }
 
 impl Message {
-    /// The provider's usage blob as stored, verbatim.
+    /// The provider's usage blob exactly as this message's record carried it.
+    ///
+    /// For Claude that is the record's own `message.usage`, which may be an
+    /// earlier snapshot than `usage` when one response was streamed as several
+    /// records; `usage` is normalized from the request's settled blob.
     pub fn raw_usage(&self) -> Option<&str> {
-        self.token_json.as_deref()
+        self.raw_usage.as_deref()
     }
 }
 
@@ -2524,6 +2684,10 @@ pub struct Block {
 
 fn group_messages(source: Source, events: &[(SessionEvent, Option<i64>)]) -> Vec<Message> {
     let mut messages: Vec<Message> = Vec::new();
+    // The stored blob each message's `usage` is normalized from, parallel to
+    // `messages`: for Claude, the blob a streamed request's copies settle
+    // into, which is not the record's own `raw_usage`.
+    let mut usage_blobs: Vec<Option<String>> = Vec::new();
     let mut index: BTreeMap<String, usize> = BTreeMap::new();
     for (event, text_bytes) in events {
         let block = Block {
@@ -2548,10 +2712,14 @@ fn group_messages(source: Source, events: &[(SessionEvent, Option<i64>)]) -> Vec
                 // Claude copies one message's usage onto every block. The
                 // copies are expected to agree; when they do not, the message
                 // does not get to pick one.
-                match (&message.token_json, &event.token_json) {
+                if message.raw_usage.is_none() {
+                    message.raw_usage = record_usage(event);
+                }
+                let blob = &mut usage_blobs[at];
+                match (&*blob, &event.token_json) {
                     (None, Some(raw)) => {
-                        message.token_json = Some(raw.clone());
-                        set_usage(source, message);
+                        *blob = Some(raw.clone());
+                        set_usage(source, message, raw);
                     }
                     (Some(have), Some(raw)) if have != raw => {
                         message.usage = None;
@@ -2600,20 +2768,33 @@ fn group_messages(source: Source, events: &[(SessionEvent, Option<i64>)]) -> Vec
                     usage: None,
                     usage_error: None,
                     blocks: vec![block],
-                    token_json: event.token_json.clone(),
+                    raw_usage: record_usage(event),
                 };
-                set_usage(source, &mut message);
+                if let Some(raw) = event.token_json.as_deref() {
+                    set_usage(source, &mut message, raw);
+                }
                 messages.push(message);
+                usage_blobs.push(event.token_json.clone());
             }
         }
     }
     messages
 }
 
-fn set_usage(source: Source, message: &mut Message) {
-    let Some(raw) = message.token_json.as_deref() else {
-        return;
-    };
+/// The usage blob the event's own record carried.
+///
+/// `record_token_json` is set only where Claude's settlement replaced the
+/// record's own usage in `token_json`, and is JSON `null` for a copy that
+/// carried none; everywhere else `token_json` is the record's own.
+fn record_usage(event: &SessionEvent) -> Option<String> {
+    match event.record_token_json.as_deref() {
+        Some("null") => None,
+        Some(own) => Some(own.to_string()),
+        None => event.token_json.clone(),
+    }
+}
+
+fn set_usage(source: Source, message: &mut Message, raw: &str) {
     match normalize_usage_str(source.as_str(), raw) {
         Ok(usage) => {
             message.usage = usage;
@@ -2791,6 +2972,20 @@ impl FileEdit {
 /// `lifecycle`, `unknown`, …); `subkind` is the provider-native type
 /// verbatim. `payload` is a bounded projection — every string at 128
 /// characters, every container at 32 entries — never the bytes of an image.
+/// A Codex `usage_snapshot` carries its counters typed in `usage_snapshot`
+/// instead, and has no `payload`.
+///
+/// A Codex `turn_context` marker is stored only where the configuration
+/// changes: the configuration of a turn is the latest `turn_context` marker
+/// at or before that turn's start in rollout order (the `<line>` of
+/// `<line>:<suffix>` in `marker_uid`) -- the marker carrying the turn's
+/// `turn_id` when there is one, else the latest earlier one. A fork child's
+/// replayed parent history writes none; its chain starts at its first own
+/// `turn_context`, which is always stored. Its
+/// `turn_id` is the turn it took effect at, and every other payload field is
+/// the configuration of each turn up to the next marker -- except
+/// `root_turn_id` where the turn's `task_started` marker carries its own,
+/// which is then that turn's root.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Marker {
@@ -2805,6 +3000,14 @@ pub struct Marker {
     /// (grok). `None` when the query asked for no text.
     pub text: Option<String>,
     pub payload: Option<Value>,
+    /// For a `usage_snapshot` (Codex `token_count`), the provider's `info`
+    /// object, typed: no JSON is parsed into a [`Value`] to read it. Its
+    /// counters and `model_context_window` are kept whole and unaltered; only
+    /// its other strings and containers carry the marker bounds. `None` for
+    /// every other kind, and for the `info: null` snapshot Codex writes before
+    /// a turn has spent anything.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage_snapshot: Option<Box<UsageSnapshot>>,
     #[serde(
         rename = "raw_payload",
         default,
@@ -2814,28 +3017,66 @@ pub struct Marker {
 }
 
 impl Marker {
-    /// The stored `payload_json`, verbatim.
+    /// The stored `payload_json`, verbatim. `None` for a `usage_snapshot`,
+    /// whose stored payload is read into [`Marker::usage_snapshot`].
     pub fn raw_payload(&self) -> Option<&str> {
         self.payload_json.as_deref()
     }
 
-    fn from_row(row: SessionMarker) -> Self {
-        Self {
-            marker_uid: row.marker_uid,
-            ts_ms: row.ts_ms,
-            message_id: row.message_id,
-            parent_id: row.parent_id,
-            turn_id: row.turn_id,
-            kind: row.kind,
-            subkind: row.subkind,
-            text: row.text,
-            payload: row
-                .payload_json
-                .as_deref()
-                .and_then(|raw| serde_json::from_str(raw).ok()),
-            payload_json: row.payload_json,
-        }
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        let kind: String = row.get(5)?;
+        // Borrowed from the row: a snapshot's stored payload is decoded in
+        // place and never copied.
+        let raw = row.get_ref(8)?.as_str_or_null()?;
+        let (payload, usage_snapshot, payload_json) = match raw {
+            Some(raw) if kind == "usage_snapshot" => match usage_snapshot::decode(raw) {
+                Some(usage_snapshot::Decoded::Snapshot(snapshot)) => (None, Some(snapshot), None),
+                Some(usage_snapshot::Decoded::Other(info)) => (Some(info), None, Some(raw.into())),
+                // A payload stored as the `info` object itself.
+                None => {
+                    let info: Option<Value> = serde_json::from_str(raw).ok();
+                    match info.as_ref().and_then(UsageSnapshot::from_info) {
+                        Some(snapshot) => (None, Some(Box::new(snapshot)), None),
+                        None => (info, None, Some(raw.into())),
+                    }
+                }
+            },
+            Some(raw) => (serde_json::from_str(raw).ok(), None, Some(raw.into())),
+            None => (None, None, None),
+        };
+        Ok(Self {
+            marker_uid: row.get(0)?,
+            ts_ms: row.get(1)?,
+            message_id: row.get(2)?,
+            parent_id: row.get(3)?,
+            turn_id: row.get(4)?,
+            kind,
+            subkind: row.get(6)?,
+            text: row.get(7)?,
+            payload,
+            usage_snapshot,
+            payload_json,
+        })
     }
+}
+
+/// Every marker of a session, oldest first, on the caller's snapshot, without
+/// moving the `text` column when `include_text` is false.
+fn session_markers(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+    include_text: bool,
+) -> anyhow::Result<Vec<Marker>> {
+    let sql = format!(
+        "SELECT marker_uid, ts_ms, message_id, parent_id, turn_id, kind, subkind, {}, \
+         payload_json FROM session_markers WHERE source = ? AND session_id = ? \
+         ORDER BY ts_ms IS NULL, ts_ms ASC, id ASC",
+        if include_text { "text" } else { "NULL" }
+    );
+    let mut stmt = conn.prepare_cached(&sql)?;
+    let rows = stmt.query_map(rusqlite::params![source, session_id], Marker::from_row)?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// Which end of a [`Relationship`] the queried session sits on.
@@ -4183,13 +4424,15 @@ mod tests {
              VALUES ('claude', 's1', 'm1', 10, 'user', 'text', 'hello', 'e1');
              INSERT INTO session_events \
              (source, session_id, message_id, ts_ms, role, kind, text, event_uid, model, \
-              token_json, request_id, stop_reason) \
+              token_json, record_token_json, request_id, stop_reason) \
              VALUES ('claude', 's1', 'm2', 20, 'assistant', 'thinking', 'hmm', 'e2', 'm', \
+              '{\"input_tokens\":3,\"output_tokens\":4}', \
               '{\"input_tokens\":3,\"output_tokens\":4}', 'req_1', 'end_turn');
              INSERT INTO session_events \
              (source, session_id, message_id, ts_ms, role, kind, text, event_uid, model, \
-              token_json, tool_use_id, request_id) \
+              token_json, record_token_json, tool_use_id, request_id) \
              VALUES ('claude', 's1', 'm2', 20, 'assistant', 'tool_use', NULL, 'e3', 'm', \
+              '{\"input_tokens\":3,\"output_tokens\":4}', \
               '{\"input_tokens\":3,\"output_tokens\":4}', 'tu_1', 'req_1');
              INSERT INTO session_events \
              (source, session_id, message_id, ts_ms, role, kind, text, event_uid, tool_use_id, \

@@ -347,7 +347,9 @@ It returns the whole reachable work, never a truncated part of it.
 Continuity (a fork, resume or continuation) is not followed: those are
 conversations of their own. An embedder sharing a session's work shares these
 with it. `delegated_by(&SessionIdentity)` is the other direction: the sessions
-that delegated work to one, empty for a session of its own.
+that delegated work to one, empty for a session of its own. Each descendant's
+evidence is read with `session()` by its id; see
+[delegated children](#delegated-children).
 
 A delegated child is part of its parent's work, not a session to offer apart
 from it. Setting `CatalogQuery { exclude_delegated: true, .. }` or calling
@@ -398,6 +400,41 @@ summary together; `History` the prompts; the other kinds their own table. What
 is read is `coverage ∩ kinds`, reported back as `loaded`, so a kind the source
 cannot produce is never fetched and never listed. `CommitLink` is not carried
 by `session()`.
+
+#### Delegated children
+
+A Claude subagent sidecar or a Codex child thread is kept out of the catalog —
+it is part of its parent's work — but its evidence is stored under its own id,
+and `session(&SessionRef::id(source, child_id), ..)` reads it like any
+session: messages with `raw_usage()`, requests and the usage rollup, tool
+calls and results, markers. Its `session` is `DiscoveryState::Delegated`,
+described from the child's own rows — `cwd`, `git_branch`, `agent_version`,
+`models`, the activity window and `project_key` its events recorded, and
+`raw_path` the transcript its delegation edge names; `first_prompt`,
+`last_assistant_text` and `source_stamp` are `None` and `locations` is empty,
+because a child has no catalog row or presence of its own. Its
+`relationships` carry the `RelationshipSide::Child` edge whose
+`parent_session_id` is the session that spawned it — for a nested Claude
+subagent, the subagent whose tool use started it — and the `Parent` edges of
+anything it spawned in turn. An id no session delegated to, or one nothing is
+stored under, is `None`, and a child is named by id, never by path.
+
+Every child of a session, for a consumer accounting for its delegated spend:
+
+```rust
+let root = SessionIdentity::new("claude", session_id);
+for child in store.delegated_descendants(&[root])? {
+    let Some(source) = child.source() else { continue };
+    let Some(evidence) = store.session(&SessionRef::id(source, &child.session_id), SessionQuery::default())? else {
+        continue; // named by an edge, nothing stored under it
+    };
+    // evidence.messages[..].raw_usage(), evidence.requests, evidence.tool_calls …
+}
+```
+
+Each read is one session's evidence, so a child's usage is never folded into
+its parent's rollup and nothing is counted twice; `sessions()` and
+`session_identities` with `exclude_delegated` still list only the root.
 
 A `Block` carries `control: Option<ControlKind>`: why a block in the user role
 is not a human prompt — a slash-command caveat, invocation or output, a task
@@ -720,17 +757,64 @@ Bring a tokenizer and apply it to `byte_len`.
 carry, kept rather than dropped — compaction and summary boundaries, provider
 `system` rows, non-text content blocks (`image`, `document`,
 `redacted_thinking`, thinking signatures), tool-replacement metadata, Codex
-lifecycle events, and the folded slash-command triad.
+lifecycle events, Codex `turn_context` settings and `token_count` usage
+snapshots, and the folded slash-command triad.
 
 | Field | Meaning |
 | --- | --- |
 | `id`, `marker_uid` | Row id and the stable per-session marker identity |
 | `ts_ms` | `Option` — some markers are undated |
 | `message_id`, `parent_id`, `turn_id` | Where in the conversation it sits, as far as the provider said |
-| `kind` | The parser's classified vocabulary — `compaction_boundary`, `system`, `synthetic_turn`, `encrypted_reasoning`, `slash_command`, `unknown`, … — stable per source once written |
+| `kind` | The parser's classified vocabulary — `compaction_boundary`, `system`, `synthetic_turn`, `encrypted_reasoning`, `usage_snapshot`, `turn_context`, `slash_command`, `unknown`, … — stable per source once written |
 | `subkind` | The provider-native type, verbatim — so a record no classifier knows still lands with its real name |
 | `text` | The provider's own readable text, when it wrote one. `None` under `include_text: false` |
-| `payload` | `Option<serde_json::Value>`: an allowlisted, bounded projection, parsed — strings cut at 128 characters, containers at 32 entries, recursively. Never the bytes of an image. `raw_payload()` is the stored string |
+| `payload` | `Option<serde_json::Value>`: a bounded projection, parsed — strings cut at 128 characters, containers at 32 entries, recursively; numbers are never altered. Where this parser classifies the record it keeps an allowlist of fields; where the payload is the provider's own document (Codex `turn_context`, Grok `signals`, a compaction checkpoint) the document is bounded whole. Never the bytes of an image. `raw_payload()` is the stored string. `None` for a `usage_snapshot` |
+| `usage_snapshot` | `Option<Box<UsageSnapshot>>`: a Codex `usage_snapshot`'s `info` object, bounded the same way, typed — `total_token_usage` / `last_token_usage` as `TokenUsage` (each counter the value as written, so `u64` above `i64::MAX` and a malformed fractional or negative counter are exact; `None` absent, `Some(Null)` written as `null`; other keys in `other`), `model_context_window`, and every other key in `other`. Nothing is parsed into a `Value` to read it, and `UsageSnapshot::to_value()` is the object as written. Stored in `payload_json` positionally (`[total, last, window, other]`, see the crate's `usage_snapshot` module). `None` for the `info: null` snapshot and for every other kind |
+
+A Codex `turn_context` marker is stored only where the configuration changes:
+Codex restates its whole configuration on every turn, and a record that repeats
+the previous one apart from the fields naming its turn stores nothing. **The
+configuration of a turn is the latest `turn_context` marker at or before that
+turn's start in rollout order** — the marker carrying the turn's `turn_id` when
+there is one, else the latest earlier one. Rollout order is the record's line:
+every Codex `marker_uid` and `event_uid` is `<line>:<suffix>`, `<line>` the
+record's zero-based line in the rollout. `markers` is read in timestamp order,
+which agrees with it whenever the rollout's timestamps do.
+
+Every stored marker is the record whole. Its `turn_id` is the turn it took
+effect at. `root_turn_id` — the turn of the root thread that the delegated
+thread is working for — is left out of the comparison when the turn's own
+`task_started` wrote the same value, and that `task_started` marker carries it
+as `payload.root_turn_id`; older Codex writes it on `turn_context` alone, and
+there it is compared like any other field. Every other field — `model`,
+`effort`, `cwd`, `current_date`, the approval and sandbox policy — is the
+configuration of each turn up to the next marker.
+
+A session's first `turn_context` is always stored. In a fork, the parent history
+the child replays is one `fork_replay_boundary` marker and writes no
+`turn_context` markers under the child; the comparison starts at the child's
+first own `turn_context`, which is always stored, so a child's own markers
+configure every child turn.
+
+```rust
+// turn id -> the turn_context payload it ran under, in rollout order.
+let line = |uid: &str| uid.split_once(':').and_then(|(n, _)| n.parse::<u64>().ok());
+let mut markers: Vec<&Marker> = evidence.markers.iter().collect();
+markers.sort_by_key(|m| line(&m.marker_uid));
+let mut current: Option<&serde_json::Value> = None;
+let mut configs: HashMap<&str, Option<&serde_json::Value>> = HashMap::new();
+for marker in markers {
+    if marker.kind == "turn_context" {
+        current = marker.payload.as_ref();
+    }
+    let Some(turn) = marker.turn_id.as_deref() else { continue };
+    if marker.kind == "turn_context" {
+        configs.insert(turn, current);
+    } else {
+        configs.entry(turn).or_insert(current);
+    }
+}
+```
 
 A compaction marker is where a session's token baseline resets. Cost attribution
 across one without it is wrong, which is why the table exists. A slash command's

@@ -197,6 +197,12 @@ export interface NativeSessionEvent {
    * and for every model-output row.
    */
   controlKind?: string
+  /**
+   * Claude: the usage blob this one record carried, where it differs from
+   * the settled request blob in `token_json` (JSON `null` for a copy that
+   * carried none). Null wherever `token_json` is the record's own.
+   */
+  recordTokenJson?: string
 }
 export interface EventCursor {
   tsMs: number

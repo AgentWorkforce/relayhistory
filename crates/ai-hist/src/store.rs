@@ -321,6 +321,11 @@ CREATE TABLE IF NOT EXISTS session_events (
     -- Null for a genuine prompt and for every model-output row. See
     -- `ingest::control`.
     control_kind TEXT,
+    -- Claude: the usage blob exactly as this one record carried it, kept
+    -- only where `token_json` holds a different blob -- the one a streamed
+    -- request's copies settle into -- and JSON `null` for a copy that carried
+    -- none. Null wherever `token_json` already is the record's own.
+    record_token_json TEXT,
     -- Which evidence backs this row: 'local' (a local parser read it from
     -- the provider's own files), 'remote' (a remote observation supplied
     -- it) or 'both'. See `EVIDENCE_LOCATION_TABLES`.
@@ -790,6 +795,14 @@ const REQUIRED_SESSION_EVENT_COLUMNS: &[(&str, &str)] = &[
     // so it is re-stamped by the same raw-facts backfill that repairs the
     // columns above: a row without it is a row the classifier never saw.
     ("control_kind", "TEXT"),
+    // Claude: the usage blob as this one record carried it, verbatim. Claude
+    // writes one streamed response as several records whose usage snapshots
+    // `token_json` settles into one blob; this keeps a record's own where it
+    // differs (JSON `null` for a copy that carried none), and is null wherever
+    // `token_json` already is the record's own. Written
+    // by the same parser generation as the facts above, so the raw-facts
+    // backfill fills it on rows indexed before it existed.
+    ("record_token_json", "TEXT"),
 ];
 /// Columns the v2 `session_relationships` shape adds. A v1 row set cannot
 /// represent related evidence whose child has no provider-recorded identity,
@@ -832,6 +845,9 @@ const REQUIRED_INDEXES: &[&str] = &[
     "idx_session_events_page",
     "idx_tool_calls_page_v2",
     "idx_file_edits_page_v2",
+    // Retiring one record's rows on a re-read keys on its message id.
+    "idx_tool_calls_message",
+    "idx_file_edits_message",
     "idx_session_markers_page",
     "idx_session_presences_location",
     "idx_session_presences_locator",
@@ -1941,6 +1957,18 @@ VALUES ('session_presences_local_backfill_v1');
         "CREATE INDEX IF NOT EXISTS idx_session_markers_page ON session_markers(source, session_id, (ts_ms IS NULL), ts_ms, id)",
         [],
     )?;
+    // A re-read retires one record's rows by `(source, session_id,
+    // message_id)` -- the Claude parser does it for every sidechain record it
+    // moves onto its child -- and without these each retirement scanned every
+    // tool call and edit of the parent session.
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_tool_calls_message ON tool_calls(source, session_id, message_id)",
+        [],
+    )?;
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_file_edits_message ON file_edits(source, session_id, message_id)",
+        [],
+    )?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_file_edits_path ON file_edits(file_path)",
         [],
@@ -2972,7 +3000,8 @@ pub struct SessionEvent {
     /// One of `slash_command_caveat`, `slash_command_invocation`,
     /// `slash_command_output`, `task_notification`, `hook_output`,
     /// `bash_passthrough_input`, `bash_passthrough_output`,
-    /// `system_reminder`, `codex_context_wrapper`, `meta`, `resume_marker`.
+    /// `system_reminder`, `codex_context_wrapper`, `meta`, `resume_marker`,
+    /// `synthetic`.
     /// The row keeps `role = "user"` and `kind = "text"` and its text
     /// verbatim; this column is what a consumer building human turns, prompt
     /// roots or an overhead breakdown filters on, so none of them has to
@@ -2980,6 +3009,12 @@ pub struct SessionEvent {
     /// `None` also on rows written before the column existed, which the next
     /// plain `sync` re-stamps.
     pub control_kind: Option<String>,
+    /// Claude: the usage blob exactly as this one record carried it, where
+    /// `token_json` holds a different one -- the blob a streamed request's
+    /// copies settle into. JSON `null` for a copy that carried none. `None`
+    /// wherever `token_json` already is the record's own: every row of other
+    /// sources, and a Claude row whose usage settlement did not change.
+    pub record_token_json: Option<String>,
 }
 
 /// Stable continuation for normalized session events.
@@ -3039,7 +3074,11 @@ pub struct SessionFileEdit {
 ///
 /// 3: `session_events` rows carry `control_kind`, and the user-turn page
 /// leaves control rows out.
-pub const SESSION_EVIDENCE_CONTRACT_VERSION: u32 = 3;
+///
+/// 4: `control_kind` may be `synthetic` (OpenCode harness-written user
+/// text), and `session_events` rows carry `record_token_json`, a Claude
+/// record's own usage beside the settled request blob.
+pub const SESSION_EVIDENCE_CONTRACT_VERSION: u32 = 4;
 
 /// Stable continuation for tool calls and file edits.
 ///
@@ -3115,7 +3154,7 @@ pub(crate) const SESSION_EVENT_COLUMNS: &str =
      payload_truncated, payload_hash, call_index, event_index, result_status, event_source, \
      error_signal, subagent_session_id, agent_id, request_id, provider_message_id, \
      stop_reason, agent_version, is_sidechain, is_meta, turn_id, request_span, raw_kind, \
-     control_kind";
+     control_kind, record_token_json";
 
 pub(crate) fn row_to_session_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionEvent> {
     Ok(SessionEvent {
@@ -3157,6 +3196,7 @@ pub(crate) fn row_to_session_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<
         request_span: row.get(35)?,
         raw_kind: row.get(36)?,
         control_kind: row.get(37)?,
+        record_token_json: row.get(38)?,
     })
 }
 
@@ -3194,7 +3234,8 @@ pub fn session_events(
 
 /// Every normalized event for one session, oldest first, with the UTF-8
 /// length of its `text` column beside it — and, when `include_text` is
-/// false, without moving the text column out of SQLite at all.
+/// false, without moving the text column out of SQLite at all (the length is
+/// an `octet_length`; see [`USER_TURN_BYTE_LEN`]).
 ///
 /// For [`crate::SessionStore::session`]: a hash-only consumer must not pay
 /// to carry transcript text, and dropping it after the row was materialized
@@ -3225,7 +3266,7 @@ pub(crate) fn session_events_sized(
 /// [`session_events_sized`]'s statement, shared with its query-plan test.
 fn session_events_sized_sql(columns: &str) -> String {
     format!(
-        "SELECT {columns}, LENGTH(CAST(text AS BLOB)) FROM session_events \
+        "SELECT {columns}, octet_length(text) FROM session_events \
          WHERE source = ? AND session_id = ? {SESSION_EVENT_ORDER}"
     )
 }
@@ -3253,7 +3294,7 @@ pub(crate) fn session_prompts_sized(
 ) -> Result<Vec<PromptRow>> {
     let prompt = if include_text { "prompt" } else { "NULL" };
     let sql = format!(
-        "SELECT project, timestamp_ms, prompt_hash, LENGTH(CAST(prompt AS BLOB)), {prompt} \
+        "SELECT project, timestamp_ms, prompt_hash, octet_length(prompt), {prompt} \
          FROM history WHERE source = ? AND session_id = ? ORDER BY timestamp_ms ASC, id ASC"
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -3266,28 +3307,6 @@ pub(crate) fn session_prompts_sized(
             prompt: row.get(4)?,
         })
     })?;
-    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
-}
-
-/// Every marker of a session, oldest first, on the caller's snapshot, without
-/// moving the `text` column when `include_text` is false.
-pub(crate) fn session_markers_sized(
-    conn: &Connection,
-    source: &str,
-    session_id: &str,
-    include_text: bool,
-) -> Result<Vec<SessionMarker>> {
-    let columns = if include_text {
-        SESSION_MARKER_COLUMNS.to_string()
-    } else {
-        SESSION_MARKER_COLUMNS.replacen(", text, ", ", NULL AS text, ", 1)
-    };
-    let sql = format!(
-        "SELECT {columns} FROM session_markers WHERE source = ? AND session_id = ? \
-         ORDER BY ts_ms IS NULL, ts_ms ASC, id ASC"
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params![source, session_id], row_to_session_marker)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
@@ -3730,7 +3749,14 @@ pub struct SessionUserTurnPage {
 
 /// Byte length of a stored `text` column, counted in bytes rather than
 /// characters so it is comparable with a measured `payload_bytes`.
-const USER_TURN_BYTE_LEN: &str = "COALESCE(payload_bytes, LENGTH(CAST(text AS BLOB)), 0)";
+///
+/// Every sized read measures with `octet_length(x)`: for a column argument
+/// SQLite answers it from the record header's serial type, so a text-free
+/// read never pulls a large body off its overflow pages.
+/// `LENGTH(CAST(x AS BLOB))` returns the same number but materializes the
+/// whole value first. `octet_length` needs SQLite 3.43+, which the bundled
+/// `libsqlite3-sys` provides.
+const USER_TURN_BYTE_LEN: &str = "COALESCE(payload_bytes, octet_length(text), 0)";
 
 /// The grouping key for a user turn: a provider message id when the row has
 /// one, otherwise the row's own identity, so an unattributed event becomes a
@@ -3763,9 +3789,13 @@ const USER_TURN_KEY: &str = "COALESCE(NULLIF(message_id, ''), 'event:' || id)";
 /// A user-role row carrying a `control_kind` is the harness's, not the
 /// human's: a Codex context wrapper would otherwise read as a turn of its own,
 /// and a `<system-reminder>` row split off a prompt would be counted among the
-/// prompt's blocks and bytes.
-const USER_TURN_ROW_FILTER: &str = "((role = 'user' AND control_kind IS NULL) \
-     OR (role = 'tool_result' AND event_source = 'tool_result'))";
+/// prompt's blocks and bytes. A Claude sidechain row is delegated traffic --
+/// the delegating agent's prompt to a subagent and the tool results the
+/// subagent received -- so it is evidence of the delegated thread, never a
+/// turn of the session's human.
+const USER_TURN_ROW_FILTER: &str = "(COALESCE(is_sidechain, 0) = 0 \
+     AND ((role = 'user' AND control_kind IS NULL) \
+       OR (role = 'tool_result' AND event_source = 'tool_result')))";
 
 /// The message recorded next to a turn, on either side of it.
 ///
@@ -8971,6 +9001,101 @@ mod tests {
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap()
             .join(" | ")
+    }
+
+    /// The sized reads measure with `octet_length`, which must report exactly
+    /// the bytes `LENGTH(CAST(x AS BLOB))` does for every value a column can
+    /// hold -- multibyte UTF-8, empty, NULL, BLOB-typed, numeric, and a body
+    /// large enough to spill onto overflow pages.
+    #[test]
+    fn sized_reads_report_the_stored_byte_length_of_every_value() {
+        let (major, minor) = (
+            rusqlite::version_number() / 1_000_000,
+            rusqlite::version_number() / 1_000 % 1_000,
+        );
+        assert!(
+            (major, minor) >= (3, 43),
+            "octet_length needs SQLite 3.43+, bundled is {}",
+            rusqlite::version()
+        );
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let large = "λ→🦀".repeat(20_000);
+        let texts: [Option<&str>; 5] = [
+            Some("plain ascii"),
+            Some("λ→🦀 mixed ünïcödé"),
+            Some(""),
+            None,
+            Some(&large),
+        ];
+        for (n, text) in texts.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO session_events (source, session_id, ts_ms, role, kind, text, event_uid) \
+                 VALUES ('codex', 's', ?1, 'user', 'text', ?2, ?3)",
+                params![n as i64, text, format!("e{n}")],
+            )
+            .unwrap();
+            if let Some(text) = text {
+                conn.execute(
+                    "INSERT INTO history (source, session_id, prompt, timestamp_ms) \
+                     VALUES ('codex', 's', ?1, ?2)",
+                    params![text, n as i64],
+                )
+                .unwrap();
+            }
+        }
+        // Values of every other storage class in the TEXT-affinity column.
+        for (n, sql_value) in ["X'00FF00'", "X''", "42", "1.5"].iter().enumerate() {
+            conn.execute(
+                &format!(
+                    "INSERT INTO session_events (source, session_id, ts_ms, role, kind, text, event_uid) \
+                     VALUES ('codex', 'typed', {n}, 'user', 'text', {sql_value}, 't{n}')"
+                ),
+                [],
+            )
+            .unwrap();
+        }
+        let disagreements: i64 = conn
+            .query_row(
+                &format!(
+                    "SELECT COUNT(*) FROM session_events \
+                     WHERE octet_length(text) IS NOT LENGTH(CAST(text AS BLOB)) \
+                        OR {USER_TURN_BYTE_LEN} \
+                           IS NOT COALESCE(payload_bytes, LENGTH(CAST(text AS BLOB)), 0)"
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(disagreements, 0);
+
+        let expected: Vec<Option<i64>> = texts
+            .iter()
+            .map(|text| text.map(|text| text.len() as i64))
+            .collect();
+        for include_text in [true, false] {
+            let sized = session_events_sized(&conn, "codex", "s", include_text).unwrap();
+            assert_eq!(
+                sized.iter().map(|(_, bytes)| *bytes).collect::<Vec<_>>(),
+                expected,
+                "include_text={include_text}"
+            );
+            let prompts = session_prompts_sized(&conn, "codex", "s", include_text).unwrap();
+            assert_eq!(
+                prompts
+                    .iter()
+                    .map(|row| row.prompt_bytes)
+                    .collect::<Vec<_>>(),
+                expected.iter().flatten().copied().collect::<Vec<_>>(),
+                "include_text={include_text}"
+            );
+        }
+        let typed = session_events_sized(&conn, "codex", "typed", false).unwrap();
+        assert_eq!(
+            typed.iter().map(|(_, bytes)| *bytes).collect::<Vec<_>>(),
+            vec![Some(3), Some(0), Some(2), Some(3)]
+        );
     }
 
     /// A whole-session event read is delivered in order by the page index
