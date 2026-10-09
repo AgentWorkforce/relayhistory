@@ -3,6 +3,11 @@ name: CI
 on:
   workflow_dispatch:
   pull_request:
+    # Trunk -> main promotion PR only, batched by the merge train (AgentWorkforce/cloud
+    # packages/web/lib/merge-train): opened, reopened, or the sweeper's `ci:run`
+    # label once per new trunk head. Never on synchronize; other label events
+    # skip every job.
+    types: [opened, reopened, labeled]
   push:
     branches:
       - main
@@ -13,15 +18,19 @@ on:
       - '.release/dispatch-patch-*'
 
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  # PR runs collapse per pull request; push runs key off the commit sha so two
+  # merges landing together cannot cancel each other. A `labeled` event for any
+  # label other than `ci:run` runs nothing, so it gets its own throwaway group:
+  # it must never cancel the PR's in-progress run.
+  group: ci-${{ github.event_name != 'pull_request' && format('push-{0}', github.sha) || ((github.event.action == 'labeled' && github.event.label.name != 'ci:run') && format('ignored-{0}', github.run_id) || format('pr-{0}', github.event.pull_request.number)) }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
 
 jobs:
   verify:
-    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.head_ref == 'trunk' && github.event.pull_request.head.repo.full_name == github.repository && github.base_ref == 'main')
+    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.head_ref == 'trunk' && github.event.pull_request.head.repo.full_name == github.repository && github.base_ref == 'main' && (github.event.action != 'labeled' || github.event.label.name == 'ci:run'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -102,7 +111,7 @@ jobs:
   # fails on any `rusqlite` type in the listing: an embedder never holds a
   # raw connection. See docs/sourcing-sdk.md.
   public-api:
-    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.head_ref == 'trunk' && github.event.pull_request.head.repo.full_name == github.repository && github.base_ref == 'main')
+    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.head_ref == 'trunk' && github.event.pull_request.head.repo.full_name == github.repository && github.base_ref == 'main' && (github.event.action != 'labeled' || github.event.label.name == 'ci:run'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -133,7 +142,7 @@ jobs:
   # published-crate-consumer workflow builds the same example against the
   # crate crates.io actually serves.
   rust-consumer:
-    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.head_ref == 'trunk' && github.event.pull_request.head.repo.full_name == github.repository && github.base_ref == 'main')
+    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.head_ref == 'trunk' && github.event.pull_request.head.repo.full_name == github.repository && github.base_ref == 'main' && (github.event.action != 'labeled' || github.event.label.name == 'ci:run'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -188,7 +197,7 @@ jobs:
   # tell a regression here from breakage in burn. Making the job a required
   # check is a branch-protection setting.
   burn-contract-drift:
-    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.head_ref == 'trunk' && github.event.pull_request.head.repo.full_name == github.repository && github.base_ref == 'main')
+    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.head_ref == 'trunk' && github.event.pull_request.head.repo.full_name == github.repository && github.base_ref == 'main' && (github.event.action != 'labeled' || github.event.label.name == 'ci:run'))
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -235,7 +244,7 @@ jobs:
         run: node scripts/burn-guardrails.mjs run-parity --burn-dir burn
 
   msrv:
-    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.head_ref == 'trunk' && github.event.pull_request.head.repo.full_name == github.repository && github.base_ref == 'main')
+    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.head_ref == 'trunk' && github.event.pull_request.head.repo.full_name == github.repository && github.base_ref == 'main' && (github.event.action != 'labeled' || github.event.label.name == 'ci:run'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -244,7 +253,7 @@ jobs:
         run: cargo check -p ai-hist --all-features --locked
 
   node-22-sdk:
-    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.head_ref == 'trunk' && github.event.pull_request.head.repo.full_name == github.repository && github.base_ref == 'main')
+    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.head_ref == 'trunk' && github.event.pull_request.head.repo.full_name == github.repository && github.base_ref == 'main' && (github.event.action != 'labeled' || github.event.label.name == 'ci:run'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -264,7 +273,7 @@ jobs:
         run: npm ci && npm test
 
   optional-history-plugins:
-    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.head_ref == 'trunk' && github.event.pull_request.head.repo.full_name == github.repository && github.base_ref == 'main')
+    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.head_ref == 'trunk' && github.event.pull_request.head.repo.full_name == github.repository && github.base_ref == 'main' && (github.event.action != 'labeled' || github.event.label.name == 'ci:run'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -313,7 +322,7 @@ jobs:
           node scripts/smoke-history-packages.mjs --helpers helper-packs
 
   windows-helper-cancellation:
-    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.head_ref == 'trunk' && github.event.pull_request.head.repo.full_name == github.repository && github.base_ref == 'main')
+    if: (github.event_name != 'pull_request' && github.event_name != 'pull_request_target') || (github.head_ref == 'trunk' && github.event.pull_request.head.repo.full_name == github.repository && github.base_ref == 'main' && (github.event.action != 'labeled' || github.event.label.name == 'ci:run'))
     runs-on: windows-latest
     defaults:
       run:
