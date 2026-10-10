@@ -34,7 +34,7 @@
 use super::opencode::{self, OpencodeSession, OpencodeSyncPlan};
 use super::{
     check_capture_cancelled, forget_unobserved_paths, session_events_exist, session_markers_exist,
-    sweep_generation, SweepRepairs, SyncStateStamp,
+    sweep_generation, SweepRepairs,
 };
 use crate::discover::fingerprint_hash;
 use anyhow::{Context, Result};
@@ -43,8 +43,12 @@ use serde_json::{Map, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
+mod stamps;
 #[cfg(test)]
 mod tests;
+mod tree;
+
+pub(crate) use tree::sync_opencode_storage_dir;
 
 const SESSION_STAMPS_KEY: &str = "opencode_sessions_v1";
 const STORE_STAMPS_KEY: &str = "opencode_stores_v1";
@@ -208,27 +212,54 @@ fn store_tag(store: &str) -> String {
     format!("{:016x}", fingerprint_hash("opencode-store", store, ""))
 }
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| i64::try_from(elapsed.as_millis()).unwrap_or(i64::MAX))
-        .unwrap_or_default()
+/// The sweep's OpenCode pass over whichever layout this host has, with the
+/// stamps `state` holds.
+///
+/// One owner, two layouts: `opencode.db` when the host has it, the legacy
+/// `storage/` tree when it does not. Never both -- a host that upgraded has a
+/// stale tree sitting beside a live database. Asked once, through the same
+/// `detect` that discovery and hydration use: `exists()` is true for a
+/// *directory* named by `OPENCODE_DB`, and asking that way opened it as
+/// SQLite while detect read the legacy tree.
+pub(crate) fn sync_opencode_sources(
+    conn: &Connection,
+    state: &mut Map<String, Value>,
+    roots: &crate::ProviderRoots,
+    repairs: &SweepRepairs,
+) -> Result<usize> {
+    let layout = opencode::OpencodeLayout::detect(
+        &roots.opencode_db,
+        roots.opencode_db_pinned,
+        &roots.opencode_storage_dir,
+    );
+    let mut sweep = OpencodeSweep::begin(state, repairs);
+    let inserted = match &layout {
+        Some(opencode::OpencodeLayout::Sqlite(dbs)) => sync_opencode_dbs(conn, dbs, &mut sweep),
+        Some(opencode::OpencodeLayout::JsonTree(tree)) => {
+            sync_opencode_storage_dir(conn, tree, &mut sweep)
+        }
+        None => Ok(0),
+    };
+    sweep.finish(state);
+    let inserted = inserted?;
+    note(&match &layout {
+        Some(opencode::OpencodeLayout::Sqlite(_)) => format!("  [opencode] +{inserted} rows"),
+        Some(opencode::OpencodeLayout::JsonTree(tree)) => {
+            format!("  [opencode] +{inserted} rows from {}", tree.display())
+        }
+        None => format!(
+            "  [opencode] not found: {} (skipped)",
+            roots.opencode_db.display()
+        ),
+    });
+    Ok(inserted)
 }
 
-/// The store stamp, or `None` when the files cannot vouch for their content:
-/// unreadable metadata (or no inode to read, off Unix), or an mtime within
-/// [`AMBIGUITY_MS`] of now.
-fn store_file_stamp(path: &Path, generation: &str) -> Option<String> {
-    let db = SyncStateStamp::at(path)?;
-    let mut wal_path = path.as_os_str().to_os_string();
-    wal_path.push("-wal");
-    let wal = SyncStateStamp::at(Path::new(&wal_path));
-    let newest_ns = db.mtime_ns.max(wal.map_or(0, |wal| wal.mtime_ns));
-    let newest_ms = i64::try_from(newest_ns / 1_000_000).unwrap_or(i64::MAX);
-    if now_ms().saturating_sub(newest_ms) <= AMBIGUITY_MS {
-        return None;
+/// A sync progress line, unless sync output is quiet.
+fn note(line: &str) {
+    if !super::SYNC_QUIET.load(std::sync::atomic::Ordering::Relaxed) {
+        println!("{line}");
     }
-    Some(format!("{generation}:{db:?}:{wal:?}"))
 }
 
 /// Index every session in each OpenCode SQLite store, in order, reading only
@@ -295,7 +326,7 @@ fn sync_opencode_db_file(
     let tag = store_tag(&store);
     // Before the read transaction opens: a write after this point moves the
     // files past the stamp.
-    let file_stamp = store_file_stamp(opencode_db, &sweep.generation);
+    let file_stamp = stamps::store_file_stamp(opencode_db, &sweep.generation);
     if let Some(stamp) = &file_stamp {
         if store_unchanged(conn, sweep, &tag, stamp, claimed)? {
             return Ok(0);
@@ -374,9 +405,6 @@ fn store_unchanged(
 /// Index the changed sessions of one store's pinned snapshot. Returns the
 /// prompts inserted and whether every session the store owns has a definite
 /// stamp recorded.
-///
-/// `claimed` holds the sessions an earlier store already owns; they are
-/// skipped here, and this store's own sessions are added to it.
 fn sync_store_snapshot(
     conn: &Connection,
     src: &Connection,
@@ -386,12 +414,52 @@ fn sync_store_snapshot(
     sweep: &mut OpencodeSweep<'_>,
 ) -> Result<(usize, bool)> {
     check_capture_cancelled()?;
-    let read_at = now_ms();
-    let stamps = sqlite_session_stamps(src)?;
+    let (changed, settled) = changed_sessions(conn, src, tag, claimed, sweep)?;
+    let mut read = StoreRead {
+        conn,
+        store,
+        inserted: 0,
+        definite: settled,
+        failures: Vec::new(),
+    };
+    if !changed.is_empty() {
+        read_changed(src, changed, &mut read, sweep)?;
+    }
+    if !read.failures.is_empty() {
+        anyhow::bail!(
+            "{} OpenCode session(s) in {store} could not be read (the rest were indexed): {}",
+            read.failures.len(),
+            read.failures.join("; ")
+        );
+    }
+    Ok((read.inserted, read.definite))
+}
+
+/// One session to read: its id, its stamp entry, and the stamp to record
+/// once it is written -- `None` when the stamp is not definite.
+struct Changed {
+    session_id: String,
+    entry: String,
+    token: Option<String>,
+}
+
+/// The sessions of this store whose stamps moved, and whether every one of
+/// them has a definite stamp. `claimed` holds the sessions an earlier store
+/// already owns; they are recorded as claimed here, and this store's own
+/// sessions are added to it. Entries for sessions the store no longer holds
+/// are dropped.
+fn changed_sessions(
+    conn: &Connection,
+    src: &Connection,
+    tag: &str,
+    claimed: &mut BTreeSet<String>,
+    sweep: &mut OpencodeSweep<'_>,
+) -> Result<(Vec<Changed>, bool)> {
+    let read_at = stamps::now_ms();
     let mut definite = true;
     let mut seen = BTreeSet::new();
     let mut changed = Vec::new();
-    for stamp in stamps {
+    for stamp in stamps::sqlite_session_stamps(src)? {
         check_capture_cancelled()?;
         let entry = format!("{tag}:{}", stamp.session_id);
         seen.insert(entry.clone());
@@ -405,7 +473,11 @@ fn sync_store_snapshot(
         }
         let settled = read_at.saturating_sub(stamp.newest_ms) > AMBIGUITY_MS;
         definite &= settled;
-        changed.push((stamp.session_id, entry, settled.then_some(token)));
+        changed.push(Changed {
+            session_id: stamp.session_id,
+            entry,
+            token: settled.then_some(token),
+        });
     }
     let prefix = format!("{tag}:");
     let gone: Vec<String> = sweep
@@ -417,314 +489,96 @@ fn sync_store_snapshot(
     for entry in gone {
         sweep.forget(Stamps::Sessions, entry);
     }
-    if changed.is_empty() {
-        return Ok((0, definite));
+    Ok((changed, definite))
+}
+
+/// Read the changed sessions. Session-keyed queries are bounded only when
+/// the provider indexes the column they seek on; without that index each one
+/// scans `part`, so the store is read whole once instead.
+fn read_changed(
+    src: &Connection,
+    changed: Vec<Changed>,
+    read: &mut StoreRead<'_>,
+    sweep: &mut OpencodeSweep<'_>,
+) -> Result<()> {
+    if opencode::sync_plan(src)? == OpencodeSyncPlan::PerSession {
+        for session in changed {
+            check_capture_cancelled()?;
+            let loaded = opencode::load_from_sqlite(src, &session.session_id);
+            read.index(sweep, session, loaded)?;
+        }
+        return Ok(());
     }
-    // One session's failure is that session's failure: the loader reports a
-    // row it cannot map rather than calling the session absent, and ending
-    // the sweep at the first bad row would leave every session after it
-    // unindexed for as long as that row stays bad.
-    let mut failures: Vec<String> = Vec::new();
-    let mut inserted = 0;
-    let mut index = |sweep: &mut OpencodeSweep<'_>,
-                     session_id: &str,
-                     entry: String,
-                     token: Option<String>,
-                     loaded: Result<Option<OpencodeSession>>|
-     -> Result<bool> {
+    let load = opencode::load_all_from_sqlite(src)?;
+    let mut sessions: HashMap<String, OpencodeSession> = load
+        .sessions
+        .into_iter()
+        .map(|loaded| (loaded.session.id.clone(), loaded))
+        .collect();
+    let unreadable: HashMap<String, String> = load
+        .failures
+        .into_iter()
+        .map(|failure| (failure.session_id, failure.error))
+        .collect();
+    for session in changed {
+        check_capture_cancelled()?;
+        let loaded = match unreadable.get(&session.session_id) {
+            Some(error) => Err(anyhow::anyhow!("{error}")),
+            None => Ok(sessions.remove(&session.session_id)),
+        };
+        read.index(sweep, session, loaded)?;
+    }
+    Ok(())
+}
+
+/// One store's read in progress.
+///
+/// One session's failure is that session's failure: the loader reports a
+/// row it cannot map rather than calling the session absent, and ending the
+/// sweep at the first bad row would leave every session after it unindexed
+/// for as long as that row stays bad.
+struct StoreRead<'a> {
+    conn: &'a Connection,
+    store: &'a str,
+    inserted: usize,
+    definite: bool,
+    failures: Vec<String>,
+}
+
+impl StoreRead<'_> {
+    fn index(
+        &mut self,
+        sweep: &mut OpencodeSweep<'_>,
+        session: Changed,
+        loaded: Result<Option<OpencodeSession>>,
+    ) -> Result<()> {
         #[cfg(test)]
         tests::note_read(0, 1);
         let written = loaded.and_then(|loaded| match loaded {
-            Some(loaded) => opencode::normalize(conn, &loaded, store).map(|counts| counts.prompts),
-            None => Ok(0),
+            Some(loaded) => opencode::normalize(self.conn, &loaded, self.store),
+            None => Ok(Default::default()),
         });
-        match written {
-            Ok(prompts) => {
-                inserted += prompts;
-                match token {
-                    Some(token) => {
-                        sweep.record(conn, Stamps::Sessions, entry, session_id, &token)?
-                    }
-                    None => sweep.forget(Stamps::Sessions, entry),
-                }
-                Ok(true)
-            }
-            Err(error) => {
-                check_capture_cancelled()?;
-                failures.push(format!("{session_id}: {error:#}"));
-                sweep.forget(Stamps::Sessions, entry);
-                Ok(false)
-            }
-        }
-    };
-    // Session-keyed queries are bounded only when the provider indexes the
-    // column they seek on; without that index each one scans `part`, so the
-    // store is read whole once instead.
-    match opencode::sync_plan(src)? {
-        OpencodeSyncPlan::PerSession => {
-            for (session_id, entry, token) in changed {
-                check_capture_cancelled()?;
-                let loaded = opencode::load_from_sqlite(src, &session_id);
-                definite &= index(sweep, &session_id, entry, token, loaded)?;
-            }
-        }
-        OpencodeSyncPlan::SinglePass => {
-            let load = opencode::load_all_from_sqlite(src)?;
-            let mut sessions: HashMap<String, OpencodeSession> = load
-                .sessions
-                .into_iter()
-                .map(|loaded| (loaded.session.id.clone(), loaded))
-                .collect();
-            let unreadable: HashMap<String, String> = load
-                .failures
-                .into_iter()
-                .map(|failure| (failure.session_id, failure.error))
-                .collect();
-            for (session_id, entry, token) in changed {
-                check_capture_cancelled()?;
-                let loaded = match unreadable.get(&session_id) {
-                    Some(error) => Err(anyhow::anyhow!("{error}")),
-                    None => Ok(sessions.remove(&session_id)),
-                };
-                definite &= index(sweep, &session_id, entry, token, loaded)?;
-            }
-        }
-    }
-    if !failures.is_empty() {
-        anyhow::bail!(
-            "{} OpenCode session(s) in {store} could not be read (the rest were indexed): {}",
-            failures.len(),
-            failures.join("; ")
-        );
-    }
-    Ok((inserted, definite))
-}
-
-/// Index every changed OpenCode session in a legacy `storage/` JSON tree.
-///
-/// One session's failure is that session's failure: each is indexed or
-/// reported on its own, and the error at the end names them all.
-pub(crate) fn sync_opencode_storage_dir(
-    conn: &Connection,
-    storage_dir: &Path,
-    sweep: &mut OpencodeSweep<'_>,
-) -> Result<usize> {
-    check_capture_cancelled()?;
-    if !storage_dir.join("session").is_dir() {
-        return Ok(0);
-    }
-    let mut inserted = 0;
-    let listing = opencode::list_json_tree_session_files(storage_dir);
-    // A subtree that could not be walked is not a subtree with no sessions in
-    // it: it joins the failures, so the sessions under it are reported
-    // missing instead of silently absent.
-    let mut failures: Vec<String> = listing
-        .unreadable
-        .iter()
-        .map(|dir| format!("{}: {}", dir.path.display(), dir.error))
-        .collect();
-    let root = storage_dir.join("session").to_string_lossy().into_owned();
-    let mut seen = BTreeSet::new();
-    for session_file in super::capture_files("opencode", listing.sessions) {
-        check_capture_cancelled()?;
-        let entry = session_file.to_string_lossy().into_owned();
-        seen.insert(entry.clone());
-        let session_id = session_file
-            .file_stem()
-            .map(|stem| stem.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        // Taken before the read, so a write after it moves the stamp.
-        let token = opencode::stamp_json_tree_session(&session_file, &session_id)
-            .ok()
-            .map(|stamp| sweep.session_stamp(&stamp.token()));
-        if let Some(token) = &token {
-            if sweep.session_current(conn, Stamps::Tree, &entry, &session_id, token)? {
-                continue;
-            }
-        }
-        #[cfg(test)]
-        tests::note_read(0, 1);
-        let indexed =
-            opencode::load_from_json_tree(&session_file).and_then(|loaded| match loaded {
-                Some(loaded) => opencode::normalize(conn, &loaded, &entry)
-                    .map(|counts| (counts.prompts, Some(loaded.session.id))),
-                None => Ok((0, None)),
-            });
-        match indexed {
-            Ok((prompts, read_id)) => {
-                inserted += prompts;
-                // Under the id the file holds, which is what its evidence is
-                // keyed by; a skip asks about the file name's.
-                match (token, read_id) {
-                    (Some(token), Some(read_id)) if read_id == session_id => {
-                        sweep.record(conn, Stamps::Tree, entry, &read_id, &token)?;
-                    }
-                    _ => sweep.forget(Stamps::Tree, entry),
-                }
-            }
-            Err(error) => {
-                failures.push(format!("{}: {error:#}", session_file.display()));
-                sweep.forget(Stamps::Tree, entry);
-            }
-        }
-    }
-    let gone: Vec<String> = sweep
-        .map(Stamps::Tree)
-        .keys()
-        .filter(|entry| entry.starts_with(&root) && !seen.contains(*entry))
-        .cloned()
-        .collect();
-    for entry in gone {
-        sweep.forget(Stamps::Tree, entry);
-    }
-    if !failures.is_empty() {
-        anyhow::bail!(
-            "{} OpenCode path(s) under {} could not be read (the rest were indexed): {}",
-            failures.len(),
-            storage_dir.display(),
-            failures.join("; ")
-        );
-    }
-    Ok(inserted)
-}
-
-/// One SQLite session's stamp inputs: its row's fields and its `message` and
-/// `part` aggregates, plus the newest `time_updated` among them.
-struct SessionStampRow {
-    session_id: String,
-    parts: String,
-    newest_ms: i64,
-}
-
-/// `(count, newest time_updated, sum of row hashes)` per session.
-type TableAggregate = HashMap<String, (i64, Option<i64>, i64)>;
-
-/// Every session's stamp inputs, in one pass over each table.
-///
-/// Each row's hash covers its id, `time_updated` and payload length --
-/// `octet_length` reads the length from the record header, not the payload --
-/// so a rewritten row moves the sum even when the count and the newest
-/// timestamp stay where they were. The columns read are the ones the loaders
-/// read; a schema without one stamps without it.
-fn sqlite_session_stamps(src: &Connection) -> Result<Vec<SessionStampRow>> {
-    let session_columns = opencode::table_columns(src, "session")?;
-    if !session_columns.contains("id") {
-        return Ok(Vec::new());
-    }
-    let column = |name| opencode::optional_column(&session_columns, name);
-    let messages = message_aggregate(src)?;
-    let parts = part_aggregate(src)?;
-    let sql = format!(
-        "SELECT id, {}, {}, {}, {} FROM session WHERE id IS NOT NULL AND id <> ''",
-        column("parent_id"),
-        column("directory"),
-        column("time_created"),
-        column("time_updated"),
-    );
-    let mut stmt = src.prepare(&sql)?;
-    let rows = stmt.query_map([], |row| {
-        let fields: [rusqlite::types::Value; 4] =
-            [row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?];
-        Ok((row.get::<_, String>(0)?, fields))
-    })?;
-    let mut stamps = Vec::new();
-    for row in rows {
-        let (session_id, fields) = row?;
-        let message = messages.get(&session_id).copied().unwrap_or_default();
-        let part = parts.get(&session_id).copied().unwrap_or_default();
-        let row_ms = [&fields[2], &fields[3]]
-            .into_iter()
-            .filter_map(|value| match value {
-                rusqlite::types::Value::Integer(ms) => Some(*ms),
-                _ => None,
-            })
-            .max();
-        let newest_ms = [row_ms, message.1, part.1]
-            .into_iter()
-            .flatten()
-            .max()
-            .unwrap_or_default();
-        stamps.push(SessionStampRow {
-            parts: format!("{fields:?}|m{message:?}|p{part:?}"),
+        let Changed {
             session_id,
-            newest_ms,
-        });
-    }
-    Ok(stamps)
-}
-
-fn message_aggregate(src: &Connection) -> Result<TableAggregate> {
-    let columns = opencode::table_columns(src, "message")?;
-    if !["id", "data", "session_id"]
-        .iter()
-        .all(|name| columns.contains(*name))
-    {
-        return Ok(TableAggregate::new());
-    }
-    let updated = opencode::optional_column(&columns, "time_updated");
-    aggregate(
-        src,
-        &format!(
-            "SELECT session_id, COUNT(*), MAX({updated}), \
-             SUM(ai_hist_fnv(id || '|' || COALESCE(CAST({updated} AS TEXT), '') \
-                 || '|' || COALESCE(octet_length(data), -1))) \
-             FROM message GROUP BY session_id"
-        ),
-    )
-}
-
-/// Grouped by the part's own `session_id` when it has one, otherwise by its
-/// message's session -- the same parts either loader reads.
-fn part_aggregate(src: &Connection) -> Result<TableAggregate> {
-    let columns = opencode::table_columns(src, "part")?;
-    if !["id", "data", "message_id"]
-        .iter()
-        .all(|name| columns.contains(*name))
-    {
-        return Ok(TableAggregate::new());
-    }
-    let updated = match columns.contains("time_updated") {
-        true => "p.time_updated",
-        false => "NULL",
-    };
-    let (session, from) = if columns.contains("session_id") {
-        ("p.session_id", "part p")
-    } else {
-        let message = opencode::table_columns(src, "message")?;
-        if !message.contains("id") || !message.contains("session_id") {
-            return Ok(TableAggregate::new());
+            entry,
+            token,
+        } = session;
+        match (written, token) {
+            (Ok(counts), Some(token)) => {
+                self.inserted += counts.prompts;
+                sweep.record(self.conn, Stamps::Sessions, entry, &session_id, &token)?;
+            }
+            (Ok(counts), None) => {
+                self.inserted += counts.prompts;
+                sweep.forget(Stamps::Sessions, entry);
+            }
+            (Err(error), _) => {
+                check_capture_cancelled()?;
+                self.failures.push(format!("{session_id}: {error:#}"));
+                self.definite = false;
+                sweep.forget(Stamps::Sessions, entry);
+            }
         }
-        (
-            "m.session_id",
-            "part p JOIN message m ON m.id = p.message_id",
-        )
-    };
-    aggregate(
-        src,
-        &format!(
-            "SELECT {session}, COUNT(*), MAX({updated}), \
-             SUM(ai_hist_fnv(p.id || '|' || p.message_id || '|' \
-                 || COALESCE(CAST({updated} AS TEXT), '') \
-                 || '|' || COALESCE(octet_length(p.data), -1))) \
-             FROM {from} GROUP BY {session}"
-        ),
-    )
-}
-
-fn aggregate(src: &Connection, sql: &str) -> Result<TableAggregate> {
-    let mut stmt = src.prepare(sql)?;
-    let rows = stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, Option<String>>(0)?,
-            (row.get(1)?, row.get(2)?, row.get(3)?),
-        ))
-    })?;
-    let mut out = TableAggregate::new();
-    for row in rows {
-        let (session_id, aggregate) = row?;
-        if let Some(session_id) = session_id {
-            out.insert(session_id, aggregate);
-        }
+        Ok(())
     }
-    Ok(out)
 }

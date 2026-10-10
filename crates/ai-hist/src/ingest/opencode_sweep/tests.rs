@@ -200,7 +200,7 @@ fn a_session_written_moments_ago_is_not_stamped() {
     store
         .execute(
             "UPDATE session SET time_updated = ?1 WHERE id = ?2",
-            rusqlite::params![now_ms(), ROOT],
+            rusqlite::params![stamps::now_ms(), ROOT],
         )
         .unwrap();
     // The store file is as recent as the write: no store stamp either.

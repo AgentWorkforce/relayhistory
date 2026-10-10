@@ -1369,21 +1369,35 @@ CREATE TABLE IF NOT EXISTS session_continuity_evidence (
 );
 "#;
 
+/// Drop `trigger` unless every one of `markers` is applied, so the `CREATE
+/// TRIGGER IF NOT EXISTS` after it installs the current body.
+fn drop_trigger_unless_applied(conn: &Connection, trigger: &str, markers: &[&str]) -> Result<()> {
+    for marker in markers {
+        if !migration_applied(conn, marker)? {
+            conn.execute_batch(&format!("DROP TRIGGER IF EXISTS {trigger};"))?;
+            break;
+        }
+    }
+    Ok(())
+}
+
 fn init_db_locked(conn: &Connection) -> Result<()> {
     retire_export_capture(conn)?;
     // Same shape as the hydration-state trigger below: a body change has to
     // drop the old trigger before the `IF NOT EXISTS` in SCHEMA re-creates it.
-    if !migration_applied(conn, "session_events_fts_update_of_v1")? {
-        conn.execute_batch("DROP TRIGGER IF EXISTS session_events_au;")?;
-    }
-    if !migration_applied(conn, "history_fts_update_of_v1")?
-        || !migration_applied(conn, "fts_update_changed_only_v1")?
-    {
-        conn.execute_batch("DROP TRIGGER IF EXISTS history_au;")?;
-    }
-    if !migration_applied(conn, "fts_update_changed_only_v1")? {
-        conn.execute_batch("DROP TRIGGER IF EXISTS session_events_au;")?;
-    }
+    drop_trigger_unless_applied(
+        conn,
+        "session_events_au",
+        &[
+            "session_events_fts_update_of_v1",
+            "fts_update_changed_only_v1",
+        ],
+    )?;
+    drop_trigger_unless_applied(
+        conn,
+        "history_au",
+        &["history_fts_update_of_v1", "fts_update_changed_only_v1"],
+    )?;
     conn.execute_batch(SCHEMA)?;
     // Before the trigger below, whose body deletes from these tables.
     conn.execute_batch(SESSION_RELATIONSHIPS_DDL)?;
@@ -1391,11 +1405,14 @@ fn init_db_locked(conn: &Connection) -> Result<()> {
     // A trigger created by an earlier release keeps its old body through every
     // `CREATE TRIGGER IF NOT EXISTS`, so a changed body has to drop the old
     // one first. Behind a marker, so it happens once rather than on every open.
-    if !migration_applied(conn, "session_delete_continuity_reopen_v1")?
-        || !migration_applied(conn, SESSION_DELETE_EDGE_SEEKS)?
-    {
-        conn.execute_batch("DROP TRIGGER IF EXISTS delete_session_hydration_state;")?;
-    }
+    drop_trigger_unless_applied(
+        conn,
+        "delete_session_hydration_state",
+        &[
+            "session_delete_continuity_reopen_v1",
+            SESSION_DELETE_EDGE_SEEKS,
+        ],
+    )?;
     conn.execute_batch(
         r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (

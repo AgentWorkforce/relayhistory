@@ -2309,47 +2309,12 @@ fn sync_basic(
     }
     capture_progress("opencode", 0, None);
     check_capture_cancelled()?;
-    let opencode = roots.opencode_db.clone();
-    let opencode_storage = roots.opencode_storage_dir.clone();
-    // One owner, two layouts: `opencode.db` when the host has it, the legacy
-    // `storage/` tree when it does not. Never both — a host that upgraded has
-    // a stale tree sitting beside a live database.
-    //
-    // Asked once, through the same `detect` that discovery and hydration use.
-    // Asking it a second way here is how the two came apart: `exists()` is
-    // true for a *directory* named by `OPENCODE_DB`, so sync opened it as
-    // SQLite and failed while detect read the legacy tree — catalog rows with
-    // no evidence behind them, and nothing saying why.
-    let layout = crate::ingest::opencode::OpencodeLayout::detect(
-        &opencode,
-        roots.opencode_db_pinned,
-        &opencode_storage,
-    );
-    let mut sweep = opencode_sweep::OpencodeSweep::begin(&mut state, &repairs);
-    let opencode_result = match &layout {
-        Some(opencode::OpencodeLayout::Sqlite(dbs)) => {
-            opencode_sweep::sync_opencode_dbs(conn, dbs, &mut sweep)
-        }
-        Some(opencode::OpencodeLayout::JsonTree(tree)) => {
-            opencode_sweep::sync_opencode_storage_dir(conn, tree, &mut sweep)
-        }
-        None => Ok(0),
-    };
-    sweep.finish(&mut state);
-    if let Some(open_inserted) = report.capture("opencode", opencode_result) {
+    if let Some(inserted) = report.capture(
+        "opencode",
+        opencode_sweep::sync_opencode_sources(conn, &mut state, roots, &repairs),
+    ) {
+        total_inserted += inserted;
         checkpoints.save(&state);
-        match &layout {
-            Some(crate::ingest::opencode::OpencodeLayout::Sqlite(_)) => {
-                sync_note!("  [opencode] +{open_inserted} rows");
-            }
-            Some(crate::ingest::opencode::OpencodeLayout::JsonTree(tree)) => {
-                sync_note!("  [opencode] +{open_inserted} rows from {}", tree.display());
-            }
-            None => {
-                sync_note!("  [opencode] not found: {} (skipped)", opencode.display());
-            }
-        }
-        total_inserted += open_inserted;
     }
     capture_progress("devin", 0, None);
     check_capture_cancelled()?;
