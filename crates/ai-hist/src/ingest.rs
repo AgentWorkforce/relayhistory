@@ -30,6 +30,7 @@ pub(crate) mod jsonl;
 pub(crate) mod muse;
 pub(crate) mod opencode;
 pub(crate) mod tool_result_facts;
+mod trajectory_scan;
 pub(crate) mod transcript_cursor;
 
 #[cfg(test)]
@@ -42,6 +43,10 @@ use claude_standalone::{
 pub(crate) use claude_standalone::{
     migrate_claude_request_evidence, standalone_records_migration_pending,
 };
+use trajectory_scan::trajectory_files;
+pub(crate) use trajectory_scan::trajectory_roots;
+#[cfg(test)]
+use trajectory_scan::{collect_named_dirs, collect_trajectory_json};
 
 /// `session_markers.kind` for the point a harness compacted its context. The
 /// turns either side of it are real, but the model's view of everything
@@ -1788,18 +1793,20 @@ fn subagent_deregistered(conn: &Connection, source: &str, session_id: &str) -> R
 /// for an unrelated transcript to move — indefinitely, on a machine that only
 /// uses the flat log.
 ///
-/// Stat-only, like the adapters' own inputs: enumerating trajectory files is a
-/// directory walk, and the two logs are one stat each.
-fn sweep_only_fingerprint_inputs(roots: &crate::ProviderRoots) -> Vec<Candidate> {
+/// Stat-only, like the adapters' own inputs. The trajectory files are the
+/// sweep's own enumeration, shared with the trajectory phase rather than walked
+/// a second time; one that failed is passed as empty, which can only cause an
+/// extra sweep, never a skipped one.
+fn sweep_only_fingerprint_inputs(
+    roots: &crate::ProviderRoots,
+    trajectory_files: &[PathBuf],
+) -> Vec<Candidate> {
     let mut paths = vec![
         roots.claude.join("history.jsonl"),
         roots.codex.join("history.jsonl"),
         grok_unified_log_path(&roots.grok),
     ];
-    // Errors here mean an unreadable directory, not "no trajectories". The
-    // fold simply omits what it could not enumerate, which can only cause an
-    // extra sweep, never a skipped one.
-    paths.extend(trajectory_files(roots).unwrap_or_default());
+    paths.extend_from_slice(trajectory_files);
     let mut candidates: Vec<Candidate> = Vec::new();
     // OpenCode's legacy layout is a *tree*, and the evidence a sweep reads
     // lives in the message and part files under it rather than in the session
@@ -2160,6 +2167,13 @@ fn sync_basic(
     let mut checkpoints = SweepCheckpoints::new(&state_path, &state, state_stamp);
     let mut coverage = SweepCoverage::default();
     let providers = shallow_providers();
+    // The one trajectory enumeration this sweep makes, shared by the
+    // fingerprint and the trajectory phase. A cancellation stops the sweep
+    // here; any other failure is the phase's to report.
+    let trajectory_files = match trajectory_files(roots) {
+        Err(error) if error.is::<CaptureCancelled>() => return Err(error),
+        files => files,
+    };
     // Captured before the sweep, not after. Anything that changes while the
     // sweep runs yields a different fingerprint next time and forces one more
     // pass — cheap, because the per-session stamps then skip what already
@@ -2173,7 +2187,7 @@ fn sync_basic(
                 .iter()
                 .map(|provider| provider.as_ref())
                 .collect::<Vec<_>>(),
-            &sweep_only_fingerprint_inputs(roots),
+            &sweep_only_fingerprint_inputs(roots, trajectory_files.as_deref().unwrap_or_default()),
         );
         if let Err(error) = &taken {
             sync_note!("  [sync] source fingerprint unavailable: {error:#}");
@@ -2305,7 +2319,8 @@ fn sync_basic(
     check_capture_cancelled()?;
     if let Some(inserted) = report.capture(
         "trajectory",
-        sync_trajectories(conn, &mut state, roots, &mut coverage),
+        trajectory_files
+            .and_then(|files| sync_trajectories(conn, &mut state, files, &mut coverage)),
     ) {
         total_inserted += inserted;
         checkpoints.save(&state);
@@ -17211,13 +17226,14 @@ pub(crate) fn grok_chat_text(value: &Value, role: &str) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
+/// Index the trajectory records in `files`, the sweep's one enumeration of
+/// them (see [`trajectory_files`]).
 fn sync_trajectories(
     conn: &Connection,
     state: &mut Map<String, Value>,
-    roots: &crate::ProviderRoots,
+    files: Vec<PathBuf>,
     coverage: &mut SweepCoverage,
 ) -> Result<usize> {
-    let files = trajectory_files(roots)?;
     if files.is_empty() {
         return Ok(0);
     }
@@ -17308,131 +17324,6 @@ struct TrajectoryRow {
     path: String,
     updated_ms: i64,
     timestamp_ms: i64,
-}
-
-/// The trajectory roots this machine is configured for, whether or not
-/// anything exists inside them yet.
-///
-/// Split out from [`trajectory_files`] because the watcher and the file walk
-/// need different answers. A root that is empty, or that does not exist at
-/// all, contributes no files — but it is exactly what has to be watched, so
-/// the first trajectory written into it wakes live capture instead of waiting
-/// for the backstop.
-/// The trajectory roots these provider roots name: the explicit list when
-/// one was given (`TRAJECTORY_ROOT`, read once when the roots were built),
-/// otherwise every `.trajectories` directory under `<home>/Projects` as of
-/// now. The environment is not consulted here: an embedder that built its
-/// roots without it must not have a host's `TRAJECTORY_ROOT` redirect its
-/// sweep and its watcher outside the home it named.
-pub(crate) fn trajectory_roots(provider_roots: &crate::ProviderRoots) -> Result<Vec<PathBuf>> {
-    let mut roots = match &provider_roots.trajectory_roots {
-        Some(explicit) => explicit.clone(),
-        None => {
-            let mut derived = Vec::new();
-            let projects = provider_roots.home.join("Projects");
-            if projects.exists() {
-                collect_named_dirs(&projects, ".trajectories", &mut derived)?;
-            }
-            derived
-        }
-    };
-    roots.sort();
-    roots.dedup();
-    Ok(roots)
-}
-
-fn trajectory_files(provider_roots: &crate::ProviderRoots) -> Result<Vec<PathBuf>> {
-    let mut files = Vec::new();
-    for root in trajectory_roots(provider_roots)? {
-        check_capture_cancelled()?;
-        if root.is_file() && root.extension().and_then(|s| s.to_str()) == Some("json") {
-            files.push(root);
-            continue;
-        }
-        if !root.exists() {
-            continue;
-        }
-        // Recursively collect every trajectory JSON under the `.trajectories` root.
-        // The parser decides whether each file is a per-run trajectory or compacted roll-up.
-        collect_trajectory_json(&root, &mut files)?;
-    }
-    files.sort();
-    files.dedup();
-    Ok(files)
-}
-
-/// Directory names never worth descending into when looking for a project's
-/// `.trajectories`, and expensive enough to matter: a dependency tree or an
-/// object store can be most of the files on the disk.
-const SKIP_PROJECT_SCAN_DIRS: &[&str] = &["node_modules", "target", "vendor"];
-
-/// Find directories named `name` under `root`.
-///
-/// The pruning is load-bearing, not a micro-optimisation. This runs once per
-/// watch tick as part of the stat-only fingerprint, and an unpruned walk of
-/// `~/Projects` means walking every dependency tree and every `.git` object
-/// store on the machine before deciding that nothing has changed — which is
-/// the opposite of what a fast path is for.
-///
-/// Pruned: the names above, and any hidden directory that is not the one being
-/// looked for. A match is not descended into either; nothing nests a
-/// `.trajectories` inside another one.
-fn collect_named_dirs(root: &Path, name: &str, out: &mut Vec<PathBuf>) -> Result<()> {
-    if !root.is_dir() {
-        return Ok(());
-    }
-    for entry in fs::read_dir(root)? {
-        check_capture_cancelled()?;
-        let entry = entry?;
-        // Never follow symlinks: dependency links can revisit the same tree or cycle.
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let path = entry.path();
-        let Some(entry_name) = path.file_name().and_then(|s| s.to_str()) else {
-            continue;
-        };
-        if entry_name == name {
-            out.push(path);
-            continue;
-        }
-        if entry_name.starts_with('.')
-            || SKIP_PROJECT_SCAN_DIRS.contains(&entry_name)
-            || matches!(
-                entry_name,
-                ".next" | ".venv" | "venv" | "__pycache__" | ".cache"
-            )
-        {
-            continue;
-        }
-        collect_named_dirs(&path, name, out)?;
-    }
-    Ok(())
-}
-
-/// Recursively collect trajectory JSON under a `.trajectories` root: `completed/<month>/`
-/// individual runs, `compacted/` roll-ups, `active/`. Skips index/state/trace sidecars;
-/// `parse_trajectory_file` decides per-file what's mappable.
-fn collect_trajectory_json(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
-    if !dir.is_dir() {
-        return Ok(());
-    }
-    for entry in fs::read_dir(dir)? {
-        check_capture_cancelled()?;
-        let entry = entry?;
-        let file_type = entry.file_type()?;
-        let path = entry.path();
-        if file_type.is_dir() {
-            collect_trajectory_json(&path, out)?;
-        } else if file_type.is_file() && path.extension().and_then(|s| s.to_str()) == Some("json") {
-            let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
-            if name != "index.json" && name != ".sync-state.json" && !name.ends_with(".trace.json")
-            {
-                out.push(path);
-            }
-        }
-    }
-    Ok(())
 }
 
 fn parse_trajectory_file(path: &Path) -> Result<Option<TrajectoryRow>> {
@@ -37871,7 +37762,7 @@ mod capture_progress_tests {
                 },
                 || {
                     if named {
-                        collect_named_dirs(home.path(), ".trajectories", &mut found)
+                        collect_named_dirs(home.path(), ".trajectories", usize::MAX, &mut found)
                     } else {
                         collect_trajectory_json(home.path(), &mut found)
                     }
@@ -37882,7 +37773,7 @@ mod capture_progress_tests {
             assert!(found.len() < 20, "stop must interrupt enumeration itself");
             let mut resumed = Vec::new();
             if named {
-                collect_named_dirs(home.path(), ".trajectories", &mut resumed)
+                collect_named_dirs(home.path(), ".trajectories", usize::MAX, &mut resumed)
             } else {
                 collect_trajectory_json(home.path(), &mut resumed)
             }
@@ -37984,7 +37875,7 @@ mod capture_progress_tests {
             std::os::unix::fs::symlink(&wanted, wanted.join("completed/cycle")).unwrap();
         }
         let mut roots = vec![];
-        collect_named_dirs(home.path(), ".trajectories", &mut roots).unwrap();
+        collect_named_dirs(home.path(), ".trajectories", usize::MAX, &mut roots).unwrap();
         assert_eq!(roots, vec![wanted.clone()]);
         fs::write(wanted.join("completed/month/run.json"), "{}").unwrap();
         let mut files = vec![];
