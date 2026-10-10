@@ -105,7 +105,7 @@ CI (`.github/workflows/ci.yml`) runs, at minimum:
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -A clippy::too_many_arguments -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 cargo build -p ai-hist --no-default-features
 cargo publish --dry-run -p ai-hist --allow-dirty
