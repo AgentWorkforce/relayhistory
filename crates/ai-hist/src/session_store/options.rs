@@ -198,7 +198,9 @@ pub struct SyncOptions {
     /// every source, so a scoped sweep neither consults nor stores it, and
     /// the next unforced full sweep still sees whatever moved in the sources
     /// it left out. [`SessionStore::watch`] scopes each filesystem-event
-    /// tick this way to the sources whose roots fired.
+    /// tick this way to the sources whose roots fired. Absent from stored
+    /// JSON written before the field existed, which means a full sweep.
+    #[serde(default)]
     pub sources: Option<Vec<Source>>,
 }
 
@@ -275,5 +277,19 @@ impl HydrateOptions {
     pub fn stop(mut self, stop: StopToken) -> Self {
         self.stop = Some(stop);
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sync_options_json_without_sources_decodes_as_a_full_sweep() {
+        let options: SyncOptions =
+            serde_json::from_str(r#"{"force":true,"lock_timeout_ms":250}"#).unwrap();
+        assert!(options.force);
+        assert_eq!(options.lock_timeout_ms, 250);
+        assert!(options.sources.is_none());
     }
 }
