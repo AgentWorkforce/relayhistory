@@ -46,6 +46,8 @@ pub(crate) use claude_standalone::{
 use trajectory_scan::trajectory_files;
 pub(crate) use trajectory_scan::trajectory_roots;
 #[cfg(test)]
+pub(crate) use trajectory_scan::trajectory_walks;
+#[cfg(test)]
 use trajectory_scan::{collect_named_dirs, collect_trajectory_json};
 
 /// `session_markers.kind` for the point a harness compacted its context. The
@@ -108,6 +110,11 @@ macro_rules! sync_note {
         }
     };
 }
+
+// After `sync_note!`, which the phases report through.
+mod sweep_phases;
+use sweep_phases::SweepPhases;
+pub(crate) use sweep_phases::SweepScope;
 
 /// Refresh local agent history without performing any cloud operation.
 /// Embedding applications should use this before opening the local catalog.
@@ -320,11 +327,13 @@ pub(crate) fn sync_local_at_with_home(db_path: &Path, home: &Path) -> Result<boo
 /// changed: a baseline taken before the lock would also count whatever
 /// another sync wrote while this call waited for it. `None` means the lock
 /// was held elsewhere and nothing ran — the facade turns that into an error
-/// rather than a silent no-op.
+/// rather than a silent no-op. `scope` names the sources the sweep reads;
+/// see [`SweepScope`] for what a scoped sweep leaves alone.
 pub(crate) fn sync_facade_tick<B, R>(
     db_path: &Path,
     roots: &crate::ProviderRoots,
     force: bool,
+    scope: &SweepScope,
     before: impl FnOnce(&Connection) -> Result<B>,
     after: impl FnOnce(&Connection, B, SyncTick) -> Result<R>,
 ) -> Result<Option<(SyncTick, R)>> {
@@ -335,7 +344,7 @@ pub(crate) fn sync_facade_tick<B, R>(
     };
     let conn = open_db(db_path).map_err(|error| enrich_sync_error(db_path, error))?;
     let baseline = before(&conn)?;
-    let swept = sync_basic(&conn, db_path, roots, force)
+    let swept = sync_basic(&conn, db_path, roots, force, scope)
         .map_err(|error| enrich_sync_error(db_path, error))?;
     let tick = SyncTick {
         attempted: true,
@@ -1925,14 +1934,27 @@ mod opencode_watch_pin_tests {
 pub(crate) fn sync_watch_roots_with_provider_roots(
     provider_roots: &crate::ProviderRoots,
 ) -> Vec<discover::WatchRoot> {
-    // Per source, through the one builder `Source::capabilities()` also
-    // reads, so the roots the loop registers and the roots the facade
-    // advertises cannot drift apart.
-    let mut roots = Vec::new();
-    for source in crate::store::SOURCE_CHOICES {
-        roots.extend(source_watch_roots(source, provider_roots));
-    }
-    merge_watch_roots(roots)
+    merge_watch_roots(
+        sync_watch_roots_by_source(provider_roots)
+            .into_iter()
+            .flat_map(|(_, roots)| roots)
+            .collect(),
+    )
+}
+
+/// [`sync_watch_roots_with_provider_roots`] before the merge: each source's
+/// roots, so a watch can tell which source an event's root belongs to.
+///
+/// Per source, through the one builder `Source::capabilities()` also reads,
+/// so the roots the loop registers and the roots the facade advertises cannot
+/// drift apart.
+pub(crate) fn sync_watch_roots_by_source(
+    provider_roots: &crate::ProviderRoots,
+) -> Vec<(&'static str, Vec<discover::WatchRoot>)> {
+    crate::store::SOURCE_CHOICES
+        .iter()
+        .map(|source| (*source, source_watch_roots(source, provider_roots)))
+        .collect()
 }
 
 /// Everything the sweep reads for one source, as the watcher registers it:
@@ -1974,7 +1996,7 @@ pub(crate) fn source_watch_roots(
 }
 
 /// One entry per path, at the widest depth any claim asked for.
-fn merge_watch_roots(mut roots: Vec<discover::WatchRoot>) -> Vec<discover::WatchRoot> {
+pub(crate) fn merge_watch_roots(mut roots: Vec<discover::WatchRoot>) -> Vec<discover::WatchRoot> {
     roots.sort();
     roots.dedup_by(|later, first| {
         if later.path != first.path {
@@ -2080,15 +2102,51 @@ fn sources_unchanged(conn: &Connection, state: &Map<String, Value>, current: &st
     }
 }
 
-/// Runs the local sweep. `Ok(false)` means the stat-only source fingerprint
-/// matched the last sweep's and nothing was walked.
+/// The stat-only fingerprint of everything a full sweep reads, qualified by
+/// the generation that produced it so an upgrade that bumps a parser or
+/// scanner generation cannot honour the stamp the previous one wrote. `None`
+/// when it could not be taken, which only costs the fast path.
+fn sweep_fingerprint(
+    conn: &Connection,
+    roots: &crate::ProviderRoots,
+    providers: &[Box<dyn ShallowSessionProvider>],
+    trajectory_files: Option<&Result<Vec<PathBuf>>>,
+) -> Option<String> {
+    let env = DiscoveryEnv::with_provider_roots(conn, roots.clone());
+    let trajectory_files = match trajectory_files {
+        Some(Ok(files)) => files.as_slice(),
+        _ => &[],
+    };
+    let providers = providers
+        .iter()
+        .map(|provider| provider.as_ref())
+        .collect::<Vec<_>>();
+    let inputs = sweep_only_fingerprint_inputs(roots, trajectory_files);
+    match discover::source_fingerprint_with(&env, &providers, &inputs) {
+        Ok(sources) => Some(format!("{}/{sources}", sweep_generation())),
+        Err(error) => {
+            sync_note!("  [sync] source fingerprint unavailable: {error:#}");
+            None
+        }
+    }
+}
+
+/// Runs the local sweep over the sources `scope` names. A full sweep keeps
+/// the fingerprint fast path unless `force`; a scoped one always reads its
+/// sources and never consults or stores the fingerprint or the destination
+/// marker, both statements about every source (see [`SweepScope`]).
+/// `Ok(false)` means nothing was walked: the fingerprint matched, or the
+/// scope names no source with local files.
 fn sync_basic(
     conn: &Connection,
     db_path: &Path,
     roots: &crate::ProviderRoots,
     force: bool,
+    scope: &SweepScope,
 ) -> Result<bool> {
-    let home = &roots.home;
+    if scope.reads_nothing() {
+        return Ok(false);
+    }
     // See `begin_acquisition_pass`: the resolver's cache is sound only within
     // one pass, and a long-lived host (watch, the Node addon, a desktop app)
     // runs many passes without restarting.
@@ -2123,7 +2181,6 @@ fn sync_basic(
             }
         }
     }
-    let mut total_inserted = 0;
     let mut report = SyncSourceReport::new(db_path);
     let state_path = db_path
         .parent()
@@ -2166,39 +2223,27 @@ fn sync_basic(
     let (mut state, state_stamp) = load_sync_state_stamped(&state_path);
     let mut checkpoints = SweepCheckpoints::new(&state_path, &state, state_stamp);
     let mut coverage = SweepCoverage::default();
-    let providers = shallow_providers();
+    let mut providers = shallow_providers();
+    providers.retain(|provider| scope.includes(provider.source()));
     // The one trajectory enumeration this sweep makes, shared by the
     // fingerprint and the trajectory phase. A cancellation stops the sweep
     // here; any other failure is the phase's to report.
-    let trajectory_files = match trajectory_files(roots) {
-        Err(error) if error.is::<CaptureCancelled>() => return Err(error),
+    let trajectory_files = match scope
+        .includes("trajectory")
+        .then(|| trajectory_files(roots))
+    {
+        Some(Err(error)) if error.is::<CaptureCancelled>() => return Err(error),
         files => files,
     };
     // Captured before the sweep, not after. Anything that changes while the
     // sweep runs yields a different fingerprint next time and forces one more
     // pass — cheap, because the per-session stamps then skip what already
     // landed. A fingerprint recorded ahead of the work it describes would lose
-    // that append instead.
-    let fingerprint = {
-        let env = DiscoveryEnv::with_provider_roots(conn, roots.clone());
-        let taken = discover::source_fingerprint_with(
-            &env,
-            &providers
-                .iter()
-                .map(|provider| provider.as_ref())
-                .collect::<Vec<_>>(),
-            &sweep_only_fingerprint_inputs(roots, trajectory_files.as_deref().unwrap_or_default()),
-        );
-        if let Err(error) = &taken {
-            sync_note!("  [sync] source fingerprint unavailable: {error:#}");
-        }
-        // Qualified by the generation that produced it, so an upgrade that
-        // bumps a parser or scanner generation cannot honour the stamp the
-        // previous one wrote.
-        taken
-            .ok()
-            .map(|sources| format!("{}/{sources}", sweep_generation()))
-    };
+    // that append instead. A scoped sweep takes none: it may not store one.
+    let fingerprint = scope
+        .is_everything()
+        .then(|| sweep_fingerprint(conn, roots, &providers, trajectory_files.as_ref()))
+        .flatten();
     if !force {
         if let Some(current) = fingerprint.as_deref() {
             if sources_unchanged(conn, &state, current) {
@@ -2212,7 +2257,7 @@ fn sync_basic(
     // licenses a skip. A failure here costs the repair, not the sweep.
     // The counts it was taken from are kept: the end of the sweep needs them
     // again, and recounts only the sessions the sweep wrote (#321).
-    let (repairs, repair_plan_known, mut destination) =
+    let (repairs, repair_plan_known, destination) =
         match destination_shortfall_counted(conn, &state, None) {
             Ok((repairs, counted)) => (repairs, true, counted),
             Err(error) => {
@@ -2235,148 +2280,18 @@ fn sync_basic(
     // turns one interrupted run into a loop that re-scans from scratch forever
     // and never persists anything. Checkpointing makes each source's cursor
     // durable the moment that source completes.
-    capture_progress("claude-history", 0, None);
-    check_capture_cancelled()?;
-    if let Some(inserted) = report.capture(
-        "claude",
-        sync_jsonl_incremental(
-            conn,
-            &mut state,
-            "claude",
-            &roots.claude.join("history.jsonl"),
-            parse_claude_line,
-            &mut |in_progress| checkpoints.save(in_progress),
-        ),
-    ) {
-        total_inserted += inserted;
-        checkpoints.save(&state);
-    }
-    capture_progress("claude", 0, None);
-    check_capture_cancelled()?;
-    if report
-        .capture(
-            "claude-metadata",
-            sync_claude_session_metadata_with_repairs_and_coverage(
-                conn,
-                &mut state,
-                &roots.claude.join("projects"),
-                &repairs,
-                &mut coverage,
-            ),
-        )
-        .is_some()
-    {
-        checkpoints.save(&state);
-    }
-    capture_progress("codex", 0, None);
-    check_capture_cancelled()?;
-    if let Some(inserted) = report.capture(
-        "codex",
-        sync_codex_with_repairs_and_coverage(
-            conn,
-            &mut state,
-            &roots.codex,
-            &repairs,
-            &mut coverage,
-        ),
-    ) {
-        total_inserted += inserted;
-        checkpoints.save(&state);
-    }
-    capture_progress("cursor", 0, None);
-    check_capture_cancelled()?;
-    if let Some(inserted) = report.capture(
-        "cursor",
-        sync_cursor(
-            conn,
-            &mut state,
-            &home.join(".cursor/projects"),
-            &mut coverage,
-        ),
-    ) {
-        total_inserted += inserted;
-        checkpoints.save(&state);
-    }
-    capture_progress("grok", 0, None);
-    check_capture_cancelled()?;
-    if let Some(inserted) = report.capture(
-        "grok",
-        sync_grok_home(conn, &mut state, &roots.grok, &mut coverage),
-    ) {
-        total_inserted += inserted;
-        checkpoints.save(&state);
-    }
-    capture_progress("muse", 0, None);
-    check_capture_cancelled()?;
-    if let Some(inserted) = report.capture(
-        "muse",
-        sync_muse_with_coverage(conn, &mut state, &roots.muse, &repairs, &mut coverage),
-    ) {
-        total_inserted += inserted;
-        checkpoints.save(&state);
-    }
-    capture_progress("trajectory", 0, None);
-    check_capture_cancelled()?;
-    if let Some(inserted) = report.capture(
-        "trajectory",
-        trajectory_files
-            .and_then(|files| sync_trajectories(conn, &mut state, files, &mut coverage)),
-    ) {
-        total_inserted += inserted;
-        checkpoints.save(&state);
-    }
-    capture_progress("opencode", 0, None);
-    check_capture_cancelled()?;
-    let opencode = roots.opencode_db.clone();
-    let opencode_storage = roots.opencode_storage_dir.clone();
-    // One owner, two layouts: `opencode.db` when the host has it, the legacy
-    // `storage/` tree when it does not. Never both — a host that upgraded has
-    // a stale tree sitting beside a live database.
-    //
-    // Asked once, through the same `detect` that discovery and hydration use.
-    // Asking it a second way here is how the two came apart: `exists()` is
-    // true for a *directory* named by `OPENCODE_DB`, so sync opened it as
-    // SQLite and failed while detect read the legacy tree — catalog rows with
-    // no evidence behind them, and nothing saying why.
-    let layout = crate::ingest::opencode::OpencodeLayout::detect(
-        &opencode,
-        roots.opencode_db_pinned,
-        &opencode_storage,
-    );
-    let opencode_result = match &layout {
-        Some(crate::ingest::opencode::OpencodeLayout::Sqlite(dbs)) => sync_opencode_dbs(conn, dbs),
-        Some(crate::ingest::opencode::OpencodeLayout::JsonTree(tree)) => {
-            sync_opencode_storage_dir(conn, tree)
-        }
-        None => Ok(0),
+    let mut phases = SweepPhases {
+        conn,
+        state: &mut state,
+        roots,
+        repairs: &repairs,
+        coverage: &mut coverage,
+        report: &mut report,
+        checkpoints: &mut checkpoints,
+        inserted: 0,
     };
-    if let Some(open_inserted) = report.capture("opencode", opencode_result) {
-        match &layout {
-            Some(crate::ingest::opencode::OpencodeLayout::Sqlite(_)) => {
-                sync_note!("  [opencode] +{open_inserted} rows");
-            }
-            Some(crate::ingest::opencode::OpencodeLayout::JsonTree(tree)) => {
-                sync_note!("  [opencode] +{open_inserted} rows from {}", tree.display());
-            }
-            None => {
-                sync_note!("  [opencode] not found: {} (skipped)", opencode.display());
-            }
-        }
-        total_inserted += open_inserted;
-    }
-    capture_progress("devin", 0, None);
-    check_capture_cancelled()?;
-    if let Some(inserted) = report.capture(
-        "devin",
-        devin::sync_devin_db(conn, &mut state, &roots.devin, &repairs, &mut coverage),
-    ) {
-        total_inserted += inserted;
-        checkpoints.save(&state);
-        if inserted > 0 {
-            sync_note!("  [devin] +{inserted} rows");
-        }
-    }
-    check_capture_cancelled()?;
+    phases.run(scope, trajectory_files)?;
+    let total_inserted = phases.inserted;
 
     // A source that was statted into the fingerprint but could not be read is
     // the one case where caching the fingerprint would make a transient
@@ -2433,7 +2348,62 @@ fn sync_basic(
         );
         coverage.note_unread();
     }
-    let all_sources_read = sweep_read_everything && coverage.complete();
+    if scope.is_everything() {
+        seal_full_sweep(
+            conn,
+            &mut state,
+            &mut checkpoints,
+            FullSweepSeal {
+                all_sources_read: sweep_read_everything && coverage.complete(),
+                repairs: &repairs,
+                repair_plan_known,
+                destination,
+                fingerprint,
+            },
+        );
+    }
+    let total: i64 = conn.query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))?;
+    // Fold the WAL back into the database now that the writes are done.
+    // Left unchecked the WAL grows without bound (156MB observed in the wild).
+    let checkpoint = checkpoint_after_sweep(conn, db_path, WAL_TRUNCATE_BYTES);
+    if checkpoint.wal_bytes > WAL_WARN_BYTES {
+        eprintln!(
+            "ai-hist: WAL is {} after checkpointing -- a long-lived reader is \
+             pinning an old snapshot; run `ai-hist doctor`",
+            human_bytes(checkpoint.wal_bytes)
+        );
+    }
+    sync_note!("  [rust-sync] +{total_inserted} rows");
+    sync_note!("  Total: {total} entries");
+    Ok(true)
+}
+
+/// What the end of a full sweep needs to decide whether it may record the
+/// source fingerprint and the destination marker.
+struct FullSweepSeal<'a> {
+    all_sources_read: bool,
+    repairs: &'a SweepRepairs,
+    repair_plan_known: bool,
+    destination: Option<DestinationSnapshot>,
+    fingerprint: Option<String>,
+}
+
+/// Record the fingerprint and destination marker a full sweep earned, or
+/// leave both stale when it did not read everything or left a loss in place.
+/// Never for a scoped sweep: both are statements about every source.
+fn seal_full_sweep(
+    conn: &Connection,
+    state: &mut Map<String, Value>,
+    checkpoints: &mut SweepCheckpoints<'_>,
+    seal: FullSweepSeal<'_>,
+) {
+    let FullSweepSeal {
+        all_sources_read,
+        repairs,
+        repair_plan_known,
+        mut destination,
+        fingerprint,
+    } = seal;
     // Written after every cursor this sweep advanced, and in its own
     // checkpoint. A crash between them leaves cursors ahead of a stale
     // fingerprint, which costs one extra full walk that then finds nothing —
@@ -2453,7 +2423,7 @@ fn sync_basic(
         // recover instead of forcing full sweeps forever.
         Some(SweepRepairs::default())
     } else {
-        match destination_shortfall_counted(conn, &state, destination.take()) {
+        match destination_shortfall_counted(conn, state, destination.take()) {
             Ok((outstanding, counted)) => {
                 destination = counted;
                 Some(outstanding)
@@ -2513,23 +2483,9 @@ fn sync_basic(
                 Value::from(destination),
             );
             state.insert(DESTINATION_HEAD_KEY.to_string(), Value::from(head));
-            checkpoints.save(&state);
+            checkpoints.save(state);
         }
     }
-    let total: i64 = conn.query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))?;
-    // Fold the WAL back into the database now that the writes are done.
-    // Left unchecked the WAL grows without bound (156MB observed in the wild).
-    let checkpoint = checkpoint_after_sweep(conn, db_path, WAL_TRUNCATE_BYTES);
-    if checkpoint.wal_bytes > WAL_WARN_BYTES {
-        eprintln!(
-            "ai-hist: WAL is {} after checkpointing -- a long-lived reader is \
-             pinning an old snapshot; run `ai-hist doctor`",
-            human_bytes(checkpoint.wal_bytes)
-        );
-    }
-    sync_note!("  [rust-sync] +{total_inserted} rows");
-    sync_note!("  Total: {total} entries");
-    Ok(true)
 }
 
 /// WAL size past which the post-sweep checkpoint escalates from `PASSIVE` to
@@ -2817,7 +2773,7 @@ fn sync_exclusive_with_roots(
         return Ok(SyncTick::default());
     };
     let conn = open_db(db_path).map_err(|error| enrich_sync_error(db_path, error))?;
-    let swept = sync_basic(&conn, db_path, roots, force)
+    let swept = sync_basic(&conn, db_path, roots, force, &SweepScope::everything())
         .map_err(|error| enrich_sync_error(db_path, error))?;
     Ok(SyncTick {
         attempted: true,
@@ -2942,7 +2898,8 @@ pub fn prepare_local_sync_snapshot(db_path: &Path) -> Result<(Connection, bool)>
     };
     let conn = open_db(db_path).map_err(|error| enrich_sync_error(db_path, error))?;
     let roots = crate::ProviderRoots::from_env(home_dir());
-    sync_basic(&conn, db_path, &roots, false).map_err(|error| enrich_sync_error(db_path, error))?;
+    sync_basic(&conn, db_path, &roots, false, &SweepScope::everything())
+        .map_err(|error| enrich_sync_error(db_path, error))?;
     drop(sync_lock);
     Ok((conn, false))
 }
@@ -35425,12 +35382,12 @@ mod tests {
     /// re-indexes it, and checkpoint merging keeps the *newer* offset, so an
     /// older scan that cleared evidence a newer scan had already committed
     /// would leave those records skipped permanently. What makes it
-    /// unreachable is that `sync_cursor` is private and has exactly one
-    /// non-test caller, `sync_basic`, which in turn has exactly two:
-    /// `sync_exclusive_with_home` and `prepare_local_sync_snapshot`. Both
-    /// acquire `SyncRunLock` — an exclusive advisory lock on
-    /// `<canonical-db>.sync.lock` — *before* opening the database, and hold it
-    /// for the whole call. The second sync does not queue behind the first and
+    /// unreachable is that `sync_cursor` is private and is reached only
+    /// through the sweep's phases in `sync_basic`, whose every caller —
+    /// `sync_exclusive_with_home`, `prepare_local_sync_snapshot`,
+    /// `sync_facade_tick` — acquires `SyncRunLock` — an exclusive advisory lock on
+    /// `<canonical-db>.sync.lock` — *before* opening the database, and holds
+    /// it for the whole call. The second sync does not queue behind the first and
     /// proceed later against stale state; `try_lock_exclusive` returns
     /// `WouldBlock`, and the run reports "another sync is already running" and
     /// does nothing at all.

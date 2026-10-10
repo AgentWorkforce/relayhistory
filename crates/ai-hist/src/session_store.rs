@@ -41,8 +41,8 @@ use crate::ingest::hydrate::{
     hydrate_session_at_with_roots_and_connectors, HydrateSessionOptions, HydrateSessionResult,
 };
 use crate::ingest::{
-    source_watch_roots, sync_facade_tick, sync_watch_roots_with_provider_roots, with_capture_token,
-    CaptureCancelled, SyncTick, HOOK_HARNESSES,
+    source_watch_roots, sync_facade_tick, with_capture_token, CaptureCancelled, SweepScope,
+    SyncTick, HOOK_HARNESSES,
 };
 use crate::paths::home_dir;
 pub use crate::paths::ProviderRoots;
@@ -72,11 +72,13 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 mod options;
+mod watch_sweep;
 
 pub(crate) use options::controlled;
 pub use options::{
     DiscoveryOptions, HydrateOptions, ProgressObserver, StopToken, StoreOptions, SyncOptions,
 };
+use watch_sweep::{TickNotes, WatchSources, WatchSweep};
 
 // ---------------------------------------------------------------------------
 // errors
@@ -714,8 +716,12 @@ impl SessionStore {
         if self.read_only {
             return Err(Error::read_only("sync"));
         }
+        let scope = match &opts.sources {
+            None => SweepScope::everything(),
+            Some(sources) => SweepScope::only(sources.iter().map(|source| source.as_str())),
+        };
         let (tick, changed) = controlled(opts.stop.as_ref(), opts.progress.as_ref(), || {
-            self.sync_tick(opts.force, opts.lock_timeout_ms)
+            self.sync_tick(opts.force, opts.lock_timeout_ms, &scope)
         })?;
         Ok(SyncReport {
             swept: tick.swept,
@@ -734,6 +740,7 @@ impl SessionStore {
         &self,
         force: bool,
         lock_timeout_ms: u64,
+        scope: &SweepScope,
     ) -> Result<(SyncTick, Vec<SessionRef>), Error> {
         let started = Instant::now();
         // Bounded where it enters, like every watch interval: `Instant +
@@ -747,6 +754,7 @@ impl SessionStore {
                 &self.db_path,
                 &self.roots,
                 force,
+                scope,
                 |conn| catalog_fingerprint(conn).map_err(anyhow::Error::from),
                 |conn, before, _tick| Ok(changes_under_lock(conn, &before)?.1),
             )
@@ -903,7 +911,8 @@ impl SessionStore {
         if self.read_only {
             return Err(Error::read_only("watch"));
         }
-        let roots = sync_watch_roots_with_provider_roots(&self.roots);
+        let sources = Arc::new(WatchSources::new(self.roots.clone()));
+        let roots = sources.watch_roots();
         let (reports, receiver) = mpsc::channel::<Result<TickReport, Error>>();
         // The loop's thread takes the sender out when `run` returns, so the
         // channel closes when the loop ends and `WatchHandle::next` can block
@@ -914,22 +923,20 @@ impl SessionStore {
         let close_reports = reports.clone();
         let stop = opts.stop.clone().unwrap_or_default();
 
-        let pending: Arc<Mutex<Vec<SessionRef>>> = Arc::new(Mutex::new(Vec::new()));
+        let notes: Arc<Mutex<TickNotes>> = Arc::default();
         let sweep = WatchSweep {
             db_path: self.db_path.clone(),
-            roots: self.roots.clone(),
+            sources: sources.clone(),
             stop: stop.clone(),
             baseline: Mutex::new(None),
-            pending: pending.clone(),
+            notes: notes.clone(),
             reports: reports.clone(),
         };
-        let tick: crate::watch::TickFn = Arc::new(move |force| sweep.tick(force));
+        let tick: crate::watch::ScopedTickFn = Arc::new(move |request| sweep.tick(request));
 
         let report_sink = reports.clone();
-        let report_pending = pending;
         let error_sink = reports;
-        let refresh_roots = self.roots.clone();
-        let mut watch = WatchLoop::new(tick)
+        let mut watch = WatchLoop::scoped(tick)
             .with_roots(roots)
             .with_fs_events(opts.use_fs_events)
             .with_debounce_ms(opts.debounce_ms)
@@ -938,8 +945,8 @@ impl SessionStore {
             .with_immediate(opts.immediate)
             .with_leading_edge(opts.leading_edge)
             .on_report(Arc::new(move |report| {
-                let changed = std::mem::take(&mut *report_pending.lock().expect("watch pending"));
-                let tick = TickReport::from_loop(report, changed);
+                let notes = std::mem::take(&mut *notes.lock().expect("watch notes"));
+                let tick = TickReport::from_loop(report, notes);
                 send_report(&report_sink, || Ok(tick));
             }))
             .on_error(Arc::new(move |error| {
@@ -947,9 +954,7 @@ impl SessionStore {
                     Err(Error::sync(anyhow::anyhow!("{error:#}")))
                 });
             }));
-        watch = watch.with_roots_refresh(Arc::new(move || {
-            sync_watch_roots_with_provider_roots(&refresh_roots)
-        }));
+        watch = watch.with_roots_refresh(Arc::new(move || sources.watch_roots()));
         let watch = Arc::new(watch);
         let thread = spawn_watch_thread(watch.clone(), close_reports)?;
         Ok(WatchHandle {
@@ -1212,126 +1217,6 @@ type ReportSlot = Arc<Mutex<Option<ReportSender>>>;
 fn send_report(slot: &ReportSlot, item: impl FnOnce() -> Result<TickReport, Error>) {
     if let Some(sender) = &*slot.lock().expect("watch reports") {
         let _ = sender.send(item());
-    }
-}
-
-/// One watch loop's sweep: the same locked `sync` as [`SessionStore::sync`],
-/// diffed against a rolling catalog baseline.
-///
-/// The sweep and the report sink run on the loop's thread, one tick at a
-/// time, so a single slot (`pending`) carries "what this tick changed" from
-/// the one to the other.
-struct WatchSweep {
-    db_path: PathBuf,
-    roots: ProviderRoots,
-    stop: StopToken,
-    baseline: Mutex<Option<CatalogFingerprint>>,
-    pending: Arc<Mutex<Vec<SessionRef>>>,
-    reports: ReportSlot,
-}
-
-impl WatchSweep {
-    fn tick(&self, force: bool) -> anyhow::Result<TickOutcome> {
-        // Both reads happen under the sync lock, like `sync`'s. The
-        // baseline is the previous swept tick's `after` digest when there
-        // is one — nothing this loop reported has moved since, and a
-        // change another process made in between is a change since the
-        // last report either way — and a fresh read otherwise.
-        let mut base = self.baseline.lock().expect("watch baseline");
-        // The baseline this sweep compares against, kept outside it so a
-        // cancelled sweep can still say what it committed (below).
-        let mut swept_from: Option<CatalogFingerprint> = None;
-        let result = with_capture_token(self.stop.clone(), || {
-            rolling_tick(&mut base, |previous| {
-                self.sweep(force, previous, &mut swept_from)
-            })
-        });
-        match result {
-            Ok((outcome, changed)) => {
-                *self.pending.lock().expect("watch pending") = changed;
-                Ok(outcome)
-            }
-            Err(error) => {
-                // A stop can land after the sweep committed chunks, or
-                // after it finished and rolled the baseline forward — the
-                // capture scope re-checks the token on the way out. The
-                // loop ends on a cancellation, so this is the last chance
-                // to report those rows.
-                if error.chain().any(|cause| cause.is::<CaptureCancelled>()) {
-                    if let Some(before) = swept_from {
-                        self.report_cancelled(&mut base, &before);
-                    }
-                }
-                Err(error)
-            }
-        }
-    }
-
-    fn sweep(
-        &self,
-        force: bool,
-        previous: Option<CatalogFingerprint>,
-        swept_from: &mut Option<CatalogFingerprint>,
-    ) -> anyhow::Result<Option<(SyncTick, CatalogFingerprint, Vec<SessionRef>)>> {
-        let outcome = sync_facade_tick(
-            &self.db_path,
-            &self.roots,
-            force,
-            |conn| {
-                let before = match previous {
-                    Some(before) => before,
-                    None => catalog_fingerprint(conn).map_err(anyhow::Error::from)?,
-                };
-                *swept_from = Some(before.clone());
-                #[cfg(test)]
-                if cancel_diff_fault(&self.db_path) {
-                    // Stop once the baseline is taken, so the
-                    // sweep is cancelled with a baseline to diff.
-                    self.stop.stop();
-                }
-                Ok(before)
-            },
-            |conn, before, _tick| {
-                let (after, changed) = changes_under_lock(conn, &before)?;
-                Ok((after, changed))
-            },
-        )?;
-        Ok(outcome.map(|(tick, (after, changed))| (tick, after, changed)))
-    }
-
-    /// Diff the catalog against the baseline a cancelled sweep started from,
-    /// roll it forward, and let the cancelled report carry the result. A
-    /// read-only connection outside the sync lock: the diff writes nothing,
-    /// and a reader is no worse than the "changed since the last report" this
-    /// field already promises.
-    fn report_cancelled(&self, base: &mut Option<CatalogFingerprint>, before: &CatalogFingerprint) {
-        let diff = open_db_readonly(&self.db_path)
-            .map_err(Error::sync)
-            .and_then(|conn| {
-                #[cfg(test)]
-                if cancel_diff_fault(&self.db_path) {
-                    return Err(Error::sync(anyhow::anyhow!("injected diff failure")));
-                }
-                changes_under_lock(&conn, before)
-            });
-        match diff {
-            Ok((after, changed)) => {
-                *base = Some(after);
-                *self.pending.lock().expect("watch pending") = changed;
-            }
-            // Surfaced rather than swallowed, and without giving up the
-            // cancellation: the failure goes onto the stream as its own
-            // `Err`, ahead of the cancelled report, and the cancellation is
-            // still what this tick returns, so the loop ends as it was asked
-            // to.
-            Err(diff_error) => send_report(&self.reports, || {
-                Err(Error::sync(anyhow::anyhow!(
-                    "watch tick cancelled after committing changes \
-                     that could not be read back for its report: \
-                     {diff_error}"
-                )))
-            }),
-        }
     }
 }
 
@@ -2040,10 +1925,17 @@ pub struct TickReport {
     /// lock, swept or not, so a hydration landing between ticks is reported
     /// once by the tick that follows it. Empty on a `contended` tick.
     pub changed: Vec<SessionRef>,
+    /// The sources this tick swept (or, when `contended`, would have).
+    /// `None` is every local source: startup, backstop and manual ticks, and
+    /// an event the loop could not place under a watched root. A
+    /// filesystem-event tick names the sources whose roots fired in its
+    /// debounce window, and reads only those; see [`SyncOptions::sources`].
+    #[serde(default)]
+    pub sources: Option<Vec<Source>>,
 }
 
 impl TickReport {
-    fn from_loop(report: &crate::watch::TickReport, changed: Vec<SessionRef>) -> Self {
+    fn from_loop(report: &crate::watch::TickReport, notes: TickNotes) -> Self {
         Self {
             trigger: report.trigger,
             forced: report.forced,
@@ -2053,7 +1945,8 @@ impl TickReport {
             cancelled: report.cancelled,
             elapsed_ms: duration_ms(report.elapsed),
             first_event_age_ms: report.first_event_at.map(|at| duration_ms(at.elapsed())),
-            changed,
+            changed: notes.changed,
+            sources: notes.sources,
         }
     }
 }
@@ -3092,6 +2985,7 @@ fn all_user_turns(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ingest::sync_watch_roots_with_provider_roots;
 
     /// `Source::ALL` is the enumeration an embedder gets. The `match` here is
     /// exhaustive on purpose: a new variant that is not in `ALL` breaks the
@@ -3139,6 +3033,63 @@ mod tests {
             ..StoreOptions::default()
         })
         .unwrap()
+    }
+
+    /// A filesystem event under one provider's root sweeps that provider
+    /// alone, and the report says so; the startup tick is the full sweep.
+    #[cfg(feature = "fs-events")]
+    #[test]
+    fn an_event_tick_sweeps_only_the_provider_whose_root_fired() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ai-history.db");
+        let transcript = dir.path().join(".claude/projects/app/s1.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(dir.path().join(".codex/sessions")).unwrap();
+        let record = |uuid: &str, text: &str| {
+            format!(
+                "{{\"type\":\"user\",\"uuid\":\"{uuid}\",\"sessionId\":\"s1\",\"cwd\":\"/tmp/app\",\
+                 \"timestamp\":\"2026-09-20T00:00:00.000Z\",\"message\":{{\"role\":\"user\",\"content\":\"{text}\"}}}}\n"
+            )
+        };
+        std::fs::write(&transcript, record("u1", "first")).unwrap();
+        let store = store_at(&db);
+        let mut watch = store
+            .watch(WatchOptions {
+                debounce_ms: 50,
+                slow_poll_ms: 600_000,
+                ..WatchOptions::default()
+            })
+            .unwrap();
+        let startup = watch
+            .next_timeout(Duration::from_secs(30))
+            .expect("startup tick")
+            .unwrap();
+        assert_eq!(startup.trigger, TickTrigger::Startup);
+        assert_eq!(startup.sources, None, "startup is a full sweep");
+        // FSEvents replays the writes that seeded the tree once the stream
+        // is registered; let those ticks pass first.
+        while watch.next_timeout(Duration::from_millis(1_500)).is_some() {}
+
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        std::io::Write::write_all(&mut file, record("u2", "second").as_bytes()).unwrap();
+        drop(file);
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let event = loop {
+            assert!(Instant::now() < deadline, "no event tick for the append");
+            let Some(tick) = watch.next_timeout(Duration::from_secs(5)) else {
+                continue;
+            };
+            let tick = tick.unwrap();
+            if tick.trigger == TickTrigger::FsEvent {
+                break tick;
+            }
+        };
+        assert!(event.forced && event.swept);
+        assert_eq!(event.sources, Some(vec![Source::Claude]));
+        watch.stop();
     }
 
     /// `u64::MAX` means "wait as long as it takes", not "panic before the
@@ -3531,7 +3482,7 @@ mod tests {
                 // Assert inside the scope so its final check cannot mask an
                 // incorrectly classified SyncLocked from the retry path.
                 assert!(matches!(
-                    store.sync_tick(false, 0),
+                    store.sync_tick(false, 0, &SweepScope::everything()),
                     Err(Error::Cancelled(_))
                 ));
                 Ok(())
@@ -3687,6 +3638,7 @@ mod tests {
             &db,
             store.roots(),
             false,
+            &SweepScope::everything(),
             |conn| {
                 let before = catalog_fingerprint(conn)?;
                 conn.execute_batch(

@@ -130,8 +130,9 @@ providers' session roots (`~/.claude/projects`, `~/.codex/sessions`,
 `~/.codex/archived_sessions`, `~/.cursor/projects`, `~/.grok/sessions`, and the
 directory holding the OpenCode database) plus the flat per-harness logs
 `~/.claude/history.jsonl` and `~/.codex/history.jsonl` and any `.trajectories`
-directory. It then runs one sweep per burst of writes, with a slow poll behind
-it. When no root can be watched — a network mount, a container without inotify,
+directory (found under `~/Projects` at most five directories down, or named by
+`TRAJECTORY_ROOT`). It then runs one sweep per burst of writes, with a slow poll
+behind it. When no root can be watched — a network mount, a container without inotify,
 `--no-fsevents` — it falls back to polling at `--interval`.
 
 Startup reports which driver it took **and which roots are not covered yet**. A
