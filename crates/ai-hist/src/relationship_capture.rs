@@ -191,6 +191,19 @@ static RECORD_RELATIONSHIP_SQL: std::sync::LazyLock<String> = std::sync::LazyLoc
     )
 });
 
+/// Retires the unlinked row a named child supersedes: `?1` source, `?2`
+/// parent, `?3` locator, `?4` the unlinked status, `?5` kind, `?6` the named
+/// row's uid.
+///
+/// The parent is the selective term, so it is the one the index seeks on.
+/// The unary `+` keeps `evidence_locator` off `idx_session_relationships_locator`:
+/// every OpenCode edge cites the one store it was read from, so a locator seek
+/// reads all of them, and without statistics SQLite cannot tell the two
+/// two-column seeks apart.
+pub(crate) const RETIRE_SUPERSEDED_UNLINKED_SQL: &str = "DELETE FROM session_relationships \
+     WHERE source = ?1 AND parent_session_id = ?2 AND +evidence_locator = ?3 \
+       AND identity_status = ?4 AND relationship = ?5 AND relationship_uid != ?6";
+
 fn record_relationship_with_child_model_mode(
     conn: &Connection,
     observed: &ObservedRelationship<'_>,
@@ -202,19 +215,15 @@ fn record_relationship_with_child_model_mode(
     // both a linked and an unlinked delegation. Its uid is keyed on the
     // locator, so without this the stale row would outlive the upgrade.
     if let (Some(_), Some(locator)) = (observed.child_session_id, observed.evidence_locator) {
-        conn.execute(
-            "DELETE FROM session_relationships \
-             WHERE source = ? AND parent_session_id = ? AND evidence_locator = ? \
-               AND identity_status = ? AND relationship = ? AND relationship_uid != ?",
-            params![
+        conn.prepare_cached(RETIRE_SUPERSEDED_UNLINKED_SQL)?
+            .execute(params![
                 observed.source,
                 observed.parent_session_id,
                 locator,
                 crate::relationships::IDENTITY_UNLINKED,
                 observed.relationship,
                 observed.relationship_uid(),
-            ],
-        )?;
+            ])?;
     }
     conn.prepare_cached(&RECORD_RELATIONSHIP_SQL)?
         .execute(params![

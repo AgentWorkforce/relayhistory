@@ -6,7 +6,7 @@ use rusqlite::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -1044,6 +1044,8 @@ const REQUIRED_TRIGGERS: &[&str] = &[
     "delete_session_markers",
     "delete_session_continuity_evidence",
 ];
+/// Marks `delete_session_hydration_state` rebuilt with one seek per edge end.
+const SESSION_DELETE_EDGE_SEEKS: &str = "session_delete_edge_seeks_v1";
 const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &[
     "session_presences_local_backfill_v1",
     "session_relationships_v2",
@@ -1060,6 +1062,9 @@ const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &[
     // NOT EXISTS` would otherwise leave an existing database on the old body
     // forever. The marker is what makes the rebuild happen exactly once.
     "session_delete_continuity_reopen_v1",
+    // The same trigger again: it seeks each end of a deleted session's edges
+    // instead of an `OR` over both.
+    SESSION_DELETE_EDGE_SEEKS,
     "session_events_raw_facts_v1",
     "session_project_key_v1",
     // The FTS update trigger narrowed to the columns it indexes. `CREATE
@@ -1386,7 +1391,9 @@ fn init_db_locked(conn: &Connection) -> Result<()> {
     // A trigger created by an earlier release keeps its old body through every
     // `CREATE TRIGGER IF NOT EXISTS`, so a changed body has to drop the old
     // one first. Behind a marker, so it happens once rather than on every open.
-    if !migration_applied(conn, "session_delete_continuity_reopen_v1")? {
+    if !migration_applied(conn, "session_delete_continuity_reopen_v1")?
+        || !migration_applied(conn, SESSION_DELETE_EDGE_SEEKS)?
+    {
         conn.execute_batch("DROP TRIGGER IF EXISTS delete_session_hydration_state;")?;
     }
     conn.execute_batch(
@@ -1520,19 +1527,28 @@ BEGIN
     -- first would leave every dependent resolved, with nothing left to
     -- rediscover it by, so rehydrating this session would never rebuild the
     -- continuation it used to carry.
+    --
+    -- Each end of an edge is its own seek, the parent and the child index.
+    -- An OR across the two, or an `evidence_locator IS NOT NULL` term (a
+    -- range on the locator index; IN never matches a NULL anyway), leaves
+    -- the access path to statistics, and without them SQLite read every
+    -- edge of the source for each deleted session.
     UPDATE session_continuity_evidence
     SET pending_reason = 'unreconciled'
     WHERE source = OLD.source
       AND locator IN (
         SELECT evidence_locator FROM session_relationships
-        WHERE source = OLD.source
+        WHERE source = OLD.source AND parent_session_id = OLD.session_id
           AND relationship IN ('continuation', 'fork', 'resume')
-          AND evidence_locator IS NOT NULL
-          AND (parent_session_id = OLD.session_id OR child_session_id = OLD.session_id)
+        UNION ALL
+        SELECT evidence_locator FROM session_relationships
+        WHERE source = OLD.source AND child_session_id = OLD.session_id
+          AND relationship IN ('continuation', 'fork', 'resume')
       );
     DELETE FROM session_relationships
-    WHERE source = OLD.source
-      AND (parent_session_id = OLD.session_id OR child_session_id = OLD.session_id);
+    WHERE source = OLD.source AND parent_session_id = OLD.session_id;
+    DELETE FROM session_relationships
+    WHERE source = OLD.source AND child_session_id = OLD.session_id;
 END;
 CREATE TRIGGER IF NOT EXISTS delete_session_identity_correlations
 AFTER DELETE ON sessions
@@ -1566,6 +1582,7 @@ END;
     conn.execute_batch(
         "INSERT OR IGNORE INTO schema_migrations (name) \
          VALUES ('session_delete_continuity_reopen_v1'), \
+                ('session_delete_edge_seeks_v1'), \
                 ('session_events_fts_update_of_v1'), \
                 ('history_fts_update_of_v1'), \
                 ('fts_update_changed_only_v1');",
@@ -5288,12 +5305,30 @@ pub fn shell_quote(value: &str) -> String {
 /// The copy is a per-sync `Connection::backup` of the provider's entire store
 /// plus a provider-side index build on the copy; on a large `opencode.db` that
 /// is hundreds of megabytes of I/O for evidence the bounded path reads with
-/// session-keyed queries. It is now opt-in at *runtime* as well as at compile
+/// session-keyed queries. It is opt-in at *runtime* as well as at compile
 /// time, so the default path does not copy even in a build that has the
 /// feature — which is what `--all-features` gives CI.
 #[cfg(feature = "opencode-backup")]
-fn opencode_backup_requested() -> bool {
+pub(crate) fn opencode_backup_requested() -> bool {
     std::env::var_os("AI_HIST_OPENCODE_BACKUP").is_some_and(|value| value == "1")
+}
+
+/// A whole-database copy of `opencode_db`, indexed for session-keyed reads.
+#[cfg(feature = "opencode-backup")]
+pub(crate) fn opencode_backup_copy(opencode_db: &Path) -> Result<Connection> {
+    let tmp = tempfile::NamedTempFile::new()?.into_temp_path();
+    let src_live = Connection::open_with_flags(
+        opencode_db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .with_context(|| format!("opening {}", opencode_db.display()))?;
+    src_live.busy_timeout(std::time::Duration::from_secs(5))?;
+    src_live
+        .backup(DatabaseName::Main, &tmp, None)
+        .map_err(|source| SourceDatabaseError::new(opencode_db, source))?;
+    let src = Connection::open(&tmp)?;
+    src.execute_batch("CREATE INDEX IF NOT EXISTS ai_hist_sync_part_session ON part(session_id);")?;
+    Ok(src)
 }
 
 /// Index every OpenCode session the provider store holds.
@@ -5307,229 +5342,21 @@ pub fn sync_opencode_db(conn: &Connection, opencode_db: &Path) -> Result<usize> 
     sync_opencode_dbs(conn, &[opencode_db.to_path_buf()])
 }
 
-/// Index every session in each OpenCode store, in order.
-///
-/// OpenCode keeps one database per release channel, and the caller passes
-/// them in [`crate::paths::opencode_db_files`] order. A session present in
-/// more than one is claimed by the first store that holds it — the same rule
-/// discovery applies — so it is indexed once, from the store its catalog row
-/// names, rather than rewritten by each store in turn. One store's failure is
-/// that store's: the rest are still indexed, and the error names every store
-/// that failed.
+/// Index every session in each OpenCode store, in order, reading every one:
+/// the sweep's pass ([`crate::ingest::opencode_sweep`]) with no stamps to
+/// skip by.
 pub fn sync_opencode_dbs(conn: &Connection, opencode_dbs: &[PathBuf]) -> Result<usize> {
-    let files: Vec<&Path> = opencode_dbs
-        .iter()
-        .map(PathBuf::as_path)
-        .filter(|path| path.is_file())
-        .collect();
-    let mut inserted = 0;
-    let mut claimed = BTreeSet::new();
-    let mut failures: Vec<anyhow::Error> = Vec::new();
-    for path in crate::ingest::capture_files("opencode", files) {
-        match sync_opencode_db_file(conn, path, &mut claimed) {
-            Ok(count) => inserted += count,
-            Err(error) => {
-                // Cancellation ends the whole sweep, not one store.
-                crate::ingest::check_capture_cancelled()?;
-                failures.push(error);
-            }
-        }
-    }
-    crate::ingest::check_capture_cancelled()?;
-    match failures.len() {
-        0 => Ok(inserted),
-        1 => Err(failures.remove(0)),
-        _ => anyhow::bail!(
-            "{} OpenCode stores could not be fully indexed (the rest were): {}",
-            failures.len(),
-            failures
-                .iter()
-                .map(|error| format!("{error:#}"))
-                .collect::<Vec<_>>()
-                .join("; ")
-        ),
-    }
+    crate::ingest::opencode_sweep::unstamped(|sweep| {
+        crate::ingest::opencode_sweep::sync_opencode_dbs(conn, opencode_dbs, sweep)
+    })
 }
 
-fn sync_opencode_db_file(
-    conn: &Connection,
-    opencode_db: &Path,
-    claimed: &mut BTreeSet<String>,
-) -> Result<usize> {
-    crate::ingest::check_capture_cancelled()?;
-    // `is_file`, the same question `OpencodeLayout::detect` asks. `exists` is
-    // true for a directory, and `OPENCODE_DB` is an arbitrary path, so the
-    // looser guard let a directory reach `Connection::open` and fail there --
-    // a caller that classified first would never send one, and one that did
-    // not deserves the same answer as an absent store rather than an SQLite
-    // error about a path that is not a database.
-    if !opencode_db.is_file() {
-        return Ok(0);
-    }
-    #[cfg(feature = "opencode-backup")]
-    if opencode_backup_requested() {
-        let tmp = tempfile::NamedTempFile::new()?.into_temp_path();
-        let src_live = Connection::open_with_flags(
-            opencode_db,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-        )
-        .with_context(|| format!("opening {}", opencode_db.display()))?;
-        src_live.busy_timeout(std::time::Duration::from_secs(5))?;
-        src_live
-            .backup(DatabaseName::Main, &tmp, None)
-            .map_err(|source| SourceDatabaseError::new(opencode_db, source))?;
-        let src = Connection::open(&tmp)?;
-        src.execute_batch(
-            "CREATE INDEX IF NOT EXISTS ai_hist_sync_part_session ON part(session_id);",
-        )?;
-        return sync_opencode_sessions_from_source(conn, &src, opencode_db, claimed);
-    }
-    let src = Connection::open_with_flags(
-        opencode_db,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-    )
-    .with_context(|| format!("opening {}", opencode_db.display()))?;
-    src.busy_timeout(std::time::Duration::from_secs(5))?;
-    src.execute_batch("BEGIN")?;
-    let result = sync_opencode_sessions_from_source(conn, &src, opencode_db, claimed);
-    let _ = src.execute_batch("ROLLBACK");
-    result
-}
-
-/// Index every OpenCode session in a legacy `storage/` JSON tree.
+/// Index every OpenCode session in a legacy `storage/` JSON tree, reading
+/// every one.
 pub fn sync_opencode_storage_dir(conn: &Connection, storage_dir: &Path) -> Result<usize> {
-    crate::ingest::check_capture_cancelled()?;
-    if !storage_dir.join("session").is_dir() {
-        return Ok(0);
-    }
-    // One session's failure is that session's failure. The loader reports I/O
-    // errors now, and propagating the first one would leave every healthy
-    // session in the same tree unindexed for as long as the one path stays
-    // broken -- the opposite of what making the read failure visible was for.
-    // So each session is indexed or reported on its own, and the error at the
-    // end names them all rather than the first.
-    let mut inserted = 0;
-    let listing = crate::ingest::opencode::list_json_tree_session_files(storage_dir);
-    // A subtree that could not be walked is not a subtree with no sessions in
-    // it. It joins the per-session failures rather than being dropped, so the
-    // sessions under it are reported missing instead of silently absent.
-    let mut failures: Vec<String> = listing
-        .unreadable
-        .iter()
-        .map(|dir| format!("{}: {}", dir.path.display(), dir.error))
-        .collect();
-    for session_file in crate::ingest::capture_files("opencode", listing.sessions) {
-        crate::ingest::check_capture_cancelled()?;
-        let indexed =
-            crate::ingest::opencode::load_from_json_tree(&session_file).and_then(|loaded| {
-                match loaded {
-                    Some(loaded) => crate::ingest::opencode::normalize(
-                        conn,
-                        &loaded,
-                        &session_file.to_string_lossy(),
-                    )
-                    .map(|counts| counts.prompts),
-                    None => Ok(0),
-                }
-            });
-        match indexed {
-            Ok(prompts) => inserted += prompts,
-            Err(error) => failures.push(format!("{}: {error:#}", session_file.display())),
-        }
-    }
-    if !failures.is_empty() {
-        anyhow::bail!(
-            "{} OpenCode path(s) under {} could not be read (the rest were indexed): {}",
-            failures.len(),
-            storage_dir.display(),
-            failures.join("; ")
-        );
-    }
-    Ok(inserted)
-}
-
-/// `claimed` holds the sessions an earlier store already owns; they are
-/// skipped here, and this store's own sessions are added to it.
-fn sync_opencode_sessions_from_source(
-    conn: &Connection,
-    src: &Connection,
-    raw_path: &Path,
-    claimed: &mut BTreeSet<String>,
-) -> Result<usize> {
-    crate::ingest::check_capture_cancelled()?;
-    let raw_path = raw_path.to_string_lossy().into_owned();
-    let mut inserted = 0;
-    // One session's failure is that session's failure, the same way the legacy
-    // tree's sweep treats it. The loader reports a row it cannot map rather
-    // than calling the session absent, and taking that error out of the loop
-    // with `?` would end the sweep at the first bad row -- every session after
-    // it in the store unindexed for as long as that one row stays bad.
-    let mut failures: Vec<String> = Vec::new();
-    // Session-keyed queries are bounded only when the provider indexes the
-    // column they seek on. Without that index each one scans `part`, and this
-    // loop runs one per session -- quadratic on exactly the large stores the
-    // bounded path exists to protect. Read the whole store once instead.
-    match crate::ingest::opencode::sync_plan(src)? {
-        crate::ingest::opencode::OpencodeSyncPlan::PerSession => {
-            for session_id in crate::ingest::opencode::list_sqlite_session_ids(src)? {
-                crate::ingest::check_capture_cancelled()?;
-                if !claimed.insert(session_id.clone()) {
-                    continue;
-                }
-                let indexed = crate::ingest::opencode::load_from_sqlite(src, &session_id).and_then(
-                    |loaded| match loaded {
-                        Some(loaded) => {
-                            crate::ingest::opencode::normalize(conn, &loaded, &raw_path)
-                                .map(|counts| counts.prompts)
-                        }
-                        None => Ok(0),
-                    },
-                );
-                match indexed {
-                    Ok(prompts) => inserted += prompts,
-                    Err(error) => failures.push(format!("{session_id}: {error:#}")),
-                }
-            }
-        }
-        crate::ingest::opencode::OpencodeSyncPlan::SinglePass => {
-            crate::ingest::check_capture_cancelled()?;
-            let load = crate::ingest::opencode::load_all_from_sqlite(src)?;
-            // Decided before anything is written, over every session this
-            // store holds — readable or not — so a session that failed here
-            // is not then indexed from a later store behind this one's back.
-            let already_claimed: BTreeSet<String> = load
-                .failures
-                .iter()
-                .map(|failure| failure.session_id.clone())
-                .chain(load.sessions.iter().map(|loaded| loaded.session.id.clone()))
-                .filter(|session_id| !claimed.insert(session_id.clone()))
-                .collect();
-            failures.extend(
-                load.failures
-                    .iter()
-                    .filter(|failure| !already_claimed.contains(&failure.session_id))
-                    .map(|failure| format!("{}: {}", failure.session_id, failure.error)),
-            );
-            for loaded in load.sessions {
-                crate::ingest::check_capture_cancelled()?;
-                if already_claimed.contains(&loaded.session.id) {
-                    continue;
-                }
-                match crate::ingest::opencode::normalize(conn, &loaded, &raw_path) {
-                    Ok(counts) => inserted += counts.prompts,
-                    Err(error) => failures.push(format!("{}: {error:#}", loaded.session.id)),
-                }
-            }
-        }
-    }
-    if !failures.is_empty() {
-        anyhow::bail!(
-            "{} OpenCode session(s) in {raw_path} could not be read (the rest were indexed): {}",
-            failures.len(),
-            failures.join("; ")
-        );
-    }
-    Ok(inserted)
+    crate::ingest::opencode_sweep::unstamped(|sweep| {
+        crate::ingest::opencode_sweep::sync_opencode_storage_dir(conn, storage_dir, sweep)
+    })
 }
 
 /// Ingest one OpenCode session with session-keyed queries against the live

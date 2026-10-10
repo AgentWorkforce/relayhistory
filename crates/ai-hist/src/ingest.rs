@@ -28,6 +28,7 @@ pub(crate) mod incremental;
 pub(crate) mod jsonl;
 pub(crate) mod muse;
 pub(crate) mod opencode;
+pub(crate) mod opencode_sweep;
 pub(crate) mod tool_result_facts;
 pub(crate) mod transcript_cursor;
 
@@ -2324,14 +2325,19 @@ fn sync_basic(
         roots.opencode_db_pinned,
         &opencode_storage,
     );
+    let mut sweep = opencode_sweep::OpencodeSweep::begin(&mut state, &repairs);
     let opencode_result = match &layout {
-        Some(crate::ingest::opencode::OpencodeLayout::Sqlite(dbs)) => sync_opencode_dbs(conn, dbs),
-        Some(crate::ingest::opencode::OpencodeLayout::JsonTree(tree)) => {
-            sync_opencode_storage_dir(conn, tree)
+        Some(opencode::OpencodeLayout::Sqlite(dbs)) => {
+            opencode_sweep::sync_opencode_dbs(conn, dbs, &mut sweep)
+        }
+        Some(opencode::OpencodeLayout::JsonTree(tree)) => {
+            opencode_sweep::sync_opencode_storage_dir(conn, tree, &mut sweep)
         }
         None => Ok(0),
     };
+    sweep.finish(&mut state);
     if let Some(open_inserted) = report.capture("opencode", opencode_result) {
+        checkpoints.save(&state);
         match &layout {
             Some(crate::ingest::opencode::OpencodeLayout::Sqlite(_)) => {
                 sync_note!("  [opencode] +{open_inserted} rows");
@@ -4862,10 +4868,14 @@ fn cleanup_subagent_registration(conn: &Connection, source: &str, session_id: &s
            AS SELECT * FROM session_relationships WHERE 0; \
          DELETE FROM retained_relationships;",
     )?;
+    // One seek per end of the edge; see `session_continuity_edges`.
     conn.execute(
-        "INSERT INTO retained_relationships SELECT * FROM session_relationships \
-         WHERE source = ? AND (parent_session_id = ? OR child_session_id = ?)",
-        params![source, session_id, session_id],
+        "INSERT INTO retained_relationships \
+         SELECT * FROM session_relationships WHERE source = ?1 AND parent_session_id = ?2 \
+         UNION ALL \
+         SELECT * FROM session_relationships \
+         WHERE source = ?1 AND child_session_id = ?2 AND parent_session_id <> ?2",
+        params![source, session_id],
     )?;
     conn.execute(
         "DELETE FROM sessions \
