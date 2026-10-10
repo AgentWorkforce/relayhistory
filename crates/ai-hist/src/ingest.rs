@@ -17,6 +17,7 @@ use std::time::Duration;
 
 mod claude_standalone;
 pub(crate) mod codex;
+mod codex_subagent;
 pub(crate) mod control;
 pub(crate) mod cursor;
 pub(crate) mod devin;
@@ -5053,13 +5054,6 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                 let recorded_session = record
                     .and_then(|r| r.get("session"))
                     .and_then(Value::as_str);
-                // A rollout recorded as a subagent with no delegation edge is
-                // re-read by its `session_meta` line. One that names a parent
-                // gets the edge backfilled (a database synced before
-                // delegation was recorded has no topology, and its stamps
-                // never change again). One that names none is a standalone
-                // thread an earlier build hid as a child: it falls through to
-                // the full path below, which catalogs it as a session.
                 let mut promoted_to_root = false;
                 if record
                     .and_then(|r| r.get("subagent"))
@@ -5067,38 +5061,13 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                     == Some(true)
                 {
                     if let Some(session_id) = recorded_session {
-                        let unlinked_meta = if codex_delegation_recorded(conn, session_id)? {
-                            None
-                        } else {
-                            read_codex_session_meta(&rollout)?
-                        };
-                        promoted_to_root =
-                            unlinked_meta.as_ref().is_some_and(|meta| !meta.is_subagent);
-                        if promoted_to_root {
-                            // Discovery remembered the rollout as a known
-                            // non-session at this same stamp; forgetting that
-                            // lets its next scan catalog it like any root.
-                            conn.execute(
-                                "DELETE FROM observation_discovery_skips \
-                                 WHERE source = 'codex' AND locator = ?",
-                                [&key],
-                            )?;
-                        } else {
-                            // The fast path must still repair state from an
-                            // older sync/migration. In particular, presence
-                            // backfill can recreate a local catalog
-                            // registration from retained subagent events
-                            // without changing the rollout stamp.
-                            cwds.remove(session_id);
-                            branches.remove(session_id);
-                            cleanup_codex_subagent_history(conn, session_id)?;
-                            cleanup_codex_subagent_registration(conn, session_id)?;
-                            if let Some(meta) = &unlinked_meta {
-                                if let Some(parent) = meta.parent_session_id.as_deref() {
-                                    record_codex_delegation(conn, parent, meta, &rollout)?;
-                                }
-                            }
-                        }
+                        promoted_to_root = codex_subagent::repair_recorded_codex_subagent(
+                            conn,
+                            &rollout,
+                            session_id,
+                            &mut cwds,
+                            &mut branches,
+                        )?;
                     }
                 }
                 // The same gap on the continuity side, repaired the same way.

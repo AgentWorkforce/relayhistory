@@ -897,7 +897,7 @@ How each adapter works:
   is a `session_meta` record, which
   makes codex the richest source: originator, `cli_version`, git remote, initial
   commit, workspace roots and model all come from it. Both trees are catalogued
-  the same way: Codex moves a finished thread's rollout from `sessions/` to
+  the same way: archiving a thread moves its rollout from `sessions/` to
   `archived_sessions/` unchanged, and an archived thread is still the user's
   history, so it keeps its session id and evidence.
 
