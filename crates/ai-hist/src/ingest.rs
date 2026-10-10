@@ -12480,7 +12480,7 @@ fn upsert_session_inner(
         None => (None, None),
     };
     let project_key_merge = crate::store::project_key_merge_sql();
-    conn.execute(
+    conn.prepare_cached(
         &format!("INSERT INTO sessions \
          (session_id, source, cwd, git_branch, first_activity_ms, last_activity_ms, last_assistant_text, raw_path, parser_version, project_key, project_key_method, discovery_state) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'full') \
@@ -12495,6 +12495,8 @@ fn upsert_session_inner(
          parser_version = excluded.parser_version, \
          discovery_state = 'full'"
         ),
+    )?
+    .execute(
         params![
             session_id,
             source,

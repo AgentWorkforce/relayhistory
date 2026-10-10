@@ -610,11 +610,18 @@ fn enable_wal_for_migration(conn: &Connection) -> Result<()> {
     unreachable!("the bounded journal-mode retry loop always returns")
 }
 
+/// Prepared statements a writable connection keeps compiled.
+const STATEMENT_CACHE_CAPACITY: usize = 128;
+
 pub fn open_db(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let conn = Connection::open(path)?;
+    // A sweep and a hydration cycle through a few dozen statements per
+    // session -- more than rusqlite's default cache of 16 holds -- so each
+    // one would be compiled again, triggers and all, for every session.
+    conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
     // Before init_db: creating the schema takes a write lock too.
     configure_busy_retry(&conn)?;
     init_db(&conn)?;
@@ -2122,16 +2129,17 @@ pub(crate) fn retire_evidence_share(
         SessionLocation::Remote => ("remote", "local"),
     };
     // `table` and `condition` come from internal call sites, never from input.
-    let deleted = conn.execute(
-        &format!("DELETE FROM {table} WHERE ({condition}) AND location = '{own}'"),
-        params,
-    )?;
-    conn.execute(
-        &format!(
-            "UPDATE {table} SET location = '{other}' WHERE ({condition}) AND location = 'both'"
-        ),
-        params,
-    )?;
+    // Cached: compiling these statements re-plans every trigger on the table,
+    // and a sweep runs them for every session it reads.
+    let deleted = conn
+        .prepare_cached(&format!(
+            "DELETE FROM {table} WHERE ({condition}) AND location = '{own}'"
+        ))?
+        .execute(params)?;
+    conn.prepare_cached(&format!(
+        "UPDATE {table} SET location = '{other}' WHERE ({condition}) AND location = 'both'"
+    ))?
+    .execute(params)?;
     Ok(deleted)
 }
 
@@ -4253,38 +4261,56 @@ pub fn refresh_project_identity(conn: &Connection) -> Result<usize> {
     Ok(written)
 }
 
-/// Which database a remembered refresh belongs to: the file, and the change
-/// feed's epoch, which a database recreated at the same path does not share.
-type RefreshedStore = (PathBuf, i64);
-
-/// The change-feed revision each database's last successful
-/// [`refresh_project_identity_incrementally`] in this process started at.
+/// Where the database records the change-feed position its last successful
+/// [`refresh_project_identity_incrementally`] started at: one row, keyed by
+/// the feed's epoch, which a database recreated in place does not share.
 ///
 /// Every row a refresh can find out of line was written, by some process,
 /// after the last refresh that left everything in line: the feed's triggers
 /// stamp every insert and every update that changes a column, `project_key`
 /// and `project_key_method` included, with a revision above that point. So the
 /// inheriting and denormalizing passes need to look only at sessions holding
-/// such a row, and at their delegation descendants.
-static REFRESHED_THROUGH: std::sync::LazyLock<std::sync::Mutex<BTreeMap<RefreshedStore, i64>>> =
-    std::sync::LazyLock::new(Default::default);
+/// such a row, and at their delegation descendants. Kept in the database, not
+/// the process, because every `ai-hist sync` and every embedder's sweep is a
+/// process of its own, and each one's first refresh would otherwise be full.
+/// The table has no change-feed trigger, so writing it moves no revision.
+const IDENTITY_REFRESH_DDL: &str = "CREATE TABLE IF NOT EXISTS project_identity_refreshed \
+     (epoch INTEGER PRIMARY KEY, revision INTEGER NOT NULL)";
 
 /// The feed epoch and head revision of `conn`'s database, or `None` when it
-/// has no change feed (or no file) to scope by.
-///
-/// The database is named by its canonical path, the identity the sync lock
-/// uses, so two spellings of one file share a remembered point; and the head
-/// is the change feed's own single-statement read of epoch and revision.
-fn feed_position(conn: &Connection) -> Option<(RefreshedStore, i64)> {
-    let path = Path::new(conn.path().filter(|path| !path.is_empty())?);
-    let path = crate::ingest::canonical_db_identity(path).ok()?;
+/// has no change feed to scope by.
+fn feed_position(conn: &Connection) -> Option<(i64, i64)> {
     let head = crate::change_feed::read_head(conn).ok()?;
-    Some(((path, head.epoch as i64), head.revision as i64))
+    Some((head.epoch as i64, head.revision as i64))
 }
 
-/// [`refresh_project_identity`] scoped to what was written since the previous
-/// refresh of the same database in this process. Sync sweeps and discovery
-/// passes both end with it.
+/// The revision the last successful refresh under `epoch` started at.
+fn refreshed_through(conn: &Connection, epoch: i64) -> Result<Option<i64>> {
+    conn.execute_batch(IDENTITY_REFRESH_DDL)?;
+    Ok(conn
+        .query_row(
+            "SELECT revision FROM project_identity_refreshed WHERE epoch = ?1",
+            [epoch],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+/// Record (or, after a failure, forget) the refreshed-through point.
+fn remember_refresh(conn: &Connection, point: Option<(i64, i64)>) -> Result<()> {
+    conn.execute("DELETE FROM project_identity_refreshed", [])?;
+    if let Some((epoch, revision)) = point {
+        conn.execute(
+            "INSERT INTO project_identity_refreshed (epoch, revision) VALUES (?1, ?2)",
+            [epoch, revision],
+        )?;
+    }
+    Ok(())
+}
+
+/// [`refresh_project_identity`] scoped to what was written since the
+/// database's previous refresh. Sync sweeps and discovery passes both end
+/// with it.
 ///
 /// Pass 1 runs in full: it is how a checkout that gained an `origin` reaches
 /// sessions whose transcripts never change, and it reads only the catalog.
@@ -4306,17 +4332,17 @@ fn feed_position(conn: &Connection) -> Option<(RefreshedStore, i64)> {
 /// Rows pass 1 rewrites just now carry such a revision too, so the scope is
 /// collected after it runs.
 ///
-/// The first refresh of a database in a process runs in full, as does one
-/// whose feed epoch changed or whose head went backwards (a database replaced
-/// under the process), and one after a relationship was deleted, since its
-/// tombstone does not name the child that lost a parent. A failed refresh
-/// forgets the point, so the next one is full again.
+/// A database's first refresh runs in full, as does one whose feed epoch
+/// changed or whose head went backwards (a database replaced in place), and
+/// one after a relationship was deleted, since its tombstone does not name
+/// the child that lost a parent. A failed refresh forgets the point, so the
+/// next one is full again.
 pub(crate) fn refresh_project_identity_incrementally(conn: &Connection) -> Result<usize> {
     let position = feed_position(conn);
-    let since = position.as_ref().and_then(|(store, head)| {
-        let remembered = REFRESHED_THROUGH.lock().ok()?.get(store).copied()?;
-        (remembered <= *head).then_some(remembered)
-    });
+    let since = match position {
+        Some((epoch, head)) => refreshed_through(conn, epoch)?.filter(|point| *point <= head),
+        None => None,
+    };
     let refreshed = (|| {
         let mut written = resolve_missing_project_keys(conn)?;
         let scoped = match since {
@@ -4334,16 +4360,13 @@ pub(crate) fn refresh_project_identity_incrementally(conn: &Connection) -> Resul
         }
         Ok(written)
     })();
-    if let Some((store, head)) = position {
-        if let Ok(mut remembered) = REFRESHED_THROUGH.lock() {
-            match refreshed {
-                // The head read before any pass ran: a row written while the
-                // passes ran, by this refresh or by anyone else, sits above it
-                // and is looked at next time.
-                Ok(_) => remembered.insert(store, head),
-                Err(_) => remembered.remove(&store),
-            };
-        }
+    // The head read before any pass ran: a row written while the passes ran,
+    // by this refresh or by anyone else, sits above it and is looked at next
+    // time. A point that did not move is not rewritten, so a refresh over an
+    // unchanged catalog stays read-only.
+    let point = position.filter(|_| refreshed.is_ok());
+    if position.is_some() && point.map(|(_, head)| head) != since {
+        remember_refresh(conn, point)?;
     }
     refreshed
 }
@@ -9152,7 +9175,7 @@ mod tests {
         insert_event("a", "a1", None);
         insert_event("b", "b1", None);
 
-        // The first refresh in the process has nothing to scope by: full.
+        // The database's first refresh has nothing to scope by: full.
         assert_eq!(refresh_project_identity_incrementally(&conn).unwrap(), 2);
         assert_eq!(event_key("a1").as_deref(), Some("/work/a"));
         assert_eq!(event_key("b1").as_deref(), Some("/work/b"));
@@ -9183,8 +9206,8 @@ mod tests {
         // And the scope really is the changed rows. An event put out of line
         // under an old revision (the update trigger leaves a write that sets
         // `revision` itself alone) is invisible to the scoped pass, and found
-        // by the full one -- which is why the first refresh of a process, and
-        // any after a failed one, stays full.
+        // by the full one -- which is why a database's first refresh, and any
+        // after a failed one, stays full.
         conn.execute(
             "UPDATE session_events SET project_key = NULL, revision = 1 \
              WHERE event_uid = 'b1'",
@@ -9192,6 +9215,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(refresh_project_identity_incrementally(&conn).unwrap(), 0);
+        assert_eq!(event_key("b1"), None);
+        // The point is the database's, not the connection's: the next
+        // process's first refresh is scoped too.
+        let next_process = open_db(&temp.path().join("scoped.db")).unwrap();
+        assert_eq!(
+            refresh_project_identity_incrementally(&next_process).unwrap(),
+            0
+        );
         assert_eq!(event_key("b1"), None);
         assert_eq!(refresh_project_identity(&conn).unwrap(), 1);
         assert_eq!(event_key("b1").as_deref(), Some("/work/b"));
