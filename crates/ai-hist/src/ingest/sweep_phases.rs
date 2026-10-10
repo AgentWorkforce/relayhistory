@@ -2,8 +2,7 @@
 //!
 //! A full sweep walks every provider. A live watch used to run one for every
 //! filesystem event — a Claude session appending every couple of seconds
-//! re-walked Codex, Cursor, Grok, Muse, OpenCode, Devin and every trajectory
-//! root each time. A [`SweepScope`] names the sources an event actually fell
+//! re-walked Codex, Cursor, Grok, Muse, OpenCode and Devin each time. A [`SweepScope`] names the sources an event actually fell
 //! under, and the sweep runs only their phases.
 //!
 //! What a scoped sweep must never do is claim more than it read. The stored
@@ -56,8 +55,8 @@ impl SweepScope {
         self.only.as_ref().is_none_or(|only| only.contains(&source))
     }
 
-    /// Whether a scoped sweep has no local phase to run at all — an empty
-    /// list, or only sources (relay) that have no local files.
+    /// Whether a scoped sweep has no phase to run at all: an empty list, or
+    /// only names this build does not know.
     pub(crate) fn reads_nothing(&self) -> bool {
         !SWEEP_PHASE_SOURCES
             .iter()
@@ -89,14 +88,7 @@ pub(super) fn discover_for_sweep(
 
 /// The sources with a local sweep phase, in the order the sweep runs them.
 const SWEEP_PHASE_SOURCES: &[&str] = &[
-    "claude",
-    "codex",
-    "cursor",
-    "grok",
-    "muse",
-    "trajectory",
-    "opencode",
-    "devin",
+    "claude", "codex", "cursor", "grok", "muse", "opencode", "devin",
 ];
 
 /// One sweep's per-source phases and the state they share. Each phase
@@ -115,13 +107,7 @@ pub(super) struct SweepPhases<'s, 'c> {
 
 impl SweepPhases<'_, '_> {
     /// Run every phase `scope` includes, in the order a full sweep runs them.
-    /// `trajectory_files` is the sweep's one trajectory enumeration, taken
-    /// with the fingerprint; `None` when the scope leaves trajectories out.
-    pub(super) fn run(
-        &mut self,
-        scope: &SweepScope,
-        trajectory_files: Option<Result<Vec<PathBuf>>>,
-    ) -> Result<()> {
+    pub(super) fn run(&mut self, scope: &SweepScope) -> Result<()> {
         if scope.includes("claude") {
             self.claude()?;
         }
@@ -136,9 +122,6 @@ impl SweepPhases<'_, '_> {
         }
         if scope.includes("muse") {
             self.muse()?;
-        }
-        if let Some(files) = trajectory_files {
-            self.trajectory(files)?;
         }
         if scope.includes("opencode") {
             self.opencode()?;
@@ -230,15 +213,6 @@ impl SweepPhases<'_, '_> {
         Ok(())
     }
 
-    fn trajectory(&mut self, files: Result<Vec<PathBuf>>) -> Result<()> {
-        capture_progress("trajectory", 0, None);
-        check_capture_cancelled()?;
-        let result =
-            files.and_then(|files| sync_trajectories(self.conn, self.state, files, self.coverage));
-        self.counted("trajectory", result);
-        Ok(())
-    }
-
     fn opencode(&mut self) -> Result<()> {
         capture_progress("opencode", 0, None);
         check_capture_cancelled()?;
@@ -277,18 +251,18 @@ mod tests {
     fn a_scope_names_only_sources_this_build_knows() {
         let scope = SweepScope::only(["codex", "claude", "codex", "nonsense"]);
         assert_eq!(scope, SweepScope::only(["claude", "codex"]));
-        assert!(scope.includes("claude") && !scope.includes("trajectory"));
+        assert!(scope.includes("claude") && !scope.includes("devin"));
         assert!(!scope.is_everything() && !scope.reads_nothing());
-        assert!(SweepScope::everything().includes("trajectory"));
+        assert!(SweepScope::everything().includes("devin"));
         assert!(SweepScope::only([]).reads_nothing());
-        assert!(SweepScope::only(["relay"]).reads_nothing());
+        assert!(SweepScope::only(["trajectory"]).reads_nothing());
     }
 
     #[test]
     fn every_local_source_has_a_phase() {
         for source in crate::store::SOURCE_CHOICES {
             assert!(
-                *source == "relay" || SWEEP_PHASE_SOURCES.contains(source),
+                SWEEP_PHASE_SOURCES.contains(source),
                 "{source} has no sweep phase, so a scoped sweep could never read it"
             );
         }
@@ -403,32 +377,11 @@ mod tests {
     #[test]
     fn a_scope_with_no_local_source_reads_nothing() {
         let f = fixture();
-        for scope in [SweepScope::only([]), SweepScope::only(["relay"])] {
+        for scope in [SweepScope::only([]), SweepScope::only(["trajectory"])] {
             assert!(!sync_basic(&f.conn, &f.db, &f.roots, true, &scope).unwrap());
         }
         assert_eq!(history_rows(&f.conn, "claude"), 0);
         assert!(!f.db.parent().unwrap().join(".sync-state.json").exists());
-    }
-
-    /// The trajectory roots are derived by walking `<home>/Projects`, which
-    /// on a real disk is the most expensive stat-only work a sweep does. A
-    /// full sweep pays for it once, shared by the fingerprint and the phase;
-    /// a sweep scoped away from trajectories never pays for it.
-    #[test]
-    fn a_full_sweep_walks_projects_once_and_a_claude_sweep_not_at_all() {
-        let f = fixture();
-        let store = f.roots.home.join("Projects/repo/.trajectories/completed");
-        fs::create_dir_all(&store).unwrap();
-        fs::write(store.join("run.json"), "{}").unwrap();
-
-        let before = trajectory_scan::trajectory_walks();
-        assert!(sync_basic(&f.conn, &f.db, &f.roots, true, &SweepScope::everything()).unwrap());
-        assert_eq!(trajectory_scan::trajectory_walks() - before, 1);
-
-        let before = trajectory_scan::trajectory_walks();
-        let claude_only = SweepScope::only(["claude"]);
-        assert!(sync_basic(&f.conn, &f.db, &f.roots, true, &claude_only).unwrap());
-        assert_eq!(trajectory_scan::trajectory_walks(), before);
     }
 
     /// One in-scope adapter failing is a diagnostic, as it is in a full

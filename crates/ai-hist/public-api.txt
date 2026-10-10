@@ -46,7 +46,6 @@ pub ai_hist::ChangeKind::SessionEvent
 pub ai_hist::ChangeKind::SessionMarker
 pub ai_hist::ChangeKind::SourceObservation
 pub ai_hist::ChangeKind::ToolCall
-pub ai_hist::ChangeKind::Trajectory
 impl ai_hist::ChangeKind
 pub const ai_hist::ChangeKind::ALL: &'static [ai_hist::ChangeKind]
 pub fn ai_hist::ChangeKind::as_str(self) -> &'static str
@@ -184,8 +183,6 @@ pub ai_hist::Source::Devin
 pub ai_hist::Source::Grok
 pub ai_hist::Source::Muse
 pub ai_hist::Source::OpenCode
-pub ai_hist::Source::Relay
-pub ai_hist::Source::Trajectory
 impl ai_hist::Source
 pub const ai_hist::Source::ALL: &'static [ai_hist::Source]
 pub fn ai_hist::Source::as_str(self) -> &'static str
@@ -512,7 +509,6 @@ pub ai_hist::ProviderRoots::muse: std::path::PathBuf
 pub ai_hist::ProviderRoots::opencode_db: std::path::PathBuf
 pub ai_hist::ProviderRoots::opencode_db_pinned: bool
 pub ai_hist::ProviderRoots::opencode_storage_dir: std::path::PathBuf
-pub ai_hist::ProviderRoots::trajectory_roots: core::option::Option<alloc::vec::Vec<std::path::PathBuf>>
 pub ai_hist::ProviderRoots::use_env_roots: bool
 impl ai_hist::ProviderRoots
 pub fn ai_hist::ProviderRoots::from_env(std::path::PathBuf) -> Self

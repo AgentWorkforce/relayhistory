@@ -79,8 +79,6 @@ INSERT INTO history (source, session_id, prompt, timestamp_ms)
            ('claude', '', 'a prompt with an empty session', 3);
 INSERT INTO session_events (source, session_id, message_id, ts_ms, role, kind, text, event_uid)
     VALUES ('grok', '', 'm', 1, 'user', 'text', 'no session', 'e1');
-INSERT INTO trajectories (id, decisions_json, retrospective_json, search_text, updated_ms,
-    timestamp_ms) VALUES ('', '[]', '{}', 'x', 1, 1);
 INSERT INTO tool_calls (source, session_id, tool_use_id, name)
     VALUES ('claude', 'tool-only', 't1', 'Bash');
 INSERT INTO file_edits (source, session_id, tool_use_id, file_path, tool_name)
@@ -102,8 +100,6 @@ INSERT INTO session_observations (source, session_id, location, connector_id,
 INSERT INTO observation_evidence (source, session_id, location, connector_id,
     connector_instance, evidence_uid, payload_json)
     VALUES ('some-new-agent', 'observed-only', 'remote', 'conn', 'default', 'ev1', '{}');
-INSERT INTO trajectories (id, decisions_json, retrospective_json, search_text, updated_ms,
-    timestamp_ms) VALUES ('traj-1', '[]', '{}', 'x', 1, 1);
 "#;
 
 /// A session counts when any table stores a row under it: an events-only
@@ -130,7 +126,6 @@ fn every_stored_session_is_an_identity_once() {
             ("grok", "marker-only"),
             ("opencode", "presence-only"),
             ("some-new-agent", "observed-only"),
-            ("trajectory", "traj-1"),
         ]
     );
     for identity in &identities {
@@ -144,7 +139,6 @@ fn every_stored_session_is_an_identity_once() {
     }
     assert_eq!(identities[0].source(), Some(Source::Claude));
     assert_eq!(identities[9].source(), None, "an unknown source is carried");
-    assert_eq!(identities[10].source(), Some(Source::Trajectory));
 }
 
 /// Every page size walks the same identities, completely and without a
@@ -168,7 +162,7 @@ fn paging_is_complete_and_never_repeats() {
     }
     store.write(&bulk);
     let whole = store.all(10_000);
-    assert_eq!(whole.len(), 11 + 150);
+    assert_eq!(whole.len(), 10 + 150);
     let distinct: BTreeSet<&SessionIdentity> = whole.iter().collect();
     assert_eq!(distinct.len(), whole.len(), "no identity repeats");
     let mut sorted = whole.clone();
@@ -238,7 +232,7 @@ fn has_session_is_true_exactly_for_listed_identities() {
          VALUES ('', 'blank-source', 't1', 'Bash');",
     );
     let identities = store.all(1_000);
-    assert_eq!(identities.len(), 11);
+    assert_eq!(identities.len(), 10);
     for identity in &identities {
         assert!(store.store.has_session(identity).unwrap(), "{identity:?}");
     }
@@ -247,7 +241,6 @@ fn has_session_is_true_exactly_for_listed_identities() {
         ("claude", ""),
         ("grok", ""),
         ("codex", "missing"),
-        ("trajectory", "missing"),
         ("claude", "child-named-by-an-edge"),
     ] {
         assert!(

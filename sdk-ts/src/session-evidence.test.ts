@@ -286,9 +286,8 @@ test('an unsupported provider is rejected, not answered with an empty page', asy
       }
     }
 
-    // Every id the SDK does publish stays accepted, including `trajectory`,
-    // which the catalog excludes but evidence rows may carry.
-    for (const source of ['claude', 'codex', 'cursor', 'grok', 'relay', 'trajectory', 'opencode', 'muse', 'devin'] as const) {
+    // Every id the SDK does publish stays accepted.
+    for (const source of ['claude', 'codex', 'cursor', 'grok', 'opencode', 'muse', 'devin'] as const) {
       assert.equal((await getSessionToolCallsPage(source, 'no-such-session', { dbPath })).source, source);
       assert.equal((await getSessionFileEditsPage(source, 'no-such-session', { dbPath })).source, source);
     }

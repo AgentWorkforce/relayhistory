@@ -12,9 +12,7 @@ fn isolated_sync(temp: &tempfile::TempDir, db_path: &std::path::Path) -> Command
         .env("USERPROFILE", temp.path())
         .env("XDG_DATA_HOME", temp.path().join("xdg"))
         .env_remove("AI_HIST_DB")
-        .env_remove("OPENCODE_DB")
-        .env_remove("RELAYCAST_API_KEY")
-        .env_remove("RELAYCAST_WORKSPACE_ID");
+        .env_remove("OPENCODE_DB");
     command
 }
 

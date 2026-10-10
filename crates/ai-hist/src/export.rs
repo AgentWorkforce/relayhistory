@@ -34,7 +34,6 @@ pub const SUPPORTED_KINDS: &[&str] = &[
     "presence",
     "relationship",
     "commit_link",
-    "trajectory",
     "source_observation",
     "observation_evidence",
     "session_marker",

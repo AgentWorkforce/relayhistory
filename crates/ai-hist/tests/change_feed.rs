@@ -57,7 +57,6 @@ impl Home {
             "OPENCODE_STORAGE_DIR",
             home.join(".local/share/opencode/storage"),
         );
-        std::env::set_var("TRAJECTORY_ROOT", home.join(".trajectories"));
         std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
         std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
         std::env::remove_var("AI_HIST_DB");
@@ -345,12 +344,6 @@ const TABLES: &[(ChangeKind, &str, Option<&str>, &[&str])] = &[
         "session_commit_links",
         None,
         &["session_id", "commit_sha", "match_method"],
-    ),
-    (
-        ChangeKind::Trajectory,
-        "trajectories",
-        Some("trajectory"),
-        &["id"],
     ),
     (
         ChangeKind::SourceObservation,
@@ -915,8 +908,7 @@ fn a_session_drain_is_the_feed_restricted_to_that_session() {
     }
 }
 
-/// A session under a source this build does not know drains like any other,
-/// and a trajectory is the session its id names.
+/// A session under a source this build does not know drains like any other.
 #[test]
 fn a_session_drain_takes_any_stored_source() {
     let home = Home::new();
@@ -926,20 +918,13 @@ fn a_session_drain_takes_any_stored_source() {
             "INSERT INTO sessions (session_id, source) VALUES ('n1', 'some-new-agent'); \
              INSERT INTO sessions (session_id, source) VALUES ('n2', 'some-new-agent'); \
              INSERT INTO history (source, session_id, prompt, timestamp_ms) \
-                 VALUES ('some-new-agent', 'n1', 'hi', 7); \
-             INSERT INTO trajectories (id, decisions_json, retrospective_json, search_text, \
-                 updated_ms, timestamp_ms) VALUES ('traj-1', '[]', '{}', 'x', 1, 1);",
+                 VALUES ('some-new-agent', 'n1', 'hi', 7);",
         )
         .unwrap();
     let changes = session_drain(&store, Watermark::START, "some-new-agent", "n1");
     let kinds: Vec<ChangeKind> = changes.iter().map(|change| change.kind).collect();
     assert_eq!(kinds, vec![ChangeKind::Session, ChangeKind::History]);
     assert!(changes.iter().all(|change| change.source.is_none()));
-
-    let trajectory = session_drain(&store, Watermark::START, "trajectory", "traj-1");
-    assert_eq!(trajectory.len(), 1);
-    assert_eq!(trajectory[0].kind, ChangeKind::Trajectory);
-    assert!(session_drain(&store, Watermark::START, "claude", "traj-1").is_empty());
 }
 
 /// A session drain is a one-shot read: it cannot name a consumer, so it

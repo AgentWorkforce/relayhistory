@@ -1376,11 +1376,9 @@ fn source_capabilities_are_static_and_honest() {
     let roots = roots_under(home.path());
     assert!(!claude.watch_roots(&roots).is_empty());
 
-    let relay = Source::Relay.capabilities();
-    assert!(!relay.hydrates_by_path);
-    assert!(relay.usage_accounting.is_none());
-    assert!(relay.watch_roots(&roots).is_empty());
-    assert!(relay.evidence_kinds.contains(&EvidenceKind::History));
+    // `relay` and `trajectory` were sources once; this build names neither.
+    assert_eq!(Source::parse("relay"), None);
+    assert_eq!(Source::parse("trajectory"), None);
     assert_eq!(
         Source::Codex
             .capabilities()
@@ -1428,14 +1426,6 @@ fn sync_hydrate_and_watch_roots_share_one_root_resolution() {
         HydrateStatus::Hydrated | HydrateStatus::Unchanged
     ));
 
-    // Trajectory roots follow the explicit value too, never the environment.
-    let watched_trajectories = Source::Trajectory.capabilities().watch_roots(&roots);
-    assert!(
-        watched_trajectories
-            .iter()
-            .all(|root| root.path.starts_with(dir.path())),
-        "explicit roots keep trajectory watching under the home: {watched_trajectories:?}"
-    );
     let watched = Source::Codex.capabilities().watch_roots(&roots);
     assert!(
         watched
@@ -1507,93 +1497,159 @@ fn a_watched_path_admits_the_entries_the_watcher_acts_on() {
     assert!(tree.admits(OsStr::new("anything.jsonl")));
 }
 
-/// Serialises the tests that set `TRAJECTORY_ROOT`; every other test here
-/// builds its roots with `from_home` and never reads the variable.
-static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
-fn with_trajectory_root<T>(value: &Path, body: impl FnOnce() -> T) -> T {
-    let _guard = ENV_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let previous = std::env::var_os("TRAJECTORY_ROOT");
-    std::env::set_var("TRAJECTORY_ROOT", value);
-    let result = body();
-    match previous {
-        Some(previous) => std::env::set_var("TRAJECTORY_ROOT", previous),
-        None => std::env::remove_var("TRAJECTORY_ROOT"),
-    }
-    result
-}
-
-fn stage_trajectory(root: &Path) {
-    fs::create_dir_all(root).unwrap();
-    fs::write(
-        root.join("run.json"),
-        r#"{"id":"run-elsewhere","task":{"title":"someone else's run"},"decisions":[],"retrospective":{"summary":"done"}}"#,
+/// A store an earlier release filled with trajectory and Relaycast rows --
+/// the `trajectories` table, catalog and prompt rows under both sources, a
+/// change-feed fingerprint that still names the `trajectory` kind and a named
+/// consumer cursor over it -- opens, syncs and drains cleanly, with every one
+/// of those rows gone and the feed reset for a full replay.
+#[test]
+fn a_store_holding_retired_relay_and_trajectory_rows_opens_and_syncs_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("ai-history.db");
+    let codex = dir.path().join(".codex/sessions/2026/04/20");
+    fs::create_dir_all(&codex).unwrap();
+    fs::copy(
+        fixtures_root().join(CORPUS[7].file),
+        codex.join("rollout-2026-04-20T00-00-00-simple-turn.jsonl"),
     )
     .unwrap();
-}
-
-fn trajectory_history_rows(home: &Path) -> i64 {
-    rusqlite::Connection::open(home.join("ai-history.db"))
-        .unwrap()
-        .query_row(
-            "SELECT COUNT(*) FROM history WHERE source = 'trajectory'",
+    let epoch_before: i64 = {
+        drop(open(dir.path()));
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        // What an earlier release left behind.
+        conn.execute_batch(
+            "CREATE TABLE trajectories (
+                 id TEXT PRIMARY KEY, version INTEGER, persona_id TEXT, project_id TEXT,
+                 task_title TEXT, task_description TEXT, status TEXT, started_at TEXT,
+                 completed_at TEXT, decisions_json TEXT NOT NULL,
+                 retrospective_json TEXT NOT NULL, search_text TEXT NOT NULL, path TEXT,
+                 updated_ms INTEGER NOT NULL, timestamp_ms INTEGER NOT NULL,
+                 revision INTEGER NOT NULL DEFAULT 0
+             );
+             INSERT INTO trajectories (id, decisions_json, retrospective_json, search_text,
+                 updated_ms, timestamp_ms) VALUES ('traj-1', '[]', '{}', 'ship it', 1, 1);
+             INSERT INTO sessions (session_id, source, discovery_state, last_activity_ms)
+                 VALUES ('traj-1', 'trajectory', 'full', 9999999999999),
+                        ('ch:general', 'relay', 'shallow', 9999999999998);
+             INSERT INTO session_presences (source, session_id, location)
+                 VALUES ('trajectory', 'traj-1', 'local'), ('relay', 'ch:general', 'local');
+             INSERT INTO history (source, session_id, project, prompt, timestamp_ms)
+                 VALUES ('trajectory', 'traj-1', 'p', 'ship it', 1),
+                        ('relay', 'ch:general', 'ws', '[ana] deploy is red', 2);
+             INSERT INTO consumer_cursors (name, revision, updated_ms, kinds)
+                 VALUES ('burn', 1, 0, '*');",
+        )
+        .unwrap();
+        let digest: String = conn
+            .query_row(
+                "SELECT export_schema_digest FROM change_feed_store WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut digest: BTreeMap<String, String> = serde_json::from_str(&digest).unwrap();
+        digest.insert("trajectory".into(), "retired".into());
+        conn.execute(
+            "UPDATE change_feed_store SET export_schema_digest = ?1 WHERE singleton = 1",
+            [serde_json::to_string(&digest).unwrap()],
+        )
+        .unwrap();
+        conn.query_row(
+            "SELECT epoch FROM change_feed_store WHERE singleton = 1",
             [],
             |row| row.get(0),
         )
         .unwrap()
-}
+    };
 
-/// `from_home` roots are environment-free all the way down: a host's
-/// `TRAJECTORY_ROOT` neither feeds the sweep nor the advertised watch roots,
-/// while `from_env` roots pick it up — and both are decided when the roots
-/// are built, not when they are used.
-#[test]
-fn explicit_roots_ignore_trajectory_root_and_env_roots_honour_it() {
-    let elsewhere = tempfile::tempdir().unwrap();
-    let live = elsewhere.path().join("live/.trajectories");
-    stage_trajectory(&live);
+    let store = open(dir.path());
+    let report = store.sync(SyncOptions::default()).expect("sync");
+    assert!(report.swept);
+    let sessions: Vec<_> = store
+        .sessions(CatalogQuery::default())
+        .collect::<Result<_, _>>()
+        .expect("every catalog row reads");
+    assert_eq!(
+        sessions.iter().map(|row| row.source).collect::<Vec<_>>(),
+        vec![Source::Codex]
+    );
+    let changes: Vec<_> = store
+        .changes_since(ai_hist::Watermark::START, ai_hist::ChangeQuery::default())
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .expect("the feed drains");
+    assert!(!changes.is_empty());
+    // Every live row is Codex; the retired rows are only deletes.
+    for change in &changes {
+        match change.op {
+            ai_hist::ChangeOp::Delete => assert!(
+                change.source == Some(Source::Codex)
+                    || ["relay", "trajectory"].contains(&change.source_name.as_str()),
+                "{change:#?}"
+            ),
+            _ => assert_eq!(change.source, Some(Source::Codex), "{change:#?}"),
+        }
+    }
 
-    let isolated = tempfile::tempdir().unwrap();
-    let hosted = tempfile::tempdir().unwrap();
-    let (explicit, from_env) = with_trajectory_root(&live, || {
-        let explicit = roots_under(isolated.path());
-        let from_env = ProviderRoots::from_env(hosted.path().to_path_buf());
-        (explicit, from_env)
-    });
-    // The variable is unset again from here on: everything below runs on
-    // what the roots stored, which is the point.
-    assert_eq!(explicit.trajectory_roots, None);
-    assert_eq!(from_env.trajectory_roots, Some(vec![live.clone()]));
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let count = |sql: &str| -> i64 { conn.query_row(sql, [], |row| row.get(0)).unwrap() };
+    assert_eq!(
+        count("SELECT COUNT(*) FROM sqlite_master WHERE name = 'trajectories'"),
+        0
+    );
+    for table in ["sessions", "session_presences", "history"] {
+        assert_eq!(
+            count(&format!(
+                "SELECT COUNT(*) FROM {table} WHERE source IN ('relay', 'trajectory')"
+            )),
+            0,
+            "{table}"
+        );
+    }
+    assert_eq!(
+        count("SELECT COUNT(*) FROM evidence_tombstones WHERE kind = 'trajectory'"),
+        0
+    );
+    // A removed kind resets the stream: a new epoch, and no cursor left to
+    // resume a position in the old one.
+    assert_ne!(
+        count("SELECT epoch FROM change_feed_store WHERE singleton = 1"),
+        epoch_before
+    );
+    assert_eq!(count("SELECT COUNT(*) FROM consumer_cursors"), 0);
+    drop(conn);
 
-    let store = open_with_roots(isolated.path(), explicit.clone());
-    assert!(store.sync(SyncOptions::default()).unwrap().swept);
-    assert_eq!(trajectory_history_rows(isolated.path()), 0);
-    let advertised = Source::Trajectory.capabilities().watch_roots(&explicit);
+    // An older client writes a Relaycast prompt again; the feed delivers it.
+    let head = store.head_revision().unwrap();
+    drop(store);
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute(
+            "INSERT INTO history (source, session_id, project, prompt, timestamp_ms) \
+             VALUES ('relay', 'ch:general', 'ws', 'written again', 3)",
+            [],
+        )
+        .unwrap();
+    // The next writable open retires it, and a consumer resuming from where
+    // it was is told to drop it -- in the same epoch, without a replay.
+    let store = open(dir.path());
+    let resumed: Vec<_> = store
+        .changes_since(head, ai_hist::ChangeQuery::default())
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .expect("the same epoch resumes");
     assert!(
-        advertised
+        resumed
             .iter()
-            .all(|root| root.path.starts_with(isolated.path())),
-        "nothing outside the home is watched: {advertised:?}"
+            .any(|change| change.op == ai_hist::ChangeOp::Delete
+                && change.kind == ai_hist::ChangeKind::History
+                && change.source.is_none()
+                && change.source_name == "relay"),
+        "{resumed:#?}"
     );
-
-    let mut env_roots = from_env.clone();
-    // The rest of the hosted roots stay under the hosted home so the only
-    // difference between the two stores is the trajectory override.
-    env_roots.claude = hosted.path().join(".claude");
-    env_roots.codex = hosted.path().join(".codex");
-    env_roots.grok = hosted.path().join(".grok");
-    env_roots.opencode_db = hosted.path().join(".local/share/opencode/opencode.db");
-    env_roots.opencode_storage_dir = hosted.path().join(".local/share/opencode/storage");
-    let store = open_with_roots(hosted.path(), env_roots.clone());
-    assert!(store.sync(SyncOptions::default()).unwrap().swept);
-    assert_eq!(trajectory_history_rows(hosted.path()), 1);
-    let advertised = Source::Trajectory.capabilities().watch_roots(&env_roots);
-    assert!(
-        advertised.iter().any(|root| root.path == live),
-        "the configured root is watched: {advertised:?}"
-    );
+    assert!(resumed
+        .iter()
+        .all(|change| change.op == ai_hist::ChangeOp::Delete || change.source.is_some()));
 }
 
 // ---------------------------------------------------------------------------

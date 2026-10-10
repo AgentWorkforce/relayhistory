@@ -170,8 +170,8 @@ impl FsWatch {
         }
     }
 
-    /// Take on roots that were not known at startup — a `.trajectories`
-    /// directory created in a project an hour into the run. Returns how
+    /// Take on roots that were not known at startup — one the root
+    /// derivation first names an hour into the run. Returns how
     /// many are new, so the caller knows whether to retry attaching.
     pub(super) fn adopt(&mut self, roots: Vec<WatchRoot>) -> usize {
         let mut known = self.depth.lock().expect("watch roots");

@@ -18,8 +18,6 @@ export const SOURCES = Object.freeze([
   'codex',
   'cursor',
   'grok',
-  'relay',
-  'trajectory',
   'opencode',
   'muse',
   'devin',
@@ -51,10 +49,9 @@ export const FULL_SESSION_KINDS: readonly EvidenceKind[] = Object.freeze([
   'file_edit',
   'relationship',
 ] as const);
-export type CatalogSource = Exclude<Source, 'trajectory'>;
-export const CATALOG_SOURCES: readonly CatalogSource[] = Object.freeze(
-  SOURCES.filter((source): source is CatalogSource => source !== 'trajectory'),
-);
+/** A source that can identify a session catalog entry: every source. */
+export type CatalogSource = Source;
+export const CATALOG_SOURCES: readonly CatalogSource[] = SOURCES;
 
 const SOURCE_SET: ReadonlySet<string> = new Set(SOURCES);
 const CATALOG_SOURCE_SET: ReadonlySet<string> = new Set(CATALOG_SOURCES);

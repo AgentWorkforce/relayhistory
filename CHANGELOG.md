@@ -6,6 +6,11 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased - Minor]
 
+### Breaking Changes
+
+- Trajectories and Relaycast history are no longer sources: `relay` and `trajectory` are unknown values for `--source` and every source filter, `--source-connector relaycast` is an `INVALID_ARGUMENT`, and the TypeScript `SOURCES`, `CHANGE_KINDS` and export kinds no longer list them.
+- A writable open deletes what an earlier release stored for them: the `trajectories` table (with any leftover `trajectory_fts` index and triggers) and every row under the `relay` or `trajectory` source in this crate's own tables (never the upload daemon's `delivery_*` tables), leaving change-feed delete tombstones so consumers drop rows they hold. Because the feed loses the `trajectory` kind, the first writable open after upgrading starts a new feed epoch and drops named consumer cursors, so change-feed consumers replay from the start; a read-only open treats a database still holding such rows as stale.
+
 ### Added
 
 - `SyncOptions::sources` sweeps only the named sources, always reading them and leaving the full sweep's source fingerprint untouched; `TickReport::sources` says which sources a watch tick swept.
@@ -13,16 +18,13 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 
 - A `SessionStore::watch` filesystem-event tick sweeps only the providers whose watched roots fired, so one live Claude session no longer re-walks every other provider every couple of seconds; startup, backstop and manual ticks stay full sweeps, and the next unforced full sweep still catches whatever a scoped tick left out.
-- Trajectory roots are derived from `~/Projects` once per sweep instead of twice, once per backstop in a watch (its event ticks reuse the roots the last walk found), and only to five directories below `~/Projects`; name a deeper `.trajectories` directory in `TRAJECTORY_ROOT`.
 - Re-reading a Claude transcript asks once per record, with one indexed lookup, whether an earlier parse left the record's rows under another session or as a notice's assistant output, and retires them only when it did, instead of running eight delete and update statements for every record of every re-read.
-
-### Rust API
-
-- Added `SyncOptions::sources: Option<Vec<Source>>` with its `sources()` setter, and `TickReport::sources: Option<Vec<Source>>`.
-
-### Changed
-
 - A sync that sweeps ends with `PRAGMA optimize` under `analysis_limit = 400`, so the store carries planner statistics; the first sweep after upgrading analyzes the store once (seconds on a multi-gigabyte history).
+
+### Removed
+
+- `.trajectories` directories and `TRAJECTORY_ROOT` are no longer read or watched, and the built-in `relay` catalog adapter is gone; `ai-hist import` skips entries under either source.
+- `ai-hist learn distill`, which wrote its roll-ups into the trajectory store, is removed.
 
 ### Fixed
 
@@ -31,6 +33,11 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - An unforced `sync` skips the sweep again when no source changed on a host with an OpenCode or Devin SQLite store: the source fingerprint no longer counts the store's `-shm` index, which every read of the store rewrote.
 - A sweep refreshes canonical project identity only for the sessions written since the database's last refresh, including in a new process: every `ai-hist sync` and every embedder's first sweep re-walked every delegated child before.
 - Reading a session's parents, continuity edges and unresolved continuity evidence, and deleting a session, seek that session's own rows instead of reading every relationship or continuity row of its source, with or without planner statistics.
+
+### Rust API
+
+- `Source::Relay`, `Source::Trajectory`, `ChangeKind::Trajectory`, and `ProviderRoots::trajectory_roots` are removed; a serialized `ProviderRoots` that still carries `trajectory_roots` deserializes with the field ignored.
+- Added `SyncOptions::sources: Option<Vec<Source>>` with its `sources()` setter, and `TickReport::sources: Option<Vec<Source>>`.
 
 ## [0.38.0] - 2026-10-10
 

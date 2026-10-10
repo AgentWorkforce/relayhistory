@@ -190,8 +190,8 @@ pub struct SyncOptions {
     #[serde(skip)]
     pub progress: Option<ProgressObserver>,
     /// Sweep only these sources. `None` (the default) is the full sweep of
-    /// every local source; `Some(vec![])`, or a list naming only sources
-    /// with no local files, reads nothing and reports `swept: false`.
+    /// every local source; `Some(vec![])` reads nothing and reports
+    /// `swept: false`.
     ///
     /// A scoped sweep always reads its sources, whatever `force` says: the
     /// stat-only fingerprint the fast path compares is a statement about

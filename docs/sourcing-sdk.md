@@ -141,8 +141,8 @@ let store = SessionStore::open(
 | `read_only` | Open without creating or migrating. `discover`, `sync`, `hydrate`, `watch`, `forget_evidence` and `compact` are `Error::UnsupportedOperation`. |
 
 **Provider roots.** `ProviderRoots::from_env(home)` is the CLI's resolution —
-`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME`, `OPENCODE_DB`,
-`OPENCODE_STORAGE_DIR` and `TRAJECTORY_ROOT`, each replacing one provider's
+`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME`, `OPENCODE_DB` and
+`OPENCODE_STORAGE_DIR`, each replacing one provider's
 root when set to a non-empty value, read once at construction and stored — and
 is what `roots: None` derives from `home`. `ProviderRoots::from_home(home,
 opencode_db)` reads nothing from the environment at all, and is what a test or
@@ -214,9 +214,8 @@ always reads them, whatever `force` says, and neither consults nor stores the
 source fingerprint or the destination marker: both are statements about every
 source, so the next unforced full sweep still compares against the last full
 one and sees whatever moved in the sources a scoped sweep left out. Each
-source's own cursors and stamps are written as usual. A list naming no source
-with local files (`Some(vec![])`, or only `Relay`) reads nothing and reports
-`swept: false`.
+source's own cursors and stamps are written as usual. `Some(vec![])` reads
+nothing and reports `swept: false`.
 
 `SyncReport { swept, changed, head_revision }`: `swept` is false when the fingerprint matched
 and nothing was opened. `changed` lists the `SessionRef`s whose catalog row was
@@ -278,10 +277,7 @@ writes tick once per `debounce_ms`. A filesystem-event tick sweeps only the
 sources whose watched roots fired inside its window — a Claude session's
 appends read Claude, not every provider — and its `TickReport::sources` names
 them; startup, backstop and manual ticks, and an event the loop cannot place
-under a root (a rescan notice), are full sweeps with `sources: None`. Only a
-backstop walks `~/Projects` for `.trajectories` roots — its root refresh
-registers what it finds and its sweep reuses the walk — and event ticks reuse
-the roots the last walk found. A
+under a root (a rescan notice), are full sweeps with `sources: None`. A
 tick is the same locked `sync`; one that finds the lock held reports
 `contended` and is retried by the loop rather than counted as done. A failed
 sweep arrives as an `Err` and the loop keeps running; the rolling catalog
@@ -335,9 +331,8 @@ and an empty page is the end. `limit` is clamped to `1..=10_000`, and zero
 means 1,000. A session counts when any evidence table stores a row under it:
 `sessions`, `history`, `session_events`, `tool_calls`, `file_edits`,
 `session_markers`, `session_relationships` (under the parent),
-`session_presences`, `session_commit_links`, `session_observations`,
-`observation_evidence`, and `trajectories` (under the `trajectory` source, by
-id). The catalog alone misses evidence that arrives without a catalog row — a
+`session_presences`, `session_commit_links`, `session_observations` and
+`observation_evidence`. The catalog alone misses evidence that arrives without a catalog row — a
 subagent sidechain's events, a prompt-log entry, a connector's observation — so
 this is the read for anything that decides which sessions exist, such as a
 consent baseline. A prompt that names no session is under none, an empty
@@ -356,7 +351,6 @@ identity:
 ```text
 SEARCH session_events USING COVERING INDEX idx_session_events_session ((source,session_id)>(?,?))
 SEARCH sessions USING COVERING INDEX idx_sessions_identity ((source,session_id)>(?,?))
-SEARCH trajectories USING COVERING INDEX sqlite_autoindex_trajectories_1 (id>?)
 ```
 
 `has_session(&SessionIdentity)` answers whether one identity exists, by the
@@ -492,14 +486,14 @@ Two facts about identity a consumer must not paper over:
   and **one** entry in `requests`. Sum `requests`, not `messages`.
 - `SourceCapabilities::message_ids` says whether a source's ids are the
   provider's (`Provider`: claude, opencode), synthesized from record position
-  (`Synthesized`: codex, grok), `Mixed` (cursor) or `None` (relay,
-  trajectory).
+  (`Synthesized`: codex, grok) or `Mixed` (cursor, muse, devin); `None` (the
+  source records no messages) is reserved and no built-in source reports it.
 
 ### `changes_since`
 
 The revision-stamped change feed: every row of `sessions`, `session_events`,
 `tool_calls`, `file_edits`, `session_markers`, `session_relationships`,
-`history`, `session_presences`, `session_commit_links`, `trajectories`,
+`history`, `session_presences`, `session_commit_links`,
 `session_observations` and `observation_evidence` carries a `revision` drawn
 from the database-wide `observation_clock` and stamped by a trigger on every
 insert and on every update that changes a column the row carries (below), so no
@@ -526,7 +520,6 @@ replace, never a duplicate.
 | `History`             | `history`               | `source, timestamp_ms, prompt`                                        | `HistoryEntry`        |
 | `Presence`            | `session_presences`     | `source, session_id, location`                                        | —                     |
 | `CommitLink`          | `session_commit_links`  | `source, session_id, commit_sha, match_method`                        | —                     |
-| `Trajectory`          | `trajectories`          | `id`                                                                  | —                     |
 | `SourceObservation`   | `session_observations`  | `source, session_id, location, connector_id, connector_instance`      | —                     |
 | `ObservationEvidence` | `observation_evidence`  | `source, session_id, location, connector_id, connector_instance, evidence_uid` | —            |
 
@@ -539,11 +532,10 @@ a column a migration adds is carried without a code change. It serializes as a
 JSON object in column order. `key` is the record's identity: the kind's wire
 name, then the stored values of the table's uniqueness columns, identical on an
 upsert and on the delete that retracts it — `["history", "claude",
-1756634400000, "ship the feed"]`, `["trajectory", "traj-1"]`. `record_key` is
+1756634400000, "ship the feed"]`. `record_key` is
 the part of `key` inside a session: the one identity column's text, or a JSON
 array of several (`[1756634400000,"ship the feed"]` for a prompt).
-`session_id` is the parent session for a relationship, the id for a trajectory
-and empty for a prompt that names no session; a prompt's session is not part of
+`session_id` is the parent session for a relationship and empty for a prompt that names no session; a prompt's session is not part of
 its key, so its delete carries it empty and a prompt gaining a session is an
 upsert, never a delete. `source` is `None` for a source
 this build does not know — a row written by a newer release — and
@@ -556,8 +548,7 @@ exactly the changes whose `source_name` and `session_id` are those, with the
 same rows, keys, revisions and tombstones the unfiltered drain reports for it,
 bounded to the head at open. `source` is the stored name, so a source this
 build does not know works. It covers every kind that stores a session,
-relationships under their parent, and a trajectory under the `trajectory`
-source by its id. A prompt that names no session is in no session's drain, and
+and relationships under their parent. A prompt that names no session is in no session's drain, and
 nor is a prompt's delete, whose tombstone carries no session because a
 prompt's session is not part of its key. A session drain is a one-shot read,
 such as the backfill of a session an embedder has just started following. It
@@ -656,8 +647,8 @@ if report.sessions > 0 {
   so its next hydration re-reads the child. Kept: the catalog (`sessions`, `session_presences`,
   `session_observations`, set to `discovery_state = 'shallow'`),
   relationships, continuity and identity evidence, tags, session tags, commit
-  links, and the provider-wide logs (`history`, `grok_unified_usage`,
-  `trajectories`), which a session's hydration does not re-read.
+  links, and the provider-wide logs (`history`, `grok_unified_usage`), which a
+  session's hydration does not re-read.
 - A forgotten session's catalog row stays listed by `sessions()`, now as
   `Shallow`, and `session()` returns it with no evidence; a catalog-less child
   had no catalog row and gains none. `hydrate()` reports `Hydrated` and
@@ -704,8 +695,7 @@ there.
 
 Static, per source: `evidence_kinds` (the parser's ceiling — a kind absent here
 is one the source never reports; a kind present with no rows means the session
-has none; relay and trajectory, which shallow discovery exempts, still declare
-`History` because their sweeps write prompt rows), `relationships` (`RelationshipCapabilities`: `always` / `sometimes`
+has none), `relationships` (`RelationshipCapabilities`: `always` / `sometimes`
 / `never` stable child identity and which delegation facts are recorded),
 `usage_accounting` (`per-request`, `per-message`, `cumulative-delta`,
 `context-proxy`, or `None`), `message_ids`, `hydrates_by_path`, and
@@ -937,8 +927,6 @@ handle.
 | grok | ✓ | ✓ | ✓ | ✓ | ✓ | per-request |
 | muse | ✓ | ✓ | ✓ | ✓ | ✓ | per-request |
 | opencode | ✓ | ✓ | ✓ | ✓ | ✓ | none |
-| relay | — | — | — | — | — | none |
-| trajectory | — | — | — | — | — | none |
 <!-- sourcing-sdk-population-table:end -->
 
 The ADR's [capture matrix](decisions/2026-09-19-relayhistory-owns-session-sourcing.md#capture-matrix)

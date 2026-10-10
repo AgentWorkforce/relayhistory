@@ -32,7 +32,6 @@ pub(crate) mod muse;
 pub(crate) mod opencode;
 pub(crate) mod opencode_sweep;
 pub(crate) mod tool_result_facts;
-mod trajectory_scan;
 pub(crate) mod transcript_cursor;
 
 #[cfg(test)]
@@ -45,12 +44,6 @@ use claude_standalone::{
 pub(crate) use claude_standalone::{
     migrate_claude_request_evidence, standalone_records_migration_pending,
 };
-use trajectory_scan::trajectory_files;
-pub(crate) use trajectory_scan::trajectory_roots;
-#[cfg(test)]
-pub(crate) use trajectory_scan::trajectory_walks;
-#[cfg(test)]
-use trajectory_scan::{collect_named_dirs, collect_trajectory_json};
 
 /// `session_markers.kind` for the point a harness compacted its context. The
 /// turns either side of it are real, but the model's view of everything
@@ -1794,30 +1787,21 @@ fn subagent_deregistered(conn: &Connection, source: &str, session_id: &str) -> R
 /// The sources a sweep reads that discovery never enumerates.
 ///
 /// Discovery is about *sessions*, so its adapters walk the transcript trees.
-/// The sweep also reads two flat per-harness logs and the trajectory records,
-/// and `trajectory` is a declared [`discover::DISCOVERY_EXEMPTIONS`] entry
-/// precisely because it is not a provider session. Folding only the adapters
-/// into the fingerprint would leave these three outside it: after one
-/// successful sweep, a change confined to them would match the stored value
-/// and the sweep would return before ever reaching
-/// `sync_jsonl_incremental` / `sync_trajectories`. The records would then wait
-/// for an unrelated transcript to move — indefinitely, on a machine that only
-/// uses the flat log.
+/// The sweep also reads flat per-harness logs that no adapter enumerates.
+/// Folding only the adapters into the fingerprint would leave them outside
+/// it: after one successful sweep, a change confined to them would match the
+/// stored value and the sweep would return before ever reaching
+/// `sync_jsonl_incremental`. The records would then wait for an unrelated
+/// transcript to move — indefinitely, on a machine that only uses the flat
+/// log.
 ///
-/// Stat-only, like the adapters' own inputs. The trajectory files are the
-/// sweep's own enumeration, shared with the trajectory phase rather than walked
-/// a second time; one that failed is passed as empty, which can only cause an
-/// extra sweep, never a skipped one.
-fn sweep_only_fingerprint_inputs(
-    roots: &crate::ProviderRoots,
-    trajectory_files: &[PathBuf],
-) -> Vec<Candidate> {
-    let mut paths = vec![
+/// Stat-only, like the adapters' own inputs: each log is one stat.
+fn sweep_only_fingerprint_inputs(roots: &crate::ProviderRoots) -> Vec<Candidate> {
+    let paths = vec![
         roots.claude.join("history.jsonl"),
         roots.codex.join("history.jsonl"),
         grok_unified_log_path(&roots.grok),
     ];
-    paths.extend_from_slice(trajectory_files);
     let mut candidates: Vec<Candidate> = Vec::new();
     // OpenCode's legacy layout is a *tree*, and the evidence a sweep reads
     // lives in the message and part files under it rather than in the session
@@ -1874,19 +1858,6 @@ fn sweep_only_fingerprint_inputs(
 /// watched recursively would pull in the todo files and shell snapshots an
 /// active session rewrites constantly, each one waking a full fingerprint
 /// walk.
-///
-/// Trajectory roots come from [`trajectory_roots`], not from the parents of
-/// the files found inside them. Deriving a watch from an existing file's
-/// parent covers only the shape the tree happens to have right now: an empty
-/// root, a root that does not exist yet, and the next `completed/<month>/`
-/// directory to be created would all go unwatched. The roots themselves are
-/// watched recursively, and a root that does not exist is kept — the loop
-/// retries it, so the first trajectory written there wakes live capture rather
-/// than waiting for the backstop.
-///
-/// Call this again to pick up a `.trajectories` directory created after the
-/// loop started; [`crate::watch::WatchLoop::with_roots_refresh`] does exactly
-/// that on each backstop tick.
 pub fn sync_watch_roots(home: &Path, opencode_db: &Path) -> Vec<discover::WatchRoot> {
     let provider_roots = with_opencode_db(
         crate::ProviderRoots::from_env(home.to_path_buf()),
@@ -1961,7 +1932,7 @@ pub(crate) fn sync_watch_roots_by_source(
 
 /// Everything the sweep reads for one source, as the watcher registers it:
 /// the adapter's transcript roots, plus the flat prompt log Claude and Codex
-/// keep beside them, plus the trajectory directories for that source.
+/// keep beside them.
 ///
 /// The flat logs are watched each as the one file it is. A `directory` root
 /// would cover every entry beside them — `~/.claude/settings.json`, the
@@ -1987,11 +1958,6 @@ pub(crate) fn source_watch_roots(
         "grok" => roots.push(discover::WatchRoot::file(grok_unified_log_path(
             &provider_roots.grok,
         ))),
-        "trajectory" => {
-            for root in trajectory_roots(provider_roots).unwrap_or_default() {
-                roots.push(trajectory_watch_root(root));
-            }
-        }
         _ => {}
     }
     merge_watch_roots(roots)
@@ -2008,21 +1974,6 @@ pub(crate) fn merge_watch_roots(mut roots: Vec<discover::WatchRoot>) -> Vec<disc
         true
     });
     roots
-}
-
-/// How one `TRAJECTORY_ROOT` entry is watched.
-///
-/// An entry naming a single JSON file is watched as a *file*: the parent is
-/// what gets registered, because an atomic rewrite would take a watch on the
-/// file itself with it, but only events on that one name count. The parent of
-/// such an entry is routinely `$HOME` — or `/` — so treating it as a tree
-/// would make every unrelated write on the machine a forced sweep. Anything
-/// else is a directory the roll-ups grow inside, and is watched as a tree.
-fn trajectory_watch_root(root: PathBuf) -> discover::WatchRoot {
-    if root.extension().and_then(|extension| extension.to_str()) == Some("json") {
-        return discover::WatchRoot::file(root);
-    }
-    discover::WatchRoot::tree(root)
 }
 
 /// Whether a sweep read everything the fingerprint counted.
@@ -2112,18 +2063,13 @@ fn sweep_fingerprint(
     conn: &Connection,
     roots: &crate::ProviderRoots,
     providers: &[Box<dyn ShallowSessionProvider>],
-    trajectory_files: Option<&Result<Vec<PathBuf>>>,
 ) -> Option<String> {
     let env = DiscoveryEnv::with_provider_roots(conn, roots.clone());
-    let trajectory_files = match trajectory_files {
-        Some(Ok(files)) => files.as_slice(),
-        _ => &[],
-    };
     let providers = providers
         .iter()
         .map(|provider| provider.as_ref())
         .collect::<Vec<_>>();
-    let inputs = sweep_only_fingerprint_inputs(roots, trajectory_files);
+    let inputs = sweep_only_fingerprint_inputs(roots);
     match discover::source_fingerprint_with(&env, &providers, &inputs) {
         Ok(sources) => Some(format!("{}/{sources}", sweep_generation())),
         Err(error) => {
@@ -2227,16 +2173,6 @@ fn sync_basic(
     let mut coverage = SweepCoverage::default();
     let mut providers = shallow_providers();
     providers.retain(|provider| scope.includes(provider.source()));
-    // The one trajectory enumeration this sweep makes, shared by the
-    // fingerprint and the trajectory phase. A cancellation stops the sweep
-    // here; any other failure is the phase's to report.
-    let trajectory_files = match scope
-        .includes("trajectory")
-        .then(|| trajectory_files(roots))
-    {
-        Some(Err(error)) if error.is::<CaptureCancelled>() => return Err(error),
-        files => files,
-    };
     // Captured before the sweep, not after. Anything that changes while the
     // sweep runs yields a different fingerprint next time and forces one more
     // pass — cheap, because the per-session stamps then skip what already
@@ -2244,7 +2180,7 @@ fn sync_basic(
     // that append instead. A scoped sweep takes none: it may not store one.
     let fingerprint = scope
         .is_everything()
-        .then(|| sweep_fingerprint(conn, roots, &providers, trajectory_files.as_ref()))
+        .then(|| sweep_fingerprint(conn, roots, &providers))
         .flatten();
     if !force {
         if let Some(current) = fingerprint.as_deref() {
@@ -2292,7 +2228,7 @@ fn sync_basic(
         checkpoints: &mut checkpoints,
         inserted: 0,
     };
-    phases.run(scope, trajectory_files)?;
+    phases.run(scope)?;
     let total_inserted = phases.inserted;
 
     // A source that was statted into the fingerprint but could not be read is
@@ -17182,330 +17118,6 @@ pub(crate) fn grok_chat_text(value: &Value, role: &str) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-/// Index the trajectory records in `files`, the sweep's one enumeration of
-/// them (see [`trajectory_files`]).
-fn sync_trajectories(
-    conn: &Connection,
-    state: &mut Map<String, Value>,
-    files: Vec<PathBuf>,
-    coverage: &mut SweepCoverage,
-) -> Result<usize> {
-    if files.is_empty() {
-        return Ok(0);
-    }
-    let mut trajectory_state = state
-        .get("trajectory")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    let mut inserted = 0;
-    let mut updated = 0;
-    let mut skipped = 0;
-    let mut errors = 0;
-    for path in capture_files("trajectory", files) {
-        check_capture_cancelled()?;
-        let metadata = match path.metadata() {
-            Ok(metadata) => metadata,
-            Err(_) => {
-                errors += 1;
-                coverage.note_unread();
-                continue;
-            }
-        };
-        let stamp = format!(
-            "{}:{}",
-            metadata
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_secs())
-                .unwrap_or(0),
-            metadata.len()
-        );
-        let key = path.to_string_lossy().to_string();
-        if trajectory_state.get(&key).and_then(Value::as_str) == Some(stamp.as_str()) {
-            skipped += 1;
-            continue;
-        }
-        let Some(row) = parse_trajectory_file(&path)? else {
-            skipped += 1;
-            continue;
-        };
-        let existed: Option<i64> = conn
-            .query_row("SELECT 1 FROM trajectories WHERE id = ?", [&row.id], |r| {
-                r.get(0)
-            })
-            .ok();
-        if upsert_trajectory(conn, &row).is_err() {
-            errors += 1;
-            coverage.note_unread();
-            continue;
-        }
-        trajectory_state.insert(key, json!(stamp));
-        if existed.is_some() {
-            updated += 1;
-        } else {
-            inserted += 1;
-        }
-    }
-    state.insert("trajectory".to_string(), Value::Object(trajectory_state));
-    let mut parts = vec![format!("+{inserted} rows")];
-    if updated > 0 {
-        parts.push(format!("{updated} updated"));
-    }
-    if skipped > 0 {
-        parts.push(format!("{skipped} unchanged"));
-    }
-    if errors > 0 {
-        parts.push(format!("{errors} errors"));
-    }
-    sync_note!("  [trajectory] {}", parts.join(", "));
-    Ok(inserted + updated)
-}
-
-#[derive(Debug)]
-struct TrajectoryRow {
-    id: String,
-    version: Option<i64>,
-    persona_id: Option<String>,
-    project_id: Option<String>,
-    task_title: Option<String>,
-    task_description: Option<String>,
-    status: Option<String>,
-    started_at: Option<String>,
-    completed_at: Option<String>,
-    decisions_json: String,
-    retrospective_json: String,
-    search_text: String,
-    path: String,
-    updated_ms: i64,
-    timestamp_ms: i64,
-}
-
-fn parse_trajectory_file(path: &Path) -> Result<Option<TrajectoryRow>> {
-    let obj: Value = match serde_json::from_str(&fs::read_to_string(path)?) {
-        Ok(value) => value,
-        Err(_) => return Ok(None),
-    };
-    let Some(map) = obj.as_object() else {
-        return Ok(None);
-    };
-    let Some(id) = map
-        .get("id")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-    else {
-        return Ok(None);
-    };
-    let is_compacted = map.get("type").and_then(Value::as_str) == Some("compacted")
-        && map
-            .get("sourceTrajectories")
-            .and_then(Value::as_array)
-            .is_some();
-    let task = map.get("task").and_then(Value::as_object);
-    let retrospective = map.get("retrospective").and_then(Value::as_object);
-    let decisions = map
-        .get("decisions")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default()
-        .into_iter()
-        .filter(Value::is_object)
-        .collect::<Vec<_>>();
-    let search_text = trajectory_search_text(map);
-    let timestamp_ms = trajectory_timestamp_ms(map, path);
-    let updated_ms = path
-        .metadata()
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(timestamp_ms);
-    Ok(Some(TrajectoryRow {
-        id: id.to_string(),
-        version: map.get("version").and_then(Value::as_i64),
-        persona_id: map
-            .get("personaId")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        project_id: map
-            .get("projectId")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        task_title: task
-            .and_then(|m| m.get("title"))
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        task_description: task
-            .and_then(|m| m.get("description"))
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        status: map
-            .get("status")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        started_at: map
-            .get("startedAt")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        completed_at: map
-            .get("completedAt")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        decisions_json: serde_json::to_string(&decisions)?,
-        retrospective_json: if is_compacted {
-            serde_json::to_string(map)?
-        } else {
-            serde_json::to_string(retrospective.unwrap_or(&Map::new()))?
-        },
-        search_text,
-        path: path.to_string_lossy().to_string(),
-        updated_ms,
-        timestamp_ms,
-    }))
-}
-
-fn trajectory_search_text(map: &Map<String, Value>) -> String {
-    let mut parts = Vec::new();
-    for key in ["id", "personaId", "projectId", "status"] {
-        push_text(&mut parts, map.get(key));
-    }
-    if let Some(task) = map.get("task").and_then(Value::as_object) {
-        push_text(&mut parts, task.get("title"));
-        push_text(&mut parts, task.get("description"));
-    }
-    let decisions = map.get("decisions").and_then(Value::as_array);
-    for decision in decisions.into_iter().flatten().filter_map(Value::as_object) {
-        for key in ["question", "chosen", "reasoning"] {
-            push_text(&mut parts, decision.get(key));
-        }
-        push_text_items(&mut parts, decision.get("alternatives"));
-    }
-    if let Some(retro) = map.get("retrospective").and_then(Value::as_object) {
-        for key in ["summary", "approach"] {
-            push_text(&mut parts, retro.get(key));
-        }
-        if let Some(confidence) = retro.get("confidence") {
-            parts.push(confidence.to_string());
-        }
-        push_text_items(&mut parts, retro.get("learnings"));
-    }
-    if map.get("type").and_then(Value::as_str) == Some("compacted") {
-        push_compacted_text(&mut parts, map);
-    }
-    parts.join("\n")
-}
-
-/// [`trajectory_search_text`] for what a compacted trajectory adds.
-fn push_compacted_text(parts: &mut Vec<String>, map: &Map<String, Value>) {
-    push_text(parts, map.get("narrative"));
-    for key in ["keyFindings", "keyLearnings", "openQuestions"] {
-        push_text_items(parts, map.get(key));
-    }
-    for key in ["lessons", "conventions"] {
-        let items = map.get(key).and_then(Value::as_array);
-        for item in items.into_iter().flatten().filter_map(Value::as_object) {
-            for value in item.values() {
-                push_text(parts, Some(value));
-            }
-        }
-    }
-}
-
-/// [`push_text`] for every item of an array value.
-fn push_text_items(parts: &mut Vec<String>, items: Option<&Value>) {
-    for item in items.and_then(Value::as_array).into_iter().flatten() {
-        push_text(parts, Some(item));
-    }
-}
-
-fn push_text(parts: &mut Vec<String>, value: Option<&Value>) {
-    if let Some(text) = value.and_then(Value::as_str).filter(|s| !s.is_empty()) {
-        parts.push(text.to_string());
-    }
-}
-
-fn trajectory_timestamp_ms(map: &Map<String, Value>, path: &Path) -> i64 {
-    for key in ["completedAt", "startedAt", "compactedAt"] {
-        if let Some(ms) = map
-            .get(key)
-            .and_then(Value::as_str)
-            .and_then(parse_iso_ms)
-            .filter(|ms| *ms > 0)
-        {
-            return ms;
-        }
-    }
-    path.metadata()
-        .and_then(|m| m.modified())
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
-}
-
-fn upsert_trajectory(conn: &Connection, row: &TrajectoryRow) -> Result<()> {
-    conn.execute(
-        "INSERT INTO trajectories \
-         (id, version, persona_id, project_id, task_title, task_description, status, started_at, completed_at, decisions_json, retrospective_json, search_text, path, updated_ms, timestamp_ms) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
-         ON CONFLICT(id) DO UPDATE SET version=excluded.version, persona_id=excluded.persona_id, project_id=excluded.project_id, task_title=excluded.task_title, task_description=excluded.task_description, status=excluded.status, started_at=excluded.started_at, completed_at=excluded.completed_at, decisions_json=excluded.decisions_json, retrospective_json=excluded.retrospective_json, search_text=excluded.search_text, path=excluded.path, updated_ms=excluded.updated_ms, timestamp_ms=excluded.timestamp_ms",
-        params![
-            row.id,
-            row.version,
-            row.persona_id,
-            row.project_id,
-            row.task_title,
-            row.task_description,
-            row.status,
-            row.started_at,
-            row.completed_at,
-            row.decisions_json,
-            row.retrospective_json,
-            row.search_text,
-            row.path,
-            row.updated_ms,
-            row.timestamp_ms,
-        ],
-    )?;
-    let entry = HistoryEntry {
-        id: 0,
-        source: "trajectory".into(),
-        session_id: Some(row.id.clone()),
-        project: row.project_id.clone(),
-        prompt_hash: Some(prompt_hash(&row.search_text)),
-        prompt: row.search_text.clone(),
-        timestamp_ms: row.timestamp_ms,
-    };
-    // Every other row this trajectory filed goes; the one it files again, if
-    // it is already there, stays, so re-reading an unchanged trajectory is
-    // not a delete and an insert -- a tombstone and a new change-feed
-    // revision -- of the same prompt. A row from before `prompt_hash` was
-    // stored is the same prompt too: it is kept and given its hash in place,
-    // one update, once.
-    let params = params![
-        row.id,
-        entry.timestamp_ms,
-        entry.prompt,
-        entry.project,
-        entry.prompt_hash
-    ];
-    conn.execute(
-        "DELETE FROM history WHERE source = 'trajectory' AND session_id = ?1 \
-         AND NOT (timestamp_ms = ?2 AND prompt = ?3 AND project IS ?4 \
-                  AND (prompt_hash IS NULL OR prompt_hash IS ?5))",
-        params,
-    )?;
-    conn.execute(
-        "UPDATE history SET prompt_hash = ?5 \
-         WHERE source = 'trajectory' AND session_id = ?1 AND timestamp_ms = ?2 \
-           AND prompt = ?3 AND project IS ?4 AND prompt_hash IS NULL",
-        params,
-    )?;
-    insert_history(conn, &entry)?;
-    Ok(())
-}
-
 pub(crate) fn parse_iso_ms(raw: &str) -> Option<i64> {
     chrono::DateTime::parse_from_rfc3339(raw)
         .ok()
@@ -18302,10 +17914,9 @@ mod tests {
             .contains("changed while its provider path"));
     }
 
-    /// `TRAJECTORY_ROOT=trajectory.json` is a legal setting, and a relative
-    /// root has to end up in the same spelling as the events the watcher
-    /// reports for it — otherwise it registers, never matches, and its
-    /// trajectories are only ever found by the backstop.
+    /// A relative file root has to end up in the same spelling as the events
+    /// the watcher reports for it — otherwise it registers, never matches,
+    /// and its writes are only ever found by the backstop.
     ///
     /// This is the cheap half of that property. The half with teeth is
     /// `tests/relative_watch_roots.rs`, which puts a real watcher's own event
@@ -18314,11 +17925,11 @@ mod tests {
     #[test]
     fn a_relative_file_root_is_resolved_against_the_working_directory() {
         let cwd = std::env::current_dir().expect("current dir");
-        let bare = super::trajectory_watch_root(PathBuf::from("trajectory.json"));
+        let bare = crate::discover::WatchRoot::file(PathBuf::from("history.jsonl"));
         assert_eq!(bare.depth, crate::discover::WatchDepth::File);
-        assert_eq!(bare.path, cwd.join("trajectory.json"));
+        assert_eq!(bare.path, cwd.join("history.jsonl"));
         assert_eq!(bare.registered_path(), cwd.as_path());
-        assert!(bare.covers(&cwd.join("trajectory.json")));
+        assert!(bare.covers(&cwd.join("history.jsonl")));
         assert!(
             !bare.covers(&cwd.join("other.json")),
             "resolving the root must not widen what it covers"
@@ -18326,22 +17937,23 @@ mod tests {
 
         // Positive controls: a nested relative path keeps its own parent, and
         // an absolute one is left exactly as it was given.
-        let nested = super::trajectory_watch_root(PathBuf::from("runs/trajectory.json"));
+        let nested = crate::discover::WatchRoot::file(PathBuf::from("runs/history.jsonl"));
         assert_eq!(nested.registered_path(), cwd.join("runs"));
-        let absolute = super::trajectory_watch_root(PathBuf::from("/home/someone/trajectory.json"));
+        let absolute =
+            crate::discover::WatchRoot::file(PathBuf::from("/home/someone/history.jsonl"));
         assert_eq!(absolute.registered_path(), Path::new("/home/someone"));
         // And a path that names its own directory resolves to the same root
         // as the plain spelling, since the two mean the same file.
-        let dotted = super::trajectory_watch_root(PathBuf::from("./runs/../trajectory.json"));
+        let dotted = crate::discover::WatchRoot::file(PathBuf::from("./runs/../history.jsonl"));
         assert_eq!(dotted.path, bare.path);
     }
 
-    /// A `TRAJECTORY_ROOT` naming one JSON file must not promote its parent —
-    /// often `$HOME`, sometimes `/` — into a watched tree.
+    /// A file root must not promote its parent — often `$HOME`, sometimes a
+    /// busy config directory — into a watched tree.
     #[test]
-    fn a_json_trajectory_entry_is_watched_as_a_file() {
-        let named = PathBuf::from("/home/someone/trajectory.json");
-        let root = super::trajectory_watch_root(named.clone());
+    fn a_file_root_is_watched_as_a_file() {
+        let named = PathBuf::from("/home/someone/history.jsonl");
+        let root = crate::discover::WatchRoot::file(named.clone());
         assert_eq!(root.path, named, "the root names the file, not its parent");
         assert_eq!(root.depth, crate::discover::WatchDepth::File);
         assert_eq!(
@@ -18355,12 +17967,12 @@ mod tests {
             "a sibling in the parent must not wake a sweep"
         );
 
-        // Positive control: a directory entry is still the recursive tree the
-        // roll-ups grow inside, so the narrowing above is specific to files.
-        let dir = PathBuf::from("/home/someone/.trajectories");
-        let root = super::trajectory_watch_root(dir.clone());
+        // Positive control: a tree root still covers its whole subtree, so
+        // the narrowing above is specific to files.
+        let dir = PathBuf::from("/home/someone/sessions");
+        let root = crate::discover::WatchRoot::tree(dir.clone());
         assert_eq!(root.depth, crate::discover::WatchDepth::Tree);
-        assert!(root.covers(&dir.join("completed/2026-09/run.json")));
+        assert!(root.covers(&dir.join("2026/09/run.jsonl")));
     }
 
     fn refusal(uid: &str, generation: u64, raw: &str) -> UnreadableSnapshot {
@@ -25784,35 +25396,6 @@ mod tests {
         assert!(
             super::SyncStateLock::acquire_with_timeout(&path, std::time::Duration::ZERO).is_err()
         );
-    }
-
-    #[test]
-    fn parses_compacted_rollup_instead_of_skipping_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("compact_fixture.json");
-        fs::write(
-            &path,
-            r#"{
-                "id":"compact_fixture",
-                "type":"compacted",
-                "version":1,
-                "sourceTrajectories":["traj_a"],
-                "compactedAt":"2026-06-21T10:00:00.000Z",
-                "decisions":[{"question":"Which DB?","chosen":"Neon","reasoning":"pgvector","impact":"rank Pair warnings"}],
-                "lessons":[{"context":"Deploy","lesson":"Scrub snippets","recommendation":"Redact ghp_FAKE0000000000000000000000000000abcd"}],
-                "keyFindings":["kind in PK"],
-                "narrative":"Compacted roll-up captured durable guidance."
-            }"#,
-        )
-        .unwrap();
-
-        let row = parse_trajectory_file(&path).unwrap().unwrap();
-        assert_eq!(row.id, "compact_fixture");
-        assert_eq!(row.version, Some(1));
-        assert!(row.retrospective_json.contains(r#""type":"compacted""#));
-        assert!(row.search_text.contains("kind in PK"));
-        assert!(row.search_text.contains("Redact ghp_FAKE"));
-        assert_eq!(row.timestamp_ms, 1_782_036_000_000);
     }
 
     #[test]
@@ -37732,128 +37315,6 @@ mod capture_progress_tests {
         assert_eq!(count(), 20);
     }
 
-    /// Re-reading a trajectory whose prompt has not changed keeps its
-    /// `history` row -- no tombstone, no new change-feed revision -- and one
-    /// whose prompt changed replaces it.
-    #[test]
-    fn re_reading_an_unchanged_trajectory_keeps_its_prompt_row() {
-        let conn = Connection::open_in_memory().unwrap();
-        crate::store::init_db(&conn).unwrap();
-        let row = |search_text: &str| TrajectoryRow {
-            id: "traj-1".into(),
-            version: Some(1),
-            persona_id: None,
-            project_id: Some("/p".into()),
-            task_title: Some("t".into()),
-            task_description: None,
-            status: Some("active".into()),
-            started_at: None,
-            completed_at: None,
-            decisions_json: "[]".into(),
-            retrospective_json: "{}".into(),
-            search_text: search_text.into(),
-            path: "/t/traj-1.json".into(),
-            updated_ms: 1,
-            timestamp_ms: 1,
-        };
-        let prompts = || -> Vec<(i64, String, i64)> {
-            conn.prepare(
-                "SELECT id, prompt, revision FROM history WHERE source = 'trajectory' ORDER BY id",
-            )
-            .unwrap()
-            .query_map([], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
-            .unwrap()
-            .collect::<rusqlite::Result<_>>()
-            .unwrap()
-        };
-        let tombstones = || -> i64 {
-            conn.query_row(
-                "SELECT COUNT(*) FROM evidence_tombstones WHERE kind = 'history'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap()
-        };
-        upsert_trajectory(&conn, &row("alpha")).unwrap();
-        let first = prompts();
-        assert_eq!(first.len(), 1);
-        upsert_trajectory(&conn, &row("alpha")).unwrap();
-        assert_eq!(prompts(), first, "the same row at the same revision");
-        assert_eq!(tombstones(), 0);
-
-        upsert_trajectory(&conn, &row("beta")).unwrap();
-        let replaced = prompts();
-        assert_eq!(replaced.len(), 1);
-        assert_eq!(replaced[0].1, "beta");
-        assert_eq!(tombstones(), 1, "the old prompt is a delete");
-
-        // A row written before `prompt_hash` was stored is the same prompt:
-        // it keeps its id, gains its hash in one update, and is then left
-        // alone.
-        conn.execute(
-            "UPDATE history SET prompt_hash = NULL WHERE source = 'trajectory'",
-            [],
-        )
-        .unwrap();
-        let legacy = prompts();
-        upsert_trajectory(&conn, &row("beta")).unwrap();
-        let backfilled = prompts();
-        assert_eq!(backfilled.len(), 1);
-        assert_eq!(backfilled[0].0, legacy[0].0, "the same row");
-        assert!(backfilled[0].2 > legacy[0].2, "one update, for the hash");
-        assert_eq!(tombstones(), 1, "no delete");
-        let hash: Option<String> = conn
-            .query_row(
-                "SELECT prompt_hash FROM history WHERE source = 'trajectory'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(hash, Some(prompt_hash("beta")));
-        upsert_trajectory(&conn, &row("beta")).unwrap();
-        assert_eq!(prompts(), backfilled);
-    }
-
-    #[test]
-    fn cancellation_interrupts_both_trajectory_directory_walks() {
-        let home = tempfile::tempdir().unwrap();
-        for i in 0..20 {
-            let directory = home
-                .path()
-                .join(format!("project-{i}/.trajectories/completed"));
-            fs::create_dir_all(&directory).unwrap();
-            fs::write(directory.join("run.json"), "{}").unwrap();
-        }
-        for named in [true, false] {
-            let checks = std::cell::Cell::new(0);
-            let mut found = Vec::new();
-            let error = with_capture_stop(
-                move || {
-                    checks.set(checks.get() + 1);
-                    checks.get() > 5
-                },
-                || {
-                    if named {
-                        collect_named_dirs(home.path(), ".trajectories", usize::MAX, &mut found)
-                    } else {
-                        collect_trajectory_json(home.path(), &mut found)
-                    }
-                },
-            )
-            .unwrap_err();
-            assert!(error.is::<CaptureCancelled>());
-            assert!(found.len() < 20, "stop must interrupt enumeration itself");
-            let mut resumed = Vec::new();
-            if named {
-                collect_named_dirs(home.path(), ".trajectories", usize::MAX, &mut resumed)
-            } else {
-                collect_trajectory_json(home.path(), &mut resumed)
-            }
-            .unwrap();
-            assert_eq!(resumed.len(), 20);
-        }
-    }
-
     #[test]
     fn file_progress_counts_completed_files_and_restores_observer() {
         let updates = Arc::new(Mutex::new(Vec::new()));
@@ -37925,34 +37386,6 @@ mod capture_progress_tests {
             *updates.lock().unwrap(),
             vec!["initializing".to_string(), "complete".to_string()]
         );
-    }
-
-    #[test]
-    fn trajectory_discovery_prunes_dependencies_and_build_output() {
-        let home = tempfile::tempdir().unwrap();
-        let wanted = home.path().join("repo/.trajectories");
-        fs::create_dir_all(wanted.join("completed/month")).unwrap();
-        for ignored in [
-            "node_modules/pkg",
-            ".git/objects",
-            "target/debug",
-            ".next/cache",
-            ".venv/lib",
-        ] {
-            fs::create_dir_all(home.path().join(ignored).join(".trajectories")).unwrap();
-        }
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(home.path(), home.path().join("repo/cycle")).unwrap();
-            std::os::unix::fs::symlink(&wanted, wanted.join("completed/cycle")).unwrap();
-        }
-        let mut roots = vec![];
-        collect_named_dirs(home.path(), ".trajectories", usize::MAX, &mut roots).unwrap();
-        assert_eq!(roots, vec![wanted.clone()]);
-        fs::write(wanted.join("completed/month/run.json"), "{}").unwrap();
-        let mut files = vec![];
-        collect_trajectory_json(&wanted, &mut files).unwrap();
-        assert_eq!(files, vec![wanted.join("completed/month/run.json")]);
     }
 }
 

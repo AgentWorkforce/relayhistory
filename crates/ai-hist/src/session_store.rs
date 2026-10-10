@@ -332,8 +332,6 @@ pub enum Source {
     Codex,
     Cursor,
     Grok,
-    Relay,
-    Trajectory,
     #[serde(rename = "opencode")]
     OpenCode,
     Muse,
@@ -353,8 +351,6 @@ impl Source {
         Self::Codex,
         Self::Cursor,
         Self::Grok,
-        Self::Relay,
-        Self::Trajectory,
         Self::OpenCode,
         Self::Muse,
         Self::Devin,
@@ -367,8 +363,6 @@ impl Source {
             Self::Codex => "codex",
             Self::Cursor => "cursor",
             Self::Grok => "grok",
-            Self::Relay => "relay",
-            Self::Trajectory => "trajectory",
             Self::OpenCode => "opencode",
             Self::Muse => "muse",
             Self::Devin => "devin",
@@ -389,19 +383,6 @@ impl Source {
     pub fn capabilities(self) -> SourceCapabilities {
         let name = self.as_str();
         let mut evidence_kinds = discover::declared_evidence_kinds(name).to_vec();
-        // Two sources declare nothing through shallow discovery yet write
-        // `history` rows all the same: relay's prompts arrive through the
-        // remote connector, and a trajectory's search text is indexed as a
-        // prompt by the trajectory sweep (`.trajectories` records are exempt
-        // from discovery, not from ingestion). A consumer reading those rows
-        // must not be told the source cannot produce them — and since
-        // `session()` reads only what is declared here, an undeclared kind
-        // is also an unread one.
-        if matches!(self, Self::Relay | Self::Trajectory)
-            && !evidence_kinds.contains(&EvidenceKind::History)
-        {
-            evidence_kinds.push(EvidenceKind::History);
-        }
         // Markers are derived by this crate's own parser rather than declared
         // by an adapter (a remote connector cannot supply them, so the
         // connector-facing declaration leaves them out); the parsers that
@@ -434,7 +415,6 @@ impl Source {
                 // Devin: the chat message's own `message_id`, else
                 // `n{node id}` from its `message_nodes` row.
                 Self::Devin => MessageIdOrigin::Mixed,
-                Self::Relay | Self::Trajectory => MessageIdOrigin::None,
             },
             hydrates_by_path: HOOK_HARNESSES.contains(&name),
         }
@@ -502,10 +482,7 @@ impl SourceCapabilities {
     /// Everything [`SessionStore::watch`] watches for this source under
     /// `roots`, from the same builder the loop registers with: the adapter's
     /// transcript roots and, for Claude and Codex, the flat `history.jsonl`
-    /// prompt log beside them, each with the scope the loop applies. Empty
-    /// for a source with no local files (relay); for trajectory it is the
-    /// `.trajectories` directories known at the time of the call, which the
-    /// loop re-derives on every backstop tick.
+    /// prompt log beside them, each with the scope the loop applies.
     pub fn watch_roots(&self, roots: &ProviderRoots) -> Vec<WatchedPath> {
         source_watch_roots(self.source.as_str(), roots)
             .into_iter()
@@ -3000,8 +2977,6 @@ mod tests {
                 | Source::Codex
                 | Source::Cursor
                 | Source::Grok
-                | Source::Relay
-                | Source::Trajectory
                 | Source::OpenCode
                 | Source::Muse
                 | Source::Devin => Source::ALL.contains(source),
@@ -3993,50 +3968,6 @@ mod tests {
                 "{source} advertises its transcript tree: {mine:?}"
             );
         }
-        assert!(Source::Relay.capabilities().watch_roots(&roots).is_empty());
-    }
-
-    /// A source exempt from shallow discovery still declares the rows its
-    /// own sweep writes, so its prompts are read rather than filtered out as
-    /// "not produced by this source".
-    #[test]
-    fn a_trajectory_session_reads_its_prompt_back() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = dir.path().join("ai-history.db");
-        let store = store_at(&db);
-        open_db(&db)
-            .unwrap()
-            .execute_batch(
-                "INSERT INTO sessions (session_id, source, discovery_state) \
-                 VALUES ('traj-1', 'trajectory', 'full');
-                 INSERT INTO history (source, session_id, project, prompt, prompt_hash, \
-                  timestamp_ms) \
-                 VALUES ('trajectory', 'traj-1', 'proj', 'ship the thing', 'h', 10);",
-            )
-            .unwrap();
-        for source in [Source::Trajectory, Source::Relay] {
-            assert!(
-                source
-                    .capabilities()
-                    .evidence_kinds
-                    .contains(&EvidenceKind::History),
-                "{source} writes history rows and says so"
-            );
-        }
-        let evidence = store
-            .session(
-                &SessionRef::id(Source::Trajectory, "traj-1"),
-                SessionQuery::default(),
-            )
-            .unwrap()
-            .expect("catalogued");
-        assert_eq!(evidence.coverage, vec![EvidenceKind::History]);
-        assert_eq!(evidence.loaded, vec![EvidenceKind::History]);
-        assert_eq!(evidence.prompts.len(), 1);
-        assert_eq!(
-            evidence.prompts[0].prompt.as_deref(),
-            Some("ship the thing")
-        );
     }
 
     /// `loaded` never names a kind the source cannot produce, whatever the

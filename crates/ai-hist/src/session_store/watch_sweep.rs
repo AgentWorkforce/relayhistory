@@ -1,41 +1,24 @@
 //! One watch loop's sweep, and what it knows about the roots it watches.
 //!
 //! Every filesystem-event tick of [`SessionStore::watch`] used to be a full
-//! forced sweep. On a machine with one live Claude session that meant every
-//! provider walked, and `~/Projects` walked twice for trajectory roots, every
-//! couple of seconds. The loop now says which roots fired
-//! ([`ChangeScope`]); [`WatchSources`] maps each root back to the sources
-//! that registered it, so the tick sweeps only those, and keeps the
-//! trajectory roots last derived so an event tick never walks `~/Projects`
-//! at all. Startup, backstop and manual ticks — and any event the loop could
-//! not place — stay full sweeps. The trajectory roots are derived once per
-//! backstop, by the root refresh that registers them, and the backstop's
-//! sweep reuses that walk.
+//! forced sweep: on a machine with one live Claude session that meant every
+//! provider walked every couple of seconds. The loop now says which roots
+//! fired ([`ChangeScope`]); [`WatchSources`] maps each root back to the
+//! sources that registered it, so the tick sweeps only those. Startup,
+//! backstop and manual ticks — and any event the loop could not place — stay
+//! full sweeps.
 
 use super::*;
 use crate::discover::WatchRoot;
-use crate::ingest::{sync_watch_roots_by_source, trajectory_roots, SweepScope};
+use crate::ingest::{sync_watch_roots_by_source, SweepScope};
 use crate::watch::{ChangeScope, TickRequest};
 use std::collections::{BTreeSet, HashMap};
 
-/// Which sources registered each watched root, and the trajectory roots the
-/// last full sweep found.
+/// Which sources registered each watched root.
 pub(super) struct WatchSources {
     roots: ProviderRoots,
-    state: Mutex<WatchSourcesState>,
-}
-
-#[derive(Default)]
-struct WatchSourcesState {
-    /// The derived trajectory roots, when the provider roots name none
-    /// outright (`TRAJECTORY_ROOT` unset). `None` until first derived.
-    trajectories: Option<Vec<PathBuf>>,
-    /// Derived since the last full sweep took them — at startup, or by the
-    /// backstop refresh just ahead of a backstop sweep — so that sweep need
-    /// not walk again.
-    fresh: bool,
     /// Every watched root's path, and the sources whose roots it is.
-    by_root: HashMap<PathBuf, BTreeSet<Source>>,
+    by_root: Mutex<HashMap<PathBuf, BTreeSet<Source>>>,
 }
 
 /// What one tick sweeps: the provider roots to read and the sources to read
@@ -58,38 +41,23 @@ impl WatchSources {
     pub(super) fn new(roots: ProviderRoots) -> Self {
         Self {
             roots,
-            state: Mutex::new(WatchSourcesState::default()),
+            by_root: Mutex::new(HashMap::new()),
         }
     }
 
     /// Every root the loop should watch. Called at startup and on every
-    /// backstop refresh, just ahead of that backstop's full sweep, so it
-    /// re-derives the trajectory roots here — a `.trajectories` directory
-    /// created since the last backstop is registered now, not one backstop
-    /// later — and leaves them fresh for that sweep to reuse rather than
-    /// walk again. It also brings the root-to-source map up to date with
-    /// exactly the roots the loop is about to adopt.
+    /// backstop refresh, so it also brings the root-to-source map up to date
+    /// with exactly the roots the loop is about to adopt.
     pub(super) fn watch_roots(&self) -> Vec<WatchRoot> {
-        let mut state = self.state.lock().expect("watch sources");
-        if self.roots.trajectory_roots.is_none() {
-            // A walk that fails keeps the roots the last one found.
-            if let Ok(found) = trajectory_roots(&self.roots) {
-                state.trajectories = Some(found);
-                state.fresh = true;
-            }
-        }
-        let by_source = sync_watch_roots_by_source(&pinned(&self.roots, &state.trajectories));
-        state.by_root.clear();
+        let by_source = sync_watch_roots_by_source(&self.roots);
+        let mut by_root = self.by_root.lock().expect("watch sources");
+        by_root.clear();
         for (name, roots) in &by_source {
             let Some(source) = Source::parse(name) else {
                 continue;
             };
             for root in roots {
-                state
-                    .by_root
-                    .entry(root.path.clone())
-                    .or_default()
-                    .insert(source);
+                by_root.entry(root.path.clone()).or_default().insert(source);
             }
         }
         crate::ingest::merge_watch_roots(
@@ -98,45 +66,19 @@ impl WatchSources {
     }
 
     /// What `request` sweeps. A forced tick whose every root is known sweeps
-    /// only the sources those roots belong to, from the trajectory roots
-    /// already known; anything else is a full sweep, which re-derives the
-    /// trajectory roots unless a refresh derived them since the last one.
+    /// only the sources those roots belong to; anything else is a full sweep.
     pub(super) fn plan(&self, request: &TickRequest) -> SweepPlan {
-        let mut state = self.state.lock().expect("watch sources");
         let sources = match &request.scope {
-            ChangeScope::Roots(fired) if request.force => sources_of(&state.by_root, fired),
+            ChangeScope::Roots(fired) if request.force => {
+                sources_of(&self.by_root.lock().expect("watch sources"), fired)
+            }
             _ => None,
         };
-        if self.roots.trajectory_roots.is_some() {
-            return SweepPlan {
-                roots: self.roots.clone(),
-                sources,
-            };
-        }
-        let rewalk = match &sources {
-            None => !std::mem::take(&mut state.fresh),
-            Some(sources) => sources.contains(&Source::Trajectory) && state.trajectories.is_none(),
-        };
-        if rewalk {
-            // A walk that fails leaves the sweep to walk for itself, and to
-            // report the failure through its trajectory phase.
-            state.trajectories = trajectory_roots(&self.roots).ok();
-        }
         SweepPlan {
-            roots: pinned(&self.roots, &state.trajectories),
+            roots: self.roots.clone(),
             sources,
         }
     }
-}
-
-/// `roots` reading `trajectories` as its explicit trajectory roots, when
-/// there are some to read.
-fn pinned(roots: &ProviderRoots, trajectories: &Option<Vec<PathBuf>>) -> ProviderRoots {
-    let mut roots = roots.clone();
-    if roots.trajectory_roots.is_none() {
-        roots.trajectory_roots.clone_from(trajectories);
-    }
-    roots
 }
 
 /// The sources the fired roots belong to, or `None` — a full sweep — when
@@ -287,13 +229,12 @@ impl WatchSweep {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ingest::trajectory_walks;
     use crate::watch::TickTrigger;
 
-    fn home_with_trajectories() -> (tempfile::TempDir, ProviderRoots) {
+    fn home() -> (tempfile::TempDir, ProviderRoots) {
         let home = tempfile::tempdir().unwrap();
-        std::fs::create_dir_all(home.path().join("Projects/repo/.trajectories")).unwrap();
         std::fs::create_dir_all(home.path().join(".claude/projects")).unwrap();
+        std::fs::create_dir_all(home.path().join(".codex/sessions")).unwrap();
         let roots =
             ProviderRoots::from_home(home.path().to_path_buf(), home.path().join("opencode.db"));
         (home, roots)
@@ -317,19 +258,19 @@ mod tests {
 
     #[test]
     fn an_event_tick_sweeps_the_sources_whose_roots_fired() {
-        let (home, roots) = home_with_trajectories();
+        let (home, roots) = home();
         let sources = WatchSources::new(roots);
         sources.watch_roots();
         let claude = home.path().join(".claude/projects");
-        let trajectory = home.path().join("Projects/repo/.trajectories");
+        let codex = home.path().join(".codex/sessions");
 
         assert_eq!(
             sources.plan(&event(std::slice::from_ref(&claude))).sources,
             Some(vec![Source::Claude])
         );
         assert_eq!(
-            sources.plan(&event(&[claude.clone(), trajectory])).sources,
-            Some(vec![Source::Claude, Source::Trajectory])
+            sources.plan(&event(&[claude.clone(), codex])).sources,
+            Some(vec![Source::Claude, Source::Codex])
         );
         // A root the map does not know is not guessed at.
         assert_eq!(
@@ -348,84 +289,15 @@ mod tests {
         );
     }
 
-    /// The trajectory roots are walked for once when the watch starts and
-    /// once per backstop, by the root refresh, whose walk the sweep right
-    /// after it reuses. An event tick — Claude's or a trajectory root's —
-    /// reads the roots the last walk found and never walks.
     #[test]
-    fn only_a_backstop_walks_projects_for_trajectory_roots() {
-        let (home, roots) = home_with_trajectories();
-        let sources = WatchSources::new(roots);
-        let claude = home.path().join(".claude/projects");
-        let trajectory = home.path().join("Projects/repo/.trajectories");
-
-        let walks = trajectory_walks();
-        sources.watch_roots();
-        assert_eq!(trajectory_walks() - walks, 1, "the watch's own derivation");
-        let startup = sources.plan(&full(TickTrigger::Startup));
-        assert_eq!(trajectory_walks() - walks, 1, "served by the startup walk");
-        assert_eq!(
-            startup.roots.trajectory_roots,
-            Some(vec![trajectory.clone()])
-        );
-
-        let claude_tick = sources.plan(&event(std::slice::from_ref(&claude)));
-        let trajectory_tick = sources.plan(&event(std::slice::from_ref(&trajectory)));
-        assert_eq!(trajectory_walks() - walks, 1, "no event tick walked");
-        assert_eq!(
-            trajectory_tick.roots.trajectory_roots,
-            Some(vec![trajectory])
-        );
-        assert_eq!(claude_tick.sources, Some(vec![Source::Claude]));
-
-        // A backstop: the refresh walks, the sweep after it reuses the walk.
-        sources.watch_roots();
-        let backstop = sources.plan(&full(TickTrigger::Poll));
-        assert_eq!(trajectory_walks() - walks, 2, "one walk per backstop");
-        assert_eq!(backstop.scope(), SweepScope::everything());
-        // A full sweep with no refresh before it walks for itself.
-        sources.plan(&full(TickTrigger::Manual));
-        assert_eq!(trajectory_walks() - walks, 3);
-    }
-
-    /// A `.trajectories` directory created after the watch started is
-    /// registered by the next backstop refresh, and its events are scoped to
-    /// the trajectory source, rather than waiting a backstop more.
-    #[test]
-    fn a_new_trajectory_store_is_registered_by_the_next_refresh() {
-        let (home, roots) = home_with_trajectories();
+    fn an_unforced_tick_is_never_scoped() {
+        let (home, roots) = home();
         let sources = WatchSources::new(roots);
         sources.watch_roots();
-        sources.plan(&full(TickTrigger::Startup));
-        let created = home.path().join("Projects/other/.trajectories");
-        std::fs::create_dir_all(&created).unwrap();
-
-        let registered = sources.watch_roots();
-        assert!(
-            registered.iter().any(|root| root.path == created),
-            "the refresh registers the new store"
-        );
-        assert_eq!(
-            sources.plan(&event(std::slice::from_ref(&created))).sources,
-            Some(vec![Source::Trajectory])
-        );
-        let backstop = sources.plan(&full(TickTrigger::Poll));
-        assert!(backstop
-            .roots
-            .trajectory_roots
-            .is_some_and(|roots| roots.contains(&created)));
-    }
-
-    #[test]
-    fn explicit_trajectory_roots_are_never_walked() {
-        let (home, mut roots) = home_with_trajectories();
-        let named = home.path().join("named/.trajectories");
-        roots.trajectory_roots = Some(vec![named.clone()]);
-        let sources = WatchSources::new(roots);
-        let walks = trajectory_walks();
-        sources.watch_roots();
-        let plan = sources.plan(&full(TickTrigger::Poll));
-        assert_eq!(trajectory_walks(), walks);
-        assert_eq!(plan.roots.trajectory_roots, Some(vec![named]));
+        let mut request = event(&[home.path().join(".claude/projects")]);
+        request.force = false;
+        let plan = sources.plan(&request);
+        assert_eq!(plan.sources, None);
+        assert_eq!(plan.scope(), SweepScope::everything());
     }
 }

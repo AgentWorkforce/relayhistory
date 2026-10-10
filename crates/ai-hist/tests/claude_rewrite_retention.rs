@@ -759,7 +759,6 @@ fn in_place_rewrites_retain_already_ingested_evidence() {
     std::env::set_var("USERPROFILE", home);
     std::env::set_var("XDG_DATA_HOME", home.join("xdg"));
     std::env::set_var("OPENCODE_DB", home.join("missing-opencode.db"));
-    std::env::set_var("TRAJECTORY_ROOT", home.join("missing-trajectories"));
     std::env::remove_var("AI_HIST_DB");
     claude_sync_retention(home);
     claude_hydrate_retention(home);

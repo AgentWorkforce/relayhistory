@@ -932,60 +932,20 @@ fn configured_provider_roots_move_the_watch_roots() {
     );
 }
 
-/// A trajectory root is watched because it is *configured*, not because it
-/// already has files in it. Deriving the watch from an existing file's parent
-/// covers only the shape the tree has right now.
+/// A project's `.trajectories` directory is nothing this build reads, so it
+/// is not watched: a write there must not wake a sweep.
 #[test]
-fn trajectory_roots_are_watched_before_they_hold_anything() {
+fn a_trajectories_directory_is_not_watched() {
     let home = tempfile::tempdir().expect("tempdir");
-    let empty = home.path().join("Projects/app/.trajectories");
-    std::fs::create_dir_all(&empty).expect("empty trajectory root");
-    // A sibling that will only exist later: the root must already cover it.
-    let future = empty.join("completed/2026-09");
-
+    let trajectories = home.path().join("Projects/app/.trajectories");
+    std::fs::create_dir_all(&trajectories).expect("trajectories dir");
     let roots = ai_hist::sync_watch_roots(home.path(), &home.path().join("opencode.db"));
-    let root = roots
-        .iter()
-        .find(|root| root.path == empty)
-        .unwrap_or_else(|| panic!("empty trajectory root missing from {roots:?}"));
-    assert_eq!(
-        root.depth,
-        WatchDepth::Tree,
-        "a trajectory root must be watched as a tree, or a new completed/<month>/ goes unseen"
-    );
     assert!(
-        !roots.iter().any(|root| root.path == future),
-        "the root covers its subtree; individual descendants are not separate roots"
+        !roots
+            .iter()
+            .any(|root| root.path.starts_with(home.path().join("Projects"))),
+        "{roots:?}"
     );
-}
-
-/// The fingerprint re-derives trajectory roots on every tick, so the walk that
-/// finds them cannot afford to descend a dependency tree.
-#[test]
-fn the_trajectory_root_scan_skips_dependency_trees() {
-    let home = tempfile::tempdir().expect("tempdir");
-    let real = home.path().join("Projects/app/.trajectories");
-    std::fs::create_dir_all(&real).expect("real root");
-    for buried in [
-        "Projects/app/node_modules/pkg/.trajectories",
-        "Projects/app/.git/modules/.trajectories",
-        "Projects/app/target/debug/.trajectories",
-    ] {
-        std::fs::create_dir_all(home.path().join(buried)).expect("buried root");
-    }
-
-    let roots = ai_hist::sync_watch_roots(home.path(), &home.path().join("opencode.db"));
-    let trajectory_roots = roots
-        .iter()
-        .filter(|root| root.path.starts_with(home.path().join("Projects")))
-        .collect::<Vec<_>>();
-
-    assert_eq!(
-        trajectory_roots.len(),
-        1,
-        "only the project's own root should be found: {trajectory_roots:?}"
-    );
-    assert_eq!(trajectory_roots[0].path, real);
 }
 
 #[test]
@@ -1118,40 +1078,49 @@ fn a_write_below_a_non_recursive_root_does_not_force_a_tick() {
 }
 
 /// `retry_pending` alone cannot reach a root whose *name* was unknown at
-/// startup — a project that grows a `.trajectories` directory later. The
-/// refresh callback is what closes that, on the backstop tick.
+/// startup — one the caller's root derivation only finds later. The refresh
+/// callback is what closes that, on the backstop tick.
 #[cfg(feature = "fs-events")]
 #[test]
 fn a_root_discovered_after_startup_is_adopted() {
     let home = tempfile::tempdir().expect("tempdir");
     let projects = home.path().join("Projects/app");
     std::fs::create_dir_all(&projects).expect("project dir");
+    let late = projects.join("sessions");
     let home_for_refresh = home.path().to_path_buf();
     let opencode = home.path().join("opencode.db");
 
-    let running = RunningLoop::reporting(move |watch| {
-        watch
-            .with_immediate(false)
-            .with_fs_events(true)
-            .with_roots(ai_hist::sync_watch_roots(&home_for_refresh, &opencode))
-            .with_roots_refresh(Arc::new(move || {
-                ai_hist::sync_watch_roots(&home_for_refresh, &opencode)
-            }))
-            .with_debounce_ms(100)
-            // Short, because the backstop tick is what re-derives the roots.
-            .with_slow_poll_ms(200)
-            .with_poll_interval_ms(200)
+    let running = RunningLoop::reporting({
+        let late = late.clone();
+        move |watch| {
+            watch
+                .with_immediate(false)
+                .with_fs_events(true)
+                .with_roots(ai_hist::sync_watch_roots(&home_for_refresh, &opencode))
+                .with_roots_refresh(Arc::new(move || {
+                    // A derivation that names the directory only once it
+                    // exists, as one that searches for a name would.
+                    let mut roots = ai_hist::sync_watch_roots(&home_for_refresh, &opencode);
+                    if late.exists() {
+                        roots.push(ai_hist::discover::WatchRoot::tree(late.clone()));
+                    }
+                    roots
+                }))
+                .with_debounce_ms(100)
+                // Short, because the backstop tick is what re-derives the roots.
+                .with_slow_poll_ms(200)
+                .with_poll_interval_ms(200)
+        }
     });
 
     // The directory does not exist yet, so its name is not in any root list.
-    let late = projects.join(".trajectories");
     assert!(!running
         .watch
         .status()
         .expect("status")
         .watched
         .contains(&late));
-    std::fs::create_dir_all(&late).expect("late trajectory root");
+    std::fs::create_dir_all(&late).expect("late root");
 
     let deadline = std::time::Instant::now() + ARRIVES_WITHIN;
     while !running
@@ -1163,13 +1132,13 @@ fn a_root_discovered_after_startup_is_adopted() {
     {
         assert!(
             std::time::Instant::now() < deadline,
-            "a .trajectories directory created after startup was never adopted: {:?}",
+            "a root named after startup was never adopted: {:?}",
             running.watch.status()
         );
         std::thread::yield_now();
     }
 
-    std::fs::write(late.join("run-1.json"), "{\"id\":\"t1\"}\n").expect("write trajectory");
+    std::fs::write(late.join("run-1.jsonl"), "{}\n").expect("write in the late root");
     let deadline = std::time::Instant::now() + ARRIVES_WITHIN;
     loop {
         match running.ticks.recv_timeout(Duration::from_millis(500)) {
@@ -2628,8 +2597,8 @@ fn a_recreated_root_is_watched_again() {
         .contains(&root));
 }
 
-/// A `TRAJECTORY_ROOT` entry may name one JSON file, and that file's parent is
-/// routinely `$HOME` — or `/`. The parent is what has to be registered, since
+/// A file root's parent is routinely a busy directory — `~/.claude`, or
+/// `$HOME` itself. The parent is what has to be registered, since
 /// a watch on the file itself stops firing the moment the harness rewrites it
 /// atomically, but only the named file may wake a sweep: watching that parent
 /// as a tree turns every unrelated write on the machine into a forced
@@ -2638,7 +2607,7 @@ fn a_recreated_root_is_watched_again() {
 #[test]
 fn a_file_root_wakes_on_its_own_name_only() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let named = dir.path().join("trajectory.json");
+    let named = dir.path().join("history.jsonl");
     std::fs::write(&named, "{\"id\":\"t1\"}\n").expect("seed the named file");
     let buried = dir.path().join("nested");
     std::fs::create_dir_all(&buried).expect("sibling directory");
@@ -2877,35 +2846,6 @@ fn a_change_confined_to_a_sweep_only_source_still_runs_the_sweep() {
     );
 }
 
-/// Trajectory records are a declared discovery exemption, so nothing enumerates
-/// them — and the sweep reads them anyway.
-#[test]
-fn a_change_confined_to_a_trajectory_still_runs_the_sweep() {
-    let home = tempfile::tempdir().expect("tempdir");
-    write_claude_transcript(home.path(), "proj", "anchor-2", 1);
-    let db = home.path().join("history.db");
-    let trajectories = home.path().join("Projects/app/.trajectories");
-    std::fs::create_dir_all(&trajectories).expect("trajectory root");
-
-    assert!(sync_tick(&db, home.path(), false).swept);
-    assert!(sync_tick(&db, home.path(), false).skipped_unchanged());
-
-    std::fs::write(
-        trajectories.join("run-1.json"),
-        r#"{"id":"traj-1","task":"trajectory only","startedAt":"2026-09-19T10:00:00.000Z"}"#,
-    )
-    .expect("write trajectory");
-
-    assert!(
-        sync_tick(&db, home.path(), false).swept,
-        "a new trajectory record must reopen the sweep"
-    );
-    assert!(
-        sync_tick(&db, home.path(), false).skipped_unchanged(),
-        "and the fast path must re-arm once it has been read"
-    );
-}
-
 /// A per-file read failure never reaches `SyncSourceReport::failures` — the
 /// provider absorbs it, counts it, and returns a successful partial run. But
 /// the file was folded into the fingerprint, so arming the fast path over it
@@ -2972,49 +2912,6 @@ fn a_source_that_could_not_be_read_does_not_arm_the_fast_path() {
     assert!(
         sync_tick(&db, home.path(), false).skipped_unchanged(),
         "once every source reads again the fast path must arm"
-    );
-}
-
-/// Relay history has no file to stat, but it still changes: `import` writes it
-/// straight into the catalog. Nothing on the filesystem moves when it does, so
-/// without a generation for the relay slice the fingerprint would match and
-/// discovery would never see the imported sessions.
-#[test]
-fn imported_relay_history_reaches_the_catalog() {
-    let home = tempfile::tempdir().expect("tempdir");
-    write_claude_transcript(home.path(), "proj", "anchor-4", 1);
-    let db = home.path().join("history.db");
-
-    assert!(sync_tick(&db, home.path(), false).swept);
-    assert!(sync_tick(&db, home.path(), false).skipped_unchanged());
-
-    // What `import` does: relay rows straight into the catalog, no file
-    // anywhere on disk.
-    {
-        let conn = ai_hist::open_db(&db).expect("open db");
-        ai_hist::insert_history(
-            &conn,
-            &ai_hist::HistoryEntry {
-                id: 0,
-                source: "relay".into(),
-                session_id: Some("relay-imported".into()),
-                project: Some("/tmp/relay".into()),
-                prompt: "imported relay turn".into(),
-                prompt_hash: Some(ai_hist::prompt_hash("imported relay turn")),
-                timestamp_ms: 1_758_276_000_000,
-            },
-        )
-        .expect("insert relay history");
-    }
-
-    assert!(
-        sync_tick(&db, home.path(), false).swept,
-        "an import must reopen the sweep even though no file moved"
-    );
-    assert_eq!(
-        catalog_session_count(&db, "relay", "relay-imported"),
-        1,
-        "the imported relay session never reached the catalog"
     );
 }
 

@@ -129,10 +129,8 @@ Watch attaches a filesystem watcher to everything a local sweep reads: the
 providers' session roots (`~/.claude/projects`, `~/.codex/sessions`,
 `~/.codex/archived_sessions`, `~/.cursor/projects`, `~/.grok/sessions`, and the
 directory holding the OpenCode database) plus the flat per-harness logs
-`~/.claude/history.jsonl` and `~/.codex/history.jsonl` and any `.trajectories`
-directory (found under `~/Projects` at most five directories down, or named by
-`TRAJECTORY_ROOT`). It then runs one sweep per burst of writes, with a slow poll
-behind it. When no root can be watched — a network mount, a container without inotify,
+`~/.claude/history.jsonl` and `~/.codex/history.jsonl`. It then runs one sweep per burst of writes, with a slow poll behind
+it. When no root can be watched — a network mount, a container without inotify,
 `--no-fsevents` — it falls back to polling at `--interval`.
 
 Startup reports which driver it took **and which roots are not covered yet**. A
@@ -183,7 +181,7 @@ returned an error goes down the same path, for the same reason: a transient
 SQLite error or a provider that could not be read is not an answer about the
 change, and the wake that carried it has already been consumed.
 
-A root given relatively — `TRAJECTORY_ROOT=trajectory.json` — is resolved
+A root given relatively — an embedder's `ProviderRoots` may name one — is resolved
 against the working directory when it is built, and every event path is put
 through the same resolution before it is matched. Both sides then hold one
 spelling: a root that kept a relative name would register successfully, be
@@ -194,19 +192,15 @@ once per registration, because the backends disagree: inotify echoes the path
 the watch was registered with, while macOS FSEvents always reports the real
 one (`/private/var/…`, and the target of any symlink on the way). Either
 spelling matches. The backstop also
-re-derives the root set, so a project that grows a `.trajectories` directory
-mid-run — a root whose *name* could not have been known at startup — is picked
-up too.
+re-derives the root set, so a root whose *name* could not have been known at
+startup is picked up too.
 
 A root is watched at the depth it asks for: transcript trees recursively,
 because a new session is a new file somewhere inside; the directories holding
 the flat logs as the single files they are — registered through the parent,
 because a watch on the file itself dies with the next atomic rewrite, but
 filtered back to the one name so the todo files, shell snapshots and settings
-beside them do not each wake a sweep; and a `TRAJECTORY_ROOT`
-naming a single JSON file as that one file — registered through its parent,
-because an atomic rewrite takes a watch on the file itself with it, but
-filtered back down to the one name, since that parent is routinely `$HOME`.
+beside them do not each wake a sweep.
 That depth is enforced on the events themselves rather than left to the OS,
 because the macOS backend has no shallow mode and delivers the whole subtree
 regardless.
@@ -224,9 +218,7 @@ Two things make this cheap enough to leave running:
 
 - A tick first folds a **stat-only fingerprint** over everything the sweep
   reads — the transcripts discovery enumerates, the Claude subagent
-  `agent-*.meta.json` sidecars beside them, the two flat logs, the trajectory
-  records, and a generation for the imported Relay rows, which have no file to
-  stat but still change. If it matches the previous sweep's, the tick returns
+  `agent-*.meta.json` sidecars beside them, and the flat logs. If it matches the previous sweep's, the tick returns
   without opening a single file. Anything the sweep reads has to be in that
   fold: a source left out would sit behind an unchanged fingerprint and never
   be read again. The value is recorded in `.sync-state.json` beside the

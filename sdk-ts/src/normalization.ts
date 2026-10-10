@@ -1063,7 +1063,7 @@ export function feedChange(value: UnknownRecord): FeedChange {
   const columns = value.columns;
   return {
     kind: changeKind(value.kind),
-    // Every source the native feed names, trajectory included. A row a newer
+    // Every source the native feed names. A row a newer
     // release wrote is carried rather than failed on: `source` is null and
     // `sourceName` names a source this SDK does not know.
     source: isSource(value.source) ? value.source : null,

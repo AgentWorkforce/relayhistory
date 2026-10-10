@@ -22,7 +22,7 @@ async function isolatedHome(t: TestContext, prefix: string): Promise<{ dir: stri
   const dir = await mkdtemp(join(tmpdir(), prefix));
   t.after(() => rm(dir, { recursive: true, force: true }));
   const saved = new Map(
-    ['HOME', 'USERPROFILE', 'XDG_DATA_HOME', 'OPENCODE_DB', 'TRAJECTORY_ROOT'].map((name) => [
+    ['HOME', 'USERPROFILE', 'XDG_DATA_HOME', 'OPENCODE_DB'].map((name) => [
       name,
       process.env[name],
     ]),
@@ -227,45 +227,6 @@ test('a source filter the local plugin does not cover leaves the native pass ans
 
   await discoverSessions({ sources: ['claude'], plugins, dbPath });
   assert.equal(calls, 1);
-});
-
-test('a relay session a local plugin holds hydrates even after the built-in adapter catalogues it', async (t) => {
-  const { dbPath, root } = await isolatedHome(t, 'rh-local-plugin-relay-');
-  const registry = new HistoryPluginRegistry();
-  let hydrations = 0;
-  registry.register({
-    sources: [{
-      id: 'relay-local',
-      instanceId: 'one',
-      location: 'local',
-      roots: [root],
-      supportedSources: ['relay'],
-      discover: async () => ({
-        observations: [{ source: 'relay', session_id: 'host-1', raw_locator: 'host-1', source_stamp: '1' }],
-      }),
-      hydrate: async () => {
-        hydrations++;
-        return {
-          source_stamp: '1',
-          source_bytes: 10,
-          covered_kinds: ['history'],
-          records: [{
-            kind: 'history',
-            payload: { source: 'relay', session_id: 'host-1', prompt: 'deploy it', timestamp_ms: 1_789_000_000_000 },
-          }],
-        };
-      },
-    }],
-  });
-  await discoverSessions({ plugins: registry, dbPath });
-  const first = await hydrateSession({ source: 'relay', sessionId: 'host-1', plugins: registry, dbPath });
-  assert.equal(first.evidence.prompts, 1);
-  // The stored relay history is now what the built-in relay adapter
-  // enumerates, so it observes the session too and refuses to hydrate it.
-  await discoverSessions({ plugins: registry, dbPath });
-  const again = await hydrateSession({ source: 'relay', sessionId: 'host-1', plugins: registry, dbPath });
-  assert.equal(again.evidence.prompts, 1);
-  assert.equal(hydrations, 2);
 });
 
 test('the roots check rejects only real escapes, for raw_path and an absolute raw_locator', async (t) => {
