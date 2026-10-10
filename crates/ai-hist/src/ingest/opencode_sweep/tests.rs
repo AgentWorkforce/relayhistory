@@ -358,3 +358,33 @@ fn a_lost_catalog_row_or_parent_edge_is_read_again() {
     assert_eq!(catalog, 1);
     assert_eq!(edge(&fixture.conn), 1);
 }
+
+/// With `time_updated`, the stamp reads no payload: a rewrite moves the
+/// row's `time_updated`, as OpenCode writes it, and that is what is seen.
+#[test]
+fn a_rewrite_that_moves_time_updated_is_read_again() {
+    let mut fixture = Fixture::new();
+    let db = fixture.root.join("opencode.db");
+    let store = provider_store(&db);
+    store
+        .execute_batch(
+            "ALTER TABLE message ADD COLUMN time_updated INTEGER; \
+             ALTER TABLE part ADD COLUMN time_updated INTEGER; \
+             UPDATE message SET time_updated = time_created; \
+             UPDATE part SET time_updated = time_created;",
+        )
+        .unwrap();
+    settle(&db);
+    let none = SweepRepairs::default();
+    fixture.sweep(std::slice::from_ref(&db), &none);
+    assert_eq!(fixture.sweep(std::slice::from_ref(&db), &none), (0, 0));
+    store
+        .execute(
+            "UPDATE part SET time_updated = time_updated + 1, \
+             data = replace(data, 'add a retry', 'add a RETRY') WHERE id = 'prt_sqlite_u1_text'",
+            [],
+        )
+        .unwrap();
+    settle(&db);
+    assert_eq!(fixture.sweep(std::slice::from_ref(&db), &none), (1, 1));
+}

@@ -44,12 +44,10 @@ type TableAggregate = HashMap<String, (i64, Option<i64>, i64)>;
 
 /// Every session's stamp inputs, in one pass over each table.
 ///
-/// Each row's hash covers its id, `time_updated` and payload, so a rewritten
-/// row moves the sum even when the count, the newest timestamp and the
-/// payload's length stay where they were: OpenCode bumps `time_updated` on
-/// a rewrite, but a schema without the column, or a rewrite that lands in
-/// the same millisecond, has only the payload to show it. The columns read
-/// are the ones the loaders read; a schema without one stamps without it.
+/// Each row's hash covers its id and [`row_version`], so a rewritten row
+/// moves the sum even when the count and the newest timestamp stay where
+/// they were. The columns read are the ones the loaders read; a schema
+/// without one stamps without it.
 pub(super) fn sqlite_session_stamps(src: &Connection) -> Result<Vec<SessionStampRow>> {
     let session_columns = opencode::table_columns(src, "session")?;
     if !session_columns.contains("id") {
@@ -106,12 +104,13 @@ fn message_aggregate(src: &Connection) -> Result<TableAggregate> {
         return Ok(TableAggregate::new());
     }
     let updated = opencode::optional_column(&columns, "time_updated");
+    let version = row_version(&columns, "");
     aggregate(
         src,
         &format!(
             "SELECT session_id, COUNT(*), MAX({updated}), \
              SUM(ai_hist_fnv(id || '|' || COALESCE(CAST({updated} AS TEXT), '') \
-                 || '|' || COALESCE(data, ''))) \
+                 || '|' || {version})) \
              FROM message GROUP BY session_id"
         ),
     )
@@ -127,6 +126,7 @@ fn part_aggregate(src: &Connection) -> Result<TableAggregate> {
     {
         return Ok(TableAggregate::new());
     }
+    let version = row_version(&columns, "p.");
     let updated = match columns.contains("time_updated") {
         true => "p.time_updated",
         false => "NULL",
@@ -149,10 +149,29 @@ fn part_aggregate(src: &Connection) -> Result<TableAggregate> {
             "SELECT {session}, COUNT(*), MAX({updated}), \
              SUM(ai_hist_fnv(p.id || '|' || p.message_id || '|' \
                  || COALESCE(CAST({updated} AS TEXT), '') \
-                 || '|' || COALESCE(p.data, ''))) \
+                 || '|' || {version})) \
              FROM {from} GROUP BY {session}"
         ),
     )
+}
+
+/// What identifies one version of a row's payload, as SQL over the row
+/// (columns prefixed by `alias`).
+///
+/// OpenCode stamps `time_updated` on every write of a row, so with the
+/// column a rewrite moves `time_updated` or, within the same millisecond,
+/// lands within [`AMBIGUITY_MS`] of the read that saw the first version,
+/// which leaves that session unstamped. Its payload length, read from the
+/// record header, stands in for the rest. A schema without the column has
+/// only the payload itself to show a rewrite, so the payload is hashed --
+/// on a store of a gigabyte of payloads, seconds of reading on every sweep
+/// of a store that moved, which a schema with the column does not pay.
+fn row_version(columns: &std::collections::BTreeSet<String>, alias: &str) -> String {
+    if columns.contains("time_updated") {
+        format!("COALESCE(octet_length({alias}data), -1)")
+    } else {
+        format!("COALESCE({alias}data, '')")
+    }
 }
 
 fn aggregate(src: &Connection, sql: &str) -> Result<TableAggregate> {

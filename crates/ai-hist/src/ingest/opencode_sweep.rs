@@ -11,8 +11,9 @@
 //! * **Session stamp** (`opencode_sessions_v1`, `opencode_tree_sessions_v1`):
 //!   for a SQLite session, the session row's fields and, per `message` and
 //!   `part` table, the row count, newest `time_updated` and a sum of per-row
-//!   hashes of id, `time_updated` and payload -- one aggregate pass over each
-//!   table, which the parse and the writes it saves cost many times over.
+//!   hashes of id, `time_updated` and payload length (the payload itself
+//!   where the table has no `time_updated`) -- one aggregate pass over each
+//!   table.
 //!   For the legacy JSON tree, the stamp discovery already takes
 //!   ([`stamp_json_tree_session`]).
 //!
