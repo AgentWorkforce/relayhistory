@@ -1,6 +1,6 @@
 //! Bounded one-request bridge for explicitly selected provider-native adapters.
-use ai_hist::{observations::SessionObservation, EvidenceKind, SessionLocation};
 use ai_hist::discover::DiscoveryEnv;
+use ai_hist::{observations::SessionObservation, EvidenceKind, SessionLocation};
 use anyhow::{ensure, Context, Result};
 use serde::Deserialize;
 use serde_json::{json, Value};

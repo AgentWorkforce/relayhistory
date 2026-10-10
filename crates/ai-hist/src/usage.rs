@@ -445,164 +445,13 @@ pub fn normalize_usage(
     usage.provider_total_tokens = counter("total_tokens")?;
 
     match source {
-        "codex" => {
-            // `CodexTokenTotals::to_token_json` keeps `input_tokens`
-            // inclusive of `cached_input_tokens` even after snapshot
-            // differencing. Emitting exclusive input here is what stops a
-            // consumer that sums the categories from counting cache reads
-            // twice.
-            let input = counter("input_tokens")?;
-            let cached = counter("cached_input_tokens")?;
-            let cache_write = counter("cache_write_input_tokens")?;
-            let inclusive = input.unwrap_or(0);
-            let cached_value = cached.unwrap_or(0);
-            usage.input_tokens =
-                inclusive
-                    .checked_sub(cached_value)
-                    .ok_or(UsageError::CounterRegressed {
-                        field: "input_tokens",
-                        value: inclusive,
-                        subtracted: cached_value,
-                    })?;
-            usage.cache_read_tokens = cached_value;
-            usage.cache_write_tokens = cache_write.unwrap_or(0);
-            usage.coverage.has_input_tokens = input.is_some();
-            usage.coverage.has_cache_read_tokens = cached.is_some();
-            usage.coverage.has_cache_write_tokens = cache_write.is_some();
-        }
-        "muse" => {
-            // Responses-shaped: `input_tokens` includes the cached prefix,
-            // which Muse reports as `cache_read_tokens` (and again as
-            // `cached_tokens`, the same count). Input is emitted exclusive of
-            // it, as for Codex, so summing the categories counts each token
-            // once.
-            let input = counter("input_tokens")?;
-            let cache_read = match counter("cache_read_tokens")? {
-                Some(value) => Some(value),
-                None => counter("cached_tokens")?,
-            };
-            let cache_write = counter("cache_write_tokens")?;
-            let inclusive = input.unwrap_or(0);
-            let cached_value = cache_read.unwrap_or(0);
-            usage.input_tokens =
-                inclusive
-                    .checked_sub(cached_value)
-                    .ok_or(UsageError::CounterRegressed {
-                        field: "input_tokens",
-                        value: inclusive,
-                        subtracted: cached_value,
-                    })?;
-            usage.cache_read_tokens = cached_value;
-            usage.cache_write_tokens = cache_write.unwrap_or(0);
-            usage.coverage.has_input_tokens = input.is_some();
-            usage.coverage.has_cache_read_tokens = cache_read.is_some();
-            usage.coverage.has_cache_write_tokens = cache_write.is_some();
-        }
-        "claude" => {
-            // Claude's native `message.usage` already excludes cache reads
-            // and writes from `input_tokens`; subtracting them again would
-            // under-report ordinary input.
-            let input = counter("input_tokens")?;
-            let cache_read = counter("cache_read_input_tokens")?;
-            let cache_write_total = counter("cache_creation_input_tokens")?;
-            usage.input_tokens = input.unwrap_or(0);
-            usage.cache_read_tokens = cache_read.unwrap_or(0);
-            usage.coverage.has_input_tokens = input.is_some();
-            usage.coverage.has_cache_read_tokens = cache_read.is_some();
-
-            let creation = object.get("cache_creation").and_then(Value::as_object);
-            let ephemeral_5m = read_counter(
-                creation.and_then(|c| c.get("ephemeral_5m_input_tokens")),
-                "cache_creation.ephemeral_5m_input_tokens",
-            )?;
-            let ephemeral_1h = read_counter(
-                creation.and_then(|c| c.get("ephemeral_1h_input_tokens")),
-                "cache_creation.ephemeral_1h_input_tokens",
-            )?;
-            reported |= ephemeral_5m.is_some() || ephemeral_1h.is_some();
-            usage.cache_write_5m_tokens = ephemeral_5m;
-            usage.cache_write_1h_tokens = ephemeral_1h;
-            // Prefer the provider's own total. The TTL split is preserved
-            // beside it rather than replacing it, so a provider whose split
-            // disagrees with its total stays inspectable instead of being
-            // silently rewritten.
-            usage.cache_write_tokens = match cache_write_total {
-                Some(total) => total,
-                None => ephemeral_5m
-                    .unwrap_or(0)
-                    .checked_add(ephemeral_1h.unwrap_or(0))
-                    .ok_or(UsageError::CounterOverflow {
-                        field: "cache_creation",
-                    })?,
-            };
-            usage.coverage.has_cache_write_tokens =
-                cache_write_total.is_some() || ephemeral_5m.is_some() || ephemeral_1h.is_some();
-        }
+        "codex" => apply_codex_usage(&mut usage, object, &mut reported)?,
+        "muse" => apply_muse_usage(&mut usage, object, &mut reported)?,
+        "claude" => apply_claude_usage(&mut usage, object, &mut reported)?,
         "grok" => {
-            // Only the verbatim `turn_completed.usage` breakdown is usage. A
-            // record holding only `context_total_tokens` is a context-window
-            // snapshot, which is no usage evidence at all.
-            let Some(breakdown) = object.get("usage") else {
+            if apply_grok_usage(&mut usage, object, &mut reported)?.is_none() {
                 return Ok(None);
-            };
-            let Some(breakdown) = breakdown.as_object() else {
-                return Err(UsageError::NotAnObject);
-            };
-            let mut grok_counter =
-                |keys: &[&str], field: &'static str| -> Result<Option<u64>, UsageError> {
-                    let value = keys
-                        .iter()
-                        .find_map(|key| breakdown.get(*key).filter(|value| !value.is_null()));
-                    let value = read_counter(value, field)?;
-                    reported |= value.is_some();
-                    Ok(value)
-                };
-            use crate::ingest::grok::{
-                GROK_USAGE_CACHE_READ_KEYS, GROK_USAGE_CACHE_WRITE_KEYS, GROK_USAGE_INPUT_KEYS,
-                GROK_USAGE_OUTPUT_KEYS, GROK_USAGE_REASONING_KEYS,
-            };
-            let input = grok_counter(GROK_USAGE_INPUT_KEYS, "usage.inputTokens")?;
-            let output = grok_counter(GROK_USAGE_OUTPUT_KEYS, "usage.outputTokens")?;
-            let cache_read = grok_counter(GROK_USAGE_CACHE_READ_KEYS, "usage.cachedReadTokens")?;
-            let cache_write = grok_counter(GROK_USAGE_CACHE_WRITE_KEYS, "usage.cachedWriteTokens")?;
-            let reasoning = grok_counter(GROK_USAGE_REASONING_KEYS, "usage.reasoningTokens")?;
-            let total = read_counter(
-                ["totalTokens", "total_tokens"]
-                    .iter()
-                    .find_map(|key| breakdown.get(*key).filter(|value| !value.is_null())),
-                "usage.totalTokens",
-            )?;
-            // Grok's `inputTokens` includes its `cachedReadTokens`, as
-            // Codex's does, so the cache reads come out of input here. Its
-            // `outputTokens` includes `reasoningTokens`; that stays as
-            // written, with reasoning reported beside it, the same shape a
-            // Codex record has.
-            // Only a reported input can be checked against the cache reads:
-            // an absent one is unknown, not zero, so a breakdown that names
-            // cache reads without it keeps them and reports no input.
-            let cached = cache_read.unwrap_or(0);
-            usage.input_tokens = match input {
-                Some(inclusive) => {
-                    inclusive
-                        .checked_sub(cached)
-                        .ok_or(UsageError::CounterRegressed {
-                            field: "usage.inputTokens",
-                            value: inclusive,
-                            subtracted: cached,
-                        })?
-                }
-                None => 0,
-            };
-            usage.output_tokens = output.unwrap_or(0);
-            usage.reasoning_tokens = reasoning;
-            usage.cache_read_tokens = cached;
-            usage.cache_write_tokens = cache_write.unwrap_or(0);
-            usage.provider_total_tokens = total;
-            usage.coverage.has_input_tokens = input.is_some();
-            usage.coverage.has_output_tokens = output.is_some();
-            usage.coverage.has_reasoning_tokens = reasoning.is_some();
-            usage.coverage.has_cache_read_tokens = cache_read.is_some();
-            usage.coverage.has_cache_write_tokens = cache_write.is_some();
+            }
         }
         // `source_accounting` already rejected anything else.
         _ => unreachable!("source_accounting accepted an unhandled source"),
@@ -613,6 +462,195 @@ pub fn normalize_usage(
     usage.reported_cost_usd = cost;
 
     Ok(reported.then_some(usage))
+}
+
+fn counter_from<'a>(
+    object: &'a serde_json::Map<String, Value>,
+    reported: &'a mut bool,
+) -> impl FnMut(&'static str) -> Result<Option<u64>, UsageError> + 'a {
+    move |key| {
+        let value = read_counter(object.get(key), key)?;
+        *reported |= value.is_some();
+        Ok(value)
+    }
+}
+
+/// Input that already includes cache reads, emitted exclusive of them.
+fn apply_inclusive_input(
+    usage: &mut NormalizedUsage,
+    input: Option<u64>,
+    cached: Option<u64>,
+    cache_write: Option<u64>,
+    field: &'static str,
+) -> Result<(), UsageError> {
+    let inclusive = input.unwrap_or(0);
+    let cached_value = cached.unwrap_or(0);
+    usage.input_tokens =
+        inclusive
+            .checked_sub(cached_value)
+            .ok_or(UsageError::CounterRegressed {
+                field,
+                value: inclusive,
+                subtracted: cached_value,
+            })?;
+    usage.cache_read_tokens = cached_value;
+    usage.cache_write_tokens = cache_write.unwrap_or(0);
+    usage.coverage.has_input_tokens = input.is_some();
+    usage.coverage.has_cache_read_tokens = cached.is_some();
+    usage.coverage.has_cache_write_tokens = cache_write.is_some();
+    Ok(())
+}
+
+fn apply_codex_usage(
+    usage: &mut NormalizedUsage,
+    object: &serde_json::Map<String, Value>,
+    reported: &mut bool,
+) -> Result<(), UsageError> {
+    // `CodexTokenTotals::to_token_json` keeps `input_tokens` inclusive of
+    // `cached_input_tokens` even after snapshot differencing. Emitting
+    // exclusive input here is what stops a consumer that sums the categories
+    // from counting cache reads twice.
+    let mut counter = counter_from(object, reported);
+    let input = counter("input_tokens")?;
+    let cached = counter("cached_input_tokens")?;
+    let cache_write = counter("cache_write_input_tokens")?;
+    apply_inclusive_input(usage, input, cached, cache_write, "input_tokens")
+}
+
+fn apply_muse_usage(
+    usage: &mut NormalizedUsage,
+    object: &serde_json::Map<String, Value>,
+    reported: &mut bool,
+) -> Result<(), UsageError> {
+    // Responses-shaped: `input_tokens` includes the cached prefix, which Muse
+    // reports as `cache_read_tokens` (and again as `cached_tokens`, the same
+    // count). Input is emitted exclusive of it, as for Codex, so summing the
+    // categories counts each token once.
+    let mut counter = counter_from(object, reported);
+    let input = counter("input_tokens")?;
+    let cache_read = match counter("cache_read_tokens")? {
+        Some(value) => Some(value),
+        None => counter("cached_tokens")?,
+    };
+    let cache_write = counter("cache_write_tokens")?;
+    apply_inclusive_input(usage, input, cache_read, cache_write, "input_tokens")
+}
+
+fn apply_claude_usage(
+    usage: &mut NormalizedUsage,
+    object: &serde_json::Map<String, Value>,
+    reported: &mut bool,
+) -> Result<(), UsageError> {
+    // Claude's native `message.usage` already excludes cache reads and writes
+    // from `input_tokens`; subtracting them again would under-report ordinary
+    // input.
+    let (input, cache_read, cache_write_total) = {
+        let mut counter = counter_from(object, reported);
+        let input = counter("input_tokens")?;
+        let cache_read = counter("cache_read_input_tokens")?;
+        let cache_write_total = counter("cache_creation_input_tokens")?;
+        (input, cache_read, cache_write_total)
+    };
+    usage.input_tokens = input.unwrap_or(0);
+    usage.cache_read_tokens = cache_read.unwrap_or(0);
+    usage.coverage.has_input_tokens = input.is_some();
+    usage.coverage.has_cache_read_tokens = cache_read.is_some();
+
+    let creation = object.get("cache_creation").and_then(Value::as_object);
+    let ephemeral_5m = read_counter(
+        creation.and_then(|c| c.get("ephemeral_5m_input_tokens")),
+        "cache_creation.ephemeral_5m_input_tokens",
+    )?;
+    let ephemeral_1h = read_counter(
+        creation.and_then(|c| c.get("ephemeral_1h_input_tokens")),
+        "cache_creation.ephemeral_1h_input_tokens",
+    )?;
+    *reported |= ephemeral_5m.is_some() || ephemeral_1h.is_some();
+    usage.cache_write_5m_tokens = ephemeral_5m;
+    usage.cache_write_1h_tokens = ephemeral_1h;
+    // Prefer the provider's own total. The TTL split is preserved beside it
+    // rather than replacing it, so a provider whose split disagrees with its
+    // total stays inspectable instead of being silently rewritten.
+    usage.cache_write_tokens = match cache_write_total {
+        Some(total) => total,
+        None => ephemeral_5m
+            .unwrap_or(0)
+            .checked_add(ephemeral_1h.unwrap_or(0))
+            .ok_or(UsageError::CounterOverflow {
+                field: "cache_creation",
+            })?,
+    };
+    usage.coverage.has_cache_write_tokens =
+        cache_write_total.is_some() || ephemeral_5m.is_some() || ephemeral_1h.is_some();
+    Ok(())
+}
+
+/// `Ok(None)` is a context-window snapshot with no usage breakdown: not usage
+/// evidence. The caller's shared counters are discarded with it.
+fn apply_grok_usage(
+    usage: &mut NormalizedUsage,
+    object: &serde_json::Map<String, Value>,
+    reported: &mut bool,
+) -> Result<Option<()>, UsageError> {
+    let Some(breakdown) = object.get("usage") else {
+        return Ok(None);
+    };
+    let Some(breakdown) = breakdown.as_object() else {
+        return Err(UsageError::NotAnObject);
+    };
+    let mut grok_counter =
+        |keys: &[&str], field: &'static str| -> Result<Option<u64>, UsageError> {
+            let value = keys
+                .iter()
+                .find_map(|key| breakdown.get(*key).filter(|value| !value.is_null()));
+            let value = read_counter(value, field)?;
+            *reported |= value.is_some();
+            Ok(value)
+        };
+    use crate::ingest::grok::{
+        GROK_USAGE_CACHE_READ_KEYS, GROK_USAGE_CACHE_WRITE_KEYS, GROK_USAGE_INPUT_KEYS,
+        GROK_USAGE_OUTPUT_KEYS, GROK_USAGE_REASONING_KEYS,
+    };
+    let input = grok_counter(GROK_USAGE_INPUT_KEYS, "usage.inputTokens")?;
+    let output = grok_counter(GROK_USAGE_OUTPUT_KEYS, "usage.outputTokens")?;
+    let cache_read = grok_counter(GROK_USAGE_CACHE_READ_KEYS, "usage.cachedReadTokens")?;
+    let cache_write = grok_counter(GROK_USAGE_CACHE_WRITE_KEYS, "usage.cachedWriteTokens")?;
+    let reasoning = grok_counter(GROK_USAGE_REASONING_KEYS, "usage.reasoningTokens")?;
+    let total = read_counter(
+        ["totalTokens", "total_tokens"]
+            .iter()
+            .find_map(|key| breakdown.get(*key).filter(|value| !value.is_null())),
+        "usage.totalTokens",
+    )?;
+    // Grok's `inputTokens` includes its `cachedReadTokens`, as Codex's does,
+    // so the cache reads come out of input here. Its `outputTokens` includes
+    // `reasoningTokens`; that stays as written, with reasoning reported beside
+    // it, the same shape a Codex record has.
+    // Only a reported input can be checked against the cache reads: an absent
+    // one is unknown, not zero, so a breakdown that names cache reads without
+    // it keeps them and reports no input.
+    let cached = cache_read.unwrap_or(0);
+    usage.input_tokens = match input {
+        Some(inclusive) => inclusive
+            .checked_sub(cached)
+            .ok_or(UsageError::CounterRegressed {
+                field: "usage.inputTokens",
+                value: inclusive,
+                subtracted: cached,
+            })?,
+        None => 0,
+    };
+    usage.output_tokens = output.unwrap_or(0);
+    usage.reasoning_tokens = reasoning;
+    usage.cache_read_tokens = cached;
+    usage.cache_write_tokens = cache_write.unwrap_or(0);
+    usage.provider_total_tokens = total;
+    usage.coverage.has_input_tokens = input.is_some();
+    usage.coverage.has_output_tokens = output.is_some();
+    usage.coverage.has_reasoning_tokens = reasoning.is_some();
+    usage.coverage.has_cache_read_tokens = cache_read.is_some();
+    usage.coverage.has_cache_write_tokens = cache_write.is_some();
+    Ok(Some(()))
 }
 
 /// Read one counter: absent and `null` are "not reported"; anything that is
