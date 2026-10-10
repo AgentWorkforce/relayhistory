@@ -11,6 +11,8 @@ use rusqlite::{Connection, Row};
 use serde::{Deserialize, Serialize};
 
 mod tree;
+#[cfg(test)]
+mod plan_tests;
 pub use tree::session_tree;
 
 /// Bump whenever relationship object shapes or semantics require an SDK change.
@@ -371,27 +373,45 @@ pub fn session_relationships(
 /// of its own, so the origin side is the only queryable end; ordering by
 /// `(parent_session_id, relationship_uid)` keeps the answer a total order
 /// across both directions.
+///
+/// One index seek per end, joined with `UNION ALL`: the parent end on the
+/// primary key, the child end on [`BY_CHILD`], the child arm leaving out the
+/// self-edges the parent arm already returned. An `OR` across the two columns
+/// leaves the access path to statistics, and on a store without them SQLite
+/// read every edge of the source through the `source` prefix -- every
+/// OpenCode delegation edge, once per session read.
 pub fn session_continuity_edges(
     conn: &Connection,
     source: &str,
     session_id: &str,
 ) -> Result<Vec<SessionRelationship>> {
     let kinds = RelationshipKinds::continuity();
-    let sql = format!(
-        "SELECT {RELATIONSHIP_COLUMNS} FROM session_relationships \
-         WHERE source = ? AND (parent_session_id = ? OR child_session_id = ?){} \
-         ORDER BY parent_session_id ASC, relationship_uid ASC",
-        kinds.clause()
-    );
-    let mut values: Vec<rusqlite::types::Value> = vec![
+    let mut values: Vec<rusqlite::types::Value> =
+        vec![source.to_string().into(), session_id.to_string().into()];
+    values.extend(kinds.bind_values());
+    values.extend([
         source.to_string().into(),
         session_id.to_string().into(),
         session_id.to_string().into(),
-    ];
+    ]);
     values.extend(kinds.bind_values());
-    let mut stmt = conn.prepare(&sql)?;
+    let mut stmt = conn.prepare_cached(&continuity_edges_sql(&kinds))?;
     let rows = stmt.query_map(rusqlite::params_from_iter(values), map_relationship)?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// [`session_continuity_edges`]'s statement. Binds `source, session_id`, the
+/// kinds, then `source, session_id, session_id` and the kinds again.
+pub(crate) fn continuity_edges_sql(kinds: &RelationshipKinds) -> String {
+    let kinds = kinds.clause();
+    format!(
+        "SELECT {RELATIONSHIP_COLUMNS} FROM session_relationships \
+         WHERE source = ? AND parent_session_id = ?{kinds} \
+         UNION ALL \
+         SELECT {RELATIONSHIP_COLUMNS} FROM session_relationships {BY_CHILD} \
+         WHERE source = ? AND child_session_id = ? AND parent_session_id <> ?{kinds} \
+         ORDER BY parent_session_id ASC, relationship_uid ASC"
+    )
 }
 
 /// Every recorded child of one parent, in the traversal's total order.
@@ -482,6 +502,24 @@ pub fn session_children_page(
     })
 }
 
+/// A child-keyed lookup's index, named outright. Its `ORDER BY
+/// parent_session_id, relationship_uid` is the primary key's order, and
+/// without statistics SQLite prefers walking the primary key's `source`
+/// prefix in that order -- every edge of the source -- to seeking the child
+/// and sorting the few rows it has.
+const BY_CHILD: &str = "INDEXED BY idx_session_relationships_child";
+
+/// [`session_parents`]'s statement: binds `source, child_session_id`, then
+/// the kinds.
+pub(crate) fn parents_sql(kinds: &RelationshipKinds) -> String {
+    format!(
+        "SELECT {RELATIONSHIP_COLUMNS} FROM session_relationships {BY_CHILD} \
+         WHERE source = ? AND child_session_id = ?{} \
+         ORDER BY parent_session_id ASC, relationship_uid ASC",
+        kinds.clause()
+    )
+}
+
 /// Every recorded parent of one child.
 pub fn session_parents(
     conn: &Connection,
@@ -489,12 +527,7 @@ pub fn session_parents(
     child_session_id: &str,
     kinds: &RelationshipKinds,
 ) -> Result<Vec<SessionRelationship>> {
-    let sql = format!(
-        "SELECT {RELATIONSHIP_COLUMNS} FROM session_relationships \
-         WHERE source = ? AND child_session_id = ?{} \
-         ORDER BY parent_session_id ASC, relationship_uid ASC",
-        kinds.clause()
-    );
+    let sql = parents_sql(kinds);
     let mut values: Vec<rusqlite::types::Value> = vec![
         source.to_string().into(),
         child_session_id.to_string().into(),
