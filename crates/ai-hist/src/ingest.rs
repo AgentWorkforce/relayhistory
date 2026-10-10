@@ -750,6 +750,16 @@ const SOURCE_FINGERPRINT_KEY: &str = "source_fingerprint";
 /// source fingerprint an earlier build stored cannot skip that sweep.
 const CLAUDE_TRAILING_HOLD_GENERATION: &str = "claude_trailing_hold_v1";
 
+/// One-time sweep for stores an earlier parser built, which hid every Codex
+/// rollout marked `thread_source: "subagent"` as a child thread even when it
+/// named no parent (standalone guardian / auto-review threads). Their rollouts
+/// never change on disk, so only a sweep re-reads them: the rollout walk
+/// promotes each recorded subagent that has no delegation edge and names no
+/// parent to a catalogued session. The name is in
+/// [`SWEEP_PARSER_GENERATIONS`], so the source fingerprint an earlier build
+/// stored cannot skip that sweep.
+const CODEX_PARENTLESS_SUBAGENT_GENERATION: &str = "codex_parentless_subagent_v1";
+
 /// Where the destination's own generation is remembered, beside the source
 /// fingerprint it qualifies.
 const DESTINATION_GENERATION_KEY: &str = "destination_generation";
@@ -807,6 +817,7 @@ const SWEEP_PARSER_GENERATIONS: &[&str] = &[
     CLAUDE_STANDALONE_RECORDS_GENERATION,
     "codex_rollouts_v7",
     CODEX_STATE_MARKER_KEY,
+    CODEX_PARENTLESS_SUBAGENT_GENERATION,
     GROK_SYNC_STATE_KEY,
     OPENCODE_NORMALIZER_GENERATION,
 ];
@@ -5042,28 +5053,49 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                 let recorded_session = record
                     .and_then(|r| r.get("session"))
                     .and_then(Value::as_str);
+                // A rollout recorded as a subagent with no delegation edge is
+                // re-read by its `session_meta` line. One that names a parent
+                // gets the edge backfilled (a database synced before
+                // delegation was recorded has no topology, and its stamps
+                // never change again). One that names none is a standalone
+                // thread an earlier build hid as a child: it falls through to
+                // the full path below, which catalogs it as a session.
+                let mut promoted_to_root = false;
                 if record
                     .and_then(|r| r.get("subagent"))
                     .and_then(Value::as_bool)
                     == Some(true)
                 {
                     if let Some(session_id) = recorded_session {
-                        // The fast path must still repair state from an older
-                        // sync/migration. In particular, presence backfill can
-                        // recreate a local catalog registration from retained
-                        // subagent events without changing the rollout stamp.
-                        cwds.remove(session_id);
-                        branches.remove(session_id);
-                        cleanup_codex_subagent_history(conn, session_id)?;
-                        cleanup_codex_subagent_registration(conn, session_id)?;
-                        // A database synced before delegation was recorded has
-                        // no topology at all, and its stamps never change
-                        // again. Re-reading one meta line per subagent
-                        // backfills the edge without re-ingesting the rollout.
-                        if !codex_delegation_recorded(conn, session_id)? {
-                            if let Some(meta) = read_codex_session_meta(&rollout)? {
+                        let unlinked_meta = if codex_delegation_recorded(conn, session_id)? {
+                            None
+                        } else {
+                            read_codex_session_meta(&rollout)?
+                        };
+                        promoted_to_root =
+                            unlinked_meta.as_ref().is_some_and(|meta| !meta.is_subagent);
+                        if promoted_to_root {
+                            // Discovery remembered the rollout as a known
+                            // non-session at this same stamp; forgetting that
+                            // lets its next scan catalog it like any root.
+                            conn.execute(
+                                "DELETE FROM observation_discovery_skips \
+                                 WHERE source = 'codex' AND locator = ?",
+                                [&key],
+                            )?;
+                        } else {
+                            // The fast path must still repair state from an
+                            // older sync/migration. In particular, presence
+                            // backfill can recreate a local catalog
+                            // registration from retained subagent events
+                            // without changing the rollout stamp.
+                            cwds.remove(session_id);
+                            branches.remove(session_id);
+                            cleanup_codex_subagent_history(conn, session_id)?;
+                            cleanup_codex_subagent_registration(conn, session_id)?;
+                            if let Some(meta) = &unlinked_meta {
                                 if let Some(parent) = meta.parent_session_id.as_deref() {
-                                    record_codex_delegation(conn, parent, &meta, &rollout)?;
+                                    record_codex_delegation(conn, parent, meta, &rollout)?;
                                 }
                             }
                         }
@@ -5101,12 +5133,12 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                         reclassified =
                             read_codex_session_meta(&rollout)?.is_some_and(|meta| meta.is_subagent);
                     }
-                    if !reclassified {
+                    if !reclassified && !promoted_to_root {
                         crate::continuity::capture_codex_rollout(conn, &rollout)?;
                     }
                 }
                 match recorded_session {
-                    _ if reclassified => {}
+                    _ if reclassified || promoted_to_root => {}
                     // No session id was recorded because the file had no
                     // usable session_meta; there is nothing to re-ingest.
                     None => continue,
@@ -5642,34 +5674,37 @@ fn codex_parent_session_id(
     })
 }
 
-/// Codex rollouts marked as subagents are hidden from the root session
-/// catalog.  A `thread_source: subagent` rollout remains a child even when an
-/// older producer omitted its parent fields.  The object form of
-/// `source.subagent` is treated as a child only when an explicit parent is
-/// present, so a standalone guardian remains discoverable under `payload.id`.
+/// Whether a Codex rollout is a delegated child thread rather than a session
+/// of its own.
+///
+/// A rollout is a child exactly when its `session_meta` carries a subagent
+/// marker (`thread_source` `subagent` or `guardian_review`, or the object form
+/// of `source.subagent`) **and** names a parent thread
+/// ([`codex_parent_session_id`]). The marker says what kind of agent wrote the
+/// rollout; only the parent says it belongs to another session. A marked
+/// rollout that names no parent — a standalone guardian / auto-review thread
+/// — is a top-level session under its own `payload.id`: nothing links it to a
+/// parent, so hiding it would leave its evidence reachable from no catalog row
+/// and no `delegated_descendants` walk.
+///
+/// The rule reads only the rollout's own first record, which never changes,
+/// so a rollout's classification does not depend on which other rollouts the
+/// store holds: a child is linked by the delegation edge its own
+/// `session_meta` records, whether its parent is captured before it, after
+/// it, or never.
 pub(crate) fn codex_is_subagent(payload: Option<&Value>, session_id: &str) -> bool {
     let thread_source = payload
         .and_then(|p| p.get("thread_source"))
         .and_then(Value::as_str);
-    let thread_source_is_subagent = thread_source == Some("subagent");
-    // Codex 0.150 renamed the guardian's `thread_source` from `subagent` to
-    // `guardian_review`. It is a child only when it names its parent, like the
-    // `source.subagent` marker below: a standalone guardian stays a root.
-    let guardian_review_with_parent = thread_source == Some("guardian_review")
-        && codex_parent_session_id(payload.and_then(Value::as_object), session_id).is_some();
     let source_marks_subagent = payload
         .and_then(|p| p.get("source"))
         .and_then(Value::as_object)
         .is_some_and(|source| source.contains_key("subagent"));
-
-    // `payload.id` is always the rollout's own identity. A `source.subagent`
-    // marker is not by itself evidence of a parent: standalone guardian rollouts
-    // carry that marker while keeping their own identity, so they stay
-    // discoverable under `payload.id`.
-    thread_source_is_subagent
-        || guardian_review_with_parent
-        || (source_marks_subagent
-            && codex_parent_session_id(payload.and_then(Value::as_object), session_id).is_some())
+    // Codex 0.150 renamed the guardian's `thread_source` from `subagent` to
+    // `guardian_review`; both spellings mark the same kind of thread.
+    let marked =
+        matches!(thread_source, Some("subagent" | "guardian_review")) || source_marks_subagent;
+    marked && codex_parent_session_id(payload.and_then(Value::as_object), session_id).is_some()
 }
 
 /// Read the `session_meta` line that opens every rollout file.
@@ -5677,10 +5712,10 @@ pub(crate) fn codex_is_subagent(payload: Option<&Value>, session_id: &str) -> bo
 /// Sessions key on `payload.id` — the per-thread id. Subagent rollouts can
 /// carry their parent in `parent_thread_id`, a structured thread-spawn source,
 /// or the legacy `session_id`; keying on any of those would collapse every
-/// subagent into its parent. Subagent threads are detected instead
-/// (`thread_source`, or the object form of `payload.source` *together with* an
-/// explicit parent) and excluded from session registration. A standalone
-/// guardian carries `source.subagent` without a parent and stays discoverable.
+/// subagent into its parent. Child threads are detected instead
+/// ([`codex_is_subagent`]: a subagent marker *together with* a named parent)
+/// and excluded from session registration. A standalone guardian names no
+/// parent and is a session of its own.
 /// How far into a file a bounded head read will look, however few records it
 /// has found. Callers set their own record limit; this one stops a file whose
 /// first record is enormous, or whose leading lines are all unparseable, from
@@ -34594,6 +34629,119 @@ mod tests {
                 .swept
         );
         assert_eq!(child_assistant_rows(&conn), 2);
+    }
+
+    /// A store an earlier build synced hid a standalone Codex guardian
+    /// (`thread_source: "subagent"`, no parent) as a child: its stamp recorded
+    /// `subagent: true`, it had no catalog row, prompt history or delegation
+    /// edge, discovery remembered it as a non-session, and the fingerprint
+    /// vouched for the tree. One plain sync catalogs it, and the next takes
+    /// the fast path.
+    #[test]
+    fn an_upgraded_store_catalogs_a_parentless_codex_subagent_thread() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/08/31");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-2026-08-31T10-00-00-guardian.jsonl");
+        fs::write(
+            &rollout,
+            concat!(
+                r#"{"timestamp":"2026-08-31T10:00:00Z","type":"session_meta","payload":{"id":"guardian","session_id":"guardian","cwd":"/work/app","source":{"subagent":{"other":"guardian"}},"thread_source":"subagent"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-08-31T10:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"review this"}}"#,
+                "\n",
+                r#"{"timestamp":"2026-08-31T10:00:02Z","type":"event_msg","payload":{"type":"agent_message","message":"approved"}}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+        let db = dir.path().join("history.db");
+        let roots = crate::ProviderRoots::from_home(
+            dir.path().to_path_buf(),
+            dir.path().join("opencode.db"),
+        );
+        super::sync_exclusive_with_roots(&db, &roots, false).unwrap();
+        let conn = open_db(&db).unwrap();
+        let catalogued = |conn: &Connection| -> i64 {
+            conn.query_row(
+                "SELECT COUNT(*) FROM sessions WHERE source = 'codex' AND session_id = 'guardian'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(catalogued(&conn), 1);
+
+        // What the earlier build left behind.
+        let key = rollout.to_string_lossy().to_string();
+        cleanup_codex_subagent_history(&conn, "guardian").unwrap();
+        cleanup_codex_subagent_registration(&conn, "guardian").unwrap();
+        conn.execute(
+            "INSERT INTO observation_discovery_skips \
+             (source, location, connector_id, connector_instance, locator, stamp, updated_ms) \
+             VALUES ('codex', 'local', '', '', ?, 'stale', 0)",
+            [&key],
+        )
+        .unwrap();
+        assert_eq!(catalogued(&conn), 0);
+        let state_path = dir.path().join(".sync-state.json");
+        let mut state = load_sync_state(&state_path).unwrap();
+        state["codex_rollouts_v7"][&key]["subagent"] = json!(true);
+        let source_part = state[SOURCE_FINGERPRINT_KEY]
+            .as_str()
+            .unwrap()
+            .split_once('/')
+            .unwrap()
+            .1
+            .to_string();
+        let older: Vec<&str> = SWEEP_PARSER_GENERATIONS
+            .iter()
+            .copied()
+            .filter(|generation| *generation != CODEX_PARENTLESS_SUBAGENT_GENERATION)
+            .collect();
+        let old_fingerprint = format!("{}/{source_part}", sweep_generation_with(&older));
+        state.insert(SOURCE_FINGERPRINT_KEY.into(), json!(old_fingerprint));
+        state.insert(
+            DESTINATION_GENERATION_KEY.into(),
+            json!(destination_generation(&conn).unwrap()),
+        );
+        state.insert(
+            DESTINATION_HEAD_KEY.into(),
+            json!(destination_head(&conn).unwrap()),
+        );
+        assert!(sources_unchanged(&conn, &state, &old_fingerprint));
+        fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+
+        assert!(
+            super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept
+        );
+        assert_eq!(catalogued(&conn), 1);
+        let prompts: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM history WHERE source = 'codex' AND session_id = 'guardian'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(prompts, 1);
+        let skips: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM observation_discovery_skips WHERE locator = ? AND stamp = 'stale'",
+                [&key],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(skips, 0);
+        let state = load_sync_state(&state_path).unwrap();
+        assert_eq!(state["codex_rollouts_v7"][&key]["subagent"], json!(false));
+        assert!(
+            !super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept
+        );
+        assert_eq!(catalogued(&conn), 1);
     }
 
     /// A sidecar record whose only block is a signed thinking block with
