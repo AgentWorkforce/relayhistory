@@ -342,7 +342,15 @@ fn sync_opencode_db_file(
     src.execute_batch("BEGIN")?;
     let result = sync_store_snapshot(conn, &src, &store, &tag, claimed, sweep);
     let _ = src.execute_batch("ROLLBACK");
-    let (inserted, definite) = result?;
+    // A read that failed vouches for nothing: without the store stamp, the
+    // next sweep opens the store and re-reads the sessions left unstamped.
+    let (inserted, definite) = match result {
+        Ok(read) => read,
+        Err(error) => {
+            sweep.forget(Stamps::Stores, tag);
+            return Err(error);
+        }
+    };
     match file_stamp.filter(|_| definite) {
         Some(stamp) => sweep.insert(Stamps::Stores, tag, stamp),
         None => sweep.forget(Stamps::Stores, tag),

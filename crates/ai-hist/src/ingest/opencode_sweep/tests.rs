@@ -388,3 +388,32 @@ fn a_rewrite_that_moves_time_updated_is_read_again() {
     settle(&db);
     assert_eq!(fixture.sweep(std::slice::from_ref(&db), &none), (1, 1));
 }
+
+/// A store whose read failed is opened again next sweep even though its
+/// files did not move, so the session that failed is read again rather than
+/// left out of the store's stamps and skipped with it.
+#[test]
+fn a_failed_read_does_not_leave_the_store_stamped() {
+    let mut fixture = Fixture::new();
+    let db = fixture.root.join("opencode.db");
+    provider_store(&db);
+    let none = SweepRepairs::default();
+    fixture.sweep(std::slice::from_ref(&db), &none);
+    fixture
+        .conn
+        .execute_batch(
+            "DELETE FROM session_events WHERE source = 'opencode' AND session_id = 'ses_sqlite_root'; \
+             CREATE TEMP TRIGGER refuse_root BEFORE INSERT ON session_events \
+             WHEN NEW.session_id = 'ses_sqlite_root' BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+        )
+        .unwrap();
+    let mut sweep = OpencodeSweep::begin(&mut fixture.state, &none);
+    assert!(sync_opencode_dbs(&fixture.conn, std::slice::from_ref(&db), &mut sweep).is_err());
+    sweep.finish(&mut fixture.state);
+    fixture
+        .conn
+        .execute_batch("DROP TRIGGER temp.refuse_root;")
+        .unwrap();
+    assert_eq!(fixture.sweep(std::slice::from_ref(&db), &none), (1, 1));
+    assert!(fixture.events(ROOT) > 0);
+}

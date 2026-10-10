@@ -162,13 +162,18 @@ fn part_aggregate(src: &Connection) -> Result<TableAggregate> {
 /// column a rewrite moves `time_updated` or, within the same millisecond,
 /// lands within [`AMBIGUITY_MS`] of the read that saw the first version,
 /// which leaves that session unstamped. Its payload length, read from the
-/// record header, stands in for the rest. A schema without the column has
-/// only the payload itself to show a rewrite, so the payload is hashed --
+/// record header, stands in for the rest. A row without a `time_updated`,
+/// or a schema without the column, has only the payload itself to show a
+/// rewrite, so the payload is hashed --
 /// on a store of a gigabyte of payloads, seconds of reading on every sweep
 /// of a store that moved, which a schema with the column does not pay.
 fn row_version(columns: &std::collections::BTreeSet<String>, alias: &str) -> String {
     if columns.contains("time_updated") {
-        format!("COALESCE(octet_length({alias}data), -1)")
+        // Per row: one written without a `time_updated` is hashed whole.
+        format!(
+            "CASE WHEN {alias}time_updated IS NULL THEN COALESCE({alias}data, '') \
+             ELSE COALESCE(octet_length({alias}data), -1) END"
+        )
     } else {
         format!("COALESCE({alias}data, '')")
     }

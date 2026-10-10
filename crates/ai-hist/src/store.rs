@@ -4296,15 +4296,24 @@ fn refreshed_through(conn: &Connection, epoch: i64) -> Result<Option<i64>> {
         .optional()?)
 }
 
-/// Record (or, after a failure, forget) the refreshed-through point.
+/// Record (or, after a failure, forget) the refreshed-through point. Each
+/// statement stands alone, so a concurrent refresh's write interleaved with
+/// these cannot make either fail: the last writer's point stands, and every
+/// point is a head some refresh started at.
 fn remember_refresh(conn: &Connection, point: Option<(i64, i64)>) -> Result<()> {
-    conn.execute("DELETE FROM project_identity_refreshed", [])?;
-    if let Some((epoch, revision)) = point {
-        conn.execute(
-            "INSERT INTO project_identity_refreshed (epoch, revision) VALUES (?1, ?2)",
-            [epoch, revision],
-        )?;
-    }
+    let Some((epoch, revision)) = point else {
+        conn.execute("DELETE FROM project_identity_refreshed", [])?;
+        return Ok(());
+    };
+    conn.execute(
+        "INSERT INTO project_identity_refreshed (epoch, revision) VALUES (?1, ?2) \
+         ON CONFLICT(epoch) DO UPDATE SET revision = excluded.revision",
+        [epoch, revision],
+    )?;
+    conn.execute(
+        "DELETE FROM project_identity_refreshed WHERE epoch <> ?1",
+        [epoch],
+    )?;
     Ok(())
 }
 

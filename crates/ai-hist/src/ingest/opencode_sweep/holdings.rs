@@ -12,16 +12,21 @@ use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::HashSet;
 
-/// Events or markers.
-const EVIDENCE: char = 'e';
+/// Events.
+const EVENTS: char = 'e';
+/// Markers.
+const MARKERS: char = 'm';
 /// The `opencode_parent_id` edge naming this session as a child.
 const PARENT_EDGE: char = 'r';
 
 /// The flags for what `session_id` holds now, just after its read.
 pub(super) fn held(conn: &Connection, session_id: &str) -> Result<String> {
     let mut flags = String::new();
-    if evidence_exists(conn, session_id)? {
-        flags.push(EVIDENCE);
+    if session_events_exist(conn, "opencode", session_id)? {
+        flags.push(EVENTS);
+    }
+    if session_markers_exist(conn, "opencode", session_id)? {
+        flags.push(MARKERS);
     }
     if parent_edge_exists(conn, session_id)? {
         flags.push(PARENT_EDGE);
@@ -38,7 +43,8 @@ pub(super) fn held(conn: &Connection, session_id: &str) -> Result<String> {
 #[derive(Debug, Default)]
 pub(super) struct Holdings {
     catalog: HashSet<String>,
-    evidence: HashSet<String>,
+    events: HashSet<String>,
+    markers: HashSet<String>,
     parent_edges: HashSet<String>,
 }
 
@@ -49,10 +55,13 @@ impl Holdings {
                 conn,
                 "SELECT session_id FROM sessions WHERE source = 'opencode'",
             )?,
-            evidence: ids(
+            events: ids(
                 conn,
-                "SELECT session_id FROM session_events WHERE source = 'opencode' \
-                 UNION SELECT session_id FROM session_markers WHERE source = 'opencode'",
+                "SELECT DISTINCT session_id FROM session_events WHERE source = 'opencode'",
+            )?,
+            markers: ids(
+                conn,
+                "SELECT DISTINCT session_id FROM session_markers WHERE source = 'opencode'",
             )?,
             parent_edges: ids(
                 conn,
@@ -65,7 +74,8 @@ impl Holdings {
     /// [`holds`], from what was read.
     pub(super) fn hold(&self, session_id: &str, flags: &str) -> bool {
         self.catalog.contains(session_id)
-            && (!flags.contains(EVIDENCE) || self.evidence.contains(session_id))
+            && (!flags.contains(EVENTS) || self.events.contains(session_id))
+            && (!flags.contains(MARKERS) || self.markers.contains(session_id))
             && (!flags.contains(PARENT_EDGE) || self.parent_edges.contains(session_id))
     }
 }
@@ -84,13 +94,9 @@ fn ids(conn: &Connection, sql: &str) -> Result<HashSet<String>> {
 /// recorded.
 pub(super) fn holds(conn: &Connection, session_id: &str, flags: &str) -> Result<bool> {
     Ok(catalog_exists(conn, session_id)?
-        && (!flags.contains(EVIDENCE) || evidence_exists(conn, session_id)?)
+        && (!flags.contains(EVENTS) || session_events_exist(conn, "opencode", session_id)?)
+        && (!flags.contains(MARKERS) || session_markers_exist(conn, "opencode", session_id)?)
         && (!flags.contains(PARENT_EDGE) || parent_edge_exists(conn, session_id)?))
-}
-
-fn evidence_exists(conn: &Connection, session_id: &str) -> Result<bool> {
-    Ok(session_events_exist(conn, "opencode", session_id)?
-        || session_markers_exist(conn, "opencode", session_id)?)
 }
 
 fn catalog_exists(conn: &Connection, session_id: &str) -> Result<bool> {
