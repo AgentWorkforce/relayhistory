@@ -805,11 +805,13 @@ pub fn ai_hist::StoredRow::deserialize<D: serde_core::de::Deserializer<'de>>(D) 
 pub ai_hist::SyncOptions::force: bool
 pub ai_hist::SyncOptions::lock_timeout_ms: u64
 pub ai_hist::SyncOptions::progress: core::option::Option<ai_hist::ProgressObserver>
+pub ai_hist::SyncOptions::sources: core::option::Option<alloc::vec::Vec<ai_hist::Source>>
 pub ai_hist::SyncOptions::stop: core::option::Option<ai_hist::StopToken>
 impl ai_hist::SyncOptions
 pub fn ai_hist::SyncOptions::force(self, bool) -> Self
 pub fn ai_hist::SyncOptions::lock_timeout_ms(self, u64) -> Self
 pub fn ai_hist::SyncOptions::progress(self, ai_hist::ProgressObserver) -> Self
+pub fn ai_hist::SyncOptions::sources(self, impl core::iter::traits::collect::IntoIterator<Item = ai_hist::Source>) -> Self
 pub fn ai_hist::SyncOptions::stop(self, ai_hist::StopToken) -> Self
 #[non_exhaustive] pub struct ai_hist::SyncReport
 pub ai_hist::SyncReport::changed: alloc::vec::Vec<ai_hist::SessionRef>
@@ -823,6 +825,7 @@ pub ai_hist::TickReport::elapsed_ms: u64
 pub ai_hist::TickReport::first_event_age_ms: core::option::Option<u64>
 pub ai_hist::TickReport::forced: bool
 pub ai_hist::TickReport::skipped_unchanged: bool
+pub ai_hist::TickReport::sources: core::option::Option<alloc::vec::Vec<ai_hist::Source>>
 pub ai_hist::TickReport::swept: bool
 pub ai_hist::TickReport::trigger: ai_hist::TickTrigger
 #[non_exhaustive] pub struct ai_hist::TokenUsage

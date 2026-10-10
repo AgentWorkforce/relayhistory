@@ -22,14 +22,34 @@ pub(super) fn event_can_change_evidence(kind: &EventKind) -> bool {
 /// paths were lost, and notify emits them with an empty path list. Unknown
 /// pathless events are treated the same conservative way; a typed event
 /// still has to name a path covered by one of the roots.
+#[cfg(test)]
 pub(super) fn event_matches_evidence(event: &notify::Event, roots: &[WatchRoot]) -> bool {
-    event.need_rescan()
-        || (event.paths.is_empty()
-            && matches!(event.kind, EventKind::Any | EventKind::Other))
-        || event
-            .paths
-            .iter()
-            .any(|path| event_matches_roots(path, roots))
+    event_scope(event, roots).is_some()
+}
+
+/// The roots this event belongs to, or `None` when it belongs to none.
+///
+/// A rescan notice or an unknown pathless event cannot be placed under a
+/// root, so it covers everything; a typed event covers the roots its paths
+/// fall under, each named by the root's own path.
+pub(super) fn event_scope(event: &notify::Event, roots: &[WatchRoot]) -> Option<ChangeScope> {
+    if event.need_rescan()
+        || (event.paths.is_empty() && matches!(event.kind, EventKind::Any | EventKind::Other))
+    {
+        return Some(ChangeScope::Everything);
+    }
+    let fired: std::collections::BTreeSet<PathBuf> = event
+        .paths
+        .iter()
+        .map(|path| discover::watch_path(path))
+        .flat_map(|path| {
+            roots
+                .iter()
+                .filter(move |root| root.covers(&path))
+                .map(|root| root.path.clone())
+        })
+        .collect();
+    (!fired.is_empty()).then_some(ChangeScope::Roots(fired))
 }
 
 /// Registrations a removal or rename-away invalidated.
@@ -278,7 +298,7 @@ impl FsWatch {
 /// that does not exist is not an error — it becomes `pending`.
 pub(super) fn attach(
     roots: &[WatchRoot],
-    on_change: impl Fn() + Send + 'static,
+    on_change: impl Fn(ChangeScope) + Send + 'static,
     on_registration_lost: impl Fn() + Send + 'static,
     on_error: impl Fn(anyhow::Error) + Send + 'static,
 ) -> Result<FsWatch> {
@@ -317,7 +337,7 @@ pub(super) fn attach(
         }
         let (matched, removed) = {
             let roots = depth_for_events.lock().expect("watch roots");
-            let matched = event_matches_evidence(&event, &roots);
+            let matched = event_scope(&event, &roots);
             // A registered path that was removed takes its watch with it,
             // whatever the name does afterwards. Recorded here because the
             // backend will not say so again, and a `stat` later cannot
@@ -337,8 +357,8 @@ pub(super) fn attach(
             // long enough to miss a whole session.
             on_registration_lost();
         }
-        if matched {
-            on_change();
+        if let Some(scope) = matched {
+            on_change(scope);
         }
     })?;
     let mut watched = Vec::new();

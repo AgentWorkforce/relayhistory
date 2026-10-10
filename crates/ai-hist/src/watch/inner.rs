@@ -1,29 +1,11 @@
 use std::sync::{Condvar, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use super::scope::{widen, ChangeScope, ScopedTickFn, TickRequest};
 use super::{
-    deadline_after, DriverStatus, ErrorSink, ReportSink, TickFn, TickOutcome, TickReport,
-    TickTrigger, LEADING_EDGE_SETTLE_MS, MAX_INTERVAL_MS,
+    deadline_after, DriverStatus, ErrorSink, ReportSink, TickOutcome, TickReport, TickTrigger,
+    LEADING_EDGE_SETTLE_MS, MAX_INTERVAL_MS,
 };
-
-/// How soon a forced sweep that could not take the store's lock is tried
-/// again, before backing off.
-///
-/// Short, because the usual holder is a manual `sync` that is about to finish
-/// and the change is still owed.
-const CONTENDED_SWEEP_RETRY_MS: u64 = 250;
-
-/// The longest an owed sweep waits between attempts at a held lock.
-///
-/// Low, because the wait is paid by the change: a write made while another
-/// process sweeps is read no sooner than the first retry after that sweep
-/// releases the lock. A retry is one `try_lock` and a return, so asking once
-/// a second for as long as a holder keeps the lock costs nothing worth
-/// trading for capture latency. It used to be the slow backstop (30–60 s),
-/// reached after a handful of contended *event* ticks, which left the last
-/// writes of a burst unread for up to a minute after the lock was free
-/// (#364).
-const CONTENDED_SWEEP_RETRY_MAX_MS: u64 = 1_000;
 
 /// Whether a failed tick was a cancellation rather than a failure.
 fn is_cancellation(error: &anyhow::Error) -> bool {
@@ -32,12 +14,14 @@ fn is_cancellation(error: &anyhow::Error) -> bool {
         .any(|cause| cause.is::<crate::ingest::CaptureCancelled>())
 }
 
+
 /// What one wait produced: the trigger, and for a change-driven tick when
-/// its first signal arrived.
-#[derive(Debug, Clone, Copy)]
+/// its first signal arrived and which roots it covers.
+#[derive(Debug, Clone)]
 pub(super) struct Wake {
     pub(super) trigger: TickTrigger,
     pub(super) first_event_at: Option<Instant>,
+    pub(super) scope: ChangeScope,
 }
 
 impl From<TickTrigger> for Wake {
@@ -45,6 +29,7 @@ impl From<TickTrigger> for Wake {
         Self {
             trigger,
             first_event_at: None,
+            scope: ChangeScope::Everything,
         }
     }
 }
@@ -76,147 +61,45 @@ impl Backstop {
     }
 }
 
-/// A forced sweep the store's lock turned away, and how long to wait before
-/// asking again.
-pub(super) struct OwedSweep {
-    /// When to retry, paired with when the change it stands for first
-    /// arrived.
-    retry: Option<(Instant, Option<Instant>)>,
-    backoff: u64,
-}
-
-impl Default for OwedSweep {
-    fn default() -> Self {
-        Self {
-            retry: None,
-            backoff: CONTENDED_SWEEP_RETRY_MS,
-        }
-    }
-}
-
-/// The earlier of two arrival times, either of which may be unknown.
-fn earliest(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
-    match (a, b) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (a, b) => a.or(b),
-    }
-}
-
-impl OwedSweep {
-    /// Cut the loop's wait short at the retry deadline. A change whose sweep
-    /// never ran has nothing else to bring the loop back for it: the wake
-    /// state was cleared when its debounce window closed, so without this the
-    /// next visit is the backstop, up to `--interval` away.
-    pub(super) fn bound_idle(&self, idle: Duration) -> Duration {
-        match self.retry {
-            Some((at, _)) => idle.min(at.saturating_duration_since(Instant::now())),
-            None => idle,
-        }
-    }
-
-    /// The wake to run, with what is owed folded in, and whether it is the
-    /// owed retry itself.
-    ///
-    /// A sweep the store's lock turned away comes back as the forced tick it
-    /// was, not as the backstop tick this wake would otherwise have been: the
-    /// change it is standing in for is still unread, so the fingerprint it
-    /// would be compared against still cannot be trusted. Only the retry
-    /// itself — as opposed to a new event that happens to arrive while one is
-    /// owed — backs off.
-    pub(super) fn fold_into(&mut self, wake: Wake) -> (Wake, bool) {
-        match self.retry {
-            Some((at, since)) if Instant::now() >= at => {
-                self.retry = None;
-                let retry = Wake {
-                    trigger: TickTrigger::FsEvent,
-                    // The oldest change this sweep now covers.
-                    first_event_at: earliest(since, wake.first_event_at),
-                };
-                (retry, true)
-            }
-            // A forced wake before the retry is due sweeps the change the
-            // retry stands for as well, so it reports from the older of the
-            // two; otherwise a sweep that gets through drops the retry and
-            // its arrival time with it.
-            Some((_, Some(since))) if wake.trigger.forces_scan() => {
-                let wake = Wake {
-                    first_event_at: Some(wake.first_event_at.map_or(since, |at| at.min(since))),
-                    ..wake
-                };
-                (wake, false)
-            }
-            _ => (wake, false),
-        }
-    }
-
-    /// The lock turned a sweep away: it is still owed, and the holder may be
-    /// there for a while. Repeats coalesce into the one deadline, so a busy
-    /// tree under a long sync costs one retry per window rather than one per
-    /// event.
-    pub(super) fn turned_away(&mut self, first_event_at: Option<Instant>, is_retry: bool) {
-        let since = earliest(self.retry.and_then(|(_, since)| since), first_event_at);
-        // Backed off per attempt of the owed retry, never per event: a
-        // burst of contended events is one owed change, and letting
-        // each of them double the wait (and push the deadline later)
-        // is what stalled capture until the backstop. A new event
-        // keeps the earlier of the two deadlines.
-        let next = deadline_after(Instant::now(), self.backoff);
-        let at = match self.retry {
-            Some((held, _)) if !is_retry => held.min(next),
-            _ => next,
-        };
-        self.retry = Some((at, since));
-        if is_retry {
-            self.backoff = self
-                .backoff
-                .saturating_mul(2)
-                .clamp(CONTENDED_SWEEP_RETRY_MS, CONTENDED_SWEEP_RETRY_MAX_MS);
-        }
-    }
-
-    /// A forced sweep got through. Whatever was owed is paid, and the next
-    /// contention starts from the short cadence again.
-    pub(super) fn paid(&mut self) {
-        self.retry = None;
-        self.backoff = CONTENDED_SWEEP_RETRY_MS;
-    }
-}
-
 #[derive(Default)]
 pub(super) struct WakeState {
     /// A change signal is pending, and when the first one arrived. One slot
     /// on purpose: a thousand events between two ticks cost one wakeup, not
     /// a thousand, and the tick reports how long the oldest of them waited.
-    pending: Option<Instant>,
+    pub(super) pending: Option<Instant>,
+    /// The roots the pending changes covered.
+    pub(super) scope: Option<ChangeScope>,
     /// A registration was reported gone and has to be re-made. Kept apart
     /// from `pending` because it asks for different work: `pending` says
     /// something was written and wants a sweep, this says a watch was lost
     /// and wants the watch back.
-    registration_lost: bool,
-    stopped: bool,
+    pub(super) registration_lost: bool,
+    pub(super) stopped: bool,
     /// When the coalescing window opened by the last change-driven tick
     /// closes. A change arriving after it finds the loop quiet and, with the
     /// leading edge on, is swept at once; one arriving before it waits for
     /// it and becomes the window's one trailing tick.
-    window_until: Option<Instant>,
+    pub(super) window_until: Option<Instant>,
 }
 
 #[derive(Default)]
 pub(super) struct RunState {
-    in_flight: bool,
+    pub(super) in_flight: bool,
     /// A forced tick arrived while a run held the slot. Kept as one bit: a
     /// hundred events during a long sweep are one sweep afterwards, not a
     /// hundred.
-    deferred_force: bool,
+    pub(super) deferred_force: bool,
     /// When the oldest change behind `deferred_force` first arrived.
-    deferred_since: Option<Instant>,
+    pub(super) deferred_since: Option<Instant>,
+    /// The roots the changes behind `deferred_force` covered.
+    pub(super) deferred_scope: Option<ChangeScope>,
     /// Monotonic count of finished ticks, so a joiner can wait for "the run
     /// that was in flight when I arrived" without holding the lock across it.
-    completed: u64,
+    pub(super) completed: u64,
 }
 
 pub(super) struct WatchInner {
-    pub(super) tick: TickFn,
+    pub(super) tick: ScopedTickFn,
     pub(super) on_report: Option<ReportSink>,
     pub(super) on_error: Option<ErrorSink>,
     pub(super) wake: Mutex<WakeState>,
@@ -228,19 +111,20 @@ pub(super) struct WatchInner {
 
 /// Resets `in_flight` even when the sweep panics, so one bad tick cannot wedge
 /// the loop into "a run is always in flight" forever.
-struct InFlight<'a> {
-    inner: &'a WatchInner,
+pub(super) struct InFlight<'a> {
+    pub(super) inner: &'a WatchInner,
 }
 
 impl Drop for InFlight<'_> {
     fn drop(&mut self) {
-        let (deferred, since) = {
+        let (deferred, since, scope) = {
             let mut run = self.inner.run.lock().expect("watch run state");
             run.in_flight = false;
             run.completed = run.completed.wrapping_add(1);
             (
                 std::mem::take(&mut run.deferred_force),
                 run.deferred_since.take(),
+                run.deferred_scope.take(),
             )
         };
         self.inner.run_cv.notify_all();
@@ -248,8 +132,10 @@ impl Drop for InFlight<'_> {
             // A change arrived while this run held the slot. Post it now that
             // the slot is free: the loop is waiting on the wake state, so it
             // takes it up immediately rather than at the next backstop.
-            self.inner
-                .signal_change_since(since.unwrap_or_else(Instant::now));
+            self.inner.signal_change_since(
+                since.unwrap_or_else(Instant::now),
+                scope.unwrap_or_default(),
+            );
         }
     }
 }
@@ -260,21 +146,22 @@ impl WatchInner {
     }
 
     /// Post a change signal. Called by the filesystem watcher's callback, and
-    /// public through [`super::WatchLoop::notify_change`] for hosts that already have
+    /// public through [`WatchLoop::notify_change`] for hosts that already have
     /// their own change feed.
-    pub(super) fn signal_change(&self) {
-        self.signal_change_since(Instant::now());
+    pub(super) fn signal_change(&self, scope: ChangeScope) {
+        self.signal_change_since(Instant::now(), scope);
     }
 
     /// Post a change signal that first arrived at `at`, keeping the oldest
-    /// arrival when one is already pending.
-    fn signal_change_since(&self, at: Instant) {
+    /// arrival when one is already pending and widening its scope.
+    pub(super) fn signal_change_since(&self, at: Instant, scope: ChangeScope) {
         {
             let mut wake = self.wake.lock().expect("watch wake state");
             if wake.stopped {
                 return;
             }
             wake.pending = Some(wake.pending.map_or(at, |first| first.min(at)));
+            wake.scope = Some(widen(wake.scope.take(), scope));
         }
         self.wake_cv.notify_all();
     }
@@ -349,7 +236,7 @@ impl WatchInner {
     /// The debounce window behind a pending change signal: release `wake`,
     /// sleep the window out, and take the signal as one filesystem-event
     /// wake.
-    fn debounced_change(
+    pub(super) fn debounced_change(
         &self,
         wake: MutexGuard<'_, WakeState>,
         debounce: Duration,
@@ -398,15 +285,17 @@ impl WatchInner {
         // sweep, sets the bit again, so sustained writes keep a steady
         // window-plus-sweep cadence instead of waiting for quiet.
         let first_event_at = wake.pending.take();
+        let scope = wake.scope.take().unwrap_or_default();
         if leading_edge {
             // Bounded like every other interval here: the public
             // field can be set past `MAX_INTERVAL_MS` directly.
-            wake.window_until =
-                Instant::now().checked_add(debounce.min(Duration::from_millis(MAX_INTERVAL_MS)));
+            wake.window_until = Instant::now()
+                .checked_add(debounce.min(Duration::from_millis(MAX_INTERVAL_MS)));
         }
         Some(Wake {
             trigger: TickTrigger::FsEvent,
             first_event_at,
+            scope,
         })
     }
 
@@ -470,7 +359,7 @@ impl WatchInner {
     /// — that change is remembered as `deferred_force` and re-posted by
     /// [`InFlight::drop`], which is the same promise by another route.
     pub(super) fn run_skip_if_busy(&self, wake: Wake) -> bool {
-        let Some(guard) = self.claim_or_defer(wake) else {
+        let Some(guard) = self.claim_or_defer(&wake) else {
             return false;
         };
         self.run_claimed(wake, guard)
@@ -478,13 +367,17 @@ impl WatchInner {
 
     /// Claim the in-flight slot, or remember a forced trigger that could not
     /// have it.
-    fn claim_or_defer(&self, wake: Wake) -> Option<InFlight<'_>> {
+    pub(super) fn claim_or_defer(&self, wake: &Wake) -> Option<InFlight<'_>> {
         let mut run = self.run.lock().expect("watch run state");
         if run.in_flight {
             if wake.trigger.forces_scan() {
                 run.deferred_force = true;
                 let since = wake.first_event_at.unwrap_or_else(Instant::now);
                 run.deferred_since = Some(run.deferred_since.map_or(since, |held| held.min(since)));
+                run.deferred_scope = Some(widen(
+                    run.deferred_scope.take(),
+                    wake.scope.clone(),
+                ));
             }
             return None;
         }
@@ -517,14 +410,23 @@ impl WatchInner {
         }
     }
 
-    fn run_claimed(&self, wake: Wake, guard: InFlight<'_>) -> bool {
+    pub(super) fn run_claimed(&self, wake: Wake, guard: InFlight<'_>) -> bool {
         let Wake {
             trigger,
             first_event_at,
+            scope,
         } = wake;
         let forced = trigger.forces_scan();
         let started = Instant::now();
-        let result = (self.tick)(forced);
+        let result = (self.tick)(&TickRequest {
+            trigger,
+            force: forced,
+            scope: if forced {
+                scope
+            } else {
+                ChangeScope::Everything
+            },
+        });
         let elapsed = started.elapsed();
         let report = |outcome: TickOutcome, cancelled: bool| {
             if let Some(sink) = &self.on_report {
@@ -576,3 +478,4 @@ impl WatchInner {
         }
     }
 }
+
