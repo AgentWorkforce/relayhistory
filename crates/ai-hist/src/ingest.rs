@@ -751,16 +751,6 @@ const SOURCE_FINGERPRINT_KEY: &str = "source_fingerprint";
 /// source fingerprint an earlier build stored cannot skip that sweep.
 const CLAUDE_TRAILING_HOLD_GENERATION: &str = "claude_trailing_hold_v1";
 
-/// One-time sweep for stores an earlier parser built, which hid every Codex
-/// rollout marked `thread_source: "subagent"` as a child thread even when it
-/// named no parent (standalone guardian / auto-review threads). Their rollouts
-/// never change on disk, so only a sweep re-reads them: the rollout walk
-/// promotes each recorded subagent that has no delegation edge and names no
-/// parent to a catalogued session. The name is in
-/// [`SWEEP_PARSER_GENERATIONS`], so the source fingerprint an earlier build
-/// stored cannot skip that sweep.
-const CODEX_PARENTLESS_SUBAGENT_GENERATION: &str = "codex_parentless_subagent_v1";
-
 /// Where the destination's own generation is remembered, beside the source
 /// fingerprint it qualifies.
 const DESTINATION_GENERATION_KEY: &str = "destination_generation";
@@ -818,7 +808,6 @@ const SWEEP_PARSER_GENERATIONS: &[&str] = &[
     CLAUDE_STANDALONE_RECORDS_GENERATION,
     "codex_rollouts_v7",
     CODEX_STATE_MARKER_KEY,
-    CODEX_PARENTLESS_SUBAGENT_GENERATION,
     GROK_SYNC_STATE_KEY,
     OPENCODE_NORMALIZER_GENERATION,
 ];
@@ -34367,6 +34356,12 @@ mod tests {
     /// The sweep generation this build stores, computed with `generations`
     /// in place of [`SWEEP_PARSER_GENERATIONS`].
     fn sweep_generation_with(generations: &[&str]) -> String {
+        sweep_generation_at(crate::discover::SHALLOW_SCANNER_VERSION, generations)
+    }
+
+    /// [`sweep_generation_with`] as a build at `scanner` shallow-scanner
+    /// version computed it.
+    fn sweep_generation_at(scanner: u32, generations: &[&str]) -> String {
         let current = sweep_generation();
         let parts = SWEEP_PARSER_GENERATIONS.join("|");
         let older = generations.join("|");
@@ -34377,22 +34372,22 @@ mod tests {
              |codex_fork_replay={CODEX_FORK_REPLAY_GENERATION}\
              |codex_metadata_backfill={CODEX_METADATA_BACKFILL_GENERATION}"
         );
-        let hash = |list: &str| {
+        let hash = |scanner: u32, list: &str| {
             format!(
                 "g{:016x}",
                 crate::discover::fingerprint_hash(
                     "sweep-generation",
-                    &crate::discover::SHALLOW_SCANNER_VERSION.to_string(),
+                    &scanner.to_string(),
                     &format!("{list}{tail}"),
                 )
             )
         };
         assert_eq!(
-            hash(&parts),
+            hash(crate::discover::SHALLOW_SCANNER_VERSION, &parts),
             current,
             "the encoding above is sweep_generation's"
         );
-        hash(&older)
+        hash(scanner, &older)
     }
 
     fn claude_holding_records(dir: &Path) -> bool {
@@ -34604,7 +34599,7 @@ mod tests {
     /// (`thread_source: "subagent"`, no parent) as a child: its stamp recorded
     /// `subagent: true`, it had no catalog row, prompt history or delegation
     /// edge, discovery remembered it as a non-session, and the fingerprint
-    /// vouched for the tree. One plain sync catalogs it, and the next takes
+    /// (at the previous shallow-scanner version) vouched for the tree. One plain sync catalogs it, and the next takes
     /// the fast path.
     #[test]
     fn an_upgraded_store_catalogs_a_parentless_codex_subagent_thread() {
@@ -34648,8 +34643,11 @@ mod tests {
         conn.execute(
             "INSERT INTO observation_discovery_skips \
              (source, location, connector_id, connector_instance, locator, stamp, updated_ms) \
-             VALUES ('codex', 'local', '', '', ?, 'stale', 0)",
-            [&key],
+             VALUES ('codex', 'local', 'codex', 'default', ?, ?, 0)",
+            params![
+                key,
+                format!("v{}:stale", crate::discover::SHALLOW_SCANNER_VERSION - 1)
+            ],
         )
         .unwrap();
         assert_eq!(catalogued(&conn), 0);
@@ -34663,12 +34661,11 @@ mod tests {
             .unwrap()
             .1
             .to_string();
-        let older: Vec<&str> = SWEEP_PARSER_GENERATIONS
-            .iter()
-            .copied()
-            .filter(|generation| *generation != CODEX_PARENTLESS_SUBAGENT_GENERATION)
-            .collect();
-        let old_fingerprint = format!("{}/{source_part}", sweep_generation_with(&older));
+        let old_generation = sweep_generation_at(
+            crate::discover::SHALLOW_SCANNER_VERSION - 1,
+            SWEEP_PARSER_GENERATIONS,
+        );
+        let old_fingerprint = format!("{old_generation}/{source_part}");
         state.insert(SOURCE_FINGERPRINT_KEY.into(), json!(old_fingerprint));
         state.insert(
             DESTINATION_GENERATION_KEY.into(),
@@ -34695,14 +34692,6 @@ mod tests {
             )
             .unwrap();
         assert_eq!(prompts, 1);
-        let skips: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM observation_discovery_skips WHERE locator = ? AND stamp = 'stale'",
-                [&key],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(skips, 0);
         let state = load_sync_state(&state_path).unwrap();
         assert_eq!(state["codex_rollouts_v7"][&key]["subagent"], json!(false));
         assert!(

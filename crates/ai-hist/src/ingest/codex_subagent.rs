@@ -17,8 +17,7 @@ use std::path::Path;
 /// database synced before delegation was recorded has no topology, and its
 /// stamps never change again). One that names none is a standalone thread an
 /// earlier build hid as a child: this returns `true`, leaving it to the
-/// walk's full path to catalog it, and forgets the discovery skip that
-/// remembered it as a non-session at this same stamp.
+/// walk's full path to catalog it.
 pub(super) fn repair_recorded_codex_subagent(
     conn: &Connection,
     rollout: &Path,
@@ -32,10 +31,6 @@ pub(super) fn repair_recorded_codex_subagent(
         read_codex_session_meta(rollout)?
     };
     if unlinked_meta.as_ref().is_some_and(|meta| !meta.is_subagent) {
-        conn.execute(
-            "DELETE FROM observation_discovery_skips WHERE source = 'codex' AND locator = ?",
-            [rollout.to_string_lossy()],
-        )?;
         return Ok(true);
     }
     // Presence backfill can recreate a local catalog registration from
