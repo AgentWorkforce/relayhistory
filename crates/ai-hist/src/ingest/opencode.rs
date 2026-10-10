@@ -598,15 +598,6 @@ pub(crate) fn load_all_from_sqlite(src: &Connection) -> Result<OpencodeStoreLoad
     Ok(load)
 }
 
-/// Every session id the provider store names. Used by global sync, which is
-/// the only caller allowed to enumerate.
-pub(crate) fn list_sqlite_session_ids(src: &Connection) -> Result<Vec<String>> {
-    Ok(src
-        .prepare("SELECT id FROM session WHERE id IS NOT NULL AND id <> ''")?
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?)
-}
-
 /// Whether the OpenCode store at `store` holds `session_id` — the question
 /// that decides which channel store owns a session present in several.
 pub(crate) fn sqlite_store_holds_session(store: &Path, session_id: &str) -> Result<bool> {
@@ -622,14 +613,14 @@ pub(crate) fn sqlite_store_holds_session(store: &Path, session_id: &str) -> Resu
     Ok(held)
 }
 
-fn table_columns(conn: &Connection, table: &str) -> Result<BTreeSet<String>> {
+pub(crate) fn table_columns(conn: &Connection, table: &str) -> Result<BTreeSet<String>> {
     Ok(conn
         .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))?
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<BTreeSet<String>>>()?)
 }
 
-fn optional_column<'a>(columns: &BTreeSet<String>, name: &'a str) -> &'a str {
+pub(crate) fn optional_column<'a>(columns: &BTreeSet<String>, name: &'a str) -> &'a str {
     if columns.contains(name) {
         name
     } else {
