@@ -44,11 +44,12 @@ type TableAggregate = HashMap<String, (i64, Option<i64>, i64)>;
 
 /// Every session's stamp inputs, in one pass over each table.
 ///
-/// Each row's hash covers its id, `time_updated` and payload length --
-/// `octet_length` reads the length from the record header, not the payload --
-/// so a rewritten row moves the sum even when the count and the newest
-/// timestamp stay where they were. The columns read are the ones the loaders
-/// read; a schema without one stamps without it.
+/// Each row's hash covers its id, `time_updated` and payload, so a rewritten
+/// row moves the sum even when the count, the newest timestamp and the
+/// payload's length stay where they were: OpenCode bumps `time_updated` on
+/// a rewrite, but a schema without the column, or a rewrite that lands in
+/// the same millisecond, has only the payload to show it. The columns read
+/// are the ones the loaders read; a schema without one stamps without it.
 pub(super) fn sqlite_session_stamps(src: &Connection) -> Result<Vec<SessionStampRow>> {
     let session_columns = opencode::table_columns(src, "session")?;
     if !session_columns.contains("id") {
@@ -110,7 +111,7 @@ fn message_aggregate(src: &Connection) -> Result<TableAggregate> {
         &format!(
             "SELECT session_id, COUNT(*), MAX({updated}), \
              SUM(ai_hist_fnv(id || '|' || COALESCE(CAST({updated} AS TEXT), '') \
-                 || '|' || COALESCE(octet_length(data), -1))) \
+                 || '|' || COALESCE(data, ''))) \
              FROM message GROUP BY session_id"
         ),
     )
@@ -148,7 +149,7 @@ fn part_aggregate(src: &Connection) -> Result<TableAggregate> {
             "SELECT {session}, COUNT(*), MAX({updated}), \
              SUM(ai_hist_fnv(p.id || '|' || p.message_id || '|' \
                  || COALESCE(CAST({updated} AS TEXT), '') \
-                 || '|' || COALESCE(octet_length(p.data), -1))) \
+                 || '|' || COALESCE(p.data, ''))) \
              FROM {from} GROUP BY {session}"
         ),
     )

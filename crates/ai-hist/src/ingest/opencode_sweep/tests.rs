@@ -272,3 +272,79 @@ fn the_json_tree_reads_only_the_session_that_changed() {
     fs::write(&part, body.replacen('}', ",\"edited\":true}", 1)).unwrap();
     assert_eq!(fixture.sweep_tree(&tree), (0, 1));
 }
+
+#[test]
+fn a_same_length_rewrite_is_read_again() {
+    let mut fixture = Fixture::new();
+    let db = fixture.root.join("opencode.db");
+    let store = provider_store(&db);
+    let none = SweepRepairs::default();
+    fixture.sweep(std::slice::from_ref(&db), &none);
+    let (part, data): (String, String) = store
+        .query_row(
+            "SELECT id, data FROM part WHERE session_id = ?1 AND data LIKE '%\"text\":\"%' LIMIT 1",
+            [ROOT],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    let start = data.find("\"text\":\"").unwrap() + 8;
+    let mut rewritten = data.clone();
+    rewritten.replace_range(start..start + 1, if &data[start..start + 1] == "Z" { "Y" } else { "Z" });
+    assert_eq!(rewritten.len(), data.len());
+    // No `time_updated` in this schema: only the payload changed.
+    store
+        .execute("UPDATE part SET data = ?1 WHERE id = ?2", [&rewritten, &part])
+        .unwrap();
+    settle(&db);
+    assert_eq!(fixture.sweep(std::slice::from_ref(&db), &none), (1, 1));
+}
+
+#[test]
+fn a_lost_catalog_row_or_parent_edge_is_read_again() {
+    let mut fixture = Fixture::new();
+    let db = fixture.root.join("opencode.db");
+    provider_store(&db);
+    let none = SweepRepairs::default();
+    fixture.sweep(std::slice::from_ref(&db), &none);
+    let edge = |conn: &Connection| -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM session_relationships \
+             WHERE source = 'opencode' AND child_session_id = ?1",
+            [CHILD],
+            |row| row.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(edge(&fixture.conn), 1);
+    fixture
+        .conn
+        .execute(
+            "DELETE FROM session_relationships WHERE source = 'opencode' AND child_session_id = ?1",
+            [CHILD],
+        )
+        .unwrap();
+    assert_eq!(fixture.sweep(std::slice::from_ref(&db), &none), (1, 1));
+    assert_eq!(edge(&fixture.conn), 1);
+    fixture
+        .conn
+        .execute(
+            "DELETE FROM sessions WHERE source = 'opencode' AND session_id = ?1",
+            [ROOT],
+        )
+        .unwrap();
+    // The delete cascades the root's own evidence and its edges; reading it
+    // restores the session, and its child's edge is the child's to restore.
+    let (opened, read) = fixture.sweep(std::slice::from_ref(&db), &none);
+    assert_eq!(opened, 1);
+    assert!(read >= 1);
+    let catalog: i64 = fixture
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM sessions WHERE source = 'opencode' AND session_id = ?1",
+            [ROOT],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(catalog, 1);
+    assert_eq!(edge(&fixture.conn), 1);
+}

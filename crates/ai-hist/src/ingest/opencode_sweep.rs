@@ -11,15 +11,17 @@
 //! * **Session stamp** (`opencode_sessions_v1`, `opencode_tree_sessions_v1`):
 //!   for a SQLite session, the session row's fields and, per `message` and
 //!   `part` table, the row count, newest `time_updated` and a sum of per-row
-//!   hashes of id, `time_updated` and payload length -- one aggregate pass
-//!   over each table that reads no payload. For the legacy JSON tree, the
-//!   stamp discovery already takes ([`stamp_json_tree_session`]).
+//!   hashes of id, `time_updated` and payload -- one aggregate pass over each
+//!   table, which the parse and the writes it saves cost many times over.
+//!   For the legacy JSON tree, the stamp discovery already takes
+//!   ([`stamp_json_tree_session`]).
 //!
 //! Both are qualified by the sweep generation, so a parser upgrade re-reads
 //! every session once. A matching stamp is trusted only while the session's
-//! evidence is still there and the destination marker does not name it short
-//! -- the guard every other provider's skip has, and what brings back a
-//! session `forget_evidence` removed.
+//! evidence -- catalog row, events and markers, parent edge -- is still there
+//! and the destination marker does not name it short: the guard every other
+//! provider's skip has, and what brings back a session `forget_evidence`
+//! removed.
 //!
 //! A stamp is recorded only when it is definite. A session written within
 //! [`AMBIGUITY_MS`] of the read could be rewritten in the same millisecond at
@@ -32,10 +34,7 @@
 //! [`stamp_json_tree_session`]: super::opencode::stamp_json_tree_session
 
 use super::opencode::{self, OpencodeSession, OpencodeSyncPlan};
-use super::{
-    check_capture_cancelled, forget_unobserved_paths, session_events_exist, session_markers_exist,
-    sweep_generation, SweepRepairs,
-};
+use super::{check_capture_cancelled, forget_unobserved_paths, sweep_generation, SweepRepairs};
 use crate::discover::fingerprint_hash;
 use anyhow::{Context, Result};
 use rusqlite::{Connection, OpenFlags};
@@ -43,6 +42,7 @@ use serde_json::{Map, Value};
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
+mod holdings;
 mod stamps;
 #[cfg(test)]
 mod tests;
@@ -60,10 +60,6 @@ const AMBIGUITY_MS: i64 = 2_000;
 /// The value of a session this store holds that an earlier channel store
 /// owns.
 const CLAIMED: &str = "c";
-/// Prefixes of a recorded session stamp: whether the session held evidence
-/// when it was stamped.
-const EVIDENCE_HELD: &str = "e";
-const NOTHING_HELD: &str = "n";
 
 /// One of the three stamp maps.
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -152,13 +148,13 @@ impl<'a> OpencodeSweep<'a> {
     }
 
     /// Whether the evidence a session held when it was stamped is still
-    /// there: the destination marker does not name it short and, if it held
-    /// any rows, it still holds some.
+    /// there: the destination marker does not name it short and it holds
+    /// what [`holdings::held`] recorded.
     fn intact(&self, conn: &Connection, session_id: &str, held: &str) -> Result<bool> {
         if self.repairs.contains("opencode", session_id) {
             return Ok(false);
         }
-        Ok(held == NOTHING_HELD || session_holds_evidence(conn, session_id)?)
+        holdings::holds(conn, session_id, held)
     }
 
     /// Record one session's stamp once its evidence is written.
@@ -170,11 +166,7 @@ impl<'a> OpencodeSweep<'a> {
         session_id: &str,
         stamp: &str,
     ) -> Result<()> {
-        let held = if session_holds_evidence(conn, session_id)? {
-            EVIDENCE_HELD
-        } else {
-            NOTHING_HELD
-        };
+        let held = holdings::held(conn, session_id)?;
         self.insert(map, entry, format!("{held}:{stamp}"));
         Ok(())
     }
@@ -199,11 +191,6 @@ pub(crate) fn unstamped<T>(pass: impl FnOnce(&mut OpencodeSweep<'_>) -> Result<T
 /// `(held, stamp)` from a recorded session value.
 fn recorded(value: Option<&Value>) -> Option<(&str, &str)> {
     value.and_then(Value::as_str)?.split_once(':')
-}
-
-fn session_holds_evidence(conn: &Connection, session_id: &str) -> Result<bool> {
-    Ok(session_events_exist(conn, "opencode", session_id)?
-        || session_markers_exist(conn, "opencode", session_id)?)
 }
 
 /// A SQLite store's sessions are kept under a hash of its path, so 40,000
