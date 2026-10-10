@@ -587,8 +587,6 @@ pub(super) fn remote_url<'a>(config: &'a GitConfig, remote: &str) -> Option<&'a 
         .first()
 }
 
-/// Normalize a section header body, mirroring `^([A-Za-z0-9._-]+)\s+"(.*)"$`.
-/// A header that does not match that shape is kept verbatim, as burn keeps it.
 /// Normalize a section header body.
 ///
 /// Git's case rules are not uniform and the difference is load-bearing here:
