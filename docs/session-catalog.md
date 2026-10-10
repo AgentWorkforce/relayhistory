@@ -2130,8 +2130,8 @@ A record with **no** `stop_reason` key at all is treated as finished: older
 record shapes omit the field.
 
 A record that stores no event row of its own and opens with a `thinking`
-block with no text — the signed, empty block Claude streams first in a
-response — is held for the record after it whatever its `stop_reason` says,
+block with no text — typically the signed, empty block Claude streams first
+in a response — is held for the record after it whatever its `stop_reason` says,
 together with any later records of its message that store no event either
 (empty content, or only blocks the event model drops). A later record of its
 message that stores rows takes the response, and the opening record is its

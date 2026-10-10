@@ -81,14 +81,15 @@ fn thinking_text(block: &Value) -> Option<&str> {
 /// A block with no display text is carried by its `thinking_signature`
 /// marker, which names the record's request, while a later record of its
 /// message stores that request's rows. A record that stands alone is its
-/// response's only evidence, so its block stores the event (with its empty
-/// text) that gives the response a request and its usage.
+/// response's only evidence, so its block stores the event that gives the
+/// response a request and its usage, with empty text: blank by any measure,
+/// so the retirement in [`settle_record_usage`] names it exactly.
 pub(super) fn claude_thinking_event_text(block: &Value, stands_alone: bool) -> Option<&str> {
-    let text = thinking_text(block);
+    let text = thinking_text(block).filter(|text| !text.trim().is_empty());
     if stands_alone {
         return Some(text.unwrap_or(""));
     }
-    text.filter(|text| !text.trim().is_empty())
+    text
 }
 
 /// Settle a Claude assistant record's request usage
@@ -102,7 +103,7 @@ pub(super) fn claude_thinking_event_text(block: &Value, stands_alone: bool) -> O
 /// request itself, so those events go, and with them their usage copies,
 /// before the record settles its own: the rows match a from-zero read, where
 /// the opening record stores only its marker. Only a standalone record stores
-/// a thinking event with blank text. The retirement is the local side of
+/// a thinking event with empty text ([`claude_thinking_event_text`]). The retirement is the local side of
 /// `retire_evidence_share`, on cached statements, because it runs for every
 /// Claude assistant record that stores rows.
 pub(super) fn settle_record_usage(
@@ -132,7 +133,7 @@ fn retire_standalone_events(
 ) -> Result<()> {
     const STANDALONE: &str = "source = 'claude' AND session_id = ?1 AND provider_message_id = ?2 \
            AND role = 'assistant' AND kind = 'thinking' \
-           AND TRIM(COALESCE(text, ''), ' ' || char(9, 10, 13)) = ''";
+           AND text = ''";
     conn.prepare_cached(&format!(
         "DELETE FROM session_events WHERE {STANDALONE} AND location = 'local'"
     ))?

@@ -35406,6 +35406,32 @@ mod tests {
         );
     }
 
+    /// A standalone record whose thinking is blank by Unicode whitespace
+    /// stores its event with empty text, so the later block of its message
+    /// retires it as it retires any other.
+    #[test]
+    fn a_standalone_event_of_unicode_blank_thinking_is_retired_too() {
+        let text = [
+            sidecar_record("user", "c1", r#"{"role":"user","content":"delegated"}"#),
+            sidecar_assistant(
+                "a1",
+                "msg_1",
+                r#"{"type":"thinking","thinking":"\u2003","signature":"sig"}"#,
+                8,
+            ),
+            sidecar_record("user", "c2", r#"{"role":"user","content":"go on"}"#),
+            sidecar_tool_use("a1b", "msg_1", "toolu_1", 5),
+            sidecar_tool_result("r1", "toolu_1"),
+        ]
+        .concat();
+        for conn in every_reader(&text) {
+            assert_eq!(
+                child_assistant_events(&conn),
+                vec![("a1b:0".to_string(), "tool_use".to_string())]
+            );
+        }
+    }
+
     /// A run of records that store no event, longer than the incremental
     /// reader holds, is released as standalone by every reader alike, and the
     /// block of their message that follows retires their events: each reader
