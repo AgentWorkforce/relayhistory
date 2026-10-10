@@ -1265,6 +1265,15 @@ mod tests {
         assert!(request.force);
         assert_eq!(request.scope, ChangeScope::Everything);
 
+        // `tick` joins a sweep that is already running and does not start
+        // another. The event tick above can still be in flight after its
+        // request has been delivered, and joining that one leaves the
+        // channel empty.
+        let idle_deadline = Instant::now() + wait;
+        while watch.inner.run.lock().expect("watch run state").in_flight {
+            assert!(Instant::now() < idle_deadline, "sweep still in flight");
+            std::thread::sleep(Duration::from_millis(5));
+        }
         watch.tick();
         let request = requests.recv_timeout(wait).unwrap();
         assert_eq!(request.trigger, TickTrigger::Manual);
