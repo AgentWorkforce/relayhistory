@@ -11,7 +11,7 @@ use rusqlite::{params, Connection};
 pub(crate) const RETIRED_SOURCES: &[&str] = &["trajectory", "relay"];
 
 /// Whether `source` is one of [`RETIRED_SOURCES`].
-pub(crate) fn is_retired(source: &str) -> bool {
+pub fn is_retired_source(source: &str) -> bool {
     RETIRED_SOURCES.contains(&source)
 }
 
@@ -35,13 +35,67 @@ const RETIRED_TRAJECTORY_OBJECTS: &[(&str, &str)] = &[
     ("table", "trajectories"),
 ];
 
+/// The tables this crate creates that key a row by `source`, and so can hold
+/// a row under a [`RETIRED_SOURCES`] source. An explicit list rather than
+/// every table with a `source` column: the upload daemon keeps its own
+/// tables in this database (`delivery_journal`, `delivery_shadow`,
+/// `delivery_exclusions`, `history_subscriptions`), and they are its records,
+/// never ours to delete from. `sessions` is first: its delete triggers clear
+/// the per-session state keyed on it. Every one has an index whose leading
+/// column is `source`, so a presence probe is one seek.
+const EVIDENCE_TABLES: &[&str] = &[
+    "sessions",
+    "session_presences",
+    "history",
+    "session_events",
+    "tool_calls",
+    "file_edits",
+    "session_markers",
+    "session_relationships",
+    "session_continuity_evidence",
+    "session_commit_links",
+    "session_tags",
+    "session_hydration_checkpoints",
+    "session_identity_correlations",
+    "transcript_cursors",
+    "discovery_skips",
+    "session_observations",
+    "observation_evidence",
+    "observation_versions",
+    "observation_hydration_checkpoints",
+    "observation_discovery_skips",
+    "canonical_evidence_protection",
+];
+
+/// Whether table `name` exists. A database mid-migration may not have every
+/// [`EVIDENCE_TABLES`] entry yet.
+fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
+    Ok(conn
+        .prepare_cached("SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ? LIMIT 1")?
+        .exists([name])?)
+}
+
+/// Whether `table` holds a row under a [`RETIRED_SOURCES`] source.
+fn holds_retired_rows(conn: &Connection, table: &str) -> Result<bool> {
+    if !table_exists(conn, table)? {
+        return Ok(false);
+    }
+    let sources = retired_sources_sql();
+    Ok(conn.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM \"{table}\" WHERE source IN ({sources}))"),
+        [],
+        |row| row.get(0),
+    )?)
+}
+
 /// Whether anything [`drop_retired_trajectory_store`] or
 /// [`delete_retired_source_rows`] removes is still there: a
-/// [`RETIRED_TRAJECTORY_OBJECTS`] object, or a catalog or prompt row under a
-/// [`RETIRED_SOURCES`] source. Checked by presence rather than a migration
-/// marker, so what an older client writes again is retired again on the next
-/// writable open. The row checks are seeks on `idx_history_session` and
-/// `idx_sessions_source_last`, whose leading column is `source`.
+/// [`RETIRED_TRAJECTORY_OBJECTS`] object, or a row under a
+/// [`RETIRED_SOURCES`] source in any [`EVIDENCE_TABLES`] table -- including
+/// evidence no catalog row names, such as a sidechain's events. Checked by
+/// presence rather than a migration marker, so what an older client writes
+/// again is retired again on the next writable open, and a read-only handle
+/// treats the database as stale until then.
 pub(super) fn retired_sources_present(conn: &Connection) -> Result<bool> {
     let mut object =
         conn.prepare_cached("SELECT 1 FROM sqlite_master WHERE type = ? AND name = ? LIMIT 1")?;
@@ -50,14 +104,8 @@ pub(super) fn retired_sources_present(conn: &Connection) -> Result<bool> {
             return Ok(true);
         }
     }
-    let sources = retired_sources_sql();
-    for table in ["history", "sessions"] {
-        let present: bool = conn.query_row(
-            &format!("SELECT EXISTS(SELECT 1 FROM {table} WHERE source IN ({sources}))"),
-            [],
-            |row| row.get(0),
-        )?;
-        if present {
+    for table in EVIDENCE_TABLES {
+        if holds_retired_rows(conn, table)? {
             return Ok(true);
         }
     }
@@ -85,42 +133,24 @@ pub(super) fn drop_retired_trajectory_store(conn: &Connection) -> Result<()> {
 }
 
 /// Delete every row an earlier release stored under a [`RETIRED_SOURCES`]
-/// source, from every table that has a `source` column -- the catalog,
-/// presences, prompts, events, connector observations and the rest -- so
-/// nothing is left behind under a source this build cannot name.
+/// source from the [`EVIDENCE_TABLES`], so nothing is left behind under a
+/// source this build cannot name.
 ///
 /// Runs last in the migration pass, once every table has its current columns
 /// and triggers: a delete fires them, and a trigger body written for a column
-/// a later step adds would otherwise fail. The change feed's tombstones for
-/// these deletes, and any the retired `trajectory` kind left, go too: the
-/// feed's export-schema reconciliation resets the stream when a kind is
-/// removed, so a consumer rebuilds from a full replay in which none of these
-/// rows exist.
+/// a later step adds would otherwise fail. Only a table holding such a row is
+/// written: a delete compiles every trigger on its table.
+///
+/// Each delete leaves its change-feed tombstone, deliberately. On the first
+/// upgrade the feed has already reset its stream (the `trajectory` kind is
+/// gone), and a delete for a row a consumer never received is a no-op to it;
+/// on a later pass -- rows an older client wrote again, which the feed
+/// delivered -- the tombstone is how a consumer learns to drop them. Only the
+/// tombstones of the retired `trajectory` kind go: no drain reads that kind.
 pub(super) fn delete_retired_source_rows(conn: &Connection) -> Result<()> {
-    let tables = conn
-        .prepare(
-            "SELECT m.name FROM sqlite_master m \
-             WHERE m.type = 'table' AND m.sql NOT LIKE 'CREATE VIRTUAL TABLE%' \
-               AND m.name <> 'evidence_tombstones' \
-               AND EXISTS (SELECT 1 FROM pragma_table_info(m.name) c WHERE c.name = 'source') \
-             ORDER BY m.name",
-        )?
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
     let sources = retired_sources_sql();
-    // The catalog first: its delete triggers clear the per-session state
-    // keyed on it, and the sweep below then finds nothing left there.
-    for table in std::iter::once("sessions".to_string())
-        .chain(tables.into_iter().filter(|table| table != "sessions"))
-    {
-        // Only a table holding such a row is written: a delete compiles every
-        // trigger on its table, and there is no reason to touch the rest.
-        let held: bool = conn.query_row(
-            &format!("SELECT EXISTS(SELECT 1 FROM \"{table}\" WHERE source IN ({sources}))"),
-            [],
-            |row| row.get(0),
-        )?;
-        if held {
+    for table in EVIDENCE_TABLES {
+        if holds_retired_rows(conn, table)? {
             conn.execute(
                 &format!("DELETE FROM \"{table}\" WHERE source IN ({sources})"),
                 [],
@@ -128,15 +158,11 @@ pub(super) fn delete_retired_source_rows(conn: &Connection) -> Result<()> {
             .with_context(|| format!("deleting retired-source rows from {table}"))?;
         }
     }
-    // Last, so it takes the tombstones the deletes above just wrote.
     conn.execute(
-        &format!(
-            "DELETE FROM evidence_tombstones \
-             WHERE kind = 'trajectory' OR source IN ({sources})"
-        ),
+        "DELETE FROM evidence_tombstones WHERE kind = 'trajectory'",
         [],
     )
-    .context("deleting retired-source tombstones")?;
+    .context("deleting retired-kind tombstones")?;
     Ok(())
 }
 
@@ -279,6 +305,17 @@ mod tests {
                  VALUES (1, 'kept', 'kept', 1, 1);
                  INSERT INTO session_tags (source, session_id, tag_id, created_ms)
                  VALUES ('relay', 'r1', 1, 1);
+                 -- Evidence no catalog row names: a sidechain's tool call.
+                 INSERT INTO tool_calls (source, session_id, tool_use_id, name)
+                 VALUES ('relay', 'orphan', 't1', 'Bash');
+                 -- The upload daemon's own table, which is not ours.
+                 CREATE TABLE delivery_journal (
+                     seq INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL,
+                     source TEXT NOT NULL, session_id TEXT, record_key TEXT NOT NULL,
+                     operation TEXT NOT NULL, payload TEXT NOT NULL
+                 );
+                 INSERT INTO delivery_journal (kind, source, record_key, operation, payload)
+                 VALUES ('history', 'relay', 'k', 'upsert', '{}');
                  INSERT INTO evidence_tombstones (kind, source, session_id, record_key, revision)
                  VALUES ('trajectory', 'trajectory', 't0', 't0', 1),
                         ('history', 'relay', '', '[1,\"gone\"]', 2),
@@ -302,15 +339,39 @@ mod tests {
                 "SELECT DISTINCT source FROM {table} ORDER BY source"
             ))
         };
-        for table in [
-            "sessions",
-            "session_presences",
-            "history",
-            "evidence_tombstones",
-        ] {
+        for table in ["sessions", "session_presences", "history"] {
             assert_eq!(sources(table), vec!["claude"], "{table}");
         }
         assert!(sources("session_tags").is_empty());
+        assert!(
+            sources("tool_calls").is_empty(),
+            "orphaned evidence goes too"
+        );
+        assert_eq!(
+            sources("delivery_journal"),
+            vec!["relay"],
+            "the upload daemon's tables are left alone"
+        );
+        // The deletes leave tombstones, so a consumer drops what it holds;
+        // only the retired kind's own tombstones go.
+        assert_eq!(
+            remaining("SELECT DISTINCT kind FROM evidence_tombstones WHERE kind = 'trajectory'"),
+            Vec::<String>::new()
+        );
+        let tombstoned =
+            remaining("SELECT DISTINCT kind || ':' || source FROM evidence_tombstones ORDER BY 1");
+        for expected in [
+            "history:claude",
+            "history:relay",
+            "history:trajectory",
+            "session:relay",
+            "tool_call:relay",
+        ] {
+            assert!(
+                tombstoned.iter().any(|t| t == expected),
+                "{expected}: {tombstoned:?}"
+            );
+        }
         assert_eq!(
             remaining("SELECT prompt FROM history ORDER BY id"),
             vec!["needle claude"]
@@ -324,6 +385,18 @@ mod tests {
             vec!["needle claude"]
         );
         assert!(!retired_sources_present(&conn).unwrap());
+        // A row an older client writes again makes the schema stale until the
+        // next writable open retires it.
+        conn.execute(
+            "INSERT INTO tool_calls (source, session_id, tool_use_id, name) \
+             VALUES ('trajectory', 'again', 't1', 'Bash')",
+            [],
+        )
+        .unwrap();
+        assert!(!schema_is_current(&conn).unwrap());
+        drop(conn);
+        let conn = open_db(&path).unwrap();
+        assert!(schema_is_current(&conn).unwrap());
         drop(conn);
         // A second open finds nothing left to do.
         let conn = open_db(&path).unwrap();

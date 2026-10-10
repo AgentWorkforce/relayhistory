@@ -9,7 +9,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Breaking Changes
 
 - Trajectories and Relaycast history are no longer sources: `relay` and `trajectory` are unknown values for `--source` and every source filter, `--source-connector relaycast` is an `INVALID_ARGUMENT`, and the TypeScript `SOURCES`, `CHANGE_KINDS` and export kinds no longer list them.
-- A writable open deletes what an earlier release stored for them: the `trajectories` table (with any leftover `trajectory_fts` index and triggers) and every row under the `relay` or `trajectory` source, with their change-feed tombstones. Because the feed loses the `trajectory` kind, the first writable open after upgrading starts a new feed epoch and drops named consumer cursors, so change-feed consumers replay from the start.
+- A writable open deletes what an earlier release stored for them: the `trajectories` table (with any leftover `trajectory_fts` index and triggers) and every row under the `relay` or `trajectory` source in this crate's own tables (never the upload daemon's `delivery_*` tables), leaving change-feed delete tombstones so consumers drop rows they hold. Because the feed loses the `trajectory` kind, the first writable open after upgrading starts a new feed epoch and drops named consumer cursors, so change-feed consumers replay from the start; a read-only open treats a database still holding such rows as stale.
 
 ### Removed
 

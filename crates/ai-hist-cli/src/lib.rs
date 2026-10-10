@@ -28,6 +28,8 @@ use ai_hist::history_search::{search_all, SearchRole, SearchRow};
 use ai_hist::paths::{default_opencode_db_path, home_dir};
 use ai_hist::{discover, remote, *};
 mod export;
+mod import;
+use import::import_history;
 
 use export::export_history;
 #[cfg(test)]
@@ -2156,60 +2158,6 @@ fn print_tags(
             }
         }
     }
-    Ok(())
-}
-
-fn import_history(conn: &Connection, path: &Path, dry_run: bool) -> Result<()> {
-    let entries = if matches!(
-        path.extension().and_then(|s| s.to_str()),
-        Some("db" | "sqlite")
-    ) {
-        load_sqlite_entries(path)?
-    } else {
-        load_jsonl_entries(path)?
-    };
-    if entries.is_empty() {
-        println!("No entries found in file.");
-        return Ok(());
-    }
-    if dry_run {
-        println!(
-            "[dry-run] {} entries in {} - none written.",
-            entries.len(),
-            path.display()
-        );
-        println!();
-        for entry in entries.iter().take(5) {
-            println!(
-                "  {}  ({}){}  {}",
-                format_datetime(entry.timestamp_ms),
-                entry.source,
-                entry
-                    .project
-                    .as_ref()
-                    .map(|p| format!(" [{p}]"))
-                    .unwrap_or_default(),
-                entry
-                    .prompt
-                    .chars()
-                    .take(80)
-                    .collect::<String>()
-                    .replace('\n', " ")
-            );
-        }
-        if entries.len() > 5 {
-            println!("  ... and {} more", entries.len() - 5);
-        }
-        return Ok(());
-    }
-    let total = entries.len();
-    let inserted = import_json(conn, &entries)?;
-    let skipped = total.saturating_sub(inserted);
-    let mut parts = vec![format!("+{inserted} new entries")];
-    if skipped > 0 {
-        parts.push(format!("{skipped} already existed"));
-    }
-    println!("Imported from {}: {}", path.display(), parts.join(", "));
     Ok(())
 }
 
@@ -4388,6 +4336,48 @@ mod tests {
         import_history(&restored, &path, false).unwrap();
         assert_eq!(history_count(&restored), 3);
         assert_eq!(history_rows(&restored), history_rows(&exported_from));
+    }
+
+    /// An export from an earlier release can carry prompts under a source this
+    /// one retired; they are skipped, and the rest import as usual.
+    #[test]
+    fn an_import_skips_retired_source_prompts() {
+        let dir = tempfile::tempdir().unwrap();
+        let exported_from = fresh_db();
+        seed_exportable_history(&exported_from);
+        exported_from
+            .execute(
+                "INSERT INTO history (source, session_id, prompt, timestamp_ms) \
+                 VALUES ('relay', 'ch:general', 'a relaycast turn', 1), \
+                        ('trajectory', 't1', 'a trajectory', 2)",
+                [],
+            )
+            .unwrap();
+        let path = dir.path().join("history.jsonl");
+        export_history(
+            &exported_from,
+            Path::new(":memory:"),
+            Some(&path),
+            "jsonl",
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        let restored = fresh_db();
+        import_history(&restored, &path, true).unwrap();
+        assert_eq!(history_count(&restored), 0);
+        import_history(&restored, &path, false).unwrap();
+        assert_eq!(history_count(&restored), 3);
+        let retired: i64 = restored
+            .query_row(
+                "SELECT COUNT(*) FROM history WHERE source IN ('relay', 'trajectory')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(retired, 0);
     }
 
     #[test]

@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod retired_sources;
+pub use retired_sources::is_retired_source;
 mod schema_check;
 use schema_check::schema_has_required_indexes;
 
@@ -1157,7 +1158,6 @@ fn needs_migration(conn: &Connection) -> Result<bool> {
     Ok(!schema_is_current(conn)?
         || retired_indexes_present(conn)?
         || retired_capture_present(conn)?
-        || retired_sources::retired_sources_present(conn)?
         || crate::ingest::standalone_records_migration_pending(conn)?)
 }
 
@@ -5542,7 +5542,7 @@ pub fn import_json(conn: &Connection, entries: &[HistoryEntry]) -> Result<usize>
     // deletes.
     let kept = entries
         .iter()
-        .filter(|entry| !retired_sources::is_retired(&entry.source));
+        .filter(|entry| !is_retired_source(&entry.source));
     kept.map(|entry| insert_history(conn, entry)).sum()
 }
 

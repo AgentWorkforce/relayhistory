@@ -41,7 +41,7 @@ rust_roots = ["crates/ai-hist-cli/src", "crates/ai-hist-napi/src", "crates/ai-hi
 "crates/ai-hist/src/session_usage.rs" = 549
 "crates/ai-hist/src/store.rs" = 3333
 "crates/ai-hist/src/watch.rs" = 764
-"crates/ai-hist-cli/src/lib.rs" = 3152
+"crates/ai-hist-cli/src/lib.rs" = 3101
 "crates/ai-hist-napi/src/lib.rs" = 2175
 "plugins/provider-sources/rust/src/remote.rs" = 928
 

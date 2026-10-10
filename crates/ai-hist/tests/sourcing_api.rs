@@ -1579,12 +1579,17 @@ fn a_store_holding_retired_relay_and_trajectory_rows_opens_and_syncs_cleanly() {
         .collect::<Result<_, _>>()
         .expect("the feed drains");
     assert!(!changes.is_empty());
-    assert!(
-        changes
-            .iter()
-            .all(|change| change.source == Some(Source::Codex)),
-        "{changes:#?}"
-    );
+    // Every live row is Codex; the retired rows are only deletes.
+    for change in &changes {
+        match change.op {
+            ai_hist::ChangeOp::Delete => assert!(
+                change.source == Some(Source::Codex)
+                    || ["relay", "trajectory"].contains(&change.source_name.as_str()),
+                "{change:#?}"
+            ),
+            _ => assert_eq!(change.source, Some(Source::Codex), "{change:#?}"),
+        }
+    }
 
     let conn = rusqlite::Connection::open(&db).unwrap();
     let count = |sql: &str| -> i64 { conn.query_row(sql, [], |row| row.get(0)).unwrap() };
@@ -1592,12 +1597,7 @@ fn a_store_holding_retired_relay_and_trajectory_rows_opens_and_syncs_cleanly() {
         count("SELECT COUNT(*) FROM sqlite_master WHERE name = 'trajectories'"),
         0
     );
-    for table in [
-        "sessions",
-        "session_presences",
-        "history",
-        "evidence_tombstones",
-    ] {
+    for table in ["sessions", "session_presences", "history"] {
         assert_eq!(
             count(&format!(
                 "SELECT COUNT(*) FROM {table} WHERE source IN ('relay', 'trajectory')"
@@ -1606,6 +1606,10 @@ fn a_store_holding_retired_relay_and_trajectory_rows_opens_and_syncs_cleanly() {
             "{table}"
         );
     }
+    assert_eq!(
+        count("SELECT COUNT(*) FROM evidence_tombstones WHERE kind = 'trajectory'"),
+        0
+    );
     // A removed kind resets the stream: a new epoch, and no cursor left to
     // resume a position in the old one.
     assert_ne!(
@@ -1613,6 +1617,39 @@ fn a_store_holding_retired_relay_and_trajectory_rows_opens_and_syncs_cleanly() {
         epoch_before
     );
     assert_eq!(count("SELECT COUNT(*) FROM consumer_cursors"), 0);
+    drop(conn);
+
+    // An older client writes a Relaycast prompt again; the feed delivers it.
+    let head = store.head_revision().unwrap();
+    drop(store);
+    rusqlite::Connection::open(&db)
+        .unwrap()
+        .execute(
+            "INSERT INTO history (source, session_id, project, prompt, timestamp_ms) \
+             VALUES ('relay', 'ch:general', 'ws', 'written again', 3)",
+            [],
+        )
+        .unwrap();
+    // The next writable open retires it, and a consumer resuming from where
+    // it was is told to drop it -- in the same epoch, without a replay.
+    let store = open(dir.path());
+    let resumed: Vec<_> = store
+        .changes_since(head, ai_hist::ChangeQuery::default())
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .expect("the same epoch resumes");
+    assert!(
+        resumed
+            .iter()
+            .any(|change| change.op == ai_hist::ChangeOp::Delete
+                && change.kind == ai_hist::ChangeKind::History
+                && change.source.is_none()
+                && change.source_name == "relay"),
+        "{resumed:#?}"
+    );
+    assert!(resumed
+        .iter()
+        .all(|change| change.op == ai_hist::ChangeOp::Delete || change.source.is_some()));
 }
 
 // ---------------------------------------------------------------------------
