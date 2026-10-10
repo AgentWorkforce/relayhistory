@@ -11895,6 +11895,179 @@ mod tests {
         );
     }
 
+    /// A store an earlier parser built has a sidecar response whose only
+    /// record is a signed, empty thinking block as its marker alone. An
+    /// embedder that only hydrates gets it back: the store migration clears
+    /// the stamp of the hydration that covers the sidecar, which re-reads that
+    /// sidecar from zero, and the hydration after it is unchanged.
+    #[test]
+    fn hydration_restores_the_request_of_a_standalone_record_after_upgrade() {
+        let dir = tempfile::tempdir().unwrap();
+        let record = |uuid: &str, kind: &str, message: &str| {
+            format!(
+                "{{\"sessionId\":\"session-1\",\"agentId\":\"abc\",\"isSidechain\":true,\"uuid\":\"{uuid}\",\"cwd\":\"/work/app\",\"type\":\"{kind}\",\"requestId\":\"req_{uuid}\",\"message\":{message},\"timestamp\":\"2026-08-31T10:00:03Z\"}}\n"
+            )
+        };
+        let records = [
+            record("side-u1", "user", r#"{"role":"user","content":"delegated"}"#),
+            record(
+                "side-a1",
+                "assistant",
+                r#"{"id":"msg_1","role":"assistant","model":"claude-opus-5","stop_reason":null,"content":[{"type":"thinking","thinking":"","signature":"sig"}],"usage":{"input_tokens":2,"cache_creation_input_tokens":353736,"output_tokens":8}}"#,
+            ),
+            record("side-u2", "user", r#"{"role":"user","content":"go on"}"#),
+            record(
+                "side-a2",
+                "assistant",
+                r#"{"id":"msg_2","role":"assistant","model":"claude-opus-5","stop_reason":"end_turn","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":3,"output_tokens":4}}"#,
+            ),
+        ]
+        .concat();
+        let transcript =
+            claude_parent_with_subagent(dir.path(), &records, Some(CLAUDE_AGENT_META), "agent-abc");
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", "session-1", Some(&transcript));
+        drop(conn);
+        let requests = |conn: &Connection| -> Vec<(String, i64)> {
+            conn.prepare(
+                "SELECT request_key, json_extract(token_json, '$.output_tokens') \
+                 FROM session_requests WHERE source = 'claude' AND session_id = 'abc' \
+                 ORDER BY request_key",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        };
+        let hydrate = || {
+            hydrate_session_at_with_home(&db, &options("claude", "session-1"), dir.path())
+                .unwrap()
+                .status
+        };
+        assert_eq!(hydrate(), "hydrated");
+        let conn = open_db(&db).unwrap();
+        let healthy = requests(&conn);
+        assert_eq!(
+            healthy,
+            vec![
+                ("request-id:req_side-a1".to_string(), 8),
+                ("request-id:req_side-a2".to_string(), 4),
+            ]
+        );
+        assert_eq!(hydrate(), "unchanged");
+
+        // What the earlier parser left: the marker without its event, and the
+        // migration not yet run.
+        conn.execute_batch(
+            "DELETE FROM session_events WHERE event_uid = 'side-a1:0';
+             DELETE FROM schema_migrations WHERE name = 'claude_standalone_records_v1';",
+        )
+        .unwrap();
+        assert_eq!(requests(&conn).len(), 1);
+        drop(conn);
+        open_db(&db).unwrap();
+
+        assert_eq!(hydrate(), "hydrated");
+        let conn = open_db(&db).unwrap();
+        assert_eq!(requests(&conn), healthy);
+        assert_eq!(hydrate(), "unchanged");
+    }
+
+    /// A hook's snapshot that ends on a response's opening record -- a signed,
+    /// empty thinking block -- indexes it as standing alone, since nothing of
+    /// its message is in those bytes. The next hydration reads the block that
+    /// followed it, which retires that event: the session holds what a
+    /// from-zero hydration of the finished transcript holds.
+    #[test]
+    fn a_hook_snapshot_ending_on_an_opening_record_matches_a_from_zero_read() {
+        let home = tempfile::tempdir().unwrap();
+        let projects = home.path().join(".claude/projects/-work-app");
+        fs::create_dir_all(&projects).unwrap();
+        let transcript = projects.join("session-1.jsonl");
+        let record = |uuid: &str, kind: &str, message: &str| {
+            format!(
+                "{{\"sessionId\":\"session-1\",\"uuid\":\"{uuid}\",\"cwd\":\"/work/app\",\"type\":\"{kind}\",\"requestId\":\"req_1\",\"message\":{message},\"timestamp\":\"2026-10-01T10:00:00Z\"}}\n"
+            )
+        };
+        let head = [
+            record("u1", "user", r#"{"role":"user","content":"hi"}"#),
+            record(
+                "a1",
+                "assistant",
+                r#"{"id":"msg_1","role":"assistant","model":"claude-opus-5","stop_reason":null,"content":[{"type":"thinking","thinking":"","signature":"sig"}],"usage":{"input_tokens":2,"output_tokens":3}}"#,
+            ),
+        ]
+        .concat();
+        let tail = [
+            record(
+                "a1b",
+                "assistant",
+                r#"{"id":"msg_1","role":"assistant","model":"claude-opus-5","stop_reason":"end_turn","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":2,"output_tokens":5}}"#,
+            ),
+        ]
+        .concat();
+        fs::write(&transcript, &head).unwrap();
+        let roots = crate::ProviderRoots::from_home(
+            home.path().to_path_buf(),
+            home.path().join("opencode.db"),
+        );
+        let opts = options("claude", "session-1");
+        let assistant = |db: &Path| -> Vec<(String, String)> {
+            let conn = open_db(db).unwrap();
+            let rows = conn
+                .prepare(
+                    "SELECT event_uid, kind FROM session_events \
+                     WHERE source = 'claude' AND session_id = 'session-1' AND role = 'assistant' \
+                     ORDER BY event_uid",
+                )
+                .unwrap()
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            rows
+        };
+
+        let db = home.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "claude", "session-1", Some(&transcript));
+        drop(conn);
+        let snapshot = ClaudeTranscriptSnapshot::open(&transcript).unwrap();
+        hydrate_session_at_with_roots_connectors_and_claude_snapshot(
+            &db,
+            &opts,
+            &roots,
+            &crate::remote::SourceConnectorSelection::default(),
+            Some(snapshot),
+        )
+        .unwrap();
+        assert_eq!(
+            assistant(&db),
+            vec![("a1:0".to_string(), "thinking".to_string())]
+        );
+
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(&transcript)
+            .unwrap();
+        file.write_all(tail.as_bytes()).unwrap();
+        drop(file);
+        hydrate_session_at_with_home(&db, &opts, home.path()).unwrap();
+
+        let fresh = home.path().join("fresh.db");
+        let conn = open_db(&fresh).unwrap();
+        catalog_row(&conn, "claude", "session-1", Some(&transcript));
+        drop(conn);
+        hydrate_session_at_with_home(&fresh, &opts, home.path()).unwrap();
+        assert_eq!(
+            assistant(&fresh),
+            vec![("a1b:0".to_string(), "text".to_string())]
+        );
+        assert_eq!(assistant(&db), assistant(&fresh));
+    }
+
     #[test]
     fn claude_subagent_with_agent_id_is_a_linked_child() {
         let dir = tempfile::tempdir().unwrap();

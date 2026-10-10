@@ -9,6 +9,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - Claude subagent requests and usage reach `SessionEvidence::requests` on the sync or hydration that reads the sidecar, rather than only once the sidecar had sat still for two minutes and a later sweep ran, which `sync` skipped while no other source changed. The first sync after upgrading backfills the messages an earlier build held back.
+- A Claude response whose only record is a signed, empty `thinking` block is a request in `SessionEvidence::requests` with its usage again, instead of only a `thinking_signature` marker; the record stores its thinking event (empty text). The first sync or hydration after upgrading re-reads only the transcripts holding such a response.
 
 ### Rust API
 

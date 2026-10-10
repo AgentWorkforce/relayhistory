@@ -1215,7 +1215,8 @@ fn needs_migration(conn: &Connection) -> Result<bool> {
     Ok(!schema_is_current(conn)?
         || retired_indexes_present(conn)?
         || retired_capture_present(conn)?
-        || retired_trajectory_index_present(conn)?)
+        || retired_trajectory_index_present(conn)?
+        || crate::ingest::standalone_records_migration_pending(conn)?)
 }
 
 /// A schema migration an open in this process runs on an existing database.
@@ -1890,20 +1891,8 @@ VALUES ('session_presences_local_backfill_v1');
          WHERE provider_message_id IS NOT NULL",
         [],
     )?;
-    // Rows stored before the parser settled streamed Claude requests and
-    // reclassified `<synthetic>` notices. Both repairs read only the stored
-    // rows, so they run here once instead of waiting for every transcript to
-    // be re-read. After the marker migration, whose columns the notices move
-    // into.
-    // v2 because the summary repair joined the pass after a revision had
-    // already recorded v1 without it; every step is idempotent.
-    if !migration_applied(conn, "claude_request_evidence_v2")? {
-        crate::ingest::heal_claude_request_evidence(conn)?;
-        conn.execute(
-            "INSERT OR IGNORE INTO schema_migrations (name) VALUES ('claude_request_evidence_v2')",
-            [],
-        )?;
-    }
+    // After the marker migration, whose columns the healed notices move into.
+    crate::ingest::migrate_claude_request_evidence(conn)?;
     // Derived from `session_events`, so it must come after the DDL and the
     // column migrations above, and needs no backfill: the first query over an
     // upgraded database already sees every request its events describe.
