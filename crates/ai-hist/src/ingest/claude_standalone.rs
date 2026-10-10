@@ -11,17 +11,17 @@ use serde_json::{Map, Value};
 use std::collections::HashMap;
 use std::path::Path;
 
-/// Whether a Claude assistant record stores no event row of its own: every
-/// content block is a `thinking` block with no display text, which is the
-/// signed, empty block Claude streams as the first record of a response.
+/// Whether a Claude assistant record stores no event row of its own: no
+/// content block of it becomes an event in `ingest_claude_record` -- empty
+/// content, blank text, a `thinking` block with no display text, or a block
+/// type the event model drops (`redacted_thinking`, `image`, ...).
 ///
-/// While a later record of the same message follows it, that record stores
-/// the response's rows and this one is carried by its `thinking_signature`
-/// marker alone. A record nothing of its message follows *stands alone*: it is
-/// its response's only evidence, so it stores its thinking event and the
-/// response has a request, and its usage, like any other. The readers decide
-/// which by holding such a record until the record after it arrives
-/// ([`ClaudeRecordWalk`], and `HeldMessage` in the incremental reader).
+/// A run of such records that opens with an empty `thinking` block (see
+/// [`claude_record_may_stand_alone`]) is held until the record after it: a
+/// later record of the same message that stores rows takes the response and
+/// the run is carried by its markers alone, while anything else means the run
+/// stands alone and its empty thinking block stores the event that gives the
+/// response a request and its usage.
 pub(crate) fn claude_record_stores_no_event(obj: &Map<String, Value>) -> bool {
     let Some(message) = obj.get("message").and_then(Value::as_object) else {
         return false;
@@ -33,18 +33,47 @@ pub(crate) fn claude_record_stores_no_event(obj: &Map<String, Value>) -> bool {
     {
         return false;
     }
-    let Some(blocks) = message.get("content").and_then(Value::as_array) else {
-        return false;
-    };
-    !blocks.is_empty()
-        && blocks.iter().all(|block| {
-            block.get("type").and_then(Value::as_str) == Some("thinking")
-                && block
-                    .get("thinking")
-                    .or_else(|| block.get("text"))
+    match message.get("content") {
+        None | Some(Value::Null) => true,
+        Some(Value::String(text)) => text.trim().is_empty(),
+        Some(Value::Array(blocks)) => blocks.iter().all(|block| {
+            match block.get("type").and_then(Value::as_str).unwrap_or("") {
+                "tool_use" | "tool_result" => false,
+                "text" => block
+                    .get("text")
                     .and_then(Value::as_str)
-                    .is_none_or(|text| text.trim().is_empty())
-        })
+                    .is_none_or(|text| text.trim().is_empty()),
+                "thinking" => thinking_text(block).is_none_or(|text| text.trim().is_empty()),
+                _ => true,
+            }
+        }),
+        Some(_) => true,
+    }
+}
+
+/// Whether a record that stores no event can stand alone: it carries the
+/// empty `thinking` block Claude streams first in a response, which is what
+/// stores its event when nothing of its message follows. The readers hold
+/// such a record for the record after it ([`ClaudeRecordWalk`], and
+/// `HeldMessage` in the incremental reader).
+pub(crate) fn claude_record_may_stand_alone(obj: &Map<String, Value>) -> bool {
+    claude_record_stores_no_event(obj)
+        && obj
+            .get("message")
+            .and_then(|message| message.get("content"))
+            .and_then(Value::as_array)
+            .is_some_and(|blocks| {
+                blocks
+                    .iter()
+                    .any(|block| block.get("type").and_then(Value::as_str) == Some("thinking"))
+            })
+}
+
+fn thinking_text(block: &Value) -> Option<&str> {
+    block
+        .get("thinking")
+        .or_else(|| block.get("text"))
+        .and_then(Value::as_str)
 }
 
 /// The text a Claude `thinking` block stores as an event, if it stores one.
@@ -55,25 +84,76 @@ pub(crate) fn claude_record_stores_no_event(obj: &Map<String, Value>) -> bool {
 /// response's only evidence, so its block stores the event (with its empty
 /// text) that gives the response a request and its usage.
 pub(super) fn claude_thinking_event_text(block: &Value, stands_alone: bool) -> Option<&str> {
-    let text = block
-        .get("thinking")
-        .or_else(|| block.get("text"))
-        .and_then(Value::as_str);
+    let text = thinking_text(block);
     if stands_alone {
         return Some(text.unwrap_or(""));
     }
     text.filter(|text| !text.trim().is_empty())
 }
 
+/// Settle a Claude assistant record's request usage
+/// (`settle_claude_request_usage`), first retiring the empty thinking events
+/// its message's standalone records stored when the record stores rows.
+///
+/// A record that stands alone stores its empty thinking event only so that
+/// its response has a request. A later record of the message that stores rows
+/// -- after an interleaved record, past the held-bytes ceiling, or in a later
+/// pass over bytes an earlier pass (a hook's snapshot) ended on -- carries the
+/// request itself, so those events go, and with them their usage copies,
+/// before the record settles its own: the rows match a from-zero read, where
+/// the opening record stores only its marker. Only a standalone record stores
+/// a thinking event with blank text. The retirement is the local side of
+/// `retire_evidence_share`, on cached statements, because it runs for every
+/// Claude assistant record that stores rows.
+pub(super) fn settle_record_usage(
+    conn: &Connection,
+    session_id: &str,
+    request_id: Option<&str>,
+    provider_message_id: &str,
+    token_json: Option<&str>,
+    obj: &Map<String, Value>,
+) -> Result<Option<String>> {
+    if !claude_record_stores_no_event(obj) {
+        retire_standalone_events(conn, session_id, provider_message_id)?;
+    }
+    super::settle_claude_request_usage(
+        conn,
+        session_id,
+        request_id,
+        provider_message_id,
+        token_json,
+    )
+}
+
+fn retire_standalone_events(
+    conn: &Connection,
+    session_id: &str,
+    provider_message_id: &str,
+) -> Result<()> {
+    const STANDALONE: &str = "source = 'claude' AND session_id = ?1 AND provider_message_id = ?2 \
+           AND role = 'assistant' AND kind = 'thinking' \
+           AND TRIM(COALESCE(text, ''), ' ' || char(9, 10, 13)) = ''";
+    conn.prepare_cached(&format!(
+        "DELETE FROM session_events WHERE {STANDALONE} AND location = 'local'"
+    ))?
+    .execute(rusqlite::params![session_id, provider_message_id])?;
+    conn.prepare_cached(&format!(
+        "UPDATE session_events SET location = 'remote' WHERE {STANDALONE} AND location = 'both'"
+    ))?
+    .execute(rusqlite::params![session_id, provider_message_id])?;
+    Ok(())
+}
+
 /// A whole-file reader's walk over one transcript's records in file order.
 ///
-/// Records that store no event (see [`claude_record_stores_no_event`]) are
-/// held while consecutive records of their assistant message follow: a later
-/// record of the same message that stores rows takes the response's evidence,
-/// and the held records are indexed as its marker-only opening; anything
-/// else, or the end of the bytes, means they stand alone. The incremental
-/// reader makes the same decision over its `HeldMessage`, so every reader
-/// stores the same rows.
+/// A record that may stand alone (see [`claude_record_may_stand_alone`]) is
+/// held, with the records of its message after it that store no event either:
+/// a later record of the same message that stores rows takes the response's
+/// evidence, and the held records are indexed as its marker-only opening;
+/// anything else, the end of the bytes, or the held bytes passing
+/// [`incremental::CLAUDE_DEFERRED_BYTES_CAP`] means they stand alone. The
+/// incremental reader makes the same decision over its `HeldMessage`, so every
+/// reader stores the same rows.
 pub(super) struct ClaudeRecordWalk<'a> {
     conn: &'a Connection,
     path: &'a Path,
@@ -87,6 +167,7 @@ pub(super) struct ClaudeRecordWalk<'a> {
     triads: SlashCommandTriads,
     held_message_id: String,
     held: Vec<String>,
+    held_bytes: usize,
 }
 
 impl<'a> ClaudeRecordWalk<'a> {
@@ -106,6 +187,7 @@ impl<'a> ClaudeRecordWalk<'a> {
             triads: SlashCommandTriads::default(),
             held_message_id: String::new(),
             held: Vec::new(),
+            held_bytes: 0,
         }
     }
 
@@ -116,18 +198,16 @@ impl<'a> ClaudeRecordWalk<'a> {
             return self.release(true);
         };
         let message_id = incremental::claude_message_progress(&obj).map(|(id, _)| id);
-        let stores_no_event = message_id.is_some() && claude_record_stores_no_event(&obj);
         let continues = !self.held.is_empty() && message_id.as_ref() == Some(&self.held_message_id);
-        if continues && stores_no_event {
-            self.held.push(line.to_string());
+        if continues && claude_record_stores_no_event(&obj) {
+            self.hold(line)?;
             return Ok(());
         }
         self.release(!continues)?;
         match message_id {
-            Some(id) if stores_no_event => {
+            Some(id) if claude_record_may_stand_alone(&obj) => {
                 self.held_message_id = id;
-                self.held.push(line.to_string());
-                Ok(())
+                self.hold(line)
             }
             _ => self.index(line, &obj, false),
         }
@@ -138,8 +218,20 @@ impl<'a> ClaudeRecordWalk<'a> {
         self.release(true)
     }
 
+    /// Add a record to the held run, which stands alone once it passes the
+    /// incremental reader's ceiling, as it does there.
+    fn hold(&mut self, line: &str) -> Result<()> {
+        self.held_bytes += line.len();
+        self.held.push(line.to_string());
+        if self.held_bytes > incremental::CLAUDE_DEFERRED_BYTES_CAP {
+            self.release(true)?;
+        }
+        Ok(())
+    }
+
     /// Index the held records; `alone` when nothing of their message follows.
     fn release(&mut self, alone: bool) -> Result<()> {
+        self.held_bytes = 0;
         for line in std::mem::take(&mut self.held) {
             if let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(&line) {
                 self.index(&line, &obj, alone)?;

@@ -9804,9 +9804,8 @@ fn claude_file_session_id(path: &Path) -> Result<Option<String>> {
 /// replaced. A resumed pass restores both from the cursor.
 ///
 /// `stands_alone` is the reader's verdict on a record that stores no event of
-/// its own (see [`claude_record_stores_no_event`]): no later record of its
-/// message follows it in its run, so it stores its thinking event and its
-/// response has a request.
+/// its own (see [`claude_record_stores_no_event`]): no record of its message
+/// that stores rows follows it, so it stores its thinking event.
 #[allow(clippy::too_many_arguments)]
 fn ingest_claude_record(
     conn: &Connection,
@@ -10029,19 +10028,20 @@ fn ingest_claude_record(
     let mut record_token_json: Option<String> = None;
     if message_role == "assistant" {
         if let Some(provider_message_id) = identity.provider_message_id {
-            // The request id exactly as the row stores it, so the rows settled
-            // together are the rows the request view groups together: by
-            // `requestId` when there is one, else by `message.id` alone.
-            let request_id = identity
-                .request_id
-                .or(raw_facts.request_id)
-                .filter(|id| !id.is_empty());
-            let settled = settle_claude_request_usage(
+            let settled = claude_standalone::settle_record_usage(
                 conn,
                 session_id,
-                request_id,
+                // The request id exactly as the row stores it, so the rows
+                // settled together are the rows the request view groups
+                // together: by `requestId` when there is one, else by
+                // `message.id` alone.
+                identity
+                    .request_id
+                    .or(raw_facts.request_id)
+                    .filter(|id| !id.is_empty()),
                 provider_message_id,
                 token_json.as_deref(),
+                obj,
             )?;
             // The record's own usage is kept only where settlement replaced
             // it: JSON `null` for a copy that carried none.
@@ -35316,6 +35316,128 @@ mod tests {
         );
         assert!(pass().in_progress.is_empty());
         assert_eq!(child_requests(&conn).len(), 3);
+    }
+
+    /// A later record of the message that stores no event row either -- empty
+    /// content, or only a block the event model drops -- does not take the
+    /// response: the opening record still stands alone, so the response keeps
+    /// its request and usage, whichever reader reads it.
+    #[test]
+    fn a_continuation_that_stores_no_event_leaves_the_opening_record_standing_alone() {
+        let text = [
+            sidecar_record("user", "c1", r#"{"role":"user","content":"delegated"}"#),
+            sidecar_signature("a1", "msg_1", 8),
+            sidecar_assistant("a1x", "msg_1", "", 8),
+            sidecar_assistant(
+                "a1y",
+                "msg_1",
+                r#"{"type":"redacted_thinking","data":"opaque"}"#,
+                8,
+            ),
+            sidecar_record("user", "c2", r#"{"role":"user","content":"go on"}"#),
+        ]
+        .concat();
+        for conn in every_reader(&text) {
+            assert_eq!(
+                child_requests(&conn),
+                vec![("request-id:req_msg_1".to_string(), 8)]
+            );
+            assert_eq!(
+                child_assistant_events(&conn),
+                vec![("a1:0".to_string(), "thinking".to_string())]
+            );
+        }
+    }
+
+    /// A record that stood alone stores its thinking event only while no
+    /// other record of its message stores rows. A later block of the message
+    /// -- after an interleaved record, or read by a later pass over bytes an
+    /// earlier pass (a hook's snapshot) ended on -- retires that event, so
+    /// the store holds what a from-zero read of the whole file holds.
+    #[test]
+    fn a_later_block_of_its_message_retires_a_standalone_event() {
+        let interleaved = [
+            sidecar_record("user", "c1", r#"{"role":"user","content":"delegated"}"#),
+            sidecar_signature("a1", "msg_1", 8),
+            sidecar_record("user", "c2", r#"{"role":"user","content":"go on"}"#),
+            sidecar_tool_use("a1b", "msg_1", "toolu_1", 5),
+            sidecar_tool_result("r1", "toolu_1"),
+        ]
+        .concat();
+        for conn in every_reader(&interleaved) {
+            assert_eq!(
+                child_assistant_events(&conn),
+                vec![("a1b:0".to_string(), "tool_use".to_string())]
+            );
+            assert_eq!(
+                child_requests(&conn),
+                vec![("request-id:req_msg_1".to_string(), 5)]
+            );
+        }
+
+        // The hook's snapshot ends on the opening record, so it stands alone;
+        // the next read sees the block that follows it.
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar = dir.path().join("agent-child.jsonl");
+        let snapshot = [
+            sidecar_record("user", "c1", r#"{"role":"user","content":"delegated"}"#),
+            sidecar_signature("a1", "msg_1", 8),
+        ]
+        .concat();
+        let full = snapshot.clone()
+            + &sidecar_tool_use("a1b", "msg_1", "toolu_1", 5)
+            + &sidecar_tool_result("r1", "toolu_1");
+        fs::write(&sidecar, &full).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript_text_as(&conn, &sidecar, &snapshot, Some("child")).unwrap();
+        assert_eq!(
+            child_assistant_events(&conn),
+            vec![("a1:0".to_string(), "thinking".to_string())]
+        );
+        ingest_claude_transcript_as(&conn, &sidecar, Some("child")).unwrap();
+        assert_eq!(
+            child_assistant_events(&conn),
+            vec![("a1b:0".to_string(), "tool_use".to_string())]
+        );
+        assert_eq!(
+            child_requests(&conn),
+            vec![("request-id:req_msg_1".to_string(), 5)]
+        );
+    }
+
+    /// A run of records that store no event, longer than the incremental
+    /// reader holds, is released as standalone by every reader alike, and the
+    /// block of their message that follows retires their events: each reader
+    /// ends with the same rows.
+    #[test]
+    fn a_held_run_past_the_cap_ends_the_same_in_every_reader() {
+        let signature = "s".repeat(1024 * 1024);
+        let mut records = vec![sidecar_record(
+            "user",
+            "c1",
+            r#"{"role":"user","content":"delegated"}"#,
+        )];
+        for index in 0..9 {
+            records.push(sidecar_assistant(
+                &format!("a{index}"),
+                "msg_1",
+                &format!(r#"{{"type":"thinking","thinking":"","signature":"{signature}"}}"#),
+                1,
+            ));
+        }
+        records.push(sidecar_tool_use("a9", "msg_1", "toolu_1", 5));
+        records.push(sidecar_tool_result("r1", "toolu_1"));
+        for conn in every_reader(&records.concat()) {
+            assert_eq!(
+                child_assistant_events(&conn),
+                vec![("a9:0".to_string(), "tool_use".to_string())]
+            );
+            assert_eq!(
+                child_requests(&conn),
+                vec![("request-id:req_msg_1".to_string(), 5)]
+            );
+        }
     }
 
     /// A store an earlier parser built has a response whose only record is a

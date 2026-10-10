@@ -68,8 +68,8 @@ later record of its message follows it: its `unsupported_block` /
 `thinking_signature` marker carries the record's `ts_ms`, `message_id` (the
 record uuid) and, in its payload, the record's `request_id` and
 `provider_message_id`, so a consumer places the record that opens a streamed
-response in its request and dates the request by it. A response whose only
-record is such a block stores that record's thinking event (empty text), so
+response in its request and dates the request by it. A response no record of
+which stores rows stores the opening record's thinking event (empty text), so
 every response is a request in `SessionEvidence::requests` with its usage.
 Two obligations:
 

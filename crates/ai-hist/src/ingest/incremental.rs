@@ -10,6 +10,7 @@
 //! See [`super::cursor`] for the cursor's shape, its two key spaces, the
 //! rotation rule and what the prefix hash covers.
 
+use super::claude_standalone::claude_record_may_stand_alone;
 use super::transcript_cursor::*;
 use super::*;
 
@@ -26,7 +27,7 @@ use super::*;
 /// rows carry their own record identity and its usage settles across copies,
 /// so the blocks that arrive later land as further rows rather than as
 /// corrections to these.
-const CLAUDE_DEFERRED_BYTES_CAP: usize = 8 * 1024 * 1024;
+pub(super) const CLAUDE_DEFERRED_BYTES_CAP: usize = 8 * 1024 * 1024;
 
 /// Whether the last sweep left any Claude transcript holding a trailing
 /// message back (see [`HeldMessage`]).
@@ -111,15 +112,16 @@ pub(crate) fn claude_message_progress(obj: &Map<String, Value>) -> Option<(Strin
 /// streaming, so at most one is held at a time, and a pass that ends with one
 /// commits before its first byte so the next pass reads it again.
 ///
-/// A record that stores no event of its own (see
-/// [`claude_record_stores_no_event`]) is held the same way whatever its
-/// `stop_reason`, because whether it stands alone is up to the record after
-/// it; the hold ends at the first record of its message that stores rows.
+/// A record that may stand alone (see [`claude_record_may_stand_alone`]) is
+/// held the same way whatever its `stop_reason`, because whether it stands
+/// alone is up to the record after it; the hold ends at the first record of
+/// its message that stores rows (see [`claude_record_stores_no_event`]).
 ///
 /// Claude can write another record between two blocks of one message (a tool
 /// result for a parallel tool call), so a message released by a following
 /// record may gain a further block later. That block is indexed when it
-/// arrives under its own record identity, and the request's usage settles
+/// arrives under its own record identity -- retiring the empty thinking event
+/// a standalone opening record stored -- and the request's usage settles
 /// across every copy, so the early release neither drops nor double-counts
 /// anything.
 ///
@@ -482,6 +484,7 @@ fn place_claude_record(
 ) -> Result<bool> {
     let progress = claude_message_progress(at.obj);
     let stores_no_event = progress.is_some() && claude_record_stores_no_event(at.obj);
+    let may_stand_alone = stores_no_event && claude_record_may_stand_alone(at.obj);
     // Any record that is not another block of the held message follows it,
     // and a message something follows is finished.
     let continues_held = matches!(
@@ -513,7 +516,7 @@ fn place_claude_record(
                 release(held, claude)?;
             }
         }
-        Some((message_id, complete)) if (at.hold && !complete) || stores_no_event => {
+        Some((message_id, complete)) if (at.hold && !complete) || may_stand_alone => {
             *held = Some(HeldMessage {
                 message_id,
                 offset: at.offset,
