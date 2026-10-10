@@ -63,12 +63,15 @@ Claude is duplicated across every content block of a message.
 
 `role` × `kind` (`text`, `thinking`, `tool_use`, `tool_result`) plus the block
 payload. `session_events` already stores exactly this shape. A Claude
-`thinking` block carrying a `signature` but no text stores no event: its
-`unsupported_block` / `thinking_signature` marker carries the record's
-`ts_ms`, `message_id` (the record uuid) and, in its payload, the record's
-`request_id` and `provider_message_id`, so a consumer places the record that
-opens a streamed response in its request and dates the request by it. Two
-obligations:
+`thinking` block carrying a `signature` but no text stores no event while a
+later record of its message follows it: its `unsupported_block` /
+`thinking_signature` marker carries the record's `ts_ms`, `message_id` (the
+record uuid) and, in its payload, the record's `request_id` and
+`provider_message_id`, so a consumer places the record that opens a streamed
+response in its request and dates the request by it. A response no record of
+which stores rows stores the opening record's thinking event (empty text), so
+every response is a request in `SessionEvidence::requests` with its usage.
+Two obligations:
 
 - `SessionQuery.include_text` must be honoured, mapping onto burn's
   `ContentStoreMode::{full, hash-only, off}`. A hash-only consumer must not pay

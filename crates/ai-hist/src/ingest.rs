@@ -15,6 +15,7 @@ use std::io::{self, BufRead, BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+mod claude_standalone;
 pub(crate) mod codex;
 pub(crate) mod control;
 pub(crate) mod cursor;
@@ -28,6 +29,14 @@ pub(crate) mod muse;
 pub(crate) mod opencode;
 pub(crate) mod tool_result_facts;
 pub(crate) mod transcript_cursor;
+
+use claude_standalone::{
+    claude_record_stores_no_event, claude_thinking_event_text, ClaudeRecordWalk,
+    CLAUDE_STANDALONE_RECORDS_GENERATION,
+};
+pub(crate) use claude_standalone::{
+    migrate_claude_request_evidence, standalone_records_migration_pending,
+};
 
 /// `session_markers.kind` for the point a harness compacted its context. The
 /// turns either side of it are real, but the model's view of everything
@@ -783,11 +792,13 @@ fn destination_head(conn: &Connection) -> Result<String> {
 /// Claude transcripts are skipped on their byte cursors rather than a stamp
 /// map, so their entries name the one-time Claude passes that are pending:
 /// `CLAUDE_RECORD_ATTRIBUTION_KEY` at its generation,
-/// [`CLAUDE_DELEGATION_CAPTURE_KEY`] and [`CLAUDE_TRAILING_HOLD_GENERATION`].
+/// [`CLAUDE_DELEGATION_CAPTURE_KEY`], [`CLAUDE_TRAILING_HOLD_GENERATION`] and
+/// [`CLAUDE_STANDALONE_RECORDS_GENERATION`].
 const SWEEP_PARSER_GENERATIONS: &[&str] = &[
     "claude_record_attribution_1",
     CLAUDE_DELEGATION_CAPTURE_KEY,
     CLAUDE_TRAILING_HOLD_GENERATION,
+    CLAUDE_STANDALONE_RECORDS_GENERATION,
     "codex_rollouts_v7",
     CODEX_STATE_MARKER_KEY,
     GROK_SYNC_STATE_KEY,
@@ -9154,30 +9165,17 @@ fn ingest_claude_transcript_text_as(
             .filter(|id| !id.is_empty())
             .map(str::to_string)
     });
-    let mut indexer = tool_result_facts::ToolResultIndexer::default();
-    let mut cache_reads: HashMap<String, i64> = HashMap::new();
-    let mut triads = control::SlashCommandTriads::default();
+    let mut walk = ClaudeRecordWalk::new(
+        conn,
+        path,
+        attributed_session_id,
+        file_session_id.as_deref(),
+    );
     for line in text.lines() {
         check_capture_cancelled()?;
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        let Some(obj) = value.as_object() else {
-            continue;
-        };
-        ingest_claude_record(
-            conn,
-            path,
-            attributed_session_id,
-            file_session_id.as_deref(),
-            line,
-            obj,
-            &mut indexer,
-            &mut cache_reads,
-            &mut triads,
-        )?;
+        walk.feed(line)?;
     }
-    Ok(())
+    walk.finish()
 }
 
 pub(crate) fn scan_claude_session_file_resumed(
@@ -9735,12 +9733,12 @@ fn ingest_claude_transcript_as(
         .with_context(|| format!("reading claude transcript {}", path.display()))?;
     let mut reader = BufReader::new(file);
     let mut raw = Vec::new();
-    // Ordering is assigned over the whole transcript, and this parser always
-    // reads the file from the start, so a re-sync reproduces the same indexes
-    // instead of advancing them.
-    let mut indexer = tool_result_facts::ToolResultIndexer::default();
-    let mut cache_reads: HashMap<String, i64> = HashMap::new();
-    let mut triads = control::SlashCommandTriads::default();
+    let mut walk = ClaudeRecordWalk::new(
+        conn,
+        path,
+        attributed_session_id,
+        file_session_id.as_deref(),
+    );
     loop {
         check_capture_cancelled()?;
         raw.clear();
@@ -9754,30 +9752,11 @@ fn ingest_claude_transcript_as(
         // The record's bytes exactly as `str::lines` would yield them: the
         // fallback event identity is a hash of this string, so a trailing
         // newline here would give one record two identities depending on which
-        // reader indexed it.
-        let Ok(line) = std::str::from_utf8(&raw) else {
-            continue;
-        };
-        let line = line.trim_end_matches(['\n', '\r']);
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        let Some(obj) = value.as_object() else {
-            continue;
-        };
-        ingest_claude_record(
-            conn,
-            path,
-            attributed_session_id,
-            file_session_id.as_deref(),
-            line,
-            obj,
-            &mut indexer,
-            &mut cache_reads,
-            &mut triads,
-        )?;
+        // reader indexed it. Undecodable bytes are a malformed record.
+        let line = std::str::from_utf8(&raw).unwrap_or("");
+        walk.feed(line.trim_end_matches(['\n', '\r']))?;
     }
-    Ok(())
+    walk.finish()
 }
 
 /// The first in-log session id a transcript carries.
@@ -9823,6 +9802,10 @@ fn claude_file_session_id(path: &Path) -> Result<Option<String>> {
 /// here because both run across the whole transcript: tool-result ordering,
 /// and the cache read a compaction boundary reports as the context it
 /// replaced. A resumed pass restores both from the cursor.
+///
+/// `stands_alone` is the reader's verdict on a record that stores no event of
+/// its own (see [`claude_record_stores_no_event`]): no record of its message
+/// that stores rows follows it, so it stores its thinking event.
 #[allow(clippy::too_many_arguments)]
 fn ingest_claude_record(
     conn: &Connection,
@@ -9834,6 +9817,7 @@ fn ingest_claude_record(
     indexer: &mut tool_result_facts::ToolResultIndexer,
     last_assistant_cache_read: &mut HashMap<String, i64>,
     triads: &mut control::SlashCommandTriads,
+    stands_alone: bool,
 ) -> Result<()> {
     let stem = path
         .file_stem()
@@ -10044,19 +10028,20 @@ fn ingest_claude_record(
     let mut record_token_json: Option<String> = None;
     if message_role == "assistant" {
         if let Some(provider_message_id) = identity.provider_message_id {
-            // The request id exactly as the row stores it, so the rows settled
-            // together are the rows the request view groups together: by
-            // `requestId` when there is one, else by `message.id` alone.
-            let request_id = identity
-                .request_id
-                .or(raw_facts.request_id)
-                .filter(|id| !id.is_empty());
-            let settled = settle_claude_request_usage(
+            let settled = claude_standalone::settle_record_usage(
                 conn,
                 session_id,
-                request_id,
+                // The request id exactly as the row stores it, so the rows
+                // settled together are the rows the request view groups
+                // together: by `requestId` when there is one, else by
+                // `message.id` alone.
+                identity
+                    .request_id
+                    .or(raw_facts.request_id)
+                    .filter(|id| !id.is_empty()),
                 provider_message_id,
                 token_json.as_deref(),
+                obj,
             )?;
             // The record's own usage is kept only where settlement replaced
             // it: JSON `null` for a copy that carried none.
@@ -10337,14 +10322,7 @@ fn ingest_claude_record(
                 }
             }
             "thinking" => {
-                let text = block
-                    .get("thinking")
-                    .or_else(|| block.get("text"))
-                    .and_then(Value::as_str);
-                // A signed block with no display text is carried by its
-                // `thinking_signature` marker, which names the record's
-                // request; it has no content to store as an event.
-                if text.is_some_and(|s| !s.trim().is_empty()) {
+                if let Some(text) = claude_thinking_event_text(block, stands_alone) {
                     insert_session_event(
                         conn,
                         "claude",
@@ -10357,7 +10335,7 @@ fn ingest_claude_record(
                         ts_ms,
                         "assistant",
                         "thinking",
-                        text,
+                        Some(text),
                         model,
                         token_json.as_deref(),
                         identity,
@@ -35113,6 +35091,506 @@ mod tests {
                 .swept
         );
         assert_eq!(child_assistant_rows(&conn), 2);
+    }
+
+    /// A sidecar record whose only block is a signed thinking block with
+    /// empty text: what Claude streams first in a response.
+    fn sidecar_signature(uuid: &str, message_id: &str, output: i64) -> String {
+        sidecar_assistant(
+            uuid,
+            message_id,
+            r#"{"type":"thinking","thinking":"","signature":"sig"}"#,
+            output,
+        )
+    }
+
+    /// `(event_uid, kind)` of the child's assistant rows, in uid order.
+    fn child_assistant_events(conn: &Connection) -> Vec<(String, String)> {
+        conn.prepare(
+            "SELECT event_uid, kind FROM session_events \
+             WHERE source = 'claude' AND session_id = 'child' AND role = 'assistant' \
+             ORDER BY event_uid",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    /// Every reader -- incremental, whole-file, hook bytes -- stores the same
+    /// rows for `text` as the child's evidence.
+    fn every_reader(text: &str) -> Vec<Connection> {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar = dir.path().join("agent-child.jsonl");
+        fs::write(&sidecar, text).unwrap();
+        let incremental = Connection::open_in_memory().unwrap();
+        init_db(&incremental).unwrap();
+        let pass =
+            incremental::ingest_claude_transcript_at_locator(&incremental, &sidecar, Some("child"))
+                .unwrap();
+        assert!(pass.in_progress.is_empty() || !text.ends_with('\n'));
+        let whole = Connection::open_in_memory().unwrap();
+        init_db(&whole).unwrap();
+        ingest_claude_transcript_as(&whole, &sidecar, Some("child")).unwrap();
+        let hook = Connection::open_in_memory().unwrap();
+        init_db(&hook).unwrap();
+        ingest_claude_transcript_text_as(&hook, &sidecar, text, Some("child")).unwrap();
+        vec![incremental, whole, hook]
+    }
+
+    /// A response whose only record is a signed, empty thinking block stands
+    /// alone: it stores its thinking event, so it is a request with its usage,
+    /// whichever reader reads it. The response after it is unchanged.
+    #[test]
+    fn a_response_whose_only_record_stores_no_event_keeps_its_request_and_usage() {
+        let text = [
+            sidecar_record("user", "c1", r#"{"role":"user","content":"delegated"}"#),
+            sidecar_signature("a1", "msg_1", 8),
+            sidecar_record("user", "c2", r#"{"role":"user","content":"go on"}"#),
+            sidecar_signature("a2a", "msg_2", 1),
+            sidecar_tool_use("a2b", "msg_2", "toolu_2", 7),
+            sidecar_tool_result("r2", "toolu_2"),
+        ]
+        .concat();
+        for conn in every_reader(&text) {
+            assert_eq!(
+                child_requests(&conn),
+                vec![
+                    ("request-id:req_msg_1".to_string(), 8),
+                    ("request-id:req_msg_2".to_string(), 7),
+                ]
+            );
+            assert_eq!(
+                child_assistant_events(&conn),
+                vec![
+                    ("a1:0".to_string(), "thinking".to_string()),
+                    ("a2b:0".to_string(), "tool_use".to_string()),
+                ]
+            );
+            // Both opening records keep their markers.
+            let markers: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM session_markers WHERE subkind = 'thinking_signature'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(markers, 2);
+        }
+    }
+
+    /// A main transcript fills in `stop_reason` on every record, so a record
+    /// that stores no event is held for the record after it all the same: a
+    /// later block of its message stores the response's rows and it stores
+    /// none, and a refusal nothing follows stands alone.
+    #[test]
+    fn a_finished_record_that_stores_no_event_waits_for_the_record_after_it() {
+        let record = |uuid: &str, message: &str, stop: &str, block: &str, output: i64| {
+            format!(
+                r#"{{"type":"assistant","uuid":"{uuid}","sessionId":"child","cwd":"/work/app","requestId":"req_{message}","timestamp":"2026-10-01T10:00:01Z","message":{{"id":"{message}","role":"assistant","model":"claude-opus-5","stop_reason":"{stop}","content":[{block}],"usage":{{"input_tokens":2,"cache_creation_input_tokens":353736,"output_tokens":{output}}}}}}}"#
+            ) + "\n"
+        };
+        let signed = r#"{"type":"thinking","thinking":"","signature":"sig"}"#;
+        let text = [
+            r#"{"type":"user","uuid":"u1","sessionId":"child","cwd":"/work/app","timestamp":"2026-10-01T10:00:00Z","message":{"role":"user","content":"hi"}}"#.to_string() + "\n",
+            record("a1a", "msg_1", "tool_use", signed, 4),
+            record(
+                "a1b",
+                "msg_1",
+                "tool_use",
+                r#"{"type":"tool_use","id":"toolu_1","name":"Bash","input":{}}"#,
+                4,
+            ),
+            sidecar_tool_result("r1", "toolu_1").replace("root-1", "child"),
+            record("a2", "msg_2", "refusal", signed, 5859),
+            r#"{"type":"system","uuid":"s1","sessionId":"child","subtype":"api_error","timestamp":"2026-10-01T10:00:03Z"}"#.to_string() + "\n",
+        ]
+        .concat();
+        for conn in every_reader(&text) {
+            assert_eq!(
+                child_requests(&conn),
+                vec![
+                    ("request-id:req_msg_1".to_string(), 4),
+                    ("request-id:req_msg_2".to_string(), 5859),
+                ]
+            );
+            assert_eq!(
+                child_assistant_events(&conn),
+                vec![
+                    ("a1b:0".to_string(), "tool_use".to_string()),
+                    ("a2:0".to_string(), "thinking".to_string()),
+                ]
+            );
+        }
+    }
+
+    /// Resumed across the boundary, a record that stores no event is held
+    /// while it is the file's last record: the block of its message that
+    /// follows it takes the response (no second row), a record of anything
+    /// else releases it as standalone, and once the writer has gone quiet it
+    /// stands alone. Each ends where a from-zero read of the same bytes ends.
+    #[test]
+    fn a_trailing_record_that_stores_no_event_is_decided_by_the_record_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar = dir.path().join("agent-child.jsonl");
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let append = |text: &str| {
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&sidecar)
+                .unwrap();
+            file.write_all(text.as_bytes()).unwrap();
+        };
+        let pass = || {
+            incremental::ingest_claude_transcript_at_locator(&conn, &sidecar, Some("child"))
+                .unwrap()
+        };
+        let from_zero = |conn: &Connection| {
+            let fresh = Connection::open_in_memory().unwrap();
+            init_db(&fresh).unwrap();
+            incremental::ingest_claude_transcript_at_locator(&fresh, &sidecar, Some("child"))
+                .unwrap();
+            assert_eq!(child_requests(conn), child_requests(&fresh));
+            assert_eq!(child_assistant_events(conn), child_assistant_events(&fresh));
+        };
+
+        append(&sidecar_record(
+            "user",
+            "c1",
+            r#"{"role":"user","content":"delegated"}"#,
+        ));
+        append(&sidecar_signature("a1a", "msg_1", 1));
+        assert_eq!(pass().in_progress, vec!["msg_1".to_string()]);
+        assert!(child_assistant_events(&conn).is_empty());
+        // The block of its message: one request, the opening record's marker
+        // only.
+        append(&sidecar_tool_use("a1b", "msg_1", "toolu_1", 5));
+        append(&sidecar_tool_result("r1", "toolu_1"));
+        assert!(pass().in_progress.is_empty());
+        assert_eq!(
+            child_assistant_events(&conn),
+            vec![("a1b:0".to_string(), "tool_use".to_string())]
+        );
+        assert_eq!(
+            child_requests(&conn),
+            vec![("request-id:req_msg_1".to_string(), 5)]
+        );
+        from_zero(&conn);
+
+        // Followed by a record of something else: it stands alone.
+        append(&sidecar_signature("a2", "msg_2", 3));
+        assert_eq!(pass().in_progress, vec!["msg_2".to_string()]);
+        append(&sidecar_record(
+            "user",
+            "c2",
+            r#"{"role":"user","content":"go on"}"#,
+        ));
+        assert!(pass().in_progress.is_empty());
+        assert_eq!(
+            child_requests(&conn),
+            vec![
+                ("request-id:req_msg_1".to_string(), 5),
+                ("request-id:req_msg_2".to_string(), 3),
+            ]
+        );
+        from_zero(&conn);
+
+        // The file's last record once its writer has gone quiet.
+        append(&sidecar_signature("a3", "msg_3", 2));
+        assert_eq!(pass().in_progress, vec!["msg_3".to_string()]);
+        let key = transcript_cursor::CursorKey::Locator {
+            source: "claude",
+            locator: &sidecar.to_string_lossy(),
+        };
+        let mut cursor = transcript_cursor::load_cursor(&conn, &key).unwrap();
+        cursor.file.as_mut().unwrap().unchanged_since_ms -=
+            transcript_cursor::QUIESCENT_GRACE_MS + 1;
+        transcript_cursor::store_cursor(&conn, &key, &cursor).unwrap();
+        assert!(pass().in_progress.is_empty());
+        assert_eq!(
+            child_requests(&conn).last(),
+            Some(&("request-id:req_msg_3".to_string(), 2))
+        );
+        assert!(pass().in_progress.is_empty());
+        assert_eq!(child_requests(&conn).len(), 3);
+    }
+
+    /// A later record of the message that stores no event row either -- empty
+    /// content, or only a block the event model drops -- does not take the
+    /// response: the opening record still stands alone, so the response keeps
+    /// its request and usage, whichever reader reads it.
+    #[test]
+    fn a_continuation_that_stores_no_event_leaves_the_opening_record_standing_alone() {
+        let text = [
+            sidecar_record("user", "c1", r#"{"role":"user","content":"delegated"}"#),
+            sidecar_signature("a1", "msg_1", 8),
+            sidecar_assistant("a1x", "msg_1", "", 8),
+            sidecar_assistant(
+                "a1y",
+                "msg_1",
+                r#"{"type":"redacted_thinking","data":"opaque"}"#,
+                8,
+            ),
+            sidecar_record("user", "c2", r#"{"role":"user","content":"go on"}"#),
+        ]
+        .concat();
+        for conn in every_reader(&text) {
+            assert_eq!(
+                child_requests(&conn),
+                vec![("request-id:req_msg_1".to_string(), 8)]
+            );
+            assert_eq!(
+                child_assistant_events(&conn),
+                vec![("a1:0".to_string(), "thinking".to_string())]
+            );
+        }
+    }
+
+    /// A record that stood alone stores its thinking event only while no
+    /// other record of its message stores rows. A later block of the message
+    /// -- after an interleaved record, or read by a later pass over bytes an
+    /// earlier pass (a hook's snapshot) ended on -- retires that event, so
+    /// the store holds what a from-zero read of the whole file holds.
+    #[test]
+    fn a_later_block_of_its_message_retires_a_standalone_event() {
+        let interleaved = [
+            sidecar_record("user", "c1", r#"{"role":"user","content":"delegated"}"#),
+            sidecar_signature("a1", "msg_1", 8),
+            sidecar_record("user", "c2", r#"{"role":"user","content":"go on"}"#),
+            sidecar_tool_use("a1b", "msg_1", "toolu_1", 5),
+            sidecar_tool_result("r1", "toolu_1"),
+        ]
+        .concat();
+        for conn in every_reader(&interleaved) {
+            assert_eq!(
+                child_assistant_events(&conn),
+                vec![("a1b:0".to_string(), "tool_use".to_string())]
+            );
+            assert_eq!(
+                child_requests(&conn),
+                vec![("request-id:req_msg_1".to_string(), 5)]
+            );
+        }
+
+        // The hook's snapshot ends on the opening record, so it stands alone;
+        // the next read sees the block that follows it.
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar = dir.path().join("agent-child.jsonl");
+        let snapshot = [
+            sidecar_record("user", "c1", r#"{"role":"user","content":"delegated"}"#),
+            sidecar_signature("a1", "msg_1", 8),
+        ]
+        .concat();
+        let full = snapshot.clone()
+            + &sidecar_tool_use("a1b", "msg_1", "toolu_1", 5)
+            + &sidecar_tool_result("r1", "toolu_1");
+        fs::write(&sidecar, &full).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript_text_as(&conn, &sidecar, &snapshot, Some("child")).unwrap();
+        assert_eq!(
+            child_assistant_events(&conn),
+            vec![("a1:0".to_string(), "thinking".to_string())]
+        );
+        ingest_claude_transcript_as(&conn, &sidecar, Some("child")).unwrap();
+        assert_eq!(
+            child_assistant_events(&conn),
+            vec![("a1b:0".to_string(), "tool_use".to_string())]
+        );
+        assert_eq!(
+            child_requests(&conn),
+            vec![("request-id:req_msg_1".to_string(), 5)]
+        );
+    }
+
+    /// A standalone record whose thinking is blank by Unicode whitespace
+    /// stores its event with empty text, so the later block of its message
+    /// retires it as it retires any other.
+    #[test]
+    fn a_standalone_event_of_unicode_blank_thinking_is_retired_too() {
+        let text = [
+            sidecar_record("user", "c1", r#"{"role":"user","content":"delegated"}"#),
+            sidecar_assistant(
+                "a1",
+                "msg_1",
+                r#"{"type":"thinking","thinking":"\u2003","signature":"sig"}"#,
+                8,
+            ),
+            sidecar_record("user", "c2", r#"{"role":"user","content":"go on"}"#),
+            sidecar_tool_use("a1b", "msg_1", "toolu_1", 5),
+            sidecar_tool_result("r1", "toolu_1"),
+        ]
+        .concat();
+        for conn in every_reader(&text) {
+            assert_eq!(
+                child_assistant_events(&conn),
+                vec![("a1b:0".to_string(), "tool_use".to_string())]
+            );
+        }
+    }
+
+    /// A run of records that store no event, longer than the incremental
+    /// reader holds, is released as standalone by every reader alike, and the
+    /// block of their message that follows retires their events: each reader
+    /// ends with the same rows.
+    #[test]
+    fn a_held_run_past_the_cap_ends_the_same_in_every_reader() {
+        let signature = "s".repeat(1024 * 1024);
+        let mut records = vec![sidecar_record(
+            "user",
+            "c1",
+            r#"{"role":"user","content":"delegated"}"#,
+        )];
+        for index in 0..9 {
+            records.push(sidecar_assistant(
+                &format!("a{index}"),
+                "msg_1",
+                &format!(r#"{{"type":"thinking","thinking":"","signature":"{signature}"}}"#),
+                1,
+            ));
+        }
+        records.push(sidecar_tool_use("a9", "msg_1", "toolu_1", 5));
+        records.push(sidecar_tool_result("r1", "toolu_1"));
+        for conn in every_reader(&records.concat()) {
+            assert_eq!(
+                child_assistant_events(&conn),
+                vec![("a9:0".to_string(), "tool_use".to_string())]
+            );
+            assert_eq!(
+                child_requests(&conn),
+                vec![("request-id:req_msg_1".to_string(), 5)]
+            );
+        }
+    }
+
+    /// A store an earlier parser built has a response whose only record is a
+    /// signed, empty thinking block as its marker alone: no event, no
+    /// request. The store migration re-opens exactly that transcript and the
+    /// first sync re-reads it, past a fingerprint that vouches for the tree;
+    /// every other transcript stays on its cursor, and the next sync is
+    /// skipped.
+    #[test]
+    fn an_upgraded_store_gains_the_requests_of_standalone_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join(".claude/projects/-work-app");
+        let subagents = project.join("root-1/subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        let root = project.join("root-1.jsonl");
+        fs::write(
+            &root,
+            r#"{"type":"user","uuid":"u1","sessionId":"root-1","cwd":"/work/app","timestamp":"2026-10-01T09:59:00Z","message":{"role":"user","content":"start"}}"#.to_string() + "\n",
+        )
+        .unwrap();
+        let sidecar = subagents.join("agent-child.jsonl");
+        fs::write(
+            &sidecar,
+            [
+                sidecar_record("user", "c1", r#"{"role":"user","content":"delegated"}"#),
+                sidecar_signature("a1", "msg_1", 8),
+                sidecar_record("user", "c2", r#"{"role":"user","content":"go on"}"#),
+                sidecar_tool_use("a2", "msg_2", "toolu_2", 7),
+                sidecar_tool_result("r2", "toolu_2"),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let other = subagents.join("agent-other.jsonl");
+        fs::write(
+            &other,
+            [
+                sidecar_record("user", "o1", r#"{"role":"user","content":"delegated"}"#),
+                sidecar_tool_use("o2", "msg_o", "toolu_o", 3),
+                sidecar_tool_result("o3", "toolu_o"),
+            ]
+            .concat()
+            .replace("\"agentId\":\"child\"", "\"agentId\":\"other\""),
+        )
+        .unwrap();
+        let db = dir.path().join("history.db");
+        let roots = crate::ProviderRoots::from_home(
+            dir.path().to_path_buf(),
+            dir.path().join("opencode.db"),
+        );
+        super::sync_exclusive_with_roots(&db, &roots, false).unwrap();
+        let conn = open_db(&db).unwrap();
+        let healthy = child_requests(&conn);
+        assert_eq!(healthy.len(), 2);
+
+        // What the earlier parser left: the opening record's marker, no event,
+        // a migration not yet run, and a fingerprint without this generation.
+        conn.execute_batch(
+            "DELETE FROM session_events WHERE event_uid = 'a1:0';
+             DELETE FROM schema_migrations WHERE name = 'claude_standalone_records_v1';",
+        )
+        .unwrap();
+        assert_eq!(
+            child_requests(&conn),
+            vec![("request-id:req_msg_2".to_string(), 7)]
+        );
+        let state_path = dir.path().join(".sync-state.json");
+        let mut state = load_sync_state(&state_path).unwrap();
+        let source_part = state[SOURCE_FINGERPRINT_KEY]
+            .as_str()
+            .unwrap()
+            .split_once('/')
+            .unwrap()
+            .1
+            .to_string();
+        let older: Vec<&str> = SWEEP_PARSER_GENERATIONS
+            .iter()
+            .copied()
+            .filter(|generation| *generation != CLAUDE_STANDALONE_RECORDS_GENERATION)
+            .collect();
+        let old_fingerprint = format!("{}/{source_part}", sweep_generation_with(&older));
+        state.insert(SOURCE_FINGERPRINT_KEY.into(), json!(old_fingerprint));
+        state.insert(
+            DESTINATION_GENERATION_KEY.into(),
+            json!(destination_generation(&conn).unwrap()),
+        );
+        state.insert(
+            DESTINATION_HEAD_KEY.into(),
+            json!(destination_head(&conn).unwrap()),
+        );
+        assert!(sources_unchanged(&conn, &state, &old_fingerprint));
+        fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+        drop(conn);
+
+        let cursor_of = |conn: &Connection, path: &Path| {
+            conn.query_row(
+                "SELECT parser_state_json FROM transcript_cursors \
+                 WHERE source = 'claude' AND locator = ?1",
+                [path.to_string_lossy()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .unwrap()
+        };
+        let before = {
+            let conn = Connection::open(&db).unwrap();
+            (cursor_of(&conn, &root), cursor_of(&conn, &other))
+        };
+        // Opening the store runs the migration: only the sidecar holding the
+        // response loses its cursor.
+        let conn = open_db(&db).unwrap();
+        assert_eq!(cursor_of(&conn, &sidecar), None);
+        assert_eq!((cursor_of(&conn, &root), cursor_of(&conn, &other)), before);
+
+        assert!(
+            super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept
+        );
+        assert_eq!(child_requests(&conn), healthy);
+        assert_eq!((cursor_of(&conn, &root), cursor_of(&conn, &other)), before);
+        assert!(
+            !super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept
+        );
+        assert_eq!(child_requests(&conn), healthy);
     }
 
     #[test]
