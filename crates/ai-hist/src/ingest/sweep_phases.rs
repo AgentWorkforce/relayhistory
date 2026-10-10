@@ -65,6 +65,28 @@ impl SweepScope {
     }
 }
 
+/// The sweep's shallow discovery pass over `providers`, the in-scope ones.
+///
+/// Discovery fails outright when every provider it was handed fails, which
+/// for a full sweep means no provider on the machine could enumerate. A
+/// scoped sweep hands it only its own providers — often one — so the same
+/// rule would turn one adapter's hiccup into a failed tick, where a full
+/// sweep records it as a diagnostic beside the adapters that did enumerate.
+/// A scoped sweep keeps it the diagnostic it is in a full sweep; the sweep
+/// still notes it as an unread source.
+pub(super) fn discover_for_sweep(
+    env: &DiscoveryEnv<'_>,
+    providers: &[Box<dyn ShallowSessionProvider>],
+    scope: &SweepScope,
+) -> Result<DiscoverySummary> {
+    match discover::discover_sessions_for_sweep(env, &DiscoverOptions::default(), providers) {
+        Err(error) if !scope.is_everything() => error
+            .downcast::<AllProvidersFailed>()
+            .map(|failed| failed.summary),
+        result => result,
+    }
+}
+
 /// The sources with a local sweep phase, in the order the sweep runs them.
 const SWEEP_PHASE_SOURCES: &[&str] = &[
     "claude",
@@ -444,5 +466,70 @@ mod tests {
         let claude_only = SweepScope::only(["claude"]);
         assert!(sync_basic(&f.conn, &f.db, &f.roots, true, &claude_only).unwrap());
         assert_eq!(trajectory_scan::trajectory_walks(), before);
+    }
+
+    /// One in-scope adapter failing is a diagnostic, as it is in a full
+    /// sweep; every adapter of a full sweep failing is still an error.
+    #[test]
+    fn a_scoped_sweeps_lone_failing_adapter_is_a_diagnostic_not_an_error() {
+        let home = tempfile::tempdir().unwrap();
+        fs::write(home.path().join("opencode.db"), "definitely not sqlite").unwrap();
+        let conn = crate::open_db(&home.path().join("store.db")).unwrap();
+        let roots = crate::ProviderRoots::from_home(
+            home.path().to_path_buf(),
+            home.path().join("opencode.db"),
+        );
+        let env = DiscoveryEnv::with_provider_roots(&conn, roots);
+        let mut failing = shallow_providers();
+        failing.retain(|provider| provider.source() == "opencode");
+
+        let scoped = discover_for_sweep(&env, &failing, &SweepScope::only(["opencode"])).unwrap();
+        assert_eq!(scoped.diagnostics.len(), 1);
+        assert_eq!(scoped.diagnostics[0].source, "opencode");
+
+        let error = discover_for_sweep(&env, &failing, &SweepScope::everything()).unwrap_err();
+        assert!(error.is::<AllProvidersFailed>(), "{error:#}");
+    }
+
+    /// The tick the finding was about: a Claude event tick whose Claude
+    /// discovery fails still completes, with the failure recorded as an
+    /// unread source rather than a failed sweep.
+    #[cfg(unix)]
+    #[test]
+    fn a_claude_tick_survives_a_claude_discovery_failure() {
+        let f = fixture();
+        // A projects directory this process may not list: the transcript
+        // walk and Claude discovery both fail to enumerate it, while the
+        // prompt log beside it still reads.
+        let projects = f.roots.claude.join("projects");
+        fs::create_dir_all(projects.join("app")).unwrap();
+        let unlistable = std::os::unix::fs::PermissionsExt::from_mode(0o000);
+        fs::set_permissions(&projects, unlistable).unwrap();
+        struct Relist(PathBuf);
+        impl Drop for Relist {
+            fn drop(&mut self) {
+                let listable = std::os::unix::fs::PermissionsExt::from_mode(0o755);
+                let _ = fs::set_permissions(&self.0, listable);
+            }
+        }
+        let _relist = Relist(projects);
+        append(
+            &f.claude_log,
+            r#"{"display":"second claude prompt","sessionId":"c-1","timestamp":2}"#,
+        );
+        let claude_only = SweepScope::only(["claude"]);
+        let env = DiscoveryEnv::with_provider_roots(&f.conn, f.roots.clone());
+        let mut claude = shallow_providers();
+        claude.retain(|provider| provider.source() == "claude");
+        let discovered = discover_for_sweep(&env, &claude, &claude_only).unwrap();
+        assert_eq!(
+            discovered.diagnostics.len(),
+            1,
+            "{:?}",
+            discovered.diagnostics
+        );
+
+        assert!(sync_basic(&f.conn, &f.db, &f.roots, true, &claude_only).unwrap());
+        assert_eq!(history_rows(&f.conn, "claude"), 2);
     }
 }

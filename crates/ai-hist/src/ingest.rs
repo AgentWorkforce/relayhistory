@@ -2319,11 +2319,7 @@ fn sync_basic(
     // the code.
     // Without discovery's own identity refresh: the sweep runs it itself just
     // below, and one refresh per sweep is all the catalog needs.
-    let discovered = discover::discover_sessions_for_sweep(
-        &discovery_env,
-        &DiscoverOptions::default(),
-        &providers,
-    )?;
+    let discovered = sweep_phases::discover_for_sweep(&discovery_env, &providers, scope)?;
     // After discovery, not before: shallow discovery is what fills in `cwd`
     // and `repo_url` for sessions a provider's history file mentions without
     // describing, and inheritance needs every relationship this run recorded
