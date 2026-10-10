@@ -387,7 +387,12 @@ fn sqlite_value(value: ValueRef<'_>) -> Value {
     }
 }
 
-/// Every row of one table as stored, every column but `revision`.
+/// Columns that are the database's own bookkeeping, which the feed never
+/// carries.
+const LOCAL_COLUMNS: &[(&str, &str)] = &[("session_events", "raw_facts_version")];
+
+/// Every row of one table as the feed carries it: every column but `revision`
+/// and the [`LOCAL_COLUMNS`].
 fn stored_rows(conn: &Connection, table: &str) -> Vec<Row> {
     let mut statement = conn.prepare(&format!("SELECT * FROM {table}")).unwrap();
     let names: Vec<String> = statement
@@ -399,7 +404,7 @@ fn stored_rows(conn: &Connection, table: &str) -> Vec<Row> {
         .query_map([], |row| {
             let mut stored = Row::new();
             for (index, name) in names.iter().enumerate() {
-                if name != "revision" {
+                if name != "revision" && !LOCAL_COLUMNS.contains(&(table, name.as_str())) {
                     stored.push((name.clone(), sqlite_value(row.get_ref(index)?)));
                 }
             }
@@ -648,7 +653,8 @@ fn a_history_prompt_reaches_the_feed_with_its_stored_row() {
 
 /// A column a table gains after the feed was built is carried as soon as it
 /// exists, with every other column exactly as stored: JSON text stays text,
-/// integers stay integers, NULL stays null.
+/// integers stay integers, NULL stays null. Gaining it re-delivers no row
+/// that holds NULL in it: a column a row was delivered without is NULL.
 ///
 /// An update is stamped only when it changes a column the table's update
 /// guard names, and the guard is rebuilt over the live column list by the
@@ -667,29 +673,19 @@ fn a_column_a_table_gains_is_carried_verbatim() {
     writer
         .execute_batch("ALTER TABLE tool_calls ADD COLUMN review_note TEXT;")
         .unwrap();
-    // A fresh writable open runs the migration pass that rebuilds the guard
-    // and restamps only the changed-shape kind above the old head. The store
-    // identity stays stable so consumers can resume without replaying any
-    // unrelated kind.
+    // A fresh writable open runs the migration pass that rebuilds the guard.
+    // Every row holds NULL in the new column, so none is restamped.
     let migrated = home.store();
     let migrated_head = migrated.head_revision().unwrap();
-    assert_eq!(migrated_head.epoch, head.epoch);
-    let restamped = only(&migrated, head, ChangeKind::ToolCall);
-    assert_eq!(
-        migrated_head.revision,
-        head.revision + restamped.len() as u64
-    );
-    assert_eq!(
-        restamped.len(),
-        stored_rows(&home.raw(), "tool_calls").len(),
-        "every changed-shape row is delivered once above the old head"
-    );
-    assert!(restamped.iter().all(|change| {
-        change
-            .columns
-            .as_ref()
-            .is_some_and(|columns| columns.get("review_note") == Some(&Value::Null))
-    }));
+    assert_eq!(migrated_head, head, "no row is re-delivered");
+    assert!(only(&migrated, Watermark::START, ChangeKind::ToolCall)
+        .iter()
+        .all(|change| {
+            change
+                .columns
+                .as_ref()
+                .is_some_and(|columns| columns.get("review_note") == Some(&Value::Null))
+        }));
     writer
         .execute_batch(
             "UPDATE tool_calls SET review_note = 'looked fine' \

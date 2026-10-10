@@ -6,8 +6,13 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased - Minor]
 
+### Breaking Changes
+
+- Change-feed rows (`StoredRow`) and `ai-hist export` payloads no longer carry `session_events.raw_facts_version`, the store's own parser-generation bookkeeping; the feed does not stamp an event when only it changes.
+
 ### Fixed
 
+- An appended exported column restamps only rows holding a value in it, and a raw-facts parser-generation bump restamps only events whose evidence changed, so neither re-delivers a store's session events. A row holding NULL in an appended column keeps its revision; a consumer reads a column a row was delivered without as NULL. A dropped, renamed or retyped column still restamps every row of its kind.
 - Claude subagent requests and usage reach `SessionEvidence::requests` on the sync or hydration that reads the sidecar, rather than only once the sidecar had sat still for two minutes and a later sweep ran, which `sync` skipped while no other source changed. The first sync after upgrading backfills the messages an earlier build held back.
 - A Claude response whose only record is a signed, empty `thinking` block is a request in `SessionEvidence::requests` with its usage again, instead of only a `thinking_signature` marker; the record stores its thinking event (empty text). The first sync or hydration after upgrading re-reads only the transcripts holding such a response.
 

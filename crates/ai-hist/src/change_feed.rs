@@ -11,14 +11,15 @@
 //!   `session_presences`, `session_commit_links`, `trajectories`,
 //!   `session_observations` and `observation_evidence` carries a `revision`.
 //!   A trigger stamps the current clock on every insert, and on every update
-//!   that changes at least one of the row's columns
+//!   that changes at least one of the columns the row carries
 //!   ([`stamped_columns`](schema::stamped_columns)), so a re-parse that
 //!   upserts a row it already holds, unchanged, leaves it at the revision it
 //!   had and the feed reports nothing for it. A re-seen key
 //!   still means a replace, never a duplicate: consumers must treat it so.
 //! - An upsert carries the row twice over: typed, where the kind has a typed
-//!   row, and as stored ([`StoredRow`]) -- every column but `revision`, read
-//!   from the live table, values as SQLite holds them -- so an embedder can
+//!   row, and as stored ([`StoredRow`]) -- every column but `revision` and
+//!   the local bookkeeping in `LOCAL_COLUMNS`, read from the live table,
+//!   values as SQLite holds them -- so an embedder can
 //!   rebuild the row exactly without knowing the table's shape in advance.
 //!   Every change, a delete included, carries the record's identity: its
 //!   kind and the columns of its table's uniqueness constraint
@@ -87,6 +88,9 @@ pub const DEFAULT_CHANGE_BATCH: usize = 1_000;
 /// stamped by `v1` gains the kinds it lacked, backfilled above its head, in
 /// the one pass the missing marker triggers.
 const MIGRATION: &str = "change_feed_v2";
+
+mod export_schema;
+use export_schema::reconcile_export_schema;
 
 /// The column a named cursor records its kind set in.
 const KINDS_COLUMN: &str = "kinds";
@@ -555,21 +559,39 @@ impl FedTable {
     }
 }
 
+/// Columns that are this database's own bookkeeping rather than evidence, so
+/// the feed neither carries nor stamps them.
+///
+/// `session_events.raw_facts_version` records which local parser generation
+/// wrote a row. Every generation bump rewrites it on every row it repairs, and
+/// carried it would re-deliver a store's whole history for a change no
+/// consumer can observe in the evidence.
+///
+/// A column is local only when nothing keys off a stamp it would otherwise
+/// cause: `sessions.source_stamp` stays carried, because the watch catalog
+/// fingerprint includes it and trusts an unmoved head to mean an unchanged
+/// catalog.
+const LOCAL_COLUMNS: &[(&str, &str)] = &[("session_events", "raw_facts_version")];
+
+fn local_column(table: &str, column: &str) -> bool {
+    LOCAL_COLUMNS.contains(&(table, column))
+}
+
 /// The columns of `table` a stored row carries: every column but the feed's
-/// own [`REVISION_COLUMN`], in table order, read from the live schema so a
-/// column a migration adds is carried without a code change.
+/// own [`REVISION_COLUMN`] and the [`LOCAL_COLUMNS`], in table order, read from
+/// the live schema so a column a migration adds is carried without a code
+/// change.
 pub(crate) fn stored_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
-    let columns = conn
-        .prepare_cached("SELECT name FROM pragma_table_info(?1) ORDER BY cid")?
-        .query_map([table], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(columns
+    Ok(stored_column_schema(conn, table)?
         .into_iter()
-        .filter(|column| column != REVISION_COLUMN)
+        .map(|(column, _)| column)
         .collect())
 }
 
-fn stored_column_schema(conn: &Connection, table: &str) -> Result<Vec<(String, String)>> {
+/// Every column of `table` but [`REVISION_COLUMN`], with its declared type,
+/// in table order: [`stored_column_schema`] before the [`LOCAL_COLUMNS`] are
+/// set aside.
+fn table_column_schema(conn: &Connection, table: &str) -> Result<Vec<(String, String)>> {
     let columns = conn
         .prepare_cached("SELECT name, type FROM pragma_table_info(?1) ORDER BY cid")?
         .query_map([table], |row| {
@@ -582,32 +604,11 @@ fn stored_column_schema(conn: &Connection, table: &str) -> Result<Vec<(String, S
         .collect())
 }
 
-fn export_schema_digest(schema: &[(String, String)]) -> Result<String> {
-    Ok(format!(
-        "{:x}",
-        Sha256::digest(serde_json::to_vec(&(
-            "relayhistory-change-feed-export-schema-v2",
-            schema
-        ))?)
-    ))
-}
-
-fn export_schema_digests(conn: &Connection) -> Result<BTreeMap<String, String>> {
-    ChangeKind::ALL
-        .iter()
-        .map(|kind| {
-            let schema = stored_column_schema(conn, kind.table().name)?;
-            let digest = export_schema_digest(&schema)?;
-            Ok((kind.as_str().to_string(), digest))
-        })
-        .collect()
-}
-
-fn exported_kind_removed(
-    previous: &BTreeMap<String, String>,
-    current: &BTreeMap<String, String>,
-) -> bool {
-    previous.keys().any(|kind| !current.contains_key(kind))
+fn stored_column_schema(conn: &Connection, table: &str) -> Result<Vec<(String, String)>> {
+    Ok(table_column_schema(conn, table)?
+        .into_iter()
+        .filter(|(column, _)| !local_column(table, column))
+        .collect())
 }
 
 fn feed_identity_exists(conn: &Connection) -> Result<bool> {
@@ -627,123 +628,9 @@ fn feed_identity_exists(conn: &Connection) -> Result<bool> {
     .map_err(Into::into)
 }
 
-/// The temporary table a restamp stages each row's ordinal in, keyed by the
-/// fed table's rowid.
-const RESTAMP_ORDINALS: &str = "temp.change_feed_restamp_ordinals";
-
-/// The statement that stamps every row of `table` with `?1` plus its ordinal
-/// from [`RESTAMP_ORDINALS`].
-///
-/// The ordinals come from a staged table with an INTEGER PRIMARY KEY rather
-/// than a `ROW_NUMBER()` CTE in the statement itself: every fed table carries
-/// change-feed triggers, and SQLite does not build an automatic index on a
-/// CTE for an UPDATE of a triggered table, so the inline form rescanned the
-/// whole table per row. Through the staged table each row is one primary-key
-/// lookup, whatever the planner's heuristics.
-fn restamp_update_sql(table: &str) -> String {
-    format!(
-        "UPDATE {table}
-         SET {REVISION_COLUMN} = ?1 + (
-             SELECT ordinal FROM {RESTAMP_ORDINALS} o WHERE o.rowid = {table}.rowid
-         )"
-    )
-}
-
-fn restamp_exported_rows(conn: &Connection, kind: ChangeKind) -> Result<()> {
-    let table = kind.table().name;
-    let count: i64 = conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
-        row.get(0)
-    })?;
-    if count == 0 {
-        return Ok(());
-    }
-    let base: i64 = conn.query_row(
-        "SELECT version FROM observation_clock WHERE singleton=1",
-        [],
-        |row| row.get(0),
-    )?;
-    let head = base
-        .checked_add(count)
-        .context("change-feed revision overflow while restamping an exported schema")?;
-    conn.execute_batch(&format!(
-        "DROP TABLE IF EXISTS {RESTAMP_ORDINALS};
-         CREATE TABLE {RESTAMP_ORDINALS} (
-             rowid INTEGER PRIMARY KEY,
-             ordinal INTEGER NOT NULL
-         );
-         INSERT INTO {RESTAMP_ORDINALS} (rowid, ordinal)
-         SELECT rowid, ROW_NUMBER() OVER (ORDER BY rowid) FROM {table};"
-    ))?;
-    conn.execute(&restamp_update_sql(table), [base])?;
-    // A failed restamp rolls the staged table back with the migration's
-    // transaction, and the next attempt drops any leftover before staging.
-    conn.execute_batch(&format!("DROP TABLE IF EXISTS {RESTAMP_ORDINALS};"))?;
-    conn.execute(
-        "UPDATE observation_clock SET version=?1 WHERE singleton=1",
-        [head],
-    )?;
-    Ok(())
-}
-
-/// Reconcile each kind's exported row shape. Existing feeds without a
-/// fingerprint may already have delivered the older representation, so every
-/// existing kind is restamped once above the current head. Later changes
-/// restamp only the affected kind. A newly introduced kind has no prior
-/// fingerprint and is recorded without restamping: the feed-version migration
-/// that introduced it already backfilled its rows above the old head.
-///
-/// Keeping the store epoch and cursor rows intact is deliberate. Both external
-/// watermarks and named cursors can resume normally and observe the affected
-/// rows at their new revisions; unrelated kinds are never replayed.
-fn reconcile_export_schema(conn: &Connection, identity_existed: bool) -> Result<()> {
-    let current = export_schema_digests(conn)?;
-    let stored: Option<String> = conn.query_row(
-        &format!("SELECT {EXPORT_SCHEMA_DIGEST_COLUMN} FROM change_feed_store WHERE singleton=1"),
-        [],
-        |row| row.get(0),
-    )?;
-    let previous = stored
-        .as_deref()
-        .and_then(|value| serde_json::from_str::<BTreeMap<String, String>>(value).ok());
-    if previous.as_ref() == Some(&current) {
-        return Ok(());
-    }
-    let removed = previous
-        .as_ref()
-        .is_some_and(|previous| exported_kind_removed(previous, &current));
-    if identity_existed && removed {
-        // A removed kind has no live table left to restamp and emit. Reset the
-        // semantic stream so a full reconciliation can remove that retired
-        // material. Ordinary shape changes never take this store-wide path.
-        conn.execute_batch(
-            "UPDATE change_feed_store
-             SET epoch = CASE WHEN epoch = 9223372036854775807
-                              THEN -9223372036854775807 ELSE epoch + 2 END
-             WHERE singleton=1;
-             DELETE FROM consumer_cursors;",
-        )?;
-    } else if identity_existed {
-        for kind in ChangeKind::ALL {
-            let changed = match previous.as_ref() {
-                Some(previous) => previous
-                    .get(kind.as_str())
-                    .is_some_and(|digest| Some(digest) != current.get(kind.as_str())),
-                None => true,
-            };
-            if changed {
-                restamp_exported_rows(conn, *kind)?;
-            }
-        }
-    }
-    conn.execute(
-        &format!("UPDATE change_feed_store SET {EXPORT_SCHEMA_DIGEST_COLUMN}=? WHERE singleton=1"),
-        [serde_json::to_string(&current)?],
-    )?;
-    Ok(())
-}
-
-/// A record exactly as its table stores it: every column but `revision`, in
-/// table order, each value as SQLite holds it.
+/// A record exactly as its table stores it: every column but `revision` and
+/// the database's own bookkeeping, in table order, each value as SQLite holds
+/// it.
 ///
 /// Text stays text even when it holds JSON, an integer stays an integer, a
 /// real stays a real and NULL is `null`; nothing is parsed, defaulted or
@@ -1858,6 +1745,7 @@ fn read_tombstones(
 
 #[cfg(test)]
 mod tests {
+    use super::export_schema::*;
     use super::schema::{stamped_columns, trigger_names, trigger_sql, PRESENCE_TRIGGERS};
     use super::*;
     use crate::session_store::StoreOptions;
@@ -2758,6 +2646,286 @@ INSERT INTO observation_evidence (source, session_id, location, connector_id,
         .is_empty());
     }
 
+    fn event_revision(conn: &Connection, uid: &str) -> i64 {
+        conn.query_row(
+            "SELECT revision FROM session_events WHERE event_uid=?",
+            [uid],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn event_uids(changes: &[Change]) -> Vec<&Value> {
+        changes
+            .iter()
+            .map(|change| {
+                change
+                    .columns
+                    .as_ref()
+                    .and_then(|columns| columns.get("event_uid"))
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    /// An appended nullable column leaves every row that holds NULL in it
+    /// exporting the content it already delivered, so upgrading does not
+    /// re-deliver the store's history: only a row that already holds a value
+    /// in the new column is restamped, and a row that gains one later is
+    /// stamped by its own update.
+    #[test]
+    fn an_appended_nullable_column_restamps_only_rows_holding_a_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let (initial_store, conn) = store(dir.path());
+        insert_event(&conn, "s1", "e1", "first");
+        insert_event(&conn, "s1", "e2", "second");
+        let old_head = initial_store.head_revision().unwrap();
+        let query = || ChangeQuery::default().consumer("delivery");
+        let mut first = initial_store
+            .changes_since(Watermark::CONSUMER, query())
+            .unwrap();
+        while first.next().is_some() {}
+        assert_eq!(first.commit().unwrap(), old_head);
+        let e1_revision = event_revision(&conn, "e1");
+
+        // A migration appends the column and a backfill fills one row before
+        // the triggers know the column, so that write stamps nothing.
+        conn.execute_batch(
+            "ALTER TABLE session_events ADD COLUMN export_shape_probe TEXT;
+             UPDATE session_events SET export_shape_probe = 'filled' WHERE event_uid = 'e2';",
+        )
+        .unwrap();
+        drop(first);
+        drop(conn);
+        drop(initial_store);
+
+        let (migrated, conn) = store(dir.path());
+        let new_head = migrated.head_revision().unwrap();
+        assert_eq!(new_head.epoch, old_head.epoch);
+        assert_eq!(new_head.revision, old_head.revision + 1);
+        assert_eq!(event_revision(&conn, "e1"), e1_revision);
+        let replay = drain(
+            migrated
+                .changes_since(Watermark::CONSUMER, query())
+                .unwrap(),
+        );
+        assert_eq!(event_uids(&replay), [&Value::from("e2")]);
+        assert_eq!(
+            replay[0]
+                .columns
+                .as_ref()
+                .and_then(|columns| columns.get("export_shape_probe")),
+            Some(&Value::from("filled"))
+        );
+
+        // The reopened store's trigger guards the appended column.
+        conn.execute(
+            "UPDATE session_events SET export_shape_probe = 'later' WHERE event_uid = 'e1'",
+            [],
+        )
+        .unwrap();
+        let later = drain(
+            migrated
+                .changes_since(new_head, ChangeQuery::default())
+                .unwrap(),
+        );
+        assert_eq!(event_uids(&later), [&Value::from("e1")]);
+    }
+
+    /// A parser-generation bump rewrites `raw_facts_version` on every row it
+    /// repairs. That is the database's bookkeeping, so the rows keep their
+    /// revisions and the feed never carries the column.
+    #[test]
+    fn a_parser_generation_bump_neither_stamps_nor_carries_raw_facts_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, conn) = store(dir.path());
+        insert_event(&conn, "s1", "e1", "first");
+        let head = store.head_revision().unwrap();
+
+        conn.execute("UPDATE session_events SET raw_facts_version = 99", [])
+            .unwrap();
+        assert_eq!(store.head_revision().unwrap(), head);
+
+        let rows = all(&store);
+        assert_eq!(rows.len(), 1);
+        let columns = rows[0].columns.as_ref().unwrap();
+        assert_eq!(columns.get("raw_facts_version"), None);
+        assert_eq!(columns.get("event_uid"), Some(&Value::from("e1")));
+    }
+
+    /// `sessions.source_stamp` is local too, but the watch catalog trusts an
+    /// unmoved head to mean an unchanged catalog, and its fingerprint covers
+    /// the stamp: a stamp-only update must still move the head.
+    #[test]
+    fn a_source_stamp_only_update_still_moves_the_head() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, conn) = store(dir.path());
+        conn.execute(
+            "INSERT INTO sessions (source, session_id, source_stamp, last_activity_ms) \
+             VALUES ('claude', 's1', 'v9:1:1', 1)",
+            [],
+        )
+        .unwrap();
+        let head = store.head_revision().unwrap();
+
+        conn.execute("UPDATE sessions SET source_stamp = 'v10:1:1'", [])
+            .unwrap();
+        assert_eq!(store.head_revision().unwrap().revision, head.revision + 1);
+    }
+
+    /// A store whose fingerprint still covers `raw_facts_version` delivered
+    /// rows carrying it. Setting it aside changes nothing a consumer reads, so
+    /// the open that does so restamps no row.
+    #[test]
+    fn setting_a_column_aside_as_bookkeeping_restamps_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (initial_store, conn) = store(dir.path());
+        insert_event(&conn, "s1", "e1", "first");
+        insert_event(&conn, "s1", "e2", "second");
+        let old_head = initial_store.head_revision().unwrap();
+        let stored: String = conn
+            .query_row(
+                &format!(
+                    "SELECT {EXPORT_SCHEMA_DIGEST_COLUMN} FROM change_feed_store WHERE singleton=1"
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut digests: BTreeMap<String, String> = serde_json::from_str(&stored).unwrap();
+        digests.insert(
+            ChangeKind::SessionEvent.as_str().to_string(),
+            export_schema_digest(&table_column_schema(&conn, "session_events").unwrap()).unwrap(),
+        );
+        conn.execute(
+            &format!(
+                "UPDATE change_feed_store SET {EXPORT_SCHEMA_DIGEST_COLUMN}=? WHERE singleton=1"
+            ),
+            [serde_json::to_string(&digests).unwrap()],
+        )
+        .unwrap();
+        // The earlier release's update trigger guarded the column too; its
+        // replacement is what sends the next open through reconciliation.
+        let [_, update, _] = trigger_names(ChangeKind::SessionEvent);
+        conn.execute_batch(&format!("DROP TRIGGER {update};"))
+            .unwrap();
+        drop(conn);
+        drop(initial_store);
+
+        let (migrated, conn) = store(dir.path());
+        assert_eq!(migrated.head_revision().unwrap(), old_head);
+        let fingerprint: String = conn
+            .query_row(
+                &format!(
+                    "SELECT {EXPORT_SCHEMA_DIGEST_COLUMN} FROM change_feed_store WHERE singleton=1"
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            serde_json::from_str::<BTreeMap<String, String>>(&fingerprint).unwrap(),
+            export_schema_digests(&conn).unwrap()
+        );
+    }
+
+    /// A fingerprinted schema that is not a prefix of the current one -- a
+    /// dropped, renamed, retyped or reordered column -- can change any row's
+    /// exported JSON, so every row of the kind is restamped.
+    #[test]
+    fn a_non_additive_column_change_restamps_every_row_of_the_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let (initial_store, conn) = store(dir.path());
+        insert_event(&conn, "s1", "e1", "first");
+        insert_event(&conn, "s1", "e2", "second");
+        let old_head = initial_store.head_revision().unwrap();
+        let stored: String = conn
+            .query_row(
+                &format!(
+                    "SELECT {EXPORT_SCHEMA_DIGEST_COLUMN} FROM change_feed_store WHERE singleton=1"
+                ),
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        // The fingerprint names a schema the current one does not extend (as
+        // a dropped column leaves it), and a shape change sends the next open
+        // through reconciliation.
+        let mut digests: BTreeMap<String, String> = serde_json::from_str(&stored).unwrap();
+        conn.execute_batch("ALTER TABLE session_events ADD COLUMN export_shape_probe TEXT;")
+            .unwrap();
+        digests.insert(
+            ChangeKind::SessionEvent.as_str().to_string(),
+            export_schema_digest(&[("retired".to_string(), "TEXT".to_string())]).unwrap(),
+        );
+        conn.execute(
+            &format!(
+                "UPDATE change_feed_store SET {EXPORT_SCHEMA_DIGEST_COLUMN}=? WHERE singleton=1"
+            ),
+            [serde_json::to_string(&digests).unwrap()],
+        )
+        .unwrap();
+        drop(conn);
+        drop(initial_store);
+
+        let (migrated, _) = store(dir.path());
+        assert_eq!(
+            migrated.head_revision().unwrap().revision,
+            old_head.revision + 2
+        );
+        let restamped = drain(
+            migrated
+                .changes_since(old_head, ChangeQuery::default())
+                .unwrap(),
+        );
+        assert_eq!(
+            event_uids(&restamped),
+            [&Value::from("e1"), &Value::from("e2")]
+        );
+    }
+
+    #[test]
+    fn appended_columns_recognize_only_a_prefix() {
+        let column = |name: &str| (name.to_string(), "TEXT".to_string());
+        let previous = export_schema_digest(&[column("a"), column("b")]).unwrap();
+        assert_eq!(
+            appended_columns(
+                &previous,
+                &[column("a"), column("b"), column("c"), column("d")]
+            )
+            .unwrap(),
+            Some(vec!["c".to_string(), "d".to_string()])
+        );
+        assert_eq!(
+            appended_columns(&previous, &[column("a"), column("b")]).unwrap(),
+            Some(vec![]),
+            "unchanged"
+        );
+        assert_eq!(
+            appended_columns(&previous, &[column("b"), column("a"), column("c")]).unwrap(),
+            None,
+            "reordered"
+        );
+        assert_eq!(
+            appended_columns(
+                &previous,
+                &[
+                    column("a"),
+                    ("b".to_string(), "INTEGER".to_string()),
+                    column("c")
+                ]
+            )
+            .unwrap(),
+            None,
+            "retyped"
+        );
+        assert_eq!(
+            appended_columns(&previous, &[column("a")]).unwrap(),
+            None,
+            "dropped"
+        );
+    }
+
     /// The release before per-kind fingerprints already has a feed identity
     /// and delivered rows, but gains this nullable column during migration.
     /// Its first open must restamp every existing kind exactly once above the
@@ -2849,7 +3017,7 @@ INSERT INTO observation_evidence (source, session_id, location, connector_id,
         );
         let base = i64::try_from(store.head_revision().unwrap().revision).unwrap();
 
-        restamp_exported_rows(&conn, ChangeKind::SessionEvent).unwrap();
+        restamp_exported_rows(&conn, ChangeKind::SessionEvent, RestampScope::Every).unwrap();
 
         let revisions: Vec<i64> = conn
             .prepare("SELECT revision FROM session_events ORDER BY rowid")
@@ -4281,7 +4449,7 @@ INSERT INTO observation_evidence (source, session_id, location, connector_id,
                 let live = live_row(conn, table, change.revision);
                 let expected: Vec<(String, Value)> = live
                     .iter()
-                    .filter(|(name, _)| name != REVISION_COLUMN)
+                    .filter(|(name, _)| name != REVISION_COLUMN && !local_column(table, name))
                     .cloned()
                     .collect();
                 let columns = change.columns.clone().expect("an upsert carries its row");

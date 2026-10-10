@@ -263,7 +263,10 @@ database epoch, or a revision ahead of `head_revision` — means the store was
 reset or replaced and the consumer must resync from `Watermark::START`. A
 column-name or declared-type change restamps only rows of the affected kind
 above the current head, so consumers never reuse an equal revision with a new
-semantic payload or replay unrelated kinds. A newly fed kind is backfilled
+semantic payload or replay unrelated kinds. An appended column restamps only
+the rows holding a value in it; a row holding NULL there keeps its revision and,
+re-read, carries the column as `null`, so a consumer reads a column a row was
+delivered without as NULL. A newly fed kind is backfilled
 above the old head and does not reset established streams. Retiring a kind is
 the exceptional epoch reset because no live rows remain to communicate its
 removal. A named
