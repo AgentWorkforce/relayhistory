@@ -4,11 +4,7 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased - Minor]
-
-### Breaking Changes
-
-- Change-feed rows (`StoredRow`) and `ai-hist export` payloads no longer carry `session_events.raw_facts_version`, the store's own parser-generation bookkeeping; the feed does not stamp an event when only it changes.
+## [Unreleased]
 
 ### Added
 
@@ -20,16 +16,26 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Trajectory roots are derived from `~/Projects` once per sweep instead of twice, only by full sweeps (a watch's event ticks reuse the roots its last full sweep found), and only to five directories below `~/Projects`; name a deeper `.trajectories` directory in `TRAJECTORY_ROOT`.
 - Re-reading a Claude transcript asks once per record, with one indexed lookup, whether an earlier parse left the record's rows under another session or as a notice's assistant output, and retires them only when it did, instead of running eight delete and update statements for every record of every re-read.
 
+### Rust API
+
+- Added `SyncOptions::sources: Option<Vec<Source>>` with its `sources()` setter, and `TickReport::sources: Option<Vec<Source>>`.
+
+## [0.38.0] - 2026-10-10
+
+### Breaking Changes
+
+- Change-feed rows (`StoredRow`) and `ai-hist export` payloads no longer carry `session_events.raw_facts_version`, the store's own parser-generation bookkeeping; the feed does not stamp an event when only it changes.
+
 ### Fixed
 
 - An appended exported column restamps only rows holding a value in it, and a raw-facts parser-generation bump restamps only events whose evidence changed, so neither re-delivers a store's session events. A row holding NULL in an appended column keeps its revision; a consumer reads a column a row was delivered without as NULL. A dropped, renamed or retyped column still restamps every row of its kind.
 - Claude subagent requests and usage reach `SessionEvidence::requests` on the sync or hydration that reads the sidecar, rather than only once the sidecar had sat still for two minutes and a later sweep ran, which `sync` skipped while no other source changed. The first sync after upgrading backfills the messages an earlier build held back.
 - A Claude response whose only record is a signed, empty `thinking` block is a request in `SessionEvidence::requests` with its usage again, instead of only a `thinking_signature` marker; the record stores its thinking event (empty text). The first sync or hydration after upgrading re-reads only the transcripts holding such a response.
+- A Codex thread marked `thread_source: "subagent"` that names no parent (a standalone guardian / auto-review thread) is a catalogued session readable through `SessionStore::session`, instead of being hidden as a child of no parent; a rollout is a delegated child only when its `session_meta` names its parent. The first sync after upgrading catalogs the threads an earlier build hid.
 
 ### Rust API
 
 - `StoreOptions`, `DiscoveryOptions`, `SyncOptions`, `HydrateOptions` and `ForgetOptions` have a chainable setter per field, e.g. `StoreOptions::default().db_path(path).read_only(true)`.
-- Added `SyncOptions::sources: Option<Vec<Source>>` with its `sources()` setter, and `TickReport::sources: Option<Vec<Source>>`.
 
 ## [0.37.0] - 2026-10-09
 
@@ -694,7 +700,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - The SDK reads provider JSONL natively and works without the Python CLI.
 
-[Unreleased]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.37.0...HEAD
+[Unreleased]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.38.0...HEAD
+[0.38.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.37.0...sdk-ts-v0.38.0
 [0.37.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.36.0...sdk-ts-v0.37.0
 [0.36.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.35.0...sdk-ts-v0.36.0
 [0.35.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.34.3...sdk-ts-v0.35.0
