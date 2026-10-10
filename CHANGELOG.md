@@ -8,7 +8,6 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Breaking Changes
 
-- Change-feed rows (`StoredRow`) and `ai-hist export` payloads no longer carry `session_events.raw_facts_version`, the store's own parser-generation bookkeeping; the feed does not stamp an event when only it changes.
 - Trajectories and Relaycast history are no longer sources: `relay` and `trajectory` are unknown values for `--source` and every source filter, `--source-connector relaycast` is an `INVALID_ARGUMENT`, and the TypeScript `SOURCES`, `CHANGE_KINDS` and export kinds no longer list them.
 - A writable open deletes what an earlier release stored for them: the `trajectories` table (with any leftover `trajectory_fts` index and triggers) and every row under the `relay` or `trajectory` source, with their change-feed tombstones. Because the feed loses the `trajectory` kind, the first writable open after upgrading starts a new feed epoch and drops named consumer cursors, so change-feed consumers replay from the start.
 
@@ -17,16 +16,26 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `.trajectories` directories and `TRAJECTORY_ROOT` are no longer read or watched, and the built-in `relay` catalog adapter is gone; `ai-hist import` skips entries under either source.
 - `ai-hist learn distill`, which wrote its roll-ups into the trajectory store, is removed.
 
+### Rust API
+
+- `Source::Relay`, `Source::Trajectory`, `ChangeKind::Trajectory`, and `ProviderRoots::trajectory_roots` are removed; a serialized `ProviderRoots` that still carries `trajectory_roots` deserializes with the field ignored.
+
+## [0.38.0] - 2026-10-10
+
+### Breaking Changes
+
+- Change-feed rows (`StoredRow`) and `ai-hist export` payloads no longer carry `session_events.raw_facts_version`, the store's own parser-generation bookkeeping; the feed does not stamp an event when only it changes.
+
 ### Fixed
 
 - An appended exported column restamps only rows holding a value in it, and a raw-facts parser-generation bump restamps only events whose evidence changed, so neither re-delivers a store's session events. A row holding NULL in an appended column keeps its revision; a consumer reads a column a row was delivered without as NULL. A dropped, renamed or retyped column still restamps every row of its kind.
 - Claude subagent requests and usage reach `SessionEvidence::requests` on the sync or hydration that reads the sidecar, rather than only once the sidecar had sat still for two minutes and a later sweep ran, which `sync` skipped while no other source changed. The first sync after upgrading backfills the messages an earlier build held back.
 - A Claude response whose only record is a signed, empty `thinking` block is a request in `SessionEvidence::requests` with its usage again, instead of only a `thinking_signature` marker; the record stores its thinking event (empty text). The first sync or hydration after upgrading re-reads only the transcripts holding such a response.
+- A Codex thread marked `thread_source: "subagent"` that names no parent (a standalone guardian / auto-review thread) is a catalogued session readable through `SessionStore::session`, instead of being hidden as a child of no parent; a rollout is a delegated child only when its `session_meta` names its parent. The first sync after upgrading catalogs the threads an earlier build hid.
 
 ### Rust API
 
 - `StoreOptions`, `DiscoveryOptions`, `SyncOptions`, `HydrateOptions` and `ForgetOptions` have a chainable setter per field, e.g. `StoreOptions::default().db_path(path).read_only(true)`.
-- `Source::Relay`, `Source::Trajectory`, `ChangeKind::Trajectory`, and `ProviderRoots::trajectory_roots` are removed; a serialized `ProviderRoots` that still carries `trajectory_roots` deserializes with the field ignored.
 
 ## [0.37.0] - 2026-10-09
 
@@ -691,7 +700,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - The SDK reads provider JSONL natively and works without the Python CLI.
 
-[Unreleased]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.37.0...HEAD
+[Unreleased]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.38.0...HEAD
+[0.38.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.37.0...sdk-ts-v0.38.0
 [0.37.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.36.0...sdk-ts-v0.37.0
 [0.36.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.35.0...sdk-ts-v0.36.0
 [0.35.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.34.3...sdk-ts-v0.35.0

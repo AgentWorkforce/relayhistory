@@ -379,6 +379,125 @@ fn a_codex_child_thread_is_readable_by_its_id() {
     assert_eq!(spawned.parent_session_id, "root");
 }
 
+/// A standalone Codex guardian / auto-review thread is marked
+/// `thread_source: "subagent"` but names no parent, so nothing links it to
+/// another session: it is a catalogued session of its own, under
+/// `sessions/` and `archived_sessions/` alike, readable by its id.
+#[test]
+fn a_codex_subagent_thread_naming_no_parent_is_a_catalogued_session() {
+    let temp = tempfile::tempdir().unwrap();
+    for (tree, id) in [
+        ("sessions", "guardian"),
+        ("archived_sessions", "archived-guardian"),
+    ] {
+        let day = temp.path().join(format!(".codex/{tree}/2026/08/31"));
+        fs::create_dir_all(&day).unwrap();
+        fs::write(
+            day.join(format!("rollout-{id}.jsonl")),
+            format!(
+                concat!(
+                    r#"{{"timestamp":"2026-08-31T10:00:00Z","type":"session_meta","payload":{{"id":"{id}","session_id":"{id}","cwd":"/work/app","source":{{"subagent":{{"other":"guardian"}}}},"thread_source":"subagent"}}}}"#,
+                    "\n",
+                    r#"{{"timestamp":"2026-08-31T10:00:01Z","type":"event_msg","payload":{{"type":"user_message","message":"review this"}}}}"#,
+                    "\n",
+                    r#"{{"timestamp":"2026-08-31T10:00:02Z","type":"event_msg","payload":{{"type":"agent_message","message":"approved"}}}}"#,
+                    "\n",
+                ),
+                id = id
+            ),
+        )
+        .unwrap();
+    }
+    let store = open(temp.path());
+    store.sync(SyncOptions::default()).unwrap();
+
+    let mut listed: Vec<String> = store
+        .sessions(CatalogQuery::default())
+        .map(|row| row.unwrap().session_id)
+        .collect();
+    listed.sort();
+    assert_eq!(
+        listed,
+        vec!["archived-guardian".to_string(), "guardian".to_string()]
+    );
+    for id in ["guardian", "archived-guardian"] {
+        let evidence = store
+            .session(&SessionRef::id(Source::Codex, id), SessionQuery::default())
+            .unwrap()
+            .expect("the standalone thread is readable by its id");
+        assert_ne!(evidence.session.discovery_state, DiscoveryState::Delegated);
+        assert!(!evidence.messages.is_empty(), "{id}");
+        assert!(evidence.relationships.is_empty(), "{id}");
+    }
+}
+
+/// A child's classification comes from its own `session_meta`, so a child
+/// synced before its parent's rollout exists is already a delegated child:
+/// it never enters the catalog, and once the parent arrives the parent's
+/// descendants reach it.
+#[test]
+fn a_codex_child_synced_before_its_parent_is_linked_when_the_parent_arrives() {
+    let temp = tempfile::tempdir().unwrap();
+    let day = temp.path().join(".codex/sessions/2026/08/31");
+    fs::create_dir_all(&day).unwrap();
+    fs::write(
+        day.join("rollout-child.jsonl"),
+        concat!(
+            r#"{"timestamp":"2026-08-31T10:00:03Z","type":"session_meta","payload":{"id":"child","session_id":"root","parent_thread_id":"root","cwd":"/work/app","source":{"subagent":{"other":"guardian"}},"thread_source":"subagent"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-31T10:00:05Z","type":"event_msg","payload":{"type":"agent_message","message":"child answer"}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    let store = open(temp.path());
+    store.sync(SyncOptions::default()).unwrap();
+
+    assert_eq!(store.sessions(CatalogQuery::default()).count(), 0);
+    let child = store
+        .session(
+            &SessionRef::id(Source::Codex, "child"),
+            SessionQuery::default(),
+        )
+        .unwrap()
+        .expect("the child is readable before its parent is captured");
+    assert_eq!(child.session.discovery_state, DiscoveryState::Delegated);
+
+    fs::write(
+        day.join("rollout-root.jsonl"),
+        concat!(
+            r#"{"timestamp":"2026-08-31T10:00:00Z","type":"session_meta","payload":{"id":"root","cwd":"/work/app"}}"#,
+            "\n",
+            r#"{"timestamp":"2026-08-31T10:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"root prompt"}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    store.sync(SyncOptions::default()).unwrap();
+
+    let listed: Vec<String> = store
+        .sessions(CatalogQuery::default())
+        .map(|row| row.unwrap().session_id)
+        .collect();
+    assert_eq!(listed, vec!["root".to_string()]);
+    let children: Vec<String> = store
+        .delegated_descendants(&[SessionIdentity::new("codex", "root")])
+        .unwrap()
+        .into_iter()
+        .map(|child| child.session_id)
+        .collect();
+    assert_eq!(children, vec!["child".to_string()]);
+    let child = store
+        .session(
+            &SessionRef::id(Source::Codex, "child"),
+            SessionQuery::default(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(child.session.discovery_state, DiscoveryState::Delegated);
+    assert!(!child.messages.is_empty());
+}
+
 #[test]
 fn a_nested_sidecar_whose_meta_is_gone_keeps_its_spawner() {
     let temp = tempfile::tempdir().unwrap();
