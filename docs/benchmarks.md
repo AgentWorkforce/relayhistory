@@ -1100,7 +1100,7 @@ rather than to what changed:
   store whose database and WAL stamps are unchanged, and in a store that
   moved reads only the sessions whose row, `message` and `part` stamps moved
   (one aggregate pass per table; see
-  [session-catalog](session-catalog.md#adding-a-provider)).
+  the OpenCode entry in [session-catalog](session-catalog.md)).
 - **Edge lookups walked the source.** Every OpenCode edge cites the one
   store it was read from, so `idx_session_relationships_locator` holds
   44,000 rows under one key, and without statistics SQLite answered the
