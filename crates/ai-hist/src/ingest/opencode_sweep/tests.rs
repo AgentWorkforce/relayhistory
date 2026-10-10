@@ -289,11 +289,21 @@ fn a_same_length_rewrite_is_read_again() {
         .unwrap();
     let start = data.find("\"text\":\"").unwrap() + 8;
     let mut rewritten = data.clone();
-    rewritten.replace_range(start..start + 1, if &data[start..start + 1] == "Z" { "Y" } else { "Z" });
+    rewritten.replace_range(
+        start..start + 1,
+        if &data[start..start + 1] == "Z" {
+            "Y"
+        } else {
+            "Z"
+        },
+    );
     assert_eq!(rewritten.len(), data.len());
     // No `time_updated` in this schema: only the payload changed.
     store
-        .execute("UPDATE part SET data = ?1 WHERE id = ?2", [&rewritten, &part])
+        .execute(
+            "UPDATE part SET data = ?1 WHERE id = ?2",
+            [&rewritten, &part],
+        )
         .unwrap();
     settle(&db);
     assert_eq!(fixture.sweep(std::slice::from_ref(&db), &none), (1, 1));
