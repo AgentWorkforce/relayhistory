@@ -11,7 +11,7 @@
 //!   `session_presences`, `session_commit_links`, `trajectories`,
 //!   `session_observations` and `observation_evidence` carries a `revision`.
 //!   A trigger stamps the current clock on every insert, and on every update
-//!   that changes at least one of the row's columns
+//!   that changes at least one of the columns the row carries
 //!   ([`stamped_columns`](schema::stamped_columns)), so a re-parse that
 //!   upserts a row it already holds, unchanged, leaves it at the revision it
 //!   had and the feed reports nothing for it. A re-seen key

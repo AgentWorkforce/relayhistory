@@ -486,7 +486,10 @@ The revision-stamped change feed: every row of `sessions`, `session_events`,
 `history`, `session_presences`, `session_commit_links`, `trajectories`,
 `session_observations` and `observation_evidence` carries a `revision` drawn
 from the database-wide `observation_clock` and stamped by a trigger on every
-insert and update, so no write site can forget one; a deleted row leaves a
+insert and on every update that changes a column the row carries (below), so no
+write site can forget one: an update that rewrites a row unchanged, or changes
+only `raw_facts_version`, keeps its revision and the feed reports nothing for
+it. A deleted row leaves a
 tombstone at its own revision, which a later insert of the same key clears.
 `changes_since(from, ChangeQuery)` drains
 `Change { kind, source, source_name, session_id, record_key, key, revision, op, columns }`
