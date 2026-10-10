@@ -1524,9 +1524,8 @@ fn corpus_readme_lists_every_fixture_and_quirk() {
 /// the public `Source` enum names exactly the descriptors. Adding a provider without a
 /// fixture fails here.
 ///
-/// A source that is not a provider session at all (a trajectory, a relay row
-/// projected from other sources) has nothing to put in a harness corpus, and
-/// its descriptor says so.
+/// A source with no provider log on disk would have nothing to put in a
+/// harness corpus, and its descriptor would say so.
 #[test]
 fn every_source_choice_has_a_fixture_or_an_exemption() {
     use ai_hist::sources::catalog::{local_source, local_sources, Fixtures};

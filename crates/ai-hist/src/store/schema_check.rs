@@ -33,7 +33,13 @@ pub(super) fn schema_has_required_indexes(
     }
     let mut index =
         conn.prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ? LIMIT 1")?;
-    all_exist(&mut index, required_indexes)
+    if !all_exist(&mut index, required_indexes)? {
+        return Ok(false);
+    }
+    // Rows or tables a retired source left behind are a pending migration
+    // too: a read served before it would list sessions under a source this
+    // build cannot name.
+    Ok(!super::retired_sources::retired_sources_present(conn)?)
 }
 
 /// Whether `lookup`, a one-parameter existence query, finds every name.

@@ -195,7 +195,7 @@ pub(crate) fn devin_cli_dir_under(home: &Path) -> PathBuf {
 /// watched, or a session the sweep catalogued cannot be hydrated afterwards.
 /// Build it with [`ProviderRoots::from_env`] (the CLI's rules: the process
 /// environment's `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME`,
-/// `XDG_DATA_HOME` (for Muse Code and Devin), `OPENCODE_DB`, `OPENCODE_STORAGE_DIR` and `TRAJECTORY_ROOT` override the
+/// `XDG_DATA_HOME` (for Muse Code and Devin), `OPENCODE_DB` and `OPENCODE_STORAGE_DIR` override the
 /// defaults under `home`) or [`ProviderRoots::from_home`] (the defaults under
 /// `home`, with nothing read from the environment — what a test or an
 /// embedder with its own layout wants). The environment is read **once**,
@@ -228,13 +228,6 @@ pub struct ProviderRoots {
     /// OpenCode's legacy `storage/` JSON tree, read only when there is no
     /// `opencode.db`.
     pub opencode_storage_dir: PathBuf,
-    /// Where trajectory records are read from. `Some` names the roots
-    /// outright — `TRAJECTORY_ROOT` under [`ProviderRoots::from_env`], or
-    /// whatever an embedder sets — each entry a `.trajectories` directory or
-    /// a single JSON file; `None` derives them by finding `.trajectories`
-    /// directories under `<home>/Projects` at scan time, so one created
-    /// after the roots were built is still picked up.
-    pub trajectory_roots: Option<Vec<PathBuf>>,
     /// Whether these roots came from environment overrides, so a sweep can
     /// say when a configured root does not exist rather than silently
     /// scanning nothing.
@@ -254,7 +247,6 @@ struct ProviderRootsWire {
     #[serde(default)]
     opencode_db_pinned: bool,
     opencode_storage_dir: PathBuf,
-    trajectory_roots: Option<Vec<PathBuf>>,
     use_env_roots: bool,
 }
 
@@ -278,7 +270,6 @@ impl<'de> Deserialize<'de> for ProviderRoots {
             opencode_db: wire.opencode_db,
             opencode_db_pinned: wire.opencode_db_pinned,
             opencode_storage_dir: wire.opencode_storage_dir,
-            trajectory_roots: wire.trajectory_roots,
             use_env_roots: wire.use_env_roots,
         })
     }
@@ -297,7 +288,6 @@ impl ProviderRoots {
             opencode_db: opencode_db_path(&home),
             opencode_db_pinned: env_dir("OPENCODE_DB").is_some(),
             opencode_storage_dir: opencode_storage_dir(&home),
-            trajectory_roots: trajectory_roots_from_env(),
             use_env_roots: true,
             home,
         }
@@ -320,24 +310,9 @@ impl ProviderRoots {
             opencode_db,
             opencode_db_pinned: false,
             opencode_storage_dir,
-            trajectory_roots: None,
             use_env_roots: false,
         }
     }
-}
-
-/// `TRAJECTORY_ROOT` as a list of roots: a `PATH`-style list whose empty
-/// entries are dropped. `None` when the variable is unset, which means
-/// "derive from `<home>/Projects`"; `Some(vec![])` when it is set to nothing
-/// but empties, which means "no trajectory roots at all" — the variable was
-/// the operator's answer, and it said none.
-fn trajectory_roots_from_env() -> Option<Vec<PathBuf>> {
-    let raw = std::env::var_os("TRAJECTORY_ROOT")?;
-    Some(
-        std::env::split_paths(&raw)
-            .filter(|part| !part.as_os_str().is_empty())
-            .collect(),
-    )
 }
 
 pub fn default_opencode_db_path() -> PathBuf {
@@ -369,6 +344,7 @@ mod tests {
             "muse": "/tmp/legacy-home/.local/share/muse/sessions",
             "opencode_db": "/tmp/legacy-home/.local/share/opencode/opencode.db",
             "opencode_storage_dir": "/tmp/legacy-home/.local/share/opencode/storage",
+            // A field later builds no longer read is ignored.
             "trajectory_roots": null,
             "use_env_roots": false
         }))

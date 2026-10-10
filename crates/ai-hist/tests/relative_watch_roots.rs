@@ -28,8 +28,8 @@ fn a_relative_file_root_matches_the_events_the_watcher_reports() {
 
     // Three spellings of the same kind of root, built while the working
     // directory is the one they are relative to.
-    let bare = PathBuf::from("trajectory.json");
-    let nested = PathBuf::from("runs/trajectory.json");
+    let bare = PathBuf::from("history.json");
+    let nested = PathBuf::from("runs/history.json");
     let absolute = std::fs::canonicalize(dir.path())
         .expect("canonical tempdir")
         .join("absolute.json");
@@ -80,7 +80,7 @@ fn a_relative_file_root_matches_the_events_the_watcher_reports() {
     );
 
     // The bare relative root first: this is the one whose events the loop used
-    // to reject, because the root kept the spelling `trajectory.json` while
+    // to reject, because the root kept the spelling `history.json` while
     // the watcher reported the path it was registered with.
     forces_a_tick(&ticks, &bare, "a bare relative file root");
     // Positive controls: the two spellings that already worked must still

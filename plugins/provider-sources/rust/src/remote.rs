@@ -240,8 +240,8 @@ pub fn ensure_selected_remote_connectors_configured_for_at(
             SOURCE_CHOICES.join(", ")
         );
     }
-    // Reject capabilities before probing credentials too. Relaycast currently
-    // supports full sync only; commercial recall has no targeted hydration.
+    // Reject capabilities before probing credentials too: commercial recall
+    // has no targeted hydration.
     let applicable = SourceConnectorSelection {
         ids: selection
             .ids

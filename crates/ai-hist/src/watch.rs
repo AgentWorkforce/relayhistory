@@ -248,8 +248,8 @@ pub type ErrorSink = Arc<dyn Fn(&anyhow::Error) + Send + Sync>;
 /// when a root that did not exist appears and is picked up.
 pub type DriverSink = Arc<dyn Fn(&DriverStatus) + Send + Sync>;
 /// Re-derives the roots that should be watched. Called on backstop ticks, so a
-/// root that did not exist as a *name* at startup — a project's
-/// `.trajectories` directory created later — can still be picked up.
+/// root that did not exist as a *name* at startup — one an embedder's root
+/// derivation finds only later — can still be picked up.
 pub type RootsFn = Arc<dyn Fn() -> Vec<WatchRoot> + Send + Sync>;
 
 /// Whether an event on `path` belongs to one of `roots`.
@@ -621,7 +621,7 @@ impl WatchLoop {
     /// driver status when it moved.
     fn reconcile_watcher(&self, watch: &mut fs_events::FsWatch, refresh_due: bool) {
         // Re-derive first, then attach: a root can be new as a
-        // *name* (a project that grew a `.trajectories` directory)
+        // *name* (one the root derivation finds only now)
         // rather than merely new on disk, and only the caller
         // knows how to look for those. Only on the backstop,
         // because this is the expensive half.

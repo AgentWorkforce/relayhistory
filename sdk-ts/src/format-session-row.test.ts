@@ -32,7 +32,7 @@ test('pretty rows reject invalid clocks and handle provider rows received at run
   for (const nowMs of [NaN, Infinity, -Infinity]) {
     assert.throws(() => formatSessionRow(session, { nowMs }), InvalidArgumentError);
   }
-  // Remote native catalogs may include trajectory even though local discovery excludes it.
-  const remote = { ...session, source: 'trajectory', locations: ['remote'] } as unknown as CatalogSession;
-  assert.match(formatSessionRow(remote), /↗ \[trajectory\].*\[remote\]/);
+  // A row for a source this build does not know still formats.
+  const remote = { ...session, source: 'future-harness', locations: ['remote'] } as unknown as CatalogSession;
+  assert.match(formatSessionRow(remote), /\[future-harness\].*\[remote\]/);
 });

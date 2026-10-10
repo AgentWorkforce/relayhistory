@@ -4,7 +4,17 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased - Patch]
+## [Unreleased - Minor]
+
+### Breaking Changes
+
+- Trajectories and Relaycast history are no longer sources: `relay` and `trajectory` are unknown values for `--source` and every source filter, `--source-connector relaycast` is an `INVALID_ARGUMENT`, and the TypeScript `SOURCES`, `CHANGE_KINDS` and export kinds no longer list them.
+- A writable open deletes what an earlier release stored for them: the `trajectories` table (with any leftover `trajectory_fts` index and triggers) and every row under the `relay` or `trajectory` source in this crate's own tables (never the upload daemon's `delivery_*` tables), leaving change-feed delete tombstones so consumers drop rows they hold. Because the feed loses the `trajectory` kind, the first writable open after upgrading starts a new feed epoch and drops named consumer cursors, so change-feed consumers replay from the start; a read-only open treats a database still holding such rows as stale.
+
+### Removed
+
+- `.trajectories` directories and `TRAJECTORY_ROOT` are no longer read or watched, and the built-in `relay` catalog adapter is gone; `ai-hist import` skips entries under either source.
+- `ai-hist learn distill`, which wrote its roll-ups into the trajectory store, is removed.
 
 ### Changed
 
@@ -17,6 +27,10 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - An unforced `sync` skips the sweep again when no source changed on a host with an OpenCode or Devin SQLite store: the source fingerprint no longer counts the store's `-shm` index, which every read of the store rewrote.
 - A sweep refreshes canonical project identity only for the sessions written since the database's last refresh, including in a new process: every `ai-hist sync` and every embedder's first sweep re-walked every delegated child before.
 - Reading a session's parents, continuity edges and unresolved continuity evidence, and deleting a session, seek that session's own rows instead of reading every relationship or continuity row of its source, with or without planner statistics.
+
+### Rust API
+
+- `Source::Relay`, `Source::Trajectory`, `ChangeKind::Trajectory`, and `ProviderRoots::trajectory_roots` are removed; a serialized `ProviderRoots` that still carries `trajectory_roots` deserializes with the field ignored.
 
 ## [0.38.0] - 2026-10-10
 

@@ -59,8 +59,6 @@ pub(super) fn trigger_names(kind: ChangeKind) -> [String; 3] {
 ///   instead their writers (`record_relationship`, `observations::upsert`)
 ///   skip an upsert that changes nothing else, so the stamp is the time of the
 ///   last change and an unchanged re-read writes nothing.
-/// - `trajectories.updated_ms` is the trajectory file's mtime, a fact about
-///   the source; a trajectory is re-read only when its stamp moves.
 /// - `session_relationships.created_ms` and
 ///   `session_commit_links.created_at_ms` are written once; no upsert
 ///   rewrites them.

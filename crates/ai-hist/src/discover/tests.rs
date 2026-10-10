@@ -258,21 +258,6 @@ fn every_source_is_either_discoverable_or_explicitly_exempt() {
             "'{source}' is registered but is not a known source"
         );
     }
-    assert!(
-        exempt.contains("trajectory"),
-        "trajectories are derived records and must stay out of session discovery"
-    );
-}
-
-#[test]
-fn discovering_an_exempt_source_is_rejected_with_its_reason() {
-    let conn = catalog();
-    let home = tempfile::tempdir().unwrap();
-    let env = env_at(&conn, home.path());
-    let error = discover_sessions_with_env(&env, &only(&["trajectory"]), |_| {}).unwrap_err();
-    let message = format!("{error:#}");
-    assert!(message.contains("exempt"), "{message}");
-    assert!(message.contains("derived trajectory records"), "{message}");
 }
 
 #[test]
@@ -280,8 +265,11 @@ fn discovering_an_unknown_source_is_rejected() {
     let conn = catalog();
     let home = tempfile::tempdir().unwrap();
     let env = env_at(&conn, home.path());
-    let error = discover_sessions_with_env(&env, &only(&["nope"]), |_| {}).unwrap_err();
-    assert!(format!("{error:#}").contains("invalid source"));
+    // `relay` and `trajectory` were sources once, and are unknown now.
+    for source in ["nope", "relay", "trajectory"] {
+        let error = discover_sessions_with_env(&env, &only(&[source]), |_| {}).unwrap_err();
+        assert!(format!("{error:#}").contains("invalid source"), "{source}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2347,55 +2335,6 @@ fn opencode_waits_for_a_transient_busy_writer() {
 }
 
 // ---------------------------------------------------------------------------
-// relay
-// ---------------------------------------------------------------------------
-
-#[test]
-fn relay_discovers_from_already_synced_rows_and_never_touches_the_network() {
-    let conn = catalog();
-    let home = tempfile::tempdir().unwrap();
-    for (id, prompt, ts) in [
-        ("ch:general", "[ana] deploy is red", 1_750_000_800_000_i64),
-        ("ch:general", "[bo] rolling back", 1_750_000_900_000),
-    ] {
-        crate::insert_history(
-            &conn,
-            &crate::HistoryEntry {
-                id: 0,
-                source: "relay".into(),
-                session_id: Some(id.into()),
-                project: Some("ws-1".into()),
-                prompt: prompt.into(),
-                prompt_hash: None,
-                timestamp_ms: ts,
-            },
-        )
-        .unwrap();
-    }
-
-    let found = discover(&conn, home.path(), &only(&["relay"]));
-    let row = found.row("ch:general");
-    assert_eq!(row.first_prompt.as_deref(), Some("[ana] deploy is red"));
-    assert_eq!(row.first_activity_ms, Some(1_750_000_800_000));
-    assert_eq!(row.last_activity_ms, Some(1_750_000_900_000));
-    // Relay has no local working directory to report, and inventing one would
-    // be a fabrication.
-    assert_eq!(row.cwd, None);
-    // No local files were opened at all: relay is a database-only adapter.
-    assert_eq!(found.summary.counters.files_opened, 0);
-}
-
-#[test]
-fn relay_with_nothing_synced_discovers_nothing_rather_than_failing() {
-    let conn = catalog();
-    let home = tempfile::tempdir().unwrap();
-    let found = discover(&conn, home.path(), &only(&["relay"]));
-    assert!(found.rows.is_empty());
-    assert!(found.summary.diagnostics.is_empty());
-    assert_eq!(found.summary.providers["relay"].candidates, 0);
-}
-
-// ---------------------------------------------------------------------------
 // cross-provider
 // ---------------------------------------------------------------------------
 
@@ -2828,27 +2767,6 @@ fn the_catalog_query_reads_only_the_sessions_table() {
             "the cache-only listing must not touch {forbidden}: {sql}"
         );
     }
-}
-
-#[test]
-fn trajectory_rows_never_appear_in_a_session_listing() {
-    let conn = catalog();
-    conn.execute(
-        "INSERT INTO sessions (session_id, source, last_activity_ms, discovery_state) \
-         VALUES ('traj-1', 'trajectory', 9999999999999, 'full')",
-        [],
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO sessions (session_id, source, last_activity_ms, discovery_state) \
-         VALUES ('claude-1', 'claude', 1, 'shallow')",
-        [],
-    )
-    .unwrap();
-    mark_session_presence(&conn, "claude", "claude-1", SessionLocation::Local).unwrap();
-    let rows = list_session_catalog(&conn, &CatalogListOptions::default()).unwrap();
-    assert_eq!(rows.len(), 1);
-    assert_eq!(rows[0].source, "claude");
 }
 
 #[test]

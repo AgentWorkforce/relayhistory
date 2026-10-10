@@ -349,10 +349,7 @@ fn cli(home: &Path, db_path: &Path, args: &[&str]) -> Command {
         .env("USERPROFILE", home)
         .env("XDG_DATA_HOME", home.join("xdg"))
         .env("OPENCODE_DB", home.join("opencode.db"))
-        .env_remove("AI_HIST_DB")
-        .env_remove("TRAJECTORY_ROOT")
-        .env_remove("RELAYCAST_API_KEY")
-        .env_remove("RELAYCAST_WORKSPACE_ID");
+        .env_remove("AI_HIST_DB");
     command
 }
 

@@ -55,7 +55,7 @@ consumer whether summing records is meaningful.
 A session summary may report several modes. When it does, its totals mix units
 and should be read per mode rather than as one number.
 
-`cursor`, `relay`, `trajectory` and `opencode` record no usage this crate can
+`cursor` and `opencode` record no usage this crate can
 normalize; asking for one is `USAGE_UNKNOWN_SOURCE` rather than a zero.
 
 ### Claude

@@ -1,6 +1,6 @@
 # ai-hist
 
-Local coding-agent session history for Claude Code, Codex, Cursor, Grok, OpenCode, and Agent Relay.
+Local coding-agent session history for Claude Code, Codex, Cursor, Grok, Muse Code, OpenCode, and Devin CLI.
 
 ```rust,no_run
 use ai_hist::{CatalogQuery, SessionQuery, SessionStore};

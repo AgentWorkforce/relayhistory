@@ -653,19 +653,9 @@ mod compact_tests {
             )
             .unwrap();
         }
-        tx.execute(
-            "INSERT INTO trajectories \
-             (id, decisions_json, retrospective_json, search_text, updated_ms, timestamp_ms) \
-             VALUES ('t-gone', '[]', '{}', 'obsolete', 1, 1), \
-                    ('t-kept', '[]', '{}', 'needle trajectory', 2, 2)",
-            [],
-        )
-        .unwrap();
         tx.commit().unwrap();
         // Free pages: the rows a retention pass or a rewrite would drop.
         conn.execute("DELETE FROM history WHERE timestamp_ms % 4 <> 0", [])
-            .unwrap();
-        conn.execute("DELETE FROM trajectories WHERE id = 't-gone'", [])
             .unwrap();
         conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
         db_path

@@ -34,7 +34,7 @@ copies message.usage onto every content block").
 
 1. **relayhistory is the single owner of acquiring, parsing and storing session
    evidence** for every harness — Claude Code, Codex, Cursor, Grok, OpenCode,
-   Devin, Agent Relay, and any future collector. "Evidence" is everything the log
+   Devin, and any future collector. "Evidence" is everything the log
    contains that any downstream consumer needs: messages, content blocks, usage,
    model, stop reason, request ids, tool calls, tool results (with sizes, errors
    and truncation), file edits, compaction and summary markers, control and meta
@@ -123,36 +123,35 @@ Legend:
 - **—** — not applicable, and therefore not a backlog item: the provider emits
   nothing to capture, or the record type does not apply to that source at all.
 
-`trajectory` is not a harness. It is a derived record type
-(`DISCOVERY_EXEMPTIONS` in `src/discover.rs`, "derived trajectory records, not
-provider sessions") that lands in the `trajectories` table and is filtered out
-of `sessions list`. It is listed for completeness; every session-evidence row is
-`—` for it by construction.
+**Update (2026-10-09):** the `relay` (Relaycast-backed prompts) and
+`trajectory` (derived `.trajectories` records) columns were removed with the
+sources themselves; relayhistory no longer ingests either, and a writable open
+deletes what an earlier release stored for them.
 
-| Record type                                                        | claude | codex | cursor | grok | muse | opencode | devin | relay | trajectory | Owner / closes                                                                                                                                                                                                                                                                |
-| ------------------------------------------------------------------ | ------ | ----- | ------ | ---- | ---- | -------- | ----- | ----- | ---------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Prompt / `history` row                                             | ✓      | ✓     | ✓      | ◐    | ✓    | ✓        | ✓     | ✓     | —          | grok timestamps: [#167](https://github.com/AgentWorkforce/relayhistory/issues/167)                                                                                                                                                                                            |
-| `session_events` — `text`                                          | ✓      | ✓¹    | ✓      | ✗    | ✓    | ✓        | ✓     | ✗     | —          | [#166](https://github.com/AgentWorkforce/relayhistory/issues/166) / [#167](https://github.com/AgentWorkforce/relayhistory/issues/167) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168) / [#177](https://github.com/AgentWorkforce/relayhistory/issues/177) |
-| `session_events` — `thinking`                                      | ✓      | ✓     | —      | ✗    | ◐    | ✓        | ✓     | ✗     | —          | [#166](https://github.com/AgentWorkforce/relayhistory/issues/166) / [#167](https://github.com/AgentWorkforce/relayhistory/issues/167) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                     |
-| `session_events` — `tool_use`                                      | ✓      | ✓     | ✓      | ✗    | ✓    | ✓        | ✓     | ✗     | —          | [#166](https://github.com/AgentWorkforce/relayhistory/issues/166) / [#167](https://github.com/AgentWorkforce/relayhistory/issues/167) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                     |
-| `session_events` — `tool_result`                                   | ✓      | ✓     | —      | ✗    | ✓    | ✓        | ✓     | ✗     | —          | [#166](https://github.com/AgentWorkforce/relayhistory/issues/166) / [#167](https://github.com/AgentWorkforce/relayhistory/issues/167) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                     |
-| Model, per event                                                   | ✓      | ✓     | —      | ◐    | ✓    | ✓        | ✓     | ✗     | —          | [#166](https://github.com/AgentWorkforce/relayhistory/issues/166) / [#167](https://github.com/AgentWorkforce/relayhistory/issues/167) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                     |
-| Token usage                                                        | ✓      | ◐     | —      | ◐    | ✓    | ✓        | ◐     | ✗     | —          | [#172](https://github.com/AgentWorkforce/relayhistory/issues/172) (supersedes #99) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168) / grok: [#212](https://github.com/AgentWorkforce/relayhistory/issues/212)                                              |
-| Token usage — each streamed record verbatim                        | ✓      | —     | —      | —    | —    | —        | —     | —     | —          | `session_events.record_token_json`; other sources store usage once per record                                                                                                                                                                                                 | 
-| `request_id`                                                       | ✗      | —     | —      | —    | ✓    | —        | ✓     | —     | —          | [#164](https://github.com/AgentWorkforce/relayhistory/issues/164)                                                                                                                                                                                                             |
-| `stop_reason`                                                      | ✗      | —     | —      | —    | ✓    | ✓        | ✓     | —     | —          | [#164](https://github.com/AgentWorkforce/relayhistory/issues/164) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                                                                                         |
-| Codex `turn_id`                                                    | —      | ✗     | —      | —    | —    | —        | —     | —     | —          | [#164](https://github.com/AgentWorkforce/relayhistory/issues/164)                                                                                                                                                                                                             |
-| Sidechain / meta flags                                             | ✓      | ✗     | —      | —    | —    | —        | —     | —     | —          | [#164](https://github.com/AgentWorkforce/relayhistory/issues/164)                                                                                                                                                                                                             |
-| Tool calls (`tool_calls`)                                          | ✓      | ✓     | ✓      | ✗    | ✓    | ✓        | ✓     | ✗     | —          | [#166](https://github.com/AgentWorkforce/relayhistory/issues/166) / [#167](https://github.com/AgentWorkforce/relayhistory/issues/167) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                     |
-| Tool-result fidelity (identity, bytes, truncation, hash, ordering) | ✓      | ✓     | —      | ✗    | ✓    | ✗        | ✓     | ✗     | —          | [#171](https://github.com/AgentWorkforce/relayhistory/issues/171)                                                                                                                                                                                                             |
-| File edits (`file_edits`)                                          | ✓      | ✓     | ✓      | ✗    | ✓    | ✓        | ✓     | ✗     | —          | [#166](https://github.com/AgentWorkforce/relayhistory/issues/166) / [#167](https://github.com/AgentWorkforce/relayhistory/issues/167) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                     |
-| Compaction / summary markers                                       | ✗      | ✗     | ✗      | ✗    | ✗    | ✓        | ✓     | ✗     | —          | [#165](https://github.com/AgentWorkforce/relayhistory/issues/165) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                                                                                         |
-| Control / lifecycle rows                                           | ✓      | ✓     | ✗      | ✗    | ✓    | ✓        | ◐     | ✗     | —          | [#165](https://github.com/AgentWorkforce/relayhistory/issues/165), [#180](https://github.com/AgentWorkforce/relayhistory/issues/180)                                                                                                                                          |
-| Relationship — delegated                                           | ◐      | ✓     | —      | —    | ✓    | ✓        | —     | —     | —          | [#170](https://github.com/AgentWorkforce/relayhistory/issues/170) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                                                                                         |
-| Relationship — fork / resume / continuation                        | ✗      | ✓     | ✗      | ✗    | ✗    | ✗        | —     | ✗     | —          | [#170](https://github.com/AgentWorkforce/relayhistory/issues/170)                                                                                                                                                                                                             |
-| Session metadata (cwd, branch, versions)                           | ◐      | ✓     | ◐      | ◐    | ◐    | ◐        | ◐     | ✗     | —          | [#164](https://github.com/AgentWorkforce/relayhistory/issues/164), [#177](https://github.com/AgentWorkforce/relayhistory/issues/177)                                                                                                                                          |
-| Canonical `project_key`                                            | ✗      | ✗     | ✗      | ✗    | ✗    | ✗        | ✗     | ✗     | —          | [#175](https://github.com/AgentWorkforce/relayhistory/issues/175)                                                                                                                                                                                                             |
-| Declared hydration `capability`                                    | ◐      | ◐     | ◐      | ◐    | ◐    | ◐        | ◐     | ✗     | —          | [#169](https://github.com/AgentWorkforce/relayhistory/issues/169)                                                                                                                                                                                                             |
+| Record type                                                        | claude | codex | cursor | grok | muse | opencode | devin | Owner / closes                                                                                                                                                                                                                                                                |
+| ------------------------------------------------------------------ | ------ | ----- | ------ | ---- | ---- | -------- | ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Prompt / `history` row                                             | ✓      | ✓     | ✓      | ◐    | ✓    | ✓        | ✓     | grok timestamps: [#167](https://github.com/AgentWorkforce/relayhistory/issues/167)                                                                                                                                                                                            |
+| `session_events` — `text`                                          | ✓      | ✓¹    | ✓      | ✓    | ✓    | ✓        | ✓     | [#166](https://github.com/AgentWorkforce/relayhistory/issues/166) / [#167](https://github.com/AgentWorkforce/relayhistory/issues/167) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168) / [#177](https://github.com/AgentWorkforce/relayhistory/issues/177) |
+| `session_events` — `thinking`                                      | ✓      | ✓     | —      | ✓    | ◐    | ✓        | ✓     | [#166](https://github.com/AgentWorkforce/relayhistory/issues/166) / [#167](https://github.com/AgentWorkforce/relayhistory/issues/167) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                     |
+| `session_events` — `tool_use`                                      | ✓      | ✓     | ✓      | ✓    | ✓    | ✓        | ✓     | [#166](https://github.com/AgentWorkforce/relayhistory/issues/166) / [#167](https://github.com/AgentWorkforce/relayhistory/issues/167) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                     |
+| `session_events` — `tool_result`                                   | ✓      | ✓     | —      | ✓    | ✓    | ✓        | ✓     | [#166](https://github.com/AgentWorkforce/relayhistory/issues/166) / [#167](https://github.com/AgentWorkforce/relayhistory/issues/167) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                     |
+| Model, per event                                                   | ✓      | ✓     | —      | ✓    | ✓    | ✓        | ✓     | [#166](https://github.com/AgentWorkforce/relayhistory/issues/166) / [#167](https://github.com/AgentWorkforce/relayhistory/issues/167) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                     |
+| Token usage                                                        | ✓      | ◐     | —      | ◐    | ✓    | ✓        | ◐     | [#172](https://github.com/AgentWorkforce/relayhistory/issues/172) (supersedes #99) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168) / grok: [#212](https://github.com/AgentWorkforce/relayhistory/issues/212)                                              |
+| Token usage — each streamed record verbatim                        | ✓      | —     | —      | —    | —    | —        | —     | `session_events.record_token_json`; other sources store usage once per record                                                                                                                                                                                                 | 
+| `request_id`                                                       | ✗      | —     | —      | —    | ✓    | —        | ✓     | [#164](https://github.com/AgentWorkforce/relayhistory/issues/164)                                                                                                                                                                                                             |
+| `stop_reason`                                                      | ✗      | —     | —      | —    | ✓    | ✓        | ✓     | [#164](https://github.com/AgentWorkforce/relayhistory/issues/164) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                                                                                         |
+| Codex `turn_id`                                                    | —      | ✗     | —      | —    | —    | —        | —     | [#164](https://github.com/AgentWorkforce/relayhistory/issues/164)                                                                                                                                                                                                             |
+| Sidechain / meta flags                                             | ✓      | ✗     | —      | —    | —    | —        | —     | [#164](https://github.com/AgentWorkforce/relayhistory/issues/164)                                                                                                                                                                                                             |
+| Tool calls (`tool_calls`)                                          | ✓      | ✓     | ✓      | ✓    | ✓    | ✓        | ✓     | [#166](https://github.com/AgentWorkforce/relayhistory/issues/166) / [#167](https://github.com/AgentWorkforce/relayhistory/issues/167) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                     |
+| Tool-result fidelity (identity, bytes, truncation, hash, ordering) | ✓      | ✓     | —      | ✓    | ✓    | ✗        | ✓     | [#171](https://github.com/AgentWorkforce/relayhistory/issues/171)                                                                                                                                                                                                             |
+| File edits (`file_edits`)                                          | ✓      | ✓     | ✓      | ✓    | ✓    | ✓        | ✓     | [#166](https://github.com/AgentWorkforce/relayhistory/issues/166) / [#167](https://github.com/AgentWorkforce/relayhistory/issues/167) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                     |
+| Compaction / summary markers                                       | ✗      | ✗     | ✗      | ✓    | ✗    | ✓        | ✓     | [#165](https://github.com/AgentWorkforce/relayhistory/issues/165) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                                                                                         |
+| Control / lifecycle rows                                           | ✓      | ✓     | ✗      | ◐    | ✓    | ✓        | ◐     | [#165](https://github.com/AgentWorkforce/relayhistory/issues/165), [#180](https://github.com/AgentWorkforce/relayhistory/issues/180)                                                                                                                                          |
+| Relationship — delegated                                           | ◐      | ✓     | —      | ◐    | ✓    | ✓        | —     | [#170](https://github.com/AgentWorkforce/relayhistory/issues/170) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                                                                                         |
+| Relationship — fork / resume / continuation                        | ✗      | ✓     | ✗      | ✗    | ✗    | ✗        | —     | [#170](https://github.com/AgentWorkforce/relayhistory/issues/170)                                                                                                                                                                                                             |
+| Session metadata (cwd, branch, versions)                           | ◐      | ✓     | ◐      | ◐    | ◐    | ◐        | ◐     | [#164](https://github.com/AgentWorkforce/relayhistory/issues/164), [#177](https://github.com/AgentWorkforce/relayhistory/issues/177)                                                                                                                                          |
+| Canonical `project_key`                                            | ✗      | ✗     | ✗      | ✗    | ✗    | ✗        | ✗     | [#175](https://github.com/AgentWorkforce/relayhistory/issues/175)                                                                                                                                                                                                             |
+| Declared hydration `capability`                                    | ◐      | ◐     | ◐      | ◐    | ◐    | ◐        | ◐     | [#169](https://github.com/AgentWorkforce/relayhistory/issues/169)                                                                                                                                                                                                             |
 
 ¹ Codex text includes CLI `event_msg/agent_message` and desktop
 `response_item/message` with assistant `output_text` blocks. Adjacent equal-text
@@ -164,19 +163,21 @@ payload IDs are retained separately as `provider_message_id`.
 ### Why each non-`✓` cell reads the way it does
 
 **Prompt / `history` row.** Every source populates `history`. Grok is `◐`
-because `ingest_grok_session` writes `timestamp_ms: session.first_ts + idx` —
-the ordinal index, not a provider clock, so prompt timestamps inside a grok
-session are synthesized. Relay has no local transcript at all: its rows arrive
-from a remote connector, and `RelayProvider` in `src/discover.rs` derives its
-catalog row from `history` rows a previous sync already stored.
+because a prompt's timestamp is the record's own clock only when the chat line
+carries one; otherwise `resolve_grok_ts` takes the turn start from
+`updates.jsonl`, then the previous record's time, then the session's creation
+time, so some prompt timestamps inside a grok session are inferred.
 
-**Event rows, model, tool calls, file edits — grok, relay.**
-`ingest_grok_session` inserts `history` rows and nothing else. Relay never
-reaches an event-level parser: `source_snapshot` in `src/ingest/hydrate.rs`
-returns `HYDRATION_UNSUPPORTED` — "Relay catalog evidence has no configured
-full-evidence connector". These two sources are prompts-only. Model is `◐` for
-grok because the shallow catalog read records a `models` list from grok's
-`summary.json` while no per-event model is ever stored. OpenCode's cells are
+**Event rows, model, tool calls, file edits — grok.**
+`ingest_grok_session` reads the whole session directory: prose, thinking,
+tool calls and their results become `session_events` and `tool_calls` (results
+joined by call id), file-editing tools become `file_edits`, an assistant
+record's `model` is stored on its events, compaction checkpoints become
+`compaction_boundary` markers, and a `subagents/` entry that names a child
+session becomes a `delegated` edge (`◐`: an entry with no session id stays
+unlinked evidence). Control rows are `◐`: the system preamble and Grok-injected
+turns are kept as `system` and `synthetic_turn` markers, but no other lifecycle
+record is. OpenCode's cells are
 `✓`: one normalizer (`src/ingest/opencode.rs`) writes every assistant message
 as evidence from both of its storage layouts.
 
@@ -328,7 +329,7 @@ with a null child id. A linked child's edge names the session whose tool call
 started it (a nested subagent's parent is the subagent that spawned it), and
 its evidence is read by id through `SessionStore::session`. `relationship_capabilities().stable_child_identity` is
 `always` for codex, opencode and muse, `sometimes` for claude and grok, and
-`never` for cursor/devin/relay. Codex fork is `✓`:
+`never` for cursor/devin. Codex fork is `✓`:
 the `fork` edge is recorded from the fields Codex actually writes on
 `session_meta` — `forked_from_id` for a human fork, and
 `source.subagent.thread_spawn.parent_thread_id` for a subagent spawn — with the
@@ -364,8 +365,7 @@ writes it: codex is the one complete row (`session_meta` gives originator,
 record `version` and cwd/branch; cursor gets a cwd decoded from the directory
 name; grok and opencode get cwd and (for grok) branch; devin gets
 `working_directory`, `workspace_dirs` and `model`, and the CLI version only
-inside an `agent_manifest` marker when a transcript export exists; relay has
-none. See the
+inside an `agent_manifest` marker when a transcript export exists. See the
 per-provider matrix in
 [`docs/session-catalog.md`](../session-catalog.md#per-provider-capability-matrix),
 which this table must stay consistent with.
@@ -378,8 +378,7 @@ another source would report for the same repository.
 **Declared hydration `capability`.** `hydrate.rs` returns
 `capability: "full".to_string()` unconditionally on the success path, for every
 source. A prompts-only source therefore reports full evidence coverage. That is
-a bug, not a policy; it is `◐` for every file-backed source and `✗` for relay,
-which cannot hydrate at all.
+a bug, not a policy; it is `◐` for every file-backed source.
 
 ## Store shape: one writer implementation, not one writer process
 
@@ -459,8 +458,7 @@ exist; the escalation triggers above are restated there.
   cell above must become `✓` and the matrix must be edited in the same PR that
   closes the issue. A parity PR that does not touch this table is incomplete.
   A `—` cell is **not** a backlog item — it means the provider emits nothing to
-  capture, or the row does not apply to that record type at all (the whole
-  `trajectory` column). Turning a `—` into a `✓` is out of scope by
+  capture, or the row does not apply to that record type at all. Turning a `—` into a `✓` is out of scope by
   construction; if a provider starts emitting the field, change the cell to `✗`
   first and open an issue for it.
 - burn's cutover
