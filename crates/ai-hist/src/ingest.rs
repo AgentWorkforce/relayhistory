@@ -15,6 +15,7 @@ use std::io::{self, BufRead, BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+mod claude_record_rows;
 mod claude_standalone;
 pub(crate) mod codex;
 pub(crate) mod control;
@@ -31,6 +32,9 @@ pub(crate) mod opencode;
 pub(crate) mod tool_result_facts;
 pub(crate) mod transcript_cursor;
 
+#[cfg(test)]
+use claude_record_rows::{delete_claude_record_rows, CLAUDE_RECORD_ROWS};
+use claude_record_rows::{heal_claude_record_rows, HealedRows};
 use claude_standalone::{
     claude_record_stores_no_event, claude_thinking_event_text, ClaudeRecordWalk,
     CLAUDE_STANDALONE_RECORDS_GENERATION,
@@ -9470,63 +9474,6 @@ pub(crate) fn ingest_claude_transcript(conn: &Connection, path: &Path) -> Result
     ingest_claude_transcript_as(conn, path, None)
 }
 
-/// The rows one Claude record produced, per table, as `(table, condition)`
-/// over `(session_id, message_uuid)`. Event and marker uids are the record's
-/// uuid plus `:`-suffixes, so the prefix is a range on the uid -- `:` and `;`
-/// are adjacent bytes -- which the `(source, session_id, uid)` unique index
-/// answers, and a `_` or `%` in a provider id is a literal byte. The parser
-/// retires a record's rows under the parent for every sidechain record it
-/// moves onto its child, so a scan of the session here would make each
-/// re-read of a sidecar quadratic in the size of the parent session.
-const CLAUDE_RECORD_ROWS: [(&str, &str); 4] = [
-    (
-        "session_events",
-        "source = 'claude' AND session_id = ?1 \
-         AND event_uid >= ?2 || ':' AND event_uid < ?2 || ';'",
-    ),
-    (
-        "tool_calls",
-        "source = 'claude' AND session_id = ?1 AND message_id = ?2",
-    ),
-    (
-        "file_edits",
-        "source = 'claude' AND session_id = ?1 AND message_id = ?2",
-    ),
-    // Markers are derived from the same record and keyed on the same prefix,
-    // so they move with it rather than outliving it under the old identity.
-    (
-        "session_markers",
-        "source = 'claude' AND session_id = ?1 \
-         AND marker_uid >= ?2 || ':' AND marker_uid < ?2 || ';'",
-    ),
-];
-
-/// Remove everything a single transcript record produced under one session id.
-///
-/// `message_uuid` is the same identity insertion derives event uids from and
-/// stamps on the rows it derives from a record's tool use, so this reaches the
-/// record's events, its tool calls, its file edits and its markers together —
-/// including records with no `uuid` of their own, which fall back to the
-/// message id or a hash of the record. Leaving the derived rows behind would
-/// keep a parent exposing a delegated thread's actions as its own long after
-/// the events moved to the child.
-fn delete_claude_record_rows(
-    conn: &Connection,
-    session_id: &str,
-    message_uuid: &str,
-) -> Result<()> {
-    for (table, condition) in CLAUDE_RECORD_ROWS {
-        crate::store::retire_evidence_share(
-            conn,
-            table,
-            condition,
-            params![session_id, message_uuid],
-            SessionLocation::Local,
-        )?;
-    }
-    Ok(())
-}
-
 /// Message ids only a pre-upgrade parse could have stored: current parses
 /// never emit positional `{stem}:{line}` identities. Scoped to one file stem
 /// and session, filtered in Rust so a stem containing SQL wildcards cannot
@@ -10132,12 +10079,14 @@ fn ingest_claude_record(
     // attributed every sidechain row to the parent. Re-reading the file
     // removes the stale rows under the identity they were written with, so a
     // re-parse moves them onto the child instead of duplicating them across
-    // both.
+    // both. Asked before it is done: on a store the current parser built
+    // there is nothing under the parent, and the retirement's eight
+    // statements per record were most of a live sweep's time.
     // Pre-upgrade positional leftovers match by full stored record,
     // unique or preserved: the live index cannot identify them after a
     // rewrite.
     if session_id != record_session_id {
-        delete_claude_record_rows(conn, record_session_id, message_uuid)?;
+        heal_claude_record_rows(conn, record_session_id, message_uuid, HealedRows::All)?;
         if id_less {
             heal_legacy_positional_record(
                 conn,
@@ -10157,7 +10106,12 @@ fn ingest_claude_record(
         // An earlier parser stored the notice as assistant output under this
         // same identity; those rows are this record's and nothing else's, so
         // they are replaced by the marker rather than left beside it.
-        delete_claude_record_rows(conn, session_id, message_uuid)?;
+        heal_claude_record_rows(
+            conn,
+            session_id,
+            message_uuid,
+            HealedRows::ExceptNoticeMarker,
+        )?;
         let text = message
             .and_then(|m| m.get("content"))
             .map(claude_user_text)
