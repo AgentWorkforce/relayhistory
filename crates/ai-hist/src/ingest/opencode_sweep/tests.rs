@@ -244,6 +244,74 @@ fn a_session_an_earlier_store_drops_is_read_from_the_next_one() {
     assert_eq!(fixture.sweep(&stores, &none), (0, 0));
 }
 
+/// A part the loader places under its message's session is stamped there
+/// too, whatever its own `session_id` holds. `schema` reshapes the store's
+/// indexes before the first sweep.
+fn a_rewritten_part_owned_by_its_message_is_read_again(schema: &str) {
+    let mut fixture = Fixture::new();
+    let db = fixture.root.join("opencode.db");
+    let store = provider_store(&db);
+    store.execute_batch(schema).unwrap();
+    // The message is the root's; the part names no session of its own.
+    store
+        .execute_batch(
+            "INSERT INTO message (id, session_id, time_created, data) VALUES \
+               ('msg_sqlite_u9', 'ses_sqlite_root', 1776643300000, \
+                '{\"id\":\"msg_sqlite_u9\",\"sessionID\":\"ses_sqlite_root\",\"role\":\"user\",\"time\":{\"created\":1776643300000}}'); \
+             INSERT INTO part (id, message_id, session_id, time_created, data) VALUES \
+               ('prt_sqlite_u9', 'msg_sqlite_u9', NULL, 1776643300000, \
+                '{\"type\":\"text\",\"text\":\"one more turn\"}');",
+        )
+        .unwrap();
+    settle(&db);
+    let none = SweepRepairs::default();
+    assert_eq!(fixture.sweep(std::slice::from_ref(&db), &none), (1, 2));
+    let text = |fixture: &Fixture| -> String {
+        fixture
+            .conn
+            .query_row(
+                "SELECT text FROM session_events \
+                 WHERE session_id = ?1 AND message_id = 'msg_sqlite_u9'",
+                [ROOT],
+                |row| row.get(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(text(&fixture), "one more turn");
+    assert_eq!(fixture.sweep(std::slice::from_ref(&db), &none), (0, 0));
+    store
+        .execute(
+            "UPDATE part SET data = '{\"type\":\"text\",\"text\":\"one more turn, edited\"}' \
+             WHERE id = 'prt_sqlite_u9'",
+            [],
+        )
+        .unwrap();
+    settle(&db);
+    assert_eq!(fixture.sweep(std::slice::from_ref(&db), &none), (1, 1));
+    assert_eq!(text(&fixture), "one more turn, edited");
+}
+
+/// `part(message_id)` indexed and `part(session_id)` not: the per-session
+/// loader reads parts by message id, so a part whose `session_id` is NULL
+/// is read into its message's session, and its rewrite must move that
+/// session's stamp rather than fall under no session at all.
+#[test]
+fn a_part_read_by_message_id_is_stamped_under_its_messages_session() {
+    a_rewritten_part_owned_by_its_message_is_read_again("DROP INDEX part_session_idx;");
+}
+
+/// No index the loader can seek on: the store is read whole and every part
+/// is placed through the message map, so the stamp groups parts by message
+/// here as well, even though `part.session_id` exists.
+#[test]
+fn a_part_read_in_one_pass_is_stamped_under_its_messages_session() {
+    a_rewritten_part_owned_by_its_message_is_read_again(
+        "DROP INDEX part_session_idx; \
+         DROP INDEX part_message_id_id_idx; \
+         DROP INDEX message_session_time_created_id_idx;",
+    );
+}
+
 fn copy_tree(from: &Path, to: &Path) {
     for entry in fs::read_dir(from).unwrap() {
         let entry = entry.unwrap();
