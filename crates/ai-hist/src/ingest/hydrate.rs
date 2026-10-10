@@ -11466,12 +11466,10 @@ mod tests {
             crate::discover::missing_evidence_kinds("cursor"),
             vec![EvidenceKind::Relationship],
         );
-        // Relay rows come out of already-ingested history and an unknown
-        // source has no adapter at all: neither declares anything.
-        assert!(crate::discover::declared_evidence_kinds("relay").is_empty());
+        // An unknown source has no adapter at all, so it declares nothing.
         assert!(crate::discover::declared_evidence_kinds("not-a-provider").is_empty());
         assert_eq!(
-            crate::discover::missing_evidence_kinds("relay"),
+            crate::discover::missing_evidence_kinds("not-a-provider"),
             FULL_SESSION_KINDS.to_vec()
         );
     }

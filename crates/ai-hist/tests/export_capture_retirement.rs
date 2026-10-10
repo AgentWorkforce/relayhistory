@@ -22,7 +22,6 @@ const CAPTURED: &[&str] = &[
     "session_presences",
     "session_relationships",
     "session_commit_links",
-    "trajectories",
     "session_observations",
     "observation_evidence",
     "session_markers",
@@ -120,7 +119,6 @@ DELETE FROM delivery_journal WHERE seq < 3;
         }
         let session = match *table {
             "session_relationships" => "parent_session_id",
-            "trajectories" => "id",
             _ => "session_id",
         };
         conn.execute_batch(&format!(

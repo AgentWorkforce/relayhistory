@@ -12,7 +12,6 @@ test('selection prefers shallow sessions and rotates across providers', () => {
     session('claude', 'c2'),
     session('codex', 'x1'),
     session('grok', 'g1', 'full'),
-    session('relay', 'unsupported'),
     { ...session('cursor', 'remote'), locations: ['remote'] },
   ], 4);
   assert.deepEqual(selected.map(({ source, sessionId }) => `${source}:${sessionId}`), [

@@ -20,7 +20,7 @@
 
 use crate::discover::{
     ClaudeProvider, CodexProvider, CursorProvider, DevinProvider, GrokProvider, MuseProvider,
-    OpencodeProvider, RelayProvider, ShallowSessionProvider, SourceExemption,
+    OpencodeProvider, ShallowSessionProvider, SourceExemption,
 };
 use crate::hydrate::{self, IngestSelectedFn};
 use crate::ProviderRoots;
@@ -54,7 +54,9 @@ pub(crate) enum Discovery {
     /// Its shallow adapter. Built fresh per call, because an adapter may carry
     /// per-pass state.
     Provider(fn() -> Box<dyn ShallowSessionProvider>),
-    /// No adapter, deliberately, and why.
+    /// No adapter, deliberately, and why. No built-in source is exempt today;
+    /// the variant keeps the `exempt_sources` contract a decision per source.
+    #[allow(dead_code)]
     Exempt(&'static str),
 }
 
@@ -65,10 +67,12 @@ pub(crate) enum Hydration {
     Parser(IngestSelectedFn),
     /// A valid catalog source that no local parser backs. Hydration accepts
     /// the request and then refuses it with `HYDRATION_UNSUPPORTED` and this
-    /// message.
+    /// message. No built-in source takes this today.
+    #[allow(dead_code)]
     NoConnector(&'static str),
     /// Not a hydratable catalog source at all: rejected as an invalid
-    /// argument.
+    /// argument. No built-in source takes this today.
+    #[allow(dead_code)]
     Unsupported,
 }
 
@@ -216,28 +220,6 @@ pub(crate) const LOCAL_SOURCES: &[LocalSource] = &[
             in_project: true,
         }),
         fixtures: Fixtures::Dir("grok"),
-    },
-    LocalSource {
-        id: "relay",
-        discovery: Discovery::Provider(|| Box::new(RelayProvider)),
-        hydration: Hydration::NoConnector(
-            "Relay catalog evidence has no configured full-evidence connector",
-        ),
-        transcript_roots: |_| Vec::new(),
-        relationships: Relationships::NONE,
-        resume: None,
-        fixtures: Fixtures::Exempt(
-            "projected from already-synced local rows; no provider log on disk to capture",
-        ),
-    },
-    LocalSource {
-        id: "trajectory",
-        discovery: Discovery::Exempt("derived trajectory records, not provider sessions"),
-        hydration: Hydration::Unsupported,
-        transcript_roots: |_| Vec::new(),
-        relationships: Relationships::NONE,
-        resume: None,
-        fixtures: Fixtures::Exempt("derived trajectory records, not provider sessions"),
     },
     LocalSource {
         id: "opencode",

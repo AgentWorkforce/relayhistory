@@ -21,8 +21,6 @@ fn isolated(temp: &tempfile::TempDir, db_path: &Path, args: &[&str]) -> Command 
         .env("XDG_DATA_HOME", temp.path().join("xdg"))
         .env("OPENCODE_DB", temp.path().join("opencode.db"))
         .env_remove("AI_HIST_DB")
-        .env_remove("RELAYCAST_API_KEY")
-        .env_remove("RELAYCAST_WORKSPACE_ID")
         .env_remove("RELAYHISTORY_CLAUDE_API_BASE_URL")
         .env_remove("RELAYHISTORY_CLAUDE_CREDENTIALS");
     command
@@ -112,7 +110,7 @@ fn discover_streams_jsonl_rows_then_a_summary() {
     assert_eq!(summary["skipped_unchanged"], 0);
     assert_eq!(summary["providers"]["claude"]["discovered"], 1);
     assert_eq!(summary["providers"]["codex"]["discovered"], 1);
-    assert_eq!(summary["exempt_sources"][0]["source"], "trajectory");
+    assert_eq!(summary["exempt_sources"], serde_json::json!([]));
 }
 
 #[test]
@@ -582,7 +580,7 @@ fn local_operations_ignore_selected_commercial_connectors_and_seeded_credentials
     listener.set_nonblocking(true).unwrap();
     let base = format!("http://{}", listener.local_addr().unwrap());
     for args in [
-        vec!["sync", "--local", "--source-connector", "relaycast"],
+        vec!["sync", "--local", "--source-connector", "claude-web"],
         vec!["sync", "--all", "--no-source-connectors"],
         vec![
             "sessions",
@@ -595,9 +593,6 @@ fn local_operations_ignore_selected_commercial_connectors_and_seeded_credentials
     ] {
         let output = isolated(&temp, &db, &args)
             .env("RELAYHISTORY_HOME", temp.path().join("commercial"))
-            .env("RELAYCAST_API_KEY", "synthetic-key")
-            .env("RELAYCAST_WORKSPACE_ID", "synthetic-workspace")
-            .env("RELAYCAST_BASE_URL", &base)
             .env("RELAYHISTORY_BASE_URL", &base)
             .output()
             .unwrap();
@@ -614,7 +609,7 @@ fn local_operations_ignore_selected_commercial_connectors_and_seeded_credentials
     assert!(!temp.path().join("commercial").exists());
 }
 
-// Provider HTTP/CLI and Relaycast behavior tests live with the optional adapter
+// Provider HTTP/CLI behavior tests live with the optional adapter
 // packages. This binary's contract is local acquisition plus cached remote reads.
 #[test]
 fn installed_credentials_do_not_compose_remote_sources_into_local_cli() {
@@ -633,7 +628,6 @@ fn installed_credentials_do_not_compose_remote_sources_into_local_cli() {
         vec!["sync", "--remote"],
         vec!["sessions", "discover", "--remote", "--json"],
         vec!["sync", "--remote", "--source-connector", "claude-web"],
-        vec!["sync", "--remote", "--source-connector", "relaycast"],
     ] {
         let output = isolated(&temp, &db, &args)
             .env("RELAYHISTORY_HOME", temp.path().join("commercial"))
@@ -660,6 +654,50 @@ fn installed_credentials_do_not_compose_remote_sources_into_local_cli() {
         .iter()
         .filter(|row| row.get("session_id").is_some())
         .all(|row| row["locations"] == serde_json::json!(["local"])));
+}
+
+/// Relaycast and trajectories were history sources once. Naming either now is
+/// refused like any other unknown value -- the connector as an
+/// `INVALID_ARGUMENT`, the source with the invalid-source message.
+#[test]
+fn the_retired_relay_and_trajectory_sources_are_invalid_arguments() {
+    let temp = fake_home();
+    let db = temp.path().join("fresh.db");
+    let connector = "INVALID_ARGUMENT: invalid source connector 'relaycast'";
+    for (args, expected) in [
+        (vec!["sync", "--source-connector", "relaycast"], connector),
+        (
+            vec!["sync", "--remote", "--source-connector", "relaycast"],
+            connector,
+        ),
+        (
+            vec![
+                "sessions",
+                "discover",
+                "--source-connector",
+                "relaycast",
+                "--json",
+            ],
+            connector,
+        ),
+        (
+            vec!["sessions", "discover", "--source", "relay", "--json"],
+            "invalid source 'relay'",
+        ),
+        (
+            vec!["sessions", "list", "--source", "trajectory", "--json"],
+            "invalid source 'trajectory'",
+        ),
+        (
+            vec!["search", "x", "--source", "relay"],
+            "invalid source 'relay'",
+        ),
+    ] {
+        let output = isolated(&temp, &db, &args).output().unwrap();
+        assert!(!output.status.success(), "{args:?} succeeded");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains(expected), "{args:?}: {stderr}");
+    }
 }
 
 /// The canonical project key reaches the CLI's JSON contract, and

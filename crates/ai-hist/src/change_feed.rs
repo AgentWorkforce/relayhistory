@@ -8,8 +8,8 @@
 //!
 //! - Every row of `sessions`, `session_events`, `tool_calls`, `file_edits`,
 //!   `session_markers`, `session_relationships`, `history`,
-//!   `session_presences`, `session_commit_links`, `trajectories`,
-//!   `session_observations` and `observation_evidence` carries a `revision`.
+//!   `session_presences`, `session_commit_links`, `session_observations`
+//!   and `observation_evidence` carries a `revision`.
 //!   A trigger stamps the current clock on every insert, and on every update
 //!   that changes at least one of the columns the row carries
 //!   ([`stamped_columns`](schema::stamped_columns)), so a re-parse that
@@ -216,8 +216,6 @@ pub enum ChangeKind {
     Presence,
     /// `session_commit_links`: a commit a session is linked to.
     CommitLink,
-    /// `trajectories`.
-    Trajectory,
     /// `session_observations`: one connector's observation of a session.
     SourceObservation,
     /// `observation_evidence`: a record a connector supplied with an
@@ -237,7 +235,6 @@ impl ChangeKind {
         ChangeKind::History,
         ChangeKind::Presence,
         ChangeKind::CommitLink,
-        ChangeKind::Trajectory,
         ChangeKind::SourceObservation,
         ChangeKind::ObservationEvidence,
     ];
@@ -255,7 +252,6 @@ impl ChangeKind {
             Self::History => "history",
             Self::Presence => "presence",
             Self::CommitLink => "commit_link",
-            Self::Trajectory => "trajectory",
             Self::SourceObservation => "source_observation",
             Self::ObservationEvidence => "observation_evidence",
         }
@@ -274,7 +270,6 @@ impl ChangeKind {
             Self::CommitLink => Some(EvidenceKind::CommitLink),
             Self::Session
             | Self::Presence
-            | Self::Trajectory
             | Self::SourceObservation
             | Self::ObservationEvidence => None,
         }
@@ -349,12 +344,6 @@ impl ChangeKind {
                 &["source", "session_id", "commit_sha", "match_method"],
                 &["commit_sha", "match_method"],
             ),
-            // A trajectory row carries no source column: every one is the
-            // `trajectory` source, and its id is its session.
-            Self::Trajectory => FedTable {
-                source: "'trajectory'",
-                ..table("trajectories", "id", &["id"], &["id"])
-            },
             Self::SourceObservation => table(
                 "session_observations",
                 "session_id",
@@ -400,7 +389,6 @@ impl ChangeKind {
             Self::History => Some(HISTORY_COLUMNS),
             Self::Presence
             | Self::CommitLink
-            | Self::Trajectory
             | Self::SourceObservation
             | Self::ObservationEvidence => None,
         }
@@ -841,8 +829,8 @@ pub enum EvidenceRow {
     SessionMarker(SessionMarker),
     Relationship(SessionRelationship),
     History(HistoryEntry),
-    /// A kind with no typed row: presences, commit links, trajectories and
-    /// connector observations. [`Change::columns`] is the row.
+    /// A kind with no typed row: presences, commit links and connector
+    /// observations. [`Change::columns`] is the row.
     Untyped,
 }
 
@@ -871,20 +859,20 @@ pub struct Change {
     /// The source exactly as stored.
     #[serde(default)]
     pub source_name: String,
-    /// For a relationship, the parent session; for a trajectory, its id; for
-    /// a prompt that names no session, empty. A prompt's session is not part
+    /// For a relationship, the parent session; for a prompt that names no
+    /// session, empty. A prompt's session is not part
     /// of its identity, so a prompt's delete carries it empty too, and a
     /// prompt gaining a session is an upsert, never a delete.
     pub session_id: String,
     /// The record's identity within its source, session and kind: the one
     /// identity column's text (`event_uid`, `tool_use_id`, `marker_uid`,
-    /// `relationship_uid`, `location`, a trajectory's id, or the session id
+    /// `relationship_uid`, `location`, or the session id
     /// itself for a catalog row), or for a kind whose identity spans several
     /// columns, those columns' stored values as a JSON array.
     pub record_key: String,
     /// The record's identity: the kind's wire name, then the stored value of each column of the table's uniqueness
-    /// constraint, in order -- `["history", source, timestamp_ms, prompt]`,
-    /// `["trajectory", id]`. An upsert and a delete of one record carry the
+    /// constraint, in order -- `["history", source, timestamp_ms, prompt]`.
+    /// An upsert and a delete of one record carry the
     /// same key.
     #[serde(default)]
     pub key: Vec<Value>,
@@ -940,8 +928,7 @@ impl ChangeQuery {
     /// That is every kind that stores a session -- the catalog row, events,
     /// tool calls, file edits, markers, relationships (under their parent
     /// session), prompts, presences, commit links and connector
-    /// observations -- plus a trajectory, whose session is its own id under
-    /// the `trajectory` source. A prompt that names no session belongs to no
+    /// observations. A prompt that names no session belongs to no
     /// session's drain, and nor does a prompt's delete: a prompt's session is
     /// not part of its identity, so its tombstone carries none. Both still
     /// reach the unfiltered feed.
@@ -1624,7 +1611,6 @@ fn typed_evidence(kind: ChangeKind, row: &rusqlite::Row<'_>) -> rusqlite::Result
         ChangeKind::History => EvidenceRow::History(row_to_history(row)?),
         ChangeKind::Presence
         | ChangeKind::CommitLink
-        | ChangeKind::Trajectory
         | ChangeKind::SourceObservation
         | ChangeKind::ObservationEvidence => EvidenceRow::Untyped,
     })
@@ -1963,9 +1949,6 @@ INSERT INTO session_presences (source, session_id, location, raw_locator)
 INSERT INTO session_commit_links (source, session_id, repo, commit_sha, match_method,
     confidence, files_json, created_at_ms)
     VALUES ('claude', 's1', 'repo', 'abc123', 'trailer', 0.75, '["a.rs"]', 1);
-INSERT INTO trajectories (id, version, status, decisions_json, retrospective_json,
-    search_text, updated_ms, timestamp_ms)
-    VALUES ('traj-1', 1, 'active', '[]', '{}', 'x', 1, 1);
 INSERT INTO session_observations (source, session_id, location, connector_id,
     connector_instance, updated_ms)
     VALUES ('claude', 's1', 'remote', 'conn', 'default', 1);
@@ -3593,16 +3576,11 @@ INSERT INTO observation_evidence (source, session_id, location, connector_id,
             );
             assert!(!plan.contains(&format!("SCAN {table}")), "{table}: {plan}");
             assert!(!plan.contains("_revision"), "{table}: {plan}");
-            // The trajectory's session is its primary key; every other
-            // table's seek binds both the source and the session.
-            if table == "trajectories" {
-                assert!(plan.contains("(id=?)"), "{table}: {plan}");
-            } else {
-                assert!(
-                    plan.contains("source=?") && plan.contains("session_id=?"),
-                    "{table}: {plan}"
-                );
-            }
+            // Every table's seek binds both the source and the session.
+            assert!(
+                plan.contains("source=?") && plan.contains("session_id=?"),
+                "{table}: {plan}"
+            );
             eprintln!("{table}: {}", plan.replace('\n', " | "));
         }
     }
@@ -4152,11 +4130,10 @@ INSERT INTO observation_evidence (source, session_id, location, connector_id,
     /// and from then on a presence write stamps its session once.
     #[test]
     fn a_store_fed_before_every_kind_gains_the_rest_above_its_head() {
-        const NEW_KINDS: [ChangeKind; 6] = [
+        const NEW_KINDS: [ChangeKind; 5] = [
             ChangeKind::History,
             ChangeKind::Presence,
             ChangeKind::CommitLink,
-            ChangeKind::Trajectory,
             ChangeKind::SourceObservation,
             ChangeKind::ObservationEvidence,
         ];
@@ -4223,10 +4200,7 @@ INSERT INTO observation_evidence (source, session_id, location, connector_id,
                 "INSERT INTO history (source, session_id, prompt, timestamp_ms) \
                      VALUES ('claude', 's1', 'hello', 1000); \
                  INSERT INTO session_presences (source, session_id, location) \
-                     VALUES ('claude', 's1', 'local'); \
-                 INSERT INTO trajectories (id, decisions_json, retrospective_json, \
-                     search_text, updated_ms, timestamp_ms) \
-                     VALUES ('traj-1', '[]', '{}', 'x', 1, 1);",
+                     VALUES ('claude', 's1', 'local');",
             )
             .unwrap();
             assert!(!schema_is_current(&conn).unwrap());
@@ -4267,11 +4241,7 @@ INSERT INTO observation_evidence (source, session_id, location, connector_id,
         let kinds: Vec<ChangeKind> = resumed.iter().map(|change| change.kind).collect();
         assert_eq!(
             kinds,
-            vec![
-                ChangeKind::History,
-                ChangeKind::Presence,
-                ChangeKind::Trajectory
-            ],
+            vec![ChangeKind::History, ChangeKind::Presence],
             "the new kinds' rows, and nothing the cursor already accounted for: {resumed:?}"
         );
         assert!(resumed.iter().all(|change| change.revision > committed));
@@ -4380,7 +4350,6 @@ INSERT INTO observation_evidence (source, session_id, location, connector_id,
                     "session_commit_links",
                     &["source", "session_id", "commit_sha", "match_method"],
                 ),
-                ChangeKind::Trajectory => ("trajectories", &["id"]),
                 ChangeKind::SourceObservation => (
                     "session_observations",
                     &[
@@ -4498,7 +4467,6 @@ INSERT INTO observation_evidence (source, session_id, location, connector_id,
             "{:?}",
             inserted[&ChangeKind::History]
         );
-        assert!(inserted[&ChangeKind::Trajectory].contains(r#"["trajectory","traj-1"]"#));
 
         conn.execute_batch(
             r#"
@@ -4512,7 +4480,6 @@ UPDATE history SET project = '/q' WHERE prompt = 'hello';
 UPDATE history SET session_id = 'c1' WHERE prompt = 'no session yet';
 UPDATE session_presences SET raw_locator = '/q/s1.jsonl';
 UPDATE session_commit_links SET confidence = 0.5;
-UPDATE trajectories SET status = 'completed', completed_at = '2026-09-24';
 UPDATE session_observations SET access_state = 'unavailable';
 UPDATE observation_evidence SET payload_json = '{"a":2}';
 "#,
@@ -4528,7 +4495,6 @@ UPDATE observation_evidence SET payload_json = '{"a":2}';
 
         conn.execute_batch(
             "DELETE FROM history WHERE prompt = 'hello';
-             DELETE FROM trajectories;
              DELETE FROM observation_evidence;
              DELETE FROM session_commit_links;
              DELETE FROM sessions WHERE session_id = 's1';",
@@ -4559,7 +4525,6 @@ UPDATE observation_evidence SET payload_json = '{"a":2}';
             ChangeKind::History,
             ChangeKind::Presence,
             ChangeKind::CommitLink,
-            ChangeKind::Trajectory,
             ChangeKind::SourceObservation,
             ChangeKind::ObservationEvidence,
         ] {

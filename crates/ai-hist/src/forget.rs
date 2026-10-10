@@ -28,7 +28,7 @@
 //! | `session_relationships` | kept, `child_has_events = 0` for a forgotten child | lineage; the flag says whether the child's events are held |
 //! | `session_continuity_evidence`, `session_identity_correlations`, `observation_versions` | kept | identity and lineage, not evidence |
 //! | `tags`, `session_tags`, `session_commit_links` | kept | user-created |
-//! | `history`, `grok_unified_usage`, `trajectories` | kept | read from provider-wide logs, which a session's hydration does not re-read |
+//! | `history`, `grok_unified_usage` | kept | read from provider-wide logs, which a session's hydration does not re-read |
 //! | `canonical_evidence_protection` | kept | ownership claims that outlive any one observation |
 //! | `discovery_skips`, `observation_discovery_skips`, change-feed and cursor tables | kept | store bookkeeping |
 //!

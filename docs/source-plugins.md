@@ -97,8 +97,7 @@ export function createHistoryPlugin({ root }) {
   by both a local plugin and the built-in parser is still one session.
 - **Hydration.** The built-in parser is asked first; the plugin then adds what
   it holds for the same identity. A session only the plugin observed, or one
-  the built-in adapter cannot hydrate (`relay`), hydrates from the plugin
-  alone.
+  the built-in adapter cannot hydrate, hydrates from the plugin alone.
 
 `sdk-ts/fixtures/local-source-plugin` is a complete, dependency-free example,
 and `sdk-ts/src/local-source-plugins.test.ts` runs it end to end.

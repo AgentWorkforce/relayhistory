@@ -9,6 +9,13 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Breaking Changes
 
 - Change-feed rows (`StoredRow`) and `ai-hist export` payloads no longer carry `session_events.raw_facts_version`, the store's own parser-generation bookkeeping; the feed does not stamp an event when only it changes.
+- Trajectories and Relaycast history are no longer sources: `relay` and `trajectory` are unknown values for `--source` and every source filter, `--source-connector relaycast` is an `INVALID_ARGUMENT`, and the TypeScript `SOURCES`, `CHANGE_KINDS` and export kinds no longer list them.
+- A writable open deletes what an earlier release stored for them: the `trajectories` table (with any leftover `trajectory_fts` index and triggers) and every row under the `relay` or `trajectory` source, with their change-feed tombstones. Because the feed loses the `trajectory` kind, the first writable open after upgrading starts a new feed epoch and drops named consumer cursors, so change-feed consumers replay from the start.
+
+### Removed
+
+- `.trajectories` directories and `TRAJECTORY_ROOT` are no longer read or watched, and the built-in `relay` catalog adapter is gone; `ai-hist import` skips entries under either source.
+- `ai-hist learn distill`, which wrote its roll-ups into the trajectory store, is removed.
 
 ### Fixed
 
@@ -19,6 +26,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Rust API
 
 - `StoreOptions`, `DiscoveryOptions`, `SyncOptions`, `HydrateOptions` and `ForgetOptions` have a chainable setter per field, e.g. `StoreOptions::default().db_path(path).read_only(true)`.
+- `Source::Relay`, `Source::Trajectory`, `ChangeKind::Trajectory`, and `ProviderRoots::trajectory_roots` are removed; a serialized `ProviderRoots` that still carries `trajectory_roots` deserializes with the field ignored.
 
 ## [0.37.0] - 2026-10-09
 

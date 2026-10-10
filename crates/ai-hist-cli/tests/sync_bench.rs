@@ -186,9 +186,6 @@ fn isolate_home(home: &Path) {
         home.join(".local/share/opencode/opencode.db"),
     );
     std::env::remove_var("AI_HIST_DB");
-    std::env::remove_var("TRAJECTORY_ROOT");
-    std::env::remove_var("RELAYCAST_API_KEY");
-    std::env::remove_var("RELAYCAST_WORKSPACE_ID");
 }
 
 fn sync_once(db_path: &Path, home: &Path) {

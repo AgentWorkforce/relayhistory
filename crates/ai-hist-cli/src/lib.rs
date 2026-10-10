@@ -28,7 +28,6 @@ use ai_hist::history_search::{search_all, SearchRole, SearchRow};
 use ai_hist::paths::{default_opencode_db_path, home_dir};
 use ai_hist::{discover, remote, *};
 mod export;
-mod learn;
 
 use export::export_history;
 #[cfg(test)]
@@ -396,11 +395,6 @@ enum Command {
         #[command(subcommand)]
         action: LinkAction,
     },
-    /// Learn (Agent Relay Loop) — distill ordinary session history into Pair signal.
-    Learn {
-        #[command(subcommand)]
-        action: LearnAction,
-    },
     /// Coding-agent session catalog — cache-only listing and shallow discovery.
     Sessions {
         #[command(subcommand)]
@@ -464,7 +458,7 @@ enum SessionsAction {
     /// content blocks, agent lifecycle events. Same `(ts_ms IS NULL, ts_ms,
     /// id)` keyset as tool calls and file edits; undated markers page last.
     Markers {
-        /// Coding-agent source (claude, codex, cursor, grok, muse, relay, opencode, devin).
+        /// Coding-agent source (claude, codex, cursor, grok, muse, opencode, devin).
         source: String,
         /// Native session identifier within that source.
         session_id: String,
@@ -488,7 +482,7 @@ enum SessionsAction {
     /// and cost is never computed: `reported_cost_usd` appears only when the
     /// source data carried one.
     Usage {
-        /// Coding-agent source (claude, codex, cursor, grok, muse, relay, opencode, devin).
+        /// Coding-agent source (claude, codex, cursor, grok, muse, opencode, devin).
         source: String,
         /// Native session identifier within that source.
         session_id: String,
@@ -517,45 +511,6 @@ enum SessionsAction {
         limit: Option<usize>,
         /// Emit JSONL progressively: one `session`/`diagnostic` object per line,
         /// then a final `summary`.
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-#[derive(Subcommand)]
-enum LearnAction {
-    /// Distill local session history into decision/finding/reflection events.
-    Distill {
-        /// Only distill sessions from this source (claude, codex, cursor, grok, muse, relay, opencode, devin).
-        #[arg(long)]
-        source: Option<String>,
-        /// Distill one session id.
-        #[arg(long)]
-        session_id: Option<String>,
-        /// Maximum sessions to distill.
-        #[arg(long, default_value_t = 5)]
-        limit: usize,
-        /// Maximum transcript characters sent to the local/opt-in distiller per session.
-        #[arg(long, default_value_t = 24_000)]
-        max_chars: usize,
-        /// Approximate output-token budget for the distiller.
-        #[arg(long, default_value_t = 2_000)]
-        max_output_tokens: usize,
-        /// Provider: auto, openai, or anthropic.
-        #[arg(long, default_value = "auto")]
-        provider: String,
-        /// Model override.
-        #[arg(long)]
-        model: Option<String>,
-        /// Provider base URL override. Use a local endpoint by default, e.g. Ollama.
-        #[arg(long)]
-        base_url: Option<String>,
-        /// Explicit opt-in for cloud LLM distillation over pre-scrub full transcripts.
-        #[arg(long)]
-        allow_cloud_llm: bool,
-        /// Run distillation and report output without writing local trajectory rows.
-        #[arg(long)]
-        dry_run: bool,
         #[arg(long)]
         json: bool,
     },
@@ -1097,69 +1052,6 @@ pub fn run() -> Result<()> {
                 json,
                 quiet,
             } => link_git_commit(&conn, &repo, &commit, &match_method, !no_note, json, quiet),
-        },
-        Command::Learn { action } => match action {
-            LearnAction::Distill {
-                source,
-                session_id,
-                limit,
-                max_chars,
-                max_output_tokens,
-                provider,
-                model,
-                base_url,
-                allow_cloud_llm,
-                dry_run,
-                json,
-            } => {
-                validate_source(source.as_deref())?;
-                let provider = learn::provider_from_str(&provider)?;
-                let report = learn::distill_sessions(
-                    &conn,
-                    &learn::LearnDistillOptions {
-                        source,
-                        session_id,
-                        limit,
-                        max_chars,
-                        max_output_tokens,
-                        provider,
-                        model,
-                        base_url,
-                        allow_cloud_llm,
-                        dry_run,
-                    },
-                )?;
-                if json {
-                    println!(
-                        "{}",
-                        serde_json::json!({
-                            "scanned": report.scanned,
-                            "distilled": report.distilled,
-                            "skipped": report.skipped,
-                            "rows": report.rows.iter().map(|row| serde_json::json!({
-                                "id": row.id,
-                                "source": row.source,
-                                "sessionId": row.session_id,
-                                "eventsEstimate": row.events_estimate,
-                                "dryRun": row.dry_run,
-                            })).collect::<Vec<_>>(),
-                        })
-                    );
-                } else {
-                    println!(
-                        "Learn-distilled {} session(s) ({} scanned, {} skipped).",
-                        report.distilled, report.scanned, report.skipped
-                    );
-                    for row in report.rows {
-                        let action = if row.dry_run { "would write" } else { "wrote" };
-                        println!(
-                            "  {action} {} from {}:{} ({} event(s) estimated)",
-                            row.id, row.source, row.session_id, row.events_estimate
-                        );
-                    }
-                }
-                Ok(())
-            }
         },
         Command::Sessions { action } => match action {
             SessionsAction::List {
@@ -2545,9 +2437,9 @@ fn watch_loop_with_connectors(
             }
         }));
     if !remote_only {
-        // A project that grows a `.trajectories` directory after the run
-        // started is a root whose name could not have been known at startup,
-        // so the pending-retry path alone would never reach it.
+        // Re-derived on the backstop, so a root whose name could not have
+        // been known at startup is still reached; the pending-retry path
+        // alone covers only roots that were named but missing.
         watch = watch.with_roots_refresh(Arc::new(|| watch_roots_for_scope(SessionScope::Local)));
     }
     watch.run().map(|_| ())

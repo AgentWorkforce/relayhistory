@@ -415,7 +415,6 @@ impl<'a> DiscoveryEnv<'a> {
                 opencode_db,
                 opencode_db_pinned: false,
                 opencode_storage_dir,
-                trajectory_roots: None,
                 use_env_roots: false,
             },
         )
@@ -671,9 +670,9 @@ pub enum WatchDepth {
     /// Registered through the file's *parent*, because a watch on the file
     /// itself stops firing the moment an atomic rewrite replaces it — but
     /// every other entry in that parent is filtered back out. That distinction
-    /// matters for a `TRAJECTORY_ROOT` naming a single JSON file: its parent
-    /// can be `$HOME`, or `/`, and watching that as a tree would turn every
-    /// unrelated write on the machine into a forced sweep.
+    /// matters for a flat log such as `history.jsonl`: its parent can be a
+    /// busy config directory, and watching that as a tree would turn every
+    /// unrelated write into a forced sweep.
     File,
     /// This directory's own entries, and nothing below them.
     Directory,
@@ -684,8 +683,8 @@ pub enum WatchDepth {
 /// One path in the single spelling every comparison uses.
 ///
 /// A watch root and a backend event have to be comparable, and they arrive
-/// spelled differently: a root can be given relatively (`TRAJECTORY_ROOT=
-/// trajectory.json`), while the backend reports what it was registered
+/// spelled differently: a root can be given relatively (an embedder's
+/// `ProviderRoots` may name a relative directory), while the backend reports what it was registered
 /// with — so a relative root and an absolute event never match and the file
 /// is watched but never seen to change. The fix is not to compare cleverly
 /// but to hold one spelling: every root is absolute from the moment it is
@@ -931,7 +930,7 @@ pub fn source_fingerprint(
 /// [`source_fingerprint`] plus inputs no adapter owns.
 ///
 /// A sweep can read sources discovery never enumerates — flat per-harness
-/// logs, and records that are deliberately [`DISCOVERY_EXEMPTIONS`] entries.
+/// logs, or the records of a source that is a [`DISCOVERY_EXEMPTIONS`] entry.
 /// Anything the sweep reads has to be in the fold, or the fast path will skip
 /// a sweep that had work to do.
 pub fn source_fingerprint_with(
@@ -3738,133 +3737,6 @@ fn sqlite_store_generation(path: &Path) -> Result<String> {
 }
 
 // ---------------------------------------------------------------------------
-// relay
-// ---------------------------------------------------------------------------
-
-/// Shallow adapter for the network-backed `relay` source.
-///
-/// Relaycast has no local transcript files, and discovery must work with no
-/// network access, so this adapter derives catalog rows from rows a previous
-/// `ai-hist sync` already stored in `history` (indexed by
-/// `idx_history_session`). If nothing was ever synced it discovers nothing —
-/// that is the correct answer, not a failure.
-pub(crate) struct RelayProvider;
-
-impl ShallowSessionProvider for RelayProvider {
-    fn source(&self) -> &'static str {
-        "relay"
-    }
-    /// Relay rows are enumerated out of already-ingested `history`; there is no
-    /// relay parser, and targeted hydration is unsupported for it.
-    fn evidence_kinds(&self) -> &'static [EvidenceKind] {
-        &[]
-    }
-
-    /// Relay rows come from RelayHistory's own `history` table, so there is no
-    /// file to stat — but "no file" is not "cannot change". `ai-hist import`
-    /// writes relay history straight into that table without going through a
-    /// sweep, and nothing else in the fingerprint moves when it does. Left out
-    /// of the fold entirely, an import would land rows that discovery then
-    /// declined to look at, and the imported sessions would never reach the
-    /// catalog.
-    ///
-    /// So the signal is a generation for the relay slice: how many rows there
-    /// are and the highest one. Both move on an insert, and the count alone
-    /// moves on a delete. It is one range scan of `idx_history_session`, whose
-    /// leading column is `source`, so the cost is proportional to the relay
-    /// rows rather than the table.
-    ///
-    /// This does not invalidate itself: no local sweep source writes
-    /// `source = 'relay'`, so a tick that folds this value cannot be the
-    /// reason it changed next time.
-    fn fingerprint_inputs(&self, env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
-        let (rows, highest) = env.conn().query_row(
-            "SELECT COUNT(*), COALESCE(MAX(rowid), 0) FROM history WHERE source = 'relay'",
-            [],
-            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
-        )?;
-        if rows == 0 {
-            return Ok(Vec::new());
-        }
-        Ok(vec![Candidate {
-            source: "relay",
-            locator: "history:relay".into(),
-            session_id: None,
-            recency_hint_ms: None,
-            stamp: format!("{rows}:{highest}"),
-        }])
-    }
-
-    fn enumerate(
-        &self,
-        env: &DiscoveryEnv<'_>,
-        _requested_limit: Option<usize>,
-    ) -> Result<Vec<Candidate>> {
-        let mut stmt = env.conn().prepare(
-            "SELECT session_id, MAX(timestamp_ms), COUNT(*) FROM history \
-             WHERE source = 'relay' AND session_id IS NOT NULL AND session_id <> '' \
-             GROUP BY session_id",
-        )?;
-        let rows = stmt
-            .query_map([], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, Option<i64>>(1)?,
-                    row.get::<_, i64>(2)?,
-                ))
-            })?
-            .collect::<rusqlite::Result<Vec<_>>>()?;
-        Ok(rows
-            .into_iter()
-            .map(|(session_id, last, count)| Candidate {
-                source: "relay",
-                locator: session_id.clone(),
-                session_id: Some(session_id),
-                recency_hint_ms: last,
-                stamp: format!("{}:{count}", last.unwrap_or(0)),
-            })
-            .collect())
-    }
-
-    fn read_access(&self) -> ShallowReadAccess {
-        ShallowReadAccess::Catalog
-    }
-
-    fn read_shallow(
-        &self,
-        _scan: &ScanEnv<'_>,
-        catalog: Option<&Connection>,
-        candidate: &Candidate,
-    ) -> Result<Option<ShallowSession>> {
-        let conn = catalog.context("relay shallow reads need the catalog connection")?;
-        let bounds = conn.query_row(
-            "SELECT MIN(timestamp_ms), MAX(timestamp_ms) FROM history \
-             WHERE source = 'relay' AND session_id = ?",
-            [&candidate.locator],
-            |row| Ok((row.get::<_, Option<i64>>(0)?, row.get::<_, Option<i64>>(1)?)),
-        )?;
-        let first_prompt = conn
-            .query_row(
-                "SELECT prompt FROM history WHERE source = 'relay' AND session_id = ? \
-                 ORDER BY timestamp_ms ASC, id ASC LIMIT 1",
-                [&candidate.locator],
-                |row| row.get::<_, String>(0),
-            )
-            .ok()
-            .map(|prompt| excerpt(&prompt))
-            .filter(|prompt| !prompt.is_empty());
-        Ok(Some(ShallowSession {
-            source: "relay".into(),
-            session_id: candidate.locator.clone(),
-            first_activity_ms: bounds.0,
-            last_activity_ms: bounds.1,
-            first_prompt,
-            ..Default::default()
-        }))
-    }
-}
-
-// ---------------------------------------------------------------------------
 // shared enumeration helper
 // ---------------------------------------------------------------------------
 
@@ -4010,14 +3882,8 @@ pub struct SessionCatalogPage {
 /// Built in one place so the query-plan test asserts the plan of the statement
 /// that actually runs.
 fn catalog_list_query(options: &CatalogListOptions) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
-    let mut sql = format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE ");
-    if options.scope == SessionScope::Local {
-        sql.push_str("source <> 'trajectory'");
-    } else {
-        // Local trajectories are derived artifacts; remotely recalled trajectory
-        // sessions are provider evidence and must survive cached remote/all reads.
-        sql.push_str("(source <> 'trajectory' OR EXISTS (SELECT 1 FROM session_presences p WHERE p.source = sessions.source AND p.session_id = sessions.session_id AND p.location = 'remote'))");
-    }
+    // Every filter below is appended as ` AND …`.
+    let mut sql = format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE 1 = 1");
     let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
     match options.scope {
         SessionScope::Local => sql.push_str(
@@ -4087,9 +3953,7 @@ fn catalog_list_query(options: &CatalogListOptions) -> (String, Vec<Box<dyn rusq
 /// List the session catalog straight out of the database.
 ///
 /// Pure SQL over `sessions`: no filesystem access, no provider I/O, and no
-/// scan of `history` / `session_events` / `tool_calls`. Locally derived
-/// `trajectory` records are excluded. Remote/all scopes can include trajectory
-/// sessions with an explicitly observed remote presence from cloud recall.
+/// scan of `history` / `session_events` / `tool_calls`.
 ///
 /// Rows come back in the catalog's total order:
 /// `(last_activity_ms DESC, source ASC, session_id ASC)`, with rows of unknown
@@ -4991,7 +4855,7 @@ pub fn discover_sessions_with_connectors(
             connectors,
             &options.sources,
         ) {
-            if !status.configured || status.connector == crate::remote::RELAYCAST_CONNECTOR {
+            if !status.configured {
                 summary.diagnostics.push(DiscoveryDiagnostic {
                     connector_id: Some(status.connector.into()),
                     connector_instance: None,

@@ -324,12 +324,9 @@ types, in this order:
     "codex":    {"candidates": 1, "discovered": 1, "skipped_unchanged": 0, "failed": false},
     "cursor":   {"candidates": 0, "discovered": 0, "skipped_unchanged": 0, "failed": false},
     "grok":     {"candidates": 0, "discovered": 0, "skipped_unchanged": 0, "failed": false},
-    "opencode": {"candidates": 0, "discovered": 0, "skipped_unchanged": 0, "failed": false},
-    "relay":    {"candidates": 0, "discovered": 0, "skipped_unchanged": 0, "failed": false}
+    "opencode": {"candidates": 0, "discovered": 0, "skipped_unchanged": 0, "failed": false}
   },
-  "exempt_sources": [
-    {"source": "trajectory", "reason": "derived trajectory records, not provider sessions"}
-  ],
+  "exempt_sources": [],
   "counters": {
     "candidates_enumerated": 2,
     "shallow_reads": 2,
@@ -380,7 +377,7 @@ contract:
 
 | Field | Kind | Notes |
 |---|---|---|
-| `source` | observed | `claude`, `codex`, `cursor`, `grok`, `muse`, `opencode`, `devin`, `relay` |
+| `source` | observed | `claude`, `codex`, `cursor`, `grok`, `muse`, `opencode`, `devin` |
 | `session_id` | observed | provider-native; `(source, session_id)` is the primary key, so the same native id under two providers is two rows |
 | `cwd` | observed | working directory the provider recorded |
 | `git_branch` | observed | last branch the provider recorded |
@@ -485,7 +482,6 @@ mark captured is missing for every consumer, not just for `ai-hist`.
 | **muse** | ✓ (metadata `stream.id`) | ✓ (`workspace_root`) | – (never) | ✓ (metadata `recorded_at`) | ✓ (tail `recorded_at`) | ✓ (first `started` prompt) | ✓ (metadata, then `model_completed`) | – | ✓ (`build.semver`) | – | – | – |
 | **opencode** | ✓ | ✓ (directory / message `path.cwd`) | – | ✓ | ✓ | ✓ | ✓ (`providerID/modelID`) | – | – | – | – | – |
 | **devin** | ✓ | ✓ (`working_directory`) | – | ✓ (`created_at`, seconds→ms) | ✓ (`last_activity_at`, seconds→ms) | ✓ | ✓ (`model` / `generation_model`) | – | – (transcript `agent.version` rides a marker) | – | – | ✓ (`workspace_dirs`) |
-| **relay** | ✓ | – (never) | – | ✓ (synced min ts) | ✓ (synced max ts) | ✓ (earliest synced prompt) | – | – | – | – | – | – |
 
 ### Session markers
 
@@ -640,7 +636,6 @@ status, because a fabricated measurement reads exactly like a real one:
 | **grok** | ✓ (raw line `content`) | ✓ (harness markers) | ✓ | ✓ (`unknown` with neither signal) | `function_call_output` | `tool_result.is_error`, `tool_status` | – (no notification rail) |
 | **opencode** | ✓ (raw part `output`) | ✓ (harness markers) | ✓ | ✓ | `function_call_output` | `exit_code`, `tool_status` | – (no notification rail) |
 | **muse** | ✓ (result `text`) | ✓ (harness markers) | ✓ | ✓ (`tool_batch.effect.terminal`, joined by call id) | `function_call_output` | `tool_batch.effect`, `exit_code` (`bash`) | – |
-| **relay** | – | – | – | – | – | – | – |
 
 `payload_bytes` is the raw UTF-8 length of what the provider handed back —
 a string payload as-is, any other JSON payload stable-stringified with sorted
@@ -736,7 +731,6 @@ follows.
 | **muse** | ✓ | ✓ | ✓ | ✓ | ✓ | `full` |
 | **opencode** | ✓ | ✓ | ✓ | ✓ | ✓ | `full` |
 | **devin** | ✓ | ✓ | ✓ | ✓ | – (the store records no parent/child session link) | `partial` |
-| **relay** | – | – | – | – | – | targeted hydration unsupported |
 
 ### Per-message raw facts on `session_events`
 
@@ -753,7 +747,7 @@ in flight.
 | **opencode** | – | ✓ (last `step-finish.reason`, else message `finish`) | – | – | – | – |
 | **muse** | ✓ (`response_id`) | ✓ (the step's `finish_reason`) | ✓ (`build.semver`) | – | – | ✓ (the run's `run_id`) |
 | **devin** | ✓ (`metadata.request_id`) | ✓ (`metadata.finish_reason`) | ✓ (transcript `agent.version`) | – | – | – |
-| **cursor**, **grok**, **relay** | – | – | – | – | – | – |
+| **cursor**, **grok** | – | – | – | – | – | – |
 
 A null is "the provider did not record it", which is not the same as `false`
 or as an empty string: a Claude record with no `isSidechain` key stores null,
@@ -814,7 +808,7 @@ Delegation is a separate capability, reported on every relationship result as
 | **claude** | sometimes | ✓ | ✓ | ✓ |
 | **grok** | sometimes | ✓ | ✓ | ✓ |
 | **muse** | always | ✓ | ✓ | ✓ |
-| **cursor**, **devin**, **relay** | never | – | – | – |
+| **cursor**, **devin** | never | – | – | – |
 
 OpenCode is `always` because a subagent session is a session in its own right
 and its own record names the parent, in `session.parentID`. Nothing is
@@ -840,7 +834,7 @@ record names the child session. The edge is recorded with `evidence_kind =
 `task_stream_linked` (or `memory_reminder_child_session_linked`) record for
 that log. See ["muse"](#muse).
 
-Cursor is `never` for a different reason from grok, opencode and relay: it does
+Cursor is `never` for a different reason from devin: it does
 record the spawn — a `Task` / `functions.Subagent` tool call, preserved as a
 `tool_calls` row — but the block names no child transcript, so there is no
 identity to link. See ["cursor → Delegation"](#cursor).
@@ -1943,11 +1937,6 @@ How each adapter works:
   and the transcript file's own stamp — an unchanged session is not re-read,
   and a session whose rows vanished underneath a matching stamp is rebuilt
   rather than skipped.
-- **relay** — a **network** source with no local transcript, and discovery must
-  work offline. The adapter therefore derives rows only from `history` rows a
-  previous `ai-hist sync` already stored locally; it opens no socket. If nothing
-  was ever synced it discovers nothing, which is the correct answer rather than
-  a failure. A relay thread has no working directory, so `cwd` is always `null`.
 
 ---
 
@@ -2023,7 +2012,6 @@ Each connector presence stores a `source_stamp` —
 | grok | the chat file's marker, `\|`, the `summary.json` marker, `\|`, the `updates.jsonl` marker, `\|x:`, a digest over `signals.json`, `prompt_context.json` and the sorted entries of `compaction_checkpoints/` and `subagents/` |
 | opencode (SQLite) | `{database identity}:{schema version}:{time_created}:{time_updated}` |
 | opencode (JSON tree) | `{total bytes}:{file count}:{newest mtime nanoseconds}:{digest}` over the session file, its messages and their parts |
-| relay | `{newest synced timestamp}:{synced row count}` |
 
 The OpenCode JSON-tree marker is an aggregate for a reason: the provider
 appends a turn by writing *new* files under `message/` and `part/` and does
@@ -2527,8 +2515,8 @@ per-source edit:
   `source_snapshot` (`hydrate.rs`), and the full-sync pass in `ingest.rs` that
   runs the parser;
 - `source_watch_roots` in `ingest.rs`, for anything sync reads beyond the
-  adapter's own `watch_roots` (Claude's and Codex's `history.jsonl`,
-  trajectory roots);
+  adapter's own `watch_roots` (Claude's and Codex's `history.jsonl`, Grok's
+  `logs/unified.jsonl`);
 - the public `Source` enum in `session_store.rs` (`Source::ALL`, `as_str`),
   which is default API; the registry test checks it names exactly the
   descriptors. `Source::capabilities` also adds evidence kinds (session
@@ -2543,11 +2531,9 @@ per-source edit:
 - the TypeScript `SOURCES` list, MCP enums and resume command in `sdk-ts`.
 
 Exactly one of the adapter or an exemption is required, so a new source always
-carries a decision about whether it is discoverable. Today the only exemption
-is `trajectory` ("derived trajectory records, not provider sessions"). It is
-enforced at both ends: `sessions discover --source trajectory` fails with that
-reason, and `sessions list` filters `trajectory` rows out defensively, so a
-trajectory can never be presented as a session.
+carries a decision about whether it is discoverable. No built-in source is
+exempt today; an exempt source would be refused by `sessions discover --source`
+with its reason.
 
 The exemption list also travels in the `summary` line as `exempt_sources`, so a
 consumer can tell "this source has no sessions" apart from "this source is not
@@ -2576,7 +2562,7 @@ UPDATE_SNAPSHOTS=1 cargo test -p ai-hist --all-features --test fixture_corpus
 `SOURCE_CHOICES` value is a descriptor, and every descriptor either names a
 fixture directory holding at least one staged fixture with a committed
 snapshot, or carries a fixture exemption for a source that has no provider log
-on disk (`trajectory`, `relay`). `corpus_manifest_covers_every_fixture_file`
+on disk (no built-in source does today). `corpus_manifest_covers_every_fixture_file`
 and `corpus_readme_lists_every_fixture_and_quirk` stop a fixture from being
 added without being described, and `no_orphaned_snapshots` stops a snapshot
 from outliving its fixture.
