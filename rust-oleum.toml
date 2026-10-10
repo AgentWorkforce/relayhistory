@@ -24,36 +24,18 @@ rust_roots = ["crates/ai-hist-cli/src", "crates/ai-hist-napi/src", "crates/ai-hi
 
 [baseline.file_loc]
 "crates/ai-hist/src/change_feed.rs" = 1226
-"crates/ai-hist/src/continuity.rs" = 1106
-"crates/ai-hist/src/discover.rs" = 3809
-"crates/ai-hist/src/forget.rs" = 565
-"crates/ai-hist/src/ingest/devin.rs" = 1544
-"crates/ai-hist/src/ingest/grok.rs" = 816
+"crates/ai-hist/src/discover.rs" = 3622
+"crates/ai-hist/src/ingest/devin.rs" = 841
 "crates/ai-hist/src/ingest/hydrate.rs" = 3452
-"crates/ai-hist/src/ingest/muse.rs" = 535
 "crates/ai-hist/src/ingest/opencode.rs" = 1460
-"crates/ai-hist/src/ingest/transcript_cursor.rs" = 914
 "crates/ai-hist/src/ingest.rs" = 12031
-"crates/ai-hist/src/observations.rs" = 509
-"crates/ai-hist/src/project_identity.rs" = 695
 "crates/ai-hist/src/session_store.rs" = 1956
-"crates/ai-hist/src/session_usage/fixtures.rs" = 832
-"crates/ai-hist/src/session_usage.rs" = 549
-"crates/ai-hist/src/store.rs" = 3227
-"crates/ai-hist/src/watch.rs" = 729
+"crates/ai-hist/src/store.rs" = 3186
 "crates/ai-hist-cli/src/lib.rs" = 3101
 "crates/ai-hist-napi/src/lib.rs" = 2175
-"plugins/provider-sources/rust/src/remote.rs" = 928
 
 [baseline.cyclomatic]
-"crates/ai-hist/src/discover.rs::read_claude_shallow" = 28
-"crates/ai-hist/src/discover.rs::OpencodeProvider::read_shallow" = 26
-"crates/ai-hist/src/discover.rs::enumerate_opencode_snapshot" = 29
 "crates/ai-hist/src/discover.rs::discover_sessions_with_worker_limit" = 77
-"crates/ai-hist/src/ingest/devin.rs::load_from_sqlite" = 32
-"crates/ai-hist/src/ingest/devin.rs::normalize_inner" = 53
-"crates/ai-hist/src/ingest/grok.rs::parse_updates" = 30
-"crates/ai-hist/src/ingest/incremental.rs::ingest_claude_transcript_incremental_batched" = 30
 "crates/ai-hist/src/ingest/opencode.rs::load_all_from_sqlite" = 52
 "crates/ai-hist/src/ingest/opencode.rs::normalize_session" = 41
 "crates/ai-hist/src/ingest.rs::sync_basic" = 30
@@ -66,18 +48,10 @@ rust_roots = ["crates/ai-hist-cli/src", "crates/ai-hist-napi/src", "crates/ai-hi
 "crates/ai-hist/src/ingest.rs::ingest_grok_session" = 56
 "crates/ai-hist/src/source_intake.rs::apply_normalized" = 51
 "crates/ai-hist/src/store.rs::init_db_locked" = 73
-"crates/ai-hist/src/store.rs::row_to_session_event" = 40
-"crates/ai-hist/src/usage.rs::normalize_usage" = 42
 "crates/ai-hist-cli/src/lib.rs::run" = 94
 
 [baseline.cognitive]
-"crates/ai-hist/src/discover.rs::read_claude_shallow" = 38
-"crates/ai-hist/src/discover.rs::OpencodeProvider::read_shallow" = 23
-"crates/ai-hist/src/discover.rs::enumerate_opencode_snapshot" = 41
 "crates/ai-hist/src/discover.rs::discover_sessions_with_worker_limit" = 160
-"crates/ai-hist/src/ingest/devin.rs::normalize_inner" = 60
-"crates/ai-hist/src/ingest/grok.rs::parse_updates" = 72
-"crates/ai-hist/src/ingest/incremental.rs::ingest_claude_transcript_incremental_batched" = 37
 "crates/ai-hist/src/ingest/opencode.rs::load_all_from_sqlite" = 35
 "crates/ai-hist/src/ingest/opencode.rs::normalize_session" = 52
 "crates/ai-hist/src/ingest.rs::sync_basic" = 32

@@ -1,6 +1,10 @@
 //! Remote Codex task evidence: the diff `codex cloud diff` prints, read
 //! from the CLI under a time and size bound.
 
+use std::io::Read;
+
+use sha2::{Digest, Sha256};
+
 use super::*;
 
 const REMOTE_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);

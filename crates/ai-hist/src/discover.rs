@@ -70,6 +70,13 @@ use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+mod claude_shallow;
+use claude_shallow::{fold_claude_head_line, fold_claude_shallow_tail, ClaudeHeadFold};
+mod opencode_page;
+use opencode_page::{
+    opencode_rows_unpaged, opencode_sqlite_model, opencode_sqlite_prompt, page_limited_opencode_rows,
+};
+
 /// Version of the machine-readable session-catalog contract.
 ///
 /// Bumped when the shape or meaning of [`ShallowSession`] / the CLI JSON
@@ -1561,130 +1568,58 @@ fn read_claude_shallow(
     path: &Path,
     bounded: &BoundedJsonl,
 ) -> Result<Option<ShallowSession>> {
-        let mut session = ShallowSession {
-            source: "claude".into(),
-            raw_path: Some(candidate.locator.clone()),
-            ..Default::default()
-        };
-        let mut models = Vec::new();
-        let session_id = claude_session_id_from_bounded(bounded)?;
-        // A subagent sidecar transcript is its own file whose records carry the
-        // *parent's* sessionId (see `ingest_claude_transcript`). Enumerating it
-        // as a session would emit the parent twice per run and let the two
-        // files fight over one row's raw_path/source_stamp, so the stamp never
-        // matched again and one of them was re-read forever.
-        let sidecar_layout = crate::ingest::is_claude_sidecar_file(path);
-        let mut primary_record_seen = false;
-        let mut sidechain_records = 0usize;
-        let mut identified_records = 0usize;
-        let mut parsed_records = 0usize;
-        let mut head_records_seen = 0usize;
-        for line in bounded.head_records() {
-            head_records_seen += 1;
-            let Some(value) = parse_record(line) else {
-                continue;
-            };
-            parsed_records += 1;
-            if value
-                .get("sessionId")
-                .and_then(Value::as_str)
-                .is_some_and(|id| !id.is_empty())
-            {
-                identified_records += 1;
-                if value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
-                    sidechain_records += 1;
-                } else {
-                    primary_record_seen = true;
-                }
-            }
-            if session.cwd.is_none() {
-                session.cwd = value.get("cwd").and_then(Value::as_str).map(str::to_string);
-            }
-            if let Some(branch) = value.get("gitBranch").and_then(Value::as_str) {
-                session.git_branch = Some(branch.to_string());
-            }
-            if let Some(version) = value.get("version").and_then(Value::as_str) {
-                session.agent_version = Some(version.to_string());
-            }
-            // `<synthetic>` is the placeholder on a notice Claude Code wrote
-            // itself; no model by that name ran in the session.
-            push_unique(
-                &mut models,
-                value
-                    .pointer("/message/model")
-                    .and_then(Value::as_str)
-                    .filter(|model| !crate::ingest::is_claude_synthetic_placeholder_model(model)),
-            );
-            if let Some(ts) = claude_timestamp(&value) {
-                session.first_activity_ms.get_or_insert(ts);
-                session.last_activity_ms = Some(ts);
-            }
-            if session.first_prompt.is_none() {
-                session.first_prompt = claude_substantive_prompt(&value);
-            }
-            // Every observed field is settled, a model has been seen, and the
-            // file is not a sidecar -- by its layout, or by a primary record
-            // in one laid out as a sidecar: nothing further in the head can
-            // change the row (additional models stay best-effort), so stop
-            // paying to parse it.
-            if (primary_record_seen || !sidecar_layout)
-                && !models.is_empty()
-                && session.cwd.is_some()
-                && session.git_branch.is_some()
-                && session.agent_version.is_some()
-                && session.first_activity_ms.is_some()
-                && session.first_prompt.is_some()
-            {
-                break;
-            }
+    let mut session = ShallowSession {
+        source: "claude".into(),
+        raw_path: Some(candidate.locator.clone()),
+        ..Default::default()
+    };
+    let mut models = Vec::new();
+    let session_id = claude_session_id_from_bounded(bounded)?;
+    // A subagent sidecar transcript is its own file whose records carry the
+    // *parent's* sessionId (see `ingest_claude_transcript`). Enumerating it
+    // as a session would emit the parent twice per run and let the two
+    // files fight over one row's raw_path/source_stamp, so the stamp never
+    // matched again and one of them was re-read forever.
+    let sidecar_layout = crate::ingest::is_claude_sidecar_file(path);
+    let mut head = ClaudeHeadFold {
+        primary_record_seen: false,
+        sidechain_records: 0,
+        identified_records: 0,
+        parsed_records: 0,
+        head_records_seen: 0,
+    };
+    for line in bounded.head_records() {
+        if !fold_claude_head_line(&mut session, &mut models, &mut head, line, sidecar_layout) {
+            break;
         }
-        let mut need_last_activity = true;
-        let mut need_branch = true;
-        for line in bounded.tail_records_rev() {
-            if !need_last_activity && !need_branch {
-                break;
-            }
-            let Some(value) = parse_record(line) else {
-                continue;
-            };
-            if need_last_activity {
-                if let Some(ts) = claude_timestamp(&value) {
-                    session.last_activity_ms = Some(ts);
-                    need_last_activity = false;
-                }
-            }
-            if need_branch {
-                if let Some(branch) = value.get("gitBranch").and_then(Value::as_str) {
-                    session.git_branch = Some(branch.to_string());
-                    need_branch = false;
-                }
-            }
-        }
-        // A file laid out as a sidecar whose every identified head record is a
-        // sidechain row is a subagent's transcript, for a session whose own
-        // transcript is enumerated separately. A primary transcript of only
-        // sidechain rows -- inline Task traffic from Claude Code versions that
-        // wrote it there -- is still that session's transcript.
-        if sidecar_layout
-            && crate::ingest::claude_records_are_all_sidechain(
-                identified_records,
-                sidechain_records,
-            )
-        {
-            return Ok(None);
-        }
-        // A file with complete records that parse as nothing is corrupt, not a
-        // session. Publishing it under its file stem would put a fabricated
-        // row in the catalog and hide the corruption; a diagnostic names it.
-        // A file with no complete records at all is merely empty (a session
-        // that has just started) and is simply not a session yet.
-        if parsed_records == 0 {
-            anyhow::ensure!(
-                head_records_seen == 0,
-                "no parseable JSON records in the first {head_records_seen} record(s)"
-            );
-            return Ok(None);
-        }
+    }
+    fold_claude_shallow_tail(&mut session, bounded);
+    // A file laid out as a sidecar whose every identified head record is a
+    // sidechain row is a subagent's transcript, for a session whose own
+    // transcript is enumerated separately. A primary transcript of only
+    // sidechain rows -- inline Task traffic from Claude Code versions that
+    // wrote it there -- is still that session's transcript.
+    if sidecar_layout
+        && crate::ingest::claude_records_are_all_sidechain(
+            head.identified_records,
+            head.sidechain_records,
+        )
+    {
+        return Ok(None);
+    }
+    // A file with complete records that parse as nothing is corrupt, not a
+    // session. Publishing it under its file stem would put a fabricated
+    // row in the catalog and hide the corruption; a diagnostic names it.
+    // A file with no complete records at all is merely empty (a session
+    // that has just started) and is simply not a session yet.
+    if head.parsed_records == 0 {
+        anyhow::ensure!(
+            head.head_records_seen == 0,
+            "no parseable JSON records in the first {} record(s)",
+            head.head_records_seen
+        );
+        return Ok(None);
+    }
         let Some(session_id) = session_id.or_else(|| {
             path.file_stem()
                 .and_then(|s| s.to_str())
@@ -2793,7 +2728,6 @@ impl ShallowSessionProvider for OpencodeProvider {
         }) else {
             return Ok(None);
         };
-        let conn = &snapshot.conn;
         let Some(seed) = snapshot.sessions.get(&candidate.locator).cloned() else {
             return Ok(None);
         };
@@ -2801,112 +2735,12 @@ impl ShallowSessionProvider for OpencodeProvider {
         // hold a whole pasted file, and materializing it just to take the
         // first 4096 characters would break the bounded-read promise for a
         // catalog entry.
-        let prompt_schema = snapshot.part_columns.contains("data")
-            && snapshot.part_columns.contains("message_id")
-            && snapshot.message_columns.contains("id")
-            && snapshot.message_columns.contains("data");
-        let first_prompt = if prompt_schema
-            && (snapshot.part_by_session
-                || (snapshot.message_by_session && snapshot.part_by_message))
-        {
-            let keyed_predicate = if snapshot.part_by_session {
-                "p.session_id = ?"
-            } else {
-                "m.session_id = ?"
-            };
-            let order = match (
-                snapshot.part_columns.contains("time_created"),
-                snapshot.message_columns.contains("time_created"),
-            ) {
-                (true, true) => "COALESCE(p.time_created, m.time_created)",
-                (true, false) => "p.time_created",
-                (false, true) => "m.time_created",
-                (false, false) => "p.id",
-            };
-            let sql = format!(
-                "SELECT substr(json_extract(p.data, '$.text'), 1, ?) \
-                 FROM part p JOIN message m ON m.id = p.message_id \
-                 WHERE {keyed_predicate} AND json_valid(m.data) AND json_valid(p.data) \
-                 AND json_extract(m.data, '$.role') = 'user' \
-                 AND json_extract(p.data, '$.type') = 'text' \
-                 AND COALESCE(json_type(p.data, '$.synthetic'), 'null') <> 'true' \
-                 AND json_type(p.data, '$.text') = 'text' \
-                 AND trim(substr(json_extract(p.data, '$.text'), 1, ?), ?) <> '' \
-                 ORDER BY {order} ASC LIMIT 1"
-            );
-            scan.note_query();
-            let prompt = {
-                let mut stmt = conn.prepare_cached(&sql)?;
-                stmt.query_row(
-                    params![
-                        EXCERPT_MAX_CHARS as i64,
-                        &candidate.locator,
-                        EXCERPT_MAX_CHARS as i64,
-                        EXCERPT_TRIM_WHITESPACE
-                    ],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?
-            };
-            scan.note_records(u64::from(prompt.is_some()));
-            prompt
-                .map(|text| excerpt(&text))
-                .filter(|text| !text.is_empty())
-        } else {
-            None
-        };
+        let first_prompt = opencode_sqlite_prompt(scan, snapshot, &candidate.locator)?;
         let mut models = Vec::new();
-        if snapshot.message_by_session
-            && snapshot.message_columns.contains("session_id")
-            && snapshot.message_columns.contains("data")
-        {
-            scan.note_query();
-            let model = {
-                // Match `parse_message` and `OpencodeSession::first_model`:
-                // payload time wins, the relational column is its fallback,
-                // and a message with neither is not parseable. Checking for a
-                // JSON integer mirrors `Value::as_i64`; a string that merely
-                // looks numeric must not take precedence here.
-                let payload_created = "CASE WHEN json_type(data, '$.time.created') = 'integer' \
-                                       AND typeof(json_extract(data, '$.time.created')) = 'integer' \
-                                       THEN json_extract(data, '$.time.created') END";
-                let created = if snapshot.message_columns.contains("time_created") {
-                    format!("COALESCE({payload_created}, time_created)")
-                } else {
-                    payload_created.to_string()
-                };
-                let order_by = if snapshot.message_columns.contains("id") {
-                    format!("ORDER BY {created} ASC, id ASC")
-                } else {
-                    format!("ORDER BY {created} ASC")
-                };
-                let sql = format!(
-                    "SELECT json_extract(data, '$.providerID'), \
-                            COALESCE(json_extract(data, '$.modelID'), \
-                                     json_extract(data, '$.model.modelID')) \
-                     FROM message WHERE session_id = ? AND json_valid(data) \
-                     AND json_extract(data, '$.role') = 'assistant' \
-                     AND {created} IS NOT NULL \
-                     AND (NULLIF(json_extract(data, '$.providerID'), '') IS NOT NULL \
-                          OR NULLIF(COALESCE(json_extract(data, '$.modelID'), \
-                                             json_extract(data, '$.model.modelID')), '') IS NOT NULL) \
-                     {order_by} LIMIT 1"
-                );
-                let mut stmt = conn.prepare_cached(&sql)?;
-                stmt.query_row([&candidate.locator], |row| {
-                    Ok((
-                        row.get::<_, Option<String>>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                    ))
-                })
-                .optional()?
-                .and_then(|(provider, model)| {
-                    crate::ingest::opencode::build_model(provider.as_deref(), model.as_deref())
-                })
-            };
-            scan.note_records(u64::from(model.is_some()));
-            push_unique(&mut models, model.as_deref());
-        }
+        push_unique(
+            &mut models,
+            opencode_sqlite_model(scan, snapshot, &candidate.locator)?.as_deref(),
+        );
         Ok(Some(ShallowSession {
             source: "opencode".into(),
             session_id: candidate.locator.clone(),
@@ -3026,65 +2860,10 @@ fn enumerate_opencode_snapshot(
          WHERE id IS NOT NULL AND id <> '' ORDER BY {recency_order}{limit_sql}"
     );
     let mut stmt = snapshot.conn.prepare(&sql)?;
-    let collect = |row: &rusqlite::Row<'_>| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, Option<String>>(1)?,
-            row.get::<_, Option<i64>>(2)?,
-            row.get::<_, Option<i64>>(3)?,
-        ))
+    let rows = match sqlite_limit {
+        None => opencode_rows_unpaged(scan, &mut stmt, claimed)?,
+        Some(limit) => page_limited_opencode_rows(scan, &mut stmt, limit, earlier, claimed)?,
     };
-    let mut rows = Vec::new();
-    match sqlite_limit {
-        None => {
-            scan.note_query();
-            let page = stmt
-                .query_map([], collect)?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            scan.note_records(page.len() as u64);
-            rows.extend(page.into_iter().filter(|(id, ..)| !claimed.contains(id)));
-        }
-        Some(limit) => {
-            // The first page is exactly the limit, so a store that owns all
-            // of its newest sessions costs the one query it always did. Only
-            // a store whose page lost slots to an earlier store's sessions
-            // reads on, in wider pages.
-            let mut page_size = limit;
-            let mut offset: i64 = 0;
-            while (rows.len() as i64) < limit && page_size > 0 {
-                scan.note_query();
-                let page = stmt
-                    .query_map([page_size, offset], collect)?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                scan.note_records(page.len() as u64);
-                let exhausted = (page.len() as i64) < page_size;
-                offset += page.len() as i64;
-                for row in page {
-                    if (rows.len() as i64) == limit {
-                        break;
-                    }
-                    if claimed.contains(&row.0) {
-                        continue;
-                    }
-                    let mut owned_earlier = false;
-                    for store in earlier {
-                        scan.note_query();
-                        if opencode_store_holds(store, &row.0)? {
-                            owned_earlier = true;
-                            break;
-                        }
-                    }
-                    if !owned_earlier {
-                        rows.push(row);
-                    }
-                }
-                if exhausted {
-                    break;
-                }
-                page_size = page_size.max(256);
-            }
-        }
-    }
     snapshot.sessions = rows
         .iter()
         .map(|(id, directory, created, updated)| {

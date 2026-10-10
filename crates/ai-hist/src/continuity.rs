@@ -25,10 +25,31 @@ use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
-use crate::relationship_capture::{record_relationship, ObservedRelationship};
-use crate::relationships::{
-    RelationshipDiagnostic, RELATIONSHIP_CONTINUATION, RELATIONSHIP_FORK, RELATIONSHIP_RESUME,
+mod parse;
+mod resolve;
+mod storage;
+
+pub use parse::scan_claude_transcript;
+pub(crate) use parse::{capture_folded, finish_claude_fold, fold_claude_record};
+use parse::{fold_claude_line, next_record, push_unique, record_ts_ms, string_field};
+#[cfg(test)]
+use parse::named_at;
+
+use storage::{load_pending, table_exists};
+#[cfg(test)]
+use storage::{map_evidence, session_holding_record};
+pub(crate) use storage::CLAUDE_UID_UNMATCHED_PREDICATE;
+#[cfg(test)]
+pub(crate) use storage::{session_holding_claude_uid_sql, SESSION_HOLDING_MESSAGE_SQL};
+
+use resolve::{
+    resolve_cross_file_parent, resolve_explicit, resolve_explicit_source, resolve_fork_group,
+    resolve_resume,
 };
+
+use crate::relationships::RelationshipDiagnostic;
+#[cfg(test)]
+use crate::relationships::{RELATIONSHIP_CONTINUATION, RELATIONSHIP_FORK, RELATIONSHIP_RESUME};
 
 /// A transcript carries evidence that is still waiting on something.
 pub const CONTINUITY_UNRESOLVED: &str = "RELATIONSHIP_CONTINUITY_UNRESOLVED";
@@ -133,221 +154,6 @@ impl ContinuityEvidence {
     }
 }
 
-/// Read one newline-delimited record into `raw`; `None` at end of file, else
-/// the bytes it consumed.
-///
-/// Bounded by [`crate::ingest::transcript_cursor::MAX_RECORD_BYTES`]: a record that runs
-/// past the ceiling is walked to its newline in fixed-size chunks and `raw` is
-/// left empty, so one pathological line cannot cost this walk the file's size
-/// in memory. `raw` is reused across calls, so the buffer is grown once.
-///
-/// The count is what the reader *spent*, not what `raw` ends up holding:
-/// `raw` loses the delimiter, and an oversized record is drained and dropped
-/// entirely.
-fn next_record(
-    reader: &mut impl std::io::BufRead,
-    raw: &mut Vec<u8>,
-) -> std::io::Result<Option<u64>> {
-    use std::io::{BufRead, Read};
-    const CEILING: u64 = crate::ingest::transcript_cursor::MAX_RECORD_BYTES;
-    raw.clear();
-    // The cap is on the reader rather than a check around it: `read_until`
-    // extends `raw` until it finds a newline, so a budget consulted afterwards
-    // can only observe an allocation that already happened.
-    let consumed = reader.take(CEILING).read_until(b'\n', raw)? as u64;
-    if consumed == 0 {
-        return Ok(None);
-    }
-    if raw.last() == Some(&b'\n') {
-        raw.pop();
-        if raw.last() == Some(&b'\r') {
-            raw.pop();
-        }
-        return Ok(Some(consumed));
-    }
-    if consumed < CEILING {
-        // A genuine tail: the file ends here, under the ceiling.
-        return Ok(Some(consumed));
-    }
-    // The limited read stops at the ceiling whether the record ends there or
-    // runs past it, so the ceiling alone cannot tell them apart. The same
-    // boundary rule as the ingest reader: one byte decides, and a record that
-    // ends exactly on the ceiling is an ordinary record.
-    match reader.fill_buf()?.first().copied() {
-        // The file ends here: a complete tail, exactly on the ceiling.
-        None => Ok(Some(consumed)),
-        Some(b'\n') => {
-            reader.consume(1);
-            Ok(Some(consumed + 1))
-        }
-        // Over the ceiling. Drop what was read and walk to the newline.
-        Some(_) => {
-            raw.clear();
-            Ok(Some(consumed + skip_past_newline(reader)?))
-        }
-    }
-}
-
-/// Walk to the next newline through the reader's buffer, consuming only up to
-/// it: anything after it is the next record and must still be there to read.
-/// The bytes consumed, newline included.
-fn skip_past_newline(reader: &mut impl std::io::BufRead) -> std::io::Result<u64> {
-    let mut consumed = 0;
-    loop {
-        let available = match reader.fill_buf() {
-            Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-            Err(error) => return Err(error),
-        };
-        if available.is_empty() {
-            return Ok(consumed);
-        }
-        if let Some(at) = available.iter().position(|byte| *byte == b'\n') {
-            reader.consume(at + 1);
-            return Ok(consumed + at as u64 + 1);
-        }
-        let all = available.len();
-        reader.consume(all);
-        consumed += all as u64;
-    }
-}
-
-/// Read one Claude transcript's continuity evidence in a single pass.
-///
-/// Returns `None` for a transcript with no in-log session id: relayhistory has
-/// no identity to attach the evidence to, and inventing one from the file name
-/// is exactly what the delegation model already refuses to do.
-/// The metadata walk folds this as it goes, so hydration and the global sync
-/// never call it. It is the one-time backfill on the *skip* path: a transcript
-/// indexed before continuity existed owes its evidence, and no metadata walk
-/// runs for a file that is being skipped.
-pub fn scan_claude_transcript(path: &Path) -> Result<Option<ContinuityEvidence>> {
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("reading Claude transcript {}", path.display()))?;
-    let mut reader = std::io::BufReader::new(file);
-    let mut raw = Vec::new();
-    let mut evidence = ContinuityEvidence::default();
-    let mut first_user_seen = false;
-    let mut any = false;
-    while next_record(&mut reader, &mut raw)
-        .with_context(|| format!("reading Claude transcript {}", path.display()))?
-        .is_some()
-    {
-        crate::ingest::check_capture_cancelled()?;
-        // An oversized record is not buffered and an undecodable one is not
-        // repaired; both leave `raw` empty or unparseable and take the same
-        // skip any other malformed record takes.
-        let Ok(line) = std::str::from_utf8(&raw) else {
-            continue;
-        };
-        any |= fold_claude_line(&mut evidence, &mut first_user_seen, line);
-    }
-    Ok(finish_claude_fold(evidence, any, path))
-}
-
-/// Fold one transcript line that is a JSON object; whether it was one.
-fn fold_claude_line(
-    evidence: &mut ContinuityEvidence,
-    first_user_seen: &mut bool,
-    line: &str,
-) -> bool {
-    let Ok(Value::Object(object)) = serde_json::from_str::<Value>(line) else {
-        return false;
-    };
-    fold_claude_record(evidence, first_user_seen, &object);
-    true
-}
-
-/// Settle a folded evidence set into the row it should record, or `None`.
-///
-/// `any` is whether a record ever folded in: a file that says nothing retracts
-/// what it used to say, which is a different answer from a file that has
-/// simply not grown since the last pass.
-pub(crate) fn finish_claude_fold(
-    mut evidence: ContinuityEvidence,
-    any: bool,
-    path: &Path,
-) -> Option<ContinuityEvidence> {
-    if !any {
-        return None;
-    }
-    evidence.source = "claude".to_string();
-    evidence.locator = path.to_string_lossy().to_string();
-    // An explicit `fileSessionId` in the records wins; the file name is the
-    // fallback, which is why it is filled in here rather than seeded before
-    // the walk.
-    if evidence.file_session_id.is_none() {
-        evidence.file_session_id = file_session_id_from_path(path);
-    }
-    evidence.session_id = evidence.in_log_session_ids.first().cloned()?;
-    Some(evidence)
-}
-
-/// Record continuity evidence a walk has already folded, reading nothing.
-pub(crate) fn capture_folded(
-    conn: &Connection,
-    path: &Path,
-    evidence: Option<ContinuityEvidence>,
-) -> Result<()> {
-    capture(conn, "claude", path, evidence)
-}
-
-/// Fold one Claude record into the running continuity evidence.
-///
-/// Every field is first-wins, last-wins or accumulating, which is what makes
-/// the walk resumable: the same records in the same order give the same
-/// answer whether they arrive in one pass or several.
-pub(crate) fn fold_claude_record(
-    evidence: &mut ContinuityEvidence,
-    first_user_seen: &mut bool,
-    object: &serde_json::Map<String, Value>,
-) {
-    if let Some(explicit) = string_field(object, &["fileSessionId", "file_session_id"]) {
-        evidence.file_session_id = Some(explicit);
-    }
-    if let Some(session_id) = string_field(object, &["sessionId", "session_id"]) {
-        if !evidence.in_log_session_ids.contains(&session_id) {
-            evidence.in_log_session_ids.push(session_id);
-        }
-        if evidence.first_ts_ms.is_none() {
-            evidence.first_ts_ms = record_ts_ms(object);
-        }
-    }
-    if evidence.source_version.is_none() {
-        evidence.source_version = string_field(object, &["version", "source_version"]);
-    }
-    if let Some(target) =
-        string_field(object, &["continuedFromSessionId", "continued_from_session_id"])
-    {
-        if !evidence.explicit_continuation_targets.contains(&target) {
-            note_named_at(&mut evidence.explicit_continuation_ts_ms, &target, object);
-        }
-        push_unique(&mut evidence.explicit_continuation_targets, target);
-    }
-    if let Some(target) = string_field(object, &["forkSessionId", "fork_session_id"]) {
-        if !evidence.explicit_fork_targets.contains(&target) {
-            note_named_at(&mut evidence.explicit_fork_ts_ms, &target, object);
-        }
-        push_unique(&mut evidence.explicit_fork_targets, target);
-    }
-    if evidence.explicit_source_session_id.is_none() {
-        evidence.explicit_source_session_id =
-            string_field(object, &["sourceSessionId", "source_session_id"]);
-    }
-    let sidechain = object
-        .get("isSidechain")
-        .and_then(Value::as_bool)
-        .unwrap_or(false);
-    let is_user = object.get("type").and_then(Value::as_str) == Some("user");
-    if is_user && !sidechain {
-        if !*first_user_seen {
-            *first_user_seen = true;
-            evidence.first_parent_uuid = string_field(object, &["parentUuid", "parent_uuid"]);
-        }
-        record_resume_marker(evidence, object);
-    }
-}
-
 /// Codex records continuity on the `session_meta` line that opens a rollout,
 /// or not at all.
 ///
@@ -421,9 +227,10 @@ pub fn scan_codex_rollout_counted(path: &Path) -> Result<(Option<ContinuityEvide
             .as_object()
             .expect("session_meta line is an object here"),
     );
-    if let Some(target) =
-        string_field(payload, &["continuedFromSessionId", "continued_from_session_id"])
-    {
+    if let Some(target) = string_field(
+        payload,
+        &["continuedFromSessionId", "continued_from_session_id"],
+    ) {
         push_unique(&mut evidence.explicit_continuation_targets, target);
     }
     // Codex's own fork fields, which are what it actually writes: a human fork
@@ -876,718 +683,11 @@ pub fn pending_reasons(
         .collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
-// ---------------------------------------------------------------------------
-// Resolution steps
-// ---------------------------------------------------------------------------
-
-/// Explicit provider fields. These name the origin outright, so they never
-/// wait on anything and never produce a pending reason.
-fn resolve_explicit(
-    conn: &Connection,
-    evidence: &ContinuityEvidence,
-    written: &mut Vec<(String, String)>,
-) -> Result<()> {
-    for target in &evidence.explicit_continuation_targets {
-        if target.is_empty() || *target == evidence.session_id {
-            continue;
-        }
-        written.push(write_edge(
-            conn,
-            evidence,
-            &ContinuityEdge {
-                relationship: RELATIONSHIP_CONTINUATION,
-                parent_session_id: target,
-                child_session_id: Some(evidence.session_id.as_str()),
-                evidence_ref: REF_CONTINUED_FROM,
-                origin_session_id: evidence.explicit_source_session_id.as_deref(),
-                spawned_at_ms: named_at(&evidence.explicit_continuation_ts_ms, target, evidence),
-            },
-        )?);
-    }
-    for target in &evidence.explicit_fork_targets {
-        if target.is_empty() || *target == evidence.session_id {
-            continue;
-        }
-        let origin = evidence
-            .explicit_source_session_id
-            .as_deref()
-            .unwrap_or(target.as_str());
-        let evidence_ref = evidence
-            .explicit_fork_refs
-            .get(target)
-            .map_or(REF_FORK_SESSION, String::as_str);
-        written.push(write_edge(
-            conn,
-            evidence,
-            &ContinuityEdge {
-                relationship: RELATIONSHIP_FORK,
-                parent_session_id: target,
-                child_session_id: Some(evidence.session_id.as_str()),
-                evidence_ref,
-                origin_session_id: Some(origin),
-                spawned_at_ms: named_at(&evidence.explicit_fork_ts_ms, target, evidence),
-            },
-        )?);
-    }
-    Ok(())
-}
-
-/// An explicit `sourceSessionId`, when nothing else has said where this
-/// transcript came from.
-///
-/// The field names the origin outright, which is lineage on its own — leaving
-/// it to the fork-group fallback made a transcript that *says* where it came
-/// from wait for a sibling to prove it. But it is the weakest of the explicit
-/// signals, and on its own it does not say *how* the conversation carried on.
-/// A file that also carries `continuedFromSessionId`, a resume marker or a
-/// resolvable `parentUuid` has already been explained by a signal that does,
-/// so emitting this as well would give one transcript two parents — or a
-/// `fork` and a `continuation` to the same session. Those signals run first
-/// and this runs only if they wrote nothing.
-///
-/// `sourceSessionId` is still recorded as `origin_session_id` on whichever
-/// edge they did write, so the origin is never lost by being skipped here.
-fn resolve_explicit_source(
-    conn: &Connection,
-    evidence: &ContinuityEvidence,
-    written: &mut Vec<(String, String)>,
-) -> Result<()> {
-    if !written.is_empty() {
-        return Ok(());
-    }
-    let Some(origin) = evidence.explicit_origin() else {
-        return Ok(());
-    };
-    written.push(write_edge(
-        conn,
-        evidence,
-        &ContinuityEdge {
-            relationship: RELATIONSHIP_FORK,
-            parent_session_id: origin,
-            child_session_id: Some(evidence.session_id.as_str()),
-            evidence_ref: REF_SOURCE_SESSION,
-            origin_session_id: Some(origin),
-            spawned_at_ms: evidence.first_ts_ms,
-        },
-    )?);
-    Ok(())
-}
-
-/// A `/resume <id>` or `/continue <id>` the human typed.
-///
-/// A marker naming no session does not establish lineage. Another transcript
-/// cannot supply its missing target, so it is neither an edge nor pending work.
-fn resolve_resume(
-    conn: &Connection,
-    evidence: &ContinuityEvidence,
-    written: &mut Vec<(String, String)>,
-) -> Result<()> {
-    if !evidence.has_resume_marker {
-        return Ok(());
-    }
-    let Some(target) = evidence
-        .resume_target
-        .as_deref()
-        .filter(|target| !target.is_empty())
-    else {
-        return Ok(());
-    };
-    if target == evidence.session_id {
-        return Ok(());
-    }
-    written.push(write_edge(
-        conn,
-        evidence,
-        &ContinuityEdge {
-            relationship: RELATIONSHIP_RESUME,
-            parent_session_id: target,
-            child_session_id: Some(evidence.session_id.as_str()),
-            evidence_ref: REF_RESUME_MARKER,
-            // The explicit origin when the file names one, so skipping the
-            // source-only fork never loses it.
-            origin_session_id: evidence.explicit_origin().or(Some(target)),
-            spawned_at_ms: evidence.first_ts_ms,
-        },
-    )?);
-    Ok(())
-}
-
-/// The transcript answers a record it does not contain.
-///
-/// The uuid is resolved against the events already indexed, so the answer is
-/// whichever session actually holds that record — never a file name, and never
-/// a guess. A uuid nothing has indexed yet is left pending with the uuid in
-/// the reason, which is what makes hydrating the origin afterwards enough.
-fn resolve_cross_file_parent(
-    conn: &Connection,
-    evidence: &ContinuityEvidence,
-    reasons: &mut Vec<String>,
-    written: &mut Vec<(String, String)>,
-) -> Result<()> {
-    // An explicit field has already said where this conversation came from,
-    // and this is inference over the same question. Running it anyway left the
-    // row pending on a uuid the answer did not depend on — and once that uuid
-    // was indexed under some other session, added a second parent beside the
-    // one the provider named. Callers reach this before `sourceSessionId` is
-    // considered, so source-only evidence still gets the lookup and a
-    // resolvable parent still outranks it.
-    if !written.is_empty() {
-        return Ok(());
-    }
-    let Some(parent_uuid) = evidence
-        .first_parent_uuid
-        .as_deref()
-        .filter(|uuid| !uuid.is_empty())
-    else {
-        return Ok(());
-    };
-    let Some(parent_session_id) = session_holding_record(conn, &evidence.source, parent_uuid)?
-    else {
-        reasons.push(format!(
-            "parent record {parent_uuid} is not indexed in any session yet"
-        ));
-        return Ok(());
-    };
-    if parent_session_id == evidence.session_id {
-        return Ok(());
-    }
-    written.push(write_edge(
-        conn,
-        evidence,
-        &ContinuityEdge {
-            relationship: RELATIONSHIP_CONTINUATION,
-            parent_session_id: &parent_session_id,
-            child_session_id: Some(evidence.session_id.as_str()),
-            evidence_ref: parent_uuid,
-            origin_session_id: evidence.explicit_source_session_id.as_deref(),
-            spawned_at_ms: evidence.first_ts_ms,
-        },
-    )?);
-    Ok(())
-}
-
-/// Two or more transcripts claiming one origin conversation are its branches.
-///
-/// A group of one is not a fork — it is a single session whose file happens to
-/// be named something else — so it stays pending until a sibling shows up. The
-/// branch's child identity is its in-log session id only when that differs
-/// from the origin; when both transcripts carry the same in-log id, the branch
-/// has no provider-recorded identity of its own and the row is unlinked
-/// evidence keyed on the transcript, exactly as a nameless subagent sidecar is.
-/// Deriving a child id from the file name is what this codebase refuses to do
-/// everywhere else, and a fork is not the place to start.
-fn resolve_fork_group(
-    conn: &Connection,
-    evidence: &ContinuityEvidence,
-    has_lineage: bool,
-    reasons: &mut Vec<String>,
-    written: &mut Vec<(String, String)>,
-) -> Result<()> {
-    let Some(origin) = evidence.origin_session_id() else {
-        return Ok(());
-    };
-    // An explicit field already established the branch — `forkSessionId`, or
-    // a `sourceSessionId` naming an origin of its own. The group inference is
-    // only ever the fallback for a transcript with no explicit lineage.
-    if !evidence.explicit_fork_targets.is_empty() || evidence.explicit_origin().is_some() {
-        return Ok(());
-    }
-    let group = fork_group(conn, &evidence.source, &origin)?;
-    let labels: BTreeSet<&str> = group
-        .iter()
-        .map(|member| member.branch_label())
-        .collect::<BTreeSet<_>>();
-    if labels.len() < 2 {
-        // A transcript that already knows where it came from is not waiting on
-        // a sibling: the fork inference is the fallback for a file with no
-        // lineage of its own, so reporting it as pending here would put a
-        // permanent diagnostic on every fully explained transcript.
-        if !has_lineage {
-            reasons.push(format!(
-                "only one transcript claims origin {origin}; a fork needs a sibling"
-            ));
-        }
-        return Ok(());
-    }
-    for member in &group {
-        // Group membership alone is weaker than a provider-named target or a
-        // parent record already indexed in another session. This check must
-        // cover siblings too: they may have reconciled before the group grew,
-        // and emitting their fork here would add a second lineage parent.
-        if (member.locator == evidence.locator && has_lineage)
-            || has_stronger_lineage(conn, member)?
-        {
-            continue;
-        }
-        let child = (member.session_id != origin).then_some(member.session_id.as_str());
-        let uid = write_edge(
-            conn,
-            member,
-            &ContinuityEdge {
-                relationship: RELATIONSHIP_FORK,
-                parent_session_id: &origin,
-                child_session_id: child,
-                evidence_ref: REF_SHARED_SESSION_ID,
-                origin_session_id: Some(origin.as_str()),
-                spawned_at_ms: member.first_ts_ms,
-            },
-        )?;
-        // Only this locator's own row is part of its keep-set; a sibling's row
-        // is retracted by the sibling's own pass, never by this one.
-        if member.locator == evidence.locator {
-            written.push(uid);
-        }
-    }
-    Ok(())
-}
-
-fn has_stronger_lineage(conn: &Connection, evidence: &ContinuityEvidence) -> Result<bool> {
-    let names_other_session = |target: &str| !target.is_empty() && target != evidence.session_id;
-    if evidence
-        .explicit_continuation_targets
-        .iter()
-        .chain(&evidence.explicit_fork_targets)
-        .any(|target| names_other_session(target))
-        || evidence
-            .explicit_source_session_id
-            .as_deref()
-            .is_some_and(names_other_session)
-        || evidence.has_resume_marker
-            && evidence
-                .resume_target
-                .as_deref()
-                .is_some_and(names_other_session)
-    {
-        return Ok(true);
-    }
-    let Some(parent_uuid) = evidence.first_parent_uuid.as_deref() else {
-        return Ok(false);
-    };
-    Ok(session_holding_record(conn, &evidence.source, parent_uuid)?
-        .is_some_and(|session| session != evidence.session_id))
-}
-
-// ---------------------------------------------------------------------------
-// Storage helpers
-// ---------------------------------------------------------------------------
-
-/// One lineage edge a resolution step derived from a transcript's evidence.
-struct ContinuityEdge<'a> {
-    relationship: &'a str,
-    parent_session_id: &'a str,
-    child_session_id: Option<&'a str>,
-    evidence_ref: &'a str,
-    origin_session_id: Option<&'a str>,
-    spawned_at_ms: Option<i64>,
-}
-
-fn write_edge(
-    conn: &Connection,
-    evidence: &ContinuityEvidence,
-    edge: &ContinuityEdge<'_>,
-) -> Result<(String, String)> {
-    let &ContinuityEdge {
-        relationship,
-        parent_session_id,
-        child_session_id,
-        evidence_ref,
-        origin_session_id,
-        spawned_at_ms,
-    } = edge;
-    // Unlinked branches of one origin must not collapse into a single row, so
-    // their uid carries the transcript that distinguishes them.
-    let uid = match child_session_id {
-        Some(child) => format!("{relationship}:{child}"),
-        None => format!("{relationship}:{}", evidence.branch_label()),
-    };
-    let child_has_events = match child_session_id {
-        Some(child) => session_has_events(conn, &evidence.source, child)?,
-        None => false,
-    };
-    record_relationship(
-        conn,
-        &ObservedRelationship {
-            source: &evidence.source,
-            parent_session_id,
-            child_session_id,
-            relationship,
-            evidence_kind: evidence_kind(&evidence.source),
-            evidence_locator: Some(&evidence.locator),
-            evidence_ref: Some(evidence_ref),
-            child_has_events,
-            spawned_at_ms,
-            origin_session_id,
-            relationship_uid: Some(&uid),
-            ..ObservedRelationship::default()
-        },
-    )?;
-    Ok((parent_session_id.to_string(), uid))
-}
-
-fn evidence_kind(source: &str) -> &'static str {
-    match source {
-        "codex" => "codex_session_meta_continuity",
-        _ => "claude_transcript_continuity",
-    }
-}
-
-fn load_pending(conn: &Connection, source: &str) -> Result<Vec<ContinuityEvidence>> {
-    Ok(conn
-        .prepare(
-            "SELECT source, locator, session_id, file_session_id, first_parent_uuid, \
-                    first_ts_ms, in_log_session_ids_json, has_resume_marker, resume_target, \
-                    explicit_targets_json, source_version \
-             FROM session_continuity_evidence \
-             WHERE source = ? AND pending_reason IS NOT NULL \
-             ORDER BY locator ASC",
-        )?
-        .query_map(params![source], map_evidence)?
-        .collect::<rusqlite::Result<Vec<_>>>()?)
-}
-
-/// Every transcript claiming one origin, pending or already resolved.
-fn fork_group(conn: &Connection, source: &str, origin: &str) -> Result<Vec<ContinuityEvidence>> {
-    Ok(conn
-        .prepare(
-            "SELECT source, locator, session_id, file_session_id, first_parent_uuid, \
-                    first_ts_ms, in_log_session_ids_json, has_resume_marker, resume_target, \
-                    explicit_targets_json, source_version \
-             FROM session_continuity_evidence \
-             WHERE source = ? AND origin_session_id = ? \
-             ORDER BY locator ASC",
-        )?
-        .query_map(params![source, origin], map_evidence)?
-        .collect::<rusqlite::Result<Vec<_>>>()?)
-}
-
-fn map_evidence(row: &rusqlite::Row<'_>) -> rusqlite::Result<ContinuityEvidence> {
-    let in_log: String = row.get(6)?;
-    let targets: String = row.get(9)?;
-    let targets: Value = serde_json::from_str(&targets).unwrap_or_else(|_| json!({}));
-    Ok(ContinuityEvidence {
-        source: row.get(0)?,
-        locator: row.get(1)?,
-        session_id: row.get(2)?,
-        file_session_id: row.get(3)?,
-        first_parent_uuid: row.get(4)?,
-        first_ts_ms: row.get(5)?,
-        in_log_session_ids: serde_json::from_str(&in_log).unwrap_or_default(),
-        has_resume_marker: row.get(7)?,
-        resume_target: row.get(8)?,
-        explicit_continuation_targets: string_array(&targets, "continuation"),
-        explicit_fork_targets: string_array(&targets, "fork"),
-        explicit_fork_refs: targets
-            .get("fork_refs")
-            .and_then(Value::as_object)
-            .map(|refs| {
-                refs.iter()
-                    .filter_map(|(target, field)| {
-                        Some((target.clone(), field.as_str()?.to_string()))
-                    })
-                    .collect()
-            })
-            .unwrap_or_default(),
-        explicit_continuation_ts_ms: ts_map(&targets, "continuation_ts_ms"),
-        explicit_fork_ts_ms: ts_map(&targets, "fork_ts_ms"),
-        explicit_source_session_id: targets
-            .get("source")
-            .and_then(Value::as_str)
-            .map(str::to_string),
-        source_version: row.get(10)?,
-    })
-}
-
-/// The session holding the record with this provider uuid.
-///
-/// `message_id` is the record's own uuid; `event_uid` appends a block index to
-/// it. Both are checked so a record whose uuid only ever reached the uid still
-/// resolves, and the answer is the lowest session id either names.
-///
-/// Asked as two keyed searches rather than one `message_id = ? OR event_uid =
-/// ?` predicate. The OR fits neither index, so SQLite answered it by walking
-/// every event of the source — once per pending transcript, on every sweep,
-/// for as long as the transcript stays pending, which for a parent uuid
-/// nothing has indexed is for ever (#215). The uid half only has to find what
-/// the message half cannot: a row whose uid is `<uuid>:0` but whose
-/// `message_id` is not that uuid. That is what
-/// `idx_session_events_claude_uid_unmatched` holds, so on a store where every
-/// row's uid extends its own message id the index is empty and costs no write.
-fn session_holding_record(
-    conn: &Connection,
-    source: &str,
-    record_uuid: &str,
-) -> Result<Option<String>> {
-    let lowest = |sql: &str| -> Result<Option<String>> {
-        Ok(conn
-            .prepare_cached(sql)?
-            .query_row(params![source, record_uuid], |row| row.get::<_, String>(0))
-            .optional()?)
-    };
-    let by_message = lowest(SESSION_HOLDING_MESSAGE_SQL)?;
-    // Only Claude records a parent uuid today, and the partial index is
-    // Claude's; another source keeps the same answer through the unindexed
-    // form rather than a different one.
-    let by_uid = if source == "claude" {
-        lowest(&session_holding_claude_uid_sql())?
-    } else {
-        lowest(SESSION_HOLDING_UID_SQL)?
-    };
-    // `min` over `String` is a byte-wise comparison, which is the `BINARY`
-    // collation the single query ordered by.
-    Ok(match (by_message, by_uid) {
-        (Some(message), Some(uid)) => Some(message.min(uid)),
-        (message, uid) => message.or(uid),
-    })
-}
-
-/// The message half of [`session_holding_record`], a search on
-/// `idx_session_events_message`. `+session_id` keeps the planner from
-/// walking `idx_session_events_session` in session order to satisfy the
-/// `ORDER BY`, which without statistics it prefers and which visits every
-/// event of the source until one matches.
-pub(crate) const SESSION_HOLDING_MESSAGE_SQL: &str = "SELECT session_id FROM session_events \
-     WHERE source = ?1 AND message_id = ?2 ORDER BY +session_id ASC LIMIT 1";
-
-/// The rows `idx_session_events_claude_uid_unmatched` covers: a Claude
-/// block-0 uid that does not extend the row's own message id, which is the
-/// only shape the message half of [`session_holding_record`] cannot see.
-/// This one spelling builds both the index's `WHERE` (in `store::init_db`)
-/// and the lookup below, because SQLite proves a partial index applies by
-/// matching the query's terms against the index's, and a drift between the
-/// two would silently turn the lookup back into a scan of every Claude
-/// event per transcript per sweep.
-pub(crate) const CLAUDE_UID_UNMATCHED_PREDICATE: &str = "source = 'claude' \
-     AND substr(event_uid, -2) = ':0' \
-     AND (message_id IS NULL OR event_uid <> message_id || ':0')";
-
-/// The uid half for Claude: only rows the message half cannot see, spelled
-/// with exactly the terms of `idx_session_events_claude_uid_unmatched`'s
-/// `WHERE` ([`CLAUDE_UID_UNMATCHED_PREDICATE`]) so SQLite can prove the
-/// partial index applies. `?1` is left unreferenced so both halves bind the
-/// same parameters.
-pub(crate) fn session_holding_claude_uid_sql() -> String {
-    format!(
-        "SELECT session_id FROM session_events \
-         WHERE {CLAUDE_UID_UNMATCHED_PREDICATE} AND event_uid = ?2 || ':0' \
-         ORDER BY +session_id ASC LIMIT 1"
-    )
-}
-
-/// The uid half for any other source. No source but Claude records a parent
-/// uuid, so this is not reached today; it keeps the lookup's meaning if one
-/// ever does.
-const SESSION_HOLDING_UID_SQL: &str = "SELECT session_id FROM session_events \
-     WHERE source = ?1 AND event_uid = ?2 || ':0' ORDER BY +session_id ASC LIMIT 1";
-
-fn session_has_events(conn: &Connection, source: &str, session_id: &str) -> Result<bool> {
-    Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM session_events WHERE source = ? AND session_id = ? LIMIT 1)",
-        params![source, session_id],
-        |row| row.get(0),
-    )?)
-}
-
-fn table_exists(conn: &Connection, name: &str) -> Result<bool> {
-    Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?)",
-        [name],
-        |row| row.get(0),
-    )?)
-}
-
-// ---------------------------------------------------------------------------
-// Parsing helpers
-// ---------------------------------------------------------------------------
-
-/// The transcript's own file identity, used only to tell two files apart.
-///
-/// burn derives this from an explicit `fileSessionId` and then the transcript
-/// path's basename, deliberately never from the path the parser happened to
-/// open. relayhistory only ever has the real on-disk path, so the basename is
-/// it — and because this value is never written as a session id, a file named
-/// after nothing in particular costs nothing.
-fn file_session_id_from_path(path: &Path) -> Option<String> {
-    path.file_stem()
-        .and_then(|stem| stem.to_str())
-        .filter(|stem| !stem.is_empty())
-        .map(str::to_string)
-}
-
-/// A `/resume` or `/continue` the human ran, in either form Claude writes.
-///
-/// Claude Code does not store a slash command as the text the human typed. It
-/// stores a control wrapper — `<command-message>resume is running…`,
-/// `<command-name>/resume</command-name>`, `<command-args>…</command-args>` —
-/// which this crate already recognises as a control prompt and keeps out of
-/// prompt history. Matching only bare `/resume` therefore matched the one form
-/// a real session never contains, and every actual resume went unrecorded.
-///
-/// burn reads the same marker off plain user text only, so on the bare form
-/// the two agree; the wrapped form is one burn does not detect either.
-fn record_resume_marker(
-    evidence: &mut ContinuityEvidence,
-    object: &serde_json::Map<String, Value>,
-) {
-    let Some(text) = plain_user_text(object) else {
-        return;
-    };
-    // The same text ingestion classifies: a `<system-reminder>` Claude Code
-    // puts ahead of the wrapper is not the record's own text, and left in
-    // place it would hide the command from both parsers below.
-    let split = crate::ingest::control::split_system_reminders(&text);
-    let trimmed = split.prompt.as_str();
-    // The wrapped form first: a record that opens with a control tag is never
-    // a bare command, and `bare_command` refuses anything not starting with
-    // `/`, so an unparseable wrapper falls through to nothing rather than to
-    // a false match.
-    let Some((command, rest)) = wrapped_command(trimmed).or_else(|| bare_command(trimmed))
-    else {
-        return;
-    };
-    if command != "resume" && command != "continue" {
-        return;
-    }
-    evidence.has_resume_marker = true;
-    if evidence.resume_target.is_some() {
-        return;
-    }
-    let token_end = rest.find(char::is_whitespace).unwrap_or(rest.len());
-    let token = &rest[..token_end];
-    if !token.is_empty() {
-        evidence.resume_target = Some(token.to_string());
-    }
-}
-
-/// `/resume <target>` as typed: the form burn matches.
-fn bare_command(text: &str) -> Option<(String, &str)> {
-    let after_slash = text.strip_prefix('/')?;
-    let command_end = after_slash
-        .find(char::is_whitespace)
-        .unwrap_or(after_slash.len());
-    Some((
-        after_slash[..command_end].to_lowercase(),
-        after_slash[command_end..].trim_start(),
-    ))
-}
-
-/// The command name and arguments Claude Code's control wrapper carries.
-///
-/// `<command-args>` is absent when the command took none, and the elements can
-/// arrive in either order, so each is read independently rather than by
-/// position -- the same read `ingest::control` makes for the `slash_command`
-/// marker.
-fn wrapped_command(text: &str) -> Option<(String, &str)> {
-    if crate::ingest::control::claude_text_control_kind(text)
-        != Some(crate::ingest::control::ControlKind::SlashCommandInvocation)
-    {
-        return None;
-    }
-    let name = crate::ingest::control::tag_body(text, "command-name")?;
-    let command = name.trim().trim_start_matches('/').to_lowercase();
-    let args = crate::ingest::control::tag_body(text, "command-args")
-        .unwrap_or("")
-        .trim_start();
-    Some((command, args))
-}
-
-/// The user's own typed text, from either content shape. Tool results and
-/// structured blocks are not something a human typed a slash command into.
-fn plain_user_text(object: &serde_json::Map<String, Value>) -> Option<String> {
-    let content = object.get("message").and_then(|m| m.get("content"))?;
-    if let Some(text) = content.as_str() {
-        return Some(text.to_string());
-    }
-    let blocks = content.as_array()?;
-    let parts: Vec<&str> = blocks
-        .iter()
-        .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
-        .filter_map(|block| block.get("text").and_then(Value::as_str))
-        .collect();
-    (!parts.is_empty()).then(|| parts.join("\n"))
-}
-
-fn record_ts_ms(object: &serde_json::Map<String, Value>) -> Option<i64> {
-    object.get("timestamp").and_then(|value| {
-        value
-            .as_str()
-            .and_then(crate::parse_iso_ms)
-            .or_else(|| value.as_i64())
-    })
-}
-
-fn string_field(object: &serde_json::Map<String, Value>, keys: &[&str]) -> Option<String> {
-    keys.iter()
-        .filter_map(|key| object.get(*key))
-        .filter_map(Value::as_str)
-        .map(str::trim)
-        .find(|value| !value.is_empty())
-        .map(str::to_string)
-}
-
-fn ts_map(value: &Value, key: &str) -> BTreeMap<String, i64> {
-    value
-        .get(key)
-        .and_then(Value::as_object)
-        .map(|entries| {
-            entries
-                .iter()
-                .filter_map(|(target, ts)| Some((target.clone(), ts.as_i64()?)))
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// Remember when the record that first names `target` was written. Called
-/// only for that first record: one without a timestamp leaves the target
-/// undated rather than dated by a later record.
-fn note_named_at(
-    named: &mut BTreeMap<String, i64>,
-    target: &str,
-    object: &serde_json::Map<String, Value>,
-) {
-    if let Some(ts) = record_ts_ms(object) {
-        named.insert(target.to_string(), ts);
-    }
-}
-
-/// When the record naming an explicit target was written.
-///
-/// A Codex rollout names its targets only on the `session_meta` line that
-/// opens it, so its first record is the naming record. A Claude naming record
-/// without a timestamp leaves only the transcript's first record to date by.
-fn named_at(
-    named: &BTreeMap<String, i64>,
-    target: &str,
-    evidence: &ContinuityEvidence,
-) -> Option<i64> {
-    named.get(target).copied().or(evidence.first_ts_ms)
-}
-
-fn string_array(value: &Value, key: &str) -> Vec<String> {
-    value
-        .get(key)
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-fn push_unique(values: &mut Vec<String>, value: String) {
-    if !values.contains(&value) {
-        values.push(value);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::relationships::{RelationshipKinds, IDENTITY_OBSERVED, IDENTITY_UNLINKED};
     use crate::ingest::ingest_claude_transcript;
+    use crate::relationships::{RelationshipKinds, IDENTITY_OBSERVED, IDENTITY_UNLINKED};
     use crate::{open_db, session_children, session_relationships};
     use rusqlite::Connection;
     use std::path::PathBuf;
@@ -1709,7 +809,9 @@ mod tests {
             );
         }
         assert_eq!(
-            session_holding_record(&conn, "claude", "s7-r2").unwrap().as_deref(),
+            session_holding_record(&conn, "claude", "s7-r2")
+                .unwrap()
+                .as_deref(),
             Some("a-uid-wins")
         );
         // The parser's own rows never enter the partial index.
@@ -1778,7 +880,9 @@ mod tests {
         );
         // The marker is lineage, so the file is not also left waiting on a
         // fork sibling it has no reason to expect.
-        assert!(pending_reasons(&conn, "claude", RESUMED).unwrap().is_empty());
+        assert!(pending_reasons(&conn, "claude", RESUMED)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
@@ -1834,7 +938,11 @@ mod tests {
             json!({"sessionId": "s", "forkSessionId": "base",
                    "timestamp": "2026-04-24T02:00:01.000Z"}),
         ] {
-            fold_claude_record(&mut evidence, &mut first_user_seen, record.as_object().unwrap());
+            fold_claude_record(
+                &mut evidence,
+                &mut first_user_seen,
+                record.as_object().unwrap(),
+            );
         }
         assert!(evidence.explicit_fork_ts_ms.is_empty());
         assert_eq!(
@@ -1928,9 +1036,13 @@ mod tests {
         );
         // Both branches carry the shared in-log id, so neither has a provider
         // identity of its own. A file name is not one, here or anywhere else.
-        for edge in
-            session_children(&conn, "claude", SHARED_FORK, &RelationshipKinds::continuity())
-                .unwrap()
+        for edge in session_children(
+            &conn,
+            "claude",
+            SHARED_FORK,
+            &RelationshipKinds::continuity(),
+        )
+        .unwrap()
         {
             assert_eq!(edge.identity_status, IDENTITY_UNLINKED);
             assert_eq!(edge.child_session_id, None);
@@ -2162,7 +1274,10 @@ mod tests {
         assert!(pending_reasons(&conn, "codex", "child").unwrap().is_empty());
         let reloaded = load_pending_or_all(&conn);
         assert_eq!(
-            reloaded[0].explicit_fork_refs.get("parent").map(String::as_str),
+            reloaded[0]
+                .explicit_fork_refs
+                .get("parent")
+                .map(String::as_str),
             Some(REF_FORKED_FROM_ID)
         );
     }
@@ -2794,7 +1909,9 @@ mod tests {
             )]
         );
         assert!(
-            pending_reasons(&conn, "claude", "branch").unwrap().is_empty(),
+            pending_reasons(&conn, "claude", "branch")
+                .unwrap()
+                .is_empty(),
             "a transcript that names its origin is not waiting on a sibling"
         );
     }
@@ -2914,7 +2031,10 @@ mod tests {
     #[test]
     fn nameless_continue_does_not_leave_permanent_pending_evidence() {
         let (dir, conn) = database();
-        for (session, explicit) in [("ordinary", ""), ("continued", ",\"continuedFromSessionId\":\"prior\"")] {
+        for (session, explicit) in [
+            ("ordinary", ""),
+            ("continued", ",\"continuedFromSessionId\":\"prior\""),
+        ] {
             let path = dir.path().join(format!("{session}.jsonl"));
             std::fs::write(
                 &path,
@@ -3180,7 +2300,9 @@ mod tests {
         let one_parent = vec![(RELATIONSHIP_CONTINUATION.to_string(), "prior".to_string())];
         assert_eq!(parents(&conn), one_parent);
         assert!(
-            pending_reasons(&conn, "claude", "branch").unwrap().is_empty(),
+            pending_reasons(&conn, "claude", "branch")
+                .unwrap()
+                .is_empty(),
             "the uuid was never needed, so nothing is waiting on it"
         );
 
@@ -3239,7 +2361,10 @@ mod tests {
                 .into_iter()
                 .map(|edge| (edge.0, edge.3))
                 .collect::<Vec<_>>(),
-            vec![(RELATIONSHIP_CONTINUATION.to_string(), "origin-a".to_string())],
+            vec![(
+                RELATIONSHIP_CONTINUATION.to_string(),
+                "origin-a".to_string()
+            )],
             "the resolved uuid replaced the source fork rather than joining it"
         );
     }

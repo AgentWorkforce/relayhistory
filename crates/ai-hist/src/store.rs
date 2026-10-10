@@ -11,9 +11,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod event_row;
 mod retired_sources;
 pub use retired_sources::is_retired_source;
 mod schema_check;
+pub(crate) use event_row::row_to_session_event;
 use schema_check::schema_has_required_indexes;
 
 pub use crate::relationship_graph::{
@@ -3026,50 +3028,6 @@ pub(crate) const SESSION_EVENT_COLUMNS: &str =
      error_signal, subagent_session_id, agent_id, request_id, provider_message_id, \
      stop_reason, agent_version, is_sidechain, is_meta, turn_id, request_span, raw_kind, \
      control_kind, record_token_json";
-
-pub(crate) fn row_to_session_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionEvent> {
-    Ok(SessionEvent {
-        id: row.get(0)?,
-        source: row.get(1)?,
-        session_id: row.get(2)?,
-        project: row.get(3)?,
-        project_key: row.get(4)?,
-        cwd: row.get(5)?,
-        git_branch: row.get(6)?,
-        message_id: row.get(7)?,
-        parent_id: row.get(8)?,
-        ts_ms: row.get(9)?,
-        role: row.get(10)?,
-        kind: row.get(11)?,
-        text: row.get(12)?,
-        model: row.get(13)?,
-        token_json: row.get(14)?,
-        provider: row.get(15)?,
-        event_uid: row.get(16)?,
-        tool_use_id: row.get(17)?,
-        payload_bytes: row.get(18)?,
-        payload_truncated: row.get(19)?,
-        payload_hash: row.get(20)?,
-        call_index: row.get(21)?,
-        event_index: row.get(22)?,
-        result_status: row.get(23)?,
-        event_source: row.get(24)?,
-        error_signal: row.get(25)?,
-        subagent_session_id: row.get(26)?,
-        agent_id: row.get(27)?,
-        request_id: row.get(28)?,
-        provider_message_id: row.get(29)?,
-        stop_reason: row.get(30)?,
-        agent_version: row.get(31)?,
-        is_sidechain: row.get(32)?,
-        is_meta: row.get(33)?,
-        turn_id: row.get(34)?,
-        request_span: row.get(35)?,
-        raw_kind: row.get(36)?,
-        control_kind: row.get(37)?,
-        record_token_json: row.get(38)?,
-    })
-}
 
 /// The order every whole-session event read uses: oldest first, rows sharing
 /// a timestamp in insertion order.
