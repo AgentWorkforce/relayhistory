@@ -654,6 +654,10 @@ pub fn pending_diagnostics(
         .collect())
 }
 
+pub(crate) const PENDING_REASONS_SQL: &str = "SELECT locator, pending_reason \
+     FROM session_continuity_evidence INDEXED BY idx_session_continuity_pending \
+     WHERE source = ? AND session_id = ? AND pending_reason IS NOT NULL ORDER BY locator ASC";
+
 /// The same pending evidence, as `(locator, reason)` pairs.
 pub fn pending_reasons(
     conn: &Connection,
@@ -664,12 +668,11 @@ pub fn pending_reasons(
     if !table_exists(conn, "session_continuity_evidence")? {
         return Ok(Vec::new());
     }
+    // The index named outright: `ORDER BY locator` is the primary key's
+    // order, and without statistics SQLite walked every evidence row of the
+    // source in it rather than seek the session and sort its few rows.
     Ok(conn
-        .prepare(
-            "SELECT locator, pending_reason FROM session_continuity_evidence \
-             WHERE source = ? AND session_id = ? AND pending_reason IS NOT NULL \
-             ORDER BY locator ASC",
-        )?
+        .prepare_cached(PENDING_REASONS_SQL)?
         .query_map(params![source, session_id], |row| {
             Ok((
                 row.get::<_, String>(0)?,

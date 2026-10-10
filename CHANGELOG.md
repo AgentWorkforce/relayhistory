@@ -4,7 +4,19 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Patch]
+
+### Changed
+
+- A sync that sweeps ends with `PRAGMA optimize` under `analysis_limit = 400`, so the store carries planner statistics; the first sweep after upgrading analyzes the store once (seconds on a multi-gigabyte history).
+
+### Fixed
+
+- A Codex thread marked `thread_source: "subagent"` that names no parent (a standalone guardian / auto-review thread) is a catalogued session readable through `SessionStore::session`, instead of being hidden as a child of no parent; a rollout is a delegated child only when its `session_meta` names its parent. The first sync after upgrading catalogs the threads an earlier build hid.
+- `SessionStore::sync` reads only the OpenCode sessions that changed since the sweep that last wrote them and does not open an OpenCode store whose database and WAL are unchanged, instead of re-reading and rewriting every session on every sweep; the first sync after upgrading reads each OpenCode store once more.
+- An unforced `sync` skips the sweep again when no source changed on a host with an OpenCode or Devin SQLite store: the source fingerprint no longer counts the store's `-shm` index, which every read of the store rewrote.
+- A sweep refreshes canonical project identity only for the sessions written since the database's last refresh, including in a new process: every `ai-hist sync` and every embedder's first sweep re-walked every delegated child before.
+- Reading a session's parents, continuity edges and unresolved continuity evidence, and deleting a session, seek that session's own rows instead of reading every relationship or continuity row of its source, with or without planner statistics.
 
 ## [0.38.0] - 2026-10-10
 
@@ -17,7 +29,6 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - An appended exported column restamps only rows holding a value in it, and a raw-facts parser-generation bump restamps only events whose evidence changed, so neither re-delivers a store's session events. A row holding NULL in an appended column keeps its revision; a consumer reads a column a row was delivered without as NULL. A dropped, renamed or retyped column still restamps every row of its kind.
 - Claude subagent requests and usage reach `SessionEvidence::requests` on the sync or hydration that reads the sidecar, rather than only once the sidecar had sat still for two minutes and a later sweep ran, which `sync` skipped while no other source changed. The first sync after upgrading backfills the messages an earlier build held back.
 - A Claude response whose only record is a signed, empty `thinking` block is a request in `SessionEvidence::requests` with its usage again, instead of only a `thinking_signature` marker; the record stores its thinking event (empty text). The first sync or hydration after upgrading re-reads only the transcripts holding such a response.
-- A Codex thread marked `thread_source: "subagent"` that names no parent (a standalone guardian / auto-review thread) is a catalogued session readable through `SessionStore::session`, instead of being hidden as a child of no parent; a rollout is a delegated child only when its `session_meta` names its parent. The first sync after upgrading catalogs the threads an earlier build hid.
 
 ### Rust API
 

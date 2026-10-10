@@ -29,6 +29,7 @@ pub(crate) mod incremental;
 pub(crate) mod jsonl;
 pub(crate) mod muse;
 pub(crate) mod opencode;
+pub(crate) mod opencode_sweep;
 pub(crate) mod tool_result_facts;
 pub(crate) mod transcript_cursor;
 
@@ -2309,42 +2310,12 @@ fn sync_basic(
     }
     capture_progress("opencode", 0, None);
     check_capture_cancelled()?;
-    let opencode = roots.opencode_db.clone();
-    let opencode_storage = roots.opencode_storage_dir.clone();
-    // One owner, two layouts: `opencode.db` when the host has it, the legacy
-    // `storage/` tree when it does not. Never both — a host that upgraded has
-    // a stale tree sitting beside a live database.
-    //
-    // Asked once, through the same `detect` that discovery and hydration use.
-    // Asking it a second way here is how the two came apart: `exists()` is
-    // true for a *directory* named by `OPENCODE_DB`, so sync opened it as
-    // SQLite and failed while detect read the legacy tree — catalog rows with
-    // no evidence behind them, and nothing saying why.
-    let layout = crate::ingest::opencode::OpencodeLayout::detect(
-        &opencode,
-        roots.opencode_db_pinned,
-        &opencode_storage,
-    );
-    let opencode_result = match &layout {
-        Some(crate::ingest::opencode::OpencodeLayout::Sqlite(dbs)) => sync_opencode_dbs(conn, dbs),
-        Some(crate::ingest::opencode::OpencodeLayout::JsonTree(tree)) => {
-            sync_opencode_storage_dir(conn, tree)
-        }
-        None => Ok(0),
-    };
-    if let Some(open_inserted) = report.capture("opencode", opencode_result) {
-        match &layout {
-            Some(crate::ingest::opencode::OpencodeLayout::Sqlite(_)) => {
-                sync_note!("  [opencode] +{open_inserted} rows");
-            }
-            Some(crate::ingest::opencode::OpencodeLayout::JsonTree(tree)) => {
-                sync_note!("  [opencode] +{open_inserted} rows from {}", tree.display());
-            }
-            None => {
-                sync_note!("  [opencode] not found: {} (skipped)", opencode.display());
-            }
-        }
-        total_inserted += open_inserted;
+    if let Some(inserted) = report.capture(
+        "opencode",
+        opencode_sweep::sync_opencode_sources(conn, &mut state, roots, &repairs),
+    ) {
+        total_inserted += inserted;
+        checkpoints.save(&state);
     }
     capture_progress("devin", 0, None);
     check_capture_cancelled()?;
@@ -2497,6 +2468,9 @@ fn sync_basic(
             state.insert(DESTINATION_HEAD_KEY.to_string(), Value::from(head));
             checkpoints.save(&state);
         }
+    }
+    if let Err(error) = crate::store::refresh_planner_statistics(conn) {
+        sync_note!("  [sync] planner statistics not refreshed: {error:#}");
     }
     let total: i64 = conn.query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))?;
     // Fold the WAL back into the database now that the writes are done.
@@ -4863,10 +4837,14 @@ fn cleanup_subagent_registration(conn: &Connection, source: &str, session_id: &s
            AS SELECT * FROM session_relationships WHERE 0; \
          DELETE FROM retained_relationships;",
     )?;
+    // One seek per end of the edge; see `session_continuity_edges`.
     conn.execute(
-        "INSERT INTO retained_relationships SELECT * FROM session_relationships \
-         WHERE source = ? AND (parent_session_id = ? OR child_session_id = ?)",
-        params![source, session_id, session_id],
+        "INSERT INTO retained_relationships \
+         SELECT * FROM session_relationships WHERE source = ?1 AND parent_session_id = ?2 \
+         UNION ALL \
+         SELECT * FROM session_relationships \
+         WHERE source = ?1 AND child_session_id = ?2 AND parent_session_id <> ?2",
+        params![source, session_id],
     )?;
     conn.execute(
         "DELETE FROM sessions \
@@ -12495,7 +12473,7 @@ fn upsert_session_inner(
         None => (None, None),
     };
     let project_key_merge = crate::store::project_key_merge_sql();
-    conn.execute(
+    conn.prepare_cached(
         &format!("INSERT INTO sessions \
          (session_id, source, cwd, git_branch, first_activity_ms, last_activity_ms, last_assistant_text, raw_path, parser_version, project_key, project_key_method, discovery_state) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'full') \
@@ -12510,6 +12488,8 @@ fn upsert_session_inner(
          parser_version = excluded.parser_version, \
          discovery_state = 'full'"
         ),
+    )?
+    .execute(
         params![
             session_id,
             source,
@@ -32616,6 +32596,9 @@ mod tests {
             json!(super::destination_head(&conn).unwrap()),
         );
         assert!(super::sources_unchanged(&conn, &state, &old_fingerprint));
+        // The previous build's per-session stamps carry its generation, so
+        // none of them matches this build's.
+        state.remove("opencode_tree_sessions_v1");
         fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
 
         assert!(
