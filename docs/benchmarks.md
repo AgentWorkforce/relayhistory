@@ -1087,3 +1087,71 @@ every 20 ms throughout and records its slowest lock wait.
 - `compact` keeps its `TRUNCATE` with the full busy handler: it is an explicit
   maintenance action that already holds the sync lock and rewrites the file
   with `VACUUM`, so a wait there is expected.
+
+### 2026-10-10 a no-change sweep over a 45,000-session OpenCode store
+
+On a copy of a real store — `ai-history.db` at 6.9 GB, `opencode.db` at
+1.1 GB holding 44,615 sessions, 139,824 messages and 290,822 parts, plus
+17 GB of Codex and 1.8 GB of Claude transcripts — a sweep with nothing to
+read cost half an hour. Four causes, each a cost proportional to the store
+rather than to what changed:
+
+- **The OpenCode pass re-read and rewrote every session.** It now skips a
+  store whose database and WAL stamps are unchanged, and in a store that
+  moved reads only the sessions whose row, `message` and `part` stamps moved
+  (one aggregate pass per table; see
+  [session-catalog](session-catalog.md#adding-a-provider)).
+- **Edge lookups walked the source.** Every OpenCode edge cites the one
+  store it was read from, so `idx_session_relationships_locator` holds
+  44,000 rows under one key, and without statistics SQLite answered the
+  superseded-unlinked `DELETE`, the parent-or-child continuity read, the
+  child-keyed `ORDER BY parent_session_id` reads and the session delete
+  trigger by reading every edge of the source — 81% of a sweep's samples.
+  Each now seeks (plan tests in `relationship_graph/plan_tests.rs`, with
+  and without `ANALYZE`).
+- **The fingerprint counted `-shm`.** Reading a WAL store rewrites its
+  `-shm`, so the sweep's own read moved the fingerprint and the
+  unchanged-sources fast path never held.
+- **Every process's first identity refresh was full.** The refreshed-through
+  point lived in process memory, so every `ai-hist sync` re-walked every
+  delegated child: 30 s of a 42 s forced sweep once the first three were
+  fixed. It is kept in the database now.
+
+**How it was measured.** A scratch driver (not committed) calling
+`SessionStore::sync` through `ProviderRoots::from_home` over APFS clones of
+the store and provider roots, release builds, Apple M4 Pro, `/usr/bin/time
+-l`. The machine was shared with other agents (load average 30–160), so
+wall times are high; CPU time is the steadier figure.
+
+| Real store | main | this change |
+|---|---:|---:|
+| Sync, nothing changed (unforced) | 2,014.7 s wall; 323.6 s user + 390.4 s sys; 147 MB | 0.49–0.75 s; 0.3 s CPU; 74 MB (fast path) |
+| Sync, nothing changed (forced) | the same sweep as unforced | 7.1–7.6 s; 2.1–2.4 s CPU; 128 MB |
+| Sync after one OpenCode message is appended | the same sweep | 14.6–14.8 s; 3.8 s CPU; 141–148 MB |
+| First sync of a store main last wrote | — | reads every OpenCode session once: 232.6 s; 81 s CPU; 329 MB |
+| Cold sync, OpenCode store only | 920.5 s; 245.5 s user + 262.9 s sys; 323 MB | 705.3 s; 196.7 s user + 84.6 s sys; 296 MB |
+
+The harness (`perf-ab`, 3 interleaved rounds against main) over a generated
+store with 30,250 OpenCode sessions (`gen-rich.mjs --opencode-sessions
+30000`, 87,000 messages, 151,500 parts) and a new `opencode_append_sync`
+phase, CPU medians:
+
+| Phase | main | this change |
+|---|---:|---:|
+| `cold_sync` | 86.9 s | 77.2 s (−11%) |
+| `forced_sync` | 28.7 s | 1.05 s (−96%) |
+| `incremental_sync` (one Claude turn) | 27.2 s | 0.58 s (−98%) |
+| `opencode_append_sync` | 25.1 s | 0.78 s (−97%) |
+| `unchanged_sync` | 92 ms | 105–116 ms |
+| `read_small_sessions` | 303 ms | 131 ms (−57%) |
+
+- The read phases moved within the run's noise; an A/B of each build over
+  each build's store, and of one store with and without `sqlite_stat1`,
+  put `feed_full`, `export_full`, `catalog_page` and `search` within 3% of
+  each other.
+- `unchanged_sync` parses the per-session stamps in `.sync-state.json`
+  (2.8 MB for 30,000 sessions): about 15 ms and 13 MB more peak RSS on the
+  fast path, 29 MB more on a cold sync.
+- The remaining forced-sweep time on the real store is evenly spread:
+  Codex existence probes, discovery's per-candidate stamp reads, the OpenCode
+  holdings scan and the catalog digest, each 1–2 s of mostly I/O.
