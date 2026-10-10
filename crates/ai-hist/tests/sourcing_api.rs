@@ -179,12 +179,13 @@ fn roots_under(home: &Path) -> ProviderRoots {
 
 // `StoreOptions` is `#[non_exhaustive]`, so an outside crate builds it field
 // by field; this test is written as that crate.
-#[allow(clippy::field_reassign_with_default)]
 fn open_with_roots(home: &Path, roots: ProviderRoots) -> SessionStore {
-    let mut options = StoreOptions::default();
-    options.db_path = Some(home.join("ai-history.db"));
-    options.roots = Some(roots);
-    SessionStore::open(options).expect("open")
+    SessionStore::open(
+        StoreOptions::default()
+            .db_path(home.join("ai-history.db"))
+            .roots(roots),
+    )
+    .expect("open")
 }
 
 fn open(home: &Path) -> SessionStore {
@@ -1250,20 +1251,17 @@ fn discover_catalogs_every_session_shallow_and_hydrates_none() {
 }
 
 #[test]
-#[allow(clippy::field_reassign_with_default)]
 fn discover_reads_only_the_allowed_sources() {
     let dir = tempfile::tempdir().unwrap();
     stage(&CORPUS[0], dir.path()); // claude
     stage(&CORPUS[7], dir.path()); // codex
     let store = open(dir.path());
 
-    let mut none = DiscoveryOptions::default();
-    none.sources = Some(vec![]);
+    let none = DiscoveryOptions::default().sources([]);
     assert_eq!(store.discover(none).unwrap().discovered, 0);
     assert!(catalog(&store).is_empty(), "an empty allowlist admits none");
 
-    let mut codex = DiscoveryOptions::default();
-    codex.sources = Some(vec![Source::Codex]);
+    let codex = DiscoveryOptions::default().sources([Source::Codex]);
     assert_eq!(store.discover(codex).unwrap().discovered, 1);
     assert_eq!(
         catalog(&store),
@@ -1272,7 +1270,6 @@ fn discover_reads_only_the_allowed_sources() {
 }
 
 #[test]
-#[allow(clippy::field_reassign_with_default)]
 fn a_stopped_token_cancels_discover_sync_and_hydrate() {
     let dir = tempfile::tempdir().unwrap();
     stage(&CORPUS[0], dir.path()); // claude/simple-turn
@@ -1280,19 +1277,15 @@ fn a_stopped_token_cancels_discover_sync_and_hydrate() {
     let stop = StopToken::new();
     stop.stop();
 
-    let mut discover = DiscoveryOptions::default();
-    discover.stop = Some(stop.clone());
+    let discover = DiscoveryOptions::default().stop(stop.clone());
     let error = store.discover(discover).unwrap_err();
     assert!(matches!(error, Error::Cancelled(_)), "{error}");
     assert_eq!(error.code(), "CANCELLED");
 
-    let mut empty = DiscoveryOptions::default();
-    empty.sources = Some(vec![]);
-    empty.stop = Some(stop.clone());
+    let empty = DiscoveryOptions::default().sources([]).stop(stop.clone());
     assert!(matches!(store.discover(empty), Err(Error::Cancelled(_))));
 
-    let mut sync = SyncOptions::default();
-    sync.stop = Some(stop.clone());
+    let sync = SyncOptions::default().stop(stop.clone());
     let error = store.sync(sync).unwrap_err();
     assert!(matches!(error, Error::Cancelled(_)), "{error}");
     assert!(catalog(&store).is_empty(), "a stopped sweep read nothing");
@@ -1305,14 +1298,12 @@ fn a_stopped_token_cancels_discover_sync_and_hydrate() {
         .next()
         .unwrap()
         .unwrap();
-    let mut hydrate = HydrateOptions::default();
-    hydrate.stop = Some(stop);
+    let hydrate = HydrateOptions::default().stop(stop);
     let error = store.hydrate(&row.session_ref(), hydrate).unwrap_err();
     assert!(matches!(error, Error::Cancelled(_)), "{error}");
 }
 
 #[test]
-#[allow(clippy::field_reassign_with_default)]
 fn a_token_stopped_mid_sweep_cancels_at_the_next_file() {
     let dir = tempfile::tempdir().unwrap();
     stage(&CORPUS[0], dir.path()); // claude
@@ -1321,13 +1312,13 @@ fn a_token_stopped_mid_sweep_cancels_at_the_next_file() {
     let stop = StopToken::new();
     let stopper = stop.clone();
 
-    let mut sync = SyncOptions::default();
-    sync.stop = Some(stop);
-    sync.progress = Some(ProgressObserver::new(move |p| {
-        if p.source == "claude" && p.processed_files >= 1 {
-            stopper.stop();
-        }
-    }));
+    let sync = SyncOptions::default()
+        .stop(stop)
+        .progress(ProgressObserver::new(move |p| {
+            if p.source == "claude" && p.processed_files >= 1 {
+                stopper.stop();
+            }
+        }));
     let error = store.sync(sync).unwrap_err();
     assert!(matches!(error, Error::Cancelled(_)), "{error}");
 
@@ -1351,7 +1342,6 @@ fn a_token_stopped_mid_sweep_cancels_at_the_next_file() {
 }
 
 #[test]
-#[allow(clippy::field_reassign_with_default)]
 fn sync_reports_file_progress_to_the_observer() {
     let dir = tempfile::tempdir().unwrap();
     stage(&CORPUS[0], dir.path()); // claude/simple-turn
@@ -1359,8 +1349,7 @@ fn sync_reports_file_progress_to_the_observer() {
     let seen: std::sync::Arc<std::sync::Mutex<Vec<CaptureProgress>>> = Default::default();
     let sink = seen.clone();
 
-    let mut sync = SyncOptions::default();
-    sync.progress = Some(ProgressObserver::new(move |progress| {
+    let sync = SyncOptions::default().progress(ProgressObserver::new(move |progress| {
         sink.lock().unwrap().push(progress)
     }));
     store.sync(sync).expect("sync");

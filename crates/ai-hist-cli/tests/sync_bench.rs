@@ -191,15 +191,9 @@ fn isolate_home(home: &Path) {
     std::env::remove_var("RELAYCAST_WORKSPACE_ID");
 }
 
-// `StoreOptions` is `#[non_exhaustive]`, so a struct expression — with or
-// without `..Default::default()` — will not compile outside `ai-hist`. Field
-// assignment after `default()` is the only way to build one here.
-#[allow(clippy::field_reassign_with_default)]
 fn sync_once(db_path: &Path, home: &Path) {
-    let mut options = StoreOptions::default();
-    options.db_path = Some(db_path.to_path_buf());
-    options.home = Some(home.to_path_buf());
-    let store = SessionStore::open(options).expect("open bench store");
+    let store = SessionStore::open(StoreOptions::default().db_path(db_path).home(home))
+        .expect("open bench store");
     store.sync(SyncOptions::default()).expect("local sync");
 }
 

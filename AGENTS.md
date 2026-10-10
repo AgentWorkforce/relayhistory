@@ -24,7 +24,7 @@ parser or a second schema.
 `ai-hist` is an **in-process** crate, so this is one writer _implementation_,
 not one writer process: a consumer that calls `sync`, `hydrate` or `watch`
 opens `ai-history.db` read-write in its own process, and only a handle opened
-with `StoreOptions { read_only: true }` truly adds no writer. Every mutation
+with `StoreOptions::default().read_only(true)` truly adds no writer. Every mutation
 still goes through the crate's own schema, migrations, `SyncRunLock`, hydration
 locks and WAL busy handler. See the ADR's [store-shape
 section](docs/decisions/2026-09-19-relayhistory-owns-session-sourcing.md#store-shape-one-writer-implementation-not-one-writer-process).

@@ -25,15 +25,15 @@
 
 use super::control::ControlKind;
 use super::{
-    insert_session_event_with_provenance, insert_tool_call, upsert_file_edit_from_call,
-    upsert_session, RawMessageFacts, RequestIdentity, OPENCODE_MARKER_COMPACTION_BOUNDARY,
+    insert_session_event, insert_tool_call, upsert_file_edit_from_call, upsert_session, EventRow,
+    RawMessageFacts, SessionCatalogRow, ToolCallRef, OPENCODE_MARKER_COMPACTION_BOUNDARY,
 };
 use crate::relationship_capture::{
     record_relationship_replacing_child_model, ObservedRelationship,
 };
 use crate::{insert_history, prompt_hash, HistoryEntry};
 use anyhow::{Context, Result};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Statement};
 use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -163,6 +163,17 @@ pub(crate) fn load_from_sqlite(
     session_id: &str,
 ) -> Result<Option<OpencodeSession>> {
     super::check_capture_cancelled()?;
+    let Some(info) = read_session_info(src, session_id)? else {
+        return Ok(None);
+    };
+    let messages = read_session_messages(src, session_id)?;
+    let parts_by_message = read_session_parts(src, session_id, &messages)?;
+    Ok(Some(finish(info, messages, parts_by_message)))
+}
+
+/// The `session` row for `session_id`, or `None` when the store has no such
+/// session (or no `session.id` column to find it by).
+fn read_session_info(src: &Connection, session_id: &str) -> Result<Option<OpencodeSessionInfo>> {
     let session_columns = table_columns(src, "session")?;
     if !session_columns.contains("id") {
         return Ok(None);
@@ -196,7 +207,11 @@ pub(crate) fn load_from_sqlite(
         return Ok(None);
     };
     info.parent_id = info.parent_id.filter(|value| !value.is_empty());
+    Ok(Some(info))
+}
 
+/// This session's messages that parse, in the store's row order.
+fn read_session_messages(src: &Connection, session_id: &str) -> Result<Vec<OpencodeMessage>> {
     let message_columns = table_columns(src, "message")?;
     let mut messages = Vec::new();
     if message_columns.contains("id")
@@ -227,7 +242,15 @@ pub(crate) fn load_from_sqlite(
             }
         }
     }
+    Ok(messages)
+}
 
+/// This session's parts that parse, grouped by the message they belong to.
+fn read_session_parts(
+    src: &Connection,
+    session_id: &str,
+    messages: &[OpencodeMessage],
+) -> Result<BTreeMap<String, Vec<OpencodePart>>> {
     let part_columns = table_columns(src, "part")?;
     let mut parts_by_message: BTreeMap<String, Vec<OpencodePart>> = BTreeMap::new();
     if part_columns.contains("id")
@@ -237,24 +260,7 @@ pub(crate) fn load_from_sqlite(
         // Seek by session when the provider indexes it, otherwise by the
         // message ids this session's own messages already named. Both stay
         // session-keyed; neither scans the provider's whole `part` table.
-        let mut push = |id: String, message_id: String, data: String| {
-            let Ok(Value::Object(object)) = serde_json::from_str::<Value>(&data) else {
-                return;
-            };
-            let kind = object
-                .get("type")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string();
-            parts_by_message
-                .entry(message_id)
-                .or_default()
-                .push(OpencodePart {
-                    id,
-                    kind,
-                    raw: object,
-                });
-        };
+        //
         // Seek by whichever column the provider actually indexes. Choosing on
         // column *presence* alone picks a predicate SQLite can only answer by
         // scanning `part`, which for one session is merely slow but for the
@@ -266,43 +272,56 @@ pub(crate) fn load_from_sqlite(
             let mut stmt = src.prepare(
                 "SELECT id, message_id, data FROM part WHERE session_id = ? AND json_valid(data)",
             )?;
-            let rows = stmt
-                .query_map([session_id], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, String>(2)?,
-                    ))
-                })?
-                .collect::<rusqlite::Result<Vec<_>>>()?;
-            for (id, message_id, data) in rows {
-                super::check_capture_cancelled()?;
-                push(id, message_id, data);
-            }
+            collect_parts(&mut stmt, session_id, &mut parts_by_message)?;
         } else {
             let mut stmt = src.prepare(
                 "SELECT id, message_id, data FROM part WHERE message_id = ? AND json_valid(data)",
             )?;
-            for message in &messages {
+            for message in messages {
                 super::check_capture_cancelled()?;
-                let rows = stmt
-                    .query_map([&message.id], |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
-                        ))
-                    })?
-                    .collect::<rusqlite::Result<Vec<_>>>()?;
-                for (id, message_id, data) in rows {
-                    super::check_capture_cancelled()?;
-                    push(id, message_id, data);
-                }
+                collect_parts(&mut stmt, &message.id, &mut parts_by_message)?;
             }
         }
     }
+    Ok(parts_by_message)
+}
 
-    Ok(Some(finish(info, messages, parts_by_message)))
+/// Run a `SELECT id, message_id, data FROM part` statement keyed on `key`
+/// and group the parts that parse under their message.
+fn collect_parts(
+    stmt: &mut Statement<'_>,
+    key: &str,
+    parts_by_message: &mut BTreeMap<String, Vec<OpencodePart>>,
+) -> Result<()> {
+    let rows = stmt
+        .query_map([key], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for (id, message_id, data) in rows {
+        super::check_capture_cancelled()?;
+        let Ok(Value::Object(object)) = serde_json::from_str::<Value>(&data) else {
+            continue;
+        };
+        let kind = object
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        parts_by_message
+            .entry(message_id)
+            .or_default()
+            .push(OpencodePart {
+                id,
+                kind,
+                raw: object,
+            });
+    }
+    Ok(())
 }
 
 /// How global sync should read a provider store.
@@ -1209,7 +1228,8 @@ fn is_failed_tool(state: Option<&Map<String, Value>>) -> bool {
 /// The reason on the message's *last* `step-finish` part. A turn can take
 /// several steps; only the last one says why the turn ended, so a final step
 /// that names no reason -- or an empty one -- yields none rather than an
-/// earlier step's.
+/// earlier step's. The reason is OpenCode's wire string (`tool-calls`, `stop`,
+/// `length`, …), stored as written like Claude's `message.stop_reason`.
 fn last_step_finish_reason(parts: &[OpencodePart]) -> Option<String> {
     parts
         .iter()
@@ -1436,31 +1456,26 @@ fn normalize_session(
                     // so it is never a prompt, a `history` entry or a block of
                     // a human user turn.
                     let event_uid = format!("text:{}", part.id);
-                    insert_session_event_with_provenance(
+                    insert_session_event(
                         conn,
-                        "opencode",
-                        session_id,
-                        message_project.as_deref(),
-                        message_project.as_deref(),
-                        None,
-                        &message.id,
-                        message.parent_id.as_deref(),
-                        message.time_created,
-                        "user",
-                        "text",
-                        Some(text),
-                        None,
-                        None,
-                        None,
-                        None,
-                        RequestIdentity::none(),
-                        &event_uid,
-                        None,
-                        RawMessageFacts {
-                            control_kind: Some(ControlKind::Synthetic.as_str()),
-                            ..RawMessageFacts::default()
+                        &EventRow {
+                            source: "opencode",
+                            session_id,
+                            project: message_project.as_deref(),
+                            cwd: message_project.as_deref(),
+                            message_id: &message.id,
+                            parent_id: message.parent_id.as_deref(),
+                            ts_ms: message.time_created,
+                            role: "user",
+                            kind: "text",
+                            text: Some(text),
+                            event_uid: &event_uid,
+                            raw_facts: RawMessageFacts {
+                                control_kind: Some(ControlKind::Synthetic.as_str()),
+                                ..RawMessageFacts::default()
+                            },
+                            ..EventRow::default()
                         },
-                        None,
                     )?;
                     keys.events.insert(event_uid);
                     counts.events += 1;
@@ -1470,28 +1485,22 @@ fn normalize_session(
                     continue;
                 };
                 let event_uid = format!("text:{}", part.id);
-                insert_session_event_with_provenance(
+                insert_session_event(
                     conn,
-                    "opencode",
-                    session_id,
-                    message_project.as_deref(),
-                    message_project.as_deref(),
-                    None,
-                    &message.id,
-                    message.parent_id.as_deref(),
-                    message.time_created,
-                    "user",
-                    "text",
-                    Some(text),
-                    None,
-                    None,
-                    None,
-                    None,
-                    RequestIdentity::none(),
-                    &event_uid,
-                    None,
-                    RawMessageFacts::default(),
-                    None,
+                    &EventRow {
+                        source: "opencode",
+                        session_id,
+                        project: message_project.as_deref(),
+                        cwd: message_project.as_deref(),
+                        message_id: &message.id,
+                        parent_id: message.parent_id.as_deref(),
+                        ts_ms: message.time_created,
+                        role: "user",
+                        kind: "text",
+                        text: Some(text),
+                        event_uid: &event_uid,
+                        ..EventRow::default()
+                    },
                 )?;
                 keys.events.insert(event_uid);
                 counts.events += 1;
@@ -1556,28 +1565,26 @@ fn normalize_session(
             }
             if let Some(text) = reasoning_text(part) {
                 let event_uid = format!("reasoning:{}", part.id);
-                insert_session_event_with_provenance(
+                insert_session_event(
                     conn,
-                    "opencode",
-                    session_id,
-                    message_project.as_deref(),
-                    message_project.as_deref(),
-                    None,
-                    &message.id,
-                    message.parent_id.as_deref(),
-                    message.time_created,
-                    "assistant",
-                    "thinking",
-                    Some(text),
-                    model.as_deref(),
-                    token_json.as_deref(),
-                    message.provider_id.as_deref(),
-                    stop_reason.as_deref(),
-                    RequestIdentity::none(),
-                    &event_uid,
-                    None,
-                    RawMessageFacts::default(),
-                    None,
+                    &EventRow {
+                        source: "opencode",
+                        session_id,
+                        project: message_project.as_deref(),
+                        cwd: message_project.as_deref(),
+                        message_id: &message.id,
+                        parent_id: message.parent_id.as_deref(),
+                        ts_ms: message.time_created,
+                        role: "assistant",
+                        kind: "thinking",
+                        text: Some(text),
+                        model: model.as_deref(),
+                        token_json: token_json.as_deref(),
+                        provider: message.provider_id.as_deref(),
+                        stop_reason: stop_reason.as_deref(),
+                        event_uid: &event_uid,
+                        ..EventRow::default()
+                    },
                 )?;
                 keys.events.insert(event_uid);
                 counts.events += 1;
@@ -1585,28 +1592,26 @@ fn normalize_session(
             }
             if let Some(text) = part_text(part) {
                 let event_uid = format!("text:{}", part.id);
-                insert_session_event_with_provenance(
+                insert_session_event(
                     conn,
-                    "opencode",
-                    session_id,
-                    message_project.as_deref(),
-                    message_project.as_deref(),
-                    None,
-                    &message.id,
-                    message.parent_id.as_deref(),
-                    message.time_created,
-                    "assistant",
-                    "text",
-                    Some(text),
-                    model.as_deref(),
-                    token_json.as_deref(),
-                    message.provider_id.as_deref(),
-                    stop_reason.as_deref(),
-                    RequestIdentity::none(),
-                    &event_uid,
-                    None,
-                    RawMessageFacts::default(),
-                    None,
+                    &EventRow {
+                        source: "opencode",
+                        session_id,
+                        project: message_project.as_deref(),
+                        cwd: message_project.as_deref(),
+                        message_id: &message.id,
+                        parent_id: message.parent_id.as_deref(),
+                        ts_ms: message.time_created,
+                        role: "assistant",
+                        kind: "text",
+                        text: Some(text),
+                        model: model.as_deref(),
+                        token_json: token_json.as_deref(),
+                        provider: message.provider_id.as_deref(),
+                        stop_reason: stop_reason.as_deref(),
+                        event_uid: &event_uid,
+                        ..EventRow::default()
+                    },
                 )?;
                 keys.events.insert(event_uid);
                 counts.events += 1;
@@ -1639,60 +1644,52 @@ fn normalize_session(
             let args_json = serde_json::to_string(&input).unwrap_or_else(|_| "{}".into());
             let is_error = is_failed_tool(tool.state);
 
-            insert_session_event_with_provenance(
+            insert_session_event(
                 conn,
-                "opencode",
-                session_id,
-                message_project.as_deref(),
-                message_project.as_deref(),
-                None,
-                &message.id,
-                message.parent_id.as_deref(),
-                message.time_created,
-                "assistant",
-                "tool_use",
-                Some(&event_text),
-                model.as_deref(),
-                token_json.as_deref(),
-                message.provider_id.as_deref(),
-                stop_reason.as_deref(),
-                RequestIdentity::none(),
-                &format!("tool_use:{}", tool.call_id),
-                None,
-                RawMessageFacts::default(),
-                None,
+                &EventRow {
+                    source: "opencode",
+                    session_id,
+                    project: message_project.as_deref(),
+                    cwd: message_project.as_deref(),
+                    message_id: &message.id,
+                    parent_id: message.parent_id.as_deref(),
+                    ts_ms: message.time_created,
+                    role: "assistant",
+                    kind: "tool_use",
+                    text: Some(&event_text),
+                    model: model.as_deref(),
+                    token_json: token_json.as_deref(),
+                    provider: message.provider_id.as_deref(),
+                    stop_reason: stop_reason.as_deref(),
+                    event_uid: &format!("tool_use:{}", tool.call_id),
+                    ..EventRow::default()
+                },
             )?;
             keys.events.insert(format!("tool_use:{}", tool.call_id));
             keys.tool_calls.insert(tool.call_id.to_string());
             counts.events += 1;
+            let call = ToolCallRef {
+                source: "opencode",
+                session_id,
+                message_id: &message.id,
+                tool_use_id: tool.call_id,
+                ts_ms: message.time_created,
+                git_branch: None,
+                cwd: message_project.as_deref(),
+            };
             insert_tool_call(
                 conn,
-                "opencode",
-                session_id,
-                &message.id,
-                tool.call_id,
+                &call,
                 tool.tool,
                 target.as_deref(),
                 &args_json,
                 Some(is_error),
-                message.time_created,
             )?;
             counts.tool_calls += 1;
 
             if is_file_edit_tool(tool.tool) {
                 if let Some(file_path) = target.as_deref() {
-                    upsert_file_edit_from_call(
-                        conn,
-                        "opencode",
-                        session_id,
-                        &message.id,
-                        tool.call_id,
-                        file_path,
-                        tool.tool,
-                        message.time_created,
-                        None,
-                        message_project.as_deref(),
-                    )?;
+                    upsert_file_edit_from_call(conn, &call, file_path, tool.tool)?;
                     keys.file_edits.insert(tool.call_id.to_string());
                     counts.file_edits += 1;
                 }
@@ -1710,28 +1707,27 @@ fn normalize_session(
                         tool.state,
                     )
                     .with_ordering(call_index, event_index);
-                    insert_session_event_with_provenance(
+                    insert_session_event(
                         conn,
-                        "opencode",
-                        session_id,
-                        message_project.as_deref(),
-                        message_project.as_deref(),
-                        None,
-                        &message.id,
-                        message.parent_id.as_deref(),
-                        message.time_created,
-                        "tool_result",
-                        "tool_result",
-                        Some(&text),
-                        model.as_deref(),
-                        token_json.as_deref(),
-                        message.provider_id.as_deref(),
-                        stop_reason.as_deref(),
-                        RequestIdentity::none(),
-                        &format!("tool_result:{}", tool.call_id),
-                        Some(&facts),
-                        RawMessageFacts::default(),
-                        None,
+                        &EventRow {
+                            source: "opencode",
+                            session_id,
+                            project: message_project.as_deref(),
+                            cwd: message_project.as_deref(),
+                            message_id: &message.id,
+                            parent_id: message.parent_id.as_deref(),
+                            ts_ms: message.time_created,
+                            role: "tool_result",
+                            kind: "tool_result",
+                            text: Some(&text),
+                            model: model.as_deref(),
+                            token_json: token_json.as_deref(),
+                            provider: message.provider_id.as_deref(),
+                            stop_reason: stop_reason.as_deref(),
+                            event_uid: &format!("tool_result:{}", tool.call_id),
+                            tool_result_facts: Some(&facts),
+                            ..EventRow::default()
+                        },
                     )?;
                     keys.events.insert(format!("tool_result:{}", tool.call_id));
                     counts.events += 1;
@@ -1747,28 +1743,25 @@ fn normalize_session(
         // Without it the request — and what it billed — is not in the store.
         if counts.events == events_before_message {
             let event_uid = format!("message:{}", message.id);
-            insert_session_event_with_provenance(
+            insert_session_event(
                 conn,
-                "opencode",
-                session_id,
-                message_project.as_deref(),
-                message_project.as_deref(),
-                None,
-                &message.id,
-                message.parent_id.as_deref(),
-                message.time_created,
-                "assistant",
-                "text",
-                None,
-                model.as_deref(),
-                token_json.as_deref(),
-                message.provider_id.as_deref(),
-                stop_reason.as_deref(),
-                RequestIdentity::none(),
-                &event_uid,
-                None,
-                RawMessageFacts::default(),
-                None,
+                &EventRow {
+                    source: "opencode",
+                    session_id,
+                    project: message_project.as_deref(),
+                    cwd: message_project.as_deref(),
+                    message_id: &message.id,
+                    parent_id: message.parent_id.as_deref(),
+                    ts_ms: message.time_created,
+                    role: "assistant",
+                    kind: "text",
+                    model: model.as_deref(),
+                    token_json: token_json.as_deref(),
+                    provider: message.provider_id.as_deref(),
+                    stop_reason: stop_reason.as_deref(),
+                    event_uid: &event_uid,
+                    ..EventRow::default()
+                },
             )?;
             keys.events.insert(event_uid);
             counts.events += 1;
@@ -1777,14 +1770,16 @@ fn normalize_session(
 
     upsert_session(
         conn,
-        session_id,
-        "opencode",
-        project.as_deref(),
-        None,
-        first_ts,
-        last_ts,
-        last_assistant_text.as_deref(),
-        Some(raw_path),
+        &SessionCatalogRow {
+            session_id,
+            source: "opencode",
+            cwd: project.as_deref(),
+            git_branch: None,
+            first_ts,
+            last_ts,
+            last_assistant_text: last_assistant_text.as_deref(),
+            raw_path: Some(raw_path),
+        },
     )?;
 
     // `session.parentID` names the parent outright, so the child identity is
@@ -1987,6 +1982,26 @@ mod tests {
             part(r#"{"id":"p2","type":"step-finish","reason":"end_turn"}"#),
         ];
         assert_eq!(last_step_finish_reason(&parts).as_deref(), Some("end_turn"));
+    }
+
+    /// OpenCode records the stop reason on a `step-finish` part rather than on
+    /// the message, and writes it as its own wire string.
+    #[test]
+    fn the_step_finish_reason_is_read_verbatim_from_step_finish_parts_only() {
+        let parts = vec![
+            part(r#"{"id":"p1","type":"step-finish","reason":"tool-calls"}"#),
+            // Another part type never contributes a stop reason, whatever it
+            // happens to carry under that key.
+            part(r#"{"id":"p2","type":"text","reason":"not-a-stop-reason"}"#),
+        ];
+        assert_eq!(
+            last_step_finish_reason(&parts).as_deref(),
+            Some("tool-calls")
+        );
+        let parts = vec![part(
+            r#"{"id":"p1","type":"text","reason":"not-a-stop-reason"}"#,
+        )];
+        assert_eq!(last_step_finish_reason(&parts), None);
     }
 
     #[test]

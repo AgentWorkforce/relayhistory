@@ -39,12 +39,15 @@
 //! `shallow`, and a later hydration reports the evidence again as upserts of
 //! the same keys.
 
+mod recovery;
+
 use crate::diagnostics::{self, CompactRefused};
 use crate::ingest::{check_capture_cancelled, try_acquire_sync_lock, SyncRunLock};
 use crate::observations::{self, ObservationKey};
 use crate::session_store::{Error, SessionRef, SessionStore, StopToken};
 use crate::store::{open_db, SessionLocation};
 use crate::ProviderRoots;
+use recovery::Recovery;
 use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -77,6 +80,30 @@ pub struct ForgetOptions {
     /// Also forget sessions whose evidence a local hydration cannot read back
     /// (see [`ForgetReport::skipped_unrecoverable`]). That evidence is lost.
     pub include_unrecoverable: bool,
+}
+
+impl ForgetOptions {
+    /// Wait this long for the lock; see [`ForgetOptions::lock_timeout_ms`].
+    #[must_use]
+    pub fn lock_timeout_ms(mut self, lock_timeout_ms: u64) -> Self {
+        self.lock_timeout_ms = lock_timeout_ms;
+        self
+    }
+
+    /// Stop when this token is stopped; see [`ForgetOptions::stop`].
+    #[must_use]
+    pub fn stop(mut self, stop: StopToken) -> Self {
+        self.stop = Some(stop);
+        self
+    }
+
+    /// Also forget unrecoverable evidence; see
+    /// [`ForgetOptions::include_unrecoverable`].
+    #[must_use]
+    pub fn include_unrecoverable(mut self, include_unrecoverable: bool) -> Self {
+        self.include_unrecoverable = include_unrecoverable;
+        self
+    }
 }
 
 /// Result of [`SessionStore::forget_evidence`].
@@ -424,196 +451,40 @@ fn plan(
         .prepare("SELECT source, session_id FROM sessions")?
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
-    let scope: BTreeSet<Key> = if keep_only {
-        let keep = family.closure(named, |_| true);
-        evidence_holders(conn)?
-            .into_iter()
-            .filter(|key| !keep.contains(key))
-            .collect()
-    } else {
-        family.closure(named, |child| !catalog.contains(child))
-    };
-    let mut recovery = Recovery {
-        conn,
-        roots,
-        family: &family,
-        catalog: &catalog,
-        transcripts: claude_transcripts(conn)?,
-        probe: crate::ingest::hydrate::HydrationProbe::default(),
-        reads: HashMap::new(),
-    };
-    let mut forget = BTreeSet::new();
-    let mut skipped = 0;
-    for key in &scope {
-        check_capture_cancelled()?;
-        if include_unrecoverable || recovery.recoverable(key)? {
-            forget.insert(key.clone());
-        } else if holds_evidence(conn, key)? {
-            skipped += 1;
-        }
-    }
+    let scope = scope(conn, &family, &catalog, named, keep_only)?;
+    let mut recovery = Recovery::new(conn, roots, &family, &catalog)?;
+    let (forget, skipped) = recovery.select(&scope, include_unrecoverable)?;
     let mut targets = Vec::with_capacity(forget.len());
     for key in &forget {
-        // Every surviving catalogued ancestor whose hydration re-reads this
-        // child, through any catalog-less intermediaries: its checkpoint
-        // vouches for evidence that is about to go.
-        let locators = family.locators.get(key).cloned().unwrap_or_default();
-        let mut kept_parents = Vec::new();
-        for ancestor in family.catalogued_ancestors(key, &catalog) {
-            if !forget.contains(&ancestor)
-                && !scope.contains(&ancestor)
-                && recovery.catalogued_recoverable(&ancestor)?
-                && recovery
-                    .reads(&ancestor)?
-                    .is_some_and(|reads| locators.iter().any(|locator| reads.contains(locator)))
-            {
-                kept_parents.push(ancestor);
-            }
-        }
+        let child_locators = family.locators.get(key).cloned().unwrap_or_default();
+        let kept_parents = recovery.kept_parents(key, &child_locators, &forget, &scope)?;
         targets.push(Target {
             key: key.clone(),
-            child_locators: family.locators.get(key).cloned().unwrap_or_default(),
+            child_locators,
             kept_parents,
         });
     }
     Ok((targets, skipped))
 }
 
-/// Claude transcripts the sweep's cursors know, by the session id their
-/// records carry.
-fn claude_transcripts(conn: &Connection) -> anyhow::Result<HashMap<String, Vec<String>>> {
-    let mut statement = conn.prepare(
-        "SELECT json_extract(parser_state_json, '$.claude.scan.fold.session_id'), locator \
-         FROM transcript_cursors WHERE source = 'claude' AND json_valid(parser_state_json)",
-    )?;
-    let mut rows = statement.query([])?;
-    let mut transcripts: HashMap<String, Vec<String>> = HashMap::new();
-    while let Some(row) = rows.next()? {
-        if let Some(session_id) = row.get::<_, Option<String>>(0)? {
-            transcripts.entry(session_id).or_default().push(row.get(1)?);
-        }
+/// The sessions `named` puts in scope: with `keep_only`, every evidence
+/// holder outside the named sessions and all their delegated descendants;
+/// otherwise the named sessions and their catalog-less delegated descendants.
+fn scope(
+    conn: &Connection,
+    family: &Family,
+    catalog: &HashSet<Key>,
+    named: BTreeSet<Key>,
+    keep_only: bool,
+) -> anyhow::Result<BTreeSet<Key>> {
+    if !keep_only {
+        return Ok(family.closure(named, |child| !catalog.contains(child)));
     }
-    Ok(transcripts)
-}
-
-/// Whether the session has evidence rows, as against only a catalog row that
-/// claims a hydrated state.
-fn holds_evidence(conn: &Connection, (source, session_id): &Key) -> anyhow::Result<bool> {
-    Ok(conn
-        .prepare_cached(
-            "SELECT EXISTS(SELECT 1 FROM session_events WHERE source = ?1 AND session_id = ?2) \
-             OR EXISTS(SELECT 1 FROM tool_calls WHERE source = ?1 AND session_id = ?2) \
-             OR EXISTS(SELECT 1 FROM file_edits WHERE source = ?1 AND session_id = ?2) \
-             OR EXISTS(SELECT 1 FROM session_markers WHERE source = ?1 AND session_id = ?2) \
-             OR EXISTS(SELECT 1 FROM observation_evidence WHERE source = ?1 AND session_id = ?2)",
-        )?
-        .query_row(params![source, session_id], |row| row.get(0))?)
-}
-
-/// Whether a local hydration reads a session's evidence back, answered by
-/// the snapshot hydration itself takes.
-struct Recovery<'a> {
-    conn: &'a Connection,
-    roots: &'a ProviderRoots,
-    family: &'a Family,
-    catalog: &'a HashSet<Key>,
-    /// Every Claude transcript a sweep has read, by the session id its
-    /// records carry.
-    transcripts: HashMap<String, Vec<String>>,
-    probe: crate::ingest::hydrate::HydrationProbe,
-    /// Each catalogued session's hydration reads, once probed; `None` when
-    /// hydration would refuse it.
-    reads: HashMap<Key, Option<HashSet<String>>>,
-}
-
-impl Recovery<'_> {
-    fn recoverable(&mut self, key: &Key) -> anyhow::Result<bool> {
-        if self.catalog.contains(key) {
-            return self.catalogued_recoverable(key);
-        }
-        if self.foreign(key)? {
-            return Ok(false);
-        }
-        self.enumerated_by_ancestor(key)
-    }
-
-    /// A catalogued session hydration reads back in full: hydration accepts
-    /// it, nothing of it came from another connector, and every transcript a
-    /// sweep indexed it from is one hydration reads. A Claude conversation
-    /// forked into branch files keeps its id in each of them; a sweep indexes
-    /// all of them under that id, hydration only the catalogued one.
-    fn catalogued_recoverable(&mut self, key: &Key) -> anyhow::Result<bool> {
-        if self.foreign(key)? {
-            return Ok(false);
-        }
-        let swept = match key.0.as_str() {
-            "claude" => self.transcripts.get(&key.1).cloned().unwrap_or_default(),
-            _ => Vec::new(),
-        };
-        Ok(self
-            .reads(key)?
-            .is_some_and(|reads| swept.iter().all(|locator| reads.contains(locator))))
-    }
-
-    /// A catalog-less child comes back only through the hydration of a
-    /// catalogued ancestor that itself passes, and that hydration has to
-    /// read every transcript the child's evidence came from: the child's own
-    /// locators, checked against each ancestor, never an intermediary's.
-    fn enumerated_by_ancestor(&mut self, key: &Key) -> anyhow::Result<bool> {
-        let locators = self.family.locators.get(key).cloned().unwrap_or_default();
-        if locators.is_empty() {
-            return Ok(false);
-        }
-        for ancestor in self.family.catalogued_ancestors(key, self.catalog) {
-            if self.rereads(&ancestor, &locators)? {
-                return Ok(true);
-            }
-        }
-        Ok(false)
-    }
-
-    /// Whether `ancestor` hydrates back and its hydration reads every one of
-    /// `locators`.
-    fn rereads(&mut self, ancestor: &Key, locators: &[String]) -> anyhow::Result<bool> {
-        if !self.catalogued_recoverable(ancestor)? {
-            return Ok(false);
-        }
-        Ok(self
-            .reads(ancestor)?
-            .is_some_and(|reads| locators.iter().all(|locator| reads.contains(locator))))
-    }
-
-    fn reads(&mut self, key: &Key) -> anyhow::Result<Option<&HashSet<String>>> {
-        if !self.reads.contains_key(key) {
-            let reads = self
-                .probe
-                .reads(self.conn, &key.0, &key.1, self.roots)?
-                .map(|paths| {
-                    paths
-                        .into_iter()
-                        .map(|path| path.to_string_lossy().into_owned())
-                        .collect()
-                });
-            self.reads.insert(key.clone(), reads);
-        }
-        Ok(self.reads.get(key).and_then(Option::as_ref))
-    }
-
-    /// Evidence a remote connector or plugin intake supplied: local
-    /// hydration reads only the builtin local adapter's source.
-    fn foreign(&self, (source, session_id): &Key) -> anyhow::Result<bool> {
-        Ok(self
-            .conn
-            .prepare_cached(
-                "SELECT EXISTS(SELECT 1 FROM session_presences \
-                   WHERE source = ?1 AND session_id = ?2 AND location <> 'local') \
-                 OR EXISTS(SELECT 1 FROM session_observations \
-                   WHERE source = ?1 AND session_id = ?2 AND (location <> 'local' \
-                   OR (connector_id NOT IN (?1, 'legacy-unknown') \
-                   OR connector_instance <> 'default')))",
-            )?
-            .query_row(params![source, session_id], |row| row.get(0))?)
-    }
+    let keep = family.closure(named, |_| true);
+    Ok(evidence_holders(conn)?
+        .into_iter()
+        .filter(|key| !keep.contains(key))
+        .collect())
 }
 
 /// Forget sessions from `pending` in one write transaction until it has
@@ -687,23 +558,70 @@ fn forget_session(
     cursor_sources: &[String],
 ) -> anyhow::Result<Removed> {
     let (source, session_id) = (target.key.0.as_str(), target.key.1.as_str());
-    let delete = |table: &str| -> rusqlite::Result<u64> {
-        tx.prepare_cached(&format!(
-            "DELETE FROM {table} WHERE source = ? AND session_id = ?"
-        ))?
-        .execute(params![source, session_id])
-        .map(|n| n as u64)
-    };
     let mut removed = Removed {
-        events: delete("session_events")?,
-        tool_calls: delete("tool_calls")?,
-        file_edits: delete("file_edits")?,
-        markers: delete("session_markers")?,
-        observation_evidence: delete("observation_evidence")?,
+        events: delete_rows(tx, "session_events", source, session_id)?,
+        tool_calls: delete_rows(tx, "tool_calls", source, session_id)?,
+        file_edits: delete_rows(tx, "file_edits", source, session_id)?,
+        markers: delete_rows(tx, "session_markers", source, session_id)?,
+        observation_evidence: delete_rows(tx, "observation_evidence", source, session_id)?,
         changed: false,
     };
-    let mut state = delete("session_hydration_checkpoints")?;
-    state += delete("observation_hydration_checkpoints")?;
+    let mut state = forget_hydration_state(tx, target, cursor_sources)?;
+    // A kept parent's checkpoint vouches for this child's evidence too. Without
+    // it, and marked shallow like any session missing evidence, the parent's
+    // next hydration re-reads its related transcripts.
+    for (parent_source, parent_id) in &target.kept_parents {
+        delete_rows(
+            tx,
+            "session_hydration_checkpoints",
+            parent_source,
+            parent_id,
+        )?;
+        delete_rows(
+            tx,
+            "observation_hydration_checkpoints",
+            parent_source,
+            parent_id,
+        )?;
+        mark_shallow(tx, parent_source, parent_id)?;
+        // A hydration of the parent taken before this batch is fenced too:
+        // the related evidence it was acquired against has changed.
+        bump_observations(tx, parent_source, parent_id)?;
+    }
+    state += mark_shallow(tx, source, session_id)?;
+    removed.changed = removed.rows() + state > 0;
+    if removed.changed {
+        bump_observations(tx, source, session_id)?;
+    }
+    Ok(removed)
+}
+
+/// Delete one session's rows from a table keyed by `(source, session_id)`;
+/// the number deleted.
+fn delete_rows(
+    tx: &Connection,
+    table: &str,
+    source: &str,
+    session_id: &str,
+) -> rusqlite::Result<u64> {
+    tx.prepare_cached(&format!(
+        "DELETE FROM {table} WHERE source = ? AND session_id = ?"
+    ))?
+    .execute(params![source, session_id])
+    .map(|n| n as u64)
+}
+
+/// Drop what claims the session's evidence is current — its checkpoints, Grok
+/// turn census and transcript cursors — and clear `child_has_events` on the
+/// relationships naming it; the number of rows changed.
+fn forget_hydration_state(
+    tx: &Connection,
+    target: &Target,
+    cursor_sources: &[String],
+) -> anyhow::Result<u64> {
+    let (source, session_id) = (target.key.0.as_str(), target.key.1.as_str());
+    let mut state = delete_rows(tx, "session_hydration_checkpoints", source, session_id)?;
+    state += delete_rows(tx, "observation_hydration_checkpoints", source, session_id)?;
     if source == "grok" {
         state += tx
             .prepare_cached("DELETE FROM grok_session_turns WHERE session_id = ?")?
@@ -716,30 +634,7 @@ fn forget_session(
              WHERE source = ? AND child_session_id = ? AND child_has_events <> 0",
         )?
         .execute(params![source, session_id])? as u64;
-    // A kept parent's checkpoint vouches for this child's evidence too. Without
-    // it, and marked shallow like any session missing evidence, the parent's
-    // next hydration re-reads its related transcripts.
-    for (parent_source, parent_id) in &target.kept_parents {
-        for table in [
-            "session_hydration_checkpoints",
-            "observation_hydration_checkpoints",
-        ] {
-            tx.prepare_cached(&format!(
-                "DELETE FROM {table} WHERE source = ? AND session_id = ?"
-            ))?
-            .execute(params![parent_source, parent_id])?;
-        }
-        mark_shallow(tx, parent_source, parent_id)?;
-        // A hydration of the parent taken before this batch is fenced too:
-        // the related evidence it was acquired against has changed.
-        bump_observations(tx, parent_source, parent_id)?;
-    }
-    state += mark_shallow(tx, source, session_id)?;
-    removed.changed = removed.rows() + state > 0;
-    if removed.changed {
-        bump_observations(tx, source, session_id)?;
-    }
-    Ok(removed)
+    Ok(state)
 }
 
 /// Set the session's catalog rows to `shallow`; the number of rows changed.

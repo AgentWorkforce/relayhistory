@@ -41,9 +41,8 @@ use crate::ingest::hydrate::{
     hydrate_session_at_with_roots_and_connectors, HydrateSessionOptions, HydrateSessionResult,
 };
 use crate::ingest::{
-    source_watch_roots, sync_facade_tick, sync_watch_roots_with_provider_roots,
-    with_capture_observer, with_capture_token, CaptureCancelled, CaptureProgress, SyncTick,
-    HOOK_HARNESSES,
+    source_watch_roots, sync_facade_tick, sync_watch_roots_with_provider_roots, with_capture_token,
+    CaptureCancelled, SyncTick, HOOK_HARNESSES,
 };
 use crate::paths::home_dir;
 pub use crate::paths::ProviderRoots;
@@ -68,10 +67,16 @@ use serde_json::Value;
 use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+mod options;
+
+pub(crate) use options::controlled;
+pub use options::{
+    DiscoveryOptions, HydrateOptions, ProgressObserver, StopToken, StoreOptions, SyncOptions,
+};
 
 // ---------------------------------------------------------------------------
 // errors
@@ -580,30 +585,6 @@ impl WatchedPath {
 // store
 // ---------------------------------------------------------------------------
 
-/// How to open a [`SessionStore`].
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct StoreOptions {
-    /// The database. Defaults to `$AI_HIST_DB`, then the XDG data path, or
-    /// `<home>/.local/share/ai-hist/ai-history.db` when `home` is set.
-    pub db_path: Option<PathBuf>,
-    /// Provider home to scan instead of the process `HOME`. Ignored when
-    /// `roots` is set. Provider roots derived from it still honour
-    /// `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME` and `OPENCODE_DB` when
-    /// they are set, exactly as the CLI does.
-    pub home: Option<PathBuf>,
-    /// Exactly where each provider keeps its sessions, resolved by the
-    /// caller. `None` derives them from `home` (or the process `HOME`) with
-    /// the environment overrides applied, as [`ProviderRoots::from_env`]
-    /// does. One resolution drives `sync`, `hydrate`, `watch` and
-    /// [`SourceCapabilities::watch_roots`] alike.
-    pub roots: Option<ProviderRoots>,
-    /// Never write. `discover`, `sync`, `hydrate`, `watch`, `forget_evidence`
-    /// and `compact` return [`Error::UnsupportedOperation`]; a database older than the shape this
-    /// version reads is refused at `open` rather than failing inside a query.
-    pub read_only: bool,
-}
-
 /// A session the store can name.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -929,118 +910,20 @@ impl SessionStore {
         // on it instead of polling the thread. The sinks outlive the loop
         // (they belong to the `WatchLoop` every `WatchStop` shares), so they
         // cannot be what holds the sender open.
-        let reports = Arc::new(Mutex::new(Some(reports)));
+        let reports: ReportSlot = Arc::new(Mutex::new(Some(reports)));
         let close_reports = reports.clone();
-        let tick_reports = reports.clone();
         let stop = opts.stop.clone().unwrap_or_default();
-        let tick_stop = stop.clone();
 
-        // The sweep and the report sink run on the loop's thread, one tick at
-        // a time, so a single slot carries "what this tick changed" from the
-        // one to the other.
-        let db_path = self.db_path.clone();
-        let tick_roots = self.roots.clone();
-        let baseline: Arc<Mutex<Option<CatalogFingerprint>>> = Arc::new(Mutex::new(None));
         let pending: Arc<Mutex<Vec<SessionRef>>> = Arc::new(Mutex::new(Vec::new()));
-        let tick_baseline = baseline.clone();
-        let tick_pending = pending.clone();
-        let tick: crate::watch::TickFn = Arc::new(move |force| {
-            // Both reads happen under the sync lock, like `sync`'s. The
-            // baseline is the previous swept tick's `after` digest when there
-            // is one — nothing this loop reported has moved since, and a
-            // change another process made in between is a change since the
-            // last report either way — and a fresh read otherwise.
-            let mut base = tick_baseline.lock().expect("watch baseline");
-            // The baseline this sweep compares against, kept outside it so a
-            // cancelled sweep can still say what it committed (below).
-            let mut swept_from: Option<CatalogFingerprint> = None;
-            let result = with_capture_token(tick_stop.clone(), || {
-                rolling_tick(&mut base, |previous| {
-                    let outcome = sync_facade_tick(
-                        &db_path,
-                        &tick_roots,
-                        force,
-                        |conn| {
-                            let before = match previous {
-                                Some(before) => before,
-                                None => catalog_fingerprint(conn).map_err(anyhow::Error::from)?,
-                            };
-                            swept_from = Some(before.clone());
-                            #[cfg(test)]
-                            if cancel_diff_fault(&db_path) {
-                                // Stop once the baseline is taken, so the
-                                // sweep is cancelled with a baseline to diff.
-                                tick_stop.stop();
-                            }
-                            Ok(before)
-                        },
-                        |conn, before, _tick| {
-                            let (after, changed) = changes_under_lock(conn, &before)?;
-                            Ok((after, changed))
-                        },
-                    )?;
-                    Ok(outcome.map(|(tick, (after, changed))| (tick, after, changed)))
-                })
-            });
-            match result {
-                Ok((outcome, changed)) => {
-                    *tick_pending.lock().expect("watch pending") = changed;
-                    Ok(outcome)
-                }
-                Err(error) => {
-                    // A stop can land after the sweep committed chunks, or
-                    // after it finished and rolled the baseline forward — the
-                    // capture scope re-checks the token on the way out. The
-                    // loop ends on a cancellation, so this is the last chance
-                    // to report those rows: diff the catalog against the
-                    // baseline the sweep started from, roll it forward, and
-                    // let the cancelled report carry the result. A read-only
-                    // connection outside the sync lock: the diff writes
-                    // nothing, and a reader is no worse than the "changed
-                    // since the last report" this field already promises.
-                    if error.chain().any(|cause| cause.is::<CaptureCancelled>()) {
-                        if let Some(before) = swept_from {
-                            let diff =
-                                open_db_readonly(&db_path)
-                                    .map_err(Error::sync)
-                                    .and_then(|conn| {
-                                        #[cfg(test)]
-                                        if cancel_diff_fault(&db_path) {
-                                            return Err(Error::sync(anyhow::anyhow!(
-                                                "injected diff failure"
-                                            )));
-                                        }
-                                        changes_under_lock(&conn, &before)
-                                    });
-                            match diff {
-                                Ok((after, changed)) => {
-                                    *base = Some(after);
-                                    *tick_pending.lock().expect("watch pending") = changed;
-                                }
-                                // Surfaced rather than swallowed, and without
-                                // giving up the cancellation: the failure goes
-                                // onto the stream as its own `Err`, ahead of
-                                // the cancelled report, and the cancellation
-                                // is still what this tick returns, so the loop
-                                // ends as it was asked to.
-                                Err(diff_error) => {
-                                    if let Some(sender) =
-                                        &*tick_reports.lock().expect("watch reports")
-                                    {
-                                        let _ = sender.send(Err(Error::sync(anyhow::anyhow!(
-                                            "watch tick cancelled after committing changes \
-                                             that could not be read back for its report: \
-                                             {diff_error}"
-                                        ))));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Err(error)
-                }
-            }
-        });
+        let sweep = WatchSweep {
+            db_path: self.db_path.clone(),
+            roots: self.roots.clone(),
+            stop: stop.clone(),
+            baseline: Mutex::new(None),
+            pending: pending.clone(),
+            reports: reports.clone(),
+        };
+        let tick: crate::watch::TickFn = Arc::new(move |force| sweep.tick(force));
 
         let report_sink = reports.clone();
         let report_pending = pending;
@@ -1056,55 +939,19 @@ impl SessionStore {
             .with_leading_edge(opts.leading_edge)
             .on_report(Arc::new(move |report| {
                 let changed = std::mem::take(&mut *report_pending.lock().expect("watch pending"));
-                let tick = TickReport {
-                    trigger: report.trigger,
-                    forced: report.forced,
-                    swept: report.outcome.swept,
-                    skipped_unchanged: report.outcome.skipped_unchanged,
-                    contended: report.outcome.contended,
-                    cancelled: report.cancelled,
-                    elapsed_ms: duration_ms(report.elapsed),
-                    first_event_age_ms: report.first_event_at.map(|at| duration_ms(at.elapsed())),
-                    changed,
-                };
-                if let Some(sender) = &*report_sink.lock().expect("watch reports") {
-                    let _ = sender.send(Ok(tick));
-                }
+                let tick = TickReport::from_loop(report, changed);
+                send_report(&report_sink, || Ok(tick));
             }))
             .on_error(Arc::new(move |error| {
-                if let Some(sender) = &*error_sink.lock().expect("watch reports") {
-                    let _ = sender.send(Err(Error::sync(anyhow::anyhow!("{error:#}"))));
-                }
+                send_report(&error_sink, || {
+                    Err(Error::sync(anyhow::anyhow!("{error:#}")))
+                });
             }));
         watch = watch.with_roots_refresh(Arc::new(move || {
             sync_watch_roots_with_provider_roots(&refresh_roots)
         }));
         let watch = Arc::new(watch);
-        let runner = watch.clone();
-        let thread = std::thread::Builder::new()
-            .name("ai-hist-watch".into())
-            .spawn(move || {
-                // The loop reports every failed tick through `on_error` and
-                // never stops on one; `run` itself fails only when it cannot
-                // start at all, which the thread's end (and the closed
-                // channel) already reports to the iterator.
-                // The end of the loop is the end of the stream — on a panic
-                // too, which a blocked `next` would otherwise wait out
-                // forever.
-                struct CloseOnExit(Arc<Mutex<Option<ReportSender>>>);
-                impl Drop for CloseOnExit {
-                    fn drop(&mut self) {
-                        let mut sender = match self.0.lock() {
-                            Ok(sender) => sender,
-                            Err(poisoned) => poisoned.into_inner(),
-                        };
-                        sender.take();
-                    }
-                }
-                let _close = CloseOnExit(close_reports);
-                let _ = runner.run();
-            })
-            .map_err(|error| Error::SyncFailed(format!("spawning the watch thread: {error}")))?;
+        let thread = spawn_watch_thread(watch.clone(), close_reports)?;
         Ok(WatchHandle {
             stop: WatchStop { inner: watch, stop },
             thread: Some(thread),
@@ -1187,32 +1034,8 @@ impl SessionStore {
         let source = r.source();
         let name = source.as_str();
         let include_text = opts.include_text;
-        let row = match r {
-            SessionRef::Id { session_id, .. } => {
-                discover::catalog_row(&tx, name, session_id, include_text)
-            }
-            SessionRef::Path { path, .. } => {
-                // A path names one session only where the provider keeps one
-                // session per file. OpenCode's rows all carry the provider
-                // database as their locator, so a lookup by it would answer
-                // with whichever session sorts first — well-formed and wrong.
-                path_names_one_session(source)?;
-                discover::catalog_row_by_path(&tx, name, &path.to_string_lossy(), include_text)
-            }
-        }
-        .map_err(Error::query)?;
-        let session = match (row, r) {
-            (Some(row), _) => CatalogSession::from_row(row)?,
-            // A delegated child — a Claude subagent sidecar, a Codex child
-            // thread — is kept out of the catalog because it is part of its
-            // parent's work, but its evidence is stored under its own id.
-            (None, SessionRef::Id { session_id, .. }) => {
-                match delegated_child_session(&tx, source, session_id)? {
-                    Some(session) => session,
-                    None => return Ok(None),
-                }
-            }
-            (None, SessionRef::Path { .. }) => return Ok(None),
+        let Some(session) = catalog_session(&tx, r, include_text)? else {
+            return Ok(None);
         };
         let session_id = session.session_id.clone();
         // What this read fetches is the source's declared coverage narrowed
@@ -1226,7 +1049,6 @@ impl SessionStore {
             .filter(|kind| opts.kinds.as_ref().is_none_or(|kinds| kinds.contains(kind)))
             .collect();
         let wants = |kind: EvidenceKind| selected.contains(&kind);
-        let mut diagnostics = Vec::new();
 
         let mut evidence = SessionEvidence {
             session,
@@ -1254,15 +1076,7 @@ impl SessionStore {
                 .collect();
         }
         if wants(EvidenceKind::SessionEvent) {
-            let events =
-                session_events_sized(&tx, name, &session_id, include_text).map_err(Error::query)?;
-            evidence.messages = group_messages(source, &events);
-            evidence.tool_results = events
-                .iter()
-                .filter(|(event, _)| event.kind == "tool_result")
-                .map(|(event, bytes)| ToolResult::from_event(event, *bytes))
-                .collect();
-            evidence.user_turns = all_user_turns(&tx, name, &session_id)?;
+            load_events(&tx, source, &session_id, &mut evidence)?;
         }
         // Read once and shared: the requests take their tool use ids from the
         // same rows when both kinds are selected.
@@ -1294,30 +1108,260 @@ impl SessionStore {
                 session_markers(&tx, name, &session_id, include_text).map_err(Error::query)?;
         }
         if wants(EvidenceKind::Relationship) {
-            let graph = relationship_graph::session_relationships(&tx, name, &session_id)
-                .map_err(Error::query)?;
-            let mut relationships = Vec::new();
-            for (side, rows) in [
-                (RelationshipSide::Parent, graph.as_parent),
-                (RelationshipSide::Child, graph.as_child),
-                (RelationshipSide::Continuity, graph.continuity),
-            ] {
-                relationships.extend(
-                    rows.into_iter()
-                        .map(|row| Relationship::from_row(row, side)),
-                );
-            }
-            evidence.relationships = relationships;
-            diagnostics.extend(graph.diagnostics.into_iter().map(|diagnostic| Diagnostic {
-                code: diagnostic.code,
-                message: diagnostic.message,
-                subject: diagnostic.relationship_uid,
-            }));
+            load_relationships(&tx, name, &session_id, &mut evidence)?;
         }
         evidence.loaded = selected;
-        evidence.diagnostics = diagnostics;
         Ok(Some(evidence))
     }
+}
+
+/// The catalog row `r` names, or the delegated child its id names, or
+/// `None` when the store has neither.
+fn catalog_session(
+    conn: &Connection,
+    r: &SessionRef,
+    include_text: bool,
+) -> Result<Option<CatalogSession>, Error> {
+    let source = r.source();
+    let name = source.as_str();
+    let row = match r {
+        SessionRef::Id { session_id, .. } => {
+            discover::catalog_row(conn, name, session_id, include_text)
+        }
+        SessionRef::Path { path, .. } => {
+            // A path names one session only where the provider keeps one
+            // session per file. OpenCode's rows all carry the provider
+            // database as their locator, so a lookup by it would answer
+            // with whichever session sorts first — well-formed and wrong.
+            path_names_one_session(source)?;
+            discover::catalog_row_by_path(conn, name, &path.to_string_lossy(), include_text)
+        }
+    }
+    .map_err(Error::query)?;
+    match (row, r) {
+        (Some(row), _) => CatalogSession::from_row(row).map(Some),
+        // A delegated child — a Claude subagent sidecar, a Codex child
+        // thread — is kept out of the catalog because it is part of its
+        // parent's work, but its evidence is stored under its own id.
+        (None, SessionRef::Id { session_id, .. }) => {
+            delegated_child_session(conn, source, session_id)
+        }
+        (None, SessionRef::Path { .. }) => Ok(None),
+    }
+}
+
+/// A session's messages, tool results and user turns, from one read of its
+/// events.
+fn load_events(
+    conn: &Connection,
+    source: Source,
+    session_id: &str,
+    evidence: &mut SessionEvidence,
+) -> Result<(), Error> {
+    let name = source.as_str();
+    let events = session_events_sized(conn, name, session_id, evidence.include_text)
+        .map_err(Error::query)?;
+    evidence.messages = group_messages(source, &events);
+    evidence.tool_results = events
+        .iter()
+        .filter(|(event, _)| event.kind == "tool_result")
+        .map(|(event, bytes)| ToolResult::from_event(event, *bytes))
+        .collect();
+    evidence.user_turns = all_user_turns(conn, name, session_id)?;
+    Ok(())
+}
+
+/// A session's relationship edges from every side, and the diagnostics the
+/// graph raised reading them.
+fn load_relationships(
+    conn: &Connection,
+    name: &str,
+    session_id: &str,
+    evidence: &mut SessionEvidence,
+) -> Result<(), Error> {
+    let graph =
+        relationship_graph::session_relationships(conn, name, session_id).map_err(Error::query)?;
+    let mut relationships = Vec::new();
+    for (side, rows) in [
+        (RelationshipSide::Parent, graph.as_parent),
+        (RelationshipSide::Child, graph.as_child),
+        (RelationshipSide::Continuity, graph.continuity),
+    ] {
+        relationships.extend(
+            rows.into_iter()
+                .map(|row| Relationship::from_row(row, side)),
+        );
+    }
+    evidence.relationships = relationships;
+    evidence
+        .diagnostics
+        .extend(graph.diagnostics.into_iter().map(|diagnostic| Diagnostic {
+            code: diagnostic.code,
+            message: diagnostic.message,
+            subject: diagnostic.relationship_uid,
+        }));
+    Ok(())
+}
+
+/// The watch stream's sender, shared by the loop's sinks and taken out when
+/// the loop's thread ends.
+type ReportSlot = Arc<Mutex<Option<ReportSender>>>;
+
+/// Put one item on the watch stream, if it is still open. `item` is built
+/// only when there is a receiver to hand it to.
+fn send_report(slot: &ReportSlot, item: impl FnOnce() -> Result<TickReport, Error>) {
+    if let Some(sender) = &*slot.lock().expect("watch reports") {
+        let _ = sender.send(item());
+    }
+}
+
+/// One watch loop's sweep: the same locked `sync` as [`SessionStore::sync`],
+/// diffed against a rolling catalog baseline.
+///
+/// The sweep and the report sink run on the loop's thread, one tick at a
+/// time, so a single slot (`pending`) carries "what this tick changed" from
+/// the one to the other.
+struct WatchSweep {
+    db_path: PathBuf,
+    roots: ProviderRoots,
+    stop: StopToken,
+    baseline: Mutex<Option<CatalogFingerprint>>,
+    pending: Arc<Mutex<Vec<SessionRef>>>,
+    reports: ReportSlot,
+}
+
+impl WatchSweep {
+    fn tick(&self, force: bool) -> anyhow::Result<TickOutcome> {
+        // Both reads happen under the sync lock, like `sync`'s. The
+        // baseline is the previous swept tick's `after` digest when there
+        // is one — nothing this loop reported has moved since, and a
+        // change another process made in between is a change since the
+        // last report either way — and a fresh read otherwise.
+        let mut base = self.baseline.lock().expect("watch baseline");
+        // The baseline this sweep compares against, kept outside it so a
+        // cancelled sweep can still say what it committed (below).
+        let mut swept_from: Option<CatalogFingerprint> = None;
+        let result = with_capture_token(self.stop.clone(), || {
+            rolling_tick(&mut base, |previous| {
+                self.sweep(force, previous, &mut swept_from)
+            })
+        });
+        match result {
+            Ok((outcome, changed)) => {
+                *self.pending.lock().expect("watch pending") = changed;
+                Ok(outcome)
+            }
+            Err(error) => {
+                // A stop can land after the sweep committed chunks, or
+                // after it finished and rolled the baseline forward — the
+                // capture scope re-checks the token on the way out. The
+                // loop ends on a cancellation, so this is the last chance
+                // to report those rows.
+                if error.chain().any(|cause| cause.is::<CaptureCancelled>()) {
+                    if let Some(before) = swept_from {
+                        self.report_cancelled(&mut base, &before);
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
+    fn sweep(
+        &self,
+        force: bool,
+        previous: Option<CatalogFingerprint>,
+        swept_from: &mut Option<CatalogFingerprint>,
+    ) -> anyhow::Result<Option<(SyncTick, CatalogFingerprint, Vec<SessionRef>)>> {
+        let outcome = sync_facade_tick(
+            &self.db_path,
+            &self.roots,
+            force,
+            |conn| {
+                let before = match previous {
+                    Some(before) => before,
+                    None => catalog_fingerprint(conn).map_err(anyhow::Error::from)?,
+                };
+                *swept_from = Some(before.clone());
+                #[cfg(test)]
+                if cancel_diff_fault(&self.db_path) {
+                    // Stop once the baseline is taken, so the
+                    // sweep is cancelled with a baseline to diff.
+                    self.stop.stop();
+                }
+                Ok(before)
+            },
+            |conn, before, _tick| {
+                let (after, changed) = changes_under_lock(conn, &before)?;
+                Ok((after, changed))
+            },
+        )?;
+        Ok(outcome.map(|(tick, (after, changed))| (tick, after, changed)))
+    }
+
+    /// Diff the catalog against the baseline a cancelled sweep started from,
+    /// roll it forward, and let the cancelled report carry the result. A
+    /// read-only connection outside the sync lock: the diff writes nothing,
+    /// and a reader is no worse than the "changed since the last report" this
+    /// field already promises.
+    fn report_cancelled(&self, base: &mut Option<CatalogFingerprint>, before: &CatalogFingerprint) {
+        let diff = open_db_readonly(&self.db_path)
+            .map_err(Error::sync)
+            .and_then(|conn| {
+                #[cfg(test)]
+                if cancel_diff_fault(&self.db_path) {
+                    return Err(Error::sync(anyhow::anyhow!("injected diff failure")));
+                }
+                changes_under_lock(&conn, before)
+            });
+        match diff {
+            Ok((after, changed)) => {
+                *base = Some(after);
+                *self.pending.lock().expect("watch pending") = changed;
+            }
+            // Surfaced rather than swallowed, and without giving up the
+            // cancellation: the failure goes onto the stream as its own
+            // `Err`, ahead of the cancelled report, and the cancellation is
+            // still what this tick returns, so the loop ends as it was asked
+            // to.
+            Err(diff_error) => send_report(&self.reports, || {
+                Err(Error::sync(anyhow::anyhow!(
+                    "watch tick cancelled after committing changes \
+                     that could not be read back for its report: \
+                     {diff_error}"
+                )))
+            }),
+        }
+    }
+}
+
+/// Run the watch loop on its own thread. The loop reports every failed tick
+/// through `on_error` and never stops on one; `run` itself fails only when
+/// it cannot start at all, which the thread's end (and the closed channel)
+/// already reports to the iterator.
+fn spawn_watch_thread(
+    runner: Arc<WatchLoop>,
+    close_reports: ReportSlot,
+) -> Result<std::thread::JoinHandle<()>, Error> {
+    // The end of the loop is the end of the stream — on a panic too, which a
+    // blocked `next` would otherwise wait out forever.
+    struct CloseOnExit(ReportSlot);
+    impl Drop for CloseOnExit {
+        fn drop(&mut self) {
+            let mut sender = match self.0.lock() {
+                Ok(sender) => sender,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            sender.take();
+        }
+    }
+    std::thread::Builder::new()
+        .name("ai-hist-watch".into())
+        .spawn(move || {
+            let _close = CloseOnExit(close_reports);
+            let _ = runner.run();
+        })
+        .map_err(|error| Error::SyncFailed(format!("spawning the watch thread: {error}")))
 }
 
 /// The catalog digest at the end of a locked section, and what moved since
@@ -1540,84 +1584,6 @@ fn resolve_db_path(opts: &StoreOptions) -> PathBuf {
 // sync
 // ---------------------------------------------------------------------------
 
-/// Cooperative stop for [`SessionStore::discover`], [`SessionStore::sync`]
-/// and [`SessionStore::hydrate`]. Clones share one flag, so a token handed to
-/// a call on one thread is stopped from another.
-///
-/// A stopped call returns [`Error::Cancelled`] at the next provider, file or
-/// record boundary. Committed chunks stay; the unfinished transaction rolls
-/// back and the next call resumes from its checkpoint.
-#[derive(Debug, Clone, Default)]
-pub struct StopToken(Arc<AtomicBool>);
-
-impl StopToken {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Stop every call holding this token or a clone of it. Idempotent.
-    pub fn stop(&self) {
-        self.0.store(true, Ordering::SeqCst);
-    }
-
-    pub fn is_stopped(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
-    }
-}
-
-/// Receives content-free [`CaptureProgress`] — a source name and file
-/// counts, never paths or session contents — while a sweep reads files.
-/// Called on the thread running the sweep.
-#[derive(Clone)]
-pub struct ProgressObserver(Arc<dyn Fn(CaptureProgress) + Send + Sync>);
-
-impl ProgressObserver {
-    pub fn new(observer: impl Fn(CaptureProgress) + Send + Sync + 'static) -> Self {
-        Self(Arc::new(observer))
-    }
-}
-
-impl fmt::Debug for ProgressObserver {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str("ProgressObserver")
-    }
-}
-
-/// Run `work` with the caller's stop and progress installed for this thread.
-pub(crate) fn controlled<T>(
-    stop: Option<&StopToken>,
-    progress: Option<&ProgressObserver>,
-    work: impl FnOnce() -> Result<T, Error>,
-) -> Result<T, Error> {
-    let stop = stop.cloned();
-    let stoppable = move || match stop {
-        Some(token) => with_capture_token(token, || Ok(work())),
-        None => Ok(work()),
-    };
-    let outcome = match progress.cloned() {
-        Some(observer) => with_capture_observer(move |value| (observer.0)(value), stoppable),
-        None => stoppable(),
-    };
-    outcome.map_err(Error::sync)?
-}
-
-/// How to run a shallow catalog sweep.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct DiscoveryOptions {
-    /// Restrict to these sources. `None` means every local source;
-    /// `Some(vec![])` admits none and reads nothing.
-    pub sources: Option<Vec<Source>>,
-    /// Cap on rows read, newest first across providers. `None` (the default)
-    /// reads the whole catalog; a caller repeating a capped sweep only ever
-    /// sees the same newest sessions.
-    pub limit: Option<usize>,
-    /// Stops the sweep at the next provider or file boundary. See
-    /// [`StopToken`].
-    #[serde(skip)]
-    pub stop: Option<StopToken>,
-}
-
 /// Result of [`SessionStore::discover`].
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -1628,31 +1594,6 @@ pub struct DiscoveryReport {
     pub skipped_unchanged: usize,
     /// Providers or sessions that could not be read.
     pub diagnostics: Vec<Diagnostic>,
-}
-
-/// How to run a local sweep.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct SyncOptions {
-    /// Bypass the stat-only source fingerprint and walk every provider even
-    /// when nothing appears to have moved. The watch loop sets it for
-    /// filesystem-event ticks; a caller repairing a store it does not trust
-    /// sets it too.
-    pub force: bool,
-    /// How long to wait for another process's `SyncRunLock` before returning
-    /// [`Error::SyncLocked`]. `0` (the default) tries once. The lock is
-    /// re-tried every 100 ms while the budget lasts; a budget above seven
-    /// days is treated as seven days.
-    pub lock_timeout_ms: u64,
-    /// Stops the sweep at the next provider, file or record boundary, and
-    /// ends a wait for the lock. See [`StopToken`].
-    #[serde(skip)]
-    pub stop: Option<StopToken>,
-    /// Receives [`CaptureProgress`] as the sweep reads each provider's files.
-    /// OpenCode counts its SQLite database as one file, or one session file
-    /// per session in the legacy JSON tree. Unchanged files count as processed.
-    #[serde(skip)]
-    pub progress: Option<ProgressObserver>,
 }
 
 /// Result of [`SessionStore::sync`].
@@ -1805,28 +1746,6 @@ fn catalog_changes(before: &CatalogFingerprint, after: &CatalogFingerprint) -> V
 // ---------------------------------------------------------------------------
 // hydrate
 // ---------------------------------------------------------------------------
-
-/// How to hydrate one session.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct HydrateOptions {
-    /// Also hydrate the session's bounded related transcripts — Claude
-    /// subagent sidecars beside it, Codex child rollouts. Defaults to `true`.
-    pub include_related: bool,
-    /// Stops the hydration at the next file or record boundary. See
-    /// [`StopToken`].
-    #[serde(skip)]
-    pub stop: Option<StopToken>,
-}
-
-impl Default for HydrateOptions {
-    fn default() -> Self {
-        Self {
-            include_related: true,
-            stop: None,
-        }
-    }
-}
 
 /// What a hydration decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -2121,6 +2040,22 @@ pub struct TickReport {
     /// lock, swept or not, so a hydration landing between ticks is reported
     /// once by the tick that follows it. Empty on a `contended` tick.
     pub changed: Vec<SessionRef>,
+}
+
+impl TickReport {
+    fn from_loop(report: &crate::watch::TickReport, changed: Vec<SessionRef>) -> Self {
+        Self {
+            trigger: report.trigger,
+            forced: report.forced,
+            swept: report.outcome.swept,
+            skipped_unchanged: report.outcome.skipped_unchanged,
+            contended: report.outcome.contended,
+            cancelled: report.cancelled,
+            elapsed_ms: duration_ms(report.elapsed),
+            first_event_age_ms: report.first_event_at.map(|at| duration_ms(at.elapsed())),
+            changed,
+        }
+    }
 }
 
 /// Stops a running [`WatchHandle`] from any thread.

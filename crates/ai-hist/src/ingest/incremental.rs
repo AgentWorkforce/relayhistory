@@ -332,14 +332,9 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
                             };
                             ingest_claude_record(
                                 conn,
-                                path,
-                                None,
-                                file_session_id.as_deref(),
+                                &mut claude.file_parse(path, None, file_session_id.as_deref()),
                                 held,
                                 held_obj,
-                                &mut claude.tool_results,
-                                &mut claude.cache_reads,
-                                &mut claude.slash_commands,
                                 false,
                             )
                         })?;
@@ -435,6 +430,26 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
     Ok(pass)
 }
 
+impl ClaudeCursorState {
+    /// The transcript state this cursor carries, lent to the record indexer
+    /// for one file.
+    fn file_parse<'a>(
+        &'a mut self,
+        path: &'a Path,
+        attributed_session_id: Option<&'a str>,
+        file_session_id: Option<&'a str>,
+    ) -> ClaudeFileParse<'a> {
+        ClaudeFileParse {
+            path,
+            attributed_session_id,
+            file_session_id,
+            indexer: &mut self.tool_results,
+            last_assistant_cache_read: &mut self.cache_reads,
+            triads: &mut self.slash_commands,
+        }
+    }
+}
+
 /// Where a pass's database work is committed through, and the line index
 /// that goes with it.
 ///
@@ -527,14 +542,9 @@ fn place_claude_record(
         }
         _ => ingest_claude_record(
             conn,
-            path,
-            attributed_session_id,
-            file_session_id,
+            &mut claude.file_parse(path, attributed_session_id, file_session_id),
             at.record,
             at.obj,
-            &mut claude.tool_results,
-            &mut claude.cache_reads,
-            &mut claude.slash_commands,
             false,
         )?,
     }
@@ -602,14 +612,9 @@ fn release_held(
     for ((record, obj), stands_alone) in records.iter().zip(stands_alone) {
         ingest_claude_record(
             conn,
-            path,
-            attributed_session_id,
-            file_session_id,
+            &mut claude.file_parse(path, attributed_session_id, file_session_id),
             record,
             obj,
-            &mut claude.tool_results,
-            &mut claude.cache_reads,
-            &mut claude.slash_commands,
             stands_alone,
         )?;
     }

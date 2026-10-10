@@ -244,14 +244,16 @@ impl<'a> ClaudeRecordWalk<'a> {
     fn index(&mut self, line: &str, obj: &Map<String, Value>, stands_alone: bool) -> Result<()> {
         super::ingest_claude_record(
             self.conn,
-            self.path,
-            self.attributed_session_id,
-            self.file_session_id,
+            &mut super::ClaudeFileParse {
+                path: self.path,
+                attributed_session_id: self.attributed_session_id,
+                file_session_id: self.file_session_id,
+                indexer: &mut self.indexer,
+                last_assistant_cache_read: &mut self.cache_reads,
+                triads: &mut self.triads,
+            },
             line,
             obj,
-            &mut self.indexer,
-            &mut self.cache_reads,
-            &mut self.triads,
             stands_alone,
         )
     }

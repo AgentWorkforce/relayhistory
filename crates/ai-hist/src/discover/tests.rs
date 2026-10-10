@@ -3113,14 +3113,16 @@ fn a_shallow_rescan_never_downgrades_a_fully_indexed_row() {
     // Stand in for the full-sync path having already ingested this session.
     crate::upsert_session(
         &conn,
-        "claude-1",
-        "claude",
-        Some("/work/app"),
-        Some("main"),
-        1,
-        2,
-        Some("the assistant's last word"),
-        Some(&path.to_string_lossy()),
+        &crate::SessionCatalogRow {
+            session_id: "claude-1",
+            source: "claude",
+            cwd: Some("/work/app"),
+            git_branch: Some("main"),
+            first_ts: 1,
+            last_ts: 2,
+            last_assistant_text: Some("the assistant's last word"),
+            raw_path: Some(&path.to_string_lossy()),
+        },
     )
     .unwrap();
 

@@ -117,8 +117,19 @@ pub struct StoreOptions {           // #[non_exhaustive]
 }
 ```
 
-`StoreOptions` is `#[non_exhaustive]`: build it with `StoreOptions::default()`
-and assign the fields you set, not with a struct literal.
+`StoreOptions` is `#[non_exhaustive]`: build it from `default()` with the
+chainable setter named after each field, not with a struct literal.
+`DiscoveryOptions`, `SyncOptions`, `HydrateOptions` and `ForgetOptions` have
+the same setters.
+
+```rust
+let store = SessionStore::open(
+    StoreOptions::default()
+        .db_path("/srv/history/ai-history.db")
+        .home("/home/agent")
+        .read_only(true),
+)?;
+```
 
 | Field | Meaning |
 | --- | --- |

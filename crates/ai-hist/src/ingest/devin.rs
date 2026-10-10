@@ -899,23 +899,22 @@ fn normalize_inner(
                     present_events.insert(uid.clone());
                     super::insert_session_event(
                         conn,
-                        SOURCE,
-                        session_id,
-                        project,
-                        cwd,
-                        None,
-                        &message_id,
-                        parent_id.as_deref(),
-                        ts,
-                        "user",
-                        "text",
-                        Some(text),
-                        None,
-                        None,
-                        identity,
-                        &uid,
-                        None,
-                        raw_facts,
+                        &super::EventRow {
+                            source: SOURCE,
+                            session_id,
+                            project,
+                            cwd,
+                            message_id: &message_id,
+                            parent_id: parent_id.as_deref(),
+                            ts_ms: ts,
+                            role: "user",
+                            kind: "text",
+                            text: Some(text),
+                            identity,
+                            event_uid: &uid,
+                            raw_facts,
+                            ..super::EventRow::default()
+                        },
                     )?;
                     counts.events += 1;
                     let hash = prompt_hash(text);
@@ -970,23 +969,24 @@ fn normalize_inner(
                     present_events.insert(uid.clone());
                     super::insert_session_event(
                         conn,
-                        SOURCE,
-                        session_id,
-                        project,
-                        cwd,
-                        None,
-                        &message_id,
-                        parent_id.as_deref(),
-                        ts,
-                        "assistant",
-                        "thinking",
-                        Some(thinking),
-                        message_model,
-                        token_json.as_deref(),
-                        identity,
-                        &uid,
-                        None,
-                        raw_facts,
+                        &super::EventRow {
+                            source: SOURCE,
+                            session_id,
+                            project,
+                            cwd,
+                            message_id: &message_id,
+                            parent_id: parent_id.as_deref(),
+                            ts_ms: ts,
+                            role: "assistant",
+                            kind: "thinking",
+                            text: Some(thinking),
+                            model: message_model,
+                            token_json: token_json.as_deref(),
+                            identity,
+                            event_uid: &uid,
+                            raw_facts,
+                            ..super::EventRow::default()
+                        },
                     )?;
                     counts.events += 1;
                 }
@@ -995,23 +995,24 @@ fn normalize_inner(
                     present_events.insert(uid.clone());
                     super::insert_session_event(
                         conn,
-                        SOURCE,
-                        session_id,
-                        project,
-                        cwd,
-                        None,
-                        &message_id,
-                        parent_id.as_deref(),
-                        ts,
-                        "assistant",
-                        "text",
-                        Some(text),
-                        message_model,
-                        token_json.as_deref(),
-                        identity,
-                        &uid,
-                        None,
-                        raw_facts,
+                        &super::EventRow {
+                            source: SOURCE,
+                            session_id,
+                            project,
+                            cwd,
+                            message_id: &message_id,
+                            parent_id: parent_id.as_deref(),
+                            ts_ms: ts,
+                            role: "assistant",
+                            kind: "text",
+                            text: Some(text),
+                            model: message_model,
+                            token_json: token_json.as_deref(),
+                            identity,
+                            event_uid: &uid,
+                            raw_facts,
+                            ..super::EventRow::default()
+                        },
                     )?;
                     counts.events += 1;
                     last_assistant_text = Some(discover::excerpt(text));
@@ -1045,57 +1046,45 @@ fn normalize_inner(
                         present_events.insert(uid.clone());
                         super::insert_session_event(
                             conn,
-                            SOURCE,
-                            session_id,
-                            project,
-                            cwd,
-                            None,
-                            &message_id,
-                            parent_id.as_deref(),
-                            ts,
-                            "assistant",
-                            "tool_use",
-                            Some(&super::format_tool_event_text(
-                                name,
-                                target,
-                                arguments.unwrap_or(&Value::Null),
-                            )),
-                            message_model,
-                            token_json.as_deref(),
-                            identity,
-                            &uid,
-                            None,
-                            raw_facts,
+                            &super::EventRow {
+                                source: SOURCE,
+                                session_id,
+                                project,
+                                cwd,
+                                message_id: &message_id,
+                                parent_id: parent_id.as_deref(),
+                                ts_ms: ts,
+                                role: "assistant",
+                                kind: "tool_use",
+                                text: Some(&super::format_tool_event_text(
+                                    name,
+                                    target,
+                                    arguments.unwrap_or(&Value::Null),
+                                )),
+                                model: message_model,
+                                token_json: token_json.as_deref(),
+                                identity,
+                                event_uid: &uid,
+                                raw_facts,
+                                ..super::EventRow::default()
+                            },
                         )?;
                         counts.events += 1;
                         present_tool_calls.insert(call_id.clone());
-                        super::insert_tool_call(
-                            conn,
-                            SOURCE,
+                        let call = super::ToolCallRef {
+                            source: SOURCE,
                             session_id,
-                            &message_id,
-                            &call_id,
-                            name,
-                            target,
-                            &args_json,
-                            is_error,
-                            ts,
-                        )?;
+                            message_id: &message_id,
+                            tool_use_id: &call_id,
+                            ts_ms: ts,
+                            git_branch: None,
+                            cwd,
+                        };
+                        super::insert_tool_call(conn, &call, name, target, &args_json, is_error)?;
                         counts.tool_calls += 1;
                         if let Some(path) = edit_file_path(state, name, arguments) {
                             present_file_edits.insert(call_id.clone());
-                            super::upsert_file_edit_from_call(
-                                conn,
-                                SOURCE,
-                                session_id,
-                                &message_id,
-                                &call_id,
-                                path,
-                                name,
-                                ts,
-                                None,
-                                cwd,
-                            )?;
+                            super::upsert_file_edit_from_call(conn, &call, path, name)?;
                             counts.file_edits += 1;
                         }
                     }
@@ -1126,23 +1115,23 @@ fn normalize_inner(
                 present_events.insert(uid.clone());
                 super::insert_session_event(
                     conn,
-                    SOURCE,
-                    session_id,
-                    project,
-                    cwd,
-                    None,
-                    &message_id,
-                    parent_id.as_deref(),
-                    ts,
-                    "tool_result",
-                    "tool_result",
-                    text,
-                    None,
-                    None,
-                    identity,
-                    &uid,
-                    Some(&facts),
-                    raw_facts,
+                    &super::EventRow {
+                        source: SOURCE,
+                        session_id,
+                        project,
+                        cwd,
+                        message_id: &message_id,
+                        parent_id: parent_id.as_deref(),
+                        ts_ms: ts,
+                        role: "tool_result",
+                        kind: "tool_result",
+                        text,
+                        identity,
+                        event_uid: &uid,
+                        tool_result_facts: Some(&facts),
+                        raw_facts,
+                        ..super::EventRow::default()
+                    },
                 )?;
                 counts.events += 1;
                 if !tool_use_id.is_empty() && status == STATUS_ERRORED {
@@ -1225,57 +1214,48 @@ fn normalize_inner(
         present_events.insert(uid.clone());
         super::insert_session_event(
             conn,
-            SOURCE,
-            session_id,
-            project,
-            cwd,
-            None,
-            &message_id,
-            None,
-            orphan_ts,
-            "assistant",
-            "tool_use",
-            Some(&super::format_tool_event_text(
-                name,
-                target,
-                arguments.unwrap_or(&Value::Null),
-            )),
-            loaded.info.model.as_deref(),
-            None,
-            super::RequestIdentity::none(),
-            &uid,
-            None,
-            super::RawMessageFacts::default(),
+            &super::EventRow {
+                source: SOURCE,
+                session_id,
+                project,
+                cwd,
+                message_id: &message_id,
+                ts_ms: orphan_ts,
+                role: "assistant",
+                kind: "tool_use",
+                text: Some(&super::format_tool_event_text(
+                    name,
+                    target,
+                    arguments.unwrap_or(&Value::Null),
+                )),
+                model: loaded.info.model.as_deref(),
+                event_uid: &uid,
+                ..super::EventRow::default()
+            },
         )?;
         counts.events += 1;
         present_tool_calls.insert(call_id.clone());
+        let call = super::ToolCallRef {
+            source: SOURCE,
+            session_id,
+            message_id: &message_id,
+            tool_use_id: call_id,
+            ts_ms: orphan_ts,
+            git_branch: None,
+            cwd,
+        };
         super::insert_tool_call(
             conn,
-            SOURCE,
-            session_id,
-            &message_id,
-            call_id,
+            &call,
             name,
             target,
             &args_json,
             tool_is_error(Some(state)),
-            orphan_ts,
         )?;
         counts.tool_calls += 1;
         if let Some(path) = edit_file_path(Some(state), name, arguments) {
             present_file_edits.insert(call_id.clone());
-            super::upsert_file_edit_from_call(
-                conn,
-                SOURCE,
-                session_id,
-                &message_id,
-                call_id,
-                path,
-                name,
-                orphan_ts,
-                None,
-                cwd,
-            )?;
+            super::upsert_file_edit_from_call(conn, &call, path, name)?;
             counts.file_edits += 1;
         }
     }
@@ -1457,14 +1437,16 @@ fn normalize_inner(
     let last_ts = last_ts.max(loaded.info.last_activity_ms.unwrap_or(last_ts));
     super::upsert_session_rebuilt(
         conn,
-        session_id,
-        SOURCE,
-        cwd,
-        None,
-        first_ts,
-        last_ts,
-        last_assistant_text.as_deref(),
-        Some(raw_path),
+        &super::SessionCatalogRow {
+            session_id,
+            source: SOURCE,
+            cwd,
+            git_branch: None,
+            first_ts,
+            last_ts,
+            last_assistant_text: last_assistant_text.as_deref(),
+            raw_path: Some(raw_path),
+        },
     )?;
     retire_absent_rows(
         conn,
