@@ -190,3 +190,17 @@ fn refreshing_statistics_analyzes_the_tables_the_connection_used() {
         .unwrap();
     assert!(analyzed > 0);
 }
+
+/// The diagnostics a session read reports seek that session's pending
+/// evidence instead of walking the source's evidence in locator order.
+#[test]
+fn pending_continuity_evidence_seeks_the_session() {
+    for analyzed in [false, true] {
+        let conn = skewed(analyzed);
+        let plan = plan(&conn, crate::continuity::PENDING_REASONS_SQL);
+        assert!(
+            plan.contains("idx_session_continuity_pending (source=? AND session_id=?)"),
+            "analyzed={analyzed}:\n{plan}"
+        );
+    }
+}
