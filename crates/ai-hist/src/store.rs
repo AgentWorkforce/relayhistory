@@ -1369,6 +1369,23 @@ CREATE TABLE IF NOT EXISTS session_continuity_evidence (
 );
 "#;
 
+/// Rows `ANALYZE` samples per index when `PRAGMA optimize` runs it: SQLite's
+/// recommended bound, which keeps the first analysis of a multi-gigabyte
+/// history to seconds and every later one to milliseconds.
+const ANALYSIS_LIMIT: i64 = 400;
+
+/// Bring the planner's statistics up to date, as SQLite recommends doing at
+/// the end of a session of writes: `PRAGMA optimize` analyzes the tables this
+/// connection queried whose statistics are missing or whose size has moved
+/// well past them, and nothing else. The sweep's lookups are written to seek
+/// with or without statistics; these keep every other query's plan from
+/// being chosen blind on a store of tens of thousands of sessions.
+pub(crate) fn refresh_planner_statistics(conn: &Connection) -> Result<()> {
+    conn.pragma_update(None, "analysis_limit", ANALYSIS_LIMIT)?;
+    conn.execute_batch("PRAGMA optimize;")?;
+    Ok(())
+}
+
 /// Drop `trigger` unless every one of `markers` is applied, so the `CREATE
 /// TRIGGER IF NOT EXISTS` after it installs the current body.
 fn drop_trigger_unless_applied(conn: &Connection, trigger: &str, markers: &[&str]) -> Result<()> {

@@ -4182,3 +4182,44 @@ fn observed_session_by_locator_is_a_keyed_search() {
         assert_eq!(found, "s7");
     }
 }
+
+/// Reading an OpenCode store writes its `-shm` read marks, so a fingerprint
+/// over the `-shm` file moved after every sweep that read the store and the
+/// unchanged-sources fast path never held. A write still moves it.
+#[test]
+fn reading_an_opencode_store_does_not_move_the_fingerprint() {
+    let home = tempfile::tempdir().unwrap();
+    let conn = catalog();
+    let db = home.path().join("opencode.db");
+    let writer = Connection::open(&db).unwrap();
+    writer
+        .execute_batch(
+            "PRAGMA journal_mode = WAL; CREATE TABLE session (id TEXT PRIMARY KEY); \
+             INSERT INTO session VALUES ('ses_a');",
+        )
+        .unwrap();
+    // OpenCode is not running: the reader is the store's only connection,
+    // and the first connection to a WAL store rebuilds its `-shm` index.
+    drop(writer);
+    let read = || {
+        let reader =
+            Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
+        let _: String = reader
+            .query_row("SELECT id FROM session", [], |row| row.get(0))
+            .unwrap();
+    };
+    let env = env_at(&conn, home.path());
+    let fingerprint =
+        || source_fingerprint_with(&env, &[&OpencodeProvider::default()], &[]).unwrap();
+    // The sweep that recorded the fingerprint had read the store already.
+    read();
+    let before = fingerprint();
+    std::thread::sleep(Duration::from_millis(20));
+    read();
+    assert_eq!(fingerprint(), before);
+    Connection::open(&db)
+        .unwrap()
+        .execute("INSERT INTO session VALUES ('ses_b')", [])
+        .unwrap();
+    assert_ne!(fingerprint(), before);
+}

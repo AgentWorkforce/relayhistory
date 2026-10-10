@@ -2686,8 +2686,11 @@ impl ShallowSessionProvider for OpencodeProvider {
                 )
             });
         }
+        // The database and its WAL hold every committed write. The `-shm`
+        // index is left out: every reader writes its read marks there, this
+        // sweep's own included, so it moved after every sweep that read.
         for db in listing.stores {
-            for suffix in ["", "-wal", "-shm"] {
+            for suffix in ["", "-wal"] {
                 let mut path = db.clone().into_os_string();
                 path.push(suffix);
                 let path = PathBuf::from(path);
@@ -3250,7 +3253,8 @@ impl ShallowSessionProvider for DevinProvider {
     fn fingerprint_inputs(&self, env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
         let db = crate::ingest::devin::sessions_db_path(&env.devin_dir);
         let mut out = Vec::new();
-        for suffix in ["", "-wal", "-shm"] {
+        // Not `-shm`, which readers write; see the OpenCode adapter.
+        for suffix in ["", "-wal"] {
             let mut path = db.clone().into_os_string();
             path.push(suffix);
             let path = PathBuf::from(path);

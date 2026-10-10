@@ -2468,6 +2468,9 @@ fn sync_basic(
             checkpoints.save(&state);
         }
     }
+    if let Err(error) = crate::store::refresh_planner_statistics(conn) {
+        sync_note!("  [sync] planner statistics not refreshed: {error:#}");
+    }
     let total: i64 = conn.query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))?;
     // Fold the WAL back into the database now that the writes are done.
     // Left unchecked the WAL grows without bound (156MB observed in the wild).
@@ -32598,6 +32601,9 @@ mod tests {
             json!(super::destination_head(&conn).unwrap()),
         );
         assert!(super::sources_unchanged(&conn, &state, &old_fingerprint));
+        // The previous build's per-session stamps carry its generation, so
+        // none of them matches this build's.
+        state.remove("opencode_tree_sessions_v1");
         fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
 
         assert!(

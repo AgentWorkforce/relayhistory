@@ -10,8 +10,15 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Change-feed rows (`StoredRow`) and `ai-hist export` payloads no longer carry `session_events.raw_facts_version`, the store's own parser-generation bookkeeping; the feed does not stamp an event when only it changes.
 
+### Changed
+
+- A sync that sweeps ends with `PRAGMA optimize` under `analysis_limit = 400`, so the store carries planner statistics; the first sweep after upgrading analyzes the store once (seconds on a multi-gigabyte history).
+
 ### Fixed
 
+- `SessionStore::sync` reads only the OpenCode sessions that changed since the sweep that last wrote them and does not open an OpenCode store whose database and WAL are unchanged, instead of re-reading and rewriting every session on every sweep; the first sync after upgrading reads each OpenCode store once more.
+- An unforced `sync` skips the sweep again when no source changed on a host with an OpenCode or Devin SQLite store: the source fingerprint no longer counts the store's `-shm` index, which every read of the store rewrote.
+- Reading a session's parents and continuity edges, and deleting a session, seek that session's own relationship edges instead of reading every edge of its source, with or without planner statistics.
 - An appended exported column restamps only rows holding a value in it, and a raw-facts parser-generation bump restamps only events whose evidence changed, so neither re-delivers a store's session events. A row holding NULL in an appended column keeps its revision; a consumer reads a column a row was delivered without as NULL. A dropped, renamed or retyped column still restamps every row of its kind.
 - Claude subagent requests and usage reach `SessionEvidence::requests` on the sync or hydration that reads the sidecar, rather than only once the sidecar had sat still for two minutes and a later sweep ran, which `sync` skipped while no other source changed. The first sync after upgrading backfills the messages an earlier build held back.
 - A Claude response whose only record is a signed, empty `thinking` block is a request in `SessionEvidence::requests` with its usage again, instead of only a `thinking_signature` marker; the record stores its thinking event (empty text). The first sync or hydration after upgrading re-reads only the transcripts holding such a response.

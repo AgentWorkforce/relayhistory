@@ -173,3 +173,20 @@ fn deleting_a_session_reads_only_its_own_edges() {
         );
     }
 }
+
+/// The sweep's closing `PRAGMA optimize` analyzes a table it queried that
+/// was never analyzed, within the bounded sample.
+#[test]
+fn refreshing_statistics_analyzes_the_tables_the_connection_used() {
+    let conn = skewed(false);
+    session_continuity_edges(&conn, "opencode", "ses_b").unwrap();
+    crate::store::refresh_planner_statistics(&conn).unwrap();
+    let analyzed: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_stat1 WHERE tbl = 'session_relationships'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(analyzed > 0);
+}
