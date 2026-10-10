@@ -35,6 +35,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - An unforced `sync` skips the sweep again when no source changed on a host with an OpenCode or Devin SQLite store: the source fingerprint no longer counts the store's `-shm` index, which every read of the store rewrote.
 - A sweep refreshes canonical project identity only for the sessions written since the database's last refresh, including in a new process: every `ai-hist sync` and every embedder's first sweep re-walked every delegated child before.
 - Reading a session's parents, continuity edges and unresolved continuity evidence, and deleting a session, seek that session's own rows instead of reading every relationship or continuity row of its source, with or without planner statistics.
+- A rewritten OpenCode part is replayed on the next sweep when the store's parts are read by message id (no `part(session_id)` index, or no index at all): the per-session stamp now groups a part under its message's session, as the reader places it, instead of under the part's own `session_id`, which left a part whose `session_id` is NULL out of every stamp and its session skipped with stale evidence.
 
 ### Rust API
 

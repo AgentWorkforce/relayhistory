@@ -1,7 +1,8 @@
 //! The stamps an OpenCode sweep compares: a store's files, and each SQLite
 //! session's rows.
 
-use super::super::{opencode, SyncStateStamp};
+use super::super::opencode::{self, OpencodeSyncPlan};
+use super::super::SyncStateStamp;
 use super::AMBIGUITY_MS;
 use anyhow::Result;
 use rusqlite::Connection;
@@ -97,10 +98,7 @@ pub(super) fn sqlite_session_stamps(src: &Connection) -> Result<Vec<SessionStamp
 
 fn message_aggregate(src: &Connection) -> Result<TableAggregate> {
     let columns = opencode::table_columns(src, "message")?;
-    if !["id", "data", "session_id"]
-        .iter()
-        .all(|name| columns.contains(*name))
-    {
+    if !opencode::has_columns(&columns, &["id", "data", "session_id"]) {
         return Ok(TableAggregate::new());
     }
     let updated = opencode::optional_column(&columns, "time_updated");
@@ -116,14 +114,14 @@ fn message_aggregate(src: &Connection) -> Result<TableAggregate> {
     )
 }
 
-/// Grouped by the part's own `session_id` when it has one, otherwise by its
-/// message's session -- the same parts either loader reads.
+/// Grouped under the session each loader places the part in: its own
+/// `session_id` when the per-session loader seeks parts by that column,
+/// otherwise its message's session. A part read by message id belongs to
+/// its message's session whatever its own `session_id` holds, NULL
+/// included, and the single-pass loader places every part by message.
 fn part_aggregate(src: &Connection) -> Result<TableAggregate> {
     let columns = opencode::table_columns(src, "part")?;
-    if !["id", "data", "message_id"]
-        .iter()
-        .all(|name| columns.contains(*name))
-    {
+    if !opencode::has_columns(&columns, &["id", "data", "message_id"]) {
         return Ok(TableAggregate::new());
     }
     let version = row_version(&columns, "p.");
@@ -131,7 +129,9 @@ fn part_aggregate(src: &Connection) -> Result<TableAggregate> {
         true => "p.time_updated",
         false => "NULL",
     };
-    let (session, from) = if columns.contains("session_id") {
+    let owned_by_own_column = opencode::sync_plan(src)? == OpencodeSyncPlan::PerSession
+        && opencode::seek_parts_by_session(src, &columns)?;
+    let (session, from) = if owned_by_own_column {
         ("p.session_id", "part p")
     } else {
         let message = opencode::table_columns(src, "message")?;

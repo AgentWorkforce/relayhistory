@@ -214,10 +214,7 @@ fn read_session_info(src: &Connection, session_id: &str) -> Result<Option<Openco
 fn read_session_messages(src: &Connection, session_id: &str) -> Result<Vec<OpencodeMessage>> {
     let message_columns = table_columns(src, "message")?;
     let mut messages = Vec::new();
-    if message_columns.contains("id")
-        && message_columns.contains("data")
-        && message_columns.contains("session_id")
-    {
+    if has_columns(&message_columns, &["id", "data", "session_id"]) {
         let fallback = optional_column(&message_columns, "time_created");
         let sql = format!(
             "SELECT id, data, {fallback} FROM message WHERE session_id = ? AND json_valid(data)"
@@ -253,37 +250,43 @@ fn read_session_parts(
 ) -> Result<BTreeMap<String, Vec<OpencodePart>>> {
     let part_columns = table_columns(src, "part")?;
     let mut parts_by_message: BTreeMap<String, Vec<OpencodePart>> = BTreeMap::new();
-    if part_columns.contains("id")
-        && part_columns.contains("data")
-        && part_columns.contains("message_id")
-    {
-        // Seek by session when the provider indexes it, otherwise by the
-        // message ids this session's own messages already named. Both stay
-        // session-keyed; neither scans the provider's whole `part` table.
-        //
-        // Seek by whichever column the provider actually indexes. Choosing on
-        // column *presence* alone picks a predicate SQLite can only answer by
-        // scanning `part`, which for one session is merely slow but for the
-        // global sweep is one full scan per session.
-        let seek_part_by_session = part_columns.contains("session_id")
-            && (has_leading_index(src, "part", "session_id")?
-                || !has_leading_index(src, "part", "message_id")?);
-        if seek_part_by_session {
-            let mut stmt = src.prepare(
-                "SELECT id, message_id, data FROM part WHERE session_id = ? AND json_valid(data)",
-            )?;
-            collect_parts(&mut stmt, session_id, &mut parts_by_message)?;
-        } else {
-            let mut stmt = src.prepare(
-                "SELECT id, message_id, data FROM part WHERE message_id = ? AND json_valid(data)",
-            )?;
-            for message in messages {
-                super::check_capture_cancelled()?;
-                collect_parts(&mut stmt, &message.id, &mut parts_by_message)?;
-            }
+    if has_columns(&part_columns, &["id", "data", "message_id"]) {
+        let column = match seek_parts_by_session(src, &part_columns)? {
+            true => "session_id",
+            false => "message_id",
+        };
+        let keys: Vec<&str> = match column {
+            "session_id" => vec![session_id],
+            _ => messages.iter().map(|m| m.id.as_str()).collect(),
+        };
+        let mut stmt = src.prepare(&format!(
+            "SELECT id, message_id, data FROM part WHERE {column} = ? AND json_valid(data)"
+        ))?;
+        for key in keys {
+            super::check_capture_cancelled()?;
+            collect_parts(&mut stmt, key, &mut parts_by_message)?;
         }
     }
     Ok(parts_by_message)
+}
+
+/// Whether a session's parts are sought by their own `session_id`, or by
+/// the message ids the session's own messages named. Both stay
+/// session-keyed; neither scans the provider's whole `part` table.
+///
+/// Seek by whichever column the provider actually indexes. Choosing on
+/// column *presence* alone picks a predicate SQLite can only answer by
+/// scanning `part`, which for one session is merely slow but for the global
+/// sweep is one full scan per session.
+///
+/// This is the question of which session a part belongs to: sought by
+/// message, a part belongs to its message's session whatever its own
+/// `session_id` says (including when that is NULL), so the sweep's stamps
+/// group parts the same way.
+pub(crate) fn seek_parts_by_session(src: &Connection, columns: &BTreeSet<String>) -> Result<bool> {
+    Ok(columns.contains("session_id")
+        && (has_leading_index(src, "part", "session_id")?
+            || !has_leading_index(src, "part", "message_id")?))
 }
 
 /// Run a `SELECT id, message_id, data FROM part` statement keyed on `key`
@@ -460,10 +463,7 @@ pub(crate) fn load_all_from_sqlite(src: &Connection) -> Result<OpencodeStoreLoad
     let message_columns = table_columns(src, "message")?;
     let mut messages_by_session: BTreeMap<String, Vec<OpencodeMessage>> = BTreeMap::new();
     let mut session_of_message: BTreeMap<String, String> = BTreeMap::new();
-    if message_columns.contains("id")
-        && message_columns.contains("data")
-        && message_columns.contains("session_id")
-    {
+    if has_columns(&message_columns, &["id", "data", "session_id"]) {
         let fallback = optional_column(&message_columns, "time_created");
         let sql =
             format!("SELECT id, session_id, data, {fallback} FROM message WHERE json_valid(data)");
@@ -522,10 +522,7 @@ pub(crate) fn load_all_from_sqlite(src: &Connection) -> Result<OpencodeStoreLoad
     let part_columns = table_columns(src, "part")?;
     let mut parts_by_session: BTreeMap<String, BTreeMap<String, Vec<OpencodePart>>> =
         BTreeMap::new();
-    if part_columns.contains("id")
-        && part_columns.contains("data")
-        && part_columns.contains("message_id")
-    {
+    if has_columns(&part_columns, &["id", "data", "message_id"]) {
         let mut stmt =
             src.prepare("SELECT id, message_id, data FROM part WHERE json_valid(data)")?;
         let mapped = stmt.query_map([], |row| {
@@ -611,6 +608,11 @@ pub(crate) fn sqlite_store_holds_session(store: &Path, session_id: &str) -> Resu
         .prepare("SELECT 1 FROM session WHERE id = ?")?
         .exists([session_id])?;
     Ok(held)
+}
+
+/// Whether `columns` holds every one of `names`: the columns a loader reads.
+pub(crate) fn has_columns(columns: &BTreeSet<String>, names: &[&str]) -> bool {
+    names.iter().all(|name| columns.contains(*name))
 }
 
 pub(crate) fn table_columns(conn: &Connection, table: &str) -> Result<BTreeSet<String>> {
