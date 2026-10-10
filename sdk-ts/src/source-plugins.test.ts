@@ -163,7 +163,7 @@ test('local reads and explicit empty selection do not invoke installed source ca
   t.after(() => rm(dir, { recursive: true, force: true }));
   const dbPath = join(dir, 'history.db');
   const saved = new Map(
-    ['HOME', 'USERPROFILE', 'XDG_DATA_HOME', 'OPENCODE_DB', 'TRAJECTORY_ROOT'].map((name) => [
+    ['HOME', 'USERPROFILE', 'XDG_DATA_HOME', 'OPENCODE_DB'].map((name) => [
       name,
       process.env[name],
     ]),
@@ -222,7 +222,7 @@ test('failed source instances do not block healthy remote or local acquisition',
   t.after(() => rm(dir, { recursive: true, force: true }));
   const dbPath = join(dir, 'history.db');
   const saved = new Map(
-    ['HOME', 'USERPROFILE', 'XDG_DATA_HOME', 'OPENCODE_DB', 'TRAJECTORY_ROOT'].map((name) => [
+    ['HOME', 'USERPROFILE', 'XDG_DATA_HOME', 'OPENCODE_DB'].map((name) => [
       name,
       process.env[name],
     ]),

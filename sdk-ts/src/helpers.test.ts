@@ -12,15 +12,15 @@ import {
 } from './index.js';
 
 test('exports immutable, aligned runtime source registries and matching type guards', () => {
-  assert.deepEqual(SOURCES, ['claude', 'codex', 'cursor', 'grok', 'relay', 'trajectory', 'opencode', 'muse', 'devin']);
-  assert.deepEqual(CATALOG_SOURCES, SOURCES.filter((source) => source !== 'trajectory'));
+  assert.deepEqual(SOURCES, ['claude', 'codex', 'cursor', 'grok', 'opencode', 'muse', 'devin']);
+  assert.deepEqual(CATALOG_SOURCES, SOURCES);
   assert.equal(Object.isFrozen(SOURCES), true);
   assert.equal(Object.isFrozen(CATALOG_SOURCES), true);
 
   for (const source of SOURCES) assert.equal(isSource(source), true);
   for (const source of CATALOG_SOURCES) assert.equal(isCatalogSource(source), true);
-  assert.equal(isCatalogSource('trajectory'), false);
-  for (const value of ['unknown', '', null, undefined, 1, {}]) {
+  // `relay` and `trajectory` were sources once.
+  for (const value of ['unknown', 'relay', 'trajectory', '', null, undefined, 1, {}]) {
     assert.equal(isSource(value), false);
     assert.equal(isCatalogSource(value), false);
   }
@@ -48,6 +48,6 @@ test('resumeCommand preserves source and project-aware commands', () => {
   assert.equal(resumeCommand({ source: 'codex', sessionId: 's2', project: null, locations: ['local'] }), 'codex resume s2');
   assert.equal(resumeCommand({ source: 'cursor', sessionId: 's3', project: '/work/app', locations: ['local', 'remote'] }), 'cd /work/app && cursor-agent --resume=s3');
   assert.equal(resumeCommand({ source: 'grok', sessionId: 's4', project: null, locations: ['remote'] }), null);
-  assert.equal(resumeCommand({ source: 'relay', sessionId: 's5', project: null, locations: ['local'] }), null);
+  assert.equal(resumeCommand({ source: 'opencode', sessionId: 's5', project: null, locations: ['local'] }), null);
   assert.equal(resumeCommand({ source: 'muse', sessionId: 's6', project: '/work/app', locations: ['local'] }), 'cd /work/app && muse resume s6');
 });

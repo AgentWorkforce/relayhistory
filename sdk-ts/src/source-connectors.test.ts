@@ -61,10 +61,10 @@ test('native contract 11 is rejected because it silently ignores connector selec
 
 test('local scope ignores selected commercial connectors and all scope can disable remotes', async () => {
   await isolated(async (dbPath) => {
-    const local = await discoverSessions({ dbPath, scope: 'local', sourceConnectors: ['cloud', 'relaycast'] });
+    const local = await discoverSessions({ dbPath, scope: 'local', sourceConnectors: ['cloud', 'claude-web'] });
     assert.equal(local.scope, 'local');
     assert.deepEqual(local.locationsRun, ['local']);
-    assert.equal((await sync({ dbPath, scope: 'local', sourceConnectors: ['cloud', 'relaycast'] })).completed, true);
+    assert.equal((await sync({ dbPath, scope: 'local', sourceConnectors: ['cloud', 'claude-web'] })).completed, true);
     const all = await discoverSessions({ dbPath, scope: 'all', sourceConnectors: [] });
     assert.equal(all.scope, 'all');
     assert.deepEqual(all.locationsRun, ['local']);

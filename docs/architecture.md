@@ -280,7 +280,7 @@ so every result reports it:
 | `grok` | sometimes (only `subagents/` entries carrying a session id) | yes | yes | yes |
 | `opencode` | always | no | yes | yes |
 | `muse` | always | yes | yes | yes |
-| `cursor`, `devin`, `relay` | never | no | no | no |
+| `cursor`, `devin` | never | no | no | no |
 
 A linked child's events are stored under the child's own session id and are
 never flattened into the parent. The delegated instruction that started a

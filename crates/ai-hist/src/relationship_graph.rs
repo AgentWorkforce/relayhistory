@@ -1116,7 +1116,7 @@ mod tests {
             relationship_capabilities("grok").stable_child_identity,
             "sometimes"
         );
-        for source in ["cursor", "relay"] {
+        for source in ["cursor", "not-a-provider"] {
             let capabilities = relationship_capabilities(source);
             assert_eq!(capabilities.stable_child_identity, "never");
             assert!(!capabilities.records_agent_type);

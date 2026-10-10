@@ -38,7 +38,6 @@ impl EnvGuard {
                 "OPENCODE_STORAGE_DIR",
                 Some(home.join("missing-opencode-storage")),
             ),
-            ("TRAJECTORY_ROOT", Some(home.join("missing-trajectories"))),
             ("AI_HIST_DB", None),
         ];
         let saved = vars

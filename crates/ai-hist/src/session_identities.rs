@@ -93,8 +93,8 @@ impl SessionStore {
     /// A session counts when any evidence table stores a row under it: the
     /// catalog, prompts, events, tool calls, file edits, markers,
     /// relationships (under their parent), presences, commit links,
-    /// connector observations and their evidence, and trajectories (under the
-    /// `trajectory` source, by id). A prompt that names no session is under
+    /// and connector observations and their evidence. A prompt that names no
+    /// session is under
     /// none, and a child session only an edge names is not one until
     /// something is stored under it -- the same pairs the change feed
     /// reports in [`crate::Change::session_id`].
@@ -288,9 +288,6 @@ const IDENTITY_TABLES: &[(&str, &str)] = &[
     ("observation_evidence", "session_id"),
 ];
 
-/// A trajectory is a session of its own, under a source it does not store.
-const TRAJECTORY_SOURCE: &str = "trajectory";
-
 /// The first identity in one table, or the first after a cursor. An empty
 /// source or session id names no session -- `ChangeQuery::session` refuses
 /// either -- so it is skipped like NULL.
@@ -307,38 +304,14 @@ fn seek_sql(table: &str, session: &str, after: bool) -> String {
     )
 }
 
-fn trajectory_sql(after: bool) -> &'static str {
-    if after {
-        "SELECT id FROM trajectories WHERE id > ?1 ORDER BY id LIMIT 1"
-    } else {
-        "SELECT id FROM trajectories WHERE id > '' ORDER BY id LIMIT 1"
-    }
-}
-
 type Identity = (String, String);
 
 /// One table's next identity strictly after `after`.
 fn next_in(
     conn: &Connection,
-    arm: Option<(&str, &str)>,
+    (table, session): (&str, &str),
     after: Option<(&str, &str)>,
 ) -> Result<Option<Identity>> {
-    let Some((table, session)) = arm else {
-        // The trajectory arm: its identities all share one source, so the
-        // cursor either precedes them, falls among them, or follows them.
-        let found: Option<String> = match after {
-            Some((source, _)) if source > TRAJECTORY_SOURCE => return Ok(None),
-            Some((source, id)) if source == TRAJECTORY_SOURCE => conn
-                .prepare_cached(trajectory_sql(true))?
-                .query_row([id], |row| row.get(0))
-                .optional()?,
-            _ => conn
-                .prepare_cached(trajectory_sql(false))?
-                .query_row([], |row| row.get(0))
-                .optional()?,
-        };
-        return Ok(found.map(|id| (TRAJECTORY_SOURCE.to_string(), id)));
-    };
     let mut statement = conn.prepare_cached(&seek_sql(table, session, after.is_some()))?;
     let read = |row: &rusqlite::Row<'_>| Ok((row.get(0)?, row.get(1)?));
     Ok(match after {
@@ -368,14 +341,6 @@ pub(crate) fn identity_exists(conn: &Connection, source: &str, session_id: &str)
 }
 
 fn probe_identity(conn: &Connection, source: &str, session_id: &str) -> Result<bool> {
-    if source == TRAJECTORY_SOURCE {
-        let found: bool = conn
-            .prepare_cached("SELECT EXISTS(SELECT 1 FROM trajectories WHERE id = ?1)")?
-            .query_row([session_id], |row| row.get(0))?;
-        if found {
-            return Ok(true);
-        }
-    }
     for (table, session) in IDENTITY_TABLES {
         let found: bool = conn
             .prepare_cached(&format!(
@@ -424,11 +389,7 @@ fn merge_page(
         "SELECT {}",
         crate::relationships::delegated_child_sql("?1", "?2")
     ))?;
-    let arms: Vec<Option<(&str, &str)>> = IDENTITY_TABLES
-        .iter()
-        .map(|(table, session)| Some((*table, *session)))
-        .chain([None])
-        .collect();
+    let arms = IDENTITY_TABLES;
     let mut offers: Vec<Option<Identity>> = arms
         .iter()
         .map(|arm| next_in(conn, *arm, after))
@@ -670,7 +631,7 @@ mod tests {
             }),
         );
         assert_eq!(
-            next_in(&reader, Some(("sessions", "session_id")), None).unwrap(),
+            next_in(&reader, ("sessions", "session_id"), None).unwrap(),
             None
         );
         let first_arm = counted.load(Ordering::SeqCst);
@@ -727,30 +688,19 @@ mod tests {
                  connector_instance, updated_ms) \
                  VALUES ('some-new-agent', 'observed-only', 'remote', 'conn', 'default', 1); \
              INSERT INTO history (source, session_id, prompt, timestamp_ms) \
-                 VALUES ('codex', '', 'no session', 1); \
-             INSERT INTO trajectories (id, decisions_json, retrospective_json, search_text, \
-                 updated_ms, timestamp_ms) VALUES ('traj-1', '[]', '{}', 'x', 1, 1);",
+                 VALUES ('codex', '', 'no session', 1);",
         )
         .unwrap();
         let listed = identities_after(&conn, None, 100, false).unwrap();
         assert_eq!(
             listed,
-            [
-                ("claude", "tool-only"),
-                ("some-new-agent", "observed-only"),
-                ("trajectory", "traj-1")
-            ]
-            .map(|(source, id)| (source.to_string(), id.to_string()))
+            [("claude", "tool-only"), ("some-new-agent", "observed-only"),]
+                .map(|(source, id)| (source.to_string(), id.to_string()))
         );
         for (source, id) in &listed {
             assert!(identity_exists(&conn, source, id).unwrap(), "{source} {id}");
         }
-        for (source, id) in [
-            ("", "blank-source"),
-            ("codex", ""),
-            ("claude", "missing"),
-            ("trajectory", "missing"),
-        ] {
+        for (source, id) in [("", "blank-source"), ("codex", ""), ("claude", "missing")] {
             assert!(
                 !identity_exists(&conn, source, id).unwrap(),
                 "{source:?} {id:?}"
@@ -916,9 +866,6 @@ mod tests {
             for after in [false, true] {
                 plans.push((*table, seek_sql(table, session, after), after, 2));
             }
-        }
-        for after in [false, true] {
-            plans.push(("trajectories", trajectory_sql(after).to_string(), after, 1));
         }
         for (table, sql, after, arity) in plans {
             let values: Vec<&str> = if after {

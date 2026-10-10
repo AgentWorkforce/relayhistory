@@ -17,10 +17,9 @@ const needsNodeSqlite = sqlite ? false : 'node:sqlite requires Node >= 22';
 // Clear every provider/transport override used by these operations so neither
 // credentials nor history from the operator's environment enter the fixture.
 const ENVIRONMENT = [
-  'HOME', 'USERPROFILE', 'XDG_DATA_HOME', 'OPENCODE_DB', 'TRAJECTORY_ROOT', 'AI_HIST_DB',
+  'HOME', 'USERPROFILE', 'XDG_DATA_HOME', 'OPENCODE_DB', 'AI_HIST_DB',
   'RELAYHISTORY_HOME', 'RELAYHISTORY_BASE_URL', 'AI_HIST_BASE_URL',
   'RELAYHISTORY_CLAUDE_CREDENTIALS', 'RELAYHISTORY_CLAUDE_API_BASE_URL',
-  'RELAYCAST_API_KEY', 'RELAYCAST_WORKSPACE_ID', 'RELAYCAST_BASE_URL',
 ];
 
 async function withFixture(

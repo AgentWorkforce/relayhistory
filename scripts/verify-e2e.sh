@@ -38,11 +38,9 @@ jsonl_field() {
 }
 
 export AI_HIST_DB="$TMP/ai-history.db"
-export TRAJECTORY_ROOT="$TMP/trajectories"
 export OPENCODE_DB="$TMP/opencode.db"
 export HOME="$TMP/home"
-unset RELAYCAST_API_KEY RELAYCAST_WORKSPACE_ID RELAYCAST_BASE_URL
-mkdir -p "$HOME/.claude/projects/e2e-project" "$HOME/.codex/sessions/2026/06/20" "$TRAJECTORY_ROOT/planner/compacted"
+mkdir -p "$HOME/.claude/projects/e2e-project" "$HOME/.codex/sessions/2026/06/20"
 mkdir -p "$HOME/.grok/sessions/%2Ftmp%2Fe2e%2Fgrok/grok-e2e"
 mkdir -p "$HOME/.cursor/projects/tmp-e2e-cursor/agent-transcripts/cursor-e2e"
 
@@ -77,34 +75,6 @@ cat > "$HOME/.cursor/projects/tmp-e2e-cursor/agent-transcripts/cursor-e2e/cursor
 {"role":"assistant","message":{"content":[{"type":"text","text":"ok"}]}}
 JSONL
 
-cat > "$TRAJECTORY_ROOT/planner/compacted/trajectory-e2e.json" <<'JSON'
-{
-  "id": "trajectory-e2e",
-  "version": 1,
-  "personaId": "planner",
-  "projectId": "agent-workforce",
-  "task": {
-    "title": "e2e trajectory release tagging task",
-    "description": "Choose release test coverage."
-  },
-  "status": "completed",
-  "startedAt": "2026-06-06T10:00:00.000Z",
-  "completedAt": "2026-06-06T10:05:00.000Z",
-  "decisions": [{
-    "question": "What should be tested?",
-    "chosen": "full Rust parity E2E",
-    "reasoning": "Fallback is no longer sufficient.",
-    "alternatives": ["scoped wrapper"]
-  }],
-  "retrospective": {
-    "summary": "Parity test selected.",
-    "approach": "Exercise every source.",
-    "learnings": ["Installer and sync both matter."],
-    "confidence": 0.9
-  }
-}
-JSON
-
 sqlite3 -bail "$OPENCODE_DB" <<'SQL'
 CREATE TABLE session (id TEXT PRIMARY KEY, directory TEXT, time_created INTEGER);
 CREATE TABLE message (id TEXT PRIMARY KEY, session_id TEXT, time_created INTEGER, data TEXT);
@@ -119,7 +89,6 @@ SQL
 "$ROOT/ai-hist" tag opencode-e2e release-e2e --source opencode
 "$ROOT/ai-hist" tag grok-e2e release-e2e --source grok
 "$ROOT/ai-hist" tag cursor-e2e release-e2e --source cursor
-"$ROOT/ai-hist" tag trajectory-e2e release-e2e --source trajectory
 "$ROOT/ai-hist" search release --tag release-e2e --json
 "$ROOT/ai-hist" search --tag release-e2e >/dev/null
 session_prompt=$("$ROOT/ai-hist" session claude-e2e --full --json | json_field 'd.map((e) => e.prompt).join("|")')
@@ -134,16 +103,16 @@ context_focus=$(printf '%s\n' "$context_out" | grep -c '>>>' || true)
 assert_eq "context focus rows" "$context_focus" "1"
 
 pack_sources=$("$ROOT/ai-hist" pack release --json | json_field 'd.entries.map((e) => e.source).sort().join(",")')
-assert_eq "pack sources" "$pack_sources" "claude,codex,cursor,grok,opencode,trajectory"
+assert_eq "pack sources" "$pack_sources" "claude,codex,cursor,grok,opencode"
 
 stats_total=$("$ROOT/ai-hist" stats --json | json_field 'd.total')
-assert_eq "stats total" "$stats_total" "6"
+assert_eq "stats total" "$stats_total" "5"
 
 tagged_sessions=$("$ROOT/ai-hist" tags --sessions --json | json_field 'd.find((t) => t.name === "release-e2e").session_count')
-assert_eq "tagged session count" "$tagged_sessions" "5"
+assert_eq "tagged session count" "$tagged_sessions" "4"
 
 sources=$(sqlite3 "$AI_HIST_DB" "SELECT DISTINCT source FROM history" | sort)
-expected_sources=$(printf '%s\n' claude codex cursor grok opencode trajectory)
+expected_sources=$(printf '%s\n' claude codex cursor grok opencode)
 assert_eq "sources" "$sources" "$expected_sources"
 
 codex_project=$(sqlite3 "$AI_HIST_DB" "SELECT project FROM history WHERE source='codex' AND session_id='codex-e2e'")
@@ -176,12 +145,7 @@ assert_eq "discover trailer" "$discover_trailer" "summary"
 
 discover_exempt=$(printf '%s\n' "$discover_json" | jsonl_field \
   'd.find((l) => l.type === "summary").exempt_sources.map((e) => e.source).join(",")')
-assert_eq "discover exemptions" "$discover_exempt" "trajectory"
-
-# Trajectories are derived records, never sessions.
-discover_trajectories=$(printf '%s\n' "$discover_json" | jsonl_field \
-  'd.filter((l) => l.type === "session" && l.source === "trajectory").length')
-assert_eq "discovered trajectories" "$discover_trajectories" "0"
+assert_eq "discover exemptions" "$discover_exempt" ""
 
 # Codex session_meta provenance is observed, not invented.
 codex_branch=$(printf '%s\n' "$discover_json" | jsonl_field \

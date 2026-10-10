@@ -208,7 +208,7 @@ export interface SourceConnectorOptions {
   signal?: AbortSignal;
   /** Omit for provider-only defaults; [] disables remote acquisition. Local scope
    * never probes remote connectors. Commercial connectors require explicit IDs.
-   * Built-ins: claude-web, codex-cloud, cloud, relaycast (sync only). */
+   * Built-ins: claude-web, codex-cloud, cloud. */
   sourceConnectors?: string[];
 }
 
@@ -721,7 +721,6 @@ export const CHANGE_KINDS = Object.freeze([
   'history',
   'presence',
   'commit_link',
-  'trajectory',
   'source_observation',
   'observation_evidence',
 ] as const);
@@ -743,7 +742,7 @@ export interface FeedChange {
   /** Null for a source this build does not know; `sourceName` still names it. */
   source: Source | null;
   sourceName: string;
-  /** The parent for a relationship, the id for a trajectory, empty for a prompt with no session. */
+  /** The parent for a relationship, empty for a prompt with no session. */
   sessionId: string;
   recordKey: string;
   /** The kind's wire name, then the table's uniqueness columns as stored. */

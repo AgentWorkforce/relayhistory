@@ -141,9 +141,6 @@ export function currentSessionCandidates(env: NodeJS.ProcessEnv = process.env): 
     nonempty(env.OPENCODE_SESSION_ID)
       ? { source: 'opencode', sessionId: nonempty(env.OPENCODE_SESSION_ID)! }
       : undefined,
-    (nonempty(env.AGENT_RELAY_SESSION_ID) ?? nonempty(env.RELAY_SESSION_ID))
-      ? { source: 'relay', sessionId: (nonempty(env.AGENT_RELAY_SESSION_ID) ?? nonempty(env.RELAY_SESSION_ID))! }
-      : undefined,
   ];
   const seen = new Set<string>();
   return candidates.filter((candidate): candidate is SessionCandidate => {

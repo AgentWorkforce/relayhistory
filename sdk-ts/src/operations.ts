@@ -1070,9 +1070,7 @@ export function formatSessionRow(
     codex: '◇',
     cursor: '▸',
     grok: '◉',
-    relay: '↔',
     opencode: '⌘',
-    trajectory: '↗',
     muse: '✧',
     devin: '⬡',
   };

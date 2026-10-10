@@ -129,12 +129,12 @@ test('the feed refuses what it cannot serve and never creates a database', async
   }
 });
 
-test('a feed change keeps every source the native feed names, trajectory included', () => {
+test('a feed change keeps every source the native feed names', () => {
   const row = {
-    kind: 'trajectory', source: 'trajectory', sourceName: 'trajectory', sessionId: 't-1',
-    recordKey: 't-1', key: ['trajectory', 't-1'], revision: 7, op: 'upsert', columns: { id: 't-1' },
+    kind: 'history', source: 'codex', sourceName: 'codex', sessionId: 't-1',
+    recordKey: '[1,"x"]', key: ['history', 'codex', 1, 'x'], revision: 7, op: 'upsert', columns: { id: 1 },
   };
-  assert.equal(feedChange(row).source, 'trajectory');
+  assert.equal(feedChange(row).source, 'codex');
   // A source a newer release wrote is carried, not failed on.
   const future = feedChange({ ...row, source: null, sourceName: 'future-harness' });
   assert.equal(future.source, null);
