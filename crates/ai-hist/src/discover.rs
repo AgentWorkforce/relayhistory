@@ -91,7 +91,7 @@ pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 4;
 /// invalidates every stored stamp, so a scanner that learns to extract a new
 /// field re-reads sources whose bytes never changed. `parser_version` keeps its
 /// existing meaning (full-ingest parser generation) and is untouched.
-pub const SHALLOW_SCANNER_VERSION: u32 = 10;
+pub const SHALLOW_SCANNER_VERSION: u32 = 11;
 
 /// Version 2 shipped the classification that hid standalone guardians (see
 /// [`crate::codex_is_subagent`]). Their rollouts never change on disk, so the
@@ -158,7 +158,15 @@ const _: () = assert!(SHALLOW_SCANNER_VERSION > 8);
 /// this bump clears its stored `discovery_skips` row and moves the sweep
 /// generation, sending the first `sync` after the upgrade through the walk
 /// that catalogs it.
-const _: () = assert!(SHALLOW_SCANNER_VERSION > 9);
+///
+/// Version 10 hid every Codex rollout marked `thread_source: "subagent"` as a
+/// child thread, including a standalone guardian that names no parent, and
+/// recorded it as a known non-session. Version 11 catalogs such a rollout
+/// under its own id ([`crate::codex_is_subagent`]). Its bytes never change, so
+/// only this bump clears its stored `discovery_skips` row and moves the sweep
+/// generation, sending the first `sync` after the upgrade through the walk
+/// that catalogs it.
+const _: () = assert!(SHALLOW_SCANNER_VERSION > 10);
 
 /// Most bytes a shallow head read may consume from one transcript.
 pub const HEAD_SCAN_MAX_BYTES: u64 = 256 * 1024;

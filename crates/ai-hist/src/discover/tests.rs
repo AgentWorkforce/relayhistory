@@ -508,7 +508,7 @@ fn a_non_session_source_is_remembered_so_rescans_do_not_reread_it() {
         home.path(),
         "codex-sub",
         concat!(
-            r#"{"timestamp":"2026-06-20T11:02:00.000Z","type":"session_meta","payload":{"id":"codex-sub","cwd":"/work/api","thread_source":"subagent"}}"#,
+            r#"{"timestamp":"2026-06-20T11:02:00.000Z","type":"session_meta","payload":{"id":"codex-sub","cwd":"/work/api","parent_thread_id":"codex-1","thread_source":"subagent"}}"#,
             "\n"
         ),
         1_750_000_300_000,
@@ -712,7 +712,7 @@ fn codex_subagent_threads_are_not_sessions() {
         home.path(),
         "codex-sub",
         concat!(
-            r#"{"timestamp":"2026-06-20T11:02:00.000Z","type":"session_meta","payload":{"id":"codex-sub","cwd":"/work/api","thread_source":"subagent"}}"#,
+            r#"{"timestamp":"2026-06-20T11:02:00.000Z","type":"session_meta","payload":{"id":"codex-sub","cwd":"/work/api","parent_thread_id":"codex-1","thread_source":"subagent"}}"#,
             "\n"
         ),
         1_750_000_300_000,
@@ -725,6 +725,27 @@ fn codex_subagent_threads_are_not_sessions() {
         .query_row("SELECT COUNT(*) FROM sessions", [], |row| row.get(0))
         .unwrap();
     assert_eq!(rows, 1);
+}
+
+/// `thread_source: "subagent"` names the kind of agent, not a parent: a
+/// standalone guardian / auto-review thread that names no parent is a session
+/// of its own, catalogued under its `payload.id`.
+#[test]
+fn codex_subagent_thread_naming_no_parent_is_a_session() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    codex_rollout(
+        home.path(),
+        "codex-guardian",
+        concat!(
+            r#"{"timestamp":"2026-06-20T11:02:00.000Z","type":"session_meta","payload":{"id":"codex-guardian","session_id":"codex-guardian","cwd":"/work/api","source":{"subagent":{"other":"guardian"}},"thread_source":"subagent"}}"#,
+            "\n"
+        ),
+        1_750_000_300_000,
+    );
+
+    let found = discover(&conn, home.path(), &only(&["codex"]));
+    assert_eq!(found.ids(), vec!["codex:codex-guardian"]);
 }
 
 #[test]
@@ -3216,7 +3237,7 @@ fn non_session_candidates_do_not_consume_limit_slots() {
             id,
             &format!(
                 concat!(
-                    r#"{{"timestamp":"2026-06-20T11:02:00.000Z","type":"session_meta","payload":{{"id":"{}","cwd":"/work/api","thread_source":"subagent"}}}}"#,
+                    r#"{{"timestamp":"2026-06-20T11:02:00.000Z","type":"session_meta","payload":{{"id":"{}","cwd":"/work/api","parent_thread_id":"real-a","thread_source":"subagent"}}}}"#,
                     "\n"
                 ),
                 id
