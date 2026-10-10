@@ -20,6 +20,7 @@ pub(crate) fn sync_opencode_storage_dir(
     if !storage_dir.join("session").is_dir() {
         return Ok(0);
     }
+    sweep.read_holdings(conn, Stamps::Tree)?;
     let mut inserted = 0;
     let listing = opencode::list_json_tree_session_files(storage_dir);
     // A subtree that could not be walked is not a subtree with no sessions in

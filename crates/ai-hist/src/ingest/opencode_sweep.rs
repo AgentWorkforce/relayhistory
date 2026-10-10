@@ -85,6 +85,9 @@ impl Stamps {
 pub(crate) struct OpencodeSweep<'a> {
     repairs: &'a SweepRepairs,
     generation: String,
+    /// What the destination held when the first recorded stamp was asked
+    /// about; `None` until then.
+    holdings: Option<holdings::Holdings>,
     maps: [Map<String, Value>; 3],
     /// Entries to drop from the on-disk maps.
     forgotten: [Vec<String>; 3],
@@ -101,6 +104,7 @@ impl<'a> OpencodeSweep<'a> {
         Self {
             repairs,
             generation: sweep_generation(),
+            holdings: None,
             maps,
             forgotten: Default::default(),
         }
@@ -154,7 +158,19 @@ impl<'a> OpencodeSweep<'a> {
         if self.repairs.contains("opencode", session_id) {
             return Ok(false);
         }
-        holdings::holds(conn, session_id, held)
+        match &self.holdings {
+            Some(holdings) => Ok(holdings.hold(session_id, held)),
+            None => holdings::holds(conn, session_id, held),
+        }
+    }
+
+    /// Read what the destination holds, once, before the first stamp that
+    /// could license a skip is asked about.
+    fn read_holdings(&mut self, conn: &Connection, map: Stamps) -> Result<()> {
+        if self.holdings.is_none() && !self.map(map).is_empty() {
+            self.holdings = Some(holdings::Holdings::read(conn)?);
+        }
+        Ok(())
     }
 
     /// Record one session's stamp once its evidence is written.
@@ -314,6 +330,7 @@ fn sync_opencode_db_file(
     // Before the read transaction opens: a write after this point moves the
     // files past the stamp.
     let file_stamp = stamps::store_file_stamp(opencode_db, &sweep.generation);
+    sweep.read_holdings(conn, Stamps::Sessions)?;
     if let Some(stamp) = &file_stamp {
         if store_unchanged(conn, sweep, &tag, stamp, claimed)? {
             return Ok(0);
