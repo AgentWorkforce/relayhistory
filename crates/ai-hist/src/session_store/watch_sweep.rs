@@ -6,10 +6,11 @@
 //! couple of seconds. The loop now says which roots fired
 //! ([`ChangeScope`]); [`WatchSources`] maps each root back to the sources
 //! that registered it, so the tick sweeps only those, and keeps the
-//! trajectory roots the last full sweep derived so an event tick never walks
-//! `~/Projects` at all. Startup, backstop and manual ticks — and any event
-//! the loop could not place — stay full sweeps, and only a full sweep
-//! re-derives the trajectory roots.
+//! trajectory roots last derived so an event tick never walks `~/Projects`
+//! at all. Startup, backstop and manual ticks — and any event the loop could
+//! not place — stay full sweeps. The trajectory roots are derived once per
+//! backstop, by the root refresh that registers them, and the backstop's
+//! sweep reuses that walk.
 
 use super::*;
 use crate::discover::WatchRoot;
@@ -29,8 +30,9 @@ struct WatchSourcesState {
     /// The derived trajectory roots, when the provider roots name none
     /// outright (`TRAJECTORY_ROOT` unset). `None` until first derived.
     trajectories: Option<Vec<PathBuf>>,
-    /// Derived since the last full sweep took them, so that sweep — the
-    /// loop's first — need not walk again.
+    /// Derived since the last full sweep took them — at startup, or by the
+    /// backstop refresh just ahead of a backstop sweep — so that sweep need
+    /// not walk again.
     fresh: bool,
     /// Every watched root's path, and the sources whose roots it is.
     by_root: HashMap<PathBuf, BTreeSet<Source>>,
@@ -60,15 +62,21 @@ impl WatchSources {
         }
     }
 
-    /// Every root the loop should watch, from the trajectory roots last
-    /// derived — deriving them only when nothing has yet. Called at startup
-    /// and on every backstop, so it also brings the root-to-source map up to
-    /// date with what the loop is about to adopt.
+    /// Every root the loop should watch. Called at startup and on every
+    /// backstop refresh, just ahead of that backstop's full sweep, so it
+    /// re-derives the trajectory roots here — a `.trajectories` directory
+    /// created since the last backstop is registered now, not one backstop
+    /// later — and leaves them fresh for that sweep to reuse rather than
+    /// walk again. It also brings the root-to-source map up to date with
+    /// exactly the roots the loop is about to adopt.
     pub(super) fn watch_roots(&self) -> Vec<WatchRoot> {
         let mut state = self.state.lock().expect("watch sources");
-        if self.roots.trajectory_roots.is_none() && state.trajectories.is_none() {
-            state.trajectories = trajectory_roots(&self.roots).ok();
-            state.fresh = true;
+        if self.roots.trajectory_roots.is_none() {
+            // A walk that fails keeps the roots the last one found.
+            if let Ok(found) = trajectory_roots(&self.roots) {
+                state.trajectories = Some(found);
+                state.fresh = true;
+            }
         }
         let by_source = sync_watch_roots_by_source(&pinned(&self.roots, &state.trajectories));
         state.by_root.clear();
@@ -92,7 +100,7 @@ impl WatchSources {
     /// What `request` sweeps. A forced tick whose every root is known sweeps
     /// only the sources those roots belong to, from the trajectory roots
     /// already known; anything else is a full sweep, which re-derives the
-    /// trajectory roots (unless the startup derivation is still fresh).
+    /// trajectory roots unless a refresh derived them since the last one.
     pub(super) fn plan(&self, request: &TickRequest) -> SweepPlan {
         let mut state = self.state.lock().expect("watch sources");
         let sources = match &request.scope {
@@ -340,12 +348,12 @@ mod tests {
         );
     }
 
-    /// The trajectory roots are walked for once when the watch starts, that
-    /// walk serves the first full sweep, and after that only a full sweep
-    /// walks again. An event tick — Claude's or a trajectory root's — reads
-    /// the roots the last walk found.
+    /// The trajectory roots are walked for once when the watch starts and
+    /// once per backstop, by the root refresh, whose walk the sweep right
+    /// after it reuses. An event tick — Claude's or a trajectory root's —
+    /// reads the roots the last walk found and never walks.
     #[test]
-    fn only_a_full_sweep_walks_projects_for_trajectory_roots() {
+    fn only_a_backstop_walks_projects_for_trajectory_roots() {
         let (home, roots) = home_with_trajectories();
         let sources = WatchSources::new(roots);
         let claude = home.path().join(".claude/projects");
@@ -363,21 +371,49 @@ mod tests {
 
         let claude_tick = sources.plan(&event(std::slice::from_ref(&claude)));
         let trajectory_tick = sources.plan(&event(std::slice::from_ref(&trajectory)));
-        sources.watch_roots();
-        assert_eq!(
-            trajectory_walks() - walks,
-            1,
-            "no event tick or refresh walked"
-        );
+        assert_eq!(trajectory_walks() - walks, 1, "no event tick walked");
         assert_eq!(
             trajectory_tick.roots.trajectory_roots,
             Some(vec![trajectory])
         );
         assert_eq!(claude_tick.sources, Some(vec![Source::Claude]));
 
+        // A backstop: the refresh walks, the sweep after it reuses the walk.
+        sources.watch_roots();
         let backstop = sources.plan(&full(TickTrigger::Poll));
-        assert_eq!(trajectory_walks() - walks, 2, "the backstop re-derives");
+        assert_eq!(trajectory_walks() - walks, 2, "one walk per backstop");
         assert_eq!(backstop.scope(), SweepScope::everything());
+        // A full sweep with no refresh before it walks for itself.
+        sources.plan(&full(TickTrigger::Manual));
+        assert_eq!(trajectory_walks() - walks, 3);
+    }
+
+    /// A `.trajectories` directory created after the watch started is
+    /// registered by the next backstop refresh, and its events are scoped to
+    /// the trajectory source, rather than waiting a backstop more.
+    #[test]
+    fn a_new_trajectory_store_is_registered_by_the_next_refresh() {
+        let (home, roots) = home_with_trajectories();
+        let sources = WatchSources::new(roots);
+        sources.watch_roots();
+        sources.plan(&full(TickTrigger::Startup));
+        let created = home.path().join("Projects/other/.trajectories");
+        std::fs::create_dir_all(&created).unwrap();
+
+        let registered = sources.watch_roots();
+        assert!(
+            registered.iter().any(|root| root.path == created),
+            "the refresh registers the new store"
+        );
+        assert_eq!(
+            sources.plan(&event(std::slice::from_ref(&created))).sources,
+            Some(vec![Source::Trajectory])
+        );
+        let backstop = sources.plan(&full(TickTrigger::Poll));
+        assert!(backstop
+            .roots
+            .trajectory_roots
+            .is_some_and(|roots| roots.contains(&created)));
     }
 
     #[test]

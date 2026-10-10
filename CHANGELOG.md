@@ -4,7 +4,7 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Minor]
 
 ### Added
 
@@ -13,7 +13,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 
 - A `SessionStore::watch` filesystem-event tick sweeps only the providers whose watched roots fired, so one live Claude session no longer re-walks every other provider every couple of seconds; startup, backstop and manual ticks stay full sweeps, and the next unforced full sweep still catches whatever a scoped tick left out.
-- Trajectory roots are derived from `~/Projects` once per sweep instead of twice, only by full sweeps (a watch's event ticks reuse the roots its last full sweep found), and only to five directories below `~/Projects`; name a deeper `.trajectories` directory in `TRAJECTORY_ROOT`.
+- Trajectory roots are derived from `~/Projects` once per sweep instead of twice, once per backstop in a watch (its event ticks reuse the roots the last walk found), and only to five directories below `~/Projects`; name a deeper `.trajectories` directory in `TRAJECTORY_ROOT`.
 - Re-reading a Claude transcript asks once per record, with one indexed lookup, whether an earlier parse left the record's rows under another session or as a notice's assistant output, and retires them only when it did, instead of running eight delete and update statements for every record of every re-read.
 
 ### Rust API

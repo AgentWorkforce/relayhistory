@@ -74,7 +74,12 @@ impl OwedSweep {
     /// would be compared against still cannot be trusted. Only the retry
     /// itself — as opposed to a new event that happens to arrive while one is
     /// owed — backs off.
-    pub(super) fn fold_into(&mut self, wake: Wake) -> (Wake, bool) {
+    ///
+    /// `widens` says whether `wake` asks for more than the debt: a forced
+    /// event, or a backstop that was due anyway. The wake the retry deadline
+    /// itself produces is a `Poll` that asks for nothing, so the retry keeps
+    /// the roots it owes rather than turning into a sweep of every provider.
+    pub(super) fn fold_into(&mut self, wake: Wake, widens: bool) -> (Wake, bool) {
         match self.retry {
             Some((at, since)) if Instant::now() >= at => {
                 self.retry = None;
@@ -82,7 +87,10 @@ impl OwedSweep {
                     trigger: TickTrigger::FsEvent,
                     // The oldest change this sweep now covers.
                     first_event_at: earliest(since, wake.first_event_at),
-                    scope: scope::widen(self.scope.take(), wake.scope),
+                    scope: match self.scope.take() {
+                        Some(owed) if !widens => owed,
+                        owed => scope::widen(owed, wake.scope),
+                    },
                 };
                 (retry, true)
             }
@@ -101,6 +109,27 @@ impl OwedSweep {
             }
             _ => (wake, false),
         }
+    }
+
+    /// [`OwedSweep::fold_into`] for the loop, which knows when its backstop
+    /// last swept: a `Poll` wake is the backstop only once `sweep_every` has
+    /// run out since then, and before that it is the owed retry's own
+    /// deadline, asking for nothing wider than the debt. A retry that takes a
+    /// due backstop's place sweeps everything, so it restarts the cadence.
+    pub(super) fn fold_wake(
+        &mut self,
+        wake: Wake,
+        last_poll_sweep: &mut Instant,
+        sweep_every: u64,
+    ) -> (Wake, bool) {
+        let backstop_due = wake.trigger == TickTrigger::Poll
+            && last_poll_sweep.elapsed() >= Duration::from_millis(sweep_every);
+        let widens = wake.trigger.forces_scan() || backstop_due;
+        let (wake, is_retry) = self.fold_into(wake, widens);
+        if is_retry && backstop_due {
+            *last_poll_sweep = Instant::now();
+        }
+        (wake, is_retry)
     }
 
     /// The lock turned a sweep away: it is still owed, and the holder may be

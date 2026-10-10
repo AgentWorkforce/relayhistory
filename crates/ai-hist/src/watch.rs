@@ -974,7 +974,7 @@ impl WatchLoop {
                 // was the whole of this wake.
                 continue;
             }
-            let (wake, is_retry) = owed.fold_into(wake);
+            let (wake, is_retry) = owed.fold_wake(wake, &mut last_poll_sweep, sweep_every);
             let trigger = wake.trigger;
             if trigger == TickTrigger::Poll {
                 // Reconciled, but not yet due to sweep. Only reached when the
@@ -1775,20 +1775,77 @@ mod tests {
         let mut owed = OwedSweep::default();
         owed.turned_away(&event_wake(fired(&["/roots/a"])), false);
         // A new event before the retry is due sweeps the owed roots too.
-        let (wake, is_retry) = owed.fold_into(event_wake(fired(&["/roots/b"])));
+        let (wake, is_retry) = owed.fold_into(event_wake(fired(&["/roots/b"])), true);
         assert!(!is_retry);
         assert_eq!(wake.scope, fired(&["/roots/a", "/roots/b"]));
 
         // Turned away again: the retry, once due, carries both.
         owed.turned_away(&wake, false);
         std::thread::sleep(Duration::from_millis(CONTENDED_SWEEP_RETRY_MS + 50));
-        let (retry, is_retry) = owed.fold_into(event_wake(fired(&["/roots/c"])));
+        let (retry, is_retry) = owed.fold_into(event_wake(fired(&["/roots/c"])), true);
         assert!(is_retry);
         assert!(retry.trigger.forces_scan());
         assert_eq!(retry.scope, fired(&["/roots/a", "/roots/b", "/roots/c"]));
         owed.paid();
-        let (wake, _) = owed.fold_into(event_wake(fired(&["/roots/d"])));
+        let (wake, _) = owed.fold_into(event_wake(fired(&["/roots/d"])), true);
         assert_eq!(wake.scope, fired(&["/roots/d"]), "a paid debt is forgotten");
+    }
+
+    /// The owed retry's own deadline wakes the loop as a `Poll` that asks
+    /// for nothing: the retry sweeps the roots it owes, not every provider.
+    /// A backstop that was due anyway does widen it.
+    #[test]
+    fn a_contended_retry_keeps_its_roots_unless_a_backstop_was_due() {
+        for (widens, expected) in [
+            (false, fired(&["/roots/claude"])),
+            (true, ChangeScope::Everything),
+        ] {
+            let mut owed = OwedSweep::default();
+            owed.turned_away(&event_wake(fired(&["/roots/claude"])), false);
+            std::thread::sleep(Duration::from_millis(CONTENDED_SWEEP_RETRY_MS + 50));
+            let (retry, is_retry) = owed.fold_into(Wake::from(TickTrigger::Poll), widens);
+            assert!(is_retry && retry.trigger.forces_scan());
+            assert_eq!(retry.scope, expected, "widens = {widens}");
+        }
+    }
+
+    /// The same through the loop: an event tick the lock turned away is
+    /// retried at its deadline with no new event in between, and the retry is
+    /// scoped to the event's roots.
+    #[test]
+    fn a_loop_retries_a_contended_event_tick_with_its_own_roots() {
+        let (sender, requests) = std::sync::mpsc::channel::<TickRequest>();
+        let sender = Mutex::new(sender);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let tick: ScopedTickFn = Arc::new(move |request: &TickRequest| {
+            sender.lock().unwrap().send(request.clone()).unwrap();
+            let first = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+            Ok(TickOutcome {
+                contended: first,
+                ..TickOutcome::default()
+            })
+        });
+        let watch = Arc::new(
+            WatchLoop::scoped(tick)
+                .with_fs_events(false)
+                .with_immediate(false)
+                .with_leading_edge(false)
+                .with_debounce_ms(20)
+                .with_poll_interval_ms(MAX_INTERVAL_MS),
+        );
+        let runner = watch.clone();
+        let thread = std::thread::spawn(move || runner.run());
+        let wait = Duration::from_secs(10);
+
+        watch.inner.signal_change(fired(&["/roots/claude"]));
+        let turned_away = requests.recv_timeout(wait).unwrap();
+        assert_eq!(turned_away.scope, fired(&["/roots/claude"]));
+        let retry = requests.recv_timeout(wait).unwrap();
+        assert!(retry.force);
+        assert_eq!(retry.scope, fired(&["/roots/claude"]));
+
+        watch.stop();
+        thread.join().unwrap().unwrap();
     }
 
     #[cfg(feature = "fs-events")]

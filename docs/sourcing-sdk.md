@@ -279,8 +279,9 @@ sources whose watched roots fired inside its window — a Claude session's
 appends read Claude, not every provider — and its `TickReport::sources` names
 them; startup, backstop and manual ticks, and an event the loop cannot place
 under a root (a rescan notice), are full sweeps with `sources: None`. Only a
-full sweep walks `~/Projects` for `.trajectories` roots; event ticks reuse the
-roots the last full sweep found. A
+backstop walks `~/Projects` for `.trajectories` roots — its root refresh
+registers what it finds and its sweep reuses the walk — and event ticks reuse
+the roots the last walk found. A
 tick is the same locked `sync`; one that finds the lock held reports
 `contended` and is retried by the loop rather than counted as done. A failed
 sweep arrives as an `Err` and the loop keeps running; the rolling catalog
