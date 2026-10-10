@@ -4,59 +4,62 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Patch]
+
+### Fixed
+
+- `sync` re-reads an OpenCode session after one of its parts is edited, when the store reads parts by message id and the part's `session_id` is NULL.
 
 ## [0.39.0] - 2026-10-10
 
 ### Breaking Changes
 
-- Trajectories and Relaycast history are no longer sources: `relay` and `trajectory` are unknown values for `--source` and every source filter, `--source-connector relaycast` is an `INVALID_ARGUMENT`, and the TypeScript `SOURCES`, `CHANGE_KINDS` and export kinds no longer list them.
-- A writable open deletes what an earlier release stored for them: the `trajectories` table (with any leftover `trajectory_fts` index and triggers) and every row under the `relay` or `trajectory` source in this crate's own tables (never the upload daemon's `delivery_*` tables), leaving change-feed delete tombstones so consumers drop rows they hold. Because the feed loses the `trajectory` kind, the first writable open after upgrading starts a new feed epoch and drops named consumer cursors, so change-feed consumers replay from the start; a read-only open treats a database still holding such rows as stale.
+- Trajectories and Relaycast history are no longer sources: `relay` and `trajectory` are rejected by `--source`, source filters and `--source-connector relaycast`, and are gone from the TypeScript `SOURCES`, `CHANGE_KINDS` and export kinds.
+- The first writable open deletes stored trajectory and Relaycast data (never the upload `delivery_*` tables), emits delete tombstones and starts a new change-feed epoch, so consumers replay from the start; a read-only open treats an unmigrated database as stale.
 
 ### Added
 
-- `SyncOptions::sources` sweeps only the named sources, always reading them and leaving the full sweep's source fingerprint untouched; `TickReport::sources` says which sources a watch tick swept.
+- `SyncOptions::sources` sweeps only the named sources without touching the full-sweep fingerprint; `TickReport::sources` reports what a watch tick swept.
 
 ### Changed
 
-- A `SessionStore::watch` filesystem-event tick sweeps only the providers whose watched roots fired, so one live Claude session no longer re-walks every other provider every couple of seconds; startup, backstop and manual ticks stay full sweeps, and the next unforced full sweep still catches whatever a scoped tick left out.
-- Re-reading a Claude transcript asks once per record, with one indexed lookup, whether an earlier parse left the record's rows under another session or as a notice's assistant output, and retires them only when it did, instead of running eight delete and update statements for every record of every re-read.
-- A sync that sweeps ends with `PRAGMA optimize` under `analysis_limit = 400`, so the store carries planner statistics; the first sweep after upgrading analyzes the store once (seconds on a multi-gigabyte history).
+- `SessionStore::watch` file-event ticks sweep only the providers whose roots fired; startup, backstop and manual ticks stay full sweeps.
+- Re-reading a Claude transcript is faster: one indexed lookup per record replaces eight delete and update statements.
+- A sync that sweeps ends with `PRAGMA optimize`, so the store keeps planner statistics; the first sweep after upgrading analyzes once (seconds on a multi-gigabyte store).
 
 ### Removed
 
-- `.trajectories` directories and `TRAJECTORY_ROOT` are no longer read or watched, and the built-in `relay` catalog adapter is gone; `ai-hist import` skips entries under either source.
-- `ai-hist learn distill`, which wrote its roll-ups into the trajectory store, is removed.
+- `.trajectories` directories, `TRAJECTORY_ROOT` and the built-in `relay` catalog adapter; `ai-hist import` skips entries under either source.
+- `ai-hist learn distill`.
 
 ### Fixed
 
-- A Codex thread marked `thread_source: "subagent"` that names no parent (a standalone guardian / auto-review thread) is a catalogued session readable through `SessionStore::session`, instead of being hidden as a child of no parent; a rollout is a delegated child only when its `session_meta` names its parent. The first sync after upgrading catalogs the threads an earlier build hid.
-- `SessionStore::sync` reads only the OpenCode sessions that changed since the sweep that last wrote them and does not open an OpenCode store whose database and WAL are unchanged, instead of re-reading and rewriting every session on every sweep; the first sync after upgrading reads each OpenCode store once more.
-- An unforced `sync` skips the sweep again when no source changed on a host with an OpenCode or Devin SQLite store: the source fingerprint no longer counts the store's `-shm` index, which every read of the store rewrote.
-- A sweep refreshes canonical project identity only for the sessions written since the database's last refresh, including in a new process: every `ai-hist sync` and every embedder's first sweep re-walked every delegated child before.
-- Reading a session's parents, continuity edges and unresolved continuity evidence, and deleting a session, seek that session's own rows instead of reading every relationship or continuity row of its source, with or without planner statistics.
-- A rewritten OpenCode part is replayed on the next sweep when the store's parts are read by message id (no `part(session_id)` index, or no index at all): the per-session stamp now groups a part under its message's session, as the reader places it, instead of under the part's own `session_id`, which left a part whose `session_id` is NULL out of every stamp and its session skipped with stale evidence.
+- A Codex `subagent` thread that names no parent (a standalone guardian or auto-review thread) is a catalogued, readable session; the first sync after upgrading catalogs threads an earlier build hid.
+- `sync` re-reads only the OpenCode sessions that changed and skips unchanged OpenCode stores; the first sync after upgrading reads each store once more.
+- An unforced `sync` skips again when nothing changed on hosts with an OpenCode or Devin SQLite store; the fingerprint no longer counts the `-shm` file.
+- A sweep refreshes project identity only for sessions written since the last refresh, instead of re-walking every delegated child in each new process.
+- Reading a session's parents and continuity data, and deleting a session, touch only that session's rows.
 
 ### Rust API
 
-- `Source::Relay`, `Source::Trajectory`, `ChangeKind::Trajectory`, and `ProviderRoots::trajectory_roots` are removed; a serialized `ProviderRoots` that still carries `trajectory_roots` deserializes with the field ignored.
-- Added `SyncOptions::sources: Option<Vec<Source>>` with its `sources()` setter, and `TickReport::sources: Option<Vec<Source>>`.
+- Removed `Source::Relay`, `Source::Trajectory`, `ChangeKind::Trajectory` and `ProviderRoots::trajectory_roots`; a serialized `trajectory_roots` is ignored on deserialize.
+- Added `SyncOptions::sources` (with a `sources()` setter) and `TickReport::sources`, both `Option<Vec<Source>>`.
 
 ## [0.38.0] - 2026-10-10
 
 ### Breaking Changes
 
-- Change-feed rows (`StoredRow`) and `ai-hist export` payloads no longer carry `session_events.raw_facts_version`, the store's own parser-generation bookkeeping; the feed does not stamp an event when only it changes.
+- Change-feed rows (`StoredRow`) and `ai-hist export` payloads no longer carry `session_events.raw_facts_version`.
 
 ### Fixed
 
-- An appended exported column restamps only rows holding a value in it, and a raw-facts parser-generation bump restamps only events whose evidence changed, so neither re-delivers a store's session events. A row holding NULL in an appended column keeps its revision; a consumer reads a column a row was delivered without as NULL. A dropped, renamed or retyped column still restamps every row of its kind.
-- Claude subagent requests and usage reach `SessionEvidence::requests` on the sync or hydration that reads the sidecar, rather than only once the sidecar had sat still for two minutes and a later sweep ran, which `sync` skipped while no other source changed. The first sync after upgrading backfills the messages an earlier build held back.
-- A Claude response whose only record is a signed, empty `thinking` block is a request in `SessionEvidence::requests` with its usage again, instead of only a `thinking_signature` marker; the record stores its thinking event (empty text). The first sync or hydration after upgrading re-reads only the transcripts holding such a response.
+- Appending an exported column or bumping the raw-facts parser no longer re-delivers every session event: only rows whose values changed are restamped, and consumers read a missing column as NULL. Dropping, renaming or retyping a column still restamps its whole kind.
+- Claude subagent requests and usage reach `SessionEvidence::requests` on the first sync or hydration that reads the sidecar, not minutes later; the first sync after upgrading backfills them.
+- A Claude response whose only record is a signed, empty `thinking` block is a request with usage again; the first sync after upgrading re-reads the affected transcripts.
 
 ### Rust API
 
-- `StoreOptions`, `DiscoveryOptions`, `SyncOptions`, `HydrateOptions` and `ForgetOptions` have a chainable setter per field, e.g. `StoreOptions::default().db_path(path).read_only(true)`.
+- `StoreOptions`, `DiscoveryOptions`, `SyncOptions`, `HydrateOptions` and `ForgetOptions` have chainable per-field setters, e.g. `StoreOptions::default().db_path(path).read_only(true)`.
 
 ## [0.37.0] - 2026-10-09
 
