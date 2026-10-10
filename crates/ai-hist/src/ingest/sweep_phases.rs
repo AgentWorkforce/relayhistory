@@ -475,7 +475,14 @@ mod tests {
                 let _ = fs::set_permissions(&self.0, listable);
             }
         }
-        let _relist = Relist(projects);
+        let _relist = Relist(projects.clone());
+        // A process that may read past the mode (root, or a capability such
+        // as CAP_DAC_READ_SEARCH) has no failure to survive here: the test
+        // would fail for the wrong reason, so it stands aside.
+        if fs::read_dir(&projects).is_ok() {
+            eprintln!("skipped: this process can list a mode 000 directory");
+            return;
+        }
         append(
             &f.claude_log,
             r#"{"display":"second claude prompt","sessionId":"c-1","timestamp":2}"#,
