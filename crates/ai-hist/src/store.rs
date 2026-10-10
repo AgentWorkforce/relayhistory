@@ -4285,8 +4285,16 @@ fn feed_position(conn: &Connection) -> Option<(i64, i64)> {
 }
 
 /// The revision the last successful refresh under `epoch` started at.
+/// Read-only: a database without the table has no point yet.
 fn refreshed_through(conn: &Connection, epoch: i64) -> Result<Option<i64>> {
-    conn.execute_batch(IDENTITY_REFRESH_DDL)?;
+    let exists = conn
+        .prepare_cached(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'project_identity_refreshed'",
+        )?
+        .exists([])?;
+    if !exists {
+        return Ok(None);
+    }
     Ok(conn
         .query_row(
             "SELECT revision FROM project_identity_refreshed WHERE epoch = ?1",
@@ -4301,6 +4309,7 @@ fn refreshed_through(conn: &Connection, epoch: i64) -> Result<Option<i64>> {
 /// these cannot make either fail: the last writer's point stands, and every
 /// point is a head some refresh started at.
 fn remember_refresh(conn: &Connection, point: Option<(i64, i64)>) -> Result<()> {
+    conn.execute_batch(IDENTITY_REFRESH_DDL)?;
     let Some((epoch, revision)) = point else {
         conn.execute("DELETE FROM project_identity_refreshed", [])?;
         return Ok(());
@@ -4373,9 +4382,13 @@ pub(crate) fn refresh_project_identity_incrementally(conn: &Connection) -> Resul
     // by this refresh or by anyone else, sits above it and is looked at next
     // time. A point that did not move is not rewritten, so a refresh over an
     // unchanged catalog stays read-only.
+    //
+    // Best effort: a point that could not be written leaves the previous one,
+    // and every row this refresh would have vouched for, or failed to fix,
+    // carries a revision above it, so the next refresh only looks wider.
     let point = position.filter(|_| refreshed.is_ok());
     if position.is_some() && point.map(|(_, head)| head) != since {
-        remember_refresh(conn, point)?;
+        let _ = remember_refresh(conn, point);
     }
     refreshed
 }
