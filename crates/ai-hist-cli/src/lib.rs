@@ -27,7 +27,14 @@ use ai_hist::git_helpers::*;
 use ai_hist::history_search::{search_all, SearchRole, SearchRow};
 use ai_hist::paths::{default_opencode_db_path, home_dir};
 use ai_hist::{discover, remote, *};
+mod export;
 mod learn;
+
+use export::export_history;
+#[cfg(test)]
+use export::{
+    install_sqlite_export, parked_sidecar, persist_export, sqlite_sidecar, DEFAULT_SQLITE_EXPORT,
+};
 #[derive(Args, Debug, Clone, Copy, Default)]
 #[group(id = "session_scope", multiple = false)]
 struct SessionScopeArgs {
@@ -1089,16 +1096,7 @@ pub fn run() -> Result<()> {
                 no_note,
                 json,
                 quiet,
-            } => link_git_commit(
-                &conn,
-                &db_path,
-                &repo,
-                &commit,
-                &match_method,
-                !no_note,
-                json,
-                quiet,
-            ),
+            } => link_git_commit(&conn, &repo, &commit, &match_method, !no_note, json, quiet),
         },
         Command::Learn { action } => match action {
             LearnAction::Distill {
@@ -1687,6 +1685,50 @@ fn fmt_search_row(row: &SearchRow) -> String {
     format!("  #{:<5} {}  ({}){}  {}", row.id, dt, label, project, text)
 }
 
+/// One record of a session's JSON replay stream.
+enum ReplayRecord<'a> {
+    Event(&'a ai_hist::SessionEvent),
+    ToolCall(&'a ai_hist::SessionToolCall),
+    FileEdit(&'a ai_hist::SessionFileEdit),
+}
+
+/// Print a session as one JSON replay stream, merged chronologically across the three record
+/// types (unknown timestamps last, ties broken by row id). Sorting
+/// references and serializing at write time keeps peak memory at the
+/// fetched rows themselves, not a second serialized copy.
+fn print_session_replay(
+    events: &[ai_hist::SessionEvent],
+    tool_calls: &[ai_hist::SessionToolCall],
+    file_edits: &[ai_hist::SessionFileEdit],
+) -> Result<()> {
+    let mut records: Vec<(Option<i64>, i64, ReplayRecord)> = Vec::new();
+    for event in events {
+        records.push((Some(event.ts_ms), event.id, ReplayRecord::Event(event)));
+    }
+    for call in tool_calls {
+        records.push((call.ts_ms, call.id, ReplayRecord::ToolCall(call)));
+    }
+    for edit in file_edits {
+        records.push((edit.ts_ms, edit.id, ReplayRecord::FileEdit(edit)));
+    }
+    records.sort_by_key(|(ts, id, _)| (ts.is_none(), ts.unwrap_or(0), *id));
+    for (_, _, record) in records {
+        let line = match record {
+            ReplayRecord::Event(event) => {
+                serde_json::to_string(&json!({ "type": "event", "record": event }))?
+            }
+            ReplayRecord::ToolCall(call) => {
+                serde_json::to_string(&json!({ "type": "tool_call", "record": call }))?
+            }
+            ReplayRecord::FileEdit(edit) => {
+                serde_json::to_string(&json!({ "type": "file_edit", "record": edit }))?
+            }
+        };
+        println!("{line}");
+    }
+    Ok(())
+}
+
 fn print_session_events(
     session_id: &str,
     events: Vec<ai_hist::SessionEvent>,
@@ -1696,41 +1738,7 @@ fn print_session_events(
     json: bool,
 ) -> Result<()> {
     if json {
-        // One replay stream, merged chronologically across the three record
-        // types (unknown timestamps last, ties broken by row id). Sorting
-        // references and serializing at write time keeps peak memory at the
-        // fetched rows themselves, not a second serialized copy.
-        enum ReplayRecord<'a> {
-            Event(&'a ai_hist::SessionEvent),
-            ToolCall(&'a ai_hist::SessionToolCall),
-            FileEdit(&'a ai_hist::SessionFileEdit),
-        }
-        let mut records: Vec<(Option<i64>, i64, ReplayRecord)> = Vec::new();
-        for event in &events {
-            records.push((Some(event.ts_ms), event.id, ReplayRecord::Event(event)));
-        }
-        for call in &tool_calls {
-            records.push((call.ts_ms, call.id, ReplayRecord::ToolCall(call)));
-        }
-        for edit in &file_edits {
-            records.push((edit.ts_ms, edit.id, ReplayRecord::FileEdit(edit)));
-        }
-        records.sort_by_key(|(ts, id, _)| (ts.is_none(), ts.unwrap_or(0), *id));
-        for (_, _, record) in records {
-            let line = match record {
-                ReplayRecord::Event(event) => {
-                    serde_json::to_string(&json!({ "type": "event", "record": event }))?
-                }
-                ReplayRecord::ToolCall(call) => {
-                    serde_json::to_string(&json!({ "type": "tool_call", "record": call }))?
-                }
-                ReplayRecord::FileEdit(edit) => {
-                    serde_json::to_string(&json!({ "type": "file_edit", "record": edit }))?
-                }
-            };
-            println!("{line}");
-        }
-        return Ok(());
+        return print_session_replay(&events, &tool_calls, &file_edits);
     }
     println!(
         "  Session {session_id}: {} events, {} tool calls, {} file edits\n",
@@ -2102,16 +2110,7 @@ fn pack_entries(
     if as_json {
         let entries = rows
             .iter()
-            .map(|entry| {
-                let mut out = entry_output(entry);
-                if let Some(limit) = chars_budget {
-                    if entry.prompt.len() > limit {
-                        out["prompt"] = json!(entry.prompt.chars().take(limit).collect::<String>());
-                    }
-                }
-                out["resume_cmd"] = json!(resume_command(entry));
-                out
-            })
+            .map(|entry| pack_entry_output(entry, chars_budget))
             .collect::<Vec<_>>();
         println!(
             "{}",
@@ -2134,47 +2133,64 @@ fn pack_entries(
         rows.len()
     );
     for (idx, entry) in rows.iter().enumerate() {
-        let entry_dt = Local
-            .timestamp_millis_opt(entry.timestamp_ms)
-            .single()
-            .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-            .unwrap_or_default();
-        let project = entry
-            .project
-            .as_ref()
-            .map(|p| format!("  {p}"))
-            .unwrap_or_default();
-        let mut text = entry.prompt.replace('\n', " ");
-        if let Some(limit) = chars_budget {
-            if text.len() > limit {
-                text = format!("{}...", text.chars().take(limit).collect::<String>());
-            }
-        }
-        println!(
-            "[{}/{}] #{}  {}  {}{}",
-            idx + 1,
-            rows.len(),
-            entry.id,
-            entry_dt,
-            entry.source,
-            project
-        );
-        println!("      {text}");
-        if let Some(session_id) = &entry.session_id {
-            if let Some(cmd) = resume_command(entry) {
-                println!("      Resume: {cmd}");
-            } else {
-                let short = if session_id.len() > 16 {
-                    format!("{}...", &session_id[..16])
-                } else {
-                    session_id.clone()
-                };
-                println!("      Session: {short}");
-            }
-        }
-        println!();
+        print_pack_entry(idx, rows.len(), entry, chars_budget);
     }
     Ok(())
+}
+
+/// One `pack --json` entry, its prompt cut to the character budget.
+fn pack_entry_output(entry: &HistoryEntry, chars_budget: Option<usize>) -> serde_json::Value {
+    let mut out = entry_output(entry);
+    if let Some(limit) = chars_budget {
+        if entry.prompt.len() > limit {
+            out["prompt"] = json!(entry.prompt.chars().take(limit).collect::<String>());
+        }
+    }
+    out["resume_cmd"] = json!(resume_command(entry));
+    out
+}
+
+/// One `pack` entry as text, its prompt cut to the character budget.
+fn print_pack_entry(idx: usize, total: usize, entry: &HistoryEntry, chars_budget: Option<usize>) {
+    let entry_dt = Local
+        .timestamp_millis_opt(entry.timestamp_ms)
+        .single()
+        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
+        .unwrap_or_default();
+    let project = entry
+        .project
+        .as_ref()
+        .map(|p| format!("  {p}"))
+        .unwrap_or_default();
+    let mut text = entry.prompt.replace('\n', " ");
+    if let Some(limit) = chars_budget {
+        if text.len() > limit {
+            text = format!("{}...", text.chars().take(limit).collect::<String>());
+        }
+    }
+    println!(
+        "[{}/{}] #{}  {}  {}{}",
+        idx + 1,
+        total,
+        entry.id,
+        entry_dt,
+        entry.source,
+        project
+    );
+    println!("      {text}");
+    if let Some(session_id) = &entry.session_id {
+        if let Some(cmd) = resume_command(entry) {
+            println!("      Resume: {cmd}");
+        } else {
+            let short = if session_id.len() > 16 {
+                format!("{}...", &session_id[..16])
+            } else {
+                session_id.clone()
+            };
+            println!("      Session: {short}");
+        }
+    }
+    println!();
 }
 
 fn print_tags(
@@ -2249,272 +2265,6 @@ fn print_tags(
         }
     }
     Ok(())
-}
-
-/// Where `export --format sqlite` writes when no destination is given.
-const DEFAULT_SQLITE_EXPORT: &str = "ai-hist-export.db";
-
-/// Exports history rows to `output` (stdout for JSONL when absent).
-///
-/// `active_db` is the database this invocation actually opened, `--db`
-/// included. A destination that names it, or one of its SQLite sidecars, is
-/// refused for every format before anything is read or written. The export is
-/// staged in a sibling temporary file and renamed over the destination only
-/// once it is complete, so a failed export leaves an existing file untouched.
-fn export_history(
-    conn: &Connection,
-    active_db: &Path,
-    output: Option<&Path>,
-    format: &str,
-    source: Option<&str>,
-    project: Option<&str>,
-    since: Option<&str>,
-) -> Result<()> {
-    anyhow::ensure!(
-        matches!(format, "sqlite" | "jsonl"),
-        "unsupported export format '{format}'"
-    );
-    let dest = match (format, output) {
-        ("sqlite", None) => Some(Path::new(DEFAULT_SQLITE_EXPORT)),
-        (_, output) => output,
-    };
-    // An existing symlink destination is written through, to its target, as
-    // a direct write would; the rename below would otherwise replace the link.
-    let target = dest.map(follow_destination_symlink);
-    // `--db` is handed to SQLite as given, so a `file:` URI names a database
-    // whose filesystem path is not the argument's text. The connection knows
-    // the file it actually opened; both are guarded.
-    let opened = conn
-        .path()
-        .filter(|path| !path.is_empty())
-        .map(PathBuf::from);
-    let protected: Vec<&Path> = std::iter::once(active_db)
-        .chain(opened.as_deref())
-        .collect();
-    if let (Some(dest), Some(target)) = (dest, target.as_deref()) {
-        anyhow::ensure!(
-            !protected.iter().any(|active| {
-                names_active_database(dest, active) || names_active_database(target, active)
-            }),
-            "Refusing to export over the active database {} (destination {}).",
-            active_db.display(),
-            dest.display()
-        );
-    }
-    let rows = export_rows(conn, source, project, since)?;
-    if rows.is_empty() {
-        anyhow::bail!("No entries matched the export filters.");
-    }
-    if format == "sqlite" {
-        let dest = dest.expect("a sqlite export always has a destination");
-        let target = target.as_deref().expect("resolved alongside dest");
-        let staged = staged_export_file(target)?;
-        let inserted = {
-            let dst = Connection::open(staged.path())?;
-            ai_hist::init_db(&dst)?;
-            let mut inserted = 0;
-            for entry in &rows {
-                inserted += insert_history(&dst, entry)?;
-            }
-            // A self-contained single file: nothing left in a -wal sidecar
-            // that the rename below would not carry along.
-            dst.query_row("PRAGMA journal_mode=DELETE", [], |_| Ok(()))?;
-            dst.close().map_err(|(_, error)| error)?;
-            inserted
-        };
-        install_sqlite_export(staged, target, persist_export)?;
-        println!("Exported {inserted} entries to {}", dest.display());
-        return Ok(());
-    }
-    let mut body = Vec::new();
-    for entry in &rows {
-        let row = json!({
-            "source": entry.source,
-            "session_id": entry.session_id,
-            "project": entry.project,
-            "prompt": entry.prompt,
-            "prompt_hash": entry.prompt_hash.clone().unwrap_or_else(|| prompt_hash(&entry.prompt)),
-            "timestamp_ms": entry.timestamp_ms,
-        });
-        writeln!(&mut body, "{}", serde_json::to_string(&row)?)?;
-    }
-    if let (Some(path), Some(target)) = (dest, target.as_deref()) {
-        let mut staged = staged_export_file(target)?;
-        if path.extension().and_then(|s| s.to_str()) == Some("gz") {
-            let mut enc = GzEncoder::new(staged.as_file_mut(), Compression::default());
-            enc.write_all(&body)?;
-            enc.finish()?;
-        } else {
-            staged.write_all(&body)?;
-        }
-        staged.as_file().sync_all()?;
-        persist_export(staged, target)?;
-        eprintln!("Exported {} entries to {}", rows.len(), path.display());
-    } else {
-        io::stdout().write_all(&body)?;
-    }
-    Ok(())
-}
-
-/// A temporary file beside `dest`, so the final rename stays on one filesystem.
-fn staged_export_file(dest: &Path) -> Result<tempfile::NamedTempFile> {
-    let dir = match dest.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => parent,
-        _ => Path::new("."),
-    };
-    let name = dest
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "ai-hist-export".into());
-    tempfile::Builder::new()
-        .prefix(&format!(".{name}."))
-        .suffix(".partial")
-        .tempfile_in(dir)
-        .with_context(|| format!("create a temporary export file in {}", dir.display()))
-}
-
-fn persist_export(staged: tempfile::NamedTempFile, dest: &Path) -> Result<()> {
-    staged
-        .persist(dest)
-        .map_err(|error| error.error)
-        .with_context(|| format!("move the finished export into {}", dest.display()))?;
-    Ok(())
-}
-
-/// `dest` itself, or the file an existing symlink at `dest` points to.
-fn follow_destination_symlink(dest: &Path) -> PathBuf {
-    match fs::symlink_metadata(dest) {
-        Ok(meta) if meta.file_type().is_symlink() => {
-            fs::canonicalize(dest).unwrap_or_else(|_| match fs::read_link(dest) {
-                // A dangling link: create its target, as a direct write would.
-                Ok(link) if link.is_absolute() => link,
-                Ok(link) => dest.parent().unwrap_or_else(|| Path::new("")).join(link),
-                Err(_) => dest.to_path_buf(),
-            })
-        }
-        _ => dest.to_path_buf(),
-    }
-}
-
-const SQLITE_SIDECARS: [&str; 3] = ["-wal", "-shm", "-journal"];
-
-/// Renames the staged SQLite export over `dest` without letting a previous
-/// database's sidecars pair with the new file, and without losing them if the
-/// replacement fails.
-///
-/// Existing sidecars are first parked under a private name (any failure other
-/// than "not found" aborts the export with everything restored), then
-/// `persist` installs the new file. On success the parked sidecars are
-/// discarded; on failure they are renamed back beside the untouched old file.
-fn install_sqlite_export(
-    staged: tempfile::NamedTempFile,
-    dest: &Path,
-    persist: impl FnOnce(tempfile::NamedTempFile, &Path) -> Result<()>,
-) -> Result<()> {
-    let mut parked: Vec<(PathBuf, PathBuf)> = Vec::new();
-    for suffix in SQLITE_SIDECARS {
-        let sidecar = sqlite_sidecar(dest, suffix);
-        let aside = parked_sidecar(dest, suffix);
-        match fs::rename(&sidecar, &aside) {
-            Ok(()) => parked.push((sidecar, aside)),
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => {
-                restore_parked_sidecars(&parked);
-                return Err(error).with_context(|| {
-                    format!(
-                        "move the existing SQLite sidecar {} out of the way",
-                        sidecar.display()
-                    )
-                });
-            }
-        }
-    }
-    match persist(staged, dest) {
-        Ok(()) => {
-            // Renamed away from the database name, SQLite can no longer pair
-            // these with anything, so a failed removal is harmless.
-            for (_, aside) in &parked {
-                let _ = fs::remove_file(aside);
-            }
-            Ok(())
-        }
-        Err(error) => {
-            restore_parked_sidecars(&parked);
-            Err(error)
-        }
-    }
-}
-
-fn parked_sidecar(dest: &Path, suffix: &str) -> PathBuf {
-    sqlite_sidecar(
-        dest,
-        &format!("{suffix}.ai-hist-{}.replaced", std::process::id()),
-    )
-}
-
-fn restore_parked_sidecars(parked: &[(PathBuf, PathBuf)]) {
-    for (sidecar, aside) in parked {
-        if let Err(error) = fs::rename(aside, sidecar) {
-            eprintln!(
-                "warning: could not restore {} from {}: {error}",
-                sidecar.display(),
-                aside.display()
-            );
-        }
-    }
-}
-
-fn sqlite_sidecar(db: &Path, suffix: &str) -> PathBuf {
-    let mut name = db.as_os_str().to_owned();
-    name.push(suffix);
-    PathBuf::from(name)
-}
-
-/// Whether writing `candidate` would overwrite the database at `active` or
-/// one of its SQLite sidecars. Paths are compared after resolving `.`/`..`,
-/// symlinks and relative spellings; on Unix, two existing paths that are hard
-/// links to one file also match.
-fn names_active_database(candidate: &Path, active: &Path) -> bool {
-    let candidate_resolved = resolve_export_path(candidate);
-    ["", "-wal", "-shm", "-journal"].iter().any(|suffix| {
-        let protected = sqlite_sidecar(active, suffix);
-        candidate_resolved == resolve_export_path(&protected) || same_file(candidate, &protected)
-    })
-}
-
-/// The canonical form of `path`, or, when it does not exist yet, its
-/// canonical parent joined with its file name.
-fn resolve_export_path(path: &Path) -> PathBuf {
-    if let Ok(resolved) = fs::canonicalize(path) {
-        return resolved;
-    }
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map(|cwd| cwd.join(path))
-            .unwrap_or_else(|_| path.to_path_buf())
-    };
-    match (absolute.parent(), absolute.file_name()) {
-        (Some(parent), Some(name)) => fs::canonicalize(parent)
-            .map(|parent| parent.join(name))
-            .unwrap_or(absolute),
-        _ => absolute,
-    }
-}
-
-#[cfg(unix)]
-fn same_file(a: &Path, b: &Path) -> bool {
-    use std::os::unix::fs::MetadataExt;
-    match (fs::metadata(a), fs::metadata(b)) {
-        (Ok(a), Ok(b)) => a.dev() == b.dev() && a.ino() == b.ino(),
-        _ => false,
-    }
-}
-
-#[cfg(not(unix))]
-fn same_file(_a: &Path, _b: &Path) -> bool {
-    false
 }
 
 fn import_history(conn: &Connection, path: &Path, dry_run: bool) -> Result<()> {
@@ -3358,7 +3108,6 @@ fn uninstall_git_hook(hook_path: &Path) -> Result<()> {
 
 fn link_git_commit(
     conn: &Connection,
-    _db_path: &Path,
     repo: &Path,
     commit: &str,
     match_method: &str,
@@ -3536,32 +3285,11 @@ fn find_session_for_commit(
         if !cwd_match && !branch_match {
             continue;
         }
-        let last = last_activity_ms.or(first_activity_ms).unwrap_or(commit_ms);
-        let first = first_activity_ms.unwrap_or(last);
-        let time_distance_ms = if commit_ms < first {
-            first - commit_ms
-        } else if commit_ms > last {
-            commit_ms - last
-        } else {
-            0
-        };
+        let time_distance_ms =
+            commit_time_distance_ms(commit_ms, first_activity_ms, last_activity_ms);
         let file_overlap = session_file_overlap(conn, &source, &session_id, files)?;
-        let mut confidence: f64 = 0.45;
-        if cwd_match {
-            confidence += 0.20;
-        }
-        if branch_match {
-            confidence += 0.20;
-        }
-        if time_distance_ms == 0 {
-            confidence += 0.10;
-        } else if time_distance_ms <= 2 * 60 * 60 * 1000 {
-            confidence += 0.05;
-        }
-        if file_overlap > 0 {
-            confidence += 0.05;
-        }
-        confidence = confidence.min(0.98);
+        let confidence =
+            commit_session_confidence(cwd_match, branch_match, time_distance_ms, file_overlap);
         let evidence = json!({
             "cwd": cwd,
             "git_branch": git_branch,
@@ -3586,6 +3314,49 @@ fn find_session_for_commit(
         }
     }
     Ok(best)
+}
+
+/// How far `commit_ms` falls outside a session's activity window; zero when
+/// it falls inside.
+fn commit_time_distance_ms(
+    commit_ms: i64,
+    first_activity_ms: Option<i64>,
+    last_activity_ms: Option<i64>,
+) -> i64 {
+    let last = last_activity_ms.or(first_activity_ms).unwrap_or(commit_ms);
+    let first = first_activity_ms.unwrap_or(last);
+    if commit_ms < first {
+        first - commit_ms
+    } else if commit_ms > last {
+        commit_ms - last
+    } else {
+        0
+    }
+}
+
+/// How confidently the evidence ties a session to a commit.
+fn commit_session_confidence(
+    cwd_match: bool,
+    branch_match: bool,
+    time_distance_ms: i64,
+    file_overlap: usize,
+) -> f64 {
+    let mut confidence: f64 = 0.45;
+    if cwd_match {
+        confidence += 0.20;
+    }
+    if branch_match {
+        confidence += 0.20;
+    }
+    if time_distance_ms == 0 {
+        confidence += 0.10;
+    } else if time_distance_ms <= 2 * 60 * 60 * 1000 {
+        confidence += 0.05;
+    }
+    if file_overlap > 0 {
+        confidence += 0.05;
+    }
+    confidence.min(0.98)
 }
 
 fn cwd_matches_repo(cwd: &str, repo: &str, repo_canonical: &Path) -> bool {
@@ -3861,36 +3632,6 @@ fn tagged_sessions(conn: &Connection, tag: &str) -> Result<Vec<serde_json::Value
                 "last_activity_ms": row.get::<_, Option<i64>>(4)?,
             }))
         })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
-}
-
-fn export_rows(
-    conn: &Connection,
-    source: Option<&str>,
-    project: Option<&str>,
-    since: Option<&str>,
-) -> Result<Vec<HistoryEntry>> {
-    let mut sql =
-        "SELECT id, source, session_id, project, prompt, timestamp_ms FROM history WHERE 1=1"
-            .to_string();
-    let mut params_vec = Vec::new();
-    if let Some(source) = source {
-        sql.push_str(" AND source = ?");
-        params_vec.push(source.to_string());
-    }
-    if let Some(project) = project {
-        sql.push_str(" AND project LIKE ?");
-        params_vec.push(format!("%{project}%"));
-    }
-    if let Some(since) = since {
-        sql.push_str(" AND timestamp_ms >= ?");
-        params_vec.push(parse_date_ms(since)?.to_string());
-    }
-    sql.push_str(" ORDER BY timestamp_ms ASC");
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt
-        .query_map(rusqlite::params_from_iter(params_vec), row_to_entry)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
@@ -4352,17 +4093,7 @@ mod tests {
         )
         .unwrap();
 
-        link_git_commit(
-            &conn,
-            tmp.path(),
-            &repo,
-            commit,
-            "manual",
-            false,
-            false,
-            true,
-        )
-        .unwrap();
+        link_git_commit(&conn, &repo, commit, "manual", false, false, true).unwrap();
 
         let (session_id, commit_sha, match_method, confidence, evidence): (
             String,

@@ -612,57 +612,46 @@ fn wildmatch(pattern: &str, text: &str, fold_case: bool) -> bool {
 }
 
 fn wildmatch_bytes(pattern: &[u8], text: &[u8]) -> bool {
-    let mut p = 0;
     let mut t = 0;
-    while p < pattern.len() {
-        match pattern[p] {
-            b'*' => {
-                let double = pattern.get(p + 1) == Some(&b'*');
-                let rest = if double {
-                    &pattern[p + 2..]
-                } else {
-                    &pattern[p + 1..]
-                };
-                // `**/` consumes whole components, including none of them.
-                let rest = if double && rest.first() == Some(&b'/') {
-                    if wildmatch_bytes(&rest[1..], &text[t..]) {
-                        return true;
-                    }
-                    rest
-                } else {
-                    rest
-                };
-                let mut at = t;
-                loop {
-                    if wildmatch_bytes(rest, &text[at..]) {
-                        return true;
-                    }
-                    if at >= text.len() {
-                        return false;
-                    }
-                    if !double && text[at] == b'/' {
-                        return false;
-                    }
-                    at += 1;
-                }
-            }
-            b'?' => {
-                if t >= text.len() || text[t] == b'/' {
-                    return false;
-                }
-                p += 1;
-                t += 1;
-            }
-            literal => {
-                if t >= text.len() || text[t] != literal {
-                    return false;
-                }
-                p += 1;
-                t += 1;
-            }
+    for (p, &token) in pattern.iter().enumerate() {
+        if token == b'*' {
+            return wildmatch_star(&pattern[p..], &text[t..]);
+        }
+        match text.get(t) {
+            Some(&byte) if token_matches_byte(token, byte) => t += 1,
+            _ => return false,
         }
     }
     t == text.len()
+}
+
+/// One non-`*` pattern byte against one text byte: `?` is any byte but `/`.
+fn token_matches_byte(token: u8, byte: u8) -> bool {
+    if token == b'?' {
+        byte != b'/'
+    } else {
+        byte == token
+    }
+}
+
+/// Match `pattern`, which starts at a `*` or `**`, against `text`.
+fn wildmatch_star(pattern: &[u8], text: &[u8]) -> bool {
+    let double = pattern.get(1) == Some(&b'*');
+    let rest = if double { &pattern[2..] } else { &pattern[1..] };
+    // `**/` consumes whole components, including none of them.
+    if double && rest.first() == Some(&b'/') && wildmatch_bytes(&rest[1..], text) {
+        return true;
+    }
+    let mut at = 0;
+    loop {
+        if wildmatch_bytes(rest, &text[at..]) {
+            return true;
+        }
+        if at >= text.len() || (!double && text[at] == b'/') {
+            return false;
+        }
+        at += 1;
+    }
 }
 
 /// Parse `.git/config` text into `{section -> {key -> value}}`.

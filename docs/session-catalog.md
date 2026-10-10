@@ -2107,21 +2107,50 @@ place.
 ### Messages that are still being written
 
 A Claude assistant message is written as several JSONL records over time, one
-per content block, and only the last carries a filled-in `stop_reason`. Records
-of a message whose `stop_reason` is present and `null` are **held and not
-indexed**, and the committed offset backs up to the first byte of the earliest
-held message, so the next pass reads it again and indexes it once, complete,
-with its usage. The held count is reported as `HYDRATION_IN_PROGRESS_MESSAGES`.
+per content block. A message is finished when one of its records carries a
+filled-in `stop_reason`, **or when any later record follows it** — another
+message, a tool result, a system row. A `stop_reason` of `null` alone is no
+signal: Claude Code's subagent sidecars write `null` on nearly every record of
+every message, finished or not. So only the transcript's trailing message can
+still be streaming, and only its records at the end of the file — the ones no
+other record has followed yet — are **held and not indexed**. The committed
+offset backs up to the first of them, and the next pass reads them again and
+releases them once any complete record follows them (even one that is
+malformed or oversized) or their own record says the message is done. The held
+message is reported as `HYDRATION_IN_PROGRESS_MESSAGES`, and while any
+transcript holds one, `sync` does not skip a sweep on an unchanged source
+fingerprint.
 
-A record with **no** `stop_reason` key at all is treated as finished, not as
-streaming: older record shapes and sidechain records omit the field, and
-deferring those would hold them back on every pass forever.
+Claude can write a record between two blocks of one message (the result of a
+parallel tool call). The block that arrives after it is indexed as one more row
+of the same request under its own record identity, and the request's usage
+settles across every copy, so an early release never double-counts.
 
-Deferral is bounded — 8 MiB or 512 messages held — and past that the oldest
-held message is indexed as it stands, reported as
-`HYDRATION_IN_PROGRESS_OVERFLOW`. Memory stays bounded and the reader keeps
-making progress; the blocks that arrive later land as further rows under their
-own record identity rather than as corrections.
+A record with **no** `stop_reason` key at all is treated as finished: older
+record shapes omit the field.
+
+A record that stores no event row of its own and opens with a `thinking`
+block with no text — typically the signed, empty block Claude streams first
+in a response — is held for the record after it whatever its `stop_reason` says,
+together with any later records of its message that store no event either
+(empty content, or only blocks the event model drops). A later record of its
+message that stores rows takes the response, and the opening record is its
+`thinking_signature` marker alone. Anything else following it, the file going
+quiet after it, or the held run passing 8 MiB means it **stands alone**: it
+stores its thinking event (empty text, the record's usage), so the response is
+a request like any other. That event lasts only while it is its message's only
+row: a later record of the message that stores rows — after an interleaved
+record, or in a later pass over bytes an earlier pass (a hook's snapshot) ended
+on — retires it before settling its own usage. Every reader — incremental,
+whole-file, hook bytes — makes the same decision, so a from-zero read stores
+what the incremental passes stored.
+
+A held message the file stops writing — a session killed mid-response — is
+released by the first pass after the file has been still for the two-minute
+grace window (`QUIESCENT_GRACE_MS`). Holding is bounded at 8 MiB, and past
+that the message is indexed as it stands, reported as
+`HYDRATION_IN_PROGRESS_OVERFLOW`; the blocks that arrive later land as further
+rows under their own record identity rather than as corrections.
 
 Codex has no per-message completion marker, so its cursor commits only at turn
 boundaries: the committed offset and parser state advance only at a

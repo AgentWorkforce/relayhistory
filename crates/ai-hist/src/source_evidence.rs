@@ -232,202 +232,217 @@ pub fn validate_records(
             "INVALID_ARGUMENT: record kind is not covered by this snapshot"
         );
         let spec = record.kind.spec();
-        for (field, value) in &record.payload {
-            ensure!(
-                spec.columns.split(',').any(|column| column == field)
-                    || matches!(field.as_str(), "id" | "rowid"),
-                "INVALID_ARGUMENT: unsupported {} column {field}",
-                spec.table
-            );
-            if matches!(field.as_str(), "id" | "rowid") {
-                continue;
-            }
-            if !value.is_null() {
-                ensure!(
-                    if numeric(field) {
-                        if field == "confidence" {
-                            value.is_number()
-                        } else {
-                            value.as_i64().is_some()
-                        }
-                    } else if boolean(field) {
-                        value.is_boolean() || matches!(value.as_i64(), Some(0 | 1))
-                    } else {
-                        value.is_string()
-                    },
-                    "INVALID_ARGUMENT: invalid type for {field}"
-                );
-            }
+        validate_columns(&spec, &record.payload)?;
+        validate_ownership(key, record, &spec)?;
+        match record.kind {
+            EvidenceKind::SessionEvent => validate_session_event(&record.payload)?,
+            EvidenceKind::SessionMarker => validate_session_marker(&record.payload)?,
+            EvidenceKind::Relationship => validate_relationship(&record.payload)?,
+            _ => {}
         }
-        for required in spec.required.split(',') {
-            ensure!(
-                record
-                    .payload
-                    .get(required)
-                    .is_some_and(|value| !value.is_null()),
-                "INVALID_ARGUMENT: {required} is required"
-            );
-        }
-        let session_field = if record.kind == EvidenceKind::Relationship {
-            "parent_session_id"
-        } else {
-            "session_id"
-        };
-        ensure!(
-            record.payload.get("source").and_then(Value::as_str) == Some(&key.source)
-                && record.payload.get(session_field).and_then(Value::as_str)
-                    == Some(&key.session_id),
-            "INVALID_ARGUMENT: evidence belongs to another source or session"
-        );
-        for field in spec.key.split(',').filter(|field| !numeric(field)) {
-            ensure!(
-                record
-                    .payload
-                    .get(field)
-                    .and_then(Value::as_str)
-                    .is_some_and(|value| !value.is_empty()),
-                "INVALID_ARGUMENT: empty evidence identity {field}"
-            );
-        }
-        if record.kind == EvidenceKind::SessionEvent {
-            ensure!(
-                ["user", "assistant", "tool_result"]
-                    .contains(&record.payload["role"].as_str().unwrap_or_default())
-                    && ["text", "thinking", "tool_use", "tool_result"]
-                        .contains(&record.payload["kind"].as_str().unwrap_or_default()),
-                "INVALID_ARGUMENT: invalid event role or kind"
-            );
-            // `control_kind` is a closed vocabulary, and every reader -- the
-            // user-turn page, prompt attribution, the plugin's turn export --
-            // treats any non-null value as authoritative without rechecking
-            // it. A spelling nobody classifies, or a kind on a row the
-            // contract says can never carry one, would silently hide real
-            // evidence, so it is refused here rather than stored.
-            if let Some(value) = record.payload.get("control_kind").filter(|v| !v.is_null()) {
-                ensure!(
-                    value
-                        .as_str()
-                        .is_some_and(|value| crate::ingest::control::ControlKind::parse(value).is_some()),
-                    "INVALID_ARGUMENT: unsupported control_kind value"
-                );
-                ensure!(
-                    record.payload["role"].as_str() == Some("user")
-                        && record.payload["kind"].as_str() == Some("text"),
-                    "INVALID_ARGUMENT: control_kind is only valid on a user text event"
-                );
-            }
-            let tool_result = record.payload["kind"].as_str() == Some("tool_result");
-            for field in TOOL_RESULT_FIELDS {
-                let Some(value) = record.payload.get(*field).filter(|v| !v.is_null()) else {
-                    continue;
-                };
-                // The contract says these are null on anything that is not a
-                // tool result. An adapter that fills them anyway is describing
-                // a row it does not understand.
-                ensure!(
-                    tool_result,
-                    "INVALID_ARGUMENT: {field} is only valid on a tool_result event"
-                );
-                if NON_NEGATIVE_FIELDS.contains(field) {
-                    ensure!(
-                        value.as_i64().is_some_and(|n| n >= 0),
-                        "INVALID_ARGUMENT: {field} must not be negative"
-                    );
-                }
-                let vocabulary = match *field {
-                    "result_status" => Some(RESULT_STATUSES),
-                    "event_source" => Some(EVENT_SOURCES),
-                    "error_signal" => Some(ERROR_SIGNALS),
-                    _ => None,
-                };
-                if let Some(allowed) = vocabulary {
-                    ensure!(
-                        value
-                            .as_str()
-                            .is_some_and(|value| allowed.contains(&value)),
-                        "INVALID_ARGUMENT: unsupported {field} value"
-                    );
-                }
-            }
-        }
-        if record.kind == EvidenceKind::SessionMarker {
-            // `required` only asks whether the field is present and non-null,
-            // so `""` passed it and the NOT NULL column stored it happily. A
-            // marker whose classification is the empty string is
-            // indistinguishable from one whose classifier failed, which is the
-            // state this table exists to make impossible. `unknown` is the
-            // answer for a record nothing recognises.
-            ensure!(
-                record
-                    .payload
-                    .get("kind")
-                    .and_then(Value::as_str)
-                    .is_some_and(|kind| !kind.trim().is_empty()),
-                "INVALID_ARGUMENT: marker kind must not be empty"
-            );
-            if let Some(payload_json) = record
-                .payload
-                .get("payload_json")
-                .and_then(Value::as_str)
-            {
-                // `payload_json` is a bounded projection -- every string at 128
-                // characters, every container at 32 entries, recursively. The
-                // parsers apply that bound; putting the column on this contract
-                // handed a connector a way around it, in the one place the
-                // bound exists to defend.
-                //
-                // Refused rather than silently bounded, because that is how
-                // this boundary treats every other out-of-contract value. It
-                // derives `prompt_hash` and fills absent columns with null, but
-                // it never rewrites a value a connector supplied: doing so here
-                // would store something the submitter did not send and cannot
-                // reconcile its own copy against.
-                let parsed: Value = serde_json::from_str(payload_json).map_err(|err| {
-                    anyhow::anyhow!("INVALID_ARGUMENT: payload_json must be JSON: {err}")
-                })?;
-                ensure!(
-                    crate::ingest::marker_payload_is_bounded(&parsed),
-                    "INVALID_ARGUMENT: payload_json exceeds the marker payload bound"
-                );
-            }
-        }
-        if record.kind == EvidenceKind::Relationship {
-            let status = record.payload["identity_status"]
-                .as_str()
-                .unwrap_or_default();
-            let child = record
-                .payload
-                .get("child_session_id")
-                .and_then(Value::as_str);
-            ensure!(
-                (status == "observed" && child.is_some_and(|id| !id.is_empty()))
-                    || (status == "unlinked" && child.is_none()),
-                "INVALID_ARGUMENT: inconsistent relationship child identity"
-            );
-        }
-        if record.kind == EvidenceKind::History {
-            record.payload.insert(
-                "prompt_hash".into(),
-                Value::String(crate::prompt_hash(
-                    record.payload["prompt"].as_str().unwrap_or_default(),
-                )),
-            );
-        }
-        for column in spec.columns.split(',') {
-            record.payload.entry(column.to_string()).or_insert_with(|| {
-                if column == "child_has_events" {
-                    json!(0)
-                } else {
-                    Value::Null
-                }
-            });
-        }
+        fill_derived_columns(record, &spec);
         ensure!(
             identities.insert(record.identity()),
             "INVALID_ARGUMENT: duplicate canonical record in source snapshot"
         );
     }
     Ok(())
+}
+
+/// Every supplied column belongs to the kind's table and carries its type, and
+/// every required one is present.
+fn validate_columns(spec: &Spec, payload: &Map<String, Value>) -> Result<()> {
+    for (field, value) in payload {
+        let row_identity = matches!(field.as_str(), "id" | "rowid");
+        ensure!(
+            spec.columns.split(',').any(|column| column == field) || row_identity,
+            "INVALID_ARGUMENT: unsupported {} column {field}",
+            spec.table
+        );
+        if row_identity || value.is_null() {
+            continue;
+        }
+        ensure!(
+            column_value_has_type(field, value),
+            "INVALID_ARGUMENT: invalid type for {field}"
+        );
+    }
+    for required in spec.required.split(',') {
+        ensure!(
+            payload.get(required).is_some_and(|value| !value.is_null()),
+            "INVALID_ARGUMENT: {required} is required"
+        );
+    }
+    Ok(())
+}
+
+fn column_value_has_type(field: &str, value: &Value) -> bool {
+    match field {
+        "confidence" => value.is_number(),
+        _ if numeric(field) => value.as_i64().is_some(),
+        _ if boolean(field) => value.is_boolean() || matches!(value.as_i64(), Some(0 | 1)),
+        _ => value.is_string(),
+    }
+}
+
+/// The record belongs to the observed session and names its own identity.
+fn validate_ownership(key: &ObservationKey, record: &EvidenceRecord, spec: &Spec) -> Result<()> {
+    let session_field = if record.kind == EvidenceKind::Relationship {
+        "parent_session_id"
+    } else {
+        "session_id"
+    };
+    ensure!(
+        record.payload.get("source").and_then(Value::as_str) == Some(&key.source)
+            && record.payload.get(session_field).and_then(Value::as_str) == Some(&key.session_id),
+        "INVALID_ARGUMENT: evidence belongs to another source or session"
+    );
+    for field in spec.key.split(',').filter(|field| !numeric(field)) {
+        ensure!(
+            record
+                .payload
+                .get(field)
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.is_empty()),
+            "INVALID_ARGUMENT: empty evidence identity {field}"
+        );
+    }
+    Ok(())
+}
+
+fn validate_session_event(payload: &Map<String, Value>) -> Result<()> {
+    ensure!(
+        ["user", "assistant", "tool_result"]
+            .contains(&payload["role"].as_str().unwrap_or_default())
+            && ["text", "thinking", "tool_use", "tool_result"]
+                .contains(&payload["kind"].as_str().unwrap_or_default()),
+        "INVALID_ARGUMENT: invalid event role or kind"
+    );
+    // `control_kind` is a closed vocabulary, and every reader -- the
+    // user-turn page, prompt attribution, the plugin's turn export --
+    // treats any non-null value as authoritative without rechecking
+    // it. A spelling nobody classifies, or a kind on a row the
+    // contract says can never carry one, would silently hide real
+    // evidence, so it is refused here rather than stored.
+    if let Some(value) = payload.get("control_kind").filter(|v| !v.is_null()) {
+        ensure!(
+            value
+                .as_str()
+                .is_some_and(|value| crate::ingest::control::ControlKind::parse(value).is_some()),
+            "INVALID_ARGUMENT: unsupported control_kind value"
+        );
+        ensure!(
+            payload["role"].as_str() == Some("user") && payload["kind"].as_str() == Some("text"),
+            "INVALID_ARGUMENT: control_kind is only valid on a user text event"
+        );
+    }
+    let tool_result = payload["kind"].as_str() == Some("tool_result");
+    for field in TOOL_RESULT_FIELDS {
+        let Some(value) = payload.get(*field).filter(|v| !v.is_null()) else {
+            continue;
+        };
+        // The contract says these are null on anything that is not a
+        // tool result. An adapter that fills them anyway is describing
+        // a row it does not understand.
+        ensure!(
+            tool_result,
+            "INVALID_ARGUMENT: {field} is only valid on a tool_result event"
+        );
+        validate_tool_result_field(field, value)?;
+    }
+    Ok(())
+}
+
+fn validate_tool_result_field(field: &str, value: &Value) -> Result<()> {
+    if NON_NEGATIVE_FIELDS.contains(&field) {
+        ensure!(
+            value.as_i64().is_some_and(|n| n >= 0),
+            "INVALID_ARGUMENT: {field} must not be negative"
+        );
+    }
+    let vocabulary = match field {
+        "result_status" => Some(RESULT_STATUSES),
+        "event_source" => Some(EVENT_SOURCES),
+        "error_signal" => Some(ERROR_SIGNALS),
+        _ => None,
+    };
+    if let Some(allowed) = vocabulary {
+        ensure!(
+            value.as_str().is_some_and(|v| allowed.contains(&v)),
+            "INVALID_ARGUMENT: unsupported {field} value"
+        );
+    }
+    Ok(())
+}
+
+fn validate_session_marker(payload: &Map<String, Value>) -> Result<()> {
+    // `required` only asks whether the field is present and non-null,
+    // so `""` passed it and the NOT NULL column stored it happily. A
+    // marker whose classification is the empty string is
+    // indistinguishable from one whose classifier failed, which is the
+    // state this table exists to make impossible. `unknown` is the
+    // answer for a record nothing recognises.
+    ensure!(
+        payload
+            .get("kind")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| !kind.trim().is_empty()),
+        "INVALID_ARGUMENT: marker kind must not be empty"
+    );
+    let Some(payload_json) = payload.get("payload_json").and_then(Value::as_str) else {
+        return Ok(());
+    };
+    // `payload_json` is a bounded projection -- every string at 128
+    // characters, every container at 32 entries, recursively. The
+    // parsers apply that bound; putting the column on this contract
+    // handed a connector a way around it, in the one place the
+    // bound exists to defend.
+    //
+    // Refused rather than silently bounded, because that is how
+    // this boundary treats every other out-of-contract value. It
+    // derives `prompt_hash` and fills absent columns with null, but
+    // it never rewrites a value a connector supplied: doing so here
+    // would store something the submitter did not send and cannot
+    // reconcile its own copy against.
+    let parsed: Value = serde_json::from_str(payload_json)
+        .map_err(|err| anyhow::anyhow!("INVALID_ARGUMENT: payload_json must be JSON: {err}"))?;
+    ensure!(
+        crate::ingest::marker_payload_is_bounded(&parsed),
+        "INVALID_ARGUMENT: payload_json exceeds the marker payload bound"
+    );
+    Ok(())
+}
+
+fn validate_relationship(payload: &Map<String, Value>) -> Result<()> {
+    let status = payload["identity_status"].as_str().unwrap_or_default();
+    let child = payload.get("child_session_id").and_then(Value::as_str);
+    ensure!(
+        (status == "observed" && child.is_some_and(|id| !id.is_empty()))
+            || (status == "unlinked" && child.is_none()),
+        "INVALID_ARGUMENT: inconsistent relationship child identity"
+    );
+    Ok(())
+}
+
+/// Derive `prompt_hash` for history and give every absent column its default.
+fn fill_derived_columns(record: &mut EvidenceRecord, spec: &Spec) {
+    if record.kind == EvidenceKind::History {
+        record.payload.insert(
+            "prompt_hash".into(),
+            Value::String(crate::prompt_hash(
+                record.payload["prompt"].as_str().unwrap_or_default(),
+            )),
+        );
+    }
+    for column in spec.columns.split(',') {
+        record.payload.entry(column.to_string()).or_insert_with(|| {
+            if column == "child_has_events" {
+                json!(0)
+            } else {
+                Value::Null
+            }
+        });
+    }
 }
 fn sql_value(value: &Value) -> rusqlite::types::Value {
     match value {

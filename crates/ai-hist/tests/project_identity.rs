@@ -1285,7 +1285,6 @@ fn a_cycle_elsewhere_does_not_cost_a_child_its_grounded_key() {
 /// `origin`, must move from its path key to the remote on the next forced
 /// sweep -- row and events both.
 #[test]
-#[allow(clippy::field_reassign_with_default)]
 fn a_forced_sweep_upgrades_an_unchanged_session_whose_checkout_gained_an_origin() {
     let temp = tempfile::tempdir().unwrap();
     let home = temp.path().join("home");
@@ -1306,12 +1305,10 @@ fn a_forced_sweep_upgrades_an_unchanged_session_whose_checkout_gained_an_origin(
         &format!("{}\n{}\n", line("u1", "user"), line("a1", "assistant")),
     );
     let db = temp.path().join("history.db");
-    let mut options = ai_hist::StoreOptions::default();
-    options.db_path = Some(db.clone());
-    options.home = Some(home.clone());
-    let store = ai_hist::SessionStore::open(options).unwrap();
-    let mut force = ai_hist::SyncOptions::default();
-    force.force = true;
+    let store =
+        ai_hist::SessionStore::open(ai_hist::StoreOptions::default().db_path(&db).home(&home))
+            .unwrap();
+    let force = ai_hist::SyncOptions::default().force(true);
     store.sync(force.clone()).unwrap();
     let conn = Connection::open(&db).unwrap();
     assert_eq!(

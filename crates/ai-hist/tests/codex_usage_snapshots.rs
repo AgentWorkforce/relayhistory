@@ -27,7 +27,6 @@ fn fixture(name: &str) -> String {
 
 // `StoreOptions` is `#[non_exhaustive]`, so an outside crate builds it field
 // by field; this test is written as that crate.
-#[allow(clippy::field_reassign_with_default)]
 fn staged(rollout: &str) -> (tempfile::TempDir, SessionStore) {
     let dir = tempfile::tempdir().unwrap();
     let home = dir.path();
@@ -38,12 +37,12 @@ fn staged(rollout: &str) -> (tempfile::TempDir, SessionStore) {
         rollout,
     )
     .unwrap();
-    let mut options = StoreOptions::default();
-    options.db_path = Some(home.join("ai-history.db"));
-    options.roots = Some(ProviderRoots::from_home(
-        home.to_path_buf(),
-        home.join(".local/share/opencode/opencode.db"),
-    ));
+    let options = StoreOptions::default()
+        .db_path(home.join("ai-history.db"))
+        .roots(ProviderRoots::from_home(
+            home.to_path_buf(),
+            home.join(".local/share/opencode/opencode.db"),
+        ));
     let store = SessionStore::open(options).expect("open");
     (dir, store)
 }

@@ -15,11 +15,13 @@ use std::io::{self, BufRead, BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+mod claude_standalone;
 pub(crate) mod codex;
 pub(crate) mod control;
 pub(crate) mod cursor;
 pub(crate) mod devin;
 pub(crate) mod grok;
+mod grok_unified;
 pub(crate) mod hook;
 pub(crate) mod hydrate;
 pub(crate) mod incremental;
@@ -28,6 +30,14 @@ pub(crate) mod muse;
 pub(crate) mod opencode;
 pub(crate) mod tool_result_facts;
 pub(crate) mod transcript_cursor;
+
+use claude_standalone::{
+    claude_record_stores_no_event, claude_thinking_event_text, ClaudeRecordWalk,
+    CLAUDE_STANDALONE_RECORDS_GENERATION,
+};
+pub(crate) use claude_standalone::{
+    migrate_claude_request_evidence, standalone_records_migration_pending,
+};
 
 /// `session_markers.kind` for the point a harness compacted its context. The
 /// turns either side of it are real, but the model's view of everything
@@ -41,6 +51,11 @@ use crate::discover;
 use crate::history_search::{search_all, SearchRole};
 use crate::paths::{default_opencode_storage_dir, home_dir};
 use crate::remote;
+use grok_unified::{
+    classify_grok_turn_coverage, grok_turn_census, grok_unified_log_path,
+    materialize_grok_unified_usage, store_grok_turn_census, sync_grok_unified_log,
+    GrokUnifiedCoverage,
+};
 
 pub use crate::discover::{
     discover_sessions, discover_sessions_collect, discover_sessions_with_env,
@@ -726,6 +741,15 @@ impl<W: io::Write> SyncSourceReport<W> {
 /// the sync state file that already holds every per-source cursor.
 const SOURCE_FINGERPRINT_KEY: &str = "source_fingerprint";
 
+/// One-time sweep for stores an earlier parser built, which held back every
+/// Claude message whose records carried `stop_reason: null` — nearly every
+/// message of a subagent sidecar. Those transcripts' cursors still stand
+/// before the first held record, so this sweep resumes each one there and the
+/// current rule releases them; transcripts with nothing held are skipped on
+/// their cursors as usual. The name is in [`SWEEP_PARSER_GENERATIONS`], so the
+/// source fingerprint an earlier build stored cannot skip that sweep.
+const CLAUDE_TRAILING_HOLD_GENERATION: &str = "claude_trailing_hold_v1";
+
 /// Where the destination's own generation is remembered, beside the source
 /// fingerprint it qualifies.
 const DESTINATION_GENERATION_KEY: &str = "destination_generation";
@@ -773,11 +797,14 @@ fn destination_head(conn: &Connection) -> Result<String> {
 ///
 /// Claude transcripts are skipped on their byte cursors rather than a stamp
 /// map, so their entries name the one-time Claude passes that are pending:
-/// `CLAUDE_RECORD_ATTRIBUTION_KEY` at its generation and
-/// [`CLAUDE_DELEGATION_CAPTURE_KEY`].
+/// `CLAUDE_RECORD_ATTRIBUTION_KEY` at its generation,
+/// [`CLAUDE_DELEGATION_CAPTURE_KEY`], [`CLAUDE_TRAILING_HOLD_GENERATION`] and
+/// [`CLAUDE_STANDALONE_RECORDS_GENERATION`].
 const SWEEP_PARSER_GENERATIONS: &[&str] = &[
     "claude_record_attribution_1",
     CLAUDE_DELEGATION_CAPTURE_KEY,
+    CLAUDE_TRAILING_HOLD_GENERATION,
+    CLAUDE_STANDALONE_RECORDS_GENERATION,
     "codex_rollouts_v7",
     CODEX_STATE_MARKER_KEY,
     GROK_SYNC_STATE_KEY,
@@ -866,12 +893,16 @@ struct SessionHoldings {
 
 impl SessionHoldings {
     fn covers(&self, stored: &Self) -> bool {
+        self.covers_evidence(stored) && self.catalog >= stored.catalog
+    }
+
+    /// [`Self::covers`] for everything but the catalog row.
+    fn covers_evidence(&self, stored: &Self) -> bool {
         self.events >= stored.events
             && self.tool_calls >= stored.tool_calls
             && self.file_edits >= stored.file_edits
             && self.history >= stored.history
             && self.markers >= stored.markers
-            && self.catalog >= stored.catalog
     }
 }
 
@@ -1281,11 +1312,6 @@ fn sessions_written_since(
     // and reading every one of its rows to name sessions would cost what the
     // full count does.
     let rows_limit = i64::try_from(DESTINATION_RECOUNT_ROW_LIMIT + 1).unwrap_or(i64::MAX);
-    let note = |touched: &mut HashSet<(String, String)>, read: &mut usize, session| {
-        *read += 1;
-        touched.insert(session);
-        *read <= DESTINATION_RECOUNT_ROW_LIMIT && touched.len() <= DESTINATION_RECOUNT_LIMIT
-    };
     // A replayable prompt deleted or changed in place sends the end of the
     // sweep back to a full count; a new one is recounted like any row (see
     // `PromptBaseline`). Prompts of other sources are not counted.
@@ -1298,39 +1324,12 @@ fn sessions_written_since(
     if prompt_removed {
         return Ok(None);
     }
-    {
-        let mut statement = conn.prepare_cached(
-            "SELECT id, source, session_id FROM history WHERE revision > ?1 \
-             AND +source IN (SELECT value FROM json_each(?2)) LIMIT ?3",
-        )?;
-        let mut rows = statement.query(params![revision, history_sources.clone(), rows_limit])?;
-        let mut read = 0usize;
-        let mut appended = false;
-        while let Some(row) = rows.next()? {
-            // Every row counts toward the limit, sessionless ones too: past
-            // it the scan stops and cannot vouch for what it did not read.
-            read += 1;
-            if read > DESTINATION_RECOUNT_ROW_LIMIT {
-                return Ok(None);
-            }
-            let id: i64 = row.get(0)?;
-            if id <= prompts.max_id {
-                return Ok(None);
-            }
-            appended = true;
-            let Some(session_id) = row.get::<_, Option<String>>(2)? else {
-                continue;
-            };
-            touched.insert((row.get(1)?, session_id));
-            if touched.len() > DESTINATION_RECOUNT_LIMIT {
-                return Ok(None);
-            }
-        }
-        // A new prompt may be an old one deleted and inserted again under
-        // another session, which leaves no tombstone behind.
-        if appended && !prompts.intact(conn)? {
-            return Ok(None);
-        }
+    let window = RevisionWindow {
+        revision,
+        rows_limit,
+    };
+    if !window.note_prompts(conn, &history_sources, prompts, &mut touched)? {
+        return Ok(None);
     }
     for (table, kind) in SESSION_KEYED_HOLDINGS {
         // Markers are counted for the replayable sources only, and a busy
@@ -1344,17 +1343,88 @@ fn sessions_written_since(
             &rows_written_since_sql(table),
             &rows_removed_since_sql(kind),
         ] {
-            let mut statement = conn.prepare_cached(sql)?;
-            let mut rows = statement.query(params![revision, counted.clone(), rows_limit])?;
-            let mut read = 0usize;
-            while let Some(row) = rows.next()? {
-                if !note(&mut touched, &mut read, (row.get(0)?, row.get(1)?)) {
-                    return Ok(None);
-                }
+            if !window.note_sessions(conn, sql, counted, &mut touched)? {
+                return Ok(None);
             }
         }
     }
     Ok(Some(touched))
+}
+
+/// The rows [`sessions_written_since`] reads: those stamped above `revision`,
+/// at most `rows_limit` of them per query.
+struct RevisionWindow {
+    revision: i64,
+    rows_limit: i64,
+}
+
+impl RevisionWindow {
+    /// Notes the session of every replayable prompt appended in the window;
+    /// `false` when the window cannot be told exactly or names too much.
+    fn note_prompts(
+        &self,
+        conn: &Connection,
+        history_sources: &rusqlite::types::Value,
+        prompts: &PromptBaseline,
+        touched: &mut HashSet<(String, String)>,
+    ) -> Result<bool> {
+        let mut statement = conn.prepare_cached(
+            "SELECT id, source, session_id FROM history WHERE revision > ?1 \
+             AND +source IN (SELECT value FROM json_each(?2)) LIMIT ?3",
+        )?;
+        let mut rows = statement.query(params![
+            self.revision,
+            history_sources.clone(),
+            self.rows_limit
+        ])?;
+        let mut read = 0usize;
+        let mut appended = false;
+        while let Some(row) = rows.next()? {
+            // Every row counts toward the limit, sessionless ones too: past
+            // it the scan stops and cannot vouch for what it did not read.
+            read += 1;
+            if read > DESTINATION_RECOUNT_ROW_LIMIT {
+                return Ok(false);
+            }
+            let id: i64 = row.get(0)?;
+            if id <= prompts.max_id {
+                return Ok(false);
+            }
+            appended = true;
+            let Some(session_id) = row.get::<_, Option<String>>(2)? else {
+                continue;
+            };
+            touched.insert((row.get(1)?, session_id));
+            if touched.len() > DESTINATION_RECOUNT_LIMIT {
+                return Ok(false);
+            }
+        }
+        // A new prompt may be an old one deleted and inserted again under
+        // another session, which leaves no tombstone behind.
+        Ok(!appended || prompts.intact(conn)?)
+    }
+
+    /// Notes every `(source, session_id)` row `sql` reads in the window;
+    /// `false` once it reads past the row or session limit.
+    fn note_sessions(
+        &self,
+        conn: &Connection,
+        sql: &str,
+        counted: &rusqlite::types::Value,
+        touched: &mut HashSet<(String, String)>,
+    ) -> Result<bool> {
+        let mut statement = conn.prepare_cached(sql)?;
+        let mut rows = statement.query(params![self.revision, counted.clone(), self.rows_limit])?;
+        let mut read = 0usize;
+        while let Some(row) = rows.next()? {
+            read += 1;
+            touched.insert((row.get(0)?, row.get(1)?));
+            if read > DESTINATION_RECOUNT_ROW_LIMIT || touched.len() > DESTINATION_RECOUNT_LIMIT {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
 }
 
 /// The `(source, session_id)` of every row of `table` stamped above `?1`.
@@ -1625,20 +1695,7 @@ fn destination_shortfall_in(
     // session whose catalog row and events are both gone has no row left to be
     // found by. Catalog, event, history and marker groups collect the names
     // while counting holdings, avoiding another walk of those same tables.
-    let mut muse_children = HashSet::new();
-    // A Muse subagent has no catalog row of its own, so once every event of
-    // it is gone neither table above can name it; the edge its parent's log
-    // recorded still does, and naming it is what sends the parent back to
-    // re-read the tree.
-    let mut statement = conn.prepare(
-        "SELECT source, child_session_id FROM session_relationships \
-         WHERE source = 'muse' AND evidence_kind = 'muse_subagent_log' \
-           AND child_session_id IS NOT NULL",
-    )?;
-    let mut rows = statement.query([])?;
-    while let Some(row) = rows.next()? {
-        muse_children.insert((row.get::<_, String>(0)?, row.get::<_, String>(1)?));
-    }
+    let muse_children = muse_subagent_children(conn)?;
     let named: HashSet<(String, String)> = match &current.named {
         Some(named) => named.union(&muse_children).cloned().collect(),
         // Read from the stored marker: every session it did not recount still
@@ -1666,30 +1723,52 @@ fn destination_shortfall_in(
         // the ordinary catalog guard.
         let expected_subagent_deregistration = before.catalog > 0
             && current.catalog == 0
-            && match source.as_str() {
-                "codex" => {
-                    codex_delegation_recorded(conn, &session_id)?
-                        && !codex_session_has_remote_presence(conn, &session_id)?
-                }
-                // A Muse subagent is deregistered the same way once its log
-                // is linked to its parent.
-                "muse" => {
-                    muse_delegation_recorded(conn, &session_id)?
-                        && !session_has_remote_presence(conn, "muse", &session_id)?
-                }
-                _ => false,
-            };
-        let covered = current.events >= before.events
-            && current.tool_calls >= before.tool_calls
-            && current.file_edits >= before.file_edits
-            && current.history >= before.history
-            && current.markers >= before.markers
+            && subagent_deregistered(conn, &source, &session_id)?;
+        let covered = current.covers_evidence(before)
             && (current.catalog >= before.catalog || expected_subagent_deregistration);
         if !covered {
             repairs.sessions.insert((source, session_id));
         }
     }
     Ok(repairs)
+}
+
+/// Every Muse subagent a parent's log recorded.
+///
+/// A Muse subagent has no catalog row of its own, so once every event of it is
+/// gone neither the catalog nor the event groups can name it; the edge its
+/// parent's log recorded still does, and naming it is what sends the parent
+/// back to re-read the tree.
+fn muse_subagent_children(conn: &Connection) -> Result<HashSet<(String, String)>> {
+    let mut muse_children = HashSet::new();
+    let mut statement = conn.prepare(
+        "SELECT source, child_session_id FROM session_relationships \
+         WHERE source = 'muse' AND evidence_kind = 'muse_subagent_log' \
+           AND child_session_id IS NOT NULL",
+    )?;
+    let mut rows = statement.query([])?;
+    while let Some(row) = rows.next()? {
+        muse_children.insert((row.get::<_, String>(0)?, row.get::<_, String>(1)?));
+    }
+    Ok(muse_children)
+}
+
+/// Whether a local-only subagent's catalog row was removed because its
+/// parent's evidence proves the delegation.
+fn subagent_deregistered(conn: &Connection, source: &str, session_id: &str) -> Result<bool> {
+    Ok(match source {
+        "codex" => {
+            codex_delegation_recorded(conn, session_id)?
+                && !codex_session_has_remote_presence(conn, session_id)?
+        }
+        // A Muse subagent is deregistered the same way once its log
+        // is linked to its parent.
+        "muse" => {
+            muse_delegation_recorded(conn, session_id)?
+                && !session_has_remote_presence(conn, "muse", session_id)?
+        }
+        _ => false,
+    })
 }
 
 /// The sources a sweep reads that discovery never enumerates.
@@ -1957,7 +2036,7 @@ fn sources_unchanged(conn: &Connection, state: &Map<String, Value>, current: &st
     let Some(stored) = state.get(SOURCE_FINGERPRINT_KEY).and_then(Value::as_str) else {
         return false;
     };
-    if stored.is_empty() || stored != current {
+    if stored.is_empty() || stored != current || incremental::sweep_left_records_held(state) {
         return false;
     }
     // The sources are where the last sweep left them. That alone does not
@@ -3565,46 +3644,68 @@ fn fold_sync_state(
         if key == FORGOTTEN_PATHS_KEY {
             continue;
         }
-        // A stamp map is merged entry by entry in place: the same result as
-        // `merge_object_values`, without copying thousands of untouched
-        // stamps to change one.
-        let per_entry = match (merged.get(key), value) {
-            (Some(existing @ Value::Object(_)), Value::Object(_)) => {
-                key == CURSOR_SYNC_STATE_KEY
-                    || (!is_file_cursor(existing) && !is_file_cursor(value))
-            }
-            _ => false,
-        };
-        if let (true, Some(Value::Object(stamps)), Value::Object(theirs)) =
-            (per_entry, merged.get_mut(key), value)
-        {
-            for (entry, stamp) in theirs {
-                let next = match stamps.get(entry) {
-                    Some(saved) => merge_sync_value(saved, stamp),
-                    None => stamp.clone(),
-                };
-                if stamps.get(entry) != Some(&next) {
-                    stamps.insert(entry.clone(), next);
-                    changed = true;
-                }
-            }
-            continue;
-        }
-        let next = match merged.get(key) {
-            Some(existing) if key == CURSOR_SYNC_STATE_KEY => {
-                merge_file_cursor_map(existing, value)
-            }
-            Some(existing) => merge_sync_value(existing, value),
-            None => value.clone(),
-        };
-        if merged.get(key) == Some(&next) {
-            continue;
-        }
-        merged.insert(key.clone(), next);
+        changed |= fold_sync_key(merged, key, value);
+    }
+    changed |= sweep_retired_sync_keys(merged, ours);
+    changed |= forget_dropped_stamps(merged, ours);
+    // An instruction, not state: it must not survive into the file, and an
+    // older build that wrote one is cleaned up here.
+    if merged.remove(FORGOTTEN_PATHS_KEY).is_some() {
         changed = true;
     }
-    // Sweep after the fold, so a run concurrent with this one cannot resurrect a
-    // retired key, and only once this run actually carries the successor.
+    changed
+}
+
+/// Folds one delta key into `merged`; `true` when that changed it.
+fn fold_sync_key(merged: &mut Map<String, Value>, key: &str, value: &Value) -> bool {
+    // A stamp map is merged entry by entry in place: the same result as
+    // `merge_object_values`, without copying thousands of untouched
+    // stamps to change one.
+    let per_entry = match (merged.get(key), value) {
+        (Some(existing @ Value::Object(_)), Value::Object(_)) => {
+            key == CURSOR_SYNC_STATE_KEY || (!is_file_cursor(existing) && !is_file_cursor(value))
+        }
+        _ => false,
+    };
+    if let (true, Some(Value::Object(stamps)), Value::Object(theirs)) =
+        (per_entry, merged.get_mut(key), value)
+    {
+        return fold_stamp_entries(stamps, theirs);
+    }
+    let next = match merged.get(key) {
+        Some(existing) if key == CURSOR_SYNC_STATE_KEY => merge_file_cursor_map(existing, value),
+        Some(existing) => merge_sync_value(existing, value),
+        None => value.clone(),
+    };
+    if merged.get(key) == Some(&next) {
+        return false;
+    }
+    merged.insert(key.to_owned(), next);
+    true
+}
+
+/// Overlays `theirs` onto a stamp map entry by entry; `true` when any changed.
+fn fold_stamp_entries(stamps: &mut Map<String, Value>, theirs: &Map<String, Value>) -> bool {
+    let mut changed = false;
+    for (entry, stamp) in theirs {
+        let next = match stamps.get(entry) {
+            Some(saved) => merge_sync_value(saved, stamp),
+            None => stamp.clone(),
+        };
+        if stamps.get(entry) != Some(&next) {
+            stamps.insert(entry.clone(), next);
+            changed = true;
+        }
+    }
+    changed
+}
+
+/// Removes every retired key whose successor this run carries.
+///
+/// Swept after the fold, so a run concurrent with this one cannot resurrect a
+/// retired key, and only once this run actually carries the successor.
+fn sweep_retired_sync_keys(merged: &mut Map<String, Value>, ours: &Map<String, Value>) -> bool {
+    let mut changed = false;
     for (retired, superseded_by) in RETIRED_SYNC_STATE_KEYS {
         if !ours.contains_key(*superseded_by) {
             continue;
@@ -3613,29 +3714,32 @@ fn fold_sync_state(
             changed = true;
         }
     }
-    // The same idea one level down: entries this run deliberately dropped from
-    // a stamp map. The fold above cannot express a removal -- it only overlays
-    // the keys this run carries -- so they are applied here instead. A run
-    // concurrent with this one may have just re-stamped one of these paths
-    // because it could see the file; dropping its stamp costs that file one
-    // re-read and never loses a row, which is the safe direction.
-    if let Some(forgotten) = ours.get(FORGOTTEN_PATHS_KEY).and_then(Value::as_object) {
-        for (stamp_map_key, paths) in forgotten {
-            let Some(stamps) = merged.get_mut(stamp_map_key).and_then(Value::as_object_mut) else {
-                continue;
-            };
-            for path in paths.as_array().into_iter().flatten() {
-                let Some(path) = path.as_str() else { continue };
-                if stamps.remove(path).is_some() {
-                    changed = true;
-                }
+    changed
+}
+
+/// Removes the stamp-map entries this run deliberately dropped.
+///
+/// The same idea as [`sweep_retired_sync_keys`] one level down. The fold cannot
+/// express a removal -- it only overlays the keys this run carries -- so they
+/// are applied here instead. A run concurrent with this one may have just
+/// re-stamped one of these paths because it could see the file; dropping its
+/// stamp costs that file one re-read and never loses a row, which is the safe
+/// direction.
+fn forget_dropped_stamps(merged: &mut Map<String, Value>, ours: &Map<String, Value>) -> bool {
+    let Some(forgotten) = ours.get(FORGOTTEN_PATHS_KEY).and_then(Value::as_object) else {
+        return false;
+    };
+    let mut changed = false;
+    for (stamp_map_key, paths) in forgotten {
+        let Some(stamps) = merged.get_mut(stamp_map_key).and_then(Value::as_object_mut) else {
+            continue;
+        };
+        for path in paths.as_array().into_iter().flatten() {
+            let Some(path) = path.as_str() else { continue };
+            if stamps.remove(path).is_some() {
+                changed = true;
             }
         }
-    }
-    // An instruction, not state: it must not survive into the file, and an
-    // older build that wrote one is cleaned up here.
-    if merged.remove(FORGOTTEN_PATHS_KEY).is_some() {
-        changed = true;
     }
     changed
 }
@@ -4639,26 +4743,10 @@ fn sync_codex_sources(
     let mut consumed = offset;
     if offset < size {
         sync_note!("  [codex] syncing {} new bytes...", size - offset);
-        let mut line = String::new();
-        while let Some(position) = source.next_line(&mut line)? {
-            consumed = position;
-            if line.trim().is_empty() {
-                continue;
-            }
-            match parse_codex_line(&line) {
-                Ok(Some(mut entry)) => {
-                    if let Some(session_id) = entry.session_id.as_deref() {
-                        if entry.project.is_none() {
-                            entry.project = cwds.get(session_id).cloned();
-                        }
-                        touched.insert(session_id.to_string());
-                    }
-                    inserted += insert_history(conn, &entry)?;
-                }
-                Ok(None) => {}
-                Err(_) => errors += 1,
-            }
-        }
+        let read = ingest_codex_history_lines(conn, &mut source, &cwds, touched)?;
+        consumed = read.consumed;
+        inserted += read.inserted;
+        errors = read.errors;
     }
     // This also upgrades legacy numeric cursors at EOF. The actual committed
     // position may include complete lines appended after the initial stat.
@@ -4686,6 +4774,50 @@ fn sync_codex_sources(
         sync_note!("  [codex] {}", parts.join(", "));
     }
     Ok(inserted)
+}
+
+/// What one pass over the new lines of Codex's `history.jsonl` did.
+struct CodexHistoryRead {
+    /// The position after the last line read.
+    consumed: u64,
+    inserted: usize,
+    errors: usize,
+}
+
+/// Inserts every prompt in the unread tail of Codex's `history.jsonl`, naming
+/// a prompt's project from its session's rollout when the log does not.
+fn ingest_codex_history_lines(
+    conn: &Connection,
+    source: &mut CompleteJsonlReader,
+    cwds: &HashMap<String, String>,
+    touched: &mut HashSet<String>,
+) -> Result<CodexHistoryRead> {
+    let mut read = CodexHistoryRead {
+        consumed: source.position,
+        inserted: 0,
+        errors: 0,
+    };
+    let mut line = String::new();
+    while let Some(position) = source.next_line(&mut line)? {
+        read.consumed = position;
+        if line.trim().is_empty() {
+            continue;
+        }
+        match parse_codex_line(&line) {
+            Ok(Some(mut entry)) => {
+                if let Some(session_id) = entry.session_id.as_deref() {
+                    if entry.project.is_none() {
+                        entry.project = cwds.get(session_id).cloned();
+                    }
+                    touched.insert(session_id.to_string());
+                }
+                read.inserted += insert_history(conn, &entry)?;
+            }
+            Ok(None) => {}
+            Err(_) => read.errors += 1,
+        }
+    }
+    Ok(read)
 }
 
 /// One pass over every Codex rollout file: session metadata (cwd/branch maps
@@ -5116,14 +5248,16 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                 if let Some(first) = outcome.first_ts {
                     upsert_session(
                         conn,
-                        &meta.session_id,
-                        "codex",
-                        Some(&meta.cwd),
-                        meta.git_branch.as_deref(),
-                        first,
-                        outcome.last_ts.unwrap_or(first),
-                        outcome.last_assistant_text.as_deref(),
-                        Some(&rollout.to_string_lossy()),
+                        &SessionCatalogRow {
+                            session_id: &meta.session_id,
+                            source: "codex",
+                            cwd: Some(&meta.cwd),
+                            git_branch: meta.git_branch.as_deref(),
+                            first_ts: first,
+                            last_ts: outcome.last_ts.unwrap_or(first),
+                            last_assistant_text: outcome.last_assistant_text.as_deref(),
+                            raw_path: Some(&rollout.to_string_lossy()),
+                        },
                     )?;
                     // A fork's walk is authoritative even with no prompt of
                     // its own: an earlier build may have stored the parent's
@@ -6577,32 +6711,30 @@ fn ingest_codex_rollout_incremental(
             let message_id = message.message_id.as_deref().unwrap_or(uid.as_str());
             insert_session_event(
                 conn,
-                "codex",
-                session_id,
-                cwd,
-                cwd,
-                branch,
-                message_id,
-                None,
-                ts_ms,
-                "user",
-                "text",
-                Some(&message.text),
-                None,
-                None,
-                RequestIdentity::none(),
-                &uid,
-                None,
-                RawMessageFacts {
-                    turn_id: turn_id.as_deref(),
-                    // A user turn is not a request, and the view does not
-                    // read it.
-                    request_span: None,
-                    // App-injected context is stored, typed, and is a
-                    // prompt nowhere: not in `history`, not as
-                    // `first_prompt`, not as a prompt root.
-                    control_kind: message.control.map(control::ControlKind::as_str),
-                    ..RawMessageFacts::default()
+                &EventRow {
+                    source: "codex",
+                    session_id,
+                    project: cwd,
+                    cwd,
+                    git_branch: branch,
+                    message_id,
+                    ts_ms,
+                    role: "user",
+                    kind: "text",
+                    text: Some(&message.text),
+                    event_uid: &uid,
+                    raw_facts: RawMessageFacts {
+                        turn_id: turn_id.as_deref(),
+                        // A user turn is not a request, and the view does not
+                        // read it.
+                        request_span: None,
+                        // App-injected context is stored, typed, and is a
+                        // prompt nowhere: not in `history`, not as
+                        // `first_prompt`, not as a prompt root.
+                        control_kind: message.control.map(control::ControlKind::as_str),
+                        ..RawMessageFacts::default()
+                    },
+                    ..EventRow::default()
                 },
             )?;
             outcome.events += 1;
@@ -6680,29 +6812,30 @@ fn ingest_codex_rollout_incremental(
             let token_json = pending_usage.take().map(PendingCodexUsage::into_token_json);
             insert_session_event(
                 conn,
-                "codex",
-                session_id,
-                cwd,
-                cwd,
-                branch,
-                &uid,
-                None,
-                ts_ms,
-                "assistant",
-                "text",
-                Some(&message.text),
-                model.as_deref(),
-                token_json.as_deref(),
-                RequestIdentity {
-                    provider_message_id: message.message_id.as_deref(),
-                    ..RequestIdentity::default()
-                },
-                &uid,
-                None,
-                RawMessageFacts {
-                    turn_id: turn_id.as_deref(),
-                    request_span: Some(request_span.to_string().as_str()),
-                    ..RawMessageFacts::default()
+                &EventRow {
+                    source: "codex",
+                    session_id,
+                    project: cwd,
+                    cwd,
+                    git_branch: branch,
+                    message_id: &uid,
+                    ts_ms,
+                    role: "assistant",
+                    kind: "text",
+                    text: Some(&message.text),
+                    model: model.as_deref(),
+                    token_json: token_json.as_deref(),
+                    identity: RequestIdentity {
+                        provider_message_id: message.message_id.as_deref(),
+                        ..RequestIdentity::default()
+                    },
+                    event_uid: &uid,
+                    raw_facts: RawMessageFacts {
+                        turn_id: turn_id.as_deref(),
+                        request_span: Some(request_span.to_string().as_str()),
+                        ..RawMessageFacts::default()
+                    },
+                    ..EventRow::default()
                 },
             )?;
             outcome.events += 1;
@@ -6763,22 +6896,28 @@ fn ingest_codex_rollout_incremental(
                 "agent_reasoning" => {
                     if let Some(reasoning) = payload_str("text").filter(|t| !t.trim().is_empty()) {
                         let uid = format!("{index}:agent_reasoning");
-                        insert_codex_event(
+                        insert_session_event(
                             conn,
-                            session_id,
-                            cwd,
-                            branch,
-                            ts_ms,
-                            "assistant",
-                            "thinking",
-                            reasoning.trim(),
-                            &uid,
-                            &uid,
-                            model.as_deref(),
-                            None,
-                            None,
-                            turn_id.as_deref(),
-                            Some(request_span.to_string().as_str()),
+                            &EventRow {
+                                source: "codex",
+                                session_id,
+                                project: cwd,
+                                cwd,
+                                git_branch: branch,
+                                message_id: &uid,
+                                ts_ms,
+                                role: "assistant",
+                                kind: "thinking",
+                                text: Some(reasoning.trim()),
+                                model: model.as_deref(),
+                                event_uid: &uid,
+                                raw_facts: RawMessageFacts {
+                                    turn_id: turn_id.as_deref(),
+                                    request_span: Some(request_span.to_string().as_str()),
+                                    ..RawMessageFacts::default()
+                                },
+                                ..EventRow::default()
+                            },
                         )?;
                         outcome.events += 1;
                         untokened_assistant_uid = Some(uid);
@@ -7038,15 +7177,18 @@ fn ingest_codex_rollout_incremental(
                     }
                     insert_tool_call(
                         conn,
-                        "codex",
-                        session_id,
-                        &format!("{index}:mcp_tool_call_end"),
-                        call_id,
+                        &ToolCallRef {
+                            source: "codex",
+                            session_id,
+                            message_id: &format!("{index}:mcp_tool_call_end"),
+                            tool_use_id: call_id,
+                            ts_ms,
+                            ..Default::default()
+                        },
                         &name,
                         None,
                         &args_json,
                         is_error,
-                        ts_ms,
                     )?;
                 }
                 "web_search_end" => {
@@ -7055,15 +7197,18 @@ fn ingest_codex_rollout_incremental(
                     };
                     insert_tool_call(
                         conn,
-                        "codex",
-                        session_id,
-                        &format!("{index}:web_search_end"),
-                        call_id,
+                        &ToolCallRef {
+                            source: "codex",
+                            session_id,
+                            message_id: &format!("{index}:web_search_end"),
+                            tool_use_id: call_id,
+                            ts_ms,
+                            ..Default::default()
+                        },
                         "web_search",
                         payload_str("query"),
                         "null",
                         None,
-                        ts_ms,
                     )?;
                 }
                 "patch_apply_end" => {
@@ -7089,15 +7234,17 @@ fn ingest_codex_rollout_incremental(
                         let edit_id = format!("{call_id}#{file_path}");
                         upsert_file_edit_from_call(
                             conn,
-                            "codex",
-                            session_id,
-                            &format!("{index}:patch_apply_end"),
-                            &edit_id,
+                            &ToolCallRef {
+                                source: "codex",
+                                session_id,
+                                message_id: &format!("{index}:patch_apply_end"),
+                                tool_use_id: &edit_id,
+                                ts_ms,
+                                git_branch: branch,
+                                cwd,
+                            },
                             file_path,
                             "apply_patch",
-                            ts_ms,
-                            branch,
-                            cwd,
                         )?;
                         let diff = change
                             .get("unified_diff")
@@ -7158,22 +7305,29 @@ fn ingest_codex_rollout_incremental(
                     let message_id = payload_str("id").unwrap_or(uid.as_str()).to_string();
                     let event_text = format_tool_event_text(name, target.as_deref(), &args);
                     let token_json = pending_usage.take().map(PendingCodexUsage::into_token_json);
-                    insert_codex_event(
+                    insert_session_event(
                         conn,
-                        session_id,
-                        cwd,
-                        branch,
-                        ts_ms,
-                        "assistant",
-                        "tool_use",
-                        &event_text,
-                        &uid,
-                        &message_id,
-                        model.as_deref(),
-                        token_json.as_deref(),
-                        None,
-                        turn_id.as_deref(),
-                        Some(request_span.to_string().as_str()),
+                        &EventRow {
+                            source: "codex",
+                            session_id,
+                            project: cwd,
+                            cwd,
+                            git_branch: branch,
+                            message_id: &message_id,
+                            ts_ms,
+                            role: "assistant",
+                            kind: "tool_use",
+                            text: Some(&event_text),
+                            model: model.as_deref(),
+                            token_json: token_json.as_deref(),
+                            event_uid: &uid,
+                            raw_facts: RawMessageFacts {
+                                turn_id: turn_id.as_deref(),
+                                request_span: Some(request_span.to_string().as_str()),
+                                ..RawMessageFacts::default()
+                            },
+                            ..EventRow::default()
+                        },
                     )?;
                     outcome.events += 1;
                     untokened_assistant_uid = token_json.is_none().then(|| uid.clone());
@@ -7183,15 +7337,18 @@ fn ingest_codex_rollout_incremental(
                             serde_json::to_string(&args).unwrap_or_else(|_| "null".to_string());
                         insert_tool_call(
                             conn,
-                            "codex",
-                            session_id,
-                            &message_id,
-                            call_id,
+                            &ToolCallRef {
+                                source: "codex",
+                                session_id,
+                                message_id: &message_id,
+                                tool_use_id: call_id,
+                                ts_ms,
+                                ..Default::default()
+                            },
                             name,
                             target.as_deref(),
                             &args_json,
                             None,
-                            ts_ms,
                         )?;
                     }
                 }
@@ -7216,23 +7373,29 @@ fn ingest_codex_rollout_incremental(
                     // joined string this row stores.
                     let facts = tool_result_facts::codex_output_facts(output, call_id)
                         .with_ordering(call_index, event_index);
-                    insert_codex_event(
+                    insert_session_event(
                         conn,
-                        session_id,
-                        cwd,
-                        branch,
-                        ts_ms,
-                        "tool_result",
-                        "tool_result",
-                        &output_text,
-                        &uid,
-                        &message_id,
-                        None,
-                        None,
-                        Some(&facts),
-                        turn_id.as_deref(),
-                        // Likewise: a tool's own output is not an API call.
-                        None,
+                        &EventRow {
+                            source: "codex",
+                            session_id,
+                            project: cwd,
+                            cwd,
+                            git_branch: branch,
+                            message_id: &message_id,
+                            ts_ms,
+                            role: "tool_result",
+                            kind: "tool_result",
+                            text: Some(&output_text),
+                            event_uid: &uid,
+                            tool_result_facts: Some(&facts),
+                            raw_facts: RawMessageFacts {
+                                turn_id: turn_id.as_deref(),
+                                // Likewise: a tool's own output is not an API call.
+                                request_span: None,
+                                ..RawMessageFacts::default()
+                            },
+                            ..EventRow::default()
+                        },
                     )?;
                     outcome.events += 1;
                     if !call_id.is_empty() {
@@ -7681,50 +7844,6 @@ fn resolve_codex_tool_results(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
-fn insert_codex_event(
-    conn: &Connection,
-    session_id: &str,
-    cwd: Option<&str>,
-    branch: Option<&str>,
-    ts_ms: i64,
-    role: &str,
-    kind: &str,
-    text: &str,
-    uid: &str,
-    message_id: &str,
-    model: Option<&str>,
-    token_json: Option<&str>,
-    tool_result_facts: Option<&ToolResultFacts>,
-    turn_id: Option<&str>,
-    request_span: Option<&str>,
-) -> Result<()> {
-    insert_session_event(
-        conn,
-        "codex",
-        session_id,
-        cwd,
-        cwd,
-        branch,
-        message_id,
-        None,
-        ts_ms,
-        role,
-        kind,
-        Some(text),
-        model,
-        token_json,
-        RequestIdentity::none(),
-        uid,
-        tool_result_facts,
-        RawMessageFacts {
-            turn_id,
-            request_span,
-            ..RawMessageFacts::default()
-        },
-    )
-}
-
 fn codex_pick_tool_target(name: &str, args: &Value) -> Option<String> {
     let obj = args.as_object()?;
     let get = |keys: &[&str]| {
@@ -7847,14 +7966,16 @@ fn backfill_codex_metadata(
         if let Some(first) = first {
             upsert_session(
                 conn,
-                session_id,
-                "codex",
-                Some(cwd),
-                branch.map(String::as_str),
-                first,
-                last.unwrap_or(first),
-                None,
-                None,
+                &SessionCatalogRow {
+                    session_id,
+                    source: "codex",
+                    cwd: Some(cwd),
+                    git_branch: branch.map(String::as_str),
+                    first_ts: first,
+                    last_ts: last.unwrap_or(first),
+                    last_assistant_text: None,
+                    raw_path: None,
+                },
             )?;
         }
     }
@@ -7906,6 +8027,7 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
         {
             coverage.note_unread();
         }
+        state.insert(incremental::CLAUDE_HOLDING_RECORDS_KEY.into(), false.into());
         return Ok(());
     }
     // The `claude_sessions*` path -> stamp maps are retired. They recorded only
@@ -7982,6 +8104,10 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
     }
     let mut scanned = 0;
     let mut upserted = 0;
+    // A held transcript's cursor stands before its held message, short of the
+    // file's end, so the unchanged skip below never passes over one: every
+    // transcript holding records is re-read, and counted, on every sweep.
+    let mut holding_records = false;
     for path in capture_files("claude", transcripts) {
         check_capture_cancelled()?;
         let transcript_events = claude_transcript_events_exist(conn, &path)?;
@@ -8019,7 +8145,7 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
             && !backfill
             && !needs_repair
             && !misread_as_sidecar
-            && claude_transcript_unchanged(conn, &path)?
+            && incremental::claude_transcript_unchanged(conn, &path)?
         {
             // A transcript registered as a session and indexed before
             // continuity existed still owes its evidence. Reading it here
@@ -8052,11 +8178,12 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
         // walk absorbs it, withholds the generation if this file was one it
         // would otherwise have skipped, and drops the cursor so the next walk
         // reads it again rather than skipping it on a position that no longer
-        // describes anything readable.
+        // describes anything readable -- unless the cursor holds a message,
+        // which keeps the sweep coming back to it.
         if !transcript_is_readable(&path) {
             walked_every_known_root &= !known_before;
             if known_before {
-                transcript_cursor::forget_locator_cursor(conn, "claude", &path)?;
+                holding_records |= incremental::forget_unread_cursor_unless_held(conn, &path)?;
             }
             sync_note!(
                 "  [claude-sessions] could not open {} (skipped)",
@@ -8144,12 +8271,13 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
                 // The sync walk reports its reads through its own counters, not
                 // through a hydration result, so the byte count is dropped here.
                 let (evidence, _) = hydrate::claude_subagent_evidence(path.clone(), &meta);
-                hydrate::ingest_claude_subagent_batched(
+                let outcome = hydrate::ingest_claude_subagent_batched(
                     conn,
                     &meta.session_id,
                     &evidence,
                     &mut || write.record(),
                 )?;
+                holding_records |= !outcome.in_progress.is_empty();
                 write.commit()?;
                 continue;
             }
@@ -8165,14 +8293,16 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
             }
             upsert_session(
                 conn,
-                &meta.session_id,
-                "claude",
-                meta.cwd.as_deref(),
-                meta.git_branch.as_deref(),
-                meta.first_ts,
-                meta.last_ts,
-                meta.last_assistant_text.as_deref(),
-                Some(&path.to_string_lossy()),
+                &SessionCatalogRow {
+                    session_id: &meta.session_id,
+                    source: "claude",
+                    cwd: meta.cwd.as_deref(),
+                    git_branch: meta.git_branch.as_deref(),
+                    first_ts: meta.first_ts,
+                    last_ts: meta.last_ts,
+                    last_assistant_text: meta.last_assistant_text.as_deref(),
+                    raw_path: Some(&path.to_string_lossy()),
+                },
             )?;
             // A superseded fold read bytes that were rewritten under it, so
             // its first prompt describes no generation of the file that
@@ -8185,12 +8315,13 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
             if !scan_superseded {
                 set_claude_first_prompt(conn, &meta)?;
             }
-            incremental::ingest_claude_transcript_at_locator_batched(
+            let pass = incremental::ingest_claude_transcript_at_locator_batched(
                 conn,
                 &path,
                 None,
                 &mut || write.record(),
             )?;
+            holding_records |= !pass.in_progress.is_empty();
             if scan_superseded {
                 transcript_cursor::forget_locator_cursor(conn, "claude", &path)?;
             }
@@ -8216,11 +8347,15 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
         write.commit()?;
     }
 
+    state.insert(
+        incremental::CLAUDE_HOLDING_RECORDS_KEY.into(),
+        holding_records.into(),
+    );
     if walked_every_known_root {
         record_fidelity_backfill(state, CLAUDE_FIDELITY_GENERATION_KEY);
         state.insert(
-            CLAUDE_SIDECAR_LAYOUT_KEY.to_string(),
-            json!(CLAUDE_SIDECAR_LAYOUT_GENERATION),
+            CLAUDE_SIDECAR_LAYOUT_KEY.into(),
+            CLAUDE_SIDECAR_LAYOUT_GENERATION.into(),
         );
         state.insert(CLAUDE_DELEGATION_CAPTURE_KEY.to_string(), json!(1));
     }
@@ -8228,8 +8363,8 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
     record_raw_facts_backfill(state, CLAUDE_RAW_MESSAGE_FACTS_KEY, walked_every_known_root);
     if walked_every_known_root {
         state.insert(
-            CLAUDE_RECORD_ATTRIBUTION_KEY.to_string(),
-            json!(CLAUDE_RECORD_ATTRIBUTION_GENERATION),
+            CLAUDE_RECORD_ATTRIBUTION_KEY.into(),
+            CLAUDE_RECORD_ATTRIBUTION_GENERATION.into(),
         );
     }
     if repairs.repairs_all() && !walked_every_known_root {
@@ -8244,33 +8379,6 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
         Some(error) => Err(error),
         None => Ok(()),
     }
-}
-
-/// What a Claude transcript is skipped on when nothing about it changed.
-///
-/// A subagent sidecar's `agent-<agentId>.meta.json` is the only place the
-/// child's type, name, model and spawn depth are recorded, so metadata that
-/// changes beside an untouched transcript is still new evidence and has to
-/// reach `session_relationships`. It carries its own whole-file cursor, so it
-/// is checked here rather than folded into the transcript's stamp.
-fn claude_transcript_unchanged(conn: &Connection, path: &Path) -> Result<bool> {
-    if !transcript_cursor::transcript_unchanged(conn, "claude", path)? {
-        return Ok(false);
-    }
-    let metadata = hydrate::claude_subagent_meta_path(path);
-    // A sidecar that was indexed and has since been deleted is a change, and
-    // it is the one change no amount of looking at the file will reveal. Its
-    // cursor is the record that it was once there; without this the transcript
-    // takes the fast path forever and the relationship keeps describing a
-    // child from a file nobody can read any more.
-    let indexed_metadata =
-        transcript_cursor::locator_cursor_exists(conn, CLAUDE_SUBAGENT_META_SOURCE, &metadata)?;
-    if (metadata.is_file() || indexed_metadata)
-        && !transcript_cursor::transcript_unchanged(conn, CLAUDE_SUBAGENT_META_SOURCE, &metadata)?
-    {
-        return Ok(false);
-    }
-    Ok(true)
 }
 
 /// The cursor namespace for `agent-*.meta.json` sidecars. Not a catalog
@@ -8864,29 +8972,7 @@ impl ClaudeMetaFold {
                 object,
             );
         }
-        if value
-            .get("sessionId")
-            .and_then(Value::as_str)
-            .is_some_and(|id| !id.is_empty())
-        {
-            self.identified_records += 1;
-            if value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
-                self.sidechain_records += 1;
-            }
-            // A transcript carries one conversation. Two different ids in one
-            // file means the file is not what it claims, and indexing it would
-            // attribute one session's records to another. Recorded rather than
-            // raised here, because a fold has no way to fail: the scan turns
-            // it into the error.
-            if let Some(record_session_id) = value.get("sessionId").and_then(Value::as_str) {
-                match self.session_id.as_deref() {
-                    Some(expected) if expected != record_session_id => {
-                        self.conflicting_session_ids = true;
-                    }
-                    _ => {}
-                }
-            }
-        }
+        self.observe_identity(value);
         if self.agent_id.is_none() {
             self.agent_id = value
                 .get("agentId")
@@ -8939,19 +9025,50 @@ impl ClaudeMetaFold {
                 .is_some_and(is_claude_synthetic_placeholder_model)
         {
             if let Some(content) = value.pointer("/message/content") {
-                if let Some(text) = content.as_str() {
-                    self.last_assistant_text = Some(text.chars().take(4096).collect());
-                } else if let Some(items) = content.as_array() {
-                    let parts = items
-                        .iter()
-                        .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
-                        .filter_map(|item| item.get("text").and_then(Value::as_str))
-                        .collect::<Vec<_>>();
-                    if !parts.is_empty() {
-                        self.last_assistant_text =
-                            Some(parts.join("\n").chars().take(4096).collect());
-                    }
-                }
+                self.observe_assistant_content(content);
+            }
+        }
+    }
+
+    /// Counts a record that names its session, and notes a second session id.
+    fn observe_identity(&mut self, value: &Value) {
+        let Some(record_session_id) = value
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        else {
+            return;
+        };
+        self.identified_records += 1;
+        if value.get("isSidechain").and_then(Value::as_bool) == Some(true) {
+            self.sidechain_records += 1;
+        }
+        // A transcript carries one conversation. Two different ids in one
+        // file means the file is not what it claims, and indexing it would
+        // attribute one session's records to another. Recorded rather than
+        // raised here, because a fold has no way to fail: the scan turns
+        // it into the error.
+        if self
+            .session_id
+            .as_deref()
+            .is_some_and(|expected| expected != record_session_id)
+        {
+            self.conflicting_session_ids = true;
+        }
+    }
+
+    /// Keeps the text of a main-chain assistant message as the excerpt.
+    fn observe_assistant_content(&mut self, content: &Value) {
+        if let Some(text) = content.as_str() {
+            self.last_assistant_text = Some(text.chars().take(4096).collect());
+        } else if let Some(items) = content.as_array() {
+            let parts = items
+                .iter()
+                .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
+                .filter_map(|item| item.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>();
+            if !parts.is_empty() {
+                self.last_assistant_text = Some(parts.join("\n").chars().take(4096).collect());
             }
         }
     }
@@ -9159,30 +9276,17 @@ fn ingest_claude_transcript_text_as(
             .filter(|id| !id.is_empty())
             .map(str::to_string)
     });
-    let mut indexer = tool_result_facts::ToolResultIndexer::default();
-    let mut cache_reads: HashMap<String, i64> = HashMap::new();
-    let mut triads = control::SlashCommandTriads::default();
+    let mut walk = ClaudeRecordWalk::new(
+        conn,
+        path,
+        attributed_session_id,
+        file_session_id.as_deref(),
+    );
     for line in text.lines() {
         check_capture_cancelled()?;
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        let Some(obj) = value.as_object() else {
-            continue;
-        };
-        ingest_claude_record(
-            conn,
-            path,
-            attributed_session_id,
-            file_session_id.as_deref(),
-            line,
-            obj,
-            &mut indexer,
-            &mut cache_reads,
-            &mut triads,
-        )?;
+        walk.feed(line)?;
     }
-    Ok(())
+    walk.finish()
 }
 
 pub(crate) fn scan_claude_session_file_resumed(
@@ -9474,12 +9578,22 @@ struct ClaudeFactEvent {
     kind: String,
 }
 
-fn claude_record_facts(
-    message: Option<&Map<String, Value>>,
-    message_role: &str,
-    model: Option<&str>,
-    token_json: Option<&str>,
-) -> ClaudeRecordFacts {
+/// The parts of one transcript record its stored rows are derived from.
+#[derive(Clone, Copy)]
+struct ClaudeRecordParts<'a> {
+    message: Option<&'a Map<String, Value>>,
+    message_role: &'a str,
+    model: Option<&'a str>,
+    token_json: Option<&'a str>,
+}
+
+fn claude_record_facts(record: ClaudeRecordParts<'_>) -> ClaudeRecordFacts {
+    let ClaudeRecordParts {
+        message,
+        message_role,
+        model,
+        token_json,
+    } = record;
     let mut facts = ClaudeRecordFacts {
         events: Vec::new(),
         tool_use_ids: Vec::new(),
@@ -9569,10 +9683,7 @@ fn heal_legacy_positional_record(
     session_id: &str,
     stem: &str,
     ts_ms: i64,
-    message: Option<&Map<String, Value>>,
-    message_role: &str,
-    model: Option<&str>,
-    token_json: Option<&str>,
+    record: ClaudeRecordParts<'_>,
 ) -> Result<()> {
     let legacy = legacy_positional_message_ids(conn, session_id, stem)?;
     if legacy.is_empty() {
@@ -9583,7 +9694,7 @@ fn heal_legacy_positional_record(
         session_id,
         &legacy,
         ts_ms,
-        &claude_record_facts(message, message_role, model, token_json),
+        &claude_record_facts(record),
     )
 }
 
@@ -9616,37 +9727,8 @@ fn heal_legacy_positional_rows(
     if legacy_ids.is_empty() || (facts.events.is_empty() && facts.tool_use_ids.is_empty()) {
         return Ok(());
     }
-    let placeholders = legacy_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-    let sql = format!(
-        "SELECT message_id, text, ts_ms, role, kind, model, token_json FROM session_events \
-         WHERE source = 'claude' AND session_id = ? AND message_id IN ({placeholders})"
-    );
-    let mut statement = conn.prepare(&sql)?;
-    let mut rows = statement.query(rusqlite::params_from_iter(
-        [session_id.to_string()]
-            .into_iter()
-            .chain(legacy_ids.iter().cloned()),
-    ))?;
-    // Group legacy events by message: a legacy message heals only on an
-    // exact full-record match. Matching one shared block would erase the
-    // message's changed siblings, which the content-hash model treats as a
-    // distinct retained predecessor.
-    type MessageContentKey = Vec<LegacyEventKey>;
-    let mut by_message: HashMap<String, MessageContentKey> = HashMap::new();
-    while let Some(row) = rows.next()? {
-        let message_id: String = row.get(0)?;
-        by_message.entry(message_id).or_default().push((
-            row.get(1)?,
-            row.get(2)?,
-            row.get(3)?,
-            row.get(4)?,
-            row.get(5)?,
-            row.get(6)?,
-        ));
-    }
-    drop(rows);
-    drop(statement);
-    let mut record_key: MessageContentKey = facts
+    let by_message = legacy_events_by_message(conn, session_id, legacy_ids)?;
+    let mut record_key: LegacyMessageKey = facts
         .events
         .iter()
         .map(|event| {
@@ -9661,22 +9743,7 @@ fn heal_legacy_positional_rows(
         })
         .collect();
     record_key.sort();
-    let mut heal_messages: HashSet<String> = HashSet::new();
-    if !record_key.is_empty() {
-        let mut full_matches = Vec::new();
-        for (message_id, mut key) in by_message {
-            key.sort();
-            if key == record_key {
-                full_matches.push(message_id);
-            }
-        }
-        // Unique or preserved: two legacy messages carrying the same record
-        // stay put rather than risk healing the wrong one.
-        if full_matches.len() == 1 {
-            heal_messages.insert(full_matches.pop().unwrap());
-        }
-    }
-    for message_id in &heal_messages {
+    if let Some(message_id) = sole_full_match(by_message, &record_key) {
         crate::store::retire_evidence_share(
             conn,
             "session_events",
@@ -9691,28 +9758,101 @@ fn heal_legacy_positional_rows(
     // predecessor, so they stay unless the full-record match above heals
     // their message.
     if !facts.tool_use_ids.is_empty() {
-        let id_placeholders = facts
-            .tool_use_ids
-            .iter()
-            .map(|_| "?")
-            .collect::<Vec<_>>()
-            .join(",");
-        let msg_placeholders = legacy_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
-        for table in ["tool_calls", "file_edits"] {
-            let sql = format!(
-                "DELETE FROM {table} WHERE source = 'claude' AND session_id = ? \
-                 AND message_id IN ({msg_placeholders}) AND tool_use_id IN ({id_placeholders})"
-            );
-            conn.execute(
-                &sql,
-                rusqlite::params_from_iter(
-                    [session_id.to_string()]
-                        .into_iter()
-                        .chain(legacy_ids.iter().cloned())
-                        .chain(facts.tool_use_ids.iter().cloned()),
-                ),
-            )?;
+        delete_legacy_tool_rows(conn, session_id, legacy_ids, &facts.tool_use_ids)?;
+    }
+    Ok(())
+}
+
+/// Every event of one legacy message, as matched against a record.
+type LegacyMessageKey = Vec<LegacyEventKey>;
+
+/// The legacy events of `legacy_ids`, grouped by message: a legacy message
+/// heals only on an exact full-record match. Matching one shared block would
+/// erase the message's changed siblings, which the content-hash model treats
+/// as a distinct retained predecessor.
+fn legacy_events_by_message(
+    conn: &Connection,
+    session_id: &str,
+    legacy_ids: &[String],
+) -> Result<HashMap<String, LegacyMessageKey>> {
+    let placeholders = legacy_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    let sql = format!(
+        "SELECT message_id, text, ts_ms, role, kind, model, token_json FROM session_events \
+         WHERE source = 'claude' AND session_id = ? AND message_id IN ({placeholders})"
+    );
+    let mut statement = conn.prepare(&sql)?;
+    let mut rows = statement.query(rusqlite::params_from_iter(
+        [session_id.to_string()]
+            .into_iter()
+            .chain(legacy_ids.iter().cloned()),
+    ))?;
+    let mut by_message: HashMap<String, LegacyMessageKey> = HashMap::new();
+    while let Some(row) = rows.next()? {
+        let message_id: String = row.get(0)?;
+        by_message.entry(message_id).or_default().push((
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+            row.get(6)?,
+        ));
+    }
+    Ok(by_message)
+}
+
+/// The one legacy message whose events are exactly `record_key` (sorted).
+///
+/// Unique or preserved: two legacy messages carrying the same record stay put
+/// rather than risk healing the wrong one.
+fn sole_full_match(
+    by_message: HashMap<String, LegacyMessageKey>,
+    record_key: &LegacyMessageKey,
+) -> Option<String> {
+    if record_key.is_empty() {
+        return None;
+    }
+    let mut full_matches = Vec::new();
+    for (message_id, mut key) in by_message {
+        key.sort();
+        if key == *record_key {
+            full_matches.push(message_id);
         }
+    }
+    if full_matches.len() == 1 {
+        return full_matches.pop();
+    }
+    None
+}
+
+/// Deletes the call and edit rows of the legacy messages that `tool_use_ids`
+/// name.
+fn delete_legacy_tool_rows(
+    conn: &Connection,
+    session_id: &str,
+    legacy_ids: &[String],
+    tool_use_ids: &[String],
+) -> Result<()> {
+    let id_placeholders = tool_use_ids
+        .iter()
+        .map(|_| "?")
+        .collect::<Vec<_>>()
+        .join(",");
+    let msg_placeholders = legacy_ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+    for table in ["tool_calls", "file_edits"] {
+        let sql = format!(
+            "DELETE FROM {table} WHERE source = 'claude' AND session_id = ? \
+             AND message_id IN ({msg_placeholders}) AND tool_use_id IN ({id_placeholders})"
+        );
+        conn.execute(
+            &sql,
+            rusqlite::params_from_iter(
+                [session_id.to_string()]
+                    .into_iter()
+                    .chain(legacy_ids.iter().cloned())
+                    .chain(tool_use_ids.iter().cloned()),
+            ),
+        )?;
     }
     Ok(())
 }
@@ -9740,12 +9880,12 @@ fn ingest_claude_transcript_as(
         .with_context(|| format!("reading claude transcript {}", path.display()))?;
     let mut reader = BufReader::new(file);
     let mut raw = Vec::new();
-    // Ordering is assigned over the whole transcript, and this parser always
-    // reads the file from the start, so a re-sync reproduces the same indexes
-    // instead of advancing them.
-    let mut indexer = tool_result_facts::ToolResultIndexer::default();
-    let mut cache_reads: HashMap<String, i64> = HashMap::new();
-    let mut triads = control::SlashCommandTriads::default();
+    let mut walk = ClaudeRecordWalk::new(
+        conn,
+        path,
+        attributed_session_id,
+        file_session_id.as_deref(),
+    );
     loop {
         check_capture_cancelled()?;
         raw.clear();
@@ -9759,30 +9899,11 @@ fn ingest_claude_transcript_as(
         // The record's bytes exactly as `str::lines` would yield them: the
         // fallback event identity is a hash of this string, so a trailing
         // newline here would give one record two identities depending on which
-        // reader indexed it.
-        let Ok(line) = std::str::from_utf8(&raw) else {
-            continue;
-        };
-        let line = line.trim_end_matches(['\n', '\r']);
-        let Ok(value) = serde_json::from_str::<Value>(line) else {
-            continue;
-        };
-        let Some(obj) = value.as_object() else {
-            continue;
-        };
-        ingest_claude_record(
-            conn,
-            path,
-            attributed_session_id,
-            file_session_id.as_deref(),
-            line,
-            obj,
-            &mut indexer,
-            &mut cache_reads,
-            &mut triads,
-        )?;
+        // reader indexed it. Undecodable bytes are a malformed record.
+        let line = std::str::from_utf8(&raw).unwrap_or("");
+        walk.feed(line.trim_end_matches(['\n', '\r']))?;
     }
-    Ok(())
+    walk.finish()
 }
 
 /// The first in-log session id a transcript carries.
@@ -9815,6 +9936,26 @@ fn claude_file_session_id(path: &Path) -> Result<Option<String>> {
     }
 }
 
+/// What one Claude transcript threads through its records, whichever reader
+/// walks it.
+///
+/// `indexer`, `last_assistant_cache_read` and `triads` are borrowed rather
+/// than owned because each runs across the whole transcript: tool-result
+/// ordering, the cache read a compaction boundary reports as the context it
+/// replaced, and slash-command triads spanning records. A resumed pass
+/// restores them from the cursor.
+struct ClaudeFileParse<'a> {
+    path: &'a Path,
+    /// Overrides each record's own `sessionId`; see
+    /// `ingest_claude_transcript_as`.
+    attributed_session_id: Option<&'a str>,
+    /// The first session id the file names, for records that carry none.
+    file_session_id: Option<&'a str>,
+    indexer: &'a mut tool_result_facts::ToolResultIndexer,
+    last_assistant_cache_read: &'a mut HashMap<String, i64>,
+    triads: &'a mut control::SlashCommandTriads,
+}
+
 /// Index one Claude transcript record.
 ///
 /// Split out of the file walk so the whole-file and the incremental readers
@@ -9824,22 +9965,24 @@ fn claude_file_session_id(path: &Path) -> Result<Option<String>> {
 /// `line` is the record's bytes as written, because a record carrying neither
 /// `uuid` nor `message.id` takes its identity from a hash of them.
 ///
-/// `indexer` and `last_assistant_cache_read` are threaded in rather than owned
-/// here because both run across the whole transcript: tool-result ordering,
-/// and the cache read a compaction boundary reports as the context it
-/// replaced. A resumed pass restores both from the cursor.
-#[allow(clippy::too_many_arguments)]
+/// `stands_alone` is the reader's verdict on a record that stores no event of
+/// its own (see [`claude_record_stores_no_event`]): no record of its message
+/// that stores rows follows it, so it stores its thinking event.
 fn ingest_claude_record(
     conn: &Connection,
-    path: &Path,
-    attributed_session_id: Option<&str>,
-    file_session_id: Option<&str>,
+    file: &mut ClaudeFileParse<'_>,
     line: &str,
     obj: &Map<String, Value>,
-    indexer: &mut tool_result_facts::ToolResultIndexer,
-    last_assistant_cache_read: &mut HashMap<String, i64>,
-    triads: &mut control::SlashCommandTriads,
+    stands_alone: bool,
 ) -> Result<()> {
+    let ClaudeFileParse {
+        path,
+        attributed_session_id,
+        file_session_id,
+        ref mut indexer,
+        ref mut last_assistant_cache_read,
+        ref mut triads,
+    } = *file;
     let stem = path
         .file_stem()
         .and_then(|s| s.to_str())
@@ -10001,10 +10144,12 @@ fn ingest_claude_record(
                 record_session_id,
                 stem,
                 ts_ms,
-                message,
-                message_role,
-                model,
-                token_json.as_deref(),
+                ClaudeRecordParts {
+                    message,
+                    message_role,
+                    model,
+                    token_json: token_json.as_deref(),
+                },
             )?;
         }
     }
@@ -10049,19 +10194,20 @@ fn ingest_claude_record(
     let mut record_token_json: Option<String> = None;
     if message_role == "assistant" {
         if let Some(provider_message_id) = identity.provider_message_id {
-            // The request id exactly as the row stores it, so the rows settled
-            // together are the rows the request view groups together: by
-            // `requestId` when there is one, else by `message.id` alone.
-            let request_id = identity
-                .request_id
-                .or(raw_facts.request_id)
-                .filter(|id| !id.is_empty());
-            let settled = settle_claude_request_usage(
+            let settled = claude_standalone::settle_record_usage(
                 conn,
                 session_id,
-                request_id,
+                // The request id exactly as the row stores it, so the rows
+                // settled together are the rows the request view groups
+                // together: by `requestId` when there is one, else by
+                // `message.id` alone.
+                identity
+                    .request_id
+                    .or(raw_facts.request_id)
+                    .filter(|id| !id.is_empty()),
                 provider_message_id,
                 token_json.as_deref(),
+                obj,
             )?;
             // The record's own usage is kept only where settlement replaced
             // it: JSON `null` for a copy that carried none.
@@ -10132,30 +10278,31 @@ fn ingest_claude_record(
             // `tool_result` content block: both normalize to
             // `kind = "tool_result"`, and the normalized vocabulary is
             // deliberately not widened to carry the distinction.
-            insert_session_event_with_provenance(
+            insert_session_event(
                 conn,
-                "claude",
-                session_id,
-                project,
-                cwd,
-                git_branch,
-                message_uuid,
-                parent_id,
-                ts_ms,
-                "tool_result",
-                "tool_result",
-                notification_text,
-                None,
-                None,
-                // Claude records neither an inference provider nor a
-                // stop reason on this record.
-                None,
-                None,
-                identity,
-                &format!("{message_uuid}:subagent_notification"),
-                Some(&tool_facts),
-                raw_facts,
-                Some("system_subagent_notification"),
+                &EventRow {
+                    source: "claude",
+                    session_id,
+                    project,
+                    cwd,
+                    git_branch,
+                    message_id: message_uuid,
+                    parent_id,
+                    ts_ms,
+                    role: "tool_result",
+                    kind: "tool_result",
+                    text: notification_text,
+                    // Claude records neither an inference provider nor a
+                    // stop reason on this record.
+                    provider: None,
+                    stop_reason: None,
+                    identity,
+                    event_uid: &format!("{message_uuid}:subagent_notification"),
+                    tool_result_facts: Some(&tool_facts),
+                    raw_facts,
+                    raw_kind: Some("system_subagent_notification"),
+                    ..EventRow::default()
+                },
             )?;
             return Ok(());
         }
@@ -10342,33 +10489,28 @@ fn ingest_claude_record(
                 }
             }
             "thinking" => {
-                let text = block
-                    .get("thinking")
-                    .or_else(|| block.get("text"))
-                    .and_then(Value::as_str);
-                // A signed block with no display text is carried by its
-                // `thinking_signature` marker, which names the record's
-                // request; it has no content to store as an event.
-                if text.is_some_and(|s| !s.trim().is_empty()) {
+                if let Some(text) = claude_thinking_event_text(block, stands_alone) {
                     insert_session_event(
                         conn,
-                        "claude",
-                        session_id,
-                        project,
-                        cwd,
-                        git_branch,
-                        message_uuid,
-                        parent_id,
-                        ts_ms,
-                        "assistant",
-                        "thinking",
-                        text,
-                        model,
-                        token_json.as_deref(),
-                        identity,
-                        &event_uid,
-                        None,
-                        raw_facts,
+                        &EventRow {
+                            source: "claude",
+                            session_id,
+                            project,
+                            cwd,
+                            git_branch,
+                            message_id: message_uuid,
+                            parent_id,
+                            ts_ms,
+                            role: "assistant",
+                            kind: "thinking",
+                            text: Some(text),
+                            model,
+                            token_json: token_json.as_deref(),
+                            identity,
+                            event_uid: &event_uid,
+                            raw_facts,
+                            ..EventRow::default()
+                        },
                     )?;
                     record_rows += 1;
                 }
@@ -10381,54 +10523,43 @@ fn ingest_claude_record(
                 let event_text = format_tool_event_text(name, target.as_deref(), args);
                 insert_session_event(
                     conn,
-                    "claude",
-                    session_id,
-                    project,
-                    cwd,
-                    git_branch,
-                    message_uuid,
-                    parent_id,
-                    ts_ms,
-                    "assistant",
-                    "tool_use",
-                    Some(&event_text),
-                    model,
-                    token_json.as_deref(),
-                    identity,
-                    &event_uid,
-                    None,
-                    raw_facts,
+                    &EventRow {
+                        source: "claude",
+                        session_id,
+                        project,
+                        cwd,
+                        git_branch,
+                        message_id: message_uuid,
+                        parent_id,
+                        ts_ms,
+                        role: "assistant",
+                        kind: "tool_use",
+                        text: Some(&event_text),
+                        model,
+                        token_json: token_json.as_deref(),
+                        identity,
+                        event_uid: &event_uid,
+                        raw_facts,
+                        ..EventRow::default()
+                    },
                 )?;
                 record_rows += 1;
                 if !tool_use_id.is_empty() && !name.is_empty() {
                     let args_json =
                         serde_json::to_string(args).unwrap_or_else(|_| "null".to_string());
-                    insert_tool_call(
-                        conn,
-                        "claude",
+                    let call = ToolCallRef {
+                        source: "claude",
                         session_id,
-                        message_uuid,
+                        message_id: message_uuid,
                         tool_use_id,
-                        name,
-                        target.as_deref(),
-                        &args_json,
-                        None,
                         ts_ms,
-                    )?;
+                        git_branch,
+                        cwd,
+                    };
+                    insert_tool_call(conn, &call, name, target.as_deref(), &args_json, None)?;
                     if is_file_edit_tool(name) {
                         if let Some(file_path) = target.as_deref() {
-                            upsert_file_edit_from_call(
-                                conn,
-                                "claude",
-                                session_id,
-                                message_uuid,
-                                tool_use_id,
-                                file_path,
-                                name,
-                                ts_ms,
-                                git_branch,
-                                cwd,
-                            )?;
+                            upsert_file_edit_from_call(conn, &call, file_path, name)?;
                         }
                     }
                 }
@@ -10456,28 +10587,29 @@ fn ingest_claude_record(
                     .filter(|id| !id.is_empty())
                     .map(str::to_string);
                 let text = materialize_tool_result_text(content);
-                insert_session_event_with_provenance(
+                insert_session_event(
                     conn,
-                    "claude",
-                    session_id,
-                    project,
-                    cwd,
-                    git_branch,
-                    message_uuid,
-                    parent_id,
-                    ts_ms,
-                    "tool_result",
-                    "tool_result",
-                    text.as_deref(),
-                    model,
-                    token_json.as_deref(),
-                    None,
-                    None,
-                    identity,
-                    &event_uid,
-                    Some(&facts),
-                    raw_facts,
-                    Some("tool_result_block"),
+                    &EventRow {
+                        source: "claude",
+                        session_id,
+                        project,
+                        cwd,
+                        git_branch,
+                        message_id: message_uuid,
+                        parent_id,
+                        ts_ms,
+                        role: "tool_result",
+                        kind: "tool_result",
+                        text: text.as_deref(),
+                        model,
+                        token_json: token_json.as_deref(),
+                        identity,
+                        event_uid: &event_uid,
+                        tool_result_facts: Some(&facts),
+                        raw_facts,
+                        raw_kind: Some("tool_result_block"),
+                        ..EventRow::default()
+                    },
                 )?;
                 record_rows += 1;
                 let is_error = block.get("is_error").and_then(Value::as_bool);
@@ -10488,14 +10620,16 @@ fn ingest_claude_record(
                     if let Some(result) = find_tool_use_result(block) {
                         update_file_edit_from_tool_result(
                             conn,
-                            "claude",
-                            session_id,
-                            message_uuid,
-                            tool_use_id,
+                            &ToolCallRef {
+                                source: "claude",
+                                session_id,
+                                message_id: message_uuid,
+                                tool_use_id,
+                                ts_ms,
+                                git_branch,
+                                cwd,
+                            },
                             result,
-                            ts_ms,
-                            git_branch,
-                            cwd,
                         )?;
                     }
                 }
@@ -10612,25 +10746,27 @@ impl ClaudeTextRows<'_> {
             }
             insert_session_event(
                 conn,
-                "claude",
-                self.session_id,
-                self.project,
-                self.cwd,
-                self.git_branch,
-                self.message_uuid,
-                self.parent_id,
-                self.ts_ms,
-                self.role,
-                "text",
-                Some(text),
-                self.model,
-                self.token_json,
-                self.identity,
-                uid,
-                None,
-                RawMessageFacts {
-                    control_kind: kind.map(control::ControlKind::as_str),
-                    ..self.raw_facts
+                &EventRow {
+                    source: "claude",
+                    session_id: self.session_id,
+                    project: self.project,
+                    cwd: self.cwd,
+                    git_branch: self.git_branch,
+                    message_id: self.message_uuid,
+                    parent_id: self.parent_id,
+                    ts_ms: self.ts_ms,
+                    role: self.role,
+                    kind: "text",
+                    text: Some(text),
+                    model: self.model,
+                    token_json: self.token_json,
+                    identity: self.identity,
+                    event_uid: uid,
+                    raw_facts: RawMessageFacts {
+                        control_kind: kind.map(control::ControlKind::as_str),
+                        ..self.raw_facts
+                    },
+                    ..EventRow::default()
                 },
             )?;
             *record_rows += 1;
@@ -11349,23 +11485,6 @@ fn codex_marker_for_payload(
     }
 }
 
-/// The verbatim stop reason an OpenCode `step-finish` part carries, if this is
-/// one.
-///
-/// OpenCode does not put a stop reason on the message: it writes a trailing
-/// `step-finish` part whose `reason` is the wire string (`tool-calls`,
-/// `stop`, `length`, …). Stored as written, exactly like Claude's
-/// `message.stop_reason`; consumers map it to their own enum.
-///
-/// The event-level OpenCode parser uses the equivalent shared normalizer; this
-/// helper keeps the envelope-facts regression test explicit at this layer.
-#[allow(dead_code)]
-fn opencode_step_finish_stop_reason(part: &Value) -> Option<&str> {
-    (part.get("type").and_then(Value::as_str) == Some("step-finish"))
-        .then(|| part.get("reason").and_then(Value::as_str))
-        .flatten()
-}
-
 /// Whether a Claude `message.model` is the placeholder Claude Code writes on a
 /// notice it produced itself.
 ///
@@ -11810,7 +11929,6 @@ struct RawMessageFacts<'a> {
     record_token_json: Option<&'a str>,
 }
 
-#[allow(clippy::too_many_arguments)]
 /// The provider's own identities for the request a record belongs to, read
 /// once per record and stored verbatim.
 ///
@@ -11858,35 +11976,51 @@ impl<'a> RequestIdentity<'a> {
     }
 }
 
-/// For providers that do not record an upstream inference provider.
-/// OpenCode does, so it calls [`insert_session_event_with_provenance`]
-/// directly. Stop reasons for every provider travel in [`RawMessageFacts`].
-#[allow(clippy::too_many_arguments)]
-fn insert_session_event(
-    conn: &Connection,
-    source: &str,
-    session_id: &str,
-    project: Option<&str>,
-    cwd: Option<&str>,
-    git_branch: Option<&str>,
-    message_id: &str,
-    parent_id: Option<&str>,
+/// One normalized `session_events` row, borrowed from the record it is
+/// parsed from. Fields a provider does not record stay at their `Default`.
+#[derive(Clone, Copy, Default)]
+struct EventRow<'a> {
+    source: &'a str,
+    session_id: &'a str,
+    project: Option<&'a str>,
+    cwd: Option<&'a str>,
+    git_branch: Option<&'a str>,
+    message_id: &'a str,
+    parent_id: Option<&'a str>,
     ts_ms: i64,
-    role: &str,
-    kind: &str,
-    text: Option<&str>,
-    model: Option<&str>,
-    token_json: Option<&str>,
-    identity: RequestIdentity<'_>,
-    event_uid: &str,
-    // Carried as one struct rather than ten more positional arguments: the
-    // fidelity columns are only meaningful together, and a tenth `None` in a
-    // call list is how a fact silently ends up in the wrong column.
-    tool_result_facts: Option<&ToolResultFacts>,
-    raw_facts: RawMessageFacts<'_>,
-) -> Result<()> {
-    insert_session_event_with_provenance(
-        conn,
+    role: &'a str,
+    kind: &'a str,
+    text: Option<&'a str>,
+    model: Option<&'a str>,
+    token_json: Option<&'a str>,
+    /// The upstream inference provider, which OpenCode records as
+    /// `providerID`. Null for a provider that does not record one rather than
+    /// inferred from the model string, which is a consumer's job and not a
+    /// parser's.
+    provider: Option<&'a str>,
+    /// OpenCode's last `step-finish.reason`. Stop reasons for every other
+    /// provider travel in [`RawMessageFacts`].
+    stop_reason: Option<&'a str>,
+    identity: RequestIdentity<'a>,
+    event_uid: &'a str,
+    /// The fidelity columns travel as one struct: they are only meaningful
+    /// together, and a positional `None` is how a fact silently ends up in
+    /// the wrong column.
+    tool_result_facts: Option<&'a ToolResultFacts>,
+    raw_facts: RawMessageFacts<'a>,
+    /// The provider-native record or block type the event came from. Two very
+    /// different provider records normalize to `kind = "tool_result"`: a
+    /// `tool_result` content block, and a `type: "system"` subagent
+    /// notification reporting a delegated call finishing. It keeps them apart
+    /// without widening the normalized `kind` vocabulary, which downstream
+    /// readers switch on exhaustively.
+    raw_kind: Option<&'a str>,
+}
+
+/// Write one normalized event, including the columns only some providers can
+/// fill.
+fn insert_session_event(conn: &Connection, row: &EventRow<'_>) -> Result<()> {
+    let &EventRow {
         source,
         session_id,
         project,
@@ -11900,55 +12034,14 @@ fn insert_session_event(
         text,
         model,
         token_json,
-        None,
-        None,
+        provider,
+        stop_reason,
         identity,
         event_uid,
         tool_result_facts,
         raw_facts,
-        None,
-    )
-}
-
-/// One normalized event, including the columns only some providers can
-/// fill.
-///
-/// `provider` is the upstream inference provider, which OpenCode records as
-/// `providerID`, and `stop_reason` is OpenCode's last `step-finish.reason`.
-/// Both stay null for a provider that does not record them rather than being
-/// inferred from the model string, which is a consumer's job and not a
-/// parser's.
-///
-/// `raw_kind` is the provider-native record or block type the event came
-/// from. Two very different provider records normalize to
-/// `kind = "tool_result"`: a `tool_result` content block, and a
-/// `type: "system"` subagent notification reporting a delegated call
-/// finishing. It keeps them apart without widening the normalized `kind`
-/// vocabulary, which downstream readers switch on exhaustively.
-#[allow(clippy::too_many_arguments)]
-fn insert_session_event_with_provenance(
-    conn: &Connection,
-    source: &str,
-    session_id: &str,
-    project: Option<&str>,
-    cwd: Option<&str>,
-    git_branch: Option<&str>,
-    message_id: &str,
-    parent_id: Option<&str>,
-    ts_ms: i64,
-    role: &str,
-    kind: &str,
-    text: Option<&str>,
-    model: Option<&str>,
-    token_json: Option<&str>,
-    provider: Option<&str>,
-    stop_reason: Option<&str>,
-    identity: RequestIdentity<'_>,
-    event_uid: &str,
-    tool_result_facts: Option<&ToolResultFacts>,
-    raw_facts: RawMessageFacts<'_>,
-    raw_kind: Option<&str>,
-) -> Result<()> {
+        raw_kind,
+    } = row;
     crate::mark_session_presence(conn, source, session_id, SessionLocation::Local)?;
     let blank = ToolResultFacts::default();
     let tool_result_facts = tool_result_facts.unwrap_or(&blank);
@@ -12075,19 +12168,41 @@ fn insert_session_event_with_provenance(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
+/// One tool call as a provider record names it, with the record context its
+/// rows are written under.
+///
+/// `tool_calls` and `file_edits` both key on `(source, session_id,
+/// tool_use_id)`. An edit scoped to one file of a multi-file call is the same
+/// call under a per-file `tool_use_id`.
+#[derive(Clone, Copy, Default)]
+struct ToolCallRef<'a> {
+    source: &'a str,
+    session_id: &'a str,
+    message_id: &'a str,
+    tool_use_id: &'a str,
+    ts_ms: i64,
+    /// Stored on `file_edits` only; `tool_calls` has no checkout columns.
+    git_branch: Option<&'a str>,
+    /// Stored on `file_edits` only.
+    cwd: Option<&'a str>,
+}
+
 fn insert_tool_call(
     conn: &Connection,
-    source: &str,
-    session_id: &str,
-    message_id: &str,
-    tool_use_id: &str,
+    call: &ToolCallRef<'_>,
     name: &str,
     target: Option<&str>,
     args_json: &str,
     is_error: Option<bool>,
-    ts_ms: i64,
 ) -> Result<()> {
+    let ToolCallRef {
+        source,
+        session_id,
+        message_id,
+        tool_use_id,
+        ts_ms,
+        ..
+    } = *call;
     crate::mark_session_presence(conn, source, session_id, SessionLocation::Local)?;
     conn.prepare_cached(
         "INSERT INTO tool_calls \
@@ -12129,19 +12244,21 @@ fn set_tool_call_error(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn upsert_file_edit_from_call(
     conn: &Connection,
-    source: &str,
-    session_id: &str,
-    message_id: &str,
-    tool_use_id: &str,
+    call: &ToolCallRef<'_>,
     file_path: &str,
     tool_name: &str,
-    ts_ms: i64,
-    git_branch: Option<&str>,
-    cwd: Option<&str>,
 ) -> Result<()> {
+    let ToolCallRef {
+        source,
+        session_id,
+        message_id,
+        tool_use_id,
+        ts_ms,
+        git_branch,
+        cwd,
+    } = *call;
     crate::mark_session_presence(conn, source, session_id, SessionLocation::Local)?;
     conn.prepare_cached(
         "INSERT INTO file_edits \
@@ -12168,18 +12285,20 @@ fn upsert_file_edit_from_call(
     Ok(())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn update_file_edit_from_tool_result(
     conn: &Connection,
-    source: &str,
-    session_id: &str,
-    message_id: &str,
-    tool_use_id: &str,
+    call: &ToolCallRef<'_>,
     result: &Value,
-    ts_ms: i64,
-    git_branch: Option<&str>,
-    cwd: Option<&str>,
 ) -> Result<()> {
+    let ToolCallRef {
+        source,
+        session_id,
+        message_id,
+        tool_use_id,
+        ts_ms,
+        git_branch,
+        cwd,
+    } = *call;
     let structured_patch = result
         .get("structuredPatch")
         .or_else(|| result.get("structured_patch"));
@@ -12303,34 +12422,25 @@ fn count_patch_text(text: &str) -> (i64, i64) {
     (added, removed)
 }
 
+/// One `sessions` catalog row as an ingest pass writes it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SessionCatalogRow<'a> {
+    pub(crate) session_id: &'a str,
+    pub(crate) source: &'a str,
+    pub(crate) cwd: Option<&'a str>,
+    pub(crate) git_branch: Option<&'a str>,
+    pub(crate) first_ts: i64,
+    pub(crate) last_ts: i64,
+    pub(crate) last_assistant_text: Option<&'a str>,
+    pub(crate) raw_path: Option<&'a str>,
+}
+
 /// Register a session whose full evidence (`session_events`, `tool_calls`, …)
 /// has just been ingested, so the row is marked `discovery_state = 'full'`.
 /// Shallow discovery writes through [`discover::upsert_shallow_session`]
 /// instead and never downgrades a `'full'` row.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn upsert_session(
-    conn: &Connection,
-    session_id: &str,
-    source: &str,
-    cwd: Option<&str>,
-    git_branch: Option<&str>,
-    first_ts: i64,
-    last_ts: i64,
-    last_assistant_text: Option<&str>,
-    raw_path: Option<&str>,
-) -> Result<()> {
-    upsert_session_inner(
-        conn,
-        session_id,
-        source,
-        cwd,
-        git_branch,
-        first_ts,
-        last_ts,
-        last_assistant_text,
-        raw_path,
-        ActivityWindow::Expand,
-    )
+pub(crate) fn upsert_session(conn: &Connection, row: &SessionCatalogRow<'_>) -> Result<()> {
+    upsert_session_inner(conn, row, ActivityWindow::Expand)
 }
 
 /// How an upsert reconciles the activity window it carries with the one the
@@ -12348,20 +12458,16 @@ pub(crate) enum ActivityWindow {
     Replace,
 }
 
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn upsert_session_rebuilt(
+pub(crate) fn upsert_session_rebuilt(conn: &Connection, row: &SessionCatalogRow<'_>) -> Result<()> {
+    upsert_session_inner(conn, row, ActivityWindow::Replace)
+}
+
+fn upsert_session_inner(
     conn: &Connection,
-    session_id: &str,
-    source: &str,
-    cwd: Option<&str>,
-    git_branch: Option<&str>,
-    first_ts: i64,
-    last_ts: i64,
-    last_assistant_text: Option<&str>,
-    raw_path: Option<&str>,
+    row: &SessionCatalogRow<'_>,
+    window: ActivityWindow,
 ) -> Result<()> {
-    upsert_session_inner(
-        conn,
+    let SessionCatalogRow {
         session_id,
         source,
         cwd,
@@ -12370,23 +12476,7 @@ pub(crate) fn upsert_session_rebuilt(
         last_ts,
         last_assistant_text,
         raw_path,
-        ActivityWindow::Replace,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn upsert_session_inner(
-    conn: &Connection,
-    session_id: &str,
-    source: &str,
-    cwd: Option<&str>,
-    git_branch: Option<&str>,
-    first_ts: i64,
-    last_ts: i64,
-    last_assistant_text: Option<&str>,
-    raw_path: Option<&str>,
-    window: ActivityWindow,
-) -> Result<()> {
+    } = *row;
     // `last_assistant_text` follows the same rule as the window. A pass that
     // saw only part of the session must not erase prose it did not read, but a
     // rebuild has just re-read the whole source: if there is no assistant
@@ -12937,14 +13027,16 @@ fn sync_cursor_with_hooks(
         };
         upsert(
             &tx,
-            &transcript.session_id,
-            "cursor",
-            Some(&transcript.project),
-            None,
-            outcome.first_ts_ms.unwrap_or(transcript.timestamp_ms),
-            outcome.last_ts_ms.unwrap_or(transcript.timestamp_ms),
-            outcome.last_assistant_text.as_deref(),
-            Some(&transcript.path.to_string_lossy()),
+            &SessionCatalogRow {
+                session_id: &transcript.session_id,
+                source: "cursor",
+                cwd: Some(&transcript.project),
+                git_branch: None,
+                first_ts: outcome.first_ts_ms.unwrap_or(transcript.timestamp_ms),
+                last_ts: outcome.last_ts_ms.unwrap_or(transcript.timestamp_ms),
+                last_assistant_text: outcome.last_assistant_text.as_deref(),
+                raw_path: Some(&transcript.path.to_string_lossy()),
+            },
         )?;
     }
     tx.commit().context("commit Cursor sync")?;
@@ -13665,24 +13757,23 @@ pub(crate) fn ingest_cursor_transcript(
                     emitted_evidence = true;
                     insert_session_event(
                         conn,
-                        "cursor",
-                        session_id,
-                        project,
-                        project,
-                        None,
-                        &message_id,
-                        None,
-                        ts_ms,
-                        if is_user { "user" } else { "assistant" },
-                        "text",
-                        Some(&text),
-                        model,
-                        token_json.as_deref(),
-                        // Cursor records no request identity on this path.
-                        RequestIdentity::none(),
-                        &event_uid,
-                        None,
-                        RawMessageFacts::default(),
+                        &EventRow {
+                            source: "cursor",
+                            session_id,
+                            project,
+                            cwd: project,
+                            message_id: &message_id,
+                            ts_ms,
+                            role: if is_user { "user" } else { "assistant" },
+                            kind: "text",
+                            text: Some(&text),
+                            model,
+                            token_json: token_json.as_deref(),
+                            // Cursor records no request identity on this path.
+                            identity: RequestIdentity::none(),
+                            event_uid: &event_uid,
+                            ..EventRow::default()
+                        },
                     )?;
                 }
                 "thinking" | "reasoning" => {
@@ -13696,23 +13787,21 @@ pub(crate) fn ingest_cursor_transcript(
                         emitted_evidence = true;
                         insert_session_event(
                             conn,
-                            "cursor",
-                            session_id,
-                            project,
-                            project,
-                            None,
-                            &message_id,
-                            None,
-                            ts_ms,
-                            "assistant",
-                            "thinking",
-                            Some(thinking),
-                            model,
-                            token_json.as_deref(),
-                            RequestIdentity::none(),
-                            &event_uid,
-                            None,
-                            RawMessageFacts::default(),
+                            &EventRow {
+                                source: "cursor",
+                                session_id,
+                                project,
+                                cwd: project,
+                                message_id: &message_id,
+                                ts_ms,
+                                role: "assistant",
+                                kind: "thinking",
+                                text: Some(thinking),
+                                model,
+                                token_json: token_json.as_deref(),
+                                event_uid: &event_uid,
+                                ..EventRow::default()
+                            },
                         )?;
                     }
                 }
@@ -13747,36 +13836,40 @@ pub(crate) fn ingest_cursor_transcript(
                     emitted_evidence = true;
                     insert_session_event(
                         conn,
-                        "cursor",
-                        session_id,
-                        project,
-                        project,
-                        None,
-                        &message_id,
-                        None,
-                        ts_ms,
-                        "assistant",
-                        "tool_use",
-                        Some(&format_tool_event_text(&name, target.as_deref(), args)),
-                        model,
-                        token_json.as_deref(),
-                        // Cursor records no request identity on this path.
-                        RequestIdentity::none(),
-                        &event_uid,
-                        None,
-                        RawMessageFacts::default(),
+                        &EventRow {
+                            source: "cursor",
+                            session_id,
+                            project,
+                            cwd: project,
+                            message_id: &message_id,
+                            ts_ms,
+                            role: "assistant",
+                            kind: "tool_use",
+                            text: Some(&format_tool_event_text(&name, target.as_deref(), args)),
+                            model,
+                            token_json: token_json.as_deref(),
+                            // Cursor records no request identity on this path.
+                            identity: RequestIdentity::none(),
+                            event_uid: &event_uid,
+                            ..EventRow::default()
+                        },
                     )?;
+                    let call = ToolCallRef {
+                        source: "cursor",
+                        session_id,
+                        message_id: &message_id,
+                        tool_use_id: &tool_use_id,
+                        ts_ms,
+                        git_branch: None,
+                        cwd: project,
+                    };
                     insert_tool_call(
                         conn,
-                        "cursor",
-                        session_id,
-                        &message_id,
-                        &tool_use_id,
+                        &call,
                         &name,
                         target.as_deref(),
                         &serde_json::to_string(args).unwrap_or_else(|_| "null".to_string()),
                         None,
-                        ts_ms,
                     )?;
                     if cursor::is_file_edit_tool(&name) {
                         // One `ApplyPatch` call routinely rewrites several
@@ -13794,47 +13887,23 @@ pub(crate) fn ingest_cursor_transcript(
                             // edit keeps the unscoped call id and no line
                             // counts are invented for it.
                             if let Some(file_path) = target.as_deref() {
-                                upsert_file_edit_from_call(
-                                    conn,
-                                    "cursor",
-                                    session_id,
-                                    &message_id,
-                                    &tool_use_id,
-                                    file_path,
-                                    &name,
-                                    ts_ms,
-                                    None,
-                                    project,
-                                )?;
+                                upsert_file_edit_from_call(conn, &call, file_path, &name)?;
                             }
                         } else {
                             for file in &patched {
                                 let edit_id = format!("{tool_use_id}#{}", file.path);
-                                upsert_file_edit_from_call(
-                                    conn,
-                                    "cursor",
-                                    session_id,
-                                    &message_id,
-                                    &edit_id,
-                                    &file.path,
-                                    &name,
-                                    ts_ms,
-                                    None,
-                                    project,
-                                )?;
+                                let edit = ToolCallRef {
+                                    tool_use_id: &edit_id,
+                                    ..call
+                                };
+                                upsert_file_edit_from_call(conn, &edit, &file.path, &name)?;
                                 // Line counts come from this file's own slice
                                 // of the patch, through the same counter the
                                 // Claude edits use.
                                 update_file_edit_from_tool_result(
                                     conn,
-                                    "cursor",
-                                    session_id,
-                                    &message_id,
-                                    &edit_id,
+                                    &edit,
                                     &json!({ "structuredPatch": file.patch }),
-                                    ts_ms,
-                                    None,
-                                    project,
                                 )?;
                             }
                         }
@@ -13857,24 +13926,24 @@ pub(crate) fn ingest_cursor_transcript(
                         .with_ordering(call_index, event_index);
                     insert_session_event(
                         conn,
-                        "cursor",
-                        session_id,
-                        project,
-                        project,
-                        None,
-                        &message_id,
-                        None,
-                        ts_ms,
-                        "tool_result",
-                        "tool_result",
-                        materialize_tool_result_text(content).as_deref(),
-                        model,
-                        token_json.as_deref(),
-                        // Cursor records no request identity on this path.
-                        RequestIdentity::none(),
-                        &event_uid,
-                        Some(&facts),
-                        RawMessageFacts::default(),
+                        &EventRow {
+                            source: "cursor",
+                            session_id,
+                            project,
+                            cwd: project,
+                            message_id: &message_id,
+                            ts_ms,
+                            role: "tool_result",
+                            kind: "tool_result",
+                            text: materialize_tool_result_text(content).as_deref(),
+                            model,
+                            token_json: token_json.as_deref(),
+                            // Cursor records no request identity on this path.
+                            identity: RequestIdentity::none(),
+                            event_uid: &event_uid,
+                            tool_result_facts: Some(&facts),
+                            ..EventRow::default()
+                        },
                     )?;
                     if !tool_use_id.is_empty() {
                         if let Some(is_error) = block.get("is_error").and_then(Value::as_bool) {
@@ -13889,14 +13958,16 @@ pub(crate) fn ingest_cursor_transcript(
                         if let Some(result) = find_tool_use_result(block) {
                             update_file_edit_from_tool_result(
                                 conn,
-                                "cursor",
-                                session_id,
-                                &message_id,
-                                &tool_use_id,
+                                &ToolCallRef {
+                                    source: "cursor",
+                                    session_id,
+                                    message_id: &message_id,
+                                    tool_use_id: &tool_use_id,
+                                    ts_ms,
+                                    git_branch: None,
+                                    cwd: project,
+                                },
                                 result,
-                                ts_ms,
-                                None,
-                                project,
                             )?;
                         }
                     }
@@ -14027,54 +14098,26 @@ fn sync_muse_with_coverage(
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    let mut inserted = 0;
-    let mut scanned = 0;
-    let mut sessions = 0;
-    let mut errors = 0;
-    let mut accounted = 0;
+    let mut walk = StampedSessionWalk::default();
     for transcript in capture_files("muse", collect_muse_transcripts(root)?) {
         check_capture_cancelled()?;
         let key = transcript.to_string_lossy().to_string();
         let stamp = match muse_session_stamp(&transcript) {
             Ok(stamp) => stamp,
             Err(error) => {
-                if error.is::<CaptureCancelled>() {
-                    return Err(error);
-                }
-                scanned += 1;
-                errors += 1;
-                coverage.note_unread();
-                sync_note!(
-                    "  [muse] unreadable session {}: {error:#}",
-                    transcript.display()
-                );
+                walk.scanned += 1;
+                walk.note_unreadable(coverage, "muse", &transcript, error)?;
                 continue;
             }
         };
         let recorded = muse_state.get(&key);
-        if recorded.and_then(grok_state_stamp) == Some(stamp.as_str()) {
-            // The stamp says unchanged; the database has to agree before
-            // that is taken as "already indexed". Every Muse ingestion writes
-            // at least its catalog row, and one that wrote events is checked
-            // against those.
-            let still_there = match (
-                recorded.and_then(grok_state_session),
-                recorded.and_then(grok_state_had_evidence),
-            ) {
-                (None, _) => true,
-                // The destination marker says rows were lost under this
-                // unchanged stamp — in the session or in a subagent it links.
-                // Existence cannot see a partial loss; re-reading repairs it.
-                (Some(id), _) if muse_tree_needs_repair(conn, repairs, id)? => false,
-                (Some(id), Some(false)) => muse_catalog_row_exists(conn, id)?,
-                (Some(id), _) => muse_evidence_exists(conn, id)?,
-            };
-            if still_there {
-                accounted += 1;
-                continue;
-            }
+        if recorded.and_then(grok_state_stamp) == Some(stamp.as_str())
+            && muse_recorded_still_indexed(conn, repairs, recorded)?
+        {
+            walk.accounted += 1;
+            continue;
         }
-        scanned += 1;
+        walk.scanned += 1;
         // Everything is read before anything is written. A transcript or a
         // subagent log that cannot be read is this session's failure alone:
         // it keeps no stamp, so the next run retries it, and the pass goes on.
@@ -14084,26 +14127,13 @@ fn sync_muse_with_coverage(
         match read_muse_tree(&transcript) {
             Ok(Some((parsed, children))) => {
                 let session_id = parsed.metadata.session_id.clone();
-                let tx = conn.unchecked_transaction()?;
-                let written = muse_history_rows(&tx, &session_id).and_then(|before| {
-                    let outcome =
-                        ingest_muse_session_tree(&tx, &parsed, &transcript, Some(&children))?;
-                    let after = muse_history_rows(&tx, &session_id)?;
-                    Ok((outcome, after.saturating_sub(before)))
-                });
-                let (outcome, added) = match written {
-                    Ok(written) => written,
-                    Err(error) => {
-                        drop(tx);
-                        return Err(error);
-                    }
-                };
+                let (outcome, added) =
+                    index_muse_tree(conn, &parsed, &transcript, &children, &session_id)?;
                 // A re-read replaces the session's prompts wholesale, so what
                 // it added is the difference, not what it wrote.
-                inserted += added;
-                tx.commit()?;
-                sessions += 1;
-                accounted += 1;
+                walk.inserted += added;
+                walk.sessions += 1;
+                walk.accounted += 1;
                 muse_state.insert(
                     key,
                     json!({
@@ -14116,38 +14146,130 @@ fn sync_muse_with_coverage(
                 );
             }
             Ok(None) => {
-                accounted += 1;
+                walk.accounted += 1;
                 muse_state.insert(key, json!({ "stamp": stamp }));
             }
-            Err(error) => {
-                if error.is::<CaptureCancelled>() {
-                    return Err(error);
-                }
-                errors += 1;
-                coverage.note_unread();
-                sync_note!(
-                    "  [muse] unreadable session {}: {error:#}",
-                    transcript.display()
-                );
-            }
+            Err(error) => walk.note_unreadable(coverage, "muse", &transcript, error)?,
         }
     }
     state.insert(MUSE_SYNC_STATE_KEY.to_string(), Value::Object(muse_state));
-    if scanned > 0 {
-        let suffix = if errors > 0 {
-            format!(" ({errors} errors)")
-        } else {
-            String::new()
-        };
-        sync_note!("  [muse] +{inserted} rows from {sessions} sessions{suffix}");
+    walk.finish("muse", "Muse Code session(s)", "transcripts")
+}
+
+/// Whether a Muse session whose stamp says unchanged is still indexed.
+///
+/// The stamp says unchanged; the database has to agree before that is taken as
+/// "already indexed". Every Muse ingestion writes at least its catalog row,
+/// and one that wrote events is checked against those.
+fn muse_recorded_still_indexed(
+    conn: &Connection,
+    repairs: &SweepRepairs,
+    recorded: Option<&Value>,
+) -> Result<bool> {
+    let Some(id) = recorded.and_then(grok_state_session) else {
+        return Ok(true);
+    };
+    // The destination marker says rows were lost under this unchanged stamp
+    // — in the session or in a subagent it links. Existence cannot see a
+    // partial loss; re-reading repairs it.
+    if muse_tree_needs_repair(conn, repairs, id)? {
+        return Ok(false);
     }
-    if errors > 0 && accounted == 0 {
-        anyhow::bail!(
-            "{errors} Muse Code session(s) could not be read and none were indexed; \
-             the unreadable transcripts are named above"
+    match recorded.and_then(grok_state_had_evidence) {
+        Some(false) => muse_catalog_row_exists(conn, id),
+        _ => muse_evidence_exists(conn, id),
+    }
+}
+
+/// Writes one Muse session tree in its own transaction, returning what it
+/// wrote and how many prompts it added.
+fn index_muse_tree(
+    conn: &Connection,
+    parsed: &muse::MuseTranscript,
+    transcript: &Path,
+    children: &[MuseChildLog],
+    session_id: &str,
+) -> Result<(MuseIngestOutcome, usize)> {
+    // A failed write drops `tx`, which rolls the whole tree back.
+    let tx = conn.unchecked_transaction()?;
+    let before = muse_history_rows(&tx, session_id)?;
+    let outcome = ingest_muse_session_tree(&tx, parsed, transcript, Some(children))?;
+    let after = muse_history_rows(&tx, session_id)?;
+    tx.commit()?;
+    Ok((outcome, after.saturating_sub(before)))
+}
+
+/// The tally of one walk over a source's stamped session files.
+#[derive(Default)]
+struct StampedSessionWalk {
+    /// Prompts the walk added.
+    inserted: usize,
+    /// Sessions the walk had to read, unreadable ones included.
+    scanned: usize,
+    /// Sessions the walk indexed.
+    sessions: usize,
+    errors: usize,
+    /// Sessions this run could **account for**: indexed now, or confirmed
+    /// unchanged against a stamp it read successfully. Not the same as
+    /// `sessions`, which counts only what was indexed — a store that is fully
+    /// synced indexes nothing on every later run, and using that count to
+    /// decide whether the source failed would fail it forever over one
+    /// unreadable sibling.
+    accounted: usize,
+}
+
+impl StampedSessionWalk {
+    /// Records a session that could not be read; a cancellation ends the walk.
+    ///
+    /// Its stamp is deliberately not recorded so the next sweep retries it.
+    /// The source fingerprint stays stale too, or the next tick would skip
+    /// before reaching it.
+    fn note_unreadable(
+        &mut self,
+        coverage: &mut SweepCoverage,
+        source: &str,
+        path: &Path,
+        error: anyhow::Error,
+    ) -> Result<()> {
+        if error.is::<CaptureCancelled>() {
+            return Err(error);
+        }
+        self.errors += 1;
+        coverage.note_unread();
+        sync_note!(
+            "  [{source}] unreadable session {}: {error:#}",
+            path.display()
         );
+        Ok(())
     }
-    Ok(inserted)
+
+    /// Reports the walk, returning the prompts it added.
+    ///
+    /// A store where nothing could be read is a failed source, not an empty
+    /// one: the caller records it and the run says so. A store where something
+    /// failed and something else was accounted for stays a success, so the
+    /// sessions that did read keep their saved stamps -- otherwise one
+    /// unreadable session would send every future run back over the whole
+    /// store, and a fully synced store would fail this source on every run
+    /// from then on.
+    fn finish(&self, source: &str, sessions_noun: &str, files_noun: &str) -> Result<usize> {
+        let (inserted, sessions, errors) = (self.inserted, self.sessions, self.errors);
+        if self.scanned > 0 {
+            let suffix = if errors > 0 {
+                format!(" ({errors} errors)")
+            } else {
+                String::new()
+            };
+            sync_note!("  [{source}] +{inserted} rows from {sessions} sessions{suffix}");
+        }
+        if errors > 0 && self.accounted == 0 {
+            anyhow::bail!(
+                "{errors} {sessions_noun} could not be read and none were indexed; \
+                 the unreadable {files_noun} are named above"
+            );
+        }
+        Ok(inserted)
+    }
 }
 
 /// Whether the destination marker names this session, or any subagent its
@@ -14811,23 +14933,20 @@ pub(crate) fn ingest_muse_session(
                 }
                 insert_session_event(
                     conn,
-                    SOURCE,
-                    sid,
-                    project,
-                    project,
-                    None,
-                    &record_uid,
-                    None,
-                    ts,
-                    "user",
-                    "text",
-                    Some(text),
-                    None,
-                    None,
-                    RequestIdentity::none(),
-                    &record_uid,
-                    None,
-                    facts,
+                    &EventRow {
+                        source: SOURCE,
+                        session_id: sid,
+                        project,
+                        cwd: project,
+                        message_id: &record_uid,
+                        ts_ms: ts,
+                        role: "user",
+                        kind: "text",
+                        text: Some(text),
+                        event_uid: &record_uid,
+                        raw_facts: facts,
+                        ..EventRow::default()
+                    },
                 )?;
                 outcome.events += 1;
                 if role == MuseRole::Session {
@@ -14869,25 +14988,24 @@ pub(crate) fn ingest_muse_session(
                     let message_id = message_id.as_deref().unwrap_or(&record_uid);
                     insert_session_event(
                         conn,
-                        SOURCE,
-                        sid,
-                        project,
-                        project,
-                        None,
-                        message_id,
-                        None,
-                        ts,
-                        "assistant",
-                        "thinking",
-                        Some(text),
-                        row_model,
-                        token_json.as_deref(),
-                        RequestIdentity::none(),
-                        &record_uid,
-                        None,
-                        RawMessageFacts {
-                            stop_reason: step.as_ref().and_then(|step| step.finish_reason),
-                            ..facts
+                        &EventRow {
+                            source: SOURCE,
+                            session_id: sid,
+                            project,
+                            cwd: project,
+                            message_id,
+                            ts_ms: ts,
+                            role: "assistant",
+                            kind: "thinking",
+                            text: Some(text),
+                            model: row_model,
+                            token_json: token_json.as_deref(),
+                            event_uid: &record_uid,
+                            raw_facts: RawMessageFacts {
+                                stop_reason: step.as_ref().and_then(|step| step.finish_reason),
+                                ..facts
+                            },
+                            ..EventRow::default()
                         },
                     )?;
                     outcome.events += 1;
@@ -14928,29 +15046,29 @@ pub(crate) fn ingest_muse_session(
                 let message_id = message_id.as_deref().unwrap_or(&record_uid);
                 insert_session_event(
                     conn,
-                    SOURCE,
-                    sid,
-                    project,
-                    project,
-                    None,
-                    message_id,
-                    None,
-                    ts,
-                    "assistant",
-                    "text",
-                    Some(text),
-                    row_model,
-                    token_json.as_deref(),
-                    RequestIdentity {
-                        request_id: response_id.as_deref(),
-                        provider_message_id: Some(message_id),
-                    },
-                    &record_uid,
-                    None,
-                    RawMessageFacts {
-                        request_id: response_id.as_deref(),
-                        stop_reason: finish_reason,
-                        ..facts
+                    &EventRow {
+                        source: SOURCE,
+                        session_id: sid,
+                        project,
+                        cwd: project,
+                        message_id,
+                        ts_ms: ts,
+                        role: "assistant",
+                        kind: "text",
+                        text: Some(text),
+                        model: row_model,
+                        token_json: token_json.as_deref(),
+                        identity: RequestIdentity {
+                            request_id: response_id.as_deref(),
+                            provider_message_id: Some(message_id),
+                        },
+                        event_uid: &record_uid,
+                        raw_facts: RawMessageFacts {
+                            request_id: response_id.as_deref(),
+                            stop_reason: finish_reason,
+                            ..facts
+                        },
+                        ..EventRow::default()
                     },
                 )?;
                 outcome.events += 1;
@@ -14977,47 +15095,52 @@ pub(crate) fn ingest_muse_session(
                     let uid = format!("tool:{}", call.call_id);
                     insert_session_event(
                         conn,
-                        SOURCE,
-                        sid,
-                        project,
-                        project,
-                        None,
-                        message_id,
-                        None,
-                        ts,
-                        "assistant",
-                        "tool_use",
-                        Some(&format_tool_event_text(
-                            &call.name,
-                            target.as_deref(),
-                            &call.arguments,
-                        )),
-                        row_model,
-                        token_json.as_deref(),
-                        RequestIdentity {
-                            request_id: response_id.as_deref(),
-                            provider_message_id: Some(message_id),
-                        },
-                        &uid,
-                        None,
-                        RawMessageFacts {
-                            request_id: response_id.as_deref(),
-                            stop_reason: finish_reason,
-                            ..facts
+                        &EventRow {
+                            source: SOURCE,
+                            session_id: sid,
+                            project,
+                            cwd: project,
+                            message_id,
+                            ts_ms: ts,
+                            role: "assistant",
+                            kind: "tool_use",
+                            text: Some(&format_tool_event_text(
+                                &call.name,
+                                target.as_deref(),
+                                &call.arguments,
+                            )),
+                            model: row_model,
+                            token_json: token_json.as_deref(),
+                            identity: RequestIdentity {
+                                request_id: response_id.as_deref(),
+                                provider_message_id: Some(message_id),
+                            },
+                            event_uid: &uid,
+                            raw_facts: RawMessageFacts {
+                                request_id: response_id.as_deref(),
+                                stop_reason: finish_reason,
+                                ..facts
+                            },
+                            ..EventRow::default()
                         },
                     )?;
                     outcome.events += 1;
+                    let call_ref = ToolCallRef {
+                        source: SOURCE,
+                        session_id: sid,
+                        message_id,
+                        tool_use_id: &call.call_id,
+                        ts_ms: ts,
+                        git_branch: None,
+                        cwd: project,
+                    };
                     insert_tool_call(
                         conn,
-                        SOURCE,
-                        sid,
-                        message_id,
-                        &call.call_id,
+                        &call_ref,
                         &call.name,
                         target.as_deref(),
                         &serde_json::to_string(&call.arguments).unwrap_or_default(),
                         None,
-                        ts,
                     )?;
                     outcome.tool_calls += 1;
                     if muse::is_subagent_tool(&call.name) {
@@ -15025,18 +15148,7 @@ pub(crate) fn ingest_muse_session(
                     }
                     if muse::is_file_edit_tool(&call.name) {
                         if let Some(path) = target.as_deref() {
-                            upsert_file_edit_from_call(
-                                conn,
-                                SOURCE,
-                                sid,
-                                message_id,
-                                &call.call_id,
-                                path,
-                                &call.name,
-                                ts,
-                                None,
-                                project,
-                            )?;
+                            upsert_file_edit_from_call(conn, &call_ref, path, &call.name)?;
                             outcome.file_edits += 1;
                         }
                     }
@@ -15062,23 +15174,21 @@ pub(crate) fn ingest_muse_session(
                     let uid = format!("result:{}", result.call_id);
                     insert_session_event(
                         conn,
-                        SOURCE,
-                        sid,
-                        project,
-                        project,
-                        None,
-                        &uid,
-                        None,
-                        ts,
-                        "tool_result",
-                        "tool_result",
-                        text,
-                        None,
-                        None,
-                        RequestIdentity::none(),
-                        &uid,
-                        Some(&result_facts),
-                        facts,
+                        &EventRow {
+                            source: SOURCE,
+                            session_id: sid,
+                            project,
+                            cwd: project,
+                            message_id: &uid,
+                            ts_ms: ts,
+                            role: "tool_result",
+                            kind: "tool_result",
+                            text,
+                            event_uid: &uid,
+                            tool_result_facts: Some(&result_facts),
+                            raw_facts: facts,
+                            ..EventRow::default()
+                        },
                     )?;
                     outcome.events += 1;
                     match result_facts.result_status.as_deref() {
@@ -15201,14 +15311,16 @@ pub(crate) fn ingest_muse_session(
     let last_ts = transcript.last_ts().unwrap_or(first_ts);
     upsert_session(
         conn,
-        sid,
-        SOURCE,
-        project,
-        None,
-        first_ts,
-        last_ts,
-        last_assistant_text.as_deref(),
-        Some(raw_path),
+        &SessionCatalogRow {
+            session_id: sid,
+            source: SOURCE,
+            cwd: project,
+            git_branch: None,
+            first_ts,
+            last_ts,
+            last_assistant_text: last_assistant_text.as_deref(),
+            raw_path: Some(raw_path),
+        },
     )?;
     // `upsert_session` merges, which suits an append-only log read in pieces.
     // This read is the whole transcript, so the fields it owns are assigned
@@ -15309,17 +15421,7 @@ fn sync_grok_with_coverage(
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    let mut inserted = 0;
-    let mut scanned = 0;
-    let mut sessions = 0;
-    let mut errors = 0;
-    // Sessions this run could **account for**: indexed now, or confirmed
-    // unchanged against a stamp it read successfully. Not the same as
-    // `sessions`, which counts only what was indexed — a store that is fully
-    // synced indexes nothing on every later run, and using that count to
-    // decide whether the source failed would fail it forever over one
-    // unreadable sibling.
-    let mut accounted = 0;
+    let mut walk = StampedSessionWalk::default();
     // The enumeration is the one the source fingerprint already made this
     // sweep; the stamps below are read fresh and reused by discovery (#317).
     for chat in capture_files(
@@ -15336,71 +15438,19 @@ fn sync_grok_with_coverage(
         let stamp = match crate::discover::sweep_inventory::restamp_grok(&chat) {
             Ok((stamp, _)) => stamp,
             Err(error) => {
-                if error.is::<CaptureCancelled>() {
-                    return Err(error);
-                }
-                scanned += 1;
-                errors += 1;
-                coverage.note_unread();
-                sync_note!("  [grok] unreadable session {}: {error:#}", chat.display());
+                walk.scanned += 1;
+                walk.note_unreadable(coverage, "grok", &chat, error)?;
                 continue;
             }
         };
         let recorded = grok_state.get(&key);
-        let recorded_stamp = recorded.and_then(grok_state_stamp).map(str::to_string);
-        let recorded_session = recorded.and_then(grok_state_session).map(str::to_string);
-        let recorded_evidence = recorded.and_then(grok_state_had_evidence);
-        if recorded_stamp.as_deref() == Some(stamp.as_str()) {
-            // The stamp says the file has not changed. That is only half the
-            // question: `.sync-state.json` lives beside the database, so a
-            // deleted or rebuilt `history.db` keeps this file, and a stamp
-            // read on its own would answer "already indexed" for a session
-            // whose rows are gone -- until some file in the directory changes,
-            // which for a finished session is never. The Codex and Claude
-            // walks check the database for the same reason.
-            //
-            // The other half of that is knowing what "its rows" means for
-            // *this* session. Not every Grok session produces `session_events`
-            // -- one made only of `system` lines, synthetic turns or encrypted
-            // reasoning is stored entirely as markers, and one with an empty
-            // transcript and a `subagents/` entry only a relationship -- so
-            // asking only about events would find nothing and re-read such a
-            // session on every run, forever. The answer is not to guess from
-            // the tables but to record what the indexing run actually
-            // produced, and then to ask about that.
-            match (recorded_session.as_deref(), recorded_evidence) {
-                // Written by an older build that saved the stamp alone, so
-                // there is no session id to look the evidence up by. Trust
-                // the stamp, as that build did.
-                (None, _) => {
-                    accounted += 1;
-                    continue;
-                }
-                // The run that indexed it wrote no evidence rows at all. It
-                // still wrote a catalog row -- every ingestion does -- so
-                // that is what there is to check, and it is enough: a session
-                // with no evidence *is* its catalog row. Skipping without
-                // asking anything is what let an empty session disappear for
-                // good when the database was rebuilt.
-                (Some(id), Some(false)) if grok_catalog_row_exists(conn, id)? => {
-                    accounted += 1;
-                    continue;
-                }
-                (Some(id), Some(true) | None)
-                    if grok_indexed_evidence_remains(
-                        conn,
-                        id,
-                        recorded.and_then(grok_state_transcript_events),
-                    )? =>
-                {
-                    accounted += 1;
-                    continue;
-                }
-                // Unchanged, and what it did write is missing: re-index it.
-                _ => {}
-            }
+        if recorded.and_then(grok_state_stamp) == Some(stamp.as_str())
+            && grok_recorded_still_indexed(conn, recorded)?
+        {
+            walk.accounted += 1;
+            continue;
         }
-        scanned += 1;
+        walk.scanned += 1;
         match scan_grok_session_file(&chat) {
             Ok(Some(session)) => {
                 let raw_path = chat.to_string_lossy().to_string();
@@ -15410,7 +15460,7 @@ fn sync_grok_with_coverage(
                 // between the two halves of that.
                 let tx = conn.unchecked_transaction()?;
                 let outcome = ingest_grok_session(&tx, &session, &raw_path)?;
-                inserted += outcome.prompts;
+                walk.inserted += outcome.prompts;
                 tx.commit()?;
                 // Whether this session has any evidence to go looking for on
                 // a later run. A session stored entirely as markers has no
@@ -15421,8 +15471,8 @@ fn sync_grok_with_coverage(
                 // session never filled and re-reads it for ever.
                 let had_evidence =
                     outcome.events > 0 || outcome.markers > 0 || outcome.relationships > 0;
-                sessions += 1;
-                accounted += 1;
+                walk.sessions += 1;
+                walk.accounted += 1;
                 // The session id travels with the stamp so the next run can
                 // ask the database whether this evidence is still there, and
                 // `evidence` says whether there was any to ask about.
@@ -15442,541 +15492,52 @@ fn sync_grok_with_coverage(
             Ok(None) => {
                 // Read fine, and there was no session in it -- so there is no
                 // session id to check any future run against either.
-                accounted += 1;
+                walk.accounted += 1;
                 grok_state.insert(key, json!({ "stamp": stamp }));
             }
-            Err(error) => {
-                if error.is::<CaptureCancelled>() {
-                    return Err(error);
-                }
-                errors += 1;
-                // The stamp is deliberately not recorded so the next sweep
-                // retries this directory. Keep the source fingerprint stale
-                // too, or the next tick would skip before reaching it.
-                coverage.note_unread();
-                sync_note!("  [grok] unreadable session {}: {error:#}", chat.display());
-            }
+            Err(error) => walk.note_unreadable(coverage, "grok", &chat, error)?,
         }
     }
     state.insert(GROK_SYNC_STATE_KEY.to_string(), Value::Object(grok_state));
-    if scanned > 0 {
-        let suffix = if errors > 0 {
-            format!(" ({errors} errors)")
-        } else {
-            String::new()
-        };
-        sync_note!("  [grok] +{inserted} rows from {sessions} sessions{suffix}");
-    }
-    // A store where nothing could be read is a failed source, not an empty
-    // one: the caller records it and the run says so. A store where something
-    // failed and something else was accounted for stays a success, so the
-    // sessions that did read keep their saved stamps -- otherwise one
-    // unreadable directory would send every future run back over the whole
-    // store, and a fully synced store would fail this source on every run
-    // from then on.
-    if errors > 0 && accounted == 0 {
-        anyhow::bail!(
-            "{errors} Grok session(s) could not be read and none were indexed; \
-             the unreadable directories are named above"
-        );
-    }
-    Ok(inserted)
+    walk.finish("grok", "Grok session(s)", "directories")
 }
 
-/// Where Grok writes its process-wide per-inference log, under the Grok home
-/// (`GROK_HOME`, else `~/.grok`).
-pub(crate) fn grok_unified_log_path(grok_home: &Path) -> PathBuf {
-    grok_home.join("logs").join("unified.jsonl")
-}
-
-/// The key the unified log's per-process model memory is parked under in its
-/// `transcript_cursors` document.
-const GROK_UNIFIED_CURSOR_KEY: &str = "grok_unified";
-
-/// What one pass over `logs/unified.jsonl` did.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
-pub(crate) struct GrokUnifiedPass {
-    /// Bytes read past the committed cursor. Zero when nothing was appended.
-    pub bytes_read: u64,
-    /// Usage rows read this pass, and how many of them were new.
-    pub usage_rows: usize,
-    pub new_rows: usize,
-    /// Usage rows that named no session, so could not be attached.
-    pub unattributed: usize,
-    /// Terminated rows that were not JSON, or were too large to hold.
-    pub malformed: usize,
-    /// Catalogued sessions that gained usage events.
-    pub sessions_materialized: usize,
-    /// Stored rows, from any pass, whose session is not in the catalog. They
-    /// are kept — the log is never re-read, so dropping them would lose the
-    /// usage for good if the session is indexed later — and counted so the
-    /// retained backlog is visible.
-    pub orphan_rows: usize,
-}
-
-/// Read what `logs/unified.jsonl` gained since the last pass, in one
-/// transaction: the new rows, the advanced cursor, and the usage events of
-/// every catalogued session they touch commit together or not at all.
+/// Whether a Grok session whose stamp says unchanged is still indexed.
 ///
-/// The transaction is taken `IMMEDIATE`, so the write lock is held from the
-/// first read of the cursor: a deferred one that read the cursor while a
-/// hydration was writing would fail to upgrade (`SQLITE_BUSY_SNAPSHOT`)
-/// instead of waiting behind it.
-pub(crate) fn sync_grok_unified_log(
-    conn: &Connection,
-    grok_home: &Path,
-) -> Result<GrokUnifiedPass> {
-    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
-    let pass = sync_grok_unified_log_in(&tx, grok_home)?;
-    tx.commit()?;
-    Ok(pass)
-}
-
-/// [`sync_grok_unified_log`] inside a transaction the caller already holds —
-/// targeted hydration's.
+/// The stamp says the file has not changed. That is only half the question:
+/// `.sync-state.json` lives beside the database, so a deleted or rebuilt
+/// `history.db` keeps this file, and a stamp read on its own would answer
+/// "already indexed" for a session whose rows are gone -- until some file in
+/// the directory changes, which for a finished session is never. The Codex and
+/// Claude walks check the database for the same reason.
 ///
-/// The log is append-only and covers every session on the machine, so it is
-/// read from a byte cursor, never re-read whole: a second pass over an
-/// unchanged log reads zero bytes. Each usage row is copied into
-/// `grok_unified_usage` — the durable copy, because the bytes are never read
-/// again — keyed on [`grok::unified_row_key`], so a region read twice after a
-/// rotation writes the same rows. A trailing line with no newline is withheld
-/// until it has one. A terminated row that is not JSON is counted and passed
-/// over: the log is Grok's process log, not a session's evidence, and holding
-/// the cursor on one bad line would stop every later inference being read.
-pub(crate) fn sync_grok_unified_log_in(
-    conn: &Connection,
-    grok_home: &Path,
-) -> Result<GrokUnifiedPass> {
-    let mut pass = GrokUnifiedPass::default();
-    let path = grok_unified_log_path(grok_home);
-    match path.metadata() {
-        Ok(metadata) if metadata.is_file() => {}
-        Ok(_) => return Ok(pass),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(pass),
-        Err(error) => {
-            return Err(error).with_context(|| format!("stat Grok unified log {}", path.display()))
+/// The other half of that is knowing what "its rows" means for *this* session.
+/// Not every Grok session produces `session_events` -- one made only of
+/// `system` lines, synthetic turns or encrypted reasoning is stored entirely as
+/// markers, and one with an empty transcript and a `subagents/` entry only a
+/// relationship -- so asking only about events would find nothing and re-read
+/// such a session on every run, forever. The answer is not to guess from the
+/// tables but to record what the indexing run actually produced, and then to
+/// ask about that. Unchanged, and what it did write is missing: re-index it.
+fn grok_recorded_still_indexed(conn: &Connection, recorded: Option<&Value>) -> Result<bool> {
+    match (
+        recorded.and_then(grok_state_session),
+        recorded.and_then(grok_state_had_evidence),
+    ) {
+        // Written by an older build that saved the stamp alone, so there is no
+        // session id to look the evidence up by. Trust the stamp, as that
+        // build did.
+        (None, _) => Ok(true),
+        // The run that indexed it wrote no evidence rows at all. It still
+        // wrote a catalog row -- every ingestion does -- so that is what there
+        // is to check, and it is enough: a session with no evidence *is* its
+        // catalog row. Skipping without asking anything is what let an empty
+        // session disappear for good when the database was rebuilt.
+        (Some(id), Some(false)) => grok_catalog_row_exists(conn, id),
+        (Some(id), Some(true) | None) => {
+            grok_indexed_evidence_remains(conn, id, recorded.and_then(grok_state_transcript_events))
         }
     }
-    let locator = path.to_string_lossy().to_string();
-    let key = transcript_cursor::CursorKey::Locator {
-        source: "grok",
-        locator: &locator,
-    };
-    let mut cursor = transcript_cursor::load_cursor(conn, &key)?;
-    let mut reader = transcript_cursor::TranscriptReader::open(&path, cursor.file.as_ref(), None)
-        .with_context(|| format!("read Grok unified log {}", path.display()))?;
-    let start = reader.start_offset();
-    // Which model each process last named. Only meaningful for the bytes
-    // after the cursor, so a log read from the start begins with none.
-    let mut pid_models: HashMap<i64, String> = if start == 0 {
-        HashMap::new()
-    } else {
-        cursor
-            .extra
-            .get(GROK_UNIFIED_CURSOR_KEY)
-            .and_then(|state| state.get("pid_models"))
-            .and_then(|models| serde_json::from_value(models.clone()).ok())
-            .unwrap_or_default()
-    };
-    let mut touched: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut line = String::new();
-    loop {
-        check_capture_cancelled()?;
-        let offset = reader.position();
-        match reader.next_line(&mut line)? {
-            None | Some(transcript_cursor::ReadRecord::Unterminated) => break,
-            Some(transcript_cursor::ReadRecord::Oversized { .. }) => {
-                pass.malformed += 1;
-                continue;
-            }
-            Some(transcript_cursor::ReadRecord::Terminated) => {}
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
-            pass.malformed += 1;
-            continue;
-        };
-        match grok::parse_unified_row(&value, &pid_models) {
-            grok::GrokUnifiedRow::Usage(usage) => {
-                pass.usage_rows += 1;
-                pass.new_rows += conn.execute(
-                    "INSERT OR IGNORE INTO grok_unified_usage \
-                     (row_key, session_id, ts_ms, pid, model, event_id, usage_json, locator, line_offset) \
-                     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    params![
-                        grok::unified_row_key(&value),
-                        usage.session_id,
-                        usage.ts_ms,
-                        usage.pid,
-                        usage.model,
-                        usage.event_id,
-                        usage.usage.to_string(),
-                        locator,
-                        offset as i64,
-                    ],
-                )?;
-                touched.insert(usage.session_id);
-            }
-            grok::GrokUnifiedRow::ModelChange { pid, model } => {
-                pid_models.insert(pid, model);
-            }
-            grok::GrokUnifiedRow::Unattributed => pass.unattributed += 1,
-            grok::GrokUnifiedRow::Other => {}
-        }
-    }
-    pass.bytes_read = reader.position().saturating_sub(start);
-    match reader.commit(reader.position())? {
-        transcript_cursor::CommitOutcome::Published(file) => {
-            cursor.file = Some(file);
-            cursor.extra.insert(
-                GROK_UNIFIED_CURSOR_KEY.to_string(),
-                json!({ "pid_models": pid_models }),
-            );
-            transcript_cursor::store_cursor(conn, &key, &cursor)?;
-        }
-        // The log was replaced or truncated while it was being read. The rows
-        // already copied are keyed on their content, so keeping them is
-        // harmless; the cursor stays where it was and the next pass re-reads.
-        transcript_cursor::CommitOutcome::Superseded => {}
-    }
-    for session_id in touched {
-        if !grok_catalog_row_exists(conn, &session_id)? {
-            // Retained, not dropped: the rows wait in `grok_unified_usage`
-            // until the session is indexed, and that ingestion attaches them.
-            continue;
-        }
-        if materialize_grok_unified_usage(conn, &session_id, None)?.inserted == 0 {
-            continue;
-        }
-        // A cached hydration replays the diagnostics it stored, and those
-        // were written before this usage existed. Clearing them makes the
-        // next unchanged read rebuild the usage caveat from the stored rows.
-        conn.execute(
-            "UPDATE session_hydration_checkpoints SET source_diagnostics_json = NULL \
-             WHERE source = 'grok' AND session_id = ?",
-            params![session_id],
-        )?;
-        pass.sessions_materialized += 1;
-    }
-    let orphans: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM grok_unified_usage u WHERE NOT EXISTS \
-         (SELECT 1 FROM sessions s WHERE s.source = 'grok' AND s.session_id = u.session_id)",
-        [],
-        |row| row.get(0),
-    )?;
-    pass.orphan_rows = orphans as usize;
-    Ok(pass)
-}
-
-/// How many `logs/unified.jsonl` usage rows are stored for one session.
-fn grok_unified_rows_pending(conn: &Connection, session_id: &str) -> Result<usize> {
-    let count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM grok_unified_usage WHERE session_id = ?",
-        params![session_id],
-        |row| row.get(0),
-    )?;
-    Ok(count as usize)
-}
-
-/// What attaching one session's `logs/unified.jsonl` rows established.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct GrokUnifiedCoverage {
-    /// Stored usage rows for the session, attached now or before.
-    pub rows: usize,
-    /// Rows attached by this call; zero when nothing was new.
-    pub inserted: usize,
-    /// Turns the log covers: a demoted breakdown, or any other turn whose
-    /// window holds a log row (including a context snapshot with no breakdown).
-    pub covered_turns: usize,
-    /// Turns the log does not cover whose `turn_completed.usage` still counts.
-    pub turn_usage_turns: usize,
-    /// Turns the log does not cover and that carry no breakdown: a context
-    /// snapshot, or a turn the census recorded that left no row.
-    pub proxy_only_turns: usize,
-}
-
-/// How many turns the last replacing read of one Grok session saw.
-fn store_grok_turn_census(conn: &Connection, session_id: &str, turns: usize) -> Result<()> {
-    conn.execute(
-        "INSERT INTO grok_session_turns (session_id, turns) VALUES (?, ?) \
-         ON CONFLICT(session_id) DO UPDATE SET turns = excluded.turns",
-        params![session_id, turns as i64],
-    )?;
-    Ok(())
-}
-
-fn grok_turn_census(conn: &Connection, session_id: &str) -> Result<Option<usize>> {
-    let turns: Option<i64> = conn
-        .query_row(
-            "SELECT turns FROM grok_session_turns WHERE session_id = ?",
-            params![session_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    Ok(turns.map(|turns| turns.max(0) as usize))
-}
-
-/// Whether one stored turn row's window contains a unified-log timestamp.
-fn unified_timestamp_covers(token: &Value, timestamps: &[Option<i64>]) -> bool {
-    let Some(start) = token.get("turn_start_ms").and_then(Value::as_i64) else {
-        return false;
-    };
-    let Some(end) = token.get("turn_end_ms").and_then(Value::as_i64) else {
-        return false;
-    };
-    timestamps
-        .iter()
-        .flatten()
-        .any(|ts| *ts >= start && *ts <= end)
-}
-
-/// Which of a session's turns `logs/unified.jsonl` covers.
-///
-/// `turn_tokens` are the `updates.jsonl` token objects, one per turn that
-/// left a row. `unified_timestamps` are every stored log row's time (`None`
-/// when the row named none — that row covers every turn). `census_turns` is
-/// how many turns the stream opened, when the replacing read recorded it;
-/// turns it counts that left no row are uncovered unless a timeless log row
-/// covers the session.
-pub(crate) fn classify_grok_turn_coverage(
-    turn_tokens: &[Value],
-    unified_timestamps: &[Option<i64>],
-    census_turns: Option<usize>,
-) -> GrokUnifiedCoverage {
-    let timeless = unified_timestamps.iter().any(Option::is_none);
-    let mut covered = 0usize;
-    let mut own = 0usize;
-    let mut proxy = 0usize;
-    for token in turn_tokens {
-        if timeless
-            || token.get("turn_usage").is_some()
-            || unified_timestamp_covers(token, unified_timestamps)
-        {
-            covered += 1;
-        } else if token.get("usage").is_some() {
-            own += 1;
-        } else {
-            proxy += 1;
-        }
-    }
-    if let Some(turns) = census_turns {
-        let hidden = turns.saturating_sub(covered + own + proxy);
-        if timeless {
-            covered += hidden;
-        } else {
-            proxy += hidden;
-        }
-    }
-    GrokUnifiedCoverage {
-        covered_turns: covered,
-        turn_usage_turns: own,
-        proxy_only_turns: proxy,
-        ..GrokUnifiedCoverage::default()
-    }
-}
-
-/// One stored `grok_unified_usage` row, as materialization reads it.
-struct GrokUnifiedStored {
-    row_key: String,
-    ts_ms: Option<i64>,
-    pid: Option<i64>,
-    model: Option<String>,
-    event_id: Option<String>,
-    usage_json: String,
-}
-
-/// Attach one session's stored `logs/unified.jsonl` rows as usage events, and
-/// settle which of its turns they cover.
-///
-/// Each row becomes one assistant event keyed `unified:<row key>`, in its own
-/// request span, with `token_json = {"usage": <counters>, "source":
-/// "logs/unified.jsonl", …}` — one inference, one request, normalized as
-/// `per-request` usage. The event carries no text, so it is
-/// `kind = "text"` with `raw_kind = "unified_log_usage"` to say what it is.
-/// Only rows with no event yet are inserted: an append attaches its own rows
-/// and leaves every event already stored untouched, so the change feed sees
-/// the new rows and nothing else.
-///
-/// Coverage is decided **per turn**. A turn's `turn_completed.usage` is moved
-/// to `turn_usage` (not normalized) only when a log row falls inside that
-/// turn's `[turn_start_ms, turn_end_ms]`; a turn the log does not reach —
-/// the log started mid-session, or was rotated away — keeps its breakdown as
-/// `usage`. So the same spend is never counted twice and a turn the log never
-/// saw is not dropped. A log row with no time cannot be placed in a turn, so
-/// its presence covers every turn: dropping a turn's breakdown is recoverable
-/// from `turn_usage`, counting one inference twice is not. The rows' models
-/// join `models_json`, and a row later than the session's last activity
-/// extends it.
-fn materialize_grok_unified_usage(
-    conn: &Connection,
-    session_id: &str,
-    fallback_ts: Option<i64>,
-) -> Result<GrokUnifiedCoverage> {
-    const SOURCE: &str = "grok";
-    type SessionFacts = (Option<String>, Option<String>, Option<i64>, Option<String>);
-    let session: Option<SessionFacts> = conn
-        .query_row(
-            "SELECT cwd, git_branch, first_activity_ms, models_json FROM sessions \
-             WHERE source = 'grok' AND session_id = ?",
-            params![session_id],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .optional()?;
-    let Some((cwd, branch, first_activity, models_json)) = session else {
-        return Ok(GrokUnifiedCoverage::default());
-    };
-    let total = grok_unified_rows_pending(conn, session_id)?;
-    if total == 0 {
-        return Ok(GrokUnifiedCoverage::default());
-    }
-    // Rows whose local event is not stored yet. A row already attached is
-    // left exactly as it is.
-    let rows = conn
-        .prepare(
-            "SELECT row_key, ts_ms, pid, model, event_id, usage_json FROM grok_unified_usage u \
-             WHERE session_id = ?1 AND NOT EXISTS (SELECT 1 FROM session_events e \
-               WHERE e.source = 'grok' AND e.session_id = ?1 \
-               AND e.event_uid = 'unified:' || u.row_key AND e.location IN ('local', 'both')) \
-             ORDER BY ts_ms IS NULL, ts_ms, locator, line_offset, row_key",
-        )?
-        .query_map(params![session_id], |row| {
-            Ok(GrokUnifiedStored {
-                row_key: row.get(0)?,
-                ts_ms: row.get(1)?,
-                pid: row.get(2)?,
-                model: row.get(3)?,
-                event_id: row.get(4)?,
-                usage_json: row.get(5)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let fallback_ts = fallback_ts.or(first_activity).unwrap_or(0);
-    let mut models: Vec<String> = models_json
-        .as_deref()
-        .and_then(|raw| serde_json::from_str(raw).ok())
-        .unwrap_or_default();
-    let models_before = models.len();
-    for row in &rows {
-        check_capture_cancelled()?;
-        let uid = format!("unified:{}", row.row_key);
-        let mut token_json = serde_json::Map::new();
-        token_json.insert(
-            "usage".into(),
-            serde_json::from_str(&row.usage_json).unwrap_or(Value::Null),
-        );
-        token_json.insert("source".into(), json!("logs/unified.jsonl"));
-        if let Some(pid) = row.pid {
-            token_json.insert("pid".into(), json!(pid));
-        }
-        if let Some(event_id) = &row.event_id {
-            token_json.insert("event_id".into(), json!(event_id));
-        }
-        let token_json = Value::Object(token_json).to_string();
-        insert_session_event_with_provenance(
-            conn,
-            SOURCE,
-            session_id,
-            cwd.as_deref(),
-            cwd.as_deref(),
-            branch.as_deref(),
-            &uid,
-            None,
-            row.ts_ms.unwrap_or(fallback_ts),
-            "assistant",
-            "text",
-            None,
-            row.model.as_deref(),
-            Some(&token_json),
-            None,
-            None,
-            RequestIdentity::none(),
-            &uid,
-            None,
-            RawMessageFacts {
-                request_span: Some(&uid),
-                ..RawMessageFacts::default()
-            },
-            Some("unified_log_usage"),
-        )?;
-        if let Some(model) = &row.model {
-            if !models.iter().any(|seen| seen == model) {
-                models.push(model.clone());
-            }
-        }
-    }
-    // Per turn: demote a turn's breakdown only when the log reaches into it.
-    // A turn with no recorded window cannot be placed, so a timed row never
-    // covers it; only a timeless row (which covers every turn) does. Otherwise
-    // it keeps its own `usage`, and `classify_grok_turn_coverage` counts it so.
-    conn.execute(
-        "UPDATE session_events SET token_json = json_set(json_remove(token_json, '$.usage'), \
-         '$.turn_usage', json(json_extract(token_json, '$.usage'))) \
-         WHERE source = 'grok' AND session_id = ?1 AND event_uid NOT LIKE 'unified:%' \
-         AND token_json IS NOT NULL AND json_valid(token_json) \
-         AND json_extract(token_json, '$.source') = 'updates.jsonl' \
-         AND json_type(token_json, '$.usage') IS NOT NULL \
-         AND (EXISTS (SELECT 1 FROM grok_unified_usage u WHERE u.session_id = ?1 \
-                AND u.ts_ms IS NULL) \
-           OR EXISTS (SELECT 1 FROM grok_unified_usage u WHERE u.session_id = ?1 \
-                AND u.ts_ms BETWEEN json_extract(token_json, '$.turn_start_ms') \
-                                AND json_extract(token_json, '$.turn_end_ms')))",
-        params![session_id],
-    )?;
-    if models.len() != models_before {
-        conn.execute(
-            "UPDATE sessions SET models_json = ? WHERE source = 'grok' AND session_id = ?",
-            params![serde_json::to_string(&models)?, session_id],
-        )?;
-    }
-    // An inference logged after the session's last recorded activity is
-    // activity too.
-    conn.execute(
-        "UPDATE sessions SET last_activity_ms = \
-           (SELECT MAX(ts_ms) FROM grok_unified_usage WHERE session_id = ?1) \
-         WHERE source = 'grok' AND session_id = ?1 \
-         AND (SELECT MAX(ts_ms) FROM grok_unified_usage WHERE session_id = ?1) \
-             > COALESCE(last_activity_ms, 0)",
-        params![session_id],
-    )?;
-    let class = grok_turn_coverage(conn, session_id)?;
-    Ok(GrokUnifiedCoverage {
-        rows: total,
-        inserted: rows.len(),
-        covered_turns: class.covered_turns,
-        turn_usage_turns: class.turn_usage_turns,
-        proxy_only_turns: class.proxy_only_turns,
-    })
-}
-
-/// Coverage of one session from the rows already stored: the turn token
-/// objects, the log timestamps, and the turn census when a replacing read
-/// wrote one.
-fn grok_turn_coverage(conn: &Connection, session_id: &str) -> Result<GrokUnifiedCoverage> {
-    let turn_tokens = conn
-        .prepare(
-            "SELECT token_json FROM session_events \
-             WHERE source = 'grok' AND session_id = ? \
-               AND token_json IS NOT NULL AND json_valid(token_json) \
-               AND json_extract(token_json, '$.source') = 'updates.jsonl'",
-        )?
-        .query_map(params![session_id], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?
-        .iter()
-        .filter_map(|raw| serde_json::from_str::<Value>(raw).ok())
-        .collect::<Vec<_>>();
-    let unified_timestamps = conn
-        .prepare("SELECT ts_ms FROM grok_unified_usage WHERE session_id = ?")?
-        .query_map(params![session_id], |row| row.get::<_, Option<i64>>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(classify_grok_turn_coverage(
-        &turn_tokens,
-        &unified_timestamps,
-        grok_turn_census(conn, session_id)?,
-    ))
 }
 
 /// What indexing one Grok session directory produced, and what its own records
@@ -16190,23 +15751,20 @@ fn ingest_grok_session(
                 let uid = grok_event_uid(group.and_then(|group| group.event_key.as_deref()), idx);
                 insert_session_event(
                     conn,
-                    SOURCE,
-                    sid,
-                    project,
-                    project,
-                    branch,
-                    &uid,
-                    None,
-                    ts,
-                    "user",
-                    "text",
-                    Some(text),
-                    None,
-                    None,
-                    RequestIdentity::none(),
-                    &uid,
-                    None,
-                    RawMessageFacts::default(),
+                    &EventRow {
+                        source: SOURCE,
+                        session_id: sid,
+                        project,
+                        cwd: project,
+                        git_branch: branch,
+                        message_id: &uid,
+                        ts_ms: ts,
+                        role: "user",
+                        kind: "text",
+                        text: Some(text),
+                        event_uid: &uid,
+                        ..EventRow::default()
+                    },
                 )?;
                 outcome.events += 1;
                 outcome.prompts += insert_history(
@@ -16266,25 +15824,23 @@ fn ingest_grok_session(
                 let uid = grok_event_uid(group.and_then(|group| group.event_key.as_deref()), idx);
                 insert_session_event(
                     conn,
-                    SOURCE,
-                    sid,
-                    project,
-                    project,
-                    branch,
-                    &uid,
-                    None,
-                    ts,
-                    "assistant",
-                    "thinking",
-                    Some(summary),
-                    None,
-                    None,
-                    RequestIdentity::none(),
-                    &uid,
-                    None,
-                    RawMessageFacts {
-                        request_span: grok_turn_span(turn).as_deref(),
-                        ..RawMessageFacts::default()
+                    &EventRow {
+                        source: SOURCE,
+                        session_id: sid,
+                        project,
+                        cwd: project,
+                        git_branch: branch,
+                        message_id: &uid,
+                        ts_ms: ts,
+                        role: "assistant",
+                        kind: "thinking",
+                        text: Some(summary),
+                        event_uid: &uid,
+                        raw_facts: RawMessageFacts {
+                            request_span: grok_turn_span(turn).as_deref(),
+                            ..RawMessageFacts::default()
+                        },
+                        ..EventRow::default()
                     },
                 )?;
                 outcome.events += 1;
@@ -16312,25 +15868,24 @@ fn ingest_grok_session(
                         grok_event_uid(group.and_then(|group| group.event_key.as_deref()), idx);
                     insert_session_event(
                         conn,
-                        SOURCE,
-                        sid,
-                        project,
-                        project,
-                        branch,
-                        &uid,
-                        None,
-                        ts,
-                        "assistant",
-                        "text",
-                        Some(text),
-                        model.as_deref(),
-                        None,
-                        RequestIdentity::none(),
-                        &uid,
-                        None,
-                        RawMessageFacts {
-                            request_span: grok_turn_span(turn).as_deref(),
-                            ..RawMessageFacts::default()
+                        &EventRow {
+                            source: SOURCE,
+                            session_id: sid,
+                            project,
+                            cwd: project,
+                            git_branch: branch,
+                            message_id: &uid,
+                            ts_ms: ts,
+                            role: "assistant",
+                            kind: "text",
+                            text: Some(text),
+                            model: model.as_deref(),
+                            event_uid: &uid,
+                            raw_facts: RawMessageFacts {
+                                request_span: grok_turn_span(turn).as_deref(),
+                                ..RawMessageFacts::default()
+                            },
+                            ..EventRow::default()
                         },
                     )?;
                     outcome.events += 1;
@@ -16358,29 +15913,28 @@ fn ingest_grok_session(
                     let uid = format!("tool:{tool_use_id}");
                     insert_session_event(
                         conn,
-                        SOURCE,
-                        sid,
-                        project,
-                        project,
-                        branch,
-                        &uid,
-                        None,
-                        ts,
-                        "assistant",
-                        "tool_use",
-                        Some(&format_tool_event_text(
-                            &call.name,
-                            target.as_deref(),
-                            &call.arguments,
-                        )),
-                        model.as_deref(),
-                        None,
-                        RequestIdentity::none(),
-                        &uid,
-                        None,
-                        RawMessageFacts {
-                            request_span: grok_turn_span(call_turn).as_deref(),
-                            ..RawMessageFacts::default()
+                        &EventRow {
+                            source: SOURCE,
+                            session_id: sid,
+                            project,
+                            cwd: project,
+                            git_branch: branch,
+                            message_id: &uid,
+                            ts_ms: ts,
+                            role: "assistant",
+                            kind: "tool_use",
+                            text: Some(&format_tool_event_text(
+                                &call.name,
+                                target.as_deref(),
+                                &call.arguments,
+                            )),
+                            model: model.as_deref(),
+                            event_uid: &uid,
+                            raw_facts: RawMessageFacts {
+                                request_span: grok_turn_span(call_turn).as_deref(),
+                                ..RawMessageFacts::default()
+                            },
+                            ..EventRow::default()
                         },
                     )?;
                     outcome.events += 1;
@@ -16390,17 +15944,22 @@ fn ingest_grok_session(
                     if let Some(call_turn) = call_turn {
                         turn_tool_tail.insert(call_turn, uid.clone());
                     }
+                    let call_ref = ToolCallRef {
+                        source: SOURCE,
+                        session_id: sid,
+                        message_id: &uid,
+                        tool_use_id: &tool_use_id,
+                        ts_ms: ts,
+                        git_branch: branch,
+                        cwd: project,
+                    };
                     insert_tool_call(
                         conn,
-                        SOURCE,
-                        sid,
-                        &uid,
-                        &tool_use_id,
+                        &call_ref,
                         &call.name,
                         target.as_deref(),
                         &serde_json::to_string(&call.arguments).unwrap_or_default(),
                         None,
-                        ts,
                     )?;
                     outcome.tool_calls += 1;
                     if grok::is_subagent_tool(&call.name) {
@@ -16408,18 +15967,7 @@ fn ingest_grok_session(
                     }
                     if grok::is_file_edit_tool(&call.name) {
                         if let Some(path) = target.as_deref() {
-                            upsert_file_edit_from_call(
-                                conn,
-                                SOURCE,
-                                sid,
-                                &uid,
-                                &tool_use_id,
-                                path,
-                                &call.name,
-                                ts,
-                                branch,
-                                project,
-                            )?;
+                            upsert_file_edit_from_call(conn, &call_ref, path, &call.name)?;
                             outcome.file_edits += 1;
                         }
                     }
@@ -16473,23 +16021,21 @@ fn ingest_grok_session(
                 .with_ordering(call_index, event_index);
                 insert_session_event(
                     conn,
-                    SOURCE,
-                    sid,
-                    project,
-                    project,
-                    branch,
-                    &uid,
-                    None,
-                    ts,
-                    "tool_result",
-                    "tool_result",
-                    text.as_deref(),
-                    None,
-                    None,
-                    RequestIdentity::none(),
-                    &uid,
-                    Some(&facts),
-                    RawMessageFacts::default(),
+                    &EventRow {
+                        source: SOURCE,
+                        session_id: sid,
+                        project,
+                        cwd: project,
+                        git_branch: branch,
+                        message_id: &uid,
+                        ts_ms: ts,
+                        role: "tool_result",
+                        kind: "tool_result",
+                        text: text.as_deref(),
+                        event_uid: &uid,
+                        tool_result_facts: Some(&facts),
+                        ..EventRow::default()
+                    },
                 )?;
                 outcome.events += 1;
                 if failed || is_error.is_some() {
@@ -16566,14 +16112,16 @@ fn ingest_grok_session(
 
     upsert_session(
         conn,
-        sid,
-        SOURCE,
-        project,
-        branch,
-        session.first_ts,
-        session.last_ts,
-        session.last_assistant_text.as_deref(),
-        Some(raw_path),
+        &SessionCatalogRow {
+            session_id: sid,
+            source: SOURCE,
+            cwd: project,
+            git_branch: branch,
+            first_ts: session.first_ts,
+            last_ts: session.last_ts,
+            last_assistant_text: session.last_assistant_text.as_deref(),
+            raw_path: Some(raw_path),
+        },
     )?;
     // `upsert_session` merges: it takes MIN/MAX of the activity bounds and
     // keeps the old `last_assistant_text` when the new read has none. That is
@@ -17184,6 +16732,95 @@ struct GrokSession {
     subagents: Vec<GrokSubagentEvidence>,
 }
 
+/// Adds `model` to `models` unless it is already named.
+fn note_model(models: &mut Vec<String>, model: &str) {
+    if !models.iter().any(|seen| seen == model) {
+        models.push(model.to_owned());
+    }
+}
+
+/// Reads a session's `updates.jsonl`, and whether it was there at all.
+fn read_grok_updates(updates_path: &Path) -> Result<(grok::GrokUpdates, bool)> {
+    match fs::read_to_string(updates_path) {
+        Ok(contents) => Ok((grok::parse_updates(&contents, updates_path)?, true)),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            Ok((grok::GrokUpdates::default(), false))
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("read Grok updates {}", updates_path.display()))
+        }
+    }
+}
+
+/// What a session's `chat_history.jsonl` says, record by record.
+#[derive(Default)]
+struct GrokChatRead {
+    lines: Vec<grok::GrokChatLine>,
+    synthetic_reasons: HashMap<usize, String>,
+    last_assistant_text: Option<String>,
+    models: Vec<String>,
+}
+
+/// Parses every record of a session's chat history.
+fn read_grok_chat(chat: &Path) -> Result<GrokChatRead> {
+    let mut read = GrokChatRead::default();
+    let contents = fs::read_to_string(chat)
+        .with_context(|| format!("read Grok chat history {}", chat.display()))?;
+    for (number, row) in jsonl::rows(&contents).enumerate() {
+        check_capture_cancelled()?;
+        // A complete row that does not parse fails the read. The ingestion
+        // this feeds replaces the session's evidence, so dropping the row
+        // would commit a transcript that is missing a turn Grok did write --
+        // and save the stamp that stops the next run from looking again.
+        let Some(value) = jsonl::parse_row(row, chat, number + 1)? else {
+            continue;
+        };
+        if let Some(reason) = value.get("synthetic_reason").and_then(Value::as_str) {
+            read.synthetic_reasons
+                .insert(read.lines.len(), reason.to_string());
+        }
+        let parsed = grok::parse_chat_record(&value);
+        if let grok::GrokRecord::Assistant { text, model, .. } = &parsed.record {
+            if let Some(text) = text {
+                read.last_assistant_text = Some(text.chars().take(4096).collect::<String>());
+            }
+            if let Some(model) = model {
+                note_model(&mut read.models, model);
+            }
+        }
+        read.lines.push(parsed);
+    }
+    Ok(read)
+}
+
+/// The evidence files beside a session's chat history.
+#[derive(Default)]
+struct GrokSidecars {
+    signals: Option<grok::GrokSignals>,
+    prompt_context: Option<GrokPromptContext>,
+    compactions: Vec<GrokCompaction>,
+    subagents: Vec<GrokSubagentEvidence>,
+}
+
+/// Reads the evidence files in a Grok session directory.
+fn read_grok_sidecars(dir: &Path) -> Result<GrokSidecars> {
+    // A `signals.json` that exists but does not parse is still a fact about
+    // the session, so the marker is written from its existence and the counters
+    // are simply absent. Collapsing that into "no signals" would delete the
+    // marker a previous read wrote and record nothing in its place.
+    let signals = match read_json_file(&dir.join("signals.json"))? {
+        GrokSidecar::Absent => None,
+        GrokSidecar::Unparsed => Some(grok::GrokSignals::default()),
+        GrokSidecar::Read(value) => Some(grok::parse_signals(&value)),
+    };
+    Ok(GrokSidecars {
+        signals,
+        prompt_context: read_grok_prompt_context(&dir.join("prompt_context.json"))?,
+        compactions: read_grok_compactions(&dir.join("compaction_checkpoints"))?,
+        subagents: read_grok_subagents(&dir.join("subagents"))?,
+    })
+}
+
 fn scan_grok_session_file(chat: &Path) -> Result<Option<GrokSession>> {
     let summary = read_grok_summary(&chat.with_file_name("summary.json"))?;
     let fallback_session = chat
@@ -17243,55 +16880,19 @@ fn scan_grok_session_file(chat: &Path) -> Result<Option<GrokSession>> {
     // computed from metadata that is still perfectly readable — checkpoint
     // that loss as the session's settled state until some file changes again.
     let updates_path = chat.with_file_name("updates.jsonl");
-    let (updates, updates_present) = match fs::read_to_string(&updates_path) {
-        Ok(contents) => (grok::parse_updates(&contents, &updates_path)?, true),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            (grok::GrokUpdates::default(), false)
-        }
-        Err(error) => {
-            return Err(error)
-                .with_context(|| format!("read Grok updates {}", updates_path.display()))
-        }
-    };
+    let (updates, updates_present) = read_grok_updates(&updates_path)?;
 
-    let mut lines = Vec::new();
-    let mut synthetic_reasons = HashMap::new();
-    let mut last_assistant_text = None;
-    let mut models: Vec<String> = Vec::new();
-    let contents = fs::read_to_string(chat)
-        .with_context(|| format!("read Grok chat history {}", chat.display()))?;
-    for (number, row) in jsonl::rows(&contents).enumerate() {
-        check_capture_cancelled()?;
-        // A complete row that does not parse fails the read. The ingestion
-        // this feeds replaces the session's evidence, so dropping the row
-        // would commit a transcript that is missing a turn Grok did write --
-        // and save the stamp that stops the next run from looking again.
-        let Some(value) = jsonl::parse_row(row, chat, number + 1)? else {
-            continue;
-        };
-        if let Some(reason) = value.get("synthetic_reason").and_then(Value::as_str) {
-            synthetic_reasons.insert(lines.len(), reason.to_string());
-        }
-        let parsed = grok::parse_chat_record(&value);
-        if let grok::GrokRecord::Assistant { text, model, .. } = &parsed.record {
-            if let Some(text) = text {
-                last_assistant_text = Some(text.chars().take(4096).collect::<String>());
-            }
-            if let Some(model) = model {
-                if !models.iter().any(|seen| seen == model) {
-                    models.push(model.clone());
-                }
-            }
-        }
-        lines.push(parsed);
-    }
+    let GrokChatRead {
+        lines,
+        synthetic_reasons,
+        last_assistant_text,
+        mut models,
+    } = read_grok_chat(chat)?;
     // The models `updates.jsonl` names per turn (`_meta.modelId`, or a
     // single-key `modelUsage`) are models the session ran on too, including
     // any turn whose transcript record carried no `model_id`.
     for model in updates.turns.iter().filter_map(|turn| turn.model.as_ref()) {
-        if !models.iter().any(|seen| seen == model) {
-            models.push(model.clone());
-        }
+        note_model(&mut models, model);
     }
     if models.is_empty() {
         if let Some(model) = summary
@@ -17304,28 +16905,14 @@ fn scan_grok_session_file(chat: &Path) -> Result<Option<GrokSession>> {
     }
 
     let directory = chat.parent().map(Path::to_path_buf);
-    // A `signals.json` that exists but does not parse is still a fact about
-    // the session, so the marker is written from its existence and the counters
-    // are simply absent. Collapsing that into "no signals" would delete the
-    // marker a previous read wrote and record nothing in its place.
-    let signals = match directory.as_deref() {
-        Some(dir) => match read_json_file(&dir.join("signals.json"))? {
-            GrokSidecar::Absent => None,
-            GrokSidecar::Unparsed => Some(grok::GrokSignals::default()),
-            GrokSidecar::Read(value) => Some(grok::parse_signals(&value)),
-        },
-        None => None,
-    };
-    let prompt_context = match directory.as_deref() {
-        Some(dir) => read_grok_prompt_context(&dir.join("prompt_context.json"))?,
-        None => None,
-    };
-    let (compactions, subagents) = match directory.as_deref() {
-        Some(dir) => (
-            read_grok_compactions(&dir.join("compaction_checkpoints"))?,
-            read_grok_subagents(&dir.join("subagents"))?,
-        ),
-        None => (Vec::new(), Vec::new()),
+    let GrokSidecars {
+        signals,
+        prompt_context,
+        compactions,
+        subagents,
+    } = match directory.as_deref() {
+        Some(dir) => read_grok_sidecars(dir)?,
+        None => GrokSidecars::default(),
     };
 
     // Real recorded times first, in this order: the update stream, then any
@@ -17986,19 +17573,12 @@ fn trajectory_search_text(map: &Map<String, Value>) -> String {
         push_text(&mut parts, task.get("title"));
         push_text(&mut parts, task.get("description"));
     }
-    if let Some(decisions) = map.get("decisions").and_then(Value::as_array) {
-        for decision in decisions {
-            if let Some(decision) = decision.as_object() {
-                for key in ["question", "chosen", "reasoning"] {
-                    push_text(&mut parts, decision.get(key));
-                }
-                if let Some(items) = decision.get("alternatives").and_then(Value::as_array) {
-                    for item in items {
-                        push_text(&mut parts, Some(item));
-                    }
-                }
-            }
+    let decisions = map.get("decisions").and_then(Value::as_array);
+    for decision in decisions.into_iter().flatten().filter_map(Value::as_object) {
+        for key in ["question", "chosen", "reasoning"] {
+            push_text(&mut parts, decision.get(key));
         }
+        push_text_items(&mut parts, decision.get("alternatives"));
     }
     if let Some(retro) = map.get("retrospective").and_then(Value::as_object) {
         for key in ["summary", "approach"] {
@@ -18007,34 +17587,35 @@ fn trajectory_search_text(map: &Map<String, Value>) -> String {
         if let Some(confidence) = retro.get("confidence") {
             parts.push(confidence.to_string());
         }
-        if let Some(items) = retro.get("learnings").and_then(Value::as_array) {
-            for item in items {
-                push_text(&mut parts, Some(item));
-            }
-        }
+        push_text_items(&mut parts, retro.get("learnings"));
     }
     if map.get("type").and_then(Value::as_str) == Some("compacted") {
-        push_text(&mut parts, map.get("narrative"));
-        for key in ["keyFindings", "keyLearnings", "openQuestions"] {
-            if let Some(items) = map.get(key).and_then(Value::as_array) {
-                for item in items {
-                    push_text(&mut parts, Some(item));
-                }
-            }
-        }
-        for key in ["lessons", "conventions"] {
-            if let Some(items) = map.get(key).and_then(Value::as_array) {
-                for item in items {
-                    if let Some(item) = item.as_object() {
-                        for value in item.values() {
-                            push_text(&mut parts, Some(value));
-                        }
-                    }
-                }
+        push_compacted_text(&mut parts, map);
+    }
+    parts.join("\n")
+}
+
+/// [`trajectory_search_text`] for what a compacted trajectory adds.
+fn push_compacted_text(parts: &mut Vec<String>, map: &Map<String, Value>) {
+    push_text(parts, map.get("narrative"));
+    for key in ["keyFindings", "keyLearnings", "openQuestions"] {
+        push_text_items(parts, map.get(key));
+    }
+    for key in ["lessons", "conventions"] {
+        let items = map.get(key).and_then(Value::as_array);
+        for item in items.into_iter().flatten().filter_map(Value::as_object) {
+            for value in item.values() {
+                push_text(parts, Some(value));
             }
         }
     }
-    parts.join("\n")
+}
+
+/// [`push_text`] for every item of an array value.
+fn push_text_items(parts: &mut Vec<String>, items: Option<&Value>) {
+    for item in items.and_then(Value::as_array).into_iter().flatten() {
+        push_text(parts, Some(item));
+    }
 }
 
 fn push_text(parts: &mut Vec<String>, value: Option<&Value>) {
@@ -20009,151 +19590,6 @@ mod tests {
         assert_ne!(without_summary, with_summary);
         fs::write(dir.join("events.jsonl"), "{\"model_id\":\"grok-z\"}\n").unwrap();
         assert_ne!(super::grok_session_stamp(&chat).unwrap(), without_summary);
-    }
-
-    /// A timed log row covers only the turn whose window holds it. A turn
-    /// with no recorded window keeps its own `usage` rather than losing it
-    /// to a row that belongs to another turn; a timeless row still covers it.
-    #[test]
-    fn a_windowless_grok_turn_keeps_its_usage_unless_a_timeless_row_covers_it() {
-        let conn = Connection::open_in_memory().unwrap();
-        init_db(&conn).unwrap();
-        conn.execute(
-            "INSERT INTO sessions (session_id, source, cwd) VALUES ('g', 'grok', '/tmp/g')",
-            [],
-        )
-        .unwrap();
-        let windowed = json!({
-            "source": "updates.jsonl",
-            "turn_start_ms": 10,
-            "turn_end_ms": 20,
-            "usage": {"inputTokens": 5}
-        });
-        let windowless = json!({
-            "source": "updates.jsonl",
-            "usage": {"inputTokens": 7}
-        });
-        for (uid, token) in [("t1", &windowed), ("t2", &windowless)] {
-            conn.execute(
-                "INSERT INTO session_events \
-                 (source, session_id, ts_ms, role, kind, event_uid, token_json) \
-                 VALUES ('grok', 'g', 15, 'assistant', 'text', ?, ?)",
-                params![uid, token.to_string()],
-            )
-            .unwrap();
-        }
-        let insert_row = |key: &str, ts: Option<i64>| {
-            conn.execute(
-                "INSERT INTO grok_unified_usage \
-                 (row_key, session_id, ts_ms, usage_json, locator, line_offset) \
-                 VALUES (?, 'g', ?, '{\"inputTokens\":3}', 'unified.jsonl', 0)",
-                params![key, ts],
-            )
-            .unwrap();
-        };
-        let token = |uid: &str| -> Value {
-            let raw: String = conn
-                .query_row(
-                    "SELECT token_json FROM session_events \
-                     WHERE session_id = 'g' AND event_uid = ?",
-                    params![uid],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            serde_json::from_str(&raw).unwrap()
-        };
-
-        insert_row("timed", Some(15));
-        let coverage = super::materialize_grok_unified_usage(&conn, "g", None).unwrap();
-        assert!(token("t1").get("usage").is_none());
-        assert!(token("t1").get("turn_usage").is_some());
-        assert_eq!(
-            token("t2")["usage"]["inputTokens"],
-            7,
-            "a windowless turn keeps its usage"
-        );
-        assert!(token("t2").get("turn_usage").is_none());
-        assert_eq!(
-            (
-                coverage.covered_turns,
-                coverage.turn_usage_turns,
-                coverage.proxy_only_turns
-            ),
-            (1, 1, 0)
-        );
-
-        insert_row("timeless", None);
-        let coverage = super::materialize_grok_unified_usage(&conn, "g", None).unwrap();
-        assert!(token("t2").get("usage").is_none());
-        assert_eq!(token("t2")["turn_usage"]["inputTokens"], 7);
-        assert_eq!(
-            (
-                coverage.covered_turns,
-                coverage.turn_usage_turns,
-                coverage.proxy_only_turns
-            ),
-            (2, 0, 0)
-        );
-    }
-
-    #[test]
-    fn classify_grok_turn_coverage_counts_windows_census_and_timeless_rows() {
-        let covered = json!({
-            "source": "updates.jsonl",
-            "turn_start_ms": 10,
-            "turn_end_ms": 20,
-            "context_total_tokens": 1
-        });
-        let own = json!({
-            "source": "updates.jsonl",
-            "turn_start_ms": 30,
-            "turn_end_ms": 40,
-            "usage": {"inputTokens": 1}
-        });
-        let proxy = json!({
-            "source": "updates.jsonl",
-            "context_total_tokens": 2,
-            "turn_start_ms": 50,
-            "turn_end_ms": 60
-        });
-        let class = super::classify_grok_turn_coverage(
-            &[covered.clone(), own.clone(), proxy],
-            &[Some(15)],
-            Some(4),
-        );
-        assert_eq!(
-            (
-                class.covered_turns,
-                class.turn_usage_turns,
-                class.proxy_only_turns
-            ),
-            (1, 1, 2)
-        );
-
-        let demoted = json!({
-            "source": "updates.jsonl",
-            "turn_usage": {"inputTokens": 1},
-            "turn_start_ms": 30
-        });
-        let timeless = super::classify_grok_turn_coverage(&[own, demoted], &[None], Some(3));
-        assert_eq!(
-            (
-                timeless.covered_turns,
-                timeless.turn_usage_turns,
-                timeless.proxy_only_turns
-            ),
-            (3, 0, 0)
-        );
-
-        let no_census = super::classify_grok_turn_coverage(&[covered], &[Some(15)], None);
-        assert_eq!(
-            (
-                no_census.covered_turns,
-                no_census.turn_usage_turns,
-                no_census.proxy_only_turns
-            ),
-            (1, 0, 0)
-        );
     }
 
     /// An `updates.jsonl` that exists and cannot be read is a failure, not an
@@ -23258,49 +22694,47 @@ mod tests {
 
         super::insert_session_event(
             &conn,
-            "claude",
-            "event-session",
-            None,
-            None,
-            None,
-            "message-1",
-            None,
-            1,
-            "user",
-            "text",
-            Some("hello"),
-            None,
-            None,
-            RequestIdentity::none(),
-            "event-1",
-            None,
-            super::RawMessageFacts::default(),
+            &super::EventRow {
+                source: "claude",
+                session_id: "event-session",
+                message_id: "message-1",
+                ts_ms: 1,
+                role: "user",
+                kind: "text",
+                text: Some("hello"),
+                event_uid: "event-1",
+                ..super::EventRow::default()
+            },
         )
         .unwrap();
         super::insert_tool_call(
             &conn,
-            "claude",
-            "tool-session",
-            "message-2",
-            "tool-1",
+            &super::ToolCallRef {
+                source: "claude",
+                session_id: "tool-session",
+                message_id: "message-2",
+                tool_use_id: "tool-1",
+                ts_ms: 2,
+                ..Default::default()
+            },
             "Read",
             Some("README.md"),
             "{}",
             None,
-            2,
         )
         .unwrap();
         super::upsert_file_edit_from_call(
             &conn,
-            "claude",
-            "edit-session",
-            "message-3",
-            "tool-2",
+            &super::ToolCallRef {
+                source: "claude",
+                session_id: "edit-session",
+                message_id: "message-3",
+                tool_use_id: "tool-2",
+                ts_ms: 3,
+                ..Default::default()
+            },
             "src/lib.rs",
             "Edit",
-            3,
-            None,
-            None,
         )
         .unwrap();
 
@@ -25608,14 +25042,16 @@ mod tests {
         // What the prompt-only parser left: both endpoints at the file mtime.
         super::upsert_session(
             &conn,
-            "s-window",
-            "cursor",
-            Some("/home/dev/demo"),
-            None,
-            7_000_000_000_000,
-            7_000_000_000_000,
-            None,
-            None,
+            &SessionCatalogRow {
+                session_id: "s-window",
+                source: "cursor",
+                cwd: Some("/home/dev/demo"),
+                git_branch: None,
+                first_ts: 7_000_000_000_000,
+                last_ts: 7_000_000_000_000,
+                last_assistant_text: None,
+                raw_path: None,
+            },
         )
         .unwrap();
 
@@ -27502,108 +26938,118 @@ mod tests {
         // Unique full-record match, model and token spend included: healed.
         legacy_event(
             &conn,
-            "parent",
-            "side:0",
-            "delegated work",
-            ts("2026-09-18T10:00:00Z"),
-            0,
-            "assistant",
-            "text",
-            Some("opus"),
-            Some(&token_json),
+            LegacyEvent {
+                session_id: "parent",
+                message_id: "side:0",
+                text: "delegated work",
+                ts_ms: ts("2026-09-18T10:00:00Z"),
+                block: 0,
+                role: "assistant",
+                kind: "text",
+                model: Some("opus"),
+                token_json: Some(&token_json),
+            },
         );
         // Same text, timestamp, role and kind, different model: a changed
         // record whose predecessor stays retained.
         legacy_event(
             &conn,
-            "parent",
-            "side:12",
-            "delegated work",
-            ts("2026-09-18T10:00:00Z"),
-            0,
-            "assistant",
-            "text",
-            Some("opus-old"),
-            Some(&token_json),
+            LegacyEvent {
+                session_id: "parent",
+                message_id: "side:12",
+                text: "delegated work",
+                ts_ms: ts("2026-09-18T10:00:00Z"),
+                block: 0,
+                role: "assistant",
+                kind: "text",
+                model: Some("opus-old"),
+                token_json: Some(&token_json),
+            },
         );
         // Same text and timestamp, different role: a changed record whose
         // predecessor stays retained.
         legacy_event(
             &conn,
-            "parent",
-            "side:7",
-            "delegated work",
-            ts("2026-09-18T10:00:00Z"),
-            0,
-            "user",
-            "text",
-            None,
-            None,
+            LegacyEvent {
+                session_id: "parent",
+                message_id: "side:7",
+                text: "delegated work",
+                ts_ms: ts("2026-09-18T10:00:00Z"),
+                block: 0,
+                role: "user",
+                kind: "text",
+                ..LegacyEvent::default()
+            },
         );
         // Same text and role, different timestamp: not the same record.
         legacy_event(
             &conn,
-            "parent",
-            "side:4",
-            "delegated work",
-            1,
-            0,
-            "assistant",
-            "text",
-            None,
-            None,
+            LegacyEvent {
+                session_id: "parent",
+                message_id: "side:4",
+                text: "delegated work",
+                ts_ms: 1,
+                block: 0,
+                role: "assistant",
+                kind: "text",
+                ..LegacyEvent::default()
+            },
         );
         // Twice-stored duplicate: ambiguous, both preserved.
         legacy_event(
             &conn,
-            "parent",
-            "side:5",
-            "same words",
-            ts("2026-09-18T10:00:02Z"),
-            0,
-            "user",
-            "text",
-            None,
-            None,
+            LegacyEvent {
+                session_id: "parent",
+                message_id: "side:5",
+                text: "same words",
+                ts_ms: ts("2026-09-18T10:00:02Z"),
+                block: 0,
+                role: "user",
+                kind: "text",
+                ..LegacyEvent::default()
+            },
         );
         legacy_event(
             &conn,
-            "parent",
-            "side:6",
-            "same words",
-            ts("2026-09-18T10:00:02Z"),
-            0,
-            "user",
-            "text",
-            None,
-            None,
+            LegacyEvent {
+                session_id: "parent",
+                message_id: "side:6",
+                text: "same words",
+                ts_ms: ts("2026-09-18T10:00:02Z"),
+                block: 0,
+                role: "user",
+                kind: "text",
+                ..LegacyEvent::default()
+            },
         );
         // One shared block with a changed sibling: the record is a new
         // identity whose predecessor stays retained, so both stay.
         let partial_ts = ts("2026-09-18T10:00:03Z");
         legacy_event(
             &conn,
-            "parent",
-            "side:8",
-            "analysis",
-            partial_ts,
-            0,
-            "assistant",
-            "text",
-            None,
-            None,
+            LegacyEvent {
+                session_id: "parent",
+                message_id: "side:8",
+                text: "analysis",
+                ts_ms: partial_ts,
+                block: 0,
+                role: "assistant",
+                kind: "text",
+                ..LegacyEvent::default()
+            },
         );
         legacy_event(
             &conn,
-            "parent",
-            "side:8",
-            "old answer",
-            partial_ts,
-            1,
-            "assistant",
-            "text",
-            None,
-            None,
+            LegacyEvent {
+                session_id: "parent",
+                message_id: "side:8",
+                text: "old answer",
+                ts_ms: partial_ts,
+                block: 1,
+                role: "assistant",
+                kind: "text",
+                ..LegacyEvent::default()
+            },
         );
         // The tool use text is shared with another message, so the event
         // match stays ambiguous and the event is preserved — but the tool
@@ -27611,33 +27057,45 @@ mod tests {
         let tool_ts = ts("2026-09-18T10:00:01Z");
         legacy_event(
             &conn,
-            "parent",
-            "side:1",
-            "Read /work/app/notes.txt",
-            tool_ts,
-            0,
-            "assistant",
-            "tool_use",
-            None,
-            None,
+            LegacyEvent {
+                session_id: "parent",
+                message_id: "side:1",
+                text: "Read /work/app/notes.txt",
+                ts_ms: tool_ts,
+                block: 0,
+                role: "assistant",
+                kind: "tool_use",
+                ..LegacyEvent::default()
+            },
         );
         legacy_event(
             &conn,
-            "parent",
-            "side:9",
-            "Read /work/app/notes.txt",
-            tool_ts,
-            0,
-            "assistant",
-            "tool_use",
-            None,
-            None,
+            LegacyEvent {
+                session_id: "parent",
+                message_id: "side:9",
+                text: "Read /work/app/notes.txt",
+                ts_ms: tool_ts,
+                block: 0,
+                role: "assistant",
+                kind: "tool_use",
+                ..LegacyEvent::default()
+            },
         );
         // An empty tool result writes a null-text event; the null is part
         // of the record key, so the unchanged record still heals exactly.
         let null_ts = ts("2026-09-18T10:00:04Z");
         legacy_event(
-            &conn, "parent", "side:10", "memo", null_ts, 0, "user", "text", None, None,
+            &conn,
+            LegacyEvent {
+                session_id: "parent",
+                message_id: "side:10",
+                text: "memo",
+                ts_ms: null_ts,
+                block: 0,
+                role: "user",
+                kind: "text",
+                ..LegacyEvent::default()
+            },
         );
         conn.execute(
             "INSERT INTO session_events \
@@ -27755,18 +27213,33 @@ mod tests {
         assert_eq!(events, 1);
     }
 
-    fn legacy_event(
-        conn: &Connection,
-        session_id: &str,
-        message_id: &str,
-        text: &str,
+    /// A pre-upgrade positional `session_events` row, as an older parser
+    /// wrote it: `event_uid` is `{message_id}:{block}`.
+    #[derive(Default)]
+    struct LegacyEvent<'a> {
+        session_id: &'a str,
+        message_id: &'a str,
+        text: &'a str,
         ts_ms: i64,
         block: i64,
-        role: &str,
-        kind: &str,
-        model: Option<&str>,
-        token_json: Option<&str>,
-    ) {
+        role: &'a str,
+        kind: &'a str,
+        model: Option<&'a str>,
+        token_json: Option<&'a str>,
+    }
+
+    fn legacy_event(conn: &Connection, event: LegacyEvent<'_>) {
+        let LegacyEvent {
+            session_id,
+            message_id,
+            text,
+            ts_ms,
+            block,
+            role,
+            kind,
+            model,
+            token_json,
+        } = event;
         conn.execute(
             "INSERT INTO session_events \
              (source, session_id, message_id, ts_ms, role, kind, text, event_uid, model, token_json) \
@@ -28072,14 +27545,16 @@ mod tests {
                     if catalogued {
                         upsert_session(
                             &conn,
-                            &meta.session_id,
-                            "claude",
-                            meta.cwd.as_deref(),
-                            None,
-                            meta.first_ts,
-                            meta.last_ts,
-                            None,
-                            Some(&locator),
+                            &SessionCatalogRow {
+                                session_id: &meta.session_id,
+                                source: "claude",
+                                cwd: meta.cwd.as_deref(),
+                                git_branch: None,
+                                first_ts: meta.first_ts,
+                                last_ts: meta.last_ts,
+                                last_assistant_text: None,
+                                raw_path: Some(&locator),
+                            },
                         )
                         .unwrap();
                     }
@@ -28092,7 +27567,10 @@ mod tests {
                         if agent_id.is_some() { (0, 2) } else { (1, 0) },
                         "{case}"
                     );
-                    assert!(claude_transcript_unchanged(&conn, &path).unwrap(), "{case}");
+                    assert!(
+                        incremental::claude_transcript_unchanged(&conn, &path).unwrap(),
+                        "{case}"
+                    );
 
                     if heal_by_hydration {
                         hydrate::hydrate_session_at_with_home(
@@ -30184,7 +29662,7 @@ mod tests {
             &metadata
         )
         .unwrap());
-        assert!(claude_transcript_unchanged(&conn, &named).unwrap());
+        assert!(incremental::claude_transcript_unchanged(&conn, &named).unwrap());
     }
 
     #[test]
@@ -30235,14 +29713,16 @@ mod tests {
         // generation; what is missing here is topology, not the facts.
         super::upsert_session(
             &conn,
-            "claude-root",
-            "claude",
-            Some("/work/app"),
-            None,
-            1,
-            2,
-            None,
-            Some(&parent.to_string_lossy()),
+            &SessionCatalogRow {
+                session_id: "claude-root",
+                source: "claude",
+                cwd: Some("/work/app"),
+                git_branch: None,
+                first_ts: 1,
+                last_ts: 2,
+                last_assistant_text: None,
+                raw_path: Some(&parent.to_string_lossy()),
+            },
         )
         .unwrap();
         conn.execute(
@@ -33179,22 +32659,22 @@ mod tests {
         let meta = codex_meta(&path);
         // Simulate a pre-upgrade event-message row, already delivered under its
         // original ID. Reparse must keep that identity rather than add its twin.
-        insert_codex_event(
+        insert_session_event(
             &conn,
-            &meta.session_id,
-            Some("/tmp/project"),
-            None,
-            parse_iso_ms("2026-09-20T10:00:05Z").unwrap(),
-            "assistant",
-            "text",
-            "Reverse mirror.",
-            "7:agent_message",
-            "7:agent_message",
-            None,
-            None,
-            None,
-            None,
-            None,
+            &EventRow {
+                source: "codex",
+                session_id: &meta.session_id,
+                project: Some("/tmp/project"),
+                cwd: Some("/tmp/project"),
+                git_branch: None,
+                message_id: "7:agent_message",
+                ts_ms: parse_iso_ms("2026-09-20T10:00:05Z").unwrap(),
+                role: "assistant",
+                kind: "text",
+                text: Some("Reverse mirror."),
+                event_uid: "7:agent_message",
+                ..EventRow::default()
+            },
         )
         .unwrap();
         for _ in 0..2 {
@@ -33527,36 +33007,35 @@ mod tests {
         .unwrap();
         super::insert_session_event(
             &conn,
-            "codex",
-            "sess-repair",
-            Some("/tmp/proj"),
-            Some("/tmp/proj"),
-            None,
-            "3:agent_message",
-            None,
-            1_788_176_403_000,
-            "assistant",
-            "text",
-            Some("Done."),
-            None,
-            None,
-            RequestIdentity::none(),
-            "3:agent_message",
-            None,
-            super::RawMessageFacts::default(),
+            &super::EventRow {
+                source: "codex",
+                session_id: "sess-repair",
+                project: Some("/tmp/proj"),
+                cwd: Some("/tmp/proj"),
+                message_id: "3:agent_message",
+                ts_ms: 1_788_176_403_000,
+                role: "assistant",
+                kind: "text",
+                text: Some("Done."),
+                event_uid: "3:agent_message",
+                ..super::EventRow::default()
+            },
         )
         .unwrap();
         super::insert_tool_call(
             &conn,
-            "codex",
-            "sess-repair",
-            "fc_1",
-            "call_1",
+            &super::ToolCallRef {
+                source: "codex",
+                session_id: "sess-repair",
+                message_id: "fc_1",
+                tool_use_id: "call_1",
+                ts_ms: 1_788_176_402_000,
+                ..Default::default()
+            },
             "exec_command",
             Some("git status"),
             r#"{"cmd":"git status"}"#,
             None,
-            1_788_176_402_000,
         )
         .unwrap();
 
@@ -34617,6 +34096,1004 @@ mod tests {
         assert!(!claude_sidecar_evidence_exists(&conn, &sidecar).unwrap());
         sync_claude_session_metadata(&conn, &mut state, dir.path()).unwrap();
         assert_eq!(child_rows(&conn), (1, 1));
+    }
+
+    /// One record of a Claude Code subagent sidecar: every assistant record
+    /// carries `stop_reason: null`, finished or not, as Claude Code 2.1.28x
+    /// writes them.
+    fn sidecar_record(kind: &str, uuid: &str, body: &str) -> String {
+        format!(
+            r#"{{"type":"{kind}","uuid":"{uuid}","sessionId":"root-1","agentId":"child","isSidechain":true,"cwd":"/work/app","requestId":"req_{uuid}","timestamp":"2026-10-01T10:00:00Z","message":{body}}}"#
+        ) + "\n"
+    }
+
+    fn sidecar_assistant(uuid: &str, message_id: &str, block: &str, output: i64) -> String {
+        sidecar_record(
+            "assistant",
+            uuid,
+            &format!(
+                r#"{{"id":"{message_id}","role":"assistant","model":"claude-opus-5","stop_reason":null,"content":[{block}],"usage":{{"input_tokens":10,"cache_read_input_tokens":100,"output_tokens":{output}}}}}"#
+            ),
+        )
+        .replace(&format!("req_{uuid}"), &format!("req_{message_id}"))
+    }
+
+    fn sidecar_tool_use(uuid: &str, message_id: &str, tool: &str, output: i64) -> String {
+        sidecar_assistant(
+            uuid,
+            message_id,
+            &format!(
+                r#"{{"type":"tool_use","id":"{tool}","name":"Bash","input":{{"command":"ls"}}}}"#
+            ),
+            output,
+        )
+    }
+
+    fn sidecar_tool_result(uuid: &str, tool: &str) -> String {
+        sidecar_record(
+            "user",
+            uuid,
+            &format!(
+                r#"{{"role":"user","content":[{{"type":"tool_result","tool_use_id":"{tool}","content":"ok"}}]}}"#
+            ),
+        )
+    }
+
+    /// `(request_key, output_tokens)` for each of the child's requests.
+    fn child_requests(conn: &Connection) -> Vec<(String, i64)> {
+        conn.prepare(
+            "SELECT request_key, json_extract(token_json, '$.output_tokens') \
+             FROM session_requests WHERE source = 'claude' AND session_id = 'child' \
+             ORDER BY request_key",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    fn child_assistant_rows(conn: &Connection) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM session_events \
+             WHERE source = 'claude' AND session_id = 'child' AND role = 'assistant'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    /// A finished sidecar whose every assistant record says `stop_reason:
+    /// null` — two blocks of one message, then a tool result, and so on to the
+    /// end — has every message indexed: the record after a message finishes
+    /// it, whatever its own `stop_reason` says.
+    #[test]
+    fn a_sidecar_whose_stop_reasons_are_all_null_indexes_every_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar = dir.path().join("agent-child.jsonl");
+        let text = [
+            sidecar_record("user", "c1", r#"{"role":"user","content":"delegated"}"#),
+            sidecar_assistant(
+                "a1a",
+                "msg_1",
+                r#"{"type":"thinking","thinking":"plan","signature":"s"}"#,
+                1,
+            ),
+            sidecar_tool_use("a1b", "msg_1", "toolu_1", 5),
+            sidecar_tool_result("r1", "toolu_1"),
+            sidecar_tool_use("a2", "msg_2", "toolu_2", 7),
+            sidecar_tool_result("r2", "toolu_2"),
+            sidecar_tool_use("a3", "msg_3", "toolu_3", 9),
+            sidecar_tool_result("r3", "toolu_3"),
+        ]
+        .concat();
+        fs::write(&sidecar, &text).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let pass = incremental::ingest_claude_transcript_at_locator(&conn, &sidecar, Some("child"))
+            .unwrap();
+        assert!(pass.in_progress.is_empty(), "{:?}", pass.in_progress);
+        assert_eq!(child_assistant_rows(&conn), 4);
+        assert_eq!(
+            child_requests(&conn),
+            vec![
+                ("request-id:req_msg_1".to_string(), 5),
+                ("request-id:req_msg_2".to_string(), 7),
+                ("request-id:req_msg_3".to_string(), 9),
+            ]
+        );
+        let cursor = transcript_cursor::load_cursor(
+            &conn,
+            &transcript_cursor::CursorKey::Locator {
+                source: "claude",
+                locator: &sidecar.to_string_lossy(),
+            },
+        )
+        .unwrap();
+        assert_eq!(cursor.file.unwrap().offset, text.len() as u64);
+    }
+
+    /// Only the trailing message can still be streaming. It is held while it
+    /// is the file's last, through any number of further blocks of its own;
+    /// the record that follows it releases it; a block Claude writes after an
+    /// interleaved tool result lands as one more row of the same request. The
+    /// stored rows and usage are exactly a from-zero read's, so nothing is
+    /// counted twice.
+    #[test]
+    fn a_streaming_tail_is_held_until_a_record_follows_it_and_counted_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar = dir.path().join("agent-child.jsonl");
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let append = |text: &str| {
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&sidecar)
+                .unwrap();
+            file.write_all(text.as_bytes()).unwrap();
+        };
+        let pass = || {
+            incremental::ingest_claude_transcript_at_locator(&conn, &sidecar, Some("child"))
+                .unwrap()
+        };
+
+        let prompt = sidecar_record("user", "c1", r#"{"role":"user","content":"delegated"}"#);
+        append(&prompt);
+        append(&sidecar_assistant(
+            "a1a",
+            "msg_1",
+            r#"{"type":"thinking","thinking":"plan","signature":"s"}"#,
+            1,
+        ));
+        assert_eq!(pass().in_progress, vec!["msg_1".to_string()]);
+        assert_eq!(child_assistant_rows(&conn), 0);
+
+        // Another block of the same message: still the tail, still held.
+        append(&sidecar_tool_use("a1b", "msg_1", "toolu_1", 5));
+        assert_eq!(pass().in_progress, vec!["msg_1".to_string()]);
+        assert_eq!(child_assistant_rows(&conn), 0);
+
+        // The tool result follows it, so it is finished.
+        append(&sidecar_tool_result("r1", "toolu_1"));
+        assert!(pass().in_progress.is_empty());
+        assert_eq!(child_assistant_rows(&conn), 2);
+        assert_eq!(
+            child_requests(&conn),
+            vec![("request-id:req_msg_1".to_string(), 5)]
+        );
+
+        // A parallel tool call's block arrives after that result: one more
+        // row of the same request, whose usage settles on the latest copy.
+        append(&sidecar_tool_use("a1c", "msg_1", "toolu_1b", 6));
+        assert_eq!(pass().in_progress, vec!["msg_1".to_string()]);
+        append(&sidecar_tool_result("r1b", "toolu_1b"));
+        assert!(pass().in_progress.is_empty());
+        assert_eq!(child_assistant_rows(&conn), 3);
+        assert_eq!(
+            child_requests(&conn),
+            vec![("request-id:req_msg_1".to_string(), 6)]
+        );
+        // Nothing new: nothing changes.
+        assert!(pass().in_progress.is_empty());
+
+        let rows = |conn: &Connection| -> Vec<(String, Option<String>)> {
+            conn.prepare(
+                "SELECT event_uid, token_json FROM session_events \
+                 WHERE session_id = 'child' ORDER BY event_uid",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+        };
+        let fresh = Connection::open_in_memory().unwrap();
+        init_db(&fresh).unwrap();
+        incremental::ingest_claude_transcript_at_locator(&fresh, &sidecar, Some("child")).unwrap();
+        assert_eq!(rows(&conn), rows(&fresh));
+        assert_eq!(child_requests(&conn), child_requests(&fresh));
+    }
+
+    /// Any complete record follows the held message, including one the reader
+    /// skips: a malformed line, a non-object, an oversized record.
+    #[test]
+    fn a_skipped_record_after_a_held_message_releases_it() {
+        let dir = tempfile::tempdir().unwrap();
+        for (name, tail) in [
+            ("malformed", "{not json\n".to_string()),
+            ("array", "[1,2]\n".to_string()),
+            (
+                "oversized",
+                format!(
+                    "{{\"pad\":\"{}\"}}\n",
+                    "x".repeat(transcript_cursor::MAX_RECORD_BYTES as usize)
+                ),
+            ),
+        ] {
+            let sidecar = dir.path().join(format!("agent-{name}.jsonl"));
+            fs::write(
+                &sidecar,
+                [
+                    sidecar_record("user", "c1", r#"{"role":"user","content":"delegated"}"#),
+                    sidecar_tool_use("a1", "msg_1", "toolu_1", 5),
+                    tail,
+                ]
+                .concat(),
+            )
+            .unwrap();
+            let conn = Connection::open_in_memory().unwrap();
+            init_db(&conn).unwrap();
+            let pass =
+                incremental::ingest_claude_transcript_at_locator(&conn, &sidecar, Some("child"))
+                    .unwrap();
+            assert!(pass.in_progress.is_empty(), "{name}");
+            assert_eq!(child_assistant_rows(&conn), 1, "{name}");
+        }
+    }
+
+    /// A record whose `stop_reason` is filled in is finished on its own, so a
+    /// main transcript's trailing message is indexed on the pass that reads it.
+    #[test]
+    fn a_trailing_message_with_a_stop_reason_is_indexed_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sess-main.jsonl");
+        fs::write(
+            &path,
+            concat!(
+                r#"{"type":"user","uuid":"u1","sessionId":"sess-main","cwd":"/tmp/project","timestamp":"2026-10-01T10:00:00Z","message":{"role":"user","content":"hi"}}"#, "\n",
+                r#"{"type":"assistant","uuid":"a1","parentUuid":"u1","sessionId":"sess-main","cwd":"/tmp/project","requestId":"req_1","timestamp":"2026-10-01T10:00:01Z","message":{"id":"msg_1","role":"assistant","model":"claude-opus-5","stop_reason":"end_turn","content":[{"type":"text","text":"Done."}],"usage":{"input_tokens":10,"output_tokens":3}}}"#, "\n",
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let pass = incremental::ingest_claude_transcript_at_locator(&conn, &path, None).unwrap();
+        assert!(pass.in_progress.is_empty());
+        let requests: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_requests WHERE session_id = 'sess-main'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(requests, 1);
+    }
+
+    /// The sweep generation this build stores, computed with `generations`
+    /// in place of [`SWEEP_PARSER_GENERATIONS`].
+    fn sweep_generation_with(generations: &[&str]) -> String {
+        let current = sweep_generation();
+        let parts = SWEEP_PARSER_GENERATIONS.join("|");
+        let older = generations.join("|");
+        // Same encoding as `sweep_generation`, over the older list.
+        let tail = format!(
+            "|tool_result_fidelity={TOOL_RESULT_FIDELITY_GENERATION}\
+             |raw_message_facts={RAW_MESSAGE_FACTS_GENERATION}\
+             |codex_fork_replay={CODEX_FORK_REPLAY_GENERATION}\
+             |codex_metadata_backfill={CODEX_METADATA_BACKFILL_GENERATION}"
+        );
+        let hash = |list: &str| {
+            format!(
+                "g{:016x}",
+                crate::discover::fingerprint_hash(
+                    "sweep-generation",
+                    &crate::discover::SHALLOW_SCANNER_VERSION.to_string(),
+                    &format!("{list}{tail}"),
+                )
+            )
+        };
+        assert_eq!(
+            hash(&parts),
+            current,
+            "the encoding above is sweep_generation's"
+        );
+        hash(&older)
+    }
+
+    fn claude_holding_records(dir: &Path) -> bool {
+        load_sync_state(&dir.join(".sync-state.json")).unwrap()
+            [incremental::CLAUDE_HOLDING_RECORDS_KEY]
+            .as_bool()
+            .unwrap()
+    }
+
+    /// A transcript that stops mid-message keeps its stat, so the source
+    /// fingerprint would call the tree unchanged and skip the sweep that
+    /// releases the message once its writer has gone quiet. A sweep that left
+    /// records held therefore never licenses the next one to skip.
+    #[test]
+    fn a_held_trailing_message_keeps_the_sweep_running_until_it_is_released() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join(".claude/projects/-work-app");
+        let subagents = project.join("root-1/subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        fs::write(
+            project.join("root-1.jsonl"),
+            r#"{"type":"user","uuid":"u1","sessionId":"root-1","cwd":"/work/app","timestamp":"2026-10-01T09:59:00Z","message":{"role":"user","content":"start"}}"#.to_string() + "\n",
+        )
+        .unwrap();
+        let sidecar = subagents.join("agent-child.jsonl");
+        fs::write(
+            &sidecar,
+            [
+                sidecar_record("user", "c1", r#"{"role":"user","content":"delegated"}"#),
+                sidecar_tool_use("a1", "msg_1", "toolu_1", 5),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let db = dir.path().join("history.db");
+        let roots = crate::ProviderRoots::from_home(
+            dir.path().to_path_buf(),
+            dir.path().join("opencode.db"),
+        );
+        assert!(
+            super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept
+        );
+        assert!(claude_holding_records(dir.path()));
+        // Inside the grace window: swept again, still held.
+        assert!(
+            super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept
+        );
+        assert!(claude_holding_records(dir.path()));
+        let conn = open_db(&db).unwrap();
+        assert_eq!(child_assistant_rows(&conn), 0);
+
+        // A sweep that cannot open the held transcript still owes it a sweep.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o000)).unwrap();
+            assert!(
+                fs::File::open(&sidecar).is_err(),
+                "mode 000 must make the sidecar unreadable; run this test as a non-root user"
+            );
+            // Twice: the second unread sweep must still see what the first kept.
+            for _ in 0..2 {
+                assert!(
+                    super::sync_exclusive_with_roots(&db, &roots, false)
+                        .unwrap()
+                        .swept
+                );
+                assert!(claude_holding_records(dir.path()));
+            }
+            fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(
+                super::sync_exclusive_with_roots(&db, &roots, false)
+                    .unwrap()
+                    .swept
+            );
+            assert!(claude_holding_records(dir.path()));
+        }
+
+        // The writer has been gone past the grace window: released.
+        let key = transcript_cursor::CursorKey::Locator {
+            source: "claude",
+            locator: &sidecar.to_string_lossy(),
+        };
+        let mut cursor = transcript_cursor::load_cursor(&conn, &key).unwrap();
+        cursor.file.as_mut().unwrap().unchanged_since_ms -=
+            transcript_cursor::QUIESCENT_GRACE_MS + 1;
+        transcript_cursor::store_cursor(&conn, &key, &cursor).unwrap();
+        assert!(
+            super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept
+        );
+        assert!(!claude_holding_records(dir.path()));
+        assert_eq!(child_assistant_rows(&conn), 1);
+        assert!(
+            !super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept
+        );
+    }
+
+    /// A store an earlier parser built held back every sidecar message whose
+    /// records said `stop_reason: null`: no assistant rows, the cursor
+    /// standing before the first held record, and a fingerprint vouching for
+    /// it. One plain sync releases every message, re-reading only the held
+    /// region, and the next sync takes the fast path.
+    #[test]
+    fn an_upgraded_store_releases_messages_an_earlier_parser_held_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join(".claude/projects/-work-app");
+        let subagents = project.join("root-1/subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        fs::write(
+            project.join("root-1.jsonl"),
+            r#"{"type":"user","uuid":"u1","sessionId":"root-1","cwd":"/work/app","timestamp":"2026-10-01T09:59:00Z","message":{"role":"user","content":"start"}}"#.to_string() + "\n",
+        )
+        .unwrap();
+        let sidecar = subagents.join("agent-child.jsonl");
+        let head = sidecar_record("user", "c1", r#"{"role":"user","content":"delegated"}"#);
+        let held = [
+            sidecar_tool_use("a1", "msg_1", "toolu_1", 5),
+            sidecar_tool_result("r1", "toolu_1"),
+            sidecar_tool_use("a2", "msg_2", "toolu_2", 7),
+            sidecar_tool_result("r2", "toolu_2"),
+        ]
+        .concat();
+        let db = dir.path().join("history.db");
+        let roots = crate::ProviderRoots::from_home(
+            dir.path().to_path_buf(),
+            dir.path().join("opencode.db"),
+        );
+        // What the earlier parser left: its walk held from the first assistant
+        // record on and committed before it, so the cursor is the one a walk
+        // over the head commits, over a file that then held everything.
+        fs::write(&sidecar, &head).unwrap();
+        super::sync_exclusive_with_roots(&db, &roots, false).unwrap();
+        let conn = open_db(&db).unwrap();
+        let key = transcript_cursor::CursorKey::Locator {
+            source: "claude",
+            locator: &sidecar.to_string_lossy(),
+        };
+        let mut cursor = transcript_cursor::load_cursor(&conn, &key).unwrap();
+        fs::write(&sidecar, head.clone() + &held).unwrap();
+        let metadata = fs::metadata(&sidecar).unwrap();
+        let file = cursor.file.as_mut().unwrap();
+        assert_eq!(file.offset, head.len() as u64);
+        file.size = metadata.len();
+        file.mtime_ns = super::metadata_mtime_ns(&metadata);
+        cursor.claude.as_mut().unwrap().in_progress =
+            vec!["msg_1".to_string(), "msg_2".to_string()];
+        transcript_cursor::store_cursor(&conn, &key, &cursor).unwrap();
+        assert_eq!(child_assistant_rows(&conn), 0);
+
+        let state_path = dir.path().join(".sync-state.json");
+        let mut state = load_sync_state(&state_path).unwrap();
+        let source_part = state[SOURCE_FINGERPRINT_KEY]
+            .as_str()
+            .unwrap()
+            .split_once('/')
+            .unwrap()
+            .1
+            .to_string();
+        let older: Vec<&str> = SWEEP_PARSER_GENERATIONS
+            .iter()
+            .copied()
+            .filter(|generation| *generation != CLAUDE_TRAILING_HOLD_GENERATION)
+            .collect();
+        let old_fingerprint = format!("{}/{source_part}", sweep_generation_with(&older));
+        state.insert(SOURCE_FINGERPRINT_KEY.into(), json!(old_fingerprint));
+        state.remove(incremental::CLAUDE_HOLDING_RECORDS_KEY);
+        state.insert(
+            DESTINATION_GENERATION_KEY.into(),
+            json!(destination_generation(&conn).unwrap()),
+        );
+        state.insert(
+            DESTINATION_HEAD_KEY.into(),
+            json!(destination_head(&conn).unwrap()),
+        );
+        assert!(sources_unchanged(&conn, &state, &old_fingerprint));
+        fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+
+        assert!(
+            super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept
+        );
+        assert_eq!(child_assistant_rows(&conn), 2);
+        assert_eq!(
+            child_requests(&conn),
+            vec![
+                ("request-id:req_msg_1".to_string(), 5),
+                ("request-id:req_msg_2".to_string(), 7),
+            ]
+        );
+        assert!(!claude_holding_records(dir.path()));
+        assert!(
+            !super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept
+        );
+        assert_eq!(child_assistant_rows(&conn), 2);
+    }
+
+    /// A sidecar record whose only block is a signed thinking block with
+    /// empty text: what Claude streams first in a response.
+    fn sidecar_signature(uuid: &str, message_id: &str, output: i64) -> String {
+        sidecar_assistant(
+            uuid,
+            message_id,
+            r#"{"type":"thinking","thinking":"","signature":"sig"}"#,
+            output,
+        )
+    }
+
+    /// `(event_uid, kind)` of the child's assistant rows, in uid order.
+    fn child_assistant_events(conn: &Connection) -> Vec<(String, String)> {
+        conn.prepare(
+            "SELECT event_uid, kind FROM session_events \
+             WHERE source = 'claude' AND session_id = 'child' AND role = 'assistant' \
+             ORDER BY event_uid",
+        )
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    /// Every reader -- incremental, whole-file, hook bytes -- stores the same
+    /// rows for `text` as the child's evidence.
+    fn every_reader(text: &str) -> Vec<Connection> {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar = dir.path().join("agent-child.jsonl");
+        fs::write(&sidecar, text).unwrap();
+        let incremental = Connection::open_in_memory().unwrap();
+        init_db(&incremental).unwrap();
+        let pass =
+            incremental::ingest_claude_transcript_at_locator(&incremental, &sidecar, Some("child"))
+                .unwrap();
+        assert!(pass.in_progress.is_empty() || !text.ends_with('\n'));
+        let whole = Connection::open_in_memory().unwrap();
+        init_db(&whole).unwrap();
+        ingest_claude_transcript_as(&whole, &sidecar, Some("child")).unwrap();
+        let hook = Connection::open_in_memory().unwrap();
+        init_db(&hook).unwrap();
+        ingest_claude_transcript_text_as(&hook, &sidecar, text, Some("child")).unwrap();
+        vec![incremental, whole, hook]
+    }
+
+    /// A response whose only record is a signed, empty thinking block stands
+    /// alone: it stores its thinking event, so it is a request with its usage,
+    /// whichever reader reads it. The response after it is unchanged.
+    #[test]
+    fn a_response_whose_only_record_stores_no_event_keeps_its_request_and_usage() {
+        let text = [
+            sidecar_record("user", "c1", r#"{"role":"user","content":"delegated"}"#),
+            sidecar_signature("a1", "msg_1", 8),
+            sidecar_record("user", "c2", r#"{"role":"user","content":"go on"}"#),
+            sidecar_signature("a2a", "msg_2", 1),
+            sidecar_tool_use("a2b", "msg_2", "toolu_2", 7),
+            sidecar_tool_result("r2", "toolu_2"),
+        ]
+        .concat();
+        for conn in every_reader(&text) {
+            assert_eq!(
+                child_requests(&conn),
+                vec![
+                    ("request-id:req_msg_1".to_string(), 8),
+                    ("request-id:req_msg_2".to_string(), 7),
+                ]
+            );
+            assert_eq!(
+                child_assistant_events(&conn),
+                vec![
+                    ("a1:0".to_string(), "thinking".to_string()),
+                    ("a2b:0".to_string(), "tool_use".to_string()),
+                ]
+            );
+            // Both opening records keep their markers.
+            let markers: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM session_markers WHERE subkind = 'thinking_signature'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(markers, 2);
+        }
+    }
+
+    /// A main transcript fills in `stop_reason` on every record, so a record
+    /// that stores no event is held for the record after it all the same: a
+    /// later block of its message stores the response's rows and it stores
+    /// none, and a refusal nothing follows stands alone.
+    #[test]
+    fn a_finished_record_that_stores_no_event_waits_for_the_record_after_it() {
+        let record = |uuid: &str, message: &str, stop: &str, block: &str, output: i64| {
+            format!(
+                r#"{{"type":"assistant","uuid":"{uuid}","sessionId":"child","cwd":"/work/app","requestId":"req_{message}","timestamp":"2026-10-01T10:00:01Z","message":{{"id":"{message}","role":"assistant","model":"claude-opus-5","stop_reason":"{stop}","content":[{block}],"usage":{{"input_tokens":2,"cache_creation_input_tokens":353736,"output_tokens":{output}}}}}}}"#
+            ) + "\n"
+        };
+        let signed = r#"{"type":"thinking","thinking":"","signature":"sig"}"#;
+        let text = [
+            r#"{"type":"user","uuid":"u1","sessionId":"child","cwd":"/work/app","timestamp":"2026-10-01T10:00:00Z","message":{"role":"user","content":"hi"}}"#.to_string() + "\n",
+            record("a1a", "msg_1", "tool_use", signed, 4),
+            record(
+                "a1b",
+                "msg_1",
+                "tool_use",
+                r#"{"type":"tool_use","id":"toolu_1","name":"Bash","input":{}}"#,
+                4,
+            ),
+            sidecar_tool_result("r1", "toolu_1").replace("root-1", "child"),
+            record("a2", "msg_2", "refusal", signed, 5859),
+            r#"{"type":"system","uuid":"s1","sessionId":"child","subtype":"api_error","timestamp":"2026-10-01T10:00:03Z"}"#.to_string() + "\n",
+        ]
+        .concat();
+        for conn in every_reader(&text) {
+            assert_eq!(
+                child_requests(&conn),
+                vec![
+                    ("request-id:req_msg_1".to_string(), 4),
+                    ("request-id:req_msg_2".to_string(), 5859),
+                ]
+            );
+            assert_eq!(
+                child_assistant_events(&conn),
+                vec![
+                    ("a1b:0".to_string(), "tool_use".to_string()),
+                    ("a2:0".to_string(), "thinking".to_string()),
+                ]
+            );
+        }
+    }
+
+    /// Resumed across the boundary, a record that stores no event is held
+    /// while it is the file's last record: the block of its message that
+    /// follows it takes the response (no second row), a record of anything
+    /// else releases it as standalone, and once the writer has gone quiet it
+    /// stands alone. Each ends where a from-zero read of the same bytes ends.
+    #[test]
+    fn a_trailing_record_that_stores_no_event_is_decided_by_the_record_after_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar = dir.path().join("agent-child.jsonl");
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let append = |text: &str| {
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&sidecar)
+                .unwrap();
+            file.write_all(text.as_bytes()).unwrap();
+        };
+        let pass = || {
+            incremental::ingest_claude_transcript_at_locator(&conn, &sidecar, Some("child"))
+                .unwrap()
+        };
+        let from_zero = |conn: &Connection| {
+            let fresh = Connection::open_in_memory().unwrap();
+            init_db(&fresh).unwrap();
+            incremental::ingest_claude_transcript_at_locator(&fresh, &sidecar, Some("child"))
+                .unwrap();
+            assert_eq!(child_requests(conn), child_requests(&fresh));
+            assert_eq!(child_assistant_events(conn), child_assistant_events(&fresh));
+        };
+
+        append(&sidecar_record(
+            "user",
+            "c1",
+            r#"{"role":"user","content":"delegated"}"#,
+        ));
+        append(&sidecar_signature("a1a", "msg_1", 1));
+        assert_eq!(pass().in_progress, vec!["msg_1".to_string()]);
+        assert!(child_assistant_events(&conn).is_empty());
+        // The block of its message: one request, the opening record's marker
+        // only.
+        append(&sidecar_tool_use("a1b", "msg_1", "toolu_1", 5));
+        append(&sidecar_tool_result("r1", "toolu_1"));
+        assert!(pass().in_progress.is_empty());
+        assert_eq!(
+            child_assistant_events(&conn),
+            vec![("a1b:0".to_string(), "tool_use".to_string())]
+        );
+        assert_eq!(
+            child_requests(&conn),
+            vec![("request-id:req_msg_1".to_string(), 5)]
+        );
+        from_zero(&conn);
+
+        // Followed by a record of something else: it stands alone.
+        append(&sidecar_signature("a2", "msg_2", 3));
+        assert_eq!(pass().in_progress, vec!["msg_2".to_string()]);
+        append(&sidecar_record(
+            "user",
+            "c2",
+            r#"{"role":"user","content":"go on"}"#,
+        ));
+        assert!(pass().in_progress.is_empty());
+        assert_eq!(
+            child_requests(&conn),
+            vec![
+                ("request-id:req_msg_1".to_string(), 5),
+                ("request-id:req_msg_2".to_string(), 3),
+            ]
+        );
+        from_zero(&conn);
+
+        // The file's last record once its writer has gone quiet.
+        append(&sidecar_signature("a3", "msg_3", 2));
+        assert_eq!(pass().in_progress, vec!["msg_3".to_string()]);
+        let key = transcript_cursor::CursorKey::Locator {
+            source: "claude",
+            locator: &sidecar.to_string_lossy(),
+        };
+        let mut cursor = transcript_cursor::load_cursor(&conn, &key).unwrap();
+        cursor.file.as_mut().unwrap().unchanged_since_ms -=
+            transcript_cursor::QUIESCENT_GRACE_MS + 1;
+        transcript_cursor::store_cursor(&conn, &key, &cursor).unwrap();
+        assert!(pass().in_progress.is_empty());
+        assert_eq!(
+            child_requests(&conn).last(),
+            Some(&("request-id:req_msg_3".to_string(), 2))
+        );
+        assert!(pass().in_progress.is_empty());
+        assert_eq!(child_requests(&conn).len(), 3);
+    }
+
+    /// A later record of the message that stores no event row either -- empty
+    /// content, or only a block the event model drops -- does not take the
+    /// response: the opening record still stands alone, so the response keeps
+    /// its request and usage, whichever reader reads it.
+    #[test]
+    fn a_continuation_that_stores_no_event_leaves_the_opening_record_standing_alone() {
+        let text = [
+            sidecar_record("user", "c1", r#"{"role":"user","content":"delegated"}"#),
+            sidecar_signature("a1", "msg_1", 8),
+            sidecar_assistant("a1x", "msg_1", "", 8),
+            sidecar_assistant(
+                "a1y",
+                "msg_1",
+                r#"{"type":"redacted_thinking","data":"opaque"}"#,
+                8,
+            ),
+            sidecar_record("user", "c2", r#"{"role":"user","content":"go on"}"#),
+        ]
+        .concat();
+        for conn in every_reader(&text) {
+            assert_eq!(
+                child_requests(&conn),
+                vec![("request-id:req_msg_1".to_string(), 8)]
+            );
+            assert_eq!(
+                child_assistant_events(&conn),
+                vec![("a1:0".to_string(), "thinking".to_string())]
+            );
+        }
+    }
+
+    /// A record that stood alone stores its thinking event only while no
+    /// other record of its message stores rows. A later block of the message
+    /// -- after an interleaved record, or read by a later pass over bytes an
+    /// earlier pass (a hook's snapshot) ended on -- retires that event, so
+    /// the store holds what a from-zero read of the whole file holds.
+    #[test]
+    fn a_later_block_of_its_message_retires_a_standalone_event() {
+        let interleaved = [
+            sidecar_record("user", "c1", r#"{"role":"user","content":"delegated"}"#),
+            sidecar_signature("a1", "msg_1", 8),
+            sidecar_record("user", "c2", r#"{"role":"user","content":"go on"}"#),
+            sidecar_tool_use("a1b", "msg_1", "toolu_1", 5),
+            sidecar_tool_result("r1", "toolu_1"),
+        ]
+        .concat();
+        for conn in every_reader(&interleaved) {
+            assert_eq!(
+                child_assistant_events(&conn),
+                vec![("a1b:0".to_string(), "tool_use".to_string())]
+            );
+            assert_eq!(
+                child_requests(&conn),
+                vec![("request-id:req_msg_1".to_string(), 5)]
+            );
+        }
+
+        // The hook's snapshot ends on the opening record, so it stands alone;
+        // the next read sees the block that follows it.
+        let dir = tempfile::tempdir().unwrap();
+        let sidecar = dir.path().join("agent-child.jsonl");
+        let snapshot = [
+            sidecar_record("user", "c1", r#"{"role":"user","content":"delegated"}"#),
+            sidecar_signature("a1", "msg_1", 8),
+        ]
+        .concat();
+        let full = snapshot.clone()
+            + &sidecar_tool_use("a1b", "msg_1", "toolu_1", 5)
+            + &sidecar_tool_result("r1", "toolu_1");
+        fs::write(&sidecar, &full).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript_text_as(&conn, &sidecar, &snapshot, Some("child")).unwrap();
+        assert_eq!(
+            child_assistant_events(&conn),
+            vec![("a1:0".to_string(), "thinking".to_string())]
+        );
+        ingest_claude_transcript_as(&conn, &sidecar, Some("child")).unwrap();
+        assert_eq!(
+            child_assistant_events(&conn),
+            vec![("a1b:0".to_string(), "tool_use".to_string())]
+        );
+        assert_eq!(
+            child_requests(&conn),
+            vec![("request-id:req_msg_1".to_string(), 5)]
+        );
+    }
+
+    /// A standalone record whose thinking is blank by Unicode whitespace
+    /// stores its event with empty text, so the later block of its message
+    /// retires it as it retires any other.
+    #[test]
+    fn a_standalone_event_of_unicode_blank_thinking_is_retired_too() {
+        let text = [
+            sidecar_record("user", "c1", r#"{"role":"user","content":"delegated"}"#),
+            sidecar_assistant(
+                "a1",
+                "msg_1",
+                r#"{"type":"thinking","thinking":"\u2003","signature":"sig"}"#,
+                8,
+            ),
+            sidecar_record("user", "c2", r#"{"role":"user","content":"go on"}"#),
+            sidecar_tool_use("a1b", "msg_1", "toolu_1", 5),
+            sidecar_tool_result("r1", "toolu_1"),
+        ]
+        .concat();
+        for conn in every_reader(&text) {
+            assert_eq!(
+                child_assistant_events(&conn),
+                vec![("a1b:0".to_string(), "tool_use".to_string())]
+            );
+        }
+    }
+
+    /// A run of records that store no event, longer than the incremental
+    /// reader holds, is released as standalone by every reader alike, and the
+    /// block of their message that follows retires their events: each reader
+    /// ends with the same rows.
+    #[test]
+    fn a_held_run_past_the_cap_ends_the_same_in_every_reader() {
+        let signature = "s".repeat(1024 * 1024);
+        let mut records = vec![sidecar_record(
+            "user",
+            "c1",
+            r#"{"role":"user","content":"delegated"}"#,
+        )];
+        for index in 0..9 {
+            records.push(sidecar_assistant(
+                &format!("a{index}"),
+                "msg_1",
+                &format!(r#"{{"type":"thinking","thinking":"","signature":"{signature}"}}"#),
+                1,
+            ));
+        }
+        records.push(sidecar_tool_use("a9", "msg_1", "toolu_1", 5));
+        records.push(sidecar_tool_result("r1", "toolu_1"));
+        for conn in every_reader(&records.concat()) {
+            assert_eq!(
+                child_assistant_events(&conn),
+                vec![("a9:0".to_string(), "tool_use".to_string())]
+            );
+            assert_eq!(
+                child_requests(&conn),
+                vec![("request-id:req_msg_1".to_string(), 5)]
+            );
+        }
+    }
+
+    /// A store an earlier parser built has a response whose only record is a
+    /// signed, empty thinking block as its marker alone: no event, no
+    /// request. The store migration re-opens exactly that transcript and the
+    /// first sync re-reads it, past a fingerprint that vouches for the tree;
+    /// every other transcript stays on its cursor, and the next sync is
+    /// skipped.
+    #[test]
+    fn an_upgraded_store_gains_the_requests_of_standalone_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join(".claude/projects/-work-app");
+        let subagents = project.join("root-1/subagents");
+        fs::create_dir_all(&subagents).unwrap();
+        let root = project.join("root-1.jsonl");
+        fs::write(
+            &root,
+            r#"{"type":"user","uuid":"u1","sessionId":"root-1","cwd":"/work/app","timestamp":"2026-10-01T09:59:00Z","message":{"role":"user","content":"start"}}"#.to_string() + "\n",
+        )
+        .unwrap();
+        let sidecar = subagents.join("agent-child.jsonl");
+        fs::write(
+            &sidecar,
+            [
+                sidecar_record("user", "c1", r#"{"role":"user","content":"delegated"}"#),
+                sidecar_signature("a1", "msg_1", 8),
+                sidecar_record("user", "c2", r#"{"role":"user","content":"go on"}"#),
+                sidecar_tool_use("a2", "msg_2", "toolu_2", 7),
+                sidecar_tool_result("r2", "toolu_2"),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let other = subagents.join("agent-other.jsonl");
+        fs::write(
+            &other,
+            [
+                sidecar_record("user", "o1", r#"{"role":"user","content":"delegated"}"#),
+                sidecar_tool_use("o2", "msg_o", "toolu_o", 3),
+                sidecar_tool_result("o3", "toolu_o"),
+            ]
+            .concat()
+            .replace("\"agentId\":\"child\"", "\"agentId\":\"other\""),
+        )
+        .unwrap();
+        let db = dir.path().join("history.db");
+        let roots = crate::ProviderRoots::from_home(
+            dir.path().to_path_buf(),
+            dir.path().join("opencode.db"),
+        );
+        super::sync_exclusive_with_roots(&db, &roots, false).unwrap();
+        let conn = open_db(&db).unwrap();
+        let healthy = child_requests(&conn);
+        assert_eq!(healthy.len(), 2);
+
+        // What the earlier parser left: the opening record's marker, no event,
+        // a migration not yet run, and a fingerprint without this generation.
+        conn.execute_batch(
+            "DELETE FROM session_events WHERE event_uid = 'a1:0';
+             DELETE FROM schema_migrations WHERE name = 'claude_standalone_records_v1';",
+        )
+        .unwrap();
+        assert_eq!(
+            child_requests(&conn),
+            vec![("request-id:req_msg_2".to_string(), 7)]
+        );
+        let state_path = dir.path().join(".sync-state.json");
+        let mut state = load_sync_state(&state_path).unwrap();
+        let source_part = state[SOURCE_FINGERPRINT_KEY]
+            .as_str()
+            .unwrap()
+            .split_once('/')
+            .unwrap()
+            .1
+            .to_string();
+        let older: Vec<&str> = SWEEP_PARSER_GENERATIONS
+            .iter()
+            .copied()
+            .filter(|generation| *generation != CLAUDE_STANDALONE_RECORDS_GENERATION)
+            .collect();
+        let old_fingerprint = format!("{}/{source_part}", sweep_generation_with(&older));
+        state.insert(SOURCE_FINGERPRINT_KEY.into(), json!(old_fingerprint));
+        state.insert(
+            DESTINATION_GENERATION_KEY.into(),
+            json!(destination_generation(&conn).unwrap()),
+        );
+        state.insert(
+            DESTINATION_HEAD_KEY.into(),
+            json!(destination_head(&conn).unwrap()),
+        );
+        assert!(sources_unchanged(&conn, &state, &old_fingerprint));
+        fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+        drop(conn);
+
+        let cursor_of = |conn: &Connection, path: &Path| {
+            conn.query_row(
+                "SELECT parser_state_json FROM transcript_cursors \
+                 WHERE source = 'claude' AND locator = ?1",
+                [path.to_string_lossy()],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .unwrap()
+        };
+        let before = {
+            let conn = Connection::open(&db).unwrap();
+            (cursor_of(&conn, &root), cursor_of(&conn, &other))
+        };
+        // Opening the store runs the migration: only the sidecar holding the
+        // response loses its cursor.
+        let conn = open_db(&db).unwrap();
+        assert_eq!(cursor_of(&conn, &sidecar), None);
+        assert_eq!((cursor_of(&conn, &root), cursor_of(&conn, &other)), before);
+
+        assert!(
+            super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept
+        );
+        assert_eq!(child_requests(&conn), healthy);
+        assert_eq!((cursor_of(&conn, &root), cursor_of(&conn, &other)), before);
+        assert!(
+            !super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept
+        );
+        assert_eq!(child_requests(&conn), healthy);
     }
 
     #[test]
@@ -36484,31 +36961,8 @@ mod tests {
         );
     }
 
-    /// OpenCode records the stop reason on a `step-finish` part rather than on
-    /// the message, and writes it as its own wire string.
-    #[test]
-    fn opencode_step_finish_reason_is_read_verbatim() {
-        assert_eq!(
-            super::opencode_step_finish_stop_reason(
-                &json!({"type": "step-finish", "reason": "tool-calls"})
-            ),
-            Some("tool-calls")
-        );
-        assert_eq!(
-            super::opencode_step_finish_stop_reason(&json!({"type": "step-finish"})),
-            None
-        );
-        // Another part type never contributes a stop reason, whatever it
-        // happens to carry under that key.
-        assert_eq!(
-            super::opencode_step_finish_stop_reason(
-                &json!({"type": "text", "reason": "not-a-stop-reason"})
-            ),
-            None
-        );
-    }
-
-    /// The end-to-end half of the OpenCode stop-reason contract.
+    /// The end-to-end half of the OpenCode stop-reason contract; the parser's
+    /// `last_step_finish_reason` tests are the unit half.
     #[test]
     fn opencode_assistant_events_carry_step_finish_stop_reason() {
         let dir = tempfile::tempdir().unwrap();
