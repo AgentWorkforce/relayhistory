@@ -6,7 +6,7 @@ use rusqlite::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet, HashSet};
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -610,11 +610,18 @@ fn enable_wal_for_migration(conn: &Connection) -> Result<()> {
     unreachable!("the bounded journal-mode retry loop always returns")
 }
 
+/// Prepared statements a writable connection keeps compiled.
+const STATEMENT_CACHE_CAPACITY: usize = 128;
+
 pub fn open_db(path: &Path) -> Result<Connection> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
     let conn = Connection::open(path)?;
+    // A sweep and a hydration cycle through a few dozen statements per
+    // session -- more than rusqlite's default cache of 16 holds -- so each
+    // one would be compiled again, triggers and all, for every session.
+    conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
     // Before init_db: creating the schema takes a write lock too.
     configure_busy_retry(&conn)?;
     init_db(&conn)?;
@@ -1044,6 +1051,8 @@ const REQUIRED_TRIGGERS: &[&str] = &[
     "delete_session_markers",
     "delete_session_continuity_evidence",
 ];
+/// Marks `delete_session_hydration_state` rebuilt with one seek per edge end.
+const SESSION_DELETE_EDGE_SEEKS: &str = "session_delete_edge_seeks_v1";
 const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &[
     "session_presences_local_backfill_v1",
     "session_relationships_v2",
@@ -1060,6 +1069,9 @@ const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &[
     // NOT EXISTS` would otherwise leave an existing database on the old body
     // forever. The marker is what makes the rebuild happen exactly once.
     "session_delete_continuity_reopen_v1",
+    // The same trigger again: it seeks each end of a deleted session's edges
+    // instead of an `OR` over both.
+    SESSION_DELETE_EDGE_SEEKS,
     "session_events_raw_facts_v1",
     "session_project_key_v1",
     // The FTS update trigger narrowed to the columns it indexes. `CREATE
@@ -1364,21 +1376,52 @@ CREATE TABLE IF NOT EXISTS session_continuity_evidence (
 );
 "#;
 
+/// Rows `ANALYZE` samples per index when `PRAGMA optimize` runs it: SQLite's
+/// recommended bound, which keeps the first analysis of a multi-gigabyte
+/// history to seconds and every later one to milliseconds.
+const ANALYSIS_LIMIT: i64 = 400;
+
+/// Bring the planner's statistics up to date, as SQLite recommends doing at
+/// the end of a session of writes: `PRAGMA optimize` analyzes the tables this
+/// connection queried whose statistics are missing or whose size has moved
+/// well past them, and nothing else. The sweep's lookups are written to seek
+/// with or without statistics; these keep every other query's plan from
+/// being chosen blind on a store of tens of thousands of sessions.
+pub(crate) fn refresh_planner_statistics(conn: &Connection) -> Result<()> {
+    conn.pragma_update(None, "analysis_limit", ANALYSIS_LIMIT)?;
+    conn.execute_batch("PRAGMA optimize;")?;
+    Ok(())
+}
+
+/// Drop `trigger` unless every one of `markers` is applied, so the `CREATE
+/// TRIGGER IF NOT EXISTS` after it installs the current body.
+fn drop_trigger_unless_applied(conn: &Connection, trigger: &str, markers: &[&str]) -> Result<()> {
+    for marker in markers {
+        if !migration_applied(conn, marker)? {
+            conn.execute_batch(&format!("DROP TRIGGER IF EXISTS {trigger};"))?;
+            break;
+        }
+    }
+    Ok(())
+}
+
 fn init_db_locked(conn: &Connection) -> Result<()> {
     retire_export_capture(conn)?;
     // Same shape as the hydration-state trigger below: a body change has to
     // drop the old trigger before the `IF NOT EXISTS` in SCHEMA re-creates it.
-    if !migration_applied(conn, "session_events_fts_update_of_v1")? {
-        conn.execute_batch("DROP TRIGGER IF EXISTS session_events_au;")?;
-    }
-    if !migration_applied(conn, "history_fts_update_of_v1")?
-        || !migration_applied(conn, "fts_update_changed_only_v1")?
-    {
-        conn.execute_batch("DROP TRIGGER IF EXISTS history_au;")?;
-    }
-    if !migration_applied(conn, "fts_update_changed_only_v1")? {
-        conn.execute_batch("DROP TRIGGER IF EXISTS session_events_au;")?;
-    }
+    drop_trigger_unless_applied(
+        conn,
+        "session_events_au",
+        &[
+            "session_events_fts_update_of_v1",
+            "fts_update_changed_only_v1",
+        ],
+    )?;
+    drop_trigger_unless_applied(
+        conn,
+        "history_au",
+        &["history_fts_update_of_v1", "fts_update_changed_only_v1"],
+    )?;
     conn.execute_batch(SCHEMA)?;
     // Before the trigger below, whose body deletes from these tables.
     conn.execute_batch(SESSION_RELATIONSHIPS_DDL)?;
@@ -1386,9 +1429,14 @@ fn init_db_locked(conn: &Connection) -> Result<()> {
     // A trigger created by an earlier release keeps its old body through every
     // `CREATE TRIGGER IF NOT EXISTS`, so a changed body has to drop the old
     // one first. Behind a marker, so it happens once rather than on every open.
-    if !migration_applied(conn, "session_delete_continuity_reopen_v1")? {
-        conn.execute_batch("DROP TRIGGER IF EXISTS delete_session_hydration_state;")?;
-    }
+    drop_trigger_unless_applied(
+        conn,
+        "delete_session_hydration_state",
+        &[
+            "session_delete_continuity_reopen_v1",
+            SESSION_DELETE_EDGE_SEEKS,
+        ],
+    )?;
     conn.execute_batch(
         r#"
 CREATE TABLE IF NOT EXISTS schema_migrations (
@@ -1520,19 +1568,28 @@ BEGIN
     -- first would leave every dependent resolved, with nothing left to
     -- rediscover it by, so rehydrating this session would never rebuild the
     -- continuation it used to carry.
+    --
+    -- Each end of an edge is its own seek, the parent and the child index.
+    -- An OR across the two, or an `evidence_locator IS NOT NULL` term (a
+    -- range on the locator index; IN never matches a NULL anyway), leaves
+    -- the access path to statistics, and without them SQLite read every
+    -- edge of the source for each deleted session.
     UPDATE session_continuity_evidence
     SET pending_reason = 'unreconciled'
     WHERE source = OLD.source
       AND locator IN (
         SELECT evidence_locator FROM session_relationships
-        WHERE source = OLD.source
+        WHERE source = OLD.source AND parent_session_id = OLD.session_id
           AND relationship IN ('continuation', 'fork', 'resume')
-          AND evidence_locator IS NOT NULL
-          AND (parent_session_id = OLD.session_id OR child_session_id = OLD.session_id)
+        UNION ALL
+        SELECT evidence_locator FROM session_relationships
+        WHERE source = OLD.source AND child_session_id = OLD.session_id
+          AND relationship IN ('continuation', 'fork', 'resume')
       );
     DELETE FROM session_relationships
-    WHERE source = OLD.source
-      AND (parent_session_id = OLD.session_id OR child_session_id = OLD.session_id);
+    WHERE source = OLD.source AND parent_session_id = OLD.session_id;
+    DELETE FROM session_relationships
+    WHERE source = OLD.source AND child_session_id = OLD.session_id;
 END;
 CREATE TRIGGER IF NOT EXISTS delete_session_identity_correlations
 AFTER DELETE ON sessions
@@ -1566,6 +1623,7 @@ END;
     conn.execute_batch(
         "INSERT OR IGNORE INTO schema_migrations (name) \
          VALUES ('session_delete_continuity_reopen_v1'), \
+                ('session_delete_edge_seeks_v1'), \
                 ('session_events_fts_update_of_v1'), \
                 ('history_fts_update_of_v1'), \
                 ('fts_update_changed_only_v1');",
@@ -2071,16 +2129,17 @@ pub(crate) fn retire_evidence_share(
         SessionLocation::Remote => ("remote", "local"),
     };
     // `table` and `condition` come from internal call sites, never from input.
-    let deleted = conn.execute(
-        &format!("DELETE FROM {table} WHERE ({condition}) AND location = '{own}'"),
-        params,
-    )?;
-    conn.execute(
-        &format!(
-            "UPDATE {table} SET location = '{other}' WHERE ({condition}) AND location = 'both'"
-        ),
-        params,
-    )?;
+    // Cached: compiling these statements re-plans every trigger on the table,
+    // and a sweep runs them for every session it reads.
+    let deleted = conn
+        .prepare_cached(&format!(
+            "DELETE FROM {table} WHERE ({condition}) AND location = '{own}'"
+        ))?
+        .execute(params)?;
+    conn.prepare_cached(&format!(
+        "UPDATE {table} SET location = '{other}' WHERE ({condition}) AND location = 'both'"
+    ))?
+    .execute(params)?;
     Ok(deleted)
 }
 
@@ -4202,38 +4261,74 @@ pub fn refresh_project_identity(conn: &Connection) -> Result<usize> {
     Ok(written)
 }
 
-/// Which database a remembered refresh belongs to: the file, and the change
-/// feed's epoch, which a database recreated at the same path does not share.
-type RefreshedStore = (PathBuf, i64);
-
-/// The change-feed revision each database's last successful
-/// [`refresh_project_identity_incrementally`] in this process started at.
+/// Where the database records the change-feed position its last successful
+/// [`refresh_project_identity_incrementally`] started at: one row, keyed by
+/// the feed's epoch, which a database recreated in place does not share.
 ///
 /// Every row a refresh can find out of line was written, by some process,
 /// after the last refresh that left everything in line: the feed's triggers
 /// stamp every insert and every update that changes a column, `project_key`
 /// and `project_key_method` included, with a revision above that point. So the
 /// inheriting and denormalizing passes need to look only at sessions holding
-/// such a row, and at their delegation descendants.
-static REFRESHED_THROUGH: std::sync::LazyLock<std::sync::Mutex<BTreeMap<RefreshedStore, i64>>> =
-    std::sync::LazyLock::new(Default::default);
+/// such a row, and at their delegation descendants. Kept in the database, not
+/// the process, because every `ai-hist sync` and every embedder's sweep is a
+/// process of its own, and each one's first refresh would otherwise be full.
+/// The table has no change-feed trigger, so writing it moves no revision.
+const IDENTITY_REFRESH_DDL: &str = "CREATE TABLE IF NOT EXISTS project_identity_refreshed \
+     (epoch INTEGER PRIMARY KEY, revision INTEGER NOT NULL)";
 
 /// The feed epoch and head revision of `conn`'s database, or `None` when it
-/// has no change feed (or no file) to scope by.
-///
-/// The database is named by its canonical path, the identity the sync lock
-/// uses, so two spellings of one file share a remembered point; and the head
-/// is the change feed's own single-statement read of epoch and revision.
-fn feed_position(conn: &Connection) -> Option<(RefreshedStore, i64)> {
-    let path = Path::new(conn.path().filter(|path| !path.is_empty())?);
-    let path = crate::ingest::canonical_db_identity(path).ok()?;
+/// has no change feed to scope by.
+fn feed_position(conn: &Connection) -> Option<(i64, i64)> {
     let head = crate::change_feed::read_head(conn).ok()?;
-    Some(((path, head.epoch as i64), head.revision as i64))
+    Some((head.epoch as i64, head.revision as i64))
 }
 
-/// [`refresh_project_identity`] scoped to what was written since the previous
-/// refresh of the same database in this process. Sync sweeps and discovery
-/// passes both end with it.
+/// The revision the last successful refresh under `epoch` started at.
+/// Read-only: a database without the table has no point yet.
+fn refreshed_through(conn: &Connection, epoch: i64) -> Result<Option<i64>> {
+    let exists = conn
+        .prepare_cached(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'project_identity_refreshed'",
+        )?
+        .exists([])?;
+    if !exists {
+        return Ok(None);
+    }
+    Ok(conn
+        .query_row(
+            "SELECT revision FROM project_identity_refreshed WHERE epoch = ?1",
+            [epoch],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+/// Record (or, after a failure, forget) the refreshed-through point. Each
+/// statement stands alone, so a concurrent refresh's write interleaved with
+/// these cannot make either fail: the last writer's point stands, and every
+/// point is a head some refresh started at.
+fn remember_refresh(conn: &Connection, point: Option<(i64, i64)>) -> Result<()> {
+    conn.execute_batch(IDENTITY_REFRESH_DDL)?;
+    let Some((epoch, revision)) = point else {
+        conn.execute("DELETE FROM project_identity_refreshed", [])?;
+        return Ok(());
+    };
+    conn.execute(
+        "INSERT INTO project_identity_refreshed (epoch, revision) VALUES (?1, ?2) \
+         ON CONFLICT(epoch) DO UPDATE SET revision = excluded.revision",
+        [epoch, revision],
+    )?;
+    conn.execute(
+        "DELETE FROM project_identity_refreshed WHERE epoch <> ?1",
+        [epoch],
+    )?;
+    Ok(())
+}
+
+/// [`refresh_project_identity`] scoped to what was written since the
+/// database's previous refresh. Sync sweeps and discovery passes both end
+/// with it.
 ///
 /// Pass 1 runs in full: it is how a checkout that gained an `origin` reaches
 /// sessions whose transcripts never change, and it reads only the catalog.
@@ -4255,17 +4350,17 @@ fn feed_position(conn: &Connection) -> Option<(RefreshedStore, i64)> {
 /// Rows pass 1 rewrites just now carry such a revision too, so the scope is
 /// collected after it runs.
 ///
-/// The first refresh of a database in a process runs in full, as does one
-/// whose feed epoch changed or whose head went backwards (a database replaced
-/// under the process), and one after a relationship was deleted, since its
-/// tombstone does not name the child that lost a parent. A failed refresh
-/// forgets the point, so the next one is full again.
+/// A database's first refresh runs in full, as does one whose feed epoch
+/// changed or whose head went backwards (a database replaced in place), and
+/// one after a relationship was deleted, since its tombstone does not name
+/// the child that lost a parent. A failed refresh forgets the point, so the
+/// next one is full again.
 pub(crate) fn refresh_project_identity_incrementally(conn: &Connection) -> Result<usize> {
     let position = feed_position(conn);
-    let since = position.as_ref().and_then(|(store, head)| {
-        let remembered = REFRESHED_THROUGH.lock().ok()?.get(store).copied()?;
-        (remembered <= *head).then_some(remembered)
-    });
+    let since = match position {
+        Some((epoch, head)) => refreshed_through(conn, epoch)?.filter(|point| *point <= head),
+        None => None,
+    };
     let refreshed = (|| {
         let mut written = resolve_missing_project_keys(conn)?;
         let scoped = match since {
@@ -4283,16 +4378,17 @@ pub(crate) fn refresh_project_identity_incrementally(conn: &Connection) -> Resul
         }
         Ok(written)
     })();
-    if let Some((store, head)) = position {
-        if let Ok(mut remembered) = REFRESHED_THROUGH.lock() {
-            match refreshed {
-                // The head read before any pass ran: a row written while the
-                // passes ran, by this refresh or by anyone else, sits above it
-                // and is looked at next time.
-                Ok(_) => remembered.insert(store, head),
-                Err(_) => remembered.remove(&store),
-            };
-        }
+    // The head read before any pass ran: a row written while the passes ran,
+    // by this refresh or by anyone else, sits above it and is looked at next
+    // time. A point that did not move is not rewritten, so a refresh over an
+    // unchanged catalog stays read-only.
+    //
+    // Best effort: a point that could not be written leaves the previous one,
+    // and every row this refresh would have vouched for, or failed to fix,
+    // carries a revision above it, so the next refresh only looks wider.
+    let point = position.filter(|_| refreshed.is_ok());
+    if position.is_some() && point.map(|(_, head)| head) != since {
+        let _ = remember_refresh(conn, point);
     }
     refreshed
 }
@@ -5288,12 +5384,30 @@ pub fn shell_quote(value: &str) -> String {
 /// The copy is a per-sync `Connection::backup` of the provider's entire store
 /// plus a provider-side index build on the copy; on a large `opencode.db` that
 /// is hundreds of megabytes of I/O for evidence the bounded path reads with
-/// session-keyed queries. It is now opt-in at *runtime* as well as at compile
+/// session-keyed queries. It is opt-in at *runtime* as well as at compile
 /// time, so the default path does not copy even in a build that has the
 /// feature — which is what `--all-features` gives CI.
 #[cfg(feature = "opencode-backup")]
-fn opencode_backup_requested() -> bool {
+pub(crate) fn opencode_backup_requested() -> bool {
     std::env::var_os("AI_HIST_OPENCODE_BACKUP").is_some_and(|value| value == "1")
+}
+
+/// A whole-database copy of `opencode_db`, indexed for session-keyed reads.
+#[cfg(feature = "opencode-backup")]
+pub(crate) fn opencode_backup_copy(opencode_db: &Path) -> Result<Connection> {
+    let tmp = tempfile::NamedTempFile::new()?.into_temp_path();
+    let src_live = Connection::open_with_flags(
+        opencode_db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .with_context(|| format!("opening {}", opencode_db.display()))?;
+    src_live.busy_timeout(std::time::Duration::from_secs(5))?;
+    src_live
+        .backup(DatabaseName::Main, &tmp, None)
+        .map_err(|source| SourceDatabaseError::new(opencode_db, source))?;
+    let src = Connection::open(&tmp)?;
+    src.execute_batch("CREATE INDEX IF NOT EXISTS ai_hist_sync_part_session ON part(session_id);")?;
+    Ok(src)
 }
 
 /// Index every OpenCode session the provider store holds.
@@ -5307,229 +5421,21 @@ pub fn sync_opencode_db(conn: &Connection, opencode_db: &Path) -> Result<usize> 
     sync_opencode_dbs(conn, &[opencode_db.to_path_buf()])
 }
 
-/// Index every session in each OpenCode store, in order.
-///
-/// OpenCode keeps one database per release channel, and the caller passes
-/// them in [`crate::paths::opencode_db_files`] order. A session present in
-/// more than one is claimed by the first store that holds it — the same rule
-/// discovery applies — so it is indexed once, from the store its catalog row
-/// names, rather than rewritten by each store in turn. One store's failure is
-/// that store's: the rest are still indexed, and the error names every store
-/// that failed.
+/// Index every session in each OpenCode store, in order, reading every one:
+/// the sweep's pass ([`crate::ingest::opencode_sweep`]) with no stamps to
+/// skip by.
 pub fn sync_opencode_dbs(conn: &Connection, opencode_dbs: &[PathBuf]) -> Result<usize> {
-    let files: Vec<&Path> = opencode_dbs
-        .iter()
-        .map(PathBuf::as_path)
-        .filter(|path| path.is_file())
-        .collect();
-    let mut inserted = 0;
-    let mut claimed = BTreeSet::new();
-    let mut failures: Vec<anyhow::Error> = Vec::new();
-    for path in crate::ingest::capture_files("opencode", files) {
-        match sync_opencode_db_file(conn, path, &mut claimed) {
-            Ok(count) => inserted += count,
-            Err(error) => {
-                // Cancellation ends the whole sweep, not one store.
-                crate::ingest::check_capture_cancelled()?;
-                failures.push(error);
-            }
-        }
-    }
-    crate::ingest::check_capture_cancelled()?;
-    match failures.len() {
-        0 => Ok(inserted),
-        1 => Err(failures.remove(0)),
-        _ => anyhow::bail!(
-            "{} OpenCode stores could not be fully indexed (the rest were): {}",
-            failures.len(),
-            failures
-                .iter()
-                .map(|error| format!("{error:#}"))
-                .collect::<Vec<_>>()
-                .join("; ")
-        ),
-    }
+    crate::ingest::opencode_sweep::unstamped(|sweep| {
+        crate::ingest::opencode_sweep::sync_opencode_dbs(conn, opencode_dbs, sweep)
+    })
 }
 
-fn sync_opencode_db_file(
-    conn: &Connection,
-    opencode_db: &Path,
-    claimed: &mut BTreeSet<String>,
-) -> Result<usize> {
-    crate::ingest::check_capture_cancelled()?;
-    // `is_file`, the same question `OpencodeLayout::detect` asks. `exists` is
-    // true for a directory, and `OPENCODE_DB` is an arbitrary path, so the
-    // looser guard let a directory reach `Connection::open` and fail there --
-    // a caller that classified first would never send one, and one that did
-    // not deserves the same answer as an absent store rather than an SQLite
-    // error about a path that is not a database.
-    if !opencode_db.is_file() {
-        return Ok(0);
-    }
-    #[cfg(feature = "opencode-backup")]
-    if opencode_backup_requested() {
-        let tmp = tempfile::NamedTempFile::new()?.into_temp_path();
-        let src_live = Connection::open_with_flags(
-            opencode_db,
-            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-        )
-        .with_context(|| format!("opening {}", opencode_db.display()))?;
-        src_live.busy_timeout(std::time::Duration::from_secs(5))?;
-        src_live
-            .backup(DatabaseName::Main, &tmp, None)
-            .map_err(|source| SourceDatabaseError::new(opencode_db, source))?;
-        let src = Connection::open(&tmp)?;
-        src.execute_batch(
-            "CREATE INDEX IF NOT EXISTS ai_hist_sync_part_session ON part(session_id);",
-        )?;
-        return sync_opencode_sessions_from_source(conn, &src, opencode_db, claimed);
-    }
-    let src = Connection::open_with_flags(
-        opencode_db,
-        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
-    )
-    .with_context(|| format!("opening {}", opencode_db.display()))?;
-    src.busy_timeout(std::time::Duration::from_secs(5))?;
-    src.execute_batch("BEGIN")?;
-    let result = sync_opencode_sessions_from_source(conn, &src, opencode_db, claimed);
-    let _ = src.execute_batch("ROLLBACK");
-    result
-}
-
-/// Index every OpenCode session in a legacy `storage/` JSON tree.
+/// Index every OpenCode session in a legacy `storage/` JSON tree, reading
+/// every one.
 pub fn sync_opencode_storage_dir(conn: &Connection, storage_dir: &Path) -> Result<usize> {
-    crate::ingest::check_capture_cancelled()?;
-    if !storage_dir.join("session").is_dir() {
-        return Ok(0);
-    }
-    // One session's failure is that session's failure. The loader reports I/O
-    // errors now, and propagating the first one would leave every healthy
-    // session in the same tree unindexed for as long as the one path stays
-    // broken -- the opposite of what making the read failure visible was for.
-    // So each session is indexed or reported on its own, and the error at the
-    // end names them all rather than the first.
-    let mut inserted = 0;
-    let listing = crate::ingest::opencode::list_json_tree_session_files(storage_dir);
-    // A subtree that could not be walked is not a subtree with no sessions in
-    // it. It joins the per-session failures rather than being dropped, so the
-    // sessions under it are reported missing instead of silently absent.
-    let mut failures: Vec<String> = listing
-        .unreadable
-        .iter()
-        .map(|dir| format!("{}: {}", dir.path.display(), dir.error))
-        .collect();
-    for session_file in crate::ingest::capture_files("opencode", listing.sessions) {
-        crate::ingest::check_capture_cancelled()?;
-        let indexed =
-            crate::ingest::opencode::load_from_json_tree(&session_file).and_then(|loaded| {
-                match loaded {
-                    Some(loaded) => crate::ingest::opencode::normalize(
-                        conn,
-                        &loaded,
-                        &session_file.to_string_lossy(),
-                    )
-                    .map(|counts| counts.prompts),
-                    None => Ok(0),
-                }
-            });
-        match indexed {
-            Ok(prompts) => inserted += prompts,
-            Err(error) => failures.push(format!("{}: {error:#}", session_file.display())),
-        }
-    }
-    if !failures.is_empty() {
-        anyhow::bail!(
-            "{} OpenCode path(s) under {} could not be read (the rest were indexed): {}",
-            failures.len(),
-            storage_dir.display(),
-            failures.join("; ")
-        );
-    }
-    Ok(inserted)
-}
-
-/// `claimed` holds the sessions an earlier store already owns; they are
-/// skipped here, and this store's own sessions are added to it.
-fn sync_opencode_sessions_from_source(
-    conn: &Connection,
-    src: &Connection,
-    raw_path: &Path,
-    claimed: &mut BTreeSet<String>,
-) -> Result<usize> {
-    crate::ingest::check_capture_cancelled()?;
-    let raw_path = raw_path.to_string_lossy().into_owned();
-    let mut inserted = 0;
-    // One session's failure is that session's failure, the same way the legacy
-    // tree's sweep treats it. The loader reports a row it cannot map rather
-    // than calling the session absent, and taking that error out of the loop
-    // with `?` would end the sweep at the first bad row -- every session after
-    // it in the store unindexed for as long as that one row stays bad.
-    let mut failures: Vec<String> = Vec::new();
-    // Session-keyed queries are bounded only when the provider indexes the
-    // column they seek on. Without that index each one scans `part`, and this
-    // loop runs one per session -- quadratic on exactly the large stores the
-    // bounded path exists to protect. Read the whole store once instead.
-    match crate::ingest::opencode::sync_plan(src)? {
-        crate::ingest::opencode::OpencodeSyncPlan::PerSession => {
-            for session_id in crate::ingest::opencode::list_sqlite_session_ids(src)? {
-                crate::ingest::check_capture_cancelled()?;
-                if !claimed.insert(session_id.clone()) {
-                    continue;
-                }
-                let indexed = crate::ingest::opencode::load_from_sqlite(src, &session_id).and_then(
-                    |loaded| match loaded {
-                        Some(loaded) => {
-                            crate::ingest::opencode::normalize(conn, &loaded, &raw_path)
-                                .map(|counts| counts.prompts)
-                        }
-                        None => Ok(0),
-                    },
-                );
-                match indexed {
-                    Ok(prompts) => inserted += prompts,
-                    Err(error) => failures.push(format!("{session_id}: {error:#}")),
-                }
-            }
-        }
-        crate::ingest::opencode::OpencodeSyncPlan::SinglePass => {
-            crate::ingest::check_capture_cancelled()?;
-            let load = crate::ingest::opencode::load_all_from_sqlite(src)?;
-            // Decided before anything is written, over every session this
-            // store holds — readable or not — so a session that failed here
-            // is not then indexed from a later store behind this one's back.
-            let already_claimed: BTreeSet<String> = load
-                .failures
-                .iter()
-                .map(|failure| failure.session_id.clone())
-                .chain(load.sessions.iter().map(|loaded| loaded.session.id.clone()))
-                .filter(|session_id| !claimed.insert(session_id.clone()))
-                .collect();
-            failures.extend(
-                load.failures
-                    .iter()
-                    .filter(|failure| !already_claimed.contains(&failure.session_id))
-                    .map(|failure| format!("{}: {}", failure.session_id, failure.error)),
-            );
-            for loaded in load.sessions {
-                crate::ingest::check_capture_cancelled()?;
-                if already_claimed.contains(&loaded.session.id) {
-                    continue;
-                }
-                match crate::ingest::opencode::normalize(conn, &loaded, &raw_path) {
-                    Ok(counts) => inserted += counts.prompts,
-                    Err(error) => failures.push(format!("{}: {error:#}", loaded.session.id)),
-                }
-            }
-        }
-    }
-    if !failures.is_empty() {
-        anyhow::bail!(
-            "{} OpenCode session(s) in {raw_path} could not be read (the rest were indexed): {}",
-            failures.len(),
-            failures.join("; ")
-        );
-    }
-    Ok(inserted)
+    crate::ingest::opencode_sweep::unstamped(|sweep| {
+        crate::ingest::opencode_sweep::sync_opencode_storage_dir(conn, storage_dir, sweep)
+    })
 }
 
 /// Ingest one OpenCode session with session-keyed queries against the live
@@ -9291,7 +9197,7 @@ mod tests {
         insert_event("a", "a1", None);
         insert_event("b", "b1", None);
 
-        // The first refresh in the process has nothing to scope by: full.
+        // The database's first refresh has nothing to scope by: full.
         assert_eq!(refresh_project_identity_incrementally(&conn).unwrap(), 2);
         assert_eq!(event_key("a1").as_deref(), Some("/work/a"));
         assert_eq!(event_key("b1").as_deref(), Some("/work/b"));
@@ -9322,8 +9228,8 @@ mod tests {
         // And the scope really is the changed rows. An event put out of line
         // under an old revision (the update trigger leaves a write that sets
         // `revision` itself alone) is invisible to the scoped pass, and found
-        // by the full one -- which is why the first refresh of a process, and
-        // any after a failed one, stays full.
+        // by the full one -- which is why a database's first refresh, and any
+        // after a failed one, stays full.
         conn.execute(
             "UPDATE session_events SET project_key = NULL, revision = 1 \
              WHERE event_uid = 'b1'",
@@ -9331,6 +9237,14 @@ mod tests {
         )
         .unwrap();
         assert_eq!(refresh_project_identity_incrementally(&conn).unwrap(), 0);
+        assert_eq!(event_key("b1"), None);
+        // The point is the database's, not the connection's: the next
+        // process's first refresh is scoped too.
+        let next_process = open_db(&temp.path().join("scoped.db")).unwrap();
+        assert_eq!(
+            refresh_project_identity_incrementally(&next_process).unwrap(),
+            0
+        );
         assert_eq!(event_key("b1"), None);
         assert_eq!(refresh_project_identity(&conn).unwrap(), 1);
         assert_eq!(event_key("b1").as_deref(), Some("/work/b"));

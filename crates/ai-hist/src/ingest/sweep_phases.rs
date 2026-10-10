@@ -242,46 +242,9 @@ impl SweepPhases<'_, '_> {
     fn opencode(&mut self) -> Result<()> {
         capture_progress("opencode", 0, None);
         check_capture_cancelled()?;
-        let roots = self.roots;
-        // One owner, two layouts: `opencode.db` when the host has it, the
-        // legacy `storage/` tree when it does not. Never both — a host that
-        // upgraded has a stale tree sitting beside a live database.
-        //
-        // Asked once, through the same `detect` that discovery and hydration
-        // use. Asking it a second way here is how the two came apart:
-        // `exists()` is true for a *directory* named by `OPENCODE_DB`, so sync
-        // opened it as SQLite and failed while detect read the legacy tree —
-        // catalog rows with no evidence behind them, and nothing saying why.
-        let layout = opencode::OpencodeLayout::detect(
-            &roots.opencode_db,
-            roots.opencode_db_pinned,
-            &roots.opencode_storage_dir,
-        );
-        let result = match &layout {
-            Some(opencode::OpencodeLayout::Sqlite(dbs)) => sync_opencode_dbs(self.conn, dbs),
-            Some(opencode::OpencodeLayout::JsonTree(tree)) => {
-                sync_opencode_storage_dir(self.conn, tree)
-            }
-            None => Ok(0),
-        };
-        let Some(inserted) = self.report.capture("opencode", result) else {
-            return Ok(());
-        };
-        match &layout {
-            Some(opencode::OpencodeLayout::Sqlite(_)) => {
-                sync_note!("  [opencode] +{inserted} rows");
-            }
-            Some(opencode::OpencodeLayout::JsonTree(tree)) => {
-                sync_note!("  [opencode] +{inserted} rows from {}", tree.display());
-            }
-            None => {
-                sync_note!(
-                    "  [opencode] not found: {} (skipped)",
-                    roots.opencode_db.display()
-                );
-            }
-        }
-        self.inserted += inserted;
+        let result =
+            opencode_sweep::sync_opencode_sources(self.conn, self.state, self.roots, self.repairs);
+        self.counted("opencode", result);
         Ok(())
     }
 

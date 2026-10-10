@@ -30,6 +30,7 @@ pub(crate) mod incremental;
 pub(crate) mod jsonl;
 pub(crate) mod muse;
 pub(crate) mod opencode;
+pub(crate) mod opencode_sweep;
 pub(crate) mod tool_result_facts;
 mod trajectory_scan;
 pub(crate) mod transcript_cursor;
@@ -2358,6 +2359,9 @@ fn sync_basic(
                 fingerprint,
             },
         );
+    }
+    if let Err(error) = crate::store::refresh_planner_statistics(conn) {
+        sync_note!("  [sync] planner statistics not refreshed: {error:#}");
     }
     let total: i64 = conn.query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))?;
     // Fold the WAL back into the database now that the writes are done.
@@ -4835,10 +4839,14 @@ fn cleanup_subagent_registration(conn: &Connection, source: &str, session_id: &s
            AS SELECT * FROM session_relationships WHERE 0; \
          DELETE FROM retained_relationships;",
     )?;
+    // One seek per end of the edge; see `session_continuity_edges`.
     conn.execute(
-        "INSERT INTO retained_relationships SELECT * FROM session_relationships \
-         WHERE source = ? AND (parent_session_id = ? OR child_session_id = ?)",
-        params![source, session_id, session_id],
+        "INSERT INTO retained_relationships \
+         SELECT * FROM session_relationships WHERE source = ?1 AND parent_session_id = ?2 \
+         UNION ALL \
+         SELECT * FROM session_relationships \
+         WHERE source = ?1 AND child_session_id = ?2 AND parent_session_id <> ?2",
+        params![source, session_id],
     )?;
     conn.execute(
         "DELETE FROM sessions \
@@ -12417,7 +12425,7 @@ fn upsert_session_inner(
         None => (None, None),
     };
     let project_key_merge = crate::store::project_key_merge_sql();
-    conn.execute(
+    conn.prepare_cached(
         &format!("INSERT INTO sessions \
          (session_id, source, cwd, git_branch, first_activity_ms, last_activity_ms, last_assistant_text, raw_path, parser_version, project_key, project_key_method, discovery_state) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, 'full') \
@@ -12432,6 +12440,8 @@ fn upsert_session_inner(
          parser_version = excluded.parser_version, \
          discovery_state = 'full'"
         ),
+    )?
+    .execute(
         params![
             session_id,
             source,
@@ -32414,6 +32424,9 @@ mod tests {
             json!(super::destination_head(&conn).unwrap()),
         );
         assert!(super::sources_unchanged(&conn, &state, &old_fingerprint));
+        // The previous build's per-session stamps carry its generation, so
+        // none of them matches this build's.
+        state.remove("opencode_tree_sessions_v1");
         fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
 
         assert!(

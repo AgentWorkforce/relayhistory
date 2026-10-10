@@ -1824,6 +1824,22 @@ How each adapter works:
   Setting `OPENCODE_DB` names exactly one store and its channel siblings are
   not read; so does `ai-hist sync-opencode --opencode-db <path>`.
 
+  A sweep reads only the OpenCode sessions that changed since the sweep that
+  last wrote them. A SQLite store whose database and `-wal` file (device,
+  inode, length, mtime) match the last sweep's is not opened at all; the
+  `-shm` index is not compared, since every reader writes to it. In a store
+  that moved, each session is stamped on its row's fields and, for `message`
+  and `part`, the row count, newest `time_updated` and a sum of per-row hashes
+  of id, `time_updated` and payload length (the payload itself where the table
+  has no `time_updated`) — one aggregate pass over each table. A legacy-tree
+  session is stamped on its files as discovery stamps it. Stamps carry the
+  sweep generation, and a matching stamp is trusted only while the session
+  still holds its catalog row and the events, markers and parent edge it held,
+  and the destination marker does not name it short, so a forgotten or damaged
+  session is read again. A session or store written within two seconds of the
+  read is not stamped, and is read again by the next sweep. `ai-hist
+  sync-opencode` reads every session.
+
   The JSON tree is laid out as `session/<scope>/<sessionId>.json`,
   `message/<sessionId>/<messageId>.json` and `part/<messageId>/<partId>.json`.
   The *payloads* are identical to the `data` columns in the SQLite tables, so
