@@ -896,10 +896,27 @@ How each adapter works:
   `$CODEX_HOME/archived_sessions` (defaulting under `~/.codex`). The first line
   is a `session_meta` record, which
   makes codex the richest source: originator, `cli_version`, git remote, initial
-  commit, workspace roots and model all come from it. Subagent threads are real
-  rollouts but not user sessions, so they are excluded — exactly as the full
-  sync excludes them — and remembered in `discovery_skips` so a rescan does not
-  re-read them.
+  commit, workspace roots and model all come from it. Both trees are catalogued
+  the same way: archiving a thread moves its rollout from `sessions/` to
+  `archived_sessions/` unchanged, and an archived thread is still the user's
+  history, so it keeps its session id and evidence.
+
+  A rollout is a **delegated child thread** exactly when its `session_meta`
+  carries a subagent marker (`thread_source` `subagent` or `guardian_review`,
+  or the object form of `source.subagent`) *and* names a parent thread
+  (`parent_thread_id`, `source.subagent.thread_spawn.parent_thread_id`, or a
+  legacy `session_id` other than its own `id`). A child is left out of the
+  catalog — exactly as the full sync leaves it out — and remembered in
+  `discovery_skips` so a rescan does not re-read it; its evidence is stored
+  under its own id behind a `delegated` edge to that parent. Every other
+  rollout is a session under its `payload.id`, including a standalone
+  guardian / auto-review thread that is marked `thread_source: "subagent"` but
+  names no parent: the marker says what kind of agent wrote it, and with no
+  parent to hang under, leaving it out would make its evidence unreachable.
+  The rule reads only the rollout's own first record, so a child's
+  classification does not depend on whether its parent's rollout has been
+  captured yet: the edge is recorded from the child, and the parent's
+  `delegated_descendants` reach it whenever the parent arrives.
 <a id="cursor"></a>
 
 - **cursor** — `~/.cursor/projects/<encoded-path>/agent-transcripts/<id>/<id>.jsonl`.
