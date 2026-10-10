@@ -15,6 +15,7 @@ use std::io::{self, BufRead, BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+mod claude_record_rows;
 mod claude_standalone;
 pub(crate) mod codex;
 mod codex_subagent;
@@ -33,6 +34,9 @@ pub(crate) mod opencode_sweep;
 pub(crate) mod tool_result_facts;
 pub(crate) mod transcript_cursor;
 
+#[cfg(test)]
+use claude_record_rows::{delete_claude_record_rows, CLAUDE_RECORD_ROWS};
+use claude_record_rows::{heal_claude_record_rows, HealedRows};
 use claude_standalone::{
     claude_record_stores_no_event, claude_thinking_event_text, ClaudeRecordWalk,
     CLAUDE_STANDALONE_RECORDS_GENERATION,
@@ -101,6 +105,11 @@ macro_rules! sync_note {
         }
     };
 }
+
+// After `sync_note!`, which the phases report through.
+mod sweep_phases;
+use sweep_phases::SweepPhases;
+pub(crate) use sweep_phases::SweepScope;
 
 /// Refresh local agent history without performing any cloud operation.
 /// Embedding applications should use this before opening the local catalog.
@@ -313,11 +322,13 @@ pub(crate) fn sync_local_at_with_home(db_path: &Path, home: &Path) -> Result<boo
 /// changed: a baseline taken before the lock would also count whatever
 /// another sync wrote while this call waited for it. `None` means the lock
 /// was held elsewhere and nothing ran — the facade turns that into an error
-/// rather than a silent no-op.
+/// rather than a silent no-op. `scope` names the sources the sweep reads;
+/// see [`SweepScope`] for what a scoped sweep leaves alone.
 pub(crate) fn sync_facade_tick<B, R>(
     db_path: &Path,
     roots: &crate::ProviderRoots,
     force: bool,
+    scope: &SweepScope,
     before: impl FnOnce(&Connection) -> Result<B>,
     after: impl FnOnce(&Connection, B, SyncTick) -> Result<R>,
 ) -> Result<Option<(SyncTick, R)>> {
@@ -328,7 +339,7 @@ pub(crate) fn sync_facade_tick<B, R>(
     };
     let conn = open_db(db_path).map_err(|error| enrich_sync_error(db_path, error))?;
     let baseline = before(&conn)?;
-    let swept = sync_basic(&conn, db_path, roots, force)
+    let swept = sync_basic(&conn, db_path, roots, force, scope)
         .map_err(|error| enrich_sync_error(db_path, error))?;
     let tick = SyncTick {
         attempted: true,
@@ -1896,14 +1907,27 @@ mod opencode_watch_pin_tests {
 pub(crate) fn sync_watch_roots_with_provider_roots(
     provider_roots: &crate::ProviderRoots,
 ) -> Vec<discover::WatchRoot> {
-    // Per source, through the one builder `Source::capabilities()` also
-    // reads, so the roots the loop registers and the roots the facade
-    // advertises cannot drift apart.
-    let mut roots = Vec::new();
-    for source in crate::store::SOURCE_CHOICES {
-        roots.extend(source_watch_roots(source, provider_roots));
-    }
-    merge_watch_roots(roots)
+    merge_watch_roots(
+        sync_watch_roots_by_source(provider_roots)
+            .into_iter()
+            .flat_map(|(_, roots)| roots)
+            .collect(),
+    )
+}
+
+/// [`sync_watch_roots_with_provider_roots`] before the merge: each source's
+/// roots, so a watch can tell which source an event's root belongs to.
+///
+/// Per source, through the one builder `Source::capabilities()` also reads,
+/// so the roots the loop registers and the roots the facade advertises cannot
+/// drift apart.
+pub(crate) fn sync_watch_roots_by_source(
+    provider_roots: &crate::ProviderRoots,
+) -> Vec<(&'static str, Vec<discover::WatchRoot>)> {
+    crate::store::SOURCE_CHOICES
+        .iter()
+        .map(|source| (*source, source_watch_roots(source, provider_roots)))
+        .collect()
 }
 
 /// Everything the sweep reads for one source, as the watcher registers it:
@@ -1940,7 +1964,7 @@ pub(crate) fn source_watch_roots(
 }
 
 /// One entry per path, at the widest depth any claim asked for.
-fn merge_watch_roots(mut roots: Vec<discover::WatchRoot>) -> Vec<discover::WatchRoot> {
+pub(crate) fn merge_watch_roots(mut roots: Vec<discover::WatchRoot>) -> Vec<discover::WatchRoot> {
     roots.sort();
     roots.dedup_by(|later, first| {
         if later.path != first.path {
@@ -2031,15 +2055,46 @@ fn sources_unchanged(conn: &Connection, state: &Map<String, Value>, current: &st
     }
 }
 
-/// Runs the local sweep. `Ok(false)` means the stat-only source fingerprint
-/// matched the last sweep's and nothing was walked.
+/// The stat-only fingerprint of everything a full sweep reads, qualified by
+/// the generation that produced it so an upgrade that bumps a parser or
+/// scanner generation cannot honour the stamp the previous one wrote. `None`
+/// when it could not be taken, which only costs the fast path.
+fn sweep_fingerprint(
+    conn: &Connection,
+    roots: &crate::ProviderRoots,
+    providers: &[Box<dyn ShallowSessionProvider>],
+) -> Option<String> {
+    let env = DiscoveryEnv::with_provider_roots(conn, roots.clone());
+    let providers = providers
+        .iter()
+        .map(|provider| provider.as_ref())
+        .collect::<Vec<_>>();
+    let inputs = sweep_only_fingerprint_inputs(roots);
+    match discover::source_fingerprint_with(&env, &providers, &inputs) {
+        Ok(sources) => Some(format!("{}/{sources}", sweep_generation())),
+        Err(error) => {
+            sync_note!("  [sync] source fingerprint unavailable: {error:#}");
+            None
+        }
+    }
+}
+
+/// Runs the local sweep over the sources `scope` names. A full sweep keeps
+/// the fingerprint fast path unless `force`; a scoped one always reads its
+/// sources and never consults or stores the fingerprint or the destination
+/// marker, both statements about every source (see [`SweepScope`]).
+/// `Ok(false)` means nothing was walked: the fingerprint matched, or the
+/// scope names no source with local files.
 fn sync_basic(
     conn: &Connection,
     db_path: &Path,
     roots: &crate::ProviderRoots,
     force: bool,
+    scope: &SweepScope,
 ) -> Result<bool> {
-    let home = &roots.home;
+    if scope.reads_nothing() {
+        return Ok(false);
+    }
     // See `begin_acquisition_pass`: the resolver's cache is sound only within
     // one pass, and a long-lived host (watch, the Node addon, a desktop app)
     // runs many passes without restarting.
@@ -2074,7 +2129,6 @@ fn sync_basic(
             }
         }
     }
-    let mut total_inserted = 0;
     let mut report = SyncSourceReport::new(db_path);
     let state_path = db_path
         .parent()
@@ -2117,32 +2171,17 @@ fn sync_basic(
     let (mut state, state_stamp) = load_sync_state_stamped(&state_path);
     let mut checkpoints = SweepCheckpoints::new(&state_path, &state, state_stamp);
     let mut coverage = SweepCoverage::default();
-    let providers = shallow_providers();
+    let mut providers = shallow_providers();
+    providers.retain(|provider| scope.includes(provider.source()));
     // Captured before the sweep, not after. Anything that changes while the
     // sweep runs yields a different fingerprint next time and forces one more
     // pass — cheap, because the per-session stamps then skip what already
     // landed. A fingerprint recorded ahead of the work it describes would lose
-    // that append instead.
-    let fingerprint = {
-        let env = DiscoveryEnv::with_provider_roots(conn, roots.clone());
-        let taken = discover::source_fingerprint_with(
-            &env,
-            &providers
-                .iter()
-                .map(|provider| provider.as_ref())
-                .collect::<Vec<_>>(),
-            &sweep_only_fingerprint_inputs(roots),
-        );
-        if let Err(error) = &taken {
-            sync_note!("  [sync] source fingerprint unavailable: {error:#}");
-        }
-        // Qualified by the generation that produced it, so an upgrade that
-        // bumps a parser or scanner generation cannot honour the stamp the
-        // previous one wrote.
-        taken
-            .ok()
-            .map(|sources| format!("{}/{sources}", sweep_generation()))
-    };
+    // that append instead. A scoped sweep takes none: it may not store one.
+    let fingerprint = scope
+        .is_everything()
+        .then(|| sweep_fingerprint(conn, roots, &providers))
+        .flatten();
     if !force {
         if let Some(current) = fingerprint.as_deref() {
             if sources_unchanged(conn, &state, current) {
@@ -2156,7 +2195,7 @@ fn sync_basic(
     // licenses a skip. A failure here costs the repair, not the sweep.
     // The counts it was taken from are kept: the end of the sweep needs them
     // again, and recounts only the sessions the sweep wrote (#321).
-    let (repairs, repair_plan_known, mut destination) =
+    let (repairs, repair_plan_known, destination) =
         match destination_shortfall_counted(conn, &state, None) {
             Ok((repairs, counted)) => (repairs, true, counted),
             Err(error) => {
@@ -2179,108 +2218,18 @@ fn sync_basic(
     // turns one interrupted run into a loop that re-scans from scratch forever
     // and never persists anything. Checkpointing makes each source's cursor
     // durable the moment that source completes.
-    capture_progress("claude-history", 0, None);
-    check_capture_cancelled()?;
-    if let Some(inserted) = report.capture(
-        "claude",
-        sync_jsonl_incremental(
-            conn,
-            &mut state,
-            "claude",
-            &roots.claude.join("history.jsonl"),
-            parse_claude_line,
-            &mut |in_progress| checkpoints.save(in_progress),
-        ),
-    ) {
-        total_inserted += inserted;
-        checkpoints.save(&state);
-    }
-    capture_progress("claude", 0, None);
-    check_capture_cancelled()?;
-    if report
-        .capture(
-            "claude-metadata",
-            sync_claude_session_metadata_with_repairs_and_coverage(
-                conn,
-                &mut state,
-                &roots.claude.join("projects"),
-                &repairs,
-                &mut coverage,
-            ),
-        )
-        .is_some()
-    {
-        checkpoints.save(&state);
-    }
-    capture_progress("codex", 0, None);
-    check_capture_cancelled()?;
-    if let Some(inserted) = report.capture(
-        "codex",
-        sync_codex_with_repairs_and_coverage(
-            conn,
-            &mut state,
-            &roots.codex,
-            &repairs,
-            &mut coverage,
-        ),
-    ) {
-        total_inserted += inserted;
-        checkpoints.save(&state);
-    }
-    capture_progress("cursor", 0, None);
-    check_capture_cancelled()?;
-    if let Some(inserted) = report.capture(
-        "cursor",
-        sync_cursor(
-            conn,
-            &mut state,
-            &home.join(".cursor/projects"),
-            &mut coverage,
-        ),
-    ) {
-        total_inserted += inserted;
-        checkpoints.save(&state);
-    }
-    capture_progress("grok", 0, None);
-    check_capture_cancelled()?;
-    if let Some(inserted) = report.capture(
-        "grok",
-        sync_grok_home(conn, &mut state, &roots.grok, &mut coverage),
-    ) {
-        total_inserted += inserted;
-        checkpoints.save(&state);
-    }
-    capture_progress("muse", 0, None);
-    check_capture_cancelled()?;
-    if let Some(inserted) = report.capture(
-        "muse",
-        sync_muse_with_coverage(conn, &mut state, &roots.muse, &repairs, &mut coverage),
-    ) {
-        total_inserted += inserted;
-        checkpoints.save(&state);
-    }
-    capture_progress("opencode", 0, None);
-    check_capture_cancelled()?;
-    if let Some(inserted) = report.capture(
-        "opencode",
-        opencode_sweep::sync_opencode_sources(conn, &mut state, roots, &repairs),
-    ) {
-        total_inserted += inserted;
-        checkpoints.save(&state);
-    }
-    capture_progress("devin", 0, None);
-    check_capture_cancelled()?;
-    if let Some(inserted) = report.capture(
-        "devin",
-        devin::sync_devin_db(conn, &mut state, &roots.devin, &repairs, &mut coverage),
-    ) {
-        total_inserted += inserted;
-        checkpoints.save(&state);
-        if inserted > 0 {
-            sync_note!("  [devin] +{inserted} rows");
-        }
-    }
-    check_capture_cancelled()?;
+    let mut phases = SweepPhases {
+        conn,
+        state: &mut state,
+        roots,
+        repairs: &repairs,
+        coverage: &mut coverage,
+        report: &mut report,
+        checkpoints: &mut checkpoints,
+        inserted: 0,
+    };
+    phases.run(scope)?;
+    let total_inserted = phases.inserted;
 
     // A source that was statted into the fingerprint but could not be read is
     // the one case where caching the fingerprint would make a transient
@@ -2307,11 +2256,7 @@ fn sync_basic(
     // the code.
     // Without discovery's own identity refresh: the sweep runs it itself just
     // below, and one refresh per sweep is all the catalog needs.
-    let discovered = discover::discover_sessions_for_sweep(
-        &discovery_env,
-        &DiscoverOptions::default(),
-        &providers,
-    )?;
+    let discovered = sweep_phases::discover_for_sweep(&discovery_env, &providers, scope)?;
     // After discovery, not before: shallow discovery is what fills in `cwd`
     // and `repo_url` for sessions a provider's history file mentions without
     // describing, and inheritance needs every relationship this run recorded
@@ -2337,7 +2282,65 @@ fn sync_basic(
         );
         coverage.note_unread();
     }
-    let all_sources_read = sweep_read_everything && coverage.complete();
+    if scope.is_everything() {
+        seal_full_sweep(
+            conn,
+            &mut state,
+            &mut checkpoints,
+            FullSweepSeal {
+                all_sources_read: sweep_read_everything && coverage.complete(),
+                repairs: &repairs,
+                repair_plan_known,
+                destination,
+                fingerprint,
+            },
+        );
+    }
+    if let Err(error) = crate::store::refresh_planner_statistics(conn) {
+        sync_note!("  [sync] planner statistics not refreshed: {error:#}");
+    }
+    let total: i64 = conn.query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))?;
+    // Fold the WAL back into the database now that the writes are done.
+    // Left unchecked the WAL grows without bound (156MB observed in the wild).
+    let checkpoint = checkpoint_after_sweep(conn, db_path, WAL_TRUNCATE_BYTES);
+    if checkpoint.wal_bytes > WAL_WARN_BYTES {
+        eprintln!(
+            "ai-hist: WAL is {} after checkpointing -- a long-lived reader is \
+             pinning an old snapshot; run `ai-hist doctor`",
+            human_bytes(checkpoint.wal_bytes)
+        );
+    }
+    sync_note!("  [rust-sync] +{total_inserted} rows");
+    sync_note!("  Total: {total} entries");
+    Ok(true)
+}
+
+/// What the end of a full sweep needs to decide whether it may record the
+/// source fingerprint and the destination marker.
+struct FullSweepSeal<'a> {
+    all_sources_read: bool,
+    repairs: &'a SweepRepairs,
+    repair_plan_known: bool,
+    destination: Option<DestinationSnapshot>,
+    fingerprint: Option<String>,
+}
+
+/// Record the fingerprint and destination marker a full sweep earned, or
+/// leave both stale when it did not read everything or left a loss in place.
+/// Never for a scoped sweep: both are statements about every source.
+fn seal_full_sweep(
+    conn: &Connection,
+    state: &mut Map<String, Value>,
+    checkpoints: &mut SweepCheckpoints<'_>,
+    seal: FullSweepSeal<'_>,
+) {
+    let FullSweepSeal {
+        all_sources_read,
+        repairs,
+        repair_plan_known,
+        mut destination,
+        fingerprint,
+    } = seal;
     // Written after every cursor this sweep advanced, and in its own
     // checkpoint. A crash between them leaves cursors ahead of a stale
     // fingerprint, which costs one extra full walk that then finds nothing —
@@ -2357,7 +2360,7 @@ fn sync_basic(
         // recover instead of forcing full sweeps forever.
         Some(SweepRepairs::default())
     } else {
-        match destination_shortfall_counted(conn, &state, destination.take()) {
+        match destination_shortfall_counted(conn, state, destination.take()) {
             Ok((outstanding, counted)) => {
                 destination = counted;
                 Some(outstanding)
@@ -2417,26 +2420,9 @@ fn sync_basic(
                 Value::from(destination),
             );
             state.insert(DESTINATION_HEAD_KEY.to_string(), Value::from(head));
-            checkpoints.save(&state);
+            checkpoints.save(state);
         }
     }
-    if let Err(error) = crate::store::refresh_planner_statistics(conn) {
-        sync_note!("  [sync] planner statistics not refreshed: {error:#}");
-    }
-    let total: i64 = conn.query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))?;
-    // Fold the WAL back into the database now that the writes are done.
-    // Left unchecked the WAL grows without bound (156MB observed in the wild).
-    let checkpoint = checkpoint_after_sweep(conn, db_path, WAL_TRUNCATE_BYTES);
-    if checkpoint.wal_bytes > WAL_WARN_BYTES {
-        eprintln!(
-            "ai-hist: WAL is {} after checkpointing -- a long-lived reader is \
-             pinning an old snapshot; run `ai-hist doctor`",
-            human_bytes(checkpoint.wal_bytes)
-        );
-    }
-    sync_note!("  [rust-sync] +{total_inserted} rows");
-    sync_note!("  Total: {total} entries");
-    Ok(true)
 }
 
 /// WAL size past which the post-sweep checkpoint escalates from `PASSIVE` to
@@ -2724,7 +2710,7 @@ fn sync_exclusive_with_roots(
         return Ok(SyncTick::default());
     };
     let conn = open_db(db_path).map_err(|error| enrich_sync_error(db_path, error))?;
-    let swept = sync_basic(&conn, db_path, roots, force)
+    let swept = sync_basic(&conn, db_path, roots, force, &SweepScope::everything())
         .map_err(|error| enrich_sync_error(db_path, error))?;
     Ok(SyncTick {
         attempted: true,
@@ -2849,7 +2835,8 @@ pub fn prepare_local_sync_snapshot(db_path: &Path) -> Result<(Connection, bool)>
     };
     let conn = open_db(db_path).map_err(|error| enrich_sync_error(db_path, error))?;
     let roots = crate::ProviderRoots::from_env(home_dir());
-    sync_basic(&conn, db_path, &roots, false).map_err(|error| enrich_sync_error(db_path, error))?;
+    sync_basic(&conn, db_path, &roots, false, &SweepScope::everything())
+        .map_err(|error| enrich_sync_error(db_path, error))?;
     drop(sync_lock);
     Ok((conn, false))
 }
@@ -9392,63 +9379,6 @@ pub(crate) fn ingest_claude_transcript(conn: &Connection, path: &Path) -> Result
     ingest_claude_transcript_as(conn, path, None)
 }
 
-/// The rows one Claude record produced, per table, as `(table, condition)`
-/// over `(session_id, message_uuid)`. Event and marker uids are the record's
-/// uuid plus `:`-suffixes, so the prefix is a range on the uid -- `:` and `;`
-/// are adjacent bytes -- which the `(source, session_id, uid)` unique index
-/// answers, and a `_` or `%` in a provider id is a literal byte. The parser
-/// retires a record's rows under the parent for every sidechain record it
-/// moves onto its child, so a scan of the session here would make each
-/// re-read of a sidecar quadratic in the size of the parent session.
-const CLAUDE_RECORD_ROWS: [(&str, &str); 4] = [
-    (
-        "session_events",
-        "source = 'claude' AND session_id = ?1 \
-         AND event_uid >= ?2 || ':' AND event_uid < ?2 || ';'",
-    ),
-    (
-        "tool_calls",
-        "source = 'claude' AND session_id = ?1 AND message_id = ?2",
-    ),
-    (
-        "file_edits",
-        "source = 'claude' AND session_id = ?1 AND message_id = ?2",
-    ),
-    // Markers are derived from the same record and keyed on the same prefix,
-    // so they move with it rather than outliving it under the old identity.
-    (
-        "session_markers",
-        "source = 'claude' AND session_id = ?1 \
-         AND marker_uid >= ?2 || ':' AND marker_uid < ?2 || ';'",
-    ),
-];
-
-/// Remove everything a single transcript record produced under one session id.
-///
-/// `message_uuid` is the same identity insertion derives event uids from and
-/// stamps on the rows it derives from a record's tool use, so this reaches the
-/// record's events, its tool calls, its file edits and its markers together —
-/// including records with no `uuid` of their own, which fall back to the
-/// message id or a hash of the record. Leaving the derived rows behind would
-/// keep a parent exposing a delegated thread's actions as its own long after
-/// the events moved to the child.
-fn delete_claude_record_rows(
-    conn: &Connection,
-    session_id: &str,
-    message_uuid: &str,
-) -> Result<()> {
-    for (table, condition) in CLAUDE_RECORD_ROWS {
-        crate::store::retire_evidence_share(
-            conn,
-            table,
-            condition,
-            params![session_id, message_uuid],
-            SessionLocation::Local,
-        )?;
-    }
-    Ok(())
-}
-
 /// Message ids only a pre-upgrade parse could have stored: current parses
 /// never emit positional `{stem}:{line}` identities. Scoped to one file stem
 /// and session, filtered in Rust so a stem containing SQL wildcards cannot
@@ -10054,12 +9984,14 @@ fn ingest_claude_record(
     // attributed every sidechain row to the parent. Re-reading the file
     // removes the stale rows under the identity they were written with, so a
     // re-parse moves them onto the child instead of duplicating them across
-    // both.
+    // both. Asked before it is done: on a store the current parser built
+    // there is nothing under the parent, and the retirement's eight
+    // statements per record were most of a live sweep's time.
     // Pre-upgrade positional leftovers match by full stored record,
     // unique or preserved: the live index cannot identify them after a
     // rewrite.
     if session_id != record_session_id {
-        delete_claude_record_rows(conn, record_session_id, message_uuid)?;
+        heal_claude_record_rows(conn, record_session_id, message_uuid, HealedRows::All)?;
         if id_less {
             heal_legacy_positional_record(
                 conn,
@@ -10079,7 +10011,12 @@ fn ingest_claude_record(
         // An earlier parser stored the notice as assistant output under this
         // same identity; those rows are this record's and nothing else's, so
         // they are replaced by the marker rather than left beside it.
-        delete_claude_record_rows(conn, session_id, message_uuid)?;
+        heal_claude_record_rows(
+            conn,
+            session_id,
+            message_uuid,
+            HealedRows::ExceptNoticeMarker,
+        )?;
         let text = message
             .and_then(|m| m.get("content"))
             .map(claude_user_text)
@@ -35143,12 +35080,12 @@ mod tests {
     /// re-indexes it, and checkpoint merging keeps the *newer* offset, so an
     /// older scan that cleared evidence a newer scan had already committed
     /// would leave those records skipped permanently. What makes it
-    /// unreachable is that `sync_cursor` is private and has exactly one
-    /// non-test caller, `sync_basic`, which in turn has exactly two:
-    /// `sync_exclusive_with_home` and `prepare_local_sync_snapshot`. Both
-    /// acquire `SyncRunLock` — an exclusive advisory lock on
-    /// `<canonical-db>.sync.lock` — *before* opening the database, and hold it
-    /// for the whole call. The second sync does not queue behind the first and
+    /// unreachable is that `sync_cursor` is private and is reached only
+    /// through the sweep's phases in `sync_basic`, whose every caller —
+    /// `sync_exclusive_with_home`, `prepare_local_sync_snapshot`,
+    /// `sync_facade_tick` — acquires `SyncRunLock` — an exclusive advisory lock on
+    /// `<canonical-db>.sync.lock` — *before* opening the database, and holds
+    /// it for the whole call. The second sync does not queue behind the first and
     /// proceed later against stale state; `try_lock_exclusive` returns
     /// `WouldBlock`, and the run reports "another sync is already running" and
     /// does nothing at all.

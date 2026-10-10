@@ -189,9 +189,29 @@ pub struct SyncOptions {
     /// per session in the legacy JSON tree. Unchanged files count as processed.
     #[serde(skip)]
     pub progress: Option<ProgressObserver>,
+    /// Sweep only these sources. `None` (the default) is the full sweep of
+    /// every local source; `Some(vec![])` reads nothing and reports
+    /// `swept: false`.
+    ///
+    /// A scoped sweep always reads its sources, whatever `force` says: the
+    /// stat-only fingerprint the fast path compares is a statement about
+    /// every source, so a scoped sweep neither consults nor stores it, and
+    /// the next unforced full sweep still sees whatever moved in the sources
+    /// it left out. [`SessionStore::watch`] scopes each filesystem-event
+    /// tick this way to the sources whose roots fired. Absent from stored
+    /// JSON written before the field existed, which means a full sweep.
+    #[serde(default)]
+    pub sources: Option<Vec<Source>>,
 }
 
 impl SyncOptions {
+    /// Sweep only these sources; see [`SyncOptions::sources`].
+    #[must_use]
+    pub fn sources(mut self, sources: impl IntoIterator<Item = Source>) -> Self {
+        self.sources = Some(sources.into_iter().collect());
+        self
+    }
+
     /// Walk every provider; see [`SyncOptions::force`].
     #[must_use]
     pub fn force(mut self, force: bool) -> Self {
@@ -257,5 +277,19 @@ impl HydrateOptions {
     pub fn stop(mut self, stop: StopToken) -> Self {
         self.stop = Some(stop);
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sync_options_json_without_sources_decodes_as_a_full_sweep() {
+        let options: SyncOptions =
+            serde_json::from_str(r#"{"force":true,"lock_timeout_ms":250}"#).unwrap();
+        assert!(options.force);
+        assert_eq!(options.lock_timeout_ms, 250);
+        assert!(options.sources.is_none());
     }
 }

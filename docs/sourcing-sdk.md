@@ -209,6 +209,14 @@ default timeout is `0`: one try; a budget above seven days is treated as seven
 days, the same ceiling the watch intervals have. **It is never a silent no-op**; a caller that
 asked for a sweep and got none is told.
 
+`SyncOptions::sources` scopes the sweep to the named sources. A scoped sweep
+always reads them, whatever `force` says, and neither consults nor stores the
+source fingerprint or the destination marker: both are statements about every
+source, so the next unforced full sweep still compares against the last full
+one and sees whatever moved in the sources a scoped sweep left out. Each
+source's own cursors and stamps are written as usual. `Some(vec![])` reads
+nothing and reports `swept: false`.
+
 `SyncReport { swept, changed, head_revision }`: `swept` is false when the fingerprint matched
 and nothing was opened. `changed` lists the `SessionRef`s whose catalog row was
 created or changed while the call held the lock — swept or not — derived from
@@ -265,7 +273,11 @@ With `WatchOptions::leading_edge` (the default), a filesystem event that
 finds the loop quiet is swept after a 10 ms settle, not after `debounce_ms`.
 Events inside the window that sweep opens coalesce into one trailing tick
 when the window closes, so a burst costs at most two sweeps, and sustained
-writes tick once per `debounce_ms`. A
+writes tick once per `debounce_ms`. A filesystem-event tick sweeps only the
+sources whose watched roots fired inside its window — a Claude session's
+appends read Claude, not every provider — and its `TickReport::sources` names
+them; startup, backstop and manual ticks, and an event the loop cannot place
+under a root (a rescan notice), are full sweeps with `sources: None`. A
 tick is the same locked `sync`; one that finds the lock held reports
 `contended` and is retried by the loop rather than counted as done. A failed
 sweep arrives as an `Err` and the loop keeps running; the rolling catalog

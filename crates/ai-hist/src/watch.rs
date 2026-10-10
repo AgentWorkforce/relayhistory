@@ -63,6 +63,13 @@ use crate::discover::WatchRoot;
 #[cfg(feature = "fs-events")]
 use crate::discover::WatchDepth;
 
+mod owed;
+mod scope;
+use owed::OwedSweep;
+#[cfg(test)]
+use owed::CONTENDED_SWEEP_RETRY_MS;
+pub use scope::{ChangeScope, ScopedTickFn, TickRequest};
+
 /// How often a registration that was *lost* is retried.
 ///
 /// Not derived from the user's intervals, because neither of them is about
@@ -74,25 +81,6 @@ use crate::discover::WatchDepth;
 /// until it is attached again.
 #[cfg(feature = "fs-events")]
 const LOST_REGISTRATION_RECHECK_MS: u64 = 250;
-
-/// How soon a forced sweep that could not take the store's lock is tried
-/// again, before backing off.
-///
-/// Short, because the usual holder is a manual `sync` that is about to finish
-/// and the change is still owed.
-const CONTENDED_SWEEP_RETRY_MS: u64 = 250;
-
-/// The longest an owed sweep waits between attempts at a held lock.
-///
-/// Low, because the wait is paid by the change: a write made while another
-/// process sweeps is read no sooner than the first retry after that sweep
-/// releases the lock. A retry is one `try_lock` and a return, so asking once
-/// a second for as long as a holder keeps the lock costs nothing worth
-/// trading for capture latency. It used to be the slow backstop (30–60 s),
-/// reached after a handful of contended *event* ticks, which left the last
-/// writes of a burst unread for up to a minute after the lock was free
-/// (#364).
-const CONTENDED_SWEEP_RETRY_MAX_MS: u64 = 1_000;
 
 /// The longest any configurable interval may be.
 ///
@@ -284,7 +272,7 @@ pub type RootsFn = Arc<dyn Fn() -> Vec<WatchRoot> + Send + Sync>;
 /// those would become a *forced* sweep — the expensive kind that bypasses the
 /// fingerprint. Filtering by the depth the root asked for makes the two
 /// backends agree, and on inotify it is simply a no-op the kernel already did.
-#[cfg(any(feature = "fs-events", test))]
+#[cfg(test)]
 fn event_matches_roots(path: &Path, roots: &[WatchRoot]) -> bool {
     // The event's own spelling is never compared. Roots are absolute from the
     // moment they are built, and a backend reports whatever it was registered
@@ -313,11 +301,12 @@ fn removed_registration_keys(path: &Path, roots: &[WatchRoot]) -> Vec<PathBuf> {
 }
 
 /// What one wait produced: the trigger, and for a change-driven tick when
-/// its first signal arrived.
-#[derive(Debug, Clone, Copy)]
+/// its first signal arrived and which roots it covers.
+#[derive(Debug, Clone)]
 struct Wake {
     trigger: TickTrigger,
     first_event_at: Option<Instant>,
+    scope: ChangeScope,
 }
 
 impl From<TickTrigger> for Wake {
@@ -325,6 +314,7 @@ impl From<TickTrigger> for Wake {
         Self {
             trigger,
             first_event_at: None,
+            scope: ChangeScope::Everything,
         }
     }
 }
@@ -356,118 +346,14 @@ impl Backstop {
     }
 }
 
-/// A forced sweep the store's lock turned away, and how long to wait before
-/// asking again.
-struct OwedSweep {
-    /// When to retry, paired with when the change it stands for first
-    /// arrived.
-    retry: Option<(Instant, Option<Instant>)>,
-    backoff: u64,
-}
-
-impl Default for OwedSweep {
-    fn default() -> Self {
-        Self {
-            retry: None,
-            backoff: CONTENDED_SWEEP_RETRY_MS,
-        }
-    }
-}
-
-/// The earlier of two arrival times, either of which may be unknown.
-fn earliest(a: Option<Instant>, b: Option<Instant>) -> Option<Instant> {
-    match (a, b) {
-        (Some(a), Some(b)) => Some(a.min(b)),
-        (a, b) => a.or(b),
-    }
-}
-
-impl OwedSweep {
-    /// Cut the loop's wait short at the retry deadline. A change whose sweep
-    /// never ran has nothing else to bring the loop back for it: the wake
-    /// state was cleared when its debounce window closed, so without this the
-    /// next visit is the backstop, up to `--interval` away.
-    fn bound_idle(&self, idle: Duration) -> Duration {
-        match self.retry {
-            Some((at, _)) => idle.min(at.saturating_duration_since(Instant::now())),
-            None => idle,
-        }
-    }
-
-    /// The wake to run, with what is owed folded in, and whether it is the
-    /// owed retry itself.
-    ///
-    /// A sweep the store's lock turned away comes back as the forced tick it
-    /// was, not as the backstop tick this wake would otherwise have been: the
-    /// change it is standing in for is still unread, so the fingerprint it
-    /// would be compared against still cannot be trusted. Only the retry
-    /// itself — as opposed to a new event that happens to arrive while one is
-    /// owed — backs off.
-    fn fold_into(&mut self, wake: Wake) -> (Wake, bool) {
-        match self.retry {
-            Some((at, since)) if Instant::now() >= at => {
-                self.retry = None;
-                let retry = Wake {
-                    trigger: TickTrigger::FsEvent,
-                    // The oldest change this sweep now covers.
-                    first_event_at: earliest(since, wake.first_event_at),
-                };
-                (retry, true)
-            }
-            // A forced wake before the retry is due sweeps the change the
-            // retry stands for as well, so it reports from the older of the
-            // two; otherwise a sweep that gets through drops the retry and
-            // its arrival time with it.
-            Some((_, Some(since))) if wake.trigger.forces_scan() => {
-                let wake = Wake {
-                    first_event_at: Some(wake.first_event_at.map_or(since, |at| at.min(since))),
-                    ..wake
-                };
-                (wake, false)
-            }
-            _ => (wake, false),
-        }
-    }
-
-    /// The lock turned a sweep away: it is still owed, and the holder may be
-    /// there for a while. Repeats coalesce into the one deadline, so a busy
-    /// tree under a long sync costs one retry per window rather than one per
-    /// event.
-    fn turned_away(&mut self, first_event_at: Option<Instant>, is_retry: bool) {
-        let since = earliest(self.retry.and_then(|(_, since)| since), first_event_at);
-        // Backed off per attempt of the owed retry, never per event: a
-        // burst of contended events is one owed change, and letting
-        // each of them double the wait (and push the deadline later)
-        // is what stalled capture until the backstop. A new event
-        // keeps the earlier of the two deadlines.
-        let next = deadline_after(Instant::now(), self.backoff);
-        let at = match self.retry {
-            Some((held, _)) if !is_retry => held.min(next),
-            _ => next,
-        };
-        self.retry = Some((at, since));
-        if is_retry {
-            self.backoff = self
-                .backoff
-                .saturating_mul(2)
-                .clamp(CONTENDED_SWEEP_RETRY_MS, CONTENDED_SWEEP_RETRY_MAX_MS);
-        }
-    }
-
-    /// A forced sweep got through. Whatever was owed is paid, and the next
-    /// contention starts from the short cadence again.
-    fn paid(&mut self) {
-        self.retry = None;
-        self.backoff = CONTENDED_SWEEP_RETRY_MS;
-    }
-}
-
 #[derive(Default)]
 struct WakeState {
     /// A change signal is pending, and when the first one arrived. One slot
     /// on purpose: a thousand events between two ticks cost one wakeup, not
     /// a thousand, and the tick reports how long the oldest of them waited.
     pending: Option<Instant>,
+    /// The roots the pending changes covered.
+    scope: Option<ChangeScope>,
     /// A registration was reported gone and has to be re-made. Kept apart
     /// from `pending` because it asks for different work: `pending` says
     /// something was written and wants a sweep, this says a watch was lost
@@ -490,13 +376,15 @@ struct RunState {
     deferred_force: bool,
     /// When the oldest change behind `deferred_force` first arrived.
     deferred_since: Option<Instant>,
+    /// The roots the changes behind `deferred_force` covered.
+    deferred_scope: Option<ChangeScope>,
     /// Monotonic count of finished ticks, so a joiner can wait for "the run
     /// that was in flight when I arrived" without holding the lock across it.
     completed: u64,
 }
 
 struct WatchInner {
-    tick: TickFn,
+    tick: ScopedTickFn,
     on_report: Option<ReportSink>,
     on_error: Option<ErrorSink>,
     wake: Mutex<WakeState>,
@@ -514,13 +402,14 @@ struct InFlight<'a> {
 
 impl Drop for InFlight<'_> {
     fn drop(&mut self) {
-        let (deferred, since) = {
+        let (deferred, since, scope) = {
             let mut run = self.inner.run.lock().expect("watch run state");
             run.in_flight = false;
             run.completed = run.completed.wrapping_add(1);
             (
                 std::mem::take(&mut run.deferred_force),
                 run.deferred_since.take(),
+                run.deferred_scope.take(),
             )
         };
         self.inner.run_cv.notify_all();
@@ -528,8 +417,10 @@ impl Drop for InFlight<'_> {
             // A change arrived while this run held the slot. Post it now that
             // the slot is free: the loop is waiting on the wake state, so it
             // takes it up immediately rather than at the next backstop.
-            self.inner
-                .signal_change_since(since.unwrap_or_else(Instant::now));
+            self.inner.signal_change_since(
+                since.unwrap_or_else(Instant::now),
+                scope.unwrap_or_default(),
+            );
         }
     }
 }
@@ -542,19 +433,20 @@ impl WatchInner {
     /// Post a change signal. Called by the filesystem watcher's callback, and
     /// public through [`WatchLoop::notify_change`] for hosts that already have
     /// their own change feed.
-    fn signal_change(&self) {
-        self.signal_change_since(Instant::now());
+    fn signal_change(&self, scope: ChangeScope) {
+        self.signal_change_since(Instant::now(), scope);
     }
 
     /// Post a change signal that first arrived at `at`, keeping the oldest
-    /// arrival when one is already pending.
-    fn signal_change_since(&self, at: Instant) {
+    /// arrival when one is already pending and widening its scope.
+    fn signal_change_since(&self, at: Instant, scope: ChangeScope) {
         {
             let mut wake = self.wake.lock().expect("watch wake state");
             if wake.stopped {
                 return;
             }
             wake.pending = Some(wake.pending.map_or(at, |first| first.min(at)));
+            wake.scope = Some(scope::widen(wake.scope.take(), scope));
         }
         self.wake_cv.notify_all();
     }
@@ -678,6 +570,7 @@ impl WatchInner {
         // sweep, sets the bit again, so sustained writes keep a steady
         // window-plus-sweep cadence instead of waiting for quiet.
         let first_event_at = wake.pending.take();
+        let scope = wake.scope.take().unwrap_or_default();
         if leading_edge {
             // Bounded like every other interval here: the public
             // field can be set past `MAX_INTERVAL_MS` directly.
@@ -687,6 +580,7 @@ impl WatchInner {
         Some(Wake {
             trigger: TickTrigger::FsEvent,
             first_event_at,
+            scope,
         })
     }
 
@@ -750,7 +644,7 @@ impl WatchInner {
     /// — that change is remembered as `deferred_force` and re-posted by
     /// [`InFlight::drop`], which is the same promise by another route.
     fn run_skip_if_busy(&self, wake: Wake) -> bool {
-        let Some(guard) = self.claim_or_defer(wake) else {
+        let Some(guard) = self.claim_or_defer(&wake) else {
             return false;
         };
         self.run_claimed(wake, guard)
@@ -758,13 +652,17 @@ impl WatchInner {
 
     /// Claim the in-flight slot, or remember a forced trigger that could not
     /// have it.
-    fn claim_or_defer(&self, wake: Wake) -> Option<InFlight<'_>> {
+    fn claim_or_defer(&self, wake: &Wake) -> Option<InFlight<'_>> {
         let mut run = self.run.lock().expect("watch run state");
         if run.in_flight {
             if wake.trigger.forces_scan() {
                 run.deferred_force = true;
                 let since = wake.first_event_at.unwrap_or_else(Instant::now);
                 run.deferred_since = Some(run.deferred_since.map_or(since, |held| held.min(since)));
+                run.deferred_scope = Some(scope::widen(
+                    run.deferred_scope.take(),
+                    wake.scope.clone(),
+                ));
             }
             return None;
         }
@@ -801,10 +699,19 @@ impl WatchInner {
         let Wake {
             trigger,
             first_event_at,
+            scope,
         } = wake;
         let forced = trigger.forces_scan();
         let started = Instant::now();
-        let result = (self.tick)(forced);
+        let result = (self.tick)(&TickRequest {
+            trigger,
+            force: forced,
+            scope: if forced {
+                scope
+            } else {
+                ChangeScope::Everything
+            },
+        });
         let elapsed = started.elapsed();
         let report = |outcome: TickOutcome, cancelled: bool| {
             if let Some(sink) = &self.on_report {
@@ -890,6 +797,13 @@ impl WatchLoop {
     /// 30 s slow backstop, filesystem events enabled but inert until
     /// [`with_roots`](WatchLoop::with_roots) supplies something to watch.
     pub fn new(tick: TickFn) -> Self {
+        Self::scoped(Arc::new(move |request: &TickRequest| tick(request.force)))
+    }
+
+    /// A loop whose sweep is told which roots each tick's changes fell
+    /// under, so a filesystem-event tick can read only the providers they
+    /// belong to. Otherwise the same loop as [`WatchLoop::new`].
+    pub fn scoped(tick: ScopedTickFn) -> Self {
         Self {
             debounce_ms: DEFAULT_DEBOUNCE_MS,
             poll_interval_ms: DEFAULT_POLL_INTERVAL_MS,
@@ -992,7 +906,7 @@ impl WatchLoop {
     /// Post a change signal by hand. The filesystem watcher calls this; hosts
     /// with their own change feed (an editor, an MCP server) can too.
     pub fn notify_change(&self) {
-        self.inner.signal_change();
+        self.inner.signal_change(ChangeScope::Everything);
     }
 
     /// Run one sweep now. If one is already in flight, wait for it instead of
@@ -1060,7 +974,7 @@ impl WatchLoop {
                 // was the whole of this wake.
                 continue;
             }
-            let (wake, is_retry) = owed.fold_into(wake);
+            let (wake, is_retry) = owed.fold_wake(wake, &mut last_poll_sweep, sweep_every);
             let trigger = wake.trigger;
             if trigger == TickTrigger::Poll {
                 // Reconciled, but not yet due to sweep. Only reached when the
@@ -1071,8 +985,8 @@ impl WatchLoop {
                 }
                 last_poll_sweep = std::time::Instant::now();
             }
-            if self.inner.run_skip_if_busy(wake) {
-                owed.turned_away(wake.first_event_at, is_retry);
+            if self.inner.run_skip_if_busy(wake.clone()) {
+                owed.turned_away(&wake, is_retry);
             } else if trigger.forces_scan() {
                 owed.paid();
             }
@@ -1147,7 +1061,7 @@ impl WatchLoop {
         let failed = self.inner.clone();
         fs_events::attach(
             &self.roots,
-            move || inner.signal_change(),
+            move |scope| inner.signal_change(scope),
             move || lost.signal_registration_lost(),
             move |error| {
                 failed.report_error(&anyhow::anyhow!(
@@ -1327,7 +1241,7 @@ mod fs_events {
     /// loop itself is identical in both builds.
     pub(super) fn attach(
         _roots: &[WatchRoot],
-        _on_change: impl Fn() + Send + 'static,
+        _on_change: impl Fn(ChangeScope) + Send + 'static,
         _on_registration_lost: impl Fn() + Send + 'static,
         _on_error: impl Fn(anyhow::Error) + Send + 'static,
     ) -> Result<FsWatch> {
@@ -1770,5 +1684,211 @@ mod tests {
             Path::new("/home/u/.claude/todos/task-1.json"),
             &roots
         ));
+    }
+
+    fn fired(paths: &[&str]) -> ChangeScope {
+        ChangeScope::Roots(paths.iter().map(PathBuf::from).collect())
+    }
+
+    fn event_wake(scope: ChangeScope) -> Wake {
+        Wake {
+            trigger: TickTrigger::FsEvent,
+            first_event_at: Some(Instant::now()),
+            scope,
+        }
+    }
+
+    /// Everything that fired inside one debounce window is one tick, scoped
+    /// to every root that fired; a host's own change signal and a manual
+    /// tick are not scoped at all.
+    #[test]
+    fn a_window_is_one_tick_scoped_to_every_root_that_fired() {
+        let (sender, requests) = std::sync::mpsc::channel::<TickRequest>();
+        let sender = Mutex::new(sender);
+        let tick: ScopedTickFn = Arc::new(move |request: &TickRequest| {
+            sender.lock().unwrap().send(request.clone()).unwrap();
+            Ok(TickOutcome::default())
+        });
+        let watch = Arc::new(
+            WatchLoop::scoped(tick)
+                .with_fs_events(false)
+                .with_immediate(false)
+                .with_leading_edge(false)
+                .with_debounce_ms(200)
+                .with_poll_interval_ms(MAX_INTERVAL_MS),
+        );
+        let runner = watch.clone();
+        let thread = std::thread::spawn(move || runner.run());
+        let wait = Duration::from_secs(10);
+
+        watch.inner.signal_change(fired(&["/roots/claude"]));
+        watch.inner.signal_change(fired(&["/roots/codex"]));
+        let request = requests.recv_timeout(wait).unwrap();
+        assert_eq!(request.trigger, TickTrigger::FsEvent);
+        assert!(request.force);
+        assert_eq!(request.scope, fired(&["/roots/claude", "/roots/codex"]));
+
+        watch.inner.signal_change(fired(&["/roots/claude"]));
+        watch.notify_change();
+        let request = requests.recv_timeout(wait).unwrap();
+        assert!(request.force);
+        assert_eq!(request.scope, ChangeScope::Everything);
+
+        watch.tick();
+        let request = requests.recv_timeout(wait).unwrap();
+        assert_eq!(request.trigger, TickTrigger::Manual);
+        assert!(!request.force);
+        assert_eq!(request.scope, ChangeScope::Everything);
+
+        watch.stop();
+        thread.join().unwrap().unwrap();
+    }
+
+    /// A forced tick deferred behind a running sweep comes back with every
+    /// root it stood for.
+    #[test]
+    fn a_deferred_tick_keeps_the_roots_it_stood_for() {
+        let tick: ScopedTickFn = Arc::new(|_: &TickRequest| Ok(TickOutcome::default()));
+        let watch = WatchLoop::scoped(tick);
+        let running = watch
+            .inner
+            .claim_or_defer(&Wake::from(TickTrigger::Manual))
+            .expect("the slot is free");
+        assert!(watch
+            .inner
+            .claim_or_defer(&event_wake(fired(&["/roots/a"])))
+            .is_none());
+        assert!(watch
+            .inner
+            .claim_or_defer(&event_wake(fired(&["/roots/b"])))
+            .is_none());
+        drop(running);
+        let wake = watch.inner.wake.lock().unwrap();
+        assert!(wake.pending.is_some());
+        assert_eq!(wake.scope, Some(fired(&["/roots/a", "/roots/b"])));
+    }
+
+    /// A tick the store's lock turned away is owed with its roots, and the
+    /// sweep that pays it covers them as well as its own.
+    #[test]
+    fn an_owed_tick_is_paid_with_the_roots_it_stood_for() {
+        let mut owed = OwedSweep::default();
+        owed.turned_away(&event_wake(fired(&["/roots/a"])), false);
+        // A new event before the retry is due sweeps the owed roots too.
+        let (wake, is_retry) = owed.fold_into(event_wake(fired(&["/roots/b"])), true);
+        assert!(!is_retry);
+        assert_eq!(wake.scope, fired(&["/roots/a", "/roots/b"]));
+
+        // Turned away again: the retry, once due, carries both.
+        owed.turned_away(&wake, false);
+        std::thread::sleep(Duration::from_millis(CONTENDED_SWEEP_RETRY_MS + 50));
+        let (retry, is_retry) = owed.fold_into(event_wake(fired(&["/roots/c"])), true);
+        assert!(is_retry);
+        assert!(retry.trigger.forces_scan());
+        assert_eq!(retry.scope, fired(&["/roots/a", "/roots/b", "/roots/c"]));
+        owed.paid();
+        let (wake, _) = owed.fold_into(event_wake(fired(&["/roots/d"])), true);
+        assert_eq!(wake.scope, fired(&["/roots/d"]), "a paid debt is forgotten");
+    }
+
+    /// The owed retry's own deadline wakes the loop as a `Poll` that asks
+    /// for nothing: the retry sweeps the roots it owes, not every provider.
+    /// A backstop that was due anyway does widen it.
+    #[test]
+    fn a_contended_retry_keeps_its_roots_unless_a_backstop_was_due() {
+        for (widens, expected) in [
+            (false, fired(&["/roots/claude"])),
+            (true, ChangeScope::Everything),
+        ] {
+            let mut owed = OwedSweep::default();
+            owed.turned_away(&event_wake(fired(&["/roots/claude"])), false);
+            std::thread::sleep(Duration::from_millis(CONTENDED_SWEEP_RETRY_MS + 50));
+            let (retry, is_retry) = owed.fold_into(Wake::from(TickTrigger::Poll), widens);
+            assert!(is_retry && retry.trigger.forces_scan());
+            assert_eq!(retry.scope, expected, "widens = {widens}");
+        }
+    }
+
+    /// The same through the loop: an event tick the lock turned away is
+    /// retried at its deadline with no new event in between, and the retry is
+    /// scoped to the event's roots.
+    #[test]
+    fn a_loop_retries_a_contended_event_tick_with_its_own_roots() {
+        let (sender, requests) = std::sync::mpsc::channel::<TickRequest>();
+        let sender = Mutex::new(sender);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let tick: ScopedTickFn = Arc::new(move |request: &TickRequest| {
+            sender.lock().unwrap().send(request.clone()).unwrap();
+            let first = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0;
+            Ok(TickOutcome {
+                contended: first,
+                ..TickOutcome::default()
+            })
+        });
+        let watch = Arc::new(
+            WatchLoop::scoped(tick)
+                .with_fs_events(false)
+                .with_immediate(false)
+                .with_leading_edge(false)
+                .with_debounce_ms(20)
+                .with_poll_interval_ms(MAX_INTERVAL_MS),
+        );
+        let runner = watch.clone();
+        let thread = std::thread::spawn(move || runner.run());
+        let wait = Duration::from_secs(10);
+
+        watch.inner.signal_change(fired(&["/roots/claude"]));
+        let turned_away = requests.recv_timeout(wait).unwrap();
+        assert_eq!(turned_away.scope, fired(&["/roots/claude"]));
+        let retry = requests.recv_timeout(wait).unwrap();
+        assert!(retry.force);
+        assert_eq!(retry.scope, fired(&["/roots/claude"]));
+
+        watch.stop();
+        thread.join().unwrap().unwrap();
+    }
+
+    #[cfg(feature = "fs-events")]
+    #[test]
+    fn an_event_is_scoped_to_the_roots_its_paths_fall_under() {
+        use notify::event::{CreateKind, EventKind, Flag, ModifyKind};
+
+        let roots = vec![
+            WatchRoot::tree("/home/u/.claude/projects"),
+            WatchRoot::file("/home/u/.codex/history.jsonl"),
+            WatchRoot::tree("/home/u/.codex/sessions"),
+        ];
+        let write = |paths: &[&str]| {
+            paths.iter().fold(
+                notify::Event::new(EventKind::Modify(ModifyKind::Any)),
+                |event, path| event.add_path(PathBuf::from(path)),
+            )
+        };
+        assert_eq!(
+            fs_events::event_scope(&write(&["/home/u/.claude/projects/app/s.jsonl"]), &roots),
+            Some(fired(&["/home/u/.claude/projects"]))
+        );
+        assert_eq!(
+            fs_events::event_scope(
+                &write(&[
+                    "/home/u/.codex/history.jsonl",
+                    "/home/u/.codex/sessions/2026/r.jsonl"
+                ]),
+                &roots
+            ),
+            Some(fired(&[
+                "/home/u/.codex/history.jsonl",
+                "/home/u/.codex/sessions"
+            ]))
+        );
+        assert_eq!(
+            fs_events::event_scope(&write(&["/home/u/.codex/config.toml"]), &roots),
+            None
+        );
+        let rescan = notify::Event::new(EventKind::Create(CreateKind::Any)).set_flag(Flag::Rescan);
+        assert_eq!(
+            fs_events::event_scope(&rescan, &roots),
+            Some(ChangeScope::Everything)
+        );
     }
 }
