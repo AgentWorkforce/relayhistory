@@ -11,13 +11,28 @@ pub(super) fn sync_codex_sources(
     coverage: &mut SweepCoverage,
     touched: &mut HashSet<String>,
 ) -> Result<usize> {
-    let (cwds, branches, mut inserted) = sync_codex_rollouts_with_repairs_and_coverage(
-        conn, state, root, repairs, coverage, touched,
-    )?;
+    let inserted = sync_codex_rollouts_and_history(conn, state, root, repairs, coverage, touched)?;
+    // Last, after every phase that can create a Codex row (the history
+    // backfill included): a name applied before its row exists would be
+    // recorded as applied and never land.
     let named = super::codex_thread_names::apply_codex_thread_names(conn, state, root, touched)?;
     if named > 0 {
         sync_note!("  [codex] named {named} threads");
     }
+    Ok(inserted)
+}
+
+fn sync_codex_rollouts_and_history(
+    conn: &Connection,
+    state: &mut Map<String, Value>,
+    root: &Path,
+    repairs: &SweepRepairs,
+    coverage: &mut SweepCoverage,
+    touched: &mut HashSet<String>,
+) -> Result<usize> {
+    let (cwds, branches, mut inserted) = sync_codex_rollouts_with_repairs_and_coverage(
+        conn, state, root, repairs, coverage, touched,
+    )?;
     let path = root.join("history.jsonl");
     if !path.exists() {
         sync_note!("  [codex] not found: {} (skipped)", path.display());

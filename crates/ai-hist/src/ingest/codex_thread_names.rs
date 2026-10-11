@@ -19,7 +19,7 @@ pub(crate) fn session_index_path(root: &Path) -> PathBuf {
 /// The current name of every thread the index names, last line wins. A line
 /// that does not parse, or names no thread, is skipped: the index is a cache
 /// Codex rebuilds, never evidence worth failing a sweep over.
-fn read_thread_names(path: &Path) -> Result<HashMap<String, String>> {
+pub(crate) fn read_thread_names(path: &Path) -> Result<HashMap<String, String>> {
     let reader = BufReader::new(fs::File::open(path)?);
     let mut names = HashMap::new();
     for line in reader.lines() {

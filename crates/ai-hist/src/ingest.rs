@@ -20,7 +20,7 @@ mod claude_standalone;
 pub(crate) mod claude_title;
 pub(crate) mod codex;
 mod codex_subagent;
-mod codex_thread_names;
+pub(crate) mod codex_thread_names;
 pub(crate) mod control;
 pub(crate) mod cursor;
 pub(crate) mod devin;

@@ -1502,7 +1502,7 @@ struct CatalogFingerprint {
 const CATALOG_FINGERPRINT_COLUMNS: &str = "source_stamp, last_activity_ms, first_activity_ms, \
      discovery_state, parser_version, project_key, project_key_method, cwd, git_branch, \
      raw_path, models_json, originator, agent_version, repo_url, initial_commit, \
-     workspace_roots_json";
+     workspace_roots_json, title";
 
 /// The change-feed head, or `None` when this store's feed (and with it the
 /// guarantee that every catalog write moves the head) is not in place. The

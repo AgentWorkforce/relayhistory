@@ -108,16 +108,14 @@ fn fold_claude_shallow_tail(session: &mut ShallowSession, bounded: &BoundedJsonl
     }
 }
 
-/// Title records are a few hundred bytes; a line much longer than that is a
-/// message, and is not parsed just to find out it is not a title.
-const TITLE_RECORD_MAX_BYTES: usize = 8 * 1024;
-
-/// Whether `line` could be a title record, without parsing it.
+/// Whether `line` could be a title record, without parsing it: whether it
+/// names one of the title types anywhere. No length cap — a title record
+/// carrying a long title and extra fields is still a title record.
 fn may_hold_title(line: &[u8]) -> bool {
-    line.len() <= TITLE_RECORD_MAX_BYTES
-        && [&b"\"custom-title\""[..], b"\"ai-title\"", b"\"agent-name\""]
-            .iter()
-            .any(|needle| line.windows(needle.len()).any(|window| window == *needle))
+    let text = String::from_utf8_lossy(line);
+    ["\"custom-title\"", "\"ai-title\"", "\"agent-name\""]
+        .iter()
+        .any(|needle| text.contains(needle))
 }
 
 /// The session's title from the bounded read: every title record in the head
