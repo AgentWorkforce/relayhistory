@@ -1,0 +1,21 @@
+{
+  "product": "GitHub Copilot CLI",
+  "version": "1.0.95",
+  "buildRevision": "f5ba50575c2",
+  "platform": "darwin-arm64",
+  "cliSha256": "35d33e040e8aa0554a02385f02648396ba3b853f026ed1db17d30d051a764e4b",
+  "npmIntegrity": "sha512-rh4KQhjg2uO/fJHlDkOQh3R2etNRsnQ22vLbcJcEObFVrc449m6g3injew08QhDQQT16fP+ADfPRcGxcy74P6g==",
+  "sdkRevision": "6be623b01b194a61466385e3f708639ec98ce8ac",
+  "nativeBytes": 1840,
+  "persistedEvents": 6,
+  "readerEvents": 7,
+  "capture": "official offline semantic importer followed by separate native RPC reader process",
+  "sanitization": "Only synthetic project path replaced with /fixture/copilot; writer UUIDs and timestamps retained",
+  "persistedResume": false,
+  "usage": "unproven",
+  "delegation": "unproven",
+  "edits": "unproven",
+  "privateHistory": false,
+  "modelCalls": 0,
+  "authenticationCalls": 0
+}
