@@ -206,9 +206,14 @@ fn provider_roots_are_frozen_and_old_serialized_roots_gain_home_defaults() {
     let temp = tempfile::tempdir().unwrap();
     let mut roots = ProviderRoots::from_home(temp.path().into(), temp.path().join("opencode.db"));
     let mut resolver_value = temp.path().join("first");
-    roots
-        .provider_roots
-        .insert(ID.into(), vec![super::super::resolve_root_value(temp.path(), Some(resolver_value.clone().into_os_string()), ".history-fixture")]);
+    roots.provider_roots.insert(
+        ID.into(),
+        vec![super::super::resolve_root_value(
+            temp.path(),
+            Some(resolver_value.clone().into_os_string()),
+            ".history-fixture",
+        )],
+    );
     resolver_value = temp.path().join("second");
     assert_ne!(directory(&roots), resolver_value);
     assert_eq!(directory(&roots), temp.path().join("first"));
@@ -271,25 +276,54 @@ fn assert_unforced_loss_repair(table: &str) {
     let (temp, store, _) = fixture();
     store.sync(SyncOptions::default()).unwrap();
     let reference = SessionRef::id(Source::TestFixture, "fixture-session");
-    let before = store.session(&reference, SessionQuery::default()).unwrap().unwrap();
+    let before = store
+        .session(&reference, SessionQuery::default())
+        .unwrap()
+        .unwrap();
     let conn = Connection::open(temp.path().join("store.db")).unwrap();
-    let count = || conn.query_row(&format!("SELECT count(*) FROM {table} WHERE source = 'test-fixture'"), [], |r| r.get::<_, i64>(0)).unwrap();
+    let count = || {
+        conn.query_row(
+            &format!("SELECT count(*) FROM {table} WHERE source = 'test-fixture'"),
+            [],
+            |r| r.get::<_, i64>(0),
+        )
+        .unwrap()
+    };
     let expected = count();
     assert!(expected > 0);
     conn.execute(&format!("DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} WHERE source = 'test-fixture' LIMIT 1)"), []).unwrap();
     assert_eq!(count(), expected - 1);
     store.sync(SyncOptions::default()).unwrap();
-    assert_eq!(count(), expected, "lost {table} row must be replayed on unchanged bytes");
-    assert_eq!(store.session(&reference, SessionQuery::default()).unwrap().unwrap().messages, before.messages);
+    assert_eq!(
+        count(),
+        expected,
+        "lost {table} row must be replayed on unchanged bytes"
+    );
+    assert_eq!(
+        store
+            .session(&reference, SessionQuery::default())
+            .unwrap()
+            .unwrap()
+            .messages,
+        before.messages
+    );
 }
 #[test]
-fn unforced_sync_repairs_adapter_partial_event_loss() { assert_unforced_loss_repair("session_events"); }
+fn unforced_sync_repairs_adapter_partial_event_loss() {
+    assert_unforced_loss_repair("session_events");
+}
 #[test]
-fn unforced_sync_repairs_adapter_history_loss() { assert_unforced_loss_repair("history"); }
+fn unforced_sync_repairs_adapter_history_loss() {
+    assert_unforced_loss_repair("history");
+}
 #[test]
-fn unforced_sync_repairs_adapter_marker_loss() { assert_unforced_loss_repair("session_markers"); }
+fn unforced_sync_repairs_adapter_marker_loss() {
+    assert_unforced_loss_repair("session_markers");
+}
 #[test]
-fn unforced_sync_repairs_adapter_catalog_loss() { assert_unforced_loss_repair("sessions"); }
+fn unforced_sync_repairs_adapter_catalog_loss() {
+    assert_unforced_loss_repair("sessions");
+}
 
 #[test]
 fn public_hydration_preserves_sidecar_source_mismatch_classification() {

@@ -44,7 +44,11 @@ impl ShallowSessionProvider for Provider {
         ID
     }
     fn evidence_kinds(&self) -> &'static [EvidenceKind] {
-        &[EvidenceKind::History, EvidenceKind::SessionEvent, EvidenceKind::SessionMarker]
+        &[
+            EvidenceKind::History,
+            EvidenceKind::SessionEvent,
+            EvidenceKind::SessionMarker,
+        ]
     }
     fn enumerate(&self, env: &DiscoveryEnv<'_>, _: Option<usize>) -> Result<Vec<Candidate>> {
         let dir = directory(&env.provider_roots);
@@ -148,9 +152,17 @@ fn normalize(conn: &Connection, payload: &Value, path: &Path) -> Result<usize> {
             },
         )?;
     }
-    crate::insert_session_marker(conn, ID, id, &crate::NewSessionMarker {
-        marker_uid: "fixture-start", kind: "session_start", ts_ms: Some(1000), ..Default::default()
-    })?;
+    crate::insert_session_marker(
+        conn,
+        ID,
+        id,
+        &crate::NewSessionMarker {
+            marker_uid: "fixture-start",
+            kind: "session_start",
+            ts_ms: Some(1000),
+            ..Default::default()
+        },
+    )?;
     upsert_session(
         conn,
         &SessionCatalogRow {
