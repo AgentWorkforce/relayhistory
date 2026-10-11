@@ -2889,17 +2889,10 @@ mod tests {
         let mut names: Vec<&str> = Source::ALL.iter().map(|source| source.as_str()).collect();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(
-            names.len(),
-            Source::ALL.len(),
-            "Source::ALL repeats a source"
-        );
+        assert_eq!(names.len(), Source::ALL.len(), "duplicate source");
         let mut choices: Vec<&str> = crate::store::SOURCE_CHOICES.to_vec();
         choices.sort_unstable();
-        assert_eq!(
-            names, choices,
-            "Source::ALL and SOURCE_CHOICES name different sources"
-        );
+        assert_eq!(names, choices, "source registries disagree");
     }
 
     /// A store over `db` whose provider roots are the (empty) directory

@@ -51,9 +51,9 @@ impl ShallowSessionProvider for Provider {
         if !dir.exists() {
             return Ok(Vec::new());
         }
-        std::fs::read_dir(dir)?
-            .map(|entry| {
-                let path = entry?.path();
+        crate::ingest::collect_matching_files_scoped(&dir, "", "json", env.path_scope())?
+            .into_iter()
+            .map(|path| {
                 let (stamp, recency_hint_ms) = crate::file_stamp_and_modified(&path)?;
                 Ok(Candidate {
                     source: ID,
@@ -182,7 +182,8 @@ fn ingest(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
     ))
 }
 fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
-    let env = DiscoveryEnv::with_provider_roots(ctx.conn, ctx.roots.clone());
+    let env = DiscoveryEnv::with_provider_roots(ctx.conn, ctx.roots.clone())
+        .with_path_scope(ctx.paths.cloned());
     let mut inserted = 0;
     for c in Provider.enumerate(&env, None)? {
         let path = Path::new(&c.locator);

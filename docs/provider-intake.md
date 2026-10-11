@@ -1,7 +1,7 @@
 # Provider-owned history intake
 
 This is the implementation contract for history coverage setup #426. It is based
-on RelayHistory 0.40.0 (`bfd7c90`), with seven admitted sources: `claude`,
+on RelayHistory 0.40.1 (`a88d4b9a`), with seven admitted sources: `claude`,
 `codex`, `cursor`, `grok`, `opencode`, `muse`, `devin`. Their order, spellings,
 serialization, evidence snapshots and retirement of `relay` / `trajectory` stay
 unchanged. Catalog/hydration/relationship/evidence/usage contracts remain
@@ -84,6 +84,11 @@ to `HOOK_HARNESSES` merely because their history lives in files.
   generations, returns `SweepResult { inserted, unread }`. Any absorbed per-file
   read failure increments `unread`, preventing a false complete fingerprint.
   Errors remain provider diagnostics; cancellation is not swallowed.
+  File/tree providers pass `ctx.paths` to scoped collectors and use
+  `DiscoveryEnv::path_scope()` while enumerating; `None` means a full source.
+  A partial walk must preserve unvisited cursors and must not seal a whole-source
+  generation. SQLite providers may read a complete coherent database snapshot
+  when any watched database/WAL sidecar changes.
 - `generation`: changes whenever unchanged native bytes normalize differently.
   It participates in full-sweep fingerprints and targeted hydration stamps;
   changing it resets the old byte cursor and sets `parser_upgrade`.

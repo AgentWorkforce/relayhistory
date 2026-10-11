@@ -39,5 +39,5 @@ fn ingest(_context: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
     todo!("normalize context.provider_session payload using existing store writers; never reopen source")
 }
 fn sweep(_context: SweepContext<'_>) -> Result<SweepResult> {
-    todo!("same normalizer, atomic per-session writes, repair-aware stamps, partial failures reported")
+    todo!("same normalizer, atomic writes, honor context.paths and repairs, report partial failures")
 }

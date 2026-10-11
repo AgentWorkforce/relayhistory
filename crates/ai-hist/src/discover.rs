@@ -501,7 +501,8 @@ impl<'a> DiscoveryEnv<'a> {
     /// read receives, on whatever thread it runs.
     pub fn scan(&self) -> ScanEnv<'_> {
         ScanEnv {
-            provider_roots: &self.provider_roots,            home: &self.home,
+            provider_roots: &self.provider_roots,
+            home: &self.home,
             claude_config_dir: &self.claude_config_dir,
             codex_home: &self.codex_home,
             grok_home: &self.grok_home,
@@ -574,9 +575,8 @@ impl ScanEnv<'_> {
     }
 
     pub(crate) fn note_query(&self) {
-        self.counters
-            .provider_queries
-            .fetch_add(1, Ordering::Relaxed);
+        let queries = &self.counters.provider_queries;
+        queries.fetch_add(1, Ordering::Relaxed);
     }
 
     pub(crate) fn note_records(&self, records: u64) {

@@ -114,6 +114,51 @@ fn generated_provider_scoped_watch_sweep_reads_changes_and_exposes_roots() {
 }
 
 #[test]
+fn generated_provider_path_scoped_tick_preserves_unvisited_sibling() {
+    let (_temp, store, path) = fixture();
+    let sibling = path.parent().unwrap().join("sibling.json");
+    let mut value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    value["id"] = "sibling-session".into();
+    std::fs::write(&sibling, serde_json::to_vec(&value).unwrap()).unwrap();
+    let conn = crate::open_db(store.db_path()).unwrap();
+    let scope = crate::ingest::SweepScope::only([ID]).with_paths(
+        crate::ingest::path_scope::PathScope::from_paths([path.clone()]),
+    );
+    crate::ingest::sync_basic(&conn, store.db_path(), store.roots(), true, &scope).unwrap();
+    let read = |id| {
+        store
+            .session(
+                &SessionRef::id(Source::TestFixture, id),
+                SessionQuery::default(),
+            )
+            .unwrap()
+    };
+    assert!(read("fixture-session").is_some());
+    assert!(
+        read("sibling-session").is_none(),
+        "scoped discovery and ingestion skip siblings"
+    );
+    crate::ingest::sync_basic(
+        &conn,
+        store.db_path(),
+        store.roots(),
+        true,
+        &crate::ingest::SweepScope::only([ID]),
+    )
+    .unwrap();
+    assert!(
+        read("sibling-session").is_some(),
+        "full backstop still reads siblings"
+    );
+    std::fs::write(&sibling, "unreadable sibling payload").unwrap();
+    crate::ingest::sync_basic(&conn, store.db_path(), store.roots(), true, &scope).unwrap();
+    assert!(
+        read("sibling-session").is_some(),
+        "unvisited evidence is retained"
+    );
+}
+
+#[test]
 fn captured_file_payload_cannot_change_between_stamp_and_ingest() {
     let (_temp, store, path) = fixture();
     let options = HydrateSessionOptions {

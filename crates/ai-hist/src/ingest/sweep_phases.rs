@@ -159,6 +159,7 @@ impl SweepPhases<'_, '_> {
                 state: self.state,
                 roots: self.roots,
                 repairs: self.repairs,
+                paths: scope.paths(),
             });
             if let Some(result) = self.report.capture(source, result) {
                 self.inserted += result.inserted;

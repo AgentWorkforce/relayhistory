@@ -49,6 +49,8 @@ pub(crate) struct SweepContext<'a> {
     pub conn: &'a Connection,
     pub state: &'a mut Map<String, Value>,
     pub roots: &'a ProviderRoots,
+    /// Optional changed paths; None requests the complete source.
+    pub paths: Option<&'a crate::ingest::path_scope::PathScope>,
     pub repairs: &'a crate::ingest::SweepRepairs,
 }
 #[derive(Default)]
