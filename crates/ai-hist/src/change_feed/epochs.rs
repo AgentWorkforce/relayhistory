@@ -3,16 +3,19 @@
 //! Removing an exported kind is the one schema change that relabels a store's
 //! feed. A consumer that drained every kind may hold rows of the removed kind,
 //! and no tombstone can reach it for a kind the feed no longer names, so it
-//! replays from [`Watermark::START`] to reconcile. A consumer that names its
-//! kinds cannot have named the removed one, and nothing it reads was
-//! renumbered, so its positions stay valid.
+//! replays from [`Watermark::START`] to reconcile. Nothing is renumbered, so a
+//! consumer that left kinds out keeps its positions.
 //!
 //! The store therefore draws a new epoch and records the old one as continued
 //! by it, through the head at the time (`change_feed_epochs`). A watermark of
-//! the old epoch resumes a drain over named kinds; a drain over every kind
-//! refuses it as before. Named cursors follow the same rule: one bound to
-//! every kind, or to a set naming a removed kind, is dropped; one bound to a
-//! named set is kept.
+//! the old epoch resumes a drain that leaves out at least one current kind. A
+//! drain over every current kind refuses it as before, whether it passed
+//! `kinds: None` or listed them all: the same list named the removed kind
+//! before the upgrade. An external watermark does not record the kinds it was
+//! drained with, so a consumer that itself listed the removed kind, and stopped
+//! when it could no longer name it, drops that kind's rows on its own. Named
+//! cursors record their set: one bound to every kind, or to a set naming a
+//! removed kind, is dropped; the rest are kept.
 
 use super::*;
 
@@ -73,20 +76,23 @@ fn retire_cursors(conn: &Connection, removed: &[String]) -> Result<()> {
     Ok(())
 }
 
+impl KindSet {
+    /// Whether the set leaves out a current kind, and so cannot be the set
+    /// that, listed before a retirement, included the retired kind.
+    fn leaves_out_a_kind(&self) -> bool {
+        self.kinds != ChangeKind::ALL
+    }
+}
+
 /// Whether `from`, a watermark of another epoch than `head`'s, still names a
-/// position in this store for a drain over `named_kinds` (`false`: every
-/// kind). It does when a chain of retirements leads from its epoch to the
-/// store's and it was issued before the first of them.
-pub(super) fn continues(
-    conn: &Connection,
-    from: Watermark,
-    head: u64,
-    named_kinds: bool,
-) -> Result<bool> {
+/// position in this store for a drain over `kinds`. It does when the set
+/// leaves out a current kind, a chain of retirements leads from the
+/// watermark's epoch to the store's, and it was issued before the first.
+fn continues(conn: &Connection, from: Watermark, head: u64, kinds: &KindSet) -> Result<bool> {
     if from.epoch == head {
         return Ok(true);
     }
-    if !named_kinds || !epochs_recorded(conn)? {
+    if !kinds.leaves_out_a_kind() || !epochs_recorded(conn)? {
         return Ok(false);
     }
     let mut epoch = from.epoch;
@@ -106,17 +112,17 @@ pub(super) fn continues(
 }
 
 /// [`Error::WatermarkAheadOfStore`] unless `from` is a position in this store
-/// for a drain over `named_kinds`; see [`continues`]. The sentinels name no
-/// store and always pass.
+/// for a drain over `kinds`; see [`continues`]. The sentinels name no store
+/// and always pass.
 pub(super) fn check_issued(
     conn: &Connection,
     from: Watermark,
     head: Watermark,
-    named_kinds: bool,
+    kinds: &KindSet,
 ) -> std::result::Result<(), Error> {
     if from == Watermark::START
         || from == Watermark::CONSUMER
-        || continues(conn, from, head.epoch, named_kinds).map_err(Error::query)?
+        || continues(conn, from, head.epoch, kinds).map_err(Error::query)?
     {
         return Ok(());
     }
@@ -152,25 +158,35 @@ fn link(conn: &Connection, epoch: u64) -> Result<Option<(u64, u64)>> {
 
 impl SessionStore {
     /// Whether [`SessionStore::changes_since`] resumes `query` from `from`
-    /// rather than failing with [`Error::WatermarkAheadOfStore`]: `from` was
-    /// issued by this store and is not past its head. For an embedder that
-    /// keeps the epoch it last read beside its own positions and decides
-    /// between resuming and a resync before draining. A watermark issued
-    /// before a kind was retired resumes a query over named kinds only.
+    /// rather than failing with [`Error::WatermarkAheadOfStore`]: `from` (or,
+    /// for [`Watermark::CONSUMER`], the query's named cursor) was issued by
+    /// this store and is not past its head. For an embedder that keeps the
+    /// epoch it last read beside its own positions and decides between
+    /// resuming and a resync before draining. A watermark issued before a kind
+    /// was retired resumes only a query that leaves out a current kind. The
+    /// other errors `changes_since` would return for `query` are returned here.
     pub fn resumes_from(
         &self,
         from: Watermark,
         query: &ChangeQuery,
     ) -> std::result::Result<bool, Error> {
-        if from == Watermark::START || from == Watermark::CONSUMER {
+        if from == Watermark::START {
             return Ok(true);
         }
-        let head = self.head_revision()?;
-        if from.revision > head.revision {
+        let mut conn = self.read_conn()?;
+        if !conn
+            .gate("change-feed", schema_is_current)
+            .map_err(Error::query)?
+        {
+            // Nothing in a store from before the feed is a position yet.
             return Ok(false);
         }
-        let conn = self.read_conn()?;
-        epochs::continues(&conn, from, head.epoch, query.kinds.is_some()).map_err(Error::query)
+        let kinds = KindSet::normalize(query.kinds.clone());
+        let (start, head, _) =
+            resolve_start_and_head(&conn, from, query.consumer.as_deref(), &kinds)?;
+        let issued = from == Watermark::CONSUMER
+            || continues(&conn, from, head.epoch, &kinds).map_err(Error::query)?;
+        Ok(issued && start.revision <= head.revision)
     }
 }
 
@@ -217,6 +233,11 @@ mod tests {
     /// As an open of a release that stopped feeding a kind finds the store:
     /// the stored fingerprints still name it.
     fn retire_a_kind(conn: &Connection) {
+        retire_a_kind_and(conn, |_| {});
+    }
+
+    /// [`retire_a_kind`], with `change` applied to the stored fingerprints too.
+    fn retire_a_kind_and(conn: &Connection, change: impl FnOnce(&mut BTreeMap<String, String>)) {
         let stored: String = conn
             .query_row(
                 &format!("SELECT {EXPORT_SCHEMA_DIGEST_COLUMN} FROM change_feed_store"),
@@ -226,6 +247,7 @@ mod tests {
             .unwrap();
         let mut map: BTreeMap<String, String> = serde_json::from_str(&stored).unwrap();
         map.insert("retired_kind".to_string(), "retired-schema".to_string());
+        change(&mut map);
         conn.execute(
             &format!("UPDATE change_feed_store SET {EXPORT_SCHEMA_DIGEST_COLUMN} = ?"),
             [serde_json::to_string(&map).unwrap()],
@@ -262,9 +284,57 @@ mod tests {
         assert_eq!(keys.len(), 1, "only the event written after: {keys:?}");
         assert!(keys[0].contains("after"));
 
-        assert!(!store.resumes_from(issued, &ChangeQuery::default()).unwrap());
+        // Every current kind, listed or not, named the retired one before.
+        let listed = || ChangeQuery::default().kinds(ChangeKind::ALL.iter().copied());
+        for query in [ChangeQuery::default, listed] {
+            assert!(!store.resumes_from(issued, &query()).unwrap());
+            assert!(matches!(
+                store.changes_since(issued, query()),
+                Err(Error::WatermarkAheadOfStore(_))
+            ));
+        }
+    }
+
+    /// A surviving kind whose export changed in the same upgrade is restamped
+    /// above the head, so a position kept across the retirement reads it again.
+    #[test]
+    fn a_kept_position_rereads_a_surviving_kind_whose_export_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, conn) = store(dir.path());
+        insert_event(&conn, "before");
+        let issued = store.head_revision().unwrap();
+
+        retire_a_kind_and(&conn, |map| {
+            map.insert(
+                ChangeKind::SessionEvent.as_str().to_string(),
+                "an-earlier-export".to_string(),
+            );
+        });
+
+        let keys = drained(&store, issued, events());
+        assert_eq!(keys.len(), 1, "{keys:?}");
+        assert!(keys[0].contains("before"));
+    }
+
+    /// `resumes_from` answers for a named cursor from the cursor itself: one
+    /// past the head, as a restored database leaves it, does not resume.
+    #[test]
+    fn resumes_from_reads_a_named_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, conn) = store(dir.path());
+        insert_event(&conn, "before");
+        commit(&store, events().consumer("delivery"));
+        assert!(store
+            .resumes_from(Watermark::CONSUMER, &events().consumer("delivery"))
+            .unwrap());
+
+        conn.execute("UPDATE consumer_cursors SET revision = revision + 10", [])
+            .unwrap();
+        assert!(!store
+            .resumes_from(Watermark::CONSUMER, &events().consumer("delivery"))
+            .unwrap());
         assert!(matches!(
-            store.changes_since(issued, ChangeQuery::default()),
+            store.changes_since(Watermark::CONSUMER, events().consumer("delivery")),
             Err(Error::WatermarkAheadOfStore(_))
         ));
     }

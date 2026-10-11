@@ -586,9 +586,11 @@ backfilled above the old head and records its fingerprint without replay; a name
 cursor past the head names no revision of this store, so that resync's commit
 replaces it. Retiring a fed kind rotates the epoch because no live table
 remains whose rows can be restamped to communicate the removal: a drain over
-every kind, which may hold the retired kind's rows, resyncs, while a drain over
-named kinds keeps resuming from a watermark issued before the retirement, and
-named cursors bound to named kinds keep their positions. Nothing is
+every current kind (`kinds: None` or all of them listed), which may hold the
+retired kind's rows, resyncs, while a drain that leaves out a current kind
+keeps resuming from a watermark issued before the retirement, and named
+cursors not bound to every kind or to the retired one keep their positions. A
+consumer that listed the retired kind itself drops its rows on its own. Nothing is
 renumbered. `resumes_from(watermark, &query)` says which applies before a
 drain.
 `head_revision()` reports

@@ -8,7 +8,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- Retiring a fed kind no longer makes every change-feed consumer replay the store: a watermark or named cursor over named kinds keeps resuming across the new epoch, since nothing is renumbered and it cannot include the retired kind; only consumers of every kind, which may hold the retired kind's rows, resync. A store that retires a kind under this release keeps those positions; one that 0.39.0 already reset has no record to resume from.
+- Retiring a fed kind no longer makes every change-feed consumer replay the store: since nothing is renumbered, a watermark or named cursor over a kind set that leaves out a current kind keeps resuming across the new epoch, and surviving kinds whose export changed in the same upgrade are restamped for it; only consumers of every kind, whether they pass `kinds: None` or list them all, resync. A store that retires a kind under this release keeps those positions; one that 0.39.0 already reset has no record to resume from.
 
 ### Rust API
 

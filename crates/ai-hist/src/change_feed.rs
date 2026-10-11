@@ -1197,7 +1197,6 @@ impl SessionStore {
                 self.db_path().display()
             )));
         }
-        let named_kinds = query.kinds.is_some();
         let kind_set = KindSet::normalize(query.kinds);
         let batch = match query.batch {
             0 => DEFAULT_CHANGE_BATCH,
@@ -1228,7 +1227,7 @@ impl SessionStore {
         }
         let (start, head, stale_cursor) =
             resolve_start_and_head(&conn, from, query.consumer.as_deref(), &kind_set)?;
-        epochs::check_issued(&conn, from, head, named_kinds)?;
+        epochs::check_issued(&conn, from, head, &kind_set)?;
         if start.revision > head.revision {
             return Err(Error::WatermarkAheadOfStore(format!(
                 "changes_since: watermark {} is ahead of the store head {}; the database was \
