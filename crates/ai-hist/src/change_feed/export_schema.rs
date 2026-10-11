@@ -160,7 +160,9 @@ pub(super) fn appended_columns(
 ///
 /// Keeping the store epoch and cursor rows intact is deliberate. Both external
 /// watermarks and named cursors can resume normally and observe the affected
-/// rows at their new revisions; unrelated kinds are never replayed.
+/// rows at their new revisions; unrelated kinds are never replayed. Retiring a
+/// kind is the one exception (see `epochs.rs`), and the surviving kinds are
+/// reconciled with it, since positions that leave a kind out survive it.
 pub(super) fn reconcile_export_schema(conn: &Connection, identity_existed: bool) -> Result<()> {
     let current = export_schema_digests(conn)?;
     let stored: Option<String> = conn.query_row(
@@ -178,17 +180,19 @@ pub(super) fn reconcile_export_schema(conn: &Connection, identity_existed: bool)
         .as_ref()
         .is_some_and(|previous| exported_kind_removed(previous, &current));
     if identity_existed && removed {
-        // A removed kind has no live table left to restamp and emit. Reset the
-        // semantic stream so a full reconciliation can remove that retired
-        // material. Ordinary shape changes never take this store-wide path.
-        conn.execute_batch(
-            "UPDATE change_feed_store
-             SET epoch = CASE WHEN epoch = 9223372036854775807
-                              THEN -9223372036854775807 ELSE epoch + 2 END
-             WHERE singleton=1;
-             DELETE FROM consumer_cursors;",
-        )?;
-    } else if identity_existed {
+        // A removed kind has no live table left to restamp and emit: a new
+        // epoch makes every-kind consumers, which may hold its rows, resync,
+        // while consumers that leave a kind out keep their positions -- and
+        // so still need the surviving kinds restamped below.
+        let removed: Vec<String> = previous
+            .iter()
+            .flat_map(|previous| previous.keys())
+            .filter(|kind| !current.contains_key(*kind))
+            .cloned()
+            .collect();
+        super::epochs::retire_kinds(conn, &removed)?;
+    }
+    if identity_existed {
         for kind in ChangeKind::ALL {
             let Some(previous) = previous.as_ref() else {
                 restamp_exported_rows(conn, *kind, RestampScope::Every)?;
