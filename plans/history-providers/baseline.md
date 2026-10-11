@@ -75,7 +75,9 @@ GitHub at inspection. Main already includes [#466](https://github.com/AgentWorkf
 (`c531d125`) stable evidence rereads. Do not duplicate that fix. The new public
 repeat checks characterize current admitted examples; the existing
 `a_forced_sweep_over_unchanged_files_reports_nothing` test addresses the broader
-all-kind/same-ID corpus case. An open issue title is not proof its original
+all-kind silence for non-colliding sessions and parent/sidecar acquisition.
+It explicitly excludes duplicate top-level transcripts with the same session ID;
+#328's top-level collision is not covered. An open issue title is not proof its original
 symptom persists on this head.
 
 [#358](https://github.com/AgentWorkforce/relayhistory/issues/358) is closed; parser
@@ -90,7 +92,9 @@ Initial untouched baseline:
 
 Added public characterization:
 `TMPDIR=/private/tmp cargo test -p ai-hist --all-features --test provider_baseline`
-— **7 pass** with all features and **7 pass** with no default features.
+— **7 pass**.
+`TMPDIR=/private/tmp cargo test -p ai-hist --no-default-features --test provider_baseline`
+— **7 pass**.
 Removing the Claude assistant record makes
 `claude_existing_format_repeat_acquisition` fail because `Hello!` is absent;
 restoring the fixture makes all seven pass. The fixture is unchanged in Git.
