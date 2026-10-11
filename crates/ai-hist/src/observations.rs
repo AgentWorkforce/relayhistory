@@ -215,6 +215,30 @@ fn upsert_inner(
         PreviewWrite::Replace => " OR session_observations.first_prompt IS NOT excluded.first_prompt OR session_observations.last_assistant_text IS NOT excluded.last_assistant_text",
         PreviewWrite::Preserve => "",
     };
+    // A sibling transcript does not retarget an observation that already
+    // points at the catalog file. The catalog upsert decided ownership; this
+    // does not stat the file.
+    let kept = crate::catalog_owner::retained_observation(conn, k, observation.raw_locator.as_deref())?;
+    let (raw_locator, source_stamp, first_prompt, last_assistant_text) = match &kept {
+        Some(kept) if previews == PreviewWrite::Replace => (
+            kept.raw_locator.as_deref(),
+            kept.source_stamp.as_deref(),
+            kept.first_prompt.as_deref(),
+            kept.last_assistant_text.as_deref(),
+        ),
+        Some(kept) => (
+            kept.raw_locator.as_deref(),
+            kept.source_stamp.as_deref(),
+            observation.first_prompt.as_deref(),
+            observation.last_assistant_text.as_deref(),
+        ),
+        None => (
+            observation.raw_locator.as_deref(),
+            observation.source_stamp.as_deref(),
+            observation.first_prompt.as_deref(),
+            observation.last_assistant_text.as_deref(),
+        ),
+    };
     let written = conn.execute(
         &format!(
             "INSERT INTO session_observations( \
@@ -236,13 +260,13 @@ fn upsert_inner(
             k.location.as_str(),
             k.connector_id,
             k.connector_instance,
-            observation.raw_locator,
-            observation.source_stamp,
+            raw_locator,
+            source_stamp,
             observation.discovery_state,
             observation.access_state,
             observation.updated_ms,
-            observation.first_prompt,
-            observation.last_assistant_text
+            first_prompt,
+            last_assistant_text
         ],
     )?;
     refresh_projection(conn, k)?;

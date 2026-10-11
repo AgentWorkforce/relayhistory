@@ -61,7 +61,7 @@ use std::sync::{LazyLock, Mutex, MutexGuard};
 
 use crate::project_identity::ProjectKeyMethod;
 use crate::{
-    open_db_readonly, upsert_session_presence, EvidenceKind, SessionLocation, SessionScope,
+    now_ms, open_db_readonly, upsert_session_presence, EvidenceKind, SessionLocation, SessionScope,
     FULL_SESSION_KINDS, SOURCE_CHOICES,
 };
 use crate::ingest::opencode::OpencodeLayout;
@@ -3844,13 +3844,6 @@ fn clear_non_session(
     Ok(())
 }
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as i64)
-        .unwrap_or_default()
-}
-
 /// Re-resolve the project identity of a row served straight from the catalog.
 ///
 /// The stamp shortcut is right about everything the transcript says and wrong
@@ -4056,6 +4049,9 @@ fn upsert_shallow_session_in_transaction(
     session: &ShallowSession,
     location: SessionLocation,
 ) -> Result<ShallowSession> {
+    // A sibling transcript keeps the identity of the file already recorded.
+    let kept = crate::catalog_owner::withhold_shallow(conn, session, location)?;
+    let session = kept.as_ref().unwrap_or(session);
     if location == SessionLocation::Remote {
         // Cache-only local reads classify a preexisting presence-less row as
         // legacy local. Preserve that classification before adding the first

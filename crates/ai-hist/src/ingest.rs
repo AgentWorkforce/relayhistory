@@ -8011,7 +8011,7 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
             // skip this file on every later sync and the stale fold would
             // never be replaced.
             if !scan_superseded {
-                set_claude_first_prompt(conn, &meta)?;
+                set_claude_first_prompt(conn, &meta, &path)?;
             }
             let pass = incremental::ingest_claude_transcript_at_locator_batched(
                 conn,
@@ -8938,7 +8938,19 @@ fn retire_claude_history_row(
 /// whose stored title was a row the classifier now types as control (a bare
 /// `/resume <id>`, a task notification) would keep it for good on an upgraded
 /// install, while a fresh database stores nothing.
-pub(crate) fn set_claude_first_prompt(conn: &Connection, meta: &ClaudeSessionMeta) -> Result<()> {
+pub(crate) fn set_claude_first_prompt(
+    conn: &Connection,
+    meta: &ClaudeSessionMeta,
+    path: &Path,
+) -> Result<()> {
+    // Every sibling transcript is folded. The prompt and title stay with the
+    // file the catalog row names; `upsert_session` has already kept or claimed
+    // that file, so this compares the path and does not stat again.
+    let recorded = path.to_string_lossy();
+    if !crate::catalog_owner::recorded_path_is(conn, "claude", &meta.session_id, recorded.as_ref())?
+    {
+        return Ok(());
+    }
     conn.execute(
         "UPDATE sessions SET first_prompt = ?1 WHERE source = 'claude' AND session_id = ?2",
         params![meta.first_prompt, meta.session_id],
@@ -12111,6 +12123,14 @@ fn upsert_session_inner(
             "last_assistant_text = excluded.last_assistant_text",
         ),
     };
+    // A different transcript does not replace the recorded file, or the
+    // excerpt taken from it, while that file exists. Activity still moves:
+    // events from both transcripts belong to the session. The same path is a
+    // normal update, including a directory a provider rewrites in place.
+    let keep_recorded =
+        crate::catalog_owner::incoming_must_not_replace(conn, source, session_id, raw_path)?;
+    let (assistant_text, raw_path_sql, presence_path) =
+        crate::catalog_owner::session_assigns(keep_recorded, assistant_text, raw_path);
     // Canonical project identity, derived once per session from the cwd the
     // provider recorded. Resolution is cached per directory, so the repeated
     // upserts a growing transcript produces cost one filesystem walk in total.
@@ -12130,7 +12150,7 @@ fn upsert_session_inner(
          {first_activity}, \
          {last_activity}, \
          {assistant_text}, \
-         raw_path = COALESCE(excluded.raw_path, sessions.raw_path), \
+         {raw_path_sql}, \
          parser_version = excluded.parser_version, \
          discovery_state = 'full'"
         ),
@@ -12154,7 +12174,7 @@ fn upsert_session_inner(
         source,
         session_id,
         SessionLocation::Local,
-        raw_path,
+        presence_path,
         None,
         Some("full"),
     )?;
