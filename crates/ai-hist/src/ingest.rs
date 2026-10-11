@@ -122,7 +122,7 @@ pub(crate) mod scoped_files;
 pub(crate) use scoped_files::take_dirs_read;
 pub(crate) use scoped_files::{
     collect_matching_files, collect_matching_files_scoped, collect_muse_transcripts,
-    collect_muse_transcripts_scoped, cursor_transcript_paths, grok_transcripts_for,
+    collect_muse_transcripts_scoped, grok_transcripts_for,
 };
 use sweep_phases::SweepPhases;
 pub(crate) use sweep_phases::SweepScope;
@@ -8194,7 +8194,7 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
 
     state.insert(
         incremental::CLAUDE_HOLDING_RECORDS_KEY.into(),
-        holding_records.into(),
+        scoped_files::claude_holding_flag(paths, root, holding_records, state).into(),
     );
     if walked_every_known_root {
         record_fidelity_backfill(state, CLAUDE_FIDELITY_GENERATION_KEY);

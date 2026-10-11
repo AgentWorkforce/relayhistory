@@ -3,17 +3,19 @@
 
 use anyhow::Result;
 
-use super::{file_candidates, Candidate, DiscoveryEnv};
+use super::{Candidate, DiscoveryEnv};
 
 pub(super) fn candidates(env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
     let root = env.home.join(".cursor/projects");
     match crate::ingest::path_scope::PathScope::walk_of(env.path_scope(), &root) {
         crate::ingest::path_scope::RootWalk::Partial(scope) => {
-            return file_candidates(
-                "cursor",
-                crate::cursor_transcript_paths(&root, Some(scope))?,
-                crate::file_stamp_and_modified,
-            );
+            // `read_shallow` drops a candidate with no session id and the
+            // engine then remembers the file as not a session. The id is the
+            // directory name; the partial walk already has it.
+            return Ok(stamped(crate::ingest::scoped_files::cursor_transcripts(
+                &root,
+                Some(scope),
+            )?));
         }
         crate::ingest::path_scope::RootWalk::Skip => return Ok(Vec::new()),
         crate::ingest::path_scope::RootWalk::Full => {}
@@ -42,4 +44,64 @@ pub(super) fn candidates(env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
         }
     }
     Ok(out)
+}
+
+fn stamped(files: Vec<(std::path::PathBuf, String, String)>) -> Vec<Candidate> {
+    let mut out = Vec::with_capacity(files.len());
+    for (path, session_id, _) in files {
+        let Ok((stamp, recency_hint_ms)) = crate::file_stamp_and_modified(&path) else {
+            continue;
+        };
+        out.push(Candidate {
+            source: "cursor",
+            locator: path.to_string_lossy().into_owned(),
+            session_id: Some(session_id),
+            recency_hint_ms,
+            stamp,
+        });
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::ShallowSessionProvider;
+    use super::*;
+
+    #[test]
+    fn a_path_scoped_cursor_candidate_keeps_its_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let changed = home.join(".cursor/projects/work-app/agent-transcripts/cursor-1/cursor-1.jsonl");
+        let other = home.join(".cursor/projects/other/agent-transcripts/cursor-2/cursor-2.jsonl");
+        for path in [&changed, &other] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                path,
+                "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"<user_query>\\nfix\\n</user_query>\"}]}}\n",
+            )
+            .unwrap();
+        }
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::init_db(&conn).unwrap();
+        let env = DiscoveryEnv::with_roots(
+            &conn,
+            home.to_path_buf(),
+            home.join("opencode.db"),
+        )
+        .with_path_scope(crate::ingest::path_scope::PathScope::from_paths([
+            changed.clone(),
+        ]));
+        let found = candidates(&env).unwrap();
+        assert_eq!(found.len(), 1, "the other project is not enumerated");
+        assert_eq!(found[0].session_id.as_deref(), Some("cursor-1"));
+
+        let session = super::super::CursorProvider
+            .read_shallow(&env.scan(), Some(&conn), &found[0])
+            .unwrap();
+        assert_eq!(
+            session.as_ref().map(|row| row.session_id.as_str()),
+            Some("cursor-1")
+        );
+    }
 }

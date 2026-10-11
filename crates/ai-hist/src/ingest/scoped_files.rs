@@ -17,6 +17,9 @@ use rusqlite::Connection;
 
 use super::path_scope::{self, PathScope, RootWalk};
 
+#[path = "claude_scope.rs"]
+mod claude_scope;
+
 /// Every Claude transcript under `root` that this scope names: each `*.jsonl`
 /// except the subagent workflow journals, which are metadata and never a
 /// transcript. No scope lists the whole root.
@@ -235,17 +238,7 @@ fn collect_matching_files_inner(
     Ok(())
 }
 
-pub(crate) fn cursor_transcript_paths(
-    root: &Path,
-    scope: Option<&PathScope>,
-) -> Result<Vec<PathBuf>> {
-    Ok(cursor_transcripts(root, scope)?
-        .into_iter()
-        .map(|(path, _, _)| path)
-        .collect())
-}
-
-pub(super) fn cursor_transcripts(
+pub(crate) fn cursor_transcripts(
     root: &Path,
     scope: Option<&PathScope>,
 ) -> Result<Vec<(PathBuf, String, String)>> {
@@ -489,24 +482,4 @@ pub(super) fn sweep_repairs(
     }
 }
 
-/// Claude cursors this tick may drop. A skip returns nothing and does not
-/// query: the history log is not a reason to read the cursor table.
-pub(super) fn claude_missing_cursors(
-    conn: &Connection,
-    paths: Option<&PathScope>,
-    root: &Path,
-    observed: &HashSet<String>,
-) -> Result<Vec<String>> {
-    let scope = match PathScope::walk_of(paths, root) {
-        RootWalk::Skip => return Ok(Vec::new()),
-        RootWalk::Partial(scope) => Some(scope),
-        RootWalk::Full => None,
-    };
-    Ok(super::transcript_cursor::known_locators(conn, "claude")?
-        .into_iter()
-        .filter(|locator| super::path_key_is_under(locator, root) && !observed.contains(locator))
-        .filter(|locator| {
-            scope.is_none_or(|scope| scope.include_file(Path::new(locator), "", "jsonl"))
-        })
-        .collect())
-}
+pub(super) use claude_scope::{claude_holding_flag, claude_missing_cursors};

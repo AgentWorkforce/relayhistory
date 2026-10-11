@@ -49,10 +49,12 @@ pub(crate) fn read_thread_names(path: &Path) -> Result<HashMap<String, String>> 
 /// rows changed.
 ///
 /// Reads the index when it moved since the last pass, or when this sweep
-/// touched a Codex session (a thread named before its rollout was first
-/// catalogued has a row to name only now). The file is a few hundred bytes a
-/// thread, so a read is cheap; an unchanged title is not rewritten, so it does
-/// not restamp the row.
+/// touched a Codex session that still has no title (a thread named before its
+/// rollout was first catalogued has a row to name only now). An unmoved index
+/// is not opened for a session that already has its name: the bytes cannot
+/// have changed, and re-parsing the whole index on every rollout append is
+/// the cost this skips. An unchanged title is not rewritten, so a read that
+/// does happen does not restamp the row.
 pub(crate) fn apply_codex_thread_names(
     conn: &Connection,
     state: &mut Map<String, Value>,
@@ -68,7 +70,7 @@ pub(crate) fn apply_codex_thread_names(
         .get(CODEX_SESSION_INDEX_STATE_KEY)
         .and_then(Value::as_str)
         != Some(&stamp);
-    if !moved && touched.is_empty() {
+    if !moved && !touched_session_needs_name(conn, touched)? {
         return Ok(0);
     }
     let names = read_thread_names(&path)?;
@@ -82,6 +84,21 @@ pub(crate) fn apply_codex_thread_names(
         state.insert(CODEX_SESSION_INDEX_STATE_KEY.to_string(), json!(stamp));
     }
     Ok(changed)
+}
+
+/// Whether any touched session still has no title, so the unmoved index has
+/// a name to apply. A session that already has one was named from this same
+/// index; the rollout reader does not write titles.
+fn touched_session_needs_name(conn: &Connection, touched: &HashSet<String>) -> Result<bool> {
+    let mut untitled = conn.prepare_cached(
+        "SELECT 1 FROM sessions WHERE source = 'codex' AND session_id = ?1 AND title IS NULL",
+    )?;
+    for id in touched {
+        if untitled.exists(params![id])? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -138,5 +155,39 @@ mod tests {
         let changed = apply_codex_thread_names(&conn, &mut state, &root, &touched).unwrap();
         assert_eq!(changed, 1);
         assert_eq!(title(&conn, "t1").as_deref(), Some("Renamed"));
+    }
+
+    /// The index bytes did not change and the session already has the name
+    /// they carry, so the file is not opened. Mode `0o000` makes a read fail;
+    /// a pass that still parsed the index would return that error.
+    #[cfg(unix)]
+    #[test]
+    fn an_unmoved_index_is_not_opened_for_a_session_that_already_has_its_name() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::open_db(&dir.path().join("ai-history.db")).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (session_id, source) VALUES ('t1', 'codex')",
+            [],
+        )
+        .unwrap();
+        let root = dir.path().join("codex");
+        fs::create_dir_all(&root).unwrap();
+        let index = session_index_path(&root);
+        fs::write(
+            &index,
+            "{\"id\":\"t1\",\"thread_name\":\"Named\",\"updated_at\":\"2026-10-01T00:00:00Z\"}\n",
+        )
+        .unwrap();
+        let mut state = Map::new();
+        apply_codex_thread_names(&conn, &mut state, &root, &HashSet::new()).unwrap();
+        assert_eq!(title(&conn, "t1").as_deref(), Some("Named"));
+
+        fs::set_permissions(&index, fs::Permissions::from_mode(0o0)).unwrap();
+        let touched = HashSet::from(["t1".to_string()]);
+        let changed = apply_codex_thread_names(&conn, &mut state, &root, &touched).unwrap();
+        assert_eq!(changed, 0);
+        assert_eq!(title(&conn, "t1").as_deref(), Some("Named"));
     }
 }

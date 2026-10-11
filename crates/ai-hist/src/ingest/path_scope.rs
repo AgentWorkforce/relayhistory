@@ -532,4 +532,118 @@ mod tests {
         assert!(stamps.keys().any(|key| key.ends_with("rollout-live.jsonl")));
         assert!(stamps.keys().all(|key| !key.ends_with("rollout-old.jsonl")));
     }
+
+    fn claude_locators(conn: &rusqlite::Connection) -> Vec<String> {
+        let mut stmt = conn
+            .prepare(
+                "SELECT locator FROM transcript_cursors WHERE source = 'claude' ORDER BY locator",
+            )
+            .unwrap();
+        stmt.query_map([], |row| row.get(0))
+            .unwrap()
+            .map(|locator| locator.unwrap())
+            .collect()
+    }
+
+    fn sync_claude(home: &Home) {
+        assert!(super::super::sync_basic(
+            &home.conn,
+            &home.db,
+            &home.roots,
+            true,
+            &super::super::SweepScope::only(["claude"])
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn an_append_does_not_forget_a_deleted_sibling() {
+        let home = home();
+        let projects = home.roots.claude.join("projects");
+        let one = projects.join("p/one.jsonl");
+        let two = projects.join("p/two.jsonl");
+        write_transcript(&one, "one");
+        write_transcript(&two, "two");
+        sync_claude(&home);
+        std::fs::remove_file(&two).unwrap();
+        sync_paths(&home, &[&one]);
+        let locators = claude_locators(&home.conn);
+        assert!(
+            locators
+                .iter()
+                .any(|locator| locator.ends_with("two.jsonl")),
+            "a sibling the event did not name keeps its cursor: {locators:?}"
+        );
+        assert!(locators
+            .iter()
+            .any(|locator| locator.ends_with("one.jsonl")));
+    }
+
+    #[test]
+    fn a_directory_event_forgets_only_cursors_inside_it() {
+        let home = home();
+        let projects = home.roots.claude.join("projects");
+        let one = projects.join("p/one.jsonl");
+        let two = projects.join("p/two.jsonl");
+        let three = projects.join("q/three.jsonl");
+        write_transcript(&one, "one");
+        write_transcript(&two, "two");
+        write_transcript(&three, "three");
+        sync_claude(&home);
+        std::fs::remove_file(&two).unwrap();
+        sync_paths(&home, &[projects.join("p").as_path()]);
+        let locators = claude_locators(&home.conn);
+        assert!(
+            locators
+                .iter()
+                .all(|locator| !locator.ends_with("two.jsonl")),
+            "the deleted file inside the directory is forgotten: {locators:?}"
+        );
+        assert!(locators
+            .iter()
+            .any(|locator| locator.ends_with("one.jsonl")));
+        assert!(
+            locators
+                .iter()
+                .any(|locator| locator.ends_with("three.jsonl")),
+            "a cursor outside the directory stays: {locators:?}"
+        );
+    }
+
+    #[test]
+    fn a_path_scoped_tick_keeps_a_held_record_it_did_not_visit() {
+        let home = home();
+        let projects = home.roots.claude.join("projects");
+        let one = projects.join("p/one.jsonl");
+        let two = projects.join("q/two.jsonl");
+        write_transcript(&one, "one");
+        write_transcript(&two, "two");
+        sync_claude(&home);
+        let state_path = home.db.parent().unwrap().join(".sync-state.json");
+        let mut state: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+        state.insert(
+            super::super::incremental::CLAUDE_HOLDING_RECORDS_KEY.into(),
+            true.into(),
+        );
+        std::fs::write(&state_path, serde_json::to_string(&state).unwrap()).unwrap();
+
+        sync_paths(&home, &[&one]);
+        let state: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+        assert_eq!(
+            state.get(super::super::incremental::CLAUDE_HOLDING_RECORDS_KEY),
+            Some(&serde_json::Value::Bool(true)),
+            "reading one transcript must not clear a hold on another"
+        );
+
+        sync_claude(&home);
+        let state: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&std::fs::read_to_string(&state_path).unwrap()).unwrap();
+        assert_eq!(
+            state.get(super::super::incremental::CLAUDE_HOLDING_RECORDS_KEY),
+            Some(&serde_json::Value::Bool(false)),
+            "a full walk that finds nothing held clears the flag"
+        );
+    }
 }
