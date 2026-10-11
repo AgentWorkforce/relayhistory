@@ -13,7 +13,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- Unchanged provider syncs restore lost evidence, sidecar containment failures retain their typed error code, and SDK hydration accepts native session markers.
+- Unchanged provider syncs restore lost evidence, missing adapter files and sidecar containment failures retain their typed error codes, and SDK hydration accepts native session markers.
 
 ## [0.40.1] - 2026-10-11
 

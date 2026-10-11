@@ -5,15 +5,16 @@ import path from 'node:path';
 import test from 'node:test';
 import { ROOT, descriptors, generate, outputs, markedSection } from './generate-history-providers.mjs';
 
-function sandbox(t) {
+function sandbox(t, extraFiles = false) {
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'history-provider-generator-'));
   t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
   for(const dir of ['providers','crates/ai-hist/src/providers']) fs.cpSync(path.join(ROOT,dir),path.join(root,dir),{recursive:true});
   for(const file of ['sdk-ts/src/sdk-common.ts','crates/ai-hist/tests/fixtures/README.md','docs/decisions/2026-09-19-relayhistory-owns-session-sourcing.md','docs/sourcing-sdk.md']) {
     fs.mkdirSync(path.dirname(path.join(root,file)),{recursive:true});fs.copyFileSync(path.join(ROOT,file),path.join(root,file));
   }
+  if (extraFiles) for (const directory of ['providers/history-sources','providers/test-sources']) fs.writeFileSync(path.join(root,directory,'README.md'),'descriptor notes');
   for(const directory of ['providers/history-sources','providers/test-sources']) {
-    for(const name of fs.readdirSync(path.join(root,directory))) {
+    for(const name of fs.readdirSync(path.join(root,directory)).filter(name=>name.endsWith('.json'))) {
       const descriptor=JSON.parse(fs.readFileSync(path.join(root,directory,name),'utf8'));
       for(const fixture of descriptor.fixtures) {
         for(const file of fixture.files) {
@@ -82,4 +83,9 @@ test('population declarations reject unknown evidence and accounting', t => {
   assert.throws(() => generate(root), /Invalid population declaration/);
   change(root, 'claude', d => { d.population.evidence.pop(); d.population.usage_accounting = 'invented'; });
   assert.throws(() => generate(root), /Invalid population declaration/);
+});
+
+test('sandbox ignores non-JSON descriptor-directory documentation',t=>{
+  const root=sandbox(t,true);
+  assert.ok(descriptors(root).length);
 });

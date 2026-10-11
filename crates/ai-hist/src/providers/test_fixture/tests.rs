@@ -344,3 +344,39 @@ fn public_hydration_preserves_sidecar_source_mismatch_classification() {
         .unwrap_err();
     assert_eq!(error.code(), "SESSION_SOURCE_MISMATCH");
 }
+
+fn assert_missing_adapter_source(sidecar: bool) {
+    let (_temp, store, path) = fixture();
+    let missing = path.parent().unwrap().join("gone.json");
+    if sidecar {
+        let mut value: Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        value["sidecar"] = serde_json::json!(missing);
+        std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
+    }
+    store
+        .discover(DiscoveryOptions::default().sources([Source::TestFixture]))
+        .unwrap();
+    if !sidecar {
+        std::fs::remove_file(&path).unwrap();
+    }
+    let error = store
+        .hydrate(
+            &SessionRef::id(Source::TestFixture, "fixture-session"),
+            HydrateOptions::default(),
+        )
+        .unwrap_err();
+    assert_eq!(
+        error.code(),
+        "SESSION_SOURCE_UNAVAILABLE",
+        "sidecar={sidecar}"
+    );
+}
+
+#[test]
+fn public_hydration_classifies_missing_adapter_primary() {
+    assert_missing_adapter_source(false);
+}
+#[test]
+fn public_hydration_classifies_missing_adapter_sidecar() {
+    assert_missing_adapter_source(true);
+}

@@ -21,14 +21,16 @@ pub(super) fn source_snapshot(
             )
         })?;
         let path = PathBuf::from(locator);
-        validate_provider_path(&options.source, &path, roots)?;
+        validate_provider_path(&options.source, &path, roots).map_err(provider_source_error)?;
         let acquired = (adapter.acquire)(
             options,
             &path,
             &crate::providers::AcquisitionContext::new(&options.source, roots),
-        )?;
+        )
+        .map_err(provider_source_error)?;
         for read_path in &acquired.read_paths {
-            validate_provider_path(&options.source, read_path, roots)?;
+            validate_provider_path(&options.source, read_path, roots)
+                .map_err(provider_source_error)?;
         }
         return Ok(SourceSnapshot {
             stamp: format!("{}:{}", adapter.generation, acquired.stamp),
@@ -50,6 +52,21 @@ pub(super) fn source_snapshot(
         "opencode" => opencode_store_snapshot(options, target, roots),
         "devin" => devin_store_snapshot(options, target, roots),
         _ => file_source_snapshot(conn, options, target, roots, claude_snapshot),
+    }
+}
+
+fn provider_source_error(error: anyhow::Error) -> anyhow::Error {
+    if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    }) {
+        hydration_error(
+            "SESSION_SOURCE_UNAVAILABLE",
+            format!("provider source unavailable: {error:#}"),
+        )
+    } else {
+        error
     }
 }
 
