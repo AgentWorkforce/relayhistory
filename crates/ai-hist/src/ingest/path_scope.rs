@@ -611,6 +611,33 @@ mod tests {
     }
 
     #[test]
+    fn a_session_directory_event_forgets_the_sibling_transcript_cursor() {
+        let home = home();
+        let projects = home.roots.claude.join("projects");
+        let one = projects.join("p/one.jsonl");
+        let other = projects.join("q/three.jsonl");
+        write_transcript(&one, "one");
+        write_transcript(&other, "three");
+        sync_claude(&home);
+        std::fs::remove_file(&one).unwrap();
+        // The event names the session directory, not the transcript beside it.
+        sync_paths(&home, &[projects.join("p/one").as_path()]);
+        let locators = claude_locators(&home.conn);
+        assert!(
+            locators
+                .iter()
+                .all(|locator| !locator.ends_with("one.jsonl")),
+            "the session file beside the directory is forgotten: {locators:?}"
+        );
+        assert!(
+            locators
+                .iter()
+                .any(|locator| locator.ends_with("three.jsonl")),
+            "a cursor in another project stays: {locators:?}"
+        );
+    }
+
+    #[test]
     fn a_path_scoped_tick_keeps_a_held_record_it_did_not_visit() {
         let home = home();
         let projects = home.roots.claude.join("projects");

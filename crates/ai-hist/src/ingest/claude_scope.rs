@@ -84,6 +84,10 @@ fn missing_in_scope(
                 note_absent_cursor(&mut missing, &mut seen, conn, root, &candidate, observed)?;
             }
         } else {
+            // The range is inside the directory. The session file sits beside
+            // that directory (`…/<id>/` → `…/<id>.jsonl`), which is the same
+            // stem match the listing uses, so a vanished transcript still
+            // loses its cursor.
             note_absent_prefix(
                 &mut missing,
                 &mut seen,
@@ -93,6 +97,9 @@ fn missing_in_scope(
                 scan_dir(changed),
                 observed,
             )?;
+            for candidate in stem_session_files(root, changed) {
+                note_absent_cursor(&mut missing, &mut seen, conn, root, &candidate, observed)?;
+            }
         }
     }
     Ok(missing)
