@@ -269,7 +269,8 @@ re-read, carries the column as `null`, so a consumer reads a column a row was
 delivered without as NULL. A newly fed kind is backfilled
 above the old head and does not reset established streams. Retiring a kind is
 the exceptional epoch reset because no live rows remain to communicate its
-removal. A named
+removal; it resets only consumers of every current kind, and one whose kinds
+leave out a current kind keeps its position. A named
 cursor is bound to the kind set it was committed for; a consumer that filters
 keeps one name per filter. Requests
 (section 7) are not fed as rows of their own — `session_requests` is a view —

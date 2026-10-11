@@ -343,6 +343,12 @@ fn create_feed_tables(conn: &Connection) -> Result<()> {
              singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
              epoch INTEGER NOT NULL,
              export_schema_digest TEXT
+         );
+         CREATE TABLE IF NOT EXISTS change_feed_epochs (
+             epoch INTEGER PRIMARY KEY,
+             successor INTEGER NOT NULL,
+             through_revision INTEGER NOT NULL,
+             retired_kinds TEXT NOT NULL
          );",
     )?;
     // The database's identity in every watermark it issues; see

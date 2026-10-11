@@ -555,7 +555,11 @@ Three rules a consumer must hold:
   cursors remain stable, and unrelated kinds are not
 replayed. A newly fed kind is stamped above the old head and records its
 fingerprint without resetting established consumers. Retiring a fed kind is
-the exceptional epoch reset because no live table remains to restamp.
+the exceptional epoch reset because no live table remains to restamp; it
+renumbers nothing, and the store records the old epoch as continued by the new
+one (`change_feed_epochs`), so only consumers of every current kind resync: a
+watermark or named cursor over a set that leaves out a current kind keeps
+resuming, and surviving kinds whose export changed are restamped as usual.
   `SessionStore::head_revision` reports the head with it; a stored watermark
   with another epoch, or beyond the head, fails with
   `ErrorKind::WatermarkAheadOfStore`, and the recovery is a full resync from

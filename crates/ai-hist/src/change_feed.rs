@@ -89,7 +89,9 @@ pub const DEFAULT_CHANGE_BATCH: usize = 1_000;
 /// the one pass the missing marker triggers.
 const MIGRATION: &str = "change_feed_v2";
 
+mod epochs;
 mod export_schema;
+mod validate;
 use export_schema::reconcile_export_schema;
 
 /// The column a named cursor records its kind set in.
@@ -159,8 +161,9 @@ fn kinds_mismatch(name: &str, stored: &str, offered: &str) -> Error {
 /// current head, so the database identity stays stable and both named and
 /// external cursors resume without replaying unrelated kinds.
 /// [`SessionStore::changes_since`] refuses a watermark issued by another
-/// database, however far that store has since counted. A consumer persists
-/// both fields, as the store returned them.
+/// database, however far that store has since counted, except across a
+/// retired kind for a drain over named kinds (see `epochs.rs`). A consumer
+/// persists both fields, as the store returned them.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default, Serialize, Deserialize,
 )]
@@ -1195,44 +1198,15 @@ impl SessionStore {
                 self.db_path().display()
             )));
         }
+        validate::query(from, &query, "changes_since")?;
         let kind_set = KindSet::normalize(query.kinds);
         let batch = match query.batch {
             0 => DEFAULT_CHANGE_BATCH,
             batch => batch.min(MAX_CHANGE_BATCH),
         };
-        if from == Watermark::CONSUMER && query.consumer.is_none() {
-            return Err(Error::InvalidArgument(
-                "changes_since: Watermark::CONSUMER needs ChangeQuery::consumer to name the cursor"
-                    .to_string(),
-            ));
-        }
-        if let Some(session) = &query.session {
-            if query.consumer.is_some() {
-                return Err(Error::InvalidArgument(
-                    "changes_since: ChangeQuery::session is a one-shot read and cannot name a \
-                     consumer; a cursor committed from one session's changes would skip every \
-                     other session's. Drain the session from Watermark::START without a \
-                     consumer, and keep the named cursor for the whole feed"
-                        .to_string(),
-                ));
-            }
-            if session.source_name.is_empty() || session.session_id.is_empty() {
-                return Err(Error::InvalidArgument(
-                    "changes_since: ChangeQuery::session needs a nonempty source and session id"
-                        .to_string(),
-                ));
-            }
-        }
         let (start, head, stale_cursor) =
             resolve_start_and_head(&conn, from, query.consumer.as_deref(), &kind_set)?;
-        if from != Watermark::START && from != Watermark::CONSUMER && from.epoch != head.epoch {
-            return Err(Error::WatermarkAheadOfStore(format!(
-                "changes_since: watermark {} was not issued by this store (epoch {}, this \
-                 store's is {}); the database was reset or replaced, resync from \
-                 Watermark::START",
-                from.revision, from.epoch, head.epoch
-            )));
-        }
+        epochs::check_issued(&conn, from, head, &kind_set)?;
         if start.revision > head.revision {
             return Err(Error::WatermarkAheadOfStore(format!(
                 "changes_since: watermark {} is ahead of the store head {}; the database was \

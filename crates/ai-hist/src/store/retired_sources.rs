@@ -141,11 +141,11 @@ pub(super) fn drop_retired_trajectory_store(conn: &Connection) -> Result<()> {
 /// a later step adds would otherwise fail. Only a table holding such a row is
 /// written: a delete compiles every trigger on its table.
 ///
-/// Each delete leaves its change-feed tombstone, deliberately. On the first
-/// upgrade the feed has already reset its stream (the `trajectory` kind is
-/// gone), and a delete for a row a consumer never received is a no-op to it;
-/// on a later pass -- rows an older client wrote again, which the feed
-/// delivered -- the tombstone is how a consumer learns to drop them. Only the
+/// Each delete leaves its change-feed tombstone, deliberately: it is how a
+/// consumer that keeps its position across the `trajectory` kind's
+/// retirement (one draining named kinds), or one that received rows an older
+/// client wrote again, learns to drop them. To a consumer that resynced from
+/// the start it is a delete for a row it never received, a no-op. Only the
 /// tombstones of the retired `trajectory` kind go: no drain reads that kind.
 pub(super) fn delete_retired_source_rows(conn: &Connection) -> Result<()> {
     let sources = retired_sources_sql();
