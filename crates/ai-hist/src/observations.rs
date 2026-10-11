@@ -146,7 +146,16 @@ enum PreviewWrite {
 /// preview provenance — a discovery pass that no longer sees the preview text
 /// stores NULL, which is what a later location retirement must read.
 pub fn upsert(conn: &Connection, observation: &SessionObservation) -> Result<()> {
-    upsert_with(conn, observation, PreviewWrite::Replace)
+    upsert_with(conn, observation, PreviewWrite::Replace, false)
+}
+
+/// Discovery write. A sibling transcript does not retarget the locator that
+/// already names the catalog file. A direct [`upsert`] still replaces it.
+pub(crate) fn upsert_for_discovery(
+    conn: &Connection,
+    observation: &SessionObservation,
+) -> Result<()> {
+    upsert_with(conn, observation, PreviewWrite::Replace, true)
 }
 
 /// Persist acquisition-progress state without taking ownership of the preview
@@ -156,20 +165,21 @@ pub(crate) fn upsert_preserving_previews(
     conn: &Connection,
     observation: &SessionObservation,
 ) -> Result<()> {
-    upsert_with(conn, observation, PreviewWrite::Preserve)
+    upsert_with(conn, observation, PreviewWrite::Preserve, false)
 }
 
 fn upsert_with(
     conn: &Connection,
     observation: &SessionObservation,
     previews: PreviewWrite,
+    keep_catalog_locator: bool,
 ) -> Result<()> {
     let savepoint = if conn.is_autocommit() {
         Some(conn.unchecked_transaction()?)
     } else {
         None
     };
-    let result = upsert_inner(conn, observation, previews);
+    let result = upsert_inner(conn, observation, previews, keep_catalog_locator);
     match (savepoint, result) {
         (Some(tx), Ok(())) => {
             tx.commit()?;
@@ -183,6 +193,7 @@ fn upsert_inner(
     conn: &Connection,
     observation: &SessionObservation,
     previews: PreviewWrite,
+    keep_catalog_locator: bool,
 ) -> Result<()> {
     let k = &observation.key;
     k.validate()?;
@@ -215,6 +226,32 @@ fn upsert_inner(
         PreviewWrite::Replace => " OR session_observations.first_prompt IS NOT excluded.first_prompt OR session_observations.last_assistant_text IS NOT excluded.last_assistant_text",
         PreviewWrite::Preserve => "",
     };
+    let kept = crate::catalog_owner::retained_observation(
+        conn,
+        k,
+        observation.raw_locator.as_deref(),
+        keep_catalog_locator,
+    )?;
+    let (raw_locator, source_stamp, first_prompt, last_assistant_text) = match &kept {
+        Some(kept) if previews == PreviewWrite::Replace => (
+            kept.raw_locator.as_deref(),
+            kept.source_stamp.as_deref(),
+            kept.first_prompt.as_deref(),
+            kept.last_assistant_text.as_deref(),
+        ),
+        Some(kept) => (
+            kept.raw_locator.as_deref(),
+            kept.source_stamp.as_deref(),
+            observation.first_prompt.as_deref(),
+            observation.last_assistant_text.as_deref(),
+        ),
+        None => (
+            observation.raw_locator.as_deref(),
+            observation.source_stamp.as_deref(),
+            observation.first_prompt.as_deref(),
+            observation.last_assistant_text.as_deref(),
+        ),
+    };
     let written = conn.execute(
         &format!(
             "INSERT INTO session_observations( \
@@ -236,13 +273,13 @@ fn upsert_inner(
             k.location.as_str(),
             k.connector_id,
             k.connector_instance,
-            observation.raw_locator,
-            observation.source_stamp,
+            raw_locator,
+            source_stamp,
             observation.discovery_state,
             observation.access_state,
             observation.updated_ms,
-            observation.first_prompt,
-            observation.last_assistant_text
+            first_prompt,
+            last_assistant_text
         ],
     )?;
     refresh_projection(conn, k)?;

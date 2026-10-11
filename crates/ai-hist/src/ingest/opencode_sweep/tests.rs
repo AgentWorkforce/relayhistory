@@ -213,8 +213,9 @@ fn a_session_written_moments_ago_is_not_stamped() {
 #[test]
 fn a_session_an_earlier_store_drops_is_read_from_the_next_one() {
     let mut fixture = Fixture::new();
-    let latest = fixture.root.join("opencode.db");
-    let nightly = fixture.root.join("opencode-nightly.db");
+    // The names are not `*.db`: a configured store can be any path.
+    let latest = fixture.root.join("old.store");
+    let nightly = fixture.root.join("new.store");
     let first = provider_store(&latest);
     provider_store(&nightly);
     let stores = [latest.clone(), nightly.clone()];
