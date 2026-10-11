@@ -32,7 +32,7 @@ pub(crate) const METADATA: ProviderMetadata = ProviderMetadata {
     }),
 };
 pub(crate) const ADAPTER: Option<ProviderAdapter> = Some(ProviderAdapter {
-    generation: "pi_v3_1",
+    generation: "pi_v3_2",
     acquire,
     sweep,
     resolve_roots,

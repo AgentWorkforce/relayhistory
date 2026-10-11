@@ -645,7 +645,7 @@
       "repo_url": null,
       "session_id": "custom-fork-session",
       "source": "pi",
-      "source_stamp": "pi_v3_1:sha256:2ceca70d03a3150287b96d8afc785879dc16c7b5c53a521319be5224be179dd6",
+      "source_stamp": "pi_v3_2:sha256:2ceca70d03a3150287b96d8afc785879dc16c7b5c53a521319be5224be179dd6",
       "title": "Synthetic Pi history",
       "workspace_roots_json": null
     },
@@ -665,7 +665,7 @@
       "repo_url": null,
       "session_id": "custom-history-session",
       "source": "pi",
-      "source_stamp": "pi_v3_1:sha256:62deef92497d9b675fe71b9ce8fcb<n>da45af26bc2a0dc747c9",
+      "source_stamp": "pi_v3_2:sha256:62deef92497d9b675fe71b9ce8fcb<n>da45af26bc2a0dc747c9",
       "title": "Synthetic Pi history",
       "workspace_roots_json": null
     }

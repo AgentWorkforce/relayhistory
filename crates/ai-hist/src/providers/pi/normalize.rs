@@ -317,7 +317,6 @@ fn retire(conn: &Connection, sid: &str, keys: &Keys) -> Result<()> {
     let results = serde_json::to_string(&keys.results)?;
     conn.execute("UPDATE tool_calls SET is_error = NULL WHERE source = 'pi' AND session_id = ?1 AND location = 'local' AND is_error IS NOT NULL AND tool_use_id NOT IN (SELECT value FROM json_each(?2))", rusqlite::params![sid, results])?;
 
-    reassign_shared_prompts(conn, sid, &prompts)?;
     for (table, key, present) in [
         ("session_events", "event_uid", &keys.events),
         ("tool_calls", "tool_use_id", &keys.tools),
@@ -335,15 +334,16 @@ fn retire(conn: &Connection, sid: &str, keys: &Keys) -> Result<()> {
             crate::SessionLocation::Local,
         )?;
     }
-    conn.execute("DELETE FROM history WHERE source = 'pi' AND session_id = ?1 AND (timestamp_ms || ':' || coalesce(prompt_hash, '')) NOT IN (SELECT value FROM json_each(?2))", rusqlite::params![sid, prompts])?;
+    reconcile_prompts(conn, sid, &prompts)?;
     Ok(())
 }
 
-// Prompt rows are shared across sessions. Pi user content may span several
-// blocks: compare their ordered text projection, not just a single event.
-fn reassign_shared_prompts(conn: &Connection, sid: &str, keep: &str) -> Result<()> {
+// Reconcile after local shares retire: surviving remote events in this session
+// and other sessions still support prompt rows. Compare complete ordered user
+// text projections, and prefer the existing owner when its evidence survives.
+fn reconcile_prompts(conn: &Connection, sid: &str, keep: &str) -> Result<()> {
     let reference = "SELECT e.session_id FROM session_events e \
-        WHERE e.source = 'pi' AND e.session_id <> ?1 AND e.role = 'user' \
+        WHERE e.source = 'pi' AND e.role = 'user' \
           AND e.kind = 'text' AND e.ts_ms = history.timestamp_ms \
         GROUP BY e.session_id, e.message_id \
         HAVING (SELECT group_concat(text, char(10)) FROM \
@@ -351,10 +351,13 @@ fn reassign_shared_prompts(conn: &Connection, sid: &str, keep: &str) -> Result<(
            AND b.session_id = e.session_id AND b.message_id = e.message_id \
            AND b.role = 'user' AND b.kind = 'text' \
            ORDER BY CAST(substr(b.event_uid, length(b.message_id) + 2) AS INTEGER))) = history.prompt \
-        ORDER BY e.session_id LIMIT 1";
+        ORDER BY (e.session_id = ?1) DESC, e.session_id LIMIT 1";
     conn.execute(&format!("UPDATE history SET session_id = ({reference}) \
         WHERE source = 'pi' AND session_id = ?1 \
         AND (timestamp_ms || ':' || coalesce(prompt_hash, '')) NOT IN (SELECT value FROM json_each(?2)) \
-        AND EXISTS ({reference})"), rusqlite::params![sid, keep])?;
+        AND EXISTS ({reference}) AND session_id IS NOT ({reference})"), rusqlite::params![sid, keep])?;
+    conn.execute(&format!("DELETE FROM history WHERE source = 'pi' AND session_id = ?1 \
+        AND (timestamp_ms || ':' || coalesce(prompt_hash, '')) NOT IN (SELECT value FROM json_each(?2)) \
+        AND NOT EXISTS ({reference})"), rusqlite::params![sid, keep])?;
     Ok(())
 }

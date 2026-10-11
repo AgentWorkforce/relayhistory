@@ -273,3 +273,69 @@ fn pi_fork_shared_multiblock_prompt_survives_original_rewrite() {
     let owner:String=conn.query_row("SELECT session_id FROM history WHERE source='pi' AND prompt = 'part one'||char(10)||'part two'",[],|r|r.get(0)).unwrap();
     assert_eq!(owner, "another-session");
 }
+
+#[test]
+fn pi_rewrite_preserves_prompt_backed_by_same_session_remote_events() {
+    let (_temp, store, path) = fixture();
+    let conn = crate::open_db(store.db_path()).unwrap();
+    let mut payload = snapshot(&path, &AcquisitionContext::new(ID, store.roots()))
+        .unwrap()
+        .payload;
+    payload["entries"][1]["message"]["content"] = serde_json::json!([{"type":"text","text":"remote first"},{"type":"text","text":"remote second"}]);
+    normalize::write(&conn, &payload, &path).unwrap();
+    conn.execute("UPDATE session_events SET location = 'both' WHERE source = 'pi' AND message_id = 'entry-1'", []).unwrap();
+    payload["entries"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|e| e["message"]["role"] != "user");
+    normalize::write(&conn, &payload, &path).unwrap();
+    let remote: i64 = conn.query_row("SELECT count(*) FROM session_events WHERE source = 'pi' AND message_id = 'entry-1' AND location = 'remote'", [], |r| r.get(0)).unwrap();
+    assert_eq!(
+        remote, 2,
+        "local retirement must preserve both remote text blocks"
+    );
+    let prompts: Vec<(String, String)> = conn
+        .prepare("SELECT session_id, prompt FROM history WHERE source = 'pi'")
+        .unwrap()
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(
+        prompts,
+        vec![(
+            "custom-history-session".into(),
+            "remote first\nremote second".into()
+        )],
+        "same-session remote prompt survives; local-only prompt is retired"
+    );
+    normalize::write(&conn, &payload, &path).unwrap();
+    let remaining: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM history WHERE source = 'pi'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        remaining, 1,
+        "unchanged replay preserves remote prompt ownership"
+    );
+    conn.execute(
+        "DELETE FROM session_events WHERE source = 'pi' AND message_id = 'entry-1'",
+        [],
+    )
+    .unwrap();
+    normalize::write(&conn, &payload, &path).unwrap();
+    let remaining: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM history WHERE source = 'pi'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        remaining, 0,
+        "prompt retires once no finalized user projection supports it"
+    );
+}
