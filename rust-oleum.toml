@@ -28,9 +28,9 @@ rust_roots = ["crates/ai-hist-cli/src", "crates/ai-hist-napi/src", "crates/ai-hi
 "crates/ai-hist/src/ingest/devin.rs" = 828
 "crates/ai-hist/src/ingest/hydrate.rs" = 3452
 "crates/ai-hist/src/ingest/opencode.rs" = 1455
-"crates/ai-hist/src/ingest.rs" = 11962
+"crates/ai-hist/src/ingest.rs" = 11906
 "crates/ai-hist/src/session_store.rs" = 1938
-"crates/ai-hist/src/store.rs" = 3185
+"crates/ai-hist/src/store.rs" = 3179
 "crates/ai-hist-cli/src/lib.rs" = 3101
 "crates/ai-hist-napi/src/lib.rs" = 2170
 
@@ -47,7 +47,7 @@ rust_roots = ["crates/ai-hist-cli/src", "crates/ai-hist-napi/src", "crates/ai-hi
 "crates/ai-hist/src/ingest.rs::ingest_muse_session" = 58
 "crates/ai-hist/src/ingest.rs::ingest_grok_session" = 56
 "crates/ai-hist/src/source_intake.rs::apply_normalized" = 51
-"crates/ai-hist/src/store.rs::init_db_locked" = 73
+"crates/ai-hist/src/store.rs::init_db_locked" = 72
 "crates/ai-hist-cli/src/lib.rs::run" = 94
 
 [baseline.cognitive]

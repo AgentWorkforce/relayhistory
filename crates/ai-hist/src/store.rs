@@ -452,7 +452,21 @@ CREATE TRIGGER IF NOT EXISTS history_ad AFTER DELETE ON history BEGIN
     INSERT INTO history_fts(history_fts, rowid, prompt, project)
     VALUES('delete', old.id, old.prompt, old.project);
 END;
-CREATE TRIGGER IF NOT EXISTS session_events_ai AFTER INSERT ON session_events BEGIN
+-- One row while a sweep write unit is open. The insert trigger then skips
+-- the full-text index; the unit copies its new rows in one statement before
+-- commit. A trigger on this database cannot name a temp table, so the flag
+-- lives here and rolls back with the unit. The unit deletes it before commit.
+CREATE TABLE IF NOT EXISTS session_events_fts_defer (
+    singleton INTEGER PRIMARY KEY CHECK (singleton = 1)
+);
+-- Rebuilt whenever this script runs: CREATE TRIGGER IF NOT EXISTS would keep
+-- a body from before the deferral above.
+DROP TRIGGER IF EXISTS session_events_ai;
+DROP TRIGGER IF EXISTS session_events_au;
+DROP TRIGGER IF EXISTS session_events_ad;
+CREATE TRIGGER IF NOT EXISTS session_events_ai AFTER INSERT ON session_events
+WHEN NOT EXISTS (SELECT 1 FROM session_events_fts_defer)
+BEGIN
     INSERT INTO session_events_fts(rowid, text, role, project)
     VALUES (new.id, new.text, new.role, new.project);
 END;
@@ -467,14 +481,21 @@ END;
 CREATE TRIGGER IF NOT EXISTS session_events_au AFTER UPDATE OF text, role, project ON session_events
     WHEN old.text IS NOT new.text OR old.role IS NOT new.role OR old.project IS NOT new.project
 BEGIN
+    -- A row inserted while the deferral above is set is not indexed yet.
+    -- Deleting an index entry that is not there corrupts FTS5. The new
+    -- values are written either way, one entry. The unit's catch-up skips a
+    -- row `session_events_fts_docsize` already holds, so this does not
+    -- index it again.
     INSERT INTO session_events_fts(session_events_fts, rowid, text, role, project)
-    VALUES('delete', old.id, old.text, old.role, old.project);
+    SELECT 'delete', old.id, old.text, old.role, old.project
+    WHERE EXISTS (SELECT 1 FROM session_events_fts_docsize WHERE id = old.id);
     INSERT INTO session_events_fts(rowid, text, role, project)
     VALUES (new.id, new.text, new.role, new.project);
 END;
 CREATE TRIGGER IF NOT EXISTS session_events_ad AFTER DELETE ON session_events BEGIN
     INSERT INTO session_events_fts(session_events_fts, rowid, text, role, project)
-    VALUES('delete', old.id, old.text, old.role, old.project);
+    SELECT 'delete', old.id, old.text, old.role, old.project
+    WHERE EXISTS (SELECT 1 FROM session_events_fts_docsize WHERE id = old.id);
 END;
 "#;
 
@@ -663,6 +684,7 @@ const REQUIRED_TABLES: &[&str] = &[
     "history_fts",
     "session_events",
     "session_events_fts",
+    "session_events_fts_defer",
     "session_markers",
     "tool_calls",
     "file_edits",
@@ -1072,6 +1094,7 @@ const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &[
     "fts_update_changed_only_v1",
     "evidence_location_v1",
     EXPORT_CAPTURE_RETIRED,
+    "session_events_fts_write_unit_v1",
 ];
 
 /// Whether this database already has everything [`init_db`] would add.
@@ -1353,16 +1376,8 @@ fn drop_trigger_unless_applied(conn: &Connection, trigger: &str, markers: &[&str
 
 fn init_db_locked(conn: &Connection) -> Result<()> {
     retire_export_capture(conn)?;
-    // Same shape as the hydration-state trigger below: a body change has to
-    // drop the old trigger before the `IF NOT EXISTS` in SCHEMA re-creates it.
-    drop_trigger_unless_applied(
-        conn,
-        "session_events_au",
-        &[
-            "session_events_fts_update_of_v1",
-            "fts_update_changed_only_v1",
-        ],
-    )?;
+    // SCHEMA rebuilds the three session-event full-text triggers whenever it
+    // runs. `history_au` still drops only when its markers are missing.
     drop_trigger_unless_applied(
         conn,
         "history_au",
@@ -1572,7 +1587,7 @@ END;
                 ('session_delete_edge_seeks_v1'), \
                 ('session_events_fts_update_of_v1'), \
                 ('history_fts_update_of_v1'), \
-                ('fts_update_changed_only_v1');",
+                ('fts_update_changed_only_v1'), ('session_events_fts_write_unit_v1');",
     )?;
     // Before the change feed's revision backfill, whose UPDATE of every
     // trajectory would otherwise fire the Python-era trigger.
