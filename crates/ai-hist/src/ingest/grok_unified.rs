@@ -403,6 +403,7 @@ pub(super) fn materialize_grok_unified_usage(
     if total == 0 {
         return Ok(GrokUnifiedCoverage::default());
     }
+    note_stored_unified_events(conn, session_id)?;
     let rows = grok_unified_rows_unattached(conn, session_id)?;
     let fallback_ts = fallback_ts.or(first_activity).unwrap_or(0);
     let mut models: Vec<String> = models_json
@@ -477,6 +478,47 @@ fn grok_unified_rows_unattached(
             })
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?)
+}
+
+/// Assign one turn's `updates.jsonl` token fact.
+///
+/// `?1` is the token JSON, `?2` the session id, `?3` the event uid. A fact
+/// already stored as the demotion of this same payload, while the unified log
+/// still covers that turn, is left untouched: writing the pre-demotion form
+/// back would stamp a revision and the settlement below would stamp another.
+pub(super) const GROK_TURN_TOKEN_ASSIGN: &str = "\
+UPDATE session_events SET token_json = ?1 \
+WHERE source = 'grok' AND session_id = ?2 AND event_uid = ?3 \
+  AND token_json IS NOT ( \
+    CASE WHEN json_extract(?1, '$.source') = 'updates.jsonl' \
+          AND json_type(?1, '$.usage') IS NOT NULL \
+          AND token_json = json_set(json_remove(?1, '$.usage'), \
+               '$.turn_usage', json(json_extract(?1, '$.usage'))) \
+          AND (EXISTS (SELECT 1 FROM grok_unified_usage u \
+                       WHERE u.session_id = ?2 AND u.ts_ms IS NULL) \
+            OR EXISTS (SELECT 1 FROM grok_unified_usage u \
+                       WHERE u.session_id = ?2 \
+                         AND u.ts_ms BETWEEN json_extract(?1, '$.turn_start_ms') \
+                                         AND json_extract(?1, '$.turn_end_ms'))) \
+         THEN token_json ELSE ?1 END)";
+
+/// Keep unified-log events a later sweep would otherwise treat as unseen.
+/// Materialization inserts only rows that have no event yet, and a re-read
+/// still owns every row the log still has.
+fn note_stored_unified_events(conn: &Connection, session_id: &str) -> Result<()> {
+    if !super::evidence_reconcile::armed() {
+        return Ok(());
+    }
+    let mut stmt = conn.prepare_cached(
+        "SELECT 'unified:' || row_key FROM grok_unified_usage WHERE session_id = ?1",
+    )?;
+    let uids = stmt
+        .query_map(params![session_id], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    for uid in uids {
+        super::evidence_reconcile::note_event("grok", session_id, &uid);
+    }
+    Ok(())
 }
 
 /// Settles a session once its unified-log usage events are written: demotes

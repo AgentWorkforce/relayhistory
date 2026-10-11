@@ -225,6 +225,7 @@ fn record_relationship_with_child_model_mode(
                 observed.relationship_uid(),
             ])?;
     }
+    crate::ingest::evidence_reconcile::note_relationship(observed);
     conn.prepare_cached(&RECORD_RELATIONSHIP_SQL)?
         .execute(params![
             observed.source,
