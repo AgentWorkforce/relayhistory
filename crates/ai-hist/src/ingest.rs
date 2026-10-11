@@ -1,3 +1,5 @@
+#[path = "providers/mod.rs"]
+pub(crate) mod providers;
 use crate::{
     default_db_path, insert_history, insert_session_marker, now_ms, open_db, open_db_readonly,
     parse_cursor_text, prompt_hash, schema_is_catalog_read_current, sync_opencode_dbs,
@@ -856,23 +858,7 @@ const OPENCODE_NORMALIZER_GENERATION: &str = "opencode_normalizer_v2";
 /// The one-time backfill generations are part of it for the same reason as
 /// the keys above: each is recorded in sync state and re-reads unchanged
 /// sources when it moves, which it can only do if the sweep runs.
-fn sweep_generation() -> String {
-    let parts = format!(
-        "{}|tool_result_fidelity={TOOL_RESULT_FIDELITY_GENERATION}\
-         |raw_message_facts={RAW_MESSAGE_FACTS_GENERATION}\
-         |codex_fork_replay={CODEX_FORK_REPLAY_GENERATION}\
-         |codex_metadata_backfill={CODEX_METADATA_BACKFILL_GENERATION}",
-        SWEEP_PARSER_GENERATIONS.join("|")
-    );
-    format!(
-        "g{:016x}",
-        discover::fingerprint_hash(
-            "sweep-generation",
-            &discover::SHALLOW_SCANNER_VERSION.to_string(),
-            &parts,
-        )
-    )
-}
+use crate::providers::sweep_generation;
 
 /// Version tag of the destination marker's encoding, so a marker written by a
 /// build with a different shape is rejected rather than misread.
@@ -1644,7 +1630,7 @@ impl SweepRepairs {
         self.sessions.len()
     }
 
-    fn contains(&self, source: &str, session_id: &str) -> bool {
+    pub(crate) fn contains(&self, source: &str, session_id: &str) -> bool {
         // Cheap enough to build the key: this is asked once per rollout whose
         // stamp matched, not per row.
         self.all
@@ -1965,6 +1951,9 @@ pub(crate) fn source_watch_roots(
     source: &str,
     provider_roots: &crate::ProviderRoots,
 ) -> Vec<discover::WatchRoot> {
+    if let Some(adapter) = crate::providers::adapter(source) {
+        return merge_watch_roots((adapter.watch_roots)(provider_roots));
+    }
     let mut roots = discover::provider_watch_roots(source, provider_roots);
     match source {
         "claude" => roots.push(discover::WatchRoot::file(
@@ -33575,8 +33564,16 @@ mod tests {
     /// version computed it.
     fn sweep_generation_at(scanner: u32, generations: &[&str]) -> String {
         let current = sweep_generation();
-        let parts = SWEEP_PARSER_GENERATIONS.join("|");
-        let older = generations.join("|");
+        let qualified = |legacy: &[&str]| {
+            legacy
+                .iter()
+                .map(|s| (*s).to_owned())
+                .chain(crate::providers::adapters().map(|(id, a)| format!("{id}:{}", a.generation)))
+                .collect::<Vec<_>>()
+                .join("|")
+        };
+        let parts = qualified(SWEEP_PARSER_GENERATIONS);
+        let older = qualified(generations);
         // Same encoding as `sweep_generation`, over the older list.
         let tail = format!(
             "|tool_result_fidelity={TOOL_RESULT_FIDELITY_GENERATION}\

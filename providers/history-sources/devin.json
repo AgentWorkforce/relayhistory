@@ -1,0 +1,31 @@
+{
+  "id": "devin",
+  "rust_id": "devin",
+  "variant": "Devin",
+  "order": 6,
+  "aliases": [],
+  "legacy": true,
+  "fixtures": [
+    {
+      "source": "devin",
+      "name": "sqlite-store",
+      "quirk": "the SQLite store: epoch-second timestamps, `chat_message` JSON per node, ACP `tool_call_state` with a completed read and a failed edit, a `summarized_from` node marker and a transcript `agent` envelope",
+      "layout": "DevinSqlite",
+      "origin": "RelayHistory",
+      "files": [
+        "devin/sqlite-store.sql",
+        "devin/transcripts/fixture-devin-session.json"
+      ]
+    },
+    {
+      "source": "devin",
+      "name": "malformed-and-hidden",
+      "quirk": "a `chat_message` that is not JSON is skipped per record, an in-progress tool call stays `running`, an orphan `tool_call_state` row is still indexed, and `hidden` sessions are excluded entirely",
+      "layout": "DevinSqlite",
+      "origin": "RelayHistory",
+      "files": [
+        "devin/malformed-and-hidden.sql"
+      ]
+    }
+  ]
+}

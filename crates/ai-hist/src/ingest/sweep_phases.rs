@@ -77,7 +77,7 @@ impl SweepScope {
     /// Whether a scoped sweep has no phase to run at all: an empty list, or
     /// only names this build does not know.
     pub(crate) fn reads_nothing(&self) -> bool {
-        !SWEEP_PHASE_SOURCES
+        !crate::store::SOURCE_CHOICES
             .iter()
             .any(|source| self.includes(source))
     }
@@ -106,6 +106,7 @@ pub(super) fn discover_for_sweep(
 }
 
 /// The sources with a local sweep phase, in the order the sweep runs them.
+#[cfg(test)]
 const SWEEP_PHASE_SOURCES: &[&str] = &[
     "claude", "codex", "cursor", "grok", "muse", "opencode", "devin",
 ];
@@ -147,6 +148,25 @@ impl SweepPhases<'_, '_> {
         }
         if scope.includes("devin") {
             self.devin()?;
+        }
+        for (source, adapter) in crate::providers::adapters() {
+            if !scope.includes(source) {
+                continue;
+            }
+            check_capture_cancelled()?;
+            let result = (adapter.sweep)(crate::providers::SweepContext {
+                conn: self.conn,
+                state: self.state,
+                roots: self.roots,
+                repairs: self.repairs,
+            });
+            if let Some(result) = self.report.capture(source, result) {
+                self.inserted += result.inserted;
+                if result.unread > 0 {
+                    self.coverage.note_unread();
+                }
+                self.checkpoints.save(self.state);
+            }
         }
         check_capture_cancelled()
     }
@@ -300,7 +320,7 @@ mod tests {
     fn every_local_source_has_a_phase() {
         for source in crate::store::SOURCE_CHOICES {
             assert!(
-                SWEEP_PHASE_SOURCES.contains(source),
+                SWEEP_PHASE_SOURCES.contains(source) || crate::providers::adapter(source).is_some(),
                 "{source} has no sweep phase, so a scoped sweep could never read it"
             );
         }

@@ -44,6 +44,7 @@ mod session_identities;
 mod session_store;
 mod session_usage;
 mod usage;
+pub(crate) use ingest::providers;
 mod usage_snapshot;
 
 #[cfg(all(feature = "git-hooks", feature = "unstable-internal"))]

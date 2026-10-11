@@ -236,6 +236,7 @@ struct SourceSnapshot {
     /// hydration from reopening the WAL at a newer generation before it
     /// normalizes the evidence.
     devin_session: Option<crate::ingest::devin::DevinSession>,
+    provider_session: Option<crate::providers::AcquiredSession>,
     /// For OpenCode: which of the provider's two layouts this locator was
     /// validated against. Carried rather than re-derived, because the only
     /// thing that can be re-derived from a path is its spelling — and
@@ -479,6 +480,10 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
             target: &target,
             snapshot: &snapshot,
             previous_parser: previous.as_ref().map(|previous| previous.parser_version),
+            provider_upgrade: crate::providers::generation_changed(
+                &options.source,
+                previous.as_ref().and_then(|p| p.source_stamp.as_deref()),
+            ),
             provider_bytes,
             records_parsed,
             local_key,
@@ -580,6 +585,7 @@ struct LocalPass<'a> {
     snapshot: &'a SourceSnapshot,
     /// The parser generation that wrote the session's last checkpoint.
     previous_parser: Option<i64>,
+    provider_upgrade: bool,
     provider_bytes: i64,
     /// The snapshot's record count, before the pass parses.
     records_parsed: i64,
@@ -601,6 +607,7 @@ fn commit_local_pass(
         target,
         snapshot,
         previous_parser,
+        provider_upgrade,
         provider_bytes,
         records_parsed,
         local_key,
@@ -617,14 +624,16 @@ fn commit_local_pass(
     // generation before it: the same bytes now mean something else. Starting
     // from an empty cursor is what makes the first sync after an upgrade a
     // single full re-parse per transcript, after which cursors take over.
-    let reparse =
-        previous_parser.is_none_or(|parser_version| parser_version != HYDRATION_PARSER_VERSION);
+    let reparse = previous_parser
+        .is_none_or(|parser_version| parser_version != HYDRATION_PARSER_VERSION)
+        || provider_upgrade;
     // Narrower than `reparse`: a checkpoint exists and an older parser
     // wrote it. A first hydration over a store the sweep built meets
     // related cursors the current parser committed, and has nothing to
     // re-read there.
-    let parser_upgrade =
-        previous_parser.is_some_and(|parser_version| parser_version != HYDRATION_PARSER_VERSION);
+    let parser_upgrade = previous_parser
+        .is_some_and(|parser_version| parser_version != HYDRATION_PARSER_VERSION)
+        || provider_upgrade;
     let mut cursor = if reparse {
         TranscriptCursorState::default()
     } else {
@@ -638,6 +647,7 @@ fn commit_local_pass(
         claude_subagents: &snapshot.claude_subagents,
         claude_snapshot: snapshot.claude_transcript.as_ref(),
         devin_session: snapshot.devin_session.as_ref(),
+        provider_session: snapshot.provider_session.as_ref(),
         cursor: &mut cursor,
         parser_upgrade,
         records: records_parsed,
@@ -1940,6 +1950,7 @@ fn opencode_json_tree_snapshot(
         claude_subagents: Vec::new(),
         claude_transcript: None,
         devin_session: None,
+        provider_session: None,
         scanned_bytes: 0,
         scanned_superseded: false,
         stamped_cursors: Vec::new(),
@@ -1948,25 +1959,7 @@ fn opencode_json_tree_snapshot(
     })
 }
 
-pub(crate) fn validate_provider_path(
-    source: &str,
-    path: &Path,
-    provider_roots: &crate::ProviderRoots,
-) -> Result<()> {
-    let roots = crate::sources::catalog::transcript_roots(source, provider_roots);
-    let canonical = fs::canonicalize(path)?;
-    let valid = roots
-        .iter()
-        .filter_map(|root| fs::canonicalize(root).ok())
-        .any(|root| canonical.starts_with(root));
-    if !valid {
-        return Err(hydration_error(
-            "SESSION_SOURCE_MISMATCH",
-            format!("catalog locator does not belong to the {source} provider root"),
-        ));
-    }
-    Ok(())
-}
+pub(crate) use crate::providers::validate_provider_path;
 
 // Bytes of file *content* this thread has read, for the tests that assert a
 // scan stayed on metadata. Thread-local rather than global so tests running in
@@ -2247,6 +2240,8 @@ pub(crate) struct SelectedIngest<'a> {
     pub(crate) claude_subagents: &'a [ClaudeSubagentEvidence],
     pub(crate) claude_snapshot: Option<&'a ClaudeTranscriptSnapshot>,
     pub(crate) devin_session: Option<&'a crate::ingest::devin::DevinSession>,
+    #[allow(dead_code)] // Used by provider-owned selected parsers.
+    pub(crate) provider_session: Option<&'a crate::providers::AcquiredSession>,
     pub(crate) cursor: &'a mut TranscriptCursorState,
     /// A checkpoint exists and another parser generation wrote it, so the
     /// related transcripts' stored positions -- Claude subagent sidecars,
@@ -4732,6 +4727,7 @@ mod tests {
             claude_subagents: &snapshot.claude_subagents,
             claude_snapshot: snapshot.claude_transcript.as_ref(),
             devin_session: snapshot.devin_session.as_ref(),
+            provider_session: snapshot.provider_session.as_ref(),
             cursor: &mut cursor,
             parser_upgrade: false,
             records,

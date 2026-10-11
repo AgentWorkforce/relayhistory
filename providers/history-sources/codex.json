@@ -1,0 +1,303 @@
+{
+  "id": "codex",
+  "rust_id": "codex",
+  "variant": "Codex",
+  "order": 1,
+  "aliases": [],
+  "legacy": true,
+  "fixtures": [
+    {
+      "source": "codex",
+      "name": "simple-turn",
+      "quirk": "one turn: `session_meta`, `turn_context`, `task_started`, a null `token_count`, a populated one, `task_complete`",
+      "layout": "CodexRollout",
+      "origin": "Burn",
+      "files": [
+        "codex/simple-turn.jsonl"
+      ]
+    },
+    {
+      "source": "codex",
+      "name": "multi-turn",
+      "quirk": "two turns in one rollout, each with its own cumulative `total_token_usage`",
+      "layout": "CodexRollout",
+      "origin": "Burn",
+      "files": [
+        "codex/multi-turn.jsonl"
+      ]
+    },
+    {
+      "source": "codex",
+      "name": "with-tool-call",
+      "quirk": "function calls and their outputs as `response_item` records",
+      "layout": "CodexRollout",
+      "origin": "Burn",
+      "files": [
+        "codex/with-tool-call.jsonl"
+      ]
+    },
+    {
+      "source": "codex",
+      "name": "with-spawn-agent",
+      "quirk": "a `spawn_agent` function call: delegation stated in the tool call, not in session metadata",
+      "layout": "CodexRollout",
+      "origin": "Burn",
+      "files": [
+        "codex/with-spawn-agent.jsonl"
+      ]
+    },
+    {
+      "source": "codex",
+      "name": "compaction",
+      "quirk": "a `compacted` record with `replacement_history`, followed by `context_compacted` and a fresh turn",
+      "layout": "CodexRollout",
+      "origin": "Burn",
+      "files": [
+        "codex/compaction.jsonl"
+      ]
+    },
+    {
+      "source": "codex",
+      "name": "compaction-usage-only",
+      "quirk": "burn's `compaction.jsonl` with its session id renamed so it does not collide with this corpus's `compaction.jsonl`, which adds message records: two turns either side of a `compacted` record whose only usage evidence is their cumulative `token_count`s, with no assistant message",
+      "layout": "CodexRollout",
+      "origin": "Burn",
+      "files": [
+        "codex/compaction-usage-only.jsonl"
+      ]
+    },
+    {
+      "source": "codex",
+      "name": "session-meta-relationships",
+      "quirk": "`sourceSessionId` / `forkSessionId` / `continuedFromSessionId` on a repeated `session_meta`",
+      "layout": "CodexRollout",
+      "origin": "Burn",
+      "files": [
+        "codex/session-meta-relationships.jsonl"
+      ]
+    },
+    {
+      "source": "codex",
+      "name": "user-turn-blocks",
+      "quirk": "user input arriving as `response_item` message blocks rather than `event_msg`",
+      "layout": "CodexRollout",
+      "origin": "Burn",
+      "files": [
+        "codex/user-turn-blocks.jsonl"
+      ]
+    },
+    {
+      "source": "codex",
+      "name": "oversized-shell-output",
+      "quirk": "an 80 KB shell function-call output",
+      "layout": "CodexRollout",
+      "origin": "Burn",
+      "files": [
+        "codex/oversized-shell-output.jsonl"
+      ]
+    },
+    {
+      "source": "codex",
+      "name": "parent-thread-id",
+      "quirk": "a subagent rollout naming its root through `parent_thread_id` plus `thread_source: subagent`",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "codex/parent-thread-id"
+      ]
+    },
+    {
+      "source": "codex",
+      "name": "archived-session",
+      "quirk": "a rollout under `~/.codex/archived_sessions/`, the second codex discovery root",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "codex/archived-session"
+      ]
+    },
+    {
+      "source": "codex",
+      "name": "counter-regressed",
+      "quirk": "a cached-input counter grows faster than total input, making the cumulative delta unnormalizable",
+      "layout": "CodexRollout",
+      "origin": "RelayHistory",
+      "files": [
+        "codex/counter-regressed.jsonl"
+      ]
+    },
+    {
+      "source": "codex",
+      "name": "counter-negative",
+      "quirk": "a cumulative snapshot contains a negative input counter that must be preserved and refused",
+      "layout": "CodexRollout",
+      "origin": "RelayHistory",
+      "files": [
+        "codex/counter-negative.jsonl"
+      ]
+    },
+    {
+      "source": "codex",
+      "name": "counter-fractional",
+      "quirk": "a cumulative snapshot contains a fractional output counter that must be preserved and refused",
+      "layout": "CodexRollout",
+      "origin": "RelayHistory",
+      "files": [
+        "codex/counter-fractional.jsonl"
+      ]
+    },
+    {
+      "source": "codex",
+      "name": "counter-above-i64",
+      "quirk": "a valid cumulative counter exceeds `i64::MAX` and must survive parsing as a `u64`",
+      "layout": "CodexRollout",
+      "origin": "RelayHistory",
+      "files": [
+        "codex/counter-above-i64.jsonl"
+      ]
+    },
+    {
+      "source": "codex",
+      "name": "counter-recovers",
+      "quirk": "an unreadable cumulative snapshot is superseded by a later valid snapshot for the same waiting turn",
+      "layout": "CodexRollout",
+      "origin": "RelayHistory",
+      "files": [
+        "codex/counter-recovers.jsonl"
+      ]
+    },
+    {
+      "source": "codex",
+      "name": "counter-unusable-then-new-turn",
+      "quirk": "a later advancing delta covers an earlier unreadable snapshot and clears only refusals in that span",
+      "layout": "CodexRollout",
+      "origin": "RelayHistory",
+      "files": [
+        "codex/counter-unusable-then-new-turn.jsonl"
+      ]
+    },
+    {
+      "source": "codex",
+      "name": "reasoning-then-unreadable",
+      "quirk": "a reasoning row waits through an unreadable snapshot before a valid delta measures the turn",
+      "layout": "CodexRollout",
+      "origin": "RelayHistory",
+      "files": [
+        "codex/reasoning-then-unreadable.jsonl"
+      ]
+    },
+    {
+      "source": "codex",
+      "name": "refusal-across-baseline-reinstall",
+      "quirk": "a refusal predating a cumulative-baseline reinstall must not be cleared by a later delta",
+      "layout": "CodexRollout",
+      "origin": "RelayHistory",
+      "files": [
+        "codex/refusal-across-baseline-reinstall.jsonl"
+      ]
+    },
+    {
+      "source": "codex",
+      "name": "refusal-overwritten-after-reinstall",
+      "quirk": "two refusals for one turn straddle a baseline reinstall and remain tied to their own generations",
+      "layout": "CodexRollout",
+      "origin": "RelayHistory",
+      "files": [
+        "codex/refusal-overwritten-after-reinstall.jsonl"
+      ]
+    },
+    {
+      "source": "codex",
+      "name": "resume-baseline-corrupt",
+      "quirk": "a resumed rollout starts with an unreadable baseline, so carried-over totals cannot become one request's delta",
+      "layout": "CodexRollout",
+      "origin": "RelayHistory",
+      "files": [
+        "codex/resume-baseline-corrupt.jsonl"
+      ]
+    },
+    {
+      "source": "codex",
+      "name": "two-unreadable-turns",
+      "quirk": "two unrecovered turns each retain their own unreadable usage refusal",
+      "layout": "CodexRollout",
+      "origin": "RelayHistory",
+      "files": [
+        "codex/two-unreadable-turns.jsonl"
+      ]
+    },
+    {
+      "source": "codex",
+      "name": "one-request-three-rows",
+      "quirk": "one API call written as reasoning, a tool call and a message is one request, not three",
+      "layout": "CodexRollout",
+      "origin": "RelayHistory",
+      "files": [
+        "codex/one-request-three-rows.jsonl"
+      ]
+    },
+    {
+      "source": "codex",
+      "name": "recovered-span-covers-two-turns",
+      "quirk": "a readable snapshot recovers a span an unreadable one left open, so its delta measures both turns as one request",
+      "layout": "CodexRollout",
+      "origin": "RelayHistory",
+      "files": [
+        "codex/recovered-span-covers-two-turns.jsonl"
+      ]
+    },
+    {
+      "source": "codex",
+      "name": "context-wrapper",
+      "quirk": "an `<environment_context>` wrapper the app injects as a user `response_item` ahead of the human's mirrored turn",
+      "layout": "CodexRollout",
+      "origin": "RelayHistory",
+      "files": [
+        "codex/context-wrapper.jsonl"
+      ]
+    },
+    {
+      "source": "codex",
+      "name": "two-requests-one-turn",
+      "quirk": "a tool loop makes two API calls inside one turn_id, so the turn is not the request",
+      "layout": "CodexRollout",
+      "origin": "RelayHistory",
+      "files": [
+        "codex/two-requests-one-turn.jsonl"
+      ]
+    },
+    {
+      "source": "codex",
+      "name": "fork-human",
+      "quirk": "a human fork (`forked_from_id`, `thread_source: user`) whose rollout replays the parent's `session_meta`, both turns and their cumulative `token_count` before its own turn",
+      "layout": "CodexRollout",
+      "origin": "RelayHistory",
+      "files": [
+        "codex/fork-human/parent.jsonl",
+        "codex/fork-human/child.jsonl"
+      ]
+    },
+    {
+      "source": "codex",
+      "name": "fork-subagent",
+      "quirk": "a spawned subagent naming its parent in `source.subagent.thread_spawn.parent_thread_id`, replaying the parent's open turn (with a tool call) and starting its own turn in the thread id's own millisecond",
+      "layout": "CodexRollout",
+      "origin": "RelayHistory",
+      "files": [
+        "codex/fork-subagent/root.jsonl",
+        "codex/fork-subagent/subagent.jsonl"
+      ]
+    },
+    {
+      "source": "codex",
+      "name": "guardian-review",
+      "quirk": "a Codex 0.150+ `thread_source: guardian_review` rollout with `parent_thread_id` that opens on a `compaction` item rather than a replay",
+      "layout": "CodexRollout",
+      "origin": "RelayHistory",
+      "files": [
+        "codex/guardian-review/parent.jsonl",
+        "codex/guardian-review/guardian.jsonl"
+      ]
+    }
+  ]
+}

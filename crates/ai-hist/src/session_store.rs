@@ -323,61 +323,10 @@ impl std::error::Error for Error {}
 // sources
 // ---------------------------------------------------------------------------
 
-/// Coding-agent source that produced a session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
-#[non_exhaustive]
-#[serde(rename_all = "lowercase")]
-pub enum Source {
-    Claude,
-    Codex,
-    Cursor,
-    Grok,
-    #[serde(rename = "opencode")]
-    OpenCode,
-    Muse,
-    Devin,
-}
+mod generated_sources;
+pub use generated_sources::Source;
 
 impl Source {
-    /// Every source, in ledger order.
-    ///
-    /// `Source` is `#[non_exhaustive]`, so a crate outside this one cannot
-    /// enumerate it with a `match` and any list it keeps by hand goes stale
-    /// the day a variant is added. This is the one list an embedder (or a
-    /// doc test) iterates; the unit test below is an exhaustive `match` over
-    /// the enum, so adding a variant without adding it here fails to compile.
-    pub const ALL: &'static [Source] = &[
-        Self::Claude,
-        Self::Codex,
-        Self::Cursor,
-        Self::Grok,
-        Self::OpenCode,
-        Self::Muse,
-        Self::Devin,
-    ];
-
-    /// Canonical lowercase identifier stored in the ledger.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Claude => "claude",
-            Self::Codex => "codex",
-            Self::Cursor => "cursor",
-            Self::Grok => "grok",
-            Self::OpenCode => "opencode",
-            Self::Muse => "muse",
-            Self::Devin => "devin",
-        }
-    }
-
-    /// The source a ledger identifier names, or `None` for one this build
-    /// does not know.
-    pub fn parse(value: &str) -> Option<Self> {
-        Self::ALL
-            .iter()
-            .copied()
-            .find(|source| source.as_str() == value)
-    }
-
     /// What this source's adapter can and cannot report. Static: a property
     /// of the parser, not of any one session or database.
     pub fn capabilities(self) -> SourceCapabilities {
@@ -387,11 +336,8 @@ impl Source {
         // by an adapter (a remote connector cannot supply them, so the
         // connector-facing declaration leaves them out); the parsers that
         // write them are the ones an embedder needs listed.
-        if matches!(
-            self,
-            Self::Claude | Self::Codex | Self::Grok | Self::OpenCode | Self::Muse | Self::Devin
-        ) && !evidence_kinds.contains(&EvidenceKind::SessionMarker)
-        {
+        let metadata = crate::providers::metadata(name).expect("registered source metadata");
+        if metadata.markers && !evidence_kinds.contains(&EvidenceKind::SessionMarker) {
             evidence_kinds.push(EvidenceKind::SessionMarker);
         }
         SourceCapabilities {
@@ -399,23 +345,7 @@ impl Source {
             evidence_kinds,
             relationships: relationship_graph::relationship_capabilities(name),
             usage_accounting: source_accounting(name),
-            message_ids: match self {
-                // Claude: the record `uuid`. OpenCode: the provider's own
-                // message row id.
-                Self::Claude | Self::OpenCode => MessageIdOrigin::Provider,
-                // Codex: `{line_index}:{record type}`. Grok: `ev:{id}` /
-                // `tool:{call id}`, built from the event stream.
-                Self::Codex | Self::Grok => MessageIdOrigin::Synthesized,
-                // Cursor: the message `id` when the build wrote one, else
-                // `cursor:{record offset}`.
-                Self::Cursor => MessageIdOrigin::Mixed,
-                // Muse: the record's own envelope `id` for prose and
-                // lifecycle, `tool:{call id}` / `result:{call id}` for tools.
-                Self::Muse => MessageIdOrigin::Mixed,
-                // Devin: the chat message's own `message_id`, else
-                // `n{node id}` from its `message_nodes` row.
-                Self::Devin => MessageIdOrigin::Mixed,
-            },
+            message_ids: metadata.message_ids,
             hydrates_by_path: HOOK_HARNESSES.contains(&name),
         }
     }
@@ -2949,28 +2879,21 @@ mod tests {
     use super::*;
     use crate::ingest::sync_watch_roots_with_provider_roots;
 
-    /// `Source::ALL` is the enumeration an embedder gets. The `match` here is
-    /// exhaustive on purpose: a new variant that is not in `ALL` breaks the
-    /// build here rather than quietly leaving every iterator over `ALL` a
-    /// source short. The names are then checked against `SOURCE_CHOICES`,
-    /// the ledger's own registry, so the two cannot drift apart either.
+    /// Generated enum vocabulary and the ledger registry must agree, with no
+    /// duplicates. The generator drift check separately guards enum variants.
     #[test]
     fn every_source_is_in_all_and_in_the_ledger_registry() {
         for source in Source::ALL {
-            let listed = match source {
-                Source::Claude
-                | Source::Codex
-                | Source::Cursor
-                | Source::Grok
-                | Source::OpenCode
-                | Source::Muse
-                | Source::Devin => Source::ALL.contains(source),
-            };
-            assert!(listed, "{source:?} is missing from Source::ALL");
+            assert_eq!(Source::parse(source.as_str()), Some(*source));
         }
         let mut names: Vec<&str> = Source::ALL.iter().map(|source| source.as_str()).collect();
         names.sort_unstable();
         names.dedup();
+        assert_eq!(
+            names.len(),
+            Source::ALL.len(),
+            "Source::ALL repeats a source"
+        );
         let mut choices: Vec<&str> = crate::store::SOURCE_CHOICES.to_vec();
         choices.sort_unstable();
         assert_eq!(

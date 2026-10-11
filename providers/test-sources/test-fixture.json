@@ -1,0 +1,8 @@
+{
+  "id": "test-fixture",
+  "rust_id": "test_fixture",
+  "variant": "TestFixture",
+  "order": 9999,
+  "aliases": ["test-fixture-alias"],
+  "fixtures": [{"source":"test-fixture","name":"lifecycle","layout":"HomeTree","origin":"RelayHistory","files":["test-fixture/session.json"],"quirk":"test-only provider takes the same public path as an admitted provider"}]
+}

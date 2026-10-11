@@ -12,17 +12,13 @@
 //! - `resume_command` comes from `resume`;
 //! - the fixture-corpus registry test reads `fixtures`.
 //!
-//! Some per-source code still lives outside the descriptor (the parsers and
-//! full-sync pass, sync watch roots, `Source`, usage accounting); see
-//! `docs/session-catalog.md`, "Adding a provider". Harnesses that live outside
-//! this crate register through `SourceRegistry::register` (Rust) or a local
-//! source plugin (JS) instead, and do not appear here.
+//! Provider-owned shards generate registration. New providers supply snapshot,
+//! full-sync, roots, generation and accounting hooks under `src/providers/`;
+//! legacy parser phases remain intact. See `docs/provider-intake.md`.
+//! Out-of-tree Rust/JS source plugins remain separate from admitted built-ins.
 
-use crate::discover::{
-    ClaudeProvider, CodexProvider, CursorProvider, DevinProvider, GrokProvider, MuseProvider,
-    OpencodeProvider, ShallowSessionProvider, SourceExemption,
-};
-use crate::hydrate::{self, IngestSelectedFn};
+use crate::discover::{ShallowSessionProvider, SourceExemption};
+use crate::hydrate::IngestSelectedFn;
 use crate::ProviderRoots;
 use std::path::PathBuf;
 
@@ -141,145 +137,8 @@ impl LocalSource {
     }
 }
 
-/// Every built-in harness. The declaration order is `SOURCE_CHOICES` order.
-pub(crate) const LOCAL_SOURCES: &[LocalSource] = &[
-    LocalSource {
-        id: "claude",
-        discovery: Discovery::Provider(|| Box::new(ClaudeProvider)),
-        hydration: Hydration::Parser(hydrate::ingest_selected_claude),
-        transcript_roots: |roots| vec![roots.claude.join("projects")],
-        // Claude subagent transcripts carry the parent's `sessionId`; only
-        // provider versions that also emit a per-child `agentId` give the
-        // child a stable identity.
-        relationships: Relationships {
-            stable_child_identity: "sometimes",
-            records_agent_type: true,
-            records_spawn_time: true,
-            records_evidence_locator: true,
-        },
-        resume: Some(Resume {
-            command: |sid| format!("claude --resume {sid}"),
-            in_project: true,
-        }),
-        fixtures: Fixtures::Dir("claude"),
-    },
-    LocalSource {
-        id: "codex",
-        discovery: Discovery::Provider(|| Box::new(CodexProvider::default())),
-        hydration: Hydration::Parser(hydrate::ingest_selected_codex),
-        transcript_roots: |roots| {
-            vec![
-                roots.codex.join("sessions"),
-                roots.codex.join("archived_sessions"),
-            ]
-        },
-        // Every Codex subagent rollout opens with its own thread id, and its
-        // `session_meta` names the subagent type.
-        relationships: Relationships {
-            stable_child_identity: "always",
-            records_agent_type: true,
-            records_spawn_time: true,
-            records_evidence_locator: true,
-        },
-        resume: Some(Resume {
-            command: |sid| format!("codex resume {sid}"),
-            in_project: false,
-        }),
-        fixtures: Fixtures::Dir("codex"),
-    },
-    LocalSource {
-        id: "cursor",
-        discovery: Discovery::Provider(|| Box::new(CursorProvider)),
-        hydration: Hydration::Parser(hydrate::ingest_selected_cursor),
-        transcript_roots: |roots| vec![roots.home.join(".cursor/projects")],
-        relationships: Relationships::NONE,
-        resume: Some(Resume {
-            command: |sid| format!("cursor-agent --resume={sid}"),
-            in_project: true,
-        }),
-        fixtures: Fixtures::Dir("cursor"),
-    },
-    LocalSource {
-        id: "grok",
-        discovery: Discovery::Provider(|| Box::new(GrokProvider)),
-        hydration: Hydration::Parser(hydrate::ingest_selected_grok),
-        transcript_roots: |roots| vec![roots.grok.join("sessions")],
-        // Grok records a delegation in two places. The `Task` call in the
-        // transcript names no child at all; a `subagents/` metadata entry does
-        // when it carries a session id, and the child session then lives in
-        // the normal sessions tree. The id is never taken from the file name,
-        // so an entry without one stays unlinked evidence.
-        relationships: Relationships {
-            stable_child_identity: "sometimes",
-            records_agent_type: true,
-            records_spawn_time: true,
-            records_evidence_locator: true,
-        },
-        resume: Some(Resume {
-            command: |sid| format!("grok resume {sid}"),
-            in_project: true,
-        }),
-        fixtures: Fixtures::Dir("grok"),
-    },
-    LocalSource {
-        id: "opencode",
-        discovery: Discovery::Provider(|| Box::new(OpencodeProvider::default())),
-        hydration: Hydration::Parser(hydrate::ingest_selected_opencode),
-        // OpenCode locators are validated against the configured store in
-        // `source_snapshot`, not against a transcript root.
-        transcript_roots: |_| Vec::new(),
-        // An OpenCode subagent session is a session in its own right and its
-        // record names the parent outright, in `session.parentID`, so the
-        // child identity is always stable and never inferred. But OpenCode
-        // records no *type* for that child: the parser writes the spawn time
-        // and the evidence locator, and leaves `child_agent_type` and
-        // `child_agent_name` null because nothing in the provider's records
-        // supplies them.
-        relationships: Relationships {
-            stable_child_identity: "always",
-            records_agent_type: false,
-            records_spawn_time: true,
-            records_evidence_locator: true,
-        },
-        resume: None,
-        fixtures: Fixtures::Dir("opencode"),
-    },
-    LocalSource {
-        id: "muse",
-        discovery: Discovery::Provider(|| Box::new(MuseProvider)),
-        hydration: Hydration::Parser(hydrate::ingest_selected_muse),
-        transcript_roots: |roots| vec![roots.muse.clone()],
-        // A Muse subagent writes its own `subagent/<id>/session.jsonl`, whose
-        // metadata record names the child session, so a linked child's
-        // identity is always its own. The parent's `task_stream_linked`
-        // names its role, label and model.
-        relationships: Relationships {
-            stable_child_identity: "always",
-            records_agent_type: true,
-            records_spawn_time: true,
-            records_evidence_locator: true,
-        },
-        // `muse resume <id>` finds the session by id; the `cd` puts the
-        // resumed agent back in the workspace it recorded.
-        resume: Some(Resume {
-            command: |sid| format!("muse resume {sid}"),
-            in_project: true,
-        }),
-        fixtures: Fixtures::Dir("muse"),
-    },
-    LocalSource {
-        id: "devin",
-        discovery: Discovery::Provider(|| Box::new(DevinProvider::default())),
-        hydration: Hydration::Parser(hydrate::ingest_selected_devin),
-        // Devin locators are validated against the configured `sessions.db`
-        // in `source_snapshot`, not against a transcript root.
-        transcript_roots: |_| Vec::new(),
-        // Devin records no parent/child session relationships.
-        relationships: Relationships::NONE,
-        resume: None,
-        fixtures: Fixtures::Dir("devin"),
-    },
-];
+// Every built-in harness, in `SOURCE_CHOICES` order.
+include!("../providers/generated_catalog.rs");
 
 /// Every built-in harness descriptor, in `SOURCE_CHOICES` order.
 #[cfg_attr(not(feature = "unstable-internal"), allow(dead_code))]

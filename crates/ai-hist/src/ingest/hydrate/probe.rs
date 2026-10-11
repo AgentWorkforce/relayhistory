@@ -75,6 +75,9 @@ impl HydrationProbe {
             }
             Err(_) => return Ok(None),
         };
+        if let Some(acquired) = snapshot.provider_session {
+            return Ok(Some(acquired.read_paths));
+        }
         let mut reads: Vec<PathBuf> = snapshot
             .stamped_cursors
             .into_iter()

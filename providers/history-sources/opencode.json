@@ -1,0 +1,70 @@
+{
+  "id": "opencode",
+  "rust_id": "opencode",
+  "variant": "OpenCode",
+  "order": 4,
+  "aliases": [],
+  "legacy": true,
+  "fixtures": [
+    {
+      "source": "opencode",
+      "name": "sqlite-store",
+      "quirk": "the current SQLite store: two sessions (one a child through `parent_id`), text/tool/step-finish parts, provider+model and token payloads on the assistant messages",
+      "layout": "OpencodeSqlite",
+      "origin": "RelayHistory",
+      "files": [
+        "opencode/sqlite-store.sql"
+      ]
+    },
+    {
+      "source": "opencode",
+      "name": "legacy-json-simple",
+      "quirk": "legacy `storage/{session,message,part}` JSON layout: one session, three parts",
+      "layout": "OpencodeLegacyJson",
+      "origin": "Burn",
+      "files": [
+        "opencode/legacy-json-simple"
+      ]
+    },
+    {
+      "source": "opencode",
+      "name": "legacy-json-multi-turn",
+      "quirk": "legacy layout with a `ses_child` session carrying `parentID`",
+      "layout": "OpencodeLegacyJson",
+      "origin": "Burn",
+      "files": [
+        "opencode/legacy-json-multi-turn"
+      ]
+    },
+    {
+      "source": "opencode",
+      "name": "legacy-json-with-tool",
+      "quirk": "legacy layout with a `tool` part and its completed state",
+      "layout": "OpencodeLegacyJson",
+      "origin": "Burn",
+      "files": [
+        "opencode/legacy-json-with-tool"
+      ]
+    },
+    {
+      "source": "opencode",
+      "name": "legacy-json-with-compaction",
+      "quirk": "legacy layout with a summarized/compacted message",
+      "layout": "OpencodeLegacyJson",
+      "origin": "Burn",
+      "files": [
+        "opencode/legacy-json-with-compaction"
+      ]
+    },
+    {
+      "source": "opencode",
+      "name": "legacy-json-user-turn-blocks",
+      "quirk": "legacy layout with several tool parts of different sizes, one errored",
+      "layout": "OpencodeLegacyJson",
+      "origin": "Burn",
+      "files": [
+        "opencode/legacy-json-user-turn-blocks"
+      ]
+    }
+  ]
+}

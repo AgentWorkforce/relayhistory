@@ -1,0 +1,1 @@
+{"id":"fixture-session","messages":[{"id":"u1","role":"user","text":"fixture user question","ts":1000},{"id":"a1","role":"assistant","text":"fixture assistant answer","ts":2000}]}

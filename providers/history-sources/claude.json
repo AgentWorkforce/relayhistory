@@ -1,0 +1,384 @@
+{
+  "id": "claude",
+  "rust_id": "claude",
+  "variant": "Claude",
+  "order": 0,
+  "aliases": [],
+  "legacy": true,
+  "fixtures": [
+    {
+      "source": "claude",
+      "name": "simple-turn",
+      "quirk": "one user turn and one complete assistant turn with full usage, preceded by a `permission-mode` control record",
+      "layout": "ClaudeTranscript",
+      "origin": "Burn",
+      "files": [
+        "claude/simple-turn.jsonl"
+      ]
+    },
+    {
+      "source": "claude",
+      "name": "multi-block-turn",
+      "quirk": "four assistant records share one `message.id` and one `requestId`; only the first carries the usage payload",
+      "layout": "ClaudeTranscript",
+      "origin": "Burn",
+      "files": [
+        "claude/multi-block-turn.jsonl"
+      ]
+    },
+    {
+      "source": "claude",
+      "name": "multi-block-turn-no-request-id",
+      "quirk": "assistant records omit `requestId` but share one `message.id`, which is the fallback request identity",
+      "layout": "ClaudeTranscript",
+      "origin": "RelayHistory",
+      "files": [
+        "claude/multi-block-turn-no-request-id.jsonl"
+      ]
+    },
+    {
+      "source": "claude",
+      "name": "padded-request-id",
+      "quirk": "two request ids differ only by surrounding whitespace and must remain distinct grouping keys",
+      "layout": "ClaudeTranscript",
+      "origin": "RelayHistory",
+      "files": [
+        "claude/padded-request-id.jsonl"
+      ]
+    },
+    {
+      "source": "claude",
+      "name": "multi-record-request",
+      "quirk": "two assistant records copy one request's usage, which prompt attribution must charge exactly once",
+      "layout": "ClaudeTranscript",
+      "origin": "RelayHistory",
+      "files": [
+        "claude/multi-record-request.jsonl"
+      ]
+    },
+    {
+      "source": "claude",
+      "name": "multi-record-bad-copy",
+      "quirk": "one request has a readable usage copy and an unreadable sibling, so its measurement is disputed",
+      "layout": "ClaudeTranscript",
+      "origin": "RelayHistory",
+      "files": [
+        "claude/multi-record-bad-copy.jsonl"
+      ]
+    },
+    {
+      "source": "claude",
+      "name": "multi-record-broken-sibling",
+      "quirk": "one request record has broken ancestry while a sibling establishes both ownership and usage",
+      "layout": "ClaudeTranscript",
+      "origin": "RelayHistory",
+      "files": [
+        "claude/multi-record-broken-sibling.jsonl"
+      ]
+    },
+    {
+      "source": "claude",
+      "name": "interleaved-turns",
+      "quirk": "two assistant messages interleave their blocks instead of arriving contiguously",
+      "layout": "ClaudeTranscript",
+      "origin": "Burn",
+      "files": [
+        "claude/interleaved-turns.jsonl"
+      ]
+    },
+    {
+      "source": "claude",
+      "name": "incomplete-then-complete",
+      "quirk": "a complete assistant message is followed by an in-progress one (`stop_reason: null`)",
+      "layout": "ClaudeTranscript",
+      "origin": "Burn",
+      "files": [
+        "claude/incomplete-then-complete.jsonl"
+      ]
+    },
+    {
+      "source": "claude",
+      "name": "files-touched",
+      "quirk": "two Read tool uses and a Grep in one assistant message — three calls, no file mutated",
+      "layout": "ClaudeTranscript",
+      "origin": "Burn",
+      "files": [
+        "claude/files-touched.jsonl"
+      ]
+    },
+    {
+      "source": "claude",
+      "name": "retry-loop",
+      "quirk": "the same Bash command is retried four times, every attempt returning `is_error: true`",
+      "layout": "ClaudeTranscript",
+      "origin": "Burn",
+      "files": [
+        "claude/retry-loop.jsonl"
+      ]
+    },
+    {
+      "source": "claude",
+      "name": "consecutive-failures",
+      "quirk": "three different tools fail back to back, each with its own errored tool_result",
+      "layout": "ClaudeTranscript",
+      "origin": "Burn",
+      "files": [
+        "claude/consecutive-failures.jsonl"
+      ]
+    },
+    {
+      "source": "claude",
+      "name": "edit-revert",
+      "quirk": "an Edit is applied and then reverted; tool_results carry pre/post file hashes",
+      "layout": "ClaudeTranscript",
+      "origin": "Burn",
+      "files": [
+        "claude/edit-revert.jsonl"
+      ]
+    },
+    {
+      "source": "claude",
+      "name": "missing-output-tokens",
+      "quirk": "usage carries `input_tokens` only — `output_tokens` is absent, which is not the same as zero",
+      "layout": "ClaudeTranscript",
+      "origin": "Burn",
+      "files": [
+        "claude/missing-output-tokens.jsonl"
+      ]
+    },
+    {
+      "source": "claude",
+      "name": "user-turn-blocks",
+      "quirk": "user records carrying tool_result blocks of very different sizes, one of them errored",
+      "layout": "ClaudeTranscript",
+      "origin": "Burn",
+      "files": [
+        "claude/user-turn-blocks.jsonl"
+      ]
+    },
+    {
+      "source": "claude",
+      "name": "compact-boundary",
+      "quirk": "a `system` record with `subtype: compact_boundary` splits the transcript",
+      "layout": "ClaudeTranscript",
+      "origin": "Burn",
+      "files": [
+        "claude/compact-boundary.jsonl"
+      ]
+    },
+    {
+      "source": "claude",
+      "name": "sidechain-turn",
+      "quirk": "every record is `isSidechain: true` in a primary `<session>.jsonl` — inline Task traffic, still its session's transcript",
+      "layout": "ClaudeTranscript",
+      "origin": "Burn",
+      "files": [
+        "claude/sidechain-turn.jsonl"
+      ]
+    },
+    {
+      "source": "claude",
+      "name": "sidechain-leading-then-main",
+      "quirk": "sidechain records precede the first main-chain record in the same file",
+      "layout": "ClaudeTranscript",
+      "origin": "Burn",
+      "files": [
+        "claude/sidechain-leading-then-main.jsonl"
+      ]
+    },
+    {
+      "source": "claude",
+      "name": "nested-subagent",
+      "quirk": "a subagent spawns a subagent, in one file, joined by `agentId`",
+      "layout": "ClaudeTranscript",
+      "origin": "Burn",
+      "files": [
+        "claude/nested-subagent.jsonl"
+      ]
+    },
+    {
+      "source": "claude",
+      "name": "system-subagent-notification",
+      "quirk": "a `system`/`subagent_completed` record reports a child session id the transcript never contains",
+      "layout": "ClaudeTranscript",
+      "origin": "Burn",
+      "files": [
+        "claude/system-subagent-notification.jsonl"
+      ]
+    },
+    {
+      "source": "claude",
+      "name": "task-notification",
+      "quirk": "Task tool notifications arrive as their own records",
+      "layout": "ClaudeTranscript",
+      "origin": "Burn",
+      "files": [
+        "claude/task-notification.jsonl"
+      ]
+    },
+    {
+      "source": "claude",
+      "name": "slash-command-triad",
+      "quirk": "a slash command expands into a `<command-name>`/`<command-message>`/`<command-args>` triad of user records",
+      "layout": "ClaudeTranscript",
+      "origin": "Burn",
+      "files": [
+        "claude/slash-command-triad.jsonl"
+      ]
+    },
+    {
+      "source": "claude",
+      "name": "replacement-meta",
+      "quirk": "edit metadata only reaches the log on the tool_result, not on the tool_use",
+      "layout": "ClaudeTranscript",
+      "origin": "Burn",
+      "files": [
+        "claude/replacement-meta.jsonl"
+      ]
+    },
+    {
+      "source": "claude",
+      "name": "oversized-bash-output",
+      "quirk": "an 80 KB Bash tool_result — the byte size is the fact, and no record is pretty-printed",
+      "layout": "ClaudeTranscript",
+      "origin": "Burn",
+      "files": [
+        "claude/oversized-bash-output.jsonl"
+      ]
+    },
+    {
+      "source": "claude",
+      "name": "resume-marker",
+      "quirk": "the first user record is a `/resume <sessionId>` marker naming the prior session",
+      "layout": "ClaudeTranscript",
+      "origin": "Burn",
+      "files": [
+        "claude/resume-marker.jsonl"
+      ]
+    },
+    {
+      "source": "claude",
+      "name": "parent-chain-out-of-order",
+      "quirk": "records arrive out of `parentUuid` order, so turn grouping cannot rely on file order",
+      "layout": "ClaudeTranscript",
+      "origin": "Burn",
+      "files": [
+        "claude/parent-chain-out-of-order.jsonl"
+      ]
+    },
+    {
+      "source": "claude",
+      "name": "parent-chain-interrupt-resume",
+      "quirk": "an interrupted turn is resumed, and both halves hang off the same parent record",
+      "layout": "ClaudeTranscript",
+      "origin": "Burn",
+      "files": [
+        "claude/parent-chain-interrupt-resume.jsonl"
+      ]
+    },
+    {
+      "source": "claude",
+      "name": "original-session",
+      "quirk": "the root transcript that the fork and continuation fixtures point back at",
+      "layout": "ClaudeTranscript",
+      "origin": "Burn",
+      "files": [
+        "claude/original-session.jsonl"
+      ]
+    },
+    {
+      "source": "claude",
+      "name": "cross-file-parent-reconciliation",
+      "quirk": "a continuation whose first record's `parentUuid` only exists in the other file — the link is cross-file, not in-file",
+      "layout": "ClaudeTranscript",
+      "origin": "Burn",
+      "files": [
+        "claude/original-session.jsonl",
+        "claude/cross-file-parent.jsonl"
+      ]
+    },
+    {
+      "source": "claude",
+      "name": "explicit-continuation-reconciliation",
+      "quirk": "a continuation that states `continuedFromSessionId` on the record itself",
+      "layout": "ClaudeTranscript",
+      "origin": "Burn",
+      "files": [
+        "claude/original-session.jsonl",
+        "claude/explicit-line-relationships.jsonl"
+      ]
+    },
+    {
+      "source": "claude",
+      "name": "fork-reconciliation",
+      "quirk": "two transcripts share one source session id: a fork, not a continuation",
+      "layout": "ClaudeTranscript",
+      "origin": "Burn",
+      "files": [
+        "claude/original-session.jsonl",
+        "claude/fork-branch-a.jsonl",
+        "claude/fork-branch-b.jsonl"
+      ]
+    },
+    {
+      "source": "claude",
+      "name": "settings-reference",
+      "quirk": "burn's Claude settings input that sets the Bash output cap; relayhistory reads no settings file, so it is kept for provenance only",
+      "layout": "Reference",
+      "origin": "Burn",
+      "files": [
+        "claude/settings/oversized-bash-output-length.json"
+      ]
+    },
+    {
+      "source": "claude",
+      "name": "summary-record",
+      "quirk": "a `type: \"summary\"` record with a `leafUuid` between two ordinary turns",
+      "layout": "ClaudeTranscript",
+      "origin": "RelayHistory",
+      "files": [
+        "claude/summary-record.jsonl"
+      ]
+    },
+    {
+      "source": "claude",
+      "name": "system-reminder",
+      "quirk": "`<system-reminder>` blocks injected into user content, as a block of their own, inline in a string prompt, and alone on an `isMeta` record",
+      "layout": "ClaudeTranscript",
+      "origin": "RelayHistory",
+      "files": [
+        "claude/system-reminder.jsonl"
+      ]
+    },
+    {
+      "source": "claude",
+      "name": "hook-and-passthrough",
+      "quirk": "a `<user-prompt-submit-hook>` row flagged `isMeta`, a `<bash-input>` / `<bash-stdout>` pass-through pair, and a bare `isMeta` bookkeeping row between two prompts",
+      "layout": "ClaudeTranscript",
+      "origin": "RelayHistory",
+      "files": [
+        "claude/hook-and-passthrough.jsonl"
+      ]
+    },
+    {
+      "source": "claude",
+      "name": "sidecar-subagent",
+      "quirk": "a subagent transcript in `<sessionId>/subagents/agent-<id>.jsonl` with its `agent-<id>.meta.json` sidecar, carrying the PARENT's sessionId",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "claude/sidecar-subagent"
+      ]
+    },
+    {
+      "source": "claude",
+      "name": "nested-sidecars",
+      "quirk": "two `subagents/` sidecars whose meta files name no model: `a1` spawned from the main transcript, `a2` spawned by a tool use inside `a1` (`spawnDepth` 2); the spawn results carry `toolUseResult.agentId` on the record",
+      "layout": "HomeTree",
+      "origin": "Burn",
+      "files": [
+        "claude/nested-sidecars"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,50 @@
+{
+  "id": "cursor",
+  "rust_id": "cursor",
+  "variant": "Cursor",
+  "order": 2,
+  "aliases": [],
+  "legacy": true,
+  "fixtures": [
+    {
+      "source": "cursor",
+      "name": "prompt-transcript",
+      "quirk": "`agent-transcripts/<id>/<id>.jsonl` with string, block-array and `<user_query>`-wrapped prompts, assistant text, a tool_use and a tool_result; the provider records no timestamps",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "cursor/prompt-transcript"
+      ]
+    },
+    {
+      "source": "cursor",
+      "name": "observed-3-13-25",
+      "quirk": "the reported Cursor IDE 3.13.25 record shape: id-less `tool_use`, a `turn_ended` marker and `<timestamp>`/`<user_query>` framing; staged by the ai-hist cursor parser tests rather than by this harness",
+      "layout": "Reference",
+      "origin": "RelayHistory",
+      "files": [
+        "cursor/observed-3.13.25.jsonl"
+      ]
+    },
+    {
+      "source": "cursor",
+      "name": "legacy-string-content",
+      "quirk": "the older row shape, `message.content` as a bare string with no framing; staged by the ai-hist cursor parser tests rather than by this harness",
+      "layout": "Reference",
+      "origin": "RelayHistory",
+      "files": [
+        "cursor/legacy-string-content.jsonl"
+      ]
+    },
+    {
+      "source": "cursor",
+      "name": "extended-unverified",
+      "quirk": "an **unverified** build that also writes `message.model`, `message.usage`, `thinking` blocks, `tool_use` ids and `tool_result` blocks; it proves the parser records them when present, not that Cursor writes them",
+      "layout": "Reference",
+      "origin": "RelayHistory",
+      "files": [
+        "cursor/extended-unverified.jsonl"
+      ]
+    }
+  ]
+}

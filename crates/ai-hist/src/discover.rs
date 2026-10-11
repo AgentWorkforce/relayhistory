@@ -388,6 +388,8 @@ pub struct DiscoveryEnv<'a> {
     /// every candidate. Never set on the fingerprint environment: a partial
     /// listing must not become the cached picture of a source.
     path_scope: Option<crate::ingest::path_scope::PathScope>,
+    #[allow(dead_code)] // Used by provider-owned adapters.
+    pub(crate) provider_roots: crate::ProviderRoots,
 }
 
 impl<'a> DiscoveryEnv<'a> {
@@ -402,6 +404,7 @@ impl<'a> DiscoveryEnv<'a> {
         roots: crate::ProviderRoots,
     ) -> Self {
         Self {
+            provider_roots: roots.clone(),
             home: roots.home,
             claude_config_dir: roots.claude,
             codex_home: roots.codex,
@@ -456,6 +459,7 @@ impl<'a> DiscoveryEnv<'a> {
         Self::with_provider_roots(
             conn,
             crate::ProviderRoots {
+                provider_roots: crate::providers::resolve_roots(&home, false),
                 muse,
                 devin,
                 home,
@@ -497,7 +501,7 @@ impl<'a> DiscoveryEnv<'a> {
     /// read receives, on whatever thread it runs.
     pub fn scan(&self) -> ScanEnv<'_> {
         ScanEnv {
-            home: &self.home,
+            provider_roots: &self.provider_roots,            home: &self.home,
             claude_config_dir: &self.claude_config_dir,
             codex_home: &self.codex_home,
             grok_home: &self.grok_home,
@@ -556,24 +560,26 @@ pub struct ScanEnv<'a> {
     /// Root of OpenCode's legacy `storage/` JSON tree.
     pub opencode_storage_dir: &'a Path,
     counters: &'a CounterCell,
+    #[allow(dead_code)]
+    pub(crate) provider_roots: &'a crate::ProviderRoots,
 }
 
 impl ScanEnv<'_> {
-    fn note_open(&self) {
+    pub(crate) fn note_open(&self) {
         self.counters.files_opened.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn note_bytes(&self, bytes: u64) {
+    pub(crate) fn note_bytes(&self, bytes: u64) {
         self.counters.bytes_read.fetch_add(bytes, Ordering::Relaxed);
     }
 
-    fn note_query(&self) {
+    pub(crate) fn note_query(&self) {
         self.counters
             .provider_queries
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    fn note_records(&self, records: u64) {
+    pub(crate) fn note_records(&self, records: u64) {
         self.counters
             .records_inspected
             .fetch_add(records, Ordering::Relaxed);
@@ -3660,23 +3666,7 @@ pub(crate) fn catalog_row_by_path(
 
 /// The filesystem roots one source's adapter watches under `roots`.
 pub(crate) fn provider_watch_roots(source: &str, roots: &crate::ProviderRoots) -> Vec<WatchRoot> {
-    let providers = shallow_providers();
-    let Some(provider) = providers.iter().find(|provider| provider.source() == source) else {
-        return Vec::new();
-    };
-    watch_roots(
-        std::slice::from_ref(provider),
-        &ProviderRoots {
-            home: &roots.home,
-            claude: &roots.claude,
-            codex: &roots.codex,
-            grok: &roots.grok,
-            muse: &roots.muse,
-            devin: &roots.devin,
-            opencode_db: &roots.opencode_db,
-            opencode_db_pinned: roots.opencode_db_pinned,
-        },
-    )
+    crate::providers::legacy_watch_roots(source, roots)
 }
 
 #[cfg(test)]

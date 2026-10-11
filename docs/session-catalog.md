@@ -2511,82 +2511,30 @@ downstream consumers read it through the `ai-hist` crate's `SessionStore`
 facade rather than writing a second parser. See [ADR: relayhistory owns session
 sourcing](decisions/2026-09-19-relayhistory-owns-session-sourcing.md). That
 matrix has record types as rows and sources as columns, so a new or extended
-provider must add or update its source column in the same change, and satisfy
+provider must add or update its capture cells in the same change (new sources
+use the generated provider-owned matrix section), and satisfy
 the record types in [`sourcing-contract.md`](sourcing-contract.md).
 
-### One descriptor per harness
+### Provider-owned registration
 
-Every built-in harness is declared once, as a `LocalSource` descriptor in
-[`crates/ai-hist/src/sources/catalog.rs`](../crates/ai-hist/src/sources/catalog.rs).
-These per-source tables are derived from it:
+Follow [the provider intake contract](provider-intake.md) and its checked-in
+file template. The existing `LocalSource` registry remains the acquisition
+registry; admitted provider shards generate its entries, Rust/TypeScript source
+vocabulary, usage registration, fixture manifests and capture documentation.
+Each adapter owns its roots, discovery, immutable acquisition, selected parser,
+full sweep, watch roots, evidence declarations and accounting implementation.
+Adding Pi, Hermes or another source requires no shared handwritten switch edits.
 
-| Descriptor field   | Derived from it                                                                    |
-| ------------------ | ---------------------------------------------------------------------------------- |
-| `id`               | `SOURCE_CHOICES` (declaration order)                                               |
-| `discovery`        | `shallow_providers()` (alphabetical by id) and `DISCOVERY_EXEMPTIONS`              |
-| `hydration`        | hydration's source validation and the `ingest_selected` dispatch                   |
-| `transcript_roots` | `validate_provider_path`, the root check for hydrated and hook-captured locators   |
-| `relationships`    | `relationship_capabilities`                                                        |
-| `resume`           | `resume_command`                                                                   |
-| `fixtures`         | the registry test in `fixture_corpus.rs`                                           |
-
-A new harness starts with:
-
-1. **A descriptor** in `sources/catalog.rs`. Its `discovery` is either a
-   `ShallowSessionProvider` adapter (`enumerate` may stat but not read;
-   `read_shallow` stays inside the head/tail budgets and returns `Ok(None)` for
-   "this candidate is not a session") or `Discovery::Exempt(reason)`. The
-   adapter's `evidence_kinds` is the source's declared parser coverage. Its
-   `hydration` names the parser for one selected session (a function taking
-   `SelectedIngest`), `NoConnector(message)` for a catalog source no local
-   parser backs, or `Unsupported`.
-2. **A fixture and a snapshot** (below), in the directory the descriptor's
-   `fixtures` names, which is the source id.
-
-The descriptor does not yet cover everything. These still need their own
-per-source edit:
-
-- the parser itself, the targeted-hydration snapshot branches in
-  `source_snapshot` (`hydrate.rs`), and the full-sync pass in `ingest.rs` that
-  runs the parser;
-- `source_watch_roots` in `ingest.rs`, for anything sync reads beyond the
-  adapter's own `watch_roots` (Claude's and Codex's `history.jsonl`, Grok's
-  `logs/unified.jsonl`);
-- the public `Source` enum in `session_store.rs` (`Source::ALL`, `as_str`),
-  which is default API; the registry test checks it names exactly the
-  descriptors. `Source::capabilities` also adds evidence kinds (session
-  markers, prompt history) beyond the adapter's `evidence_kinds`, and states
-  each source's message-id origin, by hand;
-- `HOOK_HARNESSES`, for a harness whose lifecycle hook hands over a
-  transcript path;
-- usage normalization (`NORMALIZABLE_SOURCES` and `source_accounting` in
-  `usage.rs`), for a harness that reports token usage;
-- a `ProviderRoots` field and environment override, if the harness has its own
-  root;
-- the TypeScript `SOURCES` list, MCP enums and resume command in `sdk-ts`.
-
-Exactly one of the adapter or an exemption is required, so a new source always
-carries a decision about whether it is discoverable. No built-in source is
-exempt today; an exempt source would be refused by `sessions discover --source`
-with its reason.
-
-The exemption list also travels in the `summary` line as `exempt_sources`, so a
-consumer can tell "this source has no sessions" apart from "this source is not
-discoverable".
-
-A store that holds sessions of an existing source somewhere the built-in parser
-does not read needs no change here: a **local source plugin**
-(`location: 'local'` with declared `roots`) discovers and hydrates it through
-the normalized evidence intake, out of tree. See
-[local source plugins](source-plugins.md#local-source-plugins).
+Local JS/Rust source plugins remain supported for stores outside the built-in
+adapters. See [local source plugins](source-plugins.md#local-source-plugins).
 
 ### Add a fixture and a snapshot
 
 A provider is not added until its log shape is in the checked-in corpus. Add at
 least one fixture under `crates/ai-hist/tests/fixtures/<source>/` (the
-directory the descriptor's `fixtures` names), register it in the `CORPUS`
-manifest in `crates/ai-hist/tests/fixture_corpus.rs` with the quirk it
-encodes, list it in `tests/fixtures/README.md`, and commit the generated
+directory the descriptor's `fixtures` names), register it in its provider-owned `providers/history-sources/<source>.json`
+fixture manifest with the quirk it encodes, run `npm run providers:generate`
+to update the corpus and README, and commit the generated
 snapshot under `crates/ai-hist/tests/snapshots/<source>/`:
 
 ```sh
