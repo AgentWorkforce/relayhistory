@@ -470,7 +470,9 @@ fn discovery_ranks_profiles_by_latest_message_and_fingerprint_never_opens_sqlite
     assert_eq!(latest[0].locator, path.to_string_lossy());
     drop(db);
     std::fs::write(path, b"not sqlite").unwrap();
-    assert!(!storage::fingerprint_inputs(&roots).unwrap().is_empty());
+    let catalog = Connection::open_in_memory().unwrap();
+    let env = DiscoveryEnv::with_provider_roots(&catalog, roots.clone());
+    assert!(!Provider.fingerprint_inputs(&env).unwrap().is_empty());
     assert!(storage::enumerate(&roots, None).is_err());
 }
 
