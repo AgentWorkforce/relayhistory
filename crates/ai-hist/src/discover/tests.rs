@@ -2861,6 +2861,61 @@ fn remote_shallow_upsert_rolls_back_canonical_row_when_presence_write_fails() {
 }
 
 #[test]
+fn grok_remote_presence_cannot_clear_a_locally_observed_subagent_kind() {
+    let conn = catalog();
+    let upsert = |id: &str, kind: Option<&str>, location| {
+        upsert_shallow_session_at_location(
+            &conn,
+            &ShallowSession {
+                source: "grok".into(),
+                session_id: id.into(),
+                session_kind: kind.map(str::to_string),
+                discovery_state: "shallow".into(),
+                ..Default::default()
+            },
+            location,
+        )
+        .unwrap();
+    };
+    let stored_kind = |id: &str| {
+        catalog_row(&conn, "grok", id, true)
+            .unwrap()
+            .unwrap()
+            .session_kind
+    };
+
+    upsert("local-first", Some("subagent"), SessionLocation::Local);
+    upsert("local-first", None, SessionLocation::Remote);
+    upsert("local-first", Some("root"), SessionLocation::Remote);
+    assert_eq!(stored_kind("local-first").as_deref(), Some("subagent"));
+
+    upsert("remote-first", None, SessionLocation::Remote);
+    upsert("remote-first", Some("subagent"), SessionLocation::Local);
+    assert_eq!(stored_kind("remote-first").as_deref(), Some("subagent"));
+    upsert("remote-only", Some("subagent"), SessionLocation::Remote);
+    assert_eq!(stored_kind("remote-only").as_deref(), Some("subagent"));
+    assert!(list_session_catalog(&conn, &CatalogListOptions {
+        scope: SessionScope::All,
+        exclude_delegated: true,
+        ..Default::default()
+    }).unwrap().is_empty());
+
+    // A subsequent local summary without the marker is authoritative: the
+    // session becomes a root even if remote presence still exists.
+    upsert("local-first", None, SessionLocation::Local);
+    upsert("remote-first", None, SessionLocation::Local);
+    upsert("remote-only", None, SessionLocation::Local);
+    assert_eq!(stored_kind("local-first"), None);
+    assert_eq!(stored_kind("remote-first"), None);
+    assert_eq!(stored_kind("remote-only"), None);
+    assert_eq!(list_session_catalog(&conn, &CatalogListOptions {
+        scope: SessionScope::All,
+        exclude_delegated: true,
+        ..Default::default()
+    }).unwrap().len(), 3);
+}
+
+#[test]
 fn the_catalog_query_reads_only_the_sessions_table() {
     let (sql, _) = catalog_list_query(&CatalogListOptions::default());
     assert!(sql.contains("FROM sessions"), "{sql}");

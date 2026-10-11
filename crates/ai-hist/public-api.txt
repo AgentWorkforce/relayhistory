@@ -304,6 +304,7 @@ pub ai_hist::CatalogSession::project_key_method: core::option::Option<alloc::str
 pub ai_hist::CatalogSession::raw_path: core::option::Option<std::path::PathBuf>
 pub ai_hist::CatalogSession::repo_url: core::option::Option<alloc::string::String>
 pub ai_hist::CatalogSession::session_id: alloc::string::String
+pub ai_hist::CatalogSession::session_kind: core::option::Option<alloc::string::String>
 pub ai_hist::CatalogSession::source: ai_hist::Source
 pub ai_hist::CatalogSession::source_stamp: core::option::Option<alloc::string::String>
 pub ai_hist::CatalogSession::title: core::option::Option<alloc::string::String>

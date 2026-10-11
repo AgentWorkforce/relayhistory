@@ -24,7 +24,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Rust API
 
-- Added `ShallowSession::session_kind` and catalog contract version 6 for provider-native session kinds.
+- Added `ShallowSession::session_kind` and `CatalogSession::session_kind`, with catalog contract version 6, for provider-native session kinds.
 - Native catalog rows expose `sessionKind` under native contract version 27.
 - Added `Source::Pi` for filtering and reading persisted Pi session history.
 
