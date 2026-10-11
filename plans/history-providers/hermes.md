@@ -128,8 +128,7 @@ After integrating those changes:
   assistant search, source filtering, and Hermes capability reads.
 - Formatting, Clippy and rust-oleum pass.
 
-No publication, merge, push or PR creation was done by this provider worker.
-Setup #464 must merge before pilot integration.
+Provider review is stacked on setup PR #464, which must merge before pilot integration.
 
 Cancellation follow-up: database/profile enumeration, snapshot session/message
 collection, and normalization now check the existing cooperative stop token.
@@ -152,3 +151,11 @@ Final-base affected verification:
 
 The final rebase changed no Hermes source behavior and required no conflict
 resolution. Existing provider snapshots remain unchanged.
+
+Out-of-tree consumer acceptance on the final provider checkout used an isolated
+copy at `/private/tmp/hermes-rust-consumer` with only a local `ai-hist` patch.
+`cargo tree --manifest-path /private/tmp/hermes-rust-consumer/Cargo.toml -p ai-hist --offline`
+proved resolution to this checkout. `RELAYHISTORY_FIXTURES=/private/tmp/relayhistory-provider-hermes/crates/ai-hist/tests/fixtures TMPDIR=/private/tmp cargo run --manifest-path /private/tmp/hermes-rust-consumer/Cargo.toml --offline`
+passed: six stock synthetic sessions, five usage rows and 104 change-feed records.
+The stock consumer exercises Claude/Codex; Hermes-specific evidence is proved
+by the public conformance test above. No repository example or lockfile changed.

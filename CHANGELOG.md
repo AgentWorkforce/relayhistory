@@ -4,7 +4,11 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased - Patch]
+## [Unreleased - Minor]
+
+### Added
+
+- Hermes schema-31 session history is discoverable and searchable across default and named profiles, including archived turns, tool calls and session markers.
 
 ### Changed
 
@@ -15,9 +19,11 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Unchanged provider syncs restore lost evidence, missing adapter files and sidecar containment failures retain their typed error codes, and SDK hydration accepts native session markers.
 
-### Fixed
-
 - A Grok or Muse re-read reports a row again only when that row changed.
+
+### Rust API
+
+- Added `Source::Hermes` for filtering and reading persisted Hermes session history.
 
 ## [0.40.1] - 2026-10-11
 
