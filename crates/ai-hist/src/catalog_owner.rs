@@ -10,16 +10,18 @@ use crate::observations::ObservationKey;
 use crate::SessionLocation;
 use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
+use std::io::Read;
 use std::path::Path;
 
 /// Whether `incoming` is a different transcript from the one `sessions.raw_path`
 /// already names, and that file is still present.
 ///
 /// One stat of the stored path, and only when the paths differ. Same path, no
-/// stored path (including NULL), a shared SQLite store, and a stored path that
-/// is no longer a file all return false so the caller writes normally. A store
-/// file stays on disk after it drops a session; that session's next store
-/// claims the row.
+/// stored path (including NULL), a SQLite store, and a stored path that is no
+/// longer a file all return false so the caller writes normally. OpenCode and
+/// Devin name that store however it was configured; the file stays on disk
+/// after it drops a session, and the session's next store claims the row. A
+/// JSON session file is the transcript, so a sibling file still leaves it.
 pub(crate) fn incoming_must_not_replace(
     conn: &Connection,
     source: &str,
@@ -32,7 +34,7 @@ pub(crate) fn incoming_must_not_replace(
     let Some(stored) = catalog_raw_path(conn, source, session_id)? else {
         return Ok(false);
     };
-    if stored == incoming || path_is_shared_store(&stored) {
+    if stored == incoming || shared_sqlite_store(source, &stored) {
         return Ok(false);
     }
     Ok(Path::new(&stored).is_file())
@@ -64,12 +66,18 @@ fn catalog_raw_path(conn: &Connection, source: &str, session_id: &str) -> Result
     Ok(stored.flatten().filter(|path| !path.is_empty()))
 }
 
-/// OpenCode and Devin record the SQLite store, not one transcript per session.
-fn path_is_shared_store(path: &str) -> bool {
-    Path::new(path)
-        .extension()
-        .and_then(|ext| ext.to_str())
-        .is_some_and(|ext| ext.eq_ignore_ascii_case("db") || ext.eq_ignore_ascii_case("sqlite"))
+/// A configured OpenCode or Devin store, recognized by its header so the name
+/// does not matter. Sixteen bytes, and only when a different path is asking
+/// to replace one of those sources.
+fn shared_sqlite_store(source: &str, path: &str) -> bool {
+    if !matches!(source, "opencode" | "devin") {
+        return false;
+    }
+    let mut header = [0_u8; 16];
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return false;
+    };
+    file.read_exact(&mut header).is_ok() && &header == b"SQLite format 3\0"
 }
 
 /// SQL fragments for a full-ingest catalog upsert.
