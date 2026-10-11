@@ -24,6 +24,7 @@ pub(crate) mod claude_title;
 pub(crate) mod codex;
 mod codex_subagent;
 pub(crate) mod codex_thread_names;
+mod codex_usage;
 pub(crate) mod control;
 pub(crate) mod cursor;
 pub(crate) mod devin;
@@ -5965,28 +5966,6 @@ fn record_codex_usage_snapshot(
     Ok(())
 }
 
-/// Attach measured usage to the assistant event that earned it, or hold it
-/// until one appears.
-fn attach_codex_usage(
-    conn: &Connection,
-    session_id: &str,
-    pending: &mut Option<PendingCodexUsage>,
-    untokened_assistant_uid: &mut Option<String>,
-    usage: PendingCodexUsage,
-) -> Result<()> {
-    match untokened_assistant_uid.take() {
-        Some(uid) => {
-            conn.execute(
-                "UPDATE session_events SET token_json = ? \
-                 WHERE source = 'codex' AND session_id = ? AND event_uid = ?",
-                params![usage.into_token_json(), session_id, uid],
-            )?;
-        }
-        None => *pending = Some(usage),
-    }
-    Ok(())
-}
-
 /// Ingest one rollout file's conversation into `session_events`,
 /// `tool_calls`, and `file_edits`, and its user prompts into `history`.
 ///
@@ -6158,6 +6137,7 @@ fn ingest_codex_rollout_incremental(
     // so a resumed pass never inherits one.
     let mut prev_totals: Option<CodexTokenTotals> = resume.prev_totals;
     let mut pending_usage: Option<PendingCodexUsage> = None;
+    let mut usage_pass = codex_usage::Pass::default();
     // Every snapshot that could not be differenced, in arrival order and never
     // rewritten, plus the baselines a delta was actually measured from. These
     // two are facts about the rollout; what they *mean* is decided once, after
@@ -6536,7 +6516,7 @@ fn ingest_codex_rollout_incremental(
                 },
             )?;
             outcome.events += 1;
-            untokened_assistant_uid = token_json.is_none().then(|| uid.clone());
+            untokened_assistant_uid = usage_pass.wrote(token_json.is_some(), &uid);
             outcome.last_assistant_text = Some(message.text.chars().take(4096).collect());
             saw_model_output = true;
             previous_assistant = Some((index, message.format, message.text));
@@ -6617,7 +6597,7 @@ fn ingest_codex_rollout_incremental(
                             },
                         )?;
                         outcome.events += 1;
-                        untokened_assistant_uid = Some(uid);
+                        untokened_assistant_uid = usage_pass.wrote(false, &uid);
                         saw_model_output = true;
                     }
                 }
@@ -6778,7 +6758,7 @@ fn ingest_codex_rollout_incremental(
                                 // than publish a clamped zero.
                                 None => PendingCodexUsage::Unusable(usage.to_string()),
                             };
-                            attach_codex_usage(
+                            usage_pass.attach(
                                 conn,
                                 session_id,
                                 &mut pending_usage,
@@ -7027,7 +7007,7 @@ fn ingest_codex_rollout_incremental(
                         },
                     )?;
                     outcome.events += 1;
-                    untokened_assistant_uid = token_json.is_none().then(|| uid.clone());
+                    untokened_assistant_uid = usage_pass.wrote(token_json.is_some(), &uid);
                     saw_model_output = true;
                     if !call_id.is_empty() && !name.is_empty() {
                         let args_json =
@@ -7135,21 +7115,13 @@ fn ingest_codex_rollout_incremental(
             )?;
         }
     }
-    // The whole rollout is known, so the refusals can be worked out from what
-    // was recorded. `token_json IS NULL` keeps one from overwriting a real
-    // measurement the turn acquired by another route.
-    for (uid, raw) in surviving_refusals(&unreadable_snapshots, &measured_generations) {
-        conn.execute(
-            "UPDATE session_events SET token_json = ? \
-             WHERE source = 'codex' AND session_id = ? AND event_uid = ? \
-               AND token_json IS NULL",
-            params![
-                PendingCodexUsage::Unusable(raw).into_token_json(),
-                session_id,
-                uid
-            ],
-        )?;
-    }
+    codex_usage::finish(
+        conn,
+        session_id,
+        &usage_pass,
+        &unreadable_snapshots,
+        &measured_generations,
+    )?;
     // End of file is not a turn boundary. A live rollout's last turn has no
     // `task_complete` yet, and the `exec_command_end` that fails one of its
     // calls can still be written after the bytes this pass read. Failures

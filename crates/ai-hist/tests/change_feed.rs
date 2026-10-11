@@ -1544,3 +1544,265 @@ fn claude_event_stored(home: &Home, uuid: &str) -> bool {
         )
         .unwrap()
 }
+
+fn codex_rollout(home: &Home, fixture: &str) -> PathBuf {
+    let stem = fixture.trim_end_matches(".jsonl");
+    home.path().join(format!(
+        ".codex/sessions/2026/04/20/rollout-2026-04-20T00-00-00-{stem}.jsonl"
+    ))
+}
+
+fn session_events_since(store: &SessionStore, from: Watermark) -> Vec<Change> {
+    drain(store, from)
+        .into_iter()
+        .filter(|change| change.kind == ChangeKind::SessionEvent)
+        .collect()
+}
+
+fn event_token(change: &Change) -> Option<&str> {
+    match &change.op {
+        ChangeOp::Upsert(EvidenceRow::SessionEvent(event)) => event.token_json.as_deref(),
+        _ => None,
+    }
+}
+
+fn stored_token(home: &Home, session: &str, uid: &str) -> Option<String> {
+    home.raw()
+        .query_row(
+            "SELECT token_json FROM session_events \
+             WHERE source = 'codex' AND session_id = ?1 AND event_uid = ?2",
+            rusqlite::params![session, uid],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// Hydrating `with-tool-call` after the sweep re-reads the rollout from the
+/// start. The assistant row is upserted before its `token_count`, and that
+/// re-read reports the event only when the usage changed.
+#[test]
+fn codex_reread_of_with_tool_call_reports_no_session_event() {
+    let home = Home::new();
+    home.stage_codex("with-tool-call.jsonl");
+    let store = home.store();
+    store.sync(Default::default()).unwrap();
+    let before = stored_token(&home, "sess_tools_1", "7:custom_tool_call");
+    assert!(
+        before
+            .as_deref()
+            .is_some_and(|json| json.contains("\"output_tokens\":800")),
+        "the sweep stored the tool call's usage: {before:?}"
+    );
+
+    let head = store.head_revision().unwrap();
+    store
+        .hydrate(
+            &SessionRef::id(Source::Codex, "sess_tools_1"),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    let events = session_events_since(&store, head);
+    assert!(
+        events.is_empty(),
+        "a re-read reports no session event: {events:?}"
+    );
+    assert_eq!(
+        stored_token(&home, "sess_tools_1", "7:custom_tool_call"),
+        before
+    );
+
+    let again = store.head_revision().unwrap();
+    store
+        .hydrate(
+            &SessionRef::id(Source::Codex, "sess_tools_1"),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    assert!(
+        session_events_since(&store, again).is_empty(),
+        "the hydration after that is quiet too"
+    );
+}
+
+/// A real usage change is one feed row, carrying the new usage.
+#[test]
+fn codex_reread_reports_a_usage_change_once() {
+    let home = Home::new();
+    home.stage_codex("with-tool-call.jsonl");
+    let store = home.store();
+    store.sync(Default::default()).unwrap();
+    let path = codex_rollout(&home, "with-tool-call.jsonl");
+    let mut text = fs::read_to_string(&path).unwrap();
+    text = text.replace("\"output_tokens\":800", "\"output_tokens\":900");
+    text = text.replace("\"total_tokens\":5800", "\"total_tokens\":5900");
+    fs::write(&path, text).unwrap();
+
+    let head = store.head_revision().unwrap();
+    store
+        .hydrate(
+            &SessionRef::id(Source::Codex, "sess_tools_1"),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    let events = session_events_since(&store, head);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].record_key, "7:custom_tool_call");
+    let token = event_token(&events[0]).unwrap();
+    assert!(token.contains("\"output_tokens\":900"), "{token}");
+    assert_eq!(
+        stored_token(&home, "sess_tools_1", "7:custom_tool_call").as_deref(),
+        Some(token)
+    );
+
+    let again = store.head_revision().unwrap();
+    store
+        .hydrate(
+            &SessionRef::id(Source::Codex, "sess_tools_1"),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    assert!(session_events_since(&store, again).is_empty());
+}
+
+/// Usage the rollout no longer contains is cleared once, not nulled and then
+/// restored.
+#[test]
+fn codex_reread_clears_usage_that_is_gone_once() {
+    let home = Home::new();
+    home.stage_codex("with-tool-call.jsonl");
+    let store = home.store();
+    store.sync(Default::default()).unwrap();
+    let path = codex_rollout(&home, "with-tool-call.jsonl");
+    let text = fs::read_to_string(&path).unwrap();
+    let kept: String = text
+        .lines()
+        .filter(|line| !line.contains("\"token_count\""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&path, format!("{kept}\n")).unwrap();
+    home.raw_writer()
+        .execute(
+            "INSERT INTO session_events \
+             (source, session_id, project_key, project_key_method, ts_ms, role, kind, \
+              event_uid, token_json, location) \
+             VALUES ('codex', 'sess_tools_1', '/tmp/project', 'path', 1, 'assistant', \
+                     'tool_use', 'remote-only', '{\"output_tokens\":2}', 'remote')",
+            [],
+        )
+        .unwrap();
+
+    let head = store.head_revision().unwrap();
+    store
+        .hydrate(
+            &SessionRef::id(Source::Codex, "sess_tools_1"),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    let events = session_events_since(&store, head);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].record_key, "7:custom_tool_call");
+    assert_eq!(event_token(&events[0]), None);
+    assert_eq!(
+        stored_token(&home, "sess_tools_1", "7:custom_tool_call"),
+        None
+    );
+    assert_eq!(
+        stored_token(&home, "sess_tools_1", "remote-only").as_deref(),
+        Some("{\"output_tokens\":2}")
+    );
+
+    let again = store.head_revision().unwrap();
+    store
+        .hydrate(
+            &SessionRef::id(Source::Codex, "sess_tools_1"),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    assert!(session_events_since(&store, again).is_empty());
+    assert_eq!(
+        stored_token(&home, "sess_tools_1", "remote-only").as_deref(),
+        Some("{\"output_tokens\":2}")
+    );
+}
+
+/// The end-of-rollout refusal fills a row that has no measurement and leaves
+/// a row that already has one.
+#[test]
+fn codex_reread_refusal_fills_a_null_row_and_keeps_a_measurement() {
+    let home = Home::new();
+    home.stage_codex("two-unreadable-turns.jsonl");
+    let store = home.store();
+    store.sync(Default::default()).unwrap();
+    let session = "sess_codex_two_bad";
+    let assistants: Vec<(String, Option<String>)> = {
+        let conn = home.raw();
+        let mut stmt = conn
+            .prepare(
+                "SELECT event_uid, token_json FROM session_events \
+                 WHERE source = 'codex' AND session_id = ?1 AND role = 'assistant' \
+                   AND kind = 'text' \
+                 ORDER BY event_uid",
+            )
+            .unwrap();
+        stmt.query_map([session], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+    };
+    assert_eq!(assistants.len(), 2, "{assistants:?}");
+    let kept = assistants[0]
+        .1
+        .clone()
+        .expect("the first refusal was stored");
+    let restored = assistants[1]
+        .1
+        .clone()
+        .expect("the second refusal was stored");
+    let sentinel = "{\"input_tokens\":42,\"output_tokens\":7}";
+    home.raw_writer()
+        .execute(
+            "UPDATE session_events SET token_json = ?1 \
+             WHERE source = 'codex' AND session_id = ?2 AND event_uid = ?3",
+            rusqlite::params![sentinel, session, assistants[0].0],
+        )
+        .unwrap();
+    home.raw_writer()
+        .execute(
+            "UPDATE session_events SET token_json = NULL \
+             WHERE source = 'codex' AND session_id = ?1 AND event_uid = ?2",
+            rusqlite::params![session, assistants[1].0],
+        )
+        .unwrap();
+
+    let head = store.head_revision().unwrap();
+    store
+        .hydrate(
+            &SessionRef::id(Source::Codex, session),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        stored_token(&home, session, &assistants[0].0).as_deref(),
+        Some(sentinel),
+        "a real measurement is not replaced by the refusal ({kept})"
+    );
+    assert_eq!(
+        stored_token(&home, session, &assistants[1].0).as_deref(),
+        Some(restored.as_str())
+    );
+    let events = session_events_since(&store, head);
+    let filled: Vec<&Change> = events
+        .iter()
+        .filter(|change| change.record_key == assistants[1].0)
+        .collect();
+    assert_eq!(filled.len(), 1, "{events:?}");
+    assert_eq!(event_token(filled[0]), Some(restored.as_str()));
+    assert!(
+        events
+            .iter()
+            .all(|change| change.record_key != assistants[0].0),
+        "the measured row is not reported: {events:?}"
+    );
+}
