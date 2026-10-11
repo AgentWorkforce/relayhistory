@@ -10,9 +10,11 @@
 //!   [`watch_roots`](crate::discover::watch_roots) wakes the loop on a real
 //!   write. A burst of events collapses into one tick through the
 //!   [`WatchLoop::debounce_ms`] window — swept on its leading edge when the
-//!   loop was quiet ([`WatchLoop::leading_edge`]) — and a slow poll at
+//!   loop was quiet ([`WatchLoop::leading_edge`]) — and that tick reads the
+//!   transcripts under the paths the events named. A slow poll at
 //!   [`WatchLoop::slow_poll_ms`] backstops the platforms where events are
-//!   silently unreliable (network mounts, some container filesystems).
+//!   silently unreliable (network mounts, some container filesystems), and
+//!   that poll is a full sweep, as are startup and a tick the loop cannot place.
 //! * **Polling** (fallback): when no roots are watchable, when the crate was
 //!   built without the `fs-events` feature, or when the caller passes
 //!   `--no-fsevents`, the loop ticks at [`WatchLoop::poll_interval_ms`].
@@ -1218,7 +1220,18 @@ mod tests {
     }
 
     fn fired(paths: &[&str]) -> ChangeScope {
-        ChangeScope::Roots(paths.iter().map(PathBuf::from).collect())
+        ChangeScope::Roots {
+            roots: paths.iter().map(PathBuf::from).collect(),
+            paths: std::collections::BTreeSet::new(),
+        }
+    }
+
+    #[cfg(feature = "fs-events")]
+    fn fired_at(roots: &[&str], paths: &[&str]) -> ChangeScope {
+        ChangeScope::Roots {
+            roots: roots.iter().map(PathBuf::from).collect(),
+            paths: paths.iter().map(PathBuf::from).collect(),
+        }
     }
 
     fn event_wake(scope: ChangeScope) -> Wake {
@@ -1406,7 +1419,10 @@ mod tests {
         };
         assert_eq!(
             fs_events::event_scope(&write(&["/home/u/.claude/projects/app/s.jsonl"]), &roots),
-            Some(fired(&["/home/u/.claude/projects"]))
+            Some(fired_at(
+                &["/home/u/.claude/projects"],
+                &["/home/u/.claude/projects/app/s.jsonl"]
+            ))
         );
         assert_eq!(
             fs_events::event_scope(
@@ -1416,10 +1432,28 @@ mod tests {
                 ]),
                 &roots
             ),
-            Some(fired(&[
-                "/home/u/.codex/history.jsonl",
-                "/home/u/.codex/sessions"
-            ]))
+            Some(fired_at(
+                &[
+                    "/home/u/.codex/history.jsonl",
+                    "/home/u/.codex/sessions"
+                ],
+                &[
+                    "/home/u/.codex/history.jsonl",
+                    "/home/u/.codex/sessions/2026/r.jsonl"
+                ]
+            ))
+        );
+        let mut aliased = WatchRoot::tree("/var/folders/claude/projects");
+        aliased.canonical = Some(PathBuf::from("/private/var/folders/claude/projects"));
+        assert_eq!(
+            fs_events::event_scope(
+                &write(&["/private/var/folders/claude/projects/app/s.jsonl"]),
+                &[aliased]
+            ),
+            Some(fired_at(
+                &["/var/folders/claude/projects"],
+                &["/var/folders/claude/projects/app/s.jsonl"]
+            ))
         );
         assert_eq!(
             fs_events::event_scope(&write(&["/home/u/.codex/config.toml"]), &roots),

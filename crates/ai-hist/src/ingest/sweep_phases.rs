@@ -17,9 +17,14 @@
 use super::*;
 
 /// The local sources a sweep reads. `None` is every one of them.
+///
+/// `paths` narrows a source to the transcripts under those paths. `None`
+/// walks each included source the way a full sweep does, which is also what
+/// an event the loop could not place under a file asks for.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct SweepScope {
     only: Option<Vec<&'static str>>,
+    paths: Option<super::path_scope::PathScope>,
 }
 
 impl SweepScope {
@@ -42,7 +47,21 @@ impl SweepScope {
             .collect();
         only.sort_unstable();
         only.dedup();
-        Self { only: Some(only) }
+        Self {
+            only: Some(only),
+            paths: None,
+        }
+    }
+
+    /// Keep reading `sources`, and only the transcripts under `paths`.
+    pub(crate) fn with_paths(mut self, paths: Option<super::path_scope::PathScope>) -> Self {
+        self.paths = paths;
+        self
+    }
+
+    /// The changed paths, when this tick has them.
+    pub(crate) fn paths(&self) -> Option<&super::path_scope::PathScope> {
+        self.paths.as_ref()
     }
 
     /// Whether this is a full sweep.
@@ -109,19 +128,19 @@ impl SweepPhases<'_, '_> {
     /// Run every phase `scope` includes, in the order a full sweep runs them.
     pub(super) fn run(&mut self, scope: &SweepScope) -> Result<()> {
         if scope.includes("claude") {
-            self.claude()?;
+            self.claude(scope)?;
         }
         if scope.includes("codex") {
-            self.codex()?;
+            self.codex(scope)?;
         }
         if scope.includes("cursor") {
-            self.cursor()?;
+            self.cursor(scope)?;
         }
         if scope.includes("grok") {
-            self.grok()?;
+            self.grok(scope)?;
         }
         if scope.includes("muse") {
-            self.muse()?;
+            self.muse(scope)?;
         }
         if scope.includes("opencode") {
             self.opencode()?;
@@ -140,19 +159,23 @@ impl SweepPhases<'_, '_> {
         }
     }
 
-    fn claude(&mut self) -> Result<()> {
-        capture_progress("claude-history", 0, None);
-        check_capture_cancelled()?;
-        let checkpoints = &mut *self.checkpoints;
-        let history = sync_jsonl_incremental(
-            self.conn,
-            self.state,
-            "claude",
-            &self.roots.claude.join("history.jsonl"),
-            parse_claude_line,
-            &mut |in_progress| checkpoints.save(in_progress),
-        );
-        self.counted("claude", history);
+    fn claude(&mut self, scope: &SweepScope) -> Result<()> {
+        let history_path = self.roots.claude.join("history.jsonl");
+        // One file. A transcript tick does not open it; the backstop does.
+        if super::path_scope::file_in_scope(scope.paths(), &history_path) {
+            capture_progress("claude-history", 0, None);
+            check_capture_cancelled()?;
+            let checkpoints = &mut *self.checkpoints;
+            let history = sync_jsonl_incremental(
+                self.conn,
+                self.state,
+                "claude",
+                &history_path,
+                parse_claude_line,
+                &mut |in_progress| checkpoints.save(in_progress),
+            );
+            self.counted("claude", history);
+        }
         capture_progress("claude", 0, None);
         check_capture_cancelled()?;
         let metadata = sync_claude_session_metadata_with_repairs_and_coverage(
@@ -161,6 +184,7 @@ impl SweepPhases<'_, '_> {
             &self.roots.claude.join("projects"),
             self.repairs,
             self.coverage,
+            scope.paths(),
         );
         if self.report.capture("claude-metadata", metadata).is_some() {
             self.checkpoints.save(self.state);
@@ -168,7 +192,7 @@ impl SweepPhases<'_, '_> {
         Ok(())
     }
 
-    fn codex(&mut self) -> Result<()> {
+    fn codex(&mut self, scope: &SweepScope) -> Result<()> {
         capture_progress("codex", 0, None);
         check_capture_cancelled()?;
         let result = sync_codex_with_repairs_and_coverage(
@@ -177,37 +201,51 @@ impl SweepPhases<'_, '_> {
             &self.roots.codex,
             self.repairs,
             self.coverage,
+            scope.paths(),
         );
         self.counted("codex", result);
         Ok(())
     }
 
-    fn cursor(&mut self) -> Result<()> {
+    fn cursor(&mut self, scope: &SweepScope) -> Result<()> {
         capture_progress("cursor", 0, None);
         check_capture_cancelled()?;
         let projects = self.roots.home.join(".cursor/projects");
-        let result = sync_cursor(self.conn, self.state, &projects, self.coverage);
+        let result = sync_cursor_in(
+            self.conn,
+            self.state,
+            &projects,
+            self.coverage,
+            scope.paths(),
+        );
         self.counted("cursor", result);
         Ok(())
     }
 
-    fn grok(&mut self) -> Result<()> {
+    fn grok(&mut self, scope: &SweepScope) -> Result<()> {
         capture_progress("grok", 0, None);
         check_capture_cancelled()?;
-        let result = sync_grok_home(self.conn, self.state, &self.roots.grok, self.coverage);
+        let result = sync_grok_home_in(
+            self.conn,
+            self.state,
+            &self.roots.grok,
+            self.coverage,
+            scope.paths(),
+        );
         self.counted("grok", result);
         Ok(())
     }
 
-    fn muse(&mut self) -> Result<()> {
+    fn muse(&mut self, scope: &SweepScope) -> Result<()> {
         capture_progress("muse", 0, None);
         check_capture_cancelled()?;
-        let result = sync_muse_with_coverage(
+        let result = sync_muse_in(
             self.conn,
             self.state,
             &self.roots.muse,
             self.repairs,
             self.coverage,
+            scope.paths(),
         );
         self.counted("muse", result);
         Ok(())

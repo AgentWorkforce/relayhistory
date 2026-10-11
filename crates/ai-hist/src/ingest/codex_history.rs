@@ -10,8 +10,10 @@ pub(super) fn sync_codex_sources(
     repairs: &SweepRepairs,
     coverage: &mut SweepCoverage,
     touched: &mut HashSet<String>,
+    paths: Option<&super::path_scope::PathScope>,
 ) -> Result<usize> {
-    let inserted = sync_codex_rollouts_and_history(conn, state, root, repairs, coverage, touched)?;
+    let inserted =
+        sync_codex_rollouts_and_history(conn, state, root, repairs, coverage, touched, paths)?;
     // Last, after every phase that can create a Codex row (the history
     // backfill included): a name applied before its row exists would be
     // recorded as applied and never land.
@@ -29,11 +31,18 @@ fn sync_codex_rollouts_and_history(
     repairs: &SweepRepairs,
     coverage: &mut SweepCoverage,
     touched: &mut HashSet<String>,
+    paths: Option<&super::path_scope::PathScope>,
 ) -> Result<usize> {
     let (cwds, branches, mut inserted) = sync_codex_rollouts_with_repairs_and_coverage(
-        conn, state, root, repairs, coverage, touched,
+        conn, state, root, repairs, coverage, touched, paths,
     )?;
     let path = root.join("history.jsonl");
+    // One incremental file. A tick whose paths are rollouts has nothing new
+    // in it, and opening it on every append is a read the backstop still does.
+    if !super::path_scope::file_in_scope(paths, &path) {
+        backfill_codex_metadata_scoped(conn, state, &cwds, &branches, touched)?;
+        return Ok(inserted);
+    }
     if !path.exists() {
         sync_note!("  [codex] not found: {} (skipped)", path.display());
         // The rows the backfill fills are already in the database; a missing

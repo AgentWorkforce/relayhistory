@@ -38,18 +38,30 @@ pub(super) fn event_scope(event: &notify::Event, roots: &[WatchRoot]) -> Option<
     {
         return Some(ChangeScope::Everything);
     }
-    let fired: std::collections::BTreeSet<PathBuf> = event
-        .paths
-        .iter()
-        .map(|path| discover::watch_path(path))
-        .flat_map(|path| {
-            roots
-                .iter()
-                .filter(move |root| root.covers(&path))
-                .map(|root| root.path.clone())
-        })
-        .collect();
-    (!fired.is_empty()).then_some(ChangeScope::Roots(fired))
+    let mut fired = std::collections::BTreeSet::new();
+    let mut paths = std::collections::BTreeSet::new();
+    let mut unplaced = false;
+    for path in event.paths.iter().map(|path| discover::watch_path(path)) {
+        for root in roots.iter().filter(|root| root.covers(&path)) {
+            fired.insert(root.path.clone());
+            match root.lexical_event_path(&path) {
+                Some(lexical) => {
+                    paths.insert(lexical);
+                }
+                // The root matched and the path did not rewrite onto it.
+                // Drop every path: a partial set would skip the one that
+                // could not be placed.
+                None => unplaced = true,
+            }
+        }
+    }
+    if unplaced {
+        paths.clear();
+    }
+    (!fired.is_empty()).then_some(ChangeScope::Roots {
+        roots: fired,
+        paths,
+    })
 }
 
 /// Registrations a removal or rename-away invalidated.
