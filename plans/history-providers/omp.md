@@ -75,6 +75,14 @@ are not permission to follow unrestricted external files. Future intake must
 freeze selected roots/provenance once and test every override/profile combination.
 No cross-platform root behavior was executed in this research.
 
+Pi also uses `PI_CODING_AGENT_DIR` and `PI_CODING_AGENT_SESSION_DIR`.
+The future OMP adapter must test co-installation with those overrides: an explicit
+shared directory and a `version: 3` header alone do not establish which product
+wrote a legacy transcript. Current OMP title slots provide a physical distinction,
+but legacy direct headers need an evidence-based classification policy. This
+research does not claim that policy is solved or allow duplicate admission of
+one ambiguous file under both sources.
+
 ## Fork, move and rewrite semantics
 
 `SessionManager.fork`, `forkFrom` and branched-session creation create a new header
