@@ -241,6 +241,7 @@
       "session_id": "sess_codex_wrong_turn",
       "source": "codex",
       "source_stamp": "<n>:1445",
+      "title": null,
       "workspace_roots_json": null
     }
   ],

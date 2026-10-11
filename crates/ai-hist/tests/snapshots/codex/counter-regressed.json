@@ -204,6 +204,7 @@
       "session_id": "sess_codex_regressed",
       "source": "codex",
       "source_stamp": "<n>:1388",
+      "title": null,
       "workspace_roots_json": null
     }
   ],

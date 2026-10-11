@@ -122,6 +122,7 @@
       "session_id": "11111111-1111-1111-1111-111111111111",
       "source": "claude",
       "source_stamp": "<n>:1004",
+      "title": null,
       "workspace_roots_json": null
     }
   ],

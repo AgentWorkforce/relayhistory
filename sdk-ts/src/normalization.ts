@@ -200,6 +200,7 @@ export function catalogSession(value: UnknownRecord): CatalogSession {
     lastActivityMs: typeof value.lastActivityMs === 'number' ? value.lastActivityMs : null,
     firstPrompt: nullableString(value.firstPrompt),
     lastAssistantText: nullableString(value.lastAssistantText),
+    title: nullableString(value.title),
     models: Array.isArray(value.models) ? value.models.map(String) : [],
     originator: nullableString(value.originator),
     agentVersion: nullableString(value.agentVersion),

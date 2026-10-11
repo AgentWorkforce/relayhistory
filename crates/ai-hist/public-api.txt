@@ -304,6 +304,7 @@ pub ai_hist::CatalogSession::repo_url: core::option::Option<alloc::string::Strin
 pub ai_hist::CatalogSession::session_id: alloc::string::String
 pub ai_hist::CatalogSession::source: ai_hist::Source
 pub ai_hist::CatalogSession::source_stamp: core::option::Option<alloc::string::String>
+pub ai_hist::CatalogSession::title: core::option::Option<alloc::string::String>
 pub ai_hist::CatalogSession::workspace_roots: alloc::vec::Vec<alloc::string::String>
 impl ai_hist::CatalogSession
 pub fn ai_hist::CatalogSession::session_ref(&self) -> ai_hist::SessionRef
@@ -766,6 +767,7 @@ pub ai_hist::ShallowSession::repo_url: core::option::Option<alloc::string::Strin
 pub ai_hist::ShallowSession::session_id: alloc::string::String
 pub ai_hist::ShallowSession::source: alloc::string::String
 pub ai_hist::ShallowSession::source_stamp: core::option::Option<alloc::string::String>
+pub ai_hist::ShallowSession::title: core::option::Option<alloc::string::String>
 pub ai_hist::ShallowSession::workspace_roots: alloc::vec::Vec<alloc::string::String>
 #[non_exhaustive] pub struct ai_hist::SourceCapabilities
 pub ai_hist::SourceCapabilities::evidence_kinds: alloc::vec::Vec<ai_hist::EvidenceKind>

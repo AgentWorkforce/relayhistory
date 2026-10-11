@@ -348,6 +348,7 @@
       "session_id": "55555555-5555-5555-5555-555555555555",
       "source": "claude",
       "source_stamp": "<n>:3927",
+      "title": null,
       "workspace_roots_json": null
     }
   ],

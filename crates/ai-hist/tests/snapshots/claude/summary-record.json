@@ -122,6 +122,7 @@
       "session_id": "summary-session",
       "source": "claude",
       "source_stamp": "<n>:945",
+      "title": null,
       "workspace_roots_json": null
     }
   ],

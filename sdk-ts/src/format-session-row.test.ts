@@ -4,7 +4,7 @@ import { formatSessionRow, InvalidArgumentError, type CatalogSession } from './i
 
 const session: CatalogSession = {
   source: 'claude', sessionId: 'session-1', cwd: '/work/demo', gitBranch: null,
-  firstActivityMs: null, lastActivityMs: 0, firstPrompt: 'Fix the search', lastAssistantText: null,
+  firstActivityMs: null, lastActivityMs: 0, firstPrompt: 'Fix the search', lastAssistantText: null, title: null,
   models: [], originator: null, agentVersion: null, repoUrl: null, initialCommit: null,
   workspaceRoots: [], rawPath: null, sourceStamp: null, discoveryState: 'shallow', fromCache: true,
   projectKey: 'github.com/AgentWorkforce/relayhistory', projectKeyMethod: 'remote',

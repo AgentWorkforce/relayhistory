@@ -701,6 +701,8 @@ const REQUIRED_SESSIONS_COLUMNS: &[&str] = &[
     // handle can serve one.
     "project_key",
     "project_key_method",
+    // The name the harness gave the session; every catalog read selects it.
+    "title",
 ];
 /// What a provider's parser reported about the session, kept with the
 /// checkpoint so a later read that parses nothing can still report it. A
@@ -1414,7 +1416,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     source_stamp TEXT,
     discovery_state TEXT,
     project_key TEXT,
-    project_key_method TEXT,
+    project_key_method TEXT, title TEXT,
     PRIMARY KEY (session_id, source)
 );
 CREATE TABLE IF NOT EXISTS session_presences (
@@ -1586,9 +1588,8 @@ END;
     ensure_text_columns(conn, "sessions", REQUIRED_SESSIONS_COLUMNS)?;
     ensure_text_columns(conn, "session_presences", REQUIRED_SESSION_PRESENCE_COLUMNS)?;
     ensure_columns(conn, "session_markers", REQUIRED_SESSION_MARKER_COLUMNS)?;
-    conn.execute(
-        "INSERT OR IGNORE INTO schema_migrations (name) VALUES ('session_markers_combined_v1')",
-        [],
+    conn.execute_batch(
+        "INSERT OR IGNORE INTO schema_migrations (name) VALUES ('session_markers_combined_v1');",
     )?;
     ensure_text_columns(
         conn,
@@ -1608,9 +1609,8 @@ END;
     // The raw-facts marker records that the columns exist; the rows are
     // backfilled by re-parsing, which HYDRATION_PARSER_VERSION forces once and
     // which a plain `sync` does once per provider.
-    conn.execute(
-        "INSERT OR IGNORE INTO schema_migrations (name) VALUES ('session_events_raw_facts_v1')",
-        [],
+    conn.execute_batch(
+        "INSERT OR IGNORE INTO schema_migrations (name) VALUES ('session_events_raw_facts_v1');",
     )?;
     // Canonical project identity (issue #175). The columns above are additive
     // and the index below is created unconditionally, so the marker records
