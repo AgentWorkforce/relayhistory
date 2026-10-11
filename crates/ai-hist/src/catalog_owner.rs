@@ -16,8 +16,10 @@ use std::path::Path;
 /// already names, and that file is still present.
 ///
 /// One stat of the stored path, and only when the paths differ. Same path, no
-/// stored path, and a stored path that is no longer a file all return false so
-/// the caller writes normally.
+/// stored path (including NULL), a shared SQLite store, and a stored path that
+/// is no longer a file all return false so the caller writes normally. A store
+/// file stays on disk after it drops a session; that session's next store
+/// claims the row.
 pub(crate) fn incoming_must_not_replace(
     conn: &Connection,
     source: &str,
@@ -27,17 +29,10 @@ pub(crate) fn incoming_must_not_replace(
     let Some(incoming) = incoming.filter(|path| !path.is_empty()) else {
         return Ok(false);
     };
-    let stored: Option<String> = conn
-        .query_row(
-            "SELECT raw_path FROM sessions WHERE source = ?1 AND session_id = ?2",
-            params![source, session_id],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let Some(stored) = stored.filter(|path| !path.is_empty()) else {
+    let Some(stored) = catalog_raw_path(conn, source, session_id)? else {
         return Ok(false);
     };
-    if stored == incoming {
+    if stored == incoming || path_is_shared_store(&stored) {
         return Ok(false);
     }
     Ok(Path::new(&stored).is_file())
@@ -53,14 +48,28 @@ pub(crate) fn recorded_path_is(
     session_id: &str,
     path: &str,
 ) -> Result<bool> {
-    let stored: Option<String> = conn
+    Ok(catalog_raw_path(conn, source, session_id)?.as_deref() == Some(path))
+}
+
+/// `raw_path` as stored, or `None` when the row is missing or the column is
+/// NULL or empty.
+fn catalog_raw_path(conn: &Connection, source: &str, session_id: &str) -> Result<Option<String>> {
+    let stored = conn
         .query_row(
             "SELECT raw_path FROM sessions WHERE source = ?1 AND session_id = ?2",
             params![source, session_id],
-            |row| row.get(0),
+            |row| row.get::<_, Option<String>>(0),
         )
         .optional()?;
-    Ok(stored.as_deref() == Some(path))
+    Ok(stored.flatten().filter(|path| !path.is_empty()))
+}
+
+/// OpenCode and Devin record the SQLite store, not one transcript per session.
+fn path_is_shared_store(path: &str) -> bool {
+    Path::new(path)
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("db") || ext.eq_ignore_ascii_case("sqlite"))
 }
 
 /// SQL fragments for a full-ingest catalog upsert.
