@@ -1353,6 +1353,7 @@ fn grok_summary_subagent_is_hidden_from_root_catalog_without_a_parent_edge() {
         vec!["child", "root"]
     );
     assert_eq!(unfiltered[0].session_kind.as_deref(), Some("subagent"));
+    assert_eq!(catalog_row(&conn, "grok", "child", true).unwrap().unwrap().session_id, "child");
     let edges: i64 = conn
         .query_row("SELECT COUNT(*) FROM session_relationships", [], |row| {
             row.get(0)
