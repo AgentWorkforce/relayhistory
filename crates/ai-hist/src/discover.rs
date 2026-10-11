@@ -4944,7 +4944,7 @@ fn discover_sessions_with_worker_limit(
                     break 'apply;
                 }
             };
-            if let Err(error) = crate::observations::upsert(
+            if let Err(error) = crate::observations::upsert_for_discovery(
                 conn,
                 &crate::observations::SessionObservation {
                     key: observation_key(provider, &session.source, &session.session_id),

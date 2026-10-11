@@ -162,7 +162,11 @@ pub(crate) fn retained_observation(
     conn: &Connection,
     key: &ObservationKey,
     incoming_locator: Option<&str>,
+    keep: bool,
 ) -> Result<Option<RetainedObservation>> {
+    if !keep {
+        return Ok(None);
+    }
     let incoming = incoming_locator.unwrap_or("");
     conn.query_row(
         "SELECT o.raw_locator, o.source_stamp, o.first_prompt, o.last_assistant_text \
