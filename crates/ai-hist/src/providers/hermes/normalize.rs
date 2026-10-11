@@ -328,7 +328,38 @@ fn is_control(m: &Message) -> bool {
 // identity or location column. Reconcile against the finalized evidence rows.
 fn reconcile_history(conn: &Connection, session: &str) -> Result<()> {
     const MATCH: &str = "e.source=history.source AND e.role='user' AND e.kind='text' AND e.control_kind IS NULL AND e.ts_ms=history.timestamp_ms AND e.text=history.prompt";
-    conn.execute(&format!("UPDATE history SET session_id=(SELECT e.session_id FROM session_events e WHERE {MATCH} ORDER BY e.session_id LIMIT 1) WHERE source=?1 AND session_id=?2 AND NOT EXISTS(SELECT 1 FROM session_events e WHERE {MATCH} AND e.session_id=?2) AND EXISTS(SELECT 1 FROM session_events e WHERE {MATCH})"),rusqlite::params![ID,session])?;
+    conn.execute(&format!("UPDATE history SET session_id=(SELECT e.session_id FROM session_events e WHERE {MATCH} ORDER BY e.session_id LIMIT 1), project=(SELECT e.cwd FROM session_events e WHERE {MATCH} ORDER BY e.session_id LIMIT 1) WHERE source=?1 AND session_id=?2 AND NOT EXISTS(SELECT 1 FROM session_events e WHERE {MATCH} AND e.session_id=?2) AND EXISTS(SELECT 1 FROM session_events e WHERE {MATCH})"),rusqlite::params![ID,session])?;
     conn.execute(&format!("DELETE FROM history WHERE source=?1 AND session_id=?2 AND NOT EXISTS(SELECT 1 FROM session_events e WHERE {MATCH})"),rusqlite::params![ID,session])?;
+    conn.execute("UPDATE history SET project=(SELECT e.cwd FROM session_events e WHERE e.source=history.source AND e.session_id=history.session_id AND e.role='user' AND e.kind='text' AND e.control_kind IS NULL AND e.ts_ms=history.timestamp_ms AND e.text=history.prompt LIMIT 1) WHERE source=?1 AND session_id=?2 AND project IS NOT (SELECT e.cwd FROM session_events e WHERE e.source=history.source AND e.session_id=history.session_id AND e.role='user' AND e.kind='text' AND e.control_kind IS NULL AND e.ts_ms=history.timestamp_ms AND e.text=history.prompt LIMIT 1)", rusqlite::params![ID,session])?;
+    Ok(())
+}
+
+pub(super) fn retire_deleted(conn: &Connection, path: &Path, sessions: &[Session]) -> Result<()> {
+    let keep = serde_json::to_string(&sessions.iter().map(|s| &s.id).collect::<Vec<_>>())?;
+    let mut stmt = conn.prepare("SELECT session_id FROM sessions WHERE source=?1 AND raw_path=?2 AND session_id NOT IN (SELECT value FROM json_each(?3))")?;
+    let absent = stmt
+        .query_map(rusqlite::params![ID, path.to_string_lossy(), keep], |r| {
+            r.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for id in absent {
+        crate::ingest::check_capture_cancelled()?;
+        for table in ["session_events", "tool_calls", "session_markers"] {
+            crate::store::retire_evidence_share(
+                conn,
+                table,
+                "source=?1 AND session_id=?2",
+                rusqlite::params![ID, id],
+                crate::SessionLocation::Local,
+            )?;
+        }
+        reconcile_history(conn, &id)?;
+        conn.execute("DELETE FROM session_hydration_checkpoints WHERE source=?1 AND session_id=?2 AND location='local'", rusqlite::params![ID,id])?;
+        conn.execute(
+            "DELETE FROM session_presences WHERE source=?1 AND session_id=?2 AND location='local'",
+            rusqlite::params![ID, id],
+        )?;
+        conn.execute("DELETE FROM sessions WHERE source=?1 AND session_id=?2 AND NOT EXISTS(SELECT 1 FROM session_presences WHERE source=?1 AND session_id=?2 AND location='remote') AND NOT EXISTS(SELECT 1 FROM session_events WHERE source=?1 AND session_id=?2) AND NOT EXISTS(SELECT 1 FROM tool_calls WHERE source=?1 AND session_id=?2) AND NOT EXISTS(SELECT 1 FROM session_markers WHERE source=?1 AND session_id=?2)", rusqlite::params![ID,id])?;
+    }
     Ok(())
 }

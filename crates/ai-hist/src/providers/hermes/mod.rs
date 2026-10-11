@@ -26,7 +26,7 @@ pub(crate) const METADATA: ProviderMetadata = ProviderMetadata {
     usage: None,
 };
 pub(crate) const ADAPTER: Option<ProviderAdapter> = Some(ProviderAdapter {
-    generation: "hermes_schema31_v1",
+    generation: "hermes_schema31_v2",
     acquire,
     sweep,
     resolve_roots: roots::resolve,
@@ -44,6 +44,7 @@ struct Session {
     parent: Option<String>,
     end_reason: Option<String>,
     started: i64,
+    latest: i64,
     ended: Option<i64>,
     messages: Vec<Message>,
 }
@@ -80,6 +81,9 @@ impl ShallowSessionProvider for Provider {
     }
     fn enumerate(&self, env: &DiscoveryEnv<'_>, limit: Option<usize>) -> Result<Vec<Candidate>> {
         storage::enumerate(&env.provider_roots, limit)
+    }
+    fn fingerprint_inputs(&self, env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
+        storage::fingerprint_inputs(&env.provider_roots)
     }
     fn read_shallow(
         &self,
@@ -118,14 +122,18 @@ fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
     // SQLite changes, including WAL writes, require a complete coherent snapshot.
     // Always re-read: this also repairs lost rows without trusting a source cursor.
     for path in storage::databases(ctx.roots)? {
+        if !storage::in_scope(&path, ctx.paths) {
+            continue;
+        }
         crate::ingest::check_capture_cancelled()?;
         let sessions = storage::all(&context, &path)?;
-        for session in sessions {
+        let tx = ctx.conn.unchecked_transaction()?;
+        for session in &sessions {
             crate::ingest::check_capture_cancelled()?;
-            let tx = ctx.conn.unchecked_transaction()?;
-            inserted += normalize::session(&tx, &session, &path)?;
-            tx.commit()?;
+            inserted += normalize::session(&tx, session, &path)?;
         }
+        normalize::retire_deleted(&tx, &path, &sessions)?;
+        tx.commit()?;
     }
     Ok(SweepResult {
         inserted,

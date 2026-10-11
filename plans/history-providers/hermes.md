@@ -159,3 +159,36 @@ proved resolution to this checkout. `RELAYHISTORY_FIXTURES=/private/tmp/relayhis
 passed: six stock synthetic sessions, five usage rows and 104 change-feed records.
 The stock consumer exercises Claude/Codex; Hermes-specific evidence is proved
 by the public conformance test above. No repository example or lockfile changed.
+
+Review corrections (schema-31 parser generation v2): discovery uses latest message
+activity and globally ranks candidates across profiles before applying the limit.
+Fingerprint inputs stat only the database, WAL and rollback journal, without opening
+SQLite. Changed-path sweeps select the database/profile named by a database,
+sidecar or ancestor event. Each selected complete database snapshot commits
+normalization and native-session deletion reconciliation in one ledger transaction;
+unread, missing and unvisited profiles cannot retire prior evidence. Remote evidence
+and remote session presence survive local deletion. Shallow prompt controls match
+full normalization, and prompt ownership/cwd rewrites refresh the project search
+projection, including a surviving fork with a different or cleared cwd.
+
+Reverting prompt controls, deleted-session reconciliation and project refresh causes
+three named regressions to fail: `shallow_prompt_excludes_undone_async_and_observed_controls_like_full_capture`,
+`deleted_sessions_retire_only_after_complete_selected_profile_capture`, and
+`prompt_project_follows_final_owner_and_cwd_rewrites`. Restoring the fixes passes
+all 22 Hermes unit tests and public history conformance. The stat-only fingerprint
+regression uses a deliberately corrupt database: fingerprints still succeed while
+SQLite discovery rejects it, distinguishing metadata polling from hidden reads.
+
+Reverting global profile ranking and retiring disappeared sessions before new
+surviving evidence causes exactly two further failures:
+`discovery_ranks_profiles_by_latest_message_and_fingerprint_never_opens_sqlite`
+and `replacement_snapshot_preserves_shared_prompt_identity_and_new_owner_project`.
+The replacement regression proves that a newly observed fork retains the prior
+prompt row ID and projects its own cwd. Surviving sessions normalize before local
+absence reconciliation within the same database transaction.
+
+Affected validation: 22 Hermes units, one public conformance test, 66 corpus tests,
+10 registry tests and the sourcing documentation population check pass. Generator
+check (8 tests), public API (949 items), formatting, Clippy and rust-oleum pass.
+The worktree-local native addon and SDK rebuild pass the strict SDK/CLI/MCP smoke.
+Only Hermes snapshot source stamps change for parser generation v2.

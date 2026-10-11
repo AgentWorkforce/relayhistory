@@ -140,7 +140,7 @@ fn sessions(
     native: Option<&str>,
 ) -> Result<Vec<Session>> {
     let profile = profile(roots, path);
-    let mut stmt = conn.prepare("SELECT id,title,model,cwd,git_branch,parent_session_id,end_reason,started_at,ended_at FROM sessions WHERE (?1 IS NULL OR id=?1) ORDER BY started_at DESC,id LIMIT ?2")?;
+    let mut stmt = conn.prepare("SELECT id,title,model,cwd,git_branch,parent_session_id,end_reason,started_at,ended_at, max(started_at,coalesce(ended_at,started_at),coalesce((SELECT max(timestamp) FROM messages WHERE session_id=sessions.id),started_at)) AS latest FROM sessions WHERE (?1 IS NULL OR id=?1) ORDER BY latest DESC,id LIMIT ?2")?;
     let rows = stmt.query_map(rusqlite::params![native, limit as i64], |r| {
         Ok((
             r.get::<_, String>(0)?,
@@ -152,12 +152,14 @@ fn sessions(
             r.get(6)?,
             r.get::<_, f64>(7)?,
             r.get::<_, Option<f64>>(8)?,
+            r.get::<_, f64>(9)?,
         ))
     })?;
     let mut result = vec![];
     for row in rows {
         check_capture_cancelled()?;
-        let (native_id, title, model, cwd, git_branch, parent, end_reason, started, ended) = row?;
+        let (native_id, title, model, cwd, git_branch, parent, end_reason, started, ended, latest) =
+            row?;
         ensure!(
             !native_id.trim().is_empty(),
             "empty Hermes session identity"
@@ -173,6 +175,7 @@ fn sessions(
             parent,
             end_reason,
             started: timestamp(started)?,
+            latest: timestamp(latest)?,
             ended: ended.map(timestamp).transpose()?,
             messages: vec![],
         });
@@ -249,7 +252,7 @@ pub(super) fn enumerate(roots: &ProviderRoots, limit: Option<usize>) -> Result<V
                 source: ID,
                 locator: path.to_string_lossy().into_owned(),
                 session_id: Some(s.id),
-                recency_hint_ms: s.ended.or(Some(s.started)),
+                recency_hint_ms: Some(s.latest),
                 stamp: stamp.clone(),
             });
         }
@@ -258,6 +261,11 @@ pub(super) fn enumerate(roots: &ProviderRoots, limit: Option<usize>) -> Result<V
         candidates.len() <= MAX_SESSIONS,
         "Hermes discovery exceeds safety limit"
     );
+    candidates.sort_by(|a, b| {
+        b.recency_hint_ms
+            .cmp(&a.recency_hint_ms)
+            .then_with(|| a.session_id.cmp(&b.session_id))
+    });
     candidates.truncate(limit.unwrap_or(MAX_SESSIONS));
     Ok(candidates)
 }
@@ -280,7 +288,7 @@ pub(super) fn shallow(scan: &ScanEnv<'_>, c: &Candidate) -> Result<Option<Shallo
         };
         scan.note_records(1);
         scan.note_query();
-        let prompt = conn.query_row("SELECT substr(content,1,512) FROM messages WHERE session_id=? AND role='user' AND _compressed_summary=0 AND observed=0 AND (display_kind IS NULL OR display_kind != 'hidden') ORDER BY id LIMIT 1", [&s.native_id], |r| r.get::<_,Option<String>>(0)).optional()?.flatten();
+        let prompt = first_prompt(conn, &s.native_id)?;
         Ok(Some(ShallowSession {
             source: ID.into(),
             session_id: s.id,
@@ -290,7 +298,7 @@ pub(super) fn shallow(scan: &ScanEnv<'_>, c: &Candidate) -> Result<Option<Shallo
             models: s.model.into_iter().collect(),
             first_prompt: prompt,
             first_activity_ms: Some(s.started),
-            last_activity_ms: s.ended.or(Some(s.started)),
+            last_activity_ms: Some(s.latest),
             raw_path: Some(c.locator.clone()),
             source_stamp: Some(c.stamp.clone()),
             discovery_state: "shallow".into(),
@@ -353,7 +361,7 @@ fn native_id(id: &str) -> Result<String> {
     );
     let bytes = encoded
         .as_bytes()
-        .chunks_exact(2)
+        .chunks(2)
         .map(|pair| {
             let text = std::str::from_utf8(pair)?;
             Ok(u8::from_str_radix(text, 16)?)
@@ -366,4 +374,40 @@ fn sidecar(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
     name.push(suffix);
     PathBuf::from(name)
+}
+
+pub(super) fn fingerprint_inputs(roots: &ProviderRoots) -> Result<Vec<Candidate>> {
+    let context = AcquisitionContext::new(ID, roots);
+    let mut result = vec![];
+    for db in databases(roots)? {
+        for suffix in ["", "-wal", "-journal"] {
+            let path = sidecar(&db, suffix);
+            if path.try_exists()? {
+                context.validate(&path)?;
+                let (stamp, modified) = crate::file_stamp_and_modified(&path)?;
+                result.push(Candidate {
+                    source: ID,
+                    locator: path.to_string_lossy().into_owned(),
+                    session_id: None,
+                    recency_hint_ms: modified,
+                    stamp,
+                });
+            }
+        }
+    }
+    Ok(result)
+}
+pub(super) fn in_scope(path: &Path, scope: Option<&crate::ingest::path_scope::PathScope>) -> bool {
+    scope.is_none_or(|scope| {
+        scope.paths().iter().any(|changed| {
+            path.starts_with(changed)
+                || ["", "-wal", "-shm", "-journal"]
+                    .iter()
+                    .any(|suffix| *changed == sidecar(path, suffix))
+        })
+    })
+}
+
+pub(super) fn first_prompt(conn: &Connection, native: &str) -> Result<Option<String>> {
+    Ok(conn.query_row("SELECT substr(content,1,512) FROM messages WHERE session_id=? AND role='user' AND content IS NOT NULL AND _compressed_summary=0 AND observed=0 AND (active=1 OR compacted=1) AND (display_kind IS NULL OR display_kind NOT IN ('hidden','async_delegation_complete')) ORDER BY id LIMIT 1", [native], |r| r.get::<_,Option<String>>(0)).optional()?.flatten())
 }

@@ -342,12 +342,31 @@ fn prompt_rewrites_remove_stale_search_text_but_keep_shared_prompt_owners() {
     let mut child = sessions.remove(0);
     child.messages =
         serde_json::from_value(serde_json::to_value(&parent.messages).unwrap()).unwrap();
+    child.cwd = Some("/fork/project".into());
     normalize::session(&conn, &parent, &path).unwrap();
     normalize::session(&conn, &child, &path).unwrap();
     parent.messages[0].content = Some("Rewritten human request".into());
     normalize::session(&conn, &parent, &path).unwrap();
     let owner:String=conn.query_row("SELECT session_id FROM history WHERE source='hermes' AND prompt='Find the Hermes fixture needle'",[],|r|r.get(0)).unwrap();
     assert_eq!(owner, child.id);
+    let project: Option<String> = conn
+        .query_row(
+            "SELECT project FROM history WHERE prompt='Find the Hermes fixture needle'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(project.as_deref(), Some("/fork/project"));
+    child.cwd = None;
+    normalize::session(&conn, &child, &path).unwrap();
+    let project: Option<String> = conn
+        .query_row(
+            "SELECT project FROM history WHERE prompt='Find the Hermes fixture needle'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(project, None);
     child.messages.remove(0);
     normalize::session(&conn, &child, &path).unwrap();
     let old:i64=conn.query_row("SELECT count(*) FROM history WHERE source='hermes' AND prompt='Find the Hermes fixture needle'",[],|r|r.get(0)).unwrap();
@@ -429,4 +448,229 @@ fn cancellation_inside_normalization_rolls_back_partial_evidence() {
         .query_row("SELECT count(*) FROM session_markers", [], |r| r.get(0))
         .unwrap();
     assert_eq!(rows, 0, "cancelled session writes must roll back");
+}
+
+#[test]
+fn discovery_ranks_profiles_by_latest_message_and_fingerprint_never_opens_sqlite() {
+    let (home, roots, path, db) = fixture();
+    let profile = home.path().join(".hermes/profiles/new/state.db");
+    std::fs::create_dir_all(profile.parent().unwrap()).unwrap();
+    let other = Connection::open(&profile).unwrap();
+    other.execute_batch(SQL).unwrap();
+    other
+        .execute("UPDATE messages SET timestamp=9999999999 WHERE id=1", [])
+        .unwrap();
+    let ranked = storage::enumerate(&roots, Some(1)).unwrap();
+    assert_eq!(ranked.len(), 1);
+    assert_eq!(ranked[0].locator, profile.to_string_lossy());
+    assert_eq!(ranked[0].recency_hint_ms, Some(9999999999000));
+    db.execute("UPDATE messages SET timestamp=99999999999 WHERE id=1", [])
+        .unwrap();
+    let latest = storage::enumerate(&roots, Some(1)).unwrap();
+    assert_eq!(latest[0].locator, path.to_string_lossy());
+    drop(db);
+    std::fs::write(path, b"not sqlite").unwrap();
+    assert!(!storage::fingerprint_inputs(&roots).unwrap().is_empty());
+    assert!(storage::enumerate(&roots, None).is_err());
+}
+
+#[test]
+fn deleted_sessions_retire_only_after_complete_selected_profile_capture() {
+    let (home, roots, path, db) = fixture();
+    let conn = crate::open_db(&home.path().join("ledger.db")).unwrap();
+    let mut state = serde_json::Map::new();
+    let repairs = crate::ingest::SweepRepairs::default();
+    let run = |state: &mut serde_json::Map<String, Value>, paths| {
+        sweep(SweepContext {
+            conn: &conn,
+            state,
+            roots: &roots,
+            paths,
+            repairs: &repairs,
+        })
+    };
+    run(&mut state, None).unwrap();
+    conn.execute(
+        "UPDATE session_events SET location='both' WHERE session_id=?1 AND event_uid='1:text'",
+        [SESSION],
+    )
+    .unwrap();
+    crate::mark_session_presence(&conn, ID, SESSION, crate::SessionLocation::Remote).unwrap();
+    db.execute("DELETE FROM messages WHERE session_id=?1", [NATIVE])
+        .unwrap();
+    db.execute(
+        "UPDATE sessions SET parent_session_id=NULL WHERE parent_session_id=?1",
+        [NATIVE],
+    )
+    .unwrap();
+    db.execute("DELETE FROM sessions WHERE id=?1", [NATIVE])
+        .unwrap();
+    let unrelated =
+        crate::ingest::path_scope::PathScope::from_paths([home.path().join("unrelated/state.db")])
+            .unwrap();
+    run(&mut state, Some(&unrelated)).unwrap();
+    assert!(crate::session_locations(&conn, ID, SESSION)
+        .unwrap()
+        .contains(&"local".into()));
+    let wal =
+        crate::ingest::path_scope::PathScope::from_paths([path.with_file_name("state.db-wal")])
+            .unwrap();
+    run(&mut state, Some(&wal)).unwrap();
+    assert_eq!(
+        crate::session_locations(&conn, ID, SESSION).unwrap(),
+        ["remote"]
+    );
+    let location: String = conn
+        .query_row(
+            "SELECT location FROM session_events WHERE session_id=?1 AND event_uid='1:text'",
+            [SESSION],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(location, "remote");
+    db.execute_batch("DELETE FROM messages; DELETE FROM sessions")
+        .unwrap();
+    db.execute("UPDATE schema_version SET version=32", [])
+        .unwrap();
+    run(&mut state, Some(&unrelated)).unwrap();
+    assert!(run(&mut state, None).is_err());
+    let retained: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sessions WHERE session_id != ?1",
+            [SESSION],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(retained, 1);
+    db.execute("UPDATE schema_version SET version=31", [])
+        .unwrap();
+    run(&mut state, None).unwrap();
+    for table in [
+        "sessions",
+        "session_events",
+        "tool_calls",
+        "session_markers",
+        "history",
+    ] {
+        let remaining: i64 = conn
+            .query_row(
+                &format!("SELECT count(*) FROM {table} WHERE source='hermes' AND session_id != ?1"),
+                [SESSION],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            remaining, 0,
+            "local-only deleted session remains in {table}"
+        );
+    }
+}
+
+#[test]
+fn prompt_project_follows_final_owner_and_cwd_rewrites() {
+    let (home, roots, path, _db) = fixture();
+    let conn = crate::open_db(&home.path().join("ledger.db")).unwrap();
+    let mut s = storage::all(&AcquisitionContext::new(ID, &roots), &path)
+        .unwrap()
+        .into_iter()
+        .find(|s| s.native_id == NATIVE)
+        .unwrap();
+    normalize::session(&conn, &s, &path).unwrap();
+    s.cwd = Some("/changed/project".into());
+    normalize::session(&conn, &s, &path).unwrap();
+    let project: String = conn
+        .query_row(
+            "SELECT project FROM history WHERE session_id=?1",
+            [SESSION],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(project, "/changed/project");
+}
+
+#[test]
+fn shallow_prompt_excludes_undone_async_and_observed_controls_like_full_capture() {
+    let (home, roots, path, db) = fixture();
+    let conn = crate::open_db(&home.path().join("ledger.db")).unwrap();
+    for assignments in [
+        "active=0,compacted=0",
+        "display_kind='async_delegation_complete'",
+        "observed=1",
+        "_compressed_summary=1",
+        "display_kind='hidden'",
+    ] {
+        db.execute("UPDATE messages SET active=1,compacted=0,display_kind=NULL,observed=0,_compressed_summary=0 WHERE id=1", []).unwrap();
+        db.execute(&format!("UPDATE messages SET {assignments} WHERE id=1"), [])
+            .unwrap();
+        let s = storage::all(&AcquisitionContext::new(ID, &roots), &path)
+            .unwrap()
+            .into_iter()
+            .find(|s| s.native_id == NATIVE)
+            .unwrap();
+        normalize::session(&conn, &s, &path).unwrap();
+        let full: Option<String> = conn
+            .query_row(
+                "SELECT first_prompt FROM sessions WHERE session_id=?1",
+                [SESSION],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(storage::first_prompt(&db, NATIVE).unwrap(), full);
+        assert_eq!(full.as_deref(), Some("Continue after restart."));
+    }
+    db.execute("UPDATE messages SET active=0,compacted=1,display_kind=NULL,observed=0,_compressed_summary=0 WHERE id=1", []).unwrap();
+    assert_eq!(
+        storage::first_prompt(&db, NATIVE).unwrap().as_deref(),
+        Some("Find the Hermes fixture needle")
+    );
+}
+
+#[test]
+fn replacement_snapshot_preserves_shared_prompt_identity_and_new_owner_project() {
+    let (home, roots, _path, db) = fixture();
+    let conn = crate::open_db(&home.path().join("ledger.db")).unwrap();
+    let mut state = serde_json::Map::new();
+    let repairs = crate::ingest::SweepRepairs::default();
+    let run = |state: &mut serde_json::Map<String, Value>| {
+        sweep(SweepContext {
+            conn: &conn,
+            state,
+            roots: &roots,
+            paths: None,
+            repairs: &repairs,
+        })
+    };
+    run(&mut state).unwrap();
+    let before: i64 = conn
+        .query_row(
+            "SELECT id FROM history WHERE prompt='Find the Hermes fixture needle'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    db.execute("UPDATE sessions SET parent_session_id=NULL", [])
+        .unwrap();
+    db.execute_batch("BEGIN; PRAGMA defer_foreign_keys=ON")
+        .unwrap();
+    db.execute(
+        "UPDATE sessions SET id='replacement',cwd='/replacement' WHERE id=?1",
+        [NATIVE],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE messages SET session_id='replacement' WHERE session_id=?1",
+        [NATIVE],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE session_model_usage SET session_id='replacement' WHERE session_id=?1",
+        [NATIVE],
+    )
+    .unwrap();
+    db.execute_batch("COMMIT").unwrap();
+    run(&mut state).unwrap();
+    let (id, owner, project): (i64, String, String) = conn.query_row("SELECT id,session_id,project FROM history WHERE prompt='Find the Hermes fixture needle'", [], |r|Ok((r.get(0)?,r.get(1)?,r.get(2)?))).unwrap();
+    assert_eq!(id, before);
+    assert_eq!(owner, "default:7265706c6163656d656e74");
+    assert_eq!(project, "/replacement");
 }
