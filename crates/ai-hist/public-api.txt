@@ -705,6 +705,8 @@ pub fn ai_hist::SessionStore::delegated_by(&self, &ai_hist::SessionIdentity) -> 
 pub fn ai_hist::SessionStore::delegated_descendants(&self, &[ai_hist::SessionIdentity]) -> core::result::Result<alloc::vec::Vec<ai_hist::SessionIdentity>, ai_hist::Error>
 pub fn ai_hist::SessionStore::has_session(&self, &ai_hist::SessionIdentity) -> core::result::Result<bool, ai_hist::Error>
 pub fn ai_hist::SessionStore::session_identities(&self, ai_hist::IdentityQuery) -> core::result::Result<alloc::vec::Vec<ai_hist::SessionIdentity>, ai_hist::Error>
+impl ai_hist::SessionStore
+pub fn ai_hist::SessionStore::resumes_from(&self, ai_hist::Watermark, &ai_hist::ChangeQuery) -> core::result::Result<bool, ai_hist::Error>
 pub struct ai_hist::SessionToolCall
 pub ai_hist::SessionToolCall::args_json: core::option::Option<alloc::string::String>
 pub ai_hist::SessionToolCall::id: i64

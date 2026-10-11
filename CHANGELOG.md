@@ -4,7 +4,15 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Patch]
+
+### Fixed
+
+- Retiring a fed kind no longer makes every change-feed consumer replay the store: a watermark or named cursor over named kinds keeps resuming across the new epoch, since nothing is renumbered and it cannot include the retired kind; only consumers of every kind, which may hold the retired kind's rows, resync. A store that retires a kind under this release keeps those positions; one that 0.39.0 already reset has no record to resume from.
+
+### Rust API
+
+- Added `SessionStore::resumes_from(Watermark, &ChangeQuery) -> Result<bool, Error>`, whether `changes_since` would resume that query from that watermark rather than fail with `WatermarkAheadOfStore`.
 
 ## [0.39.0] - 2026-10-10
 

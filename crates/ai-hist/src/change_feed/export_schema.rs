@@ -178,16 +178,17 @@ pub(super) fn reconcile_export_schema(conn: &Connection, identity_existed: bool)
         .as_ref()
         .is_some_and(|previous| exported_kind_removed(previous, &current));
     if identity_existed && removed {
-        // A removed kind has no live table left to restamp and emit. Reset the
-        // semantic stream so a full reconciliation can remove that retired
-        // material. Ordinary shape changes never take this store-wide path.
-        conn.execute_batch(
-            "UPDATE change_feed_store
-             SET epoch = CASE WHEN epoch = 9223372036854775807
-                              THEN -9223372036854775807 ELSE epoch + 2 END
-             WHERE singleton=1;
-             DELETE FROM consumer_cursors;",
-        )?;
+        // A removed kind has no live table left to restamp and emit: a new
+        // epoch makes every-kind consumers, which may hold its rows, resync,
+        // while consumers of named kinds keep their positions. Ordinary shape
+        // changes never take this path.
+        let removed: Vec<String> = previous
+            .iter()
+            .flat_map(|previous| previous.keys())
+            .filter(|kind| !current.contains_key(*kind))
+            .cloned()
+            .collect();
+        super::epochs::retire_kinds(conn, &removed)?;
     } else if identity_existed {
         for kind in ChangeKind::ALL {
             let Some(previous) = previous.as_ref() else {
