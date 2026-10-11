@@ -137,3 +137,45 @@ After the correction, all 10 Pi unit tests, 5 public acceptance tests, 66 corpus
 cases and 10 registry tests pass. Formatting, Clippy, generator (8 tests),
 rust-oleum, rebuilt native contract 26 and strict SDK/CLI/MCP smoke pass.
 Independent review found no remaining blocking findings.
+
+## Review hardening (2026-10-11)
+
+Discovery now enumerates only paths and filesystem metadata. Bad, unsupported,
+or incomplete sibling files produce locator diagnostics during shallow reads;
+they cannot abort enumeration of a valid session. The sweep similarly reports
+per-file unread evidence and leaves invalid or partial files retryable.
+
+Each completed transcript carries a provider-owned stamp, native session ID and
+normalizer generation in sync state. Unchanged files skip normalization even
+when another provider changes. Scoped ticks retain unvisited file stamps;
+full walks discard stale locator entries. Destination repair requests bypass
+these stamps, and a missing catalog row also prevents a cached skip. Parser
+refresh uses `pi_v3_3` for unchanged source bytes.
+
+Finalized shared-prompt reassignment updates its project from the same surviving
+ordered user projection as its owner. SQL updates trigger the existing FTS
+project refresh. The NULL-project regression models destination evidence with
+unknown cwd without relaxing the required upstream v3 header field. Same-session
+remote shares and multiblock fork ownership retain their earlier protection.
+
+Tool-call events expose the native ID in public `Block.tool_use_id`, matching
+the tool ledger. Empty and tool-only assistant turns preserve the last readable
+assistant preview; a complete rewrite removing all prose clears that preview.
+
+Negative controls: restoring the pre-fix Pi discovery/sweep and normalizer
+makes six targeted tests fail (bad siblings, scoped stamp retention, unchanged
+file skip, two fork-project cases and public tool identity). Restoring only the
+preview overwrite makes the readable-preview assertion fail with an empty
+string. These controls distinguish correct behavior from a passing fixture.
+
+Fresh duplicate native IDs are checked through catalog-aware shallow reads,
+so two previously unseen files cannot race and replace the chosen locator.
+That regression first fails with two discoveries before the serial catalog
+check, then passes with one discovery and one locator diagnostic.
+
+Validation for this hardening: 16 Pi module regressions, 6 public Pi tests,
+66 corpus cases, 10 registry tests and the SDK population-doc assertion pass.
+The Pi snapshot changes only native tool IDs and the `pi_v3_3` acquisition
+stamps. Provider generation checks (8 tests), formatting, workspace Clippy,
+rust-oleum without baseline changes, public API (949 items), rebuilt native
+contract 26 and the strict SDK/CLI/MCP smoke all pass.

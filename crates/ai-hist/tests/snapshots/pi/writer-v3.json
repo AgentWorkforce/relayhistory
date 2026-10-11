@@ -157,7 +157,7 @@
       "subagent_session_id": null,
       "text": "{\"arguments\":{\"path\":\"greeting.txt\"},\"id\":\"call-fixture\",\"name\":\"read\",\"type\":\"toolCall\"}",
       "token_json": "{\"cacheRead\":7,\"cacheWrite\":2,\"cost\":{\"cacheRead\":0.0001,\"cacheWrite\":0.0002,\"input\":0.001,\"output\":0.002,\"total\":0.0033},\"input\":20,\"output\":5,\"totalTokens\":34}",
-      "tool_use_id": null,
+      "tool_use_id": "call-fixture",
       "ts_ms": 1700000002000
     },
     {
@@ -397,7 +397,7 @@
       "subagent_session_id": null,
       "text": "{\"arguments\":{\"path\":\"greeting.txt\"},\"id\":\"call-fixture\",\"name\":\"read\",\"type\":\"toolCall\"}",
       "token_json": "{\"cacheRead\":7,\"cacheWrite\":2,\"cost\":{\"cacheRead\":0.0001,\"cacheWrite\":0.0002,\"input\":0.001,\"output\":0.002,\"total\":0.0033},\"input\":20,\"output\":5,\"totalTokens\":34}",
-      "tool_use_id": null,
+      "tool_use_id": "call-fixture",
       "ts_ms": 1700000002000
     },
     {
@@ -645,7 +645,7 @@
       "repo_url": null,
       "session_id": "custom-fork-session",
       "source": "pi",
-      "source_stamp": "pi_v3_2:sha256:2ceca70d03a3150287b96d8afc785879dc16c7b5c53a521319be5224be179dd6",
+      "source_stamp": "pi_v3_3:sha256:2ceca70d03a3150287b96d8afc785879dc16c7b5c53a521319be5224be179dd6",
       "title": "Synthetic Pi history",
       "workspace_roots_json": null
     },
@@ -665,7 +665,7 @@
       "repo_url": null,
       "session_id": "custom-history-session",
       "source": "pi",
-      "source_stamp": "pi_v3_2:sha256:62deef92497d9b675fe71b9ce8fcb<n>da45af26bc2a0dc747c9",
+      "source_stamp": "pi_v3_3:sha256:62deef92497d9b675fe71b9ce8fcb<n>da45af26bc2a0dc747c9",
       "title": "Synthetic Pi history",
       "workspace_roots_json": null
     }

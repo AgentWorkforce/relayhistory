@@ -148,9 +148,14 @@ fn pi_missing_empty_unsupported_malformed_and_collision_are_truthful() {
         FIXTURE.replacen("\"version\":3", "\"version\":99", 1),
     )
     .unwrap();
-    assert!(store
+    let result = store
         .discover(DiscoveryOptions::default().sources([Source::Pi]))
-        .is_err());
+        .unwrap();
+    assert_eq!(result.discovered, 0);
+    assert!(result
+        .diagnostics
+        .iter()
+        .any(|d| d.message.contains("PI_UNSUPPORTED_SCHEMA")));
     std::fs::write(&path, FIXTURE).unwrap();
     store
         .discover(DiscoveryOptions::default().sources([Source::Pi]))
@@ -162,11 +167,15 @@ fn pi_missing_empty_unsupported_malformed_and_collision_are_truthful() {
         FIXTURE.replace("Hello fixture", "WRONG PROFILE"),
     )
     .unwrap();
+    let result = store
+        .discover(DiscoveryOptions::default().sources([Source::Pi]))
+        .unwrap();
     assert!(
-        store
-            .discover(DiscoveryOptions::default().sources([Source::Pi]))
-            .is_err(),
-        "duplicate native ID must be diagnosed"
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.message.contains("PI_ID_COLLISION")),
+        "duplicate native ID must be diagnosed per file"
     );
     store.sync(SyncOptions::default().force(true)).unwrap();
     assert!(has(&read(&store), "The greeting says Hello fixture."));
@@ -188,9 +197,14 @@ fn pi_symlink_escape_is_never_read() {
     std::fs::remove_file(&path).unwrap();
     std::os::unix::fs::symlink(&secret, &path).unwrap();
     let store = open(home.path());
-    assert!(store
+    let result = store
         .discover(DiscoveryOptions::default().sources([Source::Pi]))
-        .is_err());
+        .unwrap();
+    assert_eq!(result.discovered, 0);
+    assert!(result
+        .diagnostics
+        .iter()
+        .any(|d| d.message.contains("SESSION_SOURCE_MISMATCH")));
 }
 
 #[test]
@@ -235,4 +249,32 @@ fn pi_messages_match_independent_upstream_reader_oracle() {
             }
         }
     }
+}
+
+#[test]
+fn pi_fresh_native_identity_collision_is_a_per_file_diagnostic() {
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path());
+    std::fs::write(
+        path.with_file_name("duplicate.jsonl"),
+        FIXTURE.replace("Hello fixture", "OTHER FILE"),
+    )
+    .unwrap();
+    let store = open(home.path());
+    let result = store
+        .discover(DiscoveryOptions::default().sources([Source::Pi]))
+        .unwrap();
+    assert_eq!(result.discovered, 1);
+    assert_eq!(result.diagnostics.len(), 1);
+    assert!(result.diagnostics[0].message.contains("PI_ID_COLLISION"));
+    let original_path = read(&store).session.raw_path;
+    let unchanged = store
+        .discover(DiscoveryOptions::default().sources([Source::Pi]))
+        .unwrap();
+    assert_eq!(unchanged.diagnostics.len(), 1);
+    assert_eq!(
+        read(&store).session.raw_path,
+        original_path,
+        "collision must not overwrite chosen catalog locator"
+    );
 }

@@ -32,7 +32,7 @@ pub(crate) const METADATA: ProviderMetadata = ProviderMetadata {
     }),
 };
 pub(crate) const ADAPTER: Option<ProviderAdapter> = Some(ProviderAdapter {
-    generation: "pi_v3_2",
+    generation: "pi_v3_3",
     acquire,
     sweep,
     resolve_roots,
@@ -99,7 +99,6 @@ impl ShallowSessionProvider for Provider {
     }
     fn enumerate(&self, env: &DiscoveryEnv<'_>, _: Option<usize>) -> Result<Vec<Candidate>> {
         let mut out = Vec::new();
-        let mut identities = std::collections::BTreeMap::new();
         for root in env.provider_roots.for_provider(ID) {
             if env.path_scope().is_some_and(|s| !s.mentions(root)) {
                 continue;
@@ -113,22 +112,6 @@ impl ShallowSessionProvider for Provider {
             for path in
                 crate::ingest::collect_matching_files_scoped(root, "", "jsonl", env.path_scope())?
             {
-                let context = AcquisitionContext::new(ID, &env.provider_roots);
-                let bytes = prefix(&context, &path)?;
-                env.scan().note_open();
-                env.scan().note_bytes(bytes.len() as u64);
-                let entries = format::parse(&bytes, true)?;
-                env.scan().note_records(entries.len() as u64);
-                let sid = format::string(&entries[0], "id")?;
-                normalize::check_identity(env.conn(), sid, &path)?;
-                if let Some(previous) = identities.insert(sid.to_owned(), path.clone()) {
-                    anyhow::ensure!(
-                        previous == path,
-                        "PI_ID_COLLISION: {sid:?} at {} conflicts with {}",
-                        path.display(),
-                        previous.display()
-                    );
-                }
                 let (stamp, recency_hint_ms) = crate::file_stamp_and_modified(&path)?;
                 out.push(Candidate {
                     source: ID,
@@ -142,6 +125,11 @@ impl ShallowSessionProvider for Provider {
         out.sort_by(|a, b| a.locator.cmp(&b.locator));
         out.dedup_by(|a, b| a.locator == b.locator);
         Ok(out)
+    }
+    fn read_access(&self) -> crate::discover::ShallowReadAccess {
+        // Native identity ownership must be checked against each preceding
+        // catalog write, including two files in a fresh discovery run.
+        crate::discover::ShallowReadAccess::Catalog
     }
     fn read_shallow(
         &self,
@@ -252,10 +240,42 @@ fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
     let env = DiscoveryEnv::with_provider_roots(ctx.conn, ctx.roots.clone())
         .with_path_scope(ctx.paths.cloned());
     let mut result = SweepResult::default();
-    for candidate in Provider.enumerate(&env, None)? {
+    let cache_key = "pi_file_stamps";
+    let mut cache = ctx
+        .state
+        .get(cache_key)
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let candidates = Provider.enumerate(&env, None)?;
+    if ctx.paths.is_none() {
+        let visited: std::collections::BTreeSet<_> =
+            candidates.iter().map(|c| c.locator.as_str()).collect();
+        cache.retain(|path, _| visited.contains(path.as_str()));
+    }
+    for candidate in candidates {
         crate::ingest::check_capture_cancelled()?;
         let path = Path::new(&candidate.locator);
-        let ingest = || -> Result<(usize, bool)> {
+        let generation = ADAPTER.unwrap().generation;
+        if let Some(previous) = cache.get(&candidate.locator) {
+            if previous["stamp"].as_str() == Some(&candidate.stamp)
+                && previous["generation"].as_str() == Some(generation)
+                && previous["sid"]
+                    .as_str()
+                    .is_some_and(|sid| !ctx.repairs.contains(ID, sid))
+            {
+                let sid = previous["sid"].as_str().unwrap();
+                let present: bool = ctx.conn.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM sessions WHERE source='pi' AND session_id=?1)",
+                    [sid],
+                    |r| r.get(0),
+                )?;
+                if present {
+                    continue;
+                }
+            }
+        }
+        let ingest = || -> Result<(usize, bool, String)> {
             let snapshot = snapshot(path, &AcquisitionContext::new(ID, ctx.roots))?;
             let tx = ctx.conn.unchecked_transaction()?;
             let inserted = normalize::write(&tx, &snapshot.payload, path)?;
@@ -265,19 +285,27 @@ fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
                 snapshot.payload["tail"]
                     .as_array()
                     .is_some_and(|a| !a.is_empty()),
+                format::string(&snapshot.payload["entries"][0], "id")?.to_owned(),
             ))
         };
         match ingest() {
-            Ok((n, partial)) => {
+            Ok((n, partial, sid)) => {
+                if partial {
+                    cache.remove(&candidate.locator);
+                } else {
+                    cache.insert(candidate.locator.clone(), serde_json::json!({"stamp": candidate.stamp, "generation": generation, "sid": sid}));
+                }
                 result.inserted += n;
                 result.unread += u64::from(partial);
             }
             Err(error) => {
                 crate::ingest::check_capture_cancelled()?;
                 eprintln!("Pi {}: {error:#}", path.display());
+                cache.remove(&candidate.locator);
                 result.unread += 1;
             }
         }
     }
+    ctx.state.insert(cache_key.into(), Value::Object(cache));
     Ok(result)
 }

@@ -57,7 +57,10 @@ pub(super) fn write(conn: &Connection, payload: &Value, path: &Path) -> Result<u
         if entry["type"] == "message" {
             inserted += message(conn, sid, cwd, entry, &mut keys)?;
             if entry["message"]["role"] == "assistant" {
-                assistant = Some(format::text(&entry["message"]["content"]));
+                let text = format::text(&entry["message"]["content"]);
+                if !text.trim().is_empty() {
+                    assistant = Some(text);
+                }
             }
         } else {
             marker(conn, sid, entry, format::string(entry, "id")?, &mut keys)?;
@@ -211,11 +214,16 @@ fn content(conn: &Connection, base: &EventRow<'_>, value: &Value, keys: &mut Key
                 continue;
             }
         };
+        let facts = ToolResultFacts {
+            tool_use_id: (kind == "tool_use").then(|| block["id"].as_str().unwrap().to_owned()),
+            ..Default::default()
+        };
         insert_session_event(
             conn,
             &EventRow {
                 event_uid: &uid,
                 kind,
+                tool_result_facts: Some(&facts),
                 text: text.as_deref(),
                 ..*base
             },
@@ -352,7 +360,8 @@ fn reconcile_prompts(conn: &Connection, sid: &str, keep: &str) -> Result<()> {
            AND b.role = 'user' AND b.kind = 'text' \
            ORDER BY CAST(substr(b.event_uid, length(b.message_id) + 2) AS INTEGER))) = history.prompt \
         ORDER BY (e.session_id = ?1) DESC, e.session_id LIMIT 1";
-    conn.execute(&format!("UPDATE history SET session_id = ({reference}) \
+    let project = reference.replacen("SELECT e.session_id", "SELECT e.project", 1);
+    conn.execute(&format!("UPDATE history SET project = ({project}), session_id = ({reference}) \
         WHERE source = 'pi' AND session_id = ?1 \
         AND (timestamp_ms || ':' || coalesce(prompt_hash, '')) NOT IN (SELECT value FROM json_each(?2)) \
         AND EXISTS ({reference}) AND session_id IS NOT ({reference})"), rusqlite::params![sid, keep])?;
