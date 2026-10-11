@@ -4,7 +4,11 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased - Patch]
+## [Unreleased - Minor]
+
+### Added
+
+- Pi v3 session history is discoverable and searchable, including branched conversations, tool calls, per-message usage and session markers.
 
 ### Changed
 
@@ -13,11 +17,13 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Pi history isolates invalid files, skips unchanged transcripts, and preserves prompt projects, tool identities and readable previews through rewrites.
 - Unchanged provider syncs restore lost evidence, missing adapter files and sidecar containment failures retain their typed error codes, and SDK hydration accepts native session markers.
-
-### Fixed
-
 - A Grok or Muse re-read reports a row again only when that row changed.
+
+### Rust API
+
+- Added `Source::Pi` for filtering and reading persisted Pi session history.
 
 ## [0.40.1] - 2026-10-11
 

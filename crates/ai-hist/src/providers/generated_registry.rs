@@ -35,6 +35,11 @@ const REGISTRATIONS: &[Registration] = &[
         metadata: devin::METADATA,
         adapter: devin::ADAPTER,
     },
+    Registration {
+        id: "pi",
+        metadata: pi::METADATA,
+        adapter: pi::ADAPTER,
+    },
     #[cfg(test)]
     Registration {
         id: "test-fixture",
