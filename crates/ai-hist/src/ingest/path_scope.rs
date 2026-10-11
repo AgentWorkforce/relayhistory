@@ -638,6 +638,26 @@ mod tests {
     }
 
     #[test]
+    fn a_removed_session_directory_keeps_the_sibling_transcript_cursor() {
+        let home = home();
+        let projects = home.roots.claude.join("projects");
+        let one = projects.join("p/one.jsonl");
+        write_transcript(&one, "one");
+        let session_dir = projects.join("p/one");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        sync_claude(&home);
+        std::fs::remove_dir_all(&session_dir).unwrap();
+        sync_paths(&home, &[session_dir.as_path()]);
+        let locators = claude_locators(&home.conn);
+        assert!(
+            locators
+                .iter()
+                .any(|locator| locator.ends_with("one.jsonl")),
+            "the transcript is still on disk, so its cursor stays: {locators:?}"
+        );
+    }
+
+    #[test]
     fn a_path_scoped_tick_keeps_a_held_record_it_did_not_visit() {
         let home = home();
         let projects = home.roots.claude.join("projects");

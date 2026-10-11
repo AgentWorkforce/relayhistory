@@ -81,13 +81,14 @@ fn missing_in_scope(
         if path_scope::is_collected(changed, "", "jsonl") {
             note_absent_cursor(&mut missing, &mut seen, conn, root, changed, observed)?;
             for candidate in stem_session_files(root, changed) {
-                note_absent_cursor(&mut missing, &mut seen, conn, root, &candidate, observed)?;
+                note_stem_cursor(&mut missing, &mut seen, conn, root, &candidate, observed)?;
             }
         } else {
             // The range is inside the directory. The session file sits beside
             // that directory (`…/<id>/` → `…/<id>.jsonl`), which is the same
-            // stem match the listing uses, so a vanished transcript still
-            // loses its cursor.
+            // stem match the listing uses. A vanished transcript loses its
+            // cursor; one that is still on disk keeps it, because a removed
+            // directory is not a path the listing can walk to that file.
             note_absent_prefix(
                 &mut missing,
                 &mut seen,
@@ -98,7 +99,7 @@ fn missing_in_scope(
                 observed,
             )?;
             for candidate in stem_session_files(root, changed) {
-                note_absent_cursor(&mut missing, &mut seen, conn, root, &candidate, observed)?;
+                note_stem_cursor(&mut missing, &mut seen, conn, root, &candidate, observed)?;
             }
         }
     }
@@ -145,6 +146,28 @@ fn scan_dir(changed: &Path) -> &Path {
     } else {
         changed.parent().unwrap_or(changed)
     }
+}
+
+/// A stem file the listing did not return. The listing reaches it only by
+/// walking the directory of the same name, so a removed directory leaves a
+/// live transcript unlisted. Forgetting that cursor would reread the file
+/// from byte zero. A stat here runs only for a path the listing missed.
+fn note_stem_cursor(
+    missing: &mut Vec<String>,
+    seen: &mut HashSet<String>,
+    conn: &Connection,
+    root: &Path,
+    path: &Path,
+    observed: &HashSet<String>,
+) -> Result<()> {
+    // Already listed: the file was walked, and this stat would be a second one.
+    if observed.contains(path.to_string_lossy().as_ref()) {
+        return Ok(());
+    }
+    if path.is_file() {
+        return Ok(());
+    }
+    note_absent_cursor(missing, seen, conn, root, path, observed)
 }
 
 fn note_absent_cursor(
