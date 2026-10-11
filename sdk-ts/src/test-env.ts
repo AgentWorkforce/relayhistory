@@ -1,3 +1,7 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+
 // Test-only helper (not in the published `files` list): isolate a test from
 // the operator's real history.
 
@@ -10,7 +14,7 @@
  * real sessions into a test database.
  */
 export const HISTORY_ENV_PATTERN =
-  /^(HOME|USERPROFILE|CLAUDE_CONFIG_DIR|CODEX_HOME|GROK_HOME|XDG_|OPENCODE_|AI_HIST_|RELAYHISTORY_)/;
+  /^(HOME|USERPROFILE|CLAUDE_CONFIG_DIR|CODEX_HOME|GROK_HOME|XDG_|OPENCODE_|PI_CODING_AGENT_DIR$|PI_CODING_AGENT_SESSION_DIR$|HERMES_HOME$|HERMES_DATA_DIR_SUFFIX$|AI_HIST_|RELAYHISTORY_)/;
 
 /**
  * Delete every history-root variable from `process.env` and return a function
@@ -22,8 +26,13 @@ export function scrubHistoryEnv(): () => void {
   for (const key of Object.keys(process.env)) {
     if (HISTORY_ENV_PATTERN.test(key)) delete process.env[key];
   }
+  // Pin Hermes independently of Windows LOCALAPPDATA, which belongs to the
+  // operating system and unrelated applications rather than this test.
+  const hermesHome = mkdtempSync(join(tmpdir(), 'relayhistory-isolated-hermes-'));
+  process.env.HERMES_HOME = hermesHome;
   return () => {
     for (const key of Object.keys(process.env)) if (!(key in saved)) delete process.env[key];
     Object.assign(process.env, saved);
+    rmSync(hermesHome, { recursive: true, force: true });
   };
 }

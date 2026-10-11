@@ -46,5 +46,14 @@
         "cursor/extended-unverified.jsonl"
       ]
     }
-  ]
+  ],
+  "population": {
+    "evidence": [
+      "history",
+      "session_event",
+      "tool_call",
+      "file_edit"
+    ],
+    "usage_accounting": "none"
+  }
 }

@@ -27,5 +27,14 @@
         "devin/malformed-and-hidden.sql"
       ]
     }
-  ]
+  ],
+  "population": {
+    "evidence": [
+      "history",
+      "session_event",
+      "tool_call",
+      "file_edit"
+    ],
+    "usage_accounting": "none"
+  }
 }

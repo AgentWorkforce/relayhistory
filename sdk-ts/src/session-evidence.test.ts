@@ -365,6 +365,10 @@ test('a native full capability unsupported by its coverage is a contract mismatc
     normalizeHydration({ ...base, capability: 'partial', coverage: ['history'] }).coverage,
     ['history'],
   );
+  assert.deepEqual(
+    normalizeHydration({ ...base, capability: 'partial', coverage: ['history', 'session_marker'] }).coverage,
+    ['history', 'session_marker'],
+  );
   // An absent or non-list `coverage` is malformed, not "covers nothing":
   // defaulting it would pass validation and strip the coverage a merge needs.
   for (const coverage of [undefined, null, 'history', {}]) {

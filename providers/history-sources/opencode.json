@@ -66,5 +66,15 @@
         "opencode/legacy-json-user-turn-blocks"
       ]
     }
-  ]
+  ],
+  "population": {
+    "evidence": [
+      "history",
+      "session_event",
+      "tool_call",
+      "file_edit",
+      "relationship"
+    ],
+    "usage_accounting": "none"
+  }
 }

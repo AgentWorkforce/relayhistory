@@ -39,6 +39,7 @@ export const EVIDENCE_KINDS = Object.freeze([
   'file_edit',
   'relationship',
   'commit_link',
+  'session_marker',
 ] as const);
 
 export type EvidenceKind = (typeof EVIDENCE_KINDS)[number];

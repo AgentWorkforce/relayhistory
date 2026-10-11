@@ -27,6 +27,12 @@ function readDescriptors(root, directory, testOnly) {
       if (fixture.layout === 'Sqlite' && (!fixture.target || path.isAbsolute(fixture.target) || path.win32.isAbsolute(fixture.target) || fixture.target.split(/[\\/]/).includes('..'))) throw new Error(`Invalid SQLite fixture target: ${item.id}`);
       if (fixture.layout !== 'Reference' && !testOnly && !fs.existsSync(path.join(root, 'crates/ai-hist/tests/snapshots', item.id, `${fixture.name}.json`))) throw new Error(`Missing snapshot: ${item.id}/${fixture.name}`);
     }
+    if (!testOnly) {
+      const population = item.population;
+      const kinds = ['history', 'session_event', 'tool_call', 'file_edit', 'relationship', 'commit_link', 'session_marker'];
+      const modes = ['none', 'per-request', 'per-message', 'cumulative-delta'];
+      if (!population || !Array.isArray(population.evidence) || new Set(population.evidence).size !== population.evidence.length || population.evidence.some(kind => !kinds.includes(kind)) || !modes.includes(population.usage_accounting)) throw new Error(`Invalid population declaration: ${item.id}`);
+    }
     return { ...item, testOnly };
   });
 }
@@ -49,11 +55,18 @@ export function descriptors(root = ROOT) {
   }
   return items.sort((a,b) => a.order-b.order);
 }
-function section(current, name, body) {
-  const begin = `<!-- BEGIN GENERATED ${name} -->`, end = `<!-- END GENERATED ${name} -->`;
+export function markedSection(current, begin, end, body, append = false) {
+  const count = marker => current.split(marker).length - 1;
+  const begins = count(begin), ends = count(end);
   const block = `${begin}\n${body}\n${end}`;
-  if (!current.includes(begin)) return `${current.trimEnd()}\n\n${block}\n`;
-  return current.slice(0,current.indexOf(begin)) + block + current.slice(current.indexOf(end)+end.length);
+  if (!begins && !ends && append) return `${current.trimEnd()}\n\n${block}\n`;
+  if (begins !== 1 || ends !== 1 || current.indexOf(end) < current.indexOf(begin)) {
+    throw new Error(`Invalid generation markers: ${begin}`);
+  }
+  return current.slice(0, current.indexOf(begin)) + block + current.slice(current.indexOf(end) + end.length);
+}
+function section(current, name, body) {
+  return markedSection(current, `<!-- BEGIN GENERATED ${name} -->`, `<!-- END GENERATED ${name} -->`, body, true);
 }
 export function outputs(root = ROOT) {
   const all = descriptors(root), live = all.filter(i => !i.testOnly);
@@ -64,8 +77,7 @@ export function outputs(root = ROOT) {
   out.set('crates/ai-hist/src/providers/generated_registry.rs', banner+'const REGISTRATIONS: &[Registration] = &[\n'+all.map(i => `${cfg(i)}    Registration { id: ${quote(i.id)}, metadata: ${i.rust_id}::METADATA, adapter: ${i.rust_id}::ADAPTER },`).join('\n')+'\n];\n');
   out.set('crates/ai-hist/src/session_store/generated_sources.rs', banner+`use serde::{Deserialize, Serialize};\n\n/// Coding-agent source that produced a session.\n#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]\n#[non_exhaustive]\npub enum Source {\n`+all.map(i => `${cfg(i)}    #[serde(rename = ${quote(i.id)})]\n    ${i.variant},`).join('\n')+'\n}\n\nimpl Source {\n    /// Every admitted source, in ledger order.\n    pub const ALL: &\'static [Source] = &[\n'+all.map(i => `${cfg(i)}        Self::${i.variant},`).join('\n')+'\n    ];\n\n    /// Canonical lowercase identifier stored in the ledger.\n    pub fn as_str(self) -> &\'static str {\n        match self {\n'+all.map(i => `${cfg(i)}            Self::${i.variant} => ${quote(i.id)},`).join('\n')+'\n        }\n    }\n\n    /// Parse an admitted identifier or explicit alias.\n    pub fn parse(value: &str) -> Option<Self> {\n        match value {\n'+all.map(i => `${cfg(i)}            ${[i.id,...i.aliases].map(quote).join(' | ')} => Some(Self::${i.variant}),`).join('\n')+'\n            _ => None,\n        }\n    }\n}\n');
   const common = fs.readFileSync(path.join(root,'sdk-ts/src/sdk-common.ts'),'utf8');
-  if (!common.includes('// BEGIN GENERATED PROVIDER SOURCES') || !common.includes('// END GENERATED PROVIDER SOURCES')) throw new Error('Missing SDK generation markers');
-  out.set('sdk-ts/src/sdk-common.ts', common.replace(/\/\/ BEGIN GENERATED PROVIDER SOURCES[\s\S]*?\/\/ END GENERATED PROVIDER SOURCES/, '// BEGIN GENERATED PROVIDER SOURCES\nexport const SOURCES = Object.freeze([\n'+live.map(i => `  '${i.id}',`).join('\n')+'\n] as const);\n// END GENERATED PROVIDER SOURCES'));
+  out.set('sdk-ts/src/sdk-common.ts', markedSection(common, '// BEGIN GENERATED PROVIDER SOURCES', '// END GENERATED PROVIDER SOURCES', 'export const SOURCES = Object.freeze([\n'+live.map(i => `  '${i.id}',`).join('\n')+'\n] as const);'));
   const fixtures = live.flatMap(i => i.fixtures);
   out.set('crates/ai-hist/tests/generated/provider_corpus.rs', banner+'const CORPUS: &[Fixture] = &[\n'+fixtures.map(f => `    Fixture { source: ${quote(f.source)}, name: ${quote(f.name)}, layout: Layout::${f.layout}${f.layout==='Sqlite'?`(${quote(f.target)})`:''}, origin: Origin::${f.origin}, files: &[${f.files.map(quote).join(', ')}], quirk: ${quote(f.quirk)} },`).join('\n')+'\n];\n');
   const added = live.filter(i=>!i.legacy);
@@ -74,6 +86,10 @@ export function outputs(root = ROOT) {
   out.set(readmePath,section(fs.readFileSync(path.join(root,readmePath),'utf8'),'PROVIDER FIXTURES', ['## Added provider fixtures', '', '| Fixture | Recorded behavior |','| --- | --- |',...added.flatMap(i=>i.fixtures.map(f=>`| ${i.id}/${f.name} | ${f.quirk.replaceAll('|','\\|')} |`))].join('\n')));
   const adr='docs/decisions/2026-09-19-relayhistory-owns-session-sourcing.md';
   out.set(adr,section(fs.readFileSync(path.join(root,adr),'utf8'),'PROVIDER CAPTURE', ['## Added provider capture matrix', '', 'Generated from provider-owned acquisition records; these cells describe fixture-proven capture.', '', '| Provider | Evidence | Coverage / limitations |', '| --- | --- | --- |',...added.flatMap(i=>i.capture.map(c=>`| ${i.id} | ${c.evidence.replaceAll('|','\\|')} | ${c.coverage.replaceAll('|','\\|')} |`))].join('\n')));
+  const guide = 'docs/sourcing-sdk.md';
+  const columns = ['history', 'session_event', 'tool_call', 'file_edit', 'relationship'];
+  const population = ['| Source | '+columns.join(' | ')+' | usage accounting |', '| --- | --- | --- | --- | --- | --- | --- |', ...[...live].sort((a,b)=>a.id.localeCompare(b.id)).map(item => `| ${item.id} | ${columns.map(kind=>item.population.evidence.includes(kind)?'✓':'—').join(' | ')} | ${item.population.usage_accounting} |`)].join('\n');
+  out.set(guide, markedSection(fs.readFileSync(path.join(root,guide),'utf8'), '<!-- sourcing-sdk-population-table:start -->', '<!-- sourcing-sdk-population-table:end -->', population));
   for (const [name, body] of out) {
     if (name.endsWith('.rs')) out.set(name, execFileSync('rustfmt', ['--edition', '2021', '--config', 'skip_children=true'], {input:body, encoding:'utf8'}));
   }

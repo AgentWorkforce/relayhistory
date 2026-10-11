@@ -135,6 +135,7 @@ Generated-file allowlist:
 - The marked `PROVIDER SOURCES` section of `sdk-ts/src/sdk-common.ts`.
 - The marked `PROVIDER FIXTURES` section of `tests/fixtures/README.md`.
 - The marked `PROVIDER CAPTURE` section of the sourcing ownership ADR.
+- The marked population table in `docs/sourcing-sdk.md`.
 
 Every shard's `fixtures` entries have `source`, `name`, `layout`, `origin`,
 `files`, and `quirk`. `HomeTree` copies a provider-owned fixture tree into the
@@ -143,6 +144,7 @@ execute its SQL files. Use SQL fixtures instead of checked-in live databases.
 The existing legacy layouts remain available. `capture` is an array of
 `{ "evidence": "...", "coverage": "..." }` cells describing what these
 fixtures actually prove and what is unavailable. New providers must supply it.
+`population` is required for production descriptors: `{ "evidence": ["history", "session_event", "tool_call", "session_marker"], "usage_accounting": "per-message" }`. Evidence contains exactly the canonical kinds the provider declares; accounting is `none`, `per-request`, `per-message` or `cumulative-delta`. The generator renders the SDK population table, and the Rust documentation gate verifies those cells against the actual runtime declarations.
 Do not set `legacy: true` on new admissions: it is reserved for the seven
 pre-existing handwritten ADR columns.
 

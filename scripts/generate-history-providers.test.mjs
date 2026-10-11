@@ -3,13 +3,13 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
-import { ROOT, descriptors, generate, outputs } from './generate-history-providers.mjs';
+import { ROOT, descriptors, generate, outputs, markedSection } from './generate-history-providers.mjs';
 
 function sandbox(t) {
   const root=fs.mkdtempSync(path.join(os.tmpdir(),'history-provider-generator-'));
   t.after(()=>fs.rmSync(root,{recursive:true,force:true}));
   for(const dir of ['providers','crates/ai-hist/src/providers']) fs.cpSync(path.join(ROOT,dir),path.join(root,dir),{recursive:true});
-  for(const file of ['sdk-ts/src/sdk-common.ts','crates/ai-hist/tests/fixtures/README.md','docs/decisions/2026-09-19-relayhistory-owns-session-sourcing.md']) {
+  for(const file of ['sdk-ts/src/sdk-common.ts','crates/ai-hist/tests/fixtures/README.md','docs/decisions/2026-09-19-relayhistory-owns-session-sourcing.md','docs/sourcing-sdk.md']) {
     fs.mkdirSync(path.dirname(path.join(root,file)),{recursive:true});fs.copyFileSync(path.join(ROOT,file),path.join(root,file));
   }
   for(const directory of ['providers/history-sources','providers/test-sources']) {
@@ -67,4 +67,19 @@ test('test provider is gated everywhere and absent from SDK and corpus',()=>{
   assert.doesNotMatch(result.get('sdk-ts/src/sdk-common.ts'),/test-fixture/);
   assert.doesNotMatch(result.get('crates/ai-hist/tests/generated/provider_corpus.rs'),/test-fixture/);
   assert.deepEqual(descriptors().filter(d=>!d.testOnly).slice(0,7).map(d=>d.id),['claude','codex','cursor','grok','opencode','muse','devin']);
+});
+
+test('generation markers reject missing, duplicate and reversed boundaries', () => {
+  for (const text of ['BEGIN body', 'END body', 'END BEGIN', 'BEGIN BEGIN END', 'BEGIN END END']) {
+    assert.throws(() => markedSection(text, 'BEGIN', 'END', 'new', true), /Invalid generation markers/);
+  }
+  assert.equal(markedSection('prefix BEGIN old END suffix', 'BEGIN', 'END', 'new'), 'prefix BEGIN\nnew\nEND suffix');
+});
+
+test('population declarations reject unknown evidence and accounting', t => {
+  const root = sandbox(t);
+  change(root, 'claude', d => d.population.evidence.push('future-kind'));
+  assert.throws(() => generate(root), /Invalid population declaration/);
+  change(root, 'claude', d => { d.population.evidence.pop(); d.population.usage_accounting = 'invented'; });
+  assert.throws(() => generate(root), /Invalid population declaration/);
 });

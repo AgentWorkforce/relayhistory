@@ -26,5 +26,15 @@
         "muse/tools-session"
       ]
     }
-  ]
+  ],
+  "population": {
+    "evidence": [
+      "history",
+      "session_event",
+      "tool_call",
+      "file_edit",
+      "relationship"
+    ],
+    "usage_accounting": "per-request"
+  }
 }
