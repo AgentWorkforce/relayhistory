@@ -33,6 +33,7 @@ pub(crate) mod jsonl;
 pub(crate) mod muse;
 pub(crate) mod opencode;
 pub(crate) mod opencode_sweep;
+pub(crate) mod path_scope;
 pub(crate) mod titles;
 pub(crate) mod tool_result_facts;
 pub(crate) mod transcript_cursor;
@@ -115,6 +116,14 @@ macro_rules! sync_note {
 mod sweep_phases;
 // After `sync_note!`, which it uses.
 mod codex_history;
+// After `sync_note!`, which the repair note uses.
+pub(crate) mod scoped_files;
+#[cfg(test)]
+pub(crate) use scoped_files::take_dirs_read;
+pub(crate) use scoped_files::{
+    collect_matching_files, collect_matching_files_scoped, collect_muse_transcripts,
+    collect_muse_transcripts_scoped, cursor_transcript_paths, grok_transcripts_for,
+};
 use sweep_phases::SweepPhases;
 pub(crate) use sweep_phases::SweepScope;
 
@@ -2210,13 +2219,7 @@ fn sync_basic(
     // The counts it was taken from are kept: the end of the sweep needs them
     // again, and recounts only the sessions the sweep wrote (#321).
     let (repairs, repair_plan_known, destination) =
-        match destination_shortfall_counted(conn, &state, None) {
-            Ok((repairs, counted)) => (repairs, true, counted),
-            Err(error) => {
-                sync_note!("  [sync] could not name the sessions to repair: {error:#}");
-                (SweepRepairs::default(), false, None)
-            }
-        };
+        scoped_files::sweep_repairs(conn, &state, scope);
     if repairs.repairs_all() {
         sync_note!("  [sync] destination marker unreadable; repairing all replayable sessions");
     } else if !repairs.is_empty() {
@@ -2263,7 +2266,8 @@ fn sync_basic(
     // from an old aggregate presence row.
     capture_progress("catalog", 0, None);
     check_capture_cancelled()?;
-    let discovery_env = DiscoveryEnv::with_provider_roots(conn, roots.clone());
+    let discovery_env = DiscoveryEnv::with_provider_roots(conn, roots.clone())
+        .with_path_scope(scope.paths().cloned());
     // Coded like the hydration failures, so `SessionStore` can tell a sweep
     // whose evidence landed but whose catalog pass did not from one that
     // failed outright; the CLI prints the same chain it always did, behind
@@ -4604,7 +4608,7 @@ fn sync_codex_with_repairs(
     repairs: &SweepRepairs,
 ) -> Result<usize> {
     let mut coverage = SweepCoverage::default();
-    sync_codex_with_repairs_and_coverage(conn, state, root, repairs, &mut coverage)
+    sync_codex_with_repairs_and_coverage(conn, state, root, repairs, &mut coverage, None)
 }
 
 fn sync_codex_with_repairs_and_coverage(
@@ -4613,6 +4617,7 @@ fn sync_codex_with_repairs_and_coverage(
     root: &Path,
     repairs: &SweepRepairs,
     coverage: &mut SweepCoverage,
+    paths: Option<&path_scope::PathScope>,
 ) -> Result<usize> {
     // Sessions an earlier sweep touched but whose metadata backfill never
     // completed. The scoped backfill only ever revisits what a sweep touches,
@@ -4629,13 +4634,26 @@ fn sync_codex_with_repairs_and_coverage(
                 .collect()
         })
         .unwrap_or_default();
-    let result =
-        codex_history::sync_codex_sources(conn, state, root, repairs, coverage, &mut touched);
+    let result = codex_history::sync_codex_sources(
+        conn,
+        state,
+        root,
+        repairs,
+        coverage,
+        &mut touched,
+        paths,
+    );
+    // A partial walk did not visit every rollout the pending set might name.
+    // Clearing it would drop sessions this tick never opened.
+    let partial = path_scope::roots_are_partial(
+        paths,
+        &[root.join("sessions"), root.join("archived_sessions")],
+    );
     if result.is_err() {
         let mut pending: Vec<&String> = touched.iter().collect();
         pending.sort_unstable();
         state.insert(CODEX_METADATA_PENDING_KEY.to_string(), json!(pending));
-    } else if state.contains_key(CODEX_METADATA_PENDING_KEY) {
+    } else if !partial && state.contains_key(CODEX_METADATA_PENDING_KEY) {
         // An empty value rather than a removal: the sync-state merge only
         // folds keys forward, so a removal would leave the stale list on disk.
         state.insert(CODEX_METADATA_PENDING_KEY.to_string(), json!([]));
@@ -4770,6 +4788,7 @@ fn sync_codex_rollouts_with_repairs(
         repairs,
         &mut coverage,
         &mut HashSet::new(),
+        None,
     )
 }
 
@@ -4780,6 +4799,7 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
     repairs: &SweepRepairs,
     coverage: &mut SweepCoverage,
     touched: &mut HashSet<String>,
+    paths: Option<&path_scope::PathScope>,
 ) -> Result<CodexRolloutWalk> {
     let mut cwds = load_state_string_map(state, "codex_session_cwds");
     let mut branches = load_state_string_map(state, "codex_session_branches");
@@ -4839,20 +4859,25 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
     let mut events = 0usize;
     for (index, root) in roots.into_iter().enumerate() {
         let known_here = known_roots[index];
+        // A skipped or partial root is not "every file was seen". Asked
+        // before the exists check so a narrowed root that is missing still
+        // holds the generation open.
+        walked_every_known_root &= scoped_files::codex_root_complete(paths, &root, known_here);
         if !root.exists() {
             if known_here {
                 walked_every_known_root = false;
             }
             continue;
         }
-        let rollouts = collect_matching_files(&root, "rollout-", "jsonl")?;
+        let (rollouts, _complete) = scoped_files::codex_rollouts_for_root(&root, paths)?;
         // A readable root is not a fully readable root. A partially mounted
         // archive, or a sync client part way through pulling a tree down,
         // returns some of the rollouts the stamp map names and not others, and
         // the ones it did not return are still there and still null. So the
-        // question is asked per path, not per root.
+        // question is asked per path, not per root. A path-scoped walk only
+        // forgets a stamp it would have listed.
         if known_here {
-            let missing = unobserved_known_paths(&seen, &root, &rollouts);
+            let missing = scoped_files::codex_unobserved(&seen, &root, &rollouts, paths);
             if !forget_unobserved_paths(state, &mut seen, "codex_rollouts_v7", missing) {
                 walked_every_known_root = false;
             }
@@ -7824,6 +7849,7 @@ fn sync_claude_session_metadata_with_repairs(
         root,
         repairs,
         &mut coverage,
+        None,
     )
 }
 
@@ -7833,6 +7859,7 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
     root: &Path,
     repairs: &SweepRepairs,
     coverage: &mut SweepCoverage,
+    paths: Option<&path_scope::PathScope>,
 ) -> Result<()> {
     // Load-bearing for the raw-facts generation below: an absent root returns
     // before anything is recorded, so a run that could not see the archive
@@ -7887,7 +7914,10 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
     // transcript it discovered, and a caller told the sync completed would
     // treat an incomplete cache as current.
     let mut read_error: Option<anyhow::Error> = None;
-    let transcripts = claude_transcript_files(root)?;
+    // A path scope that names this root walks only those paths, and must not
+    // record a generation or drop a cursor for a file it did not visit.
+    let transcripts = scoped_files::claude_transcript_files_scoped(root, paths)?;
+    let mut walked_every_known_root = path_scope::PathScope::walk_is_full(paths, root);
     // Same question the codex walk asks of its roots, and asked the same way:
     // per path, because a project tree can be readable while part of it is
     // not. Under cursors the set of files this install knows about is the
@@ -7898,11 +7928,7 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
         .iter()
         .map(|path| path.to_string_lossy().to_string())
         .collect();
-    let mut walked_every_known_root = true;
-    for missing in transcript_cursor::known_locators(conn, "claude")?
-        .into_iter()
-        .filter(|locator| path_key_is_under(locator, root) && !observed.contains(locator))
-    {
+    for missing in scoped_files::claude_missing_cursors(conn, paths, root, &observed)? {
         // A cursor is a claim the file is unchanged since we read it. A file
         // that vanished and came back is not something this process watched,
         // and resuming from the stale cursor is exactly how its rows would
@@ -12474,63 +12500,6 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
-/// Every Claude transcript under `root`: each `*.jsonl` in the tree except the
-/// subagent workflow journals, which are metadata and never a transcript.
-///
-/// Discovery and the sync walk both enumerate through this, so neither can
-/// list a journal the other has excluded.
-pub(crate) fn claude_transcript_files(root: &Path) -> Result<Vec<PathBuf>> {
-    let mut files = collect_matching_files(root, "", "jsonl")?;
-    #[cfg(test)]
-    if LEGACY_WALKS_WORKFLOW_JOURNALS.with(std::cell::Cell::get) {
-        return Ok(files);
-    }
-    files.retain(|path| !is_claude_workflow_journal(root, path));
-    Ok(files)
-}
-
-pub(crate) fn collect_matching_files(root: &Path, prefix: &str, ext: &str) -> Result<Vec<PathBuf>> {
-    let mut out = Vec::new();
-    collect_matching_files_inner(root, prefix, ext, &mut out)?;
-    out.sort();
-    Ok(out)
-}
-
-fn collect_matching_files_inner(
-    root: &Path,
-    prefix: &str,
-    ext: &str,
-    out: &mut Vec<PathBuf>,
-) -> Result<()> {
-    if !root.is_dir() {
-        return Ok(());
-    }
-    for entry in fs::read_dir(root)? {
-        check_capture_cancelled()?;
-        let entry = entry?;
-        // The directory read already knows each entry's type; only a symlink
-        // needs a stat to see what it points at.
-        let file_type = entry.file_type()?;
-        let path = entry.path();
-        let is_dir = if file_type.is_symlink() {
-            path.is_dir()
-        } else {
-            file_type.is_dir()
-        };
-        if is_dir {
-            collect_matching_files_inner(&path, prefix, ext, out)?;
-        } else if path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .is_some_and(|name| name.starts_with(prefix))
-            && path.extension().and_then(|s| s.to_str()) == Some(ext)
-        {
-            out.push(path);
-        }
-    }
-    Ok(())
-}
-
 fn stamp_of(metadata: &fs::Metadata) -> String {
     format!(
         "{}:{}",
@@ -12658,13 +12627,24 @@ pub(crate) fn file_stamp_and_modified(path: &Path) -> Result<(String, Option<i64
     Ok((stamp_of(&metadata), modified_ms_of(&metadata)))
 }
 
+#[cfg(test)]
 fn sync_cursor(
     conn: &Connection,
     state: &mut Map<String, Value>,
     root: &Path,
     coverage: &mut SweepCoverage,
 ) -> Result<usize> {
-    sync_cursor_with_scan_hook(conn, state, root, coverage, &mut |_| {})
+    sync_cursor_in(conn, state, root, coverage, None)
+}
+
+fn sync_cursor_in(
+    conn: &Connection,
+    state: &mut Map<String, Value>,
+    root: &Path,
+    coverage: &mut SweepCoverage,
+    paths: Option<&path_scope::PathScope>,
+) -> Result<usize> {
+    sync_cursor_with_hooks_in(conn, state, root, coverage, &mut |_| {}, &mut |_| {}, paths)
 }
 
 struct PreparedCursorTranscript {
@@ -12695,6 +12675,7 @@ struct PreparedCursorSync {
     files_seen: usize,
 }
 
+#[cfg(test)]
 fn sync_cursor_with_scan_hook(
     conn: &Connection,
     state: &mut Map<String, Value>,
@@ -12705,9 +12686,7 @@ fn sync_cursor_with_scan_hook(
     sync_cursor_with_hooks(conn, state, root, coverage, before_transcript, &mut |_| {})
 }
 
-/// `after_read` runs between a transcript's byte scan and the cursor that scan
-/// commits — the one window in which Cursor can replace a file the scan has
-/// already read but not yet identified. Production passes a no-op.
+#[cfg(test)]
 fn sync_cursor_with_hooks(
     conn: &Connection,
     state: &mut Map<String, Value>,
@@ -12716,11 +12695,34 @@ fn sync_cursor_with_hooks(
     before_transcript: &mut dyn FnMut(&Path),
     after_read: &mut dyn FnMut(&Path),
 ) -> Result<usize> {
+    sync_cursor_with_hooks_in(
+        conn,
+        state,
+        root,
+        coverage,
+        before_transcript,
+        after_read,
+        None,
+    )
+}
+
+/// `after_read` runs between a transcript's byte scan and the cursor that scan
+/// commits — the one window in which Cursor can replace a file the scan has
+/// already read but not yet identified. Production passes a no-op.
+fn sync_cursor_with_hooks_in(
+    conn: &Connection,
+    state: &mut Map<String, Value>,
+    root: &Path,
+    coverage: &mut SweepCoverage,
+    before_transcript: &mut dyn FnMut(&Path),
+    after_read: &mut dyn FnMut(&Path),
+    paths: Option<&path_scope::PathScope>,
+) -> Result<usize> {
     if !root.exists() {
         return Ok(0);
     }
     // Finish provider I/O and parsing before taking the destination writer lock.
-    let prepared = prepare_cursor_sync(state, root, coverage, before_transcript, after_read)
+    let prepared = prepare_cursor_sync(state, root, coverage, before_transcript, after_read, paths)
         .with_context(|| format!("prepare Cursor transcripts from {}", root.display()))?;
     // Match rollback to the source-wide checkpoint boundary: replaying committed
     // prompts after a file's mtime changes can duplicate them.
@@ -13155,6 +13157,7 @@ fn prepare_cursor_sync(
     coverage: &mut SweepCoverage,
     before_transcript: &mut dyn FnMut(&Path),
     after_read: &mut dyn FnMut(&Path),
+    paths: Option<&path_scope::PathScope>,
 ) -> Result<PreparedCursorSync> {
     let mut cursor_state = state
         .get(CURSOR_SYNC_STATE_KEY)
@@ -13164,33 +13167,7 @@ fn prepare_cursor_sync(
     let mut transcripts = Vec::new();
     let mut errors = 0;
     let mut files_seen = 0;
-    let mut files = Vec::new();
-    for project_dir in sorted_dirs(root)? {
-        check_capture_cancelled()?;
-        let ts_root = project_dir.join("agent-transcripts");
-        if !ts_root.is_dir() {
-            continue;
-        }
-        let project_path = decode_cursor_project(
-            project_dir
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default(),
-        );
-        for session_dir in sorted_dirs(&ts_root)? {
-            check_capture_cancelled()?;
-            let session_id = session_dir
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or_default()
-                .to_string();
-            let jsonl = session_dir.join(format!("{session_id}.jsonl"));
-            if !jsonl.exists() {
-                continue;
-            }
-            files.push((jsonl, session_id, project_path.clone()));
-        }
-    }
+    let files = scoped_files::cursor_transcripts(root, paths)?;
     for (jsonl, session_id, project_path) in capture_files("cursor", files) {
         check_capture_cancelled()?;
         before_transcript(&jsonl);
@@ -13828,23 +13805,6 @@ pub(crate) fn decode_cursor_project(name: &str) -> String {
 /// are read again; see [`GROK_SYNC_STATE_KEY`].
 const MUSE_SYNC_STATE_KEY: &str = "muse_sessions_v1";
 
-/// Every top-level Muse Code transcript under `root`, sorted.
-///
-/// A transcript under a `subagent/` directory belongs to a subagent or
-/// reminder child of the session beside it, not to a session of its own, so
-/// it is never returned.
-pub(crate) fn collect_muse_transcripts(root: &Path) -> Result<Vec<PathBuf>> {
-    Ok(
-        collect_matching_files(root, muse::SESSION_FILE.trim_end_matches(".jsonl"), "jsonl")?
-            .into_iter()
-            .filter(|path| {
-                path.file_name().and_then(|name| name.to_str()) == Some(muse::SESSION_FILE)
-                    && !muse::is_child_transcript(path, root)
-            })
-            .collect(),
-    )
-}
-
 #[cfg(test)]
 fn sync_muse(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> Result<usize> {
     sync_muse_with_coverage(
@@ -13856,6 +13816,17 @@ fn sync_muse(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> 
     )
 }
 
+#[cfg(test)]
+fn sync_muse_with_coverage(
+    conn: &Connection,
+    state: &mut Map<String, Value>,
+    root: &Path,
+    repairs: &SweepRepairs,
+    coverage: &mut SweepCoverage,
+) -> Result<usize> {
+    sync_muse_in(conn, state, root, repairs, coverage, None)
+}
+
 /// Index every Muse Code transcript whose stamp changed since the last run.
 ///
 /// A transcript is append-only, but it is read whole: a session is one file,
@@ -13863,12 +13834,13 @@ fn sync_muse(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> 
 /// re-read replace rather than merge. Same state-map discipline as Grok: a
 /// stamp is trusted only while the evidence it recorded is still stored, and
 /// an unreadable transcript keeps no stamp, so the next run retries it.
-fn sync_muse_with_coverage(
+fn sync_muse_in(
     conn: &Connection,
     state: &mut Map<String, Value>,
     root: &Path,
     repairs: &SweepRepairs,
     coverage: &mut SweepCoverage,
+    paths: Option<&path_scope::PathScope>,
 ) -> Result<usize> {
     if !root.exists() {
         sync_note!("  [muse] not found: {} (skipped)", root.display());
@@ -13880,7 +13852,7 @@ fn sync_muse_with_coverage(
         .cloned()
         .unwrap_or_default();
     let mut walk = StampedSessionWalk::default();
-    for transcript in capture_files("muse", collect_muse_transcripts(root)?) {
+    for transcript in capture_files("muse", collect_muse_transcripts_scoped(root, paths)?) {
         check_capture_cancelled()?;
         let key = transcript.to_string_lossy().to_string();
         let stamp = match muse_session_stamp(&transcript) {
@@ -15133,18 +15105,33 @@ pub(crate) fn ingest_muse_session(
 /// Everything a sweep reads under one Grok home: the session directories,
 /// then the process-wide `logs/unified.jsonl`.
 ///
-/// Sessions first, so a usage row whose session is indexed in this same sweep
-/// attaches to it now rather than on the next one. A log that cannot be read
-/// does not fail the sessions that could: it is noted, the source stays out
-/// of the cached fingerprint so the next sweep retries it, and the cursor has
-/// not moved.
+#[cfg(test)]
 fn sync_grok_home(
     conn: &Connection,
     state: &mut Map<String, Value>,
     grok_home: &Path,
     coverage: &mut SweepCoverage,
 ) -> Result<usize> {
-    let inserted = sync_grok_with_coverage(conn, state, &grok_home.join("sessions"), coverage)?;
+    sync_grok_home_in(conn, state, grok_home, coverage, None)
+}
+
+/// Sessions first, so a usage row whose session is indexed in this same sweep
+/// attaches to it now rather than on the next one. A log that cannot be read
+/// does not fail the sessions that could: it is noted, the source stays out
+/// of the cached fingerprint so the next sweep retries it, and the cursor has
+/// not moved.
+fn sync_grok_home_in(
+    conn: &Connection,
+    state: &mut Map<String, Value>,
+    grok_home: &Path,
+    coverage: &mut SweepCoverage,
+    paths: Option<&path_scope::PathScope>,
+) -> Result<usize> {
+    let inserted = sync_grok_in(conn, state, &grok_home.join("sessions"), coverage, paths)?;
+    let log = grok_unified_log_path(grok_home);
+    if !path_scope::file_in_scope(paths, &log) {
+        return Ok(inserted);
+    }
     match sync_grok_unified_log(conn, grok_home) {
         Ok(pass) => {
             if pass.bytes_read > 0 {
@@ -15187,11 +15174,22 @@ fn sync_grok(conn: &Connection, state: &mut Map<String, Value>, root: &Path) -> 
     sync_grok_with_coverage(conn, state, root, &mut SweepCoverage::default())
 }
 
+#[cfg(test)]
 fn sync_grok_with_coverage(
     conn: &Connection,
     state: &mut Map<String, Value>,
     root: &Path,
     coverage: &mut SweepCoverage,
+) -> Result<usize> {
+    sync_grok_in(conn, state, root, coverage, None)
+}
+
+fn sync_grok_in(
+    conn: &Connection,
+    state: &mut Map<String, Value>,
+    root: &Path,
+    coverage: &mut SweepCoverage,
+    paths: Option<&path_scope::PathScope>,
 ) -> Result<usize> {
     if !root.exists() {
         sync_note!("  [grok] not found: {} (skipped)", root.display());
@@ -15205,10 +15203,7 @@ fn sync_grok_with_coverage(
     let mut walk = StampedSessionWalk::default();
     // The enumeration is the one the source fingerprint already made this
     // sweep; the stamps below are read fresh and reused by discovery (#317).
-    for chat in capture_files(
-        "grok",
-        crate::discover::sweep_inventory::grok_transcripts(root)?,
-    ) {
+    for chat in capture_files("grok", grok_transcripts_for(root, paths)?) {
         check_capture_cancelled()?;
         let key = chat.to_string_lossy().to_string();
         // One unreadable session directory does not stop the rest, and it does

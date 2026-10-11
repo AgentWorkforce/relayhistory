@@ -13,6 +13,10 @@
 //! it away, carries the scope it stood for into the tick that pays it; and
 //! anything the loop cannot place — a rescan notice, a pathless event, a
 //! host's own [`super::WatchLoop::notify_change`] — is [`ChangeScope::Everything`].
+//!
+//! `paths` is the files the events named, rewritten onto each root's own
+//! spelling. Empty means the roots fired but the files could not be placed,
+//! and the sweep walks those providers whole.
 
 use std::collections::BTreeSet;
 use std::path::PathBuf;
@@ -29,20 +33,42 @@ pub enum ChangeScope {
     /// manual), or one the loop could not place under a root.
     #[default]
     Everything,
-    /// Only these roots fired, each named by its [`WatchRoot::path`]. Never
-    /// empty.
+    /// Only these roots fired, each named by its [`WatchRoot::path`]. `roots`
+    /// is never empty. `paths` is empty when a change could not be placed
+    /// under a file: the providers of `roots` are then walked whole.
     ///
     /// [`WatchRoot::path`]: crate::discover::WatchRoot::path
-    Roots(BTreeSet<PathBuf>),
+    Roots {
+        roots: BTreeSet<PathBuf>,
+        paths: BTreeSet<PathBuf>,
+    },
 }
 
 impl ChangeScope {
     /// Both scopes at once: the union of their roots, or everything.
+    ///
+    /// Path detail survives only when both sides still have it. One side
+    /// that lost track of its files widens the tick to those roots' whole
+    /// trees, which is the direction a scope is allowed to move.
     pub fn union(self, other: ChangeScope) -> ChangeScope {
         match (self, other) {
-            (ChangeScope::Roots(mut mine), ChangeScope::Roots(theirs)) => {
-                mine.extend(theirs);
-                ChangeScope::Roots(mine)
+            (
+                ChangeScope::Roots {
+                    mut roots,
+                    mut paths,
+                },
+                ChangeScope::Roots {
+                    roots: theirs,
+                    paths: their_paths,
+                },
+            ) => {
+                roots.extend(theirs);
+                if paths.is_empty() || their_paths.is_empty() {
+                    paths.clear();
+                } else {
+                    paths.extend(their_paths);
+                }
+                ChangeScope::Roots { roots, paths }
             }
             _ => ChangeScope::Everything,
         }
@@ -78,7 +104,17 @@ mod tests {
     use super::*;
 
     fn roots(paths: &[&str]) -> ChangeScope {
-        ChangeScope::Roots(paths.iter().map(PathBuf::from).collect())
+        ChangeScope::Roots {
+            roots: paths.iter().map(PathBuf::from).collect(),
+            paths: BTreeSet::new(),
+        }
+    }
+
+    fn rooted(roots: &[&str], paths: &[&str]) -> ChangeScope {
+        ChangeScope::Roots {
+            roots: roots.iter().map(PathBuf::from).collect(),
+            paths: paths.iter().map(PathBuf::from).collect(),
+        }
     }
 
     #[test]
@@ -96,6 +132,18 @@ mod tests {
         assert_eq!(
             widen(Some(roots(&["/a"])), roots(&["/a"])),
             roots(&["/a"])
+        );
+    }
+
+    #[test]
+    fn path_detail_survives_a_union_until_one_side_loses_it() {
+        assert_eq!(
+            rooted(&["/a"], &["/a/x"]).union(rooted(&["/a"], &["/a/y"])),
+            rooted(&["/a"], &["/a/x", "/a/y"])
+        );
+        assert_eq!(
+            rooted(&["/a"], &["/a/x"]).union(rooted(&["/b"], &[])),
+            rooted(&["/a", "/b"], &[])
         );
     }
 }

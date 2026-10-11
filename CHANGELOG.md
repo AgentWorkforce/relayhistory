@@ -6,6 +6,10 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- A filesystem watch tick reads only the transcripts under the paths that changed. A full sweep still runs at startup and on the backstop interval.
+
 ## [0.40.0] - 2026-10-11
 
 ### Breaking Changes

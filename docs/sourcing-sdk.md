@@ -274,11 +274,13 @@ finds the loop quiet is swept after a 10 ms settle, not after `debounce_ms`.
 Events inside the window that sweep opens coalesce into one trailing tick
 when the window closes, so a burst costs at most two sweeps, and sustained
 writes tick once per `debounce_ms`. A filesystem-event tick sweeps only the
-sources whose watched roots fired inside its window — a Claude session's
-appends read Claude, not every provider — and its `TickReport::sources` names
-them; startup, backstop and manual ticks, and an event the loop cannot place
-under a root (a rescan notice), are full sweeps with `sources: None`. A
-tick is the same locked `sync`; one that finds the lock held reports
+sources whose watched roots fired inside its window, and only the transcripts
+under the paths that changed. A Claude append reads that transcript.
+`TickReport::sources` names the sources. Startup, backstop and manual ticks,
+and an event the loop cannot place under a root (a rescan notice), are full
+sweeps with `sources: None`. An event placed under a root but not under the
+path that root walks reads that source's whole tree. A tick is the same
+locked `sync`; one that finds the lock held reports
 `contended` and is retried by the loop rather than counted as done. A failed
 sweep arrives as an `Err` and the loop keeps running; the rolling catalog
 baseline survives it, so rows a failed sweep had already committed are

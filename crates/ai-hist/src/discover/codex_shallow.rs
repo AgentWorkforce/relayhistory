@@ -67,11 +67,25 @@ impl ShallowSessionProvider for CodexProvider {
             names: None,
         };
         let mut files = Vec::new();
+        let scope = env.path_scope();
         for root in [
             env.codex_home.join("sessions"),
             env.codex_home.join("archived_sessions"),
         ] {
-            files.extend(crate::collect_matching_files(&root, "rollout-", "jsonl")?);
+            match crate::ingest::path_scope::PathScope::walk_of(scope, &root) {
+                crate::ingest::path_scope::RootWalk::Skip => {}
+                crate::ingest::path_scope::RootWalk::Full => {
+                    files.extend(crate::collect_matching_files(&root, "rollout-", "jsonl")?);
+                }
+                crate::ingest::path_scope::RootWalk::Partial(scope) => {
+                    files.extend(crate::collect_matching_files_scoped(
+                        &root,
+                        "rollout-",
+                        "jsonl",
+                        Some(scope),
+                    )?);
+                }
+            }
         }
         file_candidates("codex", files, crate::file_stamp_and_modified)
     }

@@ -10,6 +10,7 @@
 
 use super::*;
 use crate::discover::WatchRoot;
+use crate::ingest::path_scope::PathScope;
 use crate::ingest::{sync_watch_roots_by_source, SweepScope};
 use crate::watch::{ChangeScope, TickRequest};
 use std::collections::{BTreeSet, HashMap};
@@ -26,13 +27,17 @@ pub(super) struct WatchSources {
 pub(super) struct SweepPlan {
     pub(super) roots: ProviderRoots,
     pub(super) sources: Option<Vec<Source>>,
+    paths: Option<PathScope>,
 }
 
 impl SweepPlan {
     pub(super) fn scope(&self) -> SweepScope {
         match &self.sources {
+            // An unknown root widens to every source, and a full sweep does
+            // not keep a path list that was only true of some of them.
             None => SweepScope::everything(),
-            Some(sources) => SweepScope::only(sources.iter().map(|source| source.as_str())),
+            Some(sources) => SweepScope::only(sources.iter().map(|source| source.as_str()))
+                .with_paths(self.paths.clone()),
         }
     }
 }
@@ -68,15 +73,23 @@ impl WatchSources {
     /// What `request` sweeps. A forced tick whose every root is known sweeps
     /// only the sources those roots belong to; anything else is a full sweep.
     pub(super) fn plan(&self, request: &TickRequest) -> SweepPlan {
-        let sources = match &request.scope {
-            ChangeScope::Roots(fired) if request.force => {
-                sources_of(&self.by_root.lock().expect("watch sources"), fired)
+        let (sources, paths) = match &request.scope {
+            ChangeScope::Roots {
+                roots: fired,
+                paths,
+            } if request.force => {
+                let sources = sources_of(&self.by_root.lock().expect("watch sources"), fired);
+                let paths = sources
+                    .as_ref()
+                    .and_then(|_| PathScope::from_paths(paths.iter().cloned()));
+                (sources, paths)
             }
-            _ => None,
+            _ => (None, None),
         };
         SweepPlan {
             roots: self.roots.clone(),
             sources,
+            paths,
         }
     }
 }
@@ -244,7 +257,10 @@ mod tests {
         TickRequest {
             trigger: TickTrigger::FsEvent,
             force: true,
-            scope: ChangeScope::Roots(roots.iter().cloned().collect()),
+            scope: ChangeScope::Roots {
+                roots: roots.iter().cloned().collect(),
+                paths: BTreeSet::new(),
+            },
         }
     }
 
@@ -287,6 +303,29 @@ mod tests {
             None,
             "an event the loop could not place"
         );
+    }
+
+    #[test]
+    fn an_event_tick_carries_the_paths_that_changed() {
+        let (home, roots) = home();
+        let sources = WatchSources::new(roots);
+        sources.watch_roots();
+        let claude = home.path().join(".claude/projects");
+        let file = claude.join("app/s.jsonl");
+        let request = TickRequest {
+            trigger: TickTrigger::FsEvent,
+            force: true,
+            scope: ChangeScope::Roots {
+                roots: BTreeSet::from([claude.clone()]),
+                paths: BTreeSet::from([file.clone()]),
+            },
+        };
+        let plan = sources.plan(&request);
+        assert_eq!(plan.sources, Some(vec![Source::Claude]));
+        let scope = plan.scope();
+        assert!(scope.paths().unwrap().include_file(&file, "", "jsonl"));
+        // Roots with no file paths still walk that provider whole.
+        assert!(sources.plan(&event(&[claude])).scope().paths().is_none());
     }
 
     #[test]

@@ -74,6 +74,7 @@ mod claude_shallow;
 use claude_shallow::read_claude_shallow;
 mod codex_shallow;
 pub(crate) use codex_shallow::CodexProvider;
+mod cursor_files;
 mod opencode_page;
 use opencode_page::{
     opencode_rows_unpaged, opencode_sqlite_model, opencode_sqlite_prompt, opencode_sqlite_title,
@@ -383,6 +384,10 @@ pub struct DiscoveryEnv<'a> {
     pub opencode_storage_dir: PathBuf,
     conn: &'a Connection,
     counters: CounterCell,
+    /// Changed paths for this sweep's discovery pass. `None` enumerates
+    /// every candidate. Never set on the fingerprint environment: a partial
+    /// listing must not become the cached picture of a source.
+    path_scope: Option<crate::ingest::path_scope::PathScope>,
 }
 
 impl<'a> DiscoveryEnv<'a> {
@@ -408,7 +413,22 @@ impl<'a> DiscoveryEnv<'a> {
             opencode_storage_dir: roots.opencode_storage_dir,
             conn,
             counters: CounterCell::default(),
+            path_scope: None,
         }
+    }
+
+    /// Restrict file-backed enumeration to these paths. The fingerprint pass
+    /// does not call this.
+    pub(crate) fn with_path_scope(
+        mut self,
+        scope: Option<crate::ingest::path_scope::PathScope>,
+    ) -> Self {
+        self.path_scope = scope;
+        self
+    }
+
+    pub(crate) fn path_scope(&self) -> Option<&crate::ingest::path_scope::PathScope> {
+        self.path_scope.as_ref()
     }
 
     /// Build an environment with explicit roots, for hosts that keep provider
@@ -872,6 +892,22 @@ impl WatchRoot {
     /// Whether `path` is one of the spellings this root registers under.
     pub fn registers_at(&self, path: &Path) -> bool {
         self.registered_path() == path || self.canonical_registered_path() == Some(path)
+    }
+
+    /// `event` spelled with this root's own `path`.
+    ///
+    /// macOS reports the canonical path (`/private/var` for `/var`). The
+    /// sweep walks the lexical root it was given, so a canonical event is
+    /// rewritten onto that root. `None` when the event is under neither
+    /// spelling: the caller walks the whole root rather than skip a change
+    /// it cannot place.
+    pub(crate) fn lexical_event_path(&self, event: &Path) -> Option<PathBuf> {
+        if event.starts_with(&self.path) {
+            return Some(event.to_path_buf());
+        }
+        let canonical = self.canonical.as_deref()?;
+        let rest = event.strip_prefix(canonical).ok()?;
+        Some(self.path.join(rest))
     }
 
     /// Whether an event on `path` is one this root asked for.
@@ -1553,7 +1589,10 @@ impl ShallowSessionProvider for ClaudeProvider {
     ) -> Result<Vec<Candidate>> {
         file_candidates(
             "claude",
-            crate::ingest::claude_transcript_files(&env.claude_config_dir.join("projects"))?,
+            crate::ingest::scoped_files::claude_transcript_files_scoped(
+                &env.claude_config_dir.join("projects"),
+                env.path_scope(),
+            )?,
             crate::file_stamp_and_modified,
         )
     }
@@ -1616,31 +1655,7 @@ impl ShallowSessionProvider for CursorProvider {
         env: &DiscoveryEnv<'_>,
         _requested_limit: Option<usize>,
     ) -> Result<Vec<Candidate>> {
-        let root = env.home.join(".cursor/projects");
-        let mut out = Vec::new();
-        for project_dir in crate::sorted_dirs(&root)? {
-            let transcripts = project_dir.join("agent-transcripts");
-            if !transcripts.is_dir() {
-                continue;
-            }
-            for session_dir in crate::sorted_dirs(&transcripts)? {
-                let Some(session_id) = session_dir.file_name().and_then(|s| s.to_str()) else {
-                    continue;
-                };
-                let jsonl = session_dir.join(format!("{session_id}.jsonl"));
-                let Ok((stamp, recency_hint_ms)) = crate::file_stamp_and_modified(&jsonl) else {
-                    continue;
-                };
-                out.push(Candidate {
-                    source: "cursor",
-                    locator: jsonl.to_string_lossy().into_owned(),
-                    session_id: Some(session_id.to_string()),
-                    recency_hint_ms,
-                    stamp,
-                });
-            }
-        }
-        Ok(out)
+        cursor_files::candidates(env)
     }
 
     fn read_shallow(
@@ -1803,7 +1818,7 @@ impl ShallowSessionProvider for GrokProvider {
         // serve the fingerprint, the walk and this pass alike (#317).
         file_candidates(
             "grok",
-            sweep_inventory::grok_transcripts(&env.grok_home.join("sessions"))?,
+            crate::grok_transcripts_for(&env.grok_home.join("sessions"), env.path_scope())?,
             sweep_inventory::grok_stamp_and_modified,
         )
     }
@@ -1989,7 +2004,7 @@ impl ShallowSessionProvider for MuseProvider {
     ) -> Result<Vec<Candidate>> {
         file_candidates(
             "muse",
-            crate::collect_muse_transcripts(&env.muse_sessions)?,
+            crate::collect_muse_transcripts_scoped(&env.muse_sessions, env.path_scope())?,
             crate::file_stamp_and_modified,
         )
     }
