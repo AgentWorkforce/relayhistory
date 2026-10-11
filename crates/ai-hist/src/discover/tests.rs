@@ -2900,6 +2900,16 @@ fn grok_remote_presence_cannot_clear_a_locally_observed_subagent_kind() {
         ..Default::default()
     }).unwrap().is_empty());
 
+    // Without a local presence, the next remote snapshot can remove its own
+    // marker. An absent kind must not preserve stale remote classification.
+    upsert("remote-only", None, SessionLocation::Remote);
+    assert_eq!(stored_kind("remote-only"), None);
+    assert_eq!(list_session_catalog(&conn, &CatalogListOptions {
+        scope: SessionScope::All,
+        exclude_delegated: true,
+        ..Default::default()
+    }).unwrap().len(), 1);
+
     // A subsequent local summary without the marker is authoritative: the
     // session becomes a root even if remote presence still exists.
     upsert("local-first", None, SessionLocation::Local);

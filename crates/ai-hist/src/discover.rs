@@ -3975,6 +3975,7 @@ static UPSERT_SESSION_SQL: LazyLock<String> = LazyLock::new(|| {
              WHEN excluded.source = 'grok' AND EXISTS ( \
                  SELECT 1 FROM session_presences p WHERE p.source = sessions.source \
                  AND p.session_id = sessions.session_id AND p.location = 'local') THEN sessions.session_kind \
+             WHEN excluded.source = 'grok' THEN excluded.session_kind \
              ELSE COALESCE(excluded.session_kind, sessions.session_kind) END, \
          models_json = COALESCE(excluded.models_json, sessions.models_json), \
          originator = COALESCE(excluded.originator, sessions.originator), \
