@@ -34,9 +34,12 @@ pub(crate) mod muse;
 pub(crate) mod opencode;
 pub(crate) mod opencode_sweep;
 pub(crate) mod path_scope;
+mod sweep_write;
 pub(crate) mod titles;
 pub(crate) mod tool_result_facts;
 pub(crate) mod transcript_cursor;
+
+pub(crate) use sweep_write::SweepWrite;
 
 use titles::set_session_title;
 
@@ -3909,112 +3912,6 @@ fn save_sync_state(path: &Path, state: &Map<String, Value>) -> Result<()> {
 /// large backlog in one transaction would instead hold the write lock for
 /// minutes and starve everyone else.
 const JSONL_CHUNK_LINES: usize = 2_000;
-
-/// One write transaction over a transcript's worth of sweep work.
-///
-/// The global Claude and Codex walks used to write in autocommit, which at the
-/// default `synchronous = FULL` is one WAL `fsync` per statement -- several
-/// per record, and two thirds of a cold sweep's samples. Every other provider
-/// already writes a unit at a time (Cursor per source, Grok per session
-/// directory, Muse per session, hydration per session); this is the same
-/// thing for the two that did not.
-///
-/// It changes when rows become visible, not what is durable: each commit is
-/// as durable as an autocommit was, the change-feed revisions are stamped by
-/// the same per-row triggers, and every cursor these walks publish is written
-/// inside the transaction, after the rows it vouches for, so a crash leaves
-/// the rows and their cursor together or neither. `.sync-state.json` is still
-/// checkpointed only after the source finishes, so a stamp never runs ahead of
-/// the commit it describes.
-///
-/// `IMMEDIATE`, so the writer lock is taken before the first read of a
-/// cursor rather than on the first write, where a deferred transaction that
-/// raced a hydration would fail to upgrade instead of waiting behind it. A
-/// caller that is already inside a transaction keeps its own boundaries:
-/// nothing here begins, commits or rolls back on its behalf.
-///
-/// Bounded as the ADR on direct writers requires: [`SweepWrite::record`]
-/// commits and reopens every [`JSONL_CHUNK_LINES`] records, so a very large
-/// transcript holds the lock for one chunk at a time, not for its whole read.
-/// A chunk committed ahead of the transcript's cursor is what autocommit did
-/// for every statement; the re-read that follows upserts over it.
-pub(crate) struct SweepWrite<'c> {
-    conn: &'c Connection,
-    /// Whether this guard opened the transaction and so owns its boundaries.
-    owned: bool,
-    records: usize,
-}
-
-impl<'c> SweepWrite<'c> {
-    pub(crate) fn begin(conn: &'c Connection) -> Result<Self> {
-        let owned = conn.is_autocommit();
-        if owned {
-            conn.execute_batch("BEGIN IMMEDIATE")?;
-        }
-        Ok(Self {
-            conn,
-            owned,
-            records: 0,
-        })
-    }
-
-    /// One record is about to be read. Past the chunk size, commit what is
-    /// written and open the next chunk.
-    pub(crate) fn record(&mut self) -> Result<()> {
-        if !self.owned {
-            return Ok(());
-        }
-        self.records += 1;
-        if self.records < JSONL_CHUNK_LINES {
-            return Ok(());
-        }
-        self.records = 0;
-        self.conn.execute_batch("COMMIT")?;
-        if let Err(error) = self.conn.execute_batch("BEGIN IMMEDIATE") {
-            // Committed and not reopened: there is nothing left to own, and
-            // the walk ends on the error rather than writing in autocommit.
-            self.owned = false;
-            return Err(error.into());
-        }
-        Ok(())
-    }
-
-    pub(crate) fn commit(mut self) -> Result<()> {
-        if !self.owned {
-            return Ok(());
-        }
-        let committed = self.conn.execute_batch("COMMIT");
-        // Whether or not COMMIT succeeded the guard no longer owns a
-        // transaction: a successful commit ended it, and a failed one is
-        // ended here. SQLite can refuse a COMMIT (a busy commit, say) and
-        // leave the transaction open, and the sweep goes on to the next
-        // provider on this same connection. Left open, that transaction
-        // would swallow the next provider's writes and let it publish
-        // cursors for rows that vanish when the connection closes.
-        self.owned = false;
-        if let Err(error) = committed {
-            if !self.conn.is_autocommit() {
-                let _ = self.conn.execute_batch("ROLLBACK");
-            }
-            return Err(error.into());
-        }
-        Ok(())
-    }
-}
-
-impl Drop for SweepWrite<'_> {
-    fn drop(&mut self) {
-        // An error or a cancellation unwound past the guard: nothing of the
-        // open chunk is kept. Chunks a Claude transcript committed before it
-        // stay (its catalog row and the rows of those chunks), but its cursor
-        // was never published, so the next sweep reads the file again and
-        // its upserts converge on the same rows. SQLite may already have
-        // rolled back on its own.
-        if self.owned && !self.conn.is_autocommit() {
-            let _ = self.conn.execute_batch("ROLLBACK");
-        }
-    }
-}
 
 /// A byte cursor is valid only for the file generation that produced it.
 /// `observed_at_ns` orders overlapping writers across rotations, while the
