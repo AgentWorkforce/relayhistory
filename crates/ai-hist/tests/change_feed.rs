@@ -1725,10 +1725,11 @@ fn codex_reread_clears_usage_that_is_gone_once() {
     );
 }
 
-/// The end-of-rollout refusal fills a row that has no measurement and leaves
-/// a row that already has one.
+/// A re-read whose snapshot is unreadable ends on that refusal. A stale
+/// measurement the file no longer supports is replaced once, and a row that
+/// has none is filled once.
 #[test]
-fn codex_reread_refusal_fills_a_null_row_and_keeps_a_measurement() {
+fn codex_reread_refusal_replaces_a_stale_measurement_once() {
     let home = Home::new();
     home.stage_codex("two-unreadable-turns.jsonl");
     let store = home.store();
@@ -1785,24 +1786,35 @@ fn codex_reread_refusal_fills_a_null_row_and_keeps_a_measurement() {
         .unwrap();
     assert_eq!(
         stored_token(&home, session, &assistants[0].0).as_deref(),
-        Some(sentinel),
-        "a real measurement is not replaced by the refusal ({kept})"
+        Some(kept.as_str()),
+        "a stale measurement becomes the refusal the file now has ({sentinel})"
     );
     assert_eq!(
         stored_token(&home, session, &assistants[1].0).as_deref(),
         Some(restored.as_str())
     );
     let events = session_events_since(&store, head);
-    let filled: Vec<&Change> = events
-        .iter()
-        .filter(|change| change.record_key == assistants[1].0)
-        .collect();
-    assert_eq!(filled.len(), 1, "{events:?}");
-    assert_eq!(event_token(filled[0]), Some(restored.as_str()));
-    assert!(
-        events
+    for (uid, usage) in [
+        (&assistants[0].0, kept.as_str()),
+        (&assistants[1].0, restored.as_str()),
+    ] {
+        let matched: Vec<&Change> = events
             .iter()
-            .all(|change| change.record_key != assistants[0].0),
-        "the measured row is not reported: {events:?}"
+            .filter(|change| change.record_key == *uid)
+            .collect();
+        assert_eq!(matched.len(), 1, "{uid}: {events:?}");
+        assert_eq!(event_token(matched[0]), Some(usage));
+    }
+
+    let again = store.head_revision().unwrap();
+    store
+        .hydrate(
+            &SessionRef::id(Source::Codex, session),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    assert!(
+        session_events_since(&store, again).is_empty(),
+        "the same refusal is not reported again"
     );
 }

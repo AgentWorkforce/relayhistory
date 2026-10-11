@@ -15,6 +15,9 @@ use super::{surviving_refusals, PendingCodexUsage, UnreadableSnapshot};
 #[derive(Default)]
 pub(super) struct Pass {
     unsettled: HashSet<String>,
+    /// Rows this pass already gave a usage fact. A surviving refusal must
+    /// not replace that fact.
+    settled: HashSet<String>,
 }
 
 impl Pass {
@@ -24,6 +27,7 @@ impl Pass {
     pub(super) fn wrote(&mut self, settled: bool, uid: &str) -> Option<String> {
         if settled {
             self.unsettled.remove(uid);
+            self.settled.insert(uid.to_string());
             None
         } else {
             self.unsettled.insert(uid.to_string());
@@ -47,6 +51,7 @@ impl Pass {
         match untokened.take() {
             Some(uid) => {
                 self.unsettled.remove(&uid);
+                self.settled.insert(uid.clone());
                 let token_json = usage.into_token_json();
                 conn.execute(
                     "UPDATE session_events SET token_json = ?1 \
@@ -90,12 +95,13 @@ impl Pass {
     }
 }
 
-/// Clear usage this pass did not re-measure, then fill a refusal into a row
-/// that still has none.
+/// Clear usage this pass did not re-measure, then write each surviving
+/// refusal.
 ///
-/// A surviving refusal is the usage that row ends with. It is not cleared,
-/// and it is written only where `token_json` is null, so a measurement the
-/// turn acquired by another route stays.
+/// A refusal is the usage its row ends with when this pass did not attach a
+/// measurement. A stale measurement is replaced in that one write. A
+/// measurement this pass attached stays, and a remote-only row is left
+/// alone.
 pub(super) fn finish(
     conn: &Connection,
     session_id: &str,
@@ -107,15 +113,16 @@ pub(super) fn finish(
     let refused: HashSet<String> = refusals.iter().map(|(uid, _)| uid.clone()).collect();
     pass.clear_unsettled(conn, session_id, &refused)?;
     for (uid, raw) in refusals {
+        if pass.settled.contains(&uid) {
+            continue;
+        }
+        let token_json = PendingCodexUsage::Unusable(raw).into_token_json();
         conn.execute(
             "UPDATE session_events SET token_json = ?1 \
              WHERE source = 'codex' AND session_id = ?2 AND event_uid = ?3 \
-               AND token_json IS NULL",
-            params![
-                PendingCodexUsage::Unusable(raw).into_token_json(),
-                session_id,
-                uid
-            ],
+               AND location <> 'remote' \
+               AND token_json IS NOT ?1",
+            params![token_json, session_id, uid],
         )?;
     }
     Ok(())
@@ -241,38 +248,49 @@ mod tests {
     }
 
     #[test]
-    fn codex_reread_refusal_fills_only_a_null_row() {
+    fn codex_reread_refusal_replaces_a_stale_measurement_once() {
         let (_dir, conn) = db();
         insert(&conn, "measured", Some(&json(4)), "local");
+        insert(&conn, "stale", Some(&json(4)), "local");
         insert(&conn, "empty", None, "local");
+        insert(&conn, "remote-stale", Some(&json(4)), "remote");
+        let mut pass = Pass::default();
+        let mut pending = None;
+        let mut untokened = Some("measured".to_string());
+        pass.attach(&conn, "s", &mut pending, &mut untokened, usage(4))
+            .unwrap();
         let measured_rev = revision(&conn, "measured");
-        let pass = Pass::default();
-        let unreadable = vec![
-            UnreadableSnapshot {
-                uid: "measured".to_string(),
+        let remote_rev = revision(&conn, "remote-stale");
+        let unreadable = ["measured", "stale", "empty", "remote-stale"]
+            .into_iter()
+            .map(|uid| UnreadableSnapshot {
+                uid: uid.to_string(),
                 generation: 0,
                 raw: "{\"input_tokens\":-1}".to_string(),
-            },
-            UnreadableSnapshot {
-                uid: "empty".to_string(),
-                generation: 0,
-                raw: "{\"input_tokens\":-1}".to_string(),
-            },
-        ];
+            })
+            .collect::<Vec<_>>();
         finish(&conn, "s", &pass, &unreadable, &HashSet::new()).unwrap();
         assert_eq!(token(&conn, "measured").as_deref(), Some(json(4).as_str()));
         assert_eq!(revision(&conn, "measured"), measured_rev);
         assert_eq!(
+            token(&conn, "stale").as_deref(),
+            Some("{\"input_tokens\":-1}")
+        );
+        assert_eq!(
             token(&conn, "empty").as_deref(),
             Some("{\"input_tokens\":-1}")
         );
-        let filled = revision(&conn, "empty");
-        finish(&conn, "s", &pass, &unreadable, &HashSet::new()).unwrap();
         assert_eq!(
-            revision(&conn, "empty"),
-            filled,
-            "the refusal is not written twice"
+            token(&conn, "remote-stale").as_deref(),
+            Some(json(4).as_str())
         );
+        assert_eq!(revision(&conn, "remote-stale"), remote_rev);
+        let stale_rev = revision(&conn, "stale");
+        let empty_rev = revision(&conn, "empty");
+        finish(&conn, "s", &pass, &unreadable, &HashSet::new()).unwrap();
+        assert_eq!(revision(&conn, "stale"), stale_rev);
+        assert_eq!(revision(&conn, "empty"), empty_rev);
         assert_eq!(revision(&conn, "measured"), measured_rev);
+        assert_eq!(revision(&conn, "remote-stale"), remote_rev);
     }
 }
