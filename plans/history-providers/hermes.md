@@ -89,7 +89,7 @@ tests also pass; no pre-existing fixture snapshot changed.
 Final provider validation (macOS, `TMPDIR=/private/tmp`; socket/process suites
 ran outside the restrictive macOS sandbox):
 
-- `cargo test -p ai-hist --all-features providers::hermes --lib`: 15 pass.
+- `cargo test -p ai-hist --all-features providers::hermes --lib`: 17 pass.
 - `cargo test -p ai-hist --all-features --test provider_hermes --test fixture_corpus --test source_registry`: 1 + 66 + 10 pass.
 - `cargo test -p ai-hist --test provider_hermes` and `cargo test -p ai-hist --features export --test provider_hermes`: pass.
 - `npm run providers:check`: pass; `node --test scripts/*.test.mjs`: 171 pass.
@@ -127,3 +127,11 @@ Shared integration blockers (outside this provider's handwritten ownership):
 Do not label the provider integration ready or close #429 until those shared
 changes and all gates pass. No publication, merge, push or PR creation was done
 by this provider worker. Setup #464 must merge before pilot integration.
+
+Cancellation follow-up: database/profile enumeration, snapshot session/message
+collection, and normalization now check the existing cooperative stop token.
+Cancelling midway through normalization rolls back its current session transaction.
+Disabling cancellation propagation produces two named failures:
+`cancellation_interrupts_snapshot_collection_before_it_finishes` and
+`cancellation_inside_normalization_rolls_back_partial_evidence`. Restoring the
+checks passes both and all 17 focused provider tests.

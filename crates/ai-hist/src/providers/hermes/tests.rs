@@ -379,3 +379,54 @@ fn watches_filter_existing_profile_configuration_and_track_future_profile_parent
     assert!(!main.entries.admits(std::ffi::OsStr::new("config.yaml")));
     assert!(!main.entries.admits(std::ffi::OsStr::new(".env")));
 }
+
+#[test]
+fn cancellation_interrupts_snapshot_collection_before_it_finishes() {
+    let (_home, roots, path, _db) = fixture();
+    let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+    let count = calls.clone();
+    let result = crate::ingest::with_capture_stop(
+        move || {
+            let n = count.get() + 1;
+            count.set(n);
+            n >= 6
+        },
+        || {
+            let result = storage::all(&AcquisitionContext::new(ID, &roots), &path);
+            assert!(result.is_err(), "capture must stop inside its row loops");
+            result
+        },
+    );
+    assert!(result.unwrap_err().is::<crate::ingest::CaptureCancelled>());
+}
+#[test]
+fn cancellation_inside_normalization_rolls_back_partial_evidence() {
+    let (home, roots, path, _db) = fixture();
+    let session = storage::all(&AcquisitionContext::new(ID, &roots), &path)
+        .unwrap()
+        .remove(0);
+    let conn = crate::open_db(&home.path().join("ledger.db")).unwrap();
+    let calls = std::rc::Rc::new(std::cell::Cell::new(0));
+    let count = calls.clone();
+    let result = crate::ingest::with_capture_stop(
+        move || {
+            let n = count.get() + 1;
+            count.set(n);
+            n >= 4
+        },
+        || {
+            let tx = conn.unchecked_transaction()?;
+            let result = normalize::session(&tx, &session, &path);
+            assert!(
+                result.is_err(),
+                "normalization must stop before finishing all messages"
+            );
+            result
+        },
+    );
+    assert!(result.unwrap_err().is::<crate::ingest::CaptureCancelled>());
+    let rows: i64 = conn
+        .query_row("SELECT count(*) FROM session_markers", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(rows, 0, "cancelled session writes must roll back");
+}

@@ -44,6 +44,7 @@ fn marker(
     Ok(())
 }
 pub(super) fn session(conn: &Connection, s: &Session, path: &Path) -> Result<usize> {
+    crate::ingest::check_capture_cancelled()?;
     let mut keys = Keys::default();
     let mut inserted = 0;
     let mut indexer = ToolResultIndexer::default();
@@ -58,6 +59,7 @@ pub(super) fn session(conn: &Connection, s: &Session, path: &Path) -> Result<usi
         &mut keys,
     )?;
     for m in &s.messages {
+        crate::ingest::check_capture_cancelled()?;
         inserted += message(conn, s, m, &mut keys, &mut indexer)?;
     }
     let last = s

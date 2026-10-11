@@ -118,8 +118,10 @@ fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
     // SQLite changes, including WAL writes, require a complete coherent snapshot.
     // Always re-read: this also repairs lost rows without trusting a source cursor.
     for path in storage::databases(ctx.roots)? {
+        crate::ingest::check_capture_cancelled()?;
         let sessions = storage::all(&context, &path)?;
         for session in sessions {
+            crate::ingest::check_capture_cancelled()?;
             let tx = ctx.conn.unchecked_transaction()?;
             inserted += normalize::session(&tx, &session, &path)?;
             tx.commit()?;

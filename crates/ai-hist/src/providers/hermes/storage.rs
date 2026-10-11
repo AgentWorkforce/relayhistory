@@ -1,5 +1,6 @@
 use super::*;
 use crate::discover::WatchEntries;
+use crate::ingest::check_capture_cancelled;
 use anyhow::{ensure, Context};
 use sha2::{Digest, Sha256};
 const MAX_SESSIONS: usize = 100_000;
@@ -27,6 +28,7 @@ pub(super) fn databases(roots: &ProviderRoots) -> Result<Vec<PathBuf>> {
     let context = AcquisitionContext::new(ID, roots);
     let mut paths = vec![];
     for root in roots.for_provider(ID) {
+        check_capture_cancelled()?;
         match std::fs::metadata(root) {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
             Err(e) => return Err(e.into()),
@@ -42,6 +44,7 @@ pub(super) fn databases(roots: &ProviderRoots) -> Result<Vec<PathBuf>> {
         }
         context.validate(&profiles)?;
         for (index, entry) in std::fs::read_dir(profiles)?.enumerate() {
+            check_capture_cancelled()?;
             ensure!(
                 index < 1024,
                 "Hermes profile enumeration exceeds 1024 entries"
@@ -99,6 +102,7 @@ fn read<T>(
     path: &Path,
     f: impl FnOnce(&Connection) -> Result<T>,
 ) -> Result<T> {
+    check_capture_cancelled()?;
     context.validate(path)?;
     ensure!(
         path.file_name().is_some_and(|n| n == "state.db"),
@@ -152,6 +156,7 @@ fn sessions(
     })?;
     let mut result = vec![];
     for row in rows {
+        check_capture_cancelled()?;
         let (native_id, title, model, cwd, git_branch, parent, end_reason, started, ended) = row?;
         ensure!(
             !native_id.trim().is_empty(),
@@ -177,7 +182,11 @@ fn sessions(
 fn messages(conn: &Connection, native: &str) -> Result<Vec<Message>> {
     let mut stmt = conn.prepare("SELECT id,role,content,timestamp,tool_call_id,tool_calls,tool_name,reasoning,reasoning_content,finish_reason,_compressed_summary,active,compacted,observed,display_kind FROM messages WHERE session_id=? ORDER BY id LIMIT 1000001")?;
     let rows = stmt.query_map([native], message_row)?;
-    let mut result = rows.collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut result = Vec::new();
+    for row in rows {
+        check_capture_cancelled()?;
+        result.push(row?);
+    }
     ensure!(
         result.len() <= 1_000_000,
         "Hermes message capture exceeds safety limit"
@@ -189,6 +198,7 @@ fn messages(conn: &Connection, native: &str) -> Result<Vec<Message>> {
         .iter_mut()
         .zip(times.query_map([native], |r| r.get::<_, f64>(0))?)
     {
+        check_capture_cancelled()?;
         message.timestamp = timestamp(time?)?;
     }
     Ok(result)
@@ -216,6 +226,7 @@ pub(super) fn enumerate(roots: &ProviderRoots, limit: Option<usize>) -> Result<V
     let context = AcquisitionContext::new(ID, roots);
     let mut candidates = vec![];
     for path in databases(roots)? {
+        check_capture_cancelled()?;
         let mut stamps = vec![];
         for suffix in ["", "-wal", "-journal"] {
             let p = sidecar(&path, suffix);
@@ -296,6 +307,7 @@ pub(super) fn all(context: &AcquisitionContext<'_>, path: &Path) -> Result<Vec<S
             "Hermes session capture exceeds safety limit"
         );
         for row in &mut rows {
+            check_capture_cancelled()?;
             row.messages = messages(conn, &row.native_id)?;
         }
         Ok(rows)
