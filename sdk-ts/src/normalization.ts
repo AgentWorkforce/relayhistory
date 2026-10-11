@@ -201,6 +201,7 @@ export function catalogSession(value: UnknownRecord): CatalogSession {
     firstPrompt: nullableString(value.firstPrompt),
     lastAssistantText: nullableString(value.lastAssistantText),
     title: nullableString(value.title),
+    sessionKind: nullableString(value.sessionKind),
     models: Array.isArray(value.models) ? value.models.map(String) : [],
     originator: nullableString(value.originator),
     agentVersion: nullableString(value.agentVersion),

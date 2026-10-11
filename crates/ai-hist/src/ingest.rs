@@ -15726,7 +15726,7 @@ fn ingest_grok_session(
     // keeps the monotonic merge.
     conn.execute(
         "UPDATE sessions SET first_activity_ms = ?, last_activity_ms = ?, \
-         last_assistant_text = ?, models_json = ?, first_prompt = ? \
+         last_assistant_text = ?, models_json = ?, first_prompt = ?, session_kind = ? \
          WHERE source = 'grok' AND session_id = ?",
         params![
             session.first_ts,
@@ -15735,6 +15735,7 @@ fn ingest_grok_session(
             (!session.models.is_empty())
                 .then(|| serde_json::to_string(&session.models).unwrap_or_default()),
             first_prompt.as_deref(),
+            session.session_kind.as_deref(),
             sid,
         ],
     )?;
@@ -16299,6 +16300,7 @@ struct GrokPromptContext {
 /// One Grok session directory, read.
 struct GrokSession {
     session_id: String,
+    session_kind: Option<String>,
     cwd: Option<String>,
     git_branch: Option<String>,
     first_ts: i64,
@@ -16526,6 +16528,11 @@ fn scan_grok_session_file(chat: &Path) -> Result<Option<GrokSession>> {
     let title = titles::grok_title(summary.as_ref());
     Ok(Some(GrokSession {
         session_id,
+        session_kind: summary
+            .as_ref()
+            .and_then(|s| s.get("session_kind"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
         cwd,
         git_branch,
         first_ts,
@@ -18604,6 +18611,53 @@ mod tests {
         )
         .unwrap();
         (dir.join("chat_history.jsonl"), dir)
+    }
+
+    #[test]
+    fn grok_full_sync_preserves_a_parentless_subagent_for_direct_reads() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join(".grok/sessions/%2Fwork%2Fgrok");
+        for (id, kind) in [("root", ""), ("child", r#", "session_kind":"subagent""#)] {
+            let dir = root.join(id);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join("chat_history.jsonl"),
+                format!(r#"{{"type":"user","content":"{id} prompt"}}"#) + "\n",
+            )
+            .unwrap();
+            fs::write(dir.join("summary.json"), format!(
+                r#"{{"info":{{"id":"{id}","cwd":"/work/grok"}},"created_at":"2026-06-20T09:00:00.000Z"{kind}}}"#
+            )).unwrap();
+        }
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        super::sync_grok(&conn, &mut Map::new(), &home.path().join(".grok/sessions")).unwrap();
+        let all = crate::discover::list_session_catalog(
+            &conn,
+            &crate::discover::CatalogListOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(all.len(), 2);
+        let child = all.iter().find(|row| row.session_id == "child").unwrap();
+        assert_eq!(child.session_kind.as_deref(), Some("subagent"));
+        let child_events: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM session_events WHERE source = 'grok' AND session_id = 'child'", [], |row| row.get(0)
+        ).unwrap();
+        assert!(child_events > 0, "direct child evidence remains indexed");
+        let roots = crate::discover::list_session_catalog(
+            &conn,
+            &crate::discover::CatalogListOptions {
+                exclude_delegated: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            roots
+                .iter()
+                .map(|row| row.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["root"]
+        );
     }
 
     /// A Grok session indexed by a build that stored no `turn_completed.usage`
