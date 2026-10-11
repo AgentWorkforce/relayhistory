@@ -13,6 +13,7 @@ export const SESSION_USAGE_CONTRACT_VERSION = 3;
  * so the runtime checks below and the compile-time type cannot drift apart,
  * and it is the same list the MCP server's `SOURCE` enum publishes.
  */
+// BEGIN GENERATED PROVIDER SOURCES
 export const SOURCES = Object.freeze([
   'claude',
   'codex',
@@ -22,6 +23,7 @@ export const SOURCES = Object.freeze([
   'muse',
   'devin',
 ] as const);
+// END GENERATED PROVIDER SOURCES
 
 export type Source = (typeof SOURCES)[number];
 
@@ -37,6 +39,7 @@ export const EVIDENCE_KINDS = Object.freeze([
   'file_edit',
   'relationship',
   'commit_link',
+  'session_marker',
 ] as const);
 
 export type EvidenceKind = (typeof EVIDENCE_KINDS)[number];

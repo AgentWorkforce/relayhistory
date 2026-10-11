@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import test from 'node:test';
 
 import {
-  EVIDENCE_KINDS, FULL_SESSION_KINDS, InvalidArgumentError, NativeContractMismatchError,
+  SOURCES, EVIDENCE_KINDS, FULL_SESSION_KINDS, InvalidArgumentError, NativeContractMismatchError,
   SESSION_EVIDENCE_CONTRACT_VERSION, SESSION_HYDRATION_CONTRACT_VERSION,
   getSessionEvents, getSessionFileEdits, getSessionFileEditsPage, getSessionToolCalls,
   getSessionToolCallsPage, getSessionUserTurns, getSessionUserTurnsPage,
@@ -287,7 +287,7 @@ test('an unsupported provider is rejected, not answered with an empty page', asy
     }
 
     // Every id the SDK does publish stays accepted.
-    for (const source of ['claude', 'codex', 'cursor', 'grok', 'opencode', 'muse', 'devin'] as const) {
+    for (const source of SOURCES) {
       assert.equal((await getSessionToolCallsPage(source, 'no-such-session', { dbPath })).source, source);
       assert.equal((await getSessionFileEditsPage(source, 'no-such-session', { dbPath })).source, source);
     }
@@ -364,6 +364,10 @@ test('a native full capability unsupported by its coverage is a contract mismatc
   assert.deepEqual(
     normalizeHydration({ ...base, capability: 'partial', coverage: ['history'] }).coverage,
     ['history'],
+  );
+  assert.deepEqual(
+    normalizeHydration({ ...base, capability: 'partial', coverage: ['history', 'session_marker'] }).coverage,
+    ['history', 'session_marker'],
   );
   // An absent or non-list `coverage` is malformed, not "covers nothing":
   // defaulting it would pass validation and strip the coverage a merge needs.

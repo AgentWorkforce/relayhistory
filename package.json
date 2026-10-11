@@ -8,6 +8,8 @@
     "benchmark:hydration": "npm --prefix sdk-ts run benchmark:hydration --",
     "benchmark:sync": "node scripts/benchmark-sync.mjs",
     "benchmark:sync:gate": "node scripts/benchmark-sync.mjs --gate",
-    "gen:synthetic-history": "node scripts/gen-synthetic-history.mjs"
+    "gen:synthetic-history": "node scripts/gen-synthetic-history.mjs",
+    "providers:generate": "node scripts/generate-history-providers.mjs",
+    "providers:check": "node scripts/generate-history-providers.mjs --check && node --test scripts/generate-history-providers.test.mjs"
   }
 }

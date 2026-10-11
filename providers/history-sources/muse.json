@@ -1,0 +1,40 @@
+{
+  "id": "muse",
+  "rust_id": "muse",
+  "variant": "Muse",
+  "order": 5,
+  "aliases": [],
+  "legacy": true,
+  "fixtures": [
+    {
+      "source": "muse",
+      "name": "cli-capture",
+      "quirk": "a transcript the real `muse` CLI (0.2.1) wrote, trimmed to its conversation, tool and lifecycle records: three runs across two resumes, `read_file` calls with one failed outcome, per-step `model_completed` usage, and mirrored reminder task records",
+      "layout": "HomeTree",
+      "origin": "SessionMigrate",
+      "files": [
+        "muse/cli-capture"
+      ]
+    },
+    {
+      "source": "muse",
+      "name": "tools-session",
+      "quirk": "authored from the documented shape: a permission frame before the metadata, encrypted and readable reasoning, `edit_file`/`write_file` edits, a `bash` result that exits 101, a mirrored subagent task stream, a mid-session model switch, and `subagent/` logs — a worker with its own nested child, and a reminder — linked as delegated children rather than catalogued as sessions",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "muse/tools-session"
+      ]
+    }
+  ],
+  "population": {
+    "evidence": [
+      "history",
+      "session_event",
+      "tool_call",
+      "file_edit",
+      "relationship"
+    ],
+    "usage_accounting": "per-request"
+  }
+}

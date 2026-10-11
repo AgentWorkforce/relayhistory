@@ -1,3 +1,6 @@
+use crate::providers::{can_repair_source, repairable_event_sources, replayable_history_sources};
+#[path = "providers/mod.rs"]
+pub(crate) mod providers;
 use crate::{
     default_db_path, insert_history, insert_session_marker, now_ms, open_db, open_db_readonly,
     parse_cursor_text, prompt_hash, schema_is_catalog_read_current, sync_opencode_dbs,
@@ -858,49 +861,11 @@ const OPENCODE_NORMALIZER_GENERATION: &str = "opencode_normalizer_v2";
 /// The one-time backfill generations are part of it for the same reason as
 /// the keys above: each is recorded in sync state and re-reads unchanged
 /// sources when it moves, which it can only do if the sweep runs.
-fn sweep_generation() -> String {
-    let parts = format!(
-        "{}|tool_result_fidelity={TOOL_RESULT_FIDELITY_GENERATION}\
-         |raw_message_facts={RAW_MESSAGE_FACTS_GENERATION}\
-         |codex_fork_replay={CODEX_FORK_REPLAY_GENERATION}\
-         |codex_metadata_backfill={CODEX_METADATA_BACKFILL_GENERATION}",
-        SWEEP_PARSER_GENERATIONS.join("|")
-    );
-    format!(
-        "g{:016x}",
-        discover::fingerprint_hash(
-            "sweep-generation",
-            &discover::SHALLOW_SCANNER_VERSION.to_string(),
-            &parts,
-        )
-    )
-}
+use crate::providers::sweep_generation;
 
 /// Version tag of the destination marker's encoding, so a marker written by a
 /// build with a different shape is rejected rather than misread.
 const DESTINATION_MARKER_VERSION: &str = "v5";
-
-/// The sources whose events, tool calls, file edits and catalog row a *sweep*
-/// can put back.
-///
-/// The marker is a repair guard, so it may only promise what the sweep can
-/// honour. Codex rollouts and Claude transcripts are re-read and re-ingested
-/// by this sweep, so a loss in one is repairable and belongs in the marker.
-/// Adding a source here means adding its repair path in the same change.
-///
-/// Muse Code joined with its parser: every session is a whole-transcript
-/// read, and a sweep re-reads a session this marker names short, or the
-/// parent whose tree holds a short subagent.
-const REPAIRABLE_EVENT_SOURCES: &[&str] = &["claude", "codex", "opencode", "muse", "devin"];
-
-/// The sources whose `history` and `session_markers` rows a sweep can replay.
-///
-/// Cursor-backed flat logs (`~/.claude/history.jsonl`, `~/.codex/history.jsonl`)
-/// sit at EOF and cannot be safely rewound, so counting them would disarm the
-/// fast path forever over a loss it could not undo. Store-backed providers
-/// re-read their own database on each sync, so their history and markers are
-/// as repairable as their events.
-const REPLAYABLE_HISTORY_SOURCES: &[&str] = &["devin", "opencode"];
 
 /// What one session is expected to hold.
 ///
@@ -1486,8 +1451,8 @@ fn rows_removed_since_sql(kind: &str) -> String {
 /// One session's [`SessionHoldings`], counted the way the grouped reads of
 /// [`session_holdings_naming`] count it, through each table's session index.
 fn session_holding(conn: &Connection, source: &str, session_id: &str) -> Result<SessionHoldings> {
-    let repairable = REPAIRABLE_EVENT_SOURCES.contains(&source);
-    let replayable = REPLAYABLE_HISTORY_SOURCES.contains(&source);
+    let repairable = can_repair_source(source, false);
+    let replayable = can_repair_source(source, true);
     let count = |sql: &str, applies: bool| -> Result<u64> {
         if !applies {
             return Ok(0);
@@ -1574,20 +1539,6 @@ struct DestinationMarker {
     sessions: BTreeMap<u64, SessionHoldings>,
 }
 
-/// `REPAIRABLE_EVENT_SOURCES` as a bound parameter, so the grouped reads and
-/// the shortfall scan cannot drift apart.
-fn repairable_event_sources() -> rusqlite::types::Value {
-    rusqlite::types::Value::Text(
-        serde_json::to_string(REPAIRABLE_EVENT_SOURCES).unwrap_or_else(|_| "[]".to_string()),
-    )
-}
-
-fn replayable_history_sources() -> rusqlite::types::Value {
-    rusqlite::types::Value::Text(
-        serde_json::to_string(REPLAYABLE_HISTORY_SOURCES).unwrap_or_else(|_| "[]".to_string()),
-    )
-}
-
 /// Whether the destination still holds everything the stamp was written over.
 ///
 /// Growth is fine and must be: the hook fast path and hydration both add rows
@@ -1646,7 +1597,7 @@ impl SweepRepairs {
         self.sessions.len()
     }
 
-    fn contains(&self, source: &str, session_id: &str) -> bool {
+    pub(crate) fn contains(&self, source: &str, session_id: &str) -> bool {
         // Cheap enough to build the key: this is asked once per rollout whose
         // stamp matched, not per row.
         self.all
@@ -1967,6 +1918,9 @@ pub(crate) fn source_watch_roots(
     source: &str,
     provider_roots: &crate::ProviderRoots,
 ) -> Vec<discover::WatchRoot> {
+    if let Some(adapter) = crate::providers::adapter(source) {
+        return merge_watch_roots((adapter.watch_roots)(provider_roots));
+    }
     let mut roots = discover::provider_watch_roots(source, provider_roots);
     match source {
         "claude" => roots.push(discover::WatchRoot::file(
@@ -33542,8 +33496,16 @@ mod tests {
     /// version computed it.
     fn sweep_generation_at(scanner: u32, generations: &[&str]) -> String {
         let current = sweep_generation();
-        let parts = SWEEP_PARSER_GENERATIONS.join("|");
-        let older = generations.join("|");
+        let qualified = |legacy: &[&str]| {
+            legacy
+                .iter()
+                .map(|s| (*s).to_owned())
+                .chain(crate::providers::adapters().map(|(id, a)| format!("{id}:{}", a.generation)))
+                .collect::<Vec<_>>()
+                .join("|")
+        };
+        let parts = qualified(SWEEP_PARSER_GENERATIONS);
+        let older = qualified(generations);
         // Same encoding as `sweep_generation`, over the older list.
         let tail = format!(
             "|tool_result_fidelity={TOOL_RESULT_FIDELITY_GENERATION}\
@@ -34262,6 +34224,7 @@ mod tests {
     /// skipped.
     #[test]
     fn an_upgraded_store_gains_the_requests_of_standalone_records() {
+        let _settle = ImmediateSettle::on_filesystem_keeping_ctime(false);
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join(".claude/projects/-work-app");
         let subagents = project.join("root-1/subagents");

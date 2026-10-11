@@ -1065,7 +1065,7 @@ export function formatSessionRow(
       .replace(/[\u0000-\u001f\u007f-\u009f]/g, ' ')
       .replace(/\s+/g, ' ')
       .trim();
-  const icons: Record<Source, string> = {
+  const icons: Partial<Record<Source, string>> = {
     claude: '✦',
     codex: '◇',
     cursor: '▸',

@@ -359,7 +359,7 @@ impl std::error::Error for UsageError {}
 
 /// Sources this build can normalize. Anything else is an explicit
 /// [`UsageError::UnknownSource`] rather than a silent zero.
-pub const NORMALIZABLE_SOURCES: &[&str] = &["claude", "codex", "grok", "muse"];
+pub const NORMALIZABLE_SOURCES: &[&str] = crate::providers::NORMALIZABLE_SOURCES;
 
 /// Whether one model request can be spread across several stored records for
 /// this source.
@@ -370,29 +370,17 @@ pub const NORMALIZABLE_SOURCES: &[&str] = &["claude", "codex", "grok", "muse"];
 /// so its records already are its requests. This is what decides whether a
 /// request whose grouping key is only a record id is trustworthy.
 pub fn source_splits_requests_across_records(source: &str) -> bool {
-    matches!(source, "claude")
+    crate::providers::metadata(source)
+        .and_then(|m| m.usage)
+        .is_some_and(|u| u.splits_requests)
 }
 
 /// The accounting mode a source's records use, or `None` when this build has
 /// no rule for it.
 pub fn source_accounting(source: &str) -> Option<UsageAccounting> {
-    match source {
-        // Claude writes `message.usage` onto every content block of the
-        // message, so the record is per-message and needs deduplication.
-        "claude" => Some(UsageAccounting::PerMessage),
-        // Codex reports cumulative `token_count` snapshots, which the parser
-        // differences into per-request deltas before storing them.
-        "codex" => Some(UsageAccounting::CumulativeDelta),
-        // Grok's `turn_completed.usage` is one turn's spend, written once on
-        // that turn's last assistant event. The context-window snapshot
-        // stored beside it is never normalized.
-        "grok" => Some(UsageAccounting::PerRequest),
-        // Muse writes one `model_completed` usage object per model step, and
-        // the parser stores it once, on the first assistant row that step
-        // committed.
-        "muse" => Some(UsageAccounting::PerRequest),
-        _ => None,
-    }
+    crate::providers::metadata(source)
+        .and_then(|m| m.usage)
+        .map(|u| u.accounting)
 }
 
 /// Normalize one stored `token_json` string.
@@ -410,6 +398,18 @@ pub fn normalize_usage_str(source: &str, raw: &str) -> Result<Option<NormalizedU
 
 /// Normalize one parsed `token_json` value. See [`normalize_usage_str`].
 pub fn normalize_usage(
+    source: &str,
+    token_json: &Value,
+) -> Result<Option<NormalizedUsage>, UsageError> {
+    let usage = crate::providers::metadata(source)
+        .and_then(|m| m.usage)
+        .ok_or_else(|| UsageError::UnknownSource {
+            source: source.to_owned(),
+        })?;
+    (usage.normalize)(token_json)
+}
+
+pub(crate) fn normalize_legacy_usage(
     source: &str,
     token_json: &Value,
 ) -> Result<Option<NormalizedUsage>, UsageError> {

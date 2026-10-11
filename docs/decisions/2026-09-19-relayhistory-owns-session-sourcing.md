@@ -479,3 +479,12 @@ exist; the escalation triggers above are restated there.
 - burn's consumer contract: `DerivedRecords` in
   `crates/relayburn-sdk/src/ingest/ingest.rs`; record types in
   `crates/relayburn-sdk/src/reader/types.rs`.
+
+<!-- BEGIN GENERATED PROVIDER CAPTURE -->
+## Added provider capture matrix
+
+Generated from provider-owned acquisition records; these cells describe fixture-proven capture.
+
+| Provider | Evidence | Coverage / limitations |
+| --- | --- | --- |
+<!-- END GENERATED PROVIDER CAPTURE -->

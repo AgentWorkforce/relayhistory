@@ -232,6 +232,8 @@ pub struct ProviderRoots {
     /// say when a configured root does not exist rather than silently
     /// scanning nothing.
     pub use_env_roots: bool,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub(crate) provider_roots: std::collections::BTreeMap<String, Vec<PathBuf>>,
 }
 
 #[derive(Deserialize)]
@@ -248,6 +250,8 @@ struct ProviderRootsWire {
     opencode_db_pinned: bool,
     opencode_storage_dir: PathBuf,
     use_env_roots: bool,
+    #[serde(default)]
+    provider_roots: std::collections::BTreeMap<String, Vec<PathBuf>>,
 }
 
 #[doc(hidden)]
@@ -260,7 +264,10 @@ impl<'de> Deserialize<'de> for ProviderRoots {
         let devin = wire
             .devin
             .unwrap_or_else(|| devin_cli_dir_under(&wire.home));
+        let mut provider_roots = crate::providers::resolve_roots(&wire.home, false);
+        provider_roots.extend(wire.provider_roots);
         Ok(Self {
+            provider_roots,
             home: wire.home,
             claude: wire.claude,
             codex: wire.codex,
@@ -276,10 +283,16 @@ impl<'de> Deserialize<'de> for ProviderRoots {
 }
 
 impl ProviderRoots {
+    #[allow(dead_code)] // Provider-owned adapters use this frozen map.
+    pub(crate) fn for_provider(&self, id: &str) -> &[PathBuf] {
+        self.provider_roots.get(id).map(Vec::as_slice).unwrap_or(&[])
+    }
+
     /// Roots under `home`, with the process environment's provider overrides
     /// applied — the CLI's resolution.
     pub fn from_env(home: PathBuf) -> Self {
         Self {
+            provider_roots: crate::providers::resolve_roots(&home, true),
             claude: claude_config_dir(&home),
             codex: codex_home(&home),
             grok: grok_home(&home),
@@ -301,6 +314,7 @@ impl ProviderRoots {
             .map(|parent| parent.join("storage"))
             .unwrap_or_else(|| home.join(".local/share/opencode/storage"));
         Self {
+            provider_roots: crate::providers::resolve_roots(&home, false),
             claude: home.join(".claude"),
             codex: home.join(".codex"),
             grok: home.join(".grok"),

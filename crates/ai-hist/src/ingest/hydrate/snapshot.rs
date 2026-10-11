@@ -13,10 +13,60 @@ pub(super) fn source_snapshot(
     if let Some(refusal) = crate::sources::catalog::hydration_refusal(&options.source) {
         return Err(hydration_error("HYDRATION_UNSUPPORTED", refusal));
     }
+    if let Some(adapter) = crate::providers::adapter(&options.source) {
+        let locator = target.locator.as_deref().ok_or_else(|| {
+            hydration_error(
+                "SESSION_SOURCE_UNAVAILABLE",
+                "catalog row has no provider locator",
+            )
+        })?;
+        let path = PathBuf::from(locator);
+        validate_provider_path(&options.source, &path, roots).map_err(provider_source_error)?;
+        let acquired = (adapter.acquire)(
+            options,
+            &path,
+            &crate::providers::AcquisitionContext::new(&options.source, roots),
+        )
+        .map_err(provider_source_error)?;
+        for read_path in &acquired.read_paths {
+            validate_provider_path(&options.source, read_path, roots)
+                .map_err(provider_source_error)?;
+        }
+        return Ok(SourceSnapshot {
+            stamp: format!("{}:{}", adapter.generation, acquired.stamp),
+            bytes: acquired.bytes,
+            records: SnapshotRecords::Counted(acquired.records),
+            path: Some(path),
+            claude_transcript: None,
+            devin_session: None,
+            scanned_bytes: acquired.bytes,
+            provider_session: Some(acquired),
+            claude_subagents: Vec::new(),
+            scanned_superseded: false,
+            stamped_cursors: Vec::new(),
+            opencode_layout: None,
+            codex_relationship_complete: true,
+        });
+    }
     match options.source.as_str() {
         "opencode" => opencode_store_snapshot(options, target, roots),
         "devin" => devin_store_snapshot(options, target, roots),
         _ => file_source_snapshot(conn, options, target, roots, claude_snapshot),
+    }
+}
+
+fn provider_source_error(error: anyhow::Error) -> anyhow::Error {
+    if error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+    }) {
+        hydration_error(
+            "SESSION_SOURCE_UNAVAILABLE",
+            format!("provider source unavailable: {error:#}"),
+        )
+    } else {
+        error
     }
 }
 
@@ -92,6 +142,7 @@ fn opencode_store_snapshot(
         path: Some(path),
         claude_transcript: None,
         devin_session: None,
+        provider_session: None,
         claude_subagents: Vec::new(),
         scanned_bytes: 0,
         scanned_superseded: false,
@@ -165,6 +216,7 @@ fn devin_store_snapshot(
         path: Some(path),
         claude_transcript: None,
         devin_session: None,
+        provider_session: None,
         claude_subagents: Vec::new(),
         scanned_bytes: 0,
         scanned_superseded: false,
@@ -221,6 +273,7 @@ fn file_source_snapshot(
         path: Some(path),
         claude_transcript: captured_claude,
         devin_session: None,
+        provider_session: None,
         claude_subagents: subagents,
         scanned_bytes: stamped.scanned_bytes,
         scanned_superseded,

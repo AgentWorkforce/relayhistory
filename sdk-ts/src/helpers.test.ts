@@ -12,7 +12,8 @@ import {
 } from './index.js';
 
 test('exports immutable, aligned runtime source registries and matching type guards', () => {
-  assert.deepEqual(SOURCES, ['claude', 'codex', 'cursor', 'grok', 'opencode', 'muse', 'devin']);
+  assert.deepEqual(SOURCES.slice(0, 7), ['claude', 'codex', 'cursor', 'grok', 'opencode', 'muse', 'devin']);
+  assert.equal(new Set(SOURCES).size, SOURCES.length);
   assert.deepEqual(CATALOG_SOURCES, SOURCES);
   assert.equal(Object.isFrozen(SOURCES), true);
   assert.equal(Object.isFrozen(CATALOG_SOURCES), true);
