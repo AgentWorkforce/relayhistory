@@ -11897,6 +11897,7 @@ fn set_tool_call_error(
     tool_use_id: &str,
     is_error: bool,
 ) -> Result<()> {
+    evidence_reconcile::note_tool_result(source, session_id, tool_use_id);
     conn.prepare_cached(evidence_reconcile::write_sql(
         "UPDATE tool_calls SET is_error = ?1 \
          WHERE source = ?2 AND session_id = ?3 AND tool_use_id = ?4 AND is_error IS NOT ?1",
@@ -15745,7 +15746,6 @@ fn ingest_grok_session(
     }
 
     ingest_grok_session_extras(conn, session, &mut outcome)?;
-    refresh_grok_incoming_relationships(conn, sid)?;
 
     titles::upsert_titled(
         conn,
@@ -15811,9 +15811,18 @@ fn finish_grok_session(
     turn_tokens: &[String],
     created_ms: Option<i64>,
 ) -> Result<GrokUnifiedCoverage> {
-    let coverage = materialize_grok_unified_usage(conn, session_id, created_ms)?;
+    let mut coverage = materialize_grok_unified_usage(conn, session_id, created_ms)?;
     evidence_reconcile::finish(conn, reconcile)?;
+    // Parents read `child_has_events` off the rows this sweep just kept.
+    refresh_grok_incoming_relationships(conn, session_id)?;
     evidence_reconcile::clear_grok_turn_tokens_except(conn, session_id, turn_tokens)?;
+    // Coverage counts the token rows that survived the sweep and the clear.
+    if coverage.rows > 0 {
+        let settled = grok_unified::grok_turn_coverage(conn, session_id)?;
+        coverage.covered_turns = settled.covered_turns;
+        coverage.turn_usage_turns = settled.turn_usage_turns;
+        coverage.proxy_only_turns = settled.proxy_only_turns;
+    }
     Ok(coverage)
 }
 

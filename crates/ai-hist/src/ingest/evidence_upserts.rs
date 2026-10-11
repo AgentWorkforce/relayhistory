@@ -154,22 +154,24 @@ static TOOL_CALL_UNCHANGED: LazyLock<String> = LazyLock::new(|| {
 const EDIT_LOCATION_ASSIGNED: &str =
     "CASE WHEN file_edits.location = excluded.location THEN file_edits.location ELSE 'both' END";
 
-pub(crate) static FILE_EDIT_UPSERT: LazyLock<String> =
-    LazyLock::new(|| format!("{} WHERE {}", *FILE_EDIT_REWRITE, *FILE_EDIT_UNCHANGED));
+const FILE_EDIT_INSERT: &str = "INSERT INTO file_edits \
+     (source, session_id, message_id, tool_use_id, file_path, tool_name, ts_ms, git_branch, cwd) \
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+     ON CONFLICT(source, session_id, tool_use_id) DO UPDATE SET \
+     message_id=excluded.message_id, file_path=excluded.file_path, tool_name=excluded.tool_name, \
+     ts_ms=excluded.ts_ms, ";
 
-pub(crate) static FILE_EDIT_REWRITE: LazyLock<String> = LazyLock::new(|| {
-    format!(
-        "INSERT INTO file_edits \
-         (source, session_id, message_id, tool_use_id, file_path, tool_name, ts_ms, git_branch, cwd) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
-         ON CONFLICT(source, session_id, tool_use_id) DO UPDATE SET \
-         message_id=excluded.message_id, file_path=excluded.file_path, tool_name=excluded.tool_name, \
-         ts_ms=excluded.ts_ms, \
-         git_branch=COALESCE(excluded.git_branch, file_edits.git_branch), \
-         cwd=COALESCE(excluded.cwd, file_edits.cwd), \
-         location={EDIT_LOCATION_ASSIGNED}"
-    )
-});
+/// A local row takes the snapshot's branch and cwd, including NULL. A row
+/// both sides back keeps the other side's value when this snapshot has none,
+/// which is what demoting it and inserting again used to do.
+const FILE_EDIT_BRANCH_SNAPSHOT: &str = "git_branch=CASE WHEN file_edits.location = 'local' \
+     THEN excluded.git_branch ELSE COALESCE(excluded.git_branch, file_edits.git_branch) END, \
+     cwd=CASE WHEN file_edits.location = 'local' THEN excluded.cwd \
+     ELSE COALESCE(excluded.cwd, file_edits.cwd) END";
+
+const FILE_EDIT_BRANCH_KEPT: &str =
+    "git_branch=COALESCE(excluded.git_branch, file_edits.git_branch), \
+     cwd=COALESCE(excluded.cwd, file_edits.cwd)";
 
 static FILE_EDIT_UNCHANGED: LazyLock<String> = LazyLock::new(|| {
     format!(
@@ -177,8 +179,23 @@ static FILE_EDIT_UNCHANGED: LazyLock<String> = LazyLock::new(|| {
          OR excluded.file_path IS NOT file_edits.file_path \
          OR excluded.tool_name IS NOT file_edits.tool_name \
          OR excluded.ts_ms IS NOT file_edits.ts_ms \
-         OR COALESCE(excluded.git_branch, file_edits.git_branch) IS NOT file_edits.git_branch \
-         OR COALESCE(excluded.cwd, file_edits.cwd) IS NOT file_edits.cwd \
+         OR (CASE WHEN file_edits.location = 'local' THEN excluded.git_branch \
+             ELSE COALESCE(excluded.git_branch, file_edits.git_branch) END) \
+            IS NOT file_edits.git_branch \
+         OR (CASE WHEN file_edits.location = 'local' THEN excluded.cwd \
+             ELSE COALESCE(excluded.cwd, file_edits.cwd) END) \
+            IS NOT file_edits.cwd \
          OR ({EDIT_LOCATION_ASSIGNED}) IS NOT file_edits.location"
     )
+});
+
+pub(crate) static FILE_EDIT_UPSERT: LazyLock<String> = LazyLock::new(|| {
+    format!(
+        "{FILE_EDIT_INSERT}{FILE_EDIT_BRANCH_SNAPSHOT}, location={EDIT_LOCATION_ASSIGNED} WHERE {}",
+        *FILE_EDIT_UNCHANGED
+    )
+});
+
+pub(crate) static FILE_EDIT_REWRITE: LazyLock<String> = LazyLock::new(|| {
+    format!("{FILE_EDIT_INSERT}{FILE_EDIT_BRANCH_KEPT}, location={EDIT_LOCATION_ASSIGNED}")
 });

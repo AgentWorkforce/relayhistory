@@ -570,7 +570,10 @@ fn settle_grok_unified_session(
 /// Coverage of one session from the rows already stored: the turn token
 /// objects, the log timestamps, and the turn census when a replacing read
 /// wrote one.
-fn grok_turn_coverage(conn: &Connection, session_id: &str) -> Result<GrokUnifiedCoverage> {
+pub(super) fn grok_turn_coverage(
+    conn: &Connection,
+    session_id: &str,
+) -> Result<GrokUnifiedCoverage> {
     let turn_tokens = conn
         .prepare(
             "SELECT token_json FROM session_events \

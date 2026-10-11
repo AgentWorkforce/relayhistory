@@ -55,6 +55,9 @@ struct Active {
     session_id: String,
     events: HashSet<String>,
     tools: HashSet<String>,
+    /// Tool calls whose result this pass observed. A local call that is not
+    /// here keeps no error flag from a result the snapshot dropped.
+    tool_results: HashSet<String>,
     edits: HashSet<String>,
     markers: HashSet<String>,
     relationships: HashSet<String>,
@@ -88,7 +91,7 @@ impl Drop for Guard {
 }
 
 #[inline]
-pub(super) fn armed() -> bool {
+pub(crate) fn armed() -> bool {
     ARMED.with(|flag| flag.get())
 }
 
@@ -134,6 +137,7 @@ fn begin(
             session_id: session_id.to_string(),
             events: HashSet::new(),
             tools: HashSet::new(),
+            tool_results: HashSet::new(),
             edits: HashSet::new(),
             markers: HashSet::new(),
             relationships: HashSet::new(),
@@ -262,6 +266,23 @@ pub(crate) fn note_tool(source: &str, session_id: &str, tool_use_id: &str) {
     note(source, session_id, Noted::Tool, tool_use_id);
 }
 
+/// The snapshot still contains a result for this call, so its `is_error`
+/// is the result's and not whatever the previous read stored.
+pub(crate) fn note_tool_result(source: &str, session_id: &str, tool_use_id: &str) {
+    if !armed() {
+        return;
+    }
+    ACTIVE.with(|slot| {
+        let mut borrowed = slot.borrow_mut();
+        let Some(active) = borrowed.as_mut() else {
+            return;
+        };
+        if active.source == source && active.session_id == session_id {
+            active.tool_results.insert(tool_use_id.to_string());
+        }
+    });
+}
+
 #[inline]
 pub(crate) fn note_edit(source: &str, session_id: &str, tool_use_id: &str) {
     note(source, session_id, Noted::Edit, tool_use_id);
@@ -368,6 +389,12 @@ fn sweep(conn: &Connection, active: &Active) -> Result<()> {
         &active.session_id,
         &json_keys(&active.tools),
     )?;
+    clear_unconfirmed_tool_errors(
+        conn,
+        &active.source,
+        &active.session_id,
+        &json_keys(&active.tool_results),
+    )?;
     retire_unnoted(
         conn,
         "file_edits",
@@ -418,6 +445,25 @@ fn retire_unnoted(
            AND {key} NOT IN (SELECT value FROM json_each(?3))"
     ))?
     .execute(params![source, session_id, noted])?;
+    Ok(())
+}
+
+/// A local tool call whose snapshot has no result loses the error flag the
+/// previous result left. A call both sides back keeps that flag: the old
+/// replace demoted the row and the conflict kept the other side's value.
+fn clear_unconfirmed_tool_errors(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+    confirmed: &str,
+) -> Result<()> {
+    conn.prepare_cached(
+        "UPDATE tool_calls SET is_error = NULL \
+         WHERE source = ?1 AND session_id = ?2 AND location = 'local' \
+           AND is_error IS NOT NULL \
+           AND tool_use_id NOT IN (SELECT value FROM json_each(?3))",
+    )?
+    .execute(params![source, session_id, confirmed])?;
     Ok(())
 }
 
@@ -860,6 +906,142 @@ mod tests {
             .find(|(uid, _, _)| uid == &world.0)
             .expect("the assistant line is still stored");
         assert_eq!((kept.1, kept.2), (world.1, world.2));
+    }
+
+    /// A call the snapshot still contains loses the error its result used to
+    /// report, and a subagent entry loses metadata the directory dropped.
+    /// A local edit loses a branch the snapshot does not carry.
+    #[test]
+    fn a_grok_reread_drops_fields_the_snapshot_no_longer_carries() {
+        let home = tempfile::tempdir().unwrap();
+        let chat = write_grok(
+            home.path(),
+            concat!(
+                r#"{"type":"user","content":"hello","timestamp_ms":1000}"#,
+                "\n",
+                r#"{"type":"assistant","content":"","tool_calls":[{"id":"call_edit","name":"Write","arguments":{"path":"a.txt"}}],"timestamp_ms":2000}"#,
+                "\n",
+                r#"{"type":"tool_result","tool_call_id":"call_edit","content":"no","is_error":true,"timestamp_ms":3000}"#,
+                "\n",
+            ),
+            Some(r#"{"session_id":"child-1","name":"worker","model":"grok-3"}"#),
+        );
+        let (_db, conn) = ingest_grok(home.path(), &chat);
+        conn.execute(
+            "UPDATE file_edits SET git_branch = 'old' \
+             WHERE source = 'grok' AND tool_use_id = 'call_edit'",
+            [],
+        )
+        .unwrap();
+        let edge_id: i64 = conn
+            .query_row(
+                "SELECT rowid FROM session_relationships \
+                 WHERE source = 'grok' AND evidence_kind = 'grok_subagent_dir'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        write_grok(
+            home.path(),
+            concat!(
+                r#"{"type":"user","content":"hello","timestamp_ms":1000}"#,
+                "\n",
+                r#"{"type":"assistant","content":"","tool_calls":[{"id":"call_edit","name":"Write","arguments":{"path":"a.txt"}}],"timestamp_ms":2000}"#,
+                "\n",
+            ),
+            Some(r#"{"session_id":"child-1"}"#),
+        );
+        let session = super::super::scan_grok_session_file(&chat)
+            .unwrap()
+            .unwrap();
+        ingest_grok_session(&conn, &session, &chat.to_string_lossy()).unwrap();
+
+        let is_error: Option<i64> = conn
+            .query_row(
+                "SELECT is_error FROM tool_calls \
+                 WHERE source = 'grok' AND tool_use_id = 'call_edit'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(is_error, None, "the dropped result's error is gone");
+        let branch: Option<String> = conn
+            .query_row(
+                "SELECT git_branch FROM file_edits \
+                 WHERE source = 'grok' AND tool_use_id = 'call_edit'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(branch, None, "the edit's branch is the snapshot's");
+        let (id, name, model): (i64, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT rowid, child_agent_name, child_model FROM session_relationships \
+                 WHERE source = 'grok' AND evidence_kind = 'grok_subagent_dir'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(id, edge_id, "the subagent edge kept its row");
+        assert_eq!(name, None);
+        assert_eq!(model, None);
+    }
+
+    /// A child whose transcript no longer has events tells its parents so.
+    #[test]
+    fn a_grok_reread_clears_child_has_events_when_the_transcript_is_empty() {
+        let home = tempfile::tempdir().unwrap();
+        let parent = write_grok(
+            home.path(),
+            concat!(
+                r#"{"type":"user","content":"hello","timestamp_ms":1000}"#,
+                "\n",
+            ),
+            Some(r#"{"session_id":"child-1","name":"worker"}"#),
+        );
+        let (_db, conn) = ingest_grok(home.path(), &parent);
+        let child_dir = home.path().join(".grok/sessions/proj/child-1");
+        fs::create_dir_all(&child_dir).unwrap();
+        fs::write(
+            child_dir.join("summary.json"),
+            r#"{"info":{"id":"child-1","cwd":"/tmp/proj"},"created_at":"2026-01-01T00:00:00.000Z"}"#,
+        )
+        .unwrap();
+        let child_chat = child_dir.join("chat_history.jsonl");
+        fs::write(
+            &child_chat,
+            "{\"type\":\"user\",\"content\":\"work\",\"timestamp_ms\":1000}\n",
+        )
+        .unwrap();
+        let child = super::super::scan_grok_session_file(&child_chat)
+            .unwrap()
+            .unwrap();
+        ingest_grok_session(&conn, &child, &child_chat.to_string_lossy()).unwrap();
+        let flagged: i64 = conn
+            .query_row(
+                "SELECT child_has_events FROM session_relationships \
+                 WHERE source = 'grok' AND child_session_id = 'child-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(flagged, 1);
+
+        fs::write(&child_chat, "").unwrap();
+        let child = super::super::scan_grok_session_file(&child_chat)
+            .unwrap()
+            .unwrap();
+        ingest_grok_session(&conn, &child, &child_chat.to_string_lossy()).unwrap();
+        let flagged: i64 = conn
+            .query_row(
+                "SELECT child_has_events FROM session_relationships \
+                 WHERE source = 'grok' AND child_session_id = 'child-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(flagged, 0, "the child no longer has events");
     }
 
     /// A prompt this session dropped stays in `history` when another session
