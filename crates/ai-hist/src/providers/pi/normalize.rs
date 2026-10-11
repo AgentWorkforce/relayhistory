@@ -95,6 +95,8 @@ pub(super) fn write(conn: &Connection, payload: &Value, path: &Path) -> Result<u
         .and_then(|e| e["name"].as_str());
     if complete {
         crate::ingest::set_session_title(conn, ID, sid, title)?;
+        let first_prompt = format::first_prompt(entries);
+        conn.execute("UPDATE sessions SET first_prompt=?2 WHERE source='pi' AND session_id=?1 AND first_prompt IS NOT ?2", rusqlite::params![sid,first_prompt])?;
     }
     Ok(inserted)
 }
@@ -361,6 +363,9 @@ fn reconcile_prompts(conn: &Connection, sid: &str, keep: &str) -> Result<()> {
            ORDER BY CAST(substr(b.event_uid, length(b.message_id) + 2) AS INTEGER))) = history.prompt \
         ORDER BY (e.session_id = ?1) DESC, e.session_id LIMIT 1";
     let project = reference.replacen("SELECT e.session_id", "SELECT e.project", 1);
+    // Retained prompt rows keep their owner; refresh that owner's finalized
+    // project projection even when INSERT OR IGNORE saw the same prompt again.
+    conn.execute(&format!("UPDATE history SET project = ({project}) WHERE source='pi' AND session_id=?1 AND EXISTS ({reference}) AND project IS NOT ({project})"), [sid])?;
     conn.execute(&format!("UPDATE history SET project = ({project}), session_id = ({reference}) \
         WHERE source = 'pi' AND session_id = ?1 \
         AND (timestamp_ms || ':' || coalesce(prompt_hash, '')) NOT IN (SELECT value FROM json_each(?2)) \
@@ -368,5 +373,39 @@ fn reconcile_prompts(conn: &Connection, sid: &str, keep: &str) -> Result<()> {
     conn.execute(&format!("DELETE FROM history WHERE source = 'pi' AND session_id = ?1 \
         AND (timestamp_ms || ':' || coalesce(prompt_hash, '')) NOT IN (SELECT value FROM json_each(?2)) \
         AND NOT EXISTS ({reference})"), rusqlite::params![sid, keep])?;
+    Ok(())
+}
+
+pub(super) fn retire_missing_locator(conn: &Connection, path: &Path) -> Result<()> {
+    let local = maintenance::local_footprint();
+    let mut stmt = conn.prepare(&format!(
+        "SELECT session_id FROM sessions s WHERE source='pi' AND raw_path=?1 AND ({local})"
+    ))?;
+    let sessions = stmt
+        .query_map([path.to_string_lossy()], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for sid in sessions {
+        crate::ingest::retire_local_session_evidence(conn, ID, &sid)?;
+        reconcile_prompts(conn, &sid, "[]")?;
+        conn.execute("DELETE FROM session_observations WHERE source='pi' AND session_id=?1 AND location='local'", [&sid])?;
+        conn.execute("DELETE FROM session_hydration_checkpoints WHERE source='pi' AND session_id=?1 AND location='local'", [&sid])?;
+        conn.execute("DELETE FROM session_presences WHERE source='pi' AND session_id=?1 AND location='local'", [&sid])?;
+        conn.execute("DELETE FROM sessions WHERE source='pi' AND session_id=?1 AND NOT EXISTS(SELECT 1 FROM session_observations WHERE source='pi' AND session_id=?1 AND location='remote') AND NOT EXISTS(SELECT 1 FROM session_presences WHERE source='pi' AND session_id=?1 AND location='remote') AND NOT EXISTS(SELECT 1 FROM session_events WHERE source='pi' AND session_id=?1) AND NOT EXISTS(SELECT 1 FROM tool_calls WHERE source='pi' AND session_id=?1) AND NOT EXISTS(SELECT 1 FROM session_markers WHERE source='pi' AND session_id=?1) AND NOT EXISTS(SELECT 1 FROM file_edits WHERE source='pi' AND session_id=?1)", [&sid])?;
+        refresh_remote_catalog(conn, &sid)?;
+    }
+    Ok(())
+}
+
+fn refresh_remote_catalog(conn: &Connection, sid: &str) -> Result<()> {
+    for (column, recorded, fallback) in [
+        ("raw_path", "raw_locator", "SELECT raw_locator FROM session_presences WHERE source='pi' AND session_id=?1 AND location='remote' LIMIT 1"),
+        ("source_stamp", "source_stamp", "SELECT source_stamp FROM session_presences WHERE source='pi' AND session_id=?1 AND location='remote' LIMIT 1"),
+        ("first_prompt", "first_prompt", "SELECT prompt FROM history h WHERE source='pi' AND session_id=?1 AND EXISTS(SELECT 1 FROM session_events e WHERE e.source=h.source AND e.session_id=h.session_id AND e.role='user' AND e.location='remote' AND e.ts_ms=h.timestamp_ms) ORDER BY timestamp_ms,id LIMIT 1"),
+        ("last_assistant_text", "last_assistant_text", "SELECT text FROM session_events WHERE source='pi' AND session_id=?1 AND location='remote' AND role='assistant' AND kind='text' ORDER BY ts_ms DESC,id DESC LIMIT 1"),
+    ] {
+        let value = format!("COALESCE((SELECT {recorded} FROM session_observations WHERE source='pi' AND session_id=?1 AND location='remote' AND {recorded} IS NOT NULL ORDER BY connector_id='legacy-unknown',access_state!='available',connector_id,connector_instance LIMIT 1),({fallback}))");
+        conn.execute(&format!("UPDATE sessions SET {column}={value} WHERE source='pi' AND session_id=?1 AND {column} IS NOT {value}"), [sid])?;
+    }
+    conn.execute("UPDATE sessions SET discovery_state=CASE WHEN EXISTS(SELECT 1 FROM session_events WHERE source='pi' AND session_id=?1) OR EXISTS(SELECT 1 FROM session_observations WHERE source='pi' AND session_id=?1 AND location='remote' AND discovery_state='full') OR EXISTS(SELECT 1 FROM session_presences WHERE source='pi' AND session_id=?1 AND location='remote' AND discovery_state='full') THEN 'full' ELSE 'shallow' END WHERE source='pi' AND session_id=?1", [sid])?;
     Ok(())
 }

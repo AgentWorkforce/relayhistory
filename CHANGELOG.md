@@ -21,6 +21,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Native Windows and suffixed Hermes roots retain portable session identities, while explicit custom roots remain separately namespaced.
 - Hermes retires confirmed deleted databases, retains native tool block IDs, bounds activity by session start, and clears stale directory project identities.
 - Hermes discovery ranks current activity across profiles, excludes synthetic prompt previews, and reconciles deleted sessions and changed prompt projects while preserving remote evidence.
+- Pi full sweeps retire confirmed deleted local transcripts, refresh retained prompt projects and previews, and shallow discovery records observed activity.
 - Pi history isolates invalid files, skips unchanged transcripts, and preserves prompt projects, tool identities and readable previews through rewrites.
 - Unchanged provider syncs restore lost evidence, missing adapter files and sidecar containment failures retain their typed error codes, and SDK hydration accepts native session markers.
 - A Grok or Muse re-read reports a row again only when that row changed.

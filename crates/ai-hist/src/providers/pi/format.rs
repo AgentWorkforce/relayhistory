@@ -83,3 +83,12 @@ pub(super) fn text(content: &Value) -> String {
         })
         .unwrap_or_default()
 }
+
+pub(super) fn first_prompt(entries: &[Value]) -> Option<String> {
+    entries
+        .iter()
+        .filter(|e| e["type"] == "message" && e["message"]["role"] == "user")
+        .map(|e| text(&e["message"]["content"]))
+        .find(|value| !value.is_empty())
+        .map(|value| value.chars().take(4096).collect())
+}
