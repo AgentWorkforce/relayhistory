@@ -269,3 +269,25 @@ required sweep after reopening the ledger under custom provenance. The fix prove
 unchanged repeats still skip, provenance changes sweep, old local IDs retire, and
 only new custom IDs remain. All 28 Hermes units, including the corrupt-database
 no-open fingerprint control, pass; formatting, Clippy and quality gates pass.
+
+Final composition follow-up: Pi #468 merged into main. Commit `52492960`
+carries four Pi review corrections (generation `pi_v3_4`) into this branch:
+confirmed missing-file retirement, retained prompt project refresh, complete
+first-prompt replacement/clearing, and observed shallow recency. Independent
+Sol review signed off. Combined checks passed: 64 provider/setup unit tests,
+Pi/Hermes public suites (6/1), corpus (66), registry (10), sourcing docs (1),
+and both public suites without default features (6/1). Formatting, provider
+generation checks and rust-oleum passed. See the Pi plan for negative controls.
+
+A final review-thread audit found the prior reply to the quadratic-query
+finding had addressed ordering but not query cost. Commit `daf5df9f` replaces
+the correlated per-session message scan with one grouped timestamp aggregate
+joined to sessions. Selected capture filters that aggregate by native session.
+The new EXPLAIN regression fails with `CORRELATED SCALAR SUBQUERY` when only
+the old query is restored; it also verifies indexed selected-session lookup,
+limited recency ordering and empty-session end-time fallback. Independent Sol
+review signed off. Final query checks: `cargo test -p ai-hist providers::hermes
+--lib` (29), fixture corpus with `unstable-internal` (66), workspace all-target
+all-feature Clippy with warnings denied, formatting, and rust-oleum all pass.
+The previous composed head `4fe3a8aa` passed all nine hosted CI jobs; the final
+head requires a fresh run.
