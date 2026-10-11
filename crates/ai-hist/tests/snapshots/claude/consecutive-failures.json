@@ -258,6 +258,7 @@
       "session_id": "fail-session",
       "source": "claude",
       "source_stamp": "<n>:2822",
+      "title": null,
       "workspace_roots_json": null
     }
   ],

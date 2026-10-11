@@ -444,6 +444,7 @@
       "session_id": "fixture-devin-session",
       "source": "devin",
       "source_stamp": "<n>:<n>:8:8:36:<n>:3:6:<n>|<n>:307",
+      "title": "Fixture session: rename helper",
       "workspace_roots_json": "[\"/work/fixture-repo\",\"/work/fixture-extras\"]"
     }
   ],

@@ -388,6 +388,7 @@
       "session_id": "sidecar-session",
       "source": "claude",
       "source_stamp": "<n>:1881|<n>:1883|<n>:102|<n>:813|<n>:109",
+      "title": null,
       "workspace_roots_json": null
     }
   ],

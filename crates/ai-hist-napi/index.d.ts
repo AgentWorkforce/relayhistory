@@ -505,6 +505,11 @@ export interface CatalogSession {
   lastActivityMs?: number
   firstPrompt?: string
   lastAssistantText?: string
+  /**
+   * The name the harness gave the session (Claude's title, Codex's thread
+   * name).
+   */
+  title?: string
   models: Array<string>
   originator?: string
   agentVersion?: string

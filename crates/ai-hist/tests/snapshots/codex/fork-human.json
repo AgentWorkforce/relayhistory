@@ -425,6 +425,7 @@
       "session_id": "019da82f-d400-7000-8000-00000000000a",
       "source": "codex",
       "source_stamp": "<n>:2272",
+      "title": null,
       "workspace_roots_json": null
     },
     {
@@ -444,6 +445,7 @@
       "session_id": "019da830-be60-7000-8000-00000000000c",
       "source": "codex",
       "source_stamp": "<n>:3732",
+      "title": null,
       "workspace_roots_json": null
     }
   ],

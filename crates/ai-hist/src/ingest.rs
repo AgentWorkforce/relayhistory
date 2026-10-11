@@ -17,8 +17,10 @@ use std::time::Duration;
 
 mod claude_record_rows;
 mod claude_standalone;
+pub(crate) mod claude_title;
 pub(crate) mod codex;
 mod codex_subagent;
+mod codex_thread_names;
 pub(crate) mod control;
 pub(crate) mod cursor;
 pub(crate) mod devin;
@@ -31,8 +33,11 @@ pub(crate) mod jsonl;
 pub(crate) mod muse;
 pub(crate) mod opencode;
 pub(crate) mod opencode_sweep;
+pub(crate) mod titles;
 pub(crate) mod tool_result_facts;
 pub(crate) mod transcript_cursor;
+
+use titles::set_session_title;
 
 #[cfg(test)]
 use claude_record_rows::{delete_claude_record_rows, CLAUDE_RECORD_ROWS};
@@ -108,6 +113,8 @@ macro_rules! sync_note {
 
 // After `sync_note!`, which the phases report through.
 mod sweep_phases;
+// After `sync_note!`, which it uses.
+mod codex_history;
 use sweep_phases::SweepPhases;
 pub(crate) use sweep_phases::SweepScope;
 
@@ -1800,6 +1807,7 @@ fn sweep_only_fingerprint_inputs(roots: &crate::ProviderRoots) -> Vec<Candidate>
     let paths = vec![
         roots.claude.join("history.jsonl"),
         roots.codex.join("history.jsonl"),
+        codex_thread_names::session_index_path(&roots.codex),
         grok_unified_log_path(&roots.grok),
     ];
     let mut candidates: Vec<Candidate> = Vec::new();
@@ -1950,9 +1958,15 @@ pub(crate) fn source_watch_roots(
         "claude" => roots.push(discover::WatchRoot::file(
             provider_roots.claude.join("history.jsonl"),
         )),
-        "codex" => roots.push(discover::WatchRoot::file(
-            provider_roots.codex.join("history.jsonl"),
-        )),
+        "codex" => {
+            roots.push(discover::WatchRoot::file(
+                provider_roots.codex.join("history.jsonl"),
+            ));
+            // A rename moves only the thread-name index.
+            roots.push(discover::WatchRoot::file(
+                codex_thread_names::session_index_path(&provider_roots.codex),
+            ));
+        }
         // Grok's per-inference usage log sits outside the sessions tree, so
         // an append to it is watched as the one file it is.
         "grok" => roots.push(discover::WatchRoot::file(grok_unified_log_path(
@@ -4615,7 +4629,8 @@ fn sync_codex_with_repairs_and_coverage(
                 .collect()
         })
         .unwrap_or_default();
-    let result = sync_codex_sources(conn, state, root, repairs, coverage, &mut touched);
+    let result =
+        codex_history::sync_codex_sources(conn, state, root, repairs, coverage, &mut touched);
     if result.is_err() {
         let mut pending: Vec<&String> = touched.iter().collect();
         pending.sort_unstable();
@@ -4626,111 +4641,6 @@ fn sync_codex_with_repairs_and_coverage(
         state.insert(CODEX_METADATA_PENDING_KEY.to_string(), json!([]));
     }
     result
-}
-
-fn sync_codex_sources(
-    conn: &Connection,
-    state: &mut Map<String, Value>,
-    root: &Path,
-    repairs: &SweepRepairs,
-    coverage: &mut SweepCoverage,
-    touched: &mut HashSet<String>,
-) -> Result<usize> {
-    let (cwds, branches, mut inserted) = sync_codex_rollouts_with_repairs_and_coverage(
-        conn, state, root, repairs, coverage, touched,
-    )?;
-    let path = root.join("history.jsonl");
-    if !path.exists() {
-        sync_note!("  [codex] not found: {} (skipped)", path.display());
-        // The rows the backfill fills are already in the database; a missing
-        // log only means no new ones. Sessions a rollout re-read or an earlier
-        // sweep left owed still get their pass, or clearing them as pending
-        // would lose them.
-        backfill_codex_metadata_scoped(conn, state, &cwds, &branches, touched)?;
-        return Ok(inserted);
-    }
-    let mut source = CompleteJsonlReader::open(&path, state.get("codex"))?;
-    let offset = source.position;
-    let size = source.reader.get_ref().metadata()?.len();
-    let mut errors = 0;
-    let mut consumed = offset;
-    if offset < size {
-        sync_note!("  [codex] syncing {} new bytes...", size - offset);
-        let read = ingest_codex_history_lines(conn, &mut source, &cwds, touched)?;
-        consumed = read.consumed;
-        inserted += read.inserted;
-        errors = read.errors;
-    }
-    // This also upgrades legacy numeric cursors at EOF. The actual committed
-    // position may include complete lines appended after the initial stat.
-    let opened_cursor = source.cursor.to_value();
-    if consumed != offset || state.get("codex") != Some(&opened_cursor) {
-        state.insert(
-            "codex".to_string(),
-            source.committed_cursor(consumed, true)?.to_value(),
-        );
-    }
-    let backfilled = backfill_codex_metadata_scoped(conn, state, &cwds, &branches, touched)?;
-    if consumed == offset && backfilled == 0 {
-        sync_note!("  [codex] up to date");
-    } else {
-        let mut parts = Vec::new();
-        if inserted > 0 || consumed > offset {
-            parts.push(format!("+{inserted} rows"));
-        }
-        if backfilled > 0 {
-            parts.push(format!("backfilled {backfilled} project/branch values"));
-        }
-        if errors > 0 {
-            parts.push(format!("{errors} errors"));
-        }
-        sync_note!("  [codex] {}", parts.join(", "));
-    }
-    Ok(inserted)
-}
-
-/// What one pass over the new lines of Codex's `history.jsonl` did.
-struct CodexHistoryRead {
-    /// The position after the last line read.
-    consumed: u64,
-    inserted: usize,
-    errors: usize,
-}
-
-/// Inserts every prompt in the unread tail of Codex's `history.jsonl`, naming
-/// a prompt's project from its session's rollout when the log does not.
-fn ingest_codex_history_lines(
-    conn: &Connection,
-    source: &mut CompleteJsonlReader,
-    cwds: &HashMap<String, String>,
-    touched: &mut HashSet<String>,
-) -> Result<CodexHistoryRead> {
-    let mut read = CodexHistoryRead {
-        consumed: source.position,
-        inserted: 0,
-        errors: 0,
-    };
-    let mut line = String::new();
-    while let Some(position) = source.next_line(&mut line)? {
-        read.consumed = position;
-        if line.trim().is_empty() {
-            continue;
-        }
-        match parse_codex_line(&line) {
-            Ok(Some(mut entry)) => {
-                if let Some(session_id) = entry.session_id.as_deref() {
-                    if entry.project.is_none() {
-                        entry.project = cwds.get(session_id).cloned();
-                    }
-                    touched.insert(session_id.to_string());
-                }
-                read.inserted += insert_history(conn, &entry)?;
-            }
-            Ok(None) => {}
-            Err(_) => read.errors += 1,
-        }
-    }
-    Ok(read)
 }
 
 /// One pass over every Codex rollout file: session metadata (cwd/branch maps
@@ -8802,6 +8712,8 @@ pub(crate) struct ClaudeSessionMeta {
     /// `None` is the whole file's answer, not a gap: a transcript of nothing
     /// but control rows has no first prompt, and the catalog says so.
     first_prompt: Option<String>,
+    /// The name Claude Code gave the session; see [`claude_title`].
+    title: Option<String>,
     /// This file is a delegated sidecar rather than a session of its own: it
     /// is named as one ([`is_claude_sidecar_file`]) and every identified
     /// record is a sidechain row — the same rule discovery uses to keep
@@ -8843,6 +8755,11 @@ pub(crate) struct ClaudeMetaFold {
     /// First-wins, from the same classifier as discovery's `first_prompt`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub first_prompt: Option<String>,
+    /// Last-wins per kind. A fold saved by a build that did not read titles
+    /// resumes with none, so it only ever learns of renames recorded after
+    /// the cursor; the shallow scan fills the rest from the transcript's tail.
+    #[serde(default)]
+    pub titles: claude_title::ClaudeTitles,
     #[serde(default)]
     pub identified_records: usize,
     #[serde(default)]
@@ -8914,6 +8831,7 @@ impl ClaudeMetaFold {
         if self.first_prompt.is_none() {
             self.first_prompt = crate::discover::claude_substantive_prompt(value);
         }
+        self.titles.observe(value);
         if let Some(branch) = value.get("gitBranch").and_then(Value::as_str) {
             self.git_branch = Some(branch.to_string());
         }
@@ -8996,6 +8914,7 @@ impl ClaudeMetaFold {
             last_ts: self.last_ts.unwrap_or(first),
             last_assistant_text: self.last_assistant_text.clone(),
             first_prompt: self.first_prompt.clone(),
+            title: self.titles.best(),
             subagent: is_claude_sidecar_file(path)
                 && claude_records_are_all_sidechain(
                     self.identified_records,
@@ -9145,6 +9064,7 @@ pub(crate) fn set_claude_first_prompt(conn: &Connection, meta: &ClaudeSessionMet
         "UPDATE sessions SET first_prompt = ?1 WHERE source = 'claude' AND session_id = ?2",
         params![meta.first_prompt, meta.session_id],
     )?;
+    set_session_title(conn, "claude", &meta.session_id, meta.title.as_deref())?;
     Ok(())
 }
 
@@ -15971,7 +15891,7 @@ fn ingest_grok_session(
     ingest_grok_session_extras(conn, session, &mut outcome)?;
     refresh_grok_incoming_relationships(conn, sid)?;
 
-    upsert_session(
+    titles::upsert_titled(
         conn,
         &SessionCatalogRow {
             session_id: sid,
@@ -15983,6 +15903,8 @@ fn ingest_grok_session(
             last_assistant_text: session.last_assistant_text.as_deref(),
             raw_path: Some(raw_path),
         },
+        ActivityWindow::Expand,
+        session.title.as_deref(),
     )?;
     // `upsert_session` merges: it takes MIN/MAX of the activity bounds and
     // keeps the old `last_assistant_text` when the new read has none. That is
@@ -16574,6 +16496,8 @@ struct GrokSession {
     last_ts: i64,
     /// `summary.json`'s `created_at`, the last-resort timestamp.
     created_ms: i64,
+    /// `summary.json`'s `title`.
+    title: Option<String>,
     last_assistant_text: Option<String>,
     models: Vec<String>,
     lines: Vec<grok::GrokChatLine>,
@@ -16790,6 +16714,7 @@ fn scan_grok_session_file(chat: &Path) -> Result<Option<GrokSession>> {
         .unwrap_or(updated_ms)
         .max(first_ts);
 
+    let title = titles::grok_title(summary.as_ref());
     Ok(Some(GrokSession {
         session_id,
         cwd,
@@ -16797,6 +16722,7 @@ fn scan_grok_session_file(chat: &Path) -> Result<Option<GrokSession>> {
         first_ts,
         last_ts,
         created_ms,
+        title,
         last_assistant_text,
         models,
         lines,

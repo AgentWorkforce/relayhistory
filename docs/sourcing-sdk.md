@@ -413,7 +413,7 @@ pub struct SessionEvidence {
 hash-only / off content mode: every transcript string is `None`, byte lengths
 (`text_bytes`, `payload_bytes`, `prompt_bytes`) and hashes stay, and none of
 the text columns — event text, prompt bodies, marker text, the catalog's
-`first_prompt` / `last_assistant_text` excerpts — is moved out of SQLite at
+`first_prompt` / `last_assistant_text` excerpts and its `title` — is moved out of SQLite at
 all; `Prompt::prompt_hash` is then the ledger's stored hash (`None` only for a
 row written without one). `kinds` skips the tables a consumer does not need:
 `SessionEvent` loads messages, tool results, user turns, requests and the usage
@@ -432,7 +432,7 @@ calls and results, markers. Its `session` is `DiscoveryState::Delegated`,
 described from the child's own rows — `cwd`, `git_branch`, `agent_version`,
 `models`, the activity window and `project_key` its events recorded, and
 `raw_path` the transcript its delegation edge names; `first_prompt`,
-`last_assistant_text` and `source_stamp` are `None` and `locations` is empty,
+`last_assistant_text`, `title` and `source_stamp` are `None` and `locations` is empty,
 because a child has no catalog row or presence of its own. Its
 `relationships` carry the `RelationshipSide::Child` edge whose
 `parent_session_id` is the session that spawned it — for a nested Claude

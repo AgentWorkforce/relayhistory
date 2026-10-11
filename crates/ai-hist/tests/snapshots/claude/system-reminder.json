@@ -295,6 +295,7 @@
       "session_id": "reminder-session",
       "source": "claude",
       "source_stamp": "<n>:2396",
+      "title": null,
       "workspace_roots_json": null
     }
   ],

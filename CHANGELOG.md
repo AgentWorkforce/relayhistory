@@ -4,11 +4,27 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased - Patch]
+## [Unreleased - Minor]
+
+### Breaking Changes
+
+- The session catalog contract is now 5: every catalog row (`sessions list` / `discover` JSON, `CatalogSession`) carries `title`.
+
+### Added
+
+- Catalog rows carry `title`, the name the harness shows for the session: Claude's latest `custom-title` (else `ai-title`, else `agent-name`), Codex's `thread_name` from `session_index.jsonl`, OpenCode's session title (not its `New session - …` placeholder), and Devin's and Grok's session titles; a rename updates it.
+
+### Changed
+
+- The first sync after upgrading re-reads each Claude transcript's head and tail once, and each OpenCode session once, to fill in titles.
 
 ### Fixed
 
 - `sync` re-reads an OpenCode session after one of its parts is edited, when the store reads parts by message id and the part's `session_id` is NULL.
+
+### Rust API
+
+- `ShallowSession::title` and `CatalogSession::title` are new public fields; code that builds a `ShallowSession` with a struct literal must add `title` or use `..Default::default()`.
 
 ## [0.39.0] - 2026-10-10
 
