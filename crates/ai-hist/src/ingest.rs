@@ -36,6 +36,7 @@ pub(crate) mod grok;
 mod grok_unified;
 pub(crate) mod hook;
 pub(crate) mod hydrate;
+mod images;
 pub(crate) mod incremental;
 pub(crate) mod jsonl;
 pub(crate) mod muse;
@@ -3211,7 +3212,7 @@ fn record_fidelity_backfill(state: &mut Map<String, Value>, key: &str) {
 /// repairing the rows the bump was for — a change that reads as done and does
 /// nothing, for exactly the installs that needed it.
 /// `the_raw_facts_version_and_generation_are_bumped_together` is the guard.
-const RAW_MESSAGE_FACTS_GENERATION: i64 = 4;
+const RAW_MESSAGE_FACTS_GENERATION: i64 = 5;
 const CLAUDE_RAW_MESSAGE_FACTS_KEY: &str = "claude_raw_message_facts";
 
 /// One-time pass over indexed Claude transcripts for what earlier parsers
@@ -6226,6 +6227,16 @@ fn ingest_codex_rollout_incremental(
                 },
             )?;
         }
+        outcome.events += images::capture_codex(
+            conn,
+            session_id,
+            cwd,
+            branch,
+            index,
+            ts_ms,
+            turn_id.as_deref(),
+            &value,
+        )?;
         let human_outcome = human_messages.observe(&value);
         if human_outcome == codex::HumanMessageOutcome::Suppressed {
             // The mirrored encoding of the turn just stored. Its twin wrote
@@ -11082,7 +11093,7 @@ fn heal_claude_synthetic_session_summaries(conn: &Connection) -> Result<()> {
 /// Generation 4 is the one capture re-read of the release after 0.36.0: a row
 /// stamped below it predates evidence that release's parsers store, and a
 /// finished transcript never changes on disk, so only this re-read stores it.
-const RAW_MESSAGE_FACTS_VERSION: i64 = 4;
+const RAW_MESSAGE_FACTS_VERSION: i64 = 5;
 
 #[derive(Debug, Default, Clone, Copy)]
 struct RawMessageFacts<'a> {
@@ -29101,22 +29112,8 @@ mod tests {
         );
     }
 
-    /// The exception list's own failure mode, which I flagged as the risk when
-    /// I added it and then still got wrong: `response_item/message` was
-    /// exempted unconditionally on the grounds that the deduplicator stores
-    /// one row for Codex's two representations of a turn. It does — but only
-    /// when it accepts the message. A user message whose content carries no
-    /// `input_text` part (an image-only turn) is rejected, nothing is written,
-    /// and the blanket exemption then swallowed the line.
-    ///
-    /// The same holds for a blank `user_message`: the deduplicator refuses
-    /// it. An application-injected control wrapper is different since #180:
-    /// it is stored as a `codex_context_wrapper` event, so it earns no
-    /// marker.
-    ///
-    /// The exemption now has to be earned: it holds for a mirrored duplicate,
-    /// whose twin really did write, and not for a message the deduplicator
-    /// simply refused.
+    /// Image-only turns produce image events even though the text deduper has
+    /// no prompt to store. Blank turns still leave an unknown marker.
     #[test]
     fn a_codex_message_the_deduplicator_rejects_is_still_recorded() {
         let dir = tempfile::tempdir().unwrap();
@@ -29129,9 +29126,8 @@ mod tests {
             concat!(
                 r#"{"timestamp":"2026-09-13T00:00:00.000Z","type":"session_meta","payload":{"id":"sess-image","cwd":"/tmp/proj","cli_version":"0.148.0"}}"#, "\n",
                 r#"{"timestamp":"2026-09-13T00:00:00.100Z","type":"turn_context","payload":{"turn_id":"t1","cwd":"/tmp/proj","model":"gpt-5.4"}}"#, "\n",
-                // Image-only user turn: no `input_text` part, so the
-                // deduplicator rejects it and nothing stores it.
-                r#"{"timestamp":"2026-09-13T00:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]}}"#, "\n",
+                // Image-only user turn: capture copies it independently of text deduplication.
+                r#"{"timestamp":"2026-09-13T00:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="}]}}"#, "\n",
                 // Blank text: refused, so nothing stores it either. The
                 // control wrapper after it is stored, typed.
                 r#"{"timestamp":"2026-09-13T00:00:02.000Z","type":"event_msg","payload":{"type":"user_message","message":"   "}}"#, "\n",
@@ -29156,11 +29152,11 @@ mod tests {
             .unwrap();
         assert_eq!(
             events,
-            vec![(
+            vec![("![Attached image](data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=)".to_string(), None), (
                 "<environment_context>cwd=/tmp/proj</environment_context>".to_string(),
                 Some("codex_context_wrapper".to_string())
             )],
-            "the image-only turn reaches no event; the wrapper is a typed row"
+            "the image is copied and the wrapper is a typed context row"
         );
 
         let markers = markers_of(&conn, "codex", "sess-image");
@@ -29171,7 +29167,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 ("turn_context", "turn_context"),
-                ("unknown", "message"),
                 ("unknown", "user_message")
             ],
             "every user line nothing stored must leave a row: {markers:?}"

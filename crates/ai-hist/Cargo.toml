@@ -27,6 +27,7 @@ git-hooks = ["dep:url"]
 unstable-internal = []
 
 [dependencies]
+base64 = "0.22"
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 libc = "0.2"
