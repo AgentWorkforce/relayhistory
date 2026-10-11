@@ -81,7 +81,7 @@ return causes exactly these four named checks to fail:
 - `rewritten_metadata_and_retired_events_preserve_remote_shares`: catalog
   evidence is absent.
 
-Restoring the normalizer passes all twelve focused unit checks and the public
+Restoring the normalizer passes all seventeen focused unit checks and the public
 conformance test. This separates working evidence acquisition from successful
 registration or an empty sweep. Existing 66 corpus tests and 10 source-registry
 tests also pass; no pre-existing fixture snapshot changed.
@@ -92,7 +92,7 @@ ran outside the restrictive macOS sandbox):
 - `cargo test -p ai-hist --all-features providers::hermes --lib`: 17 pass.
 - `cargo test -p ai-hist --all-features --test provider_hermes --test fixture_corpus --test source_registry`: 1 + 66 + 10 pass.
 - `cargo test -p ai-hist --test provider_hermes` and `cargo test -p ai-hist --features export --test provider_hermes`: pass.
-- `npm run providers:check`: pass; `node --test scripts/*.test.mjs`: 171 pass.
+- `npm run providers:check`: pass; `node --test scripts/*.test.mjs`: 173 pass.
 - `cargo fmt --all -- --check`, explicit `rustfmt --check` for this adapter,
   `cargo clippy --workspace --all-targets --all-features -- -A clippy::too_many_arguments -D warnings`, and `rust-oleum`: pass.
 - `cargo build -p ai-hist --no-default-features` and `cargo publish --dry-run -p ai-hist --allow-dirty`: pass. The latter aborts upload as intended.
@@ -107,8 +107,12 @@ ran outside the restrictive macOS sandbox):
 - `cargo test -p ai-hist --no-default-features` also passes with no
   command-level exclusions, including the sourcing population assertion.
 
-Shared prerequisites were resolved by setup commits `9e2d0819`, `0df1d15f`,
-and formatting correction `9fdd070a` (the latter cherry-picked locally).
+Final integration base: setup commit
+`562bac904dda3c8b7962b9f4e4b29c5bfed1ed32`, composed with main `e0827b98`
+(#465). This includes the shared repair, SDK admission, generator, formatting,
+and migration test-isolation corrections. The full workspace and no-default
+runs above preceded this final mechanical rebase; affected checks below were
+rerun on the final composition.
 The descriptor now drives the generated sourcing population row. The SDK accepts
 `session_marker`, uses the existing badge fallback, and isolates provider root
 overrides in its test environments. No provider-owned handwritten shared edits
@@ -134,3 +138,17 @@ Disabling cancellation propagation produces two named failures:
 `cancellation_interrupts_snapshot_collection_before_it_finishes` and
 `cancellation_inside_normalization_rolls_back_partial_evidence`. Restoring the
 checks passes both and all 17 focused provider tests.
+
+Final-base affected verification:
+
+- `cargo test -p ai-hist --all-features providers:: --lib`: 30 pass,
+  including all 17 Hermes checks and the setup adapter repair checks.
+- `cargo test -p ai-hist --all-features an_upgraded_store_gains_the_requests_of_standalone_records --lib`: 1 pass.
+- `cargo test -p ai-hist --all-features --test provider_hermes --test fixture_corpus --test source_registry --test sourcing_sdk_doc`: 1 + 66 + 10 + 1 pass.
+- `npm run providers:check`: 8 pass; formatting, Clippy, rust-oleum and
+  public API checks pass (949 items).
+- Worktree native debug rebuild, SDK lint/build, native contract 26 and
+  `node crates/ai-hist/src/providers/hermes/smoke.mjs`: pass.
+
+The final rebase changed no Hermes source behavior and required no conflict
+resolution. Existing provider snapshots remain unchanged.
