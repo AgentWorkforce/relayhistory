@@ -101,32 +101,31 @@ ran outside the restrictive macOS sandbox):
 - `node scripts/check-public-api.mjs`: matches the updated 949-item snapshot.
   The API adds `Source::Hermes`; rustdoc also splits the existing capabilities
   method into a separate impl listing without changing its signature.
-- The unmodified workspace gate reaches and fails
-  `the_guide_population_table_is_what_the_crate_declares`: parent-owned
-  `docs/sourcing-sdk.md` needs the Hermes population row. The preceding library
-  run had 1263 passes and one ignored test. Both the full workspace/all-features suite and the no-default suite pass
-  with only that known documentation check explicitly skipped. The required
-  unmodified gates must be rerun after the shared generated documentation fix.
+- After the shared fixes, `cargo test --workspace --all-features` passes with
+  no command-level exclusions (including the sourcing population assertion,
+  66 corpus tests, 10 source-registry tests and 75 live-capture tests).
+- `cargo test -p ai-hist --no-default-features` also passes with no
+  command-level exclusions, including the sourcing population assertion.
 
-Shared integration blockers (outside this provider's handwritten ownership):
+Shared prerequisites were resolved by setup commits `9e2d0819`, `0df1d15f`,
+and formatting correction `9fdd070a` (the latter cherry-picked locally).
+The descriptor now drives the generated sourcing population row. The SDK accepts
+`session_marker`, uses the existing badge fallback, and isolates provider root
+overrides in its test environments. No provider-owned handwritten shared edits
+were needed.
 
-1. `sdk-ts/src/operations.ts` still types its seven legacy icons as
-   `Record<Source, string>`, so adding Hermes fails SDK lint/build. Its existing
-   fallback supports unknown icons; the map should be partial.
-2. `sdk-ts/src/normalization.ts::hydrationCoverage` rejects `session_marker`.
-   Hermes truthfully declares marker coverage; its final SDK hydration fails
-   with `NATIVE_CONTRACT_MISMATCH` until the shared vocabulary/types are fixed.
-   Before adding that truthful coverage declaration, the isolated smoke proved
-   historical user/assistant search, source filtering and capabilities through
-   SDK, CLI and MCP. This is not a final green SDK result. Rerun the checked-in
-   `smoke.mjs` and complete SDK suite after the shared fixes.
-3. Parent must add the sourcing SDK population row, root changelog/Rust API
-   note, and include HERMES_HOME in shared SDK test-environment scrubbing
-   (alongside the other pilot's override). Tests here use only isolated homes.
+After integrating those changes:
 
-Do not label the provider integration ready or close #429 until those shared
-changes and all gates pass. No publication, merge, push or PR creation was done
-by this provider worker. Setup #464 must merge before pilot integration.
+- Provider generation: 8 tests; repository scripts: 173 tests.
+- Native rebuilt; contract 26 and public API 949 verified.
+- SDK lint passes; SDK suite: 278 pass, one filesystem capability skip (invalid
+  UTF-8 filename support), zero failures.
+- The strict checked-in synthetic SDK/CLI/MCP smoke passes historical user and
+  assistant search, source filtering, and Hermes capability reads.
+- Formatting, Clippy and rust-oleum pass.
+
+No publication, merge, push or PR creation was done by this provider worker.
+Setup #464 must merge before pilot integration.
 
 Cancellation follow-up: database/profile enumeration, snapshot session/message
 collection, and normalization now check the existing cooperative stop token.
