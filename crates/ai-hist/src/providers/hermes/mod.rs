@@ -26,7 +26,7 @@ pub(crate) const METADATA: ProviderMetadata = ProviderMetadata {
     usage: None,
 };
 pub(crate) const ADAPTER: Option<ProviderAdapter> = Some(ProviderAdapter {
-    generation: "hermes_schema31_v3",
+    generation: "hermes_schema31_v4",
     acquire,
     sweep,
     resolve_roots: roots::resolve,
@@ -135,8 +135,29 @@ fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
         normalize::retire_deleted(&tx, &path, &sessions)?;
         tx.commit()?;
     }
+    retire_missing_databases(&ctx)?;
     Ok(SweepResult {
         inserted,
         unread: 0,
     })
+}
+
+fn retire_missing_databases(ctx: &SweepContext<'_>) -> Result<()> {
+    // A missing configured root is unavailable, not proof of deletion.
+    let mut stmt = ctx.conn.prepare(
+        "SELECT DISTINCT raw_path FROM sessions WHERE source=?1 AND raw_path IS NOT NULL",
+    )?;
+    let paths = stmt
+        .query_map([ID], |r| r.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for path in paths {
+        let path = PathBuf::from(path);
+        if storage::in_scope(&path, ctx.paths) && storage::confirmed_missing(ctx.roots, &path)? {
+            crate::ingest::check_capture_cancelled()?;
+            let tx = ctx.conn.unchecked_transaction()?;
+            normalize::retire_deleted(&tx, &path, &[])?;
+            tx.commit()?;
+        }
+    }
+    Ok(())
 }

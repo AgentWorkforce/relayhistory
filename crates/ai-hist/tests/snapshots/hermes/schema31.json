@@ -134,7 +134,7 @@
       "subagent_session_id": null,
       "text": "{\"function\":{\"arguments\":\"{\\\"path\\\":\\\"/fixture/project/notes.txt\\\"}\",\"name\":\"read_file\"},\"id\":\"call/native:1\",\"type\":\"function\"}",
       "token_json": null,
-      "tool_use_id": null,
+      "tool_use_id": "call/native:1",
       "ts_ms": 1780000002000
     },
     {
@@ -584,7 +584,7 @@
       "repo_url": null,
       "session_id": "default:636861742f6e6f742d612d757569643aceb1",
       "source": "hermes",
-      "source_stamp": "hermes_schema31_v3:sha256:d5298a1b51aed36e34d9d6a942775e5cc8e99f3c3eba1c5295687d7d27ee9f48",
+      "source_stamp": "hermes_schema31_v4:sha256:d5298a1b51aed36e34d9d6a942775e5cc8e99f3c3eba1c5295687d7d27ee9f48",
       "title": null,
       "workspace_roots_json": null
     },
@@ -604,7 +604,7 @@
       "repo_url": null,
       "session_id": "default:636f6d707265737365642d6368696c64",
       "source": "hermes",
-      "source_stamp": "hermes_schema31_v3:sha256:ba5d0af9dbad8923ae5e0c8f236040f97669caf3e120bfd85212d289282356ef",
+      "source_stamp": "hermes_schema31_v4:sha256:ba5d0af9dbad8923ae5e0c8f236040f97669caf3e120bfd85212d289282356ef",
       "title": null,
       "workspace_roots_json": null
     }

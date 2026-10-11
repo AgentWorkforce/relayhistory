@@ -412,3 +412,62 @@ pub(super) fn in_scope(path: &Path, scope: Option<&crate::ingest::path_scope::Pa
 pub(super) fn first_prompt(conn: &Connection, native: &str) -> Result<Option<String>> {
     Ok(conn.query_row("SELECT substr(content,1,512) FROM messages WHERE session_id=? AND role='user' AND content IS NOT NULL AND _compressed_summary=0 AND observed=0 AND (active=1 OR compacted=1) AND (display_kind IS NULL OR display_kind NOT IN ('hidden','async_delegation_complete')) ORDER BY id LIMIT 1", [native], |r| r.get::<_,Option<String>>(0)).optional()?.flatten())
 }
+
+// Absence is authoritative only inside an accessible configured root. Validate
+// existing ancestors; unavailable roots and escaped symlinks do not prove deletion.
+pub(super) fn confirmed_missing(roots: &ProviderRoots, path: &Path) -> Result<bool> {
+    let context = AcquisitionContext::new(ID, roots);
+    for root in roots.for_provider(ID) {
+        let Ok(relative) = path.strip_prefix(root) else {
+            continue;
+        };
+        if !native_database_path(relative) || !root.try_exists()? {
+            continue;
+        }
+        match std::fs::symlink_metadata(path) {
+            Ok(_) => {
+                context.validate(path)?;
+                return Ok(false);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        context.validate(root)?;
+        // Reading the root distinguishes accessible absence from denied roots.
+        for entry in std::fs::read_dir(root)? {
+            entry?;
+        }
+        let mut parent = path.parent();
+        while let Some(dir) = parent {
+            if dir == root {
+                break;
+            }
+            validate_existing_directory(&context, dir)?;
+            parent = dir.parent();
+        }
+        return Ok(!path.try_exists()?);
+    }
+    Ok(false)
+}
+
+fn native_database_path(relative: &Path) -> bool {
+    let parts: Vec<_> = relative.components().collect();
+    relative == Path::new("state.db")
+        || (parts.len() == 3
+            && parts[0].as_os_str() == "profiles"
+            && parts[2].as_os_str() == "state.db"
+            && matches!(parts[1], std::path::Component::Normal(_)))
+}
+fn validate_existing_directory(context: &AcquisitionContext<'_>, dir: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(dir) {
+        Ok(_) => {
+            context.validate(dir)?;
+            for entry in std::fs::read_dir(dir)? {
+                entry?;
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    Ok(())
+}

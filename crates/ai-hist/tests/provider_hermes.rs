@@ -24,5 +24,20 @@ fn hermes_public_history_conformance() {
     );
     assert_eq!(evidence.tool_calls.len(), 1);
     assert_eq!(evidence.tool_results.len(), 1);
+    let id = &evidence.tool_calls[0].tool_use_id;
+    assert_eq!(id, "call/native:1");
+    let blocks: Vec<_> = evidence
+        .messages
+        .iter()
+        .flat_map(|m| &m.blocks)
+        .filter(|b| {
+            matches!(
+                b.kind,
+                ai_hist::BlockKind::ToolUse | ai_hist::BlockKind::ToolResult
+            )
+        })
+        .collect();
+    assert_eq!(blocks.len(), 2);
+    assert!(blocks.iter().all(|b| b.tool_use_id.as_ref() == Some(id)));
     assert!(evidence.requests.iter().all(|r| r.usage.is_none()));
 }

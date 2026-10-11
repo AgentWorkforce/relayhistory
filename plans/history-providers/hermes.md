@@ -166,7 +166,7 @@ Fingerprint inputs stat only the database, WAL and rollback journal, without ope
 SQLite. Changed-path sweeps select the database/profile named by a database,
 sidecar or ancestor event. Each selected complete database snapshot commits
 normalization and native-session deletion reconciliation in one ledger transaction;
-unread, missing and unvisited profiles cannot retire prior evidence. Remote evidence
+unread and unvisited profiles cannot retire prior evidence. Remote evidence
 and remote session presence survive local deletion. Shallow prompt controls match
 full normalization, and prompt ownership/cwd rewrites refresh the project search
 projection, including a surviving fork with a different or cleared cwd.
@@ -212,3 +212,47 @@ public Hermes conformance, 10 registry cases, sourcing population documentation,
 9 generator cases, public API (unchanged 949 items), formatting and Clippy.
 `with_all_roots` now delegates default construction to `ProviderRoots::from_home`;
 its reduced discover.rs LOC ceiling is lowered from 3424 to 3411.
+
+Late review correction (parser generation v4): a complete sweep now retires local
+history for a confirmed missing default/profile `state.db`. The catalog locator
+must remain inside an accessible configured Hermes root with the native layout;
+existing ancestors are containment-validated and readable. Missing/unavailable roots,
+unconfigured old locators, unrelated watch paths, failed snapshots, and escaped
+symlinks never authorize retirement. Remote shares remain readable. Removal of an
+entire profile directory is reconciled when its configured root remains accessible.
+
+Tool-use events now retain the same native call ID as the result and public
+`ToolCall`. Full capture uses the coherent snapshot's latest timestamp, bounded by
+session start. Clearing cwd withdraws path-derived catalog/event project keys;
+stronger remote/inherited identities and remote-only event path projections remain
+intact.
+
+Negative evidence: on the prior implementation,
+`deleted_database_retires_only_confirmed_scoped_local_evidence` retains local
+presence, `hermes_public_history_conformance` exposes a null tool-use block ID,
+and `full_snapshot_bounds_activity_and_clears_path_project_identity` records
+activity before start. Reverting only the new cwd reconciliation causes that last
+regression to retain `/fixture/project`. Restoring the fixes passes these checks;
+`deleted_profile_database_preserves_unvisited_default_and_rejects_escaped_parent`
+additionally proves scoped profile deletion and containment rejection. The corpus
+snapshot changes only the tool-use ID and parser source stamps. The native smoke
+resolves its session from actual discovery so explicit custom-root identity is
+verified rather than assuming the default namespace, and checks native call/event
+ID linkage before SDK/CLI/MCP search assertions.
+
+Absence proof is filesystem-local: a still-readable empty mountpoint is
+indistinguishable from an intentionally emptied root. A missing or inaccessible
+configured root is preserved; this adapter does not infer operating-system mount
+state from directory readability.
+
+Removing only the event-location guard fails the remote-only path assertion
+(`project_key` becomes NULL). Restoring it preserves the imported remote cwd/key.
+
+Final v4 checks: `cargo test -p ai-hist --all-features providers::hermes --lib`
+passes 27; public Hermes conformance, corpus, registry and sourcing documentation
+pass 1 + 66 + 10 + 1. Provider generator checks pass 9; public API remains 949.
+Workspace Clippy with all targets/features and warnings denied, workspace/adapter
+formatting, and rust-oleum pass without baseline changes. The final native debug
+addon and SDK builds pass the stricter synthetic SDK/CLI/MCP smoke. Independent
+read-only review signed off the deletion trust/scope checks, remote-only path guard,
+canonical project preservation, timestamp bound and public block identities.

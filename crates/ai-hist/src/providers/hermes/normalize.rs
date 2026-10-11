@@ -62,13 +62,7 @@ pub(super) fn session(conn: &Connection, s: &Session, path: &Path) -> Result<usi
         crate::ingest::check_capture_cancelled()?;
         inserted += message(conn, s, m, &mut keys, &mut indexer)?;
     }
-    let last = s
-        .messages
-        .iter()
-        .map(|m| m.timestamp)
-        .chain(s.ended)
-        .max()
-        .unwrap_or(s.started);
+    let last = s.latest.max(s.started);
     let assistant = s
         .messages
         .iter()
@@ -99,6 +93,18 @@ pub(super) fn session(conn: &Connection, s: &Session, path: &Path) -> Result<usi
             ..Default::default()
         },
     )?;
+    // Missing cwd withdraws only the local path projection; stronger recorded
+    // remote/inherited identities remain authoritative.
+    if s.cwd.as_deref().is_none_or(|cwd| cwd.trim().is_empty()) {
+        for table in ["sessions", "session_events"] {
+            let scope = if table == "session_events" {
+                " AND location IN ('local','both')"
+            } else {
+                ""
+            };
+            conn.execute(&format!("UPDATE {table} SET project_key=NULL,project_key_method=NULL WHERE source=?1 AND session_id=?2 AND project_key_method='path'{scope}"), rusqlite::params![ID,s.id])?;
+        }
+    }
     // A complete snapshot is authoritative even when metadata was cleared.
     let models = serde_json::to_string(&s.model.iter().collect::<Vec<_>>())?;
     let first_prompt = s
@@ -294,6 +300,10 @@ fn tool(
     )?;
     keys.tools.insert(id.into());
     let uid = format!("{mid}:tool:{index}");
+    let facts = ToolResultFacts {
+        tool_use_id: Some(id.into()),
+        ..Default::default()
+    };
     insert_session_event(
         conn,
         &EventRow {
@@ -307,6 +317,7 @@ fn tool(
             text: Some(&call.to_string()),
             model: None,
             raw_kind: Some("tool_calls"),
+            tool_result_facts: Some(&facts),
             ..Default::default()
         },
     )?;

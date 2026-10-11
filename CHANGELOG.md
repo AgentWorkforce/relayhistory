@@ -17,6 +17,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Hermes retires confirmed deleted databases, retains native tool block IDs, bounds activity by session start, and clears stale directory project identities.
+
 - Native Windows and suffixed Hermes roots retain portable session identities, while explicit custom roots remain separately namespaced.
 - Hermes discovery ranks current activity across profiles, excludes synthetic prompt previews, and reconciles deleted sessions and changed prompt projects while preserving remote evidence.
 - Unchanged provider syncs restore lost evidence, missing adapter files and sidecar containment failures retain their typed error codes, and SDK hydration accepts native session markers.

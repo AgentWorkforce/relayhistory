@@ -777,3 +777,153 @@ fn legacy_roots_infer_only_the_canonical_default_without_reading_environment() {
             .starts_with("root:")
     );
 }
+
+#[test]
+fn deleted_database_retires_only_confirmed_scoped_local_evidence() {
+    let (home, roots, path, db) = fixture();
+    let conn = crate::open_db(&home.path().join("ledger.db")).unwrap();
+    let mut state = serde_json::Map::new();
+    let repairs = crate::ingest::SweepRepairs::default();
+    let run = |state: &mut serde_json::Map<String, Value>, paths| {
+        sweep(SweepContext {
+            conn: &conn,
+            state,
+            roots: &roots,
+            paths,
+            repairs: &repairs,
+        })
+    };
+    run(&mut state, None).unwrap();
+    conn.execute(
+        "UPDATE session_events SET location='both' WHERE session_id=?1 AND event_uid='1:text'",
+        [SESSION],
+    )
+    .unwrap();
+    crate::mark_session_presence(&conn, ID, SESSION, crate::SessionLocation::Remote).unwrap();
+    drop(db);
+    let root = path.parent().unwrap();
+    let moved = home.path().join("unavailable");
+    std::fs::rename(root, &moved).unwrap();
+    run(&mut state, None).unwrap();
+    assert!(crate::session_locations(&conn, ID, SESSION)
+        .unwrap()
+        .contains(&"local".into()));
+    std::fs::rename(&moved, root).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    let unrelated =
+        crate::ingest::path_scope::PathScope::from_paths([home.path().join("unrelated")]).unwrap();
+    run(&mut state, Some(&unrelated)).unwrap();
+    assert!(crate::session_locations(&conn, ID, SESSION)
+        .unwrap()
+        .contains(&"local".into()));
+    let selected = crate::ingest::path_scope::PathScope::from_paths([path.clone()]).unwrap();
+    run(&mut state, Some(&selected)).unwrap();
+    assert_eq!(
+        crate::session_locations(&conn, ID, SESSION).unwrap(),
+        ["remote"]
+    );
+    let retained: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sessions WHERE source='hermes'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(retained, 1);
+    let location: String = conn
+        .query_row(
+            "SELECT location FROM session_events WHERE session_id=?1 AND event_uid='1:text'",
+            [SESSION],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(location, "remote");
+    let stale: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM history WHERE source='hermes' AND session_id != ?1",
+            [SESSION],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stale, 0);
+}
+
+#[test]
+fn full_snapshot_bounds_activity_and_clears_path_project_identity() {
+    let (home, roots, path, _db) = fixture();
+    let conn = crate::open_db(&home.path().join("ledger.db")).unwrap();
+    let mut s = storage::all(&AcquisitionContext::new(ID, &roots), &path)
+        .unwrap()
+        .into_iter()
+        .find(|s| s.native_id == NATIVE)
+        .unwrap();
+    normalize::session(&conn, &s, &path).unwrap();
+    conn.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text,cwd,project_key,project_key_method,location) VALUES ('hermes',?1,'remote-only',1,'user','text','remote fact','/remote/project','/remote/project','path','remote')", [SESSION]).unwrap();
+    s.started = s.latest + 1000;
+    s.latest = s.started;
+    s.cwd = None;
+    normalize::session(&conn, &s, &path).unwrap();
+    let row: (i64, i64, Option<String>, Option<String>) = conn.query_row("SELECT first_activity_ms,last_activity_ms,cwd,project_key FROM sessions WHERE source='hermes' AND session_id=?1", [SESSION], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?))).unwrap();
+    assert_eq!(row.0, row.1);
+    assert_eq!(row.2, None);
+    assert_eq!(row.3, None);
+    let stale: i64 = conn.query_row("SELECT count(*) FROM session_events WHERE source='hermes' AND session_id=?1 AND location != 'remote' AND project_key IS NOT NULL", [SESSION], |r| r.get(0)).unwrap();
+    assert_eq!(stale, 0);
+    let remote: (String, String) = conn.query_row("SELECT cwd,project_key FROM session_events WHERE source='hermes' AND session_id=?1 AND event_uid='remote-only'", [SESSION], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!(remote, ("/remote/project".into(), "/remote/project".into()));
+
+    conn.execute("UPDATE sessions SET project_key='github.com/acme/remote',project_key_method='remote' WHERE source='hermes' AND session_id=?1", [SESSION]).unwrap();
+    conn.execute("UPDATE session_events SET project_key='github.com/acme/remote',project_key_method='remote',location='both' WHERE source='hermes' AND session_id=?1", [SESSION]).unwrap();
+    normalize::session(&conn, &s, &path).unwrap();
+    let key: String = conn
+        .query_row(
+            "SELECT project_key FROM sessions WHERE source='hermes' AND session_id=?1",
+            [SESSION],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(key, "github.com/acme/remote");
+    let lost: i64 = conn.query_row("SELECT count(*) FROM session_events WHERE source='hermes' AND session_id=?1 AND project_key IS NOT 'github.com/acme/remote'", [SESSION], |r| r.get(0)).unwrap();
+    assert_eq!(lost, 0);
+}
+
+#[test]
+fn deleted_profile_database_preserves_unvisited_default_and_rejects_escaped_parent() {
+    let (home, roots, path, _db) = fixture();
+    let profile = path.parent().unwrap().join("profiles/work/state.db");
+    std::fs::create_dir_all(profile.parent().unwrap()).unwrap();
+    let db = Connection::open(&profile).unwrap();
+    db.execute_batch(SQL).unwrap();
+    drop(db);
+    let conn = crate::open_db(&home.path().join("ledger.db")).unwrap();
+    let mut state = serde_json::Map::new();
+    let repairs = crate::ingest::SweepRepairs::default();
+    let run = |state: &mut serde_json::Map<String, Value>, paths| {
+        sweep(SweepContext {
+            conn: &conn,
+            state,
+            roots: &roots,
+            paths,
+            repairs: &repairs,
+        })
+    };
+    run(&mut state, None).unwrap();
+    std::fs::remove_dir_all(profile.parent().unwrap()).unwrap();
+    let selected = crate::ingest::path_scope::PathScope::from_paths([profile.clone()]).unwrap();
+    run(&mut state, Some(&selected)).unwrap();
+    let rows: Vec<String> = conn
+        .prepare("SELECT DISTINCT raw_path FROM sessions WHERE source='hermes'")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(rows, [path.to_string_lossy().into_owned()]);
+    #[cfg(unix)]
+    {
+        let outside = home.path().join("outside");
+        std::fs::create_dir(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, profile.parent().unwrap()).unwrap();
+        assert!(storage::confirmed_missing(&roots, &profile).is_err());
+    }
+}
