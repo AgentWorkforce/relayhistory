@@ -36,6 +36,11 @@ const REGISTRATIONS: &[Registration] = &[
         adapter: devin::ADAPTER,
     },
     Registration {
+        id: "pi",
+        metadata: pi::METADATA,
+        adapter: pi::ADAPTER,
+    },
+    Registration {
         id: "hermes",
         metadata: hermes::METADATA,
         adapter: hermes::ADAPTER,

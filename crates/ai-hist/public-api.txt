@@ -184,6 +184,7 @@ pub ai_hist::Source::Grok
 pub ai_hist::Source::Hermes
 pub ai_hist::Source::Muse
 pub ai_hist::Source::OpenCode
+pub ai_hist::Source::Pi
 impl ai_hist::Source
 pub const ai_hist::Source::ALL: &'static [ai_hist::Source]
 pub fn ai_hist::Source::as_str(self) -> &'static str

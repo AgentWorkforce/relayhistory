@@ -22,6 +22,7 @@ export const SOURCES = Object.freeze([
   'opencode',
   'muse',
   'devin',
+  'pi',
   'hermes',
 ] as const);
 // END GENERATED PROVIDER SOURCES

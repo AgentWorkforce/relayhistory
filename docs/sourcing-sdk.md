@@ -937,6 +937,7 @@ handle.
 | hermes | ✓ | ✓ | ✓ | — | — | none |
 | muse | ✓ | ✓ | ✓ | ✓ | ✓ | per-request |
 | opencode | ✓ | ✓ | ✓ | ✓ | ✓ | none |
+| pi | ✓ | ✓ | ✓ | — | — | per-message |
 <!-- sourcing-sdk-population-table:end -->
 
 The ADR's [capture matrix](decisions/2026-09-19-relayhistory-owns-session-sourcing.md#capture-matrix)

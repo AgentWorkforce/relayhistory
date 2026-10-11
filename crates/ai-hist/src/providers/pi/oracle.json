@@ -1,0 +1,70 @@
+{
+  "package": "@earendil-works/pi-coding-agent@1.1.0",
+  "inspectedUpstreamRevision": "89e5c2c075535e2f427c30fc74720d65b2944ff9",
+  "reader": "SessionManager.open(...).getEntries()",
+  "messages": [
+    {
+      "id": "entry-1",
+      "role": "user",
+      "content": "Inspect the fixture greeting."
+    },
+    {
+      "id": "entry-2",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "thinking",
+          "thinking": "I should read the fixture."
+        },
+        {
+          "type": "text",
+          "text": "I will inspect the greeting."
+        },
+        {
+          "type": "toolCall",
+          "id": "call-fixture",
+          "name": "read",
+          "arguments": {
+            "path": "greeting.txt"
+          }
+        }
+      ]
+    },
+    {
+      "id": "entry-3",
+      "role": "toolResult",
+      "content": [
+        {
+          "type": "text",
+          "text": "Hello fixture"
+        }
+      ]
+    },
+    {
+      "id": "entry-4",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "text",
+          "text": "The greeting says Hello fixture."
+        }
+      ]
+    },
+    {
+      "id": "entry-6",
+      "role": "user",
+      "content": "Explore an alternate branch."
+    },
+    {
+      "id": "entry-7",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "text",
+          "text": "This answer is on the alternate branch."
+        }
+      ]
+    }
+  ],
+  "activeContextMessages": 1
+}

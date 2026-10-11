@@ -19,6 +19,8 @@ pub enum Source {
     Muse,
     #[serde(rename = "devin")]
     Devin,
+    #[serde(rename = "pi")]
+    Pi,
     #[serde(rename = "hermes")]
     Hermes,
     #[cfg(test)]
@@ -36,6 +38,7 @@ impl Source {
         Self::OpenCode,
         Self::Muse,
         Self::Devin,
+        Self::Pi,
         Self::Hermes,
         #[cfg(test)]
         Self::TestFixture,
@@ -51,6 +54,7 @@ impl Source {
             Self::OpenCode => "opencode",
             Self::Muse => "muse",
             Self::Devin => "devin",
+            Self::Pi => "pi",
             Self::Hermes => "hermes",
             #[cfg(test)]
             Self::TestFixture => "test-fixture",
@@ -67,6 +71,7 @@ impl Source {
             "opencode" => Some(Self::OpenCode),
             "muse" => Some(Self::Muse),
             "devin" => Some(Self::Devin),
+            "pi" => Some(Self::Pi),
             "hermes" => Some(Self::Hermes),
             #[cfg(test)]
             "test-fixture" | "test-fixture-alias" => Some(Self::TestFixture),

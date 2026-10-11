@@ -7,5 +7,6 @@ pub(crate) mod grok;
 pub(crate) mod hermes;
 pub(crate) mod muse;
 pub(crate) mod opencode;
+pub(crate) mod pi;
 #[cfg(test)]
 pub(crate) mod test_fixture;

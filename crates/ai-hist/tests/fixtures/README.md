@@ -212,6 +212,7 @@ source without deciding which one fails the test.
 
 | Fixture | Recorded behavior |
 | --- | --- |
+| pi/writer-v3 | Pi 1.1.0 SessionManager v3 synthetic persistence capture: custom IDs, forkFrom parentSession, full branched history, tools/results, assistant usage, standalone usage and compaction markers; upstream getEntries oracle. |
 | hermes/schema31 | Pinned Hermes schema 31 writer, arbitrary native IDs, resumed messages, tool calls/results, compression child and archived rows; no per-request usage inferred. |
 | hermes/official-export | SessionDB.export_session(include_inactive=True) independent oracle from pinned writer. |
 <!-- END GENERATED PROVIDER FIXTURES -->

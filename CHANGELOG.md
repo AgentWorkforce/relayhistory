@@ -9,6 +9,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - Hermes schema-31 session history is discoverable and searchable across default and named profiles, including archived turns, tool calls and session markers.
+- Pi v3 session history is discoverable and searchable, including branched conversations, tool calls, per-message usage and session markers.
 
 ### Changed
 
@@ -17,16 +18,17 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- Hermes retires confirmed deleted databases, retains native tool block IDs, bounds activity by session start, and clears stale directory project identities.
-
 - Native Windows and suffixed Hermes roots retain portable session identities, while explicit custom roots remain separately namespaced.
+- Hermes retires confirmed deleted databases, retains native tool block IDs, bounds activity by session start, and clears stale directory project identities.
 - Hermes discovery ranks current activity across profiles, excludes synthetic prompt previews, and reconciles deleted sessions and changed prompt projects while preserving remote evidence.
+- Pi history isolates invalid files, skips unchanged transcripts, and preserves prompt projects, tool identities and readable previews through rewrites.
 - Unchanged provider syncs restore lost evidence, missing adapter files and sidecar containment failures retain their typed error codes, and SDK hydration accepts native session markers.
 - A Grok or Muse re-read reports a row again only when that row changed.
 
 ### Rust API
 
 - Added `Source::Hermes` for filtering and reading persisted Hermes session history.
+- Added `Source::Pi` for filtering and reading persisted Pi session history.
 
 ## [0.40.1] - 2026-10-11
 
