@@ -64,7 +64,7 @@ transactionally; partial final records are deferred and prevent pruning.
 
 Implementation is stacked on setup commit
 `562bac904dda3c8b7962b9f4e4b29c5bfed1ed32` (setup PR #464, composed on main `e0827b98`), rebased from the original verified setup commit `276bd3dba51312c7b78e7379cd79b04e5d313ff1`. Setup is not merged.
-No package publication, push, merge or provider PR was performed.
+Provider review is stacked on setup PR #464; integration waits for that dependency to land.
 
 Provider-level checks:
 
@@ -110,7 +110,7 @@ passes without exclusions on setup `588d91f3`, including the slow CLI
 contention case and all 75 live-capture checks. The no-default suite also passed
 unskipped before the final shared test-isolation/helper-extraction follow-up.
 Issue #428 remains open until the setup dependency lands and integration review
-is complete. No publication, push, PR or merge was performed.
+is complete.
 
 The final setup rebase onto main carries the shared guarded-write changes from
 #465. The integration owner validated that composition independently; Pi is
@@ -118,3 +118,22 @@ revalidated on `562bac90` with its unit/public conformance, corpus/registry/doc,
 generator, formatting, Clippy, complexity, public API and rebuilt native
 SDK/CLI/MCP smoke gates. Full Rust suites were not redundantly repeated after
 this final composition; their precise revisions are recorded above.
+
+## Review correction: remote-backed prompts
+
+Local rewrite reconciliation now checks finalized user-event projections after
+retiring local shares. A prompt remains when same-session remote events still
+support it, can move to a surviving fork owner, and is removed only when no
+finalized projection supports it. The acquisition generation is `pi_v3_2` so
+existing snapshots are normalized again.
+
+`pi_rewrite_preserves_prompt_backed_by_same_session_remote_events` fails on the
+previous implementation and passes after the fix; it also covers multi-block
+text, local-only retirement, stable replay and eventual remote removal. An
+independent public SDK probe originally observed history count 1 → 0 while the
+event remained remote; after the fix it observes 1 → 1 with that same event.
+
+After the correction, all 10 Pi unit tests, 5 public acceptance tests, 66 corpus
+cases and 10 registry tests pass. Formatting, Clippy, generator (8 tests),
+rust-oleum, rebuilt native contract 26 and strict SDK/CLI/MCP smoke pass.
+Independent review found no remaining blocking findings.
