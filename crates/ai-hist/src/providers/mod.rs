@@ -126,6 +126,17 @@ pub(crate) fn replayable_history_sources() -> rusqlite::types::Value {
     )
 }
 
+pub(crate) fn can_repair_source(source: &str, history: bool) -> bool {
+    repairable_sources(
+        if history {
+            REPLAYABLE_HISTORY_SOURCES
+        } else {
+            REPAIRABLE_EVENT_SOURCES
+        },
+        history,
+    )
+    .contains(&source)
+}
 pub(crate) fn repairable_sources(legacy: &[&'static str], history: bool) -> Vec<&'static str> {
     let mut sources = legacy.to_vec();
     sources.extend(crate::providers::adapters().filter_map(|(id, _)| {

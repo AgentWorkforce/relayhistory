@@ -1,7 +1,4 @@
-use crate::providers::{
-    repairable_event_sources, replayable_history_sources, REPAIRABLE_EVENT_SOURCES,
-    REPLAYABLE_HISTORY_SOURCES,
-};
+use crate::providers::{can_repair_source, repairable_event_sources, replayable_history_sources};
 #[path = "providers/mod.rs"]
 pub(crate) mod providers;
 use crate::{
@@ -1452,10 +1449,8 @@ fn rows_removed_since_sql(kind: &str) -> String {
 /// One session's [`SessionHoldings`], counted the way the grouped reads of
 /// [`session_holdings_naming`] count it, through each table's session index.
 fn session_holding(conn: &Connection, source: &str, session_id: &str) -> Result<SessionHoldings> {
-    let repairable =
-        crate::providers::repairable_sources(REPAIRABLE_EVENT_SOURCES, false).contains(&source);
-    let replayable =
-        crate::providers::repairable_sources(REPLAYABLE_HISTORY_SOURCES, true).contains(&source);
+    let repairable = can_repair_source(source, false);
+    let replayable = can_repair_source(source, true);
     let count = |sql: &str, applies: bool| -> Result<u64> {
         if !applies {
             return Ok(0);
@@ -34262,6 +34257,7 @@ mod tests {
     /// skipped.
     #[test]
     fn an_upgraded_store_gains_the_requests_of_standalone_records() {
+        let _settle = ImmediateSettle::on_filesystem_keeping_ctime(false);
         let dir = tempfile::tempdir().unwrap();
         let project = dir.path().join(".claude/projects/-work-app");
         let subagents = project.join("root-1/subagents");
