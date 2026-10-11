@@ -927,3 +927,46 @@ fn deleted_profile_database_preserves_unvisited_default_and_rejects_escaped_pare
         assert!(storage::confirmed_missing(&roots, &profile).is_err());
     }
 }
+
+#[test]
+fn identical_database_path_namespace_change_invalidates_unforced_sync_fingerprint() {
+    let (home, native, path, _db) = fixture();
+    let mut custom = native.clone();
+    custom.provider_default_roots.remove(ID);
+    assert_eq!(native.for_provider(ID), custom.for_provider(ID));
+    let catalog = Connection::open_in_memory().unwrap();
+    let fingerprint = |roots: &ProviderRoots| {
+        let env = DiscoveryEnv::with_provider_roots(&catalog, roots.clone());
+        crate::discover::source_fingerprint(&env, &[&Provider]).unwrap()
+    };
+    let native_fp = fingerprint(&native);
+    let custom_fp = fingerprint(&custom);
+    assert_ne!(native_fp, custom_fp);
+    assert_eq!(native_fp.split(':').nth(1), custom_fp.split(':').nth(1));
+    assert_eq!(
+        native_fp.split(':').nth(1).unwrap().parse::<u64>().unwrap(),
+        std::fs::metadata(&path).unwrap().len()
+    );
+    let ledger = home.path().join("namespace-ledger.db");
+    let open = |roots: ProviderRoots| {
+        crate::SessionStore::open(crate::StoreOptions::default().db_path(&ledger).roots(roots))
+            .unwrap()
+    };
+    let store = open(native);
+    assert!(store.sync(crate::SyncOptions::default()).unwrap().swept);
+    assert!(!store.sync(crate::SyncOptions::default()).unwrap().swept);
+    drop(store);
+    let store = open(custom);
+    assert!(store.sync(crate::SyncOptions::default()).unwrap().swept);
+    assert!(!store.sync(crate::SyncOptions::default()).unwrap().swept);
+    drop(store);
+    let conn = crate::open_db(&ledger).unwrap();
+    let (all, custom): (i64, i64) = conn
+        .query_row(
+            "SELECT count(*),sum(session_id LIKE 'root:%') FROM sessions WHERE source='hermes'",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((all, custom), (2, 2));
+}

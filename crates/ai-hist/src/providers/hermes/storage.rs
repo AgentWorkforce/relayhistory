@@ -391,7 +391,9 @@ pub(super) fn fingerprint_inputs(roots: &ProviderRoots) -> Result<Vec<Candidate>
                     locator: path.to_string_lossy().into_owned(),
                     session_id: None,
                     recency_hint_ms: modified,
-                    stamp,
+                    // Namespace is frozen acquisition metadata: identical files
+                    // can project different ledger IDs. Keep the stat length last.
+                    stamp: format!("{}/{stamp}", profile(roots, &db)),
                 });
             }
         }

@@ -256,3 +256,16 @@ formatting, and rust-oleum pass without baseline changes. The final native debug
 addon and SDK builds pass the stricter synthetic SDK/CLI/MCP smoke. Independent
 read-only review signed off the deletion trust/scope checks, remote-only path guard,
 canonical project preservation, timestamp bound and public block identities.
+
+Frozen namespace is part of the stat-only fingerprint stamp. Native and explicit
+custom roots selecting identical database paths/bytes now invalidate the source
+cache when their ledger identity contract changes. Prefixing the namespace leaves
+the terminal file length available to the shared byte fold; no SQLite open is
+introduced and normalization generation remains v4. The regression
+`identical_database_path_namespace_change_invalidates_unforced_sync_fingerprint`
+first fails on identical old fingerprints. With that assertion bypassed, restoring
+the old stat-only stamp also fails the actual public unforced sync: it skips the
+required sweep after reopening the ledger under custom provenance. The fix proves
+unchanged repeats still skip, provenance changes sweep, old local IDs retire, and
+only new custom IDs remain. All 28 Hermes units, including the corrupt-database
+no-open fingerprint control, pass; formatting, Clippy and quality gates pass.
