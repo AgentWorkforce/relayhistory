@@ -970,3 +970,36 @@ fn identical_database_path_namespace_change_invalidates_unforced_sync_fingerprin
         .unwrap();
     assert_eq!((all, custom), (2, 2));
 }
+
+#[test]
+fn recency_query_aggregates_messages_once_and_bounds_selected_capture() {
+    let (_home, roots, _path, db) = fixture();
+    for selected in [false, true] {
+        let query = storage::session_query(selected);
+        let plan: Vec<String> = db
+            .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+            .unwrap()
+            .query_map(params![selected.then_some(NATIVE), 1], |r| r.get(3))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert!(!plan.iter().any(|step| step.contains("CORRELATED")), "{plan:?}");
+        assert_eq!(plan.iter().filter(|step| step.contains("SCAN messages")).count(), 1, "{plan:?}");
+    }
+    // Optional upstream indexes must still constrain selected captures to one
+    // native session rather than aggregating the whole message index.
+    db.execute("CREATE INDEX recency_test ON messages(session_id,timestamp)", []).unwrap();
+    let selected = storage::session_query(true);
+    let plan: Vec<String> = db.prepare(&format!("EXPLAIN QUERY PLAN {selected}"))
+        .unwrap().query_map(params![NATIVE, 1], |r| r.get(3)).unwrap()
+        .map(|r| r.unwrap()).collect();
+    assert!(plan.iter().any(|step| step.contains("SEARCH messages") && step.contains("session_id=?")), "{plan:?}");
+    db.execute("INSERT INTO sessions(id,source,started_at,ended_at) VALUES('empty','cli',2000000000,2000000001)", []).unwrap();
+    db.execute("UPDATE messages SET timestamp=3000000000 WHERE session_id=?1", [NATIVE]).unwrap();
+    let candidates = storage::enumerate(&roots, Some(1)).unwrap();
+    assert_eq!(candidates[0].session_id.as_deref(), Some(SESSION));
+    assert_eq!(candidates[0].recency_hint_ms, Some(3000000000000));
+    let selected = storage::session_query(true);
+    let latest: f64 = db.query_row(&selected, params!["empty", 1], |r| r.get(9)).unwrap();
+    assert_eq!(latest, 2000000001.0);
+}

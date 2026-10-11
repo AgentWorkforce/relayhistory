@@ -133,6 +133,12 @@ fn timestamp(value: f64) -> Result<i64> {
     );
     Ok((value * 1000.0) as i64)
 }
+// Discovery scans the message table once, rather than once per session. A
+// selected capture aggregates only that session's messages.
+pub(super) fn session_query(selected: bool) -> String {
+    let predicate = if selected { "WHERE session_id=?1" } else { "" };
+    format!("SELECT s.id,s.title,s.model,s.cwd,s.git_branch,s.parent_session_id,s.end_reason,s.started_at,s.ended_at, max(s.started_at,coalesce(s.ended_at,s.started_at),coalesce(m.latest,s.started_at)) AS latest FROM sessions s LEFT JOIN (SELECT session_id,max(timestamp) AS latest FROM messages {predicate} GROUP BY session_id) m ON m.session_id=s.id WHERE (?1 IS NULL OR s.id=?1) ORDER BY latest DESC,s.id LIMIT ?2")
+}
 fn sessions(
     conn: &Connection,
     roots: &ProviderRoots,
@@ -141,7 +147,8 @@ fn sessions(
     native: Option<&str>,
 ) -> Result<Vec<Session>> {
     let profile = profile(roots, path);
-    let mut stmt = conn.prepare("SELECT id,title,model,cwd,git_branch,parent_session_id,end_reason,started_at,ended_at, max(started_at,coalesce(ended_at,started_at),coalesce((SELECT max(timestamp) FROM messages WHERE session_id=sessions.id),started_at)) AS latest FROM sessions WHERE (?1 IS NULL OR id=?1) ORDER BY latest DESC,id LIMIT ?2")?;
+    let query = session_query(native.is_some());
+    let mut stmt = conn.prepare(&query)?;
     let rows = stmt.query_map(rusqlite::params![native, limit as i64], |r| {
         Ok((
             r.get::<_, String>(0)?,
