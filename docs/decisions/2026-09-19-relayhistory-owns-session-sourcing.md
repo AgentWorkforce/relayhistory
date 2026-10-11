@@ -487,4 +487,7 @@ Generated from provider-owned acquisition records; these cells describe fixture-
 
 | Provider | Evidence | Coverage / limitations |
 | --- | --- | --- |
+| pi | Messages and identity | v3 full persisted tree, native custom session and entry IDs, user/assistant/thinking/tool content, parentId and observed timestamps; v1/v2 rejected with diagnostic; duplicate native IDs at distinct live paths rejected. |
+| pi | Tools and usage | Actual toolCallId joins and isError outcomes; assistant per-message usage with reported cost; standalone usage and summary usage retained in markers only, excluded from request totals; no inferred file edits. |
+| pi | Control and lineage | Compaction, branch summaries, labels, metadata and parentSession retained as markers; no active-context projection, inferred relationship, resume command or live execution. |
 <!-- END GENERATED PROVIDER CAPTURE -->

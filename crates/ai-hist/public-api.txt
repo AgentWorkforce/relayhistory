@@ -183,11 +183,13 @@ pub ai_hist::Source::Devin
 pub ai_hist::Source::Grok
 pub ai_hist::Source::Muse
 pub ai_hist::Source::OpenCode
+pub ai_hist::Source::Pi
 impl ai_hist::Source
 pub const ai_hist::Source::ALL: &'static [ai_hist::Source]
 pub fn ai_hist::Source::as_str(self) -> &'static str
-pub fn ai_hist::Source::capabilities(self) -> ai_hist::SourceCapabilities
 pub fn ai_hist::Source::parse(&str) -> core::option::Option<Self>
+impl ai_hist::Source
+pub fn ai_hist::Source::capabilities(self) -> ai_hist::SourceCapabilities
 impl core::fmt::Display for ai_hist::Source
 pub fn ai_hist::Source::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 impl core::str::traits::FromStr for ai_hist::Source
