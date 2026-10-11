@@ -1,0 +1,41 @@
+{
+  "default": {
+    "environment": {},
+    "runtime": "/synthetic/native-home/.gemini",
+    "temporary": "/synthetic/native-home/.gemini/tmp",
+    "project": "/synthetic/native-home/.gemini/tmp/gemini-project"
+  },
+  "custom-home": {
+    "environment": {
+      "GEMINI_CLI_HOME": "/synthetic/custom-home"
+    },
+    "runtime": "/synthetic/custom-home/.gemini",
+    "temporary": "/synthetic/custom-home/.gemini/tmp",
+    "project": "/synthetic/custom-home/.gemini/tmp/gemini-project"
+  },
+  "seatbelt": {
+    "environment": {
+      "SANDBOX": "sandbox-exec"
+    },
+    "runtime": "/synthetic/native-home/.cache/.gemini",
+    "temporary": "/synthetic/native-home/.cache/.gemini/tmp",
+    "project": "/synthetic/native-home/.cache/.gemini/tmp/gemini-project"
+  },
+  "custom-seatbelt": {
+    "environment": {
+      "GEMINI_CLI_HOME": "/synthetic/custom-home",
+      "SANDBOX": "sandbox-exec"
+    },
+    "runtime": "/synthetic/custom-home/.cache/.gemini",
+    "temporary": "/synthetic/custom-home/.cache/.gemini/tmp",
+    "project": "/synthetic/custom-home/.cache/.gemini/tmp/gemini-project"
+  },
+  "other-sandbox": {
+    "environment": {
+      "SANDBOX": "docker"
+    },
+    "runtime": "/synthetic/native-home/.gemini",
+    "temporary": "/synthetic/native-home/.gemini/tmp",
+    "project": "/synthetic/native-home/.gemini/tmp/gemini-project"
+  }
+}
