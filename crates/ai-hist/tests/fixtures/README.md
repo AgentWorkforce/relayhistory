@@ -212,4 +212,6 @@ source without deciding which one fails the test.
 
 | Fixture | Recorded behavior |
 | --- | --- |
+| hermes/schema31 | Pinned Hermes schema 31 writer, arbitrary native IDs, resumed messages, tool calls/results, compression child and archived rows; no per-request usage inferred. |
+| hermes/official-export | SessionDB.export_session(include_inactive=True) independent oracle from pinned writer. |
 <!-- END GENERATED PROVIDER FIXTURES -->

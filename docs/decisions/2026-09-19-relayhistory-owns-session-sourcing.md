@@ -487,4 +487,6 @@ Generated from provider-owned acquisition records; these cells describe fixture-
 
 | Provider | Evidence | Coverage / limitations |
 | --- | --- | --- |
+| hermes | Messages and tools | SQLite schema 31 native rows, tool IDs/results and reasoning; profile identity namespaced. |
+| hermes | Usage and relationships | Session totals are not request usage. Parent native identity retained as metadata; no delegation or native resume advertised. Legacy JSONL unsupported. |
 <!-- END GENERATED PROVIDER CAPTURE -->

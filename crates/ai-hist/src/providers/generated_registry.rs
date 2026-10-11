@@ -35,6 +35,11 @@ const REGISTRATIONS: &[Registration] = &[
         metadata: devin::METADATA,
         adapter: devin::ADAPTER,
     },
+    Registration {
+        id: "hermes",
+        metadata: hermes::METADATA,
+        adapter: hermes::ADAPTER,
+    },
     #[cfg(test)]
     Registration {
         id: "test-fixture",

@@ -1,0 +1,381 @@
+use super::*;
+use rusqlite::params;
+const SQL: &str = include_str!("../../../tests/fixtures/hermes/schema31.sql");
+const NATIVE: &str = "chat/not-a-uuid:α";
+const SESSION: &str = "default:636861742f6e6f742d612d757569643aceb1";
+fn fixture() -> (tempfile::TempDir, ProviderRoots, PathBuf, Connection) {
+    let home = tempfile::tempdir().unwrap();
+    let roots = ProviderRoots::from_home(home.path().into(), home.path().join("opencode.db"));
+    let path = home.path().join(".hermes/state.db");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch(SQL).unwrap();
+    (home, roots, path, db)
+}
+#[test]
+fn official_export_matches_captured_writer_messages() {
+    let (_home, roots, path, _db) = fixture();
+    let captured = storage::all(&AcquisitionContext::new(ID, &roots), &path).unwrap();
+    let oracle: Value = serde_json::from_str(include_str!(
+        "../../../tests/fixtures/hermes/official-export.json"
+    ))
+    .unwrap();
+    assert_eq!(oracle[0]["input_tokens"], 1500);
+    assert_eq!(oracle[0]["output_tokens"], 200);
+    for s in captured {
+        let expected = oracle
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|v| v["id"] == s.native_id)
+            .unwrap();
+        let messages = expected["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), s.messages.len());
+        for (actual, expected) in s.messages.iter().zip(messages) {
+            assert_eq!(Some(actual.role.as_str()), expected["role"].as_str());
+            assert_eq!(actual.content.as_deref(), expected["content"].as_str());
+            assert_eq!(
+                actual.tool_call_id.as_deref(),
+                expected["tool_call_id"].as_str()
+            );
+        }
+    }
+}
+#[test]
+fn wal_only_commits_change_discovery_and_captured_generation() {
+    let (_home, roots, path, db) = fixture();
+    db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0")
+        .unwrap();
+    let before = storage::enumerate(&roots, None).unwrap();
+    let capture =
+        || storage::capture(&AcquisitionContext::new(ID, &roots), &path, SESSION).unwrap();
+    let first = capture();
+    db.execute(
+        "UPDATE messages SET content='WAL-only replacement' WHERE id=1",
+        [],
+    )
+    .unwrap();
+    let after = storage::enumerate(&roots, None).unwrap();
+    assert_ne!(before[0].stamp, after[0].stamp);
+    let second = capture();
+    assert_ne!(first.stamp, second.stamp);
+    assert_eq!(
+        first.payload["messages"][0]["content"],
+        "Find the Hermes fixture needle"
+    );
+    assert_eq!(
+        second.payload["messages"][0]["content"],
+        "WAL-only replacement"
+    );
+    assert_eq!(second.bytes, 0, "SQLite bytes are unknown");
+}
+#[test]
+fn concurrent_snapshot_never_mixes_session_and_message_generations() {
+    let (_home, roots, path, db) = fixture();
+    db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0")
+        .unwrap();
+    db.execute("UPDATE sessions SET model='0'", []).unwrap();
+    db.execute("UPDATE messages SET content='0'", []).unwrap();
+    let writer = std::thread::spawn(move || {
+        for i in 1..30 {
+            let tx = db.unchecked_transaction().unwrap();
+            tx.execute("UPDATE sessions SET model=?", [i.to_string()])
+                .unwrap();
+            tx.execute("UPDATE messages SET content=?", [i.to_string()])
+                .unwrap();
+            tx.commit().unwrap();
+        }
+    });
+    for _ in 0..30 {
+        let v = storage::capture(&AcquisitionContext::new(ID, &roots), &path, SESSION)
+            .unwrap()
+            .payload;
+        assert_eq!(v["model"], v["messages"][0]["content"]);
+    }
+    writer.join().unwrap();
+}
+#[test]
+fn profiles_are_discovered_after_roots_freeze_and_native_ids_do_not_collide() {
+    let (home, roots, path, _db) = fixture();
+    let before = storage::enumerate(&roots, None).unwrap();
+    assert_eq!(before.len(), 2);
+    let profile = home.path().join(".hermes/profiles/coder/state.db");
+    std::fs::create_dir_all(profile.parent().unwrap()).unwrap();
+    Connection::open(&profile)
+        .unwrap()
+        .execute_batch(SQL)
+        .unwrap();
+    let after = storage::enumerate(&roots, None).unwrap();
+    assert_eq!(after.len(), 4);
+    let ids: std::collections::BTreeSet<_> = after.iter().map(|c| c.session_id.clone()).collect();
+    assert_eq!(ids.len(), 4);
+    let selected = storage::capture(
+        &AcquisitionContext::new(ID, &roots),
+        &profile,
+        "profile:636f646572:636861742f6e6f742d612d757569643aceb1",
+    )
+    .unwrap();
+    assert_eq!(selected.payload["native_id"], NATIVE);
+    assert!(storage::capture(
+        &AcquisitionContext::new(ID, &roots),
+        &path,
+        "profile:636f646572:636861742f6e6f742d612d757569643aceb1"
+    )
+    .is_err());
+}
+#[test]
+fn missing_empty_unsupported_and_malformed_are_distinguished() {
+    let home = tempfile::tempdir().unwrap();
+    let roots = ProviderRoots::from_home(home.path().into(), home.path().join("opencode.db"));
+    assert!(storage::enumerate(&roots, None).unwrap().is_empty());
+    let (_home, roots, path, db) = fixture();
+    db.execute_batch("DELETE FROM messages; DELETE FROM sessions")
+        .unwrap();
+    assert!(storage::enumerate(&roots, None).unwrap().is_empty());
+    db.execute("UPDATE schema_version SET version=32", [])
+        .unwrap();
+    assert!(storage::enumerate(&roots, None)
+        .unwrap_err()
+        .to_string()
+        .contains("unsupported Hermes schema 32"));
+    drop(db);
+    std::fs::write(&path, b"not SQLite").unwrap();
+    assert!(storage::enumerate(&roots, None).is_err());
+}
+#[test]
+fn malformed_evidence_rolls_back_without_pruning_previous_rows() {
+    let (_home, roots, path, db) = fixture();
+    let conn = crate::open_db(&_home.path().join("ledger.db")).unwrap();
+    let mut session = storage::all(&AcquisitionContext::new(ID, &roots), &path)
+        .unwrap()
+        .into_iter()
+        .find(|s| s.native_id == NATIVE)
+        .unwrap();
+    normalize::session(&conn, &session, &path).unwrap();
+    let before: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM session_events WHERE source='hermes'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    session.messages[1].tool_calls = Some("not JSON".into());
+    let tx = conn.unchecked_transaction().unwrap();
+    assert!(normalize::session(&tx, &session, &path).is_err());
+    drop(tx);
+    let after: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM session_events WHERE source='hermes'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(before, after);
+    db.execute("UPDATE sessions SET started_at=-1", []).unwrap();
+    assert!(storage::enumerate(&roots, None).is_err());
+}
+#[cfg(unix)]
+#[test]
+fn escaped_database_sidecar_and_profile_are_rejected_before_open() {
+    use std::os::unix::fs::symlink;
+    let (home, roots, path, db) = fixture();
+    drop(db);
+    let outside = tempfile::tempdir().unwrap();
+    let secret = outside.path().join("external");
+    std::fs::write(&secret, "private").unwrap();
+    let sidecar = path.with_file_name("state.db-wal");
+    symlink(&secret, &sidecar).unwrap();
+    assert!(
+        storage::capture(&AcquisitionContext::new(ID, &roots), &path, SESSION)
+            .unwrap_err()
+            .to_string()
+            .contains("SESSION_SOURCE_MISMATCH")
+    );
+    std::fs::remove_file(sidecar).unwrap();
+    std::fs::create_dir_all(home.path().join(".hermes/profiles")).unwrap();
+    symlink(outside.path(), home.path().join(".hermes/profiles/escape")).unwrap();
+    assert!(storage::enumerate(&roots, None).is_err());
+}
+#[cfg(unix)]
+#[test]
+fn denied_database_reports_error_and_does_not_mutate_permissions() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_home, roots, path, db) = fixture();
+    drop(db);
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o0)).unwrap();
+    assert!(storage::enumerate(&roots, None).is_err());
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+        0
+    );
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+}
+#[test]
+fn custom_root_and_old_serialized_roots_do_not_read_host_environment() {
+    let (home, mut roots, path, db) = fixture();
+    drop(db);
+    let custom = home.path().join("custom");
+    std::fs::create_dir_all(&custom).unwrap();
+    std::fs::rename(path, custom.join("state.db")).unwrap();
+    roots.provider_roots.insert(ID.into(), vec![custom]);
+    assert_eq!(storage::enumerate(&roots, None).unwrap().len(), 2);
+    let mut json = serde_json::to_value(&roots).unwrap();
+    json.as_object_mut().unwrap().remove("provider_roots");
+    let old: ProviderRoots = serde_json::from_value(json).unwrap();
+    assert_eq!(old.for_provider(ID), &[home.path().join(".hermes")]);
+}
+#[test]
+fn sqlite_source_remains_read_only_and_spill_paths_are_only_text() {
+    let (_home, roots, path, db) = fixture();
+    let before: String = db
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .unwrap();
+    db.execute(
+        "UPDATE messages SET content=? WHERE id=1",
+        params!["file:///outside/private.txt"],
+    )
+    .unwrap();
+    let captured = storage::capture(&AcquisitionContext::new(ID, &roots), &path, SESSION).unwrap();
+    assert_eq!(
+        captured.payload["messages"][0]["content"],
+        "file:///outside/private.txt"
+    );
+    let after: String = db
+        .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+        .unwrap();
+    assert_eq!(before, after);
+}
+#[test]
+fn rewritten_metadata_and_retired_events_preserve_remote_shares() {
+    let (home, roots, path, _db) = fixture();
+    let conn = crate::open_db(&home.path().join("ledger.db")).unwrap();
+    let mut session = storage::all(&AcquisitionContext::new(ID, &roots), &path)
+        .unwrap()
+        .into_iter()
+        .find(|s| s.native_id == NATIVE)
+        .unwrap();
+    session.title = Some("Original title".into());
+    normalize::session(&conn, &session, &path).unwrap();
+    conn.execute(
+        "UPDATE session_events SET location='both' WHERE source='hermes' AND event_uid='2:tool:0'",
+        [],
+    )
+    .unwrap();
+    session.messages.retain(|m| m.id != 2);
+    session.title = None;
+    session.model = None;
+    session.cwd = None;
+    session.git_branch = None;
+    normalize::session(&conn, &session, &path).unwrap();
+    let (title, models): (Option<String>, String) = conn
+        .query_row(
+            "SELECT title,models_json FROM sessions WHERE source='hermes' AND session_id=?",
+            [SESSION],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(title, None);
+    assert_eq!(models, "[]");
+    let cwd: Option<String> = conn
+        .query_row(
+            "SELECT cwd FROM sessions WHERE source='hermes' AND session_id=?",
+            [SESSION],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(cwd, None);
+    let location: String = conn
+        .query_row(
+            "SELECT location FROM session_events WHERE source='hermes' AND event_uid='2:tool:0'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(location, "remote");
+    let tools: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM tool_calls WHERE source='hermes'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(tools, 0);
+}
+#[test]
+fn compression_summary_is_not_a_human_turn_and_parent_is_not_delegation() {
+    let (home, roots, path, _db) = fixture();
+    let conn = crate::open_db(&home.path().join("ledger.db")).unwrap();
+    for s in storage::all(&AcquisitionContext::new(ID, &roots), &path).unwrap() {
+        normalize::session(&conn, &s, &path).unwrap();
+    }
+    let synthetic:i64=conn.query_row("SELECT count(*) FROM session_events WHERE source='hermes' AND control_kind='synthetic'",[],|r|r.get(0)).unwrap();
+    assert_eq!(synthetic, 2);
+    let history: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM history WHERE source='hermes' AND prompt LIKE '%summary%'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(history, 0);
+    let parent:String=conn.query_row("SELECT payload_json FROM session_markers WHERE source='hermes' AND session_id='default:636f6d707265737365642d6368696c64' AND marker_uid='session'",[],|r|r.get(0)).unwrap();
+    assert_eq!(
+        serde_json::from_str::<Value>(&parent).unwrap()["parent_session_id"],
+        NATIVE
+    );
+    let count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM session_relationships WHERE source='hermes'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0);
+}
+#[test]
+fn prompt_rewrites_remove_stale_search_text_but_keep_shared_prompt_owners() {
+    let (home, roots, path, _db) = fixture();
+    let conn = crate::open_db(&home.path().join("ledger.db")).unwrap();
+    let mut sessions = storage::all(&AcquisitionContext::new(ID, &roots), &path).unwrap();
+    let index = sessions.iter().position(|s| s.native_id == NATIVE).unwrap();
+    let mut parent = sessions.remove(index);
+    let mut child = sessions.remove(0);
+    child.messages =
+        serde_json::from_value(serde_json::to_value(&parent.messages).unwrap()).unwrap();
+    normalize::session(&conn, &parent, &path).unwrap();
+    normalize::session(&conn, &child, &path).unwrap();
+    parent.messages[0].content = Some("Rewritten human request".into());
+    normalize::session(&conn, &parent, &path).unwrap();
+    let owner:String=conn.query_row("SELECT session_id FROM history WHERE source='hermes' AND prompt='Find the Hermes fixture needle'",[],|r|r.get(0)).unwrap();
+    assert_eq!(owner, child.id);
+    child.messages.remove(0);
+    normalize::session(&conn, &child, &path).unwrap();
+    let old:i64=conn.query_row("SELECT count(*) FROM history WHERE source='hermes' AND prompt='Find the Hermes fixture needle'",[],|r|r.get(0)).unwrap();
+    assert_eq!(old, 0);
+    let new:i64=conn.query_row("SELECT count(*) FROM history WHERE source='hermes' AND prompt='Rewritten human request'",[],|r|r.get(0)).unwrap();
+    assert_eq!(new, 1);
+    let preview: String = conn
+        .query_row(
+            "SELECT first_prompt FROM sessions WHERE source='hermes' AND session_id=?",
+            [SESSION],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(preview, "Rewritten human request");
+}
+#[test]
+fn watches_filter_existing_profile_configuration_and_track_future_profile_parent() {
+    let (_home, roots, _path, _db) = fixture();
+    let watches = storage::watch_roots(&roots);
+    assert!(watches
+        .iter()
+        .all(|w| w.depth != crate::discover::WatchDepth::Tree));
+    assert!(watches.iter().any(|w| w.path.ends_with("profiles")));
+    let main = watches
+        .iter()
+        .find(|w| w.path.ends_with(".hermes"))
+        .unwrap();
+    assert!(main.entries.admits(std::ffi::OsStr::new("state.db-wal")));
+    assert!(!main.entries.admits(std::ffi::OsStr::new("config.yaml")));
+    assert!(!main.entries.admits(std::ffi::OsStr::new(".env")));
+}
