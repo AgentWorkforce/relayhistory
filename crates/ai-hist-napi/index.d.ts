@@ -510,6 +510,8 @@ export interface CatalogSession {
    * name).
    */
   title?: string
+  /** Provider-native kind, such as Grok's `subagent`. */
+  sessionKind?: string
   models: Array<string>
   originator?: string
   agentVersion?: string

@@ -17,12 +17,15 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Grok sessions marked as subagents no longer appear as root conversations when their parent is not recorded.
 - Pi history isolates invalid files, skips unchanged transcripts, and preserves prompt projects, tool identities and readable previews through rewrites.
 - Unchanged provider syncs restore lost evidence, missing adapter files and sidecar containment failures retain their typed error codes, and SDK hydration accepts native session markers.
 - A Grok or Muse re-read reports a row again only when that row changed.
 
 ### Rust API
 
+- Added `ShallowSession::session_kind` and catalog contract version 6 for provider-native session kinds.
+- Native catalog rows expose `sessionKind` under native contract version 27.
 - Added `Source::Pi` for filtering and reading persisted Pi session history.
 
 ## [0.40.1] - 2026-10-11

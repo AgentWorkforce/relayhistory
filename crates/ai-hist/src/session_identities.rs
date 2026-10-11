@@ -389,6 +389,10 @@ fn merge_page(
         "SELECT {}",
         crate::relationships::delegated_child_sql("?1", "?2")
     ))?;
+    let mut native_subagent = conn.prepare_cached(
+        "SELECT EXISTS(SELECT 1 FROM sessions WHERE source = ?1 AND session_id = ?2 \
+         AND source = 'grok' AND session_kind = 'subagent')",
+    )?;
     let arms = IDENTITY_TABLES;
     let mut offers: Vec<Option<Identity>> = arms
         .iter()
@@ -405,9 +409,11 @@ fn merge_page(
             }
         }
         if exclude_delegated
-            && delegated.query_row(rusqlite::params![next.0, next.1], |row| {
+            && (native_subagent.query_row(rusqlite::params![next.0, next.1], |row| {
                 row.get::<_, bool>(0)
-            })?
+            })? || delegated.query_row(rusqlite::params![next.0, next.1], |row| {
+                row.get::<_, bool>(0)
+            })?)
         {
             continue;
         }
@@ -593,6 +599,41 @@ mod tests {
             .unwrap();
         let names: Vec<_> = page.iter().map(|id| id.session_id.as_str()).collect();
         assert_eq!(names, ["fork", "root", "solo"]);
+    }
+
+    #[test]
+    fn identity_listing_hides_a_grok_subagent_without_a_parent_edge() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = open(dir.path());
+        let conn = open_db(&db).unwrap();
+        conn.execute_batch(
+            "INSERT INTO sessions (source, session_id, session_kind) VALUES \
+             ('grok', 'root', NULL), ('grok', 'child', 'subagent');",
+        )
+        .unwrap();
+        let store = SessionStore::open(StoreOptions {
+            db_path: Some(db),
+            read_only: true,
+            ..StoreOptions::default()
+        })
+        .unwrap();
+        let all = store.session_identities(IdentityQuery::default()).unwrap();
+        assert_eq!(
+            all.iter()
+                .map(|id| id.session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["child", "root"]
+        );
+        let roots = store
+            .session_identities(IdentityQuery::default().limit(1).exclude_delegated())
+            .unwrap();
+        assert_eq!(
+            roots
+                .iter()
+                .map(|id| id.session_id.as_str())
+                .collect::<Vec<_>>(),
+            ["root"]
+        );
     }
 
     /// A page is one snapshot even on an autocommit connection. An identity

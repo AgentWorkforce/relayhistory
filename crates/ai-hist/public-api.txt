@@ -769,6 +769,7 @@ pub ai_hist::ShallowSession::project_key_method: core::option::Option<alloc::str
 pub ai_hist::ShallowSession::raw_path: core::option::Option<alloc::string::String>
 pub ai_hist::ShallowSession::repo_url: core::option::Option<alloc::string::String>
 pub ai_hist::ShallowSession::session_id: alloc::string::String
+pub ai_hist::ShallowSession::session_kind: core::option::Option<alloc::string::String>
 pub ai_hist::ShallowSession::source: alloc::string::String
 pub ai_hist::ShallowSession::source_stamp: core::option::Option<alloc::string::String>
 pub ai_hist::ShallowSession::title: core::option::Option<alloc::string::String>
