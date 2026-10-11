@@ -7,14 +7,15 @@ const MAX_SESSIONS: usize = 100_000;
 fn hex(text: &[u8]) -> String {
     text.iter().map(|b| format!("{b:02x}")).collect()
 }
-fn profile(roots: &ProviderRoots, path: &Path) -> String {
+pub(super) fn profile(roots: &ProviderRoots, path: &Path) -> String {
     let dir = path.parent().unwrap();
-    let default = roots.home.join(".hermes");
-    if dir == default {
-        return "default".into();
-    }
-    if let Ok(relative) = dir.strip_prefix(default.join("profiles")) {
-        return format!("profile:{}", hex(relative.as_os_str().as_encoded_bytes()));
+    if let Some(default) = roots.default_for_provider(ID) {
+        if dir == default {
+            return "default".into();
+        }
+        if let Ok(relative) = dir.strip_prefix(default.join("profiles")) {
+            return format!("profile:{}", hex(relative.as_os_str().as_encoded_bytes()));
+        }
     }
     format!(
         "root:{:x}",

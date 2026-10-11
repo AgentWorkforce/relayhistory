@@ -26,7 +26,7 @@ pub(crate) const METADATA: ProviderMetadata = ProviderMetadata {
     usage: None,
 };
 pub(crate) const ADAPTER: Option<ProviderAdapter> = Some(ProviderAdapter {
-    generation: "hermes_schema31_v2",
+    generation: "hermes_schema31_v3",
     acquire,
     sweep,
     resolve_roots: roots::resolve,

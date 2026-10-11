@@ -450,26 +450,13 @@ impl<'a> DiscoveryEnv<'a> {
         grok_home: PathBuf,
         opencode_db: PathBuf,
     ) -> Self {
-        let opencode_storage_dir = opencode_db
-            .parent()
-            .map(|parent| parent.join("storage"))
-            .unwrap_or_else(|| home.join(".local/share/opencode/storage"));
-        let muse = crate::paths::default_muse_sessions_dir(&home);
-        let devin = crate::paths::devin_cli_dir_under(&home);
         Self::with_provider_roots(
             conn,
             crate::ProviderRoots {
-                provider_roots: crate::providers::resolve_roots(&home, false),
-                muse,
-                devin,
-                home,
                 claude: claude_config_dir,
                 codex: codex_home,
                 grok: grok_home,
-                opencode_db,
-                opencode_db_pinned: false,
-                opencode_storage_dir,
-                use_env_roots: false,
+                ..crate::ProviderRoots::from_home(home, opencode_db)
             },
         )
     }

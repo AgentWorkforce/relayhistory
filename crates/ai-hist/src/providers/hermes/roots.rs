@@ -1,27 +1,50 @@
 //! Hermes' process-level resolver; no context-local agent override is observable.
 use super::*;
-pub(super) fn resolve(home: &Path, use_env: bool) -> Vec<PathBuf> {
-    if !use_env {
-        return vec![home.join(".hermes")];
-    }
-    let value = match std::env::var("HERMES_HOME") {
-        Ok(value) => value,
-        Err(std::env::VarError::NotUnicode(value)) => return vec![PathBuf::from(value)],
-        Err(_) => String::new(),
-    };
-    if !value.trim().is_empty() {
-        return vec![expand(home, value.trim(), |name| std::env::var(name).ok())];
-    }
-    let suffix = std::env::var("HERMES_DATA_DIR_SUFFIX").unwrap_or_default();
-    #[cfg(windows)]
-    let root = std::env::var_os("LOCALAPPDATA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join("AppData/Local"))
-        .join(format!("hermes{suffix}"));
-    #[cfg(not(windows))]
-    let root = home.join(format!(".hermes{suffix}"));
-    vec![root]
+pub(super) fn resolve(home: &Path, use_env: bool) -> ResolvedProviderRoots {
+    resolve_with(home, use_env, cfg!(windows), |key| std::env::var_os(key))
 }
+pub(super) fn resolve_with(
+    home: &Path,
+    use_env: bool,
+    windows: bool,
+    env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> ResolvedProviderRoots {
+    if !use_env {
+        let root = home.join(".hermes");
+        return ResolvedProviderRoots {
+            paths: vec![root.clone()],
+            default_root: Some(root),
+        };
+    }
+    if let Some(value) = env("HERMES_HOME") {
+        match value.into_string() {
+            Ok(value) if !value.trim().is_empty() => {
+                return vec![expand(home, value.trim(), |name| {
+                    env(name).and_then(|v| v.into_string().ok())
+                })]
+                .into()
+            }
+            Err(value) => return vec![PathBuf::from(value)].into(),
+            _ => {}
+        }
+    }
+    let suffix = env("HERMES_DATA_DIR_SUFFIX")
+        .and_then(|v| v.into_string().ok())
+        .unwrap_or_default();
+    let root = if windows {
+        env("LOCALAPPDATA")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join("AppData/Local"))
+            .join(format!("hermes{suffix}"))
+    } else {
+        home.join(format!(".hermes{suffix}"))
+    };
+    ResolvedProviderRoots {
+        paths: vec![root.clone()],
+        default_root: Some(root),
+    }
+}
+
 fn expand(home: &Path, value: &str, env: impl Fn(&str) -> Option<String>) -> PathBuf {
     let mut output = String::new();
     let mut chars = value.chars().peekable();
@@ -93,6 +116,6 @@ mod tests {
             expand(home, "$UNKNOWN/state", env),
             PathBuf::from("$UNKNOWN/state")
         );
-        assert_eq!(resolve(home, false), vec![home.join(".hermes")]);
+        assert_eq!(resolve(home, false).paths, vec![home.join(".hermes")]);
     }
 }

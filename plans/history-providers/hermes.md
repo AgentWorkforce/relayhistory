@@ -128,7 +128,7 @@ After integrating those changes:
   assistant search, source filtering, and Hermes capability reads.
 - Formatting, Clippy and rust-oleum pass.
 
-Provider review is stacked on setup PR #464, which must merge before pilot integration.
+Setup PR #464 is merged in main `cc11ea2a`; this provider is rebased on that merged setup before pilot integration.
 
 Cancellation follow-up: database/profile enumeration, snapshot session/message
 collection, and normalization now check the existing cooperative stop token.
@@ -192,3 +192,23 @@ Affected validation: 22 Hermes units, one public conformance test, 66 corpus tes
 check (8 tests), public API (949 items), formatting, Clippy and rust-oleum pass.
 The worktree-local native addon and SDK rebuild pass the strict SDK/CLI/MCP smoke.
 Only Hermes snapshot source stamps change for parser generation v2.
+
+Root identity correction (parser generation v3): native Windows LOCALAPPDATA and
+HERMES_DATA_DIR_SUFFIX trees keep portable default/profile IDs using explicit
+resolver provenance frozen beside paths. An explicit HERMES_HOME override remains
+path-namespaced, including when it spells the same path as a native default. This
+deliberate distinction survives serialization; an empty provenance map is retained.
+Old serialized roots lacking provenance infer only the canonical no-environment
+default and never read current environment variables. Complete sweeps retire local
+rows under the former path-hashed identity when a proven native root is reclassified,
+while retaining remote evidence. Platform branches are exercised with injected
+environment inputs rather than changing process environment during parallel tests.
+
+Root-provenance acceptance: reverting `profile()` to its former path comparison
+fails `native_suffix_and_windows_roots_keep_portable_ids_but_same_path_overrides_do_not`.
+Restored resolver/provenance passes 39 provider/setup units, 5 paths units,
+94 discovery tests (including explicit root construction),
+public Hermes conformance, 10 registry cases, sourcing population documentation,
+9 generator cases, public API (unchanged 949 items), formatting and Clippy.
+`with_all_roots` now delegates default construction to `ProviderRoots::from_home`;
+its reduced discover.rs LOC ceiling is lowered from 3424 to 3411.

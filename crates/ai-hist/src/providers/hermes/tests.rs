@@ -676,3 +676,104 @@ fn replacement_snapshot_preserves_shared_prompt_identity_and_new_owner_project()
     assert_eq!(owner, "default:7265706c6163656d656e74");
     assert_eq!(project, "/replacement");
 }
+
+#[test]
+fn native_suffix_and_windows_roots_keep_portable_ids_but_same_path_overrides_do_not() {
+    let home = tempfile::tempdir().unwrap();
+    for windows in [false, true] {
+        let appdata = home.path().join("relocated-appdata");
+        let resolve = |custom: Option<PathBuf>| {
+            roots::resolve_with(home.path(), true, windows, |key| match key {
+                "HERMES_HOME" => custom.as_ref().map(|p| p.as_os_str().to_os_string()),
+                "HERMES_DATA_DIR_SUFFIX" => Some("-sandbox".into()),
+                "LOCALAPPDATA" => Some(appdata.as_os_str().to_os_string()),
+                _ => None,
+            })
+        };
+        let native = resolve(None);
+        let root = native.paths[0].clone();
+        let path = root.join("state.db");
+        let named = root.join("profiles/coder/state.db");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(named.parent().unwrap()).unwrap();
+        Connection::open(&path).unwrap().execute_batch(SQL).unwrap();
+        Connection::open(&named)
+            .unwrap()
+            .execute_batch(SQL)
+            .unwrap();
+        let mut roots =
+            ProviderRoots::from_home(home.path().into(), home.path().join("opencode.db"));
+        roots.provider_roots.insert(ID.into(), native.paths);
+        roots
+            .provider_default_roots
+            .insert(ID.into(), native.default_root.unwrap());
+        let frozen: ProviderRoots =
+            serde_json::from_value(serde_json::to_value(&roots).unwrap()).unwrap();
+        assert_eq!(storage::profile(&frozen, &path), "default");
+        assert_eq!(storage::profile(&frozen, &named), "profile:636f646572");
+        assert!(storage::enumerate(&frozen, None)
+            .unwrap()
+            .iter()
+            .any(|c| c.session_id.as_deref() == Some(SESSION)));
+        let custom = resolve(Some(root));
+        roots.provider_roots.insert(ID.into(), custom.paths);
+        assert!(custom.default_root.is_none());
+        roots.provider_default_roots.clear();
+        let custom: ProviderRoots =
+            serde_json::from_value(serde_json::to_value(&roots).unwrap()).unwrap();
+        assert!(storage::profile(&custom, &path).starts_with("root:"));
+        assert!(storage::profile(&custom, &named).starts_with("root:"));
+        // A changed identity contract retires the old local catalog rather than
+        // leaving path-hashed duplicates beside the new portable IDs.
+        let conn = crate::open_db(&home.path().join(format!("ledger-{windows}.db"))).unwrap();
+        let mut state = serde_json::Map::new();
+        let repairs = crate::ingest::SweepRepairs::default();
+        for selected in [&custom, &frozen] {
+            sweep(SweepContext {
+                conn: &conn,
+                state: &mut state,
+                roots: selected,
+                paths: None,
+                repairs: &repairs,
+            })
+            .unwrap();
+        }
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sessions WHERE source='hermes'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let stale: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sessions WHERE source='hermes' AND session_id LIKE 'root:%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 4);
+        assert_eq!(stale, 0);
+    }
+}
+
+#[test]
+fn legacy_roots_infer_only_the_canonical_default_without_reading_environment() {
+    let home = tempfile::tempdir().unwrap();
+    let roots = ProviderRoots::from_home(home.path().into(), home.path().join("opencode.db"));
+    let mut wire = serde_json::to_value(&roots).unwrap();
+    wire.as_object_mut()
+        .unwrap()
+        .remove("provider_default_roots");
+    let legacy: ProviderRoots = serde_json::from_value(wire.clone()).unwrap();
+    assert_eq!(
+        storage::profile(&legacy, &home.path().join(".hermes/state.db")),
+        "default"
+    );
+    wire["provider_roots"][ID] = serde_json::json!([home.path().join(".hermes-suffix")]);
+    let legacy: ProviderRoots = serde_json::from_value(wire).unwrap();
+    assert!(
+        storage::profile(&legacy, &home.path().join(".hermes-suffix/state.db"))
+            .starts_with("root:")
+    );
+}

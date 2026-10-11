@@ -1,11 +1,11 @@
 //! Copy to crates/ai-hist/src/providers/<rust_id>/mod.rs; fill every TODO
 //! before admission. The executable test_fixture module demonstrates this API.
-use super::{AcquiredSession, AcquisitionContext, ProviderAdapter, ProviderMetadata, SweepContext, SweepResult};
+use super::{AcquiredSession, AcquisitionContext, ProviderAdapter, ProviderMetadata, ResolvedProviderRoots, SweepContext, SweepResult};
 use crate::sources::catalog::{Discovery, Fixtures, Hydration, LocalSource, Relationships};
 use crate::hydrate::{HydrateSessionOptions, SelectedIngest, SelectedIngestResult};
 use crate::{MessageIdOrigin, ProviderRoots};
 use anyhow::Result;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 const ID: &str = "replace-me";
 pub(crate) const LOCAL_SOURCE: LocalSource = LocalSource {
@@ -29,8 +29,10 @@ pub(crate) const ADAPTER: Option<ProviderAdapter> = Some(ProviderAdapter {
     resolve_roots,
     watch_roots: |roots| roots.for_provider(ID).iter().cloned().map(crate::discover::WatchRoot::tree).collect(),
 });
-fn resolve_roots(home: &Path, use_env: bool) -> Vec<PathBuf> {
-    vec![super::resolve_root(home, use_env, "REPLACE_ME_HOME", ".replace-me")]
+fn resolve_roots(home: &Path, use_env: bool) -> ResolvedProviderRoots {
+    // Vec::into() keeps custom roots namespaced. If the provider has portable
+    // default-tree identities, return { paths, default_root } from one env read.
+    vec![super::resolve_root(home, use_env, "REPLACE_ME_HOME", ".replace-me")].into()
 }
 fn acquire(_options: &HydrateSessionOptions, _path: &Path, _context: &AcquisitionContext<'_>) -> Result<AcquiredSession> {
     todo!("validate and read through context; verify native session identity; capture immutable data")
