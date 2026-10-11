@@ -10,6 +10,10 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - A sweep writes a transcript's new session events into the search index once per write unit.
 
+### Fixed
+
+- A Grok or Muse re-read reports a row again only when that row changed.
+
 ## [0.40.1] - 2026-10-11
 
 ### Changed

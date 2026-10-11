@@ -15,6 +15,7 @@ mod event_row;
 mod retired_sources;
 pub use retired_sources::is_retired_source;
 mod schema_check;
+use crate::ingest::evidence_reconcile::{record_history_presence, record_marker_presence};
 pub(crate) use event_row::row_to_session_event;
 use schema_check::schema_has_required_indexes;
 
@@ -2678,9 +2679,7 @@ pub fn insert_history_at_location(
     // a transaction per imported prompt: evidence can never commit before its
     // classification. A lone presence after a later insert failure is harmless
     // and a duplicate evidence insert still repairs a missing presence.
-    if let Some(session_id) = entry.session_id.as_deref().filter(|id| !id.is_empty()) {
-        mark_session_presence(conn, &entry.source, session_id, location)?;
-    }
+    record_history_presence(conn, entry, location)?;
     let inserted = conn.prepare_cached(
         "INSERT OR IGNORE INTO history (source, session_id, project, prompt, prompt_hash, timestamp_ms) VALUES (?, ?, ?, ?, ?, ?)",
     )?.execute(
@@ -3342,7 +3341,7 @@ pub fn insert_session_marker(
     session_id: &str,
     marker: &NewSessionMarker<'_>,
 ) -> Result<usize> {
-    crate::mark_session_presence(conn, source, session_id, SessionLocation::Local)?;
+    record_marker_presence(conn, source, session_id, marker.marker_uid)?;
     // Cached: a sweep writes markers once per record, and preparing this
     // statement compiles the change-feed and location triggers it fires.
     let changed = conn.prepare_cached(

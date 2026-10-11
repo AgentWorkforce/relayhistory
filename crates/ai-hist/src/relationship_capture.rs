@@ -166,17 +166,41 @@ const RELATIONSHIP_REOBSERVED: &[(&str, &str)] = &[
     ("origin_session_id", "excluded.origin_session_id"),
 ];
 
-static RECORD_RELATIONSHIP_SQL: std::sync::LazyLock<String> = std::sync::LazyLock::new(|| {
-    let assignments = RELATIONSHIP_REOBSERVED
+/// A Grok `subagents/` entry is the whole snapshot. A field it no longer
+/// carries is gone; the partial-observation `COALESCE` would keep it.
+const RELATIONSHIP_SNAPSHOT: &[(&str, &str)] = &[
+    ("child_session_id", "excluded.child_session_id"),
+    ("relationship", "excluded.relationship"),
+    ("identity_status", "excluded.identity_status"),
+    ("child_agent_type", "excluded.child_agent_type"),
+    ("child_agent_name", "excluded.child_agent_name"),
+    ("child_model", "excluded.child_model"),
+    ("spawn_depth", "excluded.spawn_depth"),
+    ("evidence_kind", "excluded.evidence_kind"),
+    ("evidence_locator", "excluded.evidence_locator"),
+    ("evidence_ref", "excluded.evidence_ref"),
+    ("child_has_events", "excluded.child_has_events"),
+    ("spawned_at_ms", "excluded.spawned_at_ms"),
+    ("origin_session_id", "excluded.origin_session_id"),
+];
+
+fn relationship_upsert(columns: &[(&str, &str)], bind_unused_flag: bool) -> String {
+    let assignments = columns
         .iter()
         .map(|(column, value)| format!("{column} = {value}"))
         .collect::<Vec<_>>()
         .join(", ");
-    let changed = RELATIONSHIP_REOBSERVED
+    let changed = columns
         .iter()
         .map(|(column, value)| format!("({value}) IS NOT session_relationships.{column}"))
         .collect::<Vec<_>>()
         .join(" OR ");
+    // The caller always binds `?19`. The snapshot columns do not read it.
+    let unused = if bind_unused_flag {
+        " OR (?19 AND NOT ?19)"
+    } else {
+        ""
+    };
     format!(
         "INSERT INTO session_relationships \
          (source, parent_session_id, relationship_uid, child_session_id, relationship, \
@@ -187,9 +211,15 @@ static RECORD_RELATIONSHIP_SQL: std::sync::LazyLock<String> = std::sync::LazyLoc
                  ?17, ?18) \
          ON CONFLICT(source, parent_session_id, relationship_uid) DO UPDATE SET \
            {assignments}, updated_ms = excluded.updated_ms \
-         WHERE {changed}"
+         WHERE ({changed}){unused}"
     )
-});
+}
+
+static RECORD_RELATIONSHIP_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| relationship_upsert(RELATIONSHIP_REOBSERVED, false));
+
+static RECORD_RELATIONSHIP_SNAPSHOT_SQL: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| relationship_upsert(RELATIONSHIP_SNAPSHOT, true));
 
 /// Retires the unlinked row a named child supersedes: `?1` source, `?2`
 /// parent, `?3` locator, `?4` the unlinked status, `?5` kind, `?6` the named
@@ -225,28 +255,33 @@ fn record_relationship_with_child_model_mode(
                 observed.relationship_uid(),
             ])?;
     }
-    conn.prepare_cached(&RECORD_RELATIONSHIP_SQL)?
-        .execute(params![
-            observed.source,
-            observed.parent_session_id,
-            observed.relationship_uid(),
-            observed.child_session_id,
-            observed.relationship,
-            observed.identity_status(),
-            observed.child_agent_type,
-            observed.child_agent_name,
-            observed.child_model,
-            observed.spawn_depth,
-            observed.evidence_kind,
-            observed.evidence_locator,
-            observed.evidence_ref,
-            observed.child_has_events,
-            observed.spawned_at_ms,
-            now,
-            now,
-            observed.origin_session_id,
-            replace_child_model,
-        ])?;
+    crate::ingest::evidence_reconcile::note_relationship(observed);
+    let sql = if crate::ingest::evidence_reconcile::armed() {
+        &*RECORD_RELATIONSHIP_SNAPSHOT_SQL
+    } else {
+        &*RECORD_RELATIONSHIP_SQL
+    };
+    conn.prepare_cached(sql)?.execute(params![
+        observed.source,
+        observed.parent_session_id,
+        observed.relationship_uid(),
+        observed.child_session_id,
+        observed.relationship,
+        observed.identity_status(),
+        observed.child_agent_type,
+        observed.child_agent_name,
+        observed.child_model,
+        observed.spawn_depth,
+        observed.evidence_kind,
+        observed.evidence_locator,
+        observed.evidence_ref,
+        observed.child_has_events,
+        observed.spawned_at_ms,
+        now,
+        now,
+        observed.origin_session_id,
+        replace_child_model,
+    ])?;
     Ok(())
 }
 

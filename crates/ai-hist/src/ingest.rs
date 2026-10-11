@@ -24,6 +24,8 @@ pub(crate) mod codex_thread_names;
 pub(crate) mod control;
 pub(crate) mod cursor;
 pub(crate) mod devin;
+pub(crate) mod evidence_reconcile;
+mod evidence_upserts;
 pub(crate) mod grok;
 mod grok_unified;
 pub(crate) mod hook;
@@ -11783,90 +11785,53 @@ fn insert_session_event(conn: &Connection, row: &EventRow<'_>) -> Result<()> {
     let resolved = cwd.and_then(|cwd| crate::project_identity::identity_for(Some(cwd), None));
     let resolved_key = resolved.as_ref().map(|(key, _)| key.as_str());
     let resolved_method = resolved.as_ref().map(|(_, method)| method.as_str());
-    conn.prepare_cached(
-        "INSERT INTO session_events \
-         (source, session_id, project, project_key, project_key_method, cwd, git_branch, message_id, parent_id, ts_ms, role, kind, text, model, token_json, provider, event_uid, \
-          tool_use_id, payload_bytes, payload_truncated, payload_hash, call_index, event_index, result_status, event_source, \
-          error_signal, subagent_session_id, agent_id, \
-          request_id, provider_message_id, stop_reason, agent_version, is_sidechain, is_meta, turn_id, request_span, raw_facts_version, raw_kind, \
-          control_kind, record_token_json) \
-         VALUES (?1, ?2, ?3, \
-           COALESCE((SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2), ?16), \
-           CASE WHEN (SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2) IS NOT NULL \
-                THEN (SELECT s.project_key_method FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2) \
-                ELSE ?17 END, \
-           ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, \
-           ?14, ?15, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, \
-           ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40) \
-         ON CONFLICT(source, session_id, event_uid) DO UPDATE SET \
-         project=excluded.project, \
-         project_key=COALESCE((SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2), session_events.project_key, ?16), \
-         project_key_method=CASE \
-           WHEN (SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2) IS NOT NULL \
-             THEN (SELECT s.project_key_method FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2) \
-           WHEN session_events.project_key IS NOT NULL THEN session_events.project_key_method \
-           ELSE ?17 END, \
-         cwd=excluded.cwd, git_branch=excluded.git_branch, message_id=excluded.message_id, \
-         parent_id=excluded.parent_id, ts_ms=excluded.ts_ms, role=excluded.role, kind=excluded.kind, text=excluded.text, \
-         model=excluded.model, token_json=excluded.token_json, provider=excluded.provider, \
-         tool_use_id=excluded.tool_use_id, payload_bytes=excluded.payload_bytes, \
-         payload_truncated=excluded.payload_truncated, payload_hash=excluded.payload_hash, \
-         call_index=excluded.call_index, event_index=excluded.event_index, \
-         result_status=excluded.result_status, event_source=excluded.event_source, \
-         error_signal=excluded.error_signal, subagent_session_id=excluded.subagent_session_id, \
-         agent_id=excluded.agent_id, request_id=excluded.request_id, \
-         provider_message_id=excluded.provider_message_id, \
-         stop_reason=excluded.stop_reason, agent_version=excluded.agent_version, \
-         is_sidechain=excluded.is_sidechain, is_meta=excluded.is_meta, turn_id=excluded.turn_id, \
-         request_span=excluded.request_span, \
-         raw_facts_version=excluded.raw_facts_version, raw_kind=excluded.raw_kind, \
-         control_kind=excluded.control_kind, record_token_json=excluded.record_token_json, \
-         location=CASE WHEN session_events.location = excluded.location \
-           THEN session_events.location ELSE 'both' END",
-    )?.execute(
-        params![
-            source,
-            session_id,
-            project,
-            cwd,
-            git_branch,
-            message_id,
-            parent_id,
-            ts_ms,
-            role,
-            kind,
-            text,
-            model,
-            token_json,
-            provider,
-            event_uid,
-            resolved_key,
-            resolved_method,
-            tool_result_facts.tool_use_id,
-            tool_result_facts.payload_bytes,
-            tool_result_facts.payload_truncated.map(i64::from),
-            tool_result_facts.payload_hash,
-            tool_result_facts.call_index,
-            tool_result_facts.event_index,
-            tool_result_facts.result_status,
-            tool_result_facts.event_source,
-            tool_result_facts.error_signal,
-            tool_result_facts.subagent_session_id,
-            tool_result_facts.agent_id,
-            identity.request_id.or(raw_facts.request_id),
-            identity.provider_message_id,
-            stop_reason.or(raw_facts.stop_reason),
-            raw_facts.agent_version,
-            raw_facts.is_sidechain,
-            raw_facts.is_meta,
-            raw_facts.turn_id,
-            raw_facts.request_span,
-            RAW_MESSAGE_FACTS_VERSION,
-            raw_kind,
-            raw_facts.control_kind,
-            raw_facts.record_token_json,
-        ],
-    )?;
+    evidence_reconcile::note_event(source, session_id, event_uid);
+    conn.prepare_cached(evidence_reconcile::write_sql(
+        &evidence_reconcile::SESSION_EVENT_UPSERT,
+        &evidence_reconcile::SESSION_EVENT_REWRITE,
+    ))?
+    .execute(params![
+        source,
+        session_id,
+        project,
+        cwd,
+        git_branch,
+        message_id,
+        parent_id,
+        ts_ms,
+        role,
+        kind,
+        text,
+        model,
+        token_json,
+        provider,
+        event_uid,
+        resolved_key,
+        resolved_method,
+        tool_result_facts.tool_use_id,
+        tool_result_facts.payload_bytes,
+        tool_result_facts.payload_truncated.map(i64::from),
+        tool_result_facts.payload_hash,
+        tool_result_facts.call_index,
+        tool_result_facts.event_index,
+        tool_result_facts.result_status,
+        tool_result_facts.event_source,
+        tool_result_facts.error_signal,
+        tool_result_facts.subagent_session_id,
+        tool_result_facts.agent_id,
+        identity.request_id.or(raw_facts.request_id),
+        identity.provider_message_id,
+        stop_reason.or(raw_facts.stop_reason),
+        raw_facts.agent_version,
+        raw_facts.is_sidechain,
+        raw_facts.is_meta,
+        raw_facts.turn_id,
+        raw_facts.request_span,
+        RAW_MESSAGE_FACTS_VERSION,
+        raw_kind,
+        raw_facts.control_kind,
+        raw_facts.record_token_json,
+    ])?;
     Ok(())
 }
 
@@ -11906,28 +11871,22 @@ fn insert_tool_call(
         ..
     } = *call;
     crate::mark_session_presence(conn, source, session_id, SessionLocation::Local)?;
-    conn.prepare_cached(
-        "INSERT INTO tool_calls \
-         (source, session_id, message_id, tool_use_id, name, target, args_json, is_error, ts_ms) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
-         ON CONFLICT(source, session_id, tool_use_id) DO UPDATE SET \
-         message_id=excluded.message_id, name=excluded.name, target=excluded.target, args_json=excluded.args_json, \
-         is_error=COALESCE(excluded.is_error, tool_calls.is_error), ts_ms=excluded.ts_ms, \
-         location=CASE WHEN tool_calls.location = excluded.location \
-           THEN tool_calls.location ELSE 'both' END",
-    )?.execute(
-        params![
-            source,
-            session_id,
-            message_id,
-            tool_use_id,
-            name,
-            target,
-            args_json,
-            is_error.map(|v| if v { 1 } else { 0 }),
-            ts_ms,
-        ],
-    )?;
+    evidence_reconcile::note_tool(source, session_id, tool_use_id);
+    conn.prepare_cached(evidence_reconcile::write_sql(
+        &evidence_reconcile::TOOL_CALL_UPSERT,
+        &evidence_reconcile::TOOL_CALL_REWRITE,
+    ))?
+    .execute(params![
+        source,
+        session_id,
+        message_id,
+        tool_use_id,
+        name,
+        target,
+        args_json,
+        is_error.map(|v| if v { 1 } else { 0 }),
+        ts_ms,
+    ])?;
     Ok(())
 }
 
@@ -11938,11 +11897,19 @@ fn set_tool_call_error(
     tool_use_id: &str,
     is_error: bool,
 ) -> Result<()> {
-    conn.prepare_cached(
-        "UPDATE tool_calls SET is_error = ? WHERE source = ? AND session_id = ? AND tool_use_id = ?",
-    )?.execute(
-        params![if is_error { 1 } else { 0 }, source, session_id, tool_use_id],
-    )?;
+    evidence_reconcile::note_tool_result(source, session_id, tool_use_id);
+    conn.prepare_cached(evidence_reconcile::write_sql(
+        "UPDATE tool_calls SET is_error = ?1 \
+         WHERE source = ?2 AND session_id = ?3 AND tool_use_id = ?4 AND is_error IS NOT ?1",
+        "UPDATE tool_calls SET is_error = ?1 \
+         WHERE source = ?2 AND session_id = ?3 AND tool_use_id = ?4",
+    ))?
+    .execute(params![
+        if is_error { 1 } else { 0 },
+        source,
+        session_id,
+        tool_use_id
+    ])?;
     Ok(())
 }
 
@@ -11962,28 +11929,22 @@ fn upsert_file_edit_from_call(
         cwd,
     } = *call;
     crate::mark_session_presence(conn, source, session_id, SessionLocation::Local)?;
-    conn.prepare_cached(
-        "INSERT INTO file_edits \
-         (source, session_id, message_id, tool_use_id, file_path, tool_name, ts_ms, git_branch, cwd) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
-         ON CONFLICT(source, session_id, tool_use_id) DO UPDATE SET \
-         message_id=excluded.message_id, file_path=excluded.file_path, tool_name=excluded.tool_name, \
-         ts_ms=excluded.ts_ms, git_branch=COALESCE(excluded.git_branch, file_edits.git_branch), cwd=COALESCE(excluded.cwd, file_edits.cwd), \
-         location=CASE WHEN file_edits.location = excluded.location \
-           THEN file_edits.location ELSE 'both' END",
-    )?.execute(
-        params![
-            source,
-            session_id,
-            message_id,
-            tool_use_id,
-            file_path,
-            tool_name,
-            ts_ms,
-            git_branch,
-            cwd,
-        ],
-    )?;
+    evidence_reconcile::note_edit(source, session_id, tool_use_id);
+    conn.prepare_cached(evidence_reconcile::write_sql(
+        &evidence_reconcile::FILE_EDIT_UPSERT,
+        &evidence_reconcile::FILE_EDIT_REWRITE,
+    ))?
+    .execute(params![
+        source,
+        session_id,
+        message_id,
+        tool_use_id,
+        file_path,
+        tool_name,
+        ts_ms,
+        git_branch,
+        cwd,
+    ])?;
     Ok(())
 }
 
@@ -14519,19 +14480,18 @@ pub(crate) fn ingest_muse_session(
     let sid = transcript.metadata.session_id.as_str();
     let project = transcript.metadata.workspace_root.as_deref();
     let version = transcript.metadata.cli_version.as_deref();
-    // History is replaced, not merged, so a prompt the transcript no longer
-    // has stops being searchable. A session also known remotely shares its
-    // `history` identity with that evidence, so there only the rows this
-    // transcript wrote last time — the ones its stored prompt events name —
-    // are removed; replacing the whole identity would delete prompts it never
-    // wrote. Either way this runs before the events it reads are replaced.
+    // History ownership is snapshotted before this read rewrites the events
+    // it is judged against. A prompt the transcript no longer has stops being
+    // searchable. A session also known remotely shares its `history` identity
+    // with that evidence, so there only the rows this transcript wrote last
+    // time — the ones its stored prompt events name — are removed; replacing
+    // the whole identity would delete prompts it never wrote.
     let scope = if session_has_remote_presence(conn, SOURCE, sid)? {
         HistoryScope::OwnPromptEvents
     } else {
         HistoryScope::Session
     };
-    replace_session_history_scoped(conn, SOURCE, sid, scope)?;
-    retire_local_session_evidence(conn, SOURCE, sid)?;
+    let mut reconcile = evidence_reconcile::begin_muse(conn, sid, scope)?;
 
     let mut outcome = MuseIngestOutcome {
         unparsed_lines: transcript.unparsed_lines,
@@ -14996,6 +14956,7 @@ pub(crate) fn ingest_muse_session(
             sid,
         ],
     )?;
+    evidence_reconcile::finish(conn, &mut reconcile)?;
     Ok(outcome)
 }
 
@@ -15286,7 +15247,7 @@ fn ingest_grok_session(
     let sid = session.session_id.as_str();
     let project = session.cwd.as_deref();
     let branch = session.git_branch.as_deref();
-    replace_grok_session_evidence(conn, sid)?;
+    let mut reconcile = evidence_reconcile::begin_grok(conn, sid)?;
     let mut outcome = GrokIngestOutcome {
         missing_updates: !session.updates_present,
         updates_yielded_no_timing: session.updates_present && session.updates.is_empty(),
@@ -15325,8 +15286,12 @@ fn ingest_grok_session(
     // The last resort: a turn whose only readable output was its thinking
     // still shares one request span, and its usage belongs on that row.
     let mut turn_thinking_tail: HashMap<usize, String> = HashMap::new();
-    // The whole session is re-read on every pass (its evidence is replaced
-    // above), so the indexes are the same every time.
+    // Chosen tails for this read. The token update below skips a row whose
+    // fact is already this value, and the clear after the pass drops the fact
+    // from every other row that still carries one.
+    let mut grok_turn_tokens: Vec<String> = Vec::new();
+    // The whole session is re-read on every pass, and a row keeps the index
+    // it had when the line did not move.
     let mut tool_results = tool_result_facts::ToolResultIndexer::default();
 
     for (idx, line) in session.lines.iter().enumerate() {
@@ -15773,15 +15738,14 @@ fn ingest_grok_session(
             continue;
         }
         let token_json = Value::Object(token_json).to_string();
+        grok_turn_tokens.push(uid.clone());
         conn.execute(
-            "UPDATE session_events SET token_json = ? \
-             WHERE source = 'grok' AND session_id = ? AND event_uid = ?",
+            grok_unified::GROK_TURN_TOKEN_ASSIGN,
             params![token_json, sid, uid],
         )?;
     }
 
     ingest_grok_session_extras(conn, session, &mut outcome)?;
-    refresh_grok_incoming_relationships(conn, sid)?;
 
     titles::upsert_titled(
         conn,
@@ -15826,41 +15790,40 @@ fn ingest_grok_session(
     // materialization, and a later one that only reads the log, can see turns
     // that left no token row.
     store_grok_turn_census(conn, sid, outcome.turns)?;
-    let coverage = materialize_grok_unified_usage(conn, sid, Some(session.created_ms))?;
+    let coverage = finish_grok_session(
+        conn,
+        &mut reconcile,
+        sid,
+        &grok_turn_tokens,
+        Some(session.created_ms),
+    )?;
     outcome.unified_usage_rows = coverage.rows;
     outcome.unified_coverage = coverage;
     Ok(outcome)
 }
 
-/// Clear the evidence this session's files own, so a read is a replacement
-/// rather than a merge.
-///
-/// A Grok read is always a whole-directory read, and Grok **rewrites**
-/// `chat_history.jsonl` in place on a format upgrade or a compaction. So the
-/// files are a snapshot, not an append-only log: a tool call that is no longer
-/// in the transcript, a checkpoint whose file was removed, a `subagents/`
-/// entry that is gone — none of them happened, as far as the current evidence
-/// goes. Upserting alone would leave every one of them in the database
-/// forever, and a reader cannot tell a stale row from a live one.
-///
-/// Scope is deliberately narrow. Rows are deleted only where `source =
-/// 'grok'` and this session owns them; a relationship is deleted only where
-/// this session is the **parent** and the evidence came from its own
-/// `subagents/` directory, so another session's record of *this* session as a
-/// child is untouched. The caller runs inside a transaction, so the window
-/// where the evidence is missing is never observable.
-fn replace_grok_session_evidence(conn: &Connection, session_id: &str) -> Result<()> {
-    retire_local_session_evidence(conn, "grok", session_id)?;
-    // Every Grok prompt written before this parser carried a timestamp
-    // synthesized as `created_at + index`; merging would keep the fabricated
-    // ones forever, so history is replaced, not merged.
-    replace_session_history(conn, "grok", session_id)?;
-    conn.execute(
-        "DELETE FROM session_relationships WHERE source = 'grok' \
-         AND parent_session_id = ? AND evidence_kind = 'grok_subagent_dir'",
-        params![session_id],
-    )?;
-    Ok(())
+/// Materialize unified usage, then keep only the evidence this read wrote.
+/// One call so the session walk does not grow a branch per step.
+fn finish_grok_session(
+    conn: &Connection,
+    reconcile: &mut evidence_reconcile::Guard,
+    session_id: &str,
+    turn_tokens: &[String],
+    created_ms: Option<i64>,
+) -> Result<GrokUnifiedCoverage> {
+    let mut coverage = materialize_grok_unified_usage(conn, session_id, created_ms)?;
+    evidence_reconcile::finish(conn, reconcile)?;
+    // Parents read `child_has_events` off the rows this sweep just kept.
+    refresh_grok_incoming_relationships(conn, session_id)?;
+    evidence_reconcile::clear_grok_turn_tokens_except(conn, session_id, turn_tokens)?;
+    // Coverage counts the token rows that survived the sweep and the clear.
+    if coverage.rows > 0 {
+        let settled = grok_unified::grok_turn_coverage(conn, session_id)?;
+        coverage.covered_turns = settled.covered_turns;
+        coverage.turn_usage_turns = settled.turn_usage_turns;
+        coverage.proxy_only_turns = settled.proxy_only_turns;
+    }
+    Ok(coverage)
 }
 
 /// Drop the `history` rows one session owns, ahead of a whole-session
@@ -18740,7 +18703,11 @@ mod tests {
         // skipped, which is exactly why the key had to move.
         assert_eq!(super::sync_grok(&conn, &mut current, &root).unwrap(), 0);
 
-        assert_eq!(super::sync_grok(&conn, &mut old, &root).unwrap(), 1);
+        assert_eq!(
+            super::sync_grok(&conn, &mut old, &root).unwrap(),
+            0,
+            "the prompt is already stored; the re-read restores usage on that row"
+        );
         let (usage, span): (Option<i64>, Option<String>) = conn
             .query_row(
                 "SELECT json_extract(token_json, '$.usage.inputTokens'), request_span \
@@ -21566,8 +21533,8 @@ mod tests {
 
         assert_eq!(
             super::sync_grok(&conn, &mut state, &root).unwrap(),
-            1,
-            "an unchanged file with no rows behind it has to be read again"
+            0,
+            "the prompt row is still stored; the re-read restores the events"
         );
         assert!(super::session_events_exist(&conn, "grok", "grok-wipe-0001").unwrap());
     }
