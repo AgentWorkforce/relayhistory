@@ -296,6 +296,7 @@
       "session_id": "revert-session",
       "source": "claude",
       "source_stamp": "<n>:2798",
+      "title": null,
       "workspace_roots_json": null
     }
   ],

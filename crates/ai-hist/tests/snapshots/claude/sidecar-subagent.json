@@ -219,6 +219,7 @@
       "session_id": "claude-sidecar-parent",
       "source": "claude",
       "source_stamp": "<n>:1246|<n>:860|<n>:142",
+      "title": null,
       "workspace_roots_json": null
     }
   ],

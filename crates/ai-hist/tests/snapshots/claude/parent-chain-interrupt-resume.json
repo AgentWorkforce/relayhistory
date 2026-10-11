@@ -206,6 +206,7 @@
       "session_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
       "source": "claude",
       "source_stamp": "<n>:2069",
+      "title": null,
       "workspace_roots_json": null
     }
   ],

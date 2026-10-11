@@ -58,16 +58,24 @@ pub(super) fn sqlite_session_stamps(src: &Connection) -> Result<Vec<SessionStamp
     let messages = message_aggregate(src)?;
     let parts = part_aggregate(src)?;
     let sql = format!(
-        "SELECT id, {}, {}, {}, {} FROM session WHERE id IS NOT NULL AND id <> ''",
+        "SELECT id, {}, {}, {}, {}, {} FROM session WHERE id IS NOT NULL AND id <> ''",
         column("parent_id"),
         column("directory"),
         column("time_created"),
         column("time_updated"),
+        // A rename is not guaranteed to move `time_updated`, and the title
+        // is a column the loaders read.
+        column("title"),
     );
     let mut stmt = src.prepare(&sql)?;
     let rows = stmt.query_map([], |row| {
-        let fields: [rusqlite::types::Value; 4] =
-            [row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?];
+        let fields: [rusqlite::types::Value; 5] = [
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+        ];
         Ok((row.get::<_, String>(0)?, fields))
     })?;
     let mut stamps = Vec::new();

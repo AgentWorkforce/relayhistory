@@ -3724,7 +3724,7 @@ fn stopped_serial_and_parallel_discovery_do_not_claim_the_rest_of_the_window() {
             env: &DiscoveryEnv<'_>,
             limit: Option<usize>,
         ) -> Result<Vec<Candidate>> {
-            CodexProvider.enumerate(env, limit)
+            CodexProvider::default().enumerate(env, limit)
         }
         fn read_shallow(
             &self,
@@ -4161,4 +4161,57 @@ fn reading_an_opencode_store_does_not_move_the_fingerprint() {
         .execute("INSERT INTO session VALUES ('ses_b')", [])
         .unwrap();
     assert_ne!(fingerprint(), before);
+}
+
+/// A bounded read can miss a rename between its head and tail, so a shallow
+/// title fills a fully indexed row's missing one but never replaces it; a
+/// shallow row takes the newer read's.
+#[test]
+fn a_shallow_title_fills_but_never_replaces_a_fully_indexed_title() {
+    let conn = catalog();
+    let shallow = |id: &str, title: &str| ShallowSession {
+        source: "claude".into(),
+        session_id: id.into(),
+        title: Some(title.into()),
+        discovery_state: "shallow".into(),
+        ..Default::default()
+    };
+    conn.execute_batch(
+        "INSERT INTO sessions (session_id, source, discovery_state, title) VALUES \
+         ('full-named', 'claude', 'full', 'Chosen name'), \
+         ('full-unnamed', 'claude', 'full', NULL);",
+    )
+    .unwrap();
+    let kept = upsert_shallow_session(&conn, &shallow("full-named", "Older title")).unwrap();
+    assert_eq!(kept.title.as_deref(), Some("Chosen name"));
+    let filled = upsert_shallow_session(&conn, &shallow("full-unnamed", "Found")).unwrap();
+    assert_eq!(filled.title.as_deref(), Some("Found"));
+    upsert_shallow_session(&conn, &shallow("shallow-row", "First")).unwrap();
+    let renamed = upsert_shallow_session(&conn, &shallow("shallow-row", "Second")).unwrap();
+    assert_eq!(renamed.title.as_deref(), Some("Second"));
+}
+
+/// A title record is recognized whatever its length: a long title with
+/// extra fields is still the session's title.
+#[test]
+fn a_long_claude_title_record_is_read() {
+    let id = "33333333-3333-3333-3333-333333333333";
+    let title = "t".repeat(4000);
+    let padding = "p".repeat(9000);
+    let bytes = format!(
+        "{{\"type\":\"user\",\"sessionId\":\"{id}\",\"cwd\":\"/tmp/p\",\
+         \"timestamp\":\"2026-10-10T00:00:00.000Z\",\"message\":{{\"role\":\"user\",\"content\":\"hi\"}}}}\n\
+         {{\"type\":\"custom-title\",\"customTitle\":\"{title}\",\"extra\":\"{padding}\",\"sessionId\":\"{id}\"}}\n"
+    );
+    let candidate = Candidate {
+        source: "claude",
+        locator: format!("/tmp/project/{id}.jsonl"),
+        session_id: None,
+        recency_hint_ms: None,
+        stamp: "stamp".into(),
+    };
+    let session = claude_shallow_session_from_bytes(&candidate, bytes.as_bytes())
+        .unwrap()
+        .unwrap();
+    assert_eq!(session.title.as_deref(), Some(title.as_str()));
 }

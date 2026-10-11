@@ -138,6 +138,7 @@
       "session_id": "bloat-session",
       "source": "claude",
       "source_stamp": "<n>:81143",
+      "title": null,
       "workspace_roots_json": null
     }
   ],

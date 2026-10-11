@@ -345,6 +345,7 @@
       "session_id": "ses_sqlite_child",
       "source": "opencode",
       "source_stamp": "<n>:<n>",
+      "title": null,
       "workspace_roots_json": null
     },
     {
@@ -364,6 +365,7 @@
       "session_id": "ses_sqlite_root",
       "source": "opencode",
       "source_stamp": "<n>:<n>",
+      "title": null,
       "workspace_roots_json": null
     }
   ],

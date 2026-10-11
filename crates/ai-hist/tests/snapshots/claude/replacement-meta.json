@@ -242,6 +242,7 @@
       "session_id": "replacement-session",
       "source": "claude",
       "source_stamp": "<n>:1674",
+      "title": null,
       "workspace_roots_json": null
     }
   ],

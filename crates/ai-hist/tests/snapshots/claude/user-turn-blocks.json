@@ -288,6 +288,7 @@
       "session_id": "utb-session",
       "source": "claude",
       "source_stamp": "<n>:2676",
+      "title": null,
       "workspace_roots_json": null
     }
   ],

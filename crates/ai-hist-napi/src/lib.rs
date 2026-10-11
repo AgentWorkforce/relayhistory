@@ -1624,6 +1624,9 @@ pub struct CatalogSession {
     pub last_activity_ms: Option<i64>,
     pub first_prompt: Option<String>,
     pub last_assistant_text: Option<String>,
+    /// The name the harness gave the session (Claude's title, Codex's thread
+    /// name).
+    pub title: Option<String>,
     pub models: Vec<String>,
     pub originator: Option<String>,
     pub agent_version: Option<String>,
@@ -1653,6 +1656,7 @@ impl From<ai_hist::ShallowSession> for CatalogSession {
             last_activity_ms: session.last_activity_ms,
             first_prompt: session.first_prompt,
             last_assistant_text: session.last_assistant_text,
+            title: session.title,
             models: session.models,
             originator: session.originator,
             agent_version: session.agent_version,
@@ -1678,6 +1682,7 @@ pub struct CatalogCursor {
 }
 
 #[napi(object)]
+#[derive(Default)]
 pub struct ListCatalogOptions {
     pub scope: Option<String>,
     pub db_path: Option<String>,
@@ -1703,15 +1708,7 @@ pub struct SessionCatalogPage {
 pub async fn list_session_catalog_page(
     options: Option<ListCatalogOptions>,
 ) -> napi::Result<SessionCatalogPage> {
-    let options = options.unwrap_or(ListCatalogOptions {
-        scope: None,
-        db_path: None,
-        sources: None,
-        limit: None,
-        before_ms: None,
-        after: None,
-        project_key: None,
-    });
+    let options = options.unwrap_or_default();
     validate_limit(options.limit, DEFAULT_LIMIT, 1_000)?;
     let scope = parse_scope(options.scope)?;
     let path = db_path(options.db_path);

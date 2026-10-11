@@ -318,6 +318,7 @@
       "session_id": "retry-session",
       "source": "claude",
       "source_stamp": "<n>:3736",
+      "title": null,
       "workspace_roots_json": null
     }
   ],

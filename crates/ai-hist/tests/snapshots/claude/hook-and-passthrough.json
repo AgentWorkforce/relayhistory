@@ -295,6 +295,7 @@
       "session_id": "hook-session",
       "source": "claude",
       "source_stamp": "<n>:2420",
+      "title": null,
       "workspace_roots_json": null
     }
   ],

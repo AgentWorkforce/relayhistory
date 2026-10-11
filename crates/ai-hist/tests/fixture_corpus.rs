@@ -1099,7 +1099,7 @@ fn capture(fixture: &Fixture, home: &Path) -> Value {
 const SESSIONS_SQL: &str = "SELECT source, session_id, cwd, git_branch, first_activity_ms, \
      last_activity_ms, last_assistant_text, raw_path, first_prompt, models_json, \
      originator, agent_version, repo_url, initial_commit, workspace_roots_json, source_stamp, \
-     discovery_state FROM sessions ORDER BY source, session_id";
+     discovery_state, title FROM sessions ORDER BY source, session_id";
 /// The tool-result fidelity columns (#171) are selected too: they are
 /// measured from the raw provider payload, so a parser change that moves a
 /// byte count, a status or an error signal shows up in the snapshot diff.

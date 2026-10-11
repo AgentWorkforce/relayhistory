@@ -52,7 +52,7 @@
 //! set of sources read are identical to a serial run — parallelism changes
 //! wall-clock time, never observable behaviour.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -71,10 +71,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 mod claude_shallow;
-use claude_shallow::{fold_claude_head_line, fold_claude_shallow_tail, ClaudeHeadFold};
+use claude_shallow::read_claude_shallow;
+mod codex_shallow;
+pub(crate) use codex_shallow::CodexProvider;
 mod opencode_page;
 use opencode_page::{
-    opencode_rows_unpaged, opencode_sqlite_model, opencode_sqlite_prompt, page_limited_opencode_rows,
+    opencode_rows_unpaged, opencode_sqlite_model, opencode_sqlite_prompt, opencode_sqlite_title,
+    page_limited_opencode_rows,
 };
 
 /// Version of the machine-readable session-catalog contract.
@@ -83,7 +86,8 @@ use opencode_page::{
 /// payloads changes in a way a consumer must notice.
 /// 4 adds `project_key` / `project_key_method` to every catalog row and the
 /// `project_key` filter to the listing.
-pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 4;
+/// 5 adds `title`, the name the harness gave the session.
+pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 5;
 
 /// Version of the shallow scanners themselves.
 ///
@@ -91,7 +95,7 @@ pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 4;
 /// invalidates every stored stamp, so a scanner that learns to extract a new
 /// field re-reads sources whose bytes never changed. `parser_version` keeps its
 /// existing meaning (full-ingest parser generation) and is untouched.
-pub const SHALLOW_SCANNER_VERSION: u32 = 11;
+pub const SHALLOW_SCANNER_VERSION: u32 = 12;
 
 /// Version 2 shipped the classification that hid standalone guardians (see
 /// [`crate::codex_is_subagent`]). Their rollouts never change on disk, so the
@@ -168,6 +172,11 @@ const _: () = assert!(SHALLOW_SCANNER_VERSION > 8);
 /// that catalogs it.
 const _: () = assert!(SHALLOW_SCANNER_VERSION > 10);
 
+/// Version 12 reads a Claude session's title (`custom-title`, `ai-title`,
+/// `agent-name`). A finished transcript never changes on disk, so only this
+/// bump sends each cached Claude row through the reader that fills it.
+const _: () = assert!(SHALLOW_SCANNER_VERSION > 11);
+
 /// Most bytes a shallow head read may consume from one transcript.
 pub const HEAD_SCAN_MAX_BYTES: u64 = 256 * 1024;
 /// Most complete JSONL records a shallow head read may consider.
@@ -225,6 +234,12 @@ pub struct ShallowSession {
     /// populate it only on the full-ingest path, so their shallow rows leave
     /// it `None`; cursor fills it from the bounded tail read.
     pub last_assistant_text: Option<String>,
+    /// The name the harness gave the session, last observed. Observed. Per
+    /// provider: claude — the latest `custom-title` record (set by the user or
+    /// by the Claude app), else `ai-title`, else `agent-name`; every other
+    /// provider — none yet. A shallow read sees only the head and tail of a
+    /// transcript, so a rename recorded in neither waits for the full ingest.
+    pub title: Option<String>,
     /// Model ids observed in the bounded read. Observed, best effort: never a
     /// reason to widen a read, so an empty list means "not seen cheaply", not
     /// "no model".
@@ -1563,249 +1578,6 @@ pub(crate) fn claude_shallow_session_from_bytes(
     read_claude_shallow(candidate, &path, &bounded_jsonl_from_bytes(bytes))
 }
 
-fn read_claude_shallow(
-    candidate: &Candidate,
-    path: &Path,
-    bounded: &BoundedJsonl,
-) -> Result<Option<ShallowSession>> {
-    let mut session = ShallowSession {
-        source: "claude".into(),
-        raw_path: Some(candidate.locator.clone()),
-        ..Default::default()
-    };
-    let mut models = Vec::new();
-    let session_id = claude_session_id_from_bounded(bounded)?;
-    // A subagent sidecar transcript is its own file whose records carry the
-    // *parent's* sessionId (see `ingest_claude_transcript`). Enumerating it
-    // as a session would emit the parent twice per run and let the two
-    // files fight over one row's raw_path/source_stamp, so the stamp never
-    // matched again and one of them was re-read forever.
-    let sidecar_layout = crate::ingest::is_claude_sidecar_file(path);
-    let mut head = ClaudeHeadFold {
-        primary_record_seen: false,
-        sidechain_records: 0,
-        identified_records: 0,
-        parsed_records: 0,
-        head_records_seen: 0,
-    };
-    for line in bounded.head_records() {
-        if !fold_claude_head_line(&mut session, &mut models, &mut head, line, sidecar_layout) {
-            break;
-        }
-    }
-    fold_claude_shallow_tail(&mut session, bounded);
-    // A file laid out as a sidecar whose every identified head record is a
-    // sidechain row is a subagent's transcript, for a session whose own
-    // transcript is enumerated separately. A primary transcript of only
-    // sidechain rows -- inline Task traffic from Claude Code versions that
-    // wrote it there -- is still that session's transcript.
-    if sidecar_layout
-        && crate::ingest::claude_records_are_all_sidechain(
-            head.identified_records,
-            head.sidechain_records,
-        )
-    {
-        return Ok(None);
-    }
-    // A file with complete records that parse as nothing is corrupt, not a
-    // session. Publishing it under its file stem would put a fabricated
-    // row in the catalog and hide the corruption; a diagnostic names it.
-    // A file with no complete records at all is merely empty (a session
-    // that has just started) and is simply not a session yet.
-    if head.parsed_records == 0 {
-        anyhow::ensure!(
-            head.head_records_seen == 0,
-            "no parseable JSON records in the first {} record(s)",
-            head.head_records_seen
-        );
-        return Ok(None);
-    }
-        let Some(session_id) = session_id.or_else(|| {
-            path.file_stem()
-                .and_then(|s| s.to_str())
-                .map(str::to_string)
-                .filter(|s| !s.is_empty())
-        }) else {
-            return Ok(None);
-        };
-        session.session_id = session_id;
-        session.models = models;
-        Ok(Some(session))
-}
-
-// ---------------------------------------------------------------------------
-// codex
-// ---------------------------------------------------------------------------
-
-pub(crate) struct CodexProvider;
-
-impl ShallowSessionProvider for CodexProvider {
-    fn acquire(
-        &self,
-        _home: &Path,
-        _observation: &crate::observations::SessionObservation,
-    ) -> Result<crate::sources::AcquiredEvidence> {
-        Ok(crate::sources::AcquiredEvidence::LocalFiles)
-    }
-    fn source(&self) -> &'static str {
-        "codex"
-    }
-    /// The rollout parser writes prompts, events, tool calls, file edits and
-    /// child-thread relationships: every kind a full session is made of.
-    fn evidence_kinds(&self) -> &'static [EvidenceKind] {
-        FULL_SESSION_KINDS
-    }
-
-    fn watch_roots(&self, roots: &ProviderRoots<'_>) -> Vec<WatchRoot> {
-        vec![
-            WatchRoot::tree(roots.codex.join("sessions")),
-            WatchRoot::tree(roots.codex.join("archived_sessions")),
-        ]
-    }
-
-    fn enumerate(
-        &self,
-        env: &DiscoveryEnv<'_>,
-        _requested_limit: Option<usize>,
-    ) -> Result<Vec<Candidate>> {
-        let mut files = Vec::new();
-        for root in [
-            env.codex_home.join("sessions"),
-            env.codex_home.join("archived_sessions"),
-        ] {
-            files.extend(crate::collect_matching_files(&root, "rollout-", "jsonl")?);
-        }
-        file_candidates("codex", files, crate::file_stamp_and_modified)
-    }
-
-    fn read_shallow(
-        &self,
-        scan: &ScanEnv<'_>,
-        _catalog: Option<&Connection>,
-        candidate: &Candidate,
-    ) -> Result<Option<ShallowSession>> {
-        let path = PathBuf::from(&candidate.locator);
-        let bounded = read_bounded_jsonl(scan, &path)?;
-        let Some(meta) = bounded.head_records().next().and_then(|line| {
-            parse_record(line)
-                .filter(|v| v.get("type").and_then(Value::as_str) == Some("session_meta"))
-        }) else {
-            return Ok(None);
-        };
-        let payload = meta.get("payload");
-        let Some(session_id) = payload
-            .and_then(|p| p.get("id"))
-            .and_then(Value::as_str)
-            .filter(|s| !s.is_empty())
-        else {
-            return Ok(None);
-        };
-        // Linked subagent threads are real rollouts but not root sessions;
-        // standalone guardian rollouts may carry `source.subagent` without a
-        // parent and are cataloged under their own payload.id.
-        let is_subagent = crate::codex_is_subagent(payload, session_id);
-        if is_subagent {
-            return Ok(None);
-        }
-        let git = payload.and_then(|p| p.get("git"));
-        let string_field = |owner: Option<&Value>, key: &str| {
-            owner
-                .and_then(|o| o.get(key))
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-        };
-        let mut models = Vec::new();
-        push_unique(
-            &mut models,
-            payload.and_then(|p| p.get("model")).and_then(Value::as_str),
-        );
-        let mut first_prompt = None;
-        let mut first_activity_ms = claude_timestamp(&meta);
-        let mut last_activity_ms = first_activity_ms;
-        // A fork's copy of its parent's history is the parent's, so its
-        // prompts are not this session's first prompt -- the same rule the
-        // rollout walk applies to `history`.
-        let mut replay_gate = crate::codex::ForkReplayGate::new(
-            crate::codex::fork_parent_id(payload, session_id),
-            crate::codex::fork_origin_ms(payload, session_id, claude_timestamp(&meta)),
-        );
-        for (index, line) in bounded.head_records().enumerate() {
-            let Some(value) = parse_record(line) else {
-                continue;
-            };
-            if let Some(ts) = claude_timestamp(&value) {
-                first_activity_ms.get_or_insert(ts);
-                last_activity_ms = Some(ts);
-            }
-            if replay_gate.step(index == 0, &value) == crate::codex::ReplayStep::Replay {
-                continue;
-            }
-            if value.get("type").and_then(Value::as_str) == Some("turn_context") {
-                push_unique(
-                    &mut models,
-                    value.pointer("/payload/model").and_then(Value::as_str),
-                );
-            }
-            if first_prompt.is_none() {
-                first_prompt = codex_substantive_prompt(&value);
-            }
-            // The first prompt and first timestamp are settled; the tail owns
-            // the last timestamp and models stay best-effort, so nothing
-            // further in the head can change the row.
-            if first_prompt.is_some() && first_activity_ms.is_some() {
-                break;
-            }
-        }
-        for line in bounded.tail_records_rev() {
-            let Some(value) = parse_record(line) else {
-                continue;
-            };
-            if let Some(ts) = claude_timestamp(&value) {
-                last_activity_ms = Some(ts);
-                break;
-            }
-        }
-        let mtime = crate::file_modified_ms(&path);
-        Ok(Some(ShallowSession {
-            source: "codex".into(),
-            session_id: session_id.to_string(),
-            cwd: string_field(payload, "cwd"),
-            git_branch: string_field(git, "branch"),
-            first_activity_ms,
-            last_activity_ms: last_activity_ms.or(mtime),
-            first_prompt,
-            models,
-            originator: string_field(payload, "originator"),
-            agent_version: string_field(payload, "cli_version"),
-            repo_url: string_field(git, "repository_url")
-                .or_else(|| string_field(git, "remote_url")),
-            initial_commit: string_field(git, "commit_hash"),
-            workspace_roots: string_list(payload.and_then(|p| p.get("workspace_roots"))),
-            raw_path: Some(candidate.locator.clone()),
-            ..Default::default()
-        }))
-    }
-}
-
-fn codex_substantive_prompt(value: &Value) -> Option<String> {
-    crate::codex::human_message(value).map(|message| excerpt(&message.text))
-}
-
-fn string_list(value: Option<&Value>) -> Vec<String> {
-    value
-        .and_then(Value::as_array)
-        .map(|items| {
-            items
-                .iter()
-                .filter_map(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
 // ---------------------------------------------------------------------------
 // cursor
 // ---------------------------------------------------------------------------
@@ -2141,6 +1913,7 @@ impl ShallowSessionProvider for GrokProvider {
             first_activity_ms,
             last_activity_ms,
             first_prompt,
+            title: crate::ingest::titles::grok_title(summary.as_ref()),
             models,
             raw_path: Some(candidate.locator.clone()),
             ..Default::default()
@@ -2736,6 +2509,7 @@ impl ShallowSessionProvider for OpencodeProvider {
         // first 4096 characters would break the bounded-read promise for a
         // catalog entry.
         let first_prompt = opencode_sqlite_prompt(scan, snapshot, &candidate.locator)?;
+        let title = opencode_sqlite_title(snapshot, &candidate.locator)?;
         let mut models = Vec::new();
         push_unique(
             &mut models,
@@ -2748,6 +2522,7 @@ impl ShallowSessionProvider for OpencodeProvider {
             first_activity_ms: seed.created,
             last_activity_ms: seed.updated.or(seed.created),
             first_prompt,
+            title,
             models,
             // Preserve which concrete OpenCode store produced this catalog
             // identity. Hydration verifies that provenance before reading.
@@ -2911,6 +2686,7 @@ struct DevinSessionSeed {
     created_ms: Option<i64>,
     last_activity_ms: Option<i64>,
     model: Option<String>,
+    title: Option<String>,
 }
 
 /// One run's pinned read of `sessions.db` and the seeds enumeration filled.
@@ -3116,7 +2892,7 @@ impl ShallowSessionProvider for DevinProvider {
         // Devin records timestamps in epoch seconds; the catalog stores
         // milliseconds, so both bounds are converted in SQL.
         let sql = format!(
-            "SELECT id, {}, {}, {}, {}, {} FROM sessions \
+            "SELECT id, {}, {}, {}, {}, {}, {} FROM sessions \
              WHERE id IS NOT NULL AND id <> '' AND {hidden_pred} \
              ORDER BY {recency_order}{limit_sql}",
             column("working_directory"),
@@ -3124,6 +2900,7 @@ impl ShallowSessionProvider for DevinProvider {
             column("created_at"),
             column("last_activity_at"),
             column("model"),
+            column("title"),
         );
         let mut stmt = snapshot.conn.prepare(&sql)?;
         scan.note_query();
@@ -3135,6 +2912,7 @@ impl ShallowSessionProvider for DevinProvider {
                 row.get::<_, Option<i64>>(3)?,
                 row.get::<_, Option<i64>>(4)?,
                 row.get::<_, Option<String>>(5)?,
+                row.get::<_, Option<String>>(6)?,
             ))
         };
         let rows = match sqlite_limit {
@@ -3148,7 +2926,7 @@ impl ShallowSessionProvider for DevinProvider {
         scan.note_records(rows.len() as u64);
         snapshot.sessions = rows
             .iter()
-            .map(|(id, cwd, dirs, created, updated, model)| {
+            .map(|(id, cwd, dirs, created, updated, model, title)| {
                 (
                     id.clone(),
                     DevinSessionSeed {
@@ -3160,6 +2938,7 @@ impl ShallowSessionProvider for DevinProvider {
                         created_ms: created.map(|s| s.saturating_mul(1000)),
                         last_activity_ms: updated.map(|s| s.saturating_mul(1000)),
                         model: model.clone(),
+                        title: crate::ingest::titles::non_blank_title(title.as_deref()),
                     },
                 )
             })
@@ -3172,7 +2951,7 @@ impl ShallowSessionProvider for DevinProvider {
         let transcripts = crate::ingest::devin::transcripts_dir(scan.devin_dir);
         Ok(rows
             .into_iter()
-            .map(|(id, _cwd, _dirs, created, updated, _model)| {
+            .map(|(id, _cwd, _dirs, created, updated, _model, _title)| {
                 let content_stamp = crate::ingest::devin::session_stamp(
                     &snapshot.conn,
                     &id,
@@ -3293,6 +3072,7 @@ impl ShallowSessionProvider for DevinProvider {
             first_activity_ms: seed.created_ms,
             last_activity_ms: seed.last_activity_ms.or(seed.created_ms),
             first_prompt,
+            title: seed.title,
             models,
             workspace_roots: seed.workspace_roots,
             // The concrete store that produced this identity; hydration
@@ -3487,6 +3267,7 @@ fn read_shallow_opencode_json_tree(
             (None, newest) => newest,
         },
         first_prompt,
+        title: loaded.session.title.clone(),
         models,
         // The concrete session file, so hydration can stamp exactly what
         // discovery read.
@@ -3565,7 +3346,7 @@ fn file_candidates(
 pub(crate) const SESSION_COLUMNS: &str = "source, session_id, cwd, git_branch, first_activity_ms, \
      last_activity_ms, first_prompt, last_assistant_text, models_json, originator, \
      agent_version, repo_url, initial_commit, workspace_roots_json, raw_path, source_stamp, \
-     discovery_state, project_key, project_key_method, \
+     discovery_state, project_key, project_key_method, title, \
      CASE \
        WHEN EXISTS (SELECT 1 FROM session_presences p WHERE p.source = sessions.source AND p.session_id = sessions.session_id AND p.location = 'local') \
         AND EXISTS (SELECT 1 FROM session_presences p WHERE p.source = sessions.source AND p.session_id = sessions.session_id AND p.location = 'remote') \
@@ -3605,7 +3386,8 @@ pub(crate) fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Shallo
             .unwrap_or_else(|| "full".to_string()),
         project_key: row.get(17)?,
         project_key_method: row.get(18)?,
-        locations: json_string_list(row.get(19)?),
+        title: row.get(19)?,
+        locations: json_string_list(row.get(20)?),
         from_cache: true,
     })
 }
@@ -3806,13 +3588,14 @@ fn fetch_catalog_row(
         .ok())
 }
 
-/// The catalog columns with the two text excerpts replaced by `NULL`, for a
+/// The catalog columns with the text excerpts and the title replaced by `NULL`, for a
 /// read that asked for no transcript text: the excerpts are bounded, but
 /// "bounded" is not "not moved", and a hash-only consumer is promised the
 /// latter.
 static SESSION_COLUMNS_NO_TEXT: LazyLock<String> = LazyLock::new(|| {
     SESSION_COLUMNS
         .replacen("first_prompt, last_assistant_text,", "NULL AS first_prompt, NULL AS last_assistant_text,", 1)
+        .replacen("project_key_method, title,", "project_key_method, NULL AS title,", 1)
 });
 
 fn catalog_columns(include_text: bool) -> &'static str {
@@ -4175,9 +3958,9 @@ static UPSERT_SESSION_SQL: LazyLock<String> = LazyLock::new(|| {
          (session_id, source, cwd, git_branch, first_activity_ms, last_activity_ms, \
           last_assistant_text, raw_path, parser_version, first_prompt, models_json, originator, \
           agent_version, repo_url, initial_commit, workspace_roots_json, source_stamp, \
-          project_key, project_key_method, \
+          project_key, project_key_method, title, \
           discovery_state) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?18, ?19, 'shallow') \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?18, ?19, ?20, 'shallow') \
          ON CONFLICT(session_id, source) DO UPDATE SET \
          {project_key_merge}, \
          cwd = COALESCE(excluded.cwd, sessions.cwd), \
@@ -4199,6 +3982,10 @@ static UPSERT_SESSION_SQL: LazyLock<String> = LazyLock::new(|| {
              THEN COALESCE(sessions.raw_path, excluded.raw_path) \
              ELSE COALESCE(excluded.raw_path, sessions.raw_path) END, \
          first_prompt = COALESCE(excluded.first_prompt, sessions.first_prompt), \
+         title = CASE \
+             WHEN sessions.discovery_state IS NULL OR sessions.discovery_state = 'full' \
+             THEN COALESCE(sessions.title, excluded.title) \
+             ELSE COALESCE(excluded.title, sessions.title) END, \
          models_json = COALESCE(excluded.models_json, sessions.models_json), \
          originator = COALESCE(excluded.originator, sessions.originator), \
          agent_version = COALESCE(excluded.agent_version, sessions.agent_version), \
@@ -4215,7 +4002,11 @@ static UPSERT_SESSION_SQL: LazyLock<String> = LazyLock::new(|| {
 
 /// Write a shallow row into the catalog, returning the merged row as stored.
 ///
-/// Preview columns (`first_prompt`, `last_assistant_text`) are preserved when
+/// A fully indexed row's `title` is the full read's: a shallow pass only fills
+/// one that is missing, since a bounded read can miss a rename that sits
+/// between its head and tail and would put an older title back.
+///
+/// Preview columns (`first_prompt`, `last_assistant_text`) and `title` are preserved when
 /// a shallow pass does not supply a value, because a shallow pass does not read
 /// the transcript and therefore cannot authoritatively clear one. Other values
 /// are merged defensively — never lowers `first_activity_ms` past what a fuller
@@ -4352,6 +4143,7 @@ fn upsert_shallow_session_in_transaction(
             },
             project_key,
             project_key_method,
+            session.title,
         ],
         row_to_session,
     )?;

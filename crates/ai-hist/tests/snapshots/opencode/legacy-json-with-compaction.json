@@ -219,6 +219,7 @@
       "session_id": "ses_compact",
       "source": "opencode",
       "source_stamp": "3204:14:<n>:4d30209f0db7b1d9",
+      "title": "compaction fixture",
       "workspace_roots_json": null
     }
   ],

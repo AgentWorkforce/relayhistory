@@ -150,30 +150,13 @@ fn seconds_to_ms(seconds: Option<i64>) -> Option<i64> {
     seconds.map(|s| s.saturating_mul(1000))
 }
 
-/// The column names of `table` in `src`, for schema-drift guards.
-pub(crate) fn table_columns(src: &Connection, table: &str) -> Result<BTreeSet<String>> {
-    let mut stmt = src.prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))?;
-    let mut columns = BTreeSet::new();
-    let mut rows = stmt.query([])?;
-    while let Some(row) = rows.next()? {
-        columns.insert(row.get::<_, String>(0)?);
-    }
-    Ok(columns)
-}
-
-/// `name` when the `sessions` table has that column, else SQL `NULL`.
-///
-/// Only `id` is required of a Devin store; every other `sessions` column is
-/// read as absent when an older or newer CLI did not write it, exactly as
-/// discovery reads it, so a store discovery can list is never one sync or
-/// hydration fails on.
-fn optional_column<'a>(columns: &BTreeSet<String>, name: &'a str) -> &'a str {
-    if columns.contains(name) {
-        name
-    } else {
-        "NULL"
-    }
-}
+/// The column names of `table` in `src`, and a column read as SQL `NULL` when
+/// the table lacks it. Only `id` is required of a Devin store; every other
+/// `sessions` column is read as absent when an older or newer CLI did not
+/// write it, exactly as discovery reads it, so a store discovery can list is
+/// never one sync or hydration fails on. Shared with OpenCode, whose stores
+/// drift the same way.
+pub(crate) use super::opencode::{optional_column, table_columns};
 
 /// Whether `sessions.db` has the layout this adapter parses.
 ///
@@ -618,7 +601,7 @@ fn edit_file_path<'a>(
 /// (`node_id`/`tool_call_id`-derived uids), and [`retire_absent_rows`]
 /// removes rows whose source records disappeared. A pass that read the
 /// session's entire source is authoritative for both ends of its activity
-/// window, so this uses `upsert_session_rebuilt`.
+/// window, so this writes with `ActivityWindow::Replace`.
 ///
 /// A savepoint rather than a transaction, because the callers differ:
 /// hydration already holds one (a nested `BEGIN` would fail), global sync
@@ -705,7 +688,7 @@ fn normalize_inner(
         .unwrap_or(0);
     let last_ts = last_ts.or(loaded.info.last_activity_ms).unwrap_or(first_ts);
     let last_ts = last_ts.max(loaded.info.last_activity_ms.unwrap_or(last_ts));
-    super::upsert_session_rebuilt(
+    super::titles::upsert_titled(
         conn,
         &super::SessionCatalogRow {
             session_id,
@@ -717,6 +700,8 @@ fn normalize_inner(
             last_assistant_text: last_assistant_text.as_deref(),
             raw_path: Some(raw_path),
         },
+        super::ActivityWindow::Replace,
+        super::titles::non_blank_title(loaded.info.title.as_deref()).as_deref(),
     )?;
     retire_absent_rows(
         conn,

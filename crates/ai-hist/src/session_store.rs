@@ -1320,62 +1320,42 @@ fn delegated_child_session(
                     crate::relationships::RELATIONSHIP_DELEGATED
                 ],
                 |row| {
-                    Ok((
-                        row.get::<_, Option<i64>>(0)?,
-                        row.get::<_, Option<i64>>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                        row.get::<_, Option<String>>(5)?,
-                        row.get::<_, Option<String>>(6)?,
-                        row.get::<_, Option<String>>(7)?,
-                        row.get::<_, Option<String>>(8)?,
-                    ))
+                    let session = CatalogSession {
+                        source,
+                        session_id: session_id.to_string(),
+                        cwd: row.get(2)?,
+                        git_branch: row.get(3)?,
+                        first_activity_ms: row.get(0)?,
+                        last_activity_ms: row.get(1)?,
+                        first_prompt: None,
+                        last_assistant_text: None,
+                        title: None,
+                        models: Vec::new(),
+                        originator: None,
+                        agent_version: row.get(4)?,
+                        repo_url: None,
+                        initial_commit: None,
+                        workspace_roots: Vec::new(),
+                        project_key: row.get(5)?,
+                        project_key_method: row.get(6)?,
+                        raw_path: row.get::<_, Option<String>>(8)?.map(PathBuf::from),
+                        source_stamp: None,
+                        discovery_state: DiscoveryState::Delegated,
+                        locations: Vec::new(),
+                    };
+                    Ok((session, row.get::<_, Option<String>>(7)?))
                 },
             ))
         })
         .map_err(Error::sql)?;
-    let Some((
-        first_activity_ms,
-        last_activity_ms,
-        cwd,
-        git_branch,
-        agent_version,
-        project_key,
-        project_key_method,
-        models,
-        raw_path,
-    )) = row
-    else {
+    let Some((mut session, models)) = row else {
         return Ok(None);
     };
-    let models = match models {
-        Some(json) => serde_json::from_str::<Vec<String>>(&json)
-            .map_err(|error| Error::Query(format!("delegated child models: {error}")))?,
-        None => Vec::new(),
-    };
-    Ok(Some(CatalogSession {
-        source,
-        session_id: session_id.to_string(),
-        cwd,
-        git_branch,
-        first_activity_ms,
-        last_activity_ms,
-        first_prompt: None,
-        last_assistant_text: None,
-        models,
-        originator: None,
-        agent_version,
-        repo_url: None,
-        initial_commit: None,
-        workspace_roots: Vec::new(),
-        project_key,
-        project_key_method,
-        raw_path: raw_path.map(PathBuf::from),
-        source_stamp: None,
-        discovery_state: DiscoveryState::Delegated,
-        locations: Vec::new(),
-    }))
+    if let Some(json) = models {
+        session.models = serde_json::from_str::<Vec<String>>(&json)
+            .map_err(|error| Error::Query(format!("delegated child models: {error}")))?;
+    }
+    Ok(Some(session))
 }
 
 /// [`delegated_child_session`]'s one statement, `?1`/`?2` the child and `?3`
@@ -1522,7 +1502,7 @@ struct CatalogFingerprint {
 const CATALOG_FINGERPRINT_COLUMNS: &str = "source_stamp, last_activity_ms, first_activity_ms, \
      discovery_state, parser_version, project_key, project_key_method, cwd, git_branch, \
      raw_path, models_json, originator, agent_version, repo_url, initial_commit, \
-     workspace_roots_json";
+     workspace_roots_json, title";
 
 /// The change-feed head, or `None` when this store's feed (and with it the
 /// guarantee that every catalog write moves the head) is not in place. The
@@ -2105,6 +2085,10 @@ pub struct CatalogSession {
     /// Bounded excerpt of the last assistant text. `None` when the query
     /// asked for no text.
     pub last_assistant_text: Option<String>,
+    /// The name the harness gave the session, latest first. Claude (its
+    /// `custom-title`, else `ai-title`, else `agent-name`). `None` when the
+    /// query asked for no text.
+    pub title: Option<String>,
     /// Model ids seen in the bounded read; best effort.
     pub models: Vec<String>,
     /// Client that originated the session. Codex.
@@ -2149,6 +2133,7 @@ impl CatalogSession {
             last_activity_ms: row.last_activity_ms,
             first_prompt: row.first_prompt,
             last_assistant_text: row.last_assistant_text,
+            title: row.title,
             models: row.models,
             originator: row.originator,
             agent_version: row.agent_version,

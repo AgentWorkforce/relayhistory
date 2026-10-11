@@ -165,7 +165,7 @@ pub(crate) const LOCAL_SOURCES: &[LocalSource] = &[
     },
     LocalSource {
         id: "codex",
-        discovery: Discovery::Provider(|| Box::new(CodexProvider)),
+        discovery: Discovery::Provider(|| Box::new(CodexProvider::default())),
         hydration: Hydration::Parser(hydrate::ingest_selected_codex),
         transcript_roots: |roots| {
             vec![

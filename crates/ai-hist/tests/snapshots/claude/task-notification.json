@@ -235,6 +235,7 @@
       "session_id": "tn-session",
       "source": "claude",
       "source_stamp": "<n>:2134",
+      "title": null,
       "workspace_roots_json": null
     }
   ],
