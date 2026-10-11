@@ -1,3 +1,7 @@
+use crate::providers::{
+    repairable_event_sources, replayable_history_sources, REPAIRABLE_EVENT_SOURCES,
+    REPLAYABLE_HISTORY_SOURCES,
+};
 #[path = "providers/mod.rs"]
 pub(crate) mod providers;
 use crate::{
@@ -864,28 +868,6 @@ use crate::providers::sweep_generation;
 /// build with a different shape is rejected rather than misread.
 const DESTINATION_MARKER_VERSION: &str = "v5";
 
-/// The sources whose events, tool calls, file edits and catalog row a *sweep*
-/// can put back.
-///
-/// The marker is a repair guard, so it may only promise what the sweep can
-/// honour. Codex rollouts and Claude transcripts are re-read and re-ingested
-/// by this sweep, so a loss in one is repairable and belongs in the marker.
-/// Adding a source here means adding its repair path in the same change.
-///
-/// Muse Code joined with its parser: every session is a whole-transcript
-/// read, and a sweep re-reads a session this marker names short, or the
-/// parent whose tree holds a short subagent.
-const REPAIRABLE_EVENT_SOURCES: &[&str] = &["claude", "codex", "opencode", "muse", "devin"];
-
-/// The sources whose `history` and `session_markers` rows a sweep can replay.
-///
-/// Cursor-backed flat logs (`~/.claude/history.jsonl`, `~/.codex/history.jsonl`)
-/// sit at EOF and cannot be safely rewound, so counting them would disarm the
-/// fast path forever over a loss it could not undo. Store-backed providers
-/// re-read their own database on each sync, so their history and markers are
-/// as repairable as their events.
-const REPLAYABLE_HISTORY_SOURCES: &[&str] = &["devin", "opencode"];
-
 /// What one session is expected to hold.
 ///
 /// Every row here is re-created by re-reading the session's own transcript or
@@ -1470,8 +1452,10 @@ fn rows_removed_since_sql(kind: &str) -> String {
 /// One session's [`SessionHoldings`], counted the way the grouped reads of
 /// [`session_holdings_naming`] count it, through each table's session index.
 fn session_holding(conn: &Connection, source: &str, session_id: &str) -> Result<SessionHoldings> {
-    let repairable = REPAIRABLE_EVENT_SOURCES.contains(&source);
-    let replayable = REPLAYABLE_HISTORY_SOURCES.contains(&source);
+    let repairable =
+        crate::providers::repairable_sources(REPAIRABLE_EVENT_SOURCES, false).contains(&source);
+    let replayable =
+        crate::providers::repairable_sources(REPLAYABLE_HISTORY_SOURCES, true).contains(&source);
     let count = |sql: &str, applies: bool| -> Result<u64> {
         if !applies {
             return Ok(0);
@@ -1556,20 +1540,6 @@ fn parse_destination_marker(value: &str) -> Option<DestinationMarker> {
 
 struct DestinationMarker {
     sessions: BTreeMap<u64, SessionHoldings>,
-}
-
-/// `REPAIRABLE_EVENT_SOURCES` as a bound parameter, so the grouped reads and
-/// the shortfall scan cannot drift apart.
-fn repairable_event_sources() -> rusqlite::types::Value {
-    rusqlite::types::Value::Text(
-        serde_json::to_string(REPAIRABLE_EVENT_SOURCES).unwrap_or_else(|_| "[]".to_string()),
-    )
-}
-
-fn replayable_history_sources() -> rusqlite::types::Value {
-    rusqlite::types::Value::Text(
-        serde_json::to_string(REPLAYABLE_HISTORY_SOURCES).unwrap_or_else(|_| "[]".to_string()),
-    )
 }
 
 /// Whether the destination still holds everything the stamp was written over.

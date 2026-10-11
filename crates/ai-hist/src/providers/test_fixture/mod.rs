@@ -17,7 +17,7 @@ pub(crate) const LOCAL_SOURCE: LocalSource = LocalSource {
     fixtures: Fixtures::Dir(ID),
 };
 pub(crate) const METADATA: ProviderMetadata = ProviderMetadata {
-    markers: false,
+    markers: true,
     message_ids: MessageIdOrigin::Provider,
     usage: None,
 };
@@ -44,7 +44,7 @@ impl ShallowSessionProvider for Provider {
         ID
     }
     fn evidence_kinds(&self) -> &'static [EvidenceKind] {
-        &[EvidenceKind::History, EvidenceKind::SessionEvent]
+        &[EvidenceKind::History, EvidenceKind::SessionEvent, EvidenceKind::SessionMarker]
     }
     fn enumerate(&self, env: &DiscoveryEnv<'_>, _: Option<usize>) -> Result<Vec<Candidate>> {
         let dir = directory(&env.provider_roots);
@@ -100,6 +100,9 @@ fn acquire(
         value["id"].as_str() == Some(&options.session_id),
         "SESSION_SOURCE_MISMATCH: wrong native identity"
     );
+    if let Some(sidecar) = value["sidecar"].as_str() {
+        file_snapshot(context, vec![PathBuf::from(sidecar)])?;
+    }
     let records = value["messages"].as_array().unwrap().len() as i64;
     Ok(AcquiredSession::new(
         value,
@@ -145,6 +148,9 @@ fn normalize(conn: &Connection, payload: &Value, path: &Path) -> Result<usize> {
             },
         )?;
     }
+    crate::insert_session_marker(conn, ID, id, &crate::NewSessionMarker {
+        marker_uid: "fixture-start", kind: "session_start", ts_ms: Some(1000), ..Default::default()
+    })?;
     upsert_session(
         conn,
         &SessionCatalogRow {

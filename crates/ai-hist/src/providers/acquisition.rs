@@ -81,8 +81,10 @@ pub(crate) fn file_snapshot(
     let mut bytes = 0i64;
     let mut files = Vec::new();
     for path in &paths {
-        let data = context
-            .read(path)
+        // Keep containment failures at the top of the error chain for the
+        // public typed-error classifier. Only filesystem reads gain context.
+        context.validate(path)?;
+        let data = std::fs::read(path)
             .with_context(|| format!("read provider file {}", path.display()))?;
         bytes = bytes.saturating_add(i64::try_from(data.len()).unwrap_or(i64::MAX));
         files.push(serde_json::json!({"path":path, "bytes":data}));

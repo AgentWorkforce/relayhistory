@@ -11,6 +11,10 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A sweep writes a transcript's new session events into the search index once per write unit.
 - Built-in history providers register their acquisition, source vocabulary, accounting and fixture coverage from provider-owned modules and descriptors, allowing new adapters to share the existing discovery, hydration and sync contracts.
 
+### Fixed
+
+- Unchanged provider syncs restore lost evidence, sidecar containment failures retain their typed error code, and SDK hydration accepts native session markers.
+
 ## [0.40.1] - 2026-10-11
 
 ### Changed

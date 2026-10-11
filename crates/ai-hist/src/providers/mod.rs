@@ -81,6 +81,67 @@ pub(crate) fn adapters() -> impl Iterator<Item = (&'static str, &'static Provide
         .filter_map(|r| r.adapter.as_ref().map(|adapter| (r.id, adapter)))
 }
 
+/// The sources whose events, tool calls, file edits and catalog row a *sweep*
+/// can put back.
+///
+/// The marker is a repair guard, so it may only promise what the sweep can
+/// honour. Codex rollouts and Claude transcripts are re-read and re-ingested
+/// by this sweep, so a loss in one is repairable and belongs in the marker.
+/// Adding a source here means adding its repair path in the same change.
+///
+/// Muse Code joined with its parser: every session is a whole-transcript
+/// read, and a sweep re-reads a session this marker names short, or the
+/// parent whose tree holds a short subagent.
+pub(crate) const REPAIRABLE_EVENT_SOURCES: &[&str] =
+    &["claude", "codex", "opencode", "muse", "devin"];
+
+/// The sources whose `history` and `session_markers` rows a sweep can replay.
+///
+/// Cursor-backed flat logs (`~/.claude/history.jsonl`, `~/.codex/history.jsonl`)
+/// sit at EOF and cannot be safely rewound, so counting them would disarm the
+/// fast path forever over a loss it could not undo. Store-backed providers
+/// re-read their own database on each sync, so their history and markers are
+/// as repairable as their events.
+pub(crate) const REPLAYABLE_HISTORY_SOURCES: &[&str] = &["devin", "opencode"];
+
+/// `REPAIRABLE_EVENT_SOURCES` as a bound parameter, so the grouped reads and
+/// the shortfall scan cannot drift apart.
+pub(crate) fn repairable_event_sources() -> rusqlite::types::Value {
+    rusqlite::types::Value::Text(
+        serde_json::to_string(&crate::providers::repairable_sources(
+            REPAIRABLE_EVENT_SOURCES,
+            false,
+        ))
+        .unwrap_or_else(|_| "[]".to_string()),
+    )
+}
+
+pub(crate) fn replayable_history_sources() -> rusqlite::types::Value {
+    rusqlite::types::Value::Text(
+        serde_json::to_string(&crate::providers::repairable_sources(
+            REPLAYABLE_HISTORY_SOURCES,
+            true,
+        ))
+        .unwrap_or_else(|_| "[]".to_string()),
+    )
+}
+
+pub(crate) fn repairable_sources(legacy: &[&'static str], history: bool) -> Vec<&'static str> {
+    let mut sources = legacy.to_vec();
+    sources.extend(crate::providers::adapters().filter_map(|(id, _)| {
+        let kinds = crate::declared_evidence_kinds(id);
+        let capable = if history {
+            kinds.contains(&crate::EvidenceKind::History)
+                || kinds.contains(&crate::EvidenceKind::SessionMarker)
+        } else {
+            // Every adapter can restore its catalog, even one without events.
+            true
+        };
+        capable.then_some(id)
+    }));
+    sources
+}
+
 const USAGE_COUNT: usize = {
     let mut count = 0;
     let mut i = 0;
@@ -109,14 +170,17 @@ pub(crate) const NORMALIZABLE_SOURCES: &[&str] = &USAGE_IDS;
 
 /// Resolve an explicit override only while constructing ProviderRoots.
 pub(crate) fn resolve_root(home: &Path, use_env: bool, env: &str, relative: &str) -> PathBuf {
-    if use_env {
-        if let Some(value) =
-            std::env::var_os(env).filter(|v| !v.to_string_lossy().trim().is_empty())
-        {
-            return PathBuf::from(value);
-        }
-    }
-    home.join(relative)
+    resolve_root_value(
+        home,
+        use_env.then(|| std::env::var_os(env)).flatten(),
+        relative,
+    )
+}
+fn resolve_root_value(home: &Path, value: Option<std::ffi::OsString>, relative: &str) -> PathBuf {
+    value
+        .filter(|v| !v.to_string_lossy().trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join(relative))
 }
 pub(crate) fn resolve_roots(
     home: &Path,
