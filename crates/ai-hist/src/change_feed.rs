@@ -91,6 +91,7 @@ const MIGRATION: &str = "change_feed_v2";
 
 mod epochs;
 mod export_schema;
+mod validate;
 use export_schema::reconcile_export_schema;
 
 /// The column a named cursor records its kind set in.
@@ -1197,34 +1198,12 @@ impl SessionStore {
                 self.db_path().display()
             )));
         }
+        validate::query(from, &query, "changes_since")?;
         let kind_set = KindSet::normalize(query.kinds);
         let batch = match query.batch {
             0 => DEFAULT_CHANGE_BATCH,
             batch => batch.min(MAX_CHANGE_BATCH),
         };
-        if from == Watermark::CONSUMER && query.consumer.is_none() {
-            return Err(Error::InvalidArgument(
-                "changes_since: Watermark::CONSUMER needs ChangeQuery::consumer to name the cursor"
-                    .to_string(),
-            ));
-        }
-        if let Some(session) = &query.session {
-            if query.consumer.is_some() {
-                return Err(Error::InvalidArgument(
-                    "changes_since: ChangeQuery::session is a one-shot read and cannot name a \
-                     consumer; a cursor committed from one session's changes would skip every \
-                     other session's. Drain the session from Watermark::START without a \
-                     consumer, and keep the named cursor for the whole feed"
-                        .to_string(),
-                ));
-            }
-            if session.source_name.is_empty() || session.session_id.is_empty() {
-                return Err(Error::InvalidArgument(
-                    "changes_since: ChangeQuery::session needs a nonempty source and session id"
-                        .to_string(),
-                ));
-            }
-        }
         let (start, head, stale_cursor) =
             resolve_start_and_head(&conn, from, query.consumer.as_deref(), &kind_set)?;
         epochs::check_issued(&conn, from, head, &kind_set)?;

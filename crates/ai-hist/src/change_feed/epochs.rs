@@ -170,6 +170,7 @@ impl SessionStore {
         from: Watermark,
         query: &ChangeQuery,
     ) -> std::result::Result<bool, Error> {
+        super::validate::query(from, query, "resumes_from")?;
         if from == Watermark::START {
             return Ok(true);
         }
@@ -337,6 +338,32 @@ mod tests {
             store.changes_since(Watermark::CONSUMER, events().consumer("delivery")),
             Err(Error::WatermarkAheadOfStore(_))
         ));
+    }
+
+    /// `resumes_from` refuses every query `changes_since` refuses, from
+    /// `Watermark::START` too.
+    #[test]
+    fn resumes_from_refuses_what_changes_since_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, _conn) = store(dir.path());
+        let refused = [
+            (Watermark::CONSUMER, events()),
+            (
+                Watermark::START,
+                events().session("claude", "s1").consumer("c"),
+            ),
+            (Watermark::START, events().session("", "s1")),
+        ];
+        for (from, query) in refused {
+            assert!(matches!(
+                store.resumes_from(from, &query),
+                Err(Error::InvalidArgument(_))
+            ));
+            assert!(matches!(
+                store.changes_since(from, query),
+                Err(Error::InvalidArgument(_))
+            ));
+        }
     }
 
     /// Retirements chain: a watermark two retirements old still resumes, and
