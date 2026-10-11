@@ -62,9 +62,7 @@ transactionally; partial final records are deferred and prevent pruning.
 
 ## Verification and integration status
 
-Implementation is stacked on setup commit
-`562bac904dda3c8b7962b9f4e4b29c5bfed1ed32` (setup PR #464, composed on main `e0827b98`), rebased from the original verified setup commit `276bd3dba51312c7b78e7379cd79b04e5d313ff1`. Setup is not merged.
-Provider review is stacked on setup PR #464; integration waits for that dependency to land.
+Setup PR #464 merged into `main` at `cc11ea2aa1974eb3552cb957d9d14b1ea6ddb8ea`. Pi now targets `main` and is rebased onto that commit, including the Grok/Muse stable-reread changes from #466. Earlier validation revisions below are retained as provenance; current-head CI governs merge readiness.
 
 Provider-level checks:
 
@@ -109,7 +107,7 @@ Rebased validation:
 passes without exclusions on setup `588d91f3`, including the slow CLI
 contention case and all 75 live-capture checks. The no-default suite also passed
 unskipped before the final shared test-isolation/helper-extraction follow-up.
-Issue #428 remains open until the setup dependency lands and integration review
+Issue #428 remains open until Pi lands and integration review
 is complete.
 
 The final setup rebase onto main carries the shared guarded-write changes from
