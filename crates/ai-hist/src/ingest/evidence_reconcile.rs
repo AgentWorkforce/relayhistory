@@ -527,9 +527,14 @@ fn reconcile_history(
     Ok(())
 }
 
-/// Clear `updates.jsonl` token facts on every Grok row except the turns'
-/// chosen tails. A tail that moved is a real change; a settled tail stays
-/// as the demotion `GROK_TURN_TOKEN_ASSIGN` already left in place.
+/// Clear `updates.jsonl` token facts on the Grok rows this local read still
+/// owns, except the turns' chosen tails. A tail that moved is a real change;
+/// a settled tail stays as the demotion `GROK_TURN_TOKEN_ASSIGN` already left
+/// in place.
+///
+/// Remote-only rows, and rows this pass just handed back to remote, keep the
+/// usage they already had. This runs after [`finish`], so a demoted row is
+/// already `remote`.
 pub(crate) fn clear_grok_turn_tokens_except(
     conn: &Connection,
     session_id: &str,
@@ -539,6 +544,7 @@ pub(crate) fn clear_grok_turn_tokens_except(
     conn.prepare_cached(
         "UPDATE session_events SET token_json = NULL \
          WHERE source = 'grok' AND session_id = ?1 \
+           AND location <> 'remote' \
            AND json_extract(token_json, '$.source') = 'updates.jsonl' \
            AND event_uid NOT IN (SELECT value FROM json_each(?2))",
     )?
@@ -1094,6 +1100,38 @@ mod tests {
             .expect("the shared prompt is still stored");
         assert_eq!(moved.1, id);
         assert_eq!(moved.3, "other");
+    }
+
+    #[test]
+    fn a_token_clear_keeps_usage_on_a_remote_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::open_db(&dir.path().join("history.db")).unwrap();
+        let token = r#"{"source":"updates.jsonl","turn":1}"#;
+        for (uid, location) in [
+            ("local-e", "local"),
+            ("remote-e", "remote"),
+            ("both-e", "both"),
+        ] {
+            conn.execute(
+                "INSERT INTO session_events \
+                 (source, session_id, ts_ms, role, kind, text, event_uid, token_json, location) \
+                 VALUES ('grok', 's', 1, 'assistant', 'text', 'x', ?1, ?2, ?3)",
+                params![uid, token, location],
+            )
+            .unwrap();
+        }
+        super::clear_grok_turn_tokens_except(&conn, "s", &[]).unwrap();
+        let token_of = |uid: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT token_json FROM session_events WHERE event_uid = ?1",
+                [uid],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(token_of("local-e"), None);
+        assert_eq!(token_of("both-e"), None);
+        assert_eq!(token_of("remote-e").as_deref(), Some(token));
     }
 
     fn muse_record(
