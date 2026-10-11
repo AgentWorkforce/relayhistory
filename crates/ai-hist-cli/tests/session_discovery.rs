@@ -104,7 +104,7 @@ fn discover_streams_jsonl_rows_then_a_summary() {
 
     let summary = lines.last().expect("a summary line");
     assert_eq!(summary["type"], "summary");
-    assert_eq!(summary["contract_version"], 4);
+    assert_eq!(summary["contract_version"], 5);
     assert_eq!(summary["scope"], "local");
     assert_eq!(summary["discovered"], 2);
     assert_eq!(summary["skipped_unchanged"], 0);
@@ -160,7 +160,7 @@ fn list_serves_the_catalog_after_the_provider_files_are_gone() {
         String::from_utf8_lossy(&output.stderr)
     );
     let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(payload["contract_version"], 4);
+    assert_eq!(payload["contract_version"], 5);
     assert_eq!(payload["scope"], "local");
     let sessions = payload["sessions"].as_array().unwrap();
     assert_eq!(sessions.len(), 2);

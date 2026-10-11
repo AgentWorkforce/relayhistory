@@ -241,6 +241,7 @@
       "session_id": "sess_codex_recovered_span",
       "source": "codex",
       "source_stamp": "<n>:1453",
+      "title": null,
       "workspace_roots_json": null
     }
   ],

@@ -189,6 +189,7 @@
       "session_id": "compact-session",
       "source": "claude",
       "source_stamp": "<n>:1599",
+      "title": null,
       "workspace_roots_json": null
     }
   ],

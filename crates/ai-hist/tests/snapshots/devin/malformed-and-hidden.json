@@ -181,6 +181,7 @@
       "session_id": "fixture-devin-partial",
       "source": "devin",
       "source_stamp": "<n>:<n>:3:3:6:<n>:2:3:<n>|absent",
+      "title": null,
       "workspace_roots_json": null
     }
   ],

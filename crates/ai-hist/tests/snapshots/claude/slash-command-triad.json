@@ -375,6 +375,7 @@
       "session_id": "slash-session",
       "source": "claude",
       "source_stamp": "<n>:3667",
+      "title": null,
       "workspace_roots_json": null
     }
   ],

@@ -9,6 +9,24 @@ use anyhow::Result;
 use rusqlite::{params, OptionalExtension};
 use std::collections::BTreeSet;
 
+/// The session's title, unless it is still OpenCode's placeholder. One
+/// primary-key lookup on the row enumeration already read.
+pub(super) fn opencode_sqlite_title(
+    snapshot: &OpencodeReadSnapshot,
+    locator: &str,
+) -> Result<Option<String>> {
+    if !snapshot.session_columns.contains("title") {
+        return Ok(None);
+    }
+    let raw: Option<String> = snapshot
+        .conn
+        .prepare_cached("SELECT title FROM session WHERE id = ?")?
+        .query_row([locator], |row| row.get(0))
+        .optional()?
+        .flatten();
+    Ok(crate::ingest::titles::opencode_title(raw.as_deref()))
+}
+
 pub(super) fn opencode_sqlite_prompt(
     scan: &ScanEnv<'_>,
     snapshot: &OpencodeReadSnapshot,

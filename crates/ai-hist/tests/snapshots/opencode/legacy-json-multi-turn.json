@@ -187,6 +187,7 @@
       "session_id": "ses_child",
       "source": "opencode",
       "source_stamp": "993:4:<n>:3fc9ab016cf1893f",
+      "title": "subagent child",
       "workspace_roots_json": null
     },
     {
@@ -206,6 +207,7 @@
       "session_id": "ses_multi",
       "source": "opencode",
       "source_stamp": "1986:8:<n>:d38fb05dec856e9d",
+      "title": "multi turn",
       "workspace_roots_json": null
     }
   ],

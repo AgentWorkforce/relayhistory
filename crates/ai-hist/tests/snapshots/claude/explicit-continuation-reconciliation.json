@@ -219,6 +219,7 @@
       "session_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
       "source": "claude",
       "source_stamp": "<n>:781",
+      "title": null,
       "workspace_roots_json": null
     },
     {
@@ -238,6 +239,7 @@
       "session_id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
       "source": "claude",
       "source_stamp": "<n>:894",
+      "title": null,
       "workspace_roots_json": null
     }
   ],

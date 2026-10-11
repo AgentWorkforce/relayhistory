@@ -25,8 +25,8 @@
 
 use super::control::ControlKind;
 use super::{
-    insert_session_event, insert_tool_call, upsert_file_edit_from_call, upsert_session, EventRow,
-    RawMessageFacts, SessionCatalogRow, ToolCallRef, OPENCODE_MARKER_COMPACTION_BOUNDARY,
+    insert_session_event, insert_tool_call, titles, upsert_file_edit_from_call, ActivityWindow,
+    EventRow, RawMessageFacts, SessionCatalogRow, ToolCallRef, OPENCODE_MARKER_COMPACTION_BOUNDARY,
 };
 use crate::relationship_capture::{
     record_relationship_replacing_child_model, ObservedRelationship,
@@ -50,6 +50,36 @@ pub(crate) struct OpencodeSessionInfo {
     pub directory: Option<String>,
     pub created_ms: Option<i64>,
     pub updated_ms: Option<i64>,
+    /// `session.title`, through [`super::titles::opencode_title`].
+    pub title: Option<String>,
+}
+
+impl OpencodeSessionInfo {
+    /// The `session` columns both SQLite loaders read, a missing one as `NULL`.
+    fn columns(session_columns: &BTreeSet<String>) -> String {
+        [
+            "id",
+            "parent_id",
+            "directory",
+            "time_created",
+            "time_updated",
+            "title",
+        ]
+        .map(|name| optional_column(session_columns, name))
+        .join(", ")
+    }
+
+    /// One row selected by [`Self::columns`]. An empty `parent_id` is none.
+    fn from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            parent_id: row.get::<_, Option<String>>(1)?.filter(|id| !id.is_empty()),
+            directory: row.get(2)?,
+            created_ms: row.get(3)?,
+            updated_ms: row.get(4)?,
+            title: super::titles::opencode_title(row.get::<_, Option<String>>(5)?.as_deref()),
+        })
+    }
 }
 
 /// One message envelope. `raw` is kept so nothing has to be re-read from the
@@ -178,22 +208,12 @@ fn read_session_info(src: &Connection, session_id: &str) -> Result<Option<Openco
     if !session_columns.contains("id") {
         return Ok(None);
     }
-    let parent = optional_column(&session_columns, "parent_id");
-    let directory = optional_column(&session_columns, "directory");
-    let created = optional_column(&session_columns, "time_created");
-    let updated = optional_column(&session_columns, "time_updated");
-    let sql =
-        format!("SELECT id, {parent}, {directory}, {created}, {updated} FROM session WHERE id = ?");
+    let sql = format!(
+        "SELECT {} FROM session WHERE id = ?",
+        OpencodeSessionInfo::columns(&session_columns)
+    );
     let info = src
-        .query_row(&sql, [session_id], |row| {
-            Ok(OpencodeSessionInfo {
-                id: row.get::<_, String>(0)?,
-                parent_id: row.get::<_, Option<String>>(1)?,
-                directory: row.get::<_, Option<String>>(2)?,
-                created_ms: row.get::<_, Option<i64>>(3)?,
-                updated_ms: row.get::<_, Option<i64>>(4)?,
-            })
-        })
+        .query_row(&sql, [session_id], OpencodeSessionInfo::from_row)
         // `optional()`, not `.ok()`. A failed query is not an absent session:
         // a lock held past the busy timeout, a provider value of a type this
         // row mapping cannot take, a corrupted page — every one of them became
@@ -203,11 +223,7 @@ fn read_session_info(src: &Connection, session_id: &str) -> Result<Option<Openco
         // there, so the retry the failure called for never happens.
         .optional()
         .with_context(|| format!("reading OpenCode session {session_id}"))?;
-    let Some(mut info) = info else {
-        return Ok(None);
-    };
-    info.parent_id = info.parent_id.filter(|value| !value.is_empty());
-    Ok(Some(info))
+    Ok(info)
 }
 
 /// This session's messages that parse, in the store's row order.
@@ -414,13 +430,9 @@ pub(crate) fn load_all_from_sqlite(src: &Connection) -> Result<OpencodeStoreLoad
     if !session_columns.contains("id") {
         return Ok(load);
     }
-    let parent = optional_column(&session_columns, "parent_id");
-    let directory = optional_column(&session_columns, "directory");
-    let created = optional_column(&session_columns, "time_created");
-    let updated = optional_column(&session_columns, "time_updated");
     let sql = format!(
-        "SELECT id, {parent}, {directory}, {created}, {updated} FROM session \
-         WHERE id IS NOT NULL AND id <> ''"
+        "SELECT {} FROM session WHERE id IS NOT NULL AND id <> ''",
+        OpencodeSessionInfo::columns(&session_columns)
     );
     // Mapped one row at a time. A value the mapping cannot take is one
     // session's problem; failing to *step* the statement is the store's, and
@@ -430,23 +442,14 @@ pub(crate) fn load_all_from_sqlite(src: &Connection) -> Result<OpencodeStoreLoad
         let mut stmt = src.prepare(&sql)?;
         let rows = stmt.query_map([], |row| {
             let id = row.get::<_, String>(0);
-            let mapped = (|| -> rusqlite::Result<OpencodeSessionInfo> {
-                Ok(OpencodeSessionInfo {
-                    id: row.get::<_, String>(0)?,
-                    parent_id: row.get::<_, Option<String>>(1)?,
-                    directory: row.get::<_, Option<String>>(2)?,
-                    created_ms: row.get::<_, Option<i64>>(3)?,
-                    updated_ms: row.get::<_, Option<i64>>(4)?,
-                })
-            })();
+            let mapped = OpencodeSessionInfo::from_row(row);
             Ok((id, mapped))
         })?;
         for row in rows {
             super::check_capture_cancelled()?;
             let (id, mapped) = row?;
             match mapped {
-                Ok(mut info) => {
-                    info.parent_id = info.parent_id.filter(|value| !value.is_empty());
+                Ok(info) => {
                     infos.insert(info.id.clone(), info);
                 }
                 Err(error) => {
@@ -757,6 +760,7 @@ pub(crate) fn load_from_json_tree(session_file: &Path) -> Result<Option<Opencode
         updated_ms: time
             .and_then(|time| time.get("updated"))
             .and_then(Value::as_i64),
+        title: super::titles::opencode_title(object.get("title").and_then(Value::as_str)),
     };
     // `session/<scope>/<id>.json` → the tree root is two levels up; a session
     // file sitting directly under `session/` is one.
@@ -1761,7 +1765,7 @@ fn normalize_session(
         }
     }
 
-    upsert_session(
+    titles::upsert_titled(
         conn,
         &SessionCatalogRow {
             session_id,
@@ -1773,6 +1777,8 @@ fn normalize_session(
             last_assistant_text: last_assistant_text.as_deref(),
             raw_path: Some(raw_path),
         },
+        ActivityWindow::Expand,
+        loaded.session.title.as_deref(),
     )?;
 
     // `session.parentID` names the parent outright, so the child identity is

@@ -880,6 +880,7 @@
       "session_id": "muse-a001",
       "source": "muse",
       "source_stamp": "<n>:15581|subagent/muse-c001/session.jsonl=<n>:2880|subagent/muse-c001/subagent/muse-c002/session.jsonl=<n>:1355|subagent/muse-e001/session.jsonl=<n>:1352",
+      "title": null,
       "workspace_roots_json": null
     }
   ],
