@@ -149,7 +149,9 @@ pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 3;
 /// hydrates retires the parent history a Codex 0.133--0.148 fork copies
 /// straight after its own `session_meta`, which sync's
 /// `codex_fork_replay_gate` generation 2 retires.
-pub(crate) const HYDRATION_PARSER_VERSION: i64 = 17;
+/// Version 18: re-read unchanged Codex recordings once to retain embedded
+/// images, including checkpoints written by generation 17's fork replay fix.
+pub(crate) const HYDRATION_PARSER_VERSION: i64 = 18;
 
 #[derive(Debug, Clone)]
 pub struct HydrateSessionOptions {
@@ -9374,6 +9376,59 @@ mod tests {
         assert_ne!(
             after.status, "unchanged",
             "a same-size, same-mtime rewrite of a child must not be served from its cursor"
+        );
+    }
+
+    #[test]
+    fn generation_17_hydration_backfills_embedded_images_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/08/31");
+        fs::create_dir_all(&day).unwrap();
+        let path = day.join("rollout-images.jsonl");
+        fs::write(&path, concat!(
+            "{\"timestamp\":\"2026-08-31T10:00:00Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"image-upgrade\",\"cwd\":\"/work/app\"}}\n",
+            "{\"timestamp\":\"2026-08-31T10:00:01Z\",\"type\":\"response_item\",\"payload\":{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,iVBORw0KGgo=\"}]}}\n",
+            "{\"timestamp\":\"2026-08-31T10:00:02Z\",\"type\":\"event_msg\",\"payload\":{\"type\":\"task_complete\"}}\n",
+        )).unwrap();
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "codex", "image-upgrade", Some(&path));
+        drop(conn);
+        let opts = options("codex", "image-upgrade");
+        hydrate_session_at_with_home(&db, &opts, dir.path()).unwrap();
+        let conn = open_db(&db).unwrap();
+        let image_count = |conn: &Connection| {
+            conn.query_row("SELECT count(*) FROM session_events WHERE session_id='image-upgrade' AND raw_kind='input_image'", [], |row| row.get::<_,i64>(0)).unwrap()
+        };
+        assert_eq!(image_count(&conn), 1);
+        conn.execute(
+            "DELETE FROM session_events WHERE session_id='image-upgrade'",
+            [],
+        )
+        .unwrap();
+        for table in [
+            "session_hydration_checkpoints",
+            "observation_hydration_checkpoints",
+        ] {
+            conn.execute(
+                &format!("UPDATE {table} SET parser_version=17 WHERE source='codex'"),
+                [],
+            )
+            .unwrap();
+        }
+        drop(conn);
+        hydrate_session_at_with_home(&db, &opts, dir.path()).unwrap();
+        let conn = open_db(&db).unwrap();
+        assert_eq!(
+            image_count(&conn),
+            1,
+            "the base generation 17 must reread unchanged image evidence"
+        );
+        drop(conn);
+        let unchanged = hydrate_session_at_with_home(&db, &opts, dir.path()).unwrap();
+        assert_eq!(
+            unchanged.status, "unchanged",
+            "the upgrade must not reread indefinitely"
         );
     }
 

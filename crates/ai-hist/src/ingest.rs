@@ -3273,27 +3273,6 @@ const CODEX_STATE_MARKER_KEY: &str = "codex_state_markers_v1";
 /// Force one reread even for marker-only recordings with no old events.
 const CODEX_IMAGE_CAPTURE_KEY: &str = "codex_image_capture_v1";
 
-/// Whether the rollout behind a stamp-map record was last read by a parser
-/// older than the state-marker generation.
-///
-/// Recorded on the rollout's own stamp record, not inferred from the markers
-/// a session holds: a rollout with no `token_count` legitimately has no
-/// `usage_snapshot`, a marker observed only remotely says nothing about the
-/// local file, and either would make a marker probe re-read the rollout on
-/// every sync for as long as the backfill stays open.
-fn rollout_owes_capture(record: Option<&Map<String, Value>>, state_markers_pending: bool) -> bool {
-    (state_markers_pending && rollout_owes_state_markers(record))
-        || !record.is_some_and(|r| r.contains_key(CODEX_IMAGE_CAPTURE_KEY))
-}
-
-fn rollout_owes_state_markers(record: Option<&Map<String, Value>>) -> bool {
-    record
-        .and_then(|r| r.get("state_markers"))
-        .and_then(Value::as_i64)
-        .unwrap_or(0)
-        < CODEX_STATE_MARKER_GENERATION
-}
-
 /// Whether this provider still owes a one-time raw-facts backfill pass.
 fn raw_facts_backfill_pending(state: &Map<String, Value>, key: &str) -> bool {
     state.get(key).and_then(Value::as_i64).unwrap_or(0) < RAW_MESSAGE_FACTS_GENERATION
@@ -4881,7 +4860,7 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                             && crate::continuity::codex_evidence_names_fork(conn, &key)? => {}
                     // Indexed before its state records were stored: re-read
                     // once so its counters and turn settings are captured.
-                    Some(_) if rollout_owes_capture(record, backfill_state_markers) => {}
+                    Some(_) if images::rollout_owes_capture(record, backfill_state_markers) => {}
                     Some(id)
                         if codex_session_evidence_exists(conn, id)?
                             && !(backfill_fidelity
@@ -6236,16 +6215,8 @@ fn ingest_codex_rollout_incremental(
                 },
             )?;
         }
-        outcome.events += images::capture_codex(
-            conn,
-            session_id,
-            cwd,
-            branch,
-            index,
-            ts_ms,
-            turn_id.as_deref(),
-            &value,
-        )?;
+        outcome.events +=
+            images::capture_rollout(conn, meta, &value, (index, ts_ms, turn_id.as_deref()))?;
         let human_outcome = human_messages.observe(&value);
         if human_outcome == codex::HumanMessageOutcome::Suppressed {
             // The mirrored encoding of the turn just stored. Its twin wrote

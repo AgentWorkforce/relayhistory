@@ -3,6 +3,48 @@
 use super::*;
 use base64::Engine;
 
+/// Whether the rollout behind a stamp-map record was last read by a parser
+/// older than the state-marker generation.
+///
+/// Recorded on the rollout's own stamp record, not inferred from the markers
+/// a session holds: a rollout with no `token_count` legitimately has no
+/// `usage_snapshot`, a marker observed only remotely says nothing about the
+/// local file, and either would make a marker probe re-read the rollout on
+/// every sync for as long as the backfill stays open.
+pub(super) fn rollout_owes_capture(
+    record: Option<&Map<String, Value>>,
+    state_markers_pending: bool,
+) -> bool {
+    (state_markers_pending && rollout_owes_state_markers(record))
+        || !record.is_some_and(|r| r.contains_key(CODEX_IMAGE_CAPTURE_KEY))
+}
+
+fn rollout_owes_state_markers(record: Option<&Map<String, Value>>) -> bool {
+    record
+        .and_then(|r| r.get("state_markers"))
+        .and_then(Value::as_i64)
+        .unwrap_or(0)
+        < CODEX_STATE_MARKER_GENERATION
+}
+
+pub(super) fn capture_rollout(
+    conn: &Connection,
+    meta: &CodexSessionMeta,
+    value: &Value,
+    position: (usize, i64, Option<&str>),
+) -> Result<usize> {
+    capture_codex(
+        conn,
+        &meta.session_id,
+        Some(&meta.cwd),
+        meta.git_branch.as_deref(),
+        position.0,
+        position.1,
+        position.2,
+        value,
+    )
+}
+
 const MAX_IMAGE_BYTES: usize = 1_048_576;
 
 fn image_markdown(url: &str) -> Option<String> {
