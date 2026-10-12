@@ -12,6 +12,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- A sweep resolves a session's project key and presence once per write unit.
 - A Hermes read treats a sidecar that disappears mid-check as absent.
 - A cold sweep reads a transcript once and checks its commit digest from those bytes.
 

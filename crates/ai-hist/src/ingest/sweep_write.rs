@@ -63,6 +63,9 @@ impl<'c> SweepWrite<'c> {
                 return Err(error);
             }
         };
+        // Presence and the catalog project key are read once for this guard,
+        // including across the chunk commits it opens. Drop clears them.
+        super::sweep_session::arm(conn);
         Ok(Self {
             conn,
             owned,
@@ -130,6 +133,7 @@ impl<'c> SweepWrite<'c> {
 
 impl Drop for SweepWrite<'_> {
     fn drop(&mut self) {
+        super::sweep_session::disarm();
         // An error or a cancellation unwound past the guard: nothing of the
         // open chunk is kept. Chunks a Claude transcript committed before it
         // stay (its catalog row and the rows of those chunks), but its cursor

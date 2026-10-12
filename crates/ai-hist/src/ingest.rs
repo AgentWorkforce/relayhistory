@@ -41,6 +41,7 @@ pub(crate) mod muse;
 pub(crate) mod opencode;
 pub(crate) mod opencode_sweep;
 pub(crate) mod path_scope;
+mod sweep_session;
 mod sweep_write;
 pub(crate) mod titles;
 pub(crate) mod tool_result_facts;
@@ -11490,115 +11491,7 @@ struct EventRow<'a> {
 /// Write one normalized event, including the columns only some providers can
 /// fill.
 fn insert_session_event(conn: &Connection, row: &EventRow<'_>) -> Result<()> {
-    let &EventRow {
-        source,
-        session_id,
-        project,
-        cwd,
-        git_branch,
-        message_id,
-        parent_id,
-        ts_ms,
-        role,
-        kind,
-        text,
-        model,
-        token_json,
-        provider,
-        stop_reason,
-        identity,
-        event_uid,
-        tool_result_facts,
-        raw_facts,
-        raw_kind,
-    } = row;
-    crate::mark_session_presence(conn, source, session_id, SessionLocation::Local)?;
-    let blank = ToolResultFacts::default();
-    let tool_result_facts = tool_result_facts.unwrap_or(&blank);
-    // Stamp `project_key` as the row is inserted rather than sweeping for it
-    // afterwards. An UPDATE that changes a `session_events` row re-stamps its
-    // change-feed revision, so a sweep would report a second upsert for every
-    // event of every session on every sync.
-    //
-    // The owning session's key is preferred when the row already exists,
-    // because it may be stronger than anything derivable here (a Codex
-    // `repository_url`, or a key inherited from a delegating parent). But it
-    // is not depended on: the Codex walk writes a rollout's events *before*
-    // upserting its session, and a delegated thread never gets a catalog row
-    // at all, so a lookup alone would leave those events null and hand them
-    // straight back to the sweep this design exists to avoid. Resolving the
-    // cwd is the fallback, and it agrees with what `upsert_session` will store
-    // for the same directory, so the ordinary case converges with no rewrite.
-    //
-    // On conflict the order is the same but the stored value comes second, so
-    // a re-ingest can only ever improve the key. The cwd fallback is last
-    // precisely because it is the weakest: for a delegated child there is no
-    // `sessions` row to consult, and its stored key is the parent's, inherited
-    // by the denormalizing pass. Preferring the incoming value there -- which
-    // is what a plain `COALESCE(excluded.project_key, ...)` does now that the
-    // fallback makes it non-null -- would overwrite a canonical repository key
-    // with a machine-local path on every re-ingest, and hand every one of
-    // those events back to the sweep to fix, reporting a second change-feed
-    // upsert each time.
-    //
-    // The *method* is stamped beside the key, always from the same arm that
-    // produced it. It is what tells a later pass whether this row worked its
-    // key out from its own directory or was lent one, and a row that carries a
-    // key with no method is indistinguishable from one that was never
-    // resolved: the denormalizing pass would then replace a delegated
-    // thread's own repository with its delegator's, on every sync, forever.
-    // Reuse the compiled statement across records.
-    let resolved = cwd.and_then(|cwd| crate::project_identity::identity_for(Some(cwd), None));
-    let resolved_key = resolved.as_ref().map(|(key, _)| key.as_str());
-    let resolved_method = resolved.as_ref().map(|(_, method)| method.as_str());
-    evidence_reconcile::note_event(source, session_id, event_uid);
-    conn.prepare_cached(evidence_reconcile::write_sql(
-        &evidence_reconcile::SESSION_EVENT_UPSERT,
-        &evidence_reconcile::SESSION_EVENT_REWRITE,
-    ))?
-    .execute(params![
-        source,
-        session_id,
-        project,
-        cwd,
-        git_branch,
-        message_id,
-        parent_id,
-        ts_ms,
-        role,
-        kind,
-        text,
-        model,
-        token_json,
-        provider,
-        event_uid,
-        resolved_key,
-        resolved_method,
-        tool_result_facts.tool_use_id,
-        tool_result_facts.payload_bytes,
-        tool_result_facts.payload_truncated.map(i64::from),
-        tool_result_facts.payload_hash,
-        tool_result_facts.call_index,
-        tool_result_facts.event_index,
-        tool_result_facts.result_status,
-        tool_result_facts.event_source,
-        tool_result_facts.error_signal,
-        tool_result_facts.subagent_session_id,
-        tool_result_facts.agent_id,
-        identity.request_id.or(raw_facts.request_id),
-        identity.provider_message_id,
-        stop_reason.or(raw_facts.stop_reason),
-        raw_facts.agent_version,
-        raw_facts.is_sidechain,
-        raw_facts.is_meta,
-        raw_facts.turn_id,
-        raw_facts.request_span,
-        RAW_MESSAGE_FACTS_VERSION,
-        raw_kind,
-        raw_facts.control_kind,
-        raw_facts.record_token_json,
-    ])?;
-    Ok(())
+    sweep_session::write_event(conn, row)
 }
 
 /// One tool call as a provider record names it, with the record context its
@@ -11636,7 +11529,7 @@ fn insert_tool_call(
         ts_ms,
         ..
     } = *call;
-    crate::mark_session_presence(conn, source, session_id, SessionLocation::Local)?;
+    sweep_session::note_presence(conn, source, session_id)?;
     evidence_reconcile::note_tool(source, session_id, tool_use_id);
     conn.prepare_cached(evidence_reconcile::write_sql(
         &evidence_reconcile::TOOL_CALL_UPSERT,
@@ -11694,7 +11587,7 @@ fn upsert_file_edit_from_call(
         git_branch,
         cwd,
     } = *call;
-    crate::mark_session_presence(conn, source, session_id, SessionLocation::Local)?;
+    sweep_session::note_presence(conn, source, session_id)?;
     evidence_reconcile::note_edit(source, session_id, tool_use_id);
     conn.prepare_cached(evidence_reconcile::write_sql(
         &evidence_reconcile::FILE_EDIT_UPSERT,
@@ -11969,6 +11862,8 @@ fn upsert_session_inner(
             project_key_method,
         ],
     )?;
+    // Events earlier in this unit may have cached a miss or a weaker key.
+    sweep_session::invalidate(conn, source, session_id);
     crate::upsert_session_presence(
         conn,
         source,
