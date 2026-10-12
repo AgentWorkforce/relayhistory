@@ -8095,13 +8095,15 @@ mod tests {
         );
         // And the whole pass, validation included, is a *constant*: two
         // cursors' worth of bounded windows plus the append. Not a fraction
-        // of the file — the same six windows would validate a 200 MB
+        // of the file — the same four windows would validate a 200 MB
         // transcript, which is the property that matters and the one a
         // "much smaller than the file" assertion states only by accident.
+        // Each walk hashes the saved prefix and the grown file at open. The
+        // commit reuses that digest: the file did not move during the walk.
         let window = super::transcript_cursor::prefix_window_bytes(size as u64) as i64;
         assert_eq!(
             appended.bytes_read,
-            6 * window + 2 * addition.len() as i64,
+            4 * window + 2 * addition.len() as i64,
             "a changed pass pays its records plus a fixed number of bounded windows"
         );
         assert_eq!(
@@ -10014,9 +10016,9 @@ mod tests {
             first.len() as u64,
             "the records are the file"
         );
-        assert!(
-            first_pass.validation_bytes > 0,
-            "opening and committing a cursor hashes provider bytes, and they count"
+        assert_eq!(
+            first_pass.validation_bytes, 0,
+            "a cold pass hashes its digest from the bytes it already read"
         );
 
         let addition = format!(

@@ -31,9 +31,9 @@ mod storage;
 
 pub use parse::scan_claude_transcript;
 pub(crate) use parse::{capture_folded, finish_claude_fold, fold_claude_record};
-use parse::{fold_claude_line, next_record, push_unique, record_ts_ms, string_field};
+use parse::{fold_claude_line, push_unique, record_ts_ms, string_field};
 #[cfg(test)]
-use parse::named_at;
+use parse::{named_at, next_record};
 
 use storage::{load_pending, table_exists};
 #[cfg(test)]
@@ -180,11 +180,7 @@ pub fn scan_codex_rollout_counted(path: &Path) -> Result<(Option<ContinuityEvide
     // `session_meta` line and nothing else, and a rollout reaches hundreds of
     // megabytes — `read_to_string` here made every Codex hydration pay the
     // file's size for a fact that lives in its first few hundred bytes.
-    let file = std::fs::File::open(path)
-        .with_context(|| format!("reading Codex rollout {}", path.display()))?;
-    let mut reader = std::io::BufReader::new(file);
-    let mut raw = Vec::new();
-    let Some(bytes_read) = next_record(&mut reader, &mut raw)
+    let Some((raw, bytes_read)) = crate::ingest::cold_read::opening_record(path)
         .with_context(|| format!("reading Codex rollout {}", path.display()))?
     else {
         return Ok((None, 0));

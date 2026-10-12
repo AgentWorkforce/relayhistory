@@ -1377,7 +1377,11 @@ fn parse_record(line: &[u8]) -> Option<Value> {
 /// One file handle regardless of size. Files inside the head budget are read
 /// once and serve as their own tail.
 fn read_bounded_jsonl(scan: &ScanEnv<'_>, path: &Path) -> Result<BoundedJsonl> {
-    let mut file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    if let Some((head, tail)) = crate::ingest::cold_read::live_regions(path) {
+        return Ok(BoundedJsonl { head, tail });
+    }
+    let mut file = crate::ingest::cold_read::open_file(path)
+        .with_context(|| format!("opening {}", path.display()))?;
     scan.note_open();
     let len = file.metadata()?.len();
     if len <= HEAD_SCAN_MAX_BYTES {
