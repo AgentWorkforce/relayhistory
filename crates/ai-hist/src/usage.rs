@@ -1232,6 +1232,14 @@ mod tests {
         let attributed =
             attribute_usage_to_prompts(&[prompt.clone(), image.clone(), answer.clone()], "codex");
         assert!(attributed.contains_key(&(100, "Explain this".into())));
+        let mut parentless = answer.clone();
+        parentless.parent_id = None;
+        let attributed =
+            attribute_usage_to_prompts(&[prompt.clone(), image.clone(), parentless], "codex");
+        assert!(
+            attributed.contains_key(&(100, "Explain this".into())),
+            "native Codex records have no parent ID"
+        );
         // An image-only message remains a user boundary but is never a fake prompt.
         image.message_id = Some("image-only".into());
         image.ts_ms = 150;
