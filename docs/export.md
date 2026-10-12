@@ -49,3 +49,10 @@ cursor of the page just read serves that page again until the next page is
 read, and a snapshot lives in the process that began it until it is closed or
 expires (one hour by default).
 Abandoned snapshots expire.
+
+A page holds 100 records and at most 1 MiB. Pass `publishedLimits` — a
+delivery receipt, or the body of `GET /v1/delivery/limits` — and a positive
+integer `maxRecords` becomes the record cap (never above 10,000). The byte
+cap stays 1 MiB: `maxRequestBytes` is the server's decoded HTTP body, not
+the page's JSON. `exportLimitsFromPublished` is that same choice without
+opening a snapshot. An explicit `limits` value is used as given.
