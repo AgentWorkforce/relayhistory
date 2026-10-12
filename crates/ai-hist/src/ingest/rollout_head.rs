@@ -115,27 +115,30 @@ pub(super) fn open_codex_walk(
     if reader.start_offset() != 0 || meta.fork_parent_id.is_none() {
         return Ok((reader, gate, 0));
     }
+    // The window reads one byte past the limit, so a file of exactly the
+    // limit is told from a longer one.
     let read = Cell::new(0u64);
-    let reached_end = || read.get() < LEADING_BYTE_LIMIT;
+    let reached_end = || read.get() <= LEADING_BYTE_LIMIT;
     if let Some(bytes) = cold_read::fresh(path) {
         let records = records_after_first(io::Cursor::new(&bytes[..]), &read);
         gate.probe_copied_history(records, reached_end);
     } else {
-        let mut shared = cold_read::open_shared(path)?;
-        let records = records_after_first(BufReader::new(shared.file()), &read);
+        // Its own handle, not the sweep's parked one: the walk's reader holds
+        // that, and the probe must not take a handle parked for another file.
+        let records = records_after_first(BufReader::new(std::fs::File::open(path)?), &read);
         gate.probe_copied_history(records, reached_end);
     }
     Ok((reader, gate, read.get()))
 }
 
-/// The complete, parseable records after the first, within
+/// The complete, parseable records after the first, within one byte past
 /// [`LEADING_BYTE_LIMIT`], counting the bytes read into `read`. A read error
 /// ends them, as end of file does.
 fn records_after_first<'a>(
     reader: impl BufRead + 'a,
     read: &'a Cell<u64>,
 ) -> impl Iterator<Item = Value> + 'a {
-    let mut reader = reader.take(LEADING_BYTE_LIMIT);
+    let mut reader = reader.take(LEADING_BYTE_LIMIT + 1);
     let mut raw = Vec::new();
     std::iter::from_fn(move || {
         raw.clear();

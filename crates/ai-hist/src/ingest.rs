@@ -1605,6 +1605,12 @@ impl SweepRepairs {
         self.all
     }
 
+    /// These repairs less `sessions`.
+    fn without(mut self, sessions: &HashSet<(String, String)>) -> Self {
+        self.sessions.retain(|session| !sessions.contains(session));
+        self
+    }
+
     fn is_empty(&self) -> bool {
         !self.all && self.sessions.is_empty()
     }
@@ -1988,10 +1994,15 @@ pub(crate) fn merge_watch_roots(mut roots: Vec<discover::WatchRoot>) -> Vec<disc
 ///
 /// So partial success and fingerprint eligibility are tracked separately. A
 /// run may make progress and still be ineligible to arm the fast path.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct SweepCoverage {
     /// Sources counted into the fingerprint that this sweep could not read.
     unread: u64,
+    /// Sessions this sweep re-derived from byte zero of their own source.
+    /// What they hold is what that source yields to the current parser, so
+    /// holding less than the destination marker recorded is the parser
+    /// retiring rows (a fork's copied parent history), not a loss.
+    rederived: HashSet<(String, String)>,
 }
 
 impl SweepCoverage {
@@ -2004,8 +2015,16 @@ impl SweepCoverage {
         self.unread = self.unread.saturating_add(1);
     }
 
-    fn complete(self) -> bool {
+    fn complete(&self) -> bool {
         self.unread == 0
+    }
+
+    /// A session's source was read, from byte zero when `from_start`.
+    fn note_read(&mut self, source: &str, session_id: &str, from_start: bool) {
+        if from_start {
+            self.rederived
+                .insert((source.to_string(), session_id.to_string()));
+        }
     }
 }
 
@@ -2284,6 +2303,7 @@ fn sync_basic(
             FullSweepSeal {
                 all_sources_read: sweep_read_everything && coverage.complete(),
                 repairs: &repairs,
+                rederived: &coverage.rederived,
                 repair_plan_known,
                 destination,
                 fingerprint,
@@ -2314,6 +2334,7 @@ fn sync_basic(
 struct FullSweepSeal<'a> {
     all_sources_read: bool,
     repairs: &'a SweepRepairs,
+    rederived: &'a HashSet<(String, String)>,
     repair_plan_known: bool,
     destination: Option<DestinationSnapshot>,
     fingerprint: Option<String>,
@@ -2331,6 +2352,7 @@ fn seal_full_sweep(
     let FullSweepSeal {
         all_sources_read,
         repairs,
+        rederived,
         repair_plan_known,
         mut destination,
         fingerprint,
@@ -2357,7 +2379,7 @@ fn seal_full_sweep(
         match destination_shortfall_counted(conn, state, destination.take()) {
             Ok((outstanding, counted)) => {
                 destination = counted;
-                Some(outstanding)
+                Some(outstanding.without(rederived))
             }
             Err(error) => {
                 sync_note!("  [sync] could not re-check the destination: {error:#}");
@@ -4958,6 +4980,7 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
             // go with it -- a reclassified guardian would lose its fork edge
             // and, its evidence looking current, never be re-read for it.
             crate::continuity::capture_codex_rollout(conn, &rollout)?;
+            coverage.note_read("codex", &meta.session_id, outcome.from_start);
             inserted += outcome.prompts;
             events += outcome.events;
             // Topology is recorded by the full sync too, so delegation is
@@ -37307,6 +37330,74 @@ mod codex_fork_replay_tests {
         assert_eq!(prompts(&conn, CHILD), vec!["spawn prompt", "child prompt"]);
         assert_eq!(token_totals(&conn, CHILD), vec![900]);
         assert!(replay_marker(&conn, CHILD).is_none());
+    }
+
+    /// The full sweep that retires a fork's copy re-derives the fork from
+    /// byte zero, so the rows it no longer holds are not a destination loss:
+    /// the sweep records its fingerprint and the next sync is the fast path.
+    #[test]
+    fn the_sweep_that_retires_a_copy_is_not_a_destination_loss() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(
+            day.join("rollout-child.jsonl"),
+            paginated_fork(false, &[(CHILD_TURN, 1800, 300)]),
+        )
+        .unwrap();
+        let db = dir.path().join("history.db");
+        let roots = crate::ProviderRoots::from_home(
+            dir.path().to_path_buf(),
+            dir.path().join("opencode.db"),
+        );
+        assert!(
+            super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept
+        );
+        let conn = open_db(&db).unwrap();
+        // What a generation-1 build left: a copied event under the child,
+        // inside the span's lines, and a destination marker that counts it.
+        conn.execute_batch(&format!(
+            "CREATE TEMP TABLE planted AS SELECT * FROM session_events \
+               WHERE session_id = '{CHILD}' LIMIT 1;
+             UPDATE planted SET id = NULL, event_uid = '5:planted', message_id = 'planted';
+             INSERT INTO session_events SELECT * FROM planted;"
+        ))
+        .unwrap();
+        let state_path = dir.path().join(".sync-state.json");
+        let mut state = load_sync_state(&state_path).unwrap();
+        state.insert(CODEX_FORK_REPLAY_KEY.to_string(), json!(1));
+        state.insert(SOURCE_FINGERPRINT_KEY.into(), json!("g0/previous-build"));
+        state.insert(
+            DESTINATION_GENERATION_KEY.into(),
+            json!(destination_generation(&conn).unwrap()),
+        );
+        state.insert(
+            DESTINATION_HEAD_KEY.into(),
+            json!(destination_head(&conn).unwrap()),
+        );
+        fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+
+        assert!(
+            super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept
+        );
+        let planted: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE event_uid = '5:planted'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(planted, 0);
+        assert!(
+            !super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept,
+            "the retiring sweep sealed its fingerprint"
+        );
     }
 
     /// A store a generation-1 build wrote re-reads each fork once, retiring
