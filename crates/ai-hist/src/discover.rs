@@ -72,6 +72,7 @@ use serde_json::Value;
 
 mod claude_shallow;
 use claude_shallow::read_claude_shallow;
+mod observed_stamps;
 mod codex_shallow;
 pub(crate) use codex_shallow::CodexProvider;
 mod cursor_files;
@@ -3702,118 +3703,6 @@ pub(crate) const OBSERVED_SESSION_BY_LOCATOR_SQL: &str = "SELECT session_id FROM
        AND raw_locator=? AND access_state='available' \
      ORDER BY +session_id LIMIT 1";
 
-/// The stamp a candidate's session was last observed at through this
-/// adapter, with the session's id.
-///
-/// `None` unless that observation is `available` and the session is still
-/// catalogued -- the two conditions under which an unmoved stamp lets the
-/// candidate be served from the catalog instead of read.
-///
-/// One prepared-once statement per question rather than a fetch of the whole
-/// observation and the whole catalog row: this runs for every candidate file
-/// on every discovery pass, a sweep's included, and those per-call prepares
-/// and row decodes were 16% of a forced tick (#316). A caller that streams the
-/// row reads it afterwards, only for candidates that matched.
-fn observed_candidate_stamp(
-    conn: &Connection,
-    provider: &dyn ShallowSessionProvider,
-    candidate: &Candidate,
-) -> Result<Option<(String, Option<String>)>> {
-    let id = match candidate.session_id.as_ref() {
-        Some(id) => Some(id.clone()),
-        None => conn
-            .prepare_cached(OBSERVED_SESSION_BY_LOCATOR_SQL)?
-            .query_row(
-                params![
-                    candidate.source,
-                    provider.location().as_str(),
-                    provider.connector_id(),
-                    provider.connector_instance(),
-                    candidate.locator
-                ],
-                |r| r.get(0),
-            )
-            .optional()?,
-    };
-    let Some(id) = id else { return Ok(None) };
-    let key = observation_key(provider, candidate.source, &id);
-    key.validate()?;
-    let stamp = conn
-        .prepare_cached(
-            "SELECT o.source_stamp FROM session_observations o \
-             WHERE o.source = ?1 AND o.session_id = ?2 AND o.location = ?3 \
-               AND o.connector_id = ?4 AND o.connector_instance = ?5 \
-               AND o.access_state = 'available' \
-               AND EXISTS (SELECT 1 FROM sessions s \
-                     WHERE s.source = ?1 AND s.session_id = ?2)",
-        )?
-        .query_row(
-            params![
-                key.source,
-                key.session_id,
-                key.location.as_str(),
-                key.connector_id,
-                key.connector_instance
-            ],
-            |r| r.get::<_, Option<String>>(0),
-        )
-        .optional()?;
-    Ok(stamp.map(|stamp| (id, stamp)))
-}
-
-/// Whether this source was already examined at this exact stamp and found not
-/// to be a session.
-///
-/// Without this, every codex subagent thread and every claude sidecar — real
-/// files that legitimately produce no catalog row — was re-read on every
-/// single run, because "no row" left nothing for the stamp check to match.
-fn is_known_non_session(
-    conn: &Connection,
-    provider: &dyn ShallowSessionProvider,
-    source: &str,
-    locator: &str,
-    stamp: &str,
-) -> Result<bool> {
-    let known: Option<String> = conn
-        .prepare_cached(
-            "SELECT stamp FROM observation_discovery_skips WHERE source=? AND location=? \
-             AND connector_id=? AND connector_instance=? AND locator=?",
-        )?
-        .query_row(
-            params![
-                source,
-                provider.location().as_str(),
-                provider.connector_id(),
-                provider.connector_instance(),
-                locator
-            ],
-            |r| r.get(0),
-        )
-        .optional()?;
-    Ok(known.as_deref() == Some(stamp))
-}
-
-fn record_non_session(
-    conn: &Connection,
-    provider: &dyn ShallowSessionProvider,
-    source: &str,
-    locator: &str,
-    stamp: &str,
-) -> Result<()> {
-    conn.execute("INSERT INTO observation_discovery_skips(source,location,connector_id,connector_instance,locator,stamp,updated_ms) VALUES(?,?,?,?,?,?,?) ON CONFLICT(source,location,connector_id,connector_instance,locator) DO UPDATE SET stamp=excluded.stamp,updated_ms=excluded.updated_ms",params![source,provider.location().as_str(),provider.connector_id(),provider.connector_instance(),locator,stamp,now_ms()])?;
-    Ok(())
-}
-
-fn clear_non_session(
-    conn: &Connection,
-    provider: &dyn ShallowSessionProvider,
-    source: &str,
-    locator: &str,
-) -> Result<()> {
-    conn.execute("DELETE FROM observation_discovery_skips WHERE source=? AND location=? AND connector_id=? AND connector_instance=? AND locator=?",params![source,provider.location().as_str(),provider.connector_id(),provider.connector_instance(),locator])?;
-    Ok(())
-}
-
 /// Re-resolve the project identity of a row served straight from the catalog.
 ///
 /// The stamp shortcut is right about everything the transcript says and wrong
@@ -4548,6 +4437,7 @@ fn discover_sessions_with_worker_limit(
         .map(|provider| provider.begin_discovery_pass())
         .collect::<Result<Vec<_>>>()?;
     let conn = env.conn();
+    let _observed = observed_stamps::Guard::arm(conn, env.path_scope());
     let mut summary = DiscoverySummary {
         contract_version: SESSION_CATALOG_CONTRACT_VERSION,
         scope: options.scope,
@@ -4657,11 +4547,7 @@ fn discover_sessions_with_worker_limit(
 
     while position < candidates.len() {
         crate::ingest::check_capture_cancelled()?;
-        let window_cap = if emitted >= limit {
-            MAX_READ_WINDOW
-        } else {
-            (limit - emitted).min(MAX_READ_WINDOW)
-        };
+        let window_cap = observed_stamps::read_window(emitted, limit);
         let mut entries: Vec<WindowEntry<'_>> = Vec::new();
         let mut potential = 0usize;
         while position < candidates.len() && potential < window_cap {
@@ -4677,7 +4563,8 @@ fn discover_sessions_with_worker_limit(
             }
             let provider = providers[*provider_index];
             let expected = stored_stamp(&candidate.stamp);
-            let unchanged = match observed_candidate_stamp(conn, provider, candidate)? {
+            let unchanged = match observed_stamps::observed_candidate_stamp(conn, provider, candidate)?
+            {
                 Some((id, stamp)) if stamp.as_deref() == Some(expected.as_str()) => {
                     match identity {
                         // Nothing is streamed, so the row itself is not needed.
@@ -4720,7 +4607,7 @@ fn discover_sessions_with_worker_limit(
             // A source already examined and found not to be a session (a codex
             // subagent thread, a claude sidecar) is remembered by its stamp, so a
             // rescan costs a PK lookup instead of a fresh read every single run.
-            if is_known_non_session(
+            if observed_stamps::is_known_non_session(
                 conn,
                 provider,
                 candidate.source,
@@ -4866,7 +4753,7 @@ fn discover_sessions_with_worker_limit(
             let session = match read {
                 Ok(Some(session)) => session,
                 Ok(None) => {
-                    if let Err(error) = record_non_session(
+                    if let Err(error) = observed_stamps::record_non_session(
                         conn,
                         provider,
                         candidate.source,
@@ -4942,12 +4829,25 @@ fn discover_sessions_with_worker_limit(
                 window_error = Some(error);
                 break 'apply;
             }
+            // The snapshot still holds the stamp this write replaced. Drop it
+            // before a later window classifies the same session.
+            observed_stamps::note_observation(
+                conn,
+                provider,
+                candidate.source,
+                &session.session_id,
+                &candidate.locator,
+            );
             let mut row = fetch_catalog_row(conn, &row.source, &row.session_id)?.unwrap_or(row);
             row.from_cache = false;
             // A file that used to be skipped as a non-session (or was never one)
             // must not keep a stale marker once it resolves to a session.
-            if let Err(error) =
-                clear_non_session(conn, provider, candidate.source, &candidate.locator)
+            if let Err(error) = observed_stamps::clear_non_session(
+                conn,
+                provider,
+                candidate.source,
+                &candidate.locator,
+            )
             {
                 window_error = Some(error);
                 break 'apply;
@@ -4981,16 +4881,19 @@ fn discover_sessions_with_worker_limit(
         if let Some(error) = window_error {
             if has_writes {
                 let _ = conn.execute_batch("ROLLBACK");
+                observed_stamps::on_rollback(conn);
             }
             return Err(error);
         }
         if has_writes {
             if let Err(error) = crate::reconcile_claude_remote_relationships(conn) {
                 let _ = conn.execute_batch("ROLLBACK");
+                observed_stamps::on_rollback(conn);
                 return Err(error);
             }
             if let Err(error) = conn.execute_batch("COMMIT") {
                 let _ = conn.execute_batch("ROLLBACK");
+                observed_stamps::on_rollback(conn);
                 return Err(error.into());
             }
         }
