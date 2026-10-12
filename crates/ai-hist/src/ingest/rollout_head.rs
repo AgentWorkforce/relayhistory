@@ -93,6 +93,47 @@ fn collect_head_records(
     Ok((values, bytes_read))
 }
 
+/// Run `probe` over the records after a rollout's first, up to its verdict or
+/// [`LEADING_BYTE_LIMIT`], whichever comes first.
+///
+/// A copy that follows the child's `session_meta` is proven or ruled out at
+/// the child's first own turn, which every observed paginated fork reaches
+/// within its first 400 KiB; a copy longer than the window is still proven by
+/// a replayed turn ordered by UUIDv7, which comes in its first records. Only a
+/// fork read from byte zero pays for this read, and it stops at the verdict.
+pub(super) fn probe_codex_copied_history(
+    path: &Path,
+    probe: &mut codex::CopiedHistoryProbe,
+) -> Result<()> {
+    if let Some(bytes) = cold_read::fresh(path) {
+        return feed_probe(io::Cursor::new(&bytes[..]), probe);
+    }
+    let mut shared = cold_read::open_shared(path)?;
+    feed_probe(BufReader::new(shared.file()), probe)
+}
+
+fn feed_probe(reader: impl BufRead, probe: &mut codex::CopiedHistoryProbe) -> Result<()> {
+    let mut reader = reader.take(LEADING_BYTE_LIMIT);
+    let mut raw = Vec::new();
+    let mut first = true;
+    loop {
+        raw.clear();
+        if reader.read_until(b'\n', &mut raw)? == 0 || raw.last() != Some(&b'\n') {
+            return Ok(());
+        }
+        if std::mem::take(&mut first) {
+            continue;
+        }
+        // The walk steps the gate only for records with a payload object.
+        let Ok(value) = serde_json::from_slice::<Value>(trim_ascii_end(&raw)) else {
+            continue;
+        };
+        if value.get("payload").and_then(Value::as_object).is_some() && probe.observe(&value) {
+            return Ok(());
+        }
+    }
+}
+
 fn trim_ascii_end(raw: &[u8]) -> &[u8] {
     let mut end = raw.len();
     while end > 0 && raw[end - 1].is_ascii_whitespace() {

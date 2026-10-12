@@ -401,9 +401,17 @@ into the child's file. The rollout walk gates that copy (`ForkReplaySpan` in
 
 - The span **opens** at a `session_meta` after the file's first line whose
   `payload.id` is the parent the opening `session_meta` named in
-  `forked_from_id` or `thread_spawn.parent_thread_id`. A rollout that names no
-  such parent, or a fork that opens on something else (a guardian's
-  `compaction` item), is never gated.
+  `forked_from_id` or `thread_spawn.parent_thread_id` (Codex 0.151 and later).
+  Codex 0.133--0.148 (`history_mode: "paginated"`) copy the parent's history
+  straight after the child's `session_meta`, without the parent's: there the
+  span opens at line 1 when `codex::CopiedHistoryProbe` finds, before the
+  child's first own turn, a record only a copy can hold -- a turn ordered
+  before the fork, a `token_count`, or a `compacted` record (the child makes
+  no request and compacts nothing before its first turn). The probe reads the
+  head of a fork once, on a read from byte zero, and stops at its verdict.
+  `subagent_history_start_ordinal` is not used: 0.151+ writes the line of the
+  `thread_settings_applied` after the copy, 0.124--0.148 the file's line
+  count. A rollout that names no such parent is never gated.
 - It **closes** at the first `task_started` or `turn_context` whose turn is the
   child's: a UUIDv7 `turn_id` at or after the child thread's own UUIDv7
   timestamp (else its `session_meta` timestamp), or, for a legacy turn id,
@@ -414,7 +422,11 @@ into the child's file. The rollout walk gates that copy (`ForkReplaySpan` in
   `turn_id` of a replayed `task_started` before it, takes that verdict, since
   it describes the turn that record opened. The presence of
   `task_started` is not used: Codex 0.155 replays the parent's `task_started`
-  records too.
+  records too. In a span the probe opened, a turn nothing orders stays in the
+  span: those builds reconstruct turns from paginated history (`rollout-4`,
+  `auto-compact-0`, UUIDv4 ids) with a `started_at` stamped at the fork, so
+  once the span has ordered a replayed turn by UUIDv7, a non-v7 turn stays in
+  it whatever its `started_at`.
 
 Two limits follow from gating on explicit evidence only. A replayed legacy
 turn with no UUIDv7 id and no `started_at` (or one in the fork's own second)
@@ -428,7 +440,8 @@ prompt or model output, so what that drops is settings state the child's own
 `turn_context` restates.
 
 Lines inside the span write nothing under the child. One
-`fork_replay_boundary` marker, keyed by the replayed `session_meta`'s line,
+`fork_replay_boundary` marker, keyed by the span's first line (`subkind`
+`session_meta` or `copied_history`, for what opened it),
 accounts for them (`first_line`, `last_line`, `replayed_lines`, the closing
 turn and the rule that closed it). The last readable `token_count` inside the
 span is kept on it as `inherited_snapshot`, bounded per the marker contract

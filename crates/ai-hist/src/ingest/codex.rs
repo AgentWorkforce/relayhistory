@@ -356,20 +356,37 @@ pub(crate) enum ReplayStep {
 /// walk and shallow discovery so the two cannot drift.
 ///
 /// When Codex forks a thread it writes the child's `session_meta` and then
-/// copies the parent's history into the child's file, starting with the
-/// parent's own `session_meta`. A span **opens** at a `session_meta` after the
-/// file's first record whose `payload.id` is the parent the opening record
-/// named ([`fork_parent_id`]), and **closes** at the first `task_started` or
-/// `turn_context` that [`forked_turn_owner`] does not call a replay. Nothing
-/// else opens or closes it: a rollout without an explicit fork field, or a
-/// fork that opens on something other than its parent's `session_meta`, is
-/// never gated.
+/// copies the parent's history into the child's file. Builds copy it in one
+/// of two shapes, and a span opens on explicit evidence of either:
+///
+/// - **After the parent's own `session_meta`** (Codex 0.151 and later): a span
+///   opens at a `session_meta` after the file's first record whose
+///   `payload.id` is the parent the opening record named ([`fork_parent_id`]).
+/// - **Directly after the child's `session_meta`** (Codex 0.133 through
+///   0.148, which write `history_mode: "paginated"` and no copy of the
+///   parent's `session_meta`): the span opens at the record after the first
+///   one when [`CopiedHistoryProbe`] finds, before the child's first own turn,
+///   something only a copy can hold -- a turn ordered before the fork, a
+///   `token_count`, or a `compacted` record. The child makes no request and
+///   compacts nothing before its first turn.
+///
+/// A span closes at the first `task_started` or `turn_context` that
+/// [`forked_turn_owner`] does not call a replay. A rollout without an explicit
+/// fork field is never gated. `subagent_history_start_ordinal` is not used:
+/// 0.151+ writes it as the line of the `thread_settings_applied` that follows
+/// the copy, but 0.124--0.148 write the file's line count there.
 ///
 /// Known limits, each resolved toward indexing rather than dropping:
 ///
 /// - A replayed turn nothing can order -- a legacy (non-v7) `turn_id` with no
-///   `started_at`, or a `started_at` in the fork's own second -- closes the
-///   span, so the rest of that replay is indexed under the child as before.
+///   `started_at`, or a `started_at` in the fork's own second -- closes a span
+///   opened at the parent's `session_meta`, so the rest of that replay is
+///   indexed under the child as before. A span opened by the probe is already
+///   proven a copy, and the turns its builds reconstruct from paginated
+///   history (`rollout-4`, `auto-compact-0`, UUIDv4 ids, with a `started_at`
+///   stamped at the fork) carry no order of their own, so there they stay in
+///   the span; once the span has ordered a replayed turn by UUIDv7, so does a
+///   non-v7 turn whose `started_at` falls after the fork.
 /// - A record the child writes *before* its first `task_started` or
 ///   `turn_context` is inside the span and is not indexed. Nothing in such a
 ///   record distinguishes it from the parent's copied history (the envelope
@@ -391,6 +408,34 @@ pub(crate) struct ForkReplayGate {
     /// `started_at` to order it by, and undecided would close the span in the
     /// middle of the parent's history.
     replayed_turn: Option<Option<String>>,
+    /// Set by [`Self::arm_copied_history`]: the next record after the first
+    /// opens a span, because the copy follows the child's `session_meta`.
+    copied_history: bool,
+    /// What opened the current span.
+    opening: ReplayOpening,
+    /// The current span ordered a replayed turn by its UUIDv7 `turn_id`.
+    replayed_v7_turn: bool,
+}
+
+/// What opened a replayed span: the record its `fork_replay_boundary`
+/// marker names as `subkind`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ReplayOpening {
+    /// The parent's own `session_meta`, copied into the child's file.
+    #[default]
+    ParentSessionMeta,
+    /// The first record after the child's `session_meta`, with
+    /// [`CopiedHistoryProbe`]'s evidence that the copy starts there.
+    CopiedHistory,
+}
+
+impl ReplayOpening {
+    pub(crate) fn subkind(self) -> &'static str {
+        match self {
+            Self::ParentSessionMeta => "session_meta",
+            Self::CopiedHistory => "copied_history",
+        }
+    }
 }
 
 impl ForkReplayGate {
@@ -400,9 +445,40 @@ impl ForkReplayGate {
             // never armed rather than armed and immediately undecided.
             parent: parent.filter(|_| origin_ms.is_some()),
             origin_ms,
-            replaying: false,
-            replayed_turn: None,
+            ..Self::default()
         }
+    }
+
+    /// A probe for a copy that follows the child's `session_meta` directly,
+    /// or `None` when this rollout names no fork parent to gate.
+    pub(crate) fn copied_history_probe(&self) -> Option<CopiedHistoryProbe> {
+        self.parent.as_ref()?;
+        let mut gate = self.clone();
+        gate.copied_history = true;
+        Some(CopiedHistoryProbe {
+            gate,
+            evidence: false,
+            verdict: None,
+        })
+    }
+
+    /// Open a span at the next record after the first one when the probe,
+    /// fed the records after the file's first, proved a copy starts there.
+    pub(crate) fn arm_copied_history(&mut self, probe: &CopiedHistoryProbe) {
+        self.copied_history = probe.proves_copy();
+    }
+
+    /// What opened the current (or last) span.
+    pub(crate) fn opening(&self) -> ReplayOpening {
+        self.opening
+    }
+
+    fn open(&mut self, opening: ReplayOpening) {
+        self.replaying = true;
+        self.copied_history = false;
+        self.replayed_turn = None;
+        self.replayed_v7_turn = false;
+        self.opening = opening;
     }
 
     /// Classify one record. `first_record` is true only for the file's
@@ -413,20 +489,27 @@ impl ForkReplayGate {
         };
         let line_type = value.get("type").and_then(Value::as_str);
         let payload = value.get("payload");
-        if !self.replaying {
-            let opens = !first_record
-                && line_type == Some("session_meta")
-                && payload.and_then(|p| p.get("id")).and_then(Value::as_str) == Some(parent);
-            if !opens {
-                return ReplayStep::Outside;
-            }
-            self.replaying = true;
-            self.replayed_turn = None;
-            return ReplayStep::Replay;
-        }
         let payload_type = payload.and_then(|p| p.get("type")).and_then(Value::as_str);
         let is_turn = line_type == Some("turn_context")
             || (line_type == Some("event_msg") && payload_type == Some("task_started"));
+        if !self.replaying {
+            if first_record {
+                return ReplayStep::Outside;
+            }
+            if line_type == Some("session_meta")
+                && payload.and_then(|p| p.get("id")).and_then(Value::as_str) == Some(parent)
+            {
+                self.open(ReplayOpening::ParentSessionMeta);
+                return ReplayStep::Replay;
+            }
+            if !self.copied_history {
+                return ReplayStep::Outside;
+            }
+            self.open(ReplayOpening::CopiedHistory);
+            if !is_turn {
+                return ReplayStep::Replay;
+            }
+        }
         if !is_turn {
             return ReplayStep::Replay;
         }
@@ -444,16 +527,27 @@ impl ForkReplayGate {
                 }
             }
         }
-        let basis = match forked_turn_owner(turn_id, started_at, self.origin_ms.unwrap_or_default())
-        {
-            ForkedTurnOwner::Replay => {
+        let owner = forked_turn_owner(turn_id, started_at, self.origin_ms.unwrap_or_default());
+        let v7 = turn_id.and_then(uuid_v7_ms).is_some();
+        let basis = match (owner, self.opening) {
+            (ForkedTurnOwner::Child(basis), ReplayOpening::ParentSessionMeta) => basis,
+            (ForkedTurnOwner::Undecided, ReplayOpening::ParentSessionMeta) => "undecided",
+            (ForkedTurnOwner::Child(basis), ReplayOpening::CopiedHistory)
+                if v7 || !self.replayed_v7_turn =>
+            {
+                basis
+            }
+            (ForkedTurnOwner::Replay, _)
+            | (
+                ForkedTurnOwner::Child(_) | ForkedTurnOwner::Undecided,
+                ReplayOpening::CopiedHistory,
+            ) => {
                 if is_task_started {
                     self.replayed_turn = Some(turn_id.map(str::to_string));
                 }
+                self.replayed_v7_turn |= owner == ForkedTurnOwner::Replay && v7;
                 return ReplayStep::Replay;
             }
-            ForkedTurnOwner::Child(basis) => basis,
-            ForkedTurnOwner::Undecided => "undecided",
         };
         self.replaying = false;
         self.replayed_turn = None;
@@ -461,6 +555,69 @@ impl ForkReplayGate {
             turn_id: turn_id.map(str::to_string),
             basis,
         }
+    }
+}
+
+/// Decides whether a fork's copy of its parent's history follows the child's
+/// own `session_meta` directly, by running the gate's own rule over the
+/// records after the file's first as if a span opened there.
+///
+/// The probe ends at the span's close -- the child's first own turn -- and
+/// proves a copy when the records before it hold something only a copy can:
+/// a turn ordered before the fork, a `token_count` (the child makes no
+/// request before its first turn), or a `compacted` record (nor compacts
+/// anything). Records the child writes before that turn (its spawn prompt,
+/// `thread_settings_applied`) prove nothing. A read that ends before the
+/// close proves a copy only by a replayed turn ordered by UUIDv7; the
+/// parent's `session_meta` ends it with no verdict, since that is the other
+/// shape and opens its own span.
+#[derive(Debug, Clone)]
+pub(crate) struct CopiedHistoryProbe {
+    gate: ForkReplayGate,
+    evidence: bool,
+    verdict: Option<bool>,
+}
+
+impl CopiedHistoryProbe {
+    /// Feed the next record after the file's first. Returns `true` once the
+    /// probe has decided, after which further records change nothing.
+    pub(crate) fn observe(&mut self, value: &Value) -> bool {
+        if self.verdict.is_some() {
+            return true;
+        }
+        let line_type = value.get("type").and_then(Value::as_str);
+        if line_type == Some("session_meta")
+            && value.pointer("/payload/id").and_then(Value::as_str) == self.gate.parent.as_deref()
+        {
+            self.verdict = Some(false);
+            return true;
+        }
+        match self.gate.step(false, value) {
+            ReplayStep::Replay => {
+                let payload_type = value.pointer("/payload/type").and_then(Value::as_str);
+                let turn_id = value.pointer("/payload/turn_id").and_then(Value::as_str);
+                let started_at = value.pointer("/payload/started_at").and_then(Value::as_i64);
+                let ordered_replay = (line_type == Some("turn_context")
+                    || payload_type == Some("task_started"))
+                    && forked_turn_owner(
+                        turn_id,
+                        started_at,
+                        self.gate.origin_ms.unwrap_or_default(),
+                    ) == ForkedTurnOwner::Replay;
+                self.evidence |= ordered_replay
+                    || line_type == Some("compacted")
+                    || payload_type == Some("token_count");
+                false
+            }
+            ReplayStep::Closed { .. } | ReplayStep::Outside => {
+                self.verdict = Some(self.evidence);
+                true
+            }
+        }
+    }
+
+    fn proves_copy(&self) -> bool {
+        self.verdict.unwrap_or(self.gate.replayed_v7_turn)
     }
 }
 
@@ -567,6 +724,158 @@ mod tests {
                 basis: "undecided"
             }
         );
+    }
+
+    /// Feed `records` (after the file's first) to a fresh probe and return
+    /// the gate it arms.
+    fn probed(parent: &str, child: &str, records: &[Value]) -> ForkReplayGate {
+        let mut gate = ForkReplayGate::new(Some(parent.to_string()), uuid_v7_ms(child));
+        let mut probe = gate.copied_history_probe().expect("a fork arms a probe");
+        for record in records {
+            if probe.observe(record) {
+                break;
+            }
+        }
+        gate.arm_copied_history(&probe);
+        gate
+    }
+
+    #[test]
+    fn a_copy_after_the_childs_session_meta_opens_at_line_one() {
+        let child = "01a0c210-ec76-71c2-8585-47285eab37cc";
+        let second = uuid_v7_ms(child).unwrap() / 1000;
+        let rec = |kind: &str, payload: Value| json!({"type": kind, "payload": payload});
+        let records = [
+            rec("compacted", json!({"message": "summary"})),
+            rec(
+                "turn_context",
+                json!({"turn_id": "01a0c20f-64c5-7e82-bd2b-e08bab70470c"}),
+            ),
+            rec("event_msg", json!({"type": "token_count", "info": null})),
+            // A reconstructed turn stamped a second after the fork.
+            rec(
+                "event_msg",
+                json!({"type": "task_started", "turn_id": "rollout-4", "started_at": second + 1}),
+            ),
+            rec(
+                "event_msg",
+                json!({"type": "task_complete", "turn_id": "rollout-4"}),
+            ),
+            rec(
+                "event_msg",
+                json!({"type": "task_started", "turn_id": "01a0c210-ecae-71e2-9c2e-a0801741c6a4"}),
+            ),
+        ];
+        let mut gate = probed("parent", child, &records);
+        assert_eq!(
+            gate.step(true, &rec("session_meta", json!({"id": child}))),
+            ReplayStep::Outside
+        );
+        for record in &records[..5] {
+            assert_eq!(gate.step(false, record), ReplayStep::Replay, "{record}");
+        }
+        assert_eq!(gate.opening(), ReplayOpening::CopiedHistory);
+        assert_eq!(
+            gate.step(false, &records[5]),
+            ReplayStep::Closed {
+                turn_id: Some("01a0c210-ecae-71e2-9c2e-a0801741c6a4".to_string()),
+                basis: "turn_id"
+            }
+        );
+    }
+
+    #[test]
+    fn usage_before_the_first_own_turn_proves_a_copy_without_ordered_turns() {
+        let child = "01a0c210-ec76-71c2-8585-47285eab37cc";
+        let second = uuid_v7_ms(child).unwrap() / 1000;
+        let rec = |kind: &str, payload: Value| json!({"type": kind, "payload": payload});
+        let records = [
+            rec(
+                "turn_context",
+                json!({"turn_id": "ca738fc8-ff98-42b6-9b0b-4e382f72a3de"}),
+            ),
+            rec("event_msg", json!({"type": "token_count", "info": null})),
+            rec(
+                "event_msg",
+                json!({"type": "task_started", "turn_id": "rollout-4", "started_at": second}),
+            ),
+            rec(
+                "event_msg",
+                json!({"type": "task_started", "turn_id": "01a0c210-ecae-71e2-9c2e-a0801741c6a4"}),
+            ),
+        ];
+        let mut gate = probed("parent", child, &records);
+        for record in &records[..3] {
+            assert_eq!(gate.step(false, record), ReplayStep::Replay, "{record}");
+        }
+        assert!(matches!(
+            gate.step(false, &records[3]),
+            ReplayStep::Closed { .. }
+        ));
+    }
+
+    #[test]
+    fn a_fork_that_opens_on_its_own_turn_is_not_gated() {
+        let child = "01a0c210-ec76-71c2-8585-47285eab37cc";
+        let rec = |kind: &str, payload: Value| json!({"type": kind, "payload": payload});
+        let records = [
+            // The spawn prompt and settings the child writes before its turn.
+            rec(
+                "response_item",
+                json!({"type": "message", "role": "user", "content": []}),
+            ),
+            rec("event_msg", json!({"type": "thread_settings_applied"})),
+            rec(
+                "event_msg",
+                json!({"type": "task_started", "turn_id": "01a0c210-ecae-71e2-9c2e-a0801741c6a4"}),
+            ),
+            rec("event_msg", json!({"type": "token_count", "info": null})),
+        ];
+        let mut gate = probed("parent", child, &records);
+        for record in &records {
+            assert_eq!(gate.step(false, record), ReplayStep::Outside, "{record}");
+        }
+        // The other shape opens its own span; the probe leaves it to the gate.
+        let mut gate = probed(
+            "parent",
+            child,
+            &[
+                rec("session_meta", json!({"id": "parent"})),
+                records[1].clone(),
+            ],
+        );
+        assert_eq!(
+            gate.step(false, &rec("event_msg", json!({"type": "token_count"}))),
+            ReplayStep::Outside
+        );
+        assert_eq!(
+            gate.step(false, &rec("session_meta", json!({"id": "parent"}))),
+            ReplayStep::Replay
+        );
+        assert_eq!(gate.opening(), ReplayOpening::ParentSessionMeta);
+    }
+
+    #[test]
+    fn a_probe_cut_short_proves_a_copy_only_by_a_uuid_v7_replayed_turn() {
+        let child = "01a0c210-ec76-71c2-8585-47285eab37cc";
+        let second = uuid_v7_ms(child).unwrap() / 1000;
+        let rec = |kind: &str, payload: Value| json!({"type": kind, "payload": payload});
+        let v7 = [rec(
+            "event_msg",
+            json!({"type": "task_started", "turn_id": "01a0c20f-64c5-7e82-bd2b-e08bab70470c"}),
+        )];
+        assert!(probed("parent", child, &v7).copied_history);
+        let legacy = [
+            rec(
+                "event_msg",
+                json!({"type": "task_started", "turn_id": "legacy", "started_at": second - 10}),
+            ),
+            rec("event_msg", json!({"type": "token_count", "info": null})),
+        ];
+        assert!(!probed("parent", child, &legacy).copied_history);
+        assert!(ForkReplayGate::new(None, uuid_v7_ms(child))
+            .copied_history_probe()
+            .is_none());
     }
 
     #[test]

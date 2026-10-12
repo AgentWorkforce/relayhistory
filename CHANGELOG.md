@@ -4,7 +4,11 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Patch]
+
+### Fixed
+
+- Codex 0.133–0.148 forks and subagents no longer index the parent history they copy without the parent's `session_meta`: the copied prompts, events and `token_count` snapshots are one `fork_replay_boundary` marker (`subkind` `copied_history`) and the child's usage starts from the inherited total; the first `sync` (or `hydrate`) re-reads existing forks once.
 
 ## [0.42.0] - 2026-10-12
 

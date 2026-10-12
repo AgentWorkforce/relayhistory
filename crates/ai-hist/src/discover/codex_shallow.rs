@@ -142,6 +142,14 @@ impl ShallowSessionProvider for CodexProvider {
             crate::codex::fork_parent_id(payload, session_id),
             crate::codex::fork_origin_ms(payload, session_id, claude_timestamp(&meta)),
         );
+        if let Some(mut probe) = replay_gate.copied_history_probe() {
+            for value in bounded.head_records().skip(1).filter_map(parse_record) {
+                if value.get("payload").and_then(Value::as_object).is_some() && probe.observe(&value) {
+                    break;
+                }
+            }
+            replay_gate.arm_copied_history(&probe);
+        }
         for (index, line) in bounded.head_records().enumerate() {
             let Some(value) = parse_record(line) else {
                 continue;
