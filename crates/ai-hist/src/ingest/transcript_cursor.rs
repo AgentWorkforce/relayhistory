@@ -96,6 +96,9 @@
 use super::*;
 
 mod change_time;
+mod prefix;
+pub(crate) use prefix::prefix_window_digest_of;
+use prefix::{prefix_window_spans, PrefixSpans};
 mod reader;
 mod store;
 
@@ -528,36 +531,6 @@ fn prefix_window_digest_counted(file: &mut fs::File, offset: u64) -> Result<(Str
     #[cfg(test)]
     VALIDATION_METER.with(|meter| meter.set(meter.get() + bytes));
     Ok((format!("{:x}", hasher.finalize()), bytes))
-}
-
-/// Which regions of the committed prefix a digest covers.
-enum PrefixSpans {
-    /// The whole committed prefix, as one read.
-    Whole { len: u64 },
-    /// Two disjoint windows, one at each end.
-    Ends { window: u64, tail_start: u64 },
-}
-
-/// The regions [`prefix_window_digest_counted`] hashes for a cursor at
-/// `offset`.
-///
-/// Two windows, one at each end -- except when they meet. `window` is
-/// `min(PREFIX_WINDOW_BYTES, offset)`, so the tail begins at
-/// `offset - window`, and for any prefix of `2 * PREFIX_WINDOW_BYTES` or less
-/// that is at or before the end of the head window. Reading them separately
-/// then covers some bytes twice and, for a file smaller than one window, the
-/// same bytes twice over -- which is what made an unchanged sync over a tree
-/// of small transcripts read each file four times to prove it had not
-/// changed. One read of the union is cheaper and strictly stronger: there is
-/// no gap between the ends left uncovered.
-fn prefix_window_spans(offset: u64) -> PrefixSpans {
-    let window = PREFIX_WINDOW_BYTES.min(offset);
-    let tail_start = offset - window;
-    if tail_start <= window {
-        PrefixSpans::Whole { len: offset }
-    } else {
-        PrefixSpans::Ends { window, tail_start }
-    }
 }
 
 #[cfg(unix)]
@@ -1091,7 +1064,7 @@ mod tests {
         let mut reader = TranscriptReader::open(&path, None, None).unwrap();
         // A cloned file shares its seek position, so the stop follows actual
         // I/O rather than timing or an implementation-specific check count.
-        let probe = std::cell::RefCell::new(reader.reader.get_ref().try_clone().unwrap());
+        let probe = std::cell::RefCell::new(reader.probe_file());
         let error = crate::ingest::with_capture_stop(
             move || probe.borrow_mut().stream_position().unwrap() >= MAX_RECORD_BYTES + 64 * 1024,
             || reader.next_line(&mut String::new()),
@@ -1100,7 +1073,7 @@ mod tests {
         assert!(error.is::<crate::ingest::CaptureCancelled>());
         assert_eq!(reader.position(), 0, "an unfinished record was consumed");
         assert!(
-            reader.reader.get_mut().stream_position().unwrap() < bytes.len() as u64,
+            reader.streamed_to() < bytes.len() as u64,
             "the cancelled drain still read the rest of the file"
         );
 

@@ -25,6 +25,7 @@ pub(crate) mod codex;
 mod codex_subagent;
 pub(crate) mod codex_thread_names;
 mod codex_usage;
+pub(crate) mod cold_read;
 pub(crate) mod control;
 pub(crate) mod cursor;
 pub(crate) mod devin;
@@ -125,6 +126,12 @@ macro_rules! sync_note {
 mod sweep_phases;
 // After `sync_note!`, which it uses.
 mod codex_history;
+// After `sync_note!`, which an unreadable rollout reports through.
+mod rollout_head;
+pub(crate) use rollout_head::read_codex_session_meta;
+#[cfg(test)]
+use rollout_head::LEADING_BYTE_LIMIT;
+use rollout_head::{read_codex_session_meta_counted, read_leading_records};
 // After `sync_note!`, which the repair note uses.
 pub(crate) mod scoped_files;
 #[cfg(test)]
@@ -2078,6 +2085,7 @@ fn sync_basic(
     if scope.reads_nothing() {
         return Ok(false);
     }
+    let _cold_reads = cold_read::begin_sweep();
     // See `begin_acquisition_pass`: the resolver's cache is sound only within
     // one pass, and a long-lived host (watch, the Node addon, a desktop app)
     // runs many passes without restarting.
@@ -3266,30 +3274,9 @@ fn record_raw_facts_backfill(
     state.insert(key.to_string(), json!(RAW_MESSAGE_FACTS_GENERATION));
 }
 
-/// Whether this run can actually read `path`.
-///
-/// Both parsers reach for a transcript with
-/// `fs::read_to_string(..).unwrap_or_default()`, which turns a read error into
-/// an empty string -- and an empty string is indistinguishable from an empty
-/// file. A permission change, a path swapped for something that is not a
-/// regular file, or an I/O error between enumeration and read therefore all
-/// read as "this transcript has nothing in it", and the walk stamps the file
-/// as seen. Once the raw-facts generation is recorded, the rows behind that
-/// path stay null for the life of the install.
-///
-/// A read that fails is not an observation. Asking here lets the walk treat an
-/// unreadable file exactly as it treats one it never saw: no stamp, the
-/// generation withheld, and the stale stamp dropped so a later run that *can*
-/// read it does.
-///
-/// One byte is enough -- `EACCES`, `EISDIR` and `ENXIO` all surface on the
-/// open or the first read -- and this only runs for files the walk is about to
-/// parse anyway, never for the ones the stamp fast path skips.
+/// Whether this run can actually read `path`. See [`cold_read::probe`].
 fn transcript_is_readable(path: &Path) -> bool {
-    match fs::File::open(path) {
-        Ok(mut file) => file.read(&mut [0u8; 1]).is_ok(),
-        Err(_) => false,
-    }
+    cold_read::probe(path)
 }
 
 /// Whether `key`, a sync-state path, names a file inside `root`.
@@ -4109,11 +4096,14 @@ struct CompleteJsonlReader {
     /// The change time of the stat `open` validated against, when it is old
     /// enough to settle a cursor on. Taken before the prefix was hashed.
     settle_ctime_ns: Option<i64>,
+    /// Complete lines this reader consumed, kept when the file is small enough
+    /// that a later pass can hash and parse them without opening it again.
+    walked: Vec<u8>,
 }
 
 impl CompleteJsonlReader {
     fn open(path: &Path, saved: Option<&Value>) -> Result<Self> {
-        let file = fs::File::open(path)?;
+        let file = cold_read::open_file(path)?;
         let metadata = file.metadata()?;
         let size = metadata.len();
         let mtime_ns = metadata_mtime_ns(&metadata);
@@ -4211,6 +4201,7 @@ impl CompleteJsonlReader {
             validated_mtime_ns: mtime_ns,
             reset_cursor: None,
             settle_ctime_ns,
+            walked: Vec::new(),
         })
     }
 
@@ -4248,6 +4239,9 @@ impl CompleteJsonlReader {
         line.push_str(&String::from_utf8_lossy(&raw));
         self.position += read as u64;
         self.prefix_hasher.update(&raw);
+        if self.validated_size <= cold_read::CAPTURE_MAX_BYTES {
+            self.walked.extend_from_slice(&raw);
+        }
         Ok(Some(self.position))
     }
 
@@ -4255,8 +4249,7 @@ impl CompleteJsonlReader {
         if let Some(cursor) = &self.reset_cursor {
             return Ok(cursor.clone());
         }
-        let current = fs::File::open(&self.path)?;
-        let metadata = current.metadata()?;
+        let metadata = fs::metadata(&self.path)?;
         let mtime_ns = metadata_mtime_ns(&metadata);
         let identity = metadata_identity(&metadata);
         let expected_identity = (self.cursor.generation.device, self.cursor.generation.inode);
@@ -4298,6 +4291,17 @@ impl CompleteJsonlReader {
     }
 }
 
+impl Drop for CompleteJsonlReader {
+    fn drop(&mut self) {
+        cold_read::publish_walk(
+            &self.path,
+            &self.walked,
+            self.validated_size,
+            self.validated_mtime_ns,
+        );
+    }
+}
+
 fn empty_prefix_hash() -> String {
     format!("{:x}", Sha256::digest([]))
 }
@@ -4335,7 +4339,22 @@ pub(crate) fn prefix_hash_meter() -> u64 {
 
 fn hash_file_prefix(path: &Path, offset: u64) -> Result<(String, Sha256)> {
     meter_prefix_hash(offset);
-    let mut file = fs::File::open(path)?;
+    if offset == 0 {
+        // The empty prefix is a pure value. Statting proves the path is still
+        // there; opening it only to hash nothing was a second read.
+        path.metadata()?;
+        let hasher = Sha256::new();
+        return Ok((finish_prefix_hash(&hasher), hasher));
+    }
+    if let Some(cached) = cold_read::cached_sha_prefix(path, offset) {
+        let last = cold_read::fresh(path).and_then(|bytes| bytes.get(offset as usize - 1).copied());
+        anyhow::ensure!(
+            last == Some(b'\n'),
+            "cursor offset is not a complete-line boundary"
+        );
+        return Ok(cached);
+    }
+    let mut file = cold_read::open_file(path)?;
     let mut remaining = offset;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
@@ -5368,195 +5387,6 @@ pub(crate) fn codex_is_subagent(payload: Option<&Value>, session_id: &str) -> bo
     let marked =
         matches!(thread_source, Some("subagent" | "guardian_review")) || source_marks_subagent;
     marked && codex_parent_session_id(payload.and_then(Value::as_object), session_id).is_some()
-}
-
-/// Read the `session_meta` line that opens every rollout file.
-///
-/// Sessions key on `payload.id` — the per-thread id. Subagent rollouts can
-/// carry their parent in `parent_thread_id`, a structured thread-spawn source,
-/// or the legacy `session_id`; keying on any of those would collapse every
-/// subagent into its parent. Child threads are detected instead
-/// ([`codex_is_subagent`]: a subagent marker *together with* a named parent)
-/// and excluded from session registration. A standalone guardian names no
-/// parent and is a session of its own.
-/// How far into a file a bounded head read will look, however few records it
-/// has found. Callers set their own record limit; this one stops a file whose
-/// first record is enormous, or whose leading lines are all unparseable, from
-/// turning a bounded read back into a whole-file read.
-const LEADING_BYTE_LIMIT: u64 = 1024 * 1024;
-
-/// The first complete records of a JSONL file, and the bytes that cost.
-///
-/// For metadata that lives at the head of a transcript — a Codex
-/// `session_meta` line, the record that dates a Claude sidecar — reading the
-/// whole file to use its first line is the same defect as scanning a whole
-/// transcript to hydrate its tail, and it hides in the same place: the caller
-/// writes `.lines().next()` and looks bounded while the read is not. A
-/// trailing record with no newline counts, because the head of a one-record
-/// file is that record.
-fn read_leading_records(path: &Path, limit: usize) -> Result<(Vec<Value>, u64)> {
-    read_head_records(path, limit, true)
-}
-
-/// The **first physical record** of a file, and the bytes reading it cost.
-///
-/// Distinct from [`read_leading_records`], which walks past records it cannot
-/// parse until it finds one that it can. That is right for a caller looking
-/// for the first usable record and wrong for anything that defines identity by
-/// position: a rollout whose first line is corrupt, followed by a
-/// `session_meta` naming another session, was adopted under that other
-/// session's id. `None` here means "the first record is not one I can read",
-/// which is a different claim from "there is no such record in the file".
-fn read_first_record(path: &Path) -> Result<(Option<Value>, u64)> {
-    let (values, bytes_read) = read_head_records(path, 1, false)?;
-    Ok((values.into_iter().next(), bytes_read))
-}
-
-/// `skip_unparseable` decides what a record that does not parse means: skip
-/// past it and keep looking, or stop, having read it.
-fn read_head_records(
-    path: &Path,
-    limit: usize,
-    skip_unparseable: bool,
-) -> Result<(Vec<Value>, u64)> {
-    let file = fs::File::open(path)?;
-    // `take` is what enforces the ceiling. Checking `bytes_read` at the top of
-    // the loop only decided whether to start *another* line, and
-    // `read_until` appends until it finds a newline or reaches EOF — so a
-    // provider file whose first record is the whole file allocated the whole
-    // file, which is the unbounded read this helper exists to prevent,
-    // wearing a bound. With the limit on the reader, a record that would
-    // cross it comes back truncated, fails to parse, and is skipped.
-    let mut reader = BufReader::new(file).take(LEADING_BYTE_LIMIT);
-    let mut values = Vec::new();
-    let mut raw = Vec::new();
-    let mut bytes_read = 0u64;
-    while values.len() < limit {
-        raw.clear();
-        let read = reader.read_until(b'\n', &mut raw)?;
-        if read == 0 {
-            break;
-        }
-        bytes_read += read as u64;
-        match serde_json::from_slice::<Value>(trim_ascii_end(&raw)) {
-            Ok(value) => values.push(value),
-            Err(_) if skip_unparseable => continue,
-            // The bytes were read either way, so they are counted either way.
-            Err(_) => break,
-        }
-    }
-    Ok((values, bytes_read))
-}
-
-fn trim_ascii_end(raw: &[u8]) -> &[u8] {
-    let mut end = raw.len();
-    while end > 0 && raw[end - 1].is_ascii_whitespace() {
-        end -= 1;
-    }
-    &raw[..end]
-}
-
-pub(crate) fn read_codex_session_meta(path: &Path) -> Result<Option<CodexSessionMeta>> {
-    Ok(read_codex_session_meta_counted(path)?.0)
-}
-
-/// Codex session metadata, and the bytes reading it cost.
-///
-/// A rollout's identity is its **first** record, so this reads one line rather
-/// than the file. It used to `read_to_string` a rollout that reaches hundreds
-/// of megabytes on a fleet machine and then take `lines().next()`, so a
-/// kilobyte appended to one still read all of it before the cursor reached the
-/// tail — the Codex twin of the whole-file Claude metadata scan, and invisible
-/// for the same reason: `bytes_read` counted the cursor's work, not this.
-fn read_codex_session_meta_counted(path: &Path) -> Result<(Option<CodexSessionMeta>, u64)> {
-    // A rollout that cannot be read is a rollout with no metadata, which is
-    // what the `read_to_string(path).ok()` this replaced already meant. The
-    // bounded reader propagates `File::open` failures, and every caller
-    // propagates them further, so one locked or deleted sibling rollout
-    // started failing a whole parent hydration or Codex sync — a file that
-    // could not be read taking down the files that could. The failure is
-    // reported rather than swallowed.
-    // The *first physical* record, not the first one that parses. Codex
-    // defines a rollout's identity by position, and skipping a corrupt opening
-    // line to reach a `session_meta` further down adopts the rollout under
-    // whatever session that record names.
-    let (value, bytes_read) = match read_first_record(path) {
-        Ok(read) => read,
-        Err(error) => {
-            sync_note!(
-                "  [codex] skipping unreadable rollout {}: {error}",
-                path.display()
-            );
-            return Ok((None, 0));
-        }
-    };
-    let meta = value.as_ref().and_then(codex_session_meta_from_record);
-    Ok((meta, bytes_read))
-}
-
-/// Interpret one `session_meta` record. Pure, so the bounded reader above is
-/// the only thing that decides how much of the file is touched.
-fn codex_session_meta_from_record(value: &Value) -> Option<CodexSessionMeta> {
-    if value.get("type").and_then(Value::as_str) != Some("session_meta") {
-        return None;
-    }
-    let payload_value = value.get("payload");
-    let payload = payload_value.and_then(Value::as_object);
-    let session_id = payload
-        .and_then(|p| p.get("id"))
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())?;
-    let cwd = payload
-        .and_then(|p| p.get("cwd"))
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())?;
-    let git_branch = payload
-        .and_then(|p| p.get("git"))
-        .and_then(Value::as_object)
-        .and_then(|g| g.get("branch"))
-        .and_then(Value::as_str)
-        .map(str::to_string);
-    let subagent = payload
-        .and_then(|p| p.get("source"))
-        .and_then(Value::as_object)
-        .and_then(|s| s.get("subagent"));
-    let is_subagent = codex_is_subagent(payload_value, session_id);
-    let parent_thread_id = is_subagent
-        .then(|| codex_parent_thread_id(payload, session_id))
-        .flatten();
-    let parent_session_id = is_subagent
-        .then(|| codex_parent_session_id(payload, session_id))
-        .flatten();
-    // The label is an object in the observed rollouts (`{"other":"guardian"}`);
-    // its value names the agent, and its key is the only thing left when the
-    // value is not a string.
-    let subagent_label = subagent.and_then(|value| match value {
-        Value::String(label) => Some(label.clone()),
-        Value::Object(map) => map
-            .values()
-            .find_map(Value::as_str)
-            .map(str::to_string)
-            .or_else(|| map.keys().next().cloned()),
-        _ => None,
-    });
-    let meta_ts_ms = value
-        .get("timestamp")
-        .and_then(Value::as_str)
-        .and_then(parse_iso_ms);
-    let fork_parent_id = codex::fork_parent_id(payload_value, session_id);
-    let fork_origin_ms = codex::fork_origin_ms(payload_value, session_id, meta_ts_ms);
-    Some(CodexSessionMeta {
-        session_id: session_id.to_string(),
-        cwd: cwd.to_string(),
-        git_branch,
-        is_subagent,
-        parent_session_id,
-        parent_thread_id,
-        subagent_label,
-        meta_ts_ms,
-        fork_parent_id,
-        fork_origin_ms,
-    })
 }
 
 #[derive(Default)]
@@ -12901,7 +12731,15 @@ pub(crate) fn cursor_generation(path: &Path, through: u64) -> Result<Option<Curs
 /// is an error here.
 fn hash_prefix_bytes(path: &Path, through: u64) -> Result<Option<String>> {
     meter_prefix_hash(through);
-    let mut file = fs::File::open(path)?;
+    if let Some(bytes) = cold_read::fresh(path) {
+        if through > bytes.len() as u64 {
+            return Ok(None);
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes[..through as usize]);
+        return Ok(Some(finish_prefix_hash(&hasher)));
+    }
+    let mut file = cold_read::open_file(path)?;
     let mut hasher = Sha256::new();
     let mut buffer = [0u8; 64 * 1024];
     let mut remaining = through;
@@ -13147,7 +12985,7 @@ pub(crate) fn ingest_cursor_transcript(
     // then let the byte checkpoint advance over content nobody read. The
     // error propagates so the whole transaction, including the checkpoint
     // update, rolls back and the next sync retries the same offset.
-    let text = fs::read_to_string(path)
+    let text = cold_read::read_string(path)
         .with_context(|| format!("read Cursor transcript {}", path.display()))?;
     let mut outcome = CursorTranscriptOutcome::default();
     let mut offset: u64 = 0;
@@ -16329,7 +16167,7 @@ fn note_model(models: &mut Vec<String>, model: &str) {
 
 /// Reads a session's `updates.jsonl`, and whether it was there at all.
 fn read_grok_updates(updates_path: &Path) -> Result<(grok::GrokUpdates, bool)> {
-    match fs::read_to_string(updates_path) {
+    match cold_read::read_string(updates_path) {
         Ok(contents) => Ok((grok::parse_updates(&contents, updates_path)?, true)),
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
             Ok((grok::GrokUpdates::default(), false))
@@ -16352,7 +16190,7 @@ struct GrokChatRead {
 /// Parses every record of a session's chat history.
 fn read_grok_chat(chat: &Path) -> Result<GrokChatRead> {
     let mut read = GrokChatRead::default();
-    let contents = fs::read_to_string(chat)
+    let contents = cold_read::read_string(chat)
         .with_context(|| format!("read Grok chat history {}", chat.display()))?;
     for (number, row) in jsonl::rows(&contents).enumerate() {
         check_capture_cancelled()?;

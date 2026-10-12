@@ -1,13 +1,13 @@
 use anyhow::Result;
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Seek};
-use std::path::Path;
-#[cfg(test)]
-use std::path::PathBuf;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::{file_identity, now_ms, prefix_window_digest_counted, TranscriptFileCursor};
 
-/// Hash the bounded validation window for `[0, offset)`. See the module docs.
+mod open;
+
 /// A record's text, or `None` when its bytes are not valid UTF-8.
 fn decode_record(raw: &[u8]) -> Option<&str> {
     std::str::from_utf8(raw).ok()
@@ -158,14 +158,24 @@ pub(crate) enum CommitOutcome {
     Superseded,
 }
 
+enum Source {
+    /// A streaming read. `file` is the generation the pass opened, which
+    /// replay and the commit re-read consult even after the path is replaced.
+    File {
+        file: fs::File,
+        reader: BufReader<fs::File>,
+    },
+    /// The bytes of one open, walked again without touching the disk.
+    Memory {
+        bytes: Arc<[u8]>,
+        cursor: std::io::Cursor<Arc<[u8]>>,
+    },
+}
+
 /// A transcript opened at its cursor.
 pub(crate) struct TranscriptReader {
-    /// Only so a test hook can tell one transcript's commit from another's; a
-    /// hydration commits a parent, its sidecars and their metadata in turn.
-    #[cfg(test)]
     path: PathBuf,
-    file: fs::File,
-    pub(super) reader: BufReader<fs::File>,
+    source: Source,
     position: u64,
     start_offset: u64,
     /// Bytes of an unterminated trailing record handed to the caller.
@@ -191,6 +201,9 @@ pub(crate) struct TranscriptReader {
     /// measuring a different file state than the one being stored.
     opened_size: u64,
     opened_mtime_ns: u64,
+    /// Change time at open. A rewrite that restores mtime still moves this on
+    /// filesystems that keep one; when the platform has none, commit re-reads.
+    opened_ctime_ns: Option<i64>,
     /// The bounded window over `[0, opened_size)` as it was when the file was
     /// opened — the bytes this pass takes itself to be reading.
     ///
@@ -219,119 +232,10 @@ impl TranscriptReader {
         saved: Option<&TranscriptFileCursor>,
         rewind_to: Option<u64>,
     ) -> Result<Self> {
-        let mut file = fs::File::open(path)?;
-        let metadata = file.metadata()?;
-        let size = metadata.len();
-        let mtime_ns = super::super::metadata_mtime_ns(&metadata);
-        let (device, inode) = file_identity(&metadata);
-
-        let mut rotated = false;
-        let mut quiesced = false;
-        let mut unchanged_since_ms = now_ms();
-        // Hashed once. When the saved cursor covers the whole file — the
-        // ordinary resume — the validation below hashes the same region, and
-        // reusing it keeps this to one bounded read.
-        let mut opened_window: Option<String> = None;
-        let mut validation_bytes = 0u64;
-        // A cursor at offset 0 is still a cursor. It records the file's
-        // identity, size and mtime, and those are what say whether anything
-        // has been appended since the last pass. Reading it as "no cursor"
-        // because its offset happened to be zero meant a pass that held back
-        // the file's *first* record could never see the file go quiet, so it
-        // deferred the same records forever and the message was never
-        // indexed — while `holding_records` kept forcing the pass to run.
-        let offset = match saved {
-            Some(saved) => {
-                let identity_changed = saved.device.is_some()
-                    && device.is_some()
-                    && (saved.device, saved.inode) != (device, inode);
-                // Checked before the digest, not after. Hashing a window that
-                // extends past the end reads every byte it can and then errors,
-                // and those bytes left with the error rather than reaching
-                // `validation_bytes` — a truncated file's validation pass went
-                // unreported. A `stat` answers it without reading anything.
-                let saved_window = if size < saved.offset {
-                    // A truncated file cannot match a window that ends past
-                    // its end. Hashing anyway read every byte it could and
-                    // then errored, and those bytes left with the error rather
-                    // than reaching `validation_bytes`, so a truncated file's
-                    // validation went unreported. `valid` below refuses a
-                    // short file on the `stat` alone.
-                    None
-                } else {
-                    match prefix_window_digest_counted(&mut file, saved.offset) {
-                        Ok((digest, read)) => {
-                            validation_bytes += read;
-                            Some(digest)
-                        }
-                        Err(_) => None,
-                    }
-                };
-                // The same region, so the hash is the same: reuse it rather
-                // than reading those bytes a second time.
-                if saved.offset == size {
-                    opened_window = saved_window.clone();
-                }
-                let valid = !identity_changed
-                    && size >= saved.offset
-                    && mtime_ns >= saved.mtime_ns
-                    && saved_window.as_deref() == Some(saved.prefix_hash.as_str());
-                if valid {
-                    let stat_unchanged = size == saved.size && mtime_ns == saved.mtime_ns;
-                    // Carry the stamp forward while nothing moves; restart it
-                    // the moment anything does.
-                    unchanged_since_ms = if stat_unchanged && saved.unchanged_since_ms > 0 {
-                        saved.unchanged_since_ms
-                    } else {
-                        now_ms()
-                    };
-                    quiesced = stat_unchanged
-                        && now_ms().saturating_sub(unchanged_since_ms) >= QUIESCENT_GRACE_MS;
-                    rewind_to
-                        .filter(|rewind| *rewind <= saved.offset)
-                        .unwrap_or(saved.offset)
-                } else {
-                    // Nothing to rotate away from at offset zero: the cursor
-                    // claimed no committed work, so re-reading is not a
-                    // correction and reporting one would be noise.
-                    rotated = saved.offset > 0;
-                    0
-                }
-            }
-            None => 0,
-        };
-
-        let opened_window = match opened_window {
-            Some(window) => window,
-            None => {
-                let (digest, read) = prefix_window_digest_counted(&mut file, size)?;
-                validation_bytes += read;
-                digest
-            }
-        };
-
-        let mut handle = file.try_clone()?;
-        handle.seek(std::io::SeekFrom::Start(offset))?;
-        Ok(Self {
-            #[cfg(test)]
-            path: path.to_path_buf(),
-            file,
-            reader: BufReader::new(handle),
-            position: offset,
-            start_offset: offset,
-            tail_bytes: 0,
-            decoded: 0,
-            undecodable: 0,
-            validation_bytes,
-            opened_size: size,
-            opened_mtime_ns: mtime_ns,
-            opened_window,
-            unchanged_since_ms,
-            quiesced,
-            device,
-            inode,
-            rotated,
-        })
+        if let Some(reader) = open::open_captured(path, saved, rewind_to)? {
+            return Ok(reader);
+        }
+        open::open_streaming(path, saved, rewind_to)
     }
 
     /// Nothing has been appended since the cursor was written.
@@ -401,7 +305,7 @@ impl TranscriptReader {
         super::super::check_capture_cancelled()?;
         line.clear();
         let mut raw = Vec::new();
-        let read = match read_capped_record(&mut self.reader, &mut raw)? {
+        let read = match self.read_capped(&mut raw)? {
             CappedRead::End => return Ok(None),
             CappedRead::Record(read) => read,
             // Genuinely over. Get past it without ever holding it: walk to
@@ -450,7 +354,7 @@ impl TranscriptReader {
         let mut drained = MAX_RECORD_BYTES;
         loop {
             super::super::check_capture_cancelled()?;
-            let read = self.reader.read(&mut chunk)?;
+            let read = self.read_chunk(&mut chunk)?;
             if read == 0 {
                 // The file ends inside the record. Nothing is committed — a
                 // writer may still be producing it — but the bytes were read,
@@ -466,9 +370,7 @@ impl TranscriptReader {
                 // Anything after the newline in this chunk belongs to the next
                 // record, so start again from the byte after it.
                 let resume = self.position;
-                self.reader
-                    .get_mut()
-                    .seek(std::io::SeekFrom::Start(resume))?;
+                self.seek_to(resume)?;
                 return Ok(true);
             }
             drained += read as u64;
@@ -491,41 +393,20 @@ impl TranscriptReader {
         to: u64,
         mut each: impl FnMut(&str) -> Result<()>,
     ) -> Result<u64> {
-        let resume = self.reader.get_mut().stream_position()?;
-        let replayed = (|| -> Result<u64> {
-            let mut file = &self.file;
-            file.seek(std::io::SeekFrom::Start(from))?;
-            let mut span = BufReader::new(file.take(to.saturating_sub(from)));
-            let mut read_total = 0u64;
-            let mut raw = Vec::new();
-            loop {
-                super::super::check_capture_cancelled()?;
-                raw.clear();
-                match read_capped_record(&mut span, &mut raw)? {
-                    CappedRead::End => return Ok(read_total),
-                    CappedRead::Record(read) => {
-                        read_total += read as u64;
-                        if raw.last() == Some(&b'\n') {
-                            if let Some(text) = decode_record(&raw) {
-                                each(text.trim_end_matches(['\n', '\r']))?;
-                            }
-                        }
-                    }
-                    CappedRead::Oversized => {
-                        read_total += MAX_RECORD_BYTES;
-                        let (skipped, terminated) = skip_oversized_tail(&mut span)?;
-                        read_total += skipped;
-                        if !terminated {
-                            return Ok(read_total);
-                        }
-                    }
-                }
+        match &mut self.source {
+            Source::Memory { bytes, .. } => {
+                let start = usize::try_from(from).unwrap_or(usize::MAX).min(bytes.len());
+                let end = usize::try_from(to).unwrap_or(usize::MAX).min(bytes.len());
+                let mut span = std::io::Cursor::new(&bytes[start..end]);
+                open::replay_reader(&mut span, &mut each)
             }
-        })();
-        self.reader
-            .get_mut()
-            .seek(std::io::SeekFrom::Start(resume))?;
-        replayed
+            Source::File { file, reader } => {
+                let resume = reader.get_ref().stream_position()?;
+                let replayed = open::replay_file(file, from, to, &mut each);
+                reader.get_mut().seek(SeekFrom::Start(resume))?;
+                replayed
+            }
+        }
     }
 
     /// The cursor to store for a pass that committed through `offset`.
@@ -533,17 +414,31 @@ impl TranscriptReader {
     /// `offset` may be behind [`Self::position`]: the Claude reader commits
     /// before the earliest message still being written so the next pass reads
     /// it again, and the Codex reader commits at the last `task_complete`.
+    ///
+    /// A stable file hashes the bytes already in hand. A rewrite during the
+    /// walk — size, mtime, or change time — is read again, and a platform
+    /// with no change time is read again too, because restoring mtime is then
+    /// invisible. The streaming file is re-read through the handle this pass
+    /// opened, so a replacement at the path is not what the cursor authenticates.
     pub(crate) fn commit(&mut self, offset: u64) -> Result<CommitOutcome> {
         #[cfg(test)]
         super::run_before_commit_hook(&self.path);
-        let metadata = self.file.metadata()?;
+        let metadata = self.commit_metadata()?;
         let size = metadata.len();
         let mtime_ns = super::super::metadata_mtime_ns(&metadata);
+        let ctime_ns = super::change_time_ns(&metadata);
         // A stat that moved during the pass restarts the quiescence clock as
         // well: stamping it at `open` while storing a stat taken here made the
         // window cover the walk, and a full re-parse of a large live
         // transcript outlasts the window on its own.
-        let stat_moved = size != self.opened_size || mtime_ns != self.opened_mtime_ns;
+        let stat_moved = open::generation_moved(
+            size,
+            mtime_ns,
+            ctime_ns,
+            self.opened_size,
+            self.opened_mtime_ns,
+            self.opened_ctime_ns,
+        );
         let (device, inode) = file_identity(&metadata);
         let identity_changed = self.device.is_some()
             && device.is_some()
@@ -551,18 +446,7 @@ impl TranscriptReader {
         if identity_changed || size < offset || size < self.opened_size {
             return Ok(CommitOutcome::Superseded);
         }
-        // Checked on every commit, not only when the stat moved. A rewrite
-        // that preserves length and restores mtime is exactly the case a stat
-        // cannot see — the skip path already assumes writers do that, and
-        // gating this comparison on `stat_moved` left the one rewrite nothing
-        // else would catch free to publish a cursor over stale rows.
-        //
-        // The same bounded window over the same region, so an append compares
-        // equal and an in-place rewrite within the window does not. One
-        // bounded read is the price of the guarantee, and it is counted.
-        let (window, window_bytes) =
-            prefix_window_digest_counted(&mut self.file, self.opened_size)?;
-        self.validation_bytes += window_bytes;
+        let window = self.commit_window(stat_moved)?;
         if window != self.opened_window {
             return Ok(CommitOutcome::Superseded);
         }
@@ -573,19 +457,7 @@ impl TranscriptReader {
         } else {
             self.unchanged_since_ms
         };
-        // The cursor's own hash covers `[0, offset)`, and the comparison above
-        // covered `[0, opened_size)`. When a pass consumed the file it opened,
-        // those are the same region and the digest is the same digest — so it
-        // is reused rather than read a second time. `prefix_window_digest`
-        // folds the offset into the hash, so this is only ever done when the
-        // offsets are equal.
-        let prefix_hash = if offset == self.opened_size {
-            window
-        } else {
-            let (digest, prefix_bytes) = prefix_window_digest_counted(&mut self.file, offset)?;
-            self.validation_bytes += prefix_bytes;
-            digest
-        };
+        let prefix_hash = self.commit_prefix(offset, &window, stat_moved)?;
         Ok(CommitOutcome::Published(TranscriptFileCursor {
             offset,
             device: self.device,
@@ -595,5 +467,101 @@ impl TranscriptReader {
             unchanged_since_ms,
             prefix_hash,
         }))
+    }
+
+    /// The generation this pass opened. A streaming read stats its own handle,
+    /// which still names the inode from `open` after the path is replaced.
+    fn commit_metadata(&self) -> Result<fs::Metadata> {
+        match &self.source {
+            Source::File { file, .. } => Ok(file.metadata()?),
+            Source::Memory { .. } => Ok(fs::metadata(&self.path)?),
+        }
+    }
+
+    /// The opened window, from the bytes already hashed unless the file moved.
+    fn commit_window(&mut self, stat_moved: bool) -> Result<String> {
+        if !stat_moved {
+            return Ok(self.opened_window.clone());
+        }
+        self.hash_region(self.opened_size)
+    }
+
+    /// Digest of `[0, offset)`. The opened window when that is the same region.
+    fn commit_prefix(&mut self, offset: u64, window: &str, stat_moved: bool) -> Result<String> {
+        if offset == self.opened_size {
+            return Ok(window.to_string());
+        }
+        if !stat_moved {
+            if let Source::Memory { bytes, .. } = &self.source {
+                if offset <= bytes.len() as u64 {
+                    return super::prefix_window_digest_of(bytes, offset);
+                }
+            }
+        }
+        self.hash_region(offset)
+    }
+
+    /// Hash `offset` bytes from the open handle, or from the path when this
+    /// pass is walking a retained copy and the file has moved.
+    fn hash_region(&mut self, offset: u64) -> Result<String> {
+        let path = self.path.clone();
+        let hashed = match &mut self.source {
+            Source::File { file, .. } => prefix_window_digest_counted(file, offset),
+            Source::Memory { .. } => {
+                let mut file = super::super::cold_read::open_file(&path)?;
+                prefix_window_digest_counted(&mut file, offset)
+            }
+        };
+        let (digest, read) = hashed?;
+        self.validation_bytes += read;
+        Ok(digest)
+    }
+
+    fn read_capped(&mut self, raw: &mut Vec<u8>) -> Result<CappedRead> {
+        match &mut self.source {
+            Source::File { reader, .. } => read_capped_record(reader, raw),
+            Source::Memory { cursor, .. } => read_capped_record(cursor, raw),
+        }
+    }
+
+    fn read_chunk(&mut self, buf: &mut [u8]) -> Result<usize> {
+        match &mut self.source {
+            Source::File { reader, .. } => Ok(reader.read(buf)?),
+            Source::Memory { cursor, .. } => Ok(cursor.read(buf)?),
+        }
+    }
+
+    fn seek_to(&mut self, position: u64) -> Result<()> {
+        match &mut self.source {
+            Source::File { reader, .. } => {
+                reader.seek(SeekFrom::Start(position))?;
+            }
+            Source::Memory { cursor, .. } => {
+                cursor.seek(SeekFrom::Start(position))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// A clone of the handle `next_line` reads, so a test can watch its offset.
+    #[cfg(test)]
+    pub(crate) fn probe_file(&self) -> fs::File {
+        match &self.source {
+            Source::File { reader, .. } => {
+                reader.get_ref().try_clone().expect("streaming file clones")
+            }
+            Source::Memory { .. } => panic!("a captured transcript has no streaming file"),
+        }
+    }
+
+    /// Where the handle `next_line` reads has actually reached.
+    #[cfg(test)]
+    pub(crate) fn streamed_to(&mut self) -> u64 {
+        match &mut self.source {
+            Source::File { reader, .. } => {
+                reader.get_mut().stream_position().expect("stream position")
+            }
+            Source::Memory { cursor, .. } => cursor.stream_position().expect("stream position"),
+        }
     }
 }
