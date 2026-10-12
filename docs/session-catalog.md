@@ -575,9 +575,10 @@ stands for all of them. The span opens at the parent's own `session_meta`
 reappearing in a rollout that named that parent in `forked_from_id` or
 `source.subagent.thread_spawn.parent_thread_id`, or -- for Codex 0.133--0.148,
 which copy the history without the parent's `session_meta` -- at line 1 when
-a record before the child's first own turn is one only a copy can hold, and
-closes at the first turn
-it can attribute to the child or cannot order at all; the rule is
+a record before the child's first own turn is one only a copy can hold. A
+span opened at the parent's `session_meta` closes at the first turn it can
+attribute to the child or cannot order at all; one opened at line 1 closes
+only at the first UUIDv7 turn at or after the fork. The rule is
 `codex::ForkReplayGate`, which shallow discovery applies too, so a fork's
 `first_prompt` is its own. See [architecture](architecture.md) for the full
 rule.

@@ -2,12 +2,14 @@
 
 use anyhow::Result;
 use serde_json::Value;
+use std::cell::Cell;
 use std::io::{self, BufRead, BufReader};
 use std::path::Path;
 use std::sync::atomic::Ordering as AtomicOrdering;
 
 use super::codex;
 use super::cold_read;
+use super::transcript_cursor::{TranscriptFileCursor, TranscriptReader};
 use super::{
     codex_is_subagent, codex_parent_session_id, codex_parent_thread_id, parse_iso_ms,
     CodexSessionMeta, SYNC_QUIET,
@@ -93,47 +95,53 @@ fn collect_head_records(
     Ok((values, bytes_read))
 }
 
-/// A fork's replay gate, armed by [`codex::CopiedHistoryProbe`] over the
-/// records after the rollout's first when the read starts at byte zero
-/// (`from_start`): a copy that follows the child's own `session_meta` starts at
-/// line 1, which a resumed read never meets.
+/// Open the rollout walk's reader at its cursor, and the fork replay gate it
+/// steps, with the bytes the gate's head probe read.
 ///
-/// The probe reads up to its verdict or [`LEADING_BYTE_LIMIT`]. It is decided
-/// at the child's first own turn, which every observed paginated fork reaches
-/// within its first 400 KiB; a longer copy is still proven by a replayed turn
-/// ordered by UUIDv7, which comes in its first records.
-pub(super) fn codex_fork_replay_gate(
+/// The gate is armed by [`codex::CopiedHistoryProbe`] over the records after
+/// the rollout's first when the read starts at byte zero: a copy that follows
+/// the child's own `session_meta` starts at line 1, which a resumed read never
+/// meets. The probe reads up to its verdict or [`LEADING_BYTE_LIMIT`]. It is
+/// decided at the child's first own turn, which every observed paginated fork
+/// reaches within its first 400 KiB; a longer copy is still proven by a
+/// replayed turn ordered by UUIDv7, which comes in its first records.
+pub(super) fn open_codex_walk(
     path: &Path,
+    saved: Option<&TranscriptFileCursor>,
     meta: &CodexSessionMeta,
-    from_start: bool,
-) -> codex::ForkReplayGate {
+) -> Result<(TranscriptReader, codex::ForkReplayGate, u64)> {
+    let reader = TranscriptReader::open(path, saved, None)?;
     let mut gate = codex::ForkReplayGate::new(meta.fork_parent_id.clone(), meta.fork_origin_ms);
-    if !from_start || meta.fork_parent_id.is_none() {
-        return gate;
+    if reader.start_offset() != 0 || meta.fork_parent_id.is_none() {
+        return Ok((reader, gate, 0));
     }
+    let read = Cell::new(0u64);
+    let reached_end = || read.get() < LEADING_BYTE_LIMIT;
     if let Some(bytes) = cold_read::fresh(path) {
-        gate.probe_copied_history(records_after_first(io::Cursor::new(&bytes[..])));
-        return gate;
+        let records = records_after_first(io::Cursor::new(&bytes[..]), &read);
+        gate.probe_copied_history(records, reached_end);
+    } else {
+        let mut shared = cold_read::open_shared(path)?;
+        let records = records_after_first(BufReader::new(shared.file()), &read);
+        gate.probe_copied_history(records, reached_end);
     }
-    // A head the probe cannot open proves nothing, so the gate stays unarmed
-    // and the walk's own read reports the file.
-    if let Ok(mut shared) = cold_read::open_shared(path) {
-        gate.probe_copied_history(records_after_first(BufReader::new(shared.file())));
-    }
-    gate
+    Ok((reader, gate, read.get()))
 }
 
 /// The complete, parseable records after the first, within
-/// [`LEADING_BYTE_LIMIT`]. A read error ends them, as end of file does.
-fn records_after_first(reader: impl BufRead) -> impl Iterator<Item = Value> {
+/// [`LEADING_BYTE_LIMIT`], counting the bytes read into `read`. A read error
+/// ends them, as end of file does.
+fn records_after_first<'a>(
+    reader: impl BufRead + 'a,
+    read: &'a Cell<u64>,
+) -> impl Iterator<Item = Value> + 'a {
     let mut reader = reader.take(LEADING_BYTE_LIMIT);
     let mut raw = Vec::new();
     std::iter::from_fn(move || {
         raw.clear();
-        match reader.read_until(b'\n', &mut raw) {
-            Ok(read) if read > 0 && raw.last() == Some(&b'\n') => Some(raw.clone()),
-            _ => None,
-        }
+        let line = reader.read_until(b'\n', &mut raw).unwrap_or(0);
+        read.set(read.get() + line as u64);
+        (line > 0 && raw.last() == Some(&b'\n')).then(|| raw.clone())
     })
     .skip(1)
     .filter_map(|raw| serde_json::from_slice::<Value>(trim_ascii_end(&raw)).ok())

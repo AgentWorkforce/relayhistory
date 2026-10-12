@@ -412,8 +412,8 @@ into the child's file. The rollout walk gates that copy (`ForkReplaySpan` in
   `subagent_history_start_ordinal` is not used: 0.151+ writes the line of the
   `thread_settings_applied` after the copy, 0.124--0.148 the file's line
   count. A rollout that names no such parent is never gated.
-- It **closes** at the first `task_started` or `turn_context` whose turn is the
-  child's: a UUIDv7 `turn_id` at or after the child thread's own UUIDv7
+- A span opened at the parent's `session_meta` **closes** at the first
+  `task_started` or `turn_context` whose turn is the child's: a UUIDv7 `turn_id` at or after the child thread's own UUIDv7
   timestamp (else its `session_meta` timestamp), or, for a legacy turn id,
   `started_at` after the fork's second. A turn nothing orders against the
   fork -- including a legacy `started_at` in the fork's own second, which
@@ -428,10 +428,10 @@ into the child's file. The rollout walk gates that copy (`ForkReplaySpan` in
   ids) carry a `started_at` stamped at or just after the fork, so a non-v7
   turn stays in the span whatever its `started_at`.
 
-Two limits follow from gating on explicit evidence only. A replayed legacy
-turn with no UUIDv7 id and no `started_at` (or one in the fork's own second)
-closes the span early, and the rest
-of that replay is indexed under the child as before. And a record the child
+Two limits follow from gating on explicit evidence only. In a span opened at
+the parent's `session_meta`, a replayed legacy turn with no UUIDv7 id and no
+`started_at` (or one in the fork's own second) closes the span early, and the
+rest of that replay is indexed under the child as before. And a record the child
 writes before its first `task_started` / `turn_context` falls inside the span:
 nothing in it tells it from the parent's copy (codex-rs appends a
 `thread_settings_applied` after the copied prefix, the same shape as the

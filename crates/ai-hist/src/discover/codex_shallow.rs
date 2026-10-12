@@ -142,7 +142,10 @@ impl ShallowSessionProvider for CodexProvider {
             crate::codex::fork_parent_id(payload, session_id),
             crate::codex::fork_origin_ms(payload, session_id, claude_timestamp(&meta)),
         );
-        replay_gate.probe_copied_history(bounded.head_records().skip(1).filter_map(parse_record));
+        replay_gate.probe_copied_history(
+            bounded.head_records().skip(1).filter_map(parse_record),
+            || bounded.head_reaches_end(),
+        );
         for (index, line) in bounded.head_records().enumerate() {
             let Some(value) = parse_record(line) else {
                 continue;

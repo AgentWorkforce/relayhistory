@@ -5946,7 +5946,8 @@ fn ingest_codex_rollout_incremental(
     // Codex keeps its existing rule for a trailing line with no newline: it
     // is the half-written tail of a live rollout and the next pass re-reads
     // it. Unlike Claude, no Codex writer leaves its last line unterminated.
-    let mut reader = transcript_cursor::TranscriptReader::open(path, cursor.file.as_ref(), None)?;
+    let (mut reader, mut replay_gate, probe_bytes) =
+        rollout_head::open_codex_walk(path, cursor.file.as_ref(), meta)?;
     let mut pass = transcript_cursor::IncrementalPass {
         rotated: reader.rotated,
         ..Default::default()
@@ -6065,7 +6066,6 @@ fn ingest_codex_rollout_incremental(
     // `task_complete` the cursor could commit at, because its lines are
     // skipped before the arms that would.
     let mut fork_replay: Option<ForkReplaySpan> = None;
-    let mut replay_gate = rollout_head::codex_fork_replay_gate(path, meta, start_offset == 0);
     // The replay marker whose inherited baseline no child snapshot has
     // confirmed yet (see `inherited_baseline_verdict`). Carried across passes
     // on the cursor, so a pass may commit before the child's first snapshot
@@ -6986,7 +6986,8 @@ fn ingest_codex_rollout_incremental(
         .position()
         .saturating_sub(start_offset)
         .saturating_add(reader.tail_bytes())
-        .saturating_add(pass.validation_bytes);
+        .saturating_add(pass.validation_bytes)
+        .saturating_add(probe_bytes);
     Ok((outcome, pass))
 }
 
@@ -37225,6 +37226,51 @@ mod codex_fork_replay_tests {
                 .unwrap();
             assert_eq!(subkind, "copied_history");
         }
+    }
+
+    /// A live paginated fork whose copy holds no UUIDv7 turn: the copy is
+    /// held back whole while the child's own turn is unwritten, and its
+    /// replayed `task_complete` commits nothing, so the pass that sees the
+    /// child's turn re-reads it and indexes only the child.
+    #[test]
+    fn a_live_paginated_fork_holds_a_copy_without_ordered_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-child.jsonl");
+        let at = "2026-04-20T00:01:00.000Z";
+        let fork_second = codex::uuid_v7_ms(CHILD).unwrap() / 1000;
+        fs::write(
+            &rollout,
+            [
+                line(at, "session_meta", json!({"id": CHILD, "forked_from_id": PARENT,
+                    "cwd": "/tmp/project", "timestamp": at, "history_mode": "paginated"})),
+                line(at, "turn_context", json!({"turn_id": "ca738fc8-ff98-42b6-9b0b-4e382f72a3de"})),
+                line(at, "event_msg", usage_with_last(1000, 400)),
+                line(at, "event_msg", json!({"type": "task_started", "turn_id": "rollout-4", "started_at": fork_second + 1})),
+                line(at, "event_msg", json!({"type": "user_message", "message": "parent prompt"})),
+                line(at, "event_msg", usage_with_last(1500, 500)),
+                line(at, "event_msg", json!({"type": "task_complete", "turn_id": "rollout-4"})),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let meta = read_codex_session_meta(&rollout).unwrap().unwrap();
+        let mut cursor = transcript_cursor::TranscriptCursorState::default();
+        let (_, pass) =
+            ingest_codex_rollout_incremental(&conn, &rollout, &meta, &mut cursor).unwrap();
+        assert!(texts(&conn, CHILD).is_empty());
+        assert_eq!(cursor.file.as_ref().map(|file| file.offset).unwrap_or(0), 0);
+        // The probe's head read is a provider read too.
+        assert!(pass.bytes_read > fs::metadata(&rollout).unwrap().len());
+
+        let mut file = fs::OpenOptions::new().append(true).open(&rollout).unwrap();
+        std::io::Write::write_all(&mut file, child_turn(CHILD_TURN, 1600).as_bytes()).unwrap();
+        drop(file);
+        ingest_codex_rollout_incremental(&conn, &rollout, &meta, &mut cursor).unwrap();
+        assert_eq!(texts(&conn, CHILD), vec!["child prompt", "child answer"]);
+        assert_eq!(prompts(&conn, CHILD), vec!["child prompt"]);
+        assert_eq!(token_totals(&conn, CHILD), vec![100]);
     }
 
     /// A fork whose first record after its `session_meta` is its own spawn

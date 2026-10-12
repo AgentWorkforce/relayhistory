@@ -1356,6 +1356,12 @@ impl BoundedJsonl {
         records(&self.head).take(HEAD_SCAN_MAX_LINES)
     }
 
+    /// Whether [`Self::head_records`] runs to the end of the file: the head is
+    /// the whole file and within the line cap.
+    fn head_reaches_end(&self) -> bool {
+        self.tail.is_empty() && records(&self.head).nth(HEAD_SCAN_MAX_LINES).is_none()
+    }
+
     /// Records from the end of the file, newest first. For a file inside the
     /// head budget this walks the head region backwards, so every record —
     /// including ones past the head line cap — is reachable.

@@ -340,11 +340,17 @@ history is gated: the span from the parent's replayed `session_meta` to the
 child's first own turn (ordered by UUIDv7 turn id, else `started_at`) writes
 one `fork_replay_boundary` marker instead of re-indexing the parent's prompts,
 events and token baseline under the child
-([#210](https://github.com/AgentWorkforce/relayhistory/issues/210)). The `✓`
-is for spans the evidence can bound: a replayed legacy turn with no UUIDv7 id
-and no `started_at` (or a `started_at` in the fork's own second) is undecided,
-and an undecided span falls back to indexing
-the rest of the replay under the child, as before the gate. A plain
+([#210](https://github.com/AgentWorkforce/relayhistory/issues/210)). Codex
+0.133–0.148 (`history_mode: "paginated"`) copy that history straight after the
+child's own `session_meta`, without the parent's; there the span opens at line
+1 when a record before the child's first own turn is one only a copy can hold
+(a turn ordered before the fork, a `token_count`, a `compacted` record), closes
+at the first UUIDv7 turn at or after the fork, and its marker's `subkind` is
+`copied_history`. The `✓` is for spans the evidence can bound: in a span opened
+at the parent's `session_meta`, a replayed legacy turn with no UUIDv7 id and no
+`started_at` (or a `started_at` in the fork's own second) is undecided, and an
+undecided span falls back to indexing the rest of the replay under the child,
+as before the gate. A plain
 `codex resume` writes no identity to record, so there is nothing further to
 capture.
 

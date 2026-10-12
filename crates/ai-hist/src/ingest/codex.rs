@@ -472,13 +472,22 @@ impl ForkReplayGate {
     /// Run [`CopiedHistoryProbe`] over `records` -- the records after the
     /// file's first, in order -- and arm the gate with its verdict. Records
     /// without a payload object are skipped, as the rollout walk skips them.
-    pub(crate) fn probe_copied_history(&mut self, records: impl IntoIterator<Item = Value>) {
+    /// `reached_end` says, once the records run out, whether they ran to the
+    /// end of the file rather than to a read window.
+    pub(crate) fn probe_copied_history(
+        &mut self,
+        records: impl IntoIterator<Item = Value>,
+        reached_end: impl FnOnce() -> bool,
+    ) {
         let Some(mut probe) = self.copied_history_probe() else {
             return;
         };
-        let _decided = records.into_iter().any(|value| {
+        let decided = records.into_iter().any(|value| {
             value.get("payload").and_then(Value::as_object).is_some() && probe.observe(&value)
         });
+        if !decided && reached_end() {
+            probe.end_of_file();
+        }
         self.arm_copied_history(&probe);
     }
 
@@ -587,10 +596,11 @@ impl ForkReplayGate {
 /// a turn ordered before the fork, a `token_count` (the child makes no
 /// request before its first turn), or a `compacted` record (nor compacts
 /// anything). Records the child writes before that turn (its spawn prompt,
-/// `thread_settings_applied`) prove nothing. A read that ends before the
-/// close proves a copy only by a replayed turn ordered by UUIDv7; the
-/// parent's `session_meta` ends it with no verdict, since that is the other
-/// shape and opens its own span.
+/// `thread_settings_applied`) prove nothing. The end of the file decides the
+/// same way (a live fork whose own turn is not written yet); a read window
+/// that ends before the close proves a copy only by a replayed turn ordered
+/// by UUIDv7. The parent's `session_meta` ends the probe with no copy, since
+/// that is the other shape and opens its own span.
 #[derive(Debug, Clone)]
 pub(crate) struct CopiedHistoryProbe {
     gate: ForkReplayGate,
@@ -634,6 +644,13 @@ impl CopiedHistoryProbe {
                 true
             }
         }
+    }
+
+    /// The file ended before the child's first own turn -- a live fork whose
+    /// copy is written and whose own turn is not: what the copy holds decides,
+    /// exactly as at a close.
+    pub(crate) fn end_of_file(&mut self) {
+        self.verdict.get_or_insert(self.evidence);
     }
 
     fn proves_copy(&self) -> bool {
@@ -896,6 +913,41 @@ mod tests {
         assert!(ForkReplayGate::new(None, uuid_v7_ms(child))
             .copied_history_probe()
             .is_none());
+    }
+
+    #[test]
+    fn the_end_of_the_file_decides_a_copy_like_a_close() {
+        let child = "01a0c210-ec76-71c2-8585-47285eab37cc";
+        let second = uuid_v7_ms(child).unwrap() / 1000;
+        let rec = |kind: &str, payload: Value| json!({"type": kind, "payload": payload});
+        // A live fork: the copy holds no UUIDv7 turn and the child's own
+        // turn is not written yet.
+        let copy = vec![
+            rec(
+                "event_msg",
+                json!({"type": "task_started", "turn_id": "rollout-4", "started_at": second + 1}),
+            ),
+            rec("event_msg", json!({"type": "token_count", "info": null})),
+            rec(
+                "event_msg",
+                json!({"type": "task_complete", "turn_id": "rollout-4"}),
+            ),
+        ];
+        let mut gate = ForkReplayGate::new(Some("parent".to_string()), uuid_v7_ms(child));
+        gate.probe_copied_history(copy.clone(), || true);
+        assert_eq!(gate.step(false, &copy[0]), ReplayStep::Replay);
+        // Cut short by the read window instead, it proves nothing.
+        let mut gate = ForkReplayGate::new(Some("parent".to_string()), uuid_v7_ms(child));
+        gate.probe_copied_history(copy.clone(), || false);
+        assert_eq!(gate.step(false, &copy[0]), ReplayStep::Outside);
+        // A file that ends on the child's spawn prompt holds no copy.
+        let mut gate = ForkReplayGate::new(Some("parent".to_string()), uuid_v7_ms(child));
+        let prompt = rec(
+            "event_msg",
+            json!({"type": "user_message", "message": "spawn"}),
+        );
+        gate.probe_copied_history([prompt.clone()], || true);
+        assert_eq!(gate.step(false, &prompt), ReplayStep::Outside);
     }
 
     #[test]
