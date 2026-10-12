@@ -1,18 +1,21 @@
 //! Upserts that skip a rewrite when every assigned value is already stored.
 //!
 //! The `SET` expression and the `WHERE` comparison are the same text, so an
-//! unchanged conflict does not rewrite the row. A Grok event whose incoming
-//! `token_json` is null keeps the turn fact a later update stored.
+//! unchanged conflict does not rewrite the row. A Grok or Codex event whose
+//! incoming `token_json` is null keeps the usage a later write in the same
+//! pass stored.
 
 use std::sync::LazyLock;
 
 /// `token_json` for a Grok row is filled after the insert, by the turn tail.
-/// A conflict that wrote the incoming null would wipe that fact and stamp a
-/// revision, then the tail update would stamp another. A null incoming value
-/// keeps the stored Grok fact; every other source still clears it.
+/// A Codex row is filled by a later `token_count` in the same pass. A conflict
+/// that wrote the incoming null would wipe that fact and stamp a revision,
+/// then the later write would stamp another. A null incoming value keeps the
+/// stored fact for those two sources; every other source still clears it.
 const TOKEN_JSON_ASSIGNED: &str = "CASE \
      WHEN excluded.token_json IS NOT NULL THEN excluded.token_json \
      WHEN excluded.source = 'grok' THEN session_events.token_json \
+     WHEN excluded.source = 'codex' THEN session_events.token_json \
      ELSE excluded.token_json END";
 
 const PROJECT_KEY_ASSIGNED: &str = "COALESCE((SELECT s.project_key FROM sessions s \
