@@ -1359,10 +1359,10 @@ fn codex_paginated_fork_gates_a_copy_without_the_parents_session_meta() {
         ]
     );
     let boundary = rows(key, "session_markers")
-        .into_iter()
+        .iter()
         .find(|marker| text(marker, "kind") == "fork_replay_boundary")
         .expect("replay boundary");
-    assert_eq!(text(&boundary, "subkind"), "copied_history");
+    assert_eq!(text(boundary, "subkind"), "copied_history");
 }
 
 /// #210: a human fork records a `fork` edge from `forked_from_id`, and the
