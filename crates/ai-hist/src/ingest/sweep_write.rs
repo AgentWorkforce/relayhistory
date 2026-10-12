@@ -63,6 +63,10 @@ impl<'c> SweepWrite<'c> {
                 return Err(error);
             }
         };
+        // Presence is recorded once for this guard, including across the chunk
+        // commits it opens. The catalog key is read again after each commit.
+        // Drop clears both.
+        super::sweep_session::arm(conn);
         Ok(Self {
             conn,
             owned,
@@ -124,12 +128,17 @@ impl<'c> SweepWrite<'c> {
             return Err(error.into());
         }
         self.fts_after = arm_session_events_fts(self.conn)?;
+        // The commit above released the writer lock. A catalog key cached in
+        // the previous chunk is not this transaction's snapshot, and binding
+        // it would hide a key another writer stored in the gap.
+        super::sweep_session::release_catalog(self.conn);
         Ok(())
     }
 }
 
 impl Drop for SweepWrite<'_> {
     fn drop(&mut self) {
+        super::sweep_session::disarm();
         // An error or a cancellation unwound past the guard: nothing of the
         // open chunk is kept. Chunks a Claude transcript committed before it
         // stay (its catalog row and the rows of those chunks), but its cursor

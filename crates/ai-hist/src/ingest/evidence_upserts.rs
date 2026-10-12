@@ -18,29 +18,45 @@ const TOKEN_JSON_ASSIGNED: &str = "CASE \
      WHEN excluded.source = 'codex' THEN session_events.token_json \
      ELSE excluded.token_json END";
 
-const PROJECT_KEY_ASSIGNED: &str = "COALESCE((SELECT s.project_key FROM sessions s \
-     WHERE s.source = ?1 AND s.session_id = ?2), session_events.project_key, ?16)";
+/// The catalog lookup a one-off insert still runs. A sweep unit binds the same
+/// value as `?41` / `?42` after reading it once.
+const SESSION_KEY_LOOKUP: &str = "(SELECT s.project_key FROM sessions s \
+     WHERE s.source = ?1 AND s.session_id = ?2)";
 
-const PROJECT_KEY_METHOD_ASSIGNED: &str = "CASE \
-     WHEN (SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2) \
-          IS NOT NULL \
-       THEN (SELECT s.project_key_method FROM sessions s \
-             WHERE s.source = ?1 AND s.session_id = ?2) \
-     WHEN session_events.project_key IS NOT NULL THEN session_events.project_key_method \
-     ELSE ?17 END";
+const SESSION_METHOD_LOOKUP: &str = "(SELECT s.project_key_method FROM sessions s \
+     WHERE s.source = ?1 AND s.session_id = ?2)";
 
 const LOCATION_ASSIGNED: &str = "CASE WHEN session_events.location = excluded.location \
      THEN session_events.location ELSE 'both' END";
 
-pub(crate) static SESSION_EVENT_UPSERT: LazyLock<String> = LazyLock::new(|| {
-    format!(
-        "{} WHERE {}",
-        *SESSION_EVENT_REWRITE, *SESSION_EVENT_UNCHANGED
-    )
-});
+pub(crate) static SESSION_EVENT_UPSERT: LazyLock<String> =
+    LazyLock::new(|| session_event_sql(SESSION_KEY_LOOKUP, SESSION_METHOD_LOOKUP).1);
 
-pub(crate) static SESSION_EVENT_REWRITE: LazyLock<String> = LazyLock::new(|| {
-    format!(
+pub(crate) static SESSION_EVENT_REWRITE: LazyLock<String> =
+    LazyLock::new(|| session_event_sql(SESSION_KEY_LOOKUP, SESSION_METHOD_LOOKUP).0);
+
+/// Same assignment as [`SESSION_EVENT_UPSERT`], with the catalog key already
+/// bound. `?41` is null when the session row has no key.
+pub(crate) static SESSION_EVENT_UPSERT_CACHED: LazyLock<String> =
+    LazyLock::new(|| session_event_sql("?41", "?42").1);
+
+pub(crate) static SESSION_EVENT_REWRITE_CACHED: LazyLock<String> =
+    LazyLock::new(|| session_event_sql("?41", "?42").0);
+
+/// `(rewrite, upsert)`. The upsert adds the unchanged-row guard. The key
+/// expression prefers the catalog row, then the stored event key, then the
+/// cwd fallback (`?16`), and the method comes from the same arm.
+fn session_event_sql(session_key: &str, session_method: &str) -> (String, String) {
+    let insert_key = format!("COALESCE({session_key}, ?16)");
+    let insert_method =
+        format!("CASE WHEN {session_key} IS NOT NULL THEN {session_method} ELSE ?17 END");
+    let assigned_key = format!("COALESCE({session_key}, session_events.project_key, ?16)");
+    let assigned_method = format!(
+        "CASE WHEN {session_key} IS NOT NULL THEN {session_method} \
+         WHEN session_events.project_key IS NOT NULL THEN session_events.project_key_method \
+         ELSE ?17 END"
+    );
+    let rewrite = format!(
         "INSERT INTO session_events \
          (source, session_id, project, project_key, project_key_method, cwd, git_branch, \
           message_id, parent_id, ts_ms, role, kind, text, model, token_json, provider, event_uid, \
@@ -49,17 +65,15 @@ pub(crate) static SESSION_EVENT_REWRITE: LazyLock<String> = LazyLock::new(|| {
           request_id, provider_message_id, stop_reason, agent_version, is_sidechain, is_meta, \
           turn_id, request_span, raw_facts_version, raw_kind, control_kind, record_token_json) \
          VALUES (?1, ?2, ?3, \
-           COALESCE((SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2), ?16), \
-           CASE WHEN (SELECT s.project_key FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2) IS NOT NULL \
-                THEN (SELECT s.project_key_method FROM sessions s WHERE s.source = ?1 AND s.session_id = ?2) \
-                ELSE ?17 END, \
+           {insert_key}, \
+           {insert_method}, \
            ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, \
            ?14, ?15, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, \
            ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40) \
          ON CONFLICT(source, session_id, event_uid) DO UPDATE SET \
          project=excluded.project, \
-         project_key={PROJECT_KEY_ASSIGNED}, \
-         project_key_method={PROJECT_KEY_METHOD_ASSIGNED}, \
+         project_key={assigned_key}, \
+         project_key_method={assigned_method}, \
          cwd=excluded.cwd, git_branch=excluded.git_branch, message_id=excluded.message_id, \
          parent_id=excluded.parent_id, ts_ms=excluded.ts_ms, role=excluded.role, kind=excluded.kind, \
          text=excluded.text, model=excluded.model, token_json={TOKEN_JSON_ASSIGNED}, \
@@ -77,14 +91,11 @@ pub(crate) static SESSION_EVENT_REWRITE: LazyLock<String> = LazyLock::new(|| {
          raw_facts_version=excluded.raw_facts_version, raw_kind=excluded.raw_kind, \
          control_kind=excluded.control_kind, record_token_json=excluded.record_token_json, \
          location={LOCATION_ASSIGNED}"
-    )
-});
-
-static SESSION_EVENT_UNCHANGED: LazyLock<String> = LazyLock::new(|| {
-    format!(
+    );
+    let unchanged = format!(
         "excluded.project IS NOT session_events.project \
-         OR ({PROJECT_KEY_ASSIGNED}) IS NOT session_events.project_key \
-         OR ({PROJECT_KEY_METHOD_ASSIGNED}) IS NOT session_events.project_key_method \
+         OR ({assigned_key}) IS NOT session_events.project_key \
+         OR ({assigned_method}) IS NOT session_events.project_key_method \
          OR excluded.cwd IS NOT session_events.cwd \
          OR excluded.git_branch IS NOT session_events.git_branch \
          OR excluded.message_id IS NOT session_events.message_id \
@@ -120,8 +131,10 @@ static SESSION_EVENT_UNCHANGED: LazyLock<String> = LazyLock::new(|| {
          OR excluded.control_kind IS NOT session_events.control_kind \
          OR excluded.record_token_json IS NOT session_events.record_token_json \
          OR ({LOCATION_ASSIGNED}) IS NOT session_events.location"
-    )
-});
+    );
+    let upsert = format!("{rewrite} WHERE {unchanged}");
+    (rewrite, upsert)
+}
 
 const TOOL_LOCATION_ASSIGNED: &str = "CASE WHEN tool_calls.location = excluded.location \
      THEN tool_calls.location ELSE 'both' END";

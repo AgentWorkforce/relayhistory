@@ -24,8 +24,8 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 
 pub(crate) use super::evidence_upserts::{
-    FILE_EDIT_REWRITE, FILE_EDIT_UPSERT, SESSION_EVENT_REWRITE, SESSION_EVENT_UPSERT,
-    TOOL_CALL_REWRITE, TOOL_CALL_UPSERT,
+    FILE_EDIT_REWRITE, FILE_EDIT_UPSERT, SESSION_EVENT_REWRITE, SESSION_EVENT_REWRITE_CACHED,
+    SESSION_EVENT_UPSERT, SESSION_EVENT_UPSERT_CACHED, TOOL_CALL_REWRITE, TOOL_CALL_UPSERT,
 };
 
 /// The armed pass skips a rewrite of a row that already holds these values.
