@@ -381,12 +381,12 @@ pub(crate) enum ReplayStep {
 /// - A replayed turn nothing can order -- a legacy (non-v7) `turn_id` with no
 ///   `started_at`, or a `started_at` in the fork's own second -- closes a span
 ///   opened at the parent's `session_meta`, so the rest of that replay is
-///   indexed under the child as before. A span opened by the probe is already
-///   proven a copy, and the turns its builds reconstruct from paginated
-///   history (`rollout-4`, `auto-compact-0`, UUIDv4 ids, with a `started_at`
-///   stamped at the fork) carry no order of their own, so there they stay in
-///   the span; once the span has ordered a replayed turn by UUIDv7, so does a
-///   non-v7 turn whose `started_at` falls after the fork.
+///   indexed under the child as before. A span opened by the probe closes
+///   only at a UUIDv7 `turn_id` at or after the fork: the builds that write
+///   that shape mint UUIDv7 turn ids, and the turns they reconstruct from
+///   paginated history (`rollout-4`, `auto-compact-0`, UUIDv4 ids) carry a
+///   `started_at` stamped at or just after the fork, so a non-v7 turn there
+///   stays in the span whatever its `started_at`.
 /// - A record the child writes *before* its first `task_started` or
 ///   `turn_context` is inside the span and is not indexed. Nothing in such a
 ///   record distinguishes it from the parent's copied history (the envelope
@@ -413,7 +413,8 @@ pub(crate) struct ForkReplayGate {
     copied_history: bool,
     /// What opened the current span.
     opening: ReplayOpening,
-    /// The current span ordered a replayed turn by its UUIDv7 `turn_id`.
+    /// The current span ordered a replayed turn by its UUIDv7 `turn_id`:
+    /// what lets a probe cut short by its read window prove a copy.
     replayed_v7_turn: bool,
 }
 
@@ -571,9 +572,7 @@ impl ForkReplayGate {
             (ForkedTurnOwner::Replay, _) => None,
             (ForkedTurnOwner::Child(basis), ReplayOpening::ParentSessionMeta) => Some(basis),
             (ForkedTurnOwner::Undecided, ReplayOpening::ParentSessionMeta) => Some("undecided"),
-            (ForkedTurnOwner::Child(basis), ReplayOpening::CopiedHistory) => {
-                (v7 || !self.replayed_v7_turn).then_some(basis)
-            }
+            (ForkedTurnOwner::Child(basis), ReplayOpening::CopiedHistory) => v7.then_some(basis),
             (ForkedTurnOwner::Undecided, ReplayOpening::CopiedHistory) => None,
         }
     }
@@ -818,7 +817,7 @@ mod tests {
             rec("event_msg", json!({"type": "token_count", "info": null})),
             rec(
                 "event_msg",
-                json!({"type": "task_started", "turn_id": "rollout-4", "started_at": second}),
+                json!({"type": "task_started", "turn_id": "rollout-4", "started_at": second + 1}),
             ),
             rec(
                 "event_msg",

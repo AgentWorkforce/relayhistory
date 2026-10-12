@@ -422,11 +422,11 @@ into the child's file. The rollout walk gates that copy (`ForkReplaySpan` in
   `turn_id` of a replayed `task_started` before it, takes that verdict, since
   it describes the turn that record opened. The presence of
   `task_started` is not used: Codex 0.155 replays the parent's `task_started`
-  records too. In a span the probe opened, a turn nothing orders stays in the
-  span: those builds reconstruct turns from paginated history (`rollout-4`,
-  `auto-compact-0`, UUIDv4 ids) with a `started_at` stamped at the fork, so
-  once the span has ordered a replayed turn by UUIDv7, a non-v7 turn stays in
-  it whatever its `started_at`.
+  records too. A span the probe opened closes only at a UUIDv7 `turn_id` at
+  or after the fork: those builds mint UUIDv7 turn ids, and the turns they
+  reconstruct from paginated history (`rollout-4`, `auto-compact-0`, UUIDv4
+  ids) carry a `started_at` stamped at or just after the fork, so a non-v7
+  turn stays in the span whatever its `started_at`.
 
 Two limits follow from gating on explicit evidence only. A replayed legacy
 turn with no UUIDv7 id and no `started_at` (or one in the fork's own second)
