@@ -262,6 +262,9 @@ impl Error {
             ("CONNECTOR_FAILURE", Self::ConnectorFailure),
             ("INVALID_ARGUMENT", Self::InvalidArgument),
             ("DISCOVERY_FAILED", Self::Discovery),
+            // A discover tick's database-open failure is reported through the
+            // same sink as a sync failure. The code has to survive that.
+            ("DATABASE_OPEN_FAILED", Self::DatabaseOpen),
         ];
         for (code, build) in coded {
             if let Some(detail) = message.strip_prefix(&format!("{code}: ")) {
@@ -4336,6 +4339,10 @@ mod tests {
         assert_eq!(plain, Error::HydrationFailed("disk on fire".to_string()));
         let discovery = Error::sync(anyhow::anyhow!("DISCOVERY_FAILED: codex: boom"));
         assert_eq!(discovery, Error::Discovery("codex: boom".to_string()));
+        let opened = Error::DatabaseOpen("missing".to_string());
+        let tick_error = anyhow::anyhow!("{opened}");
+        let reported = Error::sync(anyhow::anyhow!("{tick_error:#}"));
+        assert_eq!(reported, opened);
 
         // The serialized tag is the same word `code()` answers, for every
         // variant, so a host that matches on one can match on the other.
