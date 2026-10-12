@@ -199,6 +199,15 @@ impl SweepPhases<'_, '_> {
         }
         capture_progress("claude", 0, None);
         check_capture_cancelled()?;
+        // A full walk reads the unchanged-file evidence keys once. A
+        // path-scoped tick keeps the point probe. Drop disarms the walk,
+        // including when it unwinds.
+        let projects = self.roots.claude.join("projects");
+        let _guard = super::evidence_probe::Guard::arm_when_full(
+            self.conn,
+            scope.paths(),
+            std::slice::from_ref(&projects),
+        );
         let metadata = sync_claude_session_metadata_with_repairs_and_coverage(
             self.conn,
             self.state,
