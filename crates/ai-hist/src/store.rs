@@ -15,9 +15,11 @@ mod event_row;
 mod retired_sources;
 pub use retired_sources::is_retired_source;
 mod schema_check;
+mod user_turn_page;
 use crate::ingest::evidence_reconcile::{record_history_presence, record_marker_presence};
 pub(crate) use event_row::row_to_session_event;
 use schema_check::schema_has_required_indexes;
+use user_turn_page::UserTurnHeader;
 
 pub use crate::relationship_graph::{
     relationship_capabilities, session_children, session_children_page, session_continuity_edges,
@@ -883,6 +885,9 @@ const REQUIRED_INDEXES: &[&str] = &[
     // against the record that carries it, across every session. Without this
     // that is a scan of every event on every hydration.
     "idx_session_events_message",
+    // A turn page reads one session's rows for a message id. The index
+    // above cannot bound that: Codex reuses line-derived ids across sessions.
+    "idx_session_events_session_message",
     // ... and the uid half of the same lookup, for the rows the message id
     // cannot find.
     "idx_session_events_claude_uid_unmatched",
@@ -1038,6 +1043,9 @@ const REQUIRED_CATALOG_READ_INDEXES: &[&str] = &[
 ];
 const REQUIRED_EVENT_READ_INDEXES: &[&str] =
     &["idx_session_events_source_page", "idx_session_events_page"];
+/// A turn page seeks this. Event and usage reads do not: a database that
+/// predates it still has their indexes.
+const USER_TURN_MESSAGE_INDEX: &str = "idx_session_events_session_message";
 /// Indexes the session-scoped tool call, file edit and marker pages depend
 /// on. All three always name one source and one session, so a single
 /// composite index per table carries the whole lookup and its ordering.
@@ -1132,6 +1140,16 @@ pub fn schema_is_identity_read_current(conn: &Connection) -> Result<bool> {
 /// Whether bounded event pagination has both source-scoped and source-less indexes.
 pub fn schema_is_event_read_current(conn: &Connection) -> Result<bool> {
     schema_has_required_indexes(conn, REQUIRED_EVENT_READ_INDEXES)
+}
+
+/// Whether a user-turn page can seek one session's rows for a message id.
+///
+/// Missing, the page reads that session through its page index instead.
+/// The native turn-page read uses this guard to migrate when it can,
+/// without refusing an event or usage read of the same database.
+pub fn schema_is_user_turn_read_current(conn: &Connection) -> Result<bool> {
+    Ok(schema_is_event_read_current(conn)?
+        && schema_has_required_indexes(conn, &[USER_TURN_MESSAGE_INDEX])?)
 }
 
 /// Whether delegation-topology reads can use their indexed parent and child
@@ -1795,12 +1813,17 @@ VALUES ('session_presences_local_backfill_v1');
         "CREATE INDEX IF NOT EXISTS idx_session_events_project ON session_events(source, session_id, project_key, project_key_method)",
         [],
     )?;
-    // Continuity resolves a transcript's first parent uuid to the session
-    // holding the record with that uuid, which is a lookup by message id
-    // across every session rather than within one.
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_session_events_message ON session_events(source, message_id)",
-        [],
+    // Continuity looks a message id up across every session, so it keeps
+    // `(source, message_id)` and names that index in the lookup: this
+    // session-led one is covering for `SELECT session_id`, and with no
+    // statistics the planner searches it by `source` alone. A turn page
+    // looks up one session. Codex reuses line-derived ids, and the
+    // cross-session index would return every session that stored one.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_session_events_message \
+         ON session_events(source, message_id);
+         CREATE INDEX IF NOT EXISTS idx_session_events_session_message \
+         ON session_events(source, session_id, message_id);",
     )?;
     // The other half of that lookup: a Claude record can resolve through its
     // first block's uid, `<uuid>:0`, as well as its message id. Searching the
@@ -3683,25 +3706,21 @@ fn user_turn_stream_sql() -> String {
     )
 }
 
-/// The turn headers: one row per turn key, with the turn's anchor
-/// `(MIN(ts_ms), MIN(id))`, its provider message id, and the timestamp of its
-/// last block, which is where the block pass may stop reading.
-fn user_turn_header_sql(after: bool, limited: bool) -> String {
-    let mut sql = format!(
+/// Every turn of one session, grouped once.
+///
+/// The unpaged read uses this. A page does not: `HAVING` and `LIMIT` still
+/// make SQLite aggregate every matching row first, so walking pages would
+/// regroup the turns already returned. Per-key lookups for the whole
+/// session would be one lookup per turn instead of this single pass.
+fn user_turn_header_sql() -> String {
+    format!(
         "SELECT {USER_TURN_KEY} AS turn_key, MIN(ts_ms) AS turn_ts, MIN(id) AS turn_id, \
          MIN(NULLIF(message_id, '')) AS turn_message_id, MAX(ts_ms) AS turn_last_ts \
          FROM session_events \
          WHERE source = ? AND session_id = ? AND {USER_TURN_ROW_FILTER} \
-         GROUP BY turn_key"
-    );
-    if after {
-        sql.push_str(" HAVING turn_ts > ? OR (turn_ts = ? AND turn_id > ?)");
-    }
-    sql.push_str(" ORDER BY turn_ts ASC, turn_id ASC");
-    if limited {
-        sql.push_str(" LIMIT ?");
-    }
-    sql
+         GROUP BY turn_key \
+         ORDER BY turn_ts ASC, turn_id ASC"
+    )
 }
 
 /// One bounded page of user turns for one session, oldest first.
@@ -3711,6 +3730,10 @@ fn user_turn_header_sql(after: bool, limited: bool) -> String {
 /// copy of them would be a second thing to keep true. Computing it here
 /// instead of in each consumer is what makes every consumer agree on where a
 /// turn starts and how its bytes are counted.
+///
+/// The header read starts at the cursor and stops once `limit` turns are
+/// complete and one later turn shows that another page exists. It does not
+/// group the turns already returned.
 ///
 /// A turn is the set of rows that arrived on one user message, selected by
 /// [`USER_TURN_ROW_FILTER`] and grouped by provider message id. That is exactly
@@ -3767,33 +3790,10 @@ fn read_user_turns(
         .is_autocommit()
         .then(|| conn.unchecked_transaction())
         .transpose()?;
-    let sql = user_turn_header_sql(after.is_some(), limit.is_some());
-    let mut params_vec: Vec<rusqlite::types::Value> =
-        vec![source.to_string().into(), session_id.to_string().into()];
-    if let Some(cursor) = after {
-        params_vec.push(cursor.ts_ms.into());
-        params_vec.push(cursor.ts_ms.into());
-        params_vec.push(cursor.id.into());
-    }
-    if let Some(limit) = limit {
-        params_vec.push((limit + 1).into());
-    }
-
-    let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(rusqlite::params_from_iter(params_vec), |row| {
-        Ok(UserTurnHeader {
-            key: row.get(0)?,
-            ts_ms: row.get(1)?,
-            id: row.get(2)?,
-            message_id: row.get(3)?,
-            last_ts_ms: row.get(4)?,
-        })
-    })?;
-    let mut headers = rows.collect::<rusqlite::Result<Vec<_>>>()?;
-    let has_more = limit.is_some_and(|limit| headers.len() > limit as usize);
-    if let Some(limit) = limit {
-        headers.truncate(limit as usize);
-    }
+    let (headers, has_more) = match limit {
+        Some(limit) => user_turn_page::page_headers(conn, source, session_id, limit, after)?,
+        None => (grouped_turn_headers(conn, source, session_id)?, false),
+    };
 
     let user_turns = fill_user_turns(conn, source, session_id, &headers)?;
 
@@ -3815,12 +3815,22 @@ fn read_user_turns(
     })
 }
 
-struct UserTurnHeader {
-    key: String,
-    ts_ms: i64,
-    id: i64,
-    message_id: Option<String>,
-    last_ts_ms: i64,
+fn grouped_turn_headers(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+) -> Result<Vec<UserTurnHeader>> {
+    let mut stmt = conn.prepare(&user_turn_header_sql())?;
+    let rows = stmt.query_map(params![source, session_id], |row| {
+        Ok(UserTurnHeader {
+            key: row.get(0)?,
+            ts_ms: row.get(1)?,
+            id: row.get(2)?,
+            message_id: row.get(3)?,
+            last_ts_ms: row.get(4)?,
+        })
+    })?;
+    Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
 }
 
 /// The blocks and neighbours of a page of turns, from one ordered pass.
@@ -5912,8 +5922,8 @@ mod tests {
         // per-turn block reads, or it proves nothing: a delete that commits
         // before the first read is simply an earlier snapshot, which every
         // implementation reports consistently. So first measure what the
-        // header pass costs in progress ticks, by running that exact query
-        // standalone against the same data.
+        // header pass costs in progress ticks, by running it standalone
+        // against the same data.
         let header_ticks = {
             let probe = open_db(&path).unwrap();
             let counter = std::rc::Rc::new(std::cell::Cell::new(0u32));
@@ -5928,17 +5938,10 @@ mod tests {
                     false
                 }),
             );
-            let sql = user_turn_header_sql(false, true);
-            let mut stmt = probe.prepare(&sql).unwrap();
-            let rows = stmt
-                .query_map(rusqlite::params!["claude", "s1", 101], |row| {
-                    row.get::<_, String>(0)
-                })
-                .unwrap()
-                .collect::<rusqlite::Result<Vec<_>>>()
-                .unwrap();
-            assert_eq!(rows.len(), 2);
-            drop(stmt);
+            let (headers, has_more) =
+                user_turn_page::page_headers(&probe, "claude", "s1", 100, None).unwrap();
+            assert_eq!(headers.len(), 2);
+            assert!(!has_more);
             probe.progress_handler(0, None::<fn() -> bool>);
             while rx.try_recv().is_ok() {
                 seen.set(seen.get() + 1);
@@ -9316,7 +9319,10 @@ mod user_turn_pass_tests {
         let mut params_vec: Vec<rusqlite::types::Value> =
             vec![source.to_string().into(), session_id.to_string().into()];
         if let Some(cursor) = after {
-            sql.push_str(" HAVING turn_ts > ? OR (turn_ts = ? AND turn_id > ?)");
+            // Repeat the aggregates. `HAVING` does not see the alias of
+            // `MIN(id)` — `id` is the rowid — so `turn_id > ?` is never
+            // true and a later turn at the cursor's timestamp is dropped.
+            sql.push_str(" HAVING MIN(ts_ms) > ? OR (MIN(ts_ms) = ? AND MIN(id) > ?)");
             params_vec.push(cursor.ts_ms.into());
             params_vec.push(cursor.ts_ms.into());
             params_vec.push(cursor.id.into());
@@ -9511,16 +9517,15 @@ mod user_turn_pass_tests {
                     cursor = got.next_cursor;
                 }
             }
-            let whole: Vec<SessionUserTurn> = all_reference_pages(&conn, 1_000)
-                .into_iter()
-                .flat_map(|page| page.user_turns)
-                .collect();
+            let whole = session_user_turns_all(&conn, "claude", "s").unwrap();
             assert!(!whole.is_empty(), "seed {seed} produced no turns");
-            assert_eq!(
-                session_user_turns_all(&conn, "claude", "s").unwrap(),
-                whole,
-                "seed {seed}, whole session"
-            );
+            for limit in [1, 2, 3, 7, 1_000] {
+                let paged: Vec<SessionUserTurn> = all_reference_pages(&conn, limit)
+                    .into_iter()
+                    .flat_map(|page| page.user_turns)
+                    .collect();
+                assert_eq!(paged, whole, "seed {seed}, limit {limit}, reference pages");
+            }
         }
     }
 
@@ -9600,33 +9605,157 @@ mod user_turn_pass_tests {
         (steps.load(std::sync::atomic::Ordering::Relaxed), value)
     }
 
-    /// The cost of a page grows with the session once, not once per turn on
-    /// it: a full page of 1,000 turns costs about what a page of one does,
-    /// because both regroup the session once and the blocks of the larger
-    /// page come from the same ordered pass. Per-turn statements made the
-    /// full page cost a thousand session walks.
+    /// Cursor on the last user-turn row of `exchanges` Claude-shaped
+    /// exchanges. The next turn is the following exchange's prompt, at
+    /// `exchanges * 10`. Ids follow insertion order from 1.
+    fn cursor_after_exchanges(exchanges: usize) -> SessionEventCursor {
+        let ts_ms = ((exchanges - 1) * 10 + 7) as i64;
+        SessionEventCursor {
+            ts_ms,
+            id: ts_ms + 1,
+        }
+    }
+
+    fn header_page_steps(exchanges: usize, skipped: usize, named: bool) -> u64 {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        seed_exchanges(&conn, exchanges, named);
+        let cursor = cursor_after_exchanges(skipped);
+        let (steps, (headers, has_more)) = vm_steps(&conn, || {
+            user_turn_page::page_headers(&conn, "claude", "big", 1, Some(&cursor)).unwrap()
+        });
+        assert_eq!(headers.len(), 1, "named={named} exchanges={exchanges}");
+        assert!(has_more, "named={named} exchanges={exchanges}");
+        assert_eq!(headers[0].ts_ms, (skipped * 10) as i64);
+        steps
+    }
+
+    /// A later page's headers do not grow with the turns already returned,
+    /// nor with the tail after the page is complete. Ten times the prefix,
+    /// or ten times the tail, stays under four times the work — a
+    /// whole-session `GROUP BY` tracks the ten.
     #[test]
-    fn a_full_page_costs_about_what_a_one_turn_page_costs() {
+    fn a_later_page_does_not_regroup_turns_already_returned() {
         for named in [true, false] {
-            let conn = Connection::open_in_memory().unwrap();
-            init_db(&conn).unwrap();
-            // 20,000 events: 6,000 named turns, or 8,000 unnamed ones.
-            seed_exchanges(&conn, 2_000, named);
-            let (one, page) = vm_steps(&conn, || {
-                session_user_turns_page(&conn, "claude", "big", 1, None).unwrap()
-            });
-            assert_eq!(page.user_turns.len(), 1);
-            let (full, page) = vm_steps(&conn, || {
-                session_user_turns_page(&conn, "claude", "big", 1_000, None).unwrap()
-            });
-            assert_eq!(page.user_turns.len(), 1_000);
-            eprintln!("user-turn page named={named} one={one} full={full}");
+            let small_prefix = header_page_steps(12, 8, named);
+            let large_prefix = header_page_steps(84, 80, named);
+            eprintln!(
+                "user-turn header prefix named={named} small={small_prefix} large={large_prefix}"
+            );
             assert!(
-                full < one * 3,
-                "a 1,000-turn page cost {full} steps against {one} for one turn \
-                 (named={named}): block or neighbour reads are running per turn"
+                large_prefix < small_prefix * 4,
+                "ten times the turns before the cursor cost {}x the header work (named={named})",
+                large_prefix / small_prefix.max(1)
+            );
+            let small_tail = header_page_steps(12, 4, named);
+            let large_tail = header_page_steps(120, 4, named);
+            eprintln!("user-turn header tail named={named} small={small_tail} large={large_tail}");
+            assert!(
+                large_tail < small_tail * 4,
+                "ten times the tail after the page cost {}x the header work (named={named})",
+                large_tail / small_tail.max(1)
             );
         }
+    }
+
+    /// The integrated page, neighbours included, stays bounded the same way
+    /// when a named message sits next to the turn. An unnamed session has
+    /// no such message, so the neighbour seek still runs to the end of the
+    /// range it was given; that seek is unchanged.
+    #[test]
+    fn a_later_named_page_does_not_read_the_rest_of_the_session() {
+        let page_steps = |exchanges: usize, skipped: usize| {
+            let conn = Connection::open_in_memory().unwrap();
+            init_db(&conn).unwrap();
+            seed_exchanges(&conn, exchanges, true);
+            let cursor = cursor_after_exchanges(skipped);
+            let (steps, page) = vm_steps(&conn, || {
+                session_user_turns_page(&conn, "claude", "big", 1, Some(&cursor)).unwrap()
+            });
+            assert_eq!(page.user_turns.len(), 1);
+            assert!(page.next_cursor.is_some());
+            assert_eq!(page.user_turns[0].ts_ms, (skipped * 10) as i64);
+            assert!(page.user_turns[0].preceding_message_id.is_some());
+            steps
+        };
+        let small_prefix = page_steps(12, 8);
+        let large_prefix = page_steps(84, 80);
+        let small_tail = page_steps(12, 4);
+        let large_tail = page_steps(120, 4);
+        eprintln!(
+            "user-turn named page prefix {small_prefix}/{large_prefix} tail {small_tail}/{large_tail}"
+        );
+        assert!(large_prefix < small_prefix * 4);
+        assert!(large_tail < small_tail * 4);
+    }
+
+    /// Codex reuses line-derived message ids across sessions. A one-turn
+    /// page of one session stays on that session: other sessions that stored
+    /// the same id do not multiply the work, and the anchor stays this
+    /// session's timestamp rather than an earlier one from another session.
+    #[test]
+    fn a_shared_message_id_is_not_read_from_other_sessions() {
+        let steps_for = |others: i64| {
+            let conn = Connection::open_in_memory().unwrap();
+            init_db(&conn).unwrap();
+            let tx = conn.unchecked_transaction().unwrap();
+            let mut insert = tx
+                .prepare(
+                    "INSERT INTO session_events \
+                     (source, session_id, message_id, ts_ms, role, kind, text, event_uid) \
+                     VALUES ('codex', ?1, '1:user_message', ?2, 'user', 'text', 'prompt', ?3)",
+                )
+                .unwrap();
+            insert.execute(params!["A", 5_000_i64, "a"]).unwrap();
+            for n in 0..others {
+                insert
+                    .execute(params![format!("s{n}"), 1_i64, format!("o{n}")])
+                    .unwrap();
+            }
+            drop(insert);
+            tx.commit().unwrap();
+            let (steps, page) = vm_steps(&conn, || {
+                session_user_turns_page(&conn, "codex", "A", 1, None).unwrap()
+            });
+            assert_eq!(page.user_turns.len(), 1);
+            assert_eq!(page.user_turns[0].ts_ms, 5_000);
+            assert!(page.next_cursor.is_none());
+            steps
+        };
+        let few = steps_for(2);
+        let many = steps_for(400);
+        eprintln!("shared message id few={few} many={many}");
+        assert!(
+            many < few * 4,
+            "200x the other sessions sharing the id cost {}x the page",
+            many / few.max(1)
+        );
+    }
+
+    /// Event and usage reads do not wait on the turn-page index. A database
+    /// that predates it still returns that session's turn, through the page
+    /// index, rather than failing the query or reading every other session.
+    #[test]
+    fn a_turn_page_without_its_index_stays_on_the_session() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute_batch("DROP INDEX idx_session_events_session_message")
+            .unwrap();
+        assert!(schema_is_event_read_current(&conn).unwrap());
+        assert!(schema_is_usage_read_current(&conn).unwrap());
+        assert!(!schema_is_user_turn_read_current(&conn).unwrap());
+        let tx = conn.unchecked_transaction().unwrap();
+        tx.execute_batch(
+            "INSERT INTO session_events \
+             (source, session_id, message_id, ts_ms, role, kind, text, event_uid) VALUES \
+             ('codex', 'A', '1:user_message', 5000, 'user', 'text', 'prompt', 'a'), \
+             ('codex', 'other', '1:user_message', 1, 'user', 'text', 'prompt', 'o');",
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let page = session_user_turns_page(&conn, "codex", "A", 1, None).unwrap();
+        assert_eq!(page.user_turns.len(), 1);
+        assert_eq!(page.user_turns[0].ts_ms, 5_000);
     }
 
     /// Reading every turn of a session is linear in it: twenty times the
@@ -9661,6 +9790,177 @@ mod user_turn_pass_tests {
         }
     }
 
+    fn paged_turns(
+        conn: &Connection,
+        source: &str,
+        session_id: &str,
+        limit: i64,
+    ) -> Vec<SessionUserTurn> {
+        let mut turns = Vec::new();
+        let mut cursor = None;
+        for _ in 0..10_000 {
+            let page =
+                session_user_turns_page(conn, source, session_id, limit, cursor.as_ref()).unwrap();
+            let more = page.next_cursor.is_some();
+            if let Some(cursor) = &cursor {
+                let first = page.user_turns.first().expect("a cursor yields a turn");
+                assert!(
+                    first.ts_ms > cursor.ts_ms
+                        || (first.ts_ms == cursor.ts_ms && first.id > cursor.id),
+                    "page did not move past the cursor"
+                );
+            }
+            cursor = page.next_cursor;
+            turns.extend(page.user_turns);
+            if !more {
+                return turns;
+            }
+        }
+        panic!("cursor did not advance");
+    }
+
+    /// Concatenating small pages equals the one-pass read. Covers a Claude
+    /// user message that carries tool-result blocks, a Codex rollout whose
+    /// prompt is the whole turn, a legacy row whose key is `event:<id>`,
+    /// and a session longer than one page.
+    #[test]
+    fn paged_user_turns_concatenate_to_the_whole_session() {
+        let claude = Connection::open_in_memory().unwrap();
+        init_db(&claude).unwrap();
+        let claude_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/claude/user-turn-blocks.jsonl");
+        crate::ingest_claude_transcript(&claude, &claude_path).unwrap();
+        let claude_all = session_user_turns_all(&claude, "claude", "utb-session").unwrap();
+        assert!(claude_all.len() > 1, "the fixture spans more than one page");
+        assert!(
+            claude_all.iter().any(|turn| {
+                turn.blocks
+                    .iter()
+                    .filter(|block| block.kind == "tool_result")
+                    .count()
+                    >= 2
+            }),
+            "a Claude user message keeps both tool-result blocks: {claude_all:?}"
+        );
+        assert_eq!(paged_turns(&claude, "claude", "utb-session", 1), claude_all);
+        let later = session_user_turns_page(
+            &claude,
+            "claude",
+            "utb-session",
+            1,
+            Some(&SessionEventCursor {
+                ts_ms: claude_all[0].ts_ms,
+                id: claude_all[0].id,
+            }),
+        )
+        .unwrap();
+        assert_eq!(
+            later.user_turns[0].preceding_message_id,
+            claude_all[1].preceding_message_id
+        );
+        assert_eq!(later.user_turns[0], claude_all[1]);
+
+        let codex = Connection::open_in_memory().unwrap();
+        init_db(&codex).unwrap();
+        let codex_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/codex/user-turn-blocks.jsonl");
+        let meta = crate::read_codex_session_meta(&codex_path)
+            .unwrap()
+            .unwrap();
+        crate::ingest_codex_rollout(&codex, &codex_path, &meta).unwrap();
+        let codex_all = session_user_turns_all(&codex, "codex", "sess_codex_utb").unwrap();
+        assert!(codex_all.len() > 1);
+        assert!(
+            codex_all
+                .iter()
+                .all(|turn| turn.blocks.iter().all(|block| block.kind == "text")),
+            "a Codex prompt is the whole turn: {codex_all:?}"
+        );
+        assert_eq!(paged_turns(&codex, "codex", "sess_codex_utb", 1), codex_all);
+
+        let legacy = Connection::open_in_memory().unwrap();
+        init_db(&legacy).unwrap();
+        seed_exchanges(&legacy, 3, false);
+        let legacy_all = session_user_turns_all(&legacy, "claude", "big").unwrap();
+        assert!(legacy_all.len() > 2, "more turns than one page");
+        assert!(legacy_all.iter().all(|turn| turn.message_id.is_none()));
+        assert_eq!(paged_turns(&legacy, "claude", "big", 2), legacy_all);
+    }
+
+    /// Two message ids interleaved, plus an unnamed row whose key collides
+    /// with a literal `event:<id>` message id. The anchor is `(MIN(ts_ms),
+    /// MIN(id))`, not the first row, so a key change is not the end of the
+    /// turn. Pages of one still match the whole-session grouping.
+    #[test]
+    fn interleaved_message_ids_stay_one_turn_across_pages() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let insert = |id: i64, ts: i64, message_id: Option<&str>, role: &str, kind: &str| {
+            conn.execute(
+                "INSERT INTO session_events \
+                 (id, source, session_id, message_id, ts_ms, role, kind, text, event_uid, \
+                  event_source) \
+                 VALUES (?1, 'claude', 's', ?2, ?3, ?4, ?5, 'body', ?6, ?7)",
+                params![
+                    id,
+                    message_id,
+                    ts,
+                    role,
+                    kind,
+                    format!("e{id}"),
+                    (kind == "tool_result").then_some("tool_result"),
+                ],
+            )
+            .unwrap();
+        };
+        // Unnamed row 4 and the provider id `event:4` are one turn. Its
+        // anchor sorts first.
+        insert(4, 40, None, "user", "text");
+        insert(30, 400, Some("event:4"), "user", "text");
+        insert(1, 50, Some("a0"), "assistant", "text");
+        // m1's later block has the smaller id, so the anchor is not the
+        // first row a forward scan meets. m2 sits between the two blocks.
+        insert(10, 100, Some("m1"), "user", "text");
+        insert(7, 150, Some("m2"), "user", "text");
+        insert(11, 160, Some("a1"), "assistant", "text");
+        insert(5, 200, Some("m1"), "tool_result", "tool_result");
+        insert(20, 300, None, "user", "text");
+
+        let whole = session_user_turns_all(&conn, "claude", "s").unwrap();
+        assert_eq!(
+            whole
+                .iter()
+                .map(|turn| (
+                    turn.id,
+                    turn.ts_ms,
+                    turn.message_id.clone(),
+                    turn.blocks.len()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (4, 40, Some("event:4".to_string()), 2),
+                (5, 100, Some("m1".to_string()), 2),
+                (7, 150, Some("m2".to_string()), 1),
+                (20, 300, None, 1),
+            ]
+        );
+        assert_eq!(whole[1].blocks[1].kind, "tool_result");
+        assert_eq!(paged_turns(&conn, "claude", "s", 1), whole);
+        // The page that starts on m2 still sees m1 as the message before
+        // m2's anchor, not a neighbour from the start of the session.
+        let m2 = session_user_turns_page(
+            &conn,
+            "claude",
+            "s",
+            1,
+            Some(&SessionEventCursor { ts_ms: 100, id: 5 }),
+        )
+        .unwrap();
+        assert_eq!(m2.user_turns.len(), 1);
+        assert_eq!(m2.user_turns[0].id, 7);
+        assert_eq!(m2.user_turns[0].preceding_message_id.as_deref(), Some("m1"));
+    }
+
     fn query_plan(conn: &Connection, sql: &str) -> String {
         let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
         // Unbound parameters plan as NULL; the shape is what matters.
@@ -9690,6 +9990,7 @@ mod user_turn_pass_tests {
             for (name, sql) in [
                 ("stream", user_turn_stream_sql()),
                 ("named before", USER_TURN_NAMED_BEFORE.to_string()),
+                ("turn walk", user_turn_page::user_turn_walk_sql(true)),
             ] {
                 let plan = query_plan(&conn, &sql);
                 assert!(
@@ -9705,6 +10006,30 @@ mod user_turn_pass_tests {
                     "{name} sorts instead of reading in index order (analyze={analyze}): {plan}"
                 );
             }
+            let message = query_plan(&conn, &user_turn_page::user_turn_message_rows_sql());
+            assert!(
+                message.contains("USING INDEX idx_session_events_session_message"),
+                "a turn's rows are not read through the session message index \
+                 (analyze={analyze}): {message}"
+            );
+            assert!(
+                !message.contains("SCAN session_events"),
+                "a turn's rows scan the session (analyze={analyze}): {message}"
+            );
+            let collided = query_plan(&conn, &user_turn_page::user_turn_collided_row_sql());
+            assert!(
+                collided.contains("PRIMARY KEY"),
+                "an event:<id> collision does not seek the row (analyze={analyze}): {collided}"
+            );
+            let opened = query_plan(&conn, &user_turn_page::user_turn_walk_sql(false));
+            assert!(
+                opened.contains("idx_session_events_source_page"),
+                "the first page does not seek the page index (analyze={analyze}): {opened}"
+            );
+            assert!(
+                !opened.contains("TEMP B-TREE"),
+                "the first page sorts (analyze={analyze}): {opened}"
+            );
         }
     }
 }

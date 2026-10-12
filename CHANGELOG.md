@@ -14,6 +14,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - A Hermes read treats a sidecar that disappears mid-check as absent.
 - A cold sweep reads a transcript once and checks its commit digest from those bytes.
+- A later page of user turns does not regroup the turns already returned.
 
 ### Rust API
 

@@ -15,8 +15,8 @@ use ai_hist::history_search::{search_all, search_page as core_search_page, Searc
 use ai_hist::{
     default_db_path, open_db, open_db_readonly, recent as core_recent, relationship_capabilities,
     schema_is_catalog_read_current, schema_is_event_read_current, schema_is_evidence_read_current,
-    schema_is_read_current, schema_is_relationship_read_current, session as core_session,
-    session_children_page as core_session_children_page,
+    schema_is_read_current, schema_is_relationship_read_current, schema_is_user_turn_read_current,
+    session as core_session, session_children_page as core_session_children_page,
     session_events_page as core_session_events_page,
     session_file_edits_page as core_session_file_edits_page, session_locations,
     session_relationships as core_session_relationships,
@@ -1434,7 +1434,7 @@ pub async fn get_session_user_turns_page(
             user_turns: Vec::new(),
             next_cursor: None,
         },
-        schema_is_event_read_current,
+        schema_is_user_turn_read_current,
         move |conn| core_session_user_turns_page(conn, &source, &session_id, limit, after.as_ref()),
     )
     .await
