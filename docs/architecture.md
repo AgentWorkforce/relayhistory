@@ -397,7 +397,7 @@ A forked rollout also **replays its parent's history** before its own turns:
 Codex copies the parent's `session_meta`, its turns' `task_started` /
 `turn_context` / message records and their cumulative `token_count` snapshots
 into the child's file. The rollout walk gates that copy (`ForkReplaySpan` in
-`src/ingest.rs`), and only on explicit evidence:
+`src/ingest/fork_replay.rs`), and only on explicit evidence:
 
 - The span **opens** at a `session_meta` after the file's first line whose
   `payload.id` is the parent the opening `session_meta` named in
