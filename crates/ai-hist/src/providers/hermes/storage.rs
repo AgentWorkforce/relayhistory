@@ -389,13 +389,15 @@ fn acknowledge_sidecar(context: &AcquisitionContext<'_>, path: &Path) -> Result<
 }
 
 fn is_not_found(error: &anyhow::Error) -> bool {
-    error
-        .chain()
-        .any(|cause| {
-            cause
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
-        })
+    for cause in error.chain() {
+        let Some(io) = cause.downcast_ref::<std::io::Error>() else {
+            continue;
+        };
+        if io.kind() == std::io::ErrorKind::NotFound {
+            return true;
+        }
+    }
+    false
 }
 
 fn sidecar(path: &Path, suffix: &str) -> PathBuf {
