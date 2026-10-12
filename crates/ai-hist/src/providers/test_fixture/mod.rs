@@ -32,6 +32,7 @@ pub(crate) const ADAPTER: Option<ProviderAdapter> = Some(ProviderAdapter {
             "RELAYHISTORY_TEST_FIXTURE_HOME",
             ".history-fixture",
         )]
+        .into()
     },
     watch_roots: |roots| vec![WatchRoot::tree(directory(roots))],
 });

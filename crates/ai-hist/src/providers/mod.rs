@@ -38,12 +38,30 @@ pub(crate) struct ProviderAdapter {
     pub acquire:
         fn(&HydrateSessionOptions, &Path, &AcquisitionContext<'_>) -> Result<AcquiredSession>,
     /// Resolved exactly once when ProviderRoots is constructed.
-    pub resolve_roots: fn(&Path, bool) -> Vec<PathBuf>,
+    pub resolve_roots: fn(&Path, bool) -> ResolvedProviderRoots,
     /// Full or source-scoped sync. Writes only through the existing store APIs.
     pub sweep: fn(SweepContext<'_>) -> Result<SweepResult>,
     /// Watch roots using the same root resolver as discovery/acquisition.
     pub watch_roots: fn(&ProviderRoots) -> Vec<WatchRoot>,
 }
+
+/// Paths and identity provenance frozen together by one resolver invocation.
+pub(crate) struct ResolvedProviderRoots {
+    pub paths: Vec<PathBuf>,
+    pub default_root: Option<PathBuf>,
+}
+impl From<Vec<PathBuf>> for ResolvedProviderRoots {
+    fn from(paths: Vec<PathBuf>) -> Self {
+        Self {
+            paths,
+            default_root: None,
+        }
+    }
+}
+pub(crate) type ProviderRootMaps = (
+    std::collections::BTreeMap<String, Vec<PathBuf>>,
+    std::collections::BTreeMap<String, PathBuf>,
+);
 
 pub(crate) struct SweepContext<'a> {
     pub conn: &'a Connection,
@@ -193,13 +211,17 @@ fn resolve_root_value(home: &Path, value: Option<std::ffi::OsString>, relative: 
         .map(PathBuf::from)
         .unwrap_or_else(|| home.join(relative))
 }
-pub(crate) fn resolve_roots(
-    home: &Path,
-    use_env: bool,
-) -> std::collections::BTreeMap<String, Vec<PathBuf>> {
-    adapters()
-        .map(|(id, adapter)| (id.to_owned(), (adapter.resolve_roots)(home, use_env)))
-        .collect()
+pub(crate) fn resolve_roots(home: &Path, use_env: bool) -> ProviderRootMaps {
+    let mut paths = std::collections::BTreeMap::new();
+    let mut defaults = std::collections::BTreeMap::new();
+    for (id, adapter) in adapters() {
+        let resolved = (adapter.resolve_roots)(home, use_env);
+        if let Some(default) = resolved.default_root {
+            defaults.insert(id.to_owned(), default);
+        }
+        paths.insert(id.to_owned(), resolved.paths);
+    }
+    (paths, defaults)
 }
 
 pub(crate) fn legacy_watch_roots(source: &str, roots: &ProviderRoots) -> Vec<WatchRoot> {

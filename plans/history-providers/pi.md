@@ -177,3 +177,42 @@ The Pi snapshot changes only native tool IDs and the `pi_v3_3` acquisition
 stamps. Provider generation checks (8 tests), formatting, workspace Clippy,
 rust-oleum without baseline changes, public API (949 items), rebuilt native
 contract 26 and the strict SDK/CLI/MCP smoke all pass.
+
+Late review follow-up (parser generation `pi_v3_4`): all four reports were
+reproduced. The previous project fix covered ownership reassignment, while an
+unchanged retained prompt still kept its old cwd. Reconciliation now refreshes
+the finalized existing owner's project, including the FTS projection, without
+stealing another session's shared prompt. Complete snapshots replace first_prompt
+from their first nonempty human message, or NULL when none survives. Partial tails
+preserve the prior preview. Shallow activity is the maximum timestamp actually
+observed in the bounded prefix (64 KiB / 128 records), so it is a lower bound for
+larger histories rather than a claim to have read their tail.
+
+Deleted locators are reconciled from the durable catalog/local footprint, even
+when the file-stamp cache is empty. Only an unscoped full sweep with successful
+captures authorizes retirement: missing/non-directory/unavailable roots, scoped
+walks, malformed or partial siblings, and cancellation retain prior evidence.
+Accessible configured roots and existing ancestors are containment-validated;
+removed intermediate directories are allowed, escaped symlinks and failed stats
+are not deletion proof. An accessible empty mountpoint cannot distinguish an
+unmounted filesystem from intentional deletion. Surviving candidates normalize
+first, so moved native IDs and newly observed forks retain prompt identity.
+Local shares, observations, presence and checkpoints retire together; remote
+shares and independently remote-only catalogs, even sharing the same path string,
+remain intact. Shared remote catalog locators/previews are rebuilt from surviving
+remote provenance/evidence rather than quoting removed local assistant text.
+
+Negative controls: the four new regressions fail against the prior implementation
+for stale retained project, stale first_prompt, missing shallow recency and missing
+locator retirement. The existing same-session remote and multiblock fork controls
+remain in the suite. Added deletion guards cover cache loss, unavailable/replaced
+roots, malformed/partial siblings, scope, remote-only catalog aliasing, and moved
+native IDs followed by a newly surviving fork.
+
+Removing only the per-locator local-footprint guard makes the remote-only alias
+regression fail: its independent raw_path is replaced by NULL. Restoring the guard
+passes the final 21 Pi unit regressions, six public Pi checks and the corpus
+snapshot comparison. Snapshot changes are limited to `pi_v3_4` acquisition stamps.
+Workspace/adapter formatting, workspace all-target/all-feature Clippy with warnings
+denied, and rust-oleum pass without baseline changes. Independent read-only review
+signed off these four fixes and the retirement/remote ownership guards.

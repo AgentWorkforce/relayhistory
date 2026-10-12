@@ -64,12 +64,12 @@ to `HOOK_HARNESSES` merely because their history lives in files.
 
 `ADAPTER = Some(ProviderAdapter { ... })` supplies:
 
-- `resolve_roots(home, use_env)`: freezes every provider root exactly once in
+- `resolve_roots(home, use_env)`: returns internal `ResolvedProviderRoots { paths, default_root }` and freezes every provider root and its identity provenance together exactly once in
   `ProviderRoots`. `from_home` ignores the host environment. Old serialized roots
   missing a newly admitted provider receive defaults under their recorded home,
   without reading the process environment. Discovery uses
   `env.provider_roots`, shallow reads use `scan.provider_roots`, and all other
-  paths receive the same frozen value. Use `roots.for_provider(ID)` thereafter.
+  paths receive the same frozen value. Use `roots.for_provider(ID)` thereafter. A provider with portable default/profile identities supplies `default_root` only for its native resolver default; explicit overrides return `paths.into()` with no marker. Do not infer provenance from path spelling or reread environment variables. Private `provider_default_roots` serializes even when empty, distinguishing explicit custom roots from legacy values lacking this field. Legacy deserialization only reconstructs the canonical no-environment default when that path is present; relocated/suffixed roots without provenance retain their prior namespace.
 - `acquire(options, locator, context)`: returns an `AcquiredSession` with immutable
   JSON payload, native identity validation, records, measured bytes and all read
   paths. The framework validates the primary locator first. Read every primary

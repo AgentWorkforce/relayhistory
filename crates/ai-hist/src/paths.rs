@@ -234,6 +234,8 @@ pub struct ProviderRoots {
     pub use_env_roots: bool,
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub(crate) provider_roots: std::collections::BTreeMap<String, Vec<PathBuf>>,
+    // Serialize even an empty map: explicit custom roots have no portable identity.
+    pub(crate) provider_default_roots: std::collections::BTreeMap<String, PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -252,6 +254,8 @@ struct ProviderRootsWire {
     use_env_roots: bool,
     #[serde(default)]
     provider_roots: std::collections::BTreeMap<String, Vec<PathBuf>>,
+    #[serde(default)]
+    provider_default_roots: Option<std::collections::BTreeMap<String, PathBuf>>,
 }
 
 #[doc(hidden)]
@@ -264,10 +268,16 @@ impl<'de> Deserialize<'de> for ProviderRoots {
         let devin = wire
             .devin
             .unwrap_or_else(|| devin_cli_dir_under(&wire.home));
-        let mut provider_roots = crate::providers::resolve_roots(&wire.home, false);
+        let (mut provider_roots, legacy_defaults) = crate::providers::resolve_roots(&wire.home, false);
         provider_roots.extend(wire.provider_roots);
+        // Old wire values only identify the historical canonical default safely.
+        // Never consult the current environment to infer relocated native roots.
+        let provider_default_roots = wire.provider_default_roots.unwrap_or_else(|| {
+            legacy_defaults.into_iter().filter(|(id, root)| provider_roots.get(id).is_some_and(|paths| paths.contains(root))).collect()
+        });
         Ok(Self {
             provider_roots,
+            provider_default_roots,
             home: wire.home,
             claude: wire.claude,
             codex: wire.codex,
@@ -288,11 +298,17 @@ impl ProviderRoots {
         self.provider_roots.get(id).map(Vec::as_slice).unwrap_or(&[])
     }
 
+    pub(crate) fn default_for_provider(&self, id: &str) -> Option<&Path> {
+        self.provider_default_roots.get(id).filter(|path| self.for_provider(id).contains(path)).map(PathBuf::as_path)
+    }
+
     /// Roots under `home`, with the process environment's provider overrides
     /// applied — the CLI's resolution.
     pub fn from_env(home: PathBuf) -> Self {
+        let (provider_roots, provider_default_roots) = crate::providers::resolve_roots(&home, true);
         Self {
-            provider_roots: crate::providers::resolve_roots(&home, true),
+            provider_roots,
+            provider_default_roots,
             claude: claude_config_dir(&home),
             codex: codex_home(&home),
             grok: grok_home(&home),
@@ -313,8 +329,10 @@ impl ProviderRoots {
             .parent()
             .map(|parent| parent.join("storage"))
             .unwrap_or_else(|| home.join(".local/share/opencode/storage"));
+        let (provider_roots, provider_default_roots) = crate::providers::resolve_roots(&home, false);
         Self {
-            provider_roots: crate::providers::resolve_roots(&home, false),
+            provider_roots,
+            provider_default_roots,
             claude: home.join(".claude"),
             codex: home.join(".codex"),
             grok: home.join(".grok"),

@@ -7,6 +7,7 @@ use crate::EvidenceKind;
 use anyhow::Context;
 use std::io::Read;
 mod format;
+mod maintenance;
 mod normalize;
 #[cfg(test)]
 mod tests;
@@ -32,10 +33,10 @@ pub(crate) const METADATA: ProviderMetadata = ProviderMetadata {
     }),
 };
 pub(crate) const ADAPTER: Option<ProviderAdapter> = Some(ProviderAdapter {
-    generation: "pi_v3_3",
+    generation: "pi_v3_4",
     acquire,
     sweep,
-    resolve_roots,
+    resolve_roots: |home, use_env| resolve_roots(home, use_env).into(),
     watch_roots: |r| {
         r.for_provider(ID)
             .iter()
@@ -150,22 +151,19 @@ impl ShallowSessionProvider for Provider {
         if let Some(conn) = conn {
             normalize::check_identity(conn, sid, Path::new(&c.locator))?;
         }
-        let first_prompt = entries
-            .iter()
-            .find(|e| e["message"]["role"] == "user")
-            .map(|e| {
-                format::text(&e["message"]["content"])
-                    .chars()
-                    .take(4096)
-                    .collect()
-            });
+        let first_prompt = format::first_prompt(&entries);
         Ok(Some(ShallowSession {
             source: ID.into(),
             session_id: sid.into(),
             cwd: header["cwd"].as_str().map(str::to_owned),
             first_prompt,
             first_activity_ms: Some(format::time(header)?),
-            last_activity_ms: None,
+            last_activity_ms: entries
+                .iter()
+                .map(format::time)
+                .collect::<Result<Vec<_>>>()?
+                .into_iter()
+                .max(),
             title: entries
                 .iter()
                 .rev()
@@ -305,6 +303,9 @@ fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
                 result.unread += 1;
             }
         }
+    }
+    if ctx.paths.is_none() && result.unread == 0 {
+        maintenance::retire_missing(ctx.conn, ctx.roots)?;
     }
     ctx.state.insert(cache_key.into(), Value::Object(cache));
     Ok(result)

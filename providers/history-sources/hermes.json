@@ -1,0 +1,49 @@
+{
+  "id": "hermes",
+  "rust_id": "hermes",
+  "variant": "Hermes",
+  "order": 429,
+  "aliases": [],
+  "fixtures": [
+    {
+      "source": "hermes",
+      "name": "schema31",
+      "layout": "Sqlite",
+      "target": ".hermes/state.db",
+      "origin": "RelayHistory",
+      "files": [
+        "hermes/schema31.sql"
+      ],
+      "quirk": "Pinned Hermes schema 31 writer, arbitrary native IDs, resumed messages, tool calls/results, compression child and archived rows; no per-request usage inferred."
+    },
+    {
+      "source": "hermes",
+      "name": "official-export",
+      "layout": "Reference",
+      "origin": "RelayHistory",
+      "files": [
+        "hermes/official-export.json"
+      ],
+      "quirk": "SessionDB.export_session(include_inactive=True) independent oracle from pinned writer."
+    }
+  ],
+  "capture": [
+    {
+      "evidence": "Messages and tools",
+      "coverage": "SQLite schema 31 native rows, tool IDs/results and reasoning; profile identity namespaced."
+    },
+    {
+      "evidence": "Usage and relationships",
+      "coverage": "Session totals are not request usage. Parent native identity retained as metadata; no delegation or native resume advertised. Legacy JSONL unsupported."
+    }
+  ],
+  "population": {
+    "evidence": [
+      "history",
+      "session_event",
+      "tool_call",
+      "session_marker"
+    ],
+    "usage_accounting": "none"
+  }
+}
