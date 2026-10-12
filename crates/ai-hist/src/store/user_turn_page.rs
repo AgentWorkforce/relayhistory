@@ -69,9 +69,30 @@ pub(super) fn user_turn_walk_sql(after: bool) -> String {
 /// message index matches only `(source, message_id)`, so a line-derived id
 /// Codex reuses would return every session that stored it.
 pub(super) fn user_turn_message_rows_sql() -> String {
+    message_rows_sql("idx_session_events_session_message")
+}
+
+/// The same lookup through whichever index this database has.
+///
+/// The session-message index seeks the rows. A database that predates it
+/// still has the page index, which seeks the session and filters the id.
+/// Naming the cross-session message index here would read every session
+/// that reused the id.
+fn message_rows_sql_for(conn: &Connection) -> Result<String> {
+    let present = conn
+        .prepare("SELECT 1 FROM sqlite_master WHERE type = 'index' AND name = ?1 LIMIT 1")?
+        .exists(["idx_session_events_session_message"])?;
+    Ok(if present {
+        user_turn_message_rows_sql()
+    } else {
+        message_rows_sql("idx_session_events_source_page")
+    })
+}
+
+fn message_rows_sql(index: &str) -> String {
     format!(
         "SELECT id, ts_ms, NULLIF(message_id, '') \
-         FROM session_events INDEXED BY idx_session_events_session_message \
+         FROM session_events INDEXED BY {index} \
          WHERE source = ? AND session_id = ? AND message_id = ? \
            AND {USER_TURN_ROW_FILTER}"
     )
@@ -100,7 +121,7 @@ pub(super) fn page_headers(
     after: Option<&SessionEventCursor>,
 ) -> Result<HeaderPage> {
     let mut walk = conn.prepare(&user_turn_walk_sql(after.is_some()))?;
-    let mut named = conn.prepare(&user_turn_message_rows_sql())?;
+    let mut named = conn.prepare(&message_rows_sql_for(conn)?)?;
     let mut collided = conn.prepare(&user_turn_collided_row_sql())?;
     let mut rows = match after {
         Some(cursor) => walk.query(params![source, session_id, cursor.ts_ms, cursor.id])?,

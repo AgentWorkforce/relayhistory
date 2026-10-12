@@ -1041,13 +1041,11 @@ const REQUIRED_CATALOG_READ_INDEXES: &[&str] = &[
     "idx_sessions_source_recency",
     "idx_session_presences_location",
 ];
-const REQUIRED_EVENT_READ_INDEXES: &[&str] = &[
-    "idx_session_events_source_page",
-    "idx_session_events_page",
-    // A turn page seeks this. `INDEXED BY` on a database that predates it
-    // is an error, so the read guard refuses that database.
-    "idx_session_events_session_message",
-];
+const REQUIRED_EVENT_READ_INDEXES: &[&str] =
+    &["idx_session_events_source_page", "idx_session_events_page"];
+/// A turn page seeks this. Event and usage reads do not: a database that
+/// predates it still has their indexes.
+const USER_TURN_MESSAGE_INDEX: &str = "idx_session_events_session_message";
 /// Indexes the session-scoped tool call, file edit and marker pages depend
 /// on. All three always name one source and one session, so a single
 /// composite index per table carries the whole lookup and its ordering.
@@ -1139,10 +1137,19 @@ pub fn schema_is_identity_read_current(conn: &Connection) -> Result<bool> {
     schema_has_required_indexes(conn, REQUIRED_IDENTITY_READ_INDEXES)
 }
 
-/// Whether event reads have their page indexes and the session-scoped
-/// message index a turn page seeks.
+/// Whether bounded event pagination has both source-scoped and source-less indexes.
 pub fn schema_is_event_read_current(conn: &Connection) -> Result<bool> {
     schema_has_required_indexes(conn, REQUIRED_EVENT_READ_INDEXES)
+}
+
+/// Whether a user-turn page can seek one session's rows for a message id.
+///
+/// Missing, the page reads that session through its page index instead.
+/// The native turn-page read uses this guard to migrate when it can,
+/// without refusing an event or usage read of the same database.
+pub fn schema_is_user_turn_read_current(conn: &Connection) -> Result<bool> {
+    Ok(schema_is_event_read_current(conn)?
+        && schema_has_required_indexes(conn, &[USER_TURN_MESSAGE_INDEX])?)
 }
 
 /// Whether delegation-topology reads can use their indexed parent and child
@@ -1807,10 +1814,11 @@ VALUES ('session_presences_local_backfill_v1');
         [],
     )?;
     // Continuity looks a message id up across every session, so it keeps
-    // `(source, message_id)`. A turn page looks up one session. Codex
-    // reuses line-derived ids, and the cross-session index would return
-    // every session that stored one. The session-led index does not
-    // replace it: a lookup with no `session_id` pins only `source` there.
+    // `(source, message_id)` and names that index in the lookup: this
+    // session-led one is covering for `SELECT session_id`, and with no
+    // statistics the planner searches it by `source` alone. A turn page
+    // looks up one session. Codex reuses line-derived ids, and the
+    // cross-session index would return every session that stored one.
     conn.execute_batch(
         "CREATE INDEX IF NOT EXISTS idx_session_events_message \
          ON session_events(source, message_id);
@@ -9722,6 +9730,32 @@ mod user_turn_pass_tests {
             "200x the other sessions sharing the id cost {}x the page",
             many / few.max(1)
         );
+    }
+
+    /// Event and usage reads do not wait on the turn-page index. A database
+    /// that predates it still returns that session's turn, through the page
+    /// index, rather than failing the query or reading every other session.
+    #[test]
+    fn a_turn_page_without_its_index_stays_on_the_session() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute_batch("DROP INDEX idx_session_events_session_message")
+            .unwrap();
+        assert!(schema_is_event_read_current(&conn).unwrap());
+        assert!(schema_is_usage_read_current(&conn).unwrap());
+        assert!(!schema_is_user_turn_read_current(&conn).unwrap());
+        let tx = conn.unchecked_transaction().unwrap();
+        tx.execute_batch(
+            "INSERT INTO session_events \
+             (source, session_id, message_id, ts_ms, role, kind, text, event_uid) VALUES \
+             ('codex', 'A', '1:user_message', 5000, 'user', 'text', 'prompt', 'a'), \
+             ('codex', 'other', '1:user_message', 1, 'user', 'text', 'prompt', 'o');",
+        )
+        .unwrap();
+        tx.commit().unwrap();
+        let page = session_user_turns_page(&conn, "codex", "A", 1, None).unwrap();
+        assert_eq!(page.user_turns.len(), 1);
+        assert_eq!(page.user_turns[0].ts_ms, 5_000);
     }
 
     /// Reading every turn of a session is linear in it: twenty times the

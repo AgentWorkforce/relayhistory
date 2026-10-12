@@ -184,11 +184,13 @@ pub(super) fn session_holding_record(
 }
 
 /// The message half of [`session_holding_record`], a search on
-/// `idx_session_events_message`. `+session_id` keeps the planner from
-/// walking `idx_session_events_session` in session order to satisfy the
-/// `ORDER BY`, which without statistics it prefers and which visits every
-/// event of the source until one matches.
+/// `idx_session_events_message`. `INDEXED BY` is required: the session-led
+/// message index covers `session_id`, and with no statistics the planner
+/// searches that index by `source` alone, which visits every event of the
+/// source. `+session_id` keeps the same planner from walking
+/// `idx_session_events_session` in session order to satisfy the `ORDER BY`.
 pub(crate) const SESSION_HOLDING_MESSAGE_SQL: &str = "SELECT session_id FROM session_events \
+     INDEXED BY idx_session_events_message \
      WHERE source = ?1 AND message_id = ?2 ORDER BY +session_id ASC LIMIT 1";
 
 /// The rows `idx_session_events_claude_uid_unmatched` covers: a Claude
