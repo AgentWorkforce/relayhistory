@@ -1730,6 +1730,7 @@ fn watch_reports_the_startup_sweep_and_a_session_that_appears() {
         .expect("a startup tick")
         .expect("the sweep succeeds");
     assert_eq!(first.trigger, TickTrigger::Startup);
+    assert_eq!(first.kind, ai_hist::WatchTick::Sync);
     assert!(first.swept);
     assert_eq!(first.changed.len(), 1);
     assert_eq!(first.changed[0].source(), Source::Codex);

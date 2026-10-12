@@ -13,7 +13,7 @@
 //! | [`SessionStore::discover`] | the shallow catalog sweep, hydrating nothing |
 //! | [`SessionStore::sync`] | one full local sweep under the crate's `SyncRunLock` |
 //! | [`SessionStore::hydrate`] | one session, by id or by transcript path, plus its bounded related transcripts |
-//! | [`SessionStore::watch`] | the live-capture loop, as an iterator of ticks |
+//! | [`SessionStore::watch`] | the live-capture loop, sync or discover, as an iterator of ticks |
 //! | [`SessionStore::sessions`] | the catalog, keyset-paged internally |
 //! | [`SessionStore::session`] | everything the store holds about one session, typed |
 //! | [`SessionStore::changes_since`] | the revision-stamped change feed, with named consumer cursors |
@@ -78,6 +78,7 @@ mod watch_sweep;
 pub(crate) use options::controlled;
 pub use options::{
     DiscoveryOptions, HydrateOptions, ProgressObserver, StopToken, StoreOptions, SyncOptions,
+    WatchTick,
 };
 use watch_sweep::{TickNotes, WatchSources, WatchSweep};
 
@@ -811,10 +812,11 @@ impl SessionStore {
     /// [`TickReport`]; a sweep that failed arrives as an `Err` and the loop
     /// keeps running. Iteration ends after [`WatchStop::stop`] (or dropping
     /// the handle), which cancels the sweep in flight at its next provider,
-    /// file or record boundary and waits for it to return. Every sweep is the
-    /// same locked `sync` as [`SessionStore::sync`]; a tick that finds the
-    /// lock held reports `contended` and is retried by the loop rather than
-    /// counted as done.
+    /// file or record boundary and waits for it to return. With
+    /// [`WatchTick::Sync`] (the default) every sweep is the same locked
+    /// `sync` as [`SessionStore::sync`]; a tick that finds the lock held
+    /// reports `contended` and is retried by the loop rather than counted
+    /// as done. [`WatchTick::Discover`] runs a shallow discover instead.
     pub fn watch(&self, opts: WatchOptions) -> Result<WatchHandle, Error> {
         if self.read_only {
             return Err(Error::read_only("watch"));
@@ -839,6 +841,8 @@ impl SessionStore {
             baseline: Mutex::new(None),
             notes: notes.clone(),
             reports: reports.clone(),
+            store: self.clone(),
+            kind: opts.kind,
         };
         let tick: crate::watch::ScopedTickFn = Arc::new(move |request| sweep.tick(request));
 
@@ -870,6 +874,18 @@ impl SessionStore {
             thread: Some(thread),
             receiver,
         })
+    }
+
+    /// [`SessionStore::watch`] with each tick a shallow discover.
+    ///
+    /// A filesystem event discovers only the sources whose roots it landed
+    /// under. A startup, poll or backstop tick discovers every configured
+    /// source. An event under no watched root discovers nothing on that
+    /// tick. The same stop token, leading-edge debounce, driver report and
+    /// backstop root refresh apply.
+    pub fn watch_discover(&self, mut opts: WatchOptions) -> Result<WatchHandle, Error> {
+        opts.kind = WatchTick::Discover;
+        self.watch(opts)
     }
 
     // -- catalog ------------------------------------------------------------
@@ -1726,6 +1742,12 @@ pub struct WatchOptions {
     /// deserializing options written before this field existed.
     #[serde(default = "default_leading_edge")]
     pub leading_edge: bool,
+    /// What a tick runs. [`WatchTick::Sync`] (the default) is the locked
+    /// capture. [`WatchTick::Discover`] is a shallow discover of the sources
+    /// the tick names, and it does not parse transcripts. Options serialized
+    /// before this field existed load as sync.
+    #[serde(default)]
+    pub kind: WatchTick,
     /// Cancels the tick in flight at its next provider, file or record
     /// boundary, and ends the loop: a cancelled tick arrives as a
     /// [`TickReport`] with `cancelled` set, then the iterator ends. Stopping
@@ -1746,6 +1768,7 @@ impl Default for WatchOptions {
             use_fs_events: true,
             immediate: true,
             leading_edge: true,
+            kind: WatchTick::Sync,
             stop: None,
         }
     }
@@ -1784,6 +1807,10 @@ fn duration_ms(duration: Duration) -> u64 {
 #[non_exhaustive]
 pub struct TickReport {
     pub trigger: TickTrigger,
+    /// Whether this tick ran a sync or a shallow discover. Sync for a report
+    /// serialized before the field existed.
+    #[serde(default)]
+    pub kind: WatchTick,
     /// The sweep bypassed the source fingerprint (a filesystem-event tick).
     pub forced: bool,
     /// A full walk ran.
@@ -1812,13 +1839,17 @@ pub struct TickReport {
     /// Sessions whose catalog row changed since the previous tick's report;
     /// see [`SyncReport::changed`]. Compared on every tick that took the
     /// lock, swept or not, so a hydration landing between ticks is reported
-    /// once by the tick that follows it. Empty on a `contended` tick.
+    /// once by the tick that follows it. Empty on a `contended` tick and on a
+    /// discover tick, which does not attribute catalog rows.
     pub changed: Vec<SessionRef>,
-    /// The sources this tick swept (or, when `contended`, would have).
-    /// `None` is every local source: startup, backstop and manual ticks, and
-    /// an event the loop could not place under a watched root. A
-    /// filesystem-event tick names the sources whose roots fired in its
-    /// debounce window, and reads only those; see [`SyncOptions::sources`].
+    /// The sources this tick read.
+    ///
+    /// `None` is every local source: startup, backstop, poll and manual
+    /// ticks. On a sync tick it is also an event the loop could not place
+    /// under a watched root, which is swept in full. On a discover tick that
+    /// unplaced event is [`Some`] of an empty list and discovers nothing;
+    /// the backstop covers the rest. A filesystem-event tick names the
+    /// sources whose roots fired in its debounce window.
     #[serde(default)]
     pub sources: Option<Vec<Source>>,
 }
@@ -1827,6 +1858,7 @@ impl TickReport {
     fn from_loop(report: &crate::watch::TickReport, notes: TickNotes) -> Self {
         Self {
             trigger: report.trigger,
+            kind: notes.kind,
             forced: report.forced,
             swept: report.outcome.swept,
             skipped_unchanged: report.outcome.skipped_unchanged,
@@ -2909,6 +2941,7 @@ mod tests {
             .expect("startup tick")
             .unwrap();
         assert_eq!(startup.trigger, TickTrigger::Startup);
+        assert_eq!(startup.kind, WatchTick::Sync);
         assert_eq!(startup.sources, None, "startup is a full sweep");
         // FSEvents replays the writes that seeded the tree once the stream
         // is registered; let those ticks pass first.
@@ -2932,6 +2965,7 @@ mod tests {
             }
         };
         assert!(event.forced && event.swept);
+        assert_eq!(event.kind, WatchTick::Sync);
         assert_eq!(event.sources, Some(vec![Source::Claude]));
         watch.stop();
     }
@@ -3172,6 +3206,297 @@ mod tests {
         )
         .expect("an older WatchOptions loads");
         assert!(options.leading_edge);
+        assert_eq!(options.kind, WatchTick::Sync);
+        let discover: WatchOptions = serde_json::from_str(
+            r#"{"debounce_ms":200,"poll_interval_ms":1000,"slow_poll_ms":30000,
+                "use_fs_events":true,"immediate":true,"kind":"discover"}"#,
+        )
+        .expect("kind decodes");
+        assert_eq!(discover.kind, WatchTick::Discover);
+        assert!(discover.leading_edge);
+    }
+
+    fn count_rows(db: &Path, sql: &str) -> i64 {
+        open_db(db)
+            .unwrap()
+            .query_row(sql, [], |row| row.get(0))
+            .unwrap()
+    }
+
+    fn claude_transcript(id: &str) -> String {
+        format!(
+            "{{\"type\":\"user\",\"uuid\":\"{id}\",\"sessionId\":\"{id}\",\"cwd\":\"/tmp/app\",\
+             \"timestamp\":\"2026-09-20T00:00:00.000Z\",\"message\":{{\"role\":\"user\",\"content\":\"hello\"}}}}\n"
+        )
+    }
+
+    const CODEX_ROLLOUT: &str = "\
+{\"timestamp\":\"2026-06-20T11:00:00.000Z\",\"type\":\"session_meta\",\"payload\":{\"id\":\"codex-1\",\"cwd\":\"/work/api\",\"originator\":\"codex\"}}\n";
+
+    fn write_codex(home: &Path) {
+        let path = home.join(".codex/sessions/2026/06/20/rollout-codex-1.jsonl");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, CODEX_ROLLOUT).unwrap();
+    }
+
+    /// Default options keep the sync tick: the startup sweep ingests evidence.
+    #[test]
+    fn a_watch_on_default_options_still_syncs() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ai-history.db");
+        let transcript = dir.path().join(".claude/projects/app/s1.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, claude_transcript("s1")).unwrap();
+        let store = store_at(&db);
+        let mut watch = store
+            .watch(WatchOptions {
+                use_fs_events: false,
+                poll_interval_ms: 60_000,
+                immediate: true,
+                ..WatchOptions::default()
+            })
+            .unwrap();
+        let tick = watch
+            .next_timeout(Duration::from_secs(30))
+            .expect("startup tick")
+            .expect("the sweep succeeds");
+        assert_eq!(tick.trigger, TickTrigger::Startup);
+        assert_eq!(tick.kind, WatchTick::Sync);
+        assert!(tick.swept);
+        assert_eq!(tick.sources, None);
+        assert!(count_rows(&db, "SELECT COUNT(*) FROM session_events") > 0);
+        watch.stop();
+    }
+
+    /// A discover poll reads every configured source and writes no evidence.
+    #[test]
+    fn a_discover_poll_reads_every_source_and_does_not_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ai-history.db");
+        let transcript = dir.path().join(".claude/projects/app/s1.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, claude_transcript("s1")).unwrap();
+        write_codex(dir.path());
+        let store = store_at(&db);
+        let mut watch = store
+            .watch_discover(WatchOptions {
+                use_fs_events: false,
+                poll_interval_ms: 50,
+                immediate: false,
+                ..WatchOptions::default()
+            })
+            .unwrap();
+        let tick = watch
+            .next_timeout(Duration::from_secs(30))
+            .expect("poll tick")
+            .expect("discover succeeds");
+        assert_eq!(tick.trigger, TickTrigger::Poll);
+        assert_eq!(tick.kind, WatchTick::Discover);
+        assert_eq!(tick.sources, None, "a poll discovers every source");
+        assert!(!tick.swept && !tick.contended && !tick.skipped_unchanged);
+        assert!(tick.changed.is_empty());
+        assert_eq!(count_rows(&db, "SELECT COUNT(*) FROM session_events"), 0);
+        assert_eq!(
+            count_rows(
+                &db,
+                "SELECT COUNT(*) FROM sessions WHERE source = 'claude' AND discovery_state = 'shallow'"
+            ),
+            1
+        );
+        assert_eq!(
+            count_rows(
+                &db,
+                "SELECT COUNT(*) FROM sessions WHERE source = 'codex' AND discovery_state = 'shallow'"
+            ),
+            1
+        );
+        watch.stop();
+    }
+
+    /// A stop token cancels the discover in flight and ends the loop.
+    #[test]
+    fn a_stopped_discover_watch_ends_the_loop() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = store_at(&dir.path().join("ai-history.db"));
+        let token = StopToken::new();
+        token.stop();
+        let mut watch = store
+            .watch_discover(WatchOptions {
+                use_fs_events: false,
+                poll_interval_ms: 60_000,
+                immediate: true,
+                stop: Some(token),
+                ..WatchOptions::default()
+            })
+            .unwrap();
+        let first = watch
+            .next_timeout(Duration::from_secs(30))
+            .expect("the startup tick is reported")
+            .expect("a cancelled tick is not an error");
+        assert_eq!(first.kind, WatchTick::Discover);
+        assert!(first.cancelled);
+        assert!(!first.swept && !first.contended && !first.skipped_unchanged);
+        let started = Instant::now();
+        assert!(watch.next_timeout(Duration::from_secs(30)).is_none());
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    fn store_under(db: &Path, home: &Path) -> SessionStore {
+        SessionStore::open(StoreOptions {
+            db_path: Some(db.to_path_buf()),
+            roots: Some(ProviderRoots::from_home(
+                home.to_path_buf(),
+                home.join("oc/opencode.db"),
+            )),
+            ..StoreOptions::default()
+        })
+        .unwrap()
+    }
+
+    /// A write under one source discovers that source only. A write under no
+    /// watched root does not discover the others.
+    #[cfg(feature = "fs-events")]
+    #[test]
+    fn a_discover_event_names_that_source_and_an_unplaced_write_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ai-history.db");
+        std::fs::create_dir_all(dir.path().join(".claude/projects")).unwrap();
+        std::fs::create_dir_all(dir.path().join(".codex/sessions")).unwrap();
+        std::fs::create_dir_all(dir.path().join("oc")).unwrap();
+        write_codex(dir.path());
+        let store = store_under(&db, dir.path());
+        let mut watch = store
+            .watch_discover(WatchOptions {
+                debounce_ms: 50,
+                slow_poll_ms: 600_000,
+                immediate: false,
+                ..WatchOptions::default()
+            })
+            .unwrap();
+        let drain = Instant::now() + Duration::from_millis(1_500);
+        while Instant::now() < drain {
+            if let Some(tick) = watch.next_timeout(Duration::from_millis(200)) {
+                let tick = tick.expect("replay discover");
+                assert_eq!(tick.kind, WatchTick::Discover);
+                assert!(
+                    tick.sources.is_some(),
+                    "replay must not discover every source: {tick:?}"
+                );
+                assert!(!tick.swept && tick.changed.is_empty());
+            }
+        }
+        let codex_before = count_rows(&db, "SELECT COUNT(*) FROM sessions WHERE source = 'codex'");
+        let outside = dir.path().join("outside/note.txt");
+        std::fs::create_dir_all(outside.parent().unwrap()).unwrap();
+        std::fs::write(&outside, "no").unwrap();
+        let quiet = Instant::now() + Duration::from_millis(1_500);
+        while Instant::now() < quiet {
+            if let Some(tick) = watch.next_timeout(Duration::from_millis(200)) {
+                let tick = tick.expect("unplaced discover");
+                assert_eq!(tick.kind, WatchTick::Discover);
+                assert_ne!(
+                    tick.sources, None,
+                    "a path under no root must not discover every source: {tick:?}"
+                );
+                assert!(
+                    tick.sources
+                        .iter()
+                        .flatten()
+                        .all(|source| *source == Source::Codex),
+                    "{tick:?}"
+                );
+                assert!(!tick.swept);
+            }
+        }
+        assert_eq!(
+            count_rows(&db, "SELECT COUNT(*) FROM sessions WHERE source = 'claude'"),
+            0,
+            "the outside write discovered claude"
+        );
+        assert_eq!(
+            count_rows(&db, "SELECT COUNT(*) FROM sessions WHERE source = 'codex'"),
+            codex_before
+        );
+
+        let transcript = dir.path().join(".claude/projects/app/s1.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(&transcript, claude_transcript("s1")).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let event = loop {
+            assert!(
+                Instant::now() < deadline,
+                "no discover tick for the claude write"
+            );
+            let Some(tick) = watch.next_timeout(Duration::from_secs(5)) else {
+                continue;
+            };
+            let tick = tick.expect("discover");
+            if tick.trigger == TickTrigger::FsEvent
+                && tick.sources.as_deref() == Some(&[Source::Claude])
+            {
+                break tick;
+            }
+            assert_ne!(tick.sources, None, "{tick:?}");
+        };
+        assert_eq!(event.kind, WatchTick::Discover);
+        assert!(!event.swept && !event.contended && !event.skipped_unchanged);
+        assert!(event.changed.is_empty());
+        assert_eq!(count_rows(&db, "SELECT COUNT(*) FROM session_events"), 0);
+        assert_eq!(
+            count_rows(
+                &db,
+                "SELECT COUNT(*) FROM sessions WHERE source = 'claude' AND discovery_state = 'shallow'"
+            ),
+            1
+        );
+        assert_eq!(
+            count_rows(&db, "SELECT COUNT(*) FROM sessions WHERE source = 'codex'"),
+            codex_before
+        );
+        watch.stop();
+    }
+
+    /// OpenCode's entry filter drops a write that is not a store file, so
+    /// that write does not discover.
+    #[cfg(feature = "fs-events")]
+    #[test]
+    fn an_opencode_path_the_filter_rejects_does_not_discover() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ai-history.db");
+        std::fs::create_dir_all(dir.path().join("oc")).unwrap();
+        let store = store_under(&db, dir.path());
+        let mut watch = store
+            .watch_discover(WatchOptions {
+                debounce_ms: 50,
+                slow_poll_ms: 600_000,
+                immediate: false,
+                ..WatchOptions::default()
+            })
+            .unwrap();
+        let drain = Instant::now() + Duration::from_millis(800);
+        while Instant::now() < drain {
+            let _ = watch.next_timeout(Duration::from_millis(100));
+        }
+        std::fs::write(dir.path().join("oc/noise.log"), "ignored").unwrap();
+        assert!(
+            watch.next_timeout(Duration::from_millis(1_500)).is_none(),
+            "a rejected OpenCode entry discovered"
+        );
+        std::fs::write(dir.path().join("oc/opencode.db"), "not a database").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        let tick = loop {
+            assert!(Instant::now() < deadline, "the store file did not tick");
+            if let Some(tick) = watch.next_timeout(Duration::from_secs(5)) {
+                break tick;
+            }
+        };
+        if let Ok(report) = tick {
+            assert_eq!(report.kind, WatchTick::Discover);
+            assert_eq!(report.sources, Some(vec![Source::OpenCode]));
+            assert!(!report.swept && report.changed.is_empty());
+        }
+        assert_eq!(count_rows(&db, "SELECT COUNT(*) FROM session_events"), 0);
+        watch.stop();
     }
 
     /// A timeout too large to name an instant waits without one; it does not

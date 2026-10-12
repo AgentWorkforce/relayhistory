@@ -12,7 +12,7 @@ use super::*;
 use crate::discover::WatchRoot;
 use crate::ingest::path_scope::PathScope;
 use crate::ingest::{sync_watch_roots_by_source, SweepScope};
-use crate::watch::{ChangeScope, TickRequest};
+use crate::watch::{ChangeScope, TickRequest, TickTrigger};
 use std::collections::{BTreeSet, HashMap};
 
 /// Which sources registered each watched root.
@@ -92,6 +92,31 @@ impl WatchSources {
             paths,
         }
     }
+
+    /// Sources a discover tick reads.
+    ///
+    /// `None` is every configured source: startup, poll, backstop and manual
+    /// ticks. `Some` is the sources whose roots an event landed under. An
+    /// event under no known root, or one the loop could not place, is an
+    /// empty list — this tick discovers nothing and does not widen into a
+    /// full discover.
+    pub(super) fn discover_sources(&self, request: &TickRequest) -> Option<Vec<Source>> {
+        if request.trigger != TickTrigger::FsEvent {
+            return None;
+        }
+        let ChangeScope::Roots { roots: fired, .. } = &request.scope else {
+            return Some(Vec::new());
+        };
+        let by_root = self.by_root.lock().expect("watch sources");
+        let mut sources = BTreeSet::new();
+        for root in fired {
+            let Some(found) = by_root.get(root) else {
+                return Some(Vec::new());
+            };
+            sources.extend(found.iter().copied());
+        }
+        Some(sources.into_iter().collect())
+    }
 }
 
 /// The sources the fired roots belong to, or `None` — a full sweep — when
@@ -113,6 +138,7 @@ fn sources_of(
 pub(super) struct TickNotes {
     pub(super) changed: Vec<SessionRef>,
     pub(super) sources: Option<Vec<Source>>,
+    pub(super) kind: WatchTick,
 }
 
 /// One watch loop's sweep: the same locked `sync` as [`SessionStore::sync`],
@@ -128,12 +154,21 @@ pub(super) struct WatchSweep {
     pub(super) baseline: Mutex<Option<CatalogFingerprint>>,
     pub(super) notes: Arc<Mutex<TickNotes>>,
     pub(super) reports: ReportSlot,
+    pub(super) store: SessionStore,
+    pub(super) kind: WatchTick,
 }
 
 impl WatchSweep {
     pub(super) fn tick(&self, request: &TickRequest) -> anyhow::Result<TickOutcome> {
+        if self.kind == WatchTick::Discover {
+            return self.discover_tick(request);
+        }
         let plan = self.sources.plan(request);
-        self.notes.lock().expect("watch notes").sources = plan.sources.clone();
+        {
+            let mut notes = self.notes.lock().expect("watch notes");
+            notes.kind = WatchTick::Sync;
+            notes.sources = plan.sources.clone();
+        }
         // Both reads happen under the sync lock, like `sync`'s. The
         // baseline is the previous swept tick's `after` digest when there
         // is one — nothing this loop reported has moved since, and a
@@ -166,6 +201,28 @@ impl WatchSweep {
                 }
                 Err(error)
             }
+        }
+    }
+
+    /// A shallow discover of the sources `request` names. Not a sync: no
+    /// evidence write, no transcript parse, and an unplaced event does not
+    /// widen to every source.
+    fn discover_tick(&self, request: &TickRequest) -> anyhow::Result<TickOutcome> {
+        let sources = self.sources.discover_sources(request);
+        {
+            let mut notes = self.notes.lock().expect("watch notes");
+            notes.kind = WatchTick::Discover;
+            notes.sources = sources.clone();
+            notes.changed.clear();
+        }
+        match self.store.discover(DiscoveryOptions {
+            sources,
+            stop: Some(self.stop.clone()),
+            ..DiscoveryOptions::default()
+        }) {
+            Ok(_) => Ok(TickOutcome::default()),
+            Err(Error::Cancelled(_)) => Err(CaptureCancelled.into()),
+            Err(error) => Err(anyhow::anyhow!("{error}")),
         }
     }
 
@@ -326,6 +383,37 @@ mod tests {
         assert!(scope.paths().unwrap().include_file(&file, "", "jsonl"));
         // Roots with no file paths still walk that provider whole.
         assert!(sources.plan(&event(&[claude])).scope().paths().is_none());
+    }
+
+    #[test]
+    fn a_discover_tick_names_one_source_and_an_unplaced_event_names_none() {
+        let (home, roots) = home();
+        let sources = WatchSources::new(roots);
+        sources.watch_roots();
+        let claude = home.path().join(".claude/projects");
+        let codex = home.path().join(".codex/sessions");
+
+        assert_eq!(
+            sources.discover_sources(&event(std::slice::from_ref(&claude))),
+            Some(vec![Source::Claude])
+        );
+        assert_eq!(
+            sources.discover_sources(&event(&[claude, codex])),
+            Some(vec![Source::Claude, Source::Codex])
+        );
+        assert_eq!(
+            sources.discover_sources(&event(&[home.path().join("elsewhere")])),
+            Some(vec![]),
+            "a path under no watched root discovers nothing"
+        );
+        assert_eq!(
+            sources.discover_sources(&full(TickTrigger::FsEvent)),
+            Some(vec![]),
+            "an event the loop could not place does not widen"
+        );
+        for trigger in [TickTrigger::Startup, TickTrigger::Poll, TickTrigger::Manual] {
+            assert_eq!(sources.discover_sources(&full(trigger)), None);
+        }
     }
 
     #[test]

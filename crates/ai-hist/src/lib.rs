@@ -90,7 +90,7 @@ pub use session_store::{
     HydrateReport, HydrateStatus, Marker, Message, MessageIdOrigin, ProgressObserver, Prompt,
     Relationship, RelationshipSide, Role, SessionEvidence, SessionQuery, SessionRef, SessionStore,
     Source, SourceCapabilities, StopToken, StoreOptions, SyncOptions, SyncReport, TickReport,
-    ToolCall, ToolResult, WatchHandle, WatchOptions, WatchScope, WatchStop, WatchedPath,
+    ToolCall, ToolResult, WatchHandle, WatchOptions, WatchScope, WatchStop, WatchTick, WatchedPath,
 };
 /// The usage reads that take a raw connection. Embedders reach the same data
 /// through [`SessionStore::session`], whose `requests` and `usage` fields

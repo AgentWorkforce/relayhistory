@@ -280,6 +280,23 @@ impl HydrateOptions {
     }
 }
 
+/// What one tick of [`super::SessionStore::watch`] runs.
+///
+/// [`WatchTick::Sync`] is the default, including options serialized before
+/// the field existed. [`WatchTick::Discover`] reads the shallow catalog and
+/// does not parse transcripts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[non_exhaustive]
+#[serde(rename_all = "snake_case")]
+pub enum WatchTick {
+    /// The locked capture [`super::SessionStore::sync`] runs.
+    #[default]
+    Sync,
+    /// A shallow [`super::SessionStore::discover`] of the sources the tick
+    /// names. No evidence is written and no transcript is parsed.
+    Discover,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

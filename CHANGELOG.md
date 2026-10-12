@@ -4,7 +4,15 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Minor]
+
+### Added
+
+- A watch can discover the sources whose files changed without syncing them.
+
+### Rust API
+
+- Added `WatchTick`, `WatchOptions::kind`, `TickReport::kind`, and `SessionStore::watch_discover`.
 
 ## [0.41.0] - 2026-10-12
 
