@@ -2454,7 +2454,7 @@ fn ingest_claude(
     // walk, in which case the fold describes no generation that exists and
     // the next pass, which rescans, settles it.
     if !scan_superseded {
-        crate::ingest::set_claude_first_prompt(conn, &meta)?;
+        crate::ingest::set_claude_first_prompt(conn, &meta, path)?;
     }
     let mut outcome = IngestOutcome {
         bytes_read: scanned_bytes as i64,

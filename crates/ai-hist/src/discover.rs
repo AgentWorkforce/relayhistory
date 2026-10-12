@@ -61,7 +61,7 @@ use std::sync::{LazyLock, Mutex, MutexGuard};
 
 use crate::project_identity::ProjectKeyMethod;
 use crate::{
-    open_db_readonly, upsert_session_presence, EvidenceKind, SessionLocation, SessionScope,
+    now_ms, open_db_readonly, upsert_session_presence, EvidenceKind, SessionLocation, SessionScope,
     FULL_SESSION_KINDS, SOURCE_CHOICES,
 };
 use crate::ingest::opencode::OpencodeLayout;
@@ -88,7 +88,7 @@ use opencode_page::{
 /// 4 adds `project_key` / `project_key_method` to every catalog row and the
 /// `project_key` filter to the listing.
 /// 5 adds `title`, the name the harness gave the session.
-pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 5;
+pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 6;
 
 /// Version of the shallow scanners themselves.
 ///
@@ -96,7 +96,7 @@ pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 5;
 /// invalidates every stored stamp, so a scanner that learns to extract a new
 /// field re-reads sources whose bytes never changed. `parser_version` keeps its
 /// existing meaning (full-ingest parser generation) and is untouched.
-pub const SHALLOW_SCANNER_VERSION: u32 = 12;
+pub const SHALLOW_SCANNER_VERSION: u32 = 13;
 
 /// Version 2 shipped the classification that hid standalone guardians (see
 /// [`crate::codex_is_subagent`]). Their rollouts never change on disk, so the
@@ -178,6 +178,10 @@ const _: () = assert!(SHALLOW_SCANNER_VERSION > 10);
 /// bump sends each cached Claude row through the reader that fills it.
 const _: () = assert!(SHALLOW_SCANNER_VERSION > 11);
 
+/// Version 13 reads Grok's `session_kind`. Existing rows with unchanged
+/// summaries must be revisited so root-only listings hide marked subagents.
+const _: () = assert!(SHALLOW_SCANNER_VERSION > 12);
+
 /// Most bytes a shallow head read may consume from one transcript.
 pub const HEAD_SCAN_MAX_BYTES: u64 = 256 * 1024;
 /// Most complete JSONL records a shallow head read may consider.
@@ -241,6 +245,9 @@ pub struct ShallowSession {
     /// provider — none yet. A shallow read sees only the head and tail of a
     /// transcript, so a rename recorded in neither waits for the full ingest.
     pub title: Option<String>,
+    /// Provider-native session kind, when recorded. Grok writes `subagent`
+    /// even when it does not name the delegating session.
+    pub session_kind: Option<String>,
     /// Model ids observed in the bounded read. Observed, best effort: never a
     /// reason to widen a read, so an empty list means "not seen cheaply", not
     /// "no model".
@@ -1922,6 +1929,8 @@ impl ShallowSessionProvider for GrokProvider {
             last_activity_ms,
             first_prompt,
             title: crate::ingest::titles::grok_title(summary.as_ref()),
+            session_kind: summary.as_ref().and_then(|s| s.get("session_kind"))
+                .and_then(Value::as_str).map(str::to_string),
             models,
             raw_path: Some(candidate.locator.clone()),
             ..Default::default()
@@ -3354,7 +3363,7 @@ fn file_candidates(
 pub(crate) const SESSION_COLUMNS: &str = "source, session_id, cwd, git_branch, first_activity_ms, \
      last_activity_ms, first_prompt, last_assistant_text, models_json, originator, \
      agent_version, repo_url, initial_commit, workspace_roots_json, raw_path, source_stamp, \
-     discovery_state, project_key, project_key_method, title, \
+     discovery_state, project_key, project_key_method, title, session_kind, \
      CASE \
        WHEN EXISTS (SELECT 1 FROM session_presences p WHERE p.source = sessions.source AND p.session_id = sessions.session_id AND p.location = 'local') \
         AND EXISTS (SELECT 1 FROM session_presences p WHERE p.source = sessions.source AND p.session_id = sessions.session_id AND p.location = 'remote') \
@@ -3366,39 +3375,8 @@ pub(crate) const SESSION_COLUMNS: &str = "source, session_id, cwd, git_branch, f
        ELSE '[]' \
      END";
 
-fn json_string_list(raw: Option<String>) -> Vec<String> {
-    raw.and_then(|raw| serde_json::from_str::<Vec<String>>(&raw).ok())
-        .unwrap_or_default()
-}
-
-pub(crate) fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<ShallowSession> {
-    Ok(ShallowSession {
-        source: row.get(0)?,
-        session_id: row.get(1)?,
-        cwd: row.get(2)?,
-        git_branch: row.get(3)?,
-        first_activity_ms: row.get(4)?,
-        last_activity_ms: row.get(5)?,
-        first_prompt: row.get(6)?,
-        last_assistant_text: row.get(7)?,
-        models: json_string_list(row.get(8)?),
-        originator: row.get(9)?,
-        agent_version: row.get(10)?,
-        repo_url: row.get(11)?,
-        initial_commit: row.get(12)?,
-        workspace_roots: json_string_list(row.get(13)?),
-        raw_path: row.get(14)?,
-        source_stamp: row.get(15)?,
-        discovery_state: row
-            .get::<_, Option<String>>(16)?
-            .unwrap_or_else(|| "full".to_string()),
-        project_key: row.get(17)?,
-        project_key_method: row.get(18)?,
-        title: row.get(19)?,
-        locations: json_string_list(row.get(20)?),
-        from_cache: true,
-    })
-}
+mod catalog_row;
+pub(crate) use catalog_row::row_to_session;
 
 /// A precise continuation point in the catalog's total order.
 ///
@@ -3488,6 +3466,7 @@ fn catalog_list_query(options: &CatalogListOptions) -> (String, Vec<Box<dyn rusq
         args.push(Box::new(project_key.clone()));
     }
     if options.exclude_delegated {
+        sql.push_str(" AND COALESCE(sessions.session_kind <> 'subagent' OR sessions.source <> 'grok', 1)");
         sql.push_str(&format!(
             " AND NOT {}",
             crate::relationships::delegated_child_sql("sessions.source", "sessions.session_id")
@@ -3831,13 +3810,6 @@ fn clear_non_session(
     Ok(())
 }
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis() as i64)
-        .unwrap_or_default()
-}
-
 /// Re-resolve the project identity of a row served straight from the catalog.
 ///
 /// The stamp shortcut is right about everything the transcript says and wrong
@@ -3950,9 +3922,9 @@ static UPSERT_SESSION_SQL: LazyLock<String> = LazyLock::new(|| {
          (session_id, source, cwd, git_branch, first_activity_ms, last_activity_ms, \
           last_assistant_text, raw_path, parser_version, first_prompt, models_json, originator, \
           agent_version, repo_url, initial_commit, workspace_roots_json, source_stamp, \
-          project_key, project_key_method, title, \
+          project_key, project_key_method, title, session_kind, \
           discovery_state) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?18, ?19, ?20, 'shallow') \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?18, ?19, ?20, ?21, 'shallow') \
          ON CONFLICT(session_id, source) DO UPDATE SET \
          {project_key_merge}, \
          cwd = COALESCE(excluded.cwd, sessions.cwd), \
@@ -3978,6 +3950,13 @@ static UPSERT_SESSION_SQL: LazyLock<String> = LazyLock::new(|| {
              WHEN sessions.discovery_state IS NULL OR sessions.discovery_state = 'full' \
              THEN COALESCE(sessions.title, excluded.title) \
              ELSE COALESCE(excluded.title, sessions.title) END, \
+         session_kind = CASE \
+             WHEN excluded.source = 'grok' AND ?17 = 'local' THEN excluded.session_kind \
+             WHEN excluded.source = 'grok' AND EXISTS ( \
+                 SELECT 1 FROM session_presences p WHERE p.source = sessions.source \
+                 AND p.session_id = sessions.session_id AND p.location = 'local') THEN sessions.session_kind \
+             WHEN excluded.source = 'grok' THEN excluded.session_kind \
+             ELSE COALESCE(excluded.session_kind, sessions.session_kind) END, \
          models_json = COALESCE(excluded.models_json, sessions.models_json), \
          originator = COALESCE(excluded.originator, sessions.originator), \
          agent_version = COALESCE(excluded.agent_version, sessions.agent_version), \
@@ -4043,6 +4022,9 @@ fn upsert_shallow_session_in_transaction(
     session: &ShallowSession,
     location: SessionLocation,
 ) -> Result<ShallowSession> {
+    // A sibling transcript keeps the identity of the file already recorded.
+    let kept = crate::catalog_owner::withhold_shallow(conn, session, location)?;
+    let session = kept.as_ref().unwrap_or(session);
     if location == SessionLocation::Remote {
         // Cache-only local reads classify a preexisting presence-less row as
         // legacy local. Preserve that classification before adding the first
@@ -4136,6 +4118,7 @@ fn upsert_shallow_session_in_transaction(
             project_key,
             project_key_method,
             session.title,
+            session.session_kind,
         ],
         row_to_session,
     )?;
@@ -4935,7 +4918,7 @@ fn discover_sessions_with_worker_limit(
                     break 'apply;
                 }
             };
-            if let Err(error) = crate::observations::upsert(
+            if let Err(error) = crate::observations::upsert_for_discovery(
                 conn,
                 &crate::observations::SessionObservation {
                     key: observation_key(provider, &session.source, &session.session_id),

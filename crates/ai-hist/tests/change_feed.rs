@@ -1140,9 +1140,9 @@ fn a_forced_sweep_over_unchanged_files_reports_nothing() {
     }
     // The sidecar carries its parent's session id, as Claude subagent
     // transcripts do. It is read as the parent's related transcript, not as
-    // a second claim on the catalog row, so it must not churn either. Two
-    // top-level transcripts that claim one session id do still churn on
-    // every forced tick (#328); none is staged here.
+    // a second claim on the catalog row, so it must not churn either.
+    // Top-level siblings that share a session id are
+    // `a_forced_sweep_keeps_a_shared_session_on_its_recorded_transcript`.
     let sidecar = fixtures_root().join("claude/sidecar-subagent/.claude/projects/corpus");
     let corpus = home.claude_transcript("claude-sidecar-parent.jsonl");
     fs::copy(sidecar.join("claude-sidecar-parent.jsonl"), &corpus).unwrap();
@@ -1255,4 +1255,566 @@ fn a_forced_sweep_over_unchanged_files_reports_nothing() {
             "{session:?}: a re-read of indexed records reports none of them: {evidence:?}"
         );
     }
+}
+
+/// Two forced full sweeps of the Claude fixture siblings, with no file
+/// changes between them, leave each shared session on the transcript it
+/// already recorded. Events from both files stay stored. Editing that
+/// transcript still reports a change, and removing it lets the remaining
+/// transcript claim the row.
+#[test]
+fn a_forced_sweep_keeps_a_shared_session_on_its_recorded_transcript() {
+    let home = Home::new();
+    let claude = fixtures_root().join("claude");
+    let mut by_session: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+    for entry in fs::read_dir(&claude).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        if !name.ends_with(".jsonl") || !entry.file_type().unwrap().is_file() {
+            continue;
+        }
+        let staged = home.stage_claude(&name);
+        if let Some(session_id) = claude_session_id(&staged) {
+            by_session.entry(session_id).or_default().push(staged);
+        }
+    }
+    let siblings: BTreeMap<String, Vec<PathBuf>> = by_session
+        .into_iter()
+        .filter(|(_, files)| files.len() >= 2)
+        .collect();
+    for id in [
+        "00000000-0000-0000-0000-000000000fff",
+        "22222222-2222-2222-2222-222222222222",
+        "33333333-3333-3333-3333-333333333333",
+        "44444444-4444-4444-4444-444444444444",
+        "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+    ] {
+        assert!(
+            siblings.get(id).is_some_and(|files| files.len() >= 2),
+            "{id} has no sibling pair in the staged corpus"
+        );
+    }
+    let sibling_ids: BTreeSet<String> = siblings.keys().cloned().collect();
+
+    let mut uuid_files: BTreeMap<String, usize> = BTreeMap::new();
+    for files in siblings.values() {
+        for file in files {
+            for uuid in claude_uuids(file) {
+                *uuid_files.entry(uuid).or_default() += 1;
+            }
+        }
+    }
+
+    let store = home.store();
+    let mut forced = SyncOptions::default();
+    forced.force = true;
+    store.sync(SyncOptions::default()).unwrap();
+    store.sync(forced.clone()).unwrap();
+    let _ = drain(&store, Watermark::START);
+
+    for uuid in ["u-fork-a-1", "u-fork-b-1"] {
+        assert!(
+            claude_event_stored(&home, uuid),
+            "{uuid} from one fork transcript is missing"
+        );
+    }
+    for (uuid, count) in &uuid_files {
+        if *count == 1 {
+            assert!(
+                claude_event_stored(&home, uuid),
+                "unique record {uuid} was not stored"
+            );
+        }
+    }
+
+    let before: BTreeMap<String, String> = sibling_ids
+        .iter()
+        .map(|id| (id.clone(), sibling_identity(&home, id)))
+        .collect();
+    for round in 0..2 {
+        let head = store.head_revision().unwrap();
+        store.sync(forced.clone()).unwrap();
+        let delta = drain(&store, head);
+        let churn: Vec<&Change> = delta
+            .iter()
+            .filter(|change| {
+                sibling_ids.contains(&change.session_id)
+                    && matches!(
+                        change.kind,
+                        ChangeKind::Session | ChangeKind::Presence | ChangeKind::SourceObservation
+                    )
+            })
+            .collect();
+        assert!(
+            churn.is_empty(),
+            "forced sweep {round} retargeted a shared session: {churn:?}"
+        );
+        for id in &sibling_ids {
+            assert_eq!(
+                sibling_identity(&home, id),
+                before[id],
+                "forced sweep {round} moved {id}"
+            );
+        }
+    }
+
+    let fork = "00000000-0000-0000-0000-000000000fff";
+    let owner = before[fork]
+        .lines()
+        .next()
+        .unwrap()
+        .split('|')
+        .next()
+        .unwrap();
+    let owner = PathBuf::from(owner);
+    assert!(owner.is_file(), "recorded transcript is missing: {owner:?}");
+    let remaining = siblings[fork]
+        .iter()
+        .find(|path| path.file_name() != owner.file_name())
+        .unwrap()
+        .clone();
+    let mut body = fs::read_to_string(&owner).unwrap();
+    if !body.ends_with('\n') {
+        body.push('\n');
+    }
+    body.push_str(&format!(
+        "{{\"parentUuid\":null,\"isSidechain\":false,\"type\":\"user\",\"message\":{{\"role\":\"user\",\"content\":\"and another\"}},\"uuid\":\"u-owner-edit\",\"timestamp\":\"2026-08-01T00:00:00.000Z\",\"cwd\":\"/tmp/project\",\"sessionId\":\"{fork}\",\"version\":\"2.1.97\"}}\n"
+    ));
+    fs::write(&owner, body).unwrap();
+    let head = store.head_revision().unwrap();
+    store.sync(forced.clone()).unwrap();
+    let delta = drain(&store, head);
+    assert!(
+        delta.iter().any(|change| change.session_id == fork),
+        "editing the recorded transcript reported nothing: {delta:?}"
+    );
+    assert!(claude_event_stored(&home, "u-owner-edit"));
+    let after_edit = sibling_identity(&home, fork);
+    assert!(
+        after_edit
+            .lines()
+            .next()
+            .unwrap()
+            .starts_with(&format!("{}|", owner.display())),
+        "the edit moved the catalog off the recorded file: {after_edit}"
+    );
+
+    fs::remove_file(&owner).unwrap();
+    store.sync(forced.clone()).unwrap();
+    let claimed = sibling_identity(&home, fork);
+    let claimed_path = claimed.lines().next().unwrap().split('|').next().unwrap();
+    assert_eq!(
+        Path::new(claimed_path).file_name(),
+        remaining.file_name(),
+        "the remaining transcript did not claim the row: {claimed}"
+    );
+    assert!(Path::new(claimed_path).is_file());
+    let presence = claimed.lines().nth(1).unwrap();
+    let observation = claimed.lines().nth(2).unwrap();
+    assert!(
+        presence.starts_with(&format!("{}|", claimed_path)),
+        "presence stayed on the removed file: {presence}"
+    );
+    assert!(
+        observation.starts_with(&format!("{}|", claimed_path)),
+        "observation stayed on the removed file: {observation}"
+    );
+    assert!(claude_event_stored(&home, "u-fork-a-1"));
+    assert!(claude_event_stored(&home, "u-fork-b-1"));
+
+    let head = store.head_revision().unwrap();
+    store.sync(forced).unwrap();
+    let delta = drain(&store, head);
+    let churn: Vec<&Change> = delta
+        .iter()
+        .filter(|change| {
+            change.session_id == fork
+                && matches!(
+                    change.kind,
+                    ChangeKind::Session | ChangeKind::Presence | ChangeKind::SourceObservation
+                )
+        })
+        .collect();
+    assert!(
+        churn.is_empty(),
+        "the newly claimed file flipped on the next forced sweep: {churn:?}"
+    );
+}
+
+fn claude_session_id(path: &Path) -> Option<String> {
+    let text = fs::read_to_string(path).ok()?;
+    text.lines().find_map(|line| {
+        let value: Value = serde_json::from_str(line).ok()?;
+        value
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn claude_uuids(path: &Path) -> BTreeSet<String> {
+    let Ok(text) = fs::read_to_string(path) else {
+        return BTreeSet::new();
+    };
+    text.lines()
+        .filter_map(|line| {
+            let value: Value = serde_json::from_str(line).ok()?;
+            value
+                .get("uuid")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+        })
+        .collect()
+}
+
+/// Identity columns a sibling transcript must not retarget while the recorded
+/// file exists: the catalog row, the local presence, and the local observation.
+fn sibling_identity(home: &Home, session_id: &str) -> String {
+    let conn = home.raw();
+    let session: String = conn
+        .query_row(
+            "SELECT ifnull(raw_path,''), ifnull(first_prompt,''), ifnull(title,''), \
+                    ifnull(models_json,''), ifnull(agent_version,''), ifnull(source_stamp,'') \
+             FROM sessions WHERE source = 'claude' AND session_id = ?1",
+            [session_id],
+            |row| {
+                Ok(format!(
+                    "{}|{}|{}|{}|{}|{}",
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?
+                ))
+            },
+        )
+        .unwrap();
+    let presence: String = conn
+        .query_row(
+            "SELECT ifnull(raw_locator,''), ifnull(source_stamp,'') \
+             FROM session_presences \
+             WHERE source = 'claude' AND session_id = ?1 AND location = 'local'",
+            [session_id],
+            |row| {
+                Ok(format!(
+                    "{}|{}",
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?
+                ))
+            },
+        )
+        .unwrap();
+    let observation: String = conn
+        .query_row(
+            "SELECT ifnull(raw_locator,''), ifnull(source_stamp,''), ifnull(first_prompt,'') \
+             FROM session_observations \
+             WHERE source = 'claude' AND session_id = ?1 AND location = 'local'",
+            [session_id],
+            |row| {
+                Ok(format!(
+                    "{}|{}|{}",
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?
+                ))
+            },
+        )
+        .unwrap();
+    format!("{session}\n{presence}\n{observation}")
+}
+
+fn claude_event_stored(home: &Home, uuid: &str) -> bool {
+    let prefixed = format!("{uuid}:%");
+    home.raw()
+        .query_row(
+            "SELECT EXISTS( \
+                SELECT 1 FROM session_events \
+                WHERE source = 'claude' AND (event_uid = ?1 OR event_uid LIKE ?2) \
+                UNION ALL \
+                SELECT 1 FROM session_markers \
+                WHERE source = 'claude' AND (marker_uid = ?1 OR marker_uid LIKE ?2) \
+             )",
+            rusqlite::params![uuid, prefixed],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+fn codex_rollout(home: &Home, fixture: &str) -> PathBuf {
+    let stem = fixture.trim_end_matches(".jsonl");
+    home.path().join(format!(
+        ".codex/sessions/2026/04/20/rollout-2026-04-20T00-00-00-{stem}.jsonl"
+    ))
+}
+
+fn session_events_since(store: &SessionStore, from: Watermark) -> Vec<Change> {
+    drain(store, from)
+        .into_iter()
+        .filter(|change| change.kind == ChangeKind::SessionEvent)
+        .collect()
+}
+
+fn event_token(change: &Change) -> Option<&str> {
+    match &change.op {
+        ChangeOp::Upsert(EvidenceRow::SessionEvent(event)) => event.token_json.as_deref(),
+        _ => None,
+    }
+}
+
+fn stored_token(home: &Home, session: &str, uid: &str) -> Option<String> {
+    home.raw()
+        .query_row(
+            "SELECT token_json FROM session_events \
+             WHERE source = 'codex' AND session_id = ?1 AND event_uid = ?2",
+            rusqlite::params![session, uid],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// Hydrating `with-tool-call` after the sweep re-reads the rollout from the
+/// start. The assistant row is upserted before its `token_count`, and that
+/// re-read reports the event only when the usage changed.
+#[test]
+fn codex_reread_of_with_tool_call_reports_no_session_event() {
+    let home = Home::new();
+    home.stage_codex("with-tool-call.jsonl");
+    let store = home.store();
+    store.sync(Default::default()).unwrap();
+    let before = stored_token(&home, "sess_tools_1", "7:custom_tool_call");
+    assert!(
+        before
+            .as_deref()
+            .is_some_and(|json| json.contains("\"output_tokens\":800")),
+        "the sweep stored the tool call's usage: {before:?}"
+    );
+
+    let head = store.head_revision().unwrap();
+    store
+        .hydrate(
+            &SessionRef::id(Source::Codex, "sess_tools_1"),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    let events = session_events_since(&store, head);
+    assert!(
+        events.is_empty(),
+        "a re-read reports no session event: {events:?}"
+    );
+    assert_eq!(
+        stored_token(&home, "sess_tools_1", "7:custom_tool_call"),
+        before
+    );
+
+    let again = store.head_revision().unwrap();
+    store
+        .hydrate(
+            &SessionRef::id(Source::Codex, "sess_tools_1"),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    assert!(
+        session_events_since(&store, again).is_empty(),
+        "the hydration after that is quiet too"
+    );
+}
+
+/// A real usage change is one feed row, carrying the new usage.
+#[test]
+fn codex_reread_reports_a_usage_change_once() {
+    let home = Home::new();
+    home.stage_codex("with-tool-call.jsonl");
+    let store = home.store();
+    store.sync(Default::default()).unwrap();
+    let path = codex_rollout(&home, "with-tool-call.jsonl");
+    let mut text = fs::read_to_string(&path).unwrap();
+    text = text.replace("\"output_tokens\":800", "\"output_tokens\":900");
+    text = text.replace("\"total_tokens\":5800", "\"total_tokens\":5900");
+    fs::write(&path, text).unwrap();
+
+    let head = store.head_revision().unwrap();
+    store
+        .hydrate(
+            &SessionRef::id(Source::Codex, "sess_tools_1"),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    let events = session_events_since(&store, head);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].record_key, "7:custom_tool_call");
+    let token = event_token(&events[0]).unwrap();
+    assert!(token.contains("\"output_tokens\":900"), "{token}");
+    assert_eq!(
+        stored_token(&home, "sess_tools_1", "7:custom_tool_call").as_deref(),
+        Some(token)
+    );
+
+    let again = store.head_revision().unwrap();
+    store
+        .hydrate(
+            &SessionRef::id(Source::Codex, "sess_tools_1"),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    assert!(session_events_since(&store, again).is_empty());
+}
+
+/// Usage the rollout no longer contains is cleared once, not nulled and then
+/// restored.
+#[test]
+fn codex_reread_clears_usage_that_is_gone_once() {
+    let home = Home::new();
+    home.stage_codex("with-tool-call.jsonl");
+    let store = home.store();
+    store.sync(Default::default()).unwrap();
+    let path = codex_rollout(&home, "with-tool-call.jsonl");
+    let text = fs::read_to_string(&path).unwrap();
+    let kept: String = text
+        .lines()
+        .filter(|line| !line.contains("\"token_count\""))
+        .collect::<Vec<_>>()
+        .join("\n");
+    fs::write(&path, format!("{kept}\n")).unwrap();
+    home.raw_writer()
+        .execute(
+            "INSERT INTO session_events \
+             (source, session_id, project_key, project_key_method, ts_ms, role, kind, \
+              event_uid, token_json, location) \
+             VALUES ('codex', 'sess_tools_1', '/tmp/project', 'path', 1, 'assistant', \
+                     'tool_use', 'remote-only', '{\"output_tokens\":2}', 'remote')",
+            [],
+        )
+        .unwrap();
+
+    let head = store.head_revision().unwrap();
+    store
+        .hydrate(
+            &SessionRef::id(Source::Codex, "sess_tools_1"),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    let events = session_events_since(&store, head);
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert_eq!(events[0].record_key, "7:custom_tool_call");
+    assert_eq!(event_token(&events[0]), None);
+    assert_eq!(
+        stored_token(&home, "sess_tools_1", "7:custom_tool_call"),
+        None
+    );
+    assert_eq!(
+        stored_token(&home, "sess_tools_1", "remote-only").as_deref(),
+        Some("{\"output_tokens\":2}")
+    );
+
+    let again = store.head_revision().unwrap();
+    store
+        .hydrate(
+            &SessionRef::id(Source::Codex, "sess_tools_1"),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    assert!(session_events_since(&store, again).is_empty());
+    assert_eq!(
+        stored_token(&home, "sess_tools_1", "remote-only").as_deref(),
+        Some("{\"output_tokens\":2}")
+    );
+}
+
+/// A re-read whose snapshot is unreadable ends on that refusal. A stale
+/// measurement the file no longer supports is replaced once, and a row that
+/// has none is filled once.
+#[test]
+fn codex_reread_refusal_replaces_a_stale_measurement_once() {
+    let home = Home::new();
+    home.stage_codex("two-unreadable-turns.jsonl");
+    let store = home.store();
+    store.sync(Default::default()).unwrap();
+    let session = "sess_codex_two_bad";
+    let assistants: Vec<(String, Option<String>)> = {
+        let conn = home.raw();
+        let mut stmt = conn
+            .prepare(
+                "SELECT event_uid, token_json FROM session_events \
+                 WHERE source = 'codex' AND session_id = ?1 AND role = 'assistant' \
+                   AND kind = 'text' \
+                 ORDER BY event_uid",
+            )
+            .unwrap();
+        stmt.query_map([session], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap()
+    };
+    assert_eq!(assistants.len(), 2, "{assistants:?}");
+    let kept = assistants[0]
+        .1
+        .clone()
+        .expect("the first refusal was stored");
+    let restored = assistants[1]
+        .1
+        .clone()
+        .expect("the second refusal was stored");
+    let sentinel = "{\"input_tokens\":42,\"output_tokens\":7}";
+    home.raw_writer()
+        .execute(
+            "UPDATE session_events SET token_json = ?1 \
+             WHERE source = 'codex' AND session_id = ?2 AND event_uid = ?3",
+            rusqlite::params![sentinel, session, assistants[0].0],
+        )
+        .unwrap();
+    home.raw_writer()
+        .execute(
+            "UPDATE session_events SET token_json = NULL \
+             WHERE source = 'codex' AND session_id = ?1 AND event_uid = ?2",
+            rusqlite::params![session, assistants[1].0],
+        )
+        .unwrap();
+
+    let head = store.head_revision().unwrap();
+    store
+        .hydrate(
+            &SessionRef::id(Source::Codex, session),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        stored_token(&home, session, &assistants[0].0).as_deref(),
+        Some(kept.as_str()),
+        "a stale measurement becomes the refusal the file now has ({sentinel})"
+    );
+    assert_eq!(
+        stored_token(&home, session, &assistants[1].0).as_deref(),
+        Some(restored.as_str())
+    );
+    let events = session_events_since(&store, head);
+    for (uid, usage) in [
+        (&assistants[0].0, kept.as_str()),
+        (&assistants[1].0, restored.as_str()),
+    ] {
+        let matched: Vec<&Change> = events
+            .iter()
+            .filter(|change| change.record_key == *uid)
+            .collect();
+        assert_eq!(matched.len(), 1, "{uid}: {events:?}");
+        assert_eq!(event_token(matched[0]), Some(usage));
+    }
+
+    let again = store.head_revision().unwrap();
+    store
+        .hydrate(
+            &SessionRef::id(Source::Codex, session),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    assert!(
+        session_events_since(&store, again).is_empty(),
+        "the same refusal is not reported again"
+    );
 }

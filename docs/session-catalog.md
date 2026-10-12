@@ -164,7 +164,7 @@ ai-hist sessions discover --json      # JSONL: sessions, diagnostics, summary
 
 ## The output contract
 
-Both operations carry `contract_version` — currently **4**
+Both operations carry `contract_version` — currently **6**
 (`SESSION_CATALOG_CONTRACT_VERSION`). It is bumped whenever the shape or the
 meaning of a row changes in a way a consumer must notice, so parse it and fail
 loudly on a version you do not know rather than guessing.
@@ -175,7 +175,7 @@ One object, never a bare array, so the version travels with the payload:
 
 ```jsonc
 {
-  "contract_version": 5,
+  "contract_version": 6,
   "scope": "local",
   "sessions": [
     {
@@ -188,6 +188,7 @@ One object, never a bare array, so the version travels with the payload:
       "first_prompt": "make the backoff configurable",
       "last_assistant_text": null,
       "title": "Make retry backoff configurable",
+      "session_kind": null,
       "models": ["gpt-5-codex"],
       "originator": "codex_cli_rs",
       "agent_version": "0.148.0",
@@ -315,7 +316,7 @@ types, in this order:
 // so a consumer always sees the reason before the non-zero exit
 {
   "type": "summary",
-  "contract_version": 5,
+  "contract_version": 6,
   "scope": "local",
   "locations_run": ["local"],
   "discovered": 2,
@@ -1110,6 +1111,15 @@ How each adapter works:
   not evidence of when anything happened, so it does not set the window either.
 
   ### Delegation
+
+  Grok's `summary.json` may mark a session with `session_kind: "subagent"`
+  without naming its parent. Discovery and full sync retain that native kind
+  on the catalog row. Root-only listings (`exclude_delegated`) omit an
+  explicitly marked Grok subagent even when no relationship edge can be
+  established; unfiltered listings and direct session reads still include it.
+  A summary without that marker remains a root unless an observed delegation
+  edge says otherwise. The shallow reader takes this fact from `summary.json`
+  and does not search transcript prose to guess a parent.
 
   Cursor's `Task` / `functions.Subagent` calls are recorded as ordinary
   `tool_calls` rows, so the spawn is visible. The block carries **no child

@@ -726,6 +726,8 @@ const REQUIRED_SESSIONS_COLUMNS: &[&str] = &[
     "project_key_method",
     // The name the harness gave the session; every catalog read selects it.
     "title",
+    // Provider-native kind, used when a delegated session has no observed parent.
+    "session_kind",
 ];
 /// What a provider's parser reported about the session, kept with the
 /// checkpoint so a later read that parses nothing can still report it. A
@@ -1432,7 +1434,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     source_stamp TEXT,
     discovery_state TEXT,
     project_key TEXT,
-    project_key_method TEXT, title TEXT,
+    project_key_method TEXT, title TEXT, session_kind TEXT,
     PRIMARY KEY (session_id, source)
 );
 CREATE TABLE IF NOT EXISTS session_presences (
@@ -8071,6 +8073,7 @@ mod tests {
         };
         assert!(has_column("sessions", "project_key"));
         assert!(has_column("sessions", "project_key_method"));
+        assert!(has_column("sessions", "session_kind"));
         assert!(has_column("session_events", "project_key"));
         assert!(conn
             .prepare("SELECT 1 FROM schema_migrations WHERE name = 'session_project_key_v1'")
@@ -8096,6 +8099,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(stored, (None, None));
+        let kind: Option<String> = conn
+            .query_row("SELECT session_kind FROM sessions", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(kind, None, "migration does not invent a provider kind");
         let event_key: Option<String> = conn
             .query_row("SELECT project_key FROM session_events", [], |row| {
                 row.get(0)

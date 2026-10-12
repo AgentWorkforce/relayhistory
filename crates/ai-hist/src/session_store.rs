@@ -71,6 +71,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod catalog_row;
 mod options;
 mod watch_sweep;
 
@@ -1260,6 +1261,7 @@ fn delegated_child_session(
                         first_prompt: None,
                         last_assistant_text: None,
                         title: None,
+                        session_kind: None,
                         models: Vec::new(),
                         originator: None,
                         agent_version: row.get(4)?,
@@ -2019,6 +2021,8 @@ pub struct CatalogSession {
     /// `custom-title`, else `ai-title`, else `agent-name`). `None` when the
     /// query asked for no text.
     pub title: Option<String>,
+    /// Provider-native kind, such as Grok's `subagent`.
+    pub session_kind: Option<String>,
     /// Model ids seen in the bounded read; best effort.
     pub models: Vec<String>,
     /// Client that originated the session. Codex.
@@ -2047,42 +2051,6 @@ pub struct CatalogSession {
 }
 
 impl CatalogSession {
-    fn from_row(row: ShallowSession) -> Result<Self, Error> {
-        let source = Source::parse(&row.source).ok_or_else(|| {
-            Error::Query(format!(
-                "catalog row {}/{} names a source this build does not know",
-                row.source, row.session_id
-            ))
-        })?;
-        Ok(Self {
-            source,
-            session_id: row.session_id,
-            cwd: row.cwd,
-            git_branch: row.git_branch,
-            first_activity_ms: row.first_activity_ms,
-            last_activity_ms: row.last_activity_ms,
-            first_prompt: row.first_prompt,
-            last_assistant_text: row.last_assistant_text,
-            title: row.title,
-            models: row.models,
-            originator: row.originator,
-            agent_version: row.agent_version,
-            repo_url: row.repo_url,
-            initial_commit: row.initial_commit,
-            workspace_roots: row.workspace_roots,
-            project_key: row.project_key,
-            project_key_method: row.project_key_method,
-            raw_path: row.raw_path.map(PathBuf::from),
-            source_stamp: row.source_stamp,
-            discovery_state: if row.discovery_state == "shallow" {
-                DiscoveryState::Shallow
-            } else {
-                DiscoveryState::Full
-            },
-            locations: row.locations,
-        })
-    }
-
     /// This row as a [`SessionRef`].
     pub fn session_ref(&self) -> SessionRef {
         SessionRef::id(self.source, self.session_id.clone())
@@ -3275,6 +3243,45 @@ mod tests {
             .map(|row| row.unwrap().session_id)
             .collect();
         assert_eq!(order, vec!["c", "b", "a"]);
+    }
+
+    #[test]
+    fn grok_native_kind_reaches_catalog_and_direct_session_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("ai-history.db");
+        let store = store_at(&db);
+        open_db(&db)
+            .unwrap()
+            .execute(
+                "INSERT INTO sessions (source, session_id, session_kind, discovery_state) \
+                 VALUES ('grok', 'child', 'subagent', 'shallow')",
+                [],
+            )
+            .unwrap();
+
+        let listed = store
+            .sessions(CatalogQuery::default())
+            .next()
+            .unwrap()
+            .unwrap();
+        assert_eq!(listed.session_kind.as_deref(), Some("subagent"));
+        let direct = store
+            .session(
+                &SessionRef::id(Source::Grok, "child"),
+                SessionQuery::default(),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(direct.session.session_kind.as_deref(), Some("subagent"));
+        assert_eq!(
+            store
+                .sessions(CatalogQuery {
+                    exclude_delegated: true,
+                    ..CatalogQuery::default()
+                })
+                .count(),
+            0
+        );
     }
 
     /// A catalog change the sweep makes indirectly — here the identity

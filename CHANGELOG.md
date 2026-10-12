@@ -22,13 +22,18 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Hermes retires confirmed deleted databases, retains native tool block IDs, bounds activity by session start, and clears stale directory project identities.
 - Hermes discovery ranks current activity across profiles, excludes synthetic prompt previews, and reconciles deleted sessions and changed prompt projects while preserving remote evidence.
 - Pi full sweeps retire confirmed deleted local transcripts, refresh retained prompt projects and previews, and shallow discovery records observed activity.
+- Grok sessions marked as subagents no longer appear as root conversations when their parent is not recorded.
+- A Codex re-read reports an event again only when its usage changed.
 - Pi history isolates invalid files, skips unchanged transcripts, and preserves prompt projects, tool identities and readable previews through rewrites.
 - Unchanged provider syncs restore lost evidence, missing adapter files and sidecar containment failures retain their typed error codes, and SDK hydration accepts native session markers.
 - A Grok or Muse re-read reports a row again only when that row changed.
+- A forced sweep keeps a session's catalog on the transcript it already recorded while that file exists.
 
 ### Rust API
 
 - Added `Source::Hermes` for filtering and reading persisted Hermes session history.
+- Added `ShallowSession::session_kind` and `CatalogSession::session_kind`, with catalog contract version 6, for provider-native session kinds.
+- Native catalog rows expose `sessionKind` under native contract version 27.
 - Added `Source::Pi` for filtering and reading persisted Pi session history.
 
 ## [0.40.1] - 2026-10-11

@@ -24,6 +24,7 @@ pub(crate) mod claude_title;
 pub(crate) mod codex;
 mod codex_subagent;
 pub(crate) mod codex_thread_names;
+mod codex_usage;
 pub(crate) mod control;
 pub(crate) mod cursor;
 pub(crate) mod devin;
@@ -5965,28 +5966,6 @@ fn record_codex_usage_snapshot(
     Ok(())
 }
 
-/// Attach measured usage to the assistant event that earned it, or hold it
-/// until one appears.
-fn attach_codex_usage(
-    conn: &Connection,
-    session_id: &str,
-    pending: &mut Option<PendingCodexUsage>,
-    untokened_assistant_uid: &mut Option<String>,
-    usage: PendingCodexUsage,
-) -> Result<()> {
-    match untokened_assistant_uid.take() {
-        Some(uid) => {
-            conn.execute(
-                "UPDATE session_events SET token_json = ? \
-                 WHERE source = 'codex' AND session_id = ? AND event_uid = ?",
-                params![usage.into_token_json(), session_id, uid],
-            )?;
-        }
-        None => *pending = Some(usage),
-    }
-    Ok(())
-}
-
 /// Ingest one rollout file's conversation into `session_events`,
 /// `tool_calls`, and `file_edits`, and its user prompts into `history`.
 ///
@@ -6158,6 +6137,7 @@ fn ingest_codex_rollout_incremental(
     // so a resumed pass never inherits one.
     let mut prev_totals: Option<CodexTokenTotals> = resume.prev_totals;
     let mut pending_usage: Option<PendingCodexUsage> = None;
+    let mut usage_pass = codex_usage::Pass::default();
     // Every snapshot that could not be differenced, in arrival order and never
     // rewritten, plus the baselines a delta was actually measured from. These
     // two are facts about the rollout; what they *mean* is decided once, after
@@ -6536,7 +6516,7 @@ fn ingest_codex_rollout_incremental(
                 },
             )?;
             outcome.events += 1;
-            untokened_assistant_uid = token_json.is_none().then(|| uid.clone());
+            untokened_assistant_uid = usage_pass.wrote(token_json.is_some(), &uid);
             outcome.last_assistant_text = Some(message.text.chars().take(4096).collect());
             saw_model_output = true;
             previous_assistant = Some((index, message.format, message.text));
@@ -6617,7 +6597,7 @@ fn ingest_codex_rollout_incremental(
                             },
                         )?;
                         outcome.events += 1;
-                        untokened_assistant_uid = Some(uid);
+                        untokened_assistant_uid = usage_pass.wrote(false, &uid);
                         saw_model_output = true;
                     }
                 }
@@ -6778,7 +6758,7 @@ fn ingest_codex_rollout_incremental(
                                 // than publish a clamped zero.
                                 None => PendingCodexUsage::Unusable(usage.to_string()),
                             };
-                            attach_codex_usage(
+                            usage_pass.attach(
                                 conn,
                                 session_id,
                                 &mut pending_usage,
@@ -7027,7 +7007,7 @@ fn ingest_codex_rollout_incremental(
                         },
                     )?;
                     outcome.events += 1;
-                    untokened_assistant_uid = token_json.is_none().then(|| uid.clone());
+                    untokened_assistant_uid = usage_pass.wrote(token_json.is_some(), &uid);
                     saw_model_output = true;
                     if !call_id.is_empty() && !name.is_empty() {
                         let args_json =
@@ -7135,21 +7115,13 @@ fn ingest_codex_rollout_incremental(
             )?;
         }
     }
-    // The whole rollout is known, so the refusals can be worked out from what
-    // was recorded. `token_json IS NULL` keeps one from overwriting a real
-    // measurement the turn acquired by another route.
-    for (uid, raw) in surviving_refusals(&unreadable_snapshots, &measured_generations) {
-        conn.execute(
-            "UPDATE session_events SET token_json = ? \
-             WHERE source = 'codex' AND session_id = ? AND event_uid = ? \
-               AND token_json IS NULL",
-            params![
-                PendingCodexUsage::Unusable(raw).into_token_json(),
-                session_id,
-                uid
-            ],
-        )?;
-    }
+    codex_usage::finish(
+        conn,
+        session_id,
+        &usage_pass,
+        &unreadable_snapshots,
+        &measured_generations,
+    )?;
     // End of file is not a turn boundary. A live rollout's last turn has no
     // `task_complete` yet, and the `exec_command_end` that fails one of its
     // calls can still be written after the bytes this pass read. Failures
@@ -8011,7 +7983,7 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
             // skip this file on every later sync and the stale fold would
             // never be replaced.
             if !scan_superseded {
-                set_claude_first_prompt(conn, &meta)?;
+                set_claude_first_prompt(conn, &meta, &path)?;
             }
             let pass = incremental::ingest_claude_transcript_at_locator_batched(
                 conn,
@@ -8938,7 +8910,19 @@ fn retire_claude_history_row(
 /// whose stored title was a row the classifier now types as control (a bare
 /// `/resume <id>`, a task notification) would keep it for good on an upgraded
 /// install, while a fresh database stores nothing.
-pub(crate) fn set_claude_first_prompt(conn: &Connection, meta: &ClaudeSessionMeta) -> Result<()> {
+pub(crate) fn set_claude_first_prompt(
+    conn: &Connection,
+    meta: &ClaudeSessionMeta,
+    path: &Path,
+) -> Result<()> {
+    // Every sibling transcript is folded. The prompt and title stay with the
+    // file the catalog row names; `upsert_session` has already kept or claimed
+    // that file, so this compares the path and does not stat again.
+    let recorded = path.to_string_lossy();
+    if !crate::catalog_owner::recorded_path_is(conn, "claude", &meta.session_id, recorded.as_ref())?
+    {
+        return Ok(());
+    }
     conn.execute(
         "UPDATE sessions SET first_prompt = ?1 WHERE source = 'claude' AND session_id = ?2",
         params![meta.first_prompt, meta.session_id],
@@ -12111,6 +12095,14 @@ fn upsert_session_inner(
             "last_assistant_text = excluded.last_assistant_text",
         ),
     };
+    // A different transcript does not replace the recorded file, or the
+    // excerpt taken from it, while that file exists. Activity still moves:
+    // events from both transcripts belong to the session. The same path is a
+    // normal update, including a directory a provider rewrites in place.
+    let keep_recorded =
+        crate::catalog_owner::incoming_must_not_replace(conn, source, session_id, raw_path)?;
+    let (assistant_text, raw_path_sql, presence_path) =
+        crate::catalog_owner::session_assigns(keep_recorded, assistant_text, raw_path);
     // Canonical project identity, derived once per session from the cwd the
     // provider recorded. Resolution is cached per directory, so the repeated
     // upserts a growing transcript produces cost one filesystem walk in total.
@@ -12130,7 +12122,7 @@ fn upsert_session_inner(
          {first_activity}, \
          {last_activity}, \
          {assistant_text}, \
-         raw_path = COALESCE(excluded.raw_path, sessions.raw_path), \
+         {raw_path_sql}, \
          parser_version = excluded.parser_version, \
          discovery_state = 'full'"
         ),
@@ -12154,7 +12146,7 @@ fn upsert_session_inner(
         source,
         session_id,
         SessionLocation::Local,
-        raw_path,
+        presence_path,
         None,
         Some("full"),
     )?;
@@ -15726,7 +15718,7 @@ fn ingest_grok_session(
     // keeps the monotonic merge.
     conn.execute(
         "UPDATE sessions SET first_activity_ms = ?, last_activity_ms = ?, \
-         last_assistant_text = ?, models_json = ?, first_prompt = ? \
+         last_assistant_text = ?, models_json = ?, first_prompt = ?, session_kind = ? \
          WHERE source = 'grok' AND session_id = ?",
         params![
             session.first_ts,
@@ -15735,6 +15727,7 @@ fn ingest_grok_session(
             (!session.models.is_empty())
                 .then(|| serde_json::to_string(&session.models).unwrap_or_default()),
             first_prompt.as_deref(),
+            session.session_kind.as_deref(),
             sid,
         ],
     )?;
@@ -16299,6 +16292,7 @@ struct GrokPromptContext {
 /// One Grok session directory, read.
 struct GrokSession {
     session_id: String,
+    session_kind: Option<String>,
     cwd: Option<String>,
     git_branch: Option<String>,
     first_ts: i64,
@@ -16526,6 +16520,11 @@ fn scan_grok_session_file(chat: &Path) -> Result<Option<GrokSession>> {
     let title = titles::grok_title(summary.as_ref());
     Ok(Some(GrokSession {
         session_id,
+        session_kind: summary
+            .as_ref()
+            .and_then(|s| s.get("session_kind"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
         cwd,
         git_branch,
         first_ts,
@@ -18604,6 +18603,53 @@ mod tests {
         )
         .unwrap();
         (dir.join("chat_history.jsonl"), dir)
+    }
+
+    #[test]
+    fn grok_full_sync_preserves_a_parentless_subagent_for_direct_reads() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join(".grok/sessions/%2Fwork%2Fgrok");
+        for (id, kind) in [("root", ""), ("child", r#", "session_kind":"subagent""#)] {
+            let dir = root.join(id);
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join("chat_history.jsonl"),
+                format!(r#"{{"type":"user","content":"{id} prompt"}}"#) + "\n",
+            )
+            .unwrap();
+            fs::write(dir.join("summary.json"), format!(
+                r#"{{"info":{{"id":"{id}","cwd":"/work/grok"}},"created_at":"2026-06-20T09:00:00.000Z"{kind}}}"#
+            )).unwrap();
+        }
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        super::sync_grok(&conn, &mut Map::new(), &home.path().join(".grok/sessions")).unwrap();
+        let all = crate::discover::list_session_catalog(
+            &conn,
+            &crate::discover::CatalogListOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(all.len(), 2);
+        let child = all.iter().find(|row| row.session_id == "child").unwrap();
+        assert_eq!(child.session_kind.as_deref(), Some("subagent"));
+        let child_events: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM session_events WHERE source = 'grok' AND session_id = 'child'", [], |row| row.get(0)
+        ).unwrap();
+        assert!(child_events > 0, "direct child evidence remains indexed");
+        let roots = crate::discover::list_session_catalog(
+            &conn,
+            &crate::discover::CatalogListOptions {
+                exclude_delegated: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            roots
+                .iter()
+                .map(|row| row.session_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["root"]
+        );
     }
 
     /// A Grok session indexed by a build that stored no `turn_completed.usage`

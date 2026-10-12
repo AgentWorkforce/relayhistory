@@ -132,6 +132,8 @@ export interface CatalogSession {
   lastAssistantText: string | null;
   /** The name the harness gave the session (Claude's title, Codex's thread name). */
   title: string | null;
+  /** Provider-native kind, such as Grok's `subagent`. */
+  sessionKind: string | null;
   models: string[];
   originator: string | null;
   agentVersion: string | null;

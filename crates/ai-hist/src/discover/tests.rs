@@ -481,7 +481,10 @@ fn a_primary_transcript_of_only_sidechain_rows_is_a_session() {
     assert_eq!(found.ids(), vec!["claude:claude-inline"]);
     let row = found.row("claude-inline");
     assert_eq!(row.models, vec!["claude-haiku-4-5".to_string()]);
-    assert_eq!(row.first_prompt, None, "a sidechain prompt is not a human one");
+    assert_eq!(
+        row.first_prompt, None,
+        "a sidechain prompt is not a human one"
+    );
 }
 
 /// The same defect class as the claude sidecar: a codex subagent thread is a
@@ -939,7 +942,13 @@ fn cursor_recency_uses_a_turn_time_only_the_head_can_see() {
         ));
         body.push('\n');
     }
-    cursor_session(home.path(), "work-app", "cursor-head-time", &body, 1_750_000_400_000);
+    cursor_session(
+        home.path(),
+        "work-app",
+        "cursor-head-time",
+        &body,
+        1_750_000_400_000,
+    );
 
     let found = discover(&conn, home.path(), &only(&["cursor"]));
     let row = found.row("cursor-head-time");
@@ -1313,6 +1322,102 @@ fn cursor_rescan_keeps_one_row_per_session() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn grok_summary_subagent_is_hidden_from_root_catalog_without_a_parent_edge() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    grok_session(
+        home.path(),
+        "%2Fwork%2Fgrok",
+        "root",
+        r#"{"info":{"id":"root","cwd":"/work/grok"},"created_at":"2026-06-20T09:00:00.000Z","updated_at":"2026-06-20T09:01:00.000Z"}"#,
+        "{\"type\":\"user\",\"content\":\"start work\"}\n",
+        1_750_000_500_000,
+    );
+    grok_session(
+        home.path(),
+        "%2Fwork%2Fgrok",
+        "child",
+        r#"{"info":{"id":"child","cwd":"/work/grok"},"session_kind":"subagent","created_at":"2026-06-20T09:02:00.000Z","updated_at":"2026-06-20T09:03:00.000Z"}"#,
+        "{\"type\":\"user\",\"content\":\"delegated work\"}\n",
+        1_750_000_600_000,
+    );
+
+    let first = discover(&conn, home.path(), &only(&["grok"]));
+    assert_eq!(first.summary.counters.shallow_reads, 2);
+    let unfiltered = list_session_catalog(&conn, &CatalogListOptions::default()).unwrap();
+    assert_eq!(
+        unfiltered
+            .iter()
+            .map(|row| row.session_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["child", "root"]
+    );
+    assert_eq!(unfiltered[0].session_kind.as_deref(), Some("subagent"));
+    assert_eq!(catalog_row(&conn, "grok", "child", true).unwrap().unwrap().session_id, "child");
+    let edges: i64 = conn
+        .query_row("SELECT COUNT(*) FROM session_relationships", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(edges, 0);
+    let roots = list_session_catalog(
+        &conn,
+        &CatalogListOptions {
+            exclude_delegated: true,
+            limit: Some(1),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(
+        roots
+            .iter()
+            .map(|row| row.session_id.as_str())
+            .collect::<Vec<_>>(),
+        vec!["root"]
+    );
+
+    // Model an upgraded 0.40 catalog: the child row exists, but the old
+    // scanner stamped it before it knew to persist session_kind. Unchanged
+    // provider bytes must still cause this scanner to repair that row.
+    conn.execute(
+        "UPDATE sessions SET session_kind = NULL WHERE source = 'grok' AND session_id = 'child'",
+        [],
+    )
+    .unwrap();
+    assert_eq!(
+        list_session_catalog(
+            &conn,
+            &CatalogListOptions {
+                exclude_delegated: true,
+                ..Default::default()
+            }
+        )
+        .unwrap()
+        .len(),
+        2,
+        "without persisted kind, the old catalog misclassifies the child as a root"
+    );
+    conn.execute("UPDATE session_observations SET source_stamp = REPLACE(source_stamp, 'v13:', 'v12:') WHERE source = 'grok' AND session_id = 'child'", []).unwrap();
+    let upgraded = discover(&conn, home.path(), &only(&["grok"]));
+    assert_eq!(upgraded.summary.counters.shallow_reads, 1);
+    assert_eq!(
+        list_session_catalog(
+            &conn,
+            &CatalogListOptions {
+                exclude_delegated: true,
+                ..Default::default()
+            }
+        )
+        .unwrap()
+        .iter()
+        .map(|row| row.session_id.as_str())
+        .collect::<Vec<_>>(),
+        vec!["root"]
+    );
+}
+
+#[test]
 fn grok_summary_supplies_identity_and_the_chat_head_supplies_the_prompt() {
     let conn = catalog();
     let home = tempfile::tempdir().unwrap();
@@ -1490,15 +1595,18 @@ fn grok_discovery_fails_an_unreadable_summary_rather_than_naming_the_folder() {
             .diagnostics
             .iter()
             .any(|diagnostic| diagnostic.source == "grok"
-                && diagnostic.locator.as_deref().is_some_and(|locator| {
-                    locator.contains("grok-blocked")
-                })),
+                && diagnostic
+                    .locator
+                    .as_deref()
+                    .is_some_and(|locator| { locator.contains("grok-blocked") })),
         "unreadable identity has to be a diagnostic, not a folder-named row: {:?}",
         found.summary.diagnostics
     );
     assert!(
-        found.rows.iter().all(|row| row.session_id != "grok-blocked"
-            && row.session_id != "local-folder"),
+        found
+            .rows
+            .iter()
+            .all(|row| row.session_id != "grok-blocked" && row.session_id != "local-folder"),
         "the folder name must not become the session id: {:?}",
         found.ids()
     );
@@ -1674,10 +1782,7 @@ fn an_opencode_row_from_scanner_v4_is_read_again_to_qualify_its_model() {
     );
 
     let initial = discover(&conn, home.path(), &only(&["opencode"]));
-    assert_eq!(
-        initial.row("oc-v4").models,
-        vec!["anthropic/claude-sonnet"]
-    );
+    assert_eq!(initial.row("oc-v4").models, vec!["anthropic/claude-sonnet"]);
 
     let stored: String = conn
         .query_row(
@@ -1887,10 +1992,8 @@ fn opencode_redetects_its_layout_on_the_next_registry_pass() {
         "INSERT INTO session VALUES ('ses_later', '/work/later', 30, 40);",
     );
     let mut rows = Vec::new();
-    discover_sessions_with_provider_refs(&env, &options, &providers, |row| {
-        rows.push(row.clone())
-    })
-    .unwrap();
+    discover_sessions_with_provider_refs(&env, &options, &providers, |row| rows.push(row.clone()))
+        .unwrap();
     assert_eq!(
         rows.iter()
             .map(|row| row.session_id.as_str())
@@ -2758,6 +2861,71 @@ fn remote_shallow_upsert_rolls_back_canonical_row_when_presence_write_fails() {
 }
 
 #[test]
+fn grok_remote_presence_cannot_clear_a_locally_observed_subagent_kind() {
+    let conn = catalog();
+    let upsert = |id: &str, kind: Option<&str>, location| {
+        upsert_shallow_session_at_location(
+            &conn,
+            &ShallowSession {
+                source: "grok".into(),
+                session_id: id.into(),
+                session_kind: kind.map(str::to_string),
+                discovery_state: "shallow".into(),
+                ..Default::default()
+            },
+            location,
+        )
+        .unwrap();
+    };
+    let stored_kind = |id: &str| {
+        catalog_row(&conn, "grok", id, true)
+            .unwrap()
+            .unwrap()
+            .session_kind
+    };
+
+    upsert("local-first", Some("subagent"), SessionLocation::Local);
+    upsert("local-first", None, SessionLocation::Remote);
+    upsert("local-first", Some("root"), SessionLocation::Remote);
+    assert_eq!(stored_kind("local-first").as_deref(), Some("subagent"));
+
+    upsert("remote-first", None, SessionLocation::Remote);
+    upsert("remote-first", Some("subagent"), SessionLocation::Local);
+    assert_eq!(stored_kind("remote-first").as_deref(), Some("subagent"));
+    upsert("remote-only", Some("subagent"), SessionLocation::Remote);
+    assert_eq!(stored_kind("remote-only").as_deref(), Some("subagent"));
+    assert!(list_session_catalog(&conn, &CatalogListOptions {
+        scope: SessionScope::All,
+        exclude_delegated: true,
+        ..Default::default()
+    }).unwrap().is_empty());
+
+    // Without a local presence, the next remote snapshot can remove its own
+    // marker. An absent kind must not preserve stale remote classification.
+    upsert("remote-only", None, SessionLocation::Remote);
+    assert_eq!(stored_kind("remote-only"), None);
+    assert_eq!(list_session_catalog(&conn, &CatalogListOptions {
+        scope: SessionScope::All,
+        exclude_delegated: true,
+        ..Default::default()
+    }).unwrap().len(), 1);
+
+    // A subsequent local summary without the marker is authoritative: the
+    // session becomes a root even if remote presence still exists.
+    upsert("local-first", None, SessionLocation::Local);
+    upsert("remote-first", None, SessionLocation::Local);
+    upsert("remote-only", None, SessionLocation::Local);
+    assert_eq!(stored_kind("local-first"), None);
+    assert_eq!(stored_kind("remote-first"), None);
+    assert_eq!(stored_kind("remote-only"), None);
+    assert_eq!(list_session_catalog(&conn, &CatalogListOptions {
+        scope: SessionScope::All,
+        exclude_delegated: true,
+        ..Default::default()
+    }).unwrap().len(), 3);
+}
+
+#[test]
 fn the_catalog_query_reads_only_the_sessions_table() {
     let (sql, _) = catalog_list_query(&CatalogListOptions::default());
     assert!(sql.contains("FROM sessions"), "{sql}");
@@ -3213,7 +3381,11 @@ fn bumping_the_scanner_version_invalidates_stored_stamps() {
 // project identity on the cached path
 // ---------------------------------------------------------------------------
 
-fn stored_key(conn: &Connection, source: &str, session_id: &str) -> (Option<String>, Option<String>) {
+fn stored_key(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+) -> (Option<String>, Option<String>) {
     conn.query_row(
         "SELECT project_key, project_key_method FROM sessions WHERE source = ? AND session_id = ?",
         params![source, session_id],
@@ -4003,10 +4175,8 @@ fn claude_discovery_ignores_the_opencode_wrapper_transcripts_root() {
         "{locators:?}"
     );
 
-    let roots = crate::ProviderRoots::from_home(
-        home.path().to_path_buf(),
-        home.path().join("opencode.db"),
-    );
+    let roots =
+        crate::ProviderRoots::from_home(home.path().to_path_buf(), home.path().join("opencode.db"));
     let watched: Vec<PathBuf> = provider_watch_roots("claude", &roots)
         .into_iter()
         .map(|root| root.path)
@@ -4097,7 +4267,9 @@ fn observed_session_by_locator_is_a_keyed_search() {
             conn.execute_batch("ANALYZE").unwrap();
         }
         let steps: Vec<String> = conn
-            .prepare(&format!("EXPLAIN QUERY PLAN {OBSERVED_SESSION_BY_LOCATOR_SQL}"))
+            .prepare(&format!(
+                "EXPLAIN QUERY PLAN {OBSERVED_SESSION_BY_LOCATOR_SQL}"
+            ))
             .unwrap()
             .query_map(
                 rusqlite::params!["claude", "local", "claude", "default", "/t/7.jsonl"],

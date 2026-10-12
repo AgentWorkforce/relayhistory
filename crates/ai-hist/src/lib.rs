@@ -25,6 +25,7 @@ workspace_mod!(privacy);
 workspace_mod!(source_evidence);
 workspace_mod!(relationship_graph);
 workspace_mod!(continuity);
+mod catalog_owner;
 mod ingest;
 mod relationship_capture;
 workspace_mod!(diagnostics);
