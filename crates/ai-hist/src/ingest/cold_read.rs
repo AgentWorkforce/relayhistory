@@ -105,7 +105,12 @@ fn state() -> &'static Mutex<State> {
 /// Held across one sweep so discovery can see bytes the ingest already read.
 /// Dropping it forgets those bytes. Open counts stay, for the test that reads
 /// them after the sweep returns.
-pub(crate) struct SweepGuard;
+pub(crate) struct SweepGuard {
+    /// Tests sweep many stores in one process, and this state is the
+    /// process's: one sweep at a time keeps each sweep's open counts its own.
+    #[cfg(test)]
+    _serial: std::sync::MutexGuard<'static, ()>,
+}
 
 impl Drop for SweepGuard {
     fn drop(&mut self) {
@@ -121,6 +126,13 @@ impl Drop for SweepGuard {
 }
 
 pub(crate) fn begin_sweep() -> SweepGuard {
+    #[cfg(test)]
+    let serial = {
+        static SWEEPS: Mutex<()> = Mutex::new(());
+        SWEEPS
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    };
     let mut state = lock();
     state.sweep = true;
     state.full = None;
@@ -129,7 +141,10 @@ pub(crate) fn begin_sweep() -> SweepGuard {
     state.retained = 0;
     state.parked = None;
     state.opened.clear();
-    SweepGuard
+    SweepGuard {
+        #[cfg(test)]
+        _serial: serial,
+    }
 }
 
 pub(crate) fn in_sweep() -> bool {

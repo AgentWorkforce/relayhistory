@@ -136,6 +136,7 @@ mod sweep_phases;
 mod codex_history;
 // After `sync_note!`, which an unreadable rollout reports through.
 mod fork_replay;
+mod rederived;
 mod rollout_head;
 use fork_replay::{inherited_baseline_verdict, record_codex_fork_replay, ForkReplaySpan};
 pub(crate) use rollout_head::read_codex_session_meta;
@@ -2342,25 +2343,6 @@ struct FullSweepSeal<'a> {
     fingerprint: Option<String>,
 }
 
-/// The sessions of `rederived` no remote presence backs. A local re-read
-/// restores only local evidence, so a session with remote evidence keeps the
-/// ordinary shortfall check; one whose presence cannot be read keeps it too.
-fn local_only(
-    conn: &Connection,
-    rederived: &HashSet<(String, String)>,
-) -> HashSet<(String, String)> {
-    rederived
-        .iter()
-        .filter(|(source, session_id)| {
-            matches!(
-                session_has_remote_presence(conn, source, session_id),
-                Ok(false)
-            )
-        })
-        .cloned()
-        .collect()
-}
-
 /// Record the fingerprint and destination marker a full sweep earned, or
 /// leave both stale when it did not read everything or left a loss in place.
 /// Never for a scoped sweep: both are statements about every source.
@@ -2400,7 +2382,7 @@ fn seal_full_sweep(
         match destination_shortfall_counted(conn, state, destination.take()) {
             Ok((outstanding, counted)) => {
                 destination = counted;
-                Some(outstanding.without(&local_only(conn, rederived)))
+                Some(outstanding.without(&rederived::local_only(conn, rederived)))
             }
             Err(error) => {
                 sync_note!("  [sync] could not re-check the destination: {error:#}");
@@ -37127,8 +37109,9 @@ mod codex_fork_replay_tests {
         }
     }
 
-    /// With `remote`, the fork also has a remote presence, whose evidence a
-    /// local re-read cannot restore: its shortfall stays a loss.
+    /// The fork has a remote presence; with `remote`, its own events are also
+    /// remote-backed, which a local re-read cannot vouch for: its shortfall
+    /// stays a loss.
     fn retiring_sweep_seals(remote: bool) {
         let dir = tempfile::tempdir().unwrap();
         let day = dir.path().join(".codex/sessions/2026/04/20");
@@ -37158,11 +37141,19 @@ mod codex_fork_replay_tests {
              INSERT INTO session_events SELECT * FROM planted;"
         ))
         .unwrap();
+        // A remote presence alone backs no evidence; a remote-backed event
+        // is evidence a local re-read cannot restore.
+        conn.execute(
+            "INSERT INTO session_presences \
+             (source, session_id, location, raw_locator, discovery_state) \
+             VALUES ('codex', ?1, 'remote', ?1, 'shallow')",
+            [CHILD],
+        )
+        .unwrap();
         if remote {
             conn.execute(
-                "INSERT INTO session_presences \
-                 (source, session_id, location, raw_locator, discovery_state) \
-                 VALUES ('codex', ?1, 'remote', ?1, 'shallow')",
+                "UPDATE session_events SET location = 'both' \
+                 WHERE session_id = ?1 AND event_uid != '5:planted'",
                 [CHILD],
             )
             .unwrap();
