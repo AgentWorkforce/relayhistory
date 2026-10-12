@@ -1,20 +1,22 @@
 //! One read of the evidence keys an unchanged-file probe asks about.
 //!
-//! A steady sweep asks, once per unchanged transcript, whether that file
+//! A steady full sweep asks, once per unchanged transcript, whether that file
 //! already left evidence. The answer is a point read. This module reads the
 //! keys for that answer once per armed walk and serves the later probes from
-//! it.
+//! it. A path-scoped tick does not arm: one changed file keeps the point probe.
 //!
-//! The snapshot is this connection's. It is dropped when a sweep chunk
-//! commits — that commit releases the writer lock, and another writer can
-//! change evidence in the gap — and when this sweep deletes evidence the
-//! probes read. A later probe then reads again. A missing snapshot is not
-//! "present": the probe asks the database, and a file with no evidence is
-//! still opened. The guard pops on drop, including a panic.
+//! The snapshot is this connection's. This connection's own commit does not
+//! move `PRAGMA data_version`, so a cold sweep keeps the snapshot across the
+//! chunk commits it opens. Another connection's commit does move it, and the
+//! next probe reads again instead of skipping a file whose evidence that
+//! commit removed. A delete this sweep makes is dropped the same way. A
+//! missing snapshot is not "present": the probe asks the database, and a
+//! file with no evidence is still opened. The guard pops on drop, including
+//! a panic.
 
 use std::cell::RefCell;
 use std::collections::HashSet;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use rusqlite::Connection;
@@ -34,6 +36,8 @@ thread_local! {
 
 struct Memo {
     conn: usize,
+    /// `PRAGMA data_version` when the sets were read. Unset until then.
+    version: Option<i64>,
     claude_transcripts: Option<HashSet<String>>,
     claude_sidecars: Option<HashSet<String>>,
     codex_sessions: Option<HashSet<String>>,
@@ -158,12 +162,31 @@ impl Guard {
         STACK.with(|stack| {
             stack.borrow_mut().push(Memo {
                 conn: conn_id(conn),
+                version: None,
                 claude_transcripts: None,
                 claude_sidecars: None,
                 codex_sessions: None,
             });
         });
         Self
+    }
+
+    /// Arm when every named root is walked whole. A partial root stays on the
+    /// point probe, so one changed file does not read every evidence key.
+    pub(super) fn arm_when_full(
+        conn: &Connection,
+        paths: Option<&super::path_scope::PathScope>,
+        roots: &[PathBuf],
+    ) -> Option<Self> {
+        let mut full = false;
+        for root in roots {
+            match super::path_scope::PathScope::walk_of(paths, root) {
+                super::path_scope::RootWalk::Partial(_) => return None,
+                super::path_scope::RootWalk::Full => full = true,
+                super::path_scope::RootWalk::Skip => {}
+            }
+        }
+        full.then(|| Self::arm(conn))
     }
 }
 
@@ -276,13 +299,21 @@ pub(super) fn claude_transcript_events_exist(conn: &Connection, path: &Path) -> 
     Ok(exists != 0)
 }
 
+fn data_version(conn: &Connection) -> Result<i64> {
+    Ok(conn.pragma_query_value(None, "data_version", |row| row.get(0))?)
+}
+
 fn memo(conn: &Connection, kind: Kind, key: &str) -> Result<Option<bool>> {
     let id = conn_id(conn);
+    let version = data_version(conn)?;
     let read = STACK.with(|stack| {
         let stack = stack.borrow();
         match stack.iter().rev().find(|memo| memo.conn == id) {
             None => Read::Unarmed,
-            Some(memo) if memo.is_loaded(kind) => Read::Hit(memo.contains(kind, key)),
+            // Another connection committed. Its delete is not in this set.
+            Some(memo) if memo.is_loaded(kind) && memo.version == Some(version) => {
+                Read::Hit(memo.contains(kind, key))
+            }
             Some(_) => Read::Pending,
         }
     });
@@ -290,6 +321,14 @@ fn memo(conn: &Connection, kind: Kind, key: &str) -> Result<Option<bool>> {
         Read::Unarmed => Ok(None),
         Read::Hit(present) => Ok(Some(present)),
         Read::Pending => {
+            STACK.with(|stack| {
+                let mut stack = stack.borrow_mut();
+                if let Some(memo) = stack.iter_mut().rev().find(|memo| memo.conn == id) {
+                    if memo.version.is_some() && memo.version != Some(version) {
+                        memo.clear();
+                    }
+                }
+            });
             load(conn, id, kind)?;
             Ok(STACK.with(|stack| {
                 let stack = stack.borrow();
@@ -304,16 +343,22 @@ fn memo(conn: &Connection, kind: Kind, key: &str) -> Result<Option<bool>> {
 }
 
 fn load(conn: &Connection, id: usize, kind: Kind) -> Result<()> {
+    let version = data_version(conn)?;
     let keys = match kind {
         Kind::ClaudeTranscript => load_set(conn, CLAUDE_TRANSCRIPT_KEYS_SQL)?,
         Kind::ClaudeSidecar => load_set(conn, CLAUDE_SIDECAR_KEYS_SQL)?,
         Kind::Codex => load_set(conn, CODEX_EVIDENCE_KEYS_SQL)?,
     };
+    // A commit that landed during the read is not in `keys`. Leave the slot
+    // empty so this probe asks the database, and the next one reads again.
+    if data_version(conn)? != version {
+        return Ok(());
+    }
     count_load();
     STACK.with(|stack| {
         let mut stack = stack.borrow_mut();
         if let Some(memo) = stack.iter_mut().rev().find(|memo| memo.conn == id) {
-            memo.store(kind, keys);
+            memo.store(kind, keys, version);
         }
     });
     Ok(())
@@ -331,6 +376,7 @@ fn load_set(conn: &Connection, sql: &str) -> Result<HashSet<String>> {
 
 impl Memo {
     fn clear(&mut self) {
+        self.version = None;
         self.claude_transcripts = None;
         self.claude_sidecars = None;
         self.codex_sessions = None;
@@ -350,7 +396,8 @@ impl Memo {
         self.slot(kind).map(|keys| keys.contains(key))
     }
 
-    fn store(&mut self, kind: Kind, keys: HashSet<String>) {
+    fn store(&mut self, kind: Kind, keys: HashSet<String>, version: i64) {
+        self.version = Some(version);
         *self.slot_mut(kind) = Some(keys);
     }
 
@@ -605,7 +652,7 @@ mod tests {
     }
 
     #[test]
-    fn evidence_memo_a_chunk_commit_drops_the_snapshot() {
+    fn evidence_memo_our_commit_keeps_the_snapshot() {
         let conn = db();
         let path = Path::new("/t/a.jsonl");
         session(&conn, "claude", "s", Some("/t/a.jsonl"));
@@ -618,34 +665,43 @@ mod tests {
         for _ in 0..super::super::JSONL_CHUNK_LINES {
             write.record().unwrap();
         }
-        conn.execute("DELETE FROM session_events WHERE event_uid = 'e1'", [])
-            .unwrap();
-        assert!(
-            !claude_transcript_events_exist(&conn, path).unwrap(),
-            "the pre-commit snapshot still said present"
+        assert!(claude_transcript_events_exist(&conn, path).unwrap());
+        write.commit().unwrap();
+        assert!(claude_transcript_events_exist(&conn, path).unwrap());
+        assert_eq!(
+            load_count(),
+            loaded,
+            "this connection's commit reloaded the evidence keys"
         );
-        assert!(load_count() > loaded);
-        drop(write);
     }
 
     #[test]
-    fn evidence_memo_a_sweep_commit_drops_the_snapshot() {
-        let conn = db();
-        let path = Path::new("/t/a.jsonl");
+    fn evidence_memo_an_external_delete_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        let conn = Connection::open(&path).unwrap();
+        init_db(&conn).unwrap();
         session(&conn, "claude", "s", Some("/t/a.jsonl"));
         event(&conn, "claude", "s", "e1", "hi");
+        let file = Path::new("/t/a.jsonl");
         reset_counts();
         let _guard = Guard::arm(&conn);
-        assert!(claude_transcript_events_exist(&conn, path).unwrap());
+        assert!(claude_transcript_events_exist(&conn, file).unwrap());
         let loaded = load_count();
-        let write = super::super::SweepWrite::begin(&conn).unwrap();
-        write.commit().unwrap();
-        conn.execute("DELETE FROM session_events WHERE event_uid = 'e1'", [])
+        let other = Connection::open(&path).unwrap();
+        other
+            .busy_timeout(std::time::Duration::from_secs(5))
             .unwrap();
-        assert!(!claude_transcript_events_exist(&conn, path).unwrap());
+        other
+            .execute("DELETE FROM session_events WHERE event_uid = 'e1'", [])
+            .unwrap();
+        assert!(
+            !claude_transcript_events_exist(&conn, file).unwrap(),
+            "the other connection's delete was still present"
+        );
         assert!(
             load_count() > loaded,
-            "the probe answered from the pre-commit snapshot"
+            "the probe answered from the pre-delete snapshot"
         );
     }
 
@@ -853,5 +909,79 @@ mod tests {
             )
             .unwrap();
         assert_eq!(marker, "POISON");
+    }
+
+    fn scoped_home() -> (tempfile::TempDir, PathBuf, crate::ProviderRoots, Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("store/ai-history.db");
+        fs::create_dir_all(db.parent().unwrap()).unwrap();
+        let roots = crate::ProviderRoots::from_home(
+            dir.path().to_path_buf(),
+            dir.path().join("opencode.db"),
+        );
+        let conn = crate::open_db(&db).unwrap();
+        (dir, db, roots, conn)
+    }
+
+    #[test]
+    fn evidence_memo_a_scoped_tick_asks_per_file() {
+        let (_dir, db, roots, conn) = scoped_home();
+        let projects = roots.claude.join("projects/p");
+        fs::create_dir_all(&projects).unwrap();
+        for index in 0..8 {
+            claude_file(
+                &projects,
+                &format!("{index}.jsonl"),
+                &format!("s{index}"),
+                "hi",
+            );
+        }
+        let full = super::super::SweepScope::only(["claude"]);
+        super::super::sync_basic(&conn, &db, &roots, true, &full).unwrap();
+        reset_counts();
+        let one = projects.join("0.jsonl");
+        let scoped = super::super::SweepScope::only(["claude"]).with_paths(
+            super::super::path_scope::PathScope::from_paths([one.clone()]),
+        );
+        super::super::sync_basic(&conn, &db, &roots, true, &scoped).unwrap();
+        assert_eq!(load_count(), 0, "a one-file tick read every evidence key");
+        assert!(fallback_count() > 0, "the changed file was not probed");
+
+        let day = roots.codex.join("sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        for (name, session) in [("rollout-a.jsonl", "a"), ("rollout-b.jsonl", "b")] {
+            let meta = json!({
+                "timestamp": "2026-04-20T00:00:00.000Z",
+                "type": "session_meta",
+                "payload": {"id": session, "cwd": "/tmp/p"}
+            });
+            let event = json!({
+                "timestamp": "2026-04-20T00:00:01.000Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "kept"}
+            });
+            fs::write(day.join(name), format!("{meta}\n{event}\n")).unwrap();
+        }
+        let codex = super::super::SweepScope::only(["codex"]);
+        super::super::sync_basic(&conn, &db, &roots, true, &codex).unwrap();
+        reset_counts();
+        let rollout = day.join("rollout-a.jsonl");
+        let codex_scoped = super::super::SweepScope::only(["codex"])
+            .with_paths(super::super::path_scope::PathScope::from_paths([rollout]));
+        super::super::sync_basic(&conn, &db, &roots, true, &codex_scoped).unwrap();
+        assert_eq!(
+            load_count(),
+            0,
+            "a one-rollout tick read every evidence key"
+        );
+        assert!(fallback_count() > 0, "the changed rollout was not probed");
+
+        reset_counts();
+        super::super::sync_basic(&conn, &db, &roots, true, &full).unwrap();
+        assert!(
+            load_count() > 0,
+            "a full walk did not read the evidence keys once"
+        );
+        assert_eq!(fallback_count(), 0);
     }
 }

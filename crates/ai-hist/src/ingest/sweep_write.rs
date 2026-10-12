@@ -115,11 +115,12 @@ impl<'c> SweepWrite<'c> {
             if !self.conn.is_autocommit() {
                 let _ = self.conn.execute_batch("ROLLBACK");
             }
-            // Commit or rollback: the writer lock is no longer this unit's.
+            // The rollback undoes writes this snapshot may have observed.
             super::evidence_probe::release(self.conn);
             return Err(error);
         }
-        super::evidence_probe::release(self.conn);
+        // This connection's commit does not move `data_version`. Dropping the
+        // snapshot here makes the next file read every evidence key again.
         Ok(())
     }
 
@@ -128,9 +129,8 @@ impl<'c> SweepWrite<'c> {
         let after = self.fts_after.take();
         catch_up_session_events_fts(self.conn, after)?;
         self.conn.execute_batch("COMMIT")?;
-        // The commit released the writer lock. Evidence read before it is not
-        // this transaction's snapshot; another writer can change it in the gap.
-        super::evidence_probe::release(self.conn);
+        // The snapshot stays. Another writer's commit moves `data_version`,
+        // which the next probe notices. This connection's commit does not.
         if let Err(error) = self.conn.execute_batch("BEGIN IMMEDIATE") {
             // Committed and not reopened: there is nothing left to own, and
             // the walk ends on the error rather than writing in autocommit.

@@ -33,7 +33,11 @@ fn sync_codex_rollouts_and_history(
     touched: &mut HashSet<String>,
     paths: Option<&super::path_scope::PathScope>,
 ) -> Result<usize> {
-    let _guard = super::evidence_probe::Guard::arm(conn);
+    // A full walk of either rollout root reads its evidence keys once. A
+    // path-scoped tick keeps the point probe.
+    let sessions = root.join("sessions");
+    let archived = root.join("archived_sessions");
+    let _guard = super::evidence_probe::Guard::arm_when_full(conn, paths, &[sessions, archived]);
     let (cwds, branches, mut inserted) = sync_codex_rollouts_with_repairs_and_coverage(
         conn, state, root, repairs, coverage, touched, paths,
     )?;
