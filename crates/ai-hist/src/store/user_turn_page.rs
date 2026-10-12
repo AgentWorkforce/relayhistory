@@ -9,10 +9,12 @@
 //! anchor.
 //!
 //! Each newly seen key is aggregated from its own rows. Named rows are
-//! found through `idx_session_events_message` (the message id is not a
-//! turn-key index, and one is not added). An empty message id keys the
-//! row as `event:<id>`: that is the row itself, plus any row that stored
-//! that same string as its message id.
+//! found through `idx_session_events_session_message` (the message id is
+//! not a turn-key index, and one is not added). The cross-session message
+//! index stays for continuity: Codex reuses a line-derived id across
+//! sessions, and that index would return every one of them. An empty
+//! message id keys the row as `event:<id>`: that is the row itself, plus
+//! any row that stored that same string as its message id.
 //!
 //! Once every user-turn row at a timestamp has been seen, those turns are
 //! a prefix of the page order — a turn not yet seen has a later
@@ -61,16 +63,16 @@ pub(super) fn user_turn_walk_sql(after: bool) -> String {
     )
 }
 
-/// Every user-turn row of one message, via the message index.
+/// Every user-turn row of one message in one session.
 ///
-/// `INDEXED BY` keeps a popular message id from falling back to a scan of
-/// the session. Rows of other sessions that share the id are filtered
-/// after the index lookup.
+/// `INDEXED BY` seeks `(source, session_id, message_id)`. The cross-session
+/// message index matches only `(source, message_id)`, so a line-derived id
+/// Codex reuses would return every session that stored it.
 pub(super) fn user_turn_message_rows_sql() -> String {
     format!(
         "SELECT id, ts_ms, NULLIF(message_id, '') \
-         FROM session_events INDEXED BY idx_session_events_message \
-         WHERE source = ? AND message_id = ? AND session_id = ? \
+         FROM session_events INDEXED BY idx_session_events_session_message \
+         WHERE source = ? AND session_id = ? AND message_id = ? \
            AND {USER_TURN_ROW_FILTER}"
     )
 }
@@ -322,7 +324,7 @@ fn fold_named(
     key: &str,
     fold: &mut Fold,
 ) -> Result<()> {
-    let mut rows = stmt.query(params![source, key, session_id])?;
+    let mut rows = stmt.query(params![source, session_id, key])?;
     while let Some(row) = rows.next()? {
         let named: Option<String> = row.get(2)?;
         fold.observe(row.get(0)?, row.get(1)?, named.is_some());

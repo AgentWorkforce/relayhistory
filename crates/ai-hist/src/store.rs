@@ -885,6 +885,9 @@ const REQUIRED_INDEXES: &[&str] = &[
     // against the record that carries it, across every session. Without this
     // that is a scan of every event on every hydration.
     "idx_session_events_message",
+    // A turn page reads one session's rows for a message id. The index
+    // above cannot bound that: Codex reuses line-derived ids across sessions.
+    "idx_session_events_session_message",
     // ... and the uid half of the same lookup, for the rows the message id
     // cannot find.
     "idx_session_events_claude_uid_unmatched",
@@ -1038,8 +1041,13 @@ const REQUIRED_CATALOG_READ_INDEXES: &[&str] = &[
     "idx_sessions_source_recency",
     "idx_session_presences_location",
 ];
-const REQUIRED_EVENT_READ_INDEXES: &[&str] =
-    &["idx_session_events_source_page", "idx_session_events_page"];
+const REQUIRED_EVENT_READ_INDEXES: &[&str] = &[
+    "idx_session_events_source_page",
+    "idx_session_events_page",
+    // A turn page seeks this. `INDEXED BY` on a database that predates it
+    // is an error, so the read guard refuses that database.
+    "idx_session_events_session_message",
+];
 /// Indexes the session-scoped tool call, file edit and marker pages depend
 /// on. All three always name one source and one session, so a single
 /// composite index per table carries the whole lookup and its ordering.
@@ -1131,7 +1139,8 @@ pub fn schema_is_identity_read_current(conn: &Connection) -> Result<bool> {
     schema_has_required_indexes(conn, REQUIRED_IDENTITY_READ_INDEXES)
 }
 
-/// Whether bounded event pagination has both source-scoped and source-less indexes.
+/// Whether event reads have their page indexes and the session-scoped
+/// message index a turn page seeks.
 pub fn schema_is_event_read_current(conn: &Connection) -> Result<bool> {
     schema_has_required_indexes(conn, REQUIRED_EVENT_READ_INDEXES)
 }
@@ -1797,12 +1806,16 @@ VALUES ('session_presences_local_backfill_v1');
         "CREATE INDEX IF NOT EXISTS idx_session_events_project ON session_events(source, session_id, project_key, project_key_method)",
         [],
     )?;
-    // Continuity resolves a transcript's first parent uuid to the session
-    // holding the record with that uuid, which is a lookup by message id
-    // across every session rather than within one.
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_session_events_message ON session_events(source, message_id)",
-        [],
+    // Continuity looks a message id up across every session, so it keeps
+    // `(source, message_id)`. A turn page looks up one session. Codex
+    // reuses line-derived ids, and the cross-session index would return
+    // every session that stored one. The session-led index does not
+    // replace it: a lookup with no `session_id` pins only `source` there.
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_session_events_message \
+         ON session_events(source, message_id);
+         CREATE INDEX IF NOT EXISTS idx_session_events_session_message \
+         ON session_events(source, session_id, message_id);",
     )?;
     // The other half of that lookup: a Claude record can resolve through its
     // first block's uid, `<uuid>:0`, as well as its message id. Searching the
@@ -9668,6 +9681,49 @@ mod user_turn_pass_tests {
         assert!(large_tail < small_tail * 4);
     }
 
+    /// Codex reuses line-derived message ids across sessions. A one-turn
+    /// page of one session stays on that session: other sessions that stored
+    /// the same id do not multiply the work, and the anchor stays this
+    /// session's timestamp rather than an earlier one from another session.
+    #[test]
+    fn a_shared_message_id_is_not_read_from_other_sessions() {
+        let steps_for = |others: i64| {
+            let conn = Connection::open_in_memory().unwrap();
+            init_db(&conn).unwrap();
+            let tx = conn.unchecked_transaction().unwrap();
+            let mut insert = tx
+                .prepare(
+                    "INSERT INTO session_events \
+                     (source, session_id, message_id, ts_ms, role, kind, text, event_uid) \
+                     VALUES ('codex', ?1, '1:user_message', ?2, 'user', 'text', 'prompt', ?3)",
+                )
+                .unwrap();
+            insert.execute(params!["A", 5_000_i64, "a"]).unwrap();
+            for n in 0..others {
+                insert
+                    .execute(params![format!("s{n}"), 1_i64, format!("o{n}")])
+                    .unwrap();
+            }
+            drop(insert);
+            tx.commit().unwrap();
+            let (steps, page) = vm_steps(&conn, || {
+                session_user_turns_page(&conn, "codex", "A", 1, None).unwrap()
+            });
+            assert_eq!(page.user_turns.len(), 1);
+            assert_eq!(page.user_turns[0].ts_ms, 5_000);
+            assert!(page.next_cursor.is_none());
+            steps
+        };
+        let few = steps_for(2);
+        let many = steps_for(400);
+        eprintln!("shared message id few={few} many={many}");
+        assert!(
+            many < few * 4,
+            "200x the other sessions sharing the id cost {}x the page",
+            many / few.max(1)
+        );
+    }
+
     /// Reading every turn of a session is linear in it: twenty times the
     /// events is about twenty times the work, never twenty times the turns
     /// times twenty times the events. Covers named messages and unnamed ones.
@@ -9918,8 +9974,8 @@ mod user_turn_pass_tests {
             }
             let message = query_plan(&conn, &user_turn_page::user_turn_message_rows_sql());
             assert!(
-                message.contains("USING INDEX idx_session_events_message"),
-                "a turn's rows are not read through the message index \
+                message.contains("USING INDEX idx_session_events_session_message"),
+                "a turn's rows are not read through the session message index \
                  (analyze={analyze}): {message}"
             );
             assert!(
