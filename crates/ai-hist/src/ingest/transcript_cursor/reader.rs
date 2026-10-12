@@ -431,7 +431,7 @@ impl TranscriptReader {
         // well: stamping it at `open` while storing a stat taken here made the
         // window cover the walk, and a full re-parse of a large live
         // transcript outlasts the window on its own.
-        let stat_moved = open::generation_moved(
+        let mut stat_moved = open::generation_moved(
             size,
             mtime_ns,
             ctime_ns,
@@ -439,6 +439,11 @@ impl TranscriptReader {
             self.opened_mtime_ns,
             self.opened_ctime_ns,
         );
+        // A filesystem that does not keep a change time can report one that
+        // a rewrite leaves alone. Re-hash; do not trust that stamp.
+        if !stat_moved && !super::filesystem_keeps_change_time(&self.path, &metadata) {
+            stat_moved = true;
+        }
         let (device, inode) = file_identity(&metadata);
         let identity_changed = self.device.is_some()
             && device.is_some()

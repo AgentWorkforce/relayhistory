@@ -204,7 +204,10 @@ pub(super) fn open_captured(
         return Ok(None);
     }
     let bytes = cold_read::read_all(path)?;
-    if cold_read::fresh(path).is_none() {
+    if cold_read::fresh(path).is_none() && change_time_ns(&fs::metadata(path)?).is_some() {
+        // The file moved while it was read, and its change time can prove
+        // that. A platform with no change time still walks these bytes;
+        // commit reads the path again because that time is absent.
         return Ok(None);
     }
     reader_from_bytes(path, bytes, saved, rewind_to)

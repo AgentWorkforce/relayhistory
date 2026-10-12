@@ -16,7 +16,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::discover::{HEAD_SCAN_MAX_BYTES, TAIL_SCAN_MAX_BYTES};
 
 use super::metadata_mtime_ns;
-use super::transcript_cursor::{change_time_ns, file_identity};
+use super::transcript_cursor::{change_time_ns, file_identity, filesystem_keeps_change_time};
 
 /// Largest transcript retained so a second pass can reuse the first read.
 ///
@@ -60,6 +60,9 @@ struct Parked {
 struct State {
     opens: HashMap<PathBuf, u64>,
     parked: Option<Parked>,
+    /// Change time of the first open of a path. A walk publishes only when
+    /// that time still matches, so a rewrite cannot be stored under the new one.
+    opened: HashMap<PathBuf, Stat>,
     /// The file most recently read whole.
     full: Option<Capture>,
     /// Earlier whole files from this sweep, so a later pass of the same file
@@ -76,6 +79,7 @@ impl State {
         Self {
             opens: HashMap::new(),
             parked: None,
+            opened: HashMap::new(),
             full: None,
             kept: HashMap::new(),
             bounded: HashMap::new(),
@@ -110,6 +114,7 @@ impl Drop for SweepGuard {
         state.bounded.clear();
         state.retained = 0;
         state.parked = None;
+        state.opened.clear();
     }
 }
 
@@ -121,7 +126,12 @@ pub(crate) fn begin_sweep() -> SweepGuard {
     state.bounded.clear();
     state.retained = 0;
     state.parked = None;
+    state.opened.clear();
     SweepGuard
+}
+
+pub(crate) fn in_sweep() -> bool {
+    lock().sweep
 }
 
 /// How many times `path` was opened through this module since the process started.
@@ -315,7 +325,9 @@ pub(crate) fn opening_record(path: &Path) -> io::Result<Option<(Vec<u8>, u64)>> 
     if let Some(bytes) = fresh(path) {
         return Ok(first_record(&bytes));
     }
-    if small_file_len(path)?.is_some() {
+    // Outside a sweep the caller only needs the first record. Slurping here
+    // would read every sibling rollout a hydration merely classifies.
+    if in_sweep() && small_file_len(path)?.is_some() {
         let bytes = read_all(path)?;
         return Ok(first_record(&bytes));
     }
@@ -382,19 +394,44 @@ fn skip_to_newline(reader: &mut impl std::io::BufRead) -> io::Result<u64> {
     }
 }
 
-/// Publish `walked` when it is the whole file and the stat has not moved since
-/// the walk opened it. A later pass then hashes and parses those bytes.
+/// Publish `walked` when it is still the generation the walk opened.
+///
+/// Size and mtime are not enough: a same-length rewrite can restore mtime.
+/// The change time recorded at the first open has to match too, and only on
+/// a filesystem that keeps one. Otherwise the next pass reads the path.
 pub(crate) fn publish_walk(path: &Path, walked: &[u8], opened_len: u64, opened_mtime_ns: u64) {
     if walked.is_empty() || walked.len() as u64 != opened_len {
         return;
     }
+    let opened_ctime = take_opened_ctime(path);
     let Ok(metadata) = fs::metadata(path) else {
         return;
     };
     if metadata.len() != opened_len || metadata_mtime_ns(&metadata) != opened_mtime_ns {
         return;
     }
-    publish(path, Arc::<[u8]>::from(walked), &metadata);
+    let same_generation = match (opened_ctime, change_time_ns(&metadata)) {
+        (Some(opened), Some(now)) => opened == now && filesystem_keeps_change_time(path, &metadata),
+        _ => false,
+    };
+    if same_generation {
+        publish(path, Arc::<[u8]>::from(walked), &metadata);
+    }
+}
+
+fn take_opened_ctime(path: &Path) -> Option<i64> {
+    lock().opened.remove(path).and_then(|stat| stat.ctime_ns)
+}
+
+fn remember_open(path: &Path, metadata: &fs::Metadata) {
+    let stat = Stat {
+        len: metadata.len(),
+        mtime_ns: metadata_mtime_ns(metadata),
+        ctime_ns: change_time_ns(metadata),
+        device: file_identity(metadata).0,
+        inode: file_identity(metadata).1,
+    };
+    lock().opened.entry(path.to_path_buf()).or_insert(stat);
 }
 
 /// SHA-256 of the first `offset` bytes already in hand, and the hasher that
@@ -473,6 +510,9 @@ pub(crate) fn open_shared(path: &Path) -> io::Result<SharedFile> {
         });
     }
     let file = fs::File::open(path)?;
+    if let Ok(metadata) = file.metadata() {
+        remember_open(path, &metadata);
+    }
     note_open(path);
     Ok(SharedFile {
         path: path.to_path_buf(),
@@ -581,7 +621,14 @@ mod tests {
         fs::write(&cursor, cursor_line()).unwrap();
 
         let db = home.path().join("history.db");
-        super::super::sync_local_at_with_home(&db, home.path()).unwrap();
+        // `from_home` ignores `CODEX_HOME` and `CLAUDE_CONFIG_DIR`. The
+        // fixture lives under this temp home, not under a developer override.
+        let roots = crate::ProviderRoots::from_home(
+            home.path().to_path_buf(),
+            home.path().join(".local/share/opencode/opencode.db"),
+        );
+        super::super::SYNC_QUIET.store(true, std::sync::atomic::Ordering::Relaxed);
+        super::super::sync_exclusive_with_roots(&db, &roots, false).unwrap();
 
         let conn = crate::open_db(&db).unwrap();
         let claude_rows: i64 = conn
@@ -611,5 +658,31 @@ mod tests {
         assert_eq!(opens(&claude), 1, "claude cold open count");
         assert_eq!(opens(&codex), 1, "codex cold open count");
         assert_eq!(opens(&cursor), 1, "cursor cold open count");
+    }
+
+    /// A same-length rewrite that restores mtime still moves change time.
+    /// The bytes the walk already held are not published under the new one.
+    #[test]
+    fn a_walk_does_not_publish_a_rewrite_that_restores_mtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cursor.jsonl");
+        let original = b"{\"role\":\"user\"}\n";
+        fs::write(&path, original).unwrap();
+        let before = fs::metadata(&path).unwrap();
+        let mtime = metadata_mtime_ns(&before);
+        let _opened = open_file(&path).unwrap();
+        drop(_opened);
+        let rewritten = b"{\"role\":\"bot!\"}\n";
+        assert_eq!(original.len(), rewritten.len());
+        fs::write(&path, rewritten).unwrap();
+        fs::File::open(&path)
+            .unwrap()
+            .set_modified(before.modified().unwrap())
+            .unwrap();
+        publish_walk(&path, original, before.len(), mtime);
+        assert!(
+            fresh(&path).is_none(),
+            "walked bytes are not the generation now at the path"
+        );
     }
 }

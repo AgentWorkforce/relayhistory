@@ -56,7 +56,7 @@ fn read_head_records(
     if let Some(bytes) = cold_read::fresh(path) {
         return collect_head_records(io::Cursor::new(&bytes[..]), limit, skip_unparseable);
     }
-    if cold_read::small_file_len(path)?.is_some() {
+    if cold_read::in_sweep() && cold_read::small_file_len(path)?.is_some() {
         let bytes = cold_read::read_all(path)?;
         return collect_head_records(io::Cursor::new(&bytes[..]), limit, skip_unparseable);
     }
