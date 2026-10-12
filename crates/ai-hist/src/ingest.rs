@@ -4239,9 +4239,7 @@ impl CompleteJsonlReader {
         line.push_str(&String::from_utf8_lossy(&raw));
         self.position += read as u64;
         self.prefix_hasher.update(&raw);
-        if self.validated_size <= cold_read::CAPTURE_MAX_BYTES {
-            self.walked.extend_from_slice(&raw);
-        }
+        cold_read::capture_walked(&mut self.walked, &raw, self.validated_size);
         Ok(Some(self.position))
     }
 

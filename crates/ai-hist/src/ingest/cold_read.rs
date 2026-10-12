@@ -58,6 +58,7 @@ struct Parked {
 }
 
 struct State {
+    #[cfg(test)]
     opens: HashMap<PathBuf, u64>,
     parked: Option<Parked>,
     /// Change time of the first open of a path. A walk publishes only when
@@ -77,6 +78,7 @@ struct State {
 impl State {
     fn empty() -> Self {
         Self {
+            #[cfg(test)]
             opens: HashMap::new(),
             parked: None,
             opened: HashMap::new(),
@@ -141,8 +143,25 @@ pub(crate) fn opens(path: &Path) -> u64 {
 }
 
 fn note_open(path: &Path) {
-    let mut state = lock();
-    *state.opens.entry(path.to_path_buf()).or_insert(0) += 1;
+    #[cfg(test)]
+    {
+        let mut state = lock();
+        *state.opens.entry(path.to_path_buf()).or_insert(0) += 1;
+    }
+    #[cfg(not(test))]
+    let _ = path;
+}
+
+/// Keep `raw` while the file opened under the capture cap and this line still
+/// fits. A log that grows past the cap during the walk is parsed and not held.
+pub(crate) fn capture_walked(walked: &mut Vec<u8>, raw: &[u8], opened_len: u64) {
+    if opened_len > CAPTURE_MAX_BYTES {
+        return;
+    }
+    if walked.len().saturating_add(raw.len()) > CAPTURE_MAX_BYTES as usize {
+        return;
+    }
+    walked.extend_from_slice(raw);
 }
 
 fn stat_of(path: &Path) -> io::Result<Stat> {

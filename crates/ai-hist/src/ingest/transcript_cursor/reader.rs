@@ -431,7 +431,7 @@ impl TranscriptReader {
         // well: stamping it at `open` while storing a stat taken here made the
         // window cover the walk, and a full re-parse of a large live
         // transcript outlasts the window on its own.
-        let mut stat_moved = open::generation_moved(
+        let stat_moved = open::stamp_moved(
             size,
             mtime_ns,
             ctime_ns,
@@ -439,11 +439,18 @@ impl TranscriptReader {
             self.opened_mtime_ns,
             self.opened_ctime_ns,
         );
-        // A filesystem that does not keep a change time can report one that
-        // a rewrite leaves alone. Re-hash; do not trust that stamp.
-        if !stat_moved && !super::filesystem_keeps_change_time(&self.path, &metadata) {
-            stat_moved = true;
-        }
+        // Re-hash when the stat moved, when change time is missing, or when
+        // the filesystem cannot prove a rewrite left the stamp alone. The
+        // quiet-since clock follows `stat_moved` only, so a matching digest
+        // is not a fresh change.
+        let rehash = open::generation_moved(
+            size,
+            mtime_ns,
+            ctime_ns,
+            self.opened_size,
+            self.opened_mtime_ns,
+            self.opened_ctime_ns,
+        ) || !super::filesystem_keeps_change_time(&self.path, &metadata);
         let (device, inode) = file_identity(&metadata);
         let identity_changed = self.device.is_some()
             && device.is_some()
@@ -451,7 +458,7 @@ impl TranscriptReader {
         if identity_changed || size < offset || size < self.opened_size {
             return Ok(CommitOutcome::Superseded);
         }
-        let window = self.commit_window(stat_moved)?;
+        let window = self.commit_window(rehash)?;
         if window != self.opened_window {
             return Ok(CommitOutcome::Superseded);
         }
@@ -462,7 +469,7 @@ impl TranscriptReader {
         } else {
             self.unchanged_since_ms
         };
-        let prefix_hash = self.commit_prefix(offset, &window, stat_moved)?;
+        let prefix_hash = self.commit_prefix(offset, &window, rehash)?;
         Ok(CommitOutcome::Published(TranscriptFileCursor {
             offset,
             device: self.device,
@@ -483,20 +490,20 @@ impl TranscriptReader {
         }
     }
 
-    /// The opened window, from the bytes already hashed unless the file moved.
-    fn commit_window(&mut self, stat_moved: bool) -> Result<String> {
-        if !stat_moved {
+    /// The opened window, from the bytes already hashed unless this pass re-reads.
+    fn commit_window(&mut self, rehash: bool) -> Result<String> {
+        if !rehash {
             return Ok(self.opened_window.clone());
         }
         self.hash_region(self.opened_size)
     }
 
     /// Digest of `[0, offset)`. The opened window when that is the same region.
-    fn commit_prefix(&mut self, offset: u64, window: &str, stat_moved: bool) -> Result<String> {
+    fn commit_prefix(&mut self, offset: u64, window: &str, rehash: bool) -> Result<String> {
         if offset == self.opened_size {
             return Ok(window.to_string());
         }
-        if !stat_moved {
+        if !rehash {
             if let Source::Memory { bytes, .. } = &self.source {
                 if offset <= bytes.len() as u64 {
                     return super::prefix_window_digest_of(bytes, offset);

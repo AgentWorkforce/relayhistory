@@ -164,6 +164,25 @@ fn saved_resume(
     }
 }
 
+/// Size, mtime, or a present change time moved. A missing change time does
+/// not restart the quiet-since clock; [`generation_moved`] still re-reads.
+pub(super) fn stamp_moved(
+    size: u64,
+    mtime_ns: u64,
+    ctime_ns: Option<i64>,
+    opened_size: u64,
+    opened_mtime_ns: u64,
+    opened_ctime_ns: Option<i64>,
+) -> bool {
+    if size != opened_size || mtime_ns != opened_mtime_ns {
+        return true;
+    }
+    match (opened_ctime_ns, ctime_ns) {
+        (Some(opened), Some(now)) => opened != now,
+        _ => false,
+    }
+}
+
 /// Size, mtime, or change time moved after the bytes were taken. A missing
 /// change time cannot show a rewrite that restored mtime, so it counts as
 /// moved and the commit reads the file again.

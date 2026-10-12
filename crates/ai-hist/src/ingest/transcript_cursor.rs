@@ -1466,4 +1466,31 @@ mod tests {
         assert!(stored.settled.is_none());
         assert_eq!(stored.file.unwrap().unchanged_since_ms, 12_345);
     }
+
+    /// A filesystem that does not keep a change time still re-hashes. A
+    /// matching digest is the same generation, so the quiet-since clock stays.
+    #[test]
+    fn an_untrusted_filesystem_keeps_the_quiet_clock_when_the_digest_matches() {
+        let _window = SettleWindow::with(0, false);
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("quiet.jsonl");
+        fs::write(&path, "{\"a\":1}\n").unwrap();
+        let mut reader = TranscriptReader::open(&path, None, None).unwrap();
+        let mut line = String::new();
+        while reader.next_line(&mut line).unwrap().is_some() {}
+        let CommitOutcome::Published(mut committed) = reader.commit(reader.position()).unwrap()
+        else {
+            panic!("a stable file commits");
+        };
+        committed.unchanged_since_ms = 1;
+        let mut again = TranscriptReader::open(&path, Some(&committed), None).unwrap();
+        assert!(
+            again.quiesced(),
+            "the saved clock still covers the grace window"
+        );
+        let CommitOutcome::Published(republished) = again.commit(again.position()).unwrap() else {
+            panic!("a matching digest still commits");
+        };
+        assert_eq!(republished.unchanged_since_ms, committed.unchanged_since_ms);
+    }
 }
