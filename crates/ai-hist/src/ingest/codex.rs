@@ -468,6 +468,19 @@ impl ForkReplayGate {
         self.copied_history = probe.proves_copy();
     }
 
+    /// Run [`CopiedHistoryProbe`] over `records` -- the records after the
+    /// file's first, in order -- and arm the gate with its verdict. Records
+    /// without a payload object are skipped, as the rollout walk skips them.
+    pub(crate) fn probe_copied_history(&mut self, records: impl IntoIterator<Item = Value>) {
+        let Some(mut probe) = self.copied_history_probe() else {
+            return;
+        };
+        let _decided = records.into_iter().any(|value| {
+            value.get("payload").and_then(Value::as_object).is_some() && probe.observe(&value)
+        });
+        self.arm_copied_history(&probe);
+    }
+
     /// What opened the current (or last) span.
     pub(crate) fn opening(&self) -> ReplayOpening {
         self.opening
@@ -493,67 +506,75 @@ impl ForkReplayGate {
         let is_turn = line_type == Some("turn_context")
             || (line_type == Some("event_msg") && payload_type == Some("task_started"));
         if !self.replaying {
-            if first_record {
-                return ReplayStep::Outside;
-            }
-            if line_type == Some("session_meta")
-                && payload.and_then(|p| p.get("id")).and_then(Value::as_str) == Some(parent)
-            {
-                self.open(ReplayOpening::ParentSessionMeta);
-                return ReplayStep::Replay;
-            }
-            if !self.copied_history {
-                return ReplayStep::Outside;
-            }
-            self.open(ReplayOpening::CopiedHistory);
-            if !is_turn {
-                return ReplayStep::Replay;
+            let names_parent = line_type == Some("session_meta")
+                && payload.and_then(|p| p.get("id")).and_then(Value::as_str) == Some(parent);
+            match self.opening_at(first_record, names_parent) {
+                None => return ReplayStep::Outside,
+                Some(ReplayOpening::ParentSessionMeta) => return ReplayStep::Replay,
+                Some(ReplayOpening::CopiedHistory) => {}
             }
         }
         if !is_turn {
             return ReplayStep::Replay;
         }
+        self.classify_turn(line_type == Some("event_msg"), payload)
+    }
+
+    /// Whether a span opens at this record outside one, and what opens it.
+    fn opening_at(&mut self, first_record: bool, names_parent: bool) -> Option<ReplayOpening> {
+        let opening = match (first_record, names_parent, self.copied_history) {
+            (true, _, _) | (false, false, false) => return None,
+            (false, true, _) => ReplayOpening::ParentSessionMeta,
+            (false, false, true) => ReplayOpening::CopiedHistory,
+        };
+        self.open(opening);
+        Some(opening)
+    }
+
+    /// Classify a `task_started` (`is_task_started`) or `turn_context` inside
+    /// a span.
+    fn classify_turn(&mut self, is_task_started: bool, payload: Option<&Value>) -> ReplayStep {
         let turn_id = payload
             .and_then(|p| p.get("turn_id"))
             .and_then(Value::as_str);
         let started_at = payload
             .and_then(|p| p.get("started_at"))
             .and_then(Value::as_i64);
-        let is_task_started = line_type == Some("event_msg");
-        if !is_task_started {
-            if let Some(replayed) = &self.replayed_turn {
-                if turn_id.is_none() || turn_id == replayed.as_deref() {
-                    return ReplayStep::Replay;
-                }
-            }
+        let describes_replayed_turn = self
+            .replayed_turn
+            .as_ref()
+            .is_some_and(|replayed| turn_id.is_none() || turn_id == replayed.as_deref());
+        if !is_task_started && describes_replayed_turn {
+            return ReplayStep::Replay;
         }
         let owner = forked_turn_owner(turn_id, started_at, self.origin_ms.unwrap_or_default());
         let v7 = turn_id.and_then(uuid_v7_ms).is_some();
-        let basis = match (owner, self.opening) {
-            (ForkedTurnOwner::Child(basis), ReplayOpening::ParentSessionMeta) => basis,
-            (ForkedTurnOwner::Undecided, ReplayOpening::ParentSessionMeta) => "undecided",
-            (ForkedTurnOwner::Child(basis), ReplayOpening::CopiedHistory)
-                if v7 || !self.replayed_v7_turn =>
-            {
-                basis
+        let Some(basis) = self.closing_basis(owner, v7) else {
+            if is_task_started {
+                self.replayed_turn = Some(turn_id.map(str::to_string));
             }
-            (ForkedTurnOwner::Replay, _)
-            | (
-                ForkedTurnOwner::Child(_) | ForkedTurnOwner::Undecided,
-                ReplayOpening::CopiedHistory,
-            ) => {
-                if is_task_started {
-                    self.replayed_turn = Some(turn_id.map(str::to_string));
-                }
-                self.replayed_v7_turn |= owner == ForkedTurnOwner::Replay && v7;
-                return ReplayStep::Replay;
-            }
+            self.replayed_v7_turn |= owner == ForkedTurnOwner::Replay && v7;
+            return ReplayStep::Replay;
         };
         self.replaying = false;
         self.replayed_turn = None;
         ReplayStep::Closed {
             turn_id: turn_id.map(str::to_string),
             basis,
+        }
+    }
+
+    /// The fact that closes the span at a turn of this owner, or `None` when
+    /// the turn stays in it. `v7` is whether the turn's id is a UUIDv7.
+    fn closing_basis(&self, owner: ForkedTurnOwner, v7: bool) -> Option<&'static str> {
+        match (owner, self.opening) {
+            (ForkedTurnOwner::Replay, _) => None,
+            (ForkedTurnOwner::Child(basis), ReplayOpening::ParentSessionMeta) => Some(basis),
+            (ForkedTurnOwner::Undecided, ReplayOpening::ParentSessionMeta) => Some("undecided"),
+            (ForkedTurnOwner::Child(basis), ReplayOpening::CopiedHistory) => {
+                (v7 || !self.replayed_v7_turn).then_some(basis)
+            }
+            (ForkedTurnOwner::Undecided, ReplayOpening::CopiedHistory) => None,
         }
     }
 }

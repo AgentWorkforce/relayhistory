@@ -6065,16 +6065,7 @@ fn ingest_codex_rollout_incremental(
     // `task_complete` the cursor could commit at, because its lines are
     // skipped before the arms that would.
     let mut fork_replay: Option<ForkReplaySpan> = None;
-    let mut replay_gate =
-        codex::ForkReplayGate::new(meta.fork_parent_id.clone(), meta.fork_origin_ms);
-    // A copy that follows the child's own `session_meta` starts at line 1, so
-    // only a read from byte zero can meet it.
-    if start_offset == 0 {
-        if let Some(mut probe) = replay_gate.copied_history_probe() {
-            rollout_head::probe_codex_copied_history(path, &mut probe)?;
-            replay_gate.arm_copied_history(&probe);
-        }
-    }
+    let mut replay_gate = rollout_head::codex_fork_replay_gate(path, meta, start_offset == 0);
     // The replay marker whose inherited baseline no child snapshot has
     // confirmed yet (see `inherited_baseline_verdict`). Carried across passes
     // on the cursor, so a pass may commit before the child's first snapshot

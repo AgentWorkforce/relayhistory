@@ -93,45 +93,50 @@ fn collect_head_records(
     Ok((values, bytes_read))
 }
 
-/// Run `probe` over the records after a rollout's first, up to its verdict or
-/// [`LEADING_BYTE_LIMIT`], whichever comes first.
+/// A fork's replay gate, armed by [`codex::CopiedHistoryProbe`] over the
+/// records after the rollout's first when the read starts at byte zero
+/// (`from_start`): a copy that follows the child's own `session_meta` starts at
+/// line 1, which a resumed read never meets.
 ///
-/// A copy that follows the child's `session_meta` is proven or ruled out at
-/// the child's first own turn, which every observed paginated fork reaches
-/// within its first 400 KiB; a copy longer than the window is still proven by
-/// a replayed turn ordered by UUIDv7, which comes in its first records. Only a
-/// fork read from byte zero pays for this read, and it stops at the verdict.
-pub(super) fn probe_codex_copied_history(
+/// The probe reads up to its verdict or [`LEADING_BYTE_LIMIT`]. It is decided
+/// at the child's first own turn, which every observed paginated fork reaches
+/// within its first 400 KiB; a longer copy is still proven by a replayed turn
+/// ordered by UUIDv7, which comes in its first records.
+pub(super) fn codex_fork_replay_gate(
     path: &Path,
-    probe: &mut codex::CopiedHistoryProbe,
-) -> Result<()> {
-    if let Some(bytes) = cold_read::fresh(path) {
-        return feed_probe(io::Cursor::new(&bytes[..]), probe);
+    meta: &CodexSessionMeta,
+    from_start: bool,
+) -> codex::ForkReplayGate {
+    let mut gate = codex::ForkReplayGate::new(meta.fork_parent_id.clone(), meta.fork_origin_ms);
+    if !from_start || meta.fork_parent_id.is_none() {
+        return gate;
     }
-    let mut shared = cold_read::open_shared(path)?;
-    feed_probe(BufReader::new(shared.file()), probe)
+    if let Some(bytes) = cold_read::fresh(path) {
+        gate.probe_copied_history(records_after_first(io::Cursor::new(&bytes[..])));
+        return gate;
+    }
+    // A head the probe cannot open proves nothing, so the gate stays unarmed
+    // and the walk's own read reports the file.
+    if let Ok(mut shared) = cold_read::open_shared(path) {
+        gate.probe_copied_history(records_after_first(BufReader::new(shared.file())));
+    }
+    gate
 }
 
-fn feed_probe(reader: impl BufRead, probe: &mut codex::CopiedHistoryProbe) -> Result<()> {
+/// The complete, parseable records after the first, within
+/// [`LEADING_BYTE_LIMIT`]. A read error ends them, as end of file does.
+fn records_after_first(reader: impl BufRead) -> impl Iterator<Item = Value> {
     let mut reader = reader.take(LEADING_BYTE_LIMIT);
     let mut raw = Vec::new();
-    let mut first = true;
-    loop {
+    std::iter::from_fn(move || {
         raw.clear();
-        if reader.read_until(b'\n', &mut raw)? == 0 || raw.last() != Some(&b'\n') {
-            return Ok(());
+        match reader.read_until(b'\n', &mut raw) {
+            Ok(read) if read > 0 && raw.last() == Some(&b'\n') => Some(raw.clone()),
+            _ => None,
         }
-        if std::mem::take(&mut first) {
-            continue;
-        }
-        // The walk steps the gate only for records with a payload object.
-        let Ok(value) = serde_json::from_slice::<Value>(trim_ascii_end(&raw)) else {
-            continue;
-        };
-        if value.get("payload").and_then(Value::as_object).is_some() && probe.observe(&value) {
-            return Ok(());
-        }
-    }
+    })
+    .skip(1)
+    .filter_map(|raw| serde_json::from_slice::<Value>(trim_ascii_end(&raw)).ok())
 }
 
 fn trim_ascii_end(raw: &[u8]) -> &[u8] {
