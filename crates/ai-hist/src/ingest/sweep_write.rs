@@ -57,8 +57,12 @@ impl<'c> SweepWrite<'c> {
         let fts_after = match arm_session_events_fts(conn) {
             Ok(after) => after,
             Err(error) => {
-                if owned && !conn.is_autocommit() {
-                    let _ = conn.execute_batch("ROLLBACK");
+                if owned {
+                    if !conn.is_autocommit() {
+                        let _ = conn.execute_batch("ROLLBACK");
+                    }
+                    // The rollback released the writer lock this begin took.
+                    super::evidence_probe::release(conn);
                 }
                 return Err(error);
             }
@@ -111,8 +115,11 @@ impl<'c> SweepWrite<'c> {
             if !self.conn.is_autocommit() {
                 let _ = self.conn.execute_batch("ROLLBACK");
             }
+            // Commit or rollback: the writer lock is no longer this unit's.
+            super::evidence_probe::release(self.conn);
             return Err(error);
         }
+        super::evidence_probe::release(self.conn);
         Ok(())
     }
 
@@ -121,6 +128,9 @@ impl<'c> SweepWrite<'c> {
         let after = self.fts_after.take();
         catch_up_session_events_fts(self.conn, after)?;
         self.conn.execute_batch("COMMIT")?;
+        // The commit released the writer lock. Evidence read before it is not
+        // this transaction's snapshot; another writer can change it in the gap.
+        super::evidence_probe::release(self.conn);
         if let Err(error) = self.conn.execute_batch("BEGIN IMMEDIATE") {
             // Committed and not reopened: there is nothing left to own, and
             // the walk ends on the error rather than writing in autocommit.
@@ -147,7 +157,12 @@ impl Drop for SweepWrite<'_> {
         // rolled back on its own.
         if self.owned && !self.conn.is_autocommit() {
             let _ = self.conn.execute_batch("ROLLBACK");
+            super::evidence_probe::release(self.conn);
             return;
+        }
+        if self.owned {
+            // The transaction ended without this guard committing it.
+            super::evidence_probe::release(self.conn);
         }
         // The caller owns the transaction and may still commit it. Index
         // rows have to be in that transaction; a rollback takes them with

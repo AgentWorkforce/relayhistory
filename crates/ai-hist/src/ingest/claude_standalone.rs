@@ -134,10 +134,12 @@ fn retire_standalone_events(
     const STANDALONE: &str = "source = 'claude' AND session_id = ?1 AND provider_message_id = ?2 \
            AND role = 'assistant' AND kind = 'thinking' \
            AND text = ''";
-    conn.prepare_cached(&format!(
-        "DELETE FROM session_events WHERE {STANDALONE} AND location = 'local'"
-    ))?
-    .execute(rusqlite::params![session_id, provider_message_id])?;
+    let deleted = conn
+        .prepare_cached(&format!(
+            "DELETE FROM session_events WHERE {STANDALONE} AND location = 'local'"
+        ))?
+        .execute(rusqlite::params![session_id, provider_message_id])?;
+    super::evidence_probe::note_deleted(conn, "session_events", deleted);
     conn.prepare_cached(&format!(
         "UPDATE session_events SET location = 'remote' WHERE {STANDALONE} AND location = 'both'"
     ))?

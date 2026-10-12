@@ -29,6 +29,7 @@ pub(crate) mod cold_read;
 pub(crate) mod control;
 pub(crate) mod cursor;
 pub(crate) mod devin;
+mod evidence_probe;
 pub(crate) mod evidence_reconcile;
 mod evidence_upserts;
 pub(crate) mod grok;
@@ -47,6 +48,12 @@ pub(crate) mod titles;
 pub(crate) mod tool_result_facts;
 pub(crate) mod transcript_cursor;
 
+pub(crate) use evidence_probe::note_deleted;
+use evidence_probe::{
+    claude_sidecar_evidence_exists, claude_transcript_events_exist, codex_session_evidence_exists,
+};
+#[cfg(test)]
+use evidence_probe::{CLAUDE_SIDECAR_EVIDENCE_SQL, CLAUDE_TRANSCRIPT_EVENTS_SQL};
 pub(crate) use sweep_write::SweepWrite;
 
 use titles::set_session_title;
@@ -4597,6 +4604,8 @@ fn cleanup_subagent_registration(conn: &Connection, source: &str, session_id: &s
         "INSERT OR IGNORE INTO session_relationships SELECT * FROM retained_relationships; \
          DELETE FROM retained_relationships;",
     )?;
+    // The session delete drops the relationships and markers the probes join.
+    evidence_probe::note_evidence_changed(conn);
     Ok(())
 }
 
@@ -4653,6 +4662,7 @@ fn sync_codex_rollouts_with_repairs(
     repairs: &SweepRepairs,
 ) -> Result<CodexRolloutWalk> {
     let mut coverage = SweepCoverage::default();
+    let _guard = evidence_probe::Guard::arm(conn);
     sync_codex_rollouts_with_repairs_and_coverage(
         conn,
         state,
@@ -5256,19 +5266,6 @@ fn session_events_exist(conn: &Connection, source: &str, session_id: &str) -> Re
         |row| row.get(0),
     )?;
     Ok(exists != 0)
-}
-
-/// Whether a session has any evidence this parser wrote, of any kind.
-///
-/// Not just `session_events`: a lifecycle-only rollout -- one that started,
-/// streamed an error and never produced a message -- writes markers and no
-/// events. Asking only about events answers "nothing indexed" forever for
-/// those, so the stamp fast path re-reads and re-upserts the file on every
-/// sync and the cost never converges. Nothing is lost by that, which is why it
-/// survived review once; it is pure waste that grows with the archive.
-fn codex_session_evidence_exists(conn: &Connection, session_id: &str) -> Result<bool> {
-    Ok(session_events_exist(conn, "codex", session_id)?
-        || session_markers_exist(conn, "codex", session_id)?)
 }
 
 fn session_markers_exist(conn: &Connection, source: &str, session_id: &str) -> Result<bool> {
@@ -7497,6 +7494,7 @@ fn sync_claude_session_metadata_with_repairs(
     repairs: &SweepRepairs,
 ) -> Result<()> {
     let mut coverage = SweepCoverage::default();
+    let _guard = evidence_probe::Guard::arm(conn);
     sync_claude_session_metadata_with_repairs_and_coverage(
         conn,
         state,
@@ -7884,28 +7882,6 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
 /// source: these files never become sessions, they only describe one.
 pub(crate) const CLAUDE_SUBAGENT_META_SOURCE: &str = "claude-subagent-meta";
 
-/// [`claude_sidecar_evidence_exists`]'s probe, asked of every Claude transcript
-/// the walk considers. `idx_session_relationships_locator` is what makes it a
-/// search rather than a scan of every Claude relationship.
-const CLAUDE_SIDECAR_EVIDENCE_SQL: &str = "SELECT EXISTS(
-            SELECT 1
-            FROM session_relationships r
-            WHERE r.source = 'claude' AND r.evidence_locator = ?
-              AND (
-                EXISTS(
-                  SELECT 1 FROM session_events e
-                  WHERE e.source = 'claude'
-                    AND e.session_id = COALESCE(r.child_session_id, r.parent_session_id)
-                )
-                OR EXISTS(
-                  SELECT 1 FROM session_markers m
-                  WHERE m.source = 'claude'
-                    AND m.session_id = COALESCE(r.child_session_id, r.parent_session_id)
-                )
-              )
-            LIMIT 1
-        )";
-
 /// `Connection::query_row` through the connection's statement cache.
 ///
 /// The sweep asks the same handful of existence probes about every
@@ -7975,33 +7951,11 @@ pub(crate) fn retract_claude_delegation_evidence(conn: &Connection, path: &Path)
          WHERE source = 'claude' AND relationship = 'delegated' AND evidence_locator = ?",
     )?
     .execute([locator.as_ref()])?;
+    // The relationship delete is the proof a later sidecar probe reads, and
+    // the child-row retirement above may have removed nothing when the child
+    // is still cited elsewhere.
+    evidence_probe::note_evidence_changed(conn);
     Ok(())
-}
-
-/// Whether an unchanged subagent sidecar has already been ingested.
-///
-/// A sidecar is deliberately never registered as a session, so the catalog
-/// join [`claude_transcript_events_exist`] makes can never confirm one and
-/// every sidecar would otherwise be re-read and re-ingested on every sync,
-/// however unchanged it is. Its recorded delegation is the equivalent proof,
-/// paired with the events it produced — under the child it named, or under
-/// the parent when it named none — so a wiped or rebuilt database still
-/// re-reads the file.
-fn claude_sidecar_evidence_exists(conn: &Connection, path: &Path) -> Result<bool> {
-    let locator = path.to_string_lossy();
-    // Markers count, for the same reason they count in the two session
-    // probes: a sidecar whose records the event model cannot carry -- a
-    // compaction boundary, a system row, a non-text block -- indexes markers
-    // and no events. Asking only about events reads that as "this file left
-    // nothing behind", so an unchanged sidecar is re-parsed on every sync
-    // forever while the sync reports itself perfectly normal.
-    let exists: i64 = cached_query_row(
-        conn,
-        CLAUDE_SIDECAR_EVIDENCE_SQL,
-        [locator.as_ref()],
-        |row| row.get(0),
-    )?;
-    Ok(exists != 0)
 }
 
 /// Whether this file owns a session the destination marker says is short.
@@ -8170,7 +8124,7 @@ fn events_lack_raw_facts(conn: &Connection, source: &str, session_id: &str) -> R
 }
 
 /// [`claude_transcript_lacks_tool_result_fidelity`]'s probe; `CROSS JOIN`
-/// pins the join order for the reason [`CLAUDE_TRANSCRIPT_EVENTS_SQL`] gives.
+/// pins the join order so the path's session row drives the lookup.
 const CLAUDE_LACKS_TOOL_RESULT_FIDELITY_SQL: &str = "SELECT
             EXISTS(
                 SELECT 1
@@ -8204,7 +8158,7 @@ fn claude_transcript_lacks_tool_result_fidelity(conn: &Connection, path: &Path) 
 }
 
 /// [`claude_transcript_lacks_raw_facts`]'s probe; `CROSS JOIN` pins the join
-/// order for the reason [`CLAUDE_TRANSCRIPT_EVENTS_SQL`] gives.
+/// order so the path's session row drives the lookup.
 const CLAUDE_LACKS_RAW_FACTS_SQL: &str = "SELECT
             EXISTS(
                 SELECT 1
@@ -8297,8 +8251,7 @@ fn claude_transcript_lacks_raw_facts(conn: &Connection, path: &Path) -> Result<b
 /// transcript holding an Agent/Task result with no `agent_id`, or a sidecar
 /// whose edge has no child model or hangs on a parent whose transcript does
 /// not hold the tool use that started it.
-/// `CROSS JOIN` pins the join order for the reason
-/// [`CLAUDE_TRANSCRIPT_EVENTS_SQL`] gives.
+/// `CROSS JOIN` pins the join order so the path's session row drives the lookup.
 const CLAUDE_LACKS_DELEGATION_CAPTURE_SQL: &str = "SELECT
             EXISTS(
                 SELECT 1
@@ -8334,48 +8287,6 @@ fn claude_transcript_lacks_delegation_capture(conn: &Connection, path: &Path) ->
         |row| row.get(0),
     )?;
     Ok(lacking != 0)
-}
-
-/// [`claude_transcript_events_exist`]'s probe.
-///
-/// The sync walk asks it of every Claude transcript on every sweep, so its
-/// plan is the walk's cost. `CROSS JOIN` makes SQLite drive the lookup from
-/// the one `sessions` row the path names. Left to choose, the planner (with no
-/// `sqlite_stat1`, which this crate never writes) drove it from
-/// `session_events` instead -- a scan of every Claude event until one belonged
-/// to that path's session, so a path with no row (every subagent sidecar, every
-/// new transcript) read the whole table, once per file (#215).
-const CLAUDE_TRANSCRIPT_EVENTS_SQL: &str = "SELECT EXISTS(
-            SELECT 1
-            FROM sessions s
-            CROSS JOIN session_events e ON e.source = s.source AND e.session_id = s.session_id
-            WHERE s.source = 'claude' AND s.raw_path = ?
-            LIMIT 1
-        ) OR EXISTS(
-            SELECT 1
-            FROM sessions s
-            CROSS JOIN session_markers m ON m.source = s.source AND m.session_id = s.session_id
-            WHERE s.source = 'claude' AND s.raw_path = ?
-            LIMIT 1
-        )";
-
-/// Whether this transcript has left any evidence behind, of any kind.
-///
-/// Not just `session_events`, for the same reason the Codex probe counts
-/// markers: a transcript can store only markers -- a summary, a compaction
-/// boundary, an image-only turn, a system row -- and asking about events alone
-/// answers "nothing indexed" forever for those, so the stamp fast path
-/// re-reads and re-upserts an unchanged file on every sync. Nothing is lost by
-/// that; the cost simply never converges.
-fn claude_transcript_events_exist(conn: &Connection, path: &Path) -> Result<bool> {
-    let raw_path = path.to_string_lossy();
-    let exists: i64 = cached_query_row(
-        conn,
-        CLAUDE_TRANSCRIPT_EVENTS_SQL,
-        [raw_path.as_ref(), raw_path.as_ref()],
-        |row| row.get(0),
-    )?;
-    Ok(exists != 0)
 }
 
 #[derive(Clone, Debug)]

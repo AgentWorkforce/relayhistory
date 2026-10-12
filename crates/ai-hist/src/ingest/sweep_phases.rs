@@ -199,6 +199,9 @@ impl SweepPhases<'_, '_> {
         }
         capture_progress("claude", 0, None);
         check_capture_cancelled()?;
+        // One read of the unchanged-file evidence keys, for this walk. Drop
+        // disarms it, including when the walk unwinds.
+        let _guard = super::evidence_probe::Guard::arm(self.conn);
         let metadata = sync_claude_session_metadata_with_repairs_and_coverage(
             self.conn,
             self.state,

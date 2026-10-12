@@ -2122,6 +2122,7 @@ pub(crate) fn retire_evidence_share(
             "DELETE FROM {table} WHERE ({condition}) AND location = '{own}'"
         ))?
         .execute(params)?;
+    crate::ingest::note_deleted(conn, table, deleted);
     conn.prepare_cached(&format!(
         "UPDATE {table} SET location = '{other}' WHERE ({condition}) AND location = 'both'"
     ))?

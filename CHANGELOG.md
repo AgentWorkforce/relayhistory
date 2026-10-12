@@ -17,6 +17,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A cold sweep reads a transcript once and checks its commit digest from those bytes.
 - A later page of user turns does not regroup the turns already returned.
 - An export page uses a published delivery `maxRecords` when a receipt or `GET /v1/delivery/limits` body is given, and stays at 100 records and 1 MiB when it is not.
+- A sweep reads unchanged-file evidence once and answers each later probe from that read.
 
 ### Rust API
 

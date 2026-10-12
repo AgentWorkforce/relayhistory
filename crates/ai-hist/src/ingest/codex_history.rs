@@ -33,6 +33,7 @@ fn sync_codex_rollouts_and_history(
     touched: &mut HashSet<String>,
     paths: Option<&super::path_scope::PathScope>,
 ) -> Result<usize> {
+    let _guard = super::evidence_probe::Guard::arm(conn);
     let (cwds, branches, mut inserted) = sync_codex_rollouts_with_repairs_and_coverage(
         conn, state, root, repairs, coverage, touched, paths,
     )?;

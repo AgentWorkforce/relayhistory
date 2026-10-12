@@ -434,11 +434,13 @@ fn retire_unnoted(
     session_id: &str,
     noted: &str,
 ) -> Result<()> {
-    conn.prepare_cached(&format!(
-        "DELETE FROM {table} WHERE source = ?1 AND session_id = ?2 AND location = 'local' \
-         AND {key} NOT IN (SELECT value FROM json_each(?3))"
-    ))?
-    .execute(params![source, session_id, noted])?;
+    let deleted = conn
+        .prepare_cached(&format!(
+            "DELETE FROM {table} WHERE source = ?1 AND session_id = ?2 AND location = 'local' \
+             AND {key} NOT IN (SELECT value FROM json_each(?3))"
+        ))?
+        .execute(params![source, session_id, noted])?;
+    super::evidence_probe::note_deleted(conn, table, deleted);
     conn.prepare_cached(&format!(
         "UPDATE {table} SET location = 'remote' \
          WHERE source = ?1 AND session_id = ?2 AND location = 'both' \
