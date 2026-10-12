@@ -1608,9 +1608,9 @@ impl SweepRepairs {
         self.all
     }
 
-    /// These repairs less `sessions`.
-    fn without(mut self, sessions: &HashSet<(String, String)>) -> Self {
-        self.sessions.retain(|session| !sessions.contains(session));
+    /// These repairs less the sessions `vouched` accepts.
+    fn without(mut self, mut vouched: impl FnMut(&(String, String)) -> bool) -> Self {
+        self.sessions.retain(|session| !vouched(session));
         self
     }
 
@@ -2382,7 +2382,7 @@ fn seal_full_sweep(
         match destination_shortfall_counted(conn, state, destination.take()) {
             Ok((outstanding, counted)) => {
                 destination = counted;
-                Some(outstanding.without(&rederived::local_only(conn, rederived)))
+                Some(outstanding.without(rederived::vouches_for(conn, rederived)))
             }
             Err(error) => {
                 sync_note!("  [sync] could not re-check the destination: {error:#}");

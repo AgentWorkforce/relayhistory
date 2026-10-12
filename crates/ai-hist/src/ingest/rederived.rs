@@ -6,21 +6,21 @@ use std::collections::HashSet;
 use anyhow::Result;
 use rusqlite::{params, Connection};
 
-/// The sessions of `rederived` that hold no remote-backed evidence. A local
-/// re-read restores only local rows, so a session with rows a remote side
-/// backs keeps the ordinary shortfall check; one that cannot be read keeps it
-/// too. A remote presence with no evidence behind it has nothing to restore.
-pub(super) fn local_only(
-    conn: &Connection,
-    rederived: &HashSet<(String, String)>,
-) -> HashSet<(String, String)> {
-    rederived
-        .iter()
-        .filter(|(source, session_id)| {
-            matches!(holds_remote_evidence(conn, source, session_id), Ok(false))
-        })
-        .cloned()
-        .collect()
+/// Whether a session short of the destination marker is short only by what
+/// re-deriving it from its source retired: it is in `rederived` and holds no
+/// remote-backed evidence. A local re-read restores only local rows, so a
+/// session with rows a remote side backs keeps the ordinary shortfall check;
+/// one whose rows cannot be read keeps it too. A remote presence with no
+/// evidence behind it has nothing to restore.
+pub(super) fn vouches_for<'a>(
+    conn: &'a Connection,
+    rederived: &'a HashSet<(String, String)>,
+) -> impl FnMut(&(String, String)) -> bool + 'a {
+    move |session| {
+        let (source, session_id) = session;
+        rederived.contains(session)
+            && matches!(holds_remote_evidence(conn, source, session_id), Ok(false))
+    }
 }
 
 fn holds_remote_evidence(conn: &Connection, source: &str, session_id: &str) -> Result<bool> {
