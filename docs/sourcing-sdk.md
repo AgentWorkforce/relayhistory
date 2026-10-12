@@ -93,7 +93,7 @@ What the facade owes you, and what it asks in return:
 | `discover(DiscoveryOptions)`                     | provider metadata only, stamp-gated         | shallow catalog upserts                                                   | none (SQLite serializes writes)                  |
 | `sync(SyncOptions)`                              | full local sweep, fingerprint-gated         | migrations + ingestion + shallow discovery                                | `SyncRunLock`, whole run                         |
 | `hydrate(&SessionRef, HydrateOptions)`           | one session and its bounded related files   | transactional evidence + checkpoint upsert                                | per-session hydration lock                       |
-| `watch(WatchOptions) -> WatchHandle`             | fs-event or polling driven sweeps           | the same as `sync`, per tick                                              | `SyncRunLock`, per tick                          |
+| `watch(WatchOptions) -> WatchHandle`             | fs-event or polling driven ticks            | a `sync` per tick, or a shallow `discover` when `kind` is `Discover`      | `SyncRunLock` on a sync tick; none on discover   |
 | `sessions(CatalogQuery) -> CatalogIter`          | none                                        | keyset-paged reads over `sessions`                                        | none (WAL reader)                                |
 | `session(&SessionRef, SessionQuery)`             | none                                        | every table for one session, on one snapshot                              | none (one deferred read transaction)             |
 | `session_identities(IdentityQuery)`              | none                                        | one covering index seek per identity per table that holds it              | none (one read snapshot per page)                |
@@ -280,8 +280,20 @@ under the paths that changed. A Claude append reads that transcript.
 and an event the loop cannot place under a root (a rescan notice), are full
 sweeps with `sources: None`. An event placed under a root but not under the
 path that root walks reads that source's whole tree. A tick is the same
-locked `sync`; one that finds the lock held reports
-`contended` and is retried by the loop rather than counted as done. A failed
+locked `sync` when `WatchOptions::kind` is `WatchTick::Sync` (the default,
+including options serialized before the field existed); one that finds the
+lock held reports
+`contended` and is retried by the loop rather than counted as done.
+`WatchTick::Discover` (`SessionStore::watch_discover`) runs a shallow
+discover instead and does not parse transcripts or write evidence. A
+filesystem event discovers only the sources whose roots it landed under. A
+startup, poll or backstop tick discovers every configured source. An event
+under no watched root discovers nothing on that tick (`sources` is an empty
+list) rather than falling open into a capture; the backstop covers the rest.
+The loop's entry filter, including OpenCode's, still drops a write that is
+not evidence, so that write does not discover. A discover tick leaves
+`swept`, `skipped_unchanged`, `contended` and `changed` clear.
+`TickReport::kind` says which tick ran. A failed
 sweep arrives as an `Err` and the loop keeps running; the rolling catalog
 baseline survives it, so rows a failed sweep had already committed are
 reported by the next tick that succeeds rather than lost. `WatchHandle::stopper()`

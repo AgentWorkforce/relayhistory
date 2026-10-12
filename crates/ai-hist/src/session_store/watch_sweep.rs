@@ -12,7 +12,7 @@ use super::*;
 use crate::discover::WatchRoot;
 use crate::ingest::path_scope::PathScope;
 use crate::ingest::{sync_watch_roots_by_source, SweepScope};
-use crate::watch::{ChangeScope, TickRequest};
+use crate::watch::{ChangeScope, TickRequest, TickTrigger};
 use std::collections::{BTreeSet, HashMap};
 
 /// Which sources registered each watched root.
@@ -92,6 +92,27 @@ impl WatchSources {
             paths,
         }
     }
+
+    /// Sources a discover tick reads.
+    ///
+    /// `None` is every configured source: startup, poll, backstop, manual,
+    /// and a filesystem event the loop could not place. A rescan notice is
+    /// that last case. The watcher has lost which paths changed, so the tick
+    /// shallow-discovers every source. It still does not sync.
+    ///
+    /// `Some` is the sources whose roots an event landed under. A root this
+    /// map does not know widens to every source, the same way a sync tick
+    /// does, rather than guessing or skipping the tick.
+    pub(super) fn discover_sources(&self, request: &TickRequest) -> Option<Vec<Source>> {
+        if request.trigger != TickTrigger::FsEvent {
+            return None;
+        }
+        let ChangeScope::Roots { roots: fired, .. } = &request.scope else {
+            return None;
+        };
+        let by_root = self.by_root.lock().expect("watch sources");
+        sources_of(&by_root, fired)
+    }
 }
 
 /// The sources the fired roots belong to, or `None` — a full sweep — when
@@ -113,6 +134,7 @@ fn sources_of(
 pub(super) struct TickNotes {
     pub(super) changed: Vec<SessionRef>,
     pub(super) sources: Option<Vec<Source>>,
+    pub(super) kind: WatchTick,
 }
 
 /// One watch loop's sweep: the same locked `sync` as [`SessionStore::sync`],
@@ -128,12 +150,21 @@ pub(super) struct WatchSweep {
     pub(super) baseline: Mutex<Option<CatalogFingerprint>>,
     pub(super) notes: Arc<Mutex<TickNotes>>,
     pub(super) reports: ReportSlot,
+    pub(super) store: SessionStore,
+    pub(super) kind: WatchTick,
 }
 
 impl WatchSweep {
     pub(super) fn tick(&self, request: &TickRequest) -> anyhow::Result<TickOutcome> {
+        if self.kind == WatchTick::Discover {
+            return self.discover_tick(request);
+        }
         let plan = self.sources.plan(request);
-        self.notes.lock().expect("watch notes").sources = plan.sources.clone();
+        {
+            let mut notes = self.notes.lock().expect("watch notes");
+            notes.kind = WatchTick::Sync;
+            notes.sources = plan.sources.clone();
+        }
         // Both reads happen under the sync lock, like `sync`'s. The
         // baseline is the previous swept tick's `after` digest when there
         // is one — nothing this loop reported has moved since, and a
@@ -166,6 +197,28 @@ impl WatchSweep {
                 }
                 Err(error)
             }
+        }
+    }
+
+    /// A shallow discover of the sources `request` names. Not a sync: no
+    /// evidence write and no transcript parse. An event the loop could not
+    /// place discovers every configured source.
+    fn discover_tick(&self, request: &TickRequest) -> anyhow::Result<TickOutcome> {
+        let sources = self.sources.discover_sources(request);
+        {
+            let mut notes = self.notes.lock().expect("watch notes");
+            notes.kind = WatchTick::Discover;
+            notes.sources = sources.clone();
+            notes.changed.clear();
+        }
+        match self.store.discover(DiscoveryOptions {
+            sources,
+            stop: Some(self.stop.clone()),
+            ..DiscoveryOptions::default()
+        }) {
+            Ok(_) => Ok(TickOutcome::default()),
+            Err(Error::Cancelled(_)) => Err(CaptureCancelled.into()),
+            Err(error) => Err(anyhow::anyhow!("{error}")),
         }
     }
 
@@ -326,6 +379,37 @@ mod tests {
         assert!(scope.paths().unwrap().include_file(&file, "", "jsonl"));
         // Roots with no file paths still walk that provider whole.
         assert!(sources.plan(&event(&[claude])).scope().paths().is_none());
+    }
+
+    #[test]
+    fn a_discover_tick_names_the_sources_whose_roots_fired() {
+        let (home, roots) = home();
+        let sources = WatchSources::new(roots);
+        sources.watch_roots();
+        let claude = home.path().join(".claude/projects");
+        let codex = home.path().join(".codex/sessions");
+
+        assert_eq!(
+            sources.discover_sources(&event(std::slice::from_ref(&claude))),
+            Some(vec![Source::Claude])
+        );
+        assert_eq!(
+            sources.discover_sources(&event(&[claude.clone(), codex])),
+            Some(vec![Source::Claude, Source::Codex])
+        );
+        assert_eq!(
+            sources.discover_sources(&event(&[claude, home.path().join("elsewhere")])),
+            None,
+            "a root the map does not know is not guessed at"
+        );
+        assert_eq!(
+            sources.discover_sources(&full(TickTrigger::FsEvent)),
+            None,
+            "an event the loop could not place discovers every source"
+        );
+        for trigger in [TickTrigger::Startup, TickTrigger::Poll, TickTrigger::Manual] {
+            assert_eq!(sources.discover_sources(&full(trigger)), None);
+        }
     }
 
     #[test]
