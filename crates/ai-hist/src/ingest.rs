@@ -37487,52 +37487,72 @@ mod codex_fork_replay_tests {
     /// the backfill is spent.
     #[test]
     fn marker_only_unchanged_rollout_backfills_images_once() {
-        let dir = tempfile::tempdir().unwrap();
-        let day = dir.path().join(".codex/sessions/2026/04/20");
-        fs::create_dir_all(&day).unwrap();
-        let path = day.join("rollout-images.jsonl");
-        fs::write(&path, [
-            line("2026-04-20T00:00:00.000Z", "session_meta", json!({"id": PARENT, "cwd": "/tmp/project"})),
-            line("2026-04-20T00:00:01.000Z", "response_item", json!({"type":"message","role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="}]})),
-            line("2026-04-20T00:00:03.000Z", "event_msg", json!({"type":"task_complete"})),
-        ].concat()).unwrap();
-        let conn = open_db(&dir.path().join("history.db")).unwrap();
-        let mut state = Map::new();
-        let root = dir.path().join(".codex");
-        sync_codex(&conn, &mut state, &root).unwrap();
-        conn.execute("DELETE FROM session_events", []).unwrap();
-        // Earlier parsers kept only the unknown image-line marker.
-        conn.execute("INSERT OR IGNORE INTO session_markers(source,session_id,marker_uid,kind,ts_ms) VALUES ('codex',?1,'1:marker','unknown',1000)", [PARENT]).unwrap();
-        for record in state
-            .get_mut("codex_rollouts_v7")
-            .unwrap()
-            .as_object_mut()
-            .unwrap()
-            .values_mut()
-        {
-            record
+        for location in ["local", "both", "remote"] {
+            let dir = tempfile::tempdir().unwrap();
+            let day = dir.path().join(".codex/sessions/2026/04/20");
+            fs::create_dir_all(&day).unwrap();
+            let path = day.join("rollout-images.jsonl");
+            fs::write(&path, [
+                line("2026-04-20T00:00:00.000Z", "session_meta", json!({"id": PARENT, "cwd": "/tmp/project"})),
+                line("2026-04-20T00:00:01.000Z", "response_item", json!({"type":"message","role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="}]})),
+                line("2026-04-20T00:00:03.000Z", "event_msg", json!({"type":"task_complete"})),
+            ].concat()).unwrap();
+            let conn = open_db(&dir.path().join("history.db")).unwrap();
+            let mut state = Map::new();
+            let root = dir.path().join(".codex");
+            sync_codex(&conn, &mut state, &root).unwrap();
+            conn.execute("DELETE FROM session_events", []).unwrap();
+            // Earlier parsers kept only the unknown image-line marker.
+            conn.execute("INSERT OR IGNORE INTO session_markers(source,session_id,marker_uid,kind,ts_ms) VALUES ('codex',?1,'1:marker','unknown',1000)", [PARENT]).unwrap();
+            conn.execute("UPDATE session_markers SET location=?1 WHERE source='codex' AND session_id=?2 AND marker_uid='1:marker'", params![location, PARENT]).unwrap();
+            conn.execute("INSERT INTO session_markers(source,session_id,marker_uid,kind,ts_ms) VALUES ('codex',?1,'other:marker','unknown',1000)", [PARENT]).unwrap();
+            for record in state
+                .get_mut("codex_rollouts_v7")
+                .unwrap()
                 .as_object_mut()
                 .unwrap()
-                .remove(CODEX_IMAGE_CAPTURE_KEY);
-        }
-        sync_codex(&conn, &mut state, &root).unwrap();
-        assert_eq!(
-            conn.query_row(
-                "SELECT count(*) FROM session_events WHERE raw_kind='input_image'",
-                [],
-                |r| r.get::<_, i64>(0)
-            )
-            .unwrap(),
-            1
-        );
-        conn.execute("DELETE FROM session_events", []).unwrap();
-        sync_codex(&conn, &mut state, &root).unwrap();
-        assert_eq!(
-            conn.query_row("SELECT count(*) FROM session_events", [], |r| r
-                .get::<_, i64>(0))
+                .values_mut()
+            {
+                record
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(CODEX_IMAGE_CAPTURE_KEY);
+            }
+            sync_codex(&conn, &mut state, &root).unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM session_events WHERE raw_kind='input_image'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
                 .unwrap(),
-            0
-        );
+                1
+            );
+            let remaining: Option<String> = conn.query_row("SELECT location FROM session_markers WHERE source='codex' AND session_id=?1 AND marker_uid='1:marker' AND kind='unknown'", [PARENT], |r| r.get(0)).optional().unwrap();
+            assert_eq!(
+                remaining.as_deref(),
+                (location != "local").then_some("remote"),
+                "only the obsolete local share is retired"
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM session_markers WHERE marker_uid='other:marker'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                1,
+                "unrelated unknown markers survive"
+            );
+            conn.execute("DELETE FROM session_events", []).unwrap();
+            sync_codex(&conn, &mut state, &root).unwrap();
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM session_events", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
     }
 
     #[test]

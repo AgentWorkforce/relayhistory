@@ -33,7 +33,7 @@ pub(super) fn capture_rollout(
     value: &Value,
     position: (usize, i64, Option<&str>),
 ) -> Result<usize> {
-    capture_codex(
+    let captured = capture_codex(
         conn,
         &meta.session_id,
         Some(&meta.cwd),
@@ -42,7 +42,17 @@ pub(super) fn capture_rollout(
         position.1,
         position.2,
         value,
-    )
+    )?;
+    if captured > 0 {
+        crate::store::retire_evidence_share(
+            conn,
+            "session_markers",
+            "source = 'codex' AND session_id = ?1 AND marker_uid = ?2 AND kind = 'unknown'",
+            params![meta.session_id, format!("{}:marker", position.0)],
+            SessionLocation::Local,
+        )?;
+    }
+    Ok(captured)
 }
 
 const MAX_IMAGE_BYTES: usize = 1_048_576;
