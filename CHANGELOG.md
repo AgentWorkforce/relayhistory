@@ -10,6 +10,10 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - A watch can discover the sources whose files changed without syncing them.
 
+### Fixed
+
+- A Hermes read treats a sidecar that disappears mid-check as absent.
+
 ### Rust API
 
 - Added `WatchTick`, `WatchOptions::kind`, `TickReport::kind`, and `SessionStore::watch_discover`.

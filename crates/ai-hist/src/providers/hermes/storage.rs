@@ -110,10 +110,7 @@ fn read<T>(
         "Hermes locator must name state.db"
     );
     for suffix in ["-wal", "-shm", "-journal"] {
-        let sidecar = sidecar(path, suffix);
-        if sidecar.try_exists()? {
-            context.validate(&sidecar)?;
-        }
+        let _ = acknowledge_sidecar(context, &sidecar(path, suffix))?;
     }
     sqlite_snapshot(context, path, |conn| {
         let version: i64 = conn
@@ -348,8 +345,7 @@ pub(super) fn capture(
     let mut read_paths = vec![path.to_path_buf()];
     for suffix in ["-wal", "-shm", "-journal"] {
         let sidecar = sidecar(path, suffix);
-        if sidecar.try_exists()? {
-            context.validate(&sidecar)?;
+        if acknowledge_sidecar(context, &sidecar)? {
             read_paths.push(sidecar);
         }
     }
@@ -376,6 +372,30 @@ fn native_id(id: &str) -> Result<String> {
         })
         .collect::<Result<Vec<_>>>()?;
     Ok(String::from_utf8(bytes)?)
+}
+
+/// A WAL, shm, or rollback sidecar that is present and inside the provider
+/// root. A file that disappears between the exists check and `canonicalize`
+/// is absent: another connection can unlink it while this one reads.
+fn acknowledge_sidecar(context: &AcquisitionContext<'_>, path: &Path) -> Result<bool> {
+    if !path.try_exists()? {
+        return Ok(false);
+    }
+    match context.validate(path) {
+        Ok(()) => Ok(true),
+        Err(error) if is_not_found(&error) => Ok(false),
+        Err(error) => Err(error),
+    }
+}
+
+fn is_not_found(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .any(|cause| {
+            cause
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|io| io.kind() == std::io::ErrorKind::NotFound)
+        })
 }
 
 fn sidecar(path: &Path, suffix: &str) -> PathBuf {
