@@ -1398,7 +1398,12 @@ fn grok_summary_subagent_is_hidden_from_root_catalog_without_a_parent_edge() {
         2,
         "without persisted kind, the old catalog misclassifies the child as a root"
     );
-    conn.execute("UPDATE session_observations SET source_stamp = REPLACE(source_stamp, 'v13:', 'v12:') WHERE source = 'grok' AND session_id = 'child'", []).unwrap();
+    conn.execute(
+        "UPDATE session_observations SET source_stamp = REPLACE(source_stamp, ?1, 'v12:') \
+         WHERE source = 'grok' AND session_id = 'child'",
+        [format!("v{SHALLOW_SCANNER_VERSION}:")],
+    )
+    .unwrap();
     let upgraded = discover(&conn, home.path(), &only(&["grok"]));
     assert_eq!(upgraded.summary.counters.shallow_reads, 1);
     assert_eq!(
