@@ -95,27 +95,23 @@ impl WatchSources {
 
     /// Sources a discover tick reads.
     ///
-    /// `None` is every configured source: startup, poll, backstop and manual
-    /// ticks. `Some` is the sources whose roots an event landed under. An
-    /// event under no known root, or one the loop could not place, is an
-    /// empty list — this tick discovers nothing and does not widen into a
-    /// full discover.
+    /// `None` is every configured source: startup, poll, backstop, manual,
+    /// and a filesystem event the loop could not place. A rescan notice is
+    /// that last case. The watcher has lost which paths changed, so the tick
+    /// shallow-discovers every source. It still does not sync.
+    ///
+    /// `Some` is the sources whose roots an event landed under. A root this
+    /// map does not know widens to every source, the same way a sync tick
+    /// does, rather than guessing or skipping the tick.
     pub(super) fn discover_sources(&self, request: &TickRequest) -> Option<Vec<Source>> {
         if request.trigger != TickTrigger::FsEvent {
             return None;
         }
         let ChangeScope::Roots { roots: fired, .. } = &request.scope else {
-            return Some(Vec::new());
+            return None;
         };
         let by_root = self.by_root.lock().expect("watch sources");
-        let mut sources = BTreeSet::new();
-        for root in fired {
-            let Some(found) = by_root.get(root) else {
-                return Some(Vec::new());
-            };
-            sources.extend(found.iter().copied());
-        }
-        Some(sources.into_iter().collect())
+        sources_of(&by_root, fired)
     }
 }
 
@@ -205,8 +201,8 @@ impl WatchSweep {
     }
 
     /// A shallow discover of the sources `request` names. Not a sync: no
-    /// evidence write, no transcript parse, and an unplaced event does not
-    /// widen to every source.
+    /// evidence write and no transcript parse. An event the loop could not
+    /// place discovers every configured source.
     fn discover_tick(&self, request: &TickRequest) -> anyhow::Result<TickOutcome> {
         let sources = self.sources.discover_sources(request);
         {
@@ -386,7 +382,7 @@ mod tests {
     }
 
     #[test]
-    fn a_discover_tick_names_one_source_and_an_unplaced_event_names_none() {
+    fn a_discover_tick_names_the_sources_whose_roots_fired() {
         let (home, roots) = home();
         let sources = WatchSources::new(roots);
         sources.watch_roots();
@@ -398,18 +394,18 @@ mod tests {
             Some(vec![Source::Claude])
         );
         assert_eq!(
-            sources.discover_sources(&event(&[claude, codex])),
+            sources.discover_sources(&event(&[claude.clone(), codex])),
             Some(vec![Source::Claude, Source::Codex])
         );
         assert_eq!(
-            sources.discover_sources(&event(&[home.path().join("elsewhere")])),
-            Some(vec![]),
-            "a path under no watched root discovers nothing"
+            sources.discover_sources(&event(&[claude, home.path().join("elsewhere")])),
+            None,
+            "a root the map does not know is not guessed at"
         );
         assert_eq!(
             sources.discover_sources(&full(TickTrigger::FsEvent)),
-            Some(vec![]),
-            "an event the loop could not place does not widen"
+            None,
+            "an event the loop could not place discovers every source"
         );
         for trigger in [TickTrigger::Startup, TickTrigger::Poll, TickTrigger::Manual] {
             assert_eq!(sources.discover_sources(&full(trigger)), None);

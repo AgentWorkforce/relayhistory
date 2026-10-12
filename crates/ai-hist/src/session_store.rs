@@ -1847,12 +1847,11 @@ pub struct TickReport {
     pub changed: Vec<SessionRef>,
     /// The sources this tick read.
     ///
-    /// `None` is every local source: startup, backstop, poll and manual
-    /// ticks. On a sync tick it is also an event the loop could not place
-    /// under a watched root, which is swept in full. On a discover tick that
-    /// unplaced event is [`Some`] of an empty list and discovers nothing;
-    /// the backstop covers the rest. A filesystem-event tick names the
-    /// sources whose roots fired in its debounce window.
+    /// `None` is every local source: startup, backstop, poll, manual, and an
+    /// event the loop could not place under a watched root. A sync tick then
+    /// sweeps in full. A discover tick shallow-discovers every source and
+    /// still does not sync. A filesystem event the loop could place names
+    /// the sources whose roots fired in its debounce window.
     #[serde(default)]
     pub sources: Option<Vec<Source>>,
 }
