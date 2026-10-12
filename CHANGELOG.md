@@ -13,10 +13,12 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - A Hermes read treats a sidecar that disappears mid-check as absent.
+- A cold sweep reads a transcript once and checks its commit digest from those bytes.
 
 ### Rust API
 
 - Added `WatchTick`, `WatchOptions::kind`, `TickReport::kind`, and `SessionStore::watch_discover`.
+
 
 ## [0.41.0] - 2026-10-12
 
