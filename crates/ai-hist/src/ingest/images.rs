@@ -54,6 +54,10 @@ pub(super) fn capture_codex(
         return Ok(0);
     }
     let message = codex::user_message(value);
+    let control_kind = message
+        .as_ref()
+        .and_then(|m| m.control)
+        .map(control::ControlKind::as_str);
     let mirrored = if let Some(message) = &message {
         conn.query_row(
             "SELECT message_id, ts_ms FROM session_events WHERE source='codex' AND session_id=?1 AND event_uid=?2 AND text=?3",
@@ -104,6 +108,7 @@ pub(super) fn capture_codex(
                 event_uid: &uid,
                 raw_kind: Some("input_image"),
                 raw_facts: RawMessageFacts {
+                    control_kind,
                     turn_id,
                     ..Default::default()
                 },
@@ -118,6 +123,70 @@ pub(super) fn capture_codex(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn injected_context_images_do_not_create_human_usage_boundaries() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::init_db(&conn).unwrap();
+        for (id, ts, role, text, control, tokens) in [
+            ("human", 100, "user", "Explain this", None, None),
+            (
+                "context",
+                150,
+                "user",
+                "<environment_context>injected</environment_context>",
+                Some("codex_context_wrapper"),
+                None,
+            ),
+            (
+                "answer",
+                200,
+                "assistant",
+                "Answer",
+                None,
+                Some(r#"{"input_tokens":10,"output_tokens":2}"#),
+            ),
+        ] {
+            insert_session_event(
+                &conn,
+                &EventRow {
+                    source: "codex",
+                    session_id: "s",
+                    message_id: id,
+                    event_uid: id,
+                    ts_ms: ts,
+                    role,
+                    kind: "text",
+                    text: Some(text),
+                    token_json: tokens,
+                    raw_facts: RawMessageFacts {
+                        control_kind: control,
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+        let value = json!({"type":"response_item","payload":{"type":"message","role":"user","id":"context","content":[{"type":"input_text","text":"<environment_context>injected</environment_context>"},{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="}]}});
+        assert!(codex::user_message(&value).unwrap().control.is_some());
+        capture_codex(&conn, "s", None, None, 4, 150, None, &value).unwrap();
+        let events = crate::store::session_events(&conn, "s", Some("codex")).unwrap();
+        let attributed = crate::usage::attribute_usage_to_prompts(&events, "codex");
+        assert!(
+            attributed.contains_key(&(100, "Explain this".into())),
+            "an injected context image must not steal the parentless answer's prompt"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .find(|e| e.raw_kind.as_deref() == Some("input_image"))
+                .unwrap()
+                .control_kind
+                .as_deref(),
+            Some("codex_context_wrapper")
+        );
+    }
 
     #[test]
     fn empty_native_ids_use_the_prompt_fallback_identity() {
