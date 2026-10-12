@@ -4437,7 +4437,6 @@ fn discover_sessions_with_worker_limit(
         .map(|provider| provider.begin_discovery_pass())
         .collect::<Result<Vec<_>>>()?;
     let conn = env.conn();
-    let _observed = observed_stamps::Guard::arm(conn, env.path_scope());
     let mut summary = DiscoverySummary {
         contract_version: SESSION_CATALOG_CONTRACT_VERSION,
         scope: options.scope,
@@ -4525,6 +4524,10 @@ fn discover_sessions_with_worker_limit(
             .then_with(|| a.source.cmp(b.source))
             .then_with(|| a.locator.cmp(&b.locator))
     });
+    // After the list exists: a limit that stops early must not read every
+    // observation of the source. The decision stays in the guard.
+    let _observed =
+        observed_stamps::Guard::arm(conn, env.path_scope(), options.limit, candidates.len());
 
     // The limit counts *emitted sessions*, not candidates. Truncating the
     // candidate list up front let a codex subagent thread or a claude sidecar

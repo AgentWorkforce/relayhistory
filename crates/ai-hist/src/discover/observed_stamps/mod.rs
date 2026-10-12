@@ -4,8 +4,8 @@
 //! observation stamp and — when the path does not name a session — for the
 //! locator, then again for a known non-session. This module reads each of
 //! those sets once per armed adapter and serves later candidates from that
-//! read. A path-scoped pass does not arm: one changed file keeps the point
-//! query.
+//! read. A path-scoped pass does not arm, and neither does a pass whose
+//! limit stops before the last candidate: one file keeps the point query.
 //!
 //! The snapshot is this connection's. This connection's own commit does not
 //! move `PRAGMA data_version`, so a pass keeps the read across the window
@@ -129,20 +129,39 @@ fn data_version(conn: &Connection) -> Result<i64> {
     Ok(conn.pragma_query_value(None, "data_version", |row| row.get(0))?)
 }
 
-/// Arm the snapshot for one discovery pass. A path scope leaves it unarmed.
+/// Arm the snapshot for one discovery pass. A path scope leaves it unarmed,
+/// and so does a limit that cannot cover every candidate.
 pub(super) struct Guard;
 
 impl Guard {
-    pub(super) fn arm(conn: &Connection, scope: Option<&crate::ingest::path_scope::PathScope>) -> Self {
+    pub(super) fn arm(
+        conn: &Connection,
+        scope: Option<&crate::ingest::path_scope::PathScope>,
+        limit: Option<usize>,
+        candidates: usize,
+    ) -> Self {
         STACK.with(|stack| {
             stack.borrow_mut().push(Memo {
                 conn: conn_id(conn),
-                armed: scope.is_none(),
+                armed: full_walk(scope, limit, candidates),
                 observations: HashMap::new(),
                 skips: HashMap::new(),
             });
         });
         Self
+    }
+}
+
+/// The bulk read pays off only when this pass can ask about every candidate.
+fn full_walk(
+    scope: Option<&crate::ingest::path_scope::PathScope>,
+    limit: Option<usize>,
+    candidates: usize,
+) -> bool {
+    match (scope.is_some(), limit) {
+        (true, _) => false,
+        (false, Some(limit)) => limit >= candidates,
+        (false, None) => true,
     }
 }
 
@@ -616,7 +635,7 @@ mod tests {
         let _reset = Reset::arm();
         let conn = memory();
         insert_obs(&conn, "s", "/t/a.jsonl", &v("old"), true);
-        let _guard = Guard::arm(&conn, None);
+        let _guard = Guard::arm(&conn, None, None, 0);
         for id in [Some("s"), None] {
             assert_eq!(stamp_text(&lookup(&conn, id, "/t/a.jsonl")), Some(v("old")));
         }
@@ -637,7 +656,7 @@ mod tests {
     fn observed_stamp_a_rollback_drops_uncommitted_rows() {
         let _reset = Reset::arm();
         let conn = memory();
-        let _guard = Guard::arm(&conn, None);
+        let _guard = Guard::arm(&conn, None, None, 0);
         conn.execute_batch("BEGIN IMMEDIATE").unwrap();
         insert_obs(&conn, "s", "/t/a.jsonl", &v("old"), true);
         assert_eq!(stamp_text(&lookup(&conn, Some("s"), "/t/a.jsonl")), Some(v("old")));
@@ -654,7 +673,7 @@ mod tests {
         let _reset = Reset::arm();
         let (_dir, conn) = file_db();
         insert_obs(&conn, "s", "/t/a.jsonl", &v("old"), true);
-        let _guard = Guard::arm(&conn, None);
+        let _guard = Guard::arm(&conn, None, None, 0);
         assert_eq!(stamp_text(&lookup(&conn, Some("s"), "/t/a.jsonl")), Some(v("old")));
         let loaded = load_count();
         let other = Connection::open(_dir.path().join("history.db")).unwrap();
@@ -674,7 +693,7 @@ mod tests {
         let _reset = Reset::arm();
         let (dir, conn) = file_db();
         insert_obs(&conn, "s", "/t/a.jsonl", &v("old"), true);
-        let _guard = Guard::arm(&conn, None);
+        let _guard = Guard::arm(&conn, None, None, 0);
         assert_eq!(stamp_text(&lookup(&conn, Some("s"), "/t/a.jsonl")), Some(v("old")));
         let loaded = load_count();
         let path = dir.path().join("history.db");
@@ -710,7 +729,7 @@ mod tests {
             [v("old")],
         )
         .unwrap();
-        let _guard = Guard::arm(&conn, None);
+        let _guard = Guard::arm(&conn, None, None, 0);
         assert!(super::is_known_non_session(&conn, &Claude, "claude", "/t/skip.jsonl", &v("old")).unwrap());
         let loaded = load_count();
         super::record_non_session(&conn, &Claude, "claude", "/t/skip.jsonl", &v("new")).unwrap();
@@ -726,7 +745,7 @@ mod tests {
         let conn = memory();
         insert_obs(&conn, "a", "/t/same.jsonl", &v("old"), false);
         insert_obs(&conn, "b", "/t/same.jsonl", &v("old"), true);
-        let _guard = Guard::arm(&conn, None);
+        let _guard = Guard::arm(&conn, None, None, 0);
         assert!(
             lookup(&conn, None, "/t/same.jsonl").is_none(),
             "the catalogued sibling won over the lower uncatalogued session id"
@@ -865,6 +884,33 @@ mod tests {
         let scoped = claude_env(&conn, home.path()).with_path_scope(PathScope::from_paths([one]));
         let second = discover_claude(&scoped);
         assert_eq!(load_count(), 0, "a one-file pass loaded every stamp");
+        assert!(fallback_count() > 0, "the point query did not run");
+        assert_eq!(second.counters.shallow_reads, 0);
+        assert_eq!(second.skipped_unchanged, 1);
+    }
+
+    #[test]
+    fn observed_stamp_a_limited_pass_does_not_load_the_set() {
+        let _reset = Reset::arm();
+        let home = tempfile::tempdir().unwrap();
+        let conn = memory();
+        for index in 0..12 {
+            write_claude(home.path(), &format!("s{index:02}"));
+        }
+        discover_claude(&claude_env(&conn, home.path()));
+        super::reset_counts();
+        let options = DiscoverOptions {
+            sources: vec!["claude".to_string()],
+            limit: Some(1),
+            ..Default::default()
+        };
+        let second = crate::discover::discover_sessions_with_env(
+            &claude_env(&conn, home.path()),
+            &options,
+            |_| {},
+        )
+        .unwrap();
+        assert_eq!(load_count(), 0, "a one-session limit loaded every stamp");
         assert!(fallback_count() > 0, "the point query did not run");
         assert_eq!(second.counters.shallow_reads, 0);
         assert_eq!(second.skipped_unchanged, 1);
