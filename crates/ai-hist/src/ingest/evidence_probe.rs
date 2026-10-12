@@ -9,10 +9,11 @@
 //! move `PRAGMA data_version`, so a cold sweep keeps the snapshot across the
 //! chunk commits it opens. Another connection's commit does move it, and the
 //! next probe reads again instead of skipping a file whose evidence that
-//! commit removed. A delete this sweep makes is dropped the same way. A
-//! missing snapshot is not "present": the probe asks the database, and a
-//! file with no evidence is still opened. The guard pops on drop, including
-//! a panic.
+//! commit removed. Each probe kind records the version it was read at, so
+//! loading one kind does not make another's keys current. A delete this
+//! sweep makes is dropped the same way. A missing snapshot is not "present":
+//! the probe asks the database, and a file with no evidence is still opened.
+//! The guard pops on drop, including a panic.
 
 use std::cell::RefCell;
 use std::collections::HashSet;
@@ -34,13 +35,17 @@ thread_local! {
     static FALLBACKS: Cell<u64> = const { Cell::new(0) };
 }
 
+struct Slot {
+    /// `PRAGMA data_version` when these keys were read.
+    version: i64,
+    keys: HashSet<String>,
+}
+
 struct Memo {
     conn: usize,
-    /// `PRAGMA data_version` when the sets were read. Unset until then.
-    version: Option<i64>,
-    claude_transcripts: Option<HashSet<String>>,
-    claude_sidecars: Option<HashSet<String>>,
-    codex_sessions: Option<HashSet<String>>,
+    claude_transcripts: Option<Slot>,
+    claude_sidecars: Option<Slot>,
+    codex_sessions: Option<Slot>,
 }
 
 #[derive(Clone, Copy)]
@@ -162,7 +167,6 @@ impl Guard {
         STACK.with(|stack| {
             stack.borrow_mut().push(Memo {
                 conn: conn_id(conn),
-                version: None,
                 claude_transcripts: None,
                 claude_sidecars: None,
                 codex_sessions: None,
@@ -310,47 +314,49 @@ fn memo(conn: &Connection, kind: Kind, key: &str) -> Result<Option<bool>> {
         let stack = stack.borrow();
         match stack.iter().rev().find(|memo| memo.conn == id) {
             None => Read::Unarmed,
-            // Another connection committed. Its delete is not in this set.
-            Some(memo) if memo.is_loaded(kind) && memo.version == Some(version) => {
-                Read::Hit(memo.contains(kind, key))
-            }
-            Some(_) => Read::Pending,
+            // This kind's own version. Another kind's load does not refresh it.
+            Some(memo) => match memo.answer(kind, key, version) {
+                Some(present) => Read::Hit(present),
+                None => Read::Pending,
+            },
         }
     });
     match read {
         Read::Unarmed => Ok(None),
         Read::Hit(present) => Ok(Some(present)),
         Read::Pending => {
-            STACK.with(|stack| {
-                let mut stack = stack.borrow_mut();
-                if let Some(memo) = stack.iter_mut().rev().find(|memo| memo.conn == id) {
-                    if memo.version.is_some() && memo.version != Some(version) {
-                        memo.clear();
-                    }
-                }
-            });
             load(conn, id, kind)?;
+            let version = data_version(conn)?;
             Ok(STACK.with(|stack| {
                 let stack = stack.borrow();
                 stack
                     .iter()
                     .rev()
                     .find(|memo| memo.conn == id)
-                    .and_then(|memo| memo.answer(kind, key))
+                    .and_then(|memo| memo.answer(kind, key, version))
             }))
         }
     }
 }
 
 fn load(conn: &Connection, id: usize, kind: Kind) -> Result<()> {
+    // The slot is dropped before the read. A commit during the read leaves
+    // it empty, so this probe asks the database instead of the previous set.
+    // Another kind keeps the version it was read at.
+    STACK.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        if let Some(memo) = stack.iter_mut().rev().find(|memo| memo.conn == id) {
+            memo.clear_kind(kind);
+        }
+    });
+    #[cfg(test)]
+    on_load();
     let version = data_version(conn)?;
     let keys = match kind {
         Kind::ClaudeTranscript => load_set(conn, CLAUDE_TRANSCRIPT_KEYS_SQL)?,
         Kind::ClaudeSidecar => load_set(conn, CLAUDE_SIDECAR_KEYS_SQL)?,
         Kind::Codex => load_set(conn, CODEX_EVIDENCE_KEYS_SQL)?,
     };
-    // A commit that landed during the read is not in `keys`. Leave the slot
-    // empty so this probe asks the database, and the next one reads again.
     if data_version(conn)? != version {
         return Ok(());
     }
@@ -362,6 +368,21 @@ fn load(conn: &Connection, id: usize, kind: Kind) -> Result<()> {
         }
     });
     Ok(())
+}
+
+#[cfg(test)]
+thread_local! {
+    static ON_LOAD: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) };
+}
+
+/// Runs once, at the start of the next load. Tests move `data_version`
+/// between the probe's version read and this load's.
+#[cfg(test)]
+fn on_load() {
+    let hook = ON_LOAD.with(|hook| hook.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
 }
 
 fn load_set(conn: &Connection, sql: &str) -> Result<HashSet<String>> {
@@ -376,32 +397,28 @@ fn load_set(conn: &Connection, sql: &str) -> Result<HashSet<String>> {
 
 impl Memo {
     fn clear(&mut self) {
-        self.version = None;
         self.claude_transcripts = None;
         self.claude_sidecars = None;
         self.codex_sessions = None;
     }
 
-    fn is_loaded(&self, kind: Kind) -> bool {
-        self.slot(kind).is_some()
+    fn clear_kind(&mut self, kind: Kind) {
+        *self.slot_mut(kind) = None;
     }
 
-    fn contains(&self, kind: Kind, key: &str) -> bool {
-        self.slot(kind).is_some_and(|keys| keys.contains(key))
-    }
-
-    /// `None` when this kind was not stored, so the caller asks the database
-    /// instead of treating a gap as "present".
-    fn answer(&self, kind: Kind, key: &str) -> Option<bool> {
-        self.slot(kind).map(|keys| keys.contains(key))
+    /// `None` when this kind was not stored at `version`. The caller asks the
+    /// database instead of treating a gap, or another kind's version, as
+    /// "present".
+    fn answer(&self, kind: Kind, key: &str, version: i64) -> Option<bool> {
+        let slot = self.slot(kind)?;
+        (slot.version == version).then(|| slot.keys.contains(key))
     }
 
     fn store(&mut self, kind: Kind, keys: HashSet<String>, version: i64) {
-        self.version = Some(version);
-        *self.slot_mut(kind) = Some(keys);
+        *self.slot_mut(kind) = Some(Slot { version, keys });
     }
 
-    fn slot(&self, kind: Kind) -> Option<&HashSet<String>> {
+    fn slot(&self, kind: Kind) -> Option<&Slot> {
         match kind {
             Kind::ClaudeTranscript => self.claude_transcripts.as_ref(),
             Kind::ClaudeSidecar => self.claude_sidecars.as_ref(),
@@ -409,7 +426,7 @@ impl Memo {
         }
     }
 
-    fn slot_mut(&mut self, kind: Kind) -> &mut Option<HashSet<String>> {
+    fn slot_mut(&mut self, kind: Kind) -> &mut Option<Slot> {
         match kind {
             Kind::ClaudeTranscript => &mut self.claude_transcripts,
             Kind::ClaudeSidecar => &mut self.claude_sidecars,
@@ -442,9 +459,11 @@ fn depth() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::{Kind, Memo};
     use crate::{init_db, SessionLocation};
     use rusqlite::Connection;
     use serde_json::{json, Map};
+    use std::collections::HashSet;
     use std::fs;
     use std::path::PathBuf;
 
@@ -703,6 +722,70 @@ mod tests {
             load_count() > loaded,
             "the probe answered from the pre-delete snapshot"
         );
+    }
+
+    #[test]
+    fn evidence_memo_one_kind_does_not_refresh_another() {
+        let mut transcripts = HashSet::new();
+        transcripts.insert("/t/a.jsonl".to_string());
+        let mut codex = HashSet::new();
+        codex.insert("sess".to_string());
+        let mut memo = Memo {
+            conn: 1,
+            claude_transcripts: None,
+            claude_sidecars: None,
+            codex_sessions: None,
+        };
+        memo.store(Kind::ClaudeTranscript, transcripts, 1);
+        memo.store(Kind::Codex, codex, 2);
+        assert_eq!(
+            memo.answer(Kind::ClaudeTranscript, "/t/a.jsonl", 2),
+            None,
+            "the later kind's version made the transcript keys current"
+        );
+        assert_eq!(
+            memo.answer(Kind::ClaudeTranscript, "/t/a.jsonl", 1),
+            Some(true)
+        );
+        assert_eq!(memo.answer(Kind::Codex, "sess", 2), Some(true));
+        assert_eq!(memo.answer(Kind::Codex, "missing", 2), Some(false));
+    }
+
+    #[test]
+    fn evidence_memo_a_later_load_does_not_keep_an_older_kind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        let conn = Connection::open(&path).unwrap();
+        init_db(&conn).unwrap();
+        session(&conn, "claude", "s", Some("/t/a.jsonl"));
+        event(&conn, "claude", "s", "e1", "hi");
+        event(&conn, "codex", "cx", "x", "codex");
+        let file = Path::new("/t/a.jsonl");
+        reset_counts();
+        let _guard = Guard::arm(&conn);
+        assert!(claude_transcript_events_exist(&conn, file).unwrap());
+        let loaded = load_count();
+        let other = Connection::open(&path).unwrap();
+        other
+            .busy_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        super::ON_LOAD.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                other
+                    .execute("DELETE FROM session_events WHERE event_uid = 'e1'", [])
+                    .unwrap();
+            }));
+        });
+        assert!(codex_session_evidence_exists(&conn, "cx").unwrap());
+        assert!(
+            !claude_transcript_events_exist(&conn, file).unwrap(),
+            "the transcript keys stayed current after the other kind loaded"
+        );
+        assert!(
+            load_count() > loaded,
+            "the transcript probe did not read again"
+        );
+        super::ON_LOAD.with(|hook| *hook.borrow_mut() = None);
     }
 
     #[test]
