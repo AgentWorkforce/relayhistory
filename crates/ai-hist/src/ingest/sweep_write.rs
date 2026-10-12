@@ -63,8 +63,9 @@ impl<'c> SweepWrite<'c> {
                 return Err(error);
             }
         };
-        // Presence and the catalog project key are read once for this guard,
-        // including across the chunk commits it opens. Drop clears them.
+        // Presence is recorded once for this guard, including across the chunk
+        // commits it opens. The catalog key is read again after each commit.
+        // Drop clears both.
         super::sweep_session::arm(conn);
         Ok(Self {
             conn,
@@ -127,6 +128,10 @@ impl<'c> SweepWrite<'c> {
             return Err(error.into());
         }
         self.fts_after = arm_session_events_fts(self.conn)?;
+        // The commit above released the writer lock. A catalog key cached in
+        // the previous chunk is not this transaction's snapshot, and binding
+        // it would hide a key another writer stored in the gap.
+        super::sweep_session::release_catalog(self.conn);
         Ok(())
     }
 }

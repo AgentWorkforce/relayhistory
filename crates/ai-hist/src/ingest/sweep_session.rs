@@ -1,13 +1,16 @@
 //! Session presence and catalog project key for one [`super::SweepWrite`].
 //!
-//! The first row of a `(source, session_id)` in the guard pays for the
-//! presence insert and the `sessions` lookup. Later rows bind that lookup.
+//! The first row of a `(source, session_id)` in a chunk pays for the
+//! presence insert and the `sessions` lookup. Later rows in that chunk bind
+//! that lookup. Presence is not repeated after a chunk commit.
 //! The assignment is unchanged: catalog key, then the stored event key, then
 //! the cwd fallback. A catalog write drops the cached key for that session,
 //! so a miss or a cwd key from before the row existed does not stick. The
-//! frame is this guard's, including across the chunk commits it opens, and
-//! drop — commit or rollback — discards it. A write with no guard on this
-//! connection keeps the per-row insert and the subquery.
+//! frame is this guard's. Presence stays across the chunk commits it opens.
+//! The catalog key does not: each commit releases the writer lock, so the
+//! next event reads the catalog again. Drop — commit or rollback — discards
+//! the frame. A write with no guard on this connection keeps the per-row
+//! insert and the subquery.
 
 use std::cell::RefCell;
 
@@ -92,6 +95,20 @@ pub(super) fn invalidate(conn: &Connection, source: &str, session_id: &str) {
                 .iter_mut()
                 .find(|entry| entry.source == source && entry.session_id == session_id)
             {
+                entry.project = None;
+            }
+        }
+    });
+}
+
+/// Drop every cached catalog key on this connection. A chunk commit released
+/// the writer lock, so the next event has to read the catalog in the new
+/// transaction. Presence stays: that insert already committed.
+pub(super) fn release_catalog(conn: &Connection) {
+    let id = conn_id(conn);
+    STACK.with(|stack| {
+        for unit in stack.borrow_mut().iter_mut().filter(|unit| unit.conn == id) {
+            for entry in &mut unit.sessions {
                 entry.project = None;
             }
         }
@@ -693,5 +710,52 @@ mod tests {
             );
             write.commit().unwrap();
         }
+    }
+
+    #[test]
+    fn a_chunk_commit_rereads_the_catalog_and_keeps_presence() {
+        let (_dir, conn) = store();
+        conn.execute(
+            "INSERT INTO sessions (session_id, source, project_key, project_key_method, discovery_state) \
+             VALUES ('s1', 'claude', 'path-key', 'path', 'full')",
+            [],
+        )
+        .unwrap();
+        let mut write = SweepWrite::begin(&conn).unwrap();
+        write_event(&conn, "s1", "e1", Some(WEAK_CWD));
+        let first = project_of(&conn, "e1");
+        assert_eq!(first.0.as_deref(), Some("path-key"));
+        assert_eq!(first.1.as_deref(), Some("path"));
+        assert_eq!(super::unit_counts(), (1, 1));
+        for _ in 0..super::super::JSONL_CHUNK_LINES {
+            write.record().unwrap();
+        }
+        conn.execute(
+            "UPDATE sessions SET project_key = 'github.com/acme/widget', \
+             project_key_method = 'remote' WHERE source = 'claude' AND session_id = 's1'",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE session_events SET project_key = 'github.com/acme/widget', \
+             project_key_method = 'remote' WHERE event_uid = 'e1'",
+            [],
+        )
+        .unwrap();
+        let stamped = project_of(&conn, "e1");
+        assert_eq!(stamped.0.as_deref(), Some("github.com/acme/widget"));
+        write_event(&conn, "s1", "e1", Some(WEAK_CWD));
+        assert_eq!(
+            project_of(&conn, "e1"),
+            stamped,
+            "the cached path key replaced the repository key stored during the lock gap"
+        );
+        write_event(&conn, "s1", "e2", Some(WEAK_CWD));
+        assert_eq!(
+            project_of(&conn, "e2").0.as_deref(),
+            Some("github.com/acme/widget")
+        );
+        assert_eq!(super::unit_counts(), (2, 1));
+        write.commit().unwrap();
     }
 }
