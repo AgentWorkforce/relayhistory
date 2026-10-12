@@ -555,14 +555,19 @@ pub(crate) fn open_shared(path: &Path) -> io::Result<SharedFile> {
     })
 }
 
+/// The handle parked for `path`, when it still names the same file. A take
+/// for another path leaves the parked handle where it is: it belongs to the
+/// read that parked it.
 fn take_parked(path: &Path) -> Option<fs::File> {
     let current = stat_of(path).ok()?;
     let mut state = lock();
-    let parked = state.parked.take()?;
-    if parked.path == path && parked.stat == current {
-        Some(parked.file)
-    } else {
-        None
+    match state.parked.take()? {
+        parked if parked.path == path && parked.stat == current => Some(parked.file),
+        parked if parked.path != path => {
+            state.parked = Some(parked);
+            None
+        }
+        _ => None,
     }
 }
 

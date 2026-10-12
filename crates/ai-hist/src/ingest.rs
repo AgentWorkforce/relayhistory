@@ -37109,9 +37109,9 @@ mod codex_fork_replay_tests {
         }
     }
 
-    /// The fork has a remote presence; with `remote`, its own events are also
-    /// remote-backed, which a local re-read cannot vouch for: its shortfall
-    /// stays a loss.
+    /// With `remote`, the fork has a remote presence -- remote-imported
+    /// prompts carry no location of their own -- which a local re-read cannot
+    /// vouch for: its shortfall stays a loss.
     fn retiring_sweep_seals(remote: bool) {
         let dir = tempfile::tempdir().unwrap();
         let day = dir.path().join(".codex/sessions/2026/04/20");
@@ -37141,19 +37141,11 @@ mod codex_fork_replay_tests {
              INSERT INTO session_events SELECT * FROM planted;"
         ))
         .unwrap();
-        // A remote presence alone backs no evidence; a remote-backed event
-        // is evidence a local re-read cannot restore.
-        conn.execute(
-            "INSERT INTO session_presences \
-             (source, session_id, location, raw_locator, discovery_state) \
-             VALUES ('codex', ?1, 'remote', ?1, 'shallow')",
-            [CHILD],
-        )
-        .unwrap();
         if remote {
             conn.execute(
-                "UPDATE session_events SET location = 'both' \
-                 WHERE session_id = ?1 AND event_uid != '5:planted'",
+                "INSERT INTO session_presences \
+                 (source, session_id, location, raw_locator, discovery_state) \
+                 VALUES ('codex', ?1, 'remote', ?1, 'shallow')",
                 [CHILD],
             )
             .unwrap();

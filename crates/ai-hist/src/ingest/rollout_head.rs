@@ -118,31 +118,40 @@ pub(super) fn open_codex_walk(
     // The window reads one byte past the limit, so a file of exactly the
     // limit is told from a longer one.
     let read = Cell::new(0u64);
+    let failed = Cell::new(None);
     let reached_end = || read.get() <= LEADING_BYTE_LIMIT;
     if let Some(bytes) = cold_read::fresh(path) {
-        let records = records_after_first(io::Cursor::new(&bytes[..]), &read);
+        let records = records_after_first(io::Cursor::new(&bytes[..]), &read, &failed);
         gate.probe_copied_history(records, reached_end);
     } else {
         // Its own handle, not the sweep's parked one: the walk's reader holds
         // that, and the probe must not take a handle parked for another file.
-        let records = records_after_first(BufReader::new(std::fs::File::open(path)?), &read);
-        gate.probe_copied_history(records, reached_end);
+        let file = BufReader::new(std::fs::File::open(path)?);
+        gate.probe_copied_history(records_after_first(file, &read, &failed), reached_end);
+    }
+    // A head the probe could not read proves nothing either way.
+    if let Some(error) = failed.take() {
+        return Err(error.into());
     }
     Ok((reader, gate, read.get()))
 }
 
 /// The complete, parseable records after the first, within one byte past
 /// [`LEADING_BYTE_LIMIT`], counting the bytes read into `read`. A read error
-/// ends them, as end of file does.
+/// ends them and is kept in `failed`.
 fn records_after_first<'a>(
     reader: impl BufRead + 'a,
     read: &'a Cell<u64>,
+    failed: &'a Cell<Option<io::Error>>,
 ) -> impl Iterator<Item = Value> + 'a {
     let mut reader = reader.take(LEADING_BYTE_LIMIT + 1);
     let mut raw = Vec::new();
     std::iter::from_fn(move || {
         raw.clear();
-        let line = reader.read_until(b'\n', &mut raw).unwrap_or(0);
+        let line = reader
+            .read_until(b'\n', &mut raw)
+            .map_err(|error| failed.set(Some(error)))
+            .ok()?;
         read.set(read.get() + line as u64);
         (line > 0 && raw.last() == Some(&b'\n')).then(|| raw.clone())
     })
