@@ -864,6 +864,7 @@ const SWEEP_PARSER_GENERATIONS: &[&str] = &[
     CLAUDE_STANDALONE_RECORDS_GENERATION,
     "codex_rollouts_v7",
     CODEX_STATE_MARKER_KEY,
+    CODEX_IMAGE_CAPTURE_KEY,
     GROK_SYNC_STATE_KEY,
     OPENCODE_NORMALIZER_GENERATION,
 ];
@@ -3269,6 +3270,8 @@ fn delegation_backfill_pending(state: &Map<String, Value>) -> bool {
 /// the key, for the same reason.
 const CODEX_STATE_MARKER_GENERATION: i64 = 1;
 const CODEX_STATE_MARKER_KEY: &str = "codex_state_markers_v1";
+/// Force one reread even for marker-only recordings with no old events.
+const CODEX_IMAGE_CAPTURE_KEY: &str = "codex_image_capture_v1";
 
 /// Whether the rollout behind a stamp-map record was last read by a parser
 /// older than the state-marker generation.
@@ -3278,6 +3281,11 @@ const CODEX_STATE_MARKER_KEY: &str = "codex_state_markers_v1";
 /// `usage_snapshot`, a marker observed only remotely says nothing about the
 /// local file, and either would make a marker probe re-read the rollout on
 /// every sync for as long as the backfill stays open.
+fn rollout_owes_capture(record: Option<&Map<String, Value>>, state_markers_pending: bool) -> bool {
+    (state_markers_pending && rollout_owes_state_markers(record))
+        || !record.is_some_and(|r| r.contains_key(CODEX_IMAGE_CAPTURE_KEY))
+}
+
 fn rollout_owes_state_markers(record: Option<&Map<String, Value>>) -> bool {
     record
         .and_then(|r| r.get("state_markers"))
@@ -4873,7 +4881,7 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                             && crate::continuity::codex_evidence_names_fork(conn, &key)? => {}
                     // Indexed before its state records were stored: re-read
                     // once so its counters and turn settings are captured.
-                    Some(_) if backfill_state_markers && rollout_owes_state_markers(record) => {}
+                    Some(_) if rollout_owes_capture(record, backfill_state_markers) => {}
                     Some(id)
                         if codex_session_evidence_exists(conn, id)?
                             && !(backfill_fidelity
@@ -5055,6 +5063,7 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                     "session": meta.session_id,
                     "subagent": meta.is_subagent,
                     "state_markers": CODEX_STATE_MARKER_GENERATION,
+                    CODEX_IMAGE_CAPTURE_KEY: true,
                 }),
             );
         }
@@ -6245,10 +6254,7 @@ fn ingest_codex_rollout_incremental(
             unwritten_line = None;
         }
         if let codex::HumanMessageOutcome::Stored(message) = human_outcome {
-            let suffix = match message.format {
-                codex::HumanMessageFormat::EventMessage => "user_message",
-                codex::HumanMessageFormat::ResponseItem => "response_item_user_message",
-            };
+            let suffix = codex::human_message_suffix(message.format);
             let uid = format!("{index}:{suffix}");
             let message_id = message.message_id.as_deref().unwrap_or(uid.as_str());
             insert_session_event(
@@ -31849,7 +31855,8 @@ mod tests {
                 (key): {
                     "stamp": file_stamp(&rollout).unwrap(),
                     "session": "sess-unchanged-sub",
-                    "subagent": true
+                    "subagent": true,
+                    (CODEX_IMAGE_CAPTURE_KEY): true
                 }
             }),
         );
@@ -31910,7 +31917,8 @@ mod tests {
                 rollout.to_string_lossy().to_string(): {
                     "stamp": file_stamp(rollout).unwrap(),
                     "session": session_id,
-                    "subagent": true
+                    "subagent": true,
+                    (CODEX_IMAGE_CAPTURE_KEY): true
                 }
             }),
         );
@@ -37506,6 +37514,56 @@ mod codex_fork_replay_tests {
     /// A rollout an older build indexed has an unchanged stamp, so only the
     /// one-time backfill re-reads it for its state markers. Once recorded,
     /// the backfill is spent.
+    #[test]
+    fn marker_only_unchanged_rollout_backfills_images_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        let path = day.join("rollout-images.jsonl");
+        fs::write(&path, [
+            line("2026-04-20T00:00:00.000Z", "session_meta", json!({"id": PARENT, "cwd": "/tmp/project"})),
+            line("2026-04-20T00:00:01.000Z", "response_item", json!({"type":"message","role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="}]})),
+            line("2026-04-20T00:00:03.000Z", "event_msg", json!({"type":"task_complete"})),
+        ].concat()).unwrap();
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        let root = dir.path().join(".codex");
+        sync_codex(&conn, &mut state, &root).unwrap();
+        conn.execute("DELETE FROM session_events", []).unwrap();
+        // Earlier parsers kept only the unknown image-line marker.
+        conn.execute("INSERT OR IGNORE INTO session_markers(source,session_id,marker_uid,kind,ts_ms) VALUES ('codex',?1,'1:marker','unknown',1000)", [PARENT]).unwrap();
+        for record in state
+            .get_mut("codex_rollouts_v7")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+        {
+            record
+                .as_object_mut()
+                .unwrap()
+                .remove(CODEX_IMAGE_CAPTURE_KEY);
+        }
+        sync_codex(&conn, &mut state, &root).unwrap();
+        assert_eq!(
+            conn.query_row(
+                "SELECT count(*) FROM session_events WHERE raw_kind='input_image'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+        conn.execute("DELETE FROM session_events", []).unwrap();
+        sync_codex(&conn, &mut state, &root).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM session_events", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+    }
+
     #[test]
     fn an_unchanged_rollout_is_re_read_once_for_its_state_markers() {
         let dir = tempfile::tempdir().unwrap();

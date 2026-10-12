@@ -54,19 +54,26 @@ pub(super) fn capture_codex(
         return Ok(0);
     }
     let message = codex::user_message(value);
-    let mirrored_id = if let Some(message) = &message {
+    let mirrored = if let Some(message) = &message {
         conn.query_row(
-            "SELECT message_id FROM session_events WHERE source='codex' AND session_id=?1 AND event_uid=?2 AND text=?3",
+            "SELECT message_id, ts_ms FROM session_events WHERE source='codex' AND session_id=?1 AND event_uid=?2 AND text=?3",
             params![session_id, format!("{}:user_message", index.saturating_sub(1)), message.text],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
         ).optional()?
     } else {
         None
     };
     // All blocks belong to the same human message, including a response-item
     // mirror whose event_msg already supplied the prompt row.
-    let message_id = mirrored_id
-        .or_else(|| value["payload"]["id"].as_str().map(str::to_string))
+    let ts_ms = mirrored.as_ref().map_or(ts_ms, |(_, ts)| *ts);
+    let message_id = mirrored
+        .map(|(id, _)| id)
+        .or_else(|| {
+            value["payload"]["id"]
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+        })
         .unwrap_or_else(|| format!("{index}:response_item_user_message"));
     let mut captured = 0;
     for (part_index, part) in parts.iter().enumerate() {
@@ -113,6 +120,20 @@ mod tests {
     use super::*;
 
     #[test]
+    fn empty_native_ids_use_the_prompt_fallback_identity() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::init_db(&conn).unwrap();
+        let value = json!({"type":"response_item","payload":{"type":"message","role":"user","id":"","content":[{"type":"input_text","text":"Look"},{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="}]}});
+        capture_codex(&conn, "s", None, None, 4, 101, None, &value).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT message_id FROM session_events", [], |r| r
+                .get::<_, String>(0))
+                .unwrap(),
+            "4:response_item_user_message"
+        );
+    }
+
+    #[test]
     fn copies_only_bounded_embedded_raster_bytes() {
         let png = "data:image/png;base64,iVBORw0KGgo=";
         assert_eq!(
@@ -153,7 +174,7 @@ mod tests {
         .unwrap();
         let value = json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Look at this"},{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="}]}});
         for _ in 0..2 {
-            capture_codex(&conn, "s", None, None, 4, 100, None, &value).unwrap();
+            capture_codex(&conn, "s", None, None, 4, 101, None, &value).unwrap();
         }
         assert_eq!(
             conn.query_row(
@@ -165,6 +186,15 @@ mod tests {
             "human-message"
         );
         assert_eq!(conn.query_row("SELECT count(*) FROM session_events WHERE raw_kind='input_image' AND text='![Attached image](data:image/png;base64,iVBORw0KGgo=)'", [], |r| r.get::<_,i64>(0)).unwrap(), 1);
+        assert_eq!(
+            conn.query_row(
+                "SELECT ts_ms FROM session_events WHERE raw_kind='input_image'",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            100
+        );
         assert_eq!(
             conn.query_row("SELECT count(*) FROM history", [], |r| r.get::<_, i64>(0))
                 .unwrap(),

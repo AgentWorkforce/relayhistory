@@ -25,6 +25,7 @@ name = "ai-hist"
 version = "0.42.0"
 dependencies = [
  "anyhow",
+ "base64",
  "chrono",
  "fs2",
  "libc",

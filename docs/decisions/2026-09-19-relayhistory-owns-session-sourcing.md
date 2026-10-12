@@ -501,3 +501,19 @@ Generated from provider-owned acquisition records; these cells describe fixture-
 | hermes | Messages and tools | SQLite schema 31 native rows, tool IDs/results and reasoning; profile identity namespaced. |
 | hermes | Usage and relationships | Session totals are not request usage. Parent native identity retained as metadata; no delegation or native resume advertised. Legacy JSONL unsupported. |
 <!-- END GENERATED PROVIDER CAPTURE -->
+
+### Embedded Codex image evidence
+
+An image attached to a prompt is session evidence even when the prompt has no
+text. Capture only raster bytes embedded by the harness, capped at 1 MiB per
+image, as self-contained Markdown blocks sharing the native message identity.
+Images remain outside prompt-history text and usage-attribution keys.
+
+Following local file paths or downloading remote URLs was rejected: later sync
+cannot establish that those bytes are the bytes the model originally received,
+and a transcript must not authorize filesystem or network reads. Dropping all
+images was rejected because it loses the evidence needed to understand an
+image-only turn. Unsupported or oversized references become explicit unavailable
+blocks. Copies increase database and upload size; replay therefore needs bounded
+pages that preserve whole supported images. This policy validates raster headers
+and size, not image semantics or visual redaction.

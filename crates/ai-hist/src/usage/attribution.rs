@@ -210,7 +210,11 @@ fn usage_message(id: &str, rows: &[&SessionEvent], source: &str) -> Option<Usage
     // equal to the `history` prompt the row was stored beside.
     let text = rows
         .iter()
-        .filter(|r| r.kind == "text" && r.control_kind.is_none())
+        .filter(|r| {
+            r.kind == "text"
+                && r.control_kind.is_none()
+                && r.raw_kind.as_deref() != Some("input_image")
+        })
         .filter_map(|r| r.text.as_deref())
         .map(str::trim)
         .filter(|text| !text.is_empty())
