@@ -4912,7 +4912,9 @@ fn discover_sessions_with_worker_limit(
             crate::ingest::check_capture_cancelled()?;
             emitted_sessions.insert((row.source.clone(), row.session_id.clone()));
             emitted += 1;
+            let changes_before = conn.total_changes();
             on_row(&row);
+            observed_stamps::after_emit(conn, changes_before);
         }
         // The final callback can stop the pass with no next row to check.
         crate::ingest::check_capture_cancelled()?;

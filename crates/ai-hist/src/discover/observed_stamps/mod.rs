@@ -17,8 +17,10 @@
 //! A stamp this pass writes or deletes is removed from the read. The next
 //! candidate for that session or locator asks the database, which sees the
 //! write, instead of answering "unchanged" from the value the pass replaced.
-//! A rollback drops the read: it may have observed rows the rollback undid.
-//! Same-connection commits do not.
+//! A row callback that writes through this connection drops the whole read:
+//! `data_version` does not move for that write, and the callback does not
+//! name the keys it changed. A rollback drops the read for the same reason.
+//! This connection's own commit does not.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
@@ -201,6 +203,10 @@ fn configured_window() -> usize {
 pub(super) fn on_rollback(conn: &Connection) {
     #[cfg(test)]
     ROLLBACKS.with(|rolls| rolls.set(rolls.get() + 1));
+    clear_conn(conn);
+}
+
+fn clear_conn(conn: &Connection) {
     let id = conn_id(conn);
     STACK.with(|stack| {
         for memo in stack.borrow_mut().iter_mut() {
@@ -210,6 +216,16 @@ pub(super) fn on_rollback(conn: &Connection) {
             }
         }
     });
+}
+
+/// `on_row` runs after the window commits. A write it makes on this
+/// connection does not move `data_version`, so the next candidate would
+/// skip on the pre-write stamp. Drop the read when the change count moved.
+/// Discovery's own writes are already in `changes_before`.
+pub(super) fn after_emit(conn: &Connection, changes_before: u64) {
+    if conn.total_changes() != changes_before {
+        clear_conn(conn);
+    }
 }
 
 /// This pass upserted or deleted `session_id`'s observation. The cached stamp
@@ -1006,6 +1022,89 @@ mod tests {
                 .unwrap();
             assert_eq!(stamp, v("old"), "named={named}");
         }
+    }
+
+    struct Two {
+        reads: AtomicUsize,
+    }
+
+    impl ShallowSessionProvider for Two {
+        fn source(&self) -> &'static str {
+            "claude"
+        }
+
+        fn enumerate(
+            &self,
+            _env: &DiscoveryEnv<'_>,
+            _requested_limit: Option<usize>,
+        ) -> Result<Vec<Candidate>> {
+            Ok(vec![
+                Candidate {
+                    source: "claude",
+                    locator: "/t/a.jsonl".to_string(),
+                    session_id: Some("a".to_string()),
+                    recency_hint_ms: Some(2),
+                    stamp: "old".to_string(),
+                },
+                Candidate {
+                    source: "claude",
+                    locator: "/t/b.jsonl".to_string(),
+                    session_id: Some("b".to_string()),
+                    recency_hint_ms: Some(1),
+                    stamp: "old".to_string(),
+                },
+            ])
+        }
+
+        fn read_shallow(
+            &self,
+            _scan: &ScanEnv<'_>,
+            _catalog: Option<&Connection>,
+            candidate: &Candidate,
+        ) -> Result<Option<ShallowSession>> {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            Ok(Some(ShallowSession {
+                source: "claude".to_string(),
+                session_id: candidate.session_id.clone().unwrap_or_default(),
+                raw_path: Some(candidate.locator.clone()),
+                discovery_state: "shallow".to_string(),
+                ..Default::default()
+            }))
+        }
+    }
+
+    #[test]
+    fn observed_stamp_a_callback_write_is_not_served_unchanged() {
+        let _reset = Reset::arm();
+        WINDOW.with(|window| window.set(1));
+        let home = tempfile::tempdir().unwrap();
+        let conn = memory();
+        insert_obs(&conn, "a", "/t/a.jsonl", &v("old"), true);
+        insert_obs(&conn, "b", "/t/b.jsonl", &v("old"), true);
+        let env = claude_env(&conn, home.path());
+        let provider = Two {
+            reads: AtomicUsize::new(0),
+        };
+        let providers: [&dyn ShallowSessionProvider; 1] = [&provider];
+        let summary = discover_sessions_with_worker_limit(
+            &env,
+            &DiscoverOptions::default(),
+            &providers,
+            |row| {
+                if row.session_id == "a" {
+                    conn.execute(
+                        "UPDATE session_observations SET source_stamp=?1 WHERE session_id='b'",
+                        [v("rewritten")],
+                    )
+                    .unwrap();
+                }
+            },
+            1,
+            IdentityRefresh::Streamed,
+        )
+        .unwrap();
+        assert_eq!(summary.skipped_unchanged, 1);
+        assert_eq!(provider.reads.load(Ordering::Relaxed), 1);
     }
 
     struct BadId;

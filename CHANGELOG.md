@@ -8,7 +8,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- A full discovery pass reads each adapter's observed stamps once. A path-scoped pass, and a pass that stops before the last candidate, still ask per file.
+- A full discovery pass reads each adapter's observed stamps once. A path-scoped pass, and a pass that stops before the last candidate, still ask per file. A row callback that writes on this connection drops that read.
 
 ## [0.42.0] - 2026-10-12
 
