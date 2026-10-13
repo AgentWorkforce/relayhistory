@@ -212,7 +212,7 @@ export interface SourceConnectorOptions {
   signal?: AbortSignal;
   /** Omit for provider-only defaults; [] disables remote acquisition. Local scope
    * never probes remote connectors. Commercial connectors require explicit IDs.
-   * Built-ins: claude-web, codex-cloud, cloud. */
+   * Built-ins: claude-web, codex-cloud, devin-cloud, cloud. */
   sourceConnectors?: string[];
 }
 

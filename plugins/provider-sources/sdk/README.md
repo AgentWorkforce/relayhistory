@@ -2,7 +2,8 @@
 
 `npm install ai-hist @relayhistory/provider-sources`
 
-This optional package registers `claude-web` and `codex-cloud` source adapters.
+This optional package registers `claude-web`, `codex-cloud` and `devin-cloud`
+source adapters.
 It uses the provider CLI's existing sign-in only when an acquisition is selected.
 Installation and registration do not probe credentials. Local operations remain
 in the local SDK and do not invoke these adapters.

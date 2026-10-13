@@ -260,14 +260,15 @@ pub(super) fn claude_api_base_url() -> String {
 
 /// Reject a plaintext listing endpoint. Loopback is exempt so a local mock
 /// (or proxy) works without ceremony — the same posture `cloud.rs` takes for
-/// `wrangler dev`.
+/// `wrangler dev`. Shared by every remote connector that sends a provider
+/// credential.
 pub(super) fn require_https_or_loopback(base_url: &str) -> Result<()> {
     if base_url.starts_with("https://") {
         return Ok(());
     }
     let rest = base_url
         .strip_prefix("http://")
-        .with_context(|| format!("claude.ai base URL must be http(s), got {base_url}"))?;
+        .with_context(|| format!("provider base URL must be http(s), got {base_url}"))?;
     let authority = rest.split('/').next().unwrap_or_default();
     let host_port = authority.rsplit('@').next().unwrap_or_default();
     // A bracketed IPv6 authority keeps its colons inside the brackets, so the
@@ -278,7 +279,7 @@ pub(super) fn require_https_or_loopback(base_url: &str) -> Result<()> {
     };
     anyhow::ensure!(
         matches!(host, "localhost" | "127.0.0.1" | "::1"),
-        "refusing to send the claude.ai OAuth token over plain http:// to {base_url}; use an https:// endpoint (plain http is accepted only for loopback)"
+        "refusing to send a provider credential over plain http:// to {base_url}; use an https:// endpoint (plain http is accepted only for loopback)"
     );
     Ok(())
 }
@@ -514,7 +515,7 @@ impl ShallowSessionProvider for ClaudeWebProvider {
     }
 }
 
-fn urlencode(raw: &str) -> String {
+pub(super) fn urlencode(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for byte in raw.bytes() {
         match byte {

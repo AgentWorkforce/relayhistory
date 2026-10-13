@@ -42,6 +42,7 @@ fn validate_request(request: &Request) -> Result<()> {
     let source = match connector {
         crate::remote::CLAUDE_WEB_CONNECTOR => "claude",
         crate::remote::CODEX_CLOUD_CONNECTOR => "codex",
+        crate::remote::DEVIN_CLOUD_CONNECTOR => "devin",
         _ => anyhow::bail!("unknown source connector"),
     };
     let instance = args.connector_instance.as_deref().unwrap_or("default");
