@@ -179,7 +179,7 @@ fn saved_unified_cursor(
         .and_then(|state| state.get("row_shape"))
         .and_then(Value::as_i64)
         == Some(GROK_UNIFIED_ROW_SHAPE);
-    current.then(|| cursor.file.as_ref()).flatten()
+    current.then_some(cursor.file.as_ref()).flatten()
 }
 
 /// Copies one unified-log usage row into `grok_unified_usage`; the rows it
