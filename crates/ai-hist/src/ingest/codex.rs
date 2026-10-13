@@ -125,6 +125,24 @@ pub(crate) fn assistant_message(value: &Value) -> Option<AssistantMessage> {
 
 pub(crate) fn is_control_context(prompt: &str) -> bool {
     let value = prompt.trim_start();
+    if let Some(tag) = value
+        .strip_prefix("<external_")
+        .and_then(|s| s.split_once('>').map(|p| p.0))
+    {
+        if !tag.is_empty()
+            && tag
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            let close = format!("</external_{tag}>");
+            if value
+                .split_once(&close)
+                .is_some_and(|(_, rest)| rest.trim().is_empty())
+            {
+                return true;
+            }
+        }
+    }
     [
         "<environment_context",
         "<permissions instructions",
@@ -658,6 +676,14 @@ impl CopiedHistoryProbe {
     }
 }
 
+/// Stable event suffix for each native representation.
+pub(super) fn human_message_suffix(format: HumanMessageFormat) -> &'static str {
+    match format {
+        HumanMessageFormat::EventMessage => "user_message",
+        HumanMessageFormat::ResponseItem => "response_item_user_message",
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1019,6 +1045,20 @@ mod tests {
             human_message(&current).unwrap().message_id.as_deref(),
             Some("msg_1")
         );
+    }
+
+    #[test]
+    fn external_app_context_is_not_a_human_prompt() {
+        assert!(!is_control_context("<external_>text</external_>"));
+        assert!(is_control_context(
+            "<external_codex_apps_open_page>{\"page_id\":null}</external_codex_apps_open_page>"
+        ));
+        assert!(!is_control_context(
+            "Explain <external_codex_apps_open_page> metadata"
+        ));
+        assert!(!is_control_context(
+            "<external_codex_apps_open_page>{}</external_codex_apps_open_page>\nFix tests"
+        ));
     }
 
     #[test]

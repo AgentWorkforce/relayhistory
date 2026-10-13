@@ -1214,6 +1214,40 @@ mod tests {
         );
     }
 
+    #[test]
+    fn image_blocks_do_not_change_prompt_usage_identity() {
+        let prompt = user_event("prompt", 100, "Explain this");
+        let mut image = user_event(
+            "prompt",
+            100,
+            "![Attached image](data:image/png;base64,iVBORw0KGgo=)",
+        );
+        image.raw_kind = Some("input_image".into());
+        let answer = assistant_event(
+            "answer",
+            Some("prompt"),
+            200,
+            r#"{"input_tokens":10,"output_tokens":2}"#,
+        );
+        let attributed =
+            attribute_usage_to_prompts(&[prompt.clone(), image.clone(), answer.clone()], "codex");
+        assert!(attributed.contains_key(&(100, "Explain this".into())));
+        let mut parentless = answer.clone();
+        parentless.parent_id = None;
+        let attributed =
+            attribute_usage_to_prompts(&[prompt.clone(), image.clone(), parentless], "codex");
+        assert!(
+            attributed.contains_key(&(100, "Explain this".into())),
+            "native Codex records have no parent ID"
+        );
+        // An image-only message remains a user boundary but is never a fake prompt.
+        image.message_id = Some("image-only".into());
+        image.ts_ms = 150;
+        let mut next = answer;
+        next.parent_id = Some("image-only".into());
+        assert!(attribute_usage_to_prompts(&[prompt, image, next], "codex").is_empty());
+    }
+
     fn session_event(
         message_id: &str,
         parent_id: Option<&str>,

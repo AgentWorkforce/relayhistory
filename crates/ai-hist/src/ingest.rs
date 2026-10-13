@@ -36,6 +36,7 @@ pub(crate) mod grok;
 mod grok_unified;
 pub(crate) mod hook;
 pub(crate) mod hydrate;
+mod images;
 pub(crate) mod incremental;
 pub(crate) mod jsonl;
 pub(crate) mod muse;
@@ -863,6 +864,7 @@ const SWEEP_PARSER_GENERATIONS: &[&str] = &[
     CLAUDE_STANDALONE_RECORDS_GENERATION,
     "codex_rollouts_v7",
     CODEX_STATE_MARKER_KEY,
+    CODEX_IMAGE_CAPTURE_KEY,
     GROK_SYNC_STATE_KEY,
     OPENCODE_NORMALIZER_GENERATION,
 ];
@@ -3211,7 +3213,7 @@ fn record_fidelity_backfill(state: &mut Map<String, Value>, key: &str) {
 /// repairing the rows the bump was for — a change that reads as done and does
 /// nothing, for exactly the installs that needed it.
 /// `the_raw_facts_version_and_generation_are_bumped_together` is the guard.
-const RAW_MESSAGE_FACTS_GENERATION: i64 = 4;
+const RAW_MESSAGE_FACTS_GENERATION: i64 = 5;
 const CLAUDE_RAW_MESSAGE_FACTS_KEY: &str = "claude_raw_message_facts";
 
 /// One-time pass over indexed Claude transcripts for what earlier parsers
@@ -3268,22 +3270,8 @@ fn delegation_backfill_pending(state: &Map<String, Value>) -> bool {
 /// the key, for the same reason.
 const CODEX_STATE_MARKER_GENERATION: i64 = 1;
 const CODEX_STATE_MARKER_KEY: &str = "codex_state_markers_v1";
-
-/// Whether the rollout behind a stamp-map record was last read by a parser
-/// older than the state-marker generation.
-///
-/// Recorded on the rollout's own stamp record, not inferred from the markers
-/// a session holds: a rollout with no `token_count` legitimately has no
-/// `usage_snapshot`, a marker observed only remotely says nothing about the
-/// local file, and either would make a marker probe re-read the rollout on
-/// every sync for as long as the backfill stays open.
-fn rollout_owes_state_markers(record: Option<&Map<String, Value>>) -> bool {
-    record
-        .and_then(|r| r.get("state_markers"))
-        .and_then(Value::as_i64)
-        .unwrap_or(0)
-        < CODEX_STATE_MARKER_GENERATION
-}
+/// Force one reread even for marker-only recordings with no old events.
+const CODEX_IMAGE_CAPTURE_KEY: &str = "codex_image_capture_v1";
 
 /// Whether this provider still owes a one-time raw-facts backfill pass.
 fn raw_facts_backfill_pending(state: &Map<String, Value>, key: &str) -> bool {
@@ -4872,7 +4860,7 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                             && crate::continuity::codex_evidence_names_fork(conn, &key)? => {}
                     // Indexed before its state records were stored: re-read
                     // once so its counters and turn settings are captured.
-                    Some(_) if backfill_state_markers && rollout_owes_state_markers(record) => {}
+                    Some(_) if images::rollout_owes_capture(record, backfill_state_markers) => {}
                     Some(id)
                         if codex_session_evidence_exists(conn, id)?
                             && !(backfill_fidelity
@@ -5054,6 +5042,7 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
                     "session": meta.session_id,
                     "subagent": meta.is_subagent,
                     "state_markers": CODEX_STATE_MARKER_GENERATION,
+                    CODEX_IMAGE_CAPTURE_KEY: true,
                 }),
             );
         }
@@ -6226,6 +6215,8 @@ fn ingest_codex_rollout_incremental(
                 },
             )?;
         }
+        outcome.events +=
+            images::capture_rollout(conn, meta, &value, (index, ts_ms, turn_id.as_deref()))?;
         let human_outcome = human_messages.observe(&value);
         if human_outcome == codex::HumanMessageOutcome::Suppressed {
             // The mirrored encoding of the turn just stored. Its twin wrote
@@ -6234,10 +6225,7 @@ fn ingest_codex_rollout_incremental(
             unwritten_line = None;
         }
         if let codex::HumanMessageOutcome::Stored(message) = human_outcome {
-            let suffix = match message.format {
-                codex::HumanMessageFormat::EventMessage => "user_message",
-                codex::HumanMessageFormat::ResponseItem => "response_item_user_message",
-            };
+            let suffix = codex::human_message_suffix(message.format);
             let uid = format!("{index}:{suffix}");
             let message_id = message.message_id.as_deref().unwrap_or(uid.as_str());
             insert_session_event(
@@ -11082,7 +11070,7 @@ fn heal_claude_synthetic_session_summaries(conn: &Connection) -> Result<()> {
 /// Generation 4 is the one capture re-read of the release after 0.36.0: a row
 /// stamped below it predates evidence that release's parsers store, and a
 /// finished transcript never changes on disk, so only this re-read stores it.
-const RAW_MESSAGE_FACTS_VERSION: i64 = 4;
+const RAW_MESSAGE_FACTS_VERSION: i64 = 5;
 
 #[derive(Debug, Default, Clone, Copy)]
 struct RawMessageFacts<'a> {
@@ -29101,22 +29089,8 @@ mod tests {
         );
     }
 
-    /// The exception list's own failure mode, which I flagged as the risk when
-    /// I added it and then still got wrong: `response_item/message` was
-    /// exempted unconditionally on the grounds that the deduplicator stores
-    /// one row for Codex's two representations of a turn. It does — but only
-    /// when it accepts the message. A user message whose content carries no
-    /// `input_text` part (an image-only turn) is rejected, nothing is written,
-    /// and the blanket exemption then swallowed the line.
-    ///
-    /// The same holds for a blank `user_message`: the deduplicator refuses
-    /// it. An application-injected control wrapper is different since #180:
-    /// it is stored as a `codex_context_wrapper` event, so it earns no
-    /// marker.
-    ///
-    /// The exemption now has to be earned: it holds for a mirrored duplicate,
-    /// whose twin really did write, and not for a message the deduplicator
-    /// simply refused.
+    /// Image-only turns produce image events even though the text deduper has
+    /// no prompt to store. Blank turns still leave an unknown marker.
     #[test]
     fn a_codex_message_the_deduplicator_rejects_is_still_recorded() {
         let dir = tempfile::tempdir().unwrap();
@@ -29129,9 +29103,8 @@ mod tests {
             concat!(
                 r#"{"timestamp":"2026-09-13T00:00:00.000Z","type":"session_meta","payload":{"id":"sess-image","cwd":"/tmp/proj","cli_version":"0.148.0"}}"#, "\n",
                 r#"{"timestamp":"2026-09-13T00:00:00.100Z","type":"turn_context","payload":{"turn_id":"t1","cwd":"/tmp/proj","model":"gpt-5.4"}}"#, "\n",
-                // Image-only user turn: no `input_text` part, so the
-                // deduplicator rejects it and nothing stores it.
-                r#"{"timestamp":"2026-09-13T00:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,AAAA"}]}}"#, "\n",
+                // Image-only user turn: capture copies it independently of text deduplication.
+                r#"{"timestamp":"2026-09-13T00:00:01.000Z","type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII="}]}}"#, "\n",
                 // Blank text: refused, so nothing stores it either. The
                 // control wrapper after it is stored, typed.
                 r#"{"timestamp":"2026-09-13T00:00:02.000Z","type":"event_msg","payload":{"type":"user_message","message":"   "}}"#, "\n",
@@ -29156,11 +29129,11 @@ mod tests {
             .unwrap();
         assert_eq!(
             events,
-            vec![(
+            vec![("![Attached image](data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+A8AAQUBAScY42YAAAAASUVORK5CYII=)".to_string(), None), (
                 "<environment_context>cwd=/tmp/proj</environment_context>".to_string(),
                 Some("codex_context_wrapper".to_string())
             )],
-            "the image-only turn reaches no event; the wrapper is a typed row"
+            "the image is copied and the wrapper is a typed context row"
         );
 
         let markers = markers_of(&conn, "codex", "sess-image");
@@ -29171,7 +29144,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 ("turn_context", "turn_context"),
-                ("unknown", "message"),
                 ("unknown", "user_message")
             ],
             "every user line nothing stored must leave a row: {markers:?}"
@@ -31854,7 +31826,8 @@ mod tests {
                 (key): {
                     "stamp": file_stamp(&rollout).unwrap(),
                     "session": "sess-unchanged-sub",
-                    "subagent": true
+                    "subagent": true,
+                    (CODEX_IMAGE_CAPTURE_KEY): true
                 }
             }),
         );
@@ -31915,7 +31888,8 @@ mod tests {
                 rollout.to_string_lossy().to_string(): {
                     "stamp": file_stamp(rollout).unwrap(),
                     "session": session_id,
-                    "subagent": true
+                    "subagent": true,
+                    (CODEX_IMAGE_CAPTURE_KEY): true
                 }
             }),
         );
@@ -37511,6 +37485,76 @@ mod codex_fork_replay_tests {
     /// A rollout an older build indexed has an unchanged stamp, so only the
     /// one-time backfill re-reads it for its state markers. Once recorded,
     /// the backfill is spent.
+    #[test]
+    fn marker_only_unchanged_rollout_backfills_images_once() {
+        for location in ["local", "both", "remote"] {
+            let dir = tempfile::tempdir().unwrap();
+            let day = dir.path().join(".codex/sessions/2026/04/20");
+            fs::create_dir_all(&day).unwrap();
+            let path = day.join("rollout-images.jsonl");
+            fs::write(&path, [
+                line("2026-04-20T00:00:00.000Z", "session_meta", json!({"id": PARENT, "cwd": "/tmp/project"})),
+                line("2026-04-20T00:00:01.000Z", "response_item", json!({"type":"message","role":"user","content":[{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="}]})),
+                line("2026-04-20T00:00:03.000Z", "event_msg", json!({"type":"task_complete"})),
+            ].concat()).unwrap();
+            let conn = open_db(&dir.path().join("history.db")).unwrap();
+            let mut state = Map::new();
+            let root = dir.path().join(".codex");
+            sync_codex(&conn, &mut state, &root).unwrap();
+            conn.execute("DELETE FROM session_events", []).unwrap();
+            // Earlier parsers kept only the unknown image-line marker.
+            conn.execute("INSERT OR IGNORE INTO session_markers(source,session_id,marker_uid,kind,ts_ms) VALUES ('codex',?1,'1:marker','unknown',1000)", [PARENT]).unwrap();
+            conn.execute("UPDATE session_markers SET location=?1 WHERE source='codex' AND session_id=?2 AND marker_uid='1:marker'", params![location, PARENT]).unwrap();
+            conn.execute("INSERT INTO session_markers(source,session_id,marker_uid,kind,ts_ms) VALUES ('codex',?1,'other:marker','unknown',1000)", [PARENT]).unwrap();
+            for record in state
+                .get_mut("codex_rollouts_v7")
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .values_mut()
+            {
+                record
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(CODEX_IMAGE_CAPTURE_KEY);
+            }
+            sync_codex(&conn, &mut state, &root).unwrap();
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM session_events WHERE raw_kind='input_image'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                1
+            );
+            let remaining: Option<String> = conn.query_row("SELECT location FROM session_markers WHERE source='codex' AND session_id=?1 AND marker_uid='1:marker' AND kind='unknown'", [PARENT], |r| r.get(0)).optional().unwrap();
+            assert_eq!(
+                remaining.as_deref(),
+                (location != "local").then_some("remote"),
+                "only the obsolete local share is retired"
+            );
+            assert_eq!(
+                conn.query_row(
+                    "SELECT count(*) FROM session_markers WHERE marker_uid='other:marker'",
+                    [],
+                    |r| r.get::<_, i64>(0)
+                )
+                .unwrap(),
+                1,
+                "unrelated unknown markers survive"
+            );
+            conn.execute("DELETE FROM session_events", []).unwrap();
+            sync_codex(&conn, &mut state, &root).unwrap();
+            assert_eq!(
+                conn.query_row("SELECT count(*) FROM session_events", [], |r| r
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                0
+            );
+        }
+    }
+
     #[test]
     fn an_unchanged_rollout_is_re_read_once_for_its_state_markers() {
         let dir = tempfile::tempdir().unwrap();

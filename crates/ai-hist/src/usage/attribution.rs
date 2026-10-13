@@ -145,6 +145,16 @@ pub fn attribute_usage_to_prompts(
         .iter()
         .filter(|e| e.role == "user" && e.control_kind.is_none() && e.is_sidechain != Some(1))
         .collect();
+    // Several content blocks share one native human message. Collapse only
+    // identified blocks at the same timestamp; independent same-time messages
+    // and unidentified records remain separate ambiguous boundaries.
+    let mut boundary_records = HashSet::new();
+    boundaries.retain(
+        |e| match e.message_id.as_deref().filter(|id| !id.is_empty()) {
+            Some(id) => boundary_records.insert((e.ts_ms, id)),
+            None => true,
+        },
+    );
     boundaries.sort_by_key(|e| e.ts_ms);
     // Parsers use zero when time is missing. Such a turn could fall anywhere,
     // so timestamp-only ownership is unsafe for the session.
@@ -210,7 +220,11 @@ fn usage_message(id: &str, rows: &[&SessionEvent], source: &str) -> Option<Usage
     // equal to the `history` prompt the row was stored beside.
     let text = rows
         .iter()
-        .filter(|r| r.kind == "text" && r.control_kind.is_none())
+        .filter(|r| {
+            r.kind == "text"
+                && r.control_kind.is_none()
+                && r.raw_kind.as_deref() != Some("input_image")
+        })
         .filter_map(|r| r.text.as_deref())
         .map(str::trim)
         .filter(|text| !text.is_empty())

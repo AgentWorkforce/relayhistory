@@ -135,6 +135,7 @@ deletes what an earlier release stored for them.
 | `session_events` — `thinking`                                      | ✓      | ✓     | —      | ✓    | ◐    | ✓        | ✓     | [#166](https://github.com/AgentWorkforce/relayhistory/issues/166) / [#167](https://github.com/AgentWorkforce/relayhistory/issues/167) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                     |
 | `session_events` — `tool_use`                                      | ✓      | ✓     | ✓      | ✓    | ✓    | ✓        | ✓     | [#166](https://github.com/AgentWorkforce/relayhistory/issues/166) / [#167](https://github.com/AgentWorkforce/relayhistory/issues/167) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                     |
 | `session_events` — `tool_result`                                   | ✓      | ✓     | —      | ✓    | ✓    | ✓        | ✓     | [#166](https://github.com/AgentWorkforce/relayhistory/issues/166) / [#167](https://github.com/AgentWorkforce/relayhistory/issues/167) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                     |
+| Embedded image copies (`raw_kind = input_image`, self-contained Markdown text; up to 1 MiB) | — | ✓ | — | — | — | — | — | Codex response-item image bytes; local paths and remote URLs are never followed |
 | Model, per event                                                   | ✓      | ✓     | —      | ✓    | ✓    | ✓        | ✓     | [#166](https://github.com/AgentWorkforce/relayhistory/issues/166) / [#167](https://github.com/AgentWorkforce/relayhistory/issues/167) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                     |
 | Token usage                                                        | ✓      | ◐     | —      | ✓    | ✓    | ✓        | ◐     | [#172](https://github.com/AgentWorkforce/relayhistory/issues/172) (supersedes #99) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168) / grok: [#212](https://github.com/AgentWorkforce/relayhistory/issues/212)                                              |
 | Token usage — each streamed record verbatim                        | ✓      | —     | —      | —    | —    | —        | —     | `session_events.record_token_json`; other sources store usage once per record                                                                                                                                                                                                 | 
@@ -496,3 +497,19 @@ Generated from provider-owned acquisition records; these cells describe fixture-
 | hermes | Messages and tools | SQLite schema 31 native rows, tool IDs/results and reasoning; profile identity namespaced. |
 | hermes | Usage and relationships | Session totals are not request usage. Parent native identity retained as metadata; no delegation or native resume advertised. Legacy JSONL unsupported. |
 <!-- END GENERATED PROVIDER CAPTURE -->
+
+### Embedded Codex image evidence
+
+An image attached to a prompt is session evidence even when the prompt has no
+text. Capture only raster bytes embedded by the harness, capped at 1 MiB per
+image, as self-contained Markdown blocks sharing the native message identity.
+Images remain outside prompt-history text and usage-attribution keys.
+
+Following local file paths or downloading remote URLs was rejected: later sync
+cannot establish that those bytes are the bytes the model originally received,
+and a transcript must not authorize filesystem or network reads. Dropping all
+images was rejected because it loses the evidence needed to understand an
+image-only turn. Unsupported or oversized references become explicit unavailable
+blocks. Copies increase database and upload size; replay therefore needs bounded
+pages that preserve whole supported images. This policy validates raster headers
+and size, not image semantics or visual redaction.

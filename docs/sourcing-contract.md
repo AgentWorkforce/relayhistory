@@ -79,6 +79,15 @@ Two obligations:
 - Non-text block types must stop being dropped by the parser's `_ => {}` arms
   ([#165](https://github.com/AgentWorkforce/relayhistory/issues/165)).
 
+Codex `input_image` blocks are represented by a separate `kind = text` event
+with `raw_kind = input_image` and self-contained Markdown in `text`:
+`![Attached image](data:image/png;base64,...)`. The bytes come only from the
+recorded response item, never a path or remote URL. PNG, JPEG, GIF and WebP
+copies are bounded to 1 MiB decoded; unsupported or larger blocks retain an
+explicit unavailable-image notice. Image events do not add prompt-history rows.
+Consumers render the image block separately from prose. Existing transcript
+checkpoints are invalidated once so older recordings gain their image copies.
+
 ## 3. Markers — `CompactionEvent` and control rows
 
 burn's `CompactionEvent` carries `ts`, `preceding_message_id` and

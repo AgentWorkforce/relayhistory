@@ -135,8 +135,8 @@ pub(crate) use change_time::{
 /// stamp map to v4. This branch retired that map, so the same one-time
 /// re-read is expressed here: a cursor is what the skip path consults now, and
 /// discarding the old ones is what makes the pass happen.
-// Version 4 replays Codex desktop replies skipped by the previous parser.
-pub(crate) const TRANSCRIPT_CURSOR_VERSION: u32 = 4;
+// Version 5 recaptures embedded Codex images omitted by earlier parsers.
+pub(crate) const TRANSCRIPT_CURSOR_VERSION: u32 = 5;
 
 /// How much of the committed region each end of the validation window covers.
 pub(crate) const PREFIX_WINDOW_BYTES: u64 = 64 * 1024;
