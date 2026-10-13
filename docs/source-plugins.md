@@ -6,7 +6,7 @@ Installing a package does not change local data sources.
 
 | Optional package | Connector IDs | Evidence |
 |---|---|---|
-| `@relayhistory/provider-sources` | `claude-web`, `codex-cloud` | Claude teleport events; Codex supported task diff |
+| `@relayhistory/provider-sources` | `claude-web`, `codex-cloud`, `devin-cloud` | Claude teleport events; Codex supported task diff; Devin org session messages |
 
 ```json
 {"plugins":[{"module":"@relayhistory/provider-sources","options":{"connectors":["claude-web"],"instanceId":"personal"}}]}
@@ -51,6 +51,8 @@ Provider limits and authentication stay in the
 [optional provider helper](../plugins/provider-sources/rust/README.md).
 Claude uses an observed private teleport interface which can change. Codex's
 supported diff does not imply a full transcript, token log or tool history.
+Devin's v3 message history carries user and assistant text only — no tool
+calls, token usage or file edits — and needs only `ViewOrgSessions`.
 Partial evidence is reported as partial capability.
 
 A plugin may also register destinations (`HistoryDestination`), separately from

@@ -2,17 +2,23 @@
 
 This standalone Cargo workspace installs `history-provider-sources`. It depends
 on the public local-history engine/core; neither local package depends on it.
-It contains the Claude web-session HTTP adapter and Codex cloud CLI adapter,
-including their existing bounded pagination, redirect protection, output limits,
-and provider-credential behavior. It never loads RelayHistory commercial auth.
+It contains the Claude web-session HTTP adapter, the Codex cloud CLI adapter and
+the Devin cloud HTTP adapter, including their existing bounded pagination,
+redirect protection, output limits, and provider-credential behavior. It never
+loads RelayHistory commercial auth.
 
 Rust hosts explicitly call `remote::provider(home, connector_id, instance, limit)`
 and register the returned `ShallowSessionProvider`. Construction does not read
-credentials or use a transport. Supported connector IDs are `claude-web` and
-`codex-cloud`; unknown IDs fail before any provider activity. Instances are
-non-secret user configuration keys. Provider sign-in remains owned by the
-Claude/Codex CLI. `RELAYHISTORY_CLAUDE_CREDENTIALS` and
-`RELAYHISTORY_CLAUDE_API_BASE_URL` retain their original meanings.
+credentials or use a transport. Supported connector IDs are `claude-web`,
+`codex-cloud` and `devin-cloud`; unknown IDs fail before any provider activity.
+Instances are non-secret user configuration keys. Provider sign-in remains owned
+by the provider CLIs. `RELAYHISTORY_CLAUDE_CREDENTIALS` and
+`RELAYHISTORY_CLAUDE_API_BASE_URL` retain their original meanings. Devin reads
+`windsurf_api_key` from its `credentials.toml` and `devin.org_id` from its
+`config.json`; `RELAYHISTORY_DEVIN_API_KEY`, `RELAYHISTORY_DEVIN_ORG_ID`,
+`RELAYHISTORY_DEVIN_CREDENTIALS`, `RELAYHISTORY_DEVIN_CONFIG` and
+`RELAYHISTORY_DEVIN_API_BASE_URL` override each input. Devin hydration is
+read-only — `ViewOrgSessions` suffices; `ManageOrgSessions` is never needed.
 
 The binary accepts one JSON stdin request and emits one JSON stdout response:
 

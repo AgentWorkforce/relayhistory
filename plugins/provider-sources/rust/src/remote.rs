@@ -16,6 +16,8 @@ use crate::discover::{Candidate, DiscoveryEnv, ScanEnv, ShallowSession, ShallowS
 pub const CLAUDE_WEB_CONNECTOR: &str = "claude-web";
 /// Connector name for the Codex cloud task lister.
 pub const CODEX_CLOUD_CONNECTOR: &str = "codex-cloud";
+/// Connector name for the api.devin.ai organization session lister.
+pub const DEVIN_CLOUD_CONNECTOR: &str = "devin-cloud";
 
 /// Most listing pages one enumeration may fetch, whatever the caller asked.
 const MAX_LIST_PAGES: usize = 100;
@@ -27,6 +29,8 @@ pub use crate::sources::AcquiredEvidence as RemoteSessionEvidence;
 
 mod claude_web;
 mod codex_diff;
+mod devin_auth;
+mod devin_cloud;
 
 use codex_diff::acquire_codex_remote_session;
 #[cfg(test)]
@@ -41,6 +45,12 @@ use claude_web::{
 };
 use claude_web::{claude_api_base_url, excerpt_one_line, UreqClaudeTransport};
 pub use claude_web::{ClaudeHttpResponse, ClaudeSessionsTransport, ClaudeWebProvider};
+
+use devin_auth::{devin_provider_at, devin_status};
+pub use devin_cloud::DevinCloudProvider;
+
+mod dispatch;
+pub use dispatch::provider;
 
 /// Whether one remote connector can run on this machine, and why not when it
 /// cannot.
@@ -81,7 +91,11 @@ pub struct SourceConnectorSelection {
 impl Default for SourceConnectorSelection {
     fn default() -> Self {
         Self {
-            ids: vec![CLAUDE_WEB_CONNECTOR.into(), CODEX_CLOUD_CONNECTOR.into()],
+            ids: vec![
+                CLAUDE_WEB_CONNECTOR.into(),
+                CODEX_CLOUD_CONNECTOR.into(),
+                DEVIN_CLOUD_CONNECTOR.into(),
+            ],
         }
     }
 }
@@ -90,7 +104,12 @@ impl SourceConnectorSelection {
     pub fn new(ids: Vec<String>) -> Result<Self> {
         for id in &ids {
             anyhow::ensure!(
-                [CLAUDE_WEB_CONNECTOR, CODEX_CLOUD_CONNECTOR,].contains(&id.as_str()),
+                [
+                    CLAUDE_WEB_CONNECTOR,
+                    CODEX_CLOUD_CONNECTOR,
+                    DEVIN_CLOUD_CONNECTOR,
+                ]
+                .contains(&id.as_str()),
                 "invalid source connector '{id}'"
             );
         }
@@ -125,33 +144,41 @@ pub fn selected_remote_connector_statuses_at(
     for (connector, source) in [
         (CLAUDE_WEB_CONNECTOR, "claude"),
         (CODEX_CLOUD_CONNECTOR, "codex"),
+        (DEVIN_CLOUD_CONNECTOR, "devin"),
     ] {
         if !selection.contains(connector)
             || (!sources.is_empty() && !sources.iter().any(|s| s == source))
         {
             continue;
         }
-        let path = if connector == CLAUDE_WEB_CONNECTOR {
-            claude_credentials_path(home)
-        } else {
-            codex_auth_path(home)
+        let (configured, detail) = match connector {
+            CLAUDE_WEB_CONNECTOR => cli_credential_status(claude_credentials_path(home)),
+            CODEX_CLOUD_CONNECTOR => cli_credential_status(codex_auth_path(home)),
+            _ => devin_status(home),
         };
-        let configured = path.is_file();
         statuses.push(RemoteConnectorStatus {
             connector,
             source,
             configured,
-            detail: if configured {
-                format!("provider CLI login at {}", path.display())
-            } else {
-                format!(
-                    "no provider CLI credentials at {} (sign in with the provider CLI)",
-                    path.display()
-                )
-            },
+            detail,
         });
     }
     statuses
+}
+
+/// A provider-CLI credential file's presence, as a status answer.
+fn cli_credential_status(path: PathBuf) -> (bool, String) {
+    if path.is_file() {
+        (true, format!("provider CLI login at {}", path.display()))
+    } else {
+        (
+            false,
+            format!(
+                "no provider CLI credentials at {} (sign in with the provider CLI)",
+                path.display()
+            ),
+        )
+    }
 }
 
 /// [`remote_connector_statuses_at`] under the process home directory.
@@ -249,7 +276,10 @@ pub fn ensure_selected_remote_connectors_configured_for_at(
             .filter(|id| match operation {
                 "sync" => true,
                 "hydration" | "hydrate" => {
-                    matches!(id.as_str(), CLAUDE_WEB_CONNECTOR | CODEX_CLOUD_CONNECTOR)
+                    matches!(
+                        id.as_str(),
+                        CLAUDE_WEB_CONNECTOR | CODEX_CLOUD_CONNECTOR | DEVIN_CLOUD_CONNECTOR
+                    )
                 }
                 _ => true,
             })
@@ -296,6 +326,11 @@ pub fn selected_remote_providers(
             Box::new(ExecCodexCli),
             limit,
         )));
+    }
+    if selection.contains(DEVIN_CLOUD_CONNECTOR) && applicable("devin") {
+        providers.extend(
+            devin_provider_at(home, limit).map(|p| Box::new(p) as Box<dyn ShallowSessionProvider>),
+        );
     }
     providers
 }
@@ -541,77 +576,3 @@ fn excerpt(text: &str) -> String {
 }
 #[cfg(test)]
 mod tests;
-
-/// Select exactly one adapter. Construction does not read credentials or invoke a transport.
-pub fn provider(
-    home: &Path,
-    connector: &str,
-    instance: &str,
-    limit: Option<usize>,
-) -> Result<Box<dyn ShallowSessionProvider>> {
-    anyhow::ensure!(
-        limit.is_none_or(|n| n <= 10_000),
-        "INVALID_ARGUMENT: source limit exceeds 10000"
-    );
-    anyhow::ensure!(
-        !instance.trim().is_empty() && instance.len() <= 512,
-        "INVALID_ARGUMENT: invalid connector instance"
-    );
-    let inner: Box<dyn ShallowSessionProvider> = match connector {
-        CLAUDE_WEB_CONNECTOR => Box::new(ClaudeWebProvider::new(
-            claude_credentials_path(home),
-            claude_api_base_url(),
-            Box::new(UreqClaudeTransport),
-            limit,
-        )),
-        CODEX_CLOUD_CONNECTOR => Box::new(CodexCloudProvider::new(Box::new(ExecCodexCli), limit)),
-        _ => anyhow::bail!("INVALID_ARGUMENT: unknown provider source connector"),
-    };
-    Ok(Box::new(InstanceProvider {
-        inner,
-        instance: instance.into(),
-    }))
-}
-struct InstanceProvider {
-    inner: Box<dyn ShallowSessionProvider>,
-    instance: String,
-}
-impl ShallowSessionProvider for InstanceProvider {
-    fn connector_id(&self) -> &str {
-        self.inner.connector_id()
-    }
-    fn connector_instance(&self) -> &str {
-        &self.instance
-    }
-    fn source(&self) -> &'static str {
-        self.inner.source()
-    }
-    /// Instance wrapping does not change what the wrapped connector covers.
-    fn evidence_kinds(&self) -> &'static [ai_hist::EvidenceKind] {
-        self.inner.evidence_kinds()
-    }
-    fn location(&self) -> SessionLocation {
-        self.inner.location()
-    }
-    fn check_available(&self, home: &Path) -> Result<()> {
-        self.inner.check_available(home)
-    }
-    fn acquire(
-        &self,
-        home: &Path,
-        observation: &ai_hist::observations::SessionObservation,
-    ) -> Result<RemoteSessionEvidence> {
-        self.inner.acquire(home, observation)
-    }
-    fn enumerate(&self, env: &DiscoveryEnv<'_>, limit: Option<usize>) -> Result<Vec<Candidate>> {
-        self.inner.enumerate(env, limit)
-    }
-    fn read_shallow(
-        &self,
-        env: &ScanEnv<'_>,
-        conn: Option<&Connection>,
-        candidate: &Candidate,
-    ) -> Result<Option<ShallowSession>> {
-        self.inner.read_shallow(env, conn, candidate)
-    }
-}
