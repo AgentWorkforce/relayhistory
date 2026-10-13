@@ -11,6 +11,9 @@ test('provider package registration is inert and connector IDs are selected expl
     ['claude-web'],
   );
   assert.deepEqual(registry.sourceConnectors([]), []);
+  const devin = createHistoryPlugin({ connectors: ['devin-cloud'] }).sources![0];
+  assert.equal(devin.id, 'devin-cloud');
+  assert.deepEqual(devin.supportedSources, ['devin']);
   assert.throws(
     () => createHistoryPlugin({ connectors: ['claude-web', 'claude-web'] }),
     InvalidArgumentError,

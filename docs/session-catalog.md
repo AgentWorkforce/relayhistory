@@ -419,9 +419,11 @@ available provider connector:
 run for that session, `"shallow"` means catalog metadata only. Full ingest
 always wins — a shallow rescan refreshes a `full` row's metadata and stamp but
 never downgrades its state. Local connectors provide full sync today. Claude
-remote rows can become full through targeted teleport-evidence hydration;
-Codex remote rows remain shallow after their available diff is indexed because
-the CLI exposes no transcript export (see [Remote connectors](source-plugins.md)).
+remote rows can become full through targeted teleport-evidence hydration, and
+Devin remote rows through their message history (text turns only — the v3
+messages endpoint exposes no tool calls or token usage); Codex remote rows
+remain shallow after their available diff is indexed because the CLI exposes
+no transcript export (see [Remote connectors](source-plugins.md)).
 
 ### Product boundary
 
@@ -438,8 +440,9 @@ cache-only queries over the same ledger.
 
 Discovery and sync are acquisition operations. Local adapters are always
 available; remote acquisition runs through provider connectors —
-`claude-web` for claude.ai/code web sessions and `codex-cloud` for Codex
-cloud tasks — that are configured by the provider CLI's own stored sign-in
+`claude-web` for claude.ai/code web sessions, `codex-cloud` for Codex
+cloud tasks and `devin-cloud` for an organization's Devin cloud sessions —
+that are configured by the provider CLI's own stored sign-in
 (see [Remote connectors](source-plugins.md)). Explicit remote acquisition
 on a machine with no connector configured returns an error rather than
 silently doing local work. `--all` means every configured adapter: the local

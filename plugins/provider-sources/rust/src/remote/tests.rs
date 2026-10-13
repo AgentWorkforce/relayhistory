@@ -6,12 +6,16 @@
 //! real transports are exercised end-to-end by `tests/session_discovery.rs`
 //! (a scripted `codex` binary and a loopback HTTP server).
 
+use super::devin_cloud::{
+    acquire_devin_remote_session_at, devin_org_id, devin_session_hex, map_devin_session,
+    toml_value, DevinHttpResponse, DevinTransport, UreqDevinTransport,
+};
 use super::*;
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 use crate::discover::{
     discover_sessions_with_providers, list_session_catalog, CatalogListOptions, DiscoverOptions,
 };
-use ai_hist::{init_db, SessionScope};
+use ai_hist::{init_db, EvidenceKind, SessionScope};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -55,6 +59,13 @@ fn without_credentials_override() -> ClearedCredentialsOverride {
         "RELAYHISTORY_HOME",
         "RELAYHISTORY_BASE_URL",
         "AI_HIST_BASE_URL",
+        "RELAYHISTORY_DEVIN_API_KEY",
+        "RELAYHISTORY_DEVIN_ORG_ID",
+        "RELAYHISTORY_DEVIN_API_BASE_URL",
+        "RELAYHISTORY_DEVIN_CREDENTIALS",
+        "RELAYHISTORY_DEVIN_CONFIG",
+        "XDG_DATA_HOME",
+        "XDG_CONFIG_HOME",
     ];
     let previous = keys
         .into_iter()
@@ -784,7 +795,7 @@ fn statuses_report_missing_credentials_with_the_paths_looked_at() {
     let _cleared = without_credentials_override();
     let home = tempfile::tempdir().unwrap();
     let statuses = remote_connector_statuses_at(home.path());
-    assert_eq!(statuses.len(), 2);
+    assert_eq!(statuses.len(), 3);
     assert!(statuses.iter().all(|status| !status.configured));
     let error = ensure_remote_connectors_configured_at("discovery", home.path())
         .unwrap_err()
@@ -795,6 +806,7 @@ fn statuses_report_missing_credentials_with_the_paths_looked_at() {
     );
     assert!(error.contains("claude-web"), "{error}");
     assert!(error.contains("codex-cloud"), "{error}");
+    assert!(error.contains("devin-cloud"), "{error}");
 
     std::fs::create_dir_all(home.path().join(".codex")).unwrap();
     std::fs::write(home.path().join(".codex/auth.json"), "{}").unwrap();
@@ -841,6 +853,475 @@ fn a_source_filter_that_excludes_every_configured_connector_is_unsupported() {
     // A misspelled source is an invalid argument, not an unsupported request.
     let error = ok(&["bogus"]).unwrap_err().to_string();
     assert!(error.contains("invalid source 'bogus'"), "{error}");
+}
+
+// ---------------------------------------------------------------------------
+// devin-cloud
+// ---------------------------------------------------------------------------
+
+/// Serves a fixed sequence of api.devin.ai responses and records each request.
+struct ScriptedDevinTransport {
+    responses: Vec<(u16, String)>,
+    calls: Mutex<Vec<(String, String)>>,
+    next: AtomicUsize,
+}
+
+impl ScriptedDevinTransport {
+    fn new(responses: Vec<(u16, String)>) -> Self {
+        Self {
+            responses,
+            calls: Mutex::new(Vec::new()),
+            next: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl DevinTransport for Arc<ScriptedDevinTransport> {
+    fn get(&self, url: &str, bearer_token: &str) -> Result<DevinHttpResponse> {
+        self.calls
+            .lock()
+            .unwrap()
+            .push((url.to_string(), bearer_token.to_string()));
+        let index = self.next.fetch_add(1, Ordering::Relaxed);
+        let (status, body) = self
+            .responses
+            .get(index)
+            .cloned()
+            .unwrap_or((500, "script exhausted".to_string()));
+        Ok(DevinHttpResponse { status, body })
+    }
+}
+
+const DEVIN_SESSION_ID: &str = "4b50574f40324da6bd88e9cbd30501cf";
+
+/// The Devin CLI's two config files under a fixture home: a bearer and an
+/// org id, as `credentials.toml`/`config.json` actually store them.
+fn write_devin_cli_files(home: &Path) -> (PathBuf, PathBuf) {
+    let credentials = home.join(".local/share/devin/credentials.toml");
+    std::fs::create_dir_all(credentials.parent().unwrap()).unwrap();
+    std::fs::write(
+        &credentials,
+        "windsurf_api_key = \"cog_test_key\"\n\
+         api_server_url = \"https://api.devin.ai\"\n\
+         devin_api_url = \"https://api.devin.ai\"\n",
+    )
+    .unwrap();
+    let config = home.join(".config/devin/config.json");
+    std::fs::create_dir_all(config.parent().unwrap()).unwrap();
+    std::fs::write(&config, r#"{"devin": {"org_id": "org-test"}}"#).unwrap();
+    (credentials, config)
+}
+
+fn devin_provider(
+    home: &Path,
+    transport: &Arc<ScriptedDevinTransport>,
+    limit: Option<usize>,
+) -> DevinCloudProvider {
+    let (credentials, config) = write_devin_cli_files(home);
+    DevinCloudProvider::new(credentials, config, Box::new(Arc::clone(transport)), limit)
+}
+
+fn devin_session(id: &str, title: &str) -> Value {
+    serde_json::json!({
+        "session_id": id,
+        "url": format!("https://app.devin.ai/sessions/{id}"),
+        "status": "suspended",
+        "title": title,
+        "org_id": "org-test",
+        "created_at": 1790900683,
+        "updated_at": 1790902549,
+        "is_archived": false,
+        "origin": "automation",
+        "devin_mode": "fusion"
+    })
+}
+
+fn devin_page(items: &[Value], end_cursor: Option<&str>, has_next_page: bool) -> String {
+    serde_json::json!({
+        "items": items,
+        "end_cursor": end_cursor,
+        "has_next_page": has_next_page,
+        "total": null
+    })
+    .to_string()
+}
+
+#[test]
+fn devin_mapping_carries_observed_fields_and_nothing_invented() {
+    let (candidate, session) =
+        map_devin_session(&devin_session(DEVIN_SESSION_ID, "Catch bugs in merged PRs"))
+            .expect("a mappable session");
+    assert_eq!(session.source, "devin");
+    assert_eq!(session.session_id, DEVIN_SESSION_ID);
+    assert_eq!(
+        session.first_prompt.as_deref(),
+        Some("Catch bugs in merged PRs")
+    );
+    assert_eq!(session.first_activity_ms, Some(1790900683000));
+    assert_eq!(session.last_activity_ms, Some(1790902549000));
+    assert_eq!(session.models, vec!["fusion".to_string()]);
+    assert_eq!(session.originator.as_deref(), Some("automation"));
+    assert_eq!(
+        session.raw_path.as_deref(),
+        Some("https://app.devin.ai/sessions/4b50574f40324da6bd88e9cbd30501cf")
+    );
+    assert_eq!(session.discovery_state, "shallow");
+    assert_eq!(session.cwd, None);
+    assert_eq!(session.git_branch, None);
+    assert_eq!(candidate.locator, format!("devin-{DEVIN_SESSION_ID}"));
+    assert_eq!(candidate.session_id.as_deref(), Some(DEVIN_SESSION_ID));
+    assert_eq!(candidate.recency_hint_ms, session.last_activity_ms);
+    assert_eq!(candidate.stamp, "cloud:1790902549:suspended");
+}
+
+#[test]
+fn devin_mapping_skips_malformed_ids_and_normalizes_the_prefixed_form() {
+    for bad_id in [
+        "",
+        "merciful-slip",
+        "devin-",
+        "4b50",
+        "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+    ] {
+        let entry = devin_session(bad_id, "t");
+        assert!(
+            map_devin_session(&entry).is_none(),
+            "id {bad_id:?} must not map"
+        );
+    }
+    // A `devin-`-prefixed session_id catalogs under the same bare id the
+    // unprefixed form produces.
+    let prefixed = devin_session(&format!("devin-{DEVIN_SESSION_ID}"), "t");
+    let (candidate, session) = map_devin_session(&prefixed).expect("prefixed id maps");
+    assert_eq!(session.session_id, DEVIN_SESSION_ID);
+    assert_eq!(candidate.locator, format!("devin-{DEVIN_SESSION_ID}"));
+    assert_eq!(
+        devin_session_hex(&format!("devin-{DEVIN_SESSION_ID}")),
+        Some(DEVIN_SESSION_ID)
+    );
+}
+
+#[test]
+fn devin_credentials_parse_the_flat_toml() {
+    let raw = "# comment\n\
+               windsurf_api_key = \"cog_abc\"\n\
+               devin_api_url = \"https://api.devin.ai\"\n\
+               broken = true\n\
+               other = \"x\" # inline\n";
+    assert_eq!(
+        toml_value(raw, "windsurf_api_key").as_deref(),
+        Some("cog_abc")
+    );
+    assert_eq!(
+        toml_value(raw, "devin_api_url").as_deref(),
+        Some("https://api.devin.ai")
+    );
+    assert_eq!(toml_value(raw, "missing"), None);
+    assert_eq!(toml_value(raw, "broken"), None);
+    assert_eq!(toml_value(raw, "windsurf_api_key_extra"), None);
+
+    let home = tempfile::tempdir().unwrap();
+    assert!(devin_org_id(&home.path().join("missing.json")).is_none());
+    let config = home.path().join("config.json");
+    std::fs::write(&config, r#"{"devin":{"org_id":"org-x"},"hooks":{}}"#).unwrap();
+    assert_eq!(devin_org_id(&config).as_deref(), Some("org-x"));
+    std::fs::write(&config, "not json").unwrap();
+    assert!(devin_org_id(&config).is_none());
+}
+
+#[test]
+fn devin_enumeration_pages_with_first_and_after() {
+    let _cleared = without_credentials_override();
+    let home = tempfile::tempdir().unwrap();
+    let transport = Arc::new(ScriptedDevinTransport::new(vec![
+        (
+            200,
+            devin_page(
+                &[devin_session(DEVIN_SESSION_ID, "one")],
+                Some("cursor+1/2"),
+                true,
+            ),
+        ),
+        (
+            200,
+            devin_page(
+                &[devin_session("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "two")],
+                None,
+                false,
+            ),
+        ),
+    ]));
+    let provider = devin_provider(home.path(), &transport, None);
+    let conn = catalog();
+    let env = env_at(&conn, home.path());
+    let candidates = provider.enumerate(&env, None).unwrap();
+    assert_eq!(candidates.len(), 2);
+    let calls = transport.calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(
+        calls[0].0,
+        "https://api.devin.ai/v3/organizations/org-test/sessions?first=200"
+    );
+    assert_eq!(
+        calls[1].0,
+        "https://api.devin.ai/v3/organizations/org-test/sessions?first=200&after=cursor%2B1%2F2"
+    );
+    assert!(calls.iter().all(|(_, bearer)| bearer == "cog_test_key"));
+}
+
+#[test]
+fn devin_enumeration_respects_the_row_limit() {
+    let _cleared = without_credentials_override();
+    let home = tempfile::tempdir().unwrap();
+    let transport = Arc::new(ScriptedDevinTransport::new(vec![(
+        200,
+        devin_page(
+            &[
+                devin_session(DEVIN_SESSION_ID, "one"),
+                devin_session("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "two"),
+            ],
+            Some("more"),
+            true,
+        ),
+    )]));
+    let provider = devin_provider(home.path(), &transport, Some(2));
+    let conn = catalog();
+    let env = env_at(&conn, home.path());
+    let candidates = provider.enumerate(&env, None).unwrap();
+    assert_eq!(candidates.len(), 2);
+    let calls = transport.calls.lock().unwrap();
+    assert_eq!(calls.len(), 1, "the satisfied limit ends the walk");
+    assert!(calls[0].0.ends_with("?first=2"));
+}
+
+#[test]
+fn devin_enumeration_requires_configuration_and_reports_auth() {
+    let _cleared = without_credentials_override();
+    let home = tempfile::tempdir().unwrap();
+    let (credentials, config) = (
+        home.path().join("credentials.toml"),
+        home.path().join("config.json"),
+    );
+    let transport = Arc::new(ScriptedDevinTransport::new(vec![]));
+    let provider = DevinCloudProvider::new(
+        credentials.clone(),
+        config.clone(),
+        Box::new(Arc::clone(&transport)),
+        None,
+    );
+    let conn = catalog();
+    let env = env_at(&conn, home.path());
+    let error = provider.enumerate(&env, None).unwrap_err().to_string();
+    assert!(error.starts_with("CONNECTOR_NOT_CONFIGURED:"), "{error}");
+
+    // A key without an organization id is still unconfigured.
+    std::fs::write(&credentials, "windsurf_api_key = \"cog_test_key\"\n").unwrap();
+    let error = provider.enumerate(&env, None).unwrap_err().to_string();
+    assert!(error.contains("organization id"), "{error}");
+    assert!(transport.calls.lock().unwrap().is_empty());
+
+    // Configured, then rejected upstream.
+    std::fs::write(&config, r#"{"devin":{"org_id":"org-test"}}"#).unwrap();
+    let transport = Arc::new(ScriptedDevinTransport::new(vec![(
+        401,
+        "key-secret-must-not-escape".into(),
+    )]));
+    let provider =
+        DevinCloudProvider::new(credentials, config, Box::new(Arc::clone(&transport)), None);
+    let error = provider.enumerate(&env, None).unwrap_err().to_string();
+    assert!(error.starts_with("AUTHENTICATION_EXPIRED:"), "{error}");
+    assert!(!error.contains("key-secret"), "{error}");
+}
+
+#[test]
+fn devin_acquire_hydrates_messages_into_history_and_events() {
+    let _cleared = without_credentials_override();
+    let home = tempfile::tempdir().unwrap();
+    let (credentials, config) = write_devin_cli_files(home.path());
+    let transport = Arc::new(ScriptedDevinTransport::new(vec![
+        (
+            200,
+            devin_page(
+                &[serde_json::json!({
+                    "event_id": "event-1",
+                    "source": "user",
+                    "message": "triage the flaky suite",
+                    "created_at": 1790900683,
+                    "username": "Devin Bot",
+                    "origin": "automation"
+                })],
+                Some("page-2"),
+                true,
+            ),
+        ),
+        (
+            200,
+            devin_page(
+                &[serde_json::json!({
+                    "event_id": "event-2",
+                    "source": "devin",
+                    "message": "found the retry bug",
+                    "created_at": 1790900692
+                })],
+                None,
+                false,
+            ),
+        ),
+    ]));
+    let acquired =
+        acquire_devin_remote_session_at(&credentials, &config, DEVIN_SESSION_ID, &transport)
+            .unwrap();
+    let RemoteSessionEvidence::Normalized(snapshot) = acquired else {
+        panic!("expected normalized evidence")
+    };
+    assert!(snapshot.source_stamp.starts_with("messages:"));
+    assert!(snapshot.source_bytes > 0);
+    assert_eq!(
+        snapshot.covered_kinds,
+        vec![EvidenceKind::History, EvidenceKind::SessionEvent]
+    );
+    assert_eq!(snapshot.records.len(), 3);
+    let (history, events): (Vec<_>, Vec<_>) = snapshot
+        .records
+        .iter()
+        .partition(|record| record.kind == EvidenceKind::History);
+    assert_eq!(history.len(), 1);
+    assert_eq!(
+        history[0].payload.get("prompt").and_then(Value::as_str),
+        Some("triage the flaky suite")
+    );
+    assert_eq!(
+        history[0]
+            .payload
+            .get("timestamp_ms")
+            .and_then(Value::as_i64),
+        Some(1790900683000)
+    );
+    assert_eq!(events.len(), 2);
+    assert_eq!(
+        events[0].payload.get("role").and_then(Value::as_str),
+        Some("user")
+    );
+    assert_eq!(
+        events[1].payload.get("role").and_then(Value::as_str),
+        Some("assistant")
+    );
+    assert_eq!(
+        events[1].payload.get("kind").and_then(Value::as_str),
+        Some("text")
+    );
+    assert_eq!(
+        events[1].payload.get("event_uid").and_then(Value::as_str),
+        Some("event-2")
+    );
+    let calls = transport.calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert!(calls[0].0.contains(&format!(
+        "sessions/devin-{DEVIN_SESSION_ID}/messages?first=200"
+    )));
+    assert!(calls[1].0.contains("after=page-2"));
+}
+
+#[test]
+fn devin_acquire_reports_configuration_and_bad_ids_without_a_request() {
+    let _cleared = without_credentials_override();
+    let home = tempfile::tempdir().unwrap();
+    let transport = Arc::new(ScriptedDevinTransport::new(vec![]));
+    let acquired = acquire_devin_remote_session_at(
+        &home.path().join("credentials.toml"),
+        &home.path().join("config.json"),
+        DEVIN_SESSION_ID,
+        &transport,
+    )
+    .unwrap();
+    assert!(matches!(
+        acquired,
+        RemoteSessionEvidence::CapabilityLimited {
+            code: "CONNECTOR_NOT_CONFIGURED",
+            ..
+        }
+    ));
+    assert!(transport.calls.lock().unwrap().is_empty());
+
+    let (credentials, config) = write_devin_cli_files(home.path());
+    let error = acquire_devin_remote_session_at(&credentials, &config, "merciful-slip", &transport)
+        .unwrap_err()
+        .to_string();
+    assert!(error.starts_with("INVALID_ARGUMENT:"), "{error}");
+}
+
+#[test]
+fn devin_acquire_is_page_bounded_and_surfaces_a_missing_session() {
+    let _cleared = without_credentials_override();
+    let home = tempfile::tempdir().unwrap();
+    let (credentials, config) = write_devin_cli_files(home.path());
+    let missing = Arc::new(ScriptedDevinTransport::new(vec![(404, "{}".into())]));
+    let error = acquire_devin_remote_session_at(&credentials, &config, DEVIN_SESSION_ID, &missing)
+        .unwrap_err()
+        .to_string();
+    assert!(error.starts_with("SESSION_NOT_FOUND:"), "{error}");
+
+    // Every page claims another follows; the walk stops at the bound instead
+    // of trusting the cursor forever.
+    let pages = (0..MAX_LIST_PAGES)
+        .map(|_| {
+            (
+                200,
+                devin_page(
+                    &[serde_json::json!({
+                        "event_id": "event-x",
+                        "source": "devin",
+                        "message": "still going",
+                        "created_at": 1790900692
+                    })],
+                    Some("again"),
+                    true,
+                ),
+            )
+        })
+        .collect();
+    let bounded = Arc::new(ScriptedDevinTransport::new(pages));
+    let error = acquire_devin_remote_session_at(&credentials, &config, DEVIN_SESSION_ID, &bounded)
+        .unwrap_err()
+        .to_string();
+    assert!(error.starts_with("EVIDENCE_PARTIAL:"), "{error}");
+}
+
+#[test]
+fn real_devin_transport_never_follows_a_redirect_with_credentials() {
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+
+    let _cleared = without_credentials_override();
+    let home = tempfile::tempdir().unwrap();
+    let (credentials, config) = write_devin_cli_files(home.path());
+    let target = TcpListener::bind("127.0.0.1:0").unwrap();
+    target.set_nonblocking(true).unwrap();
+    let target_url = format!("http://{}", target.local_addr().unwrap());
+    let origin = TcpListener::bind("127.0.0.1:0").unwrap();
+    let origin_url = format!("http://{}", origin.local_addr().unwrap());
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = origin.accept().unwrap();
+        let mut request = [0u8; 4096];
+        let _ = stream.read(&mut request).unwrap();
+        write!(
+            stream,
+            "HTTP/1.1 302 Found\r\nLocation: {target_url}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        )
+        .unwrap();
+    });
+    std::env::set_var("RELAYHISTORY_DEVIN_API_BASE_URL", &origin_url);
+    let provider = DevinCloudProvider::new(credentials, config, Box::new(UreqDevinTransport), None);
+    let conn = catalog();
+    let env = env_at(&conn, home.path());
+    let error = provider.enumerate(&env, None).unwrap_err().to_string();
+    server.join().unwrap();
+    assert!(error.contains("HTTP 302"), "{error}");
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        matches!(target.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
+    );
+    std::env::remove_var("RELAYHISTORY_DEVIN_API_BASE_URL");
 }
 
 // ---------------------------------------------------------------------------

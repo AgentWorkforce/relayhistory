@@ -4,7 +4,11 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased - Patch]
+## [Unreleased - Minor]
+
+### Added
+
+- `@relayhistory/provider-sources` gains a `devin-cloud` connector: `--remote` / `--all` discovery lists an organization's Devin cloud sessions through `GET /v3/organizations/{org}/sessions`, and targeted hydration returns the full message history as `devin` evidence. Sign-in stays with the Devin CLI (`credentials.toml` `windsurf_api_key` + `config.json` `devin.org_id`); `RELAYHISTORY_DEVIN_API_KEY`, `RELAYHISTORY_DEVIN_ORG_ID`, `RELAYHISTORY_DEVIN_CREDENTIALS` and `RELAYHISTORY_DEVIN_CONFIG` override each piece.
 
 ### Fixed
 
