@@ -152,7 +152,7 @@ fn ensure_devin_status(what: &str, scope: &str, status: u16, body: &str) -> Resu
             "AUTHENTICATION_EXPIRED: api.devin.ai rejected the Devin API key (HTTP 401)"
         ),
         403 => {
-            anyhow::bail!("CONNECTOR_FAILURE: {what} was denied; the Devin API key needs {scope}")
+            anyhow::bail!("PERMISSION_DENIED: {what} was denied; the Devin API key needs {scope}")
         }
         404 => anyhow::bail!("SESSION_NOT_FOUND: {what} was not found"),
         422 => anyhow::bail!(

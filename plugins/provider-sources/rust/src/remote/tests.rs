@@ -1544,7 +1544,7 @@ fn devin_send_maps_response_statuses_to_error_codes() {
     let (credentials, config) = write_devin_cli_files(home.path());
     let cases = [
         (401u16, "AUTHENTICATION_EXPIRED:"),
-        (403, "CONNECTOR_FAILURE:"),
+        (403, "PERMISSION_DENIED:"),
         (404, "SESSION_NOT_FOUND:"),
         (422, "INVALID_ARGUMENT:"),
         (500, "CONNECTOR_FAILURE:"),
