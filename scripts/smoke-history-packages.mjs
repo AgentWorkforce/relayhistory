@@ -201,7 +201,7 @@ try {
     ]);
     await writeFile(
       script,
-      `import assert from 'node:assert/strict';import * as sdk from 'ai-hist';import * as provider from '@relayhistory/provider-sources';\nconst registry=new sdk.HistoryPluginRegistry();registry.register(provider.createHistoryPlugin({binaryPath:'/never-read-during-registration'}));assert.equal(registry.sourceConnectors().length,2);\nconst {helperRequest}=await import('./node_modules/@relayhistory/provider-sources/dist/helper.js');await assert.rejects(helperRequest('fixtureUnsupported'),error=>error instanceof sdk.RelayHistoryError&&error.code!=='HISTORY_PLUGIN_BINARY_MISSING');\n`,
+      `import assert from 'node:assert/strict';import * as sdk from 'ai-hist';import * as provider from '@relayhistory/provider-sources';\nconst registry=new sdk.HistoryPluginRegistry();registry.register(provider.createHistoryPlugin({binaryPath:'/never-read-during-registration'}));assert.equal(registry.sourceConnectors().length,3);\nconst {helperRequest}=await import('./node_modules/@relayhistory/provider-sources/dist/helper.js');await assert.rejects(helperRequest('fixtureUnsupported'),error=>error instanceof sdk.RelayHistoryError&&error.code!=='HISTORY_PLUGIN_BINARY_MISSING');\n`,
     );
     run(process.execPath, [script]);
   }
