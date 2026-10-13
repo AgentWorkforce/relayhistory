@@ -884,8 +884,10 @@ pub ai_hist::SourceObservationBatch::connector_id: alloc::string::String
 pub ai_hist::SourceObservationBatch::connector_instance: alloc::string::String
 pub ai_hist::SourceObservationBatch::location: ai_hist::SessionLocation
 pub ai_hist::SourceObservationBatch::observations: alloc::vec::Vec<ai_hist::SourceObservation>
+pub ai_hist::SourceObservationBatch::skip_protected_folder_identity: bool
 impl ai_hist::SourceObservationBatch
 pub fn ai_hist::SourceObservationBatch::new(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>, ai_hist::SessionLocation, alloc::vec::Vec<ai_hist::SourceObservation>) -> Self
+pub fn ai_hist::SourceObservationBatch::skip_protected_folder_identity(self, bool) -> Self
 pub struct ai_hist::StopToken(_)
 impl ai_hist::StopToken
 pub fn ai_hist::StopToken::is_stopped(&self) -> bool
