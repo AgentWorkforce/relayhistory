@@ -29,6 +29,7 @@ pub use crate::sources::AcquiredEvidence as RemoteSessionEvidence;
 
 mod claude_web;
 mod codex_diff;
+mod devin_auth;
 mod devin_cloud;
 
 use codex_diff::acquire_codex_remote_session;
@@ -45,8 +46,8 @@ use claude_web::{
 use claude_web::{claude_api_base_url, excerpt_one_line, UreqClaudeTransport};
 pub use claude_web::{ClaudeHttpResponse, ClaudeSessionsTransport, ClaudeWebProvider};
 
+use devin_auth::{devin_provider_at, devin_status};
 pub use devin_cloud::DevinCloudProvider;
-use devin_cloud::{devin_provider_at, devin_status};
 
 mod dispatch;
 pub use dispatch::provider;

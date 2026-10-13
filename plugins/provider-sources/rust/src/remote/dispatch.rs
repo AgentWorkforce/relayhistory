@@ -9,7 +9,7 @@ use rusqlite::Connection;
 use crate::discover::{Candidate, DiscoveryEnv, ScanEnv, ShallowSession, ShallowSessionProvider};
 
 use super::claude_web::{claude_api_base_url, ClaudeWebProvider, UreqClaudeTransport};
-use super::devin_cloud::devin_provider;
+use super::devin_auth::devin_provider;
 use super::{
     claude_credentials_path, CodexCloudProvider, ExecCodexCli, RemoteSessionEvidence,
     CLAUDE_WEB_CONNECTOR, CODEX_CLOUD_CONNECTOR, DEVIN_CLOUD_CONNECTOR,

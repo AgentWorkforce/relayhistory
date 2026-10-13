@@ -9,11 +9,12 @@
 //! connector only reads: `GET .../sessions` and `GET .../messages` need
 //! `ViewOrgSessions`, never `ManageOrgSessions`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use ai_hist::{EvidenceKind, EvidenceRecord, SessionLocation};
+
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde_json::{json, Map, Value};
@@ -21,7 +22,8 @@ use sha2::{Digest, Sha256};
 
 use crate::discover::{Candidate, DiscoveryEnv, ScanEnv, ShallowSession, ShallowSessionProvider};
 
-use super::claude_web::{excerpt_one_line, require_https_or_loopback, urlencode};
+use super::claude_web::{excerpt_one_line, urlencode};
+use super::devin_auth::{devin_auth, DevinAuth};
 use super::{
     excerpt, string_field, take_fetched, FetchedRows, RemoteSessionEvidence, DEVIN_CLOUD_CONNECTOR,
     MAX_LIST_PAGES, MAX_REMOTE_EVIDENCE_BYTES,
@@ -84,175 +86,6 @@ fn bounded_devin_response(status: u16, response: ureq::Response) -> Result<Devin
         status,
         body: String::from_utf8_lossy(&bytes).into_owned(),
     })
-}
-
-// ---------------------------------------------------------------------------
-// configuration — Devin CLI files plus explicit environment overrides
-// ---------------------------------------------------------------------------
-
-/// The Devin API coordinates resolved from the Devin CLI's own files and
-/// explicit environment overrides. The bearer is never logged or returned.
-pub(super) struct DevinAuth {
-    bearer: String,
-    org_id: String,
-    base_url: String,
-}
-
-fn env_non_empty(key: &str) -> Option<String> {
-    std::env::var(key)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-}
-
-/// The Devin credential file: `RELAYHISTORY_DEVIN_CREDENTIALS`, else the
-/// CLI's `credentials.toml` under its data directory.
-pub(super) fn devin_credentials_path(home: &Path) -> PathBuf {
-    if let Some(path) = std::env::var_os("RELAYHISTORY_DEVIN_CREDENTIALS") {
-        if !path.is_empty() {
-            return PathBuf::from(path);
-        }
-    }
-    devin_data_home(home).join("credentials.toml")
-}
-
-/// The Devin CLI config: `RELAYHISTORY_DEVIN_CONFIG`, else `config.json`
-/// under its config directory. Holds `devin.org_id`.
-pub(super) fn devin_config_path(home: &Path) -> PathBuf {
-    if let Some(path) = std::env::var_os("RELAYHISTORY_DEVIN_CONFIG") {
-        if !path.is_empty() {
-            return PathBuf::from(path);
-        }
-    }
-    devin_config_home(home).join("config.json")
-}
-
-fn devin_data_home(home: &Path) -> PathBuf {
-    std::env::var_os("XDG_DATA_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".local/share"))
-        .join("devin")
-}
-
-fn devin_config_home(home: &Path) -> PathBuf {
-    std::env::var_os("XDG_CONFIG_HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .unwrap_or_else(|| home.join(".config"))
-        .join("devin")
-}
-
-/// One `key = "value"` line's value from Devin's flat `credentials.toml` —
-/// deliberately a line scan, not a TOML dependency for a two-key file.
-pub(super) fn toml_value(raw: &str, key: &str) -> Option<String> {
-    for line in raw.lines() {
-        let line = line.trim();
-        if line.starts_with('#') {
-            continue;
-        }
-        let Some((name, value)) = line.split_once('=') else {
-            continue;
-        };
-        if name.trim() != key {
-            continue;
-        }
-        if let Some(unquoted) = value
-            .trim()
-            .strip_prefix('"')
-            .and_then(|v| v.strip_suffix('"'))
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-        {
-            return Some(unquoted.to_string());
-        }
-    }
-    None
-}
-
-/// `devin.org_id` from the Devin CLI's `config.json`, when present.
-pub(super) fn devin_org_id(config_path: &Path) -> Option<String> {
-    let raw = std::fs::read_to_string(config_path).ok()?;
-    let value: Value = serde_json::from_str(&raw).ok()?;
-    value
-        .pointer("/devin/org_id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(str::to_string)
-}
-
-fn read_devin_credentials(path: &Path) -> (Option<String>, Option<String>) {
-    let Ok(raw) = std::fs::read_to_string(path) else {
-        return (None, None);
-    };
-    (
-        toml_value(&raw, "windsurf_api_key"),
-        toml_value(&raw, "devin_api_url"),
-    )
-}
-
-fn devin_auth(credentials_path: &Path, config_path: &Path) -> Result<DevinAuth> {
-    let (credential_key, credential_url) = read_devin_credentials(credentials_path);
-    let bearer = env_non_empty("RELAYHISTORY_DEVIN_API_KEY")
-        .or(credential_key)
-        .context("CONNECTOR_NOT_CONFIGURED: Devin API key unavailable; sign in with the Devin CLI or set RELAYHISTORY_DEVIN_API_KEY")?;
-    let org_id = env_non_empty("RELAYHISTORY_DEVIN_ORG_ID")
-        .or_else(|| devin_org_id(config_path))
-        .context("CONNECTOR_NOT_CONFIGURED: Devin organization id unavailable; set devin.org_id in the Devin CLI config or RELAYHISTORY_DEVIN_ORG_ID")?;
-    let base_url = env_non_empty("RELAYHISTORY_DEVIN_API_BASE_URL")
-        .or(credential_url)
-        .unwrap_or_else(|| "https://api.devin.ai".to_string());
-    let base_url = base_url.trim_end_matches('/').to_string();
-    require_https_or_loopback(&base_url)
-        .context("CONNECTOR_NOT_CONFIGURED: invalid Devin API base URL")?;
-    Ok(DevinAuth {
-        bearer,
-        org_id,
-        base_url,
-    })
-}
-
-/// Whether a credentials file and an organization id both resolve under this
-/// home — the status probe's notion of "configured".
-pub(super) fn devin_auth_ready(home: &Path) -> bool {
-    let credentials = devin_credentials_path(home);
-    let credential_key = read_devin_credentials(&credentials).0;
-    let has_key = env_non_empty("RELAYHISTORY_DEVIN_API_KEY").is_some() || credential_key.is_some();
-    let has_org = env_non_empty("RELAYHISTORY_DEVIN_ORG_ID").is_some()
-        || devin_org_id(&devin_config_path(home)).is_some();
-    has_key && has_org
-}
-
-/// The connector's status-probe answer.
-pub(super) fn devin_status(home: &Path) -> (bool, String) {
-    let path = devin_credentials_path(home);
-    if devin_auth_ready(home) {
-        (true, format!("Devin CLI sign-in at {}", path.display()))
-    } else {
-        (
-            false,
-            format!(
-                "no Devin API key at {} (or RELAYHISTORY_DEVIN_API_KEY) and no org id (or RELAYHISTORY_DEVIN_ORG_ID)",
-                path.display()
-            ),
-        )
-    }
-}
-
-/// Provider construction shared by `provider()` and bulk selection.
-pub(super) fn devin_provider(home: &Path, limit: Option<usize>) -> DevinCloudProvider {
-    DevinCloudProvider::new(
-        devin_credentials_path(home),
-        devin_config_path(home),
-        Box::new(UreqDevinTransport),
-        limit,
-    )
-}
-
-/// `Some(provider)` only when the connector is configured on this machine.
-pub(super) fn devin_provider_at(home: &Path, limit: Option<usize>) -> Option<DevinCloudProvider> {
-    devin_auth_ready(home).then(|| devin_provider(home, limit))
 }
 
 // ---------------------------------------------------------------------------
@@ -326,16 +159,42 @@ pub(super) fn map_devin_session(value: &Value) -> Option<(Candidate, ShallowSess
         .map(|seconds| seconds.saturating_mul(SECONDS_TO_MS))
         .or(created_ms);
     // Status participates in the stamp: a session that suspends or exits
-    // without a timestamp bump still deserves a re-read.
-    let stamp = format!(
-        "cloud:{}:{}",
-        value
-            .get("updated_at")
-            .and_then(Value::as_i64)
-            .map(|seconds| seconds.to_string())
-            .unwrap_or_else(|| "unknown".to_string()),
-        string_field(value, "status").unwrap_or_else(|| "unknown".to_string())
-    );
+    // without a timestamp bump still deserves a re-read. So does a digest of
+    // the mapped listing fields — a title edit that the API reports without
+    // advancing `updated_at` must still refresh the catalog row.
+    let stamp = {
+        let mut digest = Sha256::new();
+        for field in [
+            "title",
+            "devin_mode",
+            "origin",
+            "url",
+            "status",
+            "updated_at",
+        ] {
+            digest.update(field.as_bytes());
+            digest.update(
+                value
+                    .get(field)
+                    .map(|v| match v.as_str() {
+                        Some(text) => text.to_string(),
+                        None => v.to_string(),
+                    })
+                    .unwrap_or_default()
+                    .as_bytes(),
+            );
+        }
+        format!(
+            "cloud:{}:{}:{:.8}",
+            value
+                .get("updated_at")
+                .and_then(Value::as_i64)
+                .map(|seconds| seconds.to_string())
+                .unwrap_or_else(|| "unknown".to_string()),
+            string_field(value, "status").unwrap_or_else(|| "unknown".to_string()),
+            format!("{:x}", digest.finalize()),
+        )
+    };
     let session = ShallowSession {
         source: "devin".into(),
         session_id: id.clone(),
@@ -380,9 +239,18 @@ fn devin_page_url(auth: &DevinAuth, path: &str, limit: usize, cursor: Option<&st
 // ---------------------------------------------------------------------------
 
 /// One `{event_id, source, message, created_at}` entry, as normalized records.
-/// Messages without an event id or without text carry nothing a ledger can
-/// key or display, so they are skipped rather than invented around.
-fn push_devin_message_records(records: &mut Vec<EvidenceRecord>, session_id: &str, item: &Value) {
+/// The intake contract requires every session event to carry `ts_ms` and a
+/// `user`/`assistant`/`tool_result` role, and every history record a
+/// `timestamp_ms` — so messages without an event id, without text, without a
+/// usable timestamp, or from a non-conversational source are skipped rather
+/// than emitted as records validation would reject (one bad record fails the
+/// whole snapshot).
+fn push_devin_message_records(
+    records: &mut Vec<EvidenceRecord>,
+    seen_prompts: &mut HashSet<(i64, String)>,
+    session_id: &str,
+    item: &Value,
+) {
     let Some(event_id) = string_field(item, "event_id") else {
         return;
     };
@@ -393,22 +261,25 @@ fn push_devin_message_records(records: &mut Vec<EvidenceRecord>, session_id: &st
     else {
         return;
     };
-    let ts_ms = item
+    let Some(ts_ms) = item
         .get("created_at")
         .and_then(Value::as_i64)
-        .map(|seconds| seconds.saturating_mul(SECONDS_TO_MS));
-    let source = string_field(item, "source").unwrap_or_else(|| "unknown".to_string());
+        .map(|seconds| seconds.saturating_mul(SECONDS_TO_MS))
+    else {
+        return;
+    };
+    let Some(source) = string_field(item, "source") else {
+        return;
+    };
     let role = match source.as_str() {
         "user" => "user",
         "devin" => "assistant",
-        other => other,
+        _ => return,
     };
     let mut event = Map::new();
     event.insert("source".into(), json!("devin"));
     event.insert("session_id".into(), json!(session_id));
-    if let Some(ts_ms) = ts_ms {
-        event.insert("ts_ms".into(), json!(ts_ms));
-    }
+    event.insert("ts_ms".into(), json!(ts_ms));
     event.insert("role".into(), json!(role));
     event.insert("kind".into(), json!("text"));
     event.insert("text".into(), json!(text));
@@ -420,9 +291,11 @@ fn push_devin_message_records(records: &mut Vec<EvidenceRecord>, session_id: &st
         record_id: None,
         revision_id: None,
     });
-    if source == "user" {
-        // A user message is also the session's prompt history, the same way
-        // the local adapter records it.
+    // A user message is also the session's prompt history, the same way the
+    // local adapter records it. History identity is (timestamp_ms, prompt)
+    // with no event id, so two identical prompts inside the same second would
+    // collide — the event record above still preserves the second occurrence.
+    if source == "user" && seen_prompts.insert((ts_ms, text.to_string())) {
         records.push(EvidenceRecord {
             kind: EvidenceKind::History,
             payload: Map::from_iter([
@@ -457,6 +330,7 @@ pub(super) fn acquire_devin_remote_session_at(
         }
     };
     let mut records = Vec::new();
+    let mut seen_prompts = HashSet::new();
     let mut cursor: Option<String> = None;
     let mut source_bytes = 0usize;
     let mut hasher = Sha256::new();
@@ -477,7 +351,7 @@ pub(super) fn acquire_devin_remote_session_at(
         hasher.update(response.body.as_bytes());
         let page = parse_devin_page(&response.body, "message history")?;
         for item in &page.items {
-            push_devin_message_records(&mut records, session_id, item);
+            push_devin_message_records(&mut records, &mut seen_prompts, session_id, item);
         }
         cursor = page.end_cursor.filter(|_| page.has_next_page);
         if cursor.is_none() || page.items.is_empty() {
@@ -588,6 +462,13 @@ impl ShallowSessionProvider for DevinCloudProvider {
                 break;
             }
         }
+        // An open cursor after the page bound means sessions remain unlisted;
+        // reporting the prefix as complete would silently lose them. A
+        // caller-specified limit that was reached is not truncation.
+        anyhow::ensure!(
+            cursor.is_none() || self.limit.is_some_and(|limit| candidates.len() >= limit),
+            "EVIDENCE_PARTIAL: Devin session list exceeded the 100-page bound"
+        );
         *self.fetched.lock().expect("remote connector row cache") = rows;
         Ok(candidates)
     }

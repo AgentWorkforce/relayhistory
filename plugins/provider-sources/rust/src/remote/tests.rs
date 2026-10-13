@@ -6,9 +6,10 @@
 //! real transports are exercised end-to-end by `tests/session_discovery.rs`
 //! (a scripted `codex` binary and a loopback HTTP server).
 
+use super::devin_auth::{devin_org_id, toml_value};
 use super::devin_cloud::{
-    acquire_devin_remote_session_at, devin_org_id, devin_session_hex, map_devin_session,
-    toml_value, DevinHttpResponse, DevinTransport, UreqDevinTransport,
+    acquire_devin_remote_session_at, devin_session_hex, map_devin_session, DevinHttpResponse,
+    DevinTransport, UreqDevinTransport,
 };
 use super::*;
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -971,7 +972,25 @@ fn devin_mapping_carries_observed_fields_and_nothing_invented() {
     assert_eq!(candidate.locator, format!("devin-{DEVIN_SESSION_ID}"));
     assert_eq!(candidate.session_id.as_deref(), Some(DEVIN_SESSION_ID));
     assert_eq!(candidate.recency_hint_ms, session.last_activity_ms);
-    assert_eq!(candidate.stamp, "cloud:1790902549:suspended");
+    assert!(
+        candidate.stamp.starts_with("cloud:1790902549:suspended:"),
+        "{}",
+        candidate.stamp
+    );
+}
+
+#[test]
+fn devin_mapping_stamp_tracks_the_mapped_listing_fields() {
+    // A title (or other mapped field) edit that Devin reports without
+    // advancing `updated_at` must still change the stamp, else discovery
+    // serves the stale catalog row.
+    let base = map_devin_session(&devin_session(DEVIN_SESSION_ID, "one")).unwrap();
+    let mut renamed = devin_session(DEVIN_SESSION_ID, "one");
+    renamed["title"] = serde_json::json!("two");
+    let changed = map_devin_session(&renamed).unwrap();
+    assert_ne!(base.0.stamp, changed.0.stamp);
+    let identical = map_devin_session(&devin_session(DEVIN_SESSION_ID, "one")).unwrap();
+    assert_eq!(base.0.stamp, identical.0.stamp);
 }
 
 #[test]
@@ -1285,6 +1304,132 @@ fn devin_acquire_is_page_bounded_and_surfaces_a_missing_session() {
         .unwrap_err()
         .to_string();
     assert!(error.starts_with("EVIDENCE_PARTIAL:"), "{error}");
+}
+
+#[test]
+fn devin_enumeration_fails_closed_at_the_page_bound() {
+    let _cleared = without_credentials_override();
+    let home = tempfile::tempdir().unwrap();
+    // Every page claims another follows; an unbounded org list must surface
+    // as a partial-enumeration error rather than a silently truncated result.
+    let pages = (0..MAX_LIST_PAGES)
+        .map(|_| {
+            (
+                200,
+                devin_page(
+                    &[devin_session(DEVIN_SESSION_ID, "still going")],
+                    Some("again"),
+                    true,
+                ),
+            )
+        })
+        .collect();
+    let transport = Arc::new(ScriptedDevinTransport::new(pages));
+    let provider = devin_provider(home.path(), &transport, None);
+    let conn = catalog();
+    let env = env_at(&conn, home.path());
+    let error = provider.enumerate(&env, None).unwrap_err().to_string();
+    assert!(error.starts_with("EVIDENCE_PARTIAL:"), "{error}");
+    assert_eq!(transport.calls.lock().unwrap().len(), MAX_LIST_PAGES);
+}
+
+#[test]
+fn devin_organization_id_cannot_alter_the_request_route() {
+    let _cleared = without_credentials_override();
+    let home = tempfile::tempdir().unwrap();
+    let credentials = home.path().join("credentials.toml");
+    std::fs::write(&credentials, "windsurf_api_key = \"cog_test_key\"\n").unwrap();
+    let config = home.path().join("config.json");
+    std::fs::write(&config, r#"{"devin":{"org_id":"org/x/../../admin"}}"#).unwrap();
+    let transport = Arc::new(ScriptedDevinTransport::new(vec![]));
+    let provider =
+        DevinCloudProvider::new(credentials, config, Box::new(Arc::clone(&transport)), None);
+    let conn = catalog();
+    let env = env_at(&conn, home.path());
+    let error = provider.enumerate(&env, None).unwrap_err().to_string();
+    assert!(error.starts_with("CONNECTOR_NOT_CONFIGURED:"), "{error}");
+    assert!(
+        transport.calls.lock().unwrap().is_empty(),
+        "no authenticated request may run on an injected org id"
+    );
+}
+
+#[test]
+fn devin_acquire_skips_messages_the_intake_contract_would_reject() {
+    let _cleared = without_credentials_override();
+    let home = tempfile::tempdir().unwrap();
+    let (credentials, config) = write_devin_cli_files(home.path());
+    let transport = Arc::new(ScriptedDevinTransport::new(vec![(
+        200,
+        devin_page(
+            &[
+                // A non-conversational source has no role the intake accepts.
+                serde_json::json!({
+                    "event_id": "event-sys",
+                    "source": "system",
+                    "message": "context injected",
+                    "created_at": 1790900683
+                }),
+                // No timestamp: neither an event nor a history row can key it.
+                serde_json::json!({
+                    "event_id": "event-undated",
+                    "source": "user",
+                    "message": "when?"
+                }),
+                // One well-formed pair.
+                serde_json::json!({
+                    "event_id": "event-user",
+                    "source": "user",
+                    "message": "real prompt",
+                    "created_at": 1790900684
+                }),
+                serde_json::json!({
+                    "event_id": "event-devin",
+                    "source": "devin",
+                    "message": "on it",
+                    "created_at": 1790900685
+                }),
+                // A repeated prompt inside the same second shares a history
+                // identity; the event still records the second occurrence.
+                serde_json::json!({
+                    "event_id": "event-again",
+                    "source": "user",
+                    "message": "real prompt",
+                    "created_at": 1790900684
+                }),
+            ],
+            None,
+            false,
+        ),
+    )]));
+    let acquired =
+        acquire_devin_remote_session_at(&credentials, &config, DEVIN_SESSION_ID, &transport)
+            .unwrap();
+    let RemoteSessionEvidence::Normalized(snapshot) = acquired else {
+        panic!("expected normalized evidence")
+    };
+    let (history, events): (Vec<_>, Vec<_>) = snapshot
+        .records
+        .iter()
+        .partition(|record| record.kind == EvidenceKind::History);
+    assert_eq!(history.len(), 1, "{:#?}", snapshot.records);
+    assert_eq!(events.len(), 3, "{:#?}", snapshot.records);
+    assert!(events.iter().all(|event| {
+        matches!(
+            event.payload.get("role").and_then(Value::as_str),
+            Some("user" | "assistant")
+        ) && event.payload.get("ts_ms").and_then(Value::as_i64).is_some()
+    }));
+    assert!(events.iter().any(
+        |event| event.payload.get("event_uid").and_then(Value::as_str) == Some("event-again")
+    ));
+    // And the intake itself accepts the snapshot the connector produced.
+    ai_hist::sources::normalize_source_evidence(
+        "devin",
+        DEVIN_SESSION_ID,
+        RemoteSessionEvidence::Normalized(snapshot),
+    )
+    .unwrap();
 }
 
 #[test]
