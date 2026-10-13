@@ -41,12 +41,15 @@
 //!   `totalTokens`, `modelUsage`), which is kept verbatim beside the proxy and
 //!   normalized by `crate::usage`. The two are never added together.
 //! * `~/.grok/logs/unified.jsonl` (under `GROK_HOME` when it is set) is one
-//!   process-wide, append-only log that recent builds write a per-inference
-//!   token breakdown to. It is read incrementally from a byte cursor
-//!   ([`parse_unified_row`]); its rows attach to sessions by session id, and a
-//!   session it covers takes its usage from there rather than from
-//!   `turn_completed.usage` — two representations of the same spend are never
-//!   added together.
+//!   process-wide, append-only log. A Grok Build usage row is `msg`
+//!   `shell.turn.inference_done`: session id `sid` (the session directory),
+//!   `ts`, `pid`, and `ctx` counters `prompt_tokens`, `cached_prompt_tokens`,
+//!   `completion_tokens`, `reasoning_tokens`. Those are stored as
+//!   `inputTokens`, `cachedReadTokens`, `outputTokens`, `reasoningTokens`.
+//!   It is read incrementally from a byte cursor ([`parse_unified_row`]); its
+//!   rows attach to sessions by session id, and a session it covers takes its
+//!   usage from there rather than from `turn_completed.usage` — two
+//!   representations of the same spend are never added together.
 //! * `params._meta.eventId` is **not unique**: Grok reuses it across records
 //!   (tokscale, `sessions/grok.rs`). An event identity built from it is
 //!   disambiguated when it repeats ([`updates::ChunkGroup::event_key`]), and a
@@ -523,9 +526,9 @@ pub(crate) fn parse_signals(value: &Value) -> GrokSignals {
 // ---------------------------------------------------------------------------
 
 /// The model `summary.json` names, in the order it is trusted: `info.model`
-/// (what earlier builds read), then `current_model_id` and `model_id`, each
-/// looked for at the top level and under `info` because no public sample
-/// fixes which. tokscale reads the latter two as its model fallback.
+/// (what earlier builds read), then `current_model_id` and `model_id`.
+/// Current builds write `current_model_id` at the top level (`info` is `id`
+/// and `cwd`); both places are still tried.
 pub(crate) fn summary_model(summary: &Value) -> Option<String> {
     let info = summary.get("info").unwrap_or(&Value::Null);
     string_field(info, &["model"])
@@ -555,9 +558,9 @@ pub(crate) struct GrokEventsHead {
     pub first_ts_ms: Option<i64>,
 }
 
-/// Read the head of `events.jsonl`. The shape is **unverified** — tokscale
-/// reads `model_id`, `session_id` and `ts` from it and nothing public shows a
-/// row — so a line that does not parse is skipped rather than failing the
+/// Read the head of `events.jsonl`. Current builds write the file beside
+/// `summary.json`; `turn_started` rows carry `model_id`, `session_id` and
+/// `ts`. A line that does not parse is skipped rather than failing the
 /// read: this is a fallback for metadata `summary.json` normally supplies,
 /// never evidence a replacing read could lose.
 pub(crate) fn parse_events_head(contents: &str) -> GrokEventsHead {
@@ -1197,6 +1200,93 @@ mod tests {
         assert_eq!(
             parse_unified_row(&json!({"pid": 7, "msg": "heartbeat"}), &pid_models),
             GrokUnifiedRow::Other
+        );
+    }
+
+    /// Grok Build writes inference usage as `sid` plus `ctx` counters. Those
+    /// project onto the spellings `crate::usage` counts once. A duration named
+    /// `model_elapsed_ms` is not a model, and process logs are not usage.
+    #[test]
+    fn an_observed_inference_row_projects_ctx_counters_onto_canonical_keys() {
+        let row = json!({
+            "ts": "2026-10-12T15:04:05.123Z",
+            "src": "shell",
+            "pid": 42,
+            "lvl": "info",
+            "msg": "shell.turn.inference_done",
+            "ctx": {
+                "prompt_tokens": 1000,
+                "cached_prompt_tokens": 400,
+                "completion_tokens": 80,
+                "reasoning_tokens": 20,
+                "model_elapsed_ms": 15,
+                "attempts": 1
+            },
+            "ver": "0",
+            "sid": "grok-obs-0001"
+        });
+        let GrokUnifiedRow::Usage(usage) = parse_unified_row(&row, &HashMap::new()) else {
+            panic!("expected usage");
+        };
+        assert_eq!(usage.session_id, "grok-obs-0001");
+        assert_eq!(usage.pid, Some(42));
+        assert_eq!(usage.model, None, "model_elapsed_ms is not a model id");
+        assert_eq!(
+            usage.ts_ms,
+            crate::ingest::parse_iso_ms("2026-10-12T15:04:05.123Z")
+        );
+        assert!(
+            usage.ts_ms.is_some(),
+            "ISO-8601 ts with a Z offset must parse"
+        );
+        assert_eq!(
+            usage.usage,
+            json!({
+                "inputTokens": 1000,
+                "cachedReadTokens": 400,
+                "outputTokens": 80,
+                "reasoningTokens": 20
+            })
+        );
+        let normalized = crate::usage::normalize_usage("grok", &json!({ "usage": usage.usage }))
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            normalized.accounting,
+            crate::usage::UsageAccounting::PerRequest
+        );
+        assert_eq!(normalized.input_tokens, 600);
+        assert_eq!(normalized.cache_read_tokens, 400);
+        assert_eq!(normalized.output_tokens, 80);
+        assert_eq!(normalized.reasoning_tokens, Some(20));
+
+        let again: Value = serde_json::from_str(&serde_json::to_string(&row).unwrap()).unwrap();
+        assert_eq!(unified_row_key(&row), unified_row_key(&again));
+
+        for msg in ["AuthManager::new", "startup timing", "shell.tool.exec_done"] {
+            assert_eq!(
+                parse_unified_row(
+                    &json!({
+                        "ts": "2026-10-12T15:04:01.000Z",
+                        "pid": 42,
+                        "msg": msg,
+                        "ctx": {"model_elapsed_ms": "grok-x", "path": "/tmp/fake"}
+                    }),
+                    &HashMap::new()
+                ),
+                GrokUnifiedRow::Other,
+                "{msg}"
+            );
+        }
+        assert_eq!(
+            parse_unified_row(
+                &json!({"pid": 9, "msg": "model changed", "ctx": {"model": "grok-x"}}),
+                &HashMap::new()
+            ),
+            GrokUnifiedRow::ModelChange {
+                pid: 9,
+                model: "grok-x".to_string()
+            }
         );
     }
 

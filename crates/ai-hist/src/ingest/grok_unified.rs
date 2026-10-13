@@ -14,6 +14,11 @@ pub(crate) fn grok_unified_log_path(grok_home: &Path) -> PathBuf {
 /// `transcript_cursors` document.
 const GROK_UNIFIED_CURSOR_KEY: &str = "grok_unified";
 
+/// Cursor documents written before Grok Build's `sid` / `ctx` counters were
+/// read. Those passes classified the rows as other and still advanced the
+/// byte cursor, so a document without this shape is read once from the start.
+const GROK_UNIFIED_ROW_SHAPE: i64 = 2;
+
 /// What one pass over `logs/unified.jsonl` did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct GrokUnifiedPass {
@@ -57,8 +62,11 @@ pub(crate) fn sync_grok_unified_log(
 /// targeted hydration's.
 ///
 /// The log is append-only and covers every session on the machine, so it is
-/// read from a byte cursor, never re-read whole: a second pass over an
-/// unchanged log reads zero bytes. Each usage row is copied into
+/// read from a byte cursor: a second pass over an unchanged log reads zero
+/// bytes. A cursor saved before [`GROK_UNIFIED_ROW_SHAPE`] is the exception.
+/// It is read once from the start, because that pass stepped over Grok Build
+/// inference rows, and the row digest keeps a row that was already stored
+/// from being inserted again. Each usage row is copied into
 /// `grok_unified_usage` — the durable copy, because the bytes are never read
 /// again — keyed on [`grok::unified_row_key`], so a region read twice after a
 /// rotation writes the same rows. A trailing line with no newline is withheld
@@ -80,7 +88,8 @@ pub(crate) fn sync_grok_unified_log_in(
         locator: &locator,
     };
     let mut cursor = transcript_cursor::load_cursor(conn, &key)?;
-    let mut reader = transcript_cursor::TranscriptReader::open(&path, cursor.file.as_ref(), None)
+    let saved = saved_unified_cursor(&cursor);
+    let mut reader = transcript_cursor::TranscriptReader::open(&path, saved, None)
         .with_context(|| format!("read Grok unified log {}", path.display()))?;
     let start = reader.start_offset();
     // Which model each process last named. Only meaningful for the bytes
@@ -135,7 +144,7 @@ pub(crate) fn sync_grok_unified_log_in(
             cursor.file = Some(file);
             cursor.extra.insert(
                 GROK_UNIFIED_CURSOR_KEY.to_string(),
-                json!({ "pid_models": pid_models }),
+                json!({ "pid_models": pid_models, "row_shape": GROK_UNIFIED_ROW_SHAPE }),
             );
             transcript_cursor::store_cursor(conn, &key, &cursor)?;
         }
@@ -157,6 +166,20 @@ pub(crate) fn sync_grok_unified_log_in(
     )?;
     pass.orphan_rows = orphans as usize;
     Ok(pass)
+}
+
+/// The file cursor to resume from. A document that does not name the current
+/// row shape is not resumed: the next pass reads the log from byte zero.
+fn saved_unified_cursor(
+    cursor: &transcript_cursor::TranscriptCursorState,
+) -> Option<&transcript_cursor::TranscriptFileCursor> {
+    let current = cursor
+        .extra
+        .get(GROK_UNIFIED_CURSOR_KEY)
+        .and_then(|state| state.get("row_shape"))
+        .and_then(Value::as_i64)
+        == Some(GROK_UNIFIED_ROW_SHAPE);
+    current.then_some(cursor.file.as_ref()).flatten()
 }
 
 /// Copies one unified-log usage row into `grok_unified_usage`; the rows it
@@ -745,5 +768,67 @@ mod tests {
             ),
             (1, 0, 0)
         );
+    }
+
+    /// A cursor parked at EOF by a parser that skipped Grok Build inference
+    /// rows is read once from the start. The following pass reads nothing.
+    #[test]
+    fn a_cursor_without_the_row_shape_is_read_once_from_the_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let grok_home = dir.path().join(".grok");
+        let log = grok_home.join("logs");
+        std::fs::create_dir_all(&log).unwrap();
+        let row = concat!(
+            r#"{"ts":"2026-10-12T15:04:05.123Z","src":"shell","pid":7,"lvl":"info","#,
+            r#""msg":"shell.turn.inference_done","ctx":{"prompt_tokens":10,"#,
+            r#""cached_prompt_tokens":4,"completion_tokens":3,"reasoning_tokens":1},"#,
+            r#""sid":"grok-shape-1"}"#,
+            "\n",
+        );
+        std::fs::write(log.join("unified.jsonl"), row).unwrap();
+        let conn = Connection::open(dir.path().join("history.db")).unwrap();
+        init_db(&conn).unwrap();
+
+        let first = sync_grok_unified_log(&conn, &grok_home).unwrap();
+        assert_eq!(first.new_rows, 1);
+        let stored = || -> i64 {
+            conn.query_row("SELECT COUNT(*) FROM grok_unified_usage", [], |row| {
+                row.get(0)
+            })
+            .unwrap()
+        };
+        assert_eq!(stored(), 1);
+
+        let locator = grok_unified_log_path(&grok_home)
+            .to_string_lossy()
+            .to_string();
+        let raw: String = conn
+            .query_row(
+                "SELECT parser_state_json FROM transcript_cursors \
+                 WHERE source = 'grok' AND locator = ?",
+                params![locator],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut state: Value = serde_json::from_str(&raw).unwrap();
+        state["grok_unified"]
+            .as_object_mut()
+            .unwrap()
+            .remove("row_shape");
+        conn.execute(
+            "UPDATE transcript_cursors SET parser_state_json = ? \
+             WHERE source = 'grok' AND locator = ?",
+            params![state.to_string(), locator],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM grok_unified_usage", []).unwrap();
+        assert_eq!(stored(), 0);
+
+        let recovered = sync_grok_unified_log(&conn, &grok_home).unwrap();
+        assert_eq!(recovered.new_rows, 1);
+        assert_eq!(stored(), 1);
+        let quiet = sync_grok_unified_log(&conn, &grok_home).unwrap();
+        assert_eq!((quiet.bytes_read, quiet.new_rows), (0, 0));
+        assert_eq!(stored(), 1);
     }
 }

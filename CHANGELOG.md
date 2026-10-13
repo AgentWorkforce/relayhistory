@@ -10,6 +10,10 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - `@relayhistory/provider-sources` gains a `devin-cloud` connector: `--remote` / `--all` discovery lists an organization's Devin cloud sessions through `GET /v3/organizations/{org}/sessions`, and targeted hydration returns the full message history as `devin` evidence. Sign-in stays with the Devin CLI (`credentials.toml` `windsurf_api_key` + `config.json` `devin.org_id`); `RELAYHISTORY_DEVIN_API_KEY`, `RELAYHISTORY_DEVIN_ORG_ID`, `RELAYHISTORY_DEVIN_CREDENTIALS` and `RELAYHISTORY_DEVIN_CONFIG` override each piece.
 
+### Fixed
+
+- Grok Build per-inference usage in `logs/unified.jsonl` is read from `sid` and the `ctx` counters `prompt_tokens`, `cached_prompt_tokens`, `completion_tokens` and `reasoning_tokens`, stored as `inputTokens`, `cachedReadTokens`, `outputTokens` and `reasoningTokens`. A cursor saved before that shape is read once from the start; a row already stored stays one row.
+
 ## [0.42.1] - 2026-10-13
 
 ### Fixed

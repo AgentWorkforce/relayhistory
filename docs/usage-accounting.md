@@ -93,7 +93,11 @@ key) and by hydration (parser version 12).
 
 Recent builds also write a per-inference breakdown to the process-wide
 `<GROK_HOME>/logs/unified.jsonl` ([#212](https://github.com/AgentWorkforce/relayhistory/issues/212)).
-Each of its rows is stored as one assistant event with its own request span and
+A Grok Build usage row is `msg` `shell.turn.inference_done`, with session id
+`sid` and `ctx` counters `prompt_tokens`, `cached_prompt_tokens`,
+`completion_tokens` and `reasoning_tokens`. Those are stored as
+`inputTokens`, `cachedReadTokens`, `outputTokens` and `reasoningTokens`.
+Each row is one assistant event with its own request span and
 `token_json = {"usage": <counters>, "source": "logs/unified.jsonl", "pid", "event_id"}`,
 normalized with the same counter lists as `turn_completed.usage`. Coverage is
 decided per turn: a turn with a log row inside its `[turn_start_ms,
