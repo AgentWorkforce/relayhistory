@@ -372,6 +372,17 @@ pub fn ai_hist::DiscoveryOptions::stop(self, ai_hist::StopToken) -> Self
 pub ai_hist::DiscoveryReport::diagnostics: alloc::vec::Vec<ai_hist::Diagnostic>
 pub ai_hist::DiscoveryReport::discovered: usize
 pub ai_hist::DiscoveryReport::skipped_unchanged: usize
+pub struct ai_hist::DiscoverySummary
+pub ai_hist::DiscoverySummary::connectors: alloc::vec::Vec<ai_hist::discover::ConnectorSummary>
+pub ai_hist::DiscoverySummary::contract_version: u32
+pub ai_hist::DiscoverySummary::counters: ai_hist::discover::DiscoveryCounters
+pub ai_hist::DiscoverySummary::diagnostics: alloc::vec::Vec<ai_hist::discover::DiscoveryDiagnostic>
+pub ai_hist::DiscoverySummary::discovered: usize
+pub ai_hist::DiscoverySummary::exempt_sources: alloc::vec::Vec<ai_hist::discover::SourceExemption>
+pub ai_hist::DiscoverySummary::locations_run: alloc::vec::Vec<alloc::string::String>
+pub ai_hist::DiscoverySummary::providers: alloc::collections::btree::map::BTreeMap<alloc::string::String, ai_hist::discover::ProviderSummary>
+pub ai_hist::DiscoverySummary::scope: ai_hist::SessionScope
+pub ai_hist::DiscoverySummary::skipped_unchanged: usize
 pub struct ai_hist::EvidenceRecord
 pub ai_hist::EvidenceRecord::kind: ai_hist::EvidenceKind
 pub ai_hist::EvidenceRecord::payload: serde_json::map::Map<alloc::string::String, serde_json::value::Value>
@@ -436,6 +447,20 @@ pub ai_hist::HydrateReport::diagnostics: alloc::vec::Vec<ai_hist::Diagnostic>
 pub ai_hist::HydrateReport::related: alloc::vec::Vec<ai_hist::SessionRef>
 pub ai_hist::HydrateReport::session: ai_hist::SessionRef
 pub ai_hist::HydrateReport::status: ai_hist::HydrateStatus
+pub struct ai_hist::HydrateSessionResult
+pub ai_hist::HydrateSessionResult::bytes_read: i64
+pub ai_hist::HydrateSessionResult::capability: alloc::string::String
+pub ai_hist::HydrateSessionResult::contract_version: u32
+pub ai_hist::HydrateSessionResult::coverage: alloc::vec::Vec<ai_hist::EvidenceKind>
+pub ai_hist::HydrateSessionResult::diagnostics: alloc::vec::Vec<ai_hist::ingest::hydrate::HydrationDiagnostic>
+pub ai_hist::HydrateSessionResult::discovery_state: alloc::string::String
+pub ai_hist::HydrateSessionResult::evidence: ai_hist::ingest::hydrate::HydrationEvidence
+pub ai_hist::HydrateSessionResult::indexed_through: ai_hist::ingest::hydrate::HydrationIndexedThrough
+pub ai_hist::HydrateSessionResult::presence: alloc::string::String
+pub ai_hist::HydrateSessionResult::related_session_ids: alloc::vec::Vec<alloc::string::String>
+pub ai_hist::HydrateSessionResult::session_id: alloc::string::String
+pub ai_hist::HydrateSessionResult::source: alloc::string::String
+pub ai_hist::HydrateSessionResult::status: alloc::string::String
 #[non_exhaustive] pub struct ai_hist::IdentityQuery
 pub ai_hist::IdentityQuery::after: core::option::Option<ai_hist::SessionIdentity>
 pub ai_hist::IdentityQuery::exclude_delegated: bool
@@ -481,6 +506,11 @@ pub ai_hist::Message::usage: core::option::Option<ai_hist::NormalizedUsage>
 pub ai_hist::Message::usage_error: core::option::Option<alloc::string::String>
 impl ai_hist::Message
 pub fn ai_hist::Message::raw_usage(&self) -> core::option::Option<&str>
+pub struct ai_hist::NormalizedSourceEvidence
+pub ai_hist::NormalizedSourceEvidence::covered_kinds: alloc::vec::Vec<ai_hist::EvidenceKind>
+pub ai_hist::NormalizedSourceEvidence::records: alloc::vec::Vec<ai_hist::EvidenceRecord>
+pub ai_hist::NormalizedSourceEvidence::source_bytes: i64
+pub ai_hist::NormalizedSourceEvidence::source_stamp: alloc::string::String
 #[non_exhaustive] pub struct ai_hist::NormalizedUsage
 pub ai_hist::NormalizedUsage::accounting: ai_hist::UsageAccounting
 pub ai_hist::NormalizedUsage::cache_read_tokens: u64
@@ -496,6 +526,30 @@ pub ai_hist::NormalizedUsage::reported_cost_usd: core::option::Option<f64>
 impl ai_hist::NormalizedUsage
 pub fn ai_hist::NormalizedUsage::checked_add(&self, &Self) -> core::option::Option<Self>
 pub fn ai_hist::NormalizedUsage::is_zero(&self) -> bool
+pub struct ai_hist::ObservationCheckpoint
+pub ai_hist::ObservationCheckpoint::committed_offset: i64
+pub ai_hist::ObservationCheckpoint::dev_ino: core::option::Option<alloc::string::String>
+pub ai_hist::ObservationCheckpoint::include_related: bool
+pub ai_hist::ObservationCheckpoint::last_event_at_ms: core::option::Option<i64>
+pub ai_hist::ObservationCheckpoint::parser_state_json: core::option::Option<alloc::string::String>
+pub ai_hist::ObservationCheckpoint::parser_version: i64
+pub ai_hist::ObservationCheckpoint::prefix_hash: core::option::Option<alloc::string::String>
+pub ai_hist::ObservationCheckpoint::records_parsed: i64
+pub ai_hist::ObservationCheckpoint::source_bytes: i64
+pub ai_hist::ObservationCheckpoint::source_stamp: core::option::Option<alloc::string::String>
+pub ai_hist::ObservationCheckpoint::updated_ms: i64
+pub struct ai_hist::ObservationKey
+pub ai_hist::ObservationKey::connector_id: alloc::string::String
+pub ai_hist::ObservationKey::connector_instance: alloc::string::String
+pub ai_hist::ObservationKey::location: ai_hist::SessionLocation
+pub ai_hist::ObservationKey::session_id: alloc::string::String
+pub ai_hist::ObservationKey::source: alloc::string::String
+impl ai_hist::ObservationKey
+pub fn ai_hist::ObservationKey::validate(&self) -> anyhow::Result<()>
+pub struct ai_hist::ObservationState
+pub ai_hist::ObservationState::checkpoint: core::option::Option<ai_hist::ObservationCheckpoint>
+pub ai_hist::ObservationState::observation: core::option::Option<ai_hist::SessionObservation>
+pub ai_hist::ObservationState::revision: core::option::Option<alloc::string::String>
 pub struct ai_hist::ProgressObserver(_)
 impl ai_hist::ProgressObserver
 pub fn ai_hist::ProgressObserver::new(impl core::ops::function::Fn(ai_hist::CaptureProgress) + core::marker::Send + core::marker::Sync + 'static) -> Self
@@ -644,6 +698,15 @@ pub ai_hist::SessionMarker::turn_id: core::option::Option<alloc::string::String>
 pub struct ai_hist::SessionMarkerPage
 pub ai_hist::SessionMarkerPage::markers: alloc::vec::Vec<ai_hist::SessionMarker>
 pub ai_hist::SessionMarkerPage::next_cursor: core::option::Option<ai_hist::SessionEvidenceCursor>
+pub struct ai_hist::SessionObservation
+pub ai_hist::SessionObservation::access_state: alloc::string::String
+pub ai_hist::SessionObservation::discovery_state: alloc::string::String
+pub ai_hist::SessionObservation::first_prompt: core::option::Option<alloc::string::String>
+pub ai_hist::SessionObservation::key: ai_hist::ObservationKey
+pub ai_hist::SessionObservation::last_assistant_text: core::option::Option<alloc::string::String>
+pub ai_hist::SessionObservation::raw_locator: core::option::Option<alloc::string::String>
+pub ai_hist::SessionObservation::source_stamp: core::option::Option<alloc::string::String>
+pub ai_hist::SessionObservation::updated_ms: i64
 #[non_exhaustive] pub struct ai_hist::SessionQuery
 pub ai_hist::SessionQuery::include_text: bool
 pub ai_hist::SessionQuery::kinds: core::option::Option<alloc::vec::Vec<ai_hist::EvidenceKind>>
@@ -691,6 +754,10 @@ pub struct ai_hist::SessionRequestPage
 pub ai_hist::SessionRequestPage::next_cursor: core::option::Option<ai_hist::SessionRequestCursor>
 pub ai_hist::SessionRequestPage::requests: alloc::vec::Vec<ai_hist::SessionRequest>
 pub struct ai_hist::SessionStore
+impl ai_hist::SessionStore
+pub fn ai_hist::SessionStore::apply_source_evidence(&self, ai_hist::SourceEvidenceSubmission) -> core::result::Result<ai_hist::HydrateSessionResult, ai_hist::Error>
+pub fn ai_hist::SessionStore::apply_source_observations(&self, ai_hist::SourceObservationBatch) -> core::result::Result<ai_hist::DiscoverySummary, ai_hist::Error>
+pub fn ai_hist::SessionStore::source_observation(&self, &ai_hist::ObservationKey) -> core::result::Result<ai_hist::ObservationState, ai_hist::Error>
 impl ai_hist::SessionStore
 pub fn ai_hist::SessionStore::changes_since(&self, ai_hist::Watermark, ai_hist::ChangeQuery) -> anyhow::Result<ai_hist::Changes, ai_hist::Error>
 pub fn ai_hist::SessionStore::head_revision(&self) -> anyhow::Result<ai_hist::Watermark, ai_hist::Error>
@@ -780,6 +847,8 @@ pub ai_hist::ShallowSession::source: alloc::string::String
 pub ai_hist::ShallowSession::source_stamp: core::option::Option<alloc::string::String>
 pub ai_hist::ShallowSession::title: core::option::Option<alloc::string::String>
 pub ai_hist::ShallowSession::workspace_roots: alloc::vec::Vec<alloc::string::String>
+impl core::convert::From<ai_hist::ShallowSession> for ai_hist::SourceObservation
+pub fn ai_hist::SourceObservation::from(ai_hist::ShallowSession) -> Self
 #[non_exhaustive] pub struct ai_hist::SourceCapabilities
 pub ai_hist::SourceCapabilities::evidence_kinds: alloc::vec::Vec<ai_hist::EvidenceKind>
 pub ai_hist::SourceCapabilities::hydrates_by_path: bool
@@ -789,6 +858,26 @@ pub ai_hist::SourceCapabilities::source: ai_hist::Source
 pub ai_hist::SourceCapabilities::usage_accounting: core::option::Option<ai_hist::UsageAccounting>
 impl ai_hist::SourceCapabilities
 pub fn ai_hist::SourceCapabilities::watch_roots(&self, &ai_hist::ProviderRoots) -> alloc::vec::Vec<ai_hist::WatchedPath>
+#[non_exhaustive] pub struct ai_hist::SourceEvidenceSubmission
+pub ai_hist::SourceEvidenceSubmission::evidence: ai_hist::NormalizedSourceEvidence
+pub ai_hist::SourceEvidenceSubmission::expected_revision: alloc::string::String
+pub ai_hist::SourceEvidenceSubmission::include_related: core::option::Option<bool>
+pub ai_hist::SourceEvidenceSubmission::key: ai_hist::ObservationKey
+pub struct ai_hist::SourceObservation
+pub ai_hist::SourceObservation::raw_locator: core::option::Option<alloc::string::String>
+pub ai_hist::SourceObservation::session: ai_hist::ShallowSession
+impl core::convert::From<ai_hist::ShallowSession> for ai_hist::SourceObservation
+pub fn ai_hist::SourceObservation::from(ai_hist::ShallowSession) -> Self
+impl core::ops::deref::Deref for ai_hist::SourceObservation
+pub type ai_hist::SourceObservation::Target = ai_hist::ShallowSession
+pub fn ai_hist::SourceObservation::deref(&self) -> &Self::Target
+impl core::ops::deref::DerefMut for ai_hist::SourceObservation
+pub fn ai_hist::SourceObservation::deref_mut(&mut self) -> &mut Self::Target
+#[non_exhaustive] pub struct ai_hist::SourceObservationBatch
+pub ai_hist::SourceObservationBatch::connector_id: alloc::string::String
+pub ai_hist::SourceObservationBatch::connector_instance: alloc::string::String
+pub ai_hist::SourceObservationBatch::location: ai_hist::SessionLocation
+pub ai_hist::SourceObservationBatch::observations: alloc::vec::Vec<ai_hist::SourceObservation>
 pub struct ai_hist::StopToken(_)
 impl ai_hist::StopToken
 pub fn ai_hist::StopToken::is_stopped(&self) -> bool

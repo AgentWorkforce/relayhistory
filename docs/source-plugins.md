@@ -47,6 +47,12 @@ validates identities and fields, fences the observation revision captured before
 I/O, and applies the snapshot atomically. An older concurrent response returns
 `SOURCE_REVISION_CONFLICT`. Incoming database row IDs are never reused locally.
 
+A Rust host composes the same boundary through `SessionStore` without the
+native addon: `apply_source_observations` lands a connector's enumerated
+rows, `source_observation` reads the observation and revision fence, and
+`apply_source_evidence` applies the acquired snapshot. See
+[the sourcing SDK](sourcing-sdk.md#source-connector-intake).
+
 Provider limits and authentication stay in the
 [optional provider helper](../plugins/provider-sources/rust/README.md).
 Claude uses an observed private teleport interface which can change. Codex's

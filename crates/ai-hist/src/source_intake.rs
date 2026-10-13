@@ -36,21 +36,26 @@ pub struct ObservationState {
 pub fn get_source_observation(request: ObservationRequest) -> Result<ObservationState> {
     request.key.validate()?;
     let path = request.db_path.unwrap_or_else(default_db_path);
-    let mut state = ObservationState {
-        observation: None,
-        checkpoint: None,
-        revision: None,
-    };
     if !path.exists() {
-        return Ok(state);
+        return Ok(ObservationState {
+            observation: None,
+            checkpoint: None,
+            revision: None,
+        });
     }
     // Opening an existing database upgrades legacy observation state without
     // reading any source adapter or credential store.
     let conn = open_db(&path)?;
-    state.observation = observations::get(&conn, &request.key)?;
-    state.checkpoint = observations::checkpoint(&conn, &request.key)?;
-    state.revision = observations::revision(&conn, &request.key)?;
-    Ok(state)
+    observation_state(&conn, &request.key)
+}
+
+/// The observation, checkpoint and revision fence `conn` holds for `key`.
+pub(crate) fn observation_state(conn: &Connection, key: &ObservationKey) -> Result<ObservationState> {
+    Ok(ObservationState {
+        observation: observations::get(conn, key)?,
+        checkpoint: observations::checkpoint(conn, key)?,
+        revision: observations::revision(conn, key)?,
+    })
 }
 #[derive(Debug, Deserialize)]
 pub struct ApplyEvidenceRequest {

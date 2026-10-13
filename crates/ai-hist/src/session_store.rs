@@ -74,6 +74,7 @@ use std::time::{Duration, Instant};
 mod catalog_digest;
 mod catalog_row;
 mod options;
+mod source_intake;
 mod watch_sweep;
 
 pub(crate) use options::controlled;
@@ -81,6 +82,7 @@ pub use options::{
     DiscoveryOptions, HydrateOptions, ProgressObserver, StopToken, StoreOptions, SyncOptions,
     WatchTick,
 };
+pub use source_intake::{SourceEvidenceSubmission, SourceObservationBatch};
 use watch_sweep::{TickNotes, WatchSources, WatchSweep};
 
 // ---------------------------------------------------------------------------
