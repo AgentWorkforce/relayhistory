@@ -5100,6 +5100,133 @@ mod tests {
         assert_eq!(grok_token_json(&conn, "grok-uni-0001"), covered);
     }
 
+    /// A Grok Build inference row (`sid`, `ctx` counters) attaches as one
+    /// per-request usage. Process rows do not. Reading that row again does
+    /// not emit a second change.
+    #[test]
+    fn an_observed_unified_row_attaches_once_and_a_reread_is_quiet() {
+        let dir = tempfile::tempdir().unwrap();
+        let grok_home = dir.path().join(".grok");
+        let session = grok_home.join("sessions/%2Ftmp%2Fobs/grok-obs-0001");
+        fs::create_dir_all(&session).unwrap();
+        fs::write(
+            session.join("summary.json"),
+            r#"{"info":{"id":"grok-obs-0001","cwd":"/tmp/obs"},"created_at":"2026-10-12T15:00:00.000Z","current_model_id":"grok-x"}"#,
+        )
+        .unwrap();
+        fs::write(
+            session.join("chat_history.jsonl"),
+            concat!(
+                "{\"type\":\"user\",\"content\":\"<user_query>hello</user_query>\"}\n",
+                "{\"type\":\"assistant\",\"content\":\"ok\"}\n",
+            ),
+        )
+        .unwrap();
+        fs::create_dir_all(grok_home.join("logs")).unwrap();
+        fs::write(
+            grok_home.join("logs/unified.jsonl"),
+            concat!(
+                r#"{"ts":"2026-10-12T15:04:01.000Z","pid":42,"lvl":"info","msg":"AuthManager::new","ctx":{"auth_path":"/tmp/fake"},"ver":"0"}"#,
+                "\n",
+                r#"{"ts":"2026-10-12T15:04:02.000Z","pid":42,"lvl":"info","msg":"startup timing","ctx":{"phase":"boot"},"ver":"0"}"#,
+                "\n",
+                r#"{"ts":"2026-10-12T15:04:03.000Z","pid":42,"lvl":"info","msg":"shell.tool.exec_done","ctx":{"tool":"bash","model_elapsed_ms":15},"ver":"0"}"#,
+                "\n",
+                r#"{"ts":"2026-10-12T15:04:05.123Z","src":"shell","pid":42,"lvl":"info","msg":"shell.turn.inference_done","ctx":{"prompt_tokens":1000,"cached_prompt_tokens":400,"completion_tokens":80,"reasoning_tokens":20,"model_elapsed_ms":15,"attempts":1},"ver":"0","sid":"grok-obs-0001"}"#,
+                "\n",
+            ),
+        )
+        .unwrap();
+
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        sync_grok_home(
+            &conn,
+            &mut Map::new(),
+            &grok_home,
+            &mut SweepCoverage::default(),
+        )
+        .unwrap();
+
+        let unified: Vec<Value> = grok_token_json(&conn, "grok-obs-0001")
+            .into_iter()
+            .filter(is_unified)
+            .collect();
+        assert_eq!(unified.len(), 1, "{unified:#?}");
+        assert_eq!(
+            unified[0]["usage"],
+            json!({
+                "inputTokens": 1000,
+                "cachedReadTokens": 400,
+                "outputTokens": 80,
+                "reasoningTokens": 20
+            })
+        );
+        assert_eq!(unified[0]["pid"], 42);
+        assert!(unified[0].get("event_id").is_none());
+        let normalized = crate::usage::normalize_usage("grok", &unified[0])
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            normalized.accounting,
+            crate::usage::UsageAccounting::PerRequest
+        );
+        assert_eq!(
+            (
+                normalized.input_tokens,
+                normalized.cache_read_tokens,
+                normalized.output_tokens,
+                normalized.reasoning_tokens
+            ),
+            (600, 400, 80, Some(20))
+        );
+        let model: Option<String> = conn
+            .query_row(
+                "SELECT model FROM session_events \
+                 WHERE source = 'grok' AND session_id = 'grok-obs-0001' \
+                 AND raw_kind = 'unified_log_usage'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(model, None, "model_elapsed_ms must not become the model");
+        let stored: i64 = conn
+            .query_row("SELECT COUNT(*) FROM grok_unified_usage", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(stored, 1);
+
+        let revision = |conn: &Connection| -> (i64, i64) {
+            conn.query_row(
+                "SELECT COUNT(*), COALESCE(SUM(revision), 0) FROM session_events \
+                 WHERE source = 'grok' AND session_id = 'grok-obs-0001' \
+                 AND raw_kind = 'unified_log_usage'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        let before = revision(&conn);
+        assert_eq!(before.0, 1);
+        let quiet = sync_grok_unified_log(&conn, &grok_home).unwrap();
+        assert_eq!((quiet.bytes_read, quiet.new_rows), (0, 0));
+        assert_eq!(revision(&conn), before);
+
+        conn.execute("DELETE FROM transcript_cursors WHERE source = 'grok'", [])
+            .unwrap();
+        let reread = sync_grok_unified_log(&conn, &grok_home).unwrap();
+        assert_eq!(reread.usage_rows, 1);
+        assert_eq!(reread.new_rows, 0);
+        assert_eq!(reread.sessions_materialized, 0);
+        assert_eq!(revision(&conn), before, "a re-read emitted a second change");
+        let stored_again: i64 = conn
+            .query_row("SELECT COUNT(*) FROM grok_unified_usage", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(stored_again, stored);
+    }
+
     /// A row that arrives for a session not yet indexed is retained, and
     /// attaches when the session is. A row appended later is read on its own:
     /// the pass reads exactly its bytes.

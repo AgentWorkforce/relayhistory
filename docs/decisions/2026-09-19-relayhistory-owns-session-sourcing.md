@@ -136,7 +136,7 @@ deletes what an earlier release stored for them.
 | `session_events` — `tool_use`                                      | ✓      | ✓     | ✓      | ✓    | ✓    | ✓        | ✓     | [#166](https://github.com/AgentWorkforce/relayhistory/issues/166) / [#167](https://github.com/AgentWorkforce/relayhistory/issues/167) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                     |
 | `session_events` — `tool_result`                                   | ✓      | ✓     | —      | ✓    | ✓    | ✓        | ✓     | [#166](https://github.com/AgentWorkforce/relayhistory/issues/166) / [#167](https://github.com/AgentWorkforce/relayhistory/issues/167) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                     |
 | Model, per event                                                   | ✓      | ✓     | —      | ✓    | ✓    | ✓        | ✓     | [#166](https://github.com/AgentWorkforce/relayhistory/issues/166) / [#167](https://github.com/AgentWorkforce/relayhistory/issues/167) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                     |
-| Token usage                                                        | ✓      | ◐     | —      | ◐    | ✓    | ✓        | ◐     | [#172](https://github.com/AgentWorkforce/relayhistory/issues/172) (supersedes #99) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168) / grok: [#212](https://github.com/AgentWorkforce/relayhistory/issues/212)                                              |
+| Token usage                                                        | ✓      | ◐     | —      | ✓    | ✓    | ✓        | ◐     | [#172](https://github.com/AgentWorkforce/relayhistory/issues/172) (supersedes #99) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168) / grok: [#212](https://github.com/AgentWorkforce/relayhistory/issues/212)                                              |
 | Token usage — each streamed record verbatim                        | ✓      | —     | —      | —    | —    | —        | —     | `session_events.record_token_json`; other sources store usage once per record                                                                                                                                                                                                 | 
 | `request_id`                                                       | ✗      | —     | —      | —    | ✓    | —        | ✓     | [#164](https://github.com/AgentWorkforce/relayhistory/issues/164)                                                                                                                                                                                                             |
 | `stop_reason`                                                      | ✗      | —     | —      | —    | ✓    | ✓        | ✓     | [#164](https://github.com/AgentWorkforce/relayhistory/issues/164) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                                                                                         |
@@ -227,22 +227,18 @@ reason: `token_count` events carry _cumulative_ totals, and the parser derives a
 delta against the previous snapshot and attaches it to one assistant event,
 holding a `pending_delta` when no event is available yet. Both are usable, both
 are source-specific, and neither is a normalized per-request usage record.
-Grok is `◐`: a build that writes `turn_completed.usage` gets a per-turn
-`per-request` record, stored verbatim beside the context-window snapshot, but
-the per-inference rows in `~/.grok/logs/unified.jsonl` are not read yet
-([#212](https://github.com/AgentWorkforce/relayhistory/issues/212)), and older
-builds write only the snapshot, which is never usage.
-
-_Since [#212](https://github.com/AgentWorkforce/relayhistory/issues/212), the
-per-inference rows of `<GROK_HOME>/logs/unified.jsonl` are read from a byte
-cursor and stored as one `per-request` record per inference on the session
-they name. Coverage is decided per turn: a turn the log reaches has its
-`turn_completed.usage` kept as `turn_usage`, which is not normalized, and a
-turn it does not reach keeps its own breakdown, so the two are never added and
-neither is dropped. Grok stays `◐` all the same: the log's row shape, and that
-its session id is `summary.json`'s `info.id`, are inferred from tokscale and
-have not been confirmed on a real install. See `docs/session-catalog.md`
-("grok")._
+Grok is `✓`: `<GROK_HOME>/logs/unified.jsonl` is read from a byte cursor and
+stored as one `per-request` record per inference on the session it names. A
+Grok Build usage row is `msg` `shell.turn.inference_done`, with session id
+`sid` (the session directory name and `summary.json` `info.id`) and counters
+`ctx.prompt_tokens`, `ctx.cached_prompt_tokens`, `ctx.completion_tokens` and
+`ctx.reasoning_tokens`, stored as `inputTokens`, `cachedReadTokens`,
+`outputTokens` and `reasoningTokens`. Coverage is decided per turn: a turn the
+log reaches has its `turn_completed.usage` kept as `turn_usage`, which is not
+normalized, and a turn it does not reach keeps its own breakdown, so the two
+are never added and neither is dropped. A build that writes only the
+context-window snapshot still has no usage to capture. See
+`docs/session-catalog.md` ("grok").
 
 _Since [#172](https://github.com/AgentWorkforce/relayhistory/issues/172) and
 [#211](https://github.com/AgentWorkforce/relayhistory/issues/211), Claude is
