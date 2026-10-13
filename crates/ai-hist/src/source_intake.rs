@@ -447,6 +447,9 @@ pub struct ApplyObservationsRequest {
     pub connector_instance: String,
     pub location: SessionLocation,
     pub observations: Vec<SourceObservation>,
+    /// See [`crate::DiscoveryOptions::skip_protected_folder_identity`].
+    #[serde(default)]
+    pub skip_protected_folder_identity: bool,
 }
 struct BatchProvider {
     source: &'static str,
@@ -581,6 +584,7 @@ pub fn apply_source_observations(request: ApplyObservationsRequest) -> Result<Di
         &env,
         &DiscoverOptions {
             scope,
+            skip_protected_folder_identity: request.skip_protected_folder_identity,
             ..Default::default()
         },
         &providers

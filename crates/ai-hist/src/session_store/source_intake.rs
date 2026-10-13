@@ -25,6 +25,9 @@ pub struct SourceObservationBatch {
     pub location: SessionLocation,
     /// Shallow rows the connector enumerated, at most 10 000.
     pub observations: Vec<SourceObservation>,
+    /// See [`crate::DiscoveryOptions::skip_protected_folder_identity`].
+    #[serde(default)]
+    pub skip_protected_folder_identity: bool,
 }
 
 impl SourceObservationBatch {
@@ -41,7 +44,15 @@ impl SourceObservationBatch {
             connector_instance: connector_instance.into(),
             location,
             observations,
+            skip_protected_folder_identity: false,
         }
+    }
+
+    /// Keep a working directory under Desktop, Documents, or Downloads as its
+    /// raw path. Defaults off, matching [`crate::DiscoveryOptions`].
+    pub fn skip_protected_folder_identity(mut self, skip: bool) -> Self {
+        self.skip_protected_folder_identity = skip;
+        self
     }
 }
 
@@ -134,6 +145,7 @@ impl SessionStore {
             connector_instance: batch.connector_instance,
             location: batch.location,
             observations: batch.observations,
+            skip_protected_folder_identity: batch.skip_protected_folder_identity,
         })
         .map_err(|error| Error::classify(error, Error::Discovery))
     }
@@ -361,6 +373,7 @@ mod tests {
                     connector_instance: "default".into(),
                     location: SessionLocation::Remote,
                     observations: vec![observation("sess-1")],
+                    skip_protected_folder_identity: false,
                 })
                 .map(|_| ()),
             store

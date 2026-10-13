@@ -187,8 +187,9 @@ directory whose first component under the user home is `Desktop`,
 `Documents`, or `Downloads` as that raw path: discovery does not canonicalize
 it, probe `.git`, or read Git config. A provider `repo_url` is still preferred
 and does not read the directory. On macOS those three names match
-case-insensitively. Sync and hydrate do not take the option and still resolve
-every directory. `DiscoveryReport { discovered, skipped_unchanged,
+case-insensitively. A source-plugin observation submitted with
+`discoverSessions` uses the same flag. Sync and hydrate do not take the option
+and still resolve every directory. `DiscoveryReport { discovered, skipped_unchanged,
 diagnostics }`: one provider failing is a `DISCOVERY_FAILED` diagnostic, never
 an error for the rest.
 

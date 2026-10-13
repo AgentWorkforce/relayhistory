@@ -84,7 +84,10 @@ use serde::Serialize;
 /// 26 adds `onStoreMigration` and `migrateStore`, so a front end can name
 /// the one-time schema migration after an upgrade instead of appearing hung.
 /// 27 adds the provider-native `sessionKind` to catalog rows.
-pub const NATIVE_CONTRACT_VERSION: u32 = 27;
+/// 28 adds `skipProtectedFolderIdentity` on discovery and on source-observation
+/// intake. An addon that lacks it would ignore the option and still read a
+/// protected folder.
+pub const NATIVE_CONTRACT_VERSION: u32 = 28;
 const DEFAULT_LIMIT: i64 = 50;
 const DEFAULT_EVENT_LIMIT: i64 = 200;
 

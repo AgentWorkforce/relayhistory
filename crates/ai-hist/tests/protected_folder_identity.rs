@@ -223,3 +223,51 @@ fn policy_off_still_resolves_git_remotes() {
     drop(store);
     drop(temp);
 }
+
+/// Plugin intake is a second discovery pass. The flag has to travel with the
+/// observation request; the built-in discover option does not apply there.
+#[cfg(feature = "unstable-internal")]
+#[test]
+fn a_plugin_observation_keeps_a_protected_cwd_raw() {
+    use ai_hist::source_intake::{apply_source_observations, ApplyObservationsRequest};
+    use ai_hist::{SessionLocation, ShallowSession};
+
+    let _lock = ENV_LOCK.lock().unwrap();
+    let (temp, fix) = fixture();
+    isolate(&fix.home);
+    let cwd = format!("{}/Desktop/plugin-app", fix.home.display());
+    let apply = |name: &str, skip: bool| {
+        let db = fix.home.join(name);
+        apply_source_observations(ApplyObservationsRequest {
+            db_path: Some(db.clone()),
+            connector_id: "plugin".into(),
+            connector_instance: "one".into(),
+            location: SessionLocation::Local,
+            skip_protected_folder_identity: skip,
+            observations: vec![ShallowSession {
+                source: "codex".into(),
+                session_id: "plugin-desktop".into(),
+                cwd: Some(cwd.clone()),
+                raw_path: Some("plugin:one".into()),
+                source_stamp: Some("listing1".into()),
+                ..Default::default()
+            }
+            .into()],
+        })
+        .unwrap();
+        let store = SessionStore::open(StoreOptions::default().db_path(db).roots(
+            ProviderRoots::from_home(fix.home.clone(), fix.home.join("missing-opencode.db")),
+        ))
+        .unwrap();
+        project_key(&store, "plugin-desktop")
+    };
+    assert_eq!(
+        apply("plugin-on.db", true),
+        (cwd.clone(), "path".to_string())
+    );
+    assert_eq!(
+        apply("plugin-off.db", false),
+        ("github.com/Org/Home".to_string(), "remote".to_string())
+    );
+    drop(temp);
+}
