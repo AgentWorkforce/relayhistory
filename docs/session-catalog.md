@@ -1345,8 +1345,10 @@ How each adapter works:
     (the machinery of #173), by every sweep after the session directories and
     by every Grok hydration — `unchanged` ones included — in an `IMMEDIATE`
     transaction of its own, before the hydration's stamp check (the session's
-    stamp never moves when the log grows). An unchanged log reads zero bytes;
-    a trailing line with no newline waits for one. The file is in the sweep's
+    stamp never moves when the log grows). An unchanged log reads zero bytes.
+    A cursor saved before the Grok Build row shape is read once from the
+    start; a row already stored keeps its digest key.
+    A trailing line with no newline waits for one. The file is in the sweep's
     stat-only fingerprint and is a watch root of its own, so an append to it
     wakes live capture.
   - The log is every session's, so a log that cannot be read — unreadable, or

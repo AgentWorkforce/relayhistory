@@ -12,7 +12,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- Grok Build per-inference usage in `logs/unified.jsonl` is read from `sid` and the `ctx` counters `prompt_tokens`, `cached_prompt_tokens`, `completion_tokens` and `reasoning_tokens`, stored as `inputTokens`, `cachedReadTokens`, `outputTokens` and `reasoningTokens`.
+- Grok Build per-inference usage in `logs/unified.jsonl` is read from `sid` and the `ctx` counters `prompt_tokens`, `cached_prompt_tokens`, `completion_tokens` and `reasoning_tokens`, stored as `inputTokens`, `cachedReadTokens`, `outputTokens` and `reasoningTokens`. A cursor saved before that shape is read once from the start; a row already stored stays one row.
 
 ## [0.42.1] - 2026-10-13
 
