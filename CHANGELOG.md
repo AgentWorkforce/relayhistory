@@ -17,6 +17,14 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - A Rust host composes an external source connector without the native addon: `SessionStore::apply_source_observations` lands a connector's enumerated rows, `source_observation` reads the observation and revision fence, and `apply_source_evidence` applies the acquired snapshot under the same transport-free intake the SDK's plugin loader uses.
 - Discovery can keep a working directory under Desktop, Documents, or Downloads as its raw path instead of reading that folder. Source-plugin observations and `SessionStore::apply_source_observations` follow the same policy.
 
+## [0.43.0] - 2026-10-13
+
+### Added
+
+- `@relayhistory/provider-sources` gains a `devin-cloud` connector: `--remote` / `--all` discovery lists an organization's Devin cloud sessions through `GET /v3/organizations/{org}/sessions`, and targeted hydration returns the full message history as `devin` evidence. Sign-in stays with the Devin CLI (`credentials.toml` `windsurf_api_key` + `config.json` `devin.org_id`); `RELAYHISTORY_DEVIN_API_KEY`, `RELAYHISTORY_DEVIN_ORG_ID`, `RELAYHISTORY_DEVIN_CREDENTIALS` and `RELAYHISTORY_DEVIN_CONFIG` override each piece.
+- A Rust host composes an external source connector without the native addon: `SessionStore::apply_source_observations` lands a connector's enumerated rows, `source_observation` reads the observation and revision fence, and `apply_source_evidence` applies the acquired snapshot under the same transport-free intake the SDK's plugin loader uses.
+- Discovery can keep a working directory under Desktop, Documents, or Downloads as its raw path instead of reading that folder. Source-plugin observations and `SessionStore::apply_source_observations` follow the same policy.
+
 ### Rust API
 
 - Added `SessionStore::source_observation`, `SessionStore::apply_source_observations` and `SessionStore::apply_source_evidence`, with `SourceObservationBatch`, `SourceEvidenceSubmission`, `ObservationKey`, `SessionObservation`, `ObservationCheckpoint`, `ObservationState`, `NormalizedSourceEvidence`, `SourceObservation`, `DiscoverySummary` and `HydrateSessionResult`. A stale revision fence fails as `Error::SourceRevisionConflict` (`SOURCE_REVISION_CONFLICT`), matching the code the native intake reports.
@@ -978,7 +986,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - The SDK reads provider JSONL natively and works without the Python CLI.
 
-[Unreleased]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.42.1...HEAD
+[Unreleased]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.43.0...HEAD
+[0.43.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.42.1...sdk-ts-v0.43.0
 [0.42.1]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.42.0...sdk-ts-v0.42.1
 [0.42.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.41.0...sdk-ts-v0.42.0
 [0.41.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.40.1...sdk-ts-v0.41.0
