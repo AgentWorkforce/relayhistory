@@ -14,16 +14,23 @@ struct Keys {
     tools: BTreeSet<String>,
     markers: BTreeSet<String>,
 }
-fn marker(
-    conn: &Connection,
-    s: &Session,
-    uid: &str,
-    message: Option<&str>,
+/// One Hermes marker row, before the session and key bookkeeping it is
+/// written with.
+struct HermesMarker<'a> {
+    uid: &'a str,
+    message: Option<&'a str>,
     ts: i64,
-    kind: &str,
-    payload: &Value,
-    keys: &mut Keys,
-) -> Result<()> {
+    kind: &'a str,
+    payload: &'a Value,
+}
+fn marker(conn: &Connection, s: &Session, m: HermesMarker<'_>, keys: &mut Keys) -> Result<()> {
+    let HermesMarker {
+        uid,
+        message,
+        ts,
+        kind,
+        payload,
+    } = m;
     crate::insert_session_marker(
         conn,
         ID,
@@ -51,11 +58,13 @@ pub(super) fn session(conn: &Connection, s: &Session, path: &Path) -> Result<usi
     marker(
         conn,
         s,
-        "session",
-        None,
-        s.started,
-        "session_metadata",
-        &serde_json::json!({"native_session_id":s.native_id,"profile":s.profile,"parent_session_id":s.parent,"end_reason":s.end_reason,"title":s.title,"model":s.model,"schema_version":31}),
+        HermesMarker {
+            uid: "session",
+            message: None,
+            ts: s.started,
+            kind: "session_metadata",
+            payload: &serde_json::json!({"native_session_id":s.native_id,"profile":s.profile,"parent_session_id":s.parent,"end_reason":s.end_reason,"title":s.title,"model":s.model,"schema_version":31}),
+        },
         &mut keys,
     )?;
     for m in &s.messages {
@@ -150,22 +159,26 @@ fn message(
     marker(
         conn,
         s,
-        &format!("message:{mid}"),
-        Some(&mid),
-        m.timestamp,
-        "message_metadata",
-        &serde_json::json!({"active":m.active,"compacted":m.compacted,"compressed_summary":m.compressed,"observed":m.observed,"display_kind":m.display_kind,"tool_name":m.tool_name}),
+        HermesMarker {
+            uid: &format!("message:{mid}"),
+            message: Some(&mid),
+            ts: m.timestamp,
+            kind: "message_metadata",
+            payload: &serde_json::json!({"active":m.active,"compacted":m.compacted,"compressed_summary":m.compressed,"observed":m.observed,"display_kind":m.display_kind,"tool_name":m.tool_name}),
+        },
         keys,
     )?;
     if m.role == "system" {
         marker(
             conn,
             s,
-            &format!("system:{mid}"),
-            Some(&mid),
-            m.timestamp,
-            "system",
-            &serde_json::json!({"content":m.content}),
+            HermesMarker {
+                uid: &format!("system:{mid}"),
+                message: Some(&mid),
+                ts: m.timestamp,
+                kind: "system",
+                payload: &serde_json::json!({"content":m.content}),
+            },
             keys,
         )?;
         return Ok(0);
