@@ -71,6 +71,7 @@ use std::sync::mpsc::{self, Receiver};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+mod catalog_digest;
 mod catalog_row;
 mod options;
 mod watch_sweep;
@@ -1184,8 +1185,10 @@ fn spawn_watch_thread(
 /// there is nothing to do. Skipping the check on such a tick would leave that
 /// row unreported for as long as the sources stay quiet. What the check costs
 /// is one read of the change-feed head when nothing was written since
-/// `before` — the head proves the catalog is the one `before` digested — and
-/// a scan of the catalog, a SHA-256 per row, only when something was.
+/// `before` — the head proves the catalog is the one `before` digested — and,
+/// when that head has moved, a SHA-256 of each catalog row the feed stamped
+/// since the digest. A store with no feed, or a head from another epoch,
+/// still hashes every row.
 fn changes_under_lock(
     conn: &Connection,
     before: &CatalogFingerprint,
@@ -1196,7 +1199,7 @@ fn changes_under_lock(
     }
     let after = CatalogFingerprint {
         head,
-        rows: Arc::new(catalog_row_digests(conn)?),
+        rows: catalog_digest::rows_since(conn, before, head)?,
     };
     let changed = catalog_changes(before, &after);
     Ok((after, changed))
@@ -1440,20 +1443,14 @@ pub struct SyncReport {
 /// *what* changed: a moved head says something was written, not that a
 /// covered column was, and `changed` reports only rows whose digest moved.
 /// `head` is `None` on a store whose feed is not installed, and such a digest
-/// is always recomputed.
+/// is always recomputed, as is a head from another epoch. Within one epoch a
+/// moved head rehashes the sessions stamped since this digest and drops keys
+/// a session tombstone names, so a deleted row's digest does not stay.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct CatalogFingerprint {
     head: Option<crate::change_feed::Watermark>,
     rows: Arc<BTreeMap<(String, String), [u8; 32]>>,
 }
-
-/// The catalog columns the digest covers: everything a sweep, shallow
-/// discovery or the identity refresh can write, except the two text
-/// excerpts, which are the only columns whose size is not a few bytes.
-const CATALOG_FINGERPRINT_COLUMNS: &str = "source_stamp, last_activity_ms, first_activity_ms, \
-     discovery_state, parser_version, project_key, project_key_method, cwd, git_branch, \
-     raw_path, models_json, originator, agent_version, repo_url, initial_commit, \
-     workspace_roots_json, title";
 
 /// The change-feed head, or `None` when this store's feed (and with it the
 /// guarantee that every catalog write moves the head) is not in place. The
@@ -1470,59 +1467,13 @@ fn catalog_head(conn: &Connection) -> Result<Option<crate::change_feed::Watermar
 
 fn catalog_fingerprint(conn: &Connection) -> Result<CatalogFingerprint, Error> {
     // The head first: a write that lands between the two reads is then in
-    // the rows *and* past the head, so the next comparison rescans rather
-    // than trusting rows that already moved on.
+    // the rows *and* past the head, so the next comparison rehashes them
+    // rather than trusting rows that already moved on.
     let head = catalog_head(conn)?;
     Ok(CatalogFingerprint {
         head,
-        rows: Arc::new(catalog_row_digests(conn)?),
+        rows: catalog_digest::every_row(conn)?,
     })
-}
-
-fn catalog_row_digests(conn: &Connection) -> Result<BTreeMap<(String, String), [u8; 32]>, Error> {
-    use sha2::{Digest, Sha256};
-    let mut stmt = conn
-        .prepare(&format!(
-            "SELECT source, session_id, {CATALOG_FINGERPRINT_COLUMNS} FROM sessions"
-        ))
-        .map_err(Error::sql)?;
-    let columns = stmt.column_count();
-    let rows = stmt
-        .query_map([], |row| {
-            let mut digest = Sha256::new();
-            for index in 2..columns {
-                // Type and value both, with a separator, so a NULL and an
-                // empty string differ and a shifted column boundary cannot
-                // read as the same row.
-                match row.get_ref(index)? {
-                    rusqlite::types::ValueRef::Null => digest.update(b"n|"),
-                    rusqlite::types::ValueRef::Integer(value) => {
-                        digest.update(b"i");
-                        digest.update(value.to_le_bytes());
-                        digest.update(b"|");
-                    }
-                    rusqlite::types::ValueRef::Real(value) => {
-                        digest.update(b"r");
-                        digest.update(value.to_le_bytes());
-                        digest.update(b"|");
-                    }
-                    rusqlite::types::ValueRef::Text(bytes)
-                    | rusqlite::types::ValueRef::Blob(bytes) => {
-                        digest.update(b"t");
-                        digest.update((bytes.len() as u64).to_le_bytes());
-                        digest.update(bytes);
-                        digest.update(b"|");
-                    }
-                }
-            }
-            Ok((
-                (row.get::<_, String>(0)?, row.get::<_, String>(1)?),
-                digest.finalize().into(),
-            ))
-        })
-        .map_err(Error::sql)?;
-    rows.collect::<Result<BTreeMap<_, _>, _>>()
-        .map_err(Error::sql)
 }
 
 fn catalog_changes(before: &CatalogFingerprint, after: &CatalogFingerprint) -> Vec<SessionRef> {
@@ -3964,7 +3915,7 @@ mod tests {
         );
 
         // A write to a column the digest does not cover moves the head, so
-        // the catalog is rescanned -- and nothing is reported.
+        // that row is rehashed -- and nothing is reported.
         conn.execute_batch("UPDATE sessions SET first_prompt = 'hello' WHERE session_id = 'one'")
             .unwrap();
         let (after, changed) = changes_under_lock(&conn, &before).unwrap();
