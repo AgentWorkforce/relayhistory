@@ -74,6 +74,7 @@ use std::time::{Duration, Instant};
 mod catalog_digest;
 mod catalog_row;
 mod options;
+mod source_intake;
 mod watch_sweep;
 
 pub(crate) use options::controlled;
@@ -81,6 +82,7 @@ pub use options::{
     DiscoveryOptions, HydrateOptions, ProgressObserver, StopToken, StoreOptions, SyncOptions,
     WatchTick,
 };
+pub use source_intake::{SourceEvidenceSubmission, SourceObservationBatch};
 use watch_sweep::{TickNotes, WatchSources, WatchSweep};
 
 // ---------------------------------------------------------------------------
@@ -143,6 +145,13 @@ pub enum Error {
     EvidencePartial(String),
     /// A remote connector failed outright.
     ConnectorFailure(String),
+    /// The revision fence an evidence apply carried no longer matches the
+    /// observation: a concurrent enumeration moved it forward while the
+    /// connector acquired. The snapshot is refused rather than replacing
+    /// newer evidence; the host re-reads
+    /// [`SessionStore::source_observation`] and acquires again.
+    #[serde(rename = "SOURCE_REVISION_CONFLICT")]
+    SourceRevisionConflict(String),
     /// A read failed inside SQLite.
     #[serde(rename = "QUERY_FAILED")]
     Query(String),
@@ -202,6 +211,7 @@ impl Error {
             Self::AuthenticationExpired(_) => "AUTHENTICATION_EXPIRED",
             Self::EvidencePartial(_) => "EVIDENCE_PARTIAL",
             Self::ConnectorFailure(_) => "CONNECTOR_FAILURE",
+            Self::SourceRevisionConflict(_) => "SOURCE_REVISION_CONFLICT",
             Self::Query(_) => "QUERY_FAILED",
             Self::Discovery(_) => "DISCOVERY_FAILED",
             Self::SyncFailed(_) => "SYNC_FAILED",
@@ -229,6 +239,7 @@ impl Error {
             | Self::AuthenticationExpired(m)
             | Self::EvidencePartial(m)
             | Self::ConnectorFailure(m)
+            | Self::SourceRevisionConflict(m)
             | Self::Query(m)
             | Self::Discovery(m)
             | Self::SyncFailed(m)
@@ -261,6 +272,7 @@ impl Error {
             ("AUTHENTICATION_EXPIRED", Self::AuthenticationExpired),
             ("EVIDENCE_PARTIAL", Self::EvidencePartial),
             ("CONNECTOR_FAILURE", Self::ConnectorFailure),
+            ("SOURCE_REVISION_CONFLICT", Self::SourceRevisionConflict),
             ("INVALID_ARGUMENT", Self::InvalidArgument),
             ("DISCOVERY_FAILED", Self::Discovery),
             // A discover tick's database-open failure is reported through the

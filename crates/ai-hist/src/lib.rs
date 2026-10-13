@@ -79,9 +79,13 @@ pub use change_feed::{
     Change, ChangeKind, ChangeOp, ChangeQuery, Changes, EvidenceRow, StoredRow, Watermark,
     DEFAULT_CHANGE_BATCH, MAX_CHANGE_BATCH,
 };
-pub use discover::{declared_evidence_kinds, missing_evidence_kinds, ShallowSession};
+pub use discover::{
+    declared_evidence_kinds, missing_evidence_kinds, DiscoverySummary, ShallowSession,
+};
 pub use forget::{CompactOptions, CompactReport, ForgetOptions, ForgetReport, ForgetScope};
 pub use ingest::CaptureProgress;
+pub use ingest::HydrateSessionResult;
+pub use observations::{ObservationCheckpoint, ObservationKey, SessionObservation};
 pub use relationship_graph::{RelationshipCapabilities, SessionRelationship};
 pub use session_identities::{IdentityQuery, SessionIdentity};
 pub use session_store::{
@@ -89,8 +93,9 @@ pub use session_store::{
     Diagnostic, DiscoveryOptions, DiscoveryReport, DiscoveryState, Error, FileEdit, HydrateOptions,
     HydrateReport, HydrateStatus, Marker, Message, MessageIdOrigin, ProgressObserver, Prompt,
     Relationship, RelationshipSide, Role, SessionEvidence, SessionQuery, SessionRef, SessionStore,
-    Source, SourceCapabilities, StopToken, StoreOptions, SyncOptions, SyncReport, TickReport,
-    ToolCall, ToolResult, WatchHandle, WatchOptions, WatchScope, WatchStop, WatchTick, WatchedPath,
+    Source, SourceCapabilities, SourceEvidenceSubmission, SourceObservationBatch, StopToken,
+    StoreOptions, SyncOptions, SyncReport, TickReport, ToolCall, ToolResult, WatchHandle,
+    WatchOptions, WatchScope, WatchStop, WatchTick, WatchedPath,
 };
 /// The usage reads that take a raw connection. Embedders reach the same data
 /// through [`SessionStore::session`], whose `requests` and `usage` fields
@@ -103,6 +108,7 @@ pub use session_usage::{
     SessionUsageSummary, UsageDiagnostic, SESSION_USAGE_CONTRACT_VERSION,
 };
 pub use source_evidence::{EvidenceKind, EvidenceRecord, FULL_SESSION_KINDS, PARSED_SESSION_KINDS};
+pub use source_intake::{NormalizedSourceEvidence, ObservationState, SourceObservation};
 pub use usage::{
     attribute_usage_to_prompts, normalize_usage, normalize_usage_str, source_accounting,
     NormalizedUsage, PromptKey, UsageAccounting, UsageCoverage, UsageError, NORMALIZABLE_SOURCES,

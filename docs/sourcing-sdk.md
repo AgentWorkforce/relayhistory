@@ -85,7 +85,7 @@ What the facade owes you, and what it asks in return:
   `Error::UnsupportedOperation`, and a watermark the store cannot serve is
   `Error::WatermarkAheadOfStore`.
 
-## The sixteen operations
+## The nineteen operations
 
 | Method                                           | Provider I/O                                | Database work                                                             | Lock                                             |
 | ------------------------------------------------ | ------------------------------------------- | ------------------------------------------------------------------------- | ------------------------------------------------ |
@@ -93,6 +93,9 @@ What the facade owes you, and what it asks in return:
 | `discover(DiscoveryOptions)`                     | provider metadata only, stamp-gated         | shallow catalog upserts                                                   | none (SQLite serializes writes)                  |
 | `sync(SyncOptions)`                              | full local sweep, fingerprint-gated         | migrations + ingestion + shallow discovery                                | `SyncRunLock`, whole run                         |
 | `hydrate(&SessionRef, HydrateOptions)`           | one session and its bounded related files   | transactional evidence + checkpoint upsert                                | per-session hydration lock                       |
+| `source_observation(&ObservationKey)`            | none                                        | one observation, checkpoint and revision read                             | none (one read snapshot)                         |
+| `apply_source_observations(SourceObservationBatch)` | none — the connector already enumerated | shallow catalog upserts under the connector identity                      | none (SQLite serializes writes)                  |
+| `apply_source_evidence(SourceEvidenceSubmission)` | none — the connector already acquired    | atomic evidence reconcile against the observation's records               | the snapshot's expected observation revision     |
 | `watch(WatchOptions) -> WatchHandle`             | fs-event or polling driven ticks            | a `sync` per tick, or a shallow `discover` when `kind` is `Discover`      | `SyncRunLock` on a sync tick; none on discover   |
 | `sessions(CatalogQuery) -> CatalogIter`          | none                                        | keyset-paged reads over `sessions`                                        | none (WAL reader)                                |
 | `session(&SessionRef, SessionQuery)`             | none                                        | every table for one session, on one snapshot                              | none (one deferred read transaction)             |
@@ -138,7 +141,7 @@ let store = SessionStore::open(
 | `db_path: None`, `home: None` | The CLI's database: `$AI_HIST_DB` if set, else `$XDG_DATA_HOME/ai-hist/ai-history.db` if `XDG_DATA_HOME` is set, else `~/.local/share/ai-hist/ai-history.db` (`HOME`, or `USERPROFILE` on Windows). |
 | `home` | Also the directory the providers are rooted at when `roots` is `None`: `<home>/.claude`, `<home>/.codex`, `<home>/.grok`, `<home>/.local/share/opencode/`. `None` means the process `HOME`. Ignored when `roots` is set. |
 | `roots: Some(ProviderRoots)` | Exactly where each provider keeps its sessions, resolved by the caller. |
-| `read_only` | Open without creating or migrating. `discover`, `sync`, `hydrate`, `watch`, `forget_evidence` and `compact` are `Error::UnsupportedOperation`. |
+| `read_only` | Open without creating or migrating. `discover`, `sync`, `hydrate`, `watch`, `forget_evidence`, `compact`, `apply_source_observations` and `apply_source_evidence` are `Error::UnsupportedOperation`; `source_observation` still reads. |
 
 **Provider roots.** `ProviderRoots::from_env(home)` is the CLI's resolution —
 `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME`, `OPENCODE_DB` and
@@ -262,6 +265,43 @@ narrowed by the request (no `Relationship` when `include_related` is off) —
 `related` sessions, `bytes_read` and diagnostics. A missing transcript is a status, not an error: a
 hook fires inside the harness's tool call, and a file that was cleaned up
 before the hook ran is an answer.
+
+### Source connector intake
+
+The three `*_source_*` operations are how a host composes an external source
+connector — a plugin helper process, an embedded adapter — into this store.
+They are the same transport-free boundary `ai-hist-napi` exposes to the
+TypeScript SDK's plugin loader; the provider's network calls, credentials and
+transports stay outside the engine, in the connector the host runs.
+
+A driver runs one enumerate/apply cycle per connector:
+
+1. The connector enumerates its sessions into `SourceObservation` rows (a
+   `ShallowSession` plus an opaque `raw_locator` it gets back at hydration)
+   and the host lands them with
+   `apply_source_observations(SourceObservationBatch)`, keyed by
+   `connector_id` + `connector_instance` + `location`. Rows enter the normal
+   shallow catalog; a remote observation never merges with or overwrites the
+   same session's local provenance.
+2. Before acquiring evidence for one session the host reads
+   `source_observation(&ObservationKey)`: the stored observation, its
+   checkpoint and the `revision` it must fence the apply with.
+3. The connector acquires and normalizes evidence into
+   `NormalizedSourceEvidence` — the kinds it covers and the records it holds
+   — and the host applies it with
+   `apply_source_evidence(SourceEvidenceSubmission)`, carrying the revision
+   from step 2. Intake validates every record's identity and columns and
+   reconciles the snapshot atomically: a covered kind's records replace, an
+   omitted kind's stay. A concurrent writer that moved the observation
+   forward makes the revision stale, and the apply is refused
+   (`SOURCE_REVISION_CONFLICT`) rather than replacing newer evidence.
+   `include_related: Some(false)` scopes coverage to the one thread, exactly
+   as `HydrateOptions::include_related` does.
+
+`ObservationKey`, `SessionObservation`, `ObservationCheckpoint`,
+`ObservationState`, `NormalizedSourceEvidence`, `SourceObservation`,
+`SourceObservationBatch`, `SourceEvidenceSubmission`, `DiscoverySummary` and
+`HydrateSessionResult` are part of the default surface for this.
 
 ### `watch`
 
@@ -1004,7 +1044,7 @@ embedder reads before bumping.
 
 | Feature | Default | What it adds | For |
 | --- | --- | --- | --- |
-| *(none)* | ✓ | `SessionStore` and its sixteen operations, the change feed (`Change`, `ChangeQuery`, `Watermark`, `EvidenceRow`, `StoredRow`), `SessionIdentity` and `IdentityQuery`, `Source` and `SourceCapabilities`, `Error`, the evidence structs above, `NormalizedUsage` and the usage normalizers, `project_identity`, `declared_evidence_kinds` | Embedders |
+| *(none)* | ✓ | `SessionStore` and its nineteen operations, the change feed (`Change`, `ChangeQuery`, `Watermark`, `EvidenceRow`, `StoredRow`), `SessionIdentity` and `IdentityQuery`, `Source` and `SourceCapabilities`, `Error`, the evidence structs above, `NormalizedUsage` and the usage normalizers, `project_identity`, `declared_evidence_kinds` | Embedders |
 | `fs-events` | — | The `notify` backend behind `watch`; without it `watch` polls at `poll_interval_ms`. `WatchOptions::use_fs_events` selects it when it is compiled in | The CLI, and an embedder that wants event-driven ticks |
 | `export` | — | `ai_hist::export`: bounded, resumable NDJSON snapshots of the store's evidence, keyed like the change feed | napi (the SDK's `exportHistory`) |
 | `opencode-backup` | — | Snapshot a live OpenCode SQLite store through `rusqlite`'s backup API before reading it | The CLI, napi |
@@ -1069,7 +1109,7 @@ repository should — each entry is a facade gap or a deliberate non-goal.
 | `crates/ai-hist-napi` | `open_db*`, `schema_is_*_read_current`, `default_db_path` | Node holds one long-lived connection per addon and answers a schema mismatch by reopening writable |
 | | connection-taking `session_*_page`, `session_relationships`, `session_tree`, `session_children_page`, `stats_scoped_by`, `search`, `recent`, `session_locations` | The TypeScript SDK exposes relationships, trees, statistics and search the Rust facade does not; moving these reads onto `SessionStore` facade methods (markers, requests, usage, user turns and the full `SessionEvidence` op), and then dropping `rusqlite` from `ai-hist-napi`, is a follow-up to [#181](https://github.com/AgentWorkforce/relayhistory/issues/181) |
 | | `SESSION_*_CONTRACT_VERSION` constants, `export` | The native contract is versioned separately from Cargo semver; `export` backs the SDK's local `exportHistory` |
-| `plugins/provider-sources/rust` | `discover::DiscoveryEnv`, `ShallowSessionProvider`, `sources::NormalizedSourceEvidence`, `observations::SessionObservation`, `EvidenceKind`, `SOURCE_CHOICES` | Remote connectors supply normalized evidence into the store; the intake contract is internal |
+| `plugins/provider-sources/rust` | `discover::DiscoveryEnv`, `ShallowSessionProvider`, `sources::normalize_source_evidence`, `EvidenceKind`, `SOURCE_CHOICES` | Provider adapters enumerate and acquire through engine types (`DiscoveryEnv` borrows a connection); hosts land the results through the facade's `source_observation` / `apply_source_observations` / `apply_source_evidence` |
 
 The rule that follows: a new in-tree call site that reaches past the facade
 must be able to say which row of this table it belongs to, or it is a facade
