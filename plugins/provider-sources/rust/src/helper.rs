@@ -104,70 +104,96 @@ fn validate_request(request: &Request) -> Result<()> {
 }
 fn execute(request: Request) -> Result<Value> {
     let args = request.args;
-    let connector = args.connector_id.context("connectorId required")?;
-    let instance = args.connector_instance.as_deref().unwrap_or("default");
+    let connector = args.connector_id.clone().context("connectorId required")?;
+    let instance = args
+        .connector_instance
+        .clone()
+        .unwrap_or_else(|| "default".into());
     let home = resolve_home(std::env::var_os("HOME"), std::env::var_os("USERPROFILE"))?;
     let home = home.as_path();
     if request.operation == "send" {
-        // Send needs no provider instance: the dispatcher resolves the
-        // connector's own authenticated transport, and a missing sign-in
-        // answers CONNECTOR_NOT_CONFIGURED from there.
-        let session_id = args.session_id.context("sessionId required")?;
-        let message = args.message.context("message required")?;
-        crate::remote::send_remote_message_at(home, &connector, &session_id, &message)?;
-        return Ok(json!({"sent": true}));
+        return execute_send(home, &connector, args);
     }
-    let provider = crate::remote::provider(home, &connector, instance, args.limit)?;
+    let provider = crate::remote::provider(home, &connector, &instance, args.limit)?;
     if let Some(source) = &args.source {
         ensure!(provider.source() == source, "source mismatch");
     }
     if request.operation == "discover" {
-        provider.check_available(home)?;
-        // Provider enumeration takes the public engine context. This ephemeral
-        // connection cannot mutate the caller's history or acquisition cursor.
-        let conn = rusqlite::Connection::open_in_memory()?;
-        let env = DiscoveryEnv::with_roots(&conn, home.into(), home.join("unused-opencode.db"));
-        let candidates = provider.enumerate(&env, args.limit)?;
-        let mut observations = Vec::new();
-        for candidate in candidates {
-            if let Some(mut row) = provider.read_shallow(&env.scan(), None, &candidate)? {
-                row.source_stamp = Some(candidate.stamp.clone());
-                row.locations = vec!["remote".into()];
-                let mut value = serde_json::to_value(row)?;
-                value
-                    .as_object_mut()
-                    .context("source observation object required")?
-                    .insert("raw_locator".into(), json!(candidate.locator));
-                observations.push(value);
-            }
-        }
-        Ok(json!({"observations": observations}))
+        execute_discover(provider, home, args)
     } else {
-        let observation = args.observation.context("observation required")?;
-        observation.key.validate()?;
-        ensure!(
-            observation.key.connector_id == connector
-                && observation.key.connector_instance == instance
-                && observation.key.source == provider.source()
-                && observation.key.location == SessionLocation::Remote,
-            "observation identity mismatch"
-        );
-        ensure!(
-            observation.access_state == "available",
-            "observation unavailable"
-        );
-        provider.check_available(home)?;
-        let evidence = provider.acquire(home, &observation)?;
-        let mut normalized = ai_hist::sources::normalize_source_evidence(
-            provider.source(),
-            &observation.key.session_id,
-            evidence,
-        )?;
-        if args.include_related == Some(false) {
-            drop_related(&mut normalized);
-        }
-        Ok(serde_json::to_value(normalized)?)
+        execute_hydrate(provider, home, &connector, &instance, args)
     }
+}
+
+/// `send`: post the message through the connector's write path. No provider
+/// instance is needed — the dispatcher resolves the connector's own
+/// authenticated transport, and a missing sign-in answers
+/// CONNECTOR_NOT_CONFIGURED from there.
+fn execute_send(home: &std::path::Path, connector: &str, args: Arguments) -> Result<Value> {
+    let session_id = args.session_id.context("sessionId required")?;
+    let message = args.message.context("message required")?;
+    crate::remote::send_remote_message_at(home, connector, &session_id, &message)?;
+    Ok(json!({"sent": true}))
+}
+
+fn execute_discover(
+    provider: Box<dyn crate::discover::ShallowSessionProvider>,
+    home: &std::path::Path,
+    args: Arguments,
+) -> Result<Value> {
+    provider.check_available(home)?;
+    // Provider enumeration takes the public engine context. This ephemeral
+    // connection cannot mutate the caller's history or acquisition cursor.
+    let conn = rusqlite::Connection::open_in_memory()?;
+    let env = DiscoveryEnv::with_roots(&conn, home.into(), home.join("unused-opencode.db"));
+    let candidates = provider.enumerate(&env, args.limit)?;
+    let mut observations = Vec::new();
+    for candidate in candidates {
+        if let Some(mut row) = provider.read_shallow(&env.scan(), None, &candidate)? {
+            row.source_stamp = Some(candidate.stamp.clone());
+            row.locations = vec!["remote".into()];
+            let mut value = serde_json::to_value(row)?;
+            value
+                .as_object_mut()
+                .context("source observation object required")?
+                .insert("raw_locator".into(), json!(candidate.locator));
+            observations.push(value);
+        }
+    }
+    Ok(json!({"observations": observations}))
+}
+
+fn execute_hydrate(
+    provider: Box<dyn crate::discover::ShallowSessionProvider>,
+    home: &std::path::Path,
+    connector: &str,
+    instance: &str,
+    args: Arguments,
+) -> Result<Value> {
+    let observation = args.observation.context("observation required")?;
+    observation.key.validate()?;
+    ensure!(
+        observation.key.connector_id == connector
+            && observation.key.connector_instance == instance
+            && observation.key.source == provider.source()
+            && observation.key.location == SessionLocation::Remote,
+        "observation identity mismatch"
+    );
+    ensure!(
+        observation.access_state == "available",
+        "observation unavailable"
+    );
+    provider.check_available(home)?;
+    let evidence = provider.acquire(home, &observation)?;
+    let mut normalized = ai_hist::sources::normalize_source_evidence(
+        provider.source(),
+        &observation.key.session_id,
+        evidence,
+    )?;
+    if args.include_related == Some(false) {
+        drop_related(&mut normalized);
+    }
+    Ok(serde_json::to_value(normalized)?)
 }
 /// Remove delegation evidence from a snapshot the caller asked to scope to one
 /// thread.
