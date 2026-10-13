@@ -10,14 +10,17 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - `@relayhistory/provider-sources` gains a `devin-cloud` connector: `--remote` / `--all` discovery lists an organization's Devin cloud sessions through `GET /v3/organizations/{org}/sessions`, and targeted hydration returns the full message history as `devin` evidence. Sign-in stays with the Devin CLI (`credentials.toml` `windsurf_api_key` + `config.json` `devin.org_id`); `RELAYHISTORY_DEVIN_API_KEY`, `RELAYHISTORY_DEVIN_ORG_ID`, `RELAYHISTORY_DEVIN_CREDENTIALS` and `RELAYHISTORY_DEVIN_CONFIG` override each piece.
 - A Rust host composes an external source connector without the native addon: `SessionStore::apply_source_observations` lands a connector's enumerated rows, `source_observation` reads the observation and revision fence, and `apply_source_evidence` applies the acquired snapshot under the same transport-free intake the SDK's plugin loader uses.
+- Discovery can keep a working directory under Desktop, Documents, or Downloads as its raw path instead of reading that folder. Source-plugin observations and `SessionStore::apply_source_observations` follow the same policy.
 
 ### Rust API
 
 - Added `SessionStore::source_observation`, `SessionStore::apply_source_observations` and `SessionStore::apply_source_evidence`, with `SourceObservationBatch`, `SourceEvidenceSubmission`, `ObservationKey`, `SessionObservation`, `ObservationCheckpoint`, `ObservationState`, `NormalizedSourceEvidence`, `SourceObservation`, `DiscoverySummary` and `HydrateSessionResult`. A stale revision fence fails as `Error::SourceRevisionConflict` (`SOURCE_REVISION_CONFLICT`), matching the code the native intake reports.
+- `DiscoveryOptions::skip_protected_folder_identity` skips filesystem project identity for Desktop, Documents, and Downloads. It defaults off. `SourceObservationBatch::skip_protected_folder_identity` carries the same policy into host-composed intake.
+- Native contract 28 carries `skipProtectedFolderIdentity` on discovery and source-observation intake. An SDK paired with another contract fails at load.
 
 ### Fixed
 
-- Grok Build per-inference usage in `logs/unified.jsonl` is read from `sid` and the `ctx` counters `prompt_tokens`, `cached_prompt_tokens`, `completion_tokens` and `reasoning_tokens`, stored as `inputTokens`, `cachedReadTokens`, `outputTokens` and `reasoningTokens`. A cursor saved before that shape is read once from the start; a row already stored stays one row.
+- Grok Build per-inference usage in `logs/unified.jsonl` is read from `sid` and the `ctx` counters `prompt_tokens`, `cached_prompt_tokens`, `completion_tokens` and `reasoning_tokens`. A cursor saved before that shape is read once from the start; a row already stored stays one row.
 
 ## [0.42.1] - 2026-10-13
 

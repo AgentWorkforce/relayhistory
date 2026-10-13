@@ -336,7 +336,7 @@ fn discover(session_db: &Path) {
         &DiscoverOptions {
             scope: SessionScope::Local,
             sources: Vec::new(),
-            limit: None,
+            ..Default::default()
         },
     )
     .unwrap();

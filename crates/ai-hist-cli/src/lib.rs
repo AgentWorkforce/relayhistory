@@ -1368,11 +1368,7 @@ fn run_session_discovery(
     as_json: bool,
     connectors: &remote::SourceConnectorSelection,
 ) -> Result<()> {
-    let options = DiscoverOptions {
-        scope,
-        sources,
-        limit,
-    };
+    let options = DiscoverOptions::new(scope, sources, limit);
     let mut count = 0usize;
     let outcome = discover::discover_sessions_with_connectors(
         &DiscoveryEnv::new(conn),

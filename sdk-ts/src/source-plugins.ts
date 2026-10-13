@@ -33,6 +33,8 @@ export interface SourcePluginOptions {
   limit?: number;
   signal?: AbortSignal;
   acquisitionTimeoutMs?: number;
+  /** See `DiscoverSessionsOptions.skipProtectedFolderIdentity`. */
+  skipProtectedFolderIdentity?: boolean;
   onUnavailable?: (source: string, error: RelayHistoryError) => void;
 }
 // Reconstruct public errors with safe messages. Plugin messages/causes may
@@ -220,6 +222,7 @@ export async function discoverSourcePlugins(
               connector_instance: connector.instanceId,
               location: connector.location,
               observations,
+              skip_protected_folder_identity: options.skipProtectedFolderIdentity === true,
             }),
           ),
         ) as Record<string, unknown>,

@@ -892,7 +892,7 @@ fn devin_discovery_treats_an_incomplete_store_as_absent() {
         &DiscoverOptions {
             scope: SessionScope::Local,
             sources: vec!["devin".to_string()],
-            limit: None,
+            ..Default::default()
         },
         |row| found.push((row.source.clone(), row.session_id.clone())),
     )
@@ -921,7 +921,7 @@ fn devin_discovery_reports_shallow_metadata() {
         &DiscoverOptions {
             scope: SessionScope::Local,
             sources: vec!["devin".to_string()],
-            limit: None,
+            ..Default::default()
         },
         |row| found.push((row.source.clone(), row.session_id.clone())),
     )
@@ -1001,7 +1001,7 @@ fn devin_discovery_stamp_tracks_in_place_content_rewrites() {
             &DiscoverOptions {
                 scope: SessionScope::Local,
                 sources: vec!["devin".to_string()],
-                limit: None,
+                ..Default::default()
             },
             |_| {},
         )
@@ -1288,7 +1288,7 @@ fn devin_retirement_drops_unattributed_previews() {
         &DiscoverOptions {
             scope: SessionScope::Local,
             sources: vec!["devin".to_string()],
-            limit: None,
+            ..Default::default()
         },
         |row| found.push(row.session_id.clone()),
     )
@@ -1685,7 +1685,7 @@ fn devin_discovery_ignores_non_string_generation_models() {
         &DiscoverOptions {
             scope: SessionScope::Local,
             sources: vec!["devin".into()],
-            limit: None,
+            ..Default::default()
         },
         |_| {},
     )
@@ -1750,7 +1750,7 @@ fn devin_array_prompt_previews_follow_normalized_text() {
                 &DiscoverOptions {
                     scope: SessionScope::Local,
                     sources: vec!["devin".into()],
-                    limit: None,
+                    ..Default::default()
                 },
                 |_| {},
             )
@@ -1835,7 +1835,7 @@ fn devin_array_prompt_boundary_fix_invalidates_cached_preview() {
             &DiscoverOptions {
                 scope: SessionScope::Local,
                 sources: vec!["devin".into()],
-                limit: None,
+                ..Default::default()
             },
             |_| {},
         )

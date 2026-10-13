@@ -178,12 +178,22 @@ Nothing is hydrated; a caller that indexes only the sessions it picks runs
 `discover` for the catalog and `hydrate` for each pick. It takes no
 `SyncRunLock`, so it never waits behind a sweep.
 
-`DiscoveryOptions { sources, limit, stop }`: `sources: None` reads every local
-source and `Some(vec![])` reads none; `limit` caps the rows read, newest first
-across providers — leave it `None` for a catalog a caller repeats, or every run
-sees only the same newest sessions. `DiscoveryReport { discovered,
-skipped_unchanged, diagnostics }`: one provider failing is a
-`DISCOVERY_FAILED` diagnostic, never an error for the rest.
+`DiscoveryOptions { sources, limit, stop, skip_protected_folder_identity }`:
+`sources: None` reads every local source and `Some(vec![])` reads none;
+`limit` caps the rows read, newest first across providers — leave it `None`
+for a catalog a caller repeats, or every run sees only the same newest
+sessions. `skip_protected_folder_identity` (default `false`) keeps a working
+directory whose first component under the user home is `Desktop`,
+`Documents`, or `Downloads` as that raw path: discovery does not canonicalize
+it, probe `.git`, or read Git config. A provider `repo_url` is still preferred
+and does not read the directory. On macOS those three names match
+case-insensitively. A source-plugin observation submitted with
+`discoverSessions`, and a `SourceObservationBatch` that calls
+`skip_protected_folder_identity`, use the same flag. Sync and hydrate do not
+take the option
+and still resolve every directory. `DiscoveryReport { discovered, skipped_unchanged,
+diagnostics }`: one provider failing is a `DISCOVERY_FAILED` diagnostic, never
+an error for the rest.
 
 ### Stopping and progress
 

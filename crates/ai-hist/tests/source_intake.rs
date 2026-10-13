@@ -21,6 +21,7 @@ fn observe(path: &std::path::Path, instance: &str) -> Result<()> {
         connector_id: "plugin".into(),
         connector_instance: instance.into(),
         location: SessionLocation::Remote,
+        skip_protected_folder_identity: false,
         observations: vec![ShallowSession {
             source: "claude".into(),
             session_id: "s".into(),
@@ -554,6 +555,7 @@ fn malformed_complete_batch_never_creates_database() -> Result<()> {
         connector_id: "plugin".into(),
         connector_instance: "a".into(),
         location: SessionLocation::Remote,
+        skip_protected_folder_identity: false,
         observations: vec![ShallowSession {
             source: "claude".into(),
             session_id: "s".into(),

@@ -221,6 +221,8 @@ export interface DiscoverSessionsOptions extends SourceConnectorOptions {
   scope?: SessionScope;
   sources?: CatalogSource[];
   limit?: number;
+  /** Keep a working directory under Desktop, Documents, or Downloads as its raw path. Default false. */
+  skipProtectedFolderIdentity?: boolean;
 }
 
 export interface DiscoverResult {

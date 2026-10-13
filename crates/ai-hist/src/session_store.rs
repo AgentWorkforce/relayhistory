@@ -724,16 +724,7 @@ impl SessionStore {
         let conn =
             open_db(&self.db_path).map_err(|error| Error::DatabaseOpen(format!("{error:#}")))?;
         let env = discover::DiscoveryEnv::with_provider_roots(&conn, self.roots.clone());
-        let options = discover::DiscoverOptions {
-            scope: SessionScope::Local,
-            sources: opts
-                .sources
-                .iter()
-                .flatten()
-                .map(|source| source.as_str().to_string())
-                .collect(),
-            limit: opts.limit,
-        };
+        let options = opts.discover_options();
         let summary = discover::discover_sessions_with_env(&env, &options, |_| {})
             .map_err(|error| Error::classify(error, Error::Discovery))?;
         Ok(DiscoveryReport {

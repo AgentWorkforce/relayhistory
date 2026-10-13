@@ -203,6 +203,7 @@ fn options() -> DiscoverOptions {
         scope: SessionScope::Remote,
         sources: vec!["claude".into()],
         limit: Some(1),
+        ..Default::default()
     }
 }
 fn hydration() -> HydrateSessionOptions {

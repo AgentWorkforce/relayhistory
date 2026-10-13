@@ -132,7 +132,7 @@ fn canonical_keys_merge_checkouts_and_delegated_children_inherit_them() {
         &DiscoverOptions {
             scope: SessionScope::Local,
             sources: vec!["codex".into()],
-            limit: None,
+            ..Default::default()
         },
     )
     .unwrap();
