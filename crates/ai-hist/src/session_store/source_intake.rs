@@ -27,6 +27,24 @@ pub struct SourceObservationBatch {
     pub observations: Vec<SourceObservation>,
 }
 
+impl SourceObservationBatch {
+    /// One batch of rows `connector_id`/`connector_instance` enumerated for
+    /// `location`.
+    pub fn new(
+        connector_id: impl Into<String>,
+        connector_instance: impl Into<String>,
+        location: SessionLocation,
+        observations: Vec<SourceObservation>,
+    ) -> Self {
+        Self {
+            connector_id: connector_id.into(),
+            connector_instance: connector_instance.into(),
+            location,
+            observations,
+        }
+    }
+}
+
 /// One acquired evidence snapshot for [`SessionStore::apply_source_evidence`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -45,6 +63,29 @@ pub struct SourceEvidenceSubmission {
     pub evidence: NormalizedSourceEvidence,
 }
 
+impl SourceEvidenceSubmission {
+    /// `evidence` acquired for `key` while the observation held
+    /// `expected_revision`.
+    pub fn new(
+        key: ObservationKey,
+        expected_revision: impl Into<String>,
+        evidence: NormalizedSourceEvidence,
+    ) -> Self {
+        Self {
+            key,
+            expected_revision: expected_revision.into(),
+            include_related: None,
+            evidence,
+        }
+    }
+
+    /// `false` narrows the applied evidence to the selected thread.
+    pub fn include_related(mut self, include_related: bool) -> Self {
+        self.include_related = Some(include_related);
+        self
+    }
+}
+
 impl SessionStore {
     /// Read the observation, checkpoint and revision fence a connector key
     /// currently holds. A driver reads this before acquiring evidence so the
@@ -54,20 +95,24 @@ impl SessionStore {
     /// a writable one or migrates the database here.
     pub fn source_observation(&self, key: &ObservationKey) -> Result<ObservationState, Error> {
         key.validate()
-            .map_err(|error| Error::classify(error, Error::Discovery))?;
+            .map_err(|error| Error::InvalidArgument(format!("{error:#}")))?;
         if !self.db_path.exists() {
-            return Ok(ObservationState {
-                observation: None,
-                checkpoint: None,
-                revision: None,
-            });
+            return Ok(ObservationState::default());
         }
         let conn = if self.read_only {
-            crate::store::open_db_readonly(&self.db_path)
+            let conn = crate::store::open_db_readonly(&self.db_path)
+                .map_err(|error| Error::classify(error, Error::DatabaseOpen))?;
+            // A read-only open cannot migrate; a database that predates the
+            // observation schema gets the same remedy open gives for the
+            // other read indexes rather than a bare `no such table`.
+            if !crate::observations::schema_is_current(&conn).map_err(Error::query)? {
+                return Err(Error::stale_schema(&self.db_path, "connector-observation"));
+            }
+            conn
         } else {
             crate::store::open_db(&self.db_path)
-        }
-        .map_err(|error| Error::classify(error, Error::DatabaseOpen))?;
+                .map_err(|error| Error::classify(error, Error::DatabaseOpen))?
+        };
         source_intake::observation_state(&conn, key)
             .map_err(|error| Error::classify(error, Error::Discovery))
     }
@@ -213,12 +258,12 @@ mod tests {
         assert!(before.observation.is_none() && before.revision.is_none());
 
         let summary = store
-            .apply_source_observations(SourceObservationBatch {
-                connector_id: "devin-cloud".into(),
-                connector_instance: "default".into(),
-                location: SessionLocation::Remote,
-                observations: vec![observation("sess-1")],
-            })
+            .apply_source_observations(SourceObservationBatch::new(
+                "devin-cloud",
+                "default",
+                SessionLocation::Remote,
+                vec![observation("sess-1")],
+            ))
             .unwrap();
         assert_eq!(summary.discovered, 1);
 
@@ -228,23 +273,25 @@ mod tests {
         let revision = fence.revision.expect("revision fence");
 
         let result = store
-            .apply_source_evidence(SourceEvidenceSubmission {
-                key: key("sess-1"),
-                expected_revision: revision,
-                include_related: Some(false),
-                evidence: evidence(),
-            })
+            .apply_source_evidence(
+                SourceEvidenceSubmission::new(key("sess-1"), revision, evidence())
+                    .include_related(false),
+            )
             .unwrap();
         assert_eq!(result.status, "hydrated");
 
-        let mut query = CatalogQuery::default();
-        query.scope = SessionScope::All;
+        let query = CatalogQuery {
+            scope: SessionScope::All,
+            ..Default::default()
+        };
         let rows: Vec<_> = store.sessions(query).collect::<Result<_, _>>().unwrap();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].source, Source::parse("devin").unwrap());
 
-        let mut query = SessionQuery::default();
-        query.include_text = true;
+        let query = SessionQuery {
+            include_text: true,
+            ..Default::default()
+        };
         let session = store
             .session(
                 &SessionRef::id(Source::parse("devin").unwrap(), "sess-1"),
@@ -264,22 +311,24 @@ mod tests {
         let db = dir.path().join("history.db");
         let store = store_at(&db, false);
         store
-            .apply_source_observations(SourceObservationBatch {
-                connector_id: "devin-cloud".into(),
-                connector_instance: "default".into(),
-                location: SessionLocation::Remote,
-                observations: vec![observation("sess-1")],
-            })
+            .apply_source_observations(SourceObservationBatch::new(
+                "devin-cloud",
+                "default",
+                SessionLocation::Remote,
+                vec![observation("sess-1")],
+            ))
             .unwrap();
         let error = store
-            .apply_source_evidence(SourceEvidenceSubmission {
-                key: key("sess-1"),
-                expected_revision: "not-the-current-revision".into(),
-                include_related: Some(false),
-                evidence: evidence(),
-            })
+            .apply_source_evidence(
+                SourceEvidenceSubmission::new(
+                    key("sess-1"),
+                    "not-the-current-revision",
+                    evidence(),
+                )
+                .include_related(false),
+            )
             .unwrap_err();
-        assert!(format!("{error}").contains("SOURCE_REVISION_CONFLICT"));
+        assert_eq!(error.code(), "SOURCE_REVISION_CONFLICT");
     }
 
     /// Read-only stores answer the observation fence on a read-only
@@ -290,12 +339,12 @@ mod tests {
         let db = dir.path().join("history.db");
         let store = store_at(&db, false);
         store
-            .apply_source_observations(SourceObservationBatch {
-                connector_id: "devin-cloud".into(),
-                connector_instance: "default".into(),
-                location: SessionLocation::Remote,
-                observations: vec![observation("sess-1")],
-            })
+            .apply_source_observations(SourceObservationBatch::new(
+                "devin-cloud",
+                "default",
+                SessionLocation::Remote,
+                vec![observation("sess-1")],
+            ))
             .unwrap();
         drop(store);
 
@@ -315,15 +364,32 @@ mod tests {
                 })
                 .map(|_| ()),
             store
-                .apply_source_evidence(SourceEvidenceSubmission {
-                    key: key("sess-1"),
-                    expected_revision: "any".into(),
-                    include_related: None,
-                    evidence: evidence(),
-                })
+                .apply_source_evidence(SourceEvidenceSubmission::new(
+                    key("sess-1"),
+                    "any",
+                    evidence(),
+                ))
                 .map(|_| ()),
         ] {
             assert!(matches!(result, Err(Error::UnsupportedOperation(_))));
         }
+    }
+
+    /// A read-only store on a database that predates the observation schema
+    /// is told to reopen writable, not handed a bare `no such table`.
+    #[test]
+    fn a_read_only_store_reports_a_stale_observation_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("history.db");
+        store_at(&db, false);
+        crate::store::open_db(&db)
+            .unwrap()
+            .execute("DROP TABLE session_observations", [])
+            .unwrap();
+
+        let error = store_at(&db, true)
+            .source_observation(&key("sess-1"))
+            .unwrap_err();
+        assert!(error.is_stale_schema());
     }
 }

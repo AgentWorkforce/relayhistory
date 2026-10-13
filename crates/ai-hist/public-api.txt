@@ -89,6 +89,7 @@ pub ai_hist::Error::Query(alloc::string::String)
 pub ai_hist::Error::SessionNotFound(alloc::string::String)
 pub ai_hist::Error::SessionSourceUnavailable(alloc::string::String)
 pub ai_hist::Error::SourceMismatch(alloc::string::String)
+pub ai_hist::Error::SourceRevisionConflict(alloc::string::String)
 pub ai_hist::Error::StaleSchema(alloc::string::String)
 pub ai_hist::Error::SyncFailed(alloc::string::String)
 pub ai_hist::Error::SyncLocked
@@ -863,6 +864,9 @@ pub ai_hist::SourceEvidenceSubmission::evidence: ai_hist::NormalizedSourceEviden
 pub ai_hist::SourceEvidenceSubmission::expected_revision: alloc::string::String
 pub ai_hist::SourceEvidenceSubmission::include_related: core::option::Option<bool>
 pub ai_hist::SourceEvidenceSubmission::key: ai_hist::ObservationKey
+impl ai_hist::SourceEvidenceSubmission
+pub fn ai_hist::SourceEvidenceSubmission::include_related(self, bool) -> Self
+pub fn ai_hist::SourceEvidenceSubmission::new(ai_hist::ObservationKey, impl core::convert::Into<alloc::string::String>, ai_hist::NormalizedSourceEvidence) -> Self
 pub struct ai_hist::SourceObservation
 pub ai_hist::SourceObservation::raw_locator: core::option::Option<alloc::string::String>
 pub ai_hist::SourceObservation::session: ai_hist::ShallowSession
@@ -878,6 +882,8 @@ pub ai_hist::SourceObservationBatch::connector_id: alloc::string::String
 pub ai_hist::SourceObservationBatch::connector_instance: alloc::string::String
 pub ai_hist::SourceObservationBatch::location: ai_hist::SessionLocation
 pub ai_hist::SourceObservationBatch::observations: alloc::vec::Vec<ai_hist::SourceObservation>
+impl ai_hist::SourceObservationBatch
+pub fn ai_hist::SourceObservationBatch::new(impl core::convert::Into<alloc::string::String>, impl core::convert::Into<alloc::string::String>, ai_hist::SessionLocation, alloc::vec::Vec<ai_hist::SourceObservation>) -> Self
 pub struct ai_hist::StopToken(_)
 impl ai_hist::StopToken
 pub fn ai_hist::StopToken::is_stopped(&self) -> bool

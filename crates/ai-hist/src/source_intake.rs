@@ -27,7 +27,7 @@ pub struct ObservationRequest {
     #[serde(flatten)]
     pub key: ObservationKey,
 }
-#[derive(Debug, Serialize)]
+#[derive(Debug, Default, Serialize)]
 pub struct ObservationState {
     pub observation: Option<SessionObservation>,
     pub checkpoint: Option<ObservationCheckpoint>,
@@ -37,11 +37,7 @@ pub fn get_source_observation(request: ObservationRequest) -> Result<Observation
     request.key.validate()?;
     let path = request.db_path.unwrap_or_else(default_db_path);
     if !path.exists() {
-        return Ok(ObservationState {
-            observation: None,
-            checkpoint: None,
-            revision: None,
-        });
+        return Ok(ObservationState::default());
     }
     // Opening an existing database upgrades legacy observation state without
     // reading any source adapter or credential store.
@@ -50,11 +46,15 @@ pub fn get_source_observation(request: ObservationRequest) -> Result<Observation
 }
 
 /// The observation, checkpoint and revision fence `conn` holds for `key`.
+/// One deferred transaction keeps all three reads on the same snapshot, so
+/// the returned revision cannot fence evidence acquired against a stale
+/// observation that another writer has since replaced.
 pub(crate) fn observation_state(conn: &Connection, key: &ObservationKey) -> Result<ObservationState> {
+    let snapshot = conn.unchecked_transaction()?;
     Ok(ObservationState {
-        observation: observations::get(conn, key)?,
-        checkpoint: observations::checkpoint(conn, key)?,
-        revision: observations::revision(conn, key)?,
+        observation: observations::get(&snapshot, key)?,
+        checkpoint: observations::checkpoint(&snapshot, key)?,
+        revision: observations::revision(&snapshot, key)?,
     })
 }
 #[derive(Debug, Deserialize)]

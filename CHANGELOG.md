@@ -13,7 +13,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Rust API
 
-- Added `SessionStore::source_observation`, `SessionStore::apply_source_observations` and `SessionStore::apply_source_evidence`, with `SourceObservationBatch`, `SourceEvidenceSubmission`, `ObservationKey`, `SessionObservation`, `ObservationCheckpoint`, `ObservationState`, `NormalizedSourceEvidence`, `SourceObservation`, `DiscoverySummary` and `HydrateSessionResult`.
+- Added `SessionStore::source_observation`, `SessionStore::apply_source_observations` and `SessionStore::apply_source_evidence`, with `SourceObservationBatch`, `SourceEvidenceSubmission`, `ObservationKey`, `SessionObservation`, `ObservationCheckpoint`, `ObservationState`, `NormalizedSourceEvidence`, `SourceObservation`, `DiscoverySummary` and `HydrateSessionResult`. A stale revision fence fails as `Error::SourceRevisionConflict` (`SOURCE_REVISION_CONFLICT`), matching the code the native intake reports.
 
 ## [0.42.1] - 2026-10-13
 
