@@ -13,6 +13,13 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - Re-reading an older Codex image recording retires its obsolete local unknown marker while preserving any remote copy.
+
+## [0.42.1] - 2026-10-13
+
+### Fixed
+
+- A sweep hashes only the catalog rows the change feed stamped since the previous head.
+- A full discovery pass reads each adapter's observed stamps once. A path-scoped pass, and a pass that stops before the last candidate, still ask per file. A row callback that writes on this connection drops that read.
 - Codex 0.133–0.148 forks and subagents no longer index the parent history they copy without the parent's `session_meta`: the copied prompts, events and `token_count` snapshots are one `fork_replay_boundary` marker (`subkind` `copied_history`) and the child's usage starts from the inherited total; the first `sync` (or `hydrate`) re-reads existing forks once.
 - A full `sync` that re-reads a local session from byte zero and retires rows a previous parser wrote no longer reports that session as missing evidence and re-sweeps on every later `sync`.
 
@@ -958,7 +965,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - The SDK reads provider JSONL natively and works without the Python CLI.
 
-[Unreleased]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.42.0...HEAD
+[Unreleased]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.42.1...HEAD
+[0.42.1]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.42.0...sdk-ts-v0.42.1
 [0.42.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.41.0...sdk-ts-v0.42.0
 [0.41.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.40.1...sdk-ts-v0.41.0
 [0.40.1]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.40.0...sdk-ts-v0.40.1
