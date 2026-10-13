@@ -135,7 +135,10 @@ mod sweep_phases;
 // After `sync_note!`, which it uses.
 mod codex_history;
 // After `sync_note!`, which an unreadable rollout reports through.
+mod fork_replay;
+mod rederived;
 mod rollout_head;
+use fork_replay::{inherited_baseline_verdict, record_codex_fork_replay, ForkReplaySpan};
 pub(crate) use rollout_head::read_codex_session_meta;
 #[cfg(test)]
 use rollout_head::LEADING_BYTE_LIMIT;
@@ -1605,6 +1608,12 @@ impl SweepRepairs {
         self.all
     }
 
+    /// These repairs less the sessions `vouched` accepts.
+    fn without(mut self, mut vouched: impl FnMut(&(String, String)) -> bool) -> Self {
+        self.sessions.retain(|session| !vouched(session));
+        self
+    }
+
     fn is_empty(&self) -> bool {
         !self.all && self.sessions.is_empty()
     }
@@ -1988,10 +1997,15 @@ pub(crate) fn merge_watch_roots(mut roots: Vec<discover::WatchRoot>) -> Vec<disc
 ///
 /// So partial success and fingerprint eligibility are tracked separately. A
 /// run may make progress and still be ineligible to arm the fast path.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct SweepCoverage {
     /// Sources counted into the fingerprint that this sweep could not read.
     unread: u64,
+    /// Sessions this sweep re-derived from byte zero of their own source.
+    /// What a local-only one holds is what that source yields to the current
+    /// parser, so holding less than the destination marker recorded is the
+    /// parser retiring rows (a fork's copied parent history), not a loss.
+    rederived: HashSet<(String, String)>,
 }
 
 impl SweepCoverage {
@@ -2004,8 +2018,16 @@ impl SweepCoverage {
         self.unread = self.unread.saturating_add(1);
     }
 
-    fn complete(self) -> bool {
+    fn complete(&self) -> bool {
         self.unread == 0
+    }
+
+    /// A session's source was read, from byte zero when `from_start`.
+    fn note_read(&mut self, source: &str, session_id: &str, from_start: bool) {
+        if from_start {
+            self.rederived
+                .insert((source.to_string(), session_id.to_string()));
+        }
     }
 }
 
@@ -2284,6 +2306,7 @@ fn sync_basic(
             FullSweepSeal {
                 all_sources_read: sweep_read_everything && coverage.complete(),
                 repairs: &repairs,
+                rederived: &coverage.rederived,
                 repair_plan_known,
                 destination,
                 fingerprint,
@@ -2314,6 +2337,7 @@ fn sync_basic(
 struct FullSweepSeal<'a> {
     all_sources_read: bool,
     repairs: &'a SweepRepairs,
+    rederived: &'a HashSet<(String, String)>,
     repair_plan_known: bool,
     destination: Option<DestinationSnapshot>,
     fingerprint: Option<String>,
@@ -2331,6 +2355,7 @@ fn seal_full_sweep(
     let FullSweepSeal {
         all_sources_read,
         repairs,
+        rederived,
         repair_plan_known,
         mut destination,
         fingerprint,
@@ -2357,7 +2382,7 @@ fn seal_full_sweep(
         match destination_shortfall_counted(conn, state, destination.take()) {
             Ok((outstanding, counted)) => {
                 destination = counted;
-                Some(outstanding)
+                Some(outstanding.without(rederived::vouches_for(conn, rederived)))
             }
             Err(error) => {
                 sync_note!("  [sync] could not re-check the destination: {error:#}");
@@ -3206,7 +3231,10 @@ const CODEX_RAW_MESSAGE_FACTS_KEY: &str = "codex_raw_message_facts";
 /// so without this the duplicates would stay for the life of the install.
 /// Recorded only after a walk that reached every known root, like the other
 /// backfills.
-const CODEX_FORK_REPLAY_GENERATION: i64 = 1;
+///
+/// Generation 2 gates the copy Codex 0.133--0.148 write straight after the
+/// child's `session_meta`, without the parent's (`codex::CopiedHistoryProbe`).
+const CODEX_FORK_REPLAY_GENERATION: i64 = 2;
 const CODEX_FORK_REPLAY_KEY: &str = "codex_fork_replay_gate";
 
 /// One-time re-read of the Claude transcripts whose delegation evidence an
@@ -4955,6 +4983,7 @@ fn sync_codex_rollouts_with_repairs_and_coverage(
             // go with it -- a reclassified guardian would lose its fork edge
             // and, its evidence looking current, never be re-read for it.
             crate::continuity::capture_codex_rollout(conn, &rollout)?;
+            coverage.note_read("codex", &meta.session_id, outcome.from_start);
             inserted += outcome.prompts;
             events += outcome.events;
             // Topology is recorded by the full sync too, so delegation is
@@ -5943,7 +5972,8 @@ fn ingest_codex_rollout_incremental(
     // Codex keeps its existing rule for a trailing line with no newline: it
     // is the half-written tail of a live rollout and the next pass re-reads
     // it. Unlike Claude, no Codex writer leaves its last line unterminated.
-    let mut reader = transcript_cursor::TranscriptReader::open(path, cursor.file.as_ref(), None)?;
+    let (mut reader, mut replay_gate, probe_bytes) =
+        rollout_head::open_codex_walk(path, cursor.file.as_ref(), meta)?;
     let mut pass = transcript_cursor::IncrementalPass {
         rotated: reader.rotated,
         ..Default::default()
@@ -6062,8 +6092,6 @@ fn ingest_codex_rollout_incremental(
     // `task_complete` the cursor could commit at, because its lines are
     // skipped before the arms that would.
     let mut fork_replay: Option<ForkReplaySpan> = None;
-    let mut replay_gate =
-        codex::ForkReplayGate::new(meta.fork_parent_id.clone(), meta.fork_origin_ms);
     // The replay marker whose inherited baseline no child snapshot has
     // confirmed yet (see `inherited_baseline_verdict`). Carried across passes
     // on the cursor, so a pass may commit before the child's first snapshot
@@ -6126,7 +6154,7 @@ fn ingest_codex_rollout_incremental(
             codex::ReplayStep::Outside => {}
             codex::ReplayStep::Replay => {
                 fork_replay
-                    .get_or_insert_with(|| ForkReplaySpan::new(index, ts_ms))
+                    .get_or_insert_with(|| ForkReplaySpan::new(index, ts_ms, replay_gate.opening()))
                     .absorb(index, &value, payload);
                 continue;
             }
@@ -6984,241 +7012,9 @@ fn ingest_codex_rollout_incremental(
         .position()
         .saturating_sub(start_offset)
         .saturating_add(reader.tail_bytes())
-        .saturating_add(pass.validation_bytes);
+        .saturating_add(pass.validation_bytes)
+        .saturating_add(probe_bytes);
     Ok((outcome, pass))
-}
-
-/// The span of a forked rollout that is a copy of its parent's history.
-///
-/// When Codex forks a thread — a human "fork conversation" or a spawned
-/// subagent — it writes the child's own `session_meta` and then **replays the
-/// parent's history** into the child's file: the parent's `session_meta`, its
-/// turns' `task_started` / `turn_context` / message records, and whatever
-/// `token_count` snapshots they carried. Those records are the parent's
-/// evidence, already indexed under the parent's id; indexing them again under
-/// the child's id duplicates every replayed prompt in `history` and every
-/// replayed message in `session_events`.
-///
-/// Which records form the span is decided by [`codex::ForkReplayGate`], the
-/// one statement of the rule, shared with shallow discovery. It is armed only
-/// by explicit evidence: the parent's own `session_meta` reappearing in a
-/// rollout whose opening `session_meta` named that parent in
-/// `forked_from_id` or `thread_spawn.parent_thread_id`, and it closes at the
-/// first turn it can attribute to the child -- or cannot order at all,
-/// because undecided means indexed.
-///
-/// Every line inside the span writes nothing; one `fork_replay_boundary`
-/// marker, keyed by the replayed `session_meta`'s line, accounts for all of
-/// them. A readable `token_count` inside it is the parent's cumulative total,
-/// kept as the child's inherited baseline so its first request is not charged
-/// the parent's whole context.
-struct ForkReplaySpan {
-    /// Line index of the replayed parent `session_meta`.
-    first_line: usize,
-    /// Line index of the last replayed line read so far.
-    last_line: usize,
-    /// The envelope timestamp of the replayed `session_meta`: when the fork
-    /// wrote the copy.
-    ts_ms: i64,
-    /// Tool call ids the replay carried, so rows an earlier parser indexed
-    /// under the child for them can be retired.
-    call_ids: Vec<String>,
-    /// `(timestamp, prompt)` of each replayed human turn, for the same reason
-    /// on `history`.
-    prompts: Vec<(i64, String)>,
-    /// The last readable cumulative snapshot inside the replay.
-    inherited: Option<CodexTokenTotals>,
-    /// The provider's `info` object that `inherited` was read from, as
-    /// written.
-    inherited_snapshot: Option<Value>,
-}
-
-impl ForkReplaySpan {
-    fn new(first_line: usize, ts_ms: i64) -> Self {
-        Self {
-            first_line,
-            last_line: first_line,
-            ts_ms,
-            call_ids: Vec::new(),
-            prompts: Vec::new(),
-            inherited: None,
-            inherited_snapshot: None,
-        }
-    }
-
-    /// The marker that stands for this span, keyed by its first line.
-    fn marker_uid(&self) -> String {
-        format!("{}:fork_replay", self.first_line)
-    }
-
-    /// Remember what a replayed line would have written.
-    fn absorb(&mut self, index: usize, value: &Value, payload: &Map<String, Value>) {
-        self.last_line = index;
-        if let Some(call_id) = payload
-            .get("call_id")
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())
-        {
-            if !self.call_ids.iter().any(|seen| seen == call_id) {
-                self.call_ids.push(call_id.to_string());
-            }
-        }
-        if let Some(message) = codex::human_message(value) {
-            let ts_ms = value
-                .get("timestamp")
-                .and_then(Value::as_str)
-                .and_then(parse_iso_ms)
-                .unwrap_or(0);
-            self.prompts.push((ts_ms, message.text));
-        }
-        if payload.get("type").and_then(Value::as_str) == Some("token_count") {
-            let info = payload.get("info");
-            if let Some(totals) = info
-                .and_then(|info| info.get("total_token_usage"))
-                .and_then(CodexTokenTotals::from_usage)
-            {
-                self.inherited = Some(totals);
-                self.inherited_snapshot = info.cloned().map(bound_usage_info);
-            }
-        }
-    }
-}
-
-/// Whether the cumulative total a fork inherited from its replay is the
-/// baseline of the child's own counter, decided at the child's first readable
-/// snapshot. Returns `(kept, basis)`.
-///
-/// codex-rs seeds a fork's usage from the replay: `record_initial_history`
-/// handles `InitialHistory::Forked` by passing the copied items to
-/// `last_token_info_from_rollout` and the result to `set_token_info`
-/// (`codex-rs/core/src/session/mod.rs`, openai/codex@d5e6526), and each later
-/// request adds its usage to that total, so `total_token_usage` grows by
-/// exactly `last_token_usage`. A child written that way continues from its
-/// parent's total. A build that did not seed it starts from zero, and then
-/// its first snapshot's total *is* its last request.
-///
-/// So `last_token_usage` decides when the snapshot carries it: `total ==
-/// last` is a restart and the inherited baseline is dropped; `total ==
-/// inherited + last` is a continuation and it is kept. Without that evidence
-/// a total below the inherited one can only be a restart, and anything else
-/// keeps the baseline. Comparing magnitudes alone misfires when a restarted
-/// child's first request exceeds a small parent total.
-fn inherited_baseline_verdict(
-    inherited: CodexTokenTotals,
-    total: CodexTokenTotals,
-    last: Option<CodexTokenTotals>,
-) -> (bool, &'static str) {
-    if let Some(last) = last {
-        if total == last {
-            return (false, "last_token_usage");
-        }
-        if inherited.plus(&last) == Some(total) {
-            return (true, "last_token_usage");
-        }
-    }
-    if total.regressed_from(&inherited) {
-        return (false, "regression");
-    }
-    (true, "no_evidence")
-}
-
-/// Write the one marker that stands for a replayed span, and retire whatever
-/// an earlier parser indexed under the child for the lines inside it.
-///
-/// `closed_by` is the child turn that ended the span and the fact that
-/// attributed it, or `None` when the readable file ended inside the replay
-/// (a live fork whose first own turn is not written yet). The marker is keyed
-/// by the span's first line, so the pass that later sees the span close
-/// rewrites the same row.
-fn record_codex_fork_replay(
-    conn: &Connection,
-    meta: &CodexSessionMeta,
-    span: &ForkReplaySpan,
-    closed_by: Option<(Option<&str>, &str)>,
-    inherited_baseline: Option<&str>,
-) -> Result<()> {
-    let session_id = meta.session_id.as_str();
-    let marker_uid = span.marker_uid();
-    let payload_json = json!({
-        "parent_session_id": meta.fork_parent_id,
-        "first_line": span.first_line,
-        "last_line": span.last_line,
-        "replayed_lines": span.last_line + 1 - span.first_line,
-        "closed_by_turn_id": closed_by.and_then(|(turn, _)| turn),
-        "closed_by": closed_by.map(|(_, basis)| basis),
-        "inherited_total_tokens": span.inherited.map(|totals| totals.total),
-        // The replayed `token_count` `info` that total came from, as written,
-        // bounded by `bound_usage_info` (counters are never truncated).
-        "inherited_snapshot": span.inherited_snapshot,
-        // `pending` until the child's first readable snapshot, then
-        // `applied` or `dropped` with `inherited_baseline_basis` (see
-        // `inherited_baseline_verdict`); null when nothing was inherited or
-        // the span is still open.
-        "inherited_baseline": inherited_baseline,
-    })
-    .to_string();
-    insert_session_marker(
-        conn,
-        "codex",
-        session_id,
-        &NewSessionMarker {
-            marker_uid: &marker_uid,
-            ts_ms: (span.ts_ms != 0).then_some(span.ts_ms),
-            message_id: None,
-            parent_id: meta.fork_parent_id.as_deref(),
-            turn_id: closed_by.and_then(|(turn, _)| turn),
-            kind: "fork_replay_boundary",
-            subkind: Some("session_meta"),
-            text: None,
-            payload_json: Some(&payload_json),
-        },
-    )?;
-    // Rows keyed by line index: events and markers from the replayed lines.
-    let (first, last) = (span.first_line as i64, span.last_line as i64);
-    let in_span = "source = 'codex' AND session_id = ?1 \
-                   AND instr({col}, ':') > 1 \
-                   AND CAST(substr({col}, 1, instr({col}, ':') - 1) AS INTEGER) BETWEEN ?2 AND ?3";
-    crate::store::retire_evidence_share(
-        conn,
-        "session_events",
-        &in_span.replace("{col}", "event_uid"),
-        params![session_id, first, last],
-        SessionLocation::Local,
-    )?;
-    crate::store::retire_evidence_share(
-        conn,
-        "session_markers",
-        &format!(
-            "{} AND marker_uid != ?4",
-            in_span.replace("{col}", "marker_uid")
-        ),
-        params![session_id, first, last, marker_uid],
-        SessionLocation::Local,
-    )?;
-    for call_id in &span.call_ids {
-        crate::store::retire_evidence_share(
-            conn,
-            "tool_calls",
-            "source = 'codex' AND session_id = ? AND tool_use_id = ?",
-            params![session_id, call_id],
-            SessionLocation::Local,
-        )?;
-        crate::store::retire_evidence_share(
-            conn,
-            "file_edits",
-            "source = 'codex' AND session_id = ? AND substr(tool_use_id, 1, ?) = ?",
-            params![session_id, call_id.len() as i64 + 1, format!("{call_id}#")],
-            SessionLocation::Local,
-        )?;
-    }
-    for (ts_ms, prompt) in &span.prompts {
-        conn.execute(
-            "DELETE FROM history WHERE source = 'codex' AND session_id = ? \
-               AND timestamp_ms = ? AND prompt = ?",
-            params![session_id, ts_ms, prompt],
-        )?;
-    }
-    Ok(())
 }
 
 /// One Codex rollout line that has not yet been shown to write anything.
@@ -37047,6 +36843,397 @@ mod codex_fork_replay_tests {
         assert_eq!(closed["inherited_snapshot"], usage(1000)["info"]);
         // 1600 cumulative, 1000 of it inherited from the parent.
         assert_eq!(token_totals(&conn, CHILD), vec![600]);
+    }
+
+    fn usage_with_last(total: u64, last: u64) -> Value {
+        let counters = |n: u64| {
+            json!({"input_tokens": n, "cached_input_tokens": 0, "output_tokens": 0,
+                   "reasoning_output_tokens": 0, "total_tokens": n})
+        };
+        json!({"type": "token_count", "info": {
+            "total_token_usage": counters(total), "last_token_usage": counters(last)}})
+    }
+
+    /// A Codex 0.133--0.148 fork: the child's `session_meta` (paginated, its
+    /// `subagent_history_start_ordinal` the file's line count) followed
+    /// directly by a copy of two parent tasks -- a compaction, a turn ordered
+    /// before the fork, a reconstructed `rollout-4` turn stamped a second
+    /// after it, and the parent's cumulative snapshots -- with no copy of the
+    /// parent's `session_meta`.
+    ///
+    /// `subagent` writes a spawned subagent's `session_meta` (which stores no
+    /// `history` rows of its own), else a human fork's.
+    fn paginated_fork(subagent: bool, own_turns: &[(&str, u64, u64)]) -> String {
+        let at = "2026-04-20T00:01:00.000Z";
+        let fork_second = codex::uuid_v7_ms(CHILD).unwrap() / 1000;
+        let mut meta = json!({"id": CHILD, "forked_from_id": PARENT, "cwd": "/tmp/project",
+                              "timestamp": at, "thread_source": "user",
+                              "history_mode": "paginated", "subagent_history_start_ordinal": 99});
+        if subagent {
+            meta["thread_source"] = json!("subagent");
+            meta["source"] =
+                json!({"subagent": {"thread_spawn": {"parent_thread_id": PARENT, "depth": 1}}});
+        }
+        let mut lines = vec![
+            line(at, "session_meta", meta),
+            line(at, "compacted", json!({"message": "parent summary"})),
+            line(
+                at,
+                "turn_context",
+                json!({"turn_id": PARENT_TURN, "cwd": "/tmp/project", "model": "gpt-5.4"}),
+            ),
+            line(at, "event_msg", usage_with_last(1000, 400)),
+            line(
+                at,
+                "event_msg",
+                json!({"type": "task_started", "turn_id": "rollout-4", "started_at": fork_second + 1}),
+            ),
+            line(
+                at,
+                "event_msg",
+                json!({"type": "user_message", "message": "parent prompt"}),
+            ),
+            line(
+                at,
+                "event_msg",
+                json!({"type": "agent_message", "message": "parent answer"}),
+            ),
+            line(at, "event_msg", usage_with_last(1500, 500)),
+            line(
+                at,
+                "event_msg",
+                json!({"type": "task_complete", "turn_id": PARENT_TURN}),
+            ),
+            line(
+                at,
+                "event_msg",
+                json!({"type": "task_complete", "turn_id": "rollout-4"}),
+            ),
+        ];
+        for (turn, total, last) in own_turns {
+            lines.push(line(
+                "2026-04-20T00:01:05.000Z",
+                "event_msg",
+                json!({"type": "task_started", "turn_id": turn}),
+            ));
+            lines.push(line(
+                "2026-04-20T00:01:05.001Z",
+                "turn_context",
+                json!({"turn_id": turn, "cwd": "/tmp/project", "model": "gpt-5.4"}),
+            ));
+            lines.push(line(
+                "2026-04-20T00:01:05.002Z",
+                "event_msg",
+                json!({"type": "user_message", "message": format!("child prompt {turn}")}),
+            ));
+            lines.push(line(
+                "2026-04-20T00:01:08.000Z",
+                "event_msg",
+                json!({"type": "agent_message", "message": "child answer"}),
+            ));
+            lines.push(line(
+                "2026-04-20T00:01:08.001Z",
+                "event_msg",
+                usage_with_last(*total, *last),
+            ));
+            lines.push(line(
+                "2026-04-20T00:01:08.002Z",
+                "event_msg",
+                json!({"type": "task_complete", "turn_id": turn}),
+            ));
+        }
+        lines.concat()
+    }
+
+    const CHILD_TURN_2: &str = "019da830-e570-7000-8000-0000000000c2";
+
+    fn usage_snapshot_totals(conn: &Connection, session: &str) -> Vec<i64> {
+        conn.prepare(
+            "SELECT json_extract(payload_json, '$[0][5]') FROM session_markers \
+             WHERE source = 'codex' AND session_id = ? AND kind = 'usage_snapshot' \
+             ORDER BY CAST(substr(marker_uid, 1, instr(marker_uid, ':') - 1) AS INTEGER)",
+        )
+        .unwrap()
+        .query_map([session], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+    }
+
+    /// The copied parent tasks are one span: no prompt, event or snapshot of
+    /// theirs is the child's, and the child's usage is differenced from the
+    /// parent total the copy carried.
+    #[test]
+    fn a_paginated_fork_without_the_parents_session_meta_retires_its_copy() {
+        for subagent in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let rollout = dir.path().join("rollout-child.jsonl");
+            fs::write(
+                &rollout,
+                paginated_fork(
+                    subagent,
+                    &[(CHILD_TURN, 1800, 300), (CHILD_TURN_2, 2500, 700)],
+                ),
+            )
+            .unwrap();
+            let conn = Connection::open_in_memory().unwrap();
+            init_db(&conn).unwrap();
+            let meta = read_codex_session_meta(&rollout).unwrap().unwrap();
+            ingest_codex_rollout(&conn, &rollout, &meta).unwrap();
+
+            assert_eq!(
+                texts(&conn, CHILD),
+                vec![
+                    format!("child prompt {CHILD_TURN}"),
+                    "child answer".to_string(),
+                    format!("child prompt {CHILD_TURN_2}"),
+                    "child answer".to_string(),
+                ]
+            );
+            if !subagent {
+                assert_eq!(
+                    prompts(&conn, CHILD),
+                    vec![
+                        format!("child prompt {CHILD_TURN}"),
+                        format!("child prompt {CHILD_TURN_2}")
+                    ]
+                );
+            }
+            assert_eq!(token_totals(&conn, CHILD), vec![300, 700]);
+            assert_eq!(usage_snapshot_totals(&conn, CHILD), vec![1800, 2500]);
+            let marker = replay_marker(&conn, CHILD).expect("replay marker");
+            assert_eq!(marker["first_line"], 1);
+            assert_eq!(marker["replayed_lines"], 9);
+            assert_eq!(marker["closed_by_turn_id"], CHILD_TURN);
+            assert_eq!(marker["inherited_total_tokens"], 1500);
+            assert_eq!(marker["inherited_baseline"], "applied");
+            let subkind: String = conn
+                .query_row(
+                    "SELECT subkind FROM session_markers WHERE kind = 'fork_replay_boundary'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(subkind, "copied_history");
+        }
+    }
+
+    /// A live paginated fork whose copy holds no UUIDv7 turn: the copy is
+    /// held back whole while the child's own turn is unwritten, and its
+    /// replayed `task_complete` commits nothing, so the pass that sees the
+    /// child's turn re-reads it and indexes only the child.
+    #[test]
+    fn a_live_paginated_fork_holds_a_copy_without_ordered_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-child.jsonl");
+        let at = "2026-04-20T00:01:00.000Z";
+        let fork_second = codex::uuid_v7_ms(CHILD).unwrap() / 1000;
+        fs::write(
+            &rollout,
+            [
+                line(at, "session_meta", json!({"id": CHILD, "forked_from_id": PARENT,
+                    "cwd": "/tmp/project", "timestamp": at, "history_mode": "paginated"})),
+                line(at, "turn_context", json!({"turn_id": "ca738fc8-ff98-42b6-9b0b-4e382f72a3de"})),
+                line(at, "event_msg", usage_with_last(1000, 400)),
+                line(at, "event_msg", json!({"type": "task_started", "turn_id": "rollout-4", "started_at": fork_second + 1})),
+                line(at, "event_msg", json!({"type": "user_message", "message": "parent prompt"})),
+                line(at, "event_msg", usage_with_last(1500, 500)),
+                line(at, "event_msg", json!({"type": "task_complete", "turn_id": "rollout-4"})),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let meta = read_codex_session_meta(&rollout).unwrap().unwrap();
+        let mut cursor = transcript_cursor::TranscriptCursorState::default();
+        let (_, pass) =
+            ingest_codex_rollout_incremental(&conn, &rollout, &meta, &mut cursor).unwrap();
+        assert!(texts(&conn, CHILD).is_empty());
+        assert_eq!(cursor.file.as_ref().map(|file| file.offset).unwrap_or(0), 0);
+        // The probe's head read is a provider read too.
+        assert!(pass.bytes_read > fs::metadata(&rollout).unwrap().len());
+
+        let mut file = fs::OpenOptions::new().append(true).open(&rollout).unwrap();
+        std::io::Write::write_all(&mut file, child_turn(CHILD_TURN, 1600).as_bytes()).unwrap();
+        drop(file);
+        ingest_codex_rollout_incremental(&conn, &rollout, &meta, &mut cursor).unwrap();
+        assert_eq!(texts(&conn, CHILD), vec!["child prompt", "child answer"]);
+        assert_eq!(prompts(&conn, CHILD), vec!["child prompt"]);
+        assert_eq!(token_totals(&conn, CHILD), vec![100]);
+    }
+
+    /// A fork whose first record after its `session_meta` is its own spawn
+    /// prompt and first turn holds no copy, and every line is its own.
+    #[test]
+    fn a_paginated_fork_that_opens_on_its_own_turn_is_indexed_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-child.jsonl");
+        let at = "2026-04-20T00:01:00.000Z";
+        fs::write(
+            &rollout,
+            [
+                line(
+                    at,
+                    "session_meta",
+                    json!({"id": CHILD, "forked_from_id": PARENT,
+                    "cwd": "/tmp/project", "timestamp": at, "history_mode": "paginated"}),
+                ),
+                line(
+                    at,
+                    "event_msg",
+                    json!({"type": "user_message", "message": "spawn prompt"}),
+                ),
+                line(at, "event_msg", json!({"type": "thread_settings_applied"})),
+                child_turn(CHILD_TURN, 900),
+            ]
+            .concat(),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let meta = read_codex_session_meta(&rollout).unwrap().unwrap();
+        ingest_codex_rollout(&conn, &rollout, &meta).unwrap();
+        assert_eq!(prompts(&conn, CHILD), vec!["spawn prompt", "child prompt"]);
+        assert_eq!(token_totals(&conn, CHILD), vec![900]);
+        assert!(replay_marker(&conn, CHILD).is_none());
+    }
+
+    /// The full sweep that retires a fork's copy re-derives the fork from
+    /// byte zero, so the rows it no longer holds are not a destination loss:
+    /// the sweep records its fingerprint and the next sync is the fast path.
+    #[test]
+    fn the_sweep_that_retires_a_copy_is_not_a_destination_loss() {
+        for remote in [false, true] {
+            retiring_sweep_seals(remote);
+        }
+    }
+
+    /// With `remote`, the fork has a remote presence -- remote-imported
+    /// prompts carry no location of their own -- which a local re-read cannot
+    /// vouch for: its shortfall stays a loss.
+    fn retiring_sweep_seals(remote: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(
+            day.join("rollout-child.jsonl"),
+            paginated_fork(false, &[(CHILD_TURN, 1800, 300)]),
+        )
+        .unwrap();
+        let db = dir.path().join("history.db");
+        let roots = crate::ProviderRoots::from_home(
+            dir.path().to_path_buf(),
+            dir.path().join("opencode.db"),
+        );
+        assert!(
+            super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept
+        );
+        let conn = open_db(&db).unwrap();
+        // What a generation-1 build left: a copied event under the child,
+        // inside the span's lines, and a destination marker that counts it.
+        conn.execute_batch(&format!(
+            "CREATE TEMP TABLE planted AS SELECT * FROM session_events \
+               WHERE session_id = '{CHILD}' LIMIT 1;
+             UPDATE planted SET id = NULL, event_uid = '5:planted', message_id = 'planted';
+             INSERT INTO session_events SELECT * FROM planted;"
+        ))
+        .unwrap();
+        if remote {
+            conn.execute(
+                "INSERT INTO session_presences \
+                 (source, session_id, location, raw_locator, discovery_state) \
+                 VALUES ('codex', ?1, 'remote', ?1, 'shallow')",
+                [CHILD],
+            )
+            .unwrap();
+        }
+        let state_path = dir.path().join(".sync-state.json");
+        let mut state = load_sync_state(&state_path).unwrap();
+        state.insert(CODEX_FORK_REPLAY_KEY.to_string(), json!(1));
+        state.insert(SOURCE_FINGERPRINT_KEY.into(), json!("g0/previous-build"));
+        state.insert(
+            DESTINATION_GENERATION_KEY.into(),
+            json!(destination_generation(&conn).unwrap()),
+        );
+        state.insert(
+            DESTINATION_HEAD_KEY.into(),
+            json!(destination_head(&conn).unwrap()),
+        );
+        fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+
+        assert!(
+            super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept
+        );
+        let planted: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE event_uid = '5:planted'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(planted, 0);
+        assert_eq!(
+            super::sync_exclusive_with_roots(&db, &roots, false)
+                .unwrap()
+                .swept,
+            remote,
+            "a local-only fork's retiring sweep seals its fingerprint"
+        );
+    }
+
+    /// A store a generation-1 build wrote re-reads each fork once, retiring
+    /// the copy that build indexed under the child; the next sync re-reads
+    /// nothing.
+    #[test]
+    fn a_generation_one_store_re_reads_a_paginated_fork_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(
+            day.join("rollout-child.jsonl"),
+            paginated_fork(false, &[(CHILD_TURN, 1800, 300)]),
+        )
+        .unwrap();
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+        assert_eq!(state.get(CODEX_FORK_REPLAY_KEY), Some(&json!(2)));
+        let at = parse_iso_ms("2026-04-20T00:01:00.000Z").unwrap();
+        let plant_stale = || {
+            conn.execute(
+                "INSERT OR IGNORE INTO history (source, session_id, prompt, timestamp_ms) \
+                 VALUES ('codex', ?, 'parent prompt', ?)",
+                params![CHILD, at],
+            )
+            .unwrap();
+        };
+
+        // A generation-1 store indexed the copy under the child.
+        plant_stale();
+        state.insert(CODEX_FORK_REPLAY_KEY.to_string(), json!(1));
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+        assert_eq!(
+            prompts(&conn, CHILD),
+            vec![format!("child prompt {CHILD_TURN}")]
+        );
+        assert_eq!(token_totals(&conn, CHILD), vec![300]);
+        assert_eq!(state.get(CODEX_FORK_REPLAY_KEY), Some(&json!(2)));
+
+        // Spent: an unchanged fork is not re-read again.
+        plant_stale();
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+        assert_eq!(
+            prompts(&conn, CHILD),
+            vec![
+                format!("child prompt {CHILD_TURN}"),
+                "parent prompt".to_string()
+            ]
+        );
     }
 
     /// A signature marker's request identity is stored whole or not at all.

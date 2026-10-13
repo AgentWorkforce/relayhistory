@@ -522,7 +522,7 @@ it holds for every kind.
 | `stream_error` | – | ✓ | – | – | – | `stream_error` |
 | `tool_begin` | – | ✓ any `*_begin` | – | – | – | `exec_command_begin`, `patch_apply_begin`, `mcp_tool_call_begin` |
 | `review_mode` | – | ✓ | – | – | – | `entered_review_mode`, `exited_review_mode` |
-| `fork_replay_boundary` | – | ✓ one per replayed span in a forked rollout: `parent_id` is the fork parent, `turn_id` the child turn that closed it, `payload_json` carries `first_line`, `last_line`, `replayed_lines`, `closed_by` (`turn_id`, `task_started.started_at`, `undecided`, or null while the span is still open), `inherited_total_tokens` with `inherited_snapshot` (the replayed `token_count` `info` it was read from, as written, bounded per the marker contract (counters are never truncated)), and `inherited_baseline` (`pending`, `applied`, `dropped`) with `inherited_baseline_basis` (`last_token_usage`, `regression`, `no_evidence`) | – | – | – | `session_meta` |
+| `fork_replay_boundary` | – | ✓ one per replayed span in a forked rollout: `parent_id` is the fork parent, `turn_id` the child turn that closed it, `payload_json` carries `first_line`, `last_line`, `replayed_lines`, `closed_by` (`turn_id`, `task_started.started_at`, `undecided`, or null while the span is still open), `inherited_total_tokens` with `inherited_snapshot` (the replayed `token_count` `info` it was read from, as written, bounded per the marker contract (counters are never truncated)), and `inherited_baseline` (`pending`, `applied`, `dropped`) with `inherited_baseline_basis` (`last_token_usage`, `regression`, `no_evidence`) | – | – | – | `session_meta` (the replayed parent `session_meta` opened the span) or `copied_history` (the copy follows the child's own `session_meta`) |
 | `unsupported_block` | ✓ any content block with no event `kind`, plus thinking signatures | – | – | – | ✓ a human `user` node whose `content` holds no readable text; its JSON type in `payload_json`, never the payload | `image`, `document`, `redacted_thinking`, `server_tool_use`, `thinking_signature`, `user_content` |
 | `usage_snapshot` | – | ✓ every `event_msg/token_count` outside a fork's replayed parent history (the `fork_replay_boundary` marker stands for that span, and keeps its last snapshot as `inherited_snapshot`), in read order: `payload_json` is the provider's `info`, bounded per the marker contract (counters are never truncated), stored positionally as `[total, last, window, other]` — each usage object as `[input, cached_input, cache_write_input, output, reasoning_output, total, rest]` with `null` for an absent counter, every other key kept in `rest` / `other`, trailing `null`s left out (no payload for an `info: null` snapshot); read back typed as `Marker::usage_snapshot`, `turn_id` the turn it fell inside (null before the first `turn_context`, or after one that names no turn). A cumulative snapshot, never added into `session_requests` | – | – | – | `token_count` |
 | `turn_context` | – | ✓ each `turn_context` outside a fork's replayed parent history (the `fork_replay_boundary` marker stands for that span) whose payload differs from the session's previous one in any field but `turn_id` (and `root_turn_id` when the turn's `task_started` wrote the same one, which that marker keeps) — the session's first is always stored, a fork child's first own one included: `payload_json` is the record's payload as written, bounded per the marker contract (`turn_id`, `root_turn_id`, `model`, `effort`, `cwd`, `current_date`, approval and sandbox policy, …; strings at 128 characters, containers at 32 entries — in practice only instruction text is long enough to reach the bound), `turn_id` the turn it took effect at. The configuration of a turn is the latest `turn_context` marker at or before that turn's start in rollout order — the turn's model even when it wrote no assistant message | – | – | – | `turn_context` |
@@ -571,10 +571,14 @@ One Codex span is accounted for as a whole rather than line by line: the
 parent history a forked rollout replays before its own first turn. Those lines
 are the parent's evidence, already indexed under the parent, so they write
 nothing under the child, and the single `fork_replay_boundary` marker above
-stands for all of them. The span opens only at the parent's own `session_meta`
+stands for all of them. The span opens at the parent's own `session_meta`
 reappearing in a rollout that named that parent in `forked_from_id` or
-`source.subagent.thread_spawn.parent_thread_id`, and closes at the first turn
-it can attribute to the child or cannot order at all; the rule is
+`source.subagent.thread_spawn.parent_thread_id`, or -- for Codex 0.133--0.148,
+which copy the history without the parent's `session_meta` -- at line 1 when
+a record before the child's first own turn is one only a copy can hold. A
+span opened at the parent's `session_meta` closes at the first turn it can
+attribute to the child or cannot order at all; one opened at line 1 closes
+only at the first UUIDv7 turn at or after the fork. The rule is
 `codex::ForkReplayGate`, which shallow discovery applies too, so a fork's
 `first_prompt` is its own. See [architecture](architecture.md) for the full
 rule.

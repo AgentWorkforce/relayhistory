@@ -144,7 +144,12 @@ pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 3;
 ///   child's model comes from its own records when its `agent-*.meta.json`
 ///   names none, and a spawn result carries the record's
 ///   `toolUseResult.agentId` (sync's `claude_delegation_capture_v1`).
-pub(crate) const HYDRATION_PARSER_VERSION: i64 = 16;
+///
+/// Version 17: a checkpoint at 16 re-parses once, so an embedder that only
+/// hydrates retires the parent history a Codex 0.133--0.148 fork copies
+/// straight after its own `session_meta`, which sync's
+/// `codex_fork_replay_gate` generation 2 retires.
+pub(crate) const HYDRATION_PARSER_VERSION: i64 = 17;
 
 #[derive(Debug, Clone)]
 pub struct HydrateSessionOptions {

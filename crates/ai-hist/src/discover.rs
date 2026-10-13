@@ -97,7 +97,7 @@ pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 6;
 /// invalidates every stored stamp, so a scanner that learns to extract a new
 /// field re-reads sources whose bytes never changed. `parser_version` keeps its
 /// existing meaning (full-ingest parser generation) and is untouched.
-pub const SHALLOW_SCANNER_VERSION: u32 = 13;
+pub const SHALLOW_SCANNER_VERSION: u32 = 14;
 
 /// Version 2 shipped the classification that hid standalone guardians (see
 /// [`crate::codex_is_subagent`]). Their rollouts never change on disk, so the
@@ -182,6 +182,13 @@ const _: () = assert!(SHALLOW_SCANNER_VERSION > 11);
 /// Version 13 reads Grok's `session_kind`. Existing rows with unchanged
 /// summaries must be revisited so root-only listings hide marked subagents.
 const _: () = assert!(SHALLOW_SCANNER_VERSION > 12);
+
+/// Version 14 gates the parent history a Codex 0.133--0.148 fork copies
+/// straight after its own `session_meta` (`codex::CopiedHistoryProbe`), so a
+/// human fork of those builds is no longer catalogued under its parent's first
+/// prompt. A finished fork never changes on disk, so only this bump sends its
+/// cached row through the gate; it also moves the sweep generation.
+const _: () = assert!(SHALLOW_SCANNER_VERSION > 13);
 
 /// Most bytes a shallow head read may consume from one transcript.
 pub const HEAD_SCAN_MAX_BYTES: u64 = 256 * 1024;
@@ -1348,6 +1355,12 @@ impl BoundedJsonl {
     /// [`HEAD_SCAN_MAX_LINES`].
     fn head_records(&self) -> impl Iterator<Item = &[u8]> {
         records(&self.head).take(HEAD_SCAN_MAX_LINES)
+    }
+
+    /// Whether [`Self::head_records`] runs to the end of the file: the head is
+    /// the whole file and within the line cap.
+    fn head_reaches_end(&self) -> bool {
+        self.tail.is_empty() && records(&self.head).nth(HEAD_SCAN_MAX_LINES).is_none()
     }
 
     /// Records from the end of the file, newest first. For a file inside the

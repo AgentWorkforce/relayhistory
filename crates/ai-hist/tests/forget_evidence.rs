@@ -1056,6 +1056,12 @@ fn stage_codex_three_generations(home: &Path) {
         .map(|line| {
             line.replace("0000000000a1", "0000000000c1")
                 .replace("0000000000b1", "0000000000c2")
+                // The grandchild's own turn starts after its thread does;
+                // the copied root turn before it stays a replay.
+                .replace(
+                    "019da867-37b0-7000-8000-0000000000c2",
+                    "019da868-37b0-7000-8000-0000000000c2",
+                )
                 .replace("review", "re-review")
         })
         .collect();

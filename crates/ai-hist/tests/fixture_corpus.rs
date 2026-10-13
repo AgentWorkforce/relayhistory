@@ -1328,6 +1328,43 @@ fn fork_replay_marker(key: &str, session_id: &str) -> Option<Value> {
 const FORK_HUMAN_PARENT: &str = "019da82f-d400-7000-8000-00000000000a";
 const FORK_HUMAN_CHILD: &str = "019da830-be60-7000-8000-00000000000c";
 
+/// A Codex 0.133--0.148 fork copies its parent's turns straight after its own
+/// `session_meta`: the copy is one `copied_history` replay span, so the child
+/// holds only its own prompt, catalog first prompt and request.
+#[test]
+fn codex_paginated_fork_gates_a_copy_without_the_parents_session_meta() {
+    let key = "codex/fork-paginated";
+    let child_row = rows(key, "sessions")
+        .iter()
+        .find(|session| text(session, "session_id") == FORK_HUMAN_CHILD)
+        .expect("child row");
+    assert_eq!(
+        text(child_row, "first_prompt"),
+        "child prompt after the fork"
+    );
+    let child_prompts = rows(key, "history")
+        .iter()
+        .filter(|entry| text(entry, "session_id") == FORK_HUMAN_CHILD)
+        .map(|entry| text(entry, "prompt").to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(child_prompts, vec!["child prompt after the fork"]);
+    assert_eq!(
+        session_texts(key, FORK_HUMAN_CHILD),
+        vec![
+            (
+                "user".to_string(),
+                "child prompt after the fork".to_string()
+            ),
+            ("assistant".to_string(), "child answer".to_string()),
+        ]
+    );
+    let boundary = rows(key, "session_markers")
+        .iter()
+        .find(|marker| text(marker, "kind") == "fork_replay_boundary")
+        .expect("replay boundary");
+    assert_eq!(text(boundary, "subkind"), "copied_history");
+}
+
 /// #210: a human fork records a `fork` edge from `forked_from_id`, and the
 /// parent history its rollout replays is not indexed a second time under the
 /// child: two prompts for the parent, one for the child, and the child's
