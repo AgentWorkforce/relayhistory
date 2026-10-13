@@ -279,6 +279,17 @@
     },
     {
       "source": "codex",
+      "name": "fork-paginated",
+      "quirk": "a Codex 0.144 human fork (`history_mode: paginated`) whose rollout copies both parent turns and their cumulative `token_count` straight after its own `session_meta`, without the parent's",
+      "layout": "CodexRollout",
+      "origin": "RelayHistory",
+      "files": [
+        "codex/fork-paginated/parent.jsonl",
+        "codex/fork-paginated/child.jsonl"
+      ]
+    },
+    {
+      "source": "codex",
       "name": "fork-subagent",
       "quirk": "a spawned subagent naming its parent in `source.subagent.thread_spawn.parent_thread_id`, replaying the parent's open turn (with a tool call) and starting its own turn in the thread id's own millisecond",
       "layout": "CodexRollout",

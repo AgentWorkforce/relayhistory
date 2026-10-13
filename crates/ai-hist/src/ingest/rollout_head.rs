@@ -2,12 +2,14 @@
 
 use anyhow::Result;
 use serde_json::Value;
+use std::cell::Cell;
 use std::io::{self, BufRead, BufReader};
 use std::path::Path;
 use std::sync::atomic::Ordering as AtomicOrdering;
 
 use super::codex;
 use super::cold_read;
+use super::transcript_cursor::{TranscriptFileCursor, TranscriptReader};
 use super::{
     codex_is_subagent, codex_parent_session_id, codex_parent_thread_id, parse_iso_ms,
     CodexSessionMeta, SYNC_QUIET,
@@ -91,6 +93,70 @@ fn collect_head_records(
         }
     }
     Ok((values, bytes_read))
+}
+
+/// Open the rollout walk's reader at its cursor, and the fork replay gate it
+/// steps, with the bytes the gate's head probe read.
+///
+/// The gate is armed by [`codex::CopiedHistoryProbe`] over the records after
+/// the rollout's first when the read starts at byte zero: a copy that follows
+/// the child's own `session_meta` starts at line 1, which a resumed read never
+/// meets. The probe reads up to its verdict or [`LEADING_BYTE_LIMIT`]. It is
+/// decided at the child's first own turn, which every observed paginated fork
+/// reaches within its first 400 KiB; a longer copy is still proven by a
+/// replayed turn ordered by UUIDv7, which comes in its first records.
+pub(super) fn open_codex_walk(
+    path: &Path,
+    saved: Option<&TranscriptFileCursor>,
+    meta: &CodexSessionMeta,
+) -> Result<(TranscriptReader, codex::ForkReplayGate, u64)> {
+    let reader = TranscriptReader::open(path, saved, None)?;
+    let mut gate = codex::ForkReplayGate::new(meta.fork_parent_id.clone(), meta.fork_origin_ms);
+    if reader.start_offset() != 0 || meta.fork_parent_id.is_none() {
+        return Ok((reader, gate, 0));
+    }
+    // The window reads one byte past the limit, so a file of exactly the
+    // limit is told from a longer one.
+    let read = Cell::new(0u64);
+    let failed = Cell::new(None);
+    let reached_end = || read.get() <= LEADING_BYTE_LIMIT;
+    if let Some(bytes) = cold_read::fresh(path) {
+        let records = records_after_first(io::Cursor::new(&bytes[..]), &read, &failed);
+        gate.probe_copied_history(records, reached_end);
+    } else {
+        // Its own handle, not the sweep's parked one: the walk's reader holds
+        // that, and the probe must not take a handle parked for another file.
+        let file = BufReader::new(std::fs::File::open(path)?);
+        gate.probe_copied_history(records_after_first(file, &read, &failed), reached_end);
+    }
+    // A head the probe could not read proves nothing either way.
+    if let Some(error) = failed.take() {
+        return Err(error.into());
+    }
+    Ok((reader, gate, read.get()))
+}
+
+/// The complete, parseable records after the first, within one byte past
+/// [`LEADING_BYTE_LIMIT`], counting the bytes read into `read`. A read error
+/// ends them and is kept in `failed`.
+fn records_after_first<'a>(
+    reader: impl BufRead + 'a,
+    read: &'a Cell<u64>,
+    failed: &'a Cell<Option<io::Error>>,
+) -> impl Iterator<Item = Value> + 'a {
+    let mut reader = reader.take(LEADING_BYTE_LIMIT + 1);
+    let mut raw = Vec::new();
+    std::iter::from_fn(move || {
+        raw.clear();
+        let line = reader
+            .read_until(b'\n', &mut raw)
+            .map_err(|error| failed.set(Some(error)))
+            .ok()?;
+        read.set(read.get() + line as u64);
+        (line > 0 && raw.last() == Some(&b'\n')).then(|| raw.clone())
+    })
+    .skip(1)
+    .filter_map(|raw| serde_json::from_slice::<Value>(trim_ascii_end(&raw)).ok())
 }
 
 fn trim_ascii_end(raw: &[u8]) -> &[u8] {
