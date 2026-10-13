@@ -565,7 +565,10 @@ export interface DiscoverOptions {
   dbPath?: string
   sources?: Array<string>
   limit?: number
-  /** Keep a working directory under Desktop, Documents, or Downloads as its raw path. Default false. */
+  /**
+   * Skip filesystem project identity for a working directory under Desktop,
+   * Documents, or Downloads. Absent or false keeps today's resolution.
+   */
   skipProtectedFolderIdentity?: boolean
 }
 export interface DiscoveryDiagnostic {
