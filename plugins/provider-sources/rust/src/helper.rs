@@ -24,6 +24,10 @@ pub struct Arguments {
     /// Absent means the caller did not say, which keeps the historical
     /// behaviour of acquiring related evidence.
     pub include_related: Option<bool>,
+    /// `send`: the remote session to post `message` into.
+    pub session_id: Option<String>,
+    /// `send`: the text to post; bounded so a runaway request stays small.
+    pub message: Option<String>,
 }
 // Validate caller-controlled identities before resolving HOME, constructing an
 // adapter, or probing credentials. Classification is based on this phase, never
@@ -31,7 +35,7 @@ pub struct Arguments {
 fn validate_request(request: &Request) -> Result<()> {
     ensure!(request.version == 1, "unsupported helper version");
     ensure!(
-        matches!(request.operation.as_str(), "discover" | "hydrate"),
+        matches!(request.operation.as_str(), "discover" | "hydrate" | "send"),
         "unknown operation"
     );
     let args = &request.args;
@@ -82,6 +86,20 @@ fn validate_request(request: &Request) -> Result<()> {
             "invalid observation discovery state"
         );
     }
+    if request.operation == "send" {
+        let session_id = args.session_id.as_deref().context("sessionId required")?;
+        ensure!(
+            !session_id.is_empty()
+                && session_id.len() <= 512
+                && !session_id.chars().any(char::is_control),
+            "invalid session id"
+        );
+        let message = args.message.as_deref().context("message required")?;
+        ensure!(
+            !message.trim().is_empty() && message.len() <= crate::remote::MAX_REMOTE_MESSAGE_BYTES,
+            "invalid message"
+        );
+    }
     Ok(())
 }
 fn execute(request: Request) -> Result<Value> {
@@ -90,6 +108,15 @@ fn execute(request: Request) -> Result<Value> {
     let instance = args.connector_instance.as_deref().unwrap_or("default");
     let home = resolve_home(std::env::var_os("HOME"), std::env::var_os("USERPROFILE"))?;
     let home = home.as_path();
+    if request.operation == "send" {
+        // Send needs no provider instance: the dispatcher resolves the
+        // connector's own authenticated transport, and a missing sign-in
+        // answers CONNECTOR_NOT_CONFIGURED from there.
+        let session_id = args.session_id.context("sessionId required")?;
+        let message = args.message.context("message required")?;
+        crate::remote::send_remote_message_at(home, &connector, &session_id, &message)?;
+        return Ok(json!({"sent": true}));
+    }
     let provider = crate::remote::provider(home, &connector, instance, args.limit)?;
     if let Some(source) = &args.source {
         ensure!(provider.source() == source, "source mismatch");
@@ -160,14 +187,37 @@ fn drop_related(normalized: &mut ai_hist::sources::NormalizedSourceEvidence) {
         .retain(|record| record.kind != EvidenceKind::Relationship);
 }
 
+/// The error-code prefixes connector operations stamp onto their errors. A
+/// failure keeps its code in the response so a host can tell a hard refusal
+/// (`SESSION_NOT_FOUND`, a missing write scope inside `CONNECTOR_FAILURE`)
+/// from a retryable one — the detail string itself stays server-side because
+/// it can carry endpoint or credential context.
+const ERROR_CODE_PREFIXES: &[&str] = &[
+    "INVALID_ARGUMENT",
+    "CONNECTOR_NOT_CONFIGURED",
+    "AUTHENTICATION_EXPIRED",
+    "SESSION_NOT_FOUND",
+    "EVIDENCE_PARTIAL",
+    "CONNECTOR_FAILURE",
+];
+
+fn error_code(error: &anyhow::Error) -> &'static str {
+    let message = error.to_string();
+    ERROR_CODE_PREFIXES
+        .iter()
+        .copied()
+        .find(|code| message.starts_with(code) && message[code.len()..].starts_with(':'))
+        .unwrap_or("CONNECTOR_FAILURE")
+}
+
 pub fn handle(request: Request) -> Value {
     if validate_request(&request).is_err() {
         return json!({"version":1,"ok":false,"error":{"code":"INVALID_ARGUMENT","message":"Invalid provider source request; verify operation, connector identity, source and limits"}});
     }
     match execute(request) {
         Ok(value) => json!({"version":1,"ok":true,"value":value}),
-        Err(_) => {
-            json!({"version":1,"ok":false,"error":{"code":"CONNECTOR_FAILURE","message":"Provider source operation failed; verify explicit connector configuration and provider CLI sign-in"}})
+        Err(error) => {
+            json!({"version":1,"ok":false,"error":{"code":error_code(&error),"message":"Provider source operation failed; verify explicit connector configuration and provider CLI sign-in"}})
         }
     }
 }
@@ -186,6 +236,7 @@ fn resolve_home(
 mod tests {
     use super::{drop_related, resolve_home};
     use ai_hist::{EvidenceKind, EvidenceRecord};
+    use serde_json::Value;
     use std::path::PathBuf;
 
     fn record(kind: EvidenceKind) -> EvidenceRecord {
@@ -238,6 +289,46 @@ mod tests {
         );
         // Everything else the snapshot carries is untouched.
         assert_eq!(normalized.source_stamp, "stamp");
+    }
+
+    /// Send requests with missing or malformed fields are rejected at
+    /// validation — before any credential or transport is touched — with the
+    /// same INVALID_ARGUMENT the other malformed requests get.
+    #[test]
+    fn send_requests_validate_session_and_message_before_running() {
+        let send = |args: Value| {
+            super::handle(
+                serde_json::from_value(serde_json::json!({
+                    "version": 1,
+                    "operation": "send",
+                    "args": args,
+                }))
+                .expect("request shape"),
+            )
+        };
+        let code = |response: Value| response["error"]["code"].as_str().unwrap().to_string();
+        // Missing connector identity, session id, and message each refuse.
+        for args in [
+            serde_json::json!({}),
+            serde_json::json!({"connectorId": "devin-cloud"}),
+            serde_json::json!({"connectorId": "devin-cloud", "sessionId": "abc123"}),
+            serde_json::json!({"connectorId": "devin-cloud", "sessionId": "abc123", "message": " "}),
+            serde_json::json!({"connectorId": "devin-cloud", "sessionId": "a\nb", "message": "hi"}),
+            serde_json::json!({"connectorId": "claude-web", "sessionId": "abc123", "message": "hi"}),
+        ] {
+            let report = format!("{args}");
+            assert_eq!(code(send(args)), "INVALID_ARGUMENT", "{report}");
+        }
+        // An oversized message refuses at validation too.
+        let oversized = "x".repeat(crate::remote::MAX_REMOTE_MESSAGE_BYTES + 1);
+        assert_eq!(
+            code(send(serde_json::json!({
+                "connectorId": "devin-cloud",
+                "sessionId": "abc123",
+                "message": oversized,
+            }))),
+            "INVALID_ARGUMENT"
+        );
     }
 
     #[test]
