@@ -565,6 +565,8 @@ export interface DiscoverOptions {
   dbPath?: string
   sources?: Array<string>
   limit?: number
+  /** Keep a working directory under Desktop, Documents, or Downloads as its raw path. Default false. */
+  skipProtectedFolderIdentity?: boolean
 }
 export interface DiscoveryDiagnostic {
   source: string

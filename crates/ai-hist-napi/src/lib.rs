@@ -1704,12 +1704,16 @@ pub async fn list_session_catalog(
 }
 
 #[napi(object)]
+#[derive(Default)]
 pub struct DiscoverOptions {
     pub source_connectors: Option<Vec<String>>,
     pub scope: Option<String>,
     pub db_path: Option<String>,
     pub sources: Option<Vec<String>>,
     pub limit: Option<u32>,
+    /// Skip filesystem project identity for a working directory under Desktop,
+    /// Documents, or Downloads. Absent or false keeps today's resolution.
+    pub skip_protected_folder_identity: Option<bool>,
 }
 
 #[napi(object)]
@@ -1762,13 +1766,7 @@ pub struct DiscoverResult {
 /// Explicit bounded provider discovery. It updates only the session catalog.
 #[napi]
 pub async fn discover_sessions(options: Option<DiscoverOptions>) -> napi::Result<DiscoverResult> {
-    let options = options.unwrap_or(DiscoverOptions {
-        source_connectors: None,
-        scope: None,
-        db_path: None,
-        sources: None,
-        limit: None,
-    });
+    let options = options.unwrap_or_default();
     let scope = parse_scope(options.scope)?;
     let sources = options.sources.unwrap_or_default();
     let connectors = source_connector_selection(options.source_connectors)?;
@@ -1778,6 +1776,7 @@ pub async fn discover_sessions(options: Option<DiscoverOptions>) -> napi::Result
         scope,
         sources,
         limit: options.limit.map(|limit| limit as usize),
+        skip_protected_folder_identity: options.skip_protected_folder_identity.unwrap_or(false),
     };
     let (sessions, summary) = napi::tokio::task::spawn_blocking(move || {
         ai_hist::discover_sessions_scoped_at_with_connectors(&path, &request, &connectors)

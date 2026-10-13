@@ -19,6 +19,7 @@ macro_rules! workspace_mod {
 /// and a second implementation is exactly the drift this module exists to
 /// prevent.
 pub mod project_identity;
+mod protected_folder;
 mod store;
 workspace_mod!(observations);
 workspace_mod!(privacy);

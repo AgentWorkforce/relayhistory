@@ -128,7 +128,7 @@ fn delegation_topology_survives_the_whole_acquisition_path() {
         &DiscoverOptions {
             scope: SessionScope::Local,
             sources: Vec::new(),
-            limit: None,
+            ..Default::default()
         },
     )
     .unwrap();

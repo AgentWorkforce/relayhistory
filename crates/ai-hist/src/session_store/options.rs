@@ -141,6 +141,19 @@ pub struct DiscoveryOptions {
     /// [`StopToken`].
     #[serde(skip)]
     pub stop: Option<StopToken>,
+    /// Keep a working directory whose first component under the user home is
+    /// `Desktop`, `Documents`, or `Downloads` as that raw path. Discovery
+    /// does not canonicalize it, probe `.git`, or read Git config. A
+    /// provider-recorded `repo_url` is still preferred and does not read the
+    /// directory. On macOS those three names match case-insensitively;
+    /// elsewhere the match is case-sensitive. `~/Desktop-backup` and
+    /// `~/Projects` are not protected. A `..` component is not normalized
+    /// away, so a path that still textually sits under one of those folders
+    /// is protected. Default off: sync, hydrate, and any caller that leaves
+    /// this unset resolve every directory from the filesystem as before.
+    /// Absent from stored JSON written before the field existed.
+    #[serde(default)]
+    pub skip_protected_folder_identity: bool,
 }
 
 impl DiscoveryOptions {
@@ -163,6 +176,28 @@ impl DiscoveryOptions {
     pub fn stop(mut self, stop: StopToken) -> Self {
         self.stop = Some(stop);
         self
+    }
+
+    /// Skip filesystem project identity under Desktop, Documents, and
+    /// Downloads; see [`DiscoveryOptions::skip_protected_folder_identity`].
+    #[must_use]
+    pub fn skip_protected_folder_identity(mut self, skip: bool) -> Self {
+        self.skip_protected_folder_identity = skip;
+        self
+    }
+
+    pub(crate) fn discover_options(&self) -> crate::discover::DiscoverOptions {
+        crate::discover::DiscoverOptions {
+            scope: super::SessionScope::Local,
+            sources: self
+                .sources
+                .iter()
+                .flatten()
+                .map(|source| source.as_str().to_string())
+                .collect(),
+            limit: self.limit,
+            skip_protected_folder_identity: self.skip_protected_folder_identity,
+        }
     }
 }
 
@@ -308,5 +343,14 @@ mod tests {
         assert!(options.force);
         assert_eq!(options.lock_timeout_ms, 250);
         assert!(options.sources.is_none());
+    }
+
+    #[test]
+    fn discovery_options_without_the_protected_folder_field_stay_off() {
+        let options: DiscoveryOptions = serde_json::from_str(r#"{"limit":3}"#).unwrap();
+        assert!(!options.skip_protected_folder_identity);
+        assert_eq!(options.limit, Some(3));
+        let enabled = DiscoveryOptions::default().skip_protected_folder_identity(true);
+        assert!(enabled.skip_protected_folder_identity);
     }
 }

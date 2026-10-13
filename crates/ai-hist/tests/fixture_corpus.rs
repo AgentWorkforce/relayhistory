@@ -341,7 +341,7 @@ fn capture(fixture: &Fixture, home: &Path) -> Value {
         let options = DiscoverOptions {
             scope: SessionScope::Local,
             sources: Vec::new(),
-            limit: None,
+            ..Default::default()
         };
         match discover_sessions_with_env(&env, &options, |row| {
             discovered.push((row.source.clone(), row.session_id.clone()))

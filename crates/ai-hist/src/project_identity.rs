@@ -175,6 +175,12 @@ pub fn identity_for(
         return Some((key, ProjectKeyMethod::Remote));
     }
     let cwd = cwd.map(str::trim).filter(|cwd| !cwd.is_empty())?;
+    // Before any canonicalize. A discovery pass can refuse to read a
+    // protected user folder; the raw trimmed directory is the path fallback.
+    // The recorded remote above already returned without consulting `cwd`.
+    if crate::protected_folder::keeping_raw_path(cwd) {
+        return Some((cwd.to_string(), ProjectKeyMethod::PathFallback));
+    }
     let resolved = resolve_project_identity(cwd);
     Some((resolved.project_key, resolved.method))
 }

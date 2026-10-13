@@ -4092,17 +4092,8 @@ fn reconcile_grok_unified_catalog(conn: &Connection, row: &mut ShallowSession) -
 // discovery engine
 // ---------------------------------------------------------------------------
 
-/// Options for one discovery run.
-#[derive(Debug, Clone, Default)]
-pub struct DiscoverOptions {
-    /// Provider-presence scope. Defaults to local for compatibility.
-    pub scope: SessionScope,
-    /// Restrict to these sources. Empty means every adapter.
-    pub sources: Vec<String>,
-    /// Global cap on emitted rows, applied across providers by recency.
-    /// `None` means no cap.
-    pub limit: Option<usize>,
-}
+mod options;
+pub use options::DiscoverOptions;
 
 /// Something one provider (or one session) could not do.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -4426,6 +4417,10 @@ fn discover_sessions_with_worker_limit(
     // is also the unit the project-identity cache may span. A host that stays
     // up across many passes must not keep answering from a checkout's state at
     // the first one.
+    // The option covers every identity read in this pass: the shallow upsert,
+    // cached-row upgrades, and the shared end-of-pass refresh below. Sync
+    // reaches that refresh with the option off, so its default is unchanged.
+    let _protected_folders = crate::protected_folder::guard(options.skip_protected_folder_identity);
     crate::project_identity::begin_acquisition_pass();
     let mut identities = std::collections::HashSet::new();
     for provider in providers {

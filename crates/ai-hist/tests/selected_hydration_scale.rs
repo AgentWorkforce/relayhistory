@@ -25,7 +25,7 @@ fn selected_hydration_does_not_reconcile_unrelated_history() {
             &DiscoverOptions {
                 scope: SessionScope::Local,
                 sources: vec!["claude".into()],
-                limit: None,
+                ..Default::default()
             },
         )
         .unwrap();

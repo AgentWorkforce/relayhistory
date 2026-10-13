@@ -11671,7 +11671,7 @@ mod tests {
             &DiscoverOptions {
                 scope: SessionScope::Local,
                 sources: vec!["opencode".into()],
-                limit: None,
+                ..Default::default()
             },
             |_| {},
         )

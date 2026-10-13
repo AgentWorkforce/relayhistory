@@ -68,7 +68,7 @@ fn discovery_upgrades_a_path_key_once_the_checkout_gains_a_remote() {
             &DiscoverOptions {
                 scope: SessionScope::Local,
                 sources: vec!["codex".into()],
-                limit: None,
+                ..Default::default()
             },
         )
         .unwrap()
