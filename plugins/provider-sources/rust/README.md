@@ -17,8 +17,9 @@ by the provider CLIs. `RELAYHISTORY_CLAUDE_CREDENTIALS` and
 `windsurf_api_key` from its `credentials.toml` and `devin.org_id` from its
 `config.json`; `RELAYHISTORY_DEVIN_API_KEY`, `RELAYHISTORY_DEVIN_ORG_ID`,
 `RELAYHISTORY_DEVIN_CREDENTIALS`, `RELAYHISTORY_DEVIN_CONFIG` and
-`RELAYHISTORY_DEVIN_API_BASE_URL` override each input. Devin hydration is
-read-only — `ViewOrgSessions` suffices; `ManageOrgSessions` is never needed.
+`RELAYHISTORY_DEVIN_API_BASE_URL` override each input. Devin reads need
+`ViewOrgSessions`; `send`'s `POST .../messages` additionally needs
+`ManageOrgSessions`, and a denied send answers `PERMISSION_DENIED`.
 
 The binary accepts one JSON stdin request and emits one JSON stdout response:
 
@@ -36,6 +37,21 @@ claims only `file_edit` coverage; it never invents transcript completeness.
 Neither helper operation opens the caller's history database or persists a
 checkpoint. The SDK's generic intake transaction owns applying observations and
 evidence with the observation revision fence.
+
+`send` posts one message into a remote session:
+
+```json
+{"version":1,"operation":"send","args":{"connectorId":"devin-cloud","sessionId":"<32-hex or devin-prefixed>","message":"<text>"}}
+```
+
+`message` must be non-empty and at most 64 KiB. Success is
+`{version:1,ok:true,value:{sent:true}}`. Only connectors with an upstream
+write path answer — today that is `devin-cloud`, posting
+`POST /v3/organizations/{org}/sessions/{devin_id}/messages`; others refuse
+as unsupported. Errors keep their classification in `error.code`
+(`INVALID_ARGUMENT`, `CONNECTOR_NOT_CONFIGURED`, `AUTHENTICATION_EXPIRED`,
+`PERMISSION_DENIED`, `SESSION_NOT_FOUND`, `CONNECTOR_FAILURE`) so a host can
+tell a hard refusal from a retryable one; the message stays generic.
 
 Request bound: 16 MiB. Response bound: 32 MiB. Helper watchdog: 300 seconds.
 Per-request HTTP/CLI limits remain in the adapter; discovery `limit` cannot exceed

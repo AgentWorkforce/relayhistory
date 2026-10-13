@@ -27,6 +27,11 @@ const MAX_REMOTE_EVIDENCE_BYTES: usize = 16 * 1024 * 1024;
 
 pub use crate::sources::AcquiredEvidence as RemoteSessionEvidence;
 
+/// The largest message the `send` operation carries; relay DMs are
+/// chat-sized and connectors document `message` as a plain string — 64 KiB is
+/// generous headroom while still bounding a runaway request body.
+pub const MAX_REMOTE_MESSAGE_BYTES: usize = 64 * 1024;
+
 mod claude_web;
 mod codex_diff;
 mod devin_auth;
@@ -51,6 +56,9 @@ pub use devin_cloud::DevinCloudProvider;
 
 mod dispatch;
 pub use dispatch::provider;
+
+mod send;
+pub use send::send_remote_message_at;
 
 /// Whether one remote connector can run on this machine, and why not when it
 /// cannot.

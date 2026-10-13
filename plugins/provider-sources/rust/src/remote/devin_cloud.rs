@@ -1,13 +1,13 @@
-//! `devin-cloud` — the api.devin.ai v3 organization session lister and
-//! message hydrator.
+//! `devin-cloud` — the api.devin.ai v3 organization session lister,
+//! message hydrator, and message sender.
 //!
 //! Sign-in stays owned by the Devin CLI, exactly like the other connectors:
 //! the bearer comes from Devin's own `credentials.toml` (`windsurf_api_key`,
 //! which is a `cog_` service key or personal token) or the explicit
 //! `RELAYHISTORY_DEVIN_API_KEY` override, and the organization id comes from
-//! Devin's `config.json` (`devin.org_id`) or `RELAYHISTORY_DEVIN_ORG_ID`. The
-//! connector only reads: `GET .../sessions` and `GET .../messages` need
-//! `ViewOrgSessions`, never `ManageOrgSessions`.
+//! Devin's `config.json` (`devin.org_id`) or `RELAYHISTORY_DEVIN_ORG_ID`.
+//! Reads need `ViewOrgSessions`; `send`'s `POST .../messages` needs the
+//! broader `ManageOrgSessions`, and a denied send names that scope.
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
@@ -48,18 +48,14 @@ pub struct DevinHttpResponse {
 /// pagination are testable without a network.
 pub trait DevinTransport: Send + Sync {
     fn get(&self, url: &str, bearer_token: &str) -> Result<DevinHttpResponse>;
+    fn post(&self, url: &str, bearer_token: &str, body: &Value) -> Result<DevinHttpResponse>;
 }
 
 pub(super) struct UreqDevinTransport;
 
 impl DevinTransport for UreqDevinTransport {
     fn get(&self, url: &str, bearer_token: &str) -> Result<DevinHttpResponse> {
-        // Redirects are never followed: ureq would re-send the Authorization
-        // header to the redirect target, so a redirecting endpoint could move
-        // the stored credential to a host the https-or-loopback guard never
-        // saw. A 3xx therefore surfaces as a failed request, not a hop.
-        let agent = ureq::AgentBuilder::new().redirects(0).build();
-        let request = agent
+        let request = devin_agent()
             .get(url)
             .timeout(std::time::Duration::from_secs(30))
             .set("Authorization", &format!("Bearer {bearer_token}"))
@@ -70,6 +66,27 @@ impl DevinTransport for UreqDevinTransport {
             Err(error) => Err(anyhow::Error::from(error).context("api.devin.ai request")),
         }
     }
+
+    fn post(&self, url: &str, bearer_token: &str, body: &Value) -> Result<DevinHttpResponse> {
+        match devin_agent()
+            .post(url)
+            .timeout(std::time::Duration::from_secs(30))
+            .set("Authorization", &format!("Bearer {bearer_token}"))
+            .send_json(body)
+        {
+            Ok(response) => bounded_devin_response(response.status(), response),
+            Err(ureq::Error::Status(status, response)) => bounded_devin_response(status, response),
+            Err(error) => Err(anyhow::Error::from(error).context("api.devin.ai request")),
+        }
+    }
+}
+
+fn devin_agent() -> ureq::Agent {
+    // Redirects are never followed: ureq would re-send the Authorization
+    // header to the redirect target, so a redirecting endpoint could move
+    // the stored credential to a host the https-or-loopback guard never
+    // saw. A 3xx therefore surfaces as a failed request, not a hop.
+    ureq::AgentBuilder::new().redirects(0).build()
 }
 
 fn bounded_devin_response(status: u16, response: ureq::Response) -> Result<DevinHttpResponse> {
@@ -126,16 +143,24 @@ pub(super) fn devin_session_hex(id: &str) -> Option<&str> {
 }
 
 /// An api.devin.ai response status, as the connector error it stands for.
-fn ensure_devin_status(what: &str, status: u16, body: &str) -> Result<()> {
+/// `scope` names the permission a 403 asks the key holder for — reads need
+/// `ViewOrgSessions`, sends need `ManageOrgSessions`. Every 2xx is success:
+/// a POST may answer 201 or 204, and treating an acknowledged send as a
+/// failure would invite a duplicate retry.
+fn ensure_devin_status(what: &str, scope: &str, status: u16, body: &str) -> Result<()> {
     match status {
-        200 => Ok(()),
+        200..=299 => Ok(()),
         401 => anyhow::bail!(
             "AUTHENTICATION_EXPIRED: api.devin.ai rejected the Devin API key (HTTP 401)"
         ),
-        403 => anyhow::bail!(
-            "CONNECTOR_FAILURE: {what} was denied; the Devin API key needs ViewOrgSessions"
-        ),
+        403 => {
+            anyhow::bail!("PERMISSION_DENIED: {what} was denied; the Devin API key needs {scope}")
+        }
         404 => anyhow::bail!("SESSION_NOT_FOUND: {what} was not found"),
+        422 => anyhow::bail!(
+            "INVALID_ARGUMENT: api.devin.ai rejected {what} (HTTP 422): {}",
+            excerpt_one_line(body)
+        ),
         status => anyhow::bail!(
             "CONNECTOR_FAILURE: {what} failed (HTTP {status}): {}",
             excerpt_one_line(body)
@@ -342,7 +367,12 @@ pub(super) fn acquire_devin_remote_session_at(
             cursor.as_deref(),
         );
         let response = transport.get(&url, &auth.bearer)?;
-        ensure_devin_status("Devin message history", response.status, &response.body)?;
+        ensure_devin_status(
+            "Devin message history",
+            "ViewOrgSessions",
+            response.status,
+            &response.body,
+        )?;
         source_bytes = source_bytes.saturating_add(response.body.len());
         anyhow::ensure!(
             source_bytes <= MAX_REMOTE_EVIDENCE_BYTES,
@@ -446,7 +476,12 @@ impl ShallowSessionProvider for DevinCloudProvider {
             };
             let url = devin_page_url(&auth, "sessions", page_limit, cursor.as_deref());
             let response = self.transport.get(&url, &auth.bearer)?;
-            ensure_devin_status("Devin session list", response.status, &response.body)?;
+            ensure_devin_status(
+                "Devin session list",
+                "ViewOrgSessions",
+                response.status,
+                &response.body,
+            )?;
             let page = parse_devin_page(&response.body, "session list")?;
             for item in &page.items {
                 if let Some((candidate, session)) = map_devin_session(item) {
@@ -481,4 +516,44 @@ impl ShallowSessionProvider for DevinCloudProvider {
     ) -> Result<Option<ShallowSession>> {
         Ok(take_fetched(&self.fetched, &candidate.locator))
     }
+}
+
+// ---------------------------------------------------------------------------
+// send — POST .../sessions/{devin_id}/messages (ManageOrgSessions)
+// ---------------------------------------------------------------------------
+
+/// Post one message into a remote Devin session:
+/// `POST /v3/organizations/{org}/sessions/{devin_id}/messages`, the route the
+/// v3 API documents for sending into an active session (a suspended session
+/// is resumed). Needs `ManageOrgSessions` — strictly broader than the read
+/// scope — so a 403 on this path names the missing scope instead of implying
+/// the connector was never configured.
+pub(super) fn send_devin_session_message_at(
+    credentials_path: &Path,
+    config_path: &Path,
+    session_id: &str,
+    message: &str,
+    transport: &dyn DevinTransport,
+) -> Result<()> {
+    let Some(hex) = devin_session_hex(session_id) else {
+        anyhow::bail!("INVALID_ARGUMENT: remote Devin session id is malformed");
+    };
+    anyhow::ensure!(
+        !message.trim().is_empty() && message.len() <= super::MAX_REMOTE_MESSAGE_BYTES,
+        "INVALID_ARGUMENT: message must be non-empty and within {} bytes",
+        super::MAX_REMOTE_MESSAGE_BYTES,
+    );
+    let auth = devin_auth(credentials_path, config_path)?;
+    let url = format!(
+        "{}/v3/organizations/{}/sessions/devin-{hex}/messages",
+        auth.base_url, auth.org_id,
+    );
+    let body = json!({ "message": message });
+    let response = transport.post(&url, &auth.bearer, &body)?;
+    ensure_devin_status(
+        "Devin session message",
+        "ManageOrgSessions",
+        response.status,
+        &response.body,
+    )
 }

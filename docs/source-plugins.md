@@ -58,7 +58,9 @@ Provider limits and authentication stay in the
 Claude uses an observed private teleport interface which can change. Codex's
 supported diff does not imply a full transcript, token log or tool history.
 Devin's v3 message history carries user and assistant text only — no tool
-calls, token usage or file edits — and needs only `ViewOrgSessions`.
+calls, token usage or file edits — and needs only `ViewOrgSessions`. Its
+`send` operation posts a message into a remote session and needs the
+broader `ManageOrgSessions`; a denied send surfaces `PERMISSION_DENIED`.
 Partial evidence is reported as partial capability.
 
 A plugin may also register destinations (`HistoryDestination`), separately from

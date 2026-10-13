@@ -127,14 +127,17 @@ fn invalid_request_is_classified_before_home_or_provider_auth() {
     }
 }
 
+/// Errors keep their operation vocabulary code so a host can tell "sign in
+/// first" from "the connector broke" — while the message stays generic and
+/// never echoes credential contents or paths.
 #[test]
-fn valid_requests_keep_configuration_errors_generic_and_redacted() {
+fn valid_requests_keep_error_codes_safe_and_details_redacted() {
     let home = tempfile::tempdir().unwrap();
     let response = invoke(
         home.path(),
         json!({"version":1,"operation":"discover","args":{"connectorId":"claude-web"}}),
     );
-    assert_eq!(response["error"]["code"], "CONNECTOR_FAILURE");
+    assert_eq!(response["error"]["code"], "CONNECTOR_NOT_CONFIGURED");
     std::fs::create_dir_all(home.path().join(".claude")).unwrap();
     std::fs::write(
         home.path().join(".claude/.credentials.json"),

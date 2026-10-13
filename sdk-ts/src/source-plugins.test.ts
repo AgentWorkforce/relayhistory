@@ -20,6 +20,7 @@ import {
   RelayHistoryError,
   AuthenticationExpiredError,
   SessionNotFoundError,
+  PermissionDeniedError,
   type HistorySource,
   type SourceEvidenceSnapshot,
 } from './index.js';
@@ -345,6 +346,7 @@ test('typed acquisition failures survive public APIs without plugin secrets', as
   for (const [ErrorType, code] of [
     [AuthenticationExpiredError, 'AUTHENTICATION_EXPIRED'],
     [SessionNotFoundError, 'SESSION_NOT_FOUND'],
+    [PermissionDeniedError, 'PERMISSION_DENIED'],
   ] as const) {
     const fail = async (): Promise<never> => { throw new ErrorType('private-token', code, { cause: new Error('secret cause') }); };
     source.hydrate = fail;

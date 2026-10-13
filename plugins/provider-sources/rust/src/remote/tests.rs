@@ -8,8 +8,8 @@
 
 use super::devin_auth::{devin_org_id, toml_value};
 use super::devin_cloud::{
-    acquire_devin_remote_session_at, devin_session_hex, map_devin_session, DevinHttpResponse,
-    DevinTransport, UreqDevinTransport,
+    acquire_devin_remote_session_at, devin_session_hex, map_devin_session,
+    send_devin_session_message_at, DevinHttpResponse, DevinTransport, UreqDevinTransport,
 };
 use super::*;
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -863,17 +863,28 @@ fn a_source_filter_that_excludes_every_configured_connector_is_unsupported() {
 /// Serves a fixed sequence of api.devin.ai responses and records each request.
 struct ScriptedDevinTransport {
     responses: Vec<(u16, String)>,
+    post_responses: Vec<(u16, String)>,
     calls: Mutex<Vec<(String, String)>>,
+    posts: Mutex<Vec<(String, String, Value)>>,
     next: AtomicUsize,
+    next_post: AtomicUsize,
 }
 
 impl ScriptedDevinTransport {
     fn new(responses: Vec<(u16, String)>) -> Self {
         Self {
             responses,
+            post_responses: Vec::new(),
             calls: Mutex::new(Vec::new()),
+            posts: Mutex::new(Vec::new()),
             next: AtomicUsize::new(0),
+            next_post: AtomicUsize::new(0),
         }
+    }
+
+    fn with_posts(mut self, post_responses: Vec<(u16, String)>) -> Self {
+        self.post_responses = post_responses;
+        self
     }
 }
 
@@ -886,6 +897,20 @@ impl DevinTransport for Arc<ScriptedDevinTransport> {
         let index = self.next.fetch_add(1, Ordering::Relaxed);
         let (status, body) = self
             .responses
+            .get(index)
+            .cloned()
+            .unwrap_or((500, "script exhausted".to_string()));
+        Ok(DevinHttpResponse { status, body })
+    }
+
+    fn post(&self, url: &str, bearer_token: &str, body: &Value) -> Result<DevinHttpResponse> {
+        self.posts
+            .lock()
+            .unwrap()
+            .push((url.to_string(), bearer_token.to_string(), body.clone()));
+        let index = self.next_post.fetch_add(1, Ordering::Relaxed);
+        let (status, body) = self
+            .post_responses
             .get(index)
             .cloned()
             .unwrap_or((500, "script exhausted".to_string()));
@@ -1467,6 +1492,167 @@ fn real_devin_transport_never_follows_a_redirect_with_credentials() {
         matches!(target.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock)
     );
     std::env::remove_var("RELAYHISTORY_DEVIN_API_BASE_URL");
+}
+
+// ---------------------------------------------------------------------------
+// devin-cloud send
+// ---------------------------------------------------------------------------
+
+/// The send op posts the documented v3 route — the session id carries the
+/// `devin-` prefix the API requires — with `{"message": …}` as the whole body
+/// and the stored credential as the bearer.
+#[test]
+fn devin_send_posts_the_documented_route_and_body() {
+    let _cleared = without_credentials_override();
+    let home = tempfile::tempdir().unwrap();
+    let (credentials, config) = write_devin_cli_files(home.path());
+    let transport = Arc::new(ScriptedDevinTransport::new(vec![]).with_posts(vec![(
+        200,
+        r#"{"session_id":"4b50574f40324da6bd88e9cbd30501cf"}"#.into(),
+    )]));
+    send_devin_session_message_at(
+        &credentials,
+        &config,
+        DEVIN_SESSION_ID,
+        "hello from the relay",
+        &Arc::clone(&transport) as &dyn DevinTransport,
+    )
+    .expect("send");
+    let posts = transport.posts.lock().unwrap();
+    assert_eq!(posts.len(), 1);
+    let (url, bearer, body) = &posts[0];
+    assert!(
+        url.ends_with(&format!(
+            "/v3/organizations/org-test/sessions/devin-{DEVIN_SESSION_ID}/messages"
+        )),
+        "{url}"
+    );
+    assert_eq!(bearer, "cog_test_key");
+    assert_eq!(
+        body,
+        &serde_json::json!({"message": "hello from the relay"})
+    );
+}
+
+/// A 201 or 204 is still a successful send — the API acknowledged the
+/// message, and reporting it as failed would invite a duplicate retry.
+#[test]
+fn devin_send_accepts_every_success_status() {
+    let _cleared = without_credentials_override();
+    let home = tempfile::tempdir().unwrap();
+    let (credentials, config) = write_devin_cli_files(home.path());
+    for status in [200u16, 201, 204] {
+        let transport =
+            Arc::new(ScriptedDevinTransport::new(vec![]).with_posts(vec![(status, "".into())]));
+        send_devin_session_message_at(
+            &credentials,
+            &config,
+            DEVIN_SESSION_ID,
+            "hello",
+            &Arc::clone(&transport) as &dyn DevinTransport,
+        )
+        .unwrap_or_else(|error| panic!("HTTP {status}: {error}"));
+    }
+}
+
+/// Each response status maps to the operation's error vocabulary: 401 is an
+/// expired credential, 403 names the *write* scope (not the read one), 404 is
+/// a missing session, 422 is the API rejecting the request itself.
+#[test]
+fn devin_send_maps_response_statuses_to_error_codes() {
+    let _cleared = without_credentials_override();
+    let home = tempfile::tempdir().unwrap();
+    let (credentials, config) = write_devin_cli_files(home.path());
+    let cases = [
+        (401u16, "AUTHENTICATION_EXPIRED:"),
+        (403, "PERMISSION_DENIED:"),
+        (404, "SESSION_NOT_FOUND:"),
+        (422, "INVALID_ARGUMENT:"),
+        (500, "CONNECTOR_FAILURE:"),
+    ];
+    for (status, prefix) in cases {
+        let transport =
+            Arc::new(ScriptedDevinTransport::new(vec![]).with_posts(vec![(status, "{}".into())]));
+        let error = send_devin_session_message_at(
+            &credentials,
+            &config,
+            DEVIN_SESSION_ID,
+            "hello",
+            &Arc::clone(&transport) as &dyn DevinTransport,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.starts_with(prefix), "HTTP {status}: {error}");
+        if status == 403 {
+            assert!(error.contains("ManageOrgSessions"), "{error}");
+            assert!(!error.contains("ViewOrgSessions"), "{error}");
+        }
+    }
+}
+
+/// A local-style Devin session name cannot be a remote id — the request never
+/// leaves the machine. Same for an empty or oversized message.
+#[test]
+fn devin_send_rejects_malformed_targets_and_messages() {
+    let _cleared = without_credentials_override();
+    let home = tempfile::tempdir().unwrap();
+    let (credentials, config) = write_devin_cli_files(home.path());
+    let transport =
+        Arc::new(ScriptedDevinTransport::new(vec![]).with_posts(vec![(200, "{}".into())]));
+    for (session, message) in [
+        ("real-gallium", "hello"),
+        (DEVIN_SESSION_ID, ""),
+        (DEVIN_SESSION_ID, "   "),
+    ] {
+        let error = send_devin_session_message_at(
+            &credentials,
+            &config,
+            session,
+            message,
+            &Arc::clone(&transport) as &dyn DevinTransport,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.starts_with("INVALID_ARGUMENT:"), "{error}");
+    }
+    let oversized = "x".repeat(MAX_REMOTE_MESSAGE_BYTES + 1);
+    let error = send_devin_session_message_at(
+        &credentials,
+        &config,
+        DEVIN_SESSION_ID,
+        &oversized,
+        &Arc::clone(&transport) as &dyn DevinTransport,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("INVALID_ARGUMENT:"), "{error}");
+    assert!(transport.posts.lock().unwrap().is_empty());
+}
+
+/// Without a stored sign-in, the send answers CONNECTOR_NOT_CONFIGURED before
+/// any request; connectors without a write path refuse outright.
+#[test]
+fn send_refuses_unconfigured_or_unsupported_connectors() {
+    let _cleared = without_credentials_override();
+    let home = tempfile::tempdir().unwrap();
+    let (credentials, _config) = write_devin_cli_files(home.path());
+    let transport =
+        Arc::new(ScriptedDevinTransport::new(vec![]).with_posts(vec![(200, "{}".into())]));
+    let error = send_devin_session_message_at(
+        &credentials,
+        &home.path().join("missing-config.json"),
+        DEVIN_SESSION_ID,
+        "hello",
+        &Arc::clone(&transport) as &dyn DevinTransport,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("CONNECTOR_NOT_CONFIGURED:"), "{error}");
+    let error = send_remote_message_at(home.path(), CLAUDE_WEB_CONNECTOR, "s1", "hello")
+        .unwrap_err()
+        .to_string();
+    assert!(error.starts_with("INVALID_ARGUMENT:"), "{error}");
+    assert!(error.contains("cannot deliver messages"), "{error}");
 }
 
 // ---------------------------------------------------------------------------
