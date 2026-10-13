@@ -1534,6 +1534,27 @@ fn devin_send_posts_the_documented_route_and_body() {
     );
 }
 
+/// A 201 or 204 is still a successful send — the API acknowledged the
+/// message, and reporting it as failed would invite a duplicate retry.
+#[test]
+fn devin_send_accepts_every_success_status() {
+    let _cleared = without_credentials_override();
+    let home = tempfile::tempdir().unwrap();
+    let (credentials, config) = write_devin_cli_files(home.path());
+    for status in [200u16, 201, 204] {
+        let transport =
+            Arc::new(ScriptedDevinTransport::new(vec![]).with_posts(vec![(status, "".into())]));
+        send_devin_session_message_at(
+            &credentials,
+            &config,
+            DEVIN_SESSION_ID,
+            "hello",
+            &Arc::clone(&transport) as &dyn DevinTransport,
+        )
+        .unwrap_or_else(|error| panic!("HTTP {status}: {error}"));
+    }
+}
+
 /// Each response status maps to the operation's error vocabulary: 401 is an
 /// expired credential, 403 names the *write* scope (not the read one), 404 is
 /// a missing session, 422 is the API rejecting the request itself.

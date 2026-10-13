@@ -9,6 +9,7 @@ import {
   InvalidArgumentError,
   ConnectorFailureError,
   ConnectorNotConfiguredError,
+  PermissionDeniedError,
   type CatalogSource,
   type SessionScope,
 } from './sdk-common.js';
@@ -46,6 +47,7 @@ export function sourceAcquisitionError(error: unknown): RelayHistoryError {
     case 'SESSION_NOT_FOUND': return new SessionNotFoundError('Source session was not found', code);
     case 'SESSION_SOURCE_UNAVAILABLE': return new SessionSourceUnavailableError('Source session is unavailable', code);
     case 'CONNECTOR_NOT_CONFIGURED': return new ConnectorNotConfiguredError('Source connector is not configured', code);
+    case 'PERMISSION_DENIED': return new PermissionDeniedError('Source connector lacks the required scope', code);
     case 'HYDRATION_UNSUPPORTED': return new HydrationUnsupportedError('Source hydration is unsupported', code);
     case 'SOURCE_ACQUISITION_TIMEOUT':
     case 'HISTORY_PLUGIN_TIMEOUT': return new ConnectorFailureError('Source acquisition timed out', 'SOURCE_ACQUISITION_TIMEOUT');

@@ -95,6 +95,7 @@ export class HydrationUnsupportedError extends RelayHistoryError {}
 export class HydrationFailedError extends RelayHistoryError {}
 export class ConnectorNotConfiguredError extends RelayHistoryError {}
 export class AuthenticationExpiredError extends RelayHistoryError {}
+export class PermissionDeniedError extends RelayHistoryError {}
 export class EvidencePartialError extends RelayHistoryError {}
 export class ConnectorFailureError extends RelayHistoryError {}
 

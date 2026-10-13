@@ -8,6 +8,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- The `devin-cloud` connector gains a `send` operation: `remote::send_remote_message_at` posts `{"message": …}` to `POST /v3/organizations/{org}/sessions/{devin_id}/messages`, the v3 send route needing `ManageOrgSessions`. The helper exposes it as `{"operation":"send","args":{"connectorId","sessionId","message"}}`; failures keep their classification in `error.code` (`PERMISSION_DENIED`, `SESSION_NOT_FOUND`, `AUTHENTICATION_EXPIRED`, …) so a host can tell a hard refusal from a retryable one.
 - Codex session transcripts retain copies of embedded PNG, JPEG, GIF and WebP attachments up to 1 MiB as self-contained image blocks, including image-only turns.
 
 ### Fixed

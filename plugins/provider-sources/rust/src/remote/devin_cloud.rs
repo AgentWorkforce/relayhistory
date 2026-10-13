@@ -1,13 +1,13 @@
-//! `devin-cloud` — the api.devin.ai v3 organization session lister and
-//! message hydrator.
+//! `devin-cloud` — the api.devin.ai v3 organization session lister,
+//! message hydrator, and message sender.
 //!
 //! Sign-in stays owned by the Devin CLI, exactly like the other connectors:
 //! the bearer comes from Devin's own `credentials.toml` (`windsurf_api_key`,
 //! which is a `cog_` service key or personal token) or the explicit
 //! `RELAYHISTORY_DEVIN_API_KEY` override, and the organization id comes from
-//! Devin's `config.json` (`devin.org_id`) or `RELAYHISTORY_DEVIN_ORG_ID`. The
-//! connector only reads: `GET .../sessions` and `GET .../messages` need
-//! `ViewOrgSessions`, never `ManageOrgSessions`.
+//! Devin's `config.json` (`devin.org_id`) or `RELAYHISTORY_DEVIN_ORG_ID`.
+//! Reads need `ViewOrgSessions`; `send`'s `POST .../messages` needs the
+//! broader `ManageOrgSessions`, and a denied send names that scope.
 
 use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
@@ -144,10 +144,12 @@ pub(super) fn devin_session_hex(id: &str) -> Option<&str> {
 
 /// An api.devin.ai response status, as the connector error it stands for.
 /// `scope` names the permission a 403 asks the key holder for — reads need
-/// `ViewOrgSessions`, sends need `ManageOrgSessions`.
+/// `ViewOrgSessions`, sends need `ManageOrgSessions`. Every 2xx is success:
+/// a POST may answer 201 or 204, and treating an acknowledged send as a
+/// failure would invite a duplicate retry.
 fn ensure_devin_status(what: &str, scope: &str, status: u16, body: &str) -> Result<()> {
     match status {
-        200 => Ok(()),
+        200..=299 => Ok(()),
         401 => anyhow::bail!(
             "AUTHENTICATION_EXPIRED: api.devin.ai rejected the Devin API key (HTTP 401)"
         ),
