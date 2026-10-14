@@ -4,7 +4,11 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Minor]
+
+### Added
+
+- `remote::send_remote_message_with` and `RemoteCredential` let a host send a remote-session message with its own resolved Devin credential instead of the connector's file/env lookup. The error-code contract is unchanged: an unusable credential fails `INVALID_ARGUMENT`, never `CONNECTOR_NOT_CONFIGURED`.
 
 ## [0.44.0] - 2026-10-14
 

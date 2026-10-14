@@ -58,7 +58,7 @@ mod dispatch;
 pub use dispatch::provider;
 
 mod send;
-pub use send::send_remote_message_at;
+pub use send::{send_remote_message_at, send_remote_message_with, RemoteCredential};
 
 /// Whether one remote connector can run on this machine, and why not when it
 /// cannot.
