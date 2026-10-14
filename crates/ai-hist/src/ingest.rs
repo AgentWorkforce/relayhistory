@@ -6222,7 +6222,7 @@ fn ingest_codex_rollout_incremental(
             conn,
             meta,
             &value,
-            (index, ts_ms, turn_id.as_deref()),
+            (index, ts_ms, turn_id.as_deref(), request_span),
             &mut indexer,
         )?;
         let human_outcome = human_messages.observe(&value);

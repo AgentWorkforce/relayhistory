@@ -23,10 +23,10 @@ pub(super) fn capture_rollout(
     conn: &Connection,
     meta: &CodexSessionMeta,
     value: &Value,
-    position: (usize, i64, Option<&str>),
+    position: (usize, i64, Option<&str>, u64),
     indexer: &mut ToolResultIndexer,
 ) -> Result<usize> {
-    let images = images::capture_rollout(conn, meta, value, position)?;
+    let images = images::capture_rollout(conn, meta, value, (position.0, position.1, position.2))?;
     let commands = capture_command(conn, meta, value, position, indexer)?;
     Ok(images + commands)
 }
@@ -50,19 +50,39 @@ pub(super) fn is_command_execution(value: &Value) -> bool {
 fn command(item: &Map<String, Value>) -> Option<String> {
     let argv = item.get("command")?.as_array()?;
     let words: Vec<&str> = argv.iter().map(Value::as_str).collect::<Option<_>>()?;
-    let command = if words.len() >= 3 && matches!(words[words.len() - 2], "-c" | "-lc" | "-ic") {
+    let shell = words.first()?.rsplit('/').next()?;
+    let command = if words.len() >= 3
+        && matches!(shell, "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish")
+        && matches!(words[words.len() - 2], "-c" | "-lc" | "-ic")
+    {
         words[words.len() - 1].to_string()
     } else {
-        words.join(" ")
+        words
+            .iter()
+            .map(|word| quote_word(word))
+            .collect::<Vec<_>>()
+            .join(" ")
     };
     (!command.trim().is_empty()).then_some(command)
+}
+
+fn quote_word(word: &str) -> String {
+    if !word.is_empty()
+        && word
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b"_./:@+=,-".contains(&byte))
+    {
+        word.to_string()
+    } else {
+        format!("'{}'", word.replace('\'', "'\"'\"'"))
+    }
 }
 
 fn capture_command(
     conn: &Connection,
     meta: &CodexSessionMeta,
     value: &Value,
-    (index, ts_ms, turn_id): (usize, i64, Option<&str>),
+    (index, ts_ms, turn_id, request_span): (usize, i64, Option<&str>, u64),
     indexer: &mut ToolResultIndexer,
 ) -> Result<usize> {
     let session_id = meta.session_id.as_str();
@@ -98,6 +118,30 @@ fn capture_command(
     };
     let call_uid = format!("{index}:native_command_call");
     let result_uid = format!("{index}:native_command_result");
+    let args = json!({ "cmd": command });
+    let event_text = format_tool_event_text("exec_command", Some(&command), &args);
+    insert_session_event(
+        conn,
+        &EventRow {
+            source: "codex",
+            session_id,
+            project: cwd,
+            cwd,
+            git_branch: branch,
+            message_id: &call_uid,
+            ts_ms,
+            role: "assistant",
+            kind: "tool_use",
+            text: Some(&event_text),
+            event_uid: &call_uid,
+            raw_facts: RawMessageFacts {
+                turn_id,
+                request_span: Some(request_span.to_string().as_str()),
+                ..RawMessageFacts::default()
+            },
+            ..EventRow::default()
+        },
+    )?;
     insert_tool_call(
         conn,
         &ToolCallRef {
@@ -110,7 +154,7 @@ fn capture_command(
         },
         "exec_command",
         Some(&command),
-        &json!({ "cmd": command }).to_string(),
+        &args.to_string(),
         Some(exit_code != 0),
     )?;
     let (call_index, event_index) = indexer.next(call_id);
@@ -158,7 +202,7 @@ fn capture_command(
         params![session_id, format!("{index}:marker")],
         SessionLocation::Local,
     )?;
-    Ok(1)
+    Ok(2)
 }
 
 #[cfg(test)]
@@ -229,6 +273,30 @@ mod tests {
                     Some("exit_code".into())
                 ),
             ]
+        );
+        let (requests, _) =
+            crate::session_usage::session_requests_all(&conn, "codex", "native-pr", None).unwrap();
+        let ids: Vec<&str> = requests
+            .iter()
+            .flat_map(|request| request.tool_use_ids.iter().map(String::as_str))
+            .collect();
+        assert!(
+            ids.contains(&"exec-edit"),
+            "the native PR action belongs to its Codex request"
+        );
+    }
+
+    #[test]
+    fn native_command_keeps_non_shell_interpreters() {
+        let item = json!({"command":["python","-c","print('hello')"]});
+        assert_eq!(
+            command(item.as_object().unwrap()).as_deref(),
+            Some("python -c 'print('\"'\"'hello'\"'\"')'")
+        );
+        let shell = json!({"command":["/bin/zsh","-lc","gh pr edit 167"]});
+        assert_eq!(
+            command(shell.as_object().unwrap()).as_deref(),
+            Some("gh pr edit 167")
         );
     }
 }
