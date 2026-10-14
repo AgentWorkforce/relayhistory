@@ -215,13 +215,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir
             .path()
-            .join("rollout-2026-10-13T22-37-02-native-pr.jsonl");
+            .join("rollout-2025-01-02T12-00-00-native-pr.jsonl");
         let rows = [
-            json!({"timestamp":"2026-10-13T22:37:02Z","type":"session_meta","payload":{"id":"native-pr","cwd":"/tmp/skills","timestamp":"2026-10-13T22:37:02Z"}}),
-            json!({"timestamp":"2026-10-13T22:38:00Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","id":"exec-push","command":["/bin/zsh","-lc","git commit -m update && git push origin feature"],"aggregated_output":"To github.com:AgentWorkforce/skills.git\n   19e3636..7dccd1d  feature -> feature\n","exit_code":0}}}),
-            json!({"timestamp":"2026-10-13T22:39:00Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","id":"exec-edit","command":["/bin/zsh","-lc","gh pr edit 167 --add-label mergeable"],"aggregated_output":"https://github.com/AgentWorkforce/skills/pull/167\n","exit_code":0}}}),
-            json!({"timestamp":"2026-10-13T22:40:00Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","id":"exec-failed","command":["/bin/zsh","-lc","gh pr create --title failed"],"aggregated_output":"https://github.com/AgentWorkforce/skills/pull/168\n","exit_code":1}}}),
-            json!({"timestamp":"2026-10-13T22:41:00Z","type":"event_msg","payload":{"type":"task_complete"}}),
+            json!({"timestamp":"2025-01-02T12:00:00Z","type":"session_meta","payload":{"id":"native-pr","cwd":"/tmp/widget","timestamp":"2025-01-02T12:00:00Z"}}),
+            json!({"timestamp":"2025-01-02T12:01:00Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","id":"exec-push","command":["/bin/zsh","-lc","git commit -m update && git push origin feature"],"aggregated_output":"To github.com:example/widget.git\n   a1b2c3d..d4e5f6a  feature -> feature\n","exit_code":0}}}),
+            json!({"timestamp":"2025-01-02T12:02:00Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","id":"exec-edit","command":["/bin/zsh","-lc","gh pr edit 42 --add-label ready"],"aggregated_output":"https://github.com/example/widget/pull/42\n","exit_code":0}}}),
+            json!({"timestamp":"2025-01-02T12:03:00Z","type":"event_msg","payload":{"type":"item_completed","item":{"type":"CommandExecution","id":"exec-failed","command":["/bin/zsh","-lc","gh pr create --title failed"],"aggregated_output":"https://github.com/example/widget/pull/43\n","exit_code":1}}}),
+            json!({"timestamp":"2025-01-02T12:04:00Z","type":"event_msg","payload":{"type":"task_complete"}}),
         ];
         fs::write(
             &path,
@@ -249,7 +249,7 @@ mod tests {
                 ),
                 (
                     "exec-edit".into(),
-                    "gh pr edit 167 --add-label mergeable".into(),
+                    "gh pr edit 42 --add-label ready".into(),
                     0
                 ),
                 (
@@ -293,10 +293,10 @@ mod tests {
             command(item.as_object().unwrap()).as_deref(),
             Some("python -c 'print('\"'\"'hello'\"'\"')'")
         );
-        let shell = json!({"command":["/bin/zsh","-lc","gh pr edit 167"]});
+        let shell = json!({"command":["/bin/zsh","-lc","gh pr edit 42"]});
         assert_eq!(
             command(shell.as_object().unwrap()).as_deref(),
-            Some("gh pr edit 167")
+            Some("gh pr edit 42")
         );
     }
 }

@@ -37596,9 +37596,9 @@ mod codex_fork_replay_tests {
         fs::create_dir_all(&day).unwrap();
         let rollout = day.join("rollout-native-command.jsonl");
         fs::write(&rollout, [
-            line("2026-10-13T22:37:02Z", "session_meta", json!({"id": PARENT, "cwd": "/tmp/skills"})),
-            line("2026-10-13T22:38:00Z", "event_msg", json!({"type":"item_completed","item":{"type":"CommandExecution","id":"native-push","command":["/bin/zsh","-lc","git push origin feature"],"aggregated_output":"To github.com:AgentWorkforce/skills.git\n * [new branch] feature -> feature\n","exit_code":0}})),
-            line("2026-10-13T22:39:00Z", "event_msg", json!({"type":"task_complete"})),
+            line("2025-01-02T12:00:00Z", "session_meta", json!({"id": PARENT, "cwd": "/tmp/widget"})),
+            line("2025-01-02T12:01:00Z", "event_msg", json!({"type":"item_completed","item":{"type":"CommandExecution","id":"native-push","command":["/bin/zsh","-lc","git push origin feature"],"aggregated_output":"To github.com:example/widget.git\n * [new branch] feature -> feature\n","exit_code":0}})),
+            line("2025-01-02T12:02:00Z", "event_msg", json!({"type":"task_complete"})),
         ].concat()).unwrap();
         let conn = open_db(&dir.path().join("history.db")).unwrap();
         let mut state = Map::new();
