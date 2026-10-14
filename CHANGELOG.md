@@ -13,6 +13,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Codex native shell executions now retain command and result evidence, so a session can be linked to the pull requests it pushed or updated, including when older transcripts are re-read.
 - Re-reading an older Codex image recording retires its obsolete local unknown marker while preserving any remote copy.
 - `@relayhistory/provider-sources` gains a `devin-cloud` connector: `--remote` / `--all` discovery lists an organization's Devin cloud sessions through `GET /v3/organizations/{org}/sessions`, and targeted hydration returns the full message history as `devin` evidence. Sign-in stays with the Devin CLI (`credentials.toml` `windsurf_api_key` + `config.json` `devin.org_id`); `RELAYHISTORY_DEVIN_API_KEY`, `RELAYHISTORY_DEVIN_ORG_ID`, `RELAYHISTORY_DEVIN_CREDENTIALS` and `RELAYHISTORY_DEVIN_CONFIG` override each piece.
 - A Rust host composes an external source connector without the native addon: `SessionStore::apply_source_observations` lands a connector's enumerated rows, `source_observation` reads the observation and revision fence, and `apply_source_evidence` applies the acquired snapshot under the same transport-free intake the SDK's plugin loader uses.
