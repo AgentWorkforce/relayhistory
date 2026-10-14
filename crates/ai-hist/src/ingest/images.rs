@@ -33,16 +33,12 @@ pub(super) fn capture_rollout(
     value: &Value,
     position: (usize, i64, Option<&str>),
 ) -> Result<usize> {
-    let captured = capture_codex(
-        conn,
-        &meta.session_id,
-        Some(&meta.cwd),
-        meta.git_branch.as_deref(),
-        position.0,
-        position.1,
-        position.2,
-        value,
-    )?;
+    let session = ImageSession {
+        session_id: &meta.session_id,
+        cwd: Some(&meta.cwd),
+        branch: meta.git_branch.as_deref(),
+    };
+    let captured = capture_codex(conn, session, position, value)?;
     if captured > 0 {
         crate::store::retire_evidence_share(
             conn,
@@ -83,16 +79,27 @@ fn image_markdown(url: &str) -> Option<String> {
     })
 }
 
+/// The session an image block is stored under.
+#[derive(Clone, Copy)]
+pub(super) struct ImageSession<'a> {
+    pub(super) session_id: &'a str,
+    pub(super) cwd: Option<&'a str>,
+    pub(super) branch: Option<&'a str>,
+}
+
+/// Stores a Codex user message's image blocks; the record's position is its
+/// line index, timestamp and turn id.
 pub(super) fn capture_codex(
     conn: &Connection,
-    session_id: &str,
-    cwd: Option<&str>,
-    branch: Option<&str>,
-    index: usize,
-    ts_ms: i64,
-    turn_id: Option<&str>,
+    session: ImageSession<'_>,
+    (index, ts_ms, turn_id): (usize, i64, Option<&str>),
     value: &Value,
 ) -> Result<usize> {
+    let ImageSession {
+        session_id,
+        cwd,
+        branch,
+    } = session;
     if value["type"] != "response_item"
         || value["payload"]["type"] != "message"
         || value["payload"]["role"] != "user"
@@ -176,6 +183,12 @@ pub(super) fn capture_codex(
 mod tests {
     use super::*;
 
+    const TEST_SESSION: ImageSession<'static> = ImageSession {
+        session_id: "s",
+        cwd: None,
+        branch: None,
+    };
+
     #[test]
     fn injected_context_images_do_not_create_human_usage_boundaries() {
         let conn = Connection::open_in_memory().unwrap();
@@ -222,7 +235,7 @@ mod tests {
         }
         let value = json!({"type":"response_item","payload":{"type":"message","role":"user","id":"context","content":[{"type":"input_text","text":"<environment_context>injected</environment_context>"},{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="}]}});
         assert!(codex::user_message(&value).unwrap().control.is_some());
-        capture_codex(&conn, "s", None, None, 4, 150, None, &value).unwrap();
+        capture_codex(&conn, TEST_SESSION, (4, 150, None), &value).unwrap();
         let events = crate::store::session_events(&conn, "s", Some("codex")).unwrap();
         let attributed = crate::usage::attribute_usage_to_prompts(&events, "codex");
         assert!(
@@ -245,7 +258,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         crate::init_db(&conn).unwrap();
         let value = json!({"type":"response_item","payload":{"type":"message","role":"user","id":"","content":[{"type":"input_text","text":"Look"},{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="}]}});
-        capture_codex(&conn, "s", None, None, 4, 101, None, &value).unwrap();
+        capture_codex(&conn, TEST_SESSION, (4, 101, None), &value).unwrap();
         assert_eq!(
             conn.query_row("SELECT message_id FROM session_events", [], |r| r
                 .get::<_, String>(0))
@@ -295,7 +308,7 @@ mod tests {
         .unwrap();
         let value = json!({"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"Look at this"},{"type":"input_image","image_url":"data:image/png;base64,iVBORw0KGgo="}]}});
         for _ in 0..2 {
-            capture_codex(&conn, "s", None, None, 4, 101, None, &value).unwrap();
+            capture_codex(&conn, TEST_SESSION, (4, 101, None), &value).unwrap();
         }
         assert_eq!(
             conn.query_row(
