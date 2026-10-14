@@ -535,6 +535,19 @@ pub(super) fn send_devin_session_message_at(
     message: &str,
     transport: &dyn DevinTransport,
 ) -> Result<()> {
+    let auth = devin_auth(credentials_path, config_path)?;
+    send_devin_session_message(&auth, session_id, message, transport)
+}
+
+/// [`send_devin_session_message_at`] with the credential already resolved:
+/// a host holding its own Devin credential — a workspace credential store,
+/// say — sends as `auth` without the connector's file/env lookup.
+pub(super) fn send_devin_session_message(
+    auth: &DevinAuth,
+    session_id: &str,
+    message: &str,
+    transport: &dyn DevinTransport,
+) -> Result<()> {
     let Some(hex) = devin_session_hex(session_id) else {
         anyhow::bail!("INVALID_ARGUMENT: remote Devin session id is malformed");
     };
@@ -543,7 +556,6 @@ pub(super) fn send_devin_session_message_at(
         "INVALID_ARGUMENT: message must be non-empty and within {} bytes",
         super::MAX_REMOTE_MESSAGE_BYTES,
     );
-    let auth = devin_auth(credentials_path, config_path)?;
     let url = format!(
         "{}/v3/organizations/{}/sessions/devin-{hex}/messages",
         auth.base_url, auth.org_id,

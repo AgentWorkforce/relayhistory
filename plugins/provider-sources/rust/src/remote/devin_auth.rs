@@ -127,16 +127,48 @@ pub(super) fn devin_auth(credentials_path: &Path, config_path: &Path) -> Result<
     let base_url = env_non_empty("RELAYHISTORY_DEVIN_API_BASE_URL")
         .or(credential_url)
         .unwrap_or_else(|| "https://api.devin.ai".to_string());
+    checked_auth(bearer, org_id, &base_url, "CONNECTOR_NOT_CONFIGURED")
+}
+
+/// A `DevinAuth` from parts the host resolved itself — a workspace credential
+/// store, say — skipping the connector's file/env lookup entirely. The same
+/// base-URL and org-id guards apply; a malformed host credential is the
+/// host's error (`INVALID_ARGUMENT`), not a missing sign-in.
+pub(super) fn devin_auth_explicit(
+    bearer: &str,
+    org_id: &str,
+    base_url: Option<&str>,
+) -> Result<DevinAuth> {
+    anyhow::ensure!(
+        !bearer.trim().is_empty(),
+        "INVALID_ARGUMENT: Devin bearer token is empty"
+    );
+    anyhow::ensure!(
+        !org_id.trim().is_empty(),
+        "INVALID_ARGUMENT: Devin organization id is empty"
+    );
+    checked_auth(
+        bearer.trim().to_string(),
+        org_id.trim().to_string(),
+        base_url.unwrap_or("https://api.devin.ai"),
+        "INVALID_ARGUMENT",
+    )
+}
+
+/// The guards every `DevinAuth` passes — from files, env or a host's own
+/// store alike: the base URL must be https (or loopback), and the org id must
+/// be path-safe since it is interpolated into the request path.
+fn checked_auth(bearer: String, org_id: String, base_url: &str, code: &str) -> Result<DevinAuth> {
     let base_url = base_url.trim_end_matches('/').to_string();
     require_https_or_loopback(&base_url)
-        .context("CONNECTOR_NOT_CONFIGURED: invalid Devin API base URL")?;
+        .with_context(|| format!("{code}: invalid Devin API base URL"))?;
     // The org id is interpolated into the request path; a delimiter would
     // retarget an authenticated request onto a different route.
     anyhow::ensure!(
         org_id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_'),
-        "CONNECTOR_NOT_CONFIGURED: Devin organization id contains characters outside [A-Za-z0-9_-]"
+        "{code}: Devin organization id contains characters outside [A-Za-z0-9_-]"
     );
     Ok(DevinAuth {
         bearer,

@@ -6,10 +6,11 @@
 //! real transports are exercised end-to-end by `tests/session_discovery.rs`
 //! (a scripted `codex` binary and a loopback HTTP server).
 
-use super::devin_auth::{devin_org_id, toml_value};
+use super::devin_auth::{devin_auth_explicit, devin_org_id, toml_value};
 use super::devin_cloud::{
     acquire_devin_remote_session_at, devin_session_hex, map_devin_session,
-    send_devin_session_message_at, DevinHttpResponse, DevinTransport, UreqDevinTransport,
+    send_devin_session_message, send_devin_session_message_at, DevinHttpResponse, DevinTransport,
+    UreqDevinTransport,
 };
 use super::*;
 static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -1653,6 +1654,92 @@ fn send_refuses_unconfigured_or_unsupported_connectors() {
         .to_string();
     assert!(error.starts_with("INVALID_ARGUMENT:"), "{error}");
     assert!(error.contains("cannot deliver messages"), "{error}");
+}
+
+/// A host-resolved credential sends as itself — no home files, no env — and
+/// carries the same route, body and status vocabulary as the file send.
+#[test]
+fn send_with_host_credential_bypasses_local_sign_in() {
+    let _cleared = without_credentials_override();
+    let transport = Arc::new(ScriptedDevinTransport::new(vec![]).with_posts(vec![(
+        200,
+        r#"{"session_id":"4b50574f40324da6bd88e9cbd30501cf"}"#.into(),
+    )]));
+    let auth = devin_auth_explicit("cog_workspace_key", "org-workspace", None).unwrap();
+    send_devin_session_message(
+        &auth,
+        DEVIN_SESSION_ID,
+        "hello from the workspace",
+        &Arc::clone(&transport) as &dyn DevinTransport,
+    )
+    .expect("send");
+    let posts = transport.posts.lock().unwrap();
+    let (url, bearer, body) = &posts[0];
+    assert!(
+        url.ends_with(&format!(
+            "/v3/organizations/org-workspace/sessions/devin-{DEVIN_SESSION_ID}/messages"
+        )),
+        "{url}"
+    );
+    assert_eq!(bearer, "cog_workspace_key");
+    assert_eq!(
+        body,
+        &serde_json::json!({"message": "hello from the workspace"})
+    );
+}
+
+/// The explicit credential passes the same guards as a file one: empty or
+/// unsafe fields are the host's INVALID_ARGUMENT, never a missing sign-in,
+/// and the base URL defaults to api.devin.ai.
+#[test]
+fn host_credential_is_checked_and_defaults_apply() {
+    for (bearer, org) in [("", "org-1"), ("cog_x", ""), ("cog_x", "org/bad")] {
+        let error = devin_auth_explicit(bearer, org, None)
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(error.starts_with("INVALID_ARGUMENT:"), "{error}");
+    }
+    let auth = devin_auth_explicit("  cog_x  ", " org-1 ", None).unwrap();
+    assert_eq!(auth.bearer, "cog_x");
+    assert_eq!(auth.org_id, "org-1");
+    assert_eq!(auth.base_url, "https://api.devin.ai");
+    let error = devin_auth_explicit("cog_x", "org-1", Some("http://api.devin.ai"))
+        .err()
+        .unwrap()
+        .to_string();
+    assert!(error.starts_with("INVALID_ARGUMENT:"), "{error}");
+}
+
+/// `send_remote_message_with` dispatches on the connector like `_at` does:
+/// unknown connectors refuse outright, and a host credential reaches the
+/// transport — a dead loopback port fails at the request, never at the
+/// credential-lookup codes.
+#[test]
+fn send_remote_message_with_dispatches_on_the_connector() {
+    let credential = RemoteCredential {
+        bearer: "cog_x".into(),
+        org_id: "org-1".into(),
+        base_url: Some("http://127.0.0.1:1".into()),
+    };
+    let error = send_remote_message_with(CLAUDE_WEB_CONNECTOR, "s1", "hello", &credential)
+        .unwrap_err()
+        .to_string();
+    assert!(error.starts_with("INVALID_ARGUMENT:"), "{error}");
+    assert!(error.contains("cannot deliver messages"), "{error}");
+    let error = send_remote_message_with(
+        DEVIN_CLOUD_CONNECTOR,
+        DEVIN_SESSION_ID,
+        "hello",
+        &credential,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        !error.starts_with("INVALID_ARGUMENT:") && !error.starts_with("CONNECTOR_NOT_CONFIGURED:"),
+        "{error}"
+    );
+    assert!(error.contains("api.devin.ai request"), "{error}");
 }
 
 // ---------------------------------------------------------------------------
