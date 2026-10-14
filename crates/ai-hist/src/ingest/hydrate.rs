@@ -151,7 +151,9 @@ pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 3;
 /// `codex_fork_replay_gate` generation 2 retires.
 /// Version 18: re-read unchanged Codex recordings once to retain embedded
 /// images, including checkpoints written by generation 17's fork replay fix.
-pub(crate) const HYDRATION_PARSER_VERSION: i64 = 18;
+/// Version 19: capture native Codex CommandExecution command/output pairs so
+/// PR evidence in existing sessions reaches History after a re-upload.
+pub(crate) const HYDRATION_PARSER_VERSION: i64 = 19;
 
 #[derive(Debug, Clone)]
 pub struct HydrateSessionOptions {
