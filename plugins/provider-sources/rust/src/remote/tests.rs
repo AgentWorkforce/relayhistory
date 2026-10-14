@@ -1656,6 +1656,26 @@ fn send_refuses_unconfigured_or_unsupported_connectors() {
     assert!(error.contains("cannot deliver messages"), "{error}");
 }
 
+/// Argument validation precedes the credential lookup: a malformed target on
+/// an unsigned machine is the caller's `INVALID_ARGUMENT`, not a sign-in
+/// prompt — the contract callers of `send_remote_message_at` already rely on.
+#[test]
+fn send_validates_args_before_the_sign_in() {
+    let _cleared = without_credentials_override();
+    let home = tempfile::tempdir().unwrap();
+    let transport = Arc::new(ScriptedDevinTransport::new(vec![]));
+    let error = send_devin_session_message_at(
+        &home.path().join("missing-credentials.toml"),
+        &home.path().join("missing-config.json"),
+        "real-gallium",
+        "hello",
+        &Arc::clone(&transport) as &dyn DevinTransport,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.starts_with("INVALID_ARGUMENT:"), "{error}");
+}
+
 /// A host-resolved credential sends as itself — no home files, no env — and
 /// carries the same route, body and status vocabulary as the file send.
 #[test]
