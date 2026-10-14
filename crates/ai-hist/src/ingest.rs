@@ -22,6 +22,7 @@ mod claude_record_rows;
 mod claude_standalone;
 pub(crate) mod claude_title;
 pub(crate) mod codex;
+mod codex_capture;
 mod codex_subagent;
 pub(crate) mod codex_thread_names;
 mod codex_usage;
@@ -3268,8 +3269,9 @@ fn delegation_backfill_pending(state: &Map<String, Value>) -> bool {
 /// upgrade cannot honour the source fingerprint the previous build stored and
 /// skip the sweep this backfill runs in. Raising the generation means renaming
 /// the key, for the same reason.
-const CODEX_STATE_MARKER_GENERATION: i64 = 1;
-const CODEX_STATE_MARKER_KEY: &str = "codex_state_markers_v1";
+// v2 re-reads native CommandExecution items previously stored as markers only.
+const CODEX_STATE_MARKER_GENERATION: i64 = 2;
+const CODEX_STATE_MARKER_KEY: &str = "codex_state_markers_v2";
 /// Force one reread even for marker-only recordings with no old events.
 const CODEX_IMAGE_CAPTURE_KEY: &str = "codex_image_capture_v1";
 
@@ -3411,6 +3413,7 @@ fn forget_unobserved_paths(
 }
 
 const RETIRED_SYNC_STATE_KEYS: &[(&str, &str)] = &[
+    ("codex_state_markers_v1", CODEX_STATE_MARKER_KEY),
     ("codex_rollouts", "codex_rollouts_v7"),
     ("codex_rollout_user_messages_v2", "codex_rollouts_v7"),
     ("codex_rollouts_v3", "codex_rollouts_v7"),
@@ -6215,8 +6218,13 @@ fn ingest_codex_rollout_incremental(
                 },
             )?;
         }
-        outcome.events +=
-            images::capture_rollout(conn, meta, &value, (index, ts_ms, turn_id.as_deref()))?;
+        outcome.events += codex_capture::capture_rollout(
+            conn,
+            meta,
+            &value,
+            (index, ts_ms, turn_id.as_deref(), request_span),
+            &mut indexer,
+        )?;
         let human_outcome = human_messages.observe(&value);
         if human_outcome == codex::HumanMessageOutcome::Suppressed {
             // The mirrored encoding of the turn just stored. Its twin wrote
@@ -6818,7 +6826,7 @@ fn ingest_codex_rollout_incremental(
                     let target = if name == "apply_patch" {
                         codex_apply_patch_target(payload_str("input").unwrap_or(""))
                     } else {
-                        codex_pick_tool_target(name, &args)
+                        codex_capture::pick_tool_target(name, &args)
                     };
                     let uid = format!("{index}:{payload_type}");
                     let message_id = payload_str("id").unwrap_or(uid.as_str()).to_string();
@@ -7121,20 +7129,6 @@ fn resolve_codex_tool_results(
     }
     signals.clear();
     Ok(())
-}
-
-fn codex_pick_tool_target(name: &str, args: &Value) -> Option<String> {
-    let obj = args.as_object()?;
-    let get = |keys: &[&str]| {
-        keys.iter()
-            .find_map(|k| obj.get(*k).and_then(Value::as_str))
-            .map(str::to_string)
-    };
-    match name {
-        "exec_command" | "shell" | "exec" => get(&["cmd", "command"]),
-        "read_file" | "write_file" => get(&["path", "file_path"]),
-        _ => get(&["path", "file_path", "cmd", "command", "url", "query"]),
-    }
 }
 
 fn codex_apply_patch_target(input: &str) -> Option<String> {
@@ -10531,6 +10525,16 @@ fn codex_marker_for_event(
     payload_type: &str,
     payload: &Map<String, Value>,
 ) -> Option<MarkerDraft> {
+    if line_type == "event_msg"
+        && payload_type == "item_completed"
+        && payload
+            .get("item")
+            .and_then(|item| item.get("type"))
+            .and_then(Value::as_str)
+            == Some("CommandExecution")
+    {
+        return None;
+    }
     let mut draft = match line_type {
         "session_meta" | "turn_context" => return None,
         "compacted" => {
@@ -37582,6 +37586,64 @@ mod codex_fork_replay_tests {
         assert_eq!(
             state.get(CODEX_STATE_MARKER_KEY),
             Some(&json!(CODEX_STATE_MARKER_GENERATION))
+        );
+    }
+
+    #[test]
+    fn an_unchanged_codex_rollout_recovers_native_command_evidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/10/13");
+        fs::create_dir_all(&day).unwrap();
+        let rollout = day.join("rollout-native-command.jsonl");
+        fs::write(&rollout, [
+            line("2025-01-02T12:00:00Z", "session_meta", json!({"id": PARENT, "cwd": "/tmp/widget"})),
+            line("2025-01-02T12:01:00Z", "event_msg", json!({"type":"item_completed","item":{"type":"CommandExecution","id":"native-push","command":["/bin/zsh","-lc","git push origin feature"],"aggregated_output":"To github.com:example/widget.git\n * [new branch] feature -> feature\n","exit_code":0}})),
+            line("2025-01-02T12:02:00Z", "event_msg", json!({"type":"task_complete"})),
+        ].concat()).unwrap();
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        let root = dir.path().join(".codex");
+        sync_codex(&conn, &mut state, &root).unwrap();
+        conn.execute(
+            "DELETE FROM tool_calls WHERE source='codex' AND session_id=?1",
+            [PARENT],
+        )
+        .unwrap();
+        conn.execute("DELETE FROM session_events WHERE source='codex' AND session_id=?1 AND kind='tool_result'", [PARENT]).unwrap();
+        conn.execute("INSERT INTO session_markers(source,session_id,marker_uid,kind,subkind,location,ts_ms) VALUES ('codex',?1,'1:marker','unknown','item_completed','both',1000)", [PARENT]).unwrap();
+        state.remove(CODEX_STATE_MARKER_KEY);
+        state.insert("codex_state_markers_v1".into(), json!(1));
+        for record in state
+            .get_mut("codex_rollouts_v7")
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .values_mut()
+        {
+            record
+                .as_object_mut()
+                .unwrap()
+                .insert("state_markers".into(), json!(1));
+        }
+        sync_codex(&conn, &mut state, &root).unwrap();
+        let restored: i64 = conn.query_row("SELECT count(*) FROM tool_calls WHERE source='codex' AND session_id=?1 AND tool_use_id='native-push'", [PARENT], |r| r.get(0)).unwrap();
+        assert_eq!(restored, 1);
+        assert_eq!(state.get(CODEX_STATE_MARKER_KEY), Some(&json!(2)));
+        let marker_location: String = conn.query_row("SELECT location FROM session_markers WHERE source='codex' AND session_id=?1 AND marker_uid='1:marker'", [PARENT], |r| r.get(0)).unwrap();
+        assert_eq!(
+            marker_location, "remote",
+            "only the old local marker is retired"
+        );
+        conn.execute(
+            "DELETE FROM tool_calls WHERE source='codex' AND session_id=?1",
+            [PARENT],
+        )
+        .unwrap();
+        sync_codex(&conn, &mut state, &root).unwrap();
+        let rerun: i64 = conn.query_row("SELECT count(*) FROM tool_calls WHERE source='codex' AND session_id=?1 AND tool_use_id='native-push'", [PARENT], |r| r.get(0)).unwrap();
+        assert_eq!(
+            rerun, 0,
+            "the one-time backfill must not repeat on every sync"
         );
     }
 
