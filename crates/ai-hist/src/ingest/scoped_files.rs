@@ -429,13 +429,13 @@ pub(crate) fn codex_rollout_locators(
     root: &Path,
     scope: Option<&PathScope>,
 ) -> Result<Vec<PathBuf>> {
-    let (plain, compressed, named) = match PathScope::walk_of(scope, root) {
+    let (listed, compressed, named) = match PathScope::walk_of(scope, root) {
         RootWalk::Skip => return Ok(Vec::new()),
-        RootWalk::Full => (
-            collect_matching_files(root, CODEX_ROLLOUT_PREFIX, "jsonl")?,
-            collect_matching_files(root, CODEX_ROLLOUT_PREFIX, "zst")?,
-            Vec::new(),
-        ),
+        RootWalk::Full => {
+            let mut files = Vec::new();
+            collect_codex_rollouts(root, &mut files)?;
+            (files, Vec::new(), Vec::new())
+        }
         RootWalk::Partial(scope) => (
             collect_matching_files_scoped(root, CODEX_ROLLOUT_PREFIX, "jsonl", Some(scope))?,
             collect_matching_files_scoped(root, CODEX_ROLLOUT_PREFIX, "zst", Some(scope))?,
@@ -449,13 +449,10 @@ pub(crate) fn codex_rollout_locators(
                 .collect(),
         ),
     };
-    let mut locators: Vec<PathBuf> = plain
-        .into_iter()
-        .chain(
-            compressed
-                .iter()
-                .map(|path| super::transcript_file::locator_of(path)),
-        )
+    let mut locators: Vec<PathBuf> = listed
+        .iter()
+        .chain(&compressed)
+        .map(|path| super::transcript_file::locator_of(path))
         .filter(|locator| is_codex_rollout_locator(locator))
         .chain(named)
         .collect();
@@ -465,6 +462,31 @@ pub(crate) fn codex_rollout_locators(
 }
 
 const CODEX_ROLLOUT_PREFIX: &str = "rollout-";
+
+/// Every `rollout-*` file under `dir` in either encoding, in one walk.
+fn collect_codex_rollouts(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    if !dir.is_dir() {
+        return Ok(());
+    }
+    note_dir_read();
+    for entry in fs::read_dir(dir)? {
+        super::check_capture_cancelled()?;
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let path = entry.path();
+        let is_dir = if file_type.is_symlink() {
+            path.is_dir()
+        } else {
+            file_type.is_dir()
+        };
+        if is_dir {
+            collect_codex_rollouts(&path, out)?;
+        } else if is_codex_rollout_locator(&super::transcript_file::locator_of(&path)) {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
 
 fn is_codex_rollout_locator(path: &Path) -> bool {
     path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")

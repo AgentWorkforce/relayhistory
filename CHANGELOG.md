@@ -16,6 +16,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Codex rollouts that Codex has compressed to `rollout-*.jsonl.zst` are discovered, synced, hydrated and fed to the change feed as evidence under their `.jsonl` locator; a rollout compressed after it was indexed keeps its session, locator and cursor and is not ingested again.
 - The first sync of a new store records each Codex rollout's cursor, so the rollout's next append resumes instead of re-reading it from the start.
+- A sync over many changed delegated Codex threads no longer re-reads every stored Codex evidence key once per thread; on a 3,858-rollout archive, a sweep after Codex compressed 3,238 of them drops from 430 s to 33 s of CPU.
 
 ### Rust API
 
