@@ -130,6 +130,7 @@ pub(super) fn last_activity(entry: &Value) -> Option<i64> {
             .as_array()
             .into_iter()
             .flatten()
+            .filter(|turn| matches!(turn["speaker"].as_str(), Some("user" | "assistant")))
             .filter_map(|turn| turn["atMs"].as_i64())
             .fold(ts, i64::max),
     )
@@ -138,7 +139,9 @@ pub(super) fn last_activity(entry: &Value) -> Option<i64> {
 /// First entry time in the bounded head, for discovery before hydration.
 pub(super) fn first_number_hint(bytes: &[u8], field: &str) -> Option<i64> {
     let needle = format!("\"{field}\"");
-    let index = bytes.windows(needle.len()).position(|w| w == needle.as_bytes())?;
+    let index = bytes
+        .windows(needle.len())
+        .position(|w| w == needle.as_bytes())?;
     decimal_hint(&bytes[index + needle.len()..])
 }
 

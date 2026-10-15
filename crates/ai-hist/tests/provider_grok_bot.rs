@@ -158,6 +158,12 @@ fn grok_bot_voice_turns_bound_shallow_and_full_activity() {
     let path = grok_bot_fixture::stage(home.path());
     let mut replica: serde_json::Value =
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    replica["value"]["entries"][6]["conversation"]["turns"]
+        .as_array_mut()
+        .unwrap()
+        .push(
+            serde_json::json!({"speaker":"system","text":"Call metadata","atMs":1700000006300_i64}),
+        );
     replica["value"]["entries"]
         .as_array_mut()
         .unwrap()

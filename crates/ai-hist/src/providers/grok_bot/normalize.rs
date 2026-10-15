@@ -1,6 +1,8 @@
 use super::*;
 use crate::ingest::control::ControlKind;
-use crate::ingest::{insert_session_event, upsert_session, EventRow, RawMessageFacts, SessionCatalogRow};
+use crate::ingest::{
+    insert_session_event, upsert_session, EventRow, RawMessageFacts, SessionCatalogRow,
+};
 use crate::providers::file_history;
 use crate::relationship_capture::{record_relationship, ObservedRelationship};
 use crate::{insert_history, insert_session_marker, HistoryEntry, NewSessionMarker};
@@ -213,8 +215,7 @@ fn message(
         EventMeta {
             parent: None,
             raw_kind: "message",
-            control_kind: (role == "user" && from_agent)
-                .then_some(ControlKind::Synthetic.as_str()),
+            control_kind: (role == "user" && from_agent).then_some(ControlKind::Synthetic.as_str()),
         },
     )?;
     if role == "user" && !from_agent {
