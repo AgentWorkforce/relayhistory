@@ -264,7 +264,7 @@ mod tests {
         std::fs::copy(fixture, &rollout).unwrap();
         std::fs::write(
             root.join("history.jsonl"),
-            "{\"display\":\"history-only\",\"timestamp\":1776643300,\"project\":\"/work/app\",\"sessionId\":\"sqlite-rollout-primary\"}\n",
+            "{\"text\":\"history-only\",\"ts\":1776643300,\"sessionId\":\"sqlite-rollout-primary\"}\n",
         ).unwrap();
 
         let conn = crate::open_db(&dir.path().join("history.db")).unwrap();
