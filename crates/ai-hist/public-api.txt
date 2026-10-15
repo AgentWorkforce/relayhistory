@@ -185,6 +185,7 @@ pub ai_hist::Source::Devin
 pub ai_hist::Source::Grok
 pub ai_hist::Source::Hermes
 pub ai_hist::Source::Muse
+pub ai_hist::Source::Omp
 pub ai_hist::Source::OpenCode
 pub ai_hist::Source::Pi
 impl ai_hist::Source

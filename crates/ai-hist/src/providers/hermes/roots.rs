@@ -14,6 +14,7 @@ pub(super) fn resolve_with(
         return ResolvedProviderRoots {
             paths: vec![root.clone()],
             default_root: Some(root),
+            error: None,
         };
     }
     if let Some(value) = env("HERMES_HOME") {
@@ -42,6 +43,7 @@ pub(super) fn resolve_with(
     ResolvedProviderRoots {
         paths: vec![root.clone()],
         default_root: Some(root),
+        error: None,
     }
 }
 
