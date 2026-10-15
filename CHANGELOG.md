@@ -11,6 +11,10 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - GitHub Copilot CLI session history is discoverable and searchable from `$COPILOT_HOME/session-state/<id>/events.jsonl` (default `~/.copilot`), with per-message models, reasoning, tool calls and results, verbatim per-message `outputTokens`, and every other journal event — including the cumulative `session.shutdown` usage totals — as session markers.
 - `remote::send_remote_message_with` and `RemoteCredential` let a host send a remote-session message with its own resolved Devin credential instead of the connector's file/env lookup. The error-code contract is unchanged: an unusable credential fails `INVALID_ARGUMENT`, never `CONNECTOR_NOT_CONFIGURED`.
 
+### Fixed
+
+- Two simultaneous first hydrations of one local session both succeed; the slower one no longer fails `CONNECTOR_NOT_CONFIGURED` when the other records the session's local observation mid-lookup.
+
 ### Rust API
 
 - Added `Source::Copilot` for filtering and reading persisted GitHub Copilot CLI session history.
