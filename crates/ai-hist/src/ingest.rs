@@ -4624,15 +4624,10 @@ fn cleanup_subagent_registration(conn: &Connection, source: &str, session_id: &s
         "INSERT OR IGNORE INTO session_relationships SELECT * FROM retained_relationships; \
          DELETE FROM retained_relationships;",
     )?;
-    // The session delete drops the relationships and markers the probes join;
-    // a presence is not evidence they read. A thread that was never
-    // registered has no session row to delete and keeps the probes' snapshot:
-    // every changed rollout of a delegated thread passes through here, and
-    // releasing on each made a sweep over many of them re-read every evidence
-    // key once per thread.
-    if sessions > 0 {
-        evidence_probe::note_evidence_changed(conn);
-    }
+    // Only the session delete drops evidence the probes join; a presence is
+    // not. Releasing on every changed delegated-thread rollout re-read every
+    // evidence key once per thread.
+    evidence_probe::note_deleted(conn, "sessions", sessions);
     Ok(())
 }
 
