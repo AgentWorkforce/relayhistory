@@ -171,7 +171,7 @@ impl ShallowSessionProvider for Provider {
             last_activity_ms: format::last_time(if tail.is_empty() { &head } else { &tail })
                 .max(head_last),
             title: format::title(&entries).map(str::to_owned),
-            models: format::models(&entries),
+            models: catalog_models(conn, sid, format::models(&entries))?,
             agent_version: data["copilotVersion"].as_str().map(str::to_owned),
             raw_path: Some(c.locator.clone()),
             source_stamp: Some(c.stamp.clone()),
@@ -179,6 +179,33 @@ impl ShallowSessionProvider for Provider {
             ..Default::default()
         }))
     }
+}
+
+/// The bounded head's models, after every model a full ingest of this
+/// session already recorded: a journal only appends, so a later model the
+/// head cannot see stays in the catalog.
+fn catalog_models(conn: Option<&Connection>, sid: &str, head: Vec<String>) -> Result<Vec<String>> {
+    use rusqlite::OptionalExtension;
+    let stored: Option<String> = match conn {
+        Some(conn) => conn
+            .query_row(
+                "SELECT models_json FROM sessions WHERE source='copilot' AND session_id=?1 AND discovery_state='full'",
+                [sid],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten(),
+        None => None,
+    };
+    let mut models: Vec<String> = stored
+        .and_then(|json| serde_json::from_str(&json).ok())
+        .unwrap_or_default();
+    for model in head {
+        if !models.contains(&model) {
+            models.push(model);
+        }
+    }
+    Ok(models)
 }
 
 fn snapshot(path: &Path, context: &AcquisitionContext<'_>) -> Result<AcquiredSession> {

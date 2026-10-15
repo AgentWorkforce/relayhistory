@@ -499,3 +499,39 @@ fn agent_delivered_messages_are_synthetic_not_user_turns() {
         .unwrap();
     assert_eq!(evidence.user_turns.len(), 3, "only the three typed prompts");
 }
+
+#[test]
+fn rediscovery_keeps_models_a_full_ingest_saw_past_the_head() {
+    let (_temp, store, path) = fixture();
+    let header = FIXTURE.lines().next().unwrap();
+    let mut journal = format!("{header}\n");
+    for i in 0..130 {
+        journal.push_str(&format!(
+            "{}\n",
+            serde_json::json!({"type":"session.info","data":{},"id":format!("info-{i}"),
+                "timestamp":"2026-09-18T21:31:00Z","parentId":null})
+        ));
+    }
+    journal.push_str(&format!(
+        "{}\n",
+        serde_json::json!({"type":"session.model_change","data":{"newModel":"late-model"},
+            "id":"late","timestamp":"2026-09-18T21:32:00Z","parentId":null})
+    ));
+    std::fs::write(&path, &journal).unwrap();
+    let conn = crate::open_db(store.db_path()).unwrap();
+    run(&conn, &store, &mut Map::new(), None);
+    let stored = || -> String {
+        conn.query_row(
+            "SELECT models_json FROM sessions WHERE source='copilot'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert!(stored().contains("late-model"));
+    std::fs::write(&path, format!("{journal}{}\n", serde_json::json!({"type":"session.info","data":{},"id":"appended","timestamp":"2026-09-18T21:33:00Z","parentId":null}))).unwrap();
+    store
+        .discover(crate::DiscoveryOptions::default().sources([crate::Source::Copilot]))
+        .unwrap();
+    assert!(stored().contains("late-model"), "{}", stored());
+}
