@@ -999,6 +999,7 @@ handle.
 | grok | ✓ | ✓ | ✓ | ✓ | ✓ | per-request |
 | hermes | ✓ | ✓ | ✓ | — | — | none |
 | muse | ✓ | ✓ | ✓ | ✓ | ✓ | per-request |
+| omp | ✓ | ✓ | ✓ | — | — | per-message |
 | opencode | ✓ | ✓ | ✓ | ✓ | ✓ | none |
 | pi | ✓ | ✓ | ✓ | — | — | per-message |
 <!-- sourcing-sdk-population-table:end -->

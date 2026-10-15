@@ -23,6 +23,8 @@ pub enum Source {
     Pi,
     #[serde(rename = "hermes")]
     Hermes,
+    #[serde(rename = "omp")]
+    Omp,
     #[serde(rename = "copilot")]
     Copilot,
     #[cfg(test)]
@@ -42,6 +44,7 @@ impl Source {
         Self::Devin,
         Self::Pi,
         Self::Hermes,
+        Self::Omp,
         Self::Copilot,
         #[cfg(test)]
         Self::TestFixture,
@@ -59,6 +62,7 @@ impl Source {
             Self::Devin => "devin",
             Self::Pi => "pi",
             Self::Hermes => "hermes",
+            Self::Omp => "omp",
             Self::Copilot => "copilot",
             #[cfg(test)]
             Self::TestFixture => "test-fixture",
@@ -77,6 +81,7 @@ impl Source {
             "devin" => Some(Self::Devin),
             "pi" => Some(Self::Pi),
             "hermes" => Some(Self::Hermes),
+            "omp" => Some(Self::Omp),
             "copilot" => Some(Self::Copilot),
             #[cfg(test)]
             "test-fixture" | "test-fixture-alias" => Some(Self::TestFixture),

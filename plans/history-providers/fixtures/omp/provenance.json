@@ -1,0 +1,30 @@
+{
+  "upstream": "https://github.com/can1357/oh-my-pi",
+  "revision": "bd4dffd5e617ce732f8a14249b0be1e6c7621886",
+  "package": "@oh-my-pi/pi-coding-agent",
+  "version": "18.9.2",
+  "runtime": "Bun 1.3.14 darwin arm64",
+  "synthetic": true,
+  "blob_sha256": "13421365f736bf9226ad020c347ae5577cfdeb1eb56eb13b68ecd5a62e5b667a",
+  "upstream_files": {
+    "packages/coding-agent/src/session/session-title-slot.ts": "f09e29d42ace45f77c91c29f847984ca181602959132427f02c9023307520119",
+    "packages/coding-agent/src/session/session-entries.ts": "897d7a905f0578fd5175a3997f38b6210b925c71accbd6f987279fcba53e5e32",
+    "packages/coding-agent/src/session/session-loader.ts": "3f19286eaba9c9e009fc91580666dec093f0e4e934b8a00f4fdee4ad825f13e3",
+    "packages/coding-agent/src/session/blob-store.ts": "d9f9fb8c606bd98439b96798483ece7f24bc755135ee97eac0ae0bf38d99860e",
+    "packages/utils/src/stream.ts": "40d57d0cc69c36ed504cf49b9e80eec0d1dd7ad27d5b240e899502696982c349"
+  },
+  "writer_capture": {
+    "package": "@oh-my-pi/pi-coding-agent@18.9.2",
+    "revision": "bd4dffd5e617ce732f8a14249b0be1e6c7621886",
+    "runtime": "Bun 1.3.14 darwin arm64",
+    "writer": "src/session/session-manager.ts",
+    "writer_sha256": "6ea1265b55a945b5ea9c9031497252b839960c37237e1f8c7c7284ddc2df6135",
+    "reader": "SessionManager.open().getEntries() + loadSessionMessagesReadOnly()",
+    "procedure": "capture.mjs; synthetic create/tool/title/close/reopen/resume/fork, sanitized timestamps and random identities only",
+    "files": {
+      "writer-session.jsonl": "5c51b7f272152d1bc65a7d39b95a4a9848b3348d6bf1d342490d971aa639f5e9",
+      "writer-fork.jsonl": "30176ce7f49aeed5506f853b204da0f7a336fbcfa52a15f4bbcbe06a76264b00",
+      "writer-oracle.json": "5b7fbebfacb8ce8678826fa04a2d6647ab0f8485d4b1b2fd4e7f370690ea2f74"
+    }
+  }
+}
