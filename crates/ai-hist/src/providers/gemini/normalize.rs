@@ -72,6 +72,9 @@ pub(super) fn write(conn: &Connection, payload: &Value, path: &Path) -> Result<u
     let complete = payload["partial"] == false;
     if complete {
         file_history::retire(conn, ID, sid, &keys)?;
+        // The new events must exist before ownership reconciliation so a
+        // canonical prompt row can move without changing its public ID.
+        file_history::retire_locator_sessions(conn, ID, path, Some(sid))?;
     }
     let writer = if complete {
         upsert_session_rebuilt

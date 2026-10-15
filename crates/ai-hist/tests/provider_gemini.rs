@@ -270,3 +270,42 @@ fn gemini_symlink_escape_is_not_read() {
         .iter()
         .any(|d| d.message.contains("SESSION_SOURCE_MISMATCH")));
 }
+#[test]
+fn gemini_complete_identity_rewrite_retires_old_local_session_and_guards_selected_identity() {
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path());
+    let store = open(home.path());
+    discover(&store);
+    hydrate(&store);
+    let next = "44444444-4444-4444-8444-444444444444";
+    std::fs::write(&path, FIXTURE.replacen(SID, next, 1)).unwrap();
+    assert!(
+        store
+            .hydrate(
+                &SessionRef::id(Source::Gemini, SID),
+                HydrateOptions::default()
+            )
+            .is_err(),
+        "selected old identity must not import a different native session"
+    );
+    assert!(has(&read(&store), "Found the synthetic Gemini needle."));
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    assert!(
+        store
+            .session(
+                &SessionRef::id(Source::Gemini, SID),
+                SessionQuery::default()
+            )
+            .unwrap()
+            .is_none(),
+        "old local session must retire when its existing locator acquires a new native identity"
+    );
+    let e = store
+        .session(
+            &SessionRef::id(Source::Gemini, next),
+            SessionQuery::default(),
+        )
+        .unwrap()
+        .unwrap();
+    assert!(has(&e, "Found the synthetic Gemini needle."));
+}

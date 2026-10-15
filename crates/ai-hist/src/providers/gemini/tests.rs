@@ -188,8 +188,9 @@ fn scoped_sweep_preserves_unvisited_sessions_and_repairs_lost_evidence() {
         .unwrap(),
         original
     );
-    // Force a parser generation mismatch: unchanged source bytes are re-read.
-    state["gemini_file_stamps"][path.to_string_lossy().as_ref()]["generation"] = "old".into();
+    // The v2 retirement fix must replay unchanged bytes cached by v1.
+    state["gemini_file_stamps"][path.to_string_lossy().as_ref()]["generation"] =
+        "gemini_journal_v1".into();
     conn.execute("DELETE FROM session_events WHERE source='gemini'", [])
         .unwrap();
     run(&mut state, None).unwrap();
@@ -327,4 +328,43 @@ fn migration_sibling_must_match_project_and_native_session() {
         "other-project"
     )
     .is_err());
+}
+#[test]
+fn native_identity_rewrite_retires_local_share_and_preserves_remote_share() {
+    let (home, roots, path) = fixture();
+    let context = AcquisitionContext::new(ID, &roots);
+    let conn = crate::open_db(&home.path().join("test.db")).unwrap();
+    let mut payload = snapshot(&path, &context).unwrap().payload;
+    normalize::write(&conn, &payload, &path).unwrap();
+    conn.execute("UPDATE session_events SET location='both' WHERE source='gemini' AND message_id='assistant-one'",[]).unwrap();
+    let original_prompt_id: i64 = conn
+        .query_row("SELECT id FROM history WHERE source='gemini'", [], |r| {
+            r.get(0)
+        })
+        .unwrap();
+    let old = payload["ledgerId"].as_str().unwrap().to_owned();
+    let new = "55555555-5555-4555-8555-555555555555";
+    payload["ledgerId"] = new.into();
+    payload["conversation"]["sessionId"] = new.into();
+    payload["records"][0]["sessionId"] = new.into();
+    let tx = conn.unchecked_transaction().unwrap();
+    normalize::write(&tx, &payload, &path).unwrap();
+    tx.commit().unwrap();
+    let local:i64=conn.query_row("SELECT count(*) FROM session_events WHERE source='gemini' AND session_id=?1 AND location IN ('local','both')",[&old],|r|r.get(0)).unwrap();
+    let remote:i64=conn.query_row("SELECT count(*) FROM session_events WHERE source='gemini' AND session_id=?1 AND location='remote'",[&old],|r|r.get(0)).unwrap();
+    let added:i64=conn.query_row("SELECT count(*) FROM session_events WHERE source='gemini' AND session_id=?1 AND location='local'",[new],|r|r.get(0)).unwrap();
+    let retained_prompt_id: i64 = conn
+        .query_row(
+            "SELECT id FROM history WHERE source='gemini' AND session_id=?1",
+            [new],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        retained_prompt_id, original_prompt_id,
+        "identity rewrite transfers canonical prompt ownership without delete/reinsert"
+    );
+    assert_eq!(local, 0);
+    assert_eq!(remote, 3);
+    assert!(added > 0);
 }

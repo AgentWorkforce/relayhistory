@@ -33,7 +33,7 @@ pub(crate) const METADATA: ProviderMetadata = ProviderMetadata {
     }),
 };
 pub(crate) const ADAPTER: Option<ProviderAdapter> = Some(ProviderAdapter {
-    generation: "gemini_journal_v1",
+    generation: "gemini_journal_v2",
     acquire,
     sweep,
     resolve_roots,
