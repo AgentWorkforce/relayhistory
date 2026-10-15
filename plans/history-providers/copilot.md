@@ -56,14 +56,14 @@ and a 16 KiB tail (last activity).
 | `user.message` | user `text` event; a history prompt only when `data.source` is absent (a person typed it); otherwise (`agent-<id>`, `skill-<name>`) `control_kind: synthetic`, outside prompts and user turns |
 | `assistant.message` | assistant `thinking` (`reasoningText`), `text` (`content`) and `tool_use` (`toolRequests`) events; `model`, `messageId` as provider message ID, `requestId`, `turnId`; `parentToolCallId` marks a subagent message as sidechain |
 | `tool.execution_complete` | `tool_result` event joined by `toolCallId`; `success: false` is `errored` with `error.message` as its text |
+| `tool.execution_start` | marker; also the tool call when no assistant message requested it |
+| everything else | raw marker, `kind` = the native event type |
 
 A subagent numbers its tool calls independently of the main agent — real
 journals hold a main-agent `bash_14` and a subagent `bash_14` in one session —
 so a call whose record carries `parentToolCallId` is stored as
 `<parentToolCallId>/<toolCallId>`. Requests, starts and results all carry the
 same parent, so the join stays exact.
-| `tool.execution_start` | marker; also the tool call when no assistant message requested it |
-| everything else | raw marker, `kind` = the native event type |
 
 Every event carries `copilotVersion` as agent version and the header
 context's `cwd` / `branch`. `parentId` names the chronologically preceding
