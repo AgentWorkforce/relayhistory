@@ -153,8 +153,18 @@ fn related_capture_keeps_supported_children_when_other_edges_are_unavailable() {
         .unwrap();
     let second_capture = capture_related(&roots, &state_path, "sqlite-parent").unwrap();
     let second: Capture = serde_json::from_value(second_capture.payload).unwrap();
+    let stamp = |capture: &Capture| {
+        capture
+            .related_rollouts
+            .iter()
+            .find(|child| child.id == "legacy-child")
+            .unwrap()
+            .stamp
+            .clone()
+    };
     assert_ne!(
-        captured.related_rollouts[0].stamp, second.related_rollouts[0].stamp,
+        stamp(&captured),
+        stamp(&second),
         "a same-size rewrite with restored mtime must change the related stamp"
     );
 }
