@@ -592,6 +592,15 @@ fn redact_string(text: String, homes: &[String], stamp: bool) -> String {
     }
     if replaced {
         text = text.replace('\\', "/");
+        // Grok Bot follows Electron's platform-specific userData convention.
+        // Its three synthetic fixture trees represent the same store.
+        for user_data in [
+            "Library/Application Support/Grok Bot",
+            ".config/Grok Bot",
+            "AppData/Roaming/Grok Bot",
+        ] {
+            text = text.replace(user_data, "<grok-bot-user-data>");
+        }
     }
     if stamp {
         text = mask_long_digit_runs(&text);

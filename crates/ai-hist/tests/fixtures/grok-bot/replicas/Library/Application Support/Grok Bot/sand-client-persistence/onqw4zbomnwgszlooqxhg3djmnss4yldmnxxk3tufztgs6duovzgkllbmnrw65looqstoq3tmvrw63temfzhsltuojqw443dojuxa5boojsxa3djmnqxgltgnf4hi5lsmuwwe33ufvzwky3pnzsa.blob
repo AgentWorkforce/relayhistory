@@ -1,0 +1,1 @@
+{"schemaVersion":1,"value":{"entries":[{"kind":"message","id":"tbs0","role":"user","content":"Hello from the second fixture account.","timestampMs":1700000020000,"seq":0},{"kind":"send-message","id":"t0s1","message":{"type":"text","content":"Second account acknowledged."},"timestampMs":1700000022000,"seq":1}],"epochHint":1,"acceptedSequenceHint":1,"persistedAt":1700000023000}}

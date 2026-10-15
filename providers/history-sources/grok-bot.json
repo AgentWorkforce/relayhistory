@@ -1,0 +1,35 @@
+{
+  "id": "grok-bot",
+  "rust_id": "grok_bot",
+  "variant": "GrokBot",
+  "order": 500,
+  "aliases": [],
+  "fixtures": [
+    {
+      "source": "grok-bot",
+      "name": "replicas",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": ["grok-bot/replicas"],
+      "quirk": "Synthetic complete and truncated transcript tails in two account slots, roster titles, widget response, cloud-agent round trip, and voice turns."
+    }
+  ],
+  "capture": [
+    {
+      "evidence": "Messages and identity",
+      "coverage": "Base32 transcript keys, native agent and entry IDs, roster titles, complete and truncated tails across account slots; bounded local window accumulates across captures."
+    },
+    {
+      "evidence": "Control and lineage",
+      "coverage": "Widget responses, voice turns, approvals, attachments and app events retained; Cursor cloud-agent IDs recorded as observed delegation without a local child transcript."
+    },
+    {
+      "evidence": "Usage and acquisition",
+      "coverage": "No local model, token or cost usage; passive local blobs only, with no host backfill, network calls or credential reads."
+    }
+  ],
+  "population": {
+    "evidence": ["history", "session_event", "session_marker", "relationship"],
+    "usage_accounting": "none"
+  }
+}
