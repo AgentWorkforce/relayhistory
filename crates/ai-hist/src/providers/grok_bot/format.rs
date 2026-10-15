@@ -120,6 +120,28 @@ pub(super) fn timestamp(value: &Value) -> Result<i64> {
         .context("GROK_BOT_INVALID_RECORD: timestampMs")
 }
 
+pub(super) fn last_activity(entry: &Value) -> Option<i64> {
+    let ts = entry["timestampMs"].as_i64()?;
+    if entry["kind"] != "voice-call" {
+        return Some(ts);
+    }
+    Some(
+        entry["conversation"]["turns"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|turn| turn["atMs"].as_i64())
+            .fold(ts, i64::max),
+    )
+}
+
+/// First entry time in the bounded head, for discovery before hydration.
+pub(super) fn first_number_hint(bytes: &[u8], field: &str) -> Option<i64> {
+    let needle = format!("\"{field}\"");
+    let index = bytes.windows(needle.len()).position(|w| w == needle.as_bytes())?;
+    decimal_hint(&bytes[index + needle.len()..])
+}
+
 /// Read a decimal field in a bounded JSON head/tail window. This is a hint,
 /// never a substitute for full JSON validation during acquisition.
 pub(super) fn number_hint(bytes: &[u8], field: &str) -> Option<i64> {
@@ -127,7 +149,10 @@ pub(super) fn number_hint(bytes: &[u8], field: &str) -> Option<i64> {
     let index = bytes
         .windows(needle.len())
         .rposition(|w| w == needle.as_bytes())?;
-    let rest = &bytes[index + needle.len()..];
+    decimal_hint(&bytes[index + needle.len()..])
+}
+
+fn decimal_hint(rest: &[u8]) -> Option<i64> {
     let rest = rest.strip_prefix(b":").or_else(|| {
         rest.iter()
             .position(|b| *b == b':')

@@ -23,7 +23,7 @@ pub(crate) fn persistence(home: &Path) -> PathBuf {
     }
 }
 
-fn encode_key(key: &str) -> String {
+pub(crate) fn encode_key(key: &str) -> String {
     const ALPHABET: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
     let mut out = String::new();
     let mut bits = 0u32;

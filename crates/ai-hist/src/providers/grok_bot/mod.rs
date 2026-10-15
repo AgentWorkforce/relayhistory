@@ -23,7 +23,12 @@ pub(crate) const LOCAL_SOURCE: LocalSource = LocalSource {
     discovery: Discovery::Provider(|| Box::new(Provider)),
     hydration: Hydration::Parser(ingest),
     transcript_roots: |roots| roots.for_provider(ID).to_vec(),
-    relationships: Relationships::NONE,
+    relationships: Relationships {
+        stable_child_identity: "always",
+        records_agent_type: true,
+        records_spawn_time: true,
+        records_evidence_locator: true,
+    },
     resume: None,
     fixtures: Fixtures::Dir(ID),
 };
@@ -207,10 +212,10 @@ impl ShallowSessionProvider for Provider {
         Ok(Some(ShallowSession {
             source: ID.into(),
             session_id: sid,
-            first_activity_ms: format::number_hint(&head, "timestampMs"),
+            first_activity_ms: format::first_number_hint(&head, "timestampMs"),
             last_activity_ms: last_entry
                 .as_ref()
-                .and_then(|entry| entry["timestampMs"].as_i64())
+                .and_then(format::last_activity)
                 .or_else(|| format::number_hint(last, "timestampMs")),
             raw_path: Some(candidate.locator.clone()),
             source_stamp: Some(format!("{}:{persisted:?}", candidate.stamp)),

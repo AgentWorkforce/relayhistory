@@ -328,7 +328,7 @@ otherwise `relationship_capture` records it as `identity_status = 'unlinked'`
 with a null child id. A linked child's edge names the session whose tool call
 started it (a nested subagent's parent is the subagent that spawned it), and
 its evidence is read by id through `SessionStore::session`. `relationship_capabilities().stable_child_identity` is
-`always` for codex, opencode and muse, `sometimes` for claude and grok, and
+`always` for codex, grok-bot, opencode and muse, `sometimes` for claude and grok, and
 `never` for cursor/devin. Codex fork is `✓`:
 the `fork` edge is recorded from the fields Codex actually writes on
 `session_meta` — `forked_from_id` for a human fork, and

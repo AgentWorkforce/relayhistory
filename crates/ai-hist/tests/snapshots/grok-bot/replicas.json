@@ -222,7 +222,7 @@
     {
       "agent_id": null,
       "call_index": null,
-      "control_kind": null,
+      "control_kind": "synthetic",
       "cwd": null,
       "error_signal": null,
       "event_index": null,

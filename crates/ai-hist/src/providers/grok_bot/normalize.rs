@@ -1,5 +1,6 @@
 use super::*;
-use crate::ingest::{insert_session_event, upsert_session, EventRow, SessionCatalogRow};
+use crate::ingest::control::ControlKind;
+use crate::ingest::{insert_session_event, upsert_session, EventRow, RawMessageFacts, SessionCatalogRow};
 use crate::providers::file_history;
 use crate::relationship_capture::{record_relationship, ObservedRelationship};
 use crate::{insert_history, insert_session_marker, HistoryEntry, NewSessionMarker};
@@ -27,7 +28,7 @@ pub(super) fn write(conn: &Connection, payload: &Value, path: &Path) -> Result<u
         .context("GROK_BOT_INVALID_REPLICA: no timestamp")?;
     let last = entries
         .iter()
-        .filter_map(|e| e["timestampMs"].as_i64())
+        .filter_map(format::last_activity)
         .max()
         .unwrap_or(first);
     let mut inserted = 0;
@@ -71,8 +72,10 @@ pub(super) fn write(conn: &Connection, payload: &Value, path: &Path) -> Result<u
             raw_path: Some(&path.to_string_lossy()),
         },
     )?;
-    if let Some(title) = roster.and_then(|row| {
-        row["name"]
+    // An explicit blank title clears it. A missing roster row does not erase
+    // the last known name of a transcript whose local tail we still retain.
+    if let Some(row) = roster {
+        if let Some(title) = row["name"]
             .as_str()
             .filter(|name| !name.trim().is_empty())
             .or_else(|| {
@@ -80,8 +83,14 @@ pub(super) fn write(conn: &Connection, payload: &Value, path: &Path) -> Result<u
                     .as_str()
                     .filter(|title| !title.trim().is_empty())
             })
-    }) {
-        crate::ingest::set_session_title(conn, ID, sid, Some(title))?;
+        {
+            crate::ingest::set_session_title(conn, ID, sid, Some(title))?;
+        } else {
+            conn.execute(
+                "UPDATE sessions SET title=NULL WHERE source=?1 AND session_id=?2 AND title IS NOT NULL",
+                rusqlite::params![ID, sid],
+            )?;
+        }
     }
     let prompt: Option<String> = conn.query_row(
         "SELECT prompt FROM history WHERE source='grok-bot' AND session_id=?1 ORDER BY timestamp_ms,id LIMIT 1",
@@ -120,6 +129,7 @@ fn write_entry(
 struct EventMeta<'a> {
     parent: Option<&'a str>,
     raw_kind: &'a str,
+    control_kind: Option<&'a str>,
 }
 
 fn event(
@@ -144,6 +154,10 @@ fn event(
             kind: "text",
             text,
             raw_kind: Some(meta.raw_kind),
+            raw_facts: RawMessageFacts {
+                control_kind: meta.control_kind,
+                ..Default::default()
+            },
             ..Default::default()
         },
     )
@@ -182,6 +196,7 @@ fn message(
         "GROK_BOT_INVALID_RECORD: role"
     );
     let text = entry["content"].as_str().unwrap_or_default();
+    let from_agent = !entry["fromAgent"].is_null();
     let peer = entry["toAgent"]
         .as_object()
         .or_else(|| entry["fromAgent"].as_object());
@@ -198,9 +213,11 @@ fn message(
         EventMeta {
             parent: None,
             raw_kind: "message",
+            control_kind: (role == "user" && from_agent)
+                .then_some(ControlKind::Synthetic.as_str()),
         },
     )?;
-    if role == "user" && entry["fromAgent"].is_null() {
+    if role == "user" && !from_agent {
         history(conn, sid, ts, text)
     } else {
         Ok(0)
@@ -229,6 +246,7 @@ fn sent(
                 EventMeta {
                     parent: None,
                     raw_kind: "send-message/text",
+                    control_kind: None,
                 },
             )?;
             Ok(0)
@@ -246,6 +264,7 @@ fn sent(
                 EventMeta {
                     parent: None,
                     raw_kind: "send-message/widget",
+                    control_kind: None,
                 },
             )?;
             marker(
@@ -273,6 +292,7 @@ fn sent(
                     EventMeta {
                         parent: Some(id),
                         raw_kind: "widget-response",
+                        control_kind: None,
                     },
                 )?;
                 return history(conn, sid, ts, &response);
@@ -338,6 +358,7 @@ fn voice(conn: &Connection, sid: &str, entry: &Value, id: &str, ts: i64) -> Resu
                 EventMeta {
                     parent: Some(id),
                     raw_kind: "voice-call/turn",
+                    control_kind: None,
                 },
             )?;
             if role == "user" {
@@ -395,6 +416,22 @@ fn relationship(
     if !linked_children.insert(child.to_owned()) {
         return Ok(());
     }
+    // The client keeps only a sliding tail. A later window may retain a
+    // message to the child after the original spawn entry has disappeared.
+    let prior: Option<(Option<i64>, Option<String>)> = conn
+        .query_row(
+            "SELECT spawned_at_ms, evidence_ref FROM session_relationships \
+             WHERE source=?1 AND parent_session_id=?2 AND relationship_uid=?3",
+            rusqlite::params![ID, sid, format!("child:{child}")],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    let (spawned_at, evidence_ref) = match prior {
+        Some((Some(previous), previous_id)) if previous <= ts => {
+            (previous, previous_id.unwrap_or_else(|| id.to_owned()))
+        }
+        _ => (ts, id.to_owned()),
+    };
     record_relationship(
         conn,
         &ObservedRelationship {
@@ -406,9 +443,9 @@ fn relationship(
             child_agent_name: peer.get("name").and_then(Value::as_str),
             evidence_kind: "transcript-entry",
             evidence_locator: Some(&path.to_string_lossy()),
-            evidence_ref: Some(id),
+            evidence_ref: Some(&evidence_ref),
             child_has_events: false,
-            spawned_at_ms: Some(ts),
+            spawned_at_ms: Some(spawned_at),
             ..Default::default()
         },
     )

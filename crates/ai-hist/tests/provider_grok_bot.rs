@@ -4,8 +4,8 @@ mod grok_bot_fixture;
 mod provider_support;
 
 use ai_hist::{
-    DiscoveryOptions, HydrateOptions, ProviderRoots, Role, SessionQuery, SessionRef, SessionStore,
-    Source, StoreOptions, SyncOptions,
+    relationships::relationship_capabilities, CatalogQuery, DiscoveryOptions, HydrateOptions,
+    ProviderRoots, Role, SessionQuery, SessionRef, SessionStore, Source, StoreOptions, SyncOptions,
 };
 use std::path::Path;
 
@@ -56,6 +56,15 @@ fn grok_bot_discover_hydrate_read_reopen_changes_export_fullsync() {
         .relationships
         .iter()
         .any(|edge| edge.child_session_id.as_deref() == Some("bc-fixture-child")));
+    assert!(!evidence
+        .user_turns
+        .iter()
+        .any(|turn| turn.message_id.as_deref() == Some("t0s5")));
+    let capabilities = relationship_capabilities("grok-bot");
+    assert_eq!(capabilities.stable_child_identity, "always");
+    assert!(capabilities.records_agent_type);
+    assert!(capabilities.records_spawn_time);
+    assert!(capabilities.records_evidence_locator);
     assert!(evidence
         .messages
         .iter()
@@ -92,7 +101,8 @@ fn grok_bot_sliding_window_accumulates_and_ignores_unrelated_files() {
         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     replica["value"]["entries"] = serde_json::json!([
         {"kind":"message","id":"t9u","role":"user","content":"A later fixture window.","timestampMs":1700000030000_i64,"seq":99},
-        {"kind":"send-message","id":"t9s1","message":{"type":"text","content":"Later answer."},"timestampMs":1700000031000_i64,"seq":100}
+        {"kind":"message","id":"t9agent","role":"user","content":"Later route update.","fromAgent":{"id":"bc-fixture-child","name":"Route helper"},"timestampMs":1700000030500_i64,"seq":100},
+        {"kind":"send-message","id":"t9s1","message":{"type":"text","content":"Later answer."},"timestampMs":1700000031000_i64,"seq":101}
     ]);
     replica["value"]["precedingTimestampMs"] = 1700000029000_i64.into();
     replica["value"]["persistedAt"] = 1700000032000_i64.into();
@@ -117,6 +127,17 @@ fn grok_bot_sliding_window_accumulates_and_ignores_unrelated_files() {
         .markers
         .iter()
         .any(|marker| marker.kind == "truncated_tail"));
+    let child = evidence
+        .relationships
+        .iter()
+        .find(|edge| edge.child_session_id.as_deref() == Some("bc-fixture-child"))
+        .unwrap();
+    assert_eq!(child.spawned_at_ms, Some(1700000003000));
+    assert_eq!(child.evidence_ref.as_deref(), Some("t0s3"));
+    assert!(!evidence
+        .user_turns
+        .iter()
+        .any(|turn| turn.message_id.as_deref() == Some("t9agent")));
     std::fs::remove_file(&path).unwrap();
     store.sync(SyncOptions::default().force(true)).unwrap();
     assert!(
@@ -129,4 +150,78 @@ fn grok_bot_sliding_window_accumulates_and_ignores_unrelated_files() {
             .is_some(),
         "expired client replica must not erase accumulated history"
     );
+}
+
+#[test]
+fn grok_bot_voice_turns_bound_shallow_and_full_activity() {
+    let home = tempfile::tempdir().unwrap();
+    let path = grok_bot_fixture::stage(home.path());
+    let mut replica: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    replica["value"]["entries"]
+        .as_array_mut()
+        .unwrap()
+        .truncate(7);
+    std::fs::write(path, serde_json::to_vec(&replica).unwrap()).unwrap();
+    let store = open(home.path());
+    store
+        .discover(DiscoveryOptions::default().sources([Source::GrokBot]))
+        .unwrap();
+    let catalog = || {
+        store
+            .sessions(CatalogQuery::default())
+            .map(Result::unwrap)
+            .find(|session| session.session_id == SID)
+            .unwrap()
+    };
+    let shallow = catalog();
+    assert_eq!(shallow.first_activity_ms, Some(1700000000000));
+    assert_eq!(shallow.last_activity_ms, Some(1700000006200));
+    store
+        .hydrate(
+            &SessionRef::id(Source::GrokBot, SID),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    let full = catalog();
+    assert_eq!(full.first_activity_ms, Some(1700000000000));
+    assert_eq!(full.last_activity_ms, Some(1700000006200));
+}
+
+#[test]
+fn grok_bot_explicitly_cleared_roster_title_is_removed() {
+    let home = tempfile::tempdir().unwrap();
+    grok_bot_fixture::stage(home.path());
+    let store = open(home.path());
+    store
+        .discover(DiscoveryOptions::default().sources([Source::GrokBot]))
+        .unwrap();
+    store
+        .hydrate(
+            &SessionRef::id(Source::GrokBot, SID),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    let roster_path = grok_bot_fixture::persistence(home.path()).join(format!(
+        "{}.blob",
+        grok_bot_fixture::encode_key("sand.client.slice.account.fixture%7Cp.roster.last-roster")
+    ));
+    let mut roster: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&roster_path).unwrap()).unwrap();
+    let row = roster["value"]["rows"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|row| row["id"] == SID)
+        .unwrap();
+    row["name"] = "".into();
+    row["title"] = "".into();
+    std::fs::write(&roster_path, serde_json::to_vec(&roster).unwrap()).unwrap();
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    let catalog = store
+        .sessions(CatalogQuery::default())
+        .map(Result::unwrap)
+        .find(|session| session.session_id == SID)
+        .unwrap();
+    assert_eq!(catalog.title, None);
 }
