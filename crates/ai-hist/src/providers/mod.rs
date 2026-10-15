@@ -47,21 +47,26 @@ pub(crate) struct ProviderAdapter {
 }
 
 /// Paths and identity provenance frozen together by one resolver invocation.
+#[derive(Default)]
 pub(crate) struct ResolvedProviderRoots {
     pub paths: Vec<PathBuf>,
     pub default_root: Option<PathBuf>,
+    /// Invalid configuration is frozen with the paths and reported by acquisition.
+    pub error: Option<String>,
 }
 impl From<Vec<PathBuf>> for ResolvedProviderRoots {
     fn from(paths: Vec<PathBuf>) -> Self {
         Self {
             paths,
             default_root: None,
+            error: None,
         }
     }
 }
 pub(crate) type ProviderRootMaps = (
     std::collections::BTreeMap<String, Vec<PathBuf>>,
     std::collections::BTreeMap<String, PathBuf>,
+    std::collections::BTreeMap<String, String>,
 );
 
 pub(crate) struct SweepContext<'a> {
@@ -215,14 +220,18 @@ fn resolve_root_value(home: &Path, value: Option<std::ffi::OsString>, relative: 
 pub(crate) fn resolve_roots(home: &Path, use_env: bool) -> ProviderRootMaps {
     let mut paths = std::collections::BTreeMap::new();
     let mut defaults = std::collections::BTreeMap::new();
+    let mut errors = std::collections::BTreeMap::new();
     for (id, adapter) in adapters() {
         let resolved = (adapter.resolve_roots)(home, use_env);
+        if let Some(error) = resolved.error {
+            errors.insert(id.to_owned(), error);
+        }
         if let Some(default) = resolved.default_root {
             defaults.insert(id.to_owned(), default);
         }
         paths.insert(id.to_owned(), resolved.paths);
     }
-    (paths, defaults)
+    (paths, defaults, errors)
 }
 
 pub(crate) fn legacy_watch_roots(source: &str, roots: &ProviderRoots) -> Vec<WatchRoot> {

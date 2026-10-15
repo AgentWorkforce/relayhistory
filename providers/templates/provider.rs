@@ -31,7 +31,9 @@ pub(crate) const ADAPTER: Option<ProviderAdapter> = Some(ProviderAdapter {
 });
 fn resolve_roots(home: &Path, use_env: bool) -> ResolvedProviderRoots {
     // Vec::into() keeps custom roots namespaced. If the provider has portable
-    // default-tree identities, return { paths, default_root } from one env read.
+    // default-tree identities, return { paths, default_root, error: None } from one env read.
+    // Invalid configuration returns empty paths with error: Some(message);
+    // enumerate and sweep must call roots.ensure_provider_roots(ID)? first.
     vec![super::resolve_root(home, use_env, "REPLACE_ME_HOME", ".replace-me")].into()
 }
 fn acquire(_options: &HydrateSessionOptions, _path: &Path, _context: &AcquisitionContext<'_>) -> Result<AcquiredSession> {
