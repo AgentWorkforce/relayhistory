@@ -5903,30 +5903,11 @@ fn ingest_codex_rollout_at_locator(
     } else {
         transcript_cursor::TranscriptCursorState::default()
     };
-    // The reader's own validation hashes a bounded window at each end of the
-    // committed prefix (see `transcript_cursor`), so an in-place edit strictly
-    // between those windows that keeps the file's length would pass it. A
-    // changed stamp alone does not prove an append, so resume only when the
-    // file also grew past the size it had when the cursor was written: an
-    // append-only writer always grows it, an in-place edit that keeps the
-    // length never does. Anything else re-reads from byte zero.
-    //
-    // What is still assumed: an in-place edit inside that gap *and* an append
-    // in the same interval between two passes. Codex appends to its rollouts
-    // and never rewrites them, which is the same trade the Claude walk's
-    // cursor already makes.
-    //
-    // Compressing a rollout, or writing it back out, stamps it anew without
-    // touching its records: a change of encoding over records at least as long
-    // as the cursor's resumes too, and the reader's windows confirm the bytes.
+    // A changed stamp alone does not prove an append; see
+    // `TranscriptFileCursor::only_appended_to`. Anything else re-reads from
+    // byte zero.
     if let Some(file) = cursor.file.as_ref() {
-        let grew = transcript_file::metadata(path)
-            .map(|now| {
-                now.len() > file.size
-                    || (now.compressed() != file.compressed && now.len() >= file.size)
-            })
-            .unwrap_or(false);
-        if !grew {
+        if !transcript_file::metadata(path).is_ok_and(|now| file.only_appended_to(&now)) {
             cursor = transcript_cursor::TranscriptCursorState::default();
         }
     }

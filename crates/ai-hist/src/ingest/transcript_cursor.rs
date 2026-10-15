@@ -179,6 +179,25 @@ pub(crate) struct TranscriptFileCursor {
 }
 
 impl TranscriptFileCursor {
+    /// Whether a transcript whose stamp moved since this cursor can only have
+    /// gained records, so a pass may resume from it.
+    ///
+    /// The reader's own validation hashes a bounded window at each end of the
+    /// committed prefix, so an in-place edit strictly between those windows
+    /// that keeps the file's length would pass it. An append-only writer
+    /// always grows the file; an in-place edit that keeps the length never
+    /// does. What is still assumed: an in-place edit inside that gap *and* an
+    /// append in the same interval between two passes. Codex appends to its
+    /// rollouts and never rewrites them, which is the same trade the Claude
+    /// walk's cursor already makes.
+    ///
+    /// Compressing a transcript, or writing it back out, stamps it anew
+    /// without touching its records, so a change of encoding over records at
+    /// least as long as the cursor's resumes too; the windows confirm them.
+    pub(crate) fn only_appended_to(&self, now: &TranscriptMetadata) -> bool {
+        now.len() > self.size || (now.compressed() != self.compressed && now.len() >= self.size)
+    }
+
     /// The file this cursor was taken over has been replaced. Across a change
     /// of encoding the identity says nothing, and the content windows decide.
     pub(crate) fn identity_moved(&self, now: &TranscriptMetadata) -> bool {

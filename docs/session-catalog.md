@@ -914,6 +914,18 @@ How each adapter works:
   `archived_sessions/` unchanged, and an archived thread is still the user's
   history, so it keeps its session id and evidence.
 
+  Codex compresses a finished rollout in place to `rollout-*.jsonl.zst`, and
+  writes it back out as plain JSONL when the session is resumed. A rollout is
+  one transcript in either encoding: it is listed, stamped, keyed and
+  catalogued under its `.jsonl` name (`raw_path` names the `.jsonl` even while
+  only the `.zst` is on disk), and its records are read decompressed, so byte
+  offsets and cursors describe the same records in both. While both files
+  exist, the plain one is read. The change stamp measures the stored file, so
+  compressing a rollout moves `source_stamp` once; the walk then resumes from
+  the cursor it already holds, re-validated against the decompressed records,
+  and writes no evidence again. A compressed rollout does not change after
+  that, so later passes skip it on its stamp.
+
   A rollout is a **delegated child thread** exactly when its `session_meta`
   carries a subagent marker (`thread_source` `subagent` or `guardian_review`,
   or the object form of `source.subagent`) *and* names a parent thread
