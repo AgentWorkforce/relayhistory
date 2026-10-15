@@ -139,9 +139,14 @@ fn event(
     role_and_kind: (&str, &str),
     text: Option<&str>,
     result_facts: Option<&ToolResultFacts>,
-    control_kind: Option<&str>,
 ) -> Result<bool> {
     let (role, kind) = role_and_kind;
+    let control_kind = if (role, kind) == ("user", "text") {
+        text.and_then(crate::ingest::control::codex_text_control_kind)
+            .map(crate::ingest::control::ControlKind::as_str)
+    } else {
+        None
+    };
     let overlap_uid = format!("sqlite:overlap:{}", item.id);
     if matches!((role, kind), ("user" | "assistant", "text")) {
         let mapped: bool = conn.query_row(
