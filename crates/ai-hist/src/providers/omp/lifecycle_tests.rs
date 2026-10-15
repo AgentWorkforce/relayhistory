@@ -234,3 +234,25 @@ fn omp_file_cache_skips_unchanged_and_refreshes_generation() {
         "generation drift forces unchanged bytes through normalizer"
     );
 }
+
+#[test]
+#[cfg(unix)]
+fn omp_denied_root_is_reported_and_blob_references_are_not_opened() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_home, store, path) = fixture();
+    let context = AcquisitionContext::new(ID, store.roots());
+    let capture = snapshot(&path, &context).unwrap();
+    assert_eq!(capture.read_paths, vec![path.clone()]);
+    assert!(capture.payload.to_string().contains("blob:sha256:"));
+    let root = path.parent().unwrap();
+    let permissions = std::fs::metadata(root).unwrap().permissions();
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0)).unwrap();
+    let conn = crate::open_db(store.db_path()).unwrap();
+    let env = DiscoveryEnv::with_provider_roots(&conn, store.roots().clone());
+    let result = Provider.enumerate(&env, None);
+    std::fs::set_permissions(root, permissions).unwrap();
+    assert!(
+        result.is_err(),
+        "unreadable OMP root cannot be a successful empty scan"
+    );
+}
