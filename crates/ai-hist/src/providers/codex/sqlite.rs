@@ -175,7 +175,11 @@ pub(crate) fn databases(root: &Path) -> Result<Option<(PathBuf, PathBuf)>> {
 
 /// Refresh a saved rollout observation against the current projection. Query
 /// only this thread and its checkpoint; capture reads items after selection.
-pub(crate) fn current_locator(roots: &crate::ProviderRoots, id: &str) -> Result<Option<String>> {
+pub(crate) fn current_locator(
+    roots: &crate::ProviderRoots,
+    id: &str,
+    observed: &str,
+) -> Result<Option<String>> {
     let Some((state, history)) = databases(&roots.codex)? else {
         return Ok(None);
     };
@@ -192,6 +196,15 @@ pub(crate) fn current_locator(roots: &crate::ProviderRoots, id: &str) -> Result<
     let Some(rollout_path) = rollout_path else {
         return Ok(None);
     };
+    // Catalog ownership wins when another live rollout uses this session id.
+    // Only the observed file's own projection may replace it with SQLite.
+    if Path::new(observed).exists()
+        && rollout_path
+            .as_deref()
+            .is_none_or(|path| Path::new(path) != Path::new(observed))
+    {
+        return Ok(None);
+    }
     let offset: Option<i64> = sqlite_snapshot(&context, &history, |db| {
         db.query_row(
             "SELECT next_rollout_byte_offset FROM thread_history_projection_state WHERE thread_id=?1",

@@ -14,7 +14,11 @@ pub(super) fn refresh_catalog_codex_locator(
         .as_deref()
         .is_some_and(|locator| crate::providers::codex::sqlite::parse_locator(locator).is_none())
     {
-        let current = crate::providers::codex::sqlite::current_locator(roots, &options.session_id);
+        let current = crate::providers::codex::sqlite::current_locator(
+            roots,
+            &options.session_id,
+            target.locator.as_deref().unwrap_or_default(),
+        );
         let current = match current {
             Ok(current) => current,
             Err(error) if error.is::<crate::ingest::CaptureCancelled>() => return Err(error),

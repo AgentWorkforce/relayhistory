@@ -50,6 +50,51 @@ fn guardian_requires_a_parent_before_it_is_hidden_from_the_catalog() {
 }
 
 #[test]
+fn locator_refresh_preserves_a_live_catalog_owned_sibling() {
+    let dir = tempfile::tempdir().unwrap();
+    let codex = dir.path().join(".codex");
+    install_fixture(&codex, "subagent-edge");
+    let primary = codex.join("sessions/primary.jsonl");
+    let sibling = codex.join("sessions/sibling.jsonl");
+    std::fs::create_dir_all(primary.parent().unwrap()).unwrap();
+    std::fs::write(&primary, "primary\n").unwrap();
+    std::fs::write(&sibling, "sibling\n").unwrap();
+    Connection::open(codex.join("state_5.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE threads SET rollout_path=?1 WHERE id='sqlite-parent'",
+            [primary.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+    Connection::open(codex.join("thread_history_1.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE thread_history_projection_state SET next_rollout_byte_offset=8 WHERE thread_id='sqlite-parent'",
+            [],
+        )
+        .unwrap();
+    let roots =
+        crate::ProviderRoots::from_home(dir.path().to_path_buf(), dir.path().join("opencode.db"));
+    assert_eq!(
+        current_locator(&roots, "sqlite-parent", &sibling.to_string_lossy()).unwrap(),
+        None,
+        "a live catalog-owned sibling remains selected"
+    );
+    std::fs::remove_file(&sibling).unwrap();
+    assert_eq!(
+        current_locator(&roots, "sqlite-parent", &sibling.to_string_lossy()).unwrap(),
+        Some(primary.to_string_lossy().into_owned()),
+        "a missing observation may follow the current complete rollout"
+    );
+    std::fs::remove_file(&primary).unwrap();
+    assert_eq!(
+        current_locator(&roots, "sqlite-parent", &sibling.to_string_lossy()).unwrap(),
+        Some(locator(&codex.join("state_5.sqlite"), "sqlite-parent")),
+        "a pruned rollout recovers its SQLite projection"
+    );
+}
+
+#[test]
 fn related_capture_keeps_supported_children_when_other_edges_are_unavailable() {
     let dir = tempfile::tempdir().unwrap();
     let codex = dir.path().join(".codex");
