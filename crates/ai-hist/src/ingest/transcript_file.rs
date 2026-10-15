@@ -406,6 +406,11 @@ fn declared_len(file: &fs::File, stored_len: u64) -> io::Result<Option<u64>> {
         total += content;
         offset += frame_len;
     }
+    // A frame or skippable frame that runs past the end is a file still being
+    // written, or cut short: its declared records are not on disk.
+    if offset > stored_len {
+        return Err(invalid("truncated frame"));
+    }
     Ok(Some(total))
 }
 
@@ -603,6 +608,27 @@ mod tests {
         assert_eq!(
             declared_len(&file, stored_len).unwrap(),
             Some(body.len() as u64)
+        );
+    }
+
+    #[test]
+    fn a_truncated_archive_is_an_error_not_a_declared_length() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-a.jsonl.zst");
+        let whole = compress(&records(2_000));
+        fs::write(&path, &whole[..whole.len() - 5]).unwrap();
+        assert_eq!(
+            metadata(&path).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
+        );
+        let mut skippable = compress(&records(10));
+        skippable.extend_from_slice(&0x184D_2A50u32.to_le_bytes());
+        skippable.extend_from_slice(&64u32.to_le_bytes());
+        skippable.extend_from_slice(b"short");
+        fs::write(&path, skippable).unwrap();
+        assert_eq!(
+            metadata(&path).unwrap_err().kind(),
+            io::ErrorKind::InvalidData
         );
     }
 
