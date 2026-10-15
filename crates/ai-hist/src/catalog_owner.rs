@@ -41,7 +41,7 @@ pub(crate) fn incoming_must_not_replace(
     // sibling transcript that happens to share the session id.
     if source == "codex"
         && incoming.starts_with("sqlite:")
-        && crate::providers::codex::sqlite::incomplete_projection_owns_rollout(incoming, &stored)
+        && crate::providers::codex::sqlite::incomplete_projection_owns_rollout(incoming, &stored)?
     {
         return Ok(false);
     }
@@ -298,5 +298,19 @@ mod tests {
             )
             .unwrap();
         assert!(incoming_must_not_replace(&conn, "codex", "shared", Some(&incoming)).unwrap());
+        history_db
+            .execute(
+                "UPDATE thread_history_projection_state SET next_rollout_byte_offset=100",
+                [],
+            )
+            .unwrap();
+        let newer_state = root.join("state_6.sqlite");
+        Connection::open(&newer_state).unwrap();
+        let newer_locator = crate::providers::codex::sqlite::locator(&newer_state, "shared");
+        // A newer schema is not admitted until discovery supports it.
+        assert!(incoming_must_not_replace(&conn, "codex", "shared", Some(&newer_locator)).unwrap());
+        assert!(incoming_must_not_replace(&conn, "codex", "shared", Some(&incoming)).unwrap());
+        std::fs::remove_file(newer_state).unwrap();
+        assert!(!incoming_must_not_replace(&conn, "codex", "shared", Some(&incoming)).unwrap());
     }
 }
