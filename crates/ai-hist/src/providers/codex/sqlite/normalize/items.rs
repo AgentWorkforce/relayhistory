@@ -26,13 +26,23 @@ pub(super) fn normalize_item(
 
 fn user(conn: &Connection, t: &Thread, item: &Item, history_ids: &mut Vec<i64>) -> Result<usize> {
     let text = text_blocks(&item.value["content"]);
+    let control = crate::ingest::control::codex_text_control_kind(&text);
     let recorded = if text.is_empty() {
         false
     } else {
-        event(conn, t, item, &item.id, ("user", "text"), Some(&text), None)?
+        event(
+            conn,
+            t,
+            item,
+            &item.id,
+            ("user", "text"),
+            Some(&text),
+            None,
+            control.map(crate::ingest::control::ControlKind::as_str),
+        )?
     };
     user_images(conn, t, item)?;
-    if t.is_child() || !recorded {
+    if t.is_child() || !recorded || control.is_some() {
         return Ok(0);
     }
     let hash = crate::prompt_hash(&text);
@@ -147,6 +157,7 @@ fn agent(conn: &Connection, t: &Thread, item: &Item) -> Result<usize> {
         ("assistant", "text"),
         value["text"].as_str(),
         None,
+        None,
     )?;
     if let Some(phase) = value["phase"].as_str() {
         marker(
@@ -187,6 +198,7 @@ fn reasoning(conn: &Connection, t: &Thread, item: &Item) -> Result<usize> {
             &item.id,
             ("assistant", "thinking"),
             Some(&text),
+            None,
             None,
         )?;
     }
@@ -232,6 +244,7 @@ fn tool(
         &item.id,
         ("assistant", "tool_use"),
         target,
+        None,
         None,
     )? {
         crate::ingest::insert_tool_call(
@@ -285,6 +298,7 @@ fn tool(
             ("tool_result", "tool_result"),
             Some(&text),
             Some(&facts),
+            None,
         )?;
     }
     if include_related {
@@ -313,6 +327,7 @@ fn file_change(conn: &Connection, t: &Thread, item: &Item) -> Result<usize> {
         &item.id,
         ("assistant", "tool_use"),
         Some("file changes"),
+        None,
         None,
     )? {
         return Ok(0);

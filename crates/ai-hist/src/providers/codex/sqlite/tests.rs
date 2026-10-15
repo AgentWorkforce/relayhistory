@@ -1,5 +1,7 @@
 use super::*;
 
+mod control;
+
 fn install_fixture(codex: &Path, stem: &str) {
     std::fs::create_dir_all(codex).unwrap();
     let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex/sqlite");

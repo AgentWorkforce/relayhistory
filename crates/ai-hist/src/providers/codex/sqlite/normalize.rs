@@ -139,6 +139,7 @@ fn event(
     role_and_kind: (&str, &str),
     text: Option<&str>,
     result_facts: Option<&ToolResultFacts>,
+    control_kind: Option<&str>,
 ) -> Result<bool> {
     let (role, kind) = role_and_kind;
     let overlap_uid = format!("sqlite:overlap:{}", item.id);
@@ -207,6 +208,7 @@ fn event(
             tool_result_facts: result_facts,
             raw_facts: RawMessageFacts {
                 turn_id: item.turn_id.as_deref(),
+                control_kind,
                 ..Default::default()
             },
             ..Default::default()

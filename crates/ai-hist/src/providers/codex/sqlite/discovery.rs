@@ -141,6 +141,8 @@ pub(crate) fn shallow(scan: &ScanEnv<'_>, c: &Candidate) -> Result<Option<Shallo
         first_prompt: t
             .first_user_message
             .as_deref()
+            .filter(|text| !text.trim().is_empty())
+            .filter(|text| crate::ingest::control::codex_text_control_kind(text).is_none())
             .map(crate::discover::excerpt),
         models: t.model.into_iter().collect(),
         originator: t.originator,
