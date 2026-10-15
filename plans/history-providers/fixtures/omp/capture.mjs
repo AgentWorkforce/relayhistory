@@ -10,7 +10,9 @@ if(!root || !output) throw new Error('Pass isolated pinned public npm package pa
 const writer=path.join(root,'src/session/session-manager.ts');
 if(createHash('sha256').update(fs.readFileSync(writer)).digest('hex')!=='6ea1265b55a945b5ea9c9031497252b839960c37237e1f8c7c7284ddc2df6135') throw new Error('Pinned writer checksum differs');
 const synthetic=fs.mkdtempSync(path.join(os.tmpdir(),'omp-synthetic-'));
-process.env.PI_CODING_AGENT_DIR=path.join(synthetic,'agent');
+const temporary=path.join(synthetic,'tmp');fs.mkdirSync(temporary);
+for(const key of Object.keys(process.env)) delete process.env[key];
+Object.assign(process.env,{PATH:'/usr/bin:/bin:/usr/sbin:/sbin',HOME:synthetic,USERPROFILE:synthetic,TMPDIR:temporary,PI_CODING_AGENT_DIR:path.join(synthetic,'agent')});
 const {SessionManager}=await import(writer);
 const {loadSessionMessagesReadOnly}=await import(path.join(root,'src/session/session-loader.ts'));
 const {serializeTitleSlot}=await import(path.join(root,'src/session/session-title-slot.ts')); 

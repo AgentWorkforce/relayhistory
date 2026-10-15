@@ -56,3 +56,9 @@ The surface proof isolates HOME and all provider overrides in a child process,
 then checks public SDK discovery/hydration/evidence/search, CLI search, and MCP
 source schema/capabilities/search with positive OMP and negative Pi filters.
 It never reads provider auth/configuration or invokes a model.
+
+The writer harness clears inherited environment variables before importing OMP,
+then sets only a system PATH and synthetic HOME/USERPROFILE/TMPDIR/agent data
+root. Inherited profile, provider, auth, configuration and loader overrides
+cannot redirect it. This isolated capture reproduced all three committed
+writer artifacts byte-for-byte.

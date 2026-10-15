@@ -25,6 +25,13 @@
       "writer-session.jsonl": "5c51b7f272152d1bc65a7d39b95a4a9848b3348d6bf1d342490d971aa639f5e9",
       "writer-fork.jsonl": "30176ce7f49aeed5506f853b204da0f7a336fbcfa52a15f4bbcbe06a76264b00",
       "writer-oracle.json": "5b7fbebfacb8ce8678826fa04a2d6647ab0f8485d4b1b2fd4e7f370690ea2f74"
+    },
+    "environment_allowlist": {
+      "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+      "HOME": "isolated temporary directory",
+      "USERPROFILE": "isolated temporary directory",
+      "TMPDIR": "isolated temporary directory/tmp",
+      "PI_CODING_AGENT_DIR": "isolated temporary directory/agent"
     }
   }
 }
