@@ -113,6 +113,11 @@ impl TranscriptMetadata {
     pub(crate) fn compressed(&self) -> bool {
         self.compressed
     }
+
+    /// The stored file's own length: the compressed length when compressed.
+    pub(crate) fn stored_len(&self) -> u64 {
+        self.metadata.len()
+    }
 }
 
 impl Deref for TranscriptMetadata {
@@ -184,6 +189,14 @@ impl TranscriptFile {
                 len: zstd.len,
                 compressed: true,
             }),
+        }
+    }
+
+    /// The compressed file this handle decompresses; `None` when plain.
+    pub(crate) fn compressed_file(&self) -> Option<&fs::File> {
+        match self {
+            Self::Plain(_) => None,
+            Self::Zstd(zstd) => Some(&zstd.file),
         }
     }
 

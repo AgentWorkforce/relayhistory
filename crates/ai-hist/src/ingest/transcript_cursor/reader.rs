@@ -473,6 +473,7 @@ impl TranscriptReader {
             self.unchanged_since_ms
         };
         let prefix_hash = self.commit_prefix(offset, &window, rehash)?;
+        let stored_hash = self.commit_stored_window(&metadata)?;
         Ok(CommitOutcome::Published(TranscriptFileCursor {
             offset,
             device: self.device,
@@ -482,7 +483,29 @@ impl TranscriptReader {
             unchanged_since_ms,
             prefix_hash,
             compressed: self.compressed,
+            stored_hash,
         }))
+    }
+
+    /// The window over a compressed transcript's stored bytes, read through
+    /// the handle this pass opened. See [`TranscriptFileCursor::stored_hash`].
+    fn commit_stored_window(&mut self, metadata: &TranscriptMetadata) -> Result<Option<String>> {
+        if !self.compressed {
+            return Ok(None);
+        }
+        let stored_len = metadata.stored_len();
+        let (digest, read) = match &self.source {
+            Source::File { file, .. } => match file.compressed_file() {
+                Some(stored) => super::stored_window(stored, stored_len)?,
+                None => return Ok(None),
+            },
+            Source::Memory { .. } => {
+                let stored = std::fs::File::open(transcript_file::stored_path(&self.path)?)?;
+                super::stored_window(&stored, stored_len)?
+            }
+        };
+        self.validation_bytes += read;
+        Ok(Some(digest))
     }
 
     /// The generation this pass opened. A streaming read stats its own handle,

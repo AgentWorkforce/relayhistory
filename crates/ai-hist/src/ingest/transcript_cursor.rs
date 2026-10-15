@@ -97,6 +97,9 @@ use super::transcript_file::TranscriptMetadata;
 use super::*;
 
 mod change_time;
+mod encoding;
+pub(crate) use encoding::stored_window;
+use encoding::stored_window_matches;
 mod prefix;
 pub(crate) use prefix::prefix_window_digest_of;
 use prefix::{prefix_window_spans, PrefixSpans};
@@ -176,37 +179,13 @@ pub(crate) struct TranscriptFileCursor {
     /// inode are compared only between cursors of one encoding.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub compressed: bool,
-}
-
-impl TranscriptFileCursor {
-    /// Whether a transcript whose stamp moved since this cursor can only have
-    /// gained records, so a pass may resume from it.
-    ///
-    /// The reader's own validation hashes a bounded window at each end of the
-    /// committed prefix, so an in-place edit strictly between those windows
-    /// that keeps the file's length would pass it. An append-only writer
-    /// always grows the file; an in-place edit that keeps the length never
-    /// does. What is still assumed: an in-place edit inside that gap *and* an
-    /// append in the same interval between two passes. Codex appends to its
-    /// rollouts and never rewrites them, which is the same trade the Claude
-    /// walk's cursor already makes.
-    ///
-    /// Compressing a transcript, or writing it back out, stamps it anew
-    /// without touching its records, so a change of encoding over records at
-    /// least as long as the cursor's resumes too; the windows confirm them.
-    pub(crate) fn only_appended_to(&self, now: &TranscriptMetadata) -> bool {
-        now.len() > self.size || (now.compressed() != self.compressed && now.len() >= self.size)
-    }
-
-    /// The file this cursor was taken over has been replaced. Across a change
-    /// of encoding the identity says nothing, and the content windows decide.
-    pub(crate) fn identity_moved(&self, now: &TranscriptMetadata) -> bool {
-        let (device, inode) = file_identity(now);
-        self.compressed == now.compressed()
-            && self.device.is_some()
-            && device.is_some()
-            && (self.device, self.inode) != (device, inode)
-    }
+    /// For a compressed transcript, the bounded window over the stored file
+    /// itself. Codex writes the compressed copy once and never appends to it,
+    /// so its bytes standing still prove the records standing still, and
+    /// checking that reads two windows instead of decompressing every record
+    /// up to `offset`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stored_hash: Option<String>,
 }
 
 fn is_zero(value: &i64) -> bool {
@@ -613,6 +592,7 @@ pub(crate) fn whole_file_cursor(path: &Path) -> Result<(TranscriptFileCursor, u6
             unchanged_since_ms: 0,
             prefix_hash,
             compressed: false,
+            stored_hash: None,
         },
         bytes_read,
     ))
@@ -667,6 +647,9 @@ pub(crate) fn committed_prefix_matches(cursor: &TranscriptFileCursor, path: &Pat
         || super::metadata_mtime_ns(&metadata) < cursor.mtime_ns
     {
         return PrefixCheck::UNVALIDATED;
+    }
+    if let Some(check) = stored_window_matches(cursor, path, &metadata) {
+        return check;
     }
     let Ok(mut handle) = transcript_file::open(path) else {
         return PrefixCheck::UNVALIDATED;

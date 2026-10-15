@@ -27389,6 +27389,86 @@ mod tests {
         assert_eq!(codex_rows(&fresh, behind), 1);
     }
 
+    /// A cursor over a compressed rollout is proven by the window over its
+    /// stored bytes: bounded, however large the records, and an in-place
+    /// change to those bytes still fails it.
+    #[cfg(unix)]
+    #[test]
+    fn a_compressed_cursor_is_validated_without_decompressing_its_records() {
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("codex");
+        let day = root.join("sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        let (rollout, mut text) = compressible_rollout(&day, "sess_big");
+        // Incompressible turns, so the stored file is far larger than the
+        // two windows that prove it.
+        let mut noise = Sha256::digest(b"seed").to_vec();
+        for n in 3..60u32 {
+            let mut blob = String::new();
+            for _ in 0..200 {
+                noise = Sha256::digest(&noise).to_vec();
+                blob.push_str(&format!("{noise:02x?}"));
+            }
+            for (second, payload) in [
+                (
+                    1,
+                    json!({"type": "user_message", "message": format!("run {n} {blob}")}),
+                ),
+                (
+                    2,
+                    json!({"type": "agent_message", "message": format!("done {n}")}),
+                ),
+                (
+                    3,
+                    json!({"type": "task_complete", "turn_id": format!("t{n}")}),
+                ),
+            ] {
+                text.push_str(&format!(
+                    "{}\n",
+                    json!({"timestamp": format!("2026-04-20T06:{:02}:{second:02}.000Z", n % 60),
+                           "type": "event_msg", "payload": payload})
+                ));
+            }
+        }
+        fs::write(&rollout, &text).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        state.insert("codex_rollouts_v7".into(), json!({}));
+        sync_codex(&conn, &mut state, &root).unwrap();
+        let compressed = compress_rollout(&rollout);
+        sync_codex(&conn, &mut state, &root).unwrap();
+
+        let locator = rollout.to_string_lossy().to_string();
+        let cursor = transcript_cursor::load_cursor(
+            &conn,
+            &transcript_cursor::CursorKey::Locator {
+                source: "codex",
+                locator: &locator,
+            },
+        )
+        .unwrap();
+        let file = cursor.file.expect("the walk stored a cursor");
+        assert!(file.compressed && file.stored_hash.is_some(), "{file:?}");
+        let stored_len = fs::metadata(&compressed).unwrap().len();
+        assert!(stored_len > 4 * transcript_cursor::PREFIX_WINDOW_BYTES);
+        let check = transcript_cursor::committed_prefix_matches(&file, &rollout);
+        assert!(check.valid);
+        assert_eq!(
+            check.bytes_read,
+            2 * transcript_cursor::PREFIX_WINDOW_BYTES,
+            "validating the compressed copy read more than its two windows"
+        );
+
+        // The same file, its last bytes rewritten and its mtime put back.
+        let modified = fs::metadata(&compressed).unwrap().modified().unwrap();
+        let handle = fs::File::options().write(true).open(&compressed).unwrap();
+        std::os::unix::fs::FileExt::write_at(&handle, b"tampered", stored_len - 8).unwrap();
+        handle.set_modified(modified).unwrap();
+        assert!(!transcript_cursor::committed_prefix_matches(&file, &rollout).valid);
+    }
+
     /// Resuming a compressed session writes the rollout back out as plain
     /// JSONL and appends to it. The walk continues from the cursor it took
     /// over the compressed copy and indexes only the new turn.
