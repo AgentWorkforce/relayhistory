@@ -428,20 +428,24 @@ fn gemini_tool_and_opaque_usage_stays_measured_without_inferred_prompt_ownership
             ),
             (90, 30, 20)
         );
-        let conn = ai_hist::open_db(store.db_path()).unwrap();
-        let events = ai_hist::session_events(&conn, SID, Some("gemini")).unwrap();
-        let assistant: Vec<_> = events
-            .iter()
-            .filter(|e| e.message_id.as_deref() == Some("assistant-one"))
-            .collect();
-        assert!(assistant.iter().any(|e| e.token_json.is_some()));
-        assert!(assistant
-            .iter()
-            .all(|e| e.role == "assistant" && e.ts_ms == 1791720006000));
-        assert!(
-            ai_hist::attribute_usage_to_prompts(&events, "gemini").is_empty(),
-            "upstream records no ownership links; attribution must remain unavailable"
-        );
+        // Raw event grouping uses the explicitly opt-in internal test surface.
+        #[cfg(feature = "unstable-internal")]
+        {
+            let conn = ai_hist::open_db(store.db_path()).unwrap();
+            let events = ai_hist::session_events(&conn, SID, Some("gemini")).unwrap();
+            let assistant: Vec<_> = events
+                .iter()
+                .filter(|e| e.message_id.as_deref() == Some("assistant-one"))
+                .collect();
+            assert!(assistant.iter().any(|e| e.token_json.is_some()));
+            assert!(assistant
+                .iter()
+                .all(|e| e.role == "assistant" && e.ts_ms == 1791720006000));
+            assert!(
+                ai_hist::attribute_usage_to_prompts(&events, "gemini").is_empty(),
+                "upstream records no ownership links; attribution must remain unavailable"
+            );
+        }
         if tools {
             assert_eq!(evidence.tool_calls[0].ts_ms, Some(1791720008000));
         }
