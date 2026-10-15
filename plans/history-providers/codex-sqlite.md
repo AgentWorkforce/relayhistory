@@ -91,6 +91,8 @@ of assuming every ledger key matches across layouts.
   rollout exists but is shorter than `next_rollout_byte_offset` says it should
   be. A thread with a complete rollout is never re-read from SQLite, so the
   existing snapshots do not change.
+- **Schema guard.** A newer SQLite store or an incomplete store pair skips
+  SQLite capture with a diagnostic. Rollout discovery and ingestion continue.
 - **Discovery.** Enumerate `threads` where `history_mode = 'paginated'` and
   the rollout is missing. Candidate locator: `sqlite:<state_db>#<thread_id>`.
   Stamp: `(updated_at_ms, next_rollout_ordinal, next_rollout_byte_offset)`.

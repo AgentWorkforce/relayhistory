@@ -1,6 +1,15 @@
 use super::*;
 
 #[test]
+fn an_incomplete_sqlite_pair_is_skipped() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("state_5.sqlite"), b"half pair").unwrap();
+    let selection = database_selection(dir.path()).unwrap();
+    assert!(selection.pair.is_none());
+    assert!(selection.diagnostic.unwrap().contains("incomplete"));
+}
+
+#[test]
 fn a_pruned_rollout_is_read_again_after_it_was_restored() {
     let dir = tempfile::tempdir().unwrap();
     let codex = dir.path().join(".codex");

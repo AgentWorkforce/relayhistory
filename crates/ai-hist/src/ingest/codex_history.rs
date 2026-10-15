@@ -107,7 +107,11 @@ fn sync_codex_sqlite_scoped(
     touched: &mut HashSet<String>,
     paths: Option<&super::path_scope::PathScope>,
 ) -> Result<usize> {
-    let Some((state_db, history_db)) = crate::providers::codex::sqlite::databases(root)? else {
+    let selection = crate::providers::codex::sqlite::database_selection(root)?;
+    if let Some(diagnostic) = selection.diagnostic {
+        sync_note!("  [codex] skipping SQLite history: {diagnostic}");
+    }
+    let Some((state_db, history_db)) = selection.pair else {
         return Ok(0);
     };
     let changed = paths.is_none()
@@ -133,6 +137,66 @@ fn sync_codex_sqlite_scoped(
         Ok(inserted)
     } else {
         Ok(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::discover::{CodexProvider, DiscoveryEnv, ShallowSessionProvider};
+
+    #[test]
+    fn newer_sqlite_schema_skips_fallback_without_losing_rollouts() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".codex");
+        std::fs::create_dir_all(&root).unwrap();
+        for name in [
+            "state_5.sqlite",
+            "thread_history_1.sqlite",
+            "state_6.sqlite",
+        ] {
+            std::fs::write(root.join(name), b"new schema").unwrap();
+        }
+        let rollout = root.join("sessions/2026/04/20/rollout-primary.jsonl");
+        std::fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/codex/sqlite/rollout-rollout-primary.jsonl");
+        std::fs::copy(fixture, &rollout).unwrap();
+
+        let selection = crate::providers::codex::sqlite::database_selection(&root).unwrap();
+        assert!(selection.pair.is_none());
+        assert!(selection.diagnostic.unwrap().contains("state_6.sqlite"));
+
+        let conn = crate::open_db(&dir.path().join("history.db")).unwrap();
+        let mut roots = crate::ProviderRoots::from_home(
+            dir.path().to_path_buf(),
+            dir.path().join("opencode.db"),
+        );
+        roots.codex = root.clone();
+        let env = DiscoveryEnv::with_provider_roots(&conn, roots);
+        let candidates = CodexProvider::default().enumerate(&env, None).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].locator, rollout.to_string_lossy());
+
+        let mut state = Map::new();
+        sync_codex_sources(
+            &conn,
+            &mut state,
+            &root,
+            &SweepRepairs::default(),
+            &mut SweepCoverage::default(),
+            &mut HashSet::new(),
+            None,
+        )
+        .unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE source='codex' AND session_id='sqlite-rollout-primary'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
     }
 }
 

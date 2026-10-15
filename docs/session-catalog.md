@@ -932,7 +932,8 @@ How each adapter works:
   read-only with pinned transactions and retains the native item ids. Complete
   rollouts remain primary. The SQLite layout has only a cumulative
   `threads.tokens_used` total, so it supplies one snapshot marker and no
-  per-message usage.
+  per-message usage. A newer store version or an incomplete pair skips SQLite
+  with a diagnostic while rollout capture continues.
 
   A rollout is a **delegated child thread** exactly when its `session_meta`
   carries a subagent marker (`thread_source` `subagent` or `guardian_review`,

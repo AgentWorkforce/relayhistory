@@ -1,5 +1,5 @@
 //! The paginated Codex history, used only when its rollout is unavailable or incomplete.
-use anyhow::{bail, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -89,13 +89,21 @@ pub(super) struct Edge {
     pub(super) status: Option<String>,
 }
 
-/// Only the known schema pair is admitted. A higher version is a new contract.
-pub(crate) fn databases(root: &Path) -> Result<Option<(PathBuf, PathBuf)>> {
-    fn versioned(root: &Path, prefix: &str, expected: u32) -> Result<Option<PathBuf>> {
+pub(crate) struct DatabaseSelection {
+    pub(crate) pair: Option<(PathBuf, PathBuf)>,
+    pub(crate) diagnostic: Option<String>,
+}
+
+/// Only the known schema pair is admitted. A newer or incomplete pair is
+/// skipped so an unrelated Codex rollout remains discoverable and ingestible.
+pub(crate) fn database_selection(root: &Path) -> Result<DatabaseSelection> {
+    type VersionedPath = (Option<PathBuf>, Option<String>);
+    fn versioned(root: &Path, prefix: &str, expected: u32) -> Result<VersionedPath> {
         if !root.exists() {
-            return Ok(None);
+            return Ok((None, None));
         }
         let mut found = None;
+        let mut unsupported = None;
         for entry in std::fs::read_dir(root)? {
             let name = entry?.file_name();
             let Some(name) = name.to_str() else { continue };
@@ -109,25 +117,36 @@ pub(crate) fn databases(root: &Path) -> Result<Option<(PathBuf, PathBuf)>> {
                 continue;
             };
             if version > expected {
-                bail!("unsupported Codex {prefix}{version}.sqlite; supported version: {expected}");
+                unsupported = Some(format!(
+                    "unsupported Codex {prefix}{version}.sqlite; supported version: {expected}"
+                ));
             }
             if version == expected {
                 found = Some(root.join(name));
             }
         }
-        Ok(found)
+        Ok((found, unsupported))
     }
-    match (
-        versioned(root, "state_", 5)?,
-        versioned(root, "thread_history_", 1)?,
-    ) {
-        (None, None) => Ok(None),
-        (Some(state), Some(history)) => Ok(Some((state, history))),
-        _ => bail!(
-            "incomplete Codex SQLite history pair under {}",
-            root.display()
+    let (state, state_warning) = versioned(root, "state_", 5)?;
+    let (history, history_warning) = versioned(root, "thread_history_", 1)?;
+    let diagnostic = state_warning.or(history_warning);
+    let (pair, diagnostic) = match (state, history, diagnostic) {
+        (_, _, Some(warning)) => (None, Some(warning)),
+        (None, None, None) => (None, None),
+        (Some(state), Some(history), None) => (Some((state, history)), None),
+        _ => (
+            None,
+            Some(format!(
+                "incomplete Codex SQLite history pair under {}",
+                root.display()
+            )),
         ),
-    }
+    };
+    Ok(DatabaseSelection { pair, diagnostic })
+}
+
+pub(crate) fn databases(root: &Path) -> Result<Option<(PathBuf, PathBuf)>> {
+    Ok(database_selection(root)?.pair)
 }
 
 fn projection(
@@ -213,7 +232,11 @@ pub(crate) fn enumerate(
     root: &Path,
     roots: &crate::ProviderRoots,
 ) -> Result<(Vec<Candidate>, HashSet<PathBuf>)> {
-    let Some((state, history)) = databases(root)? else {
+    let selection = database_selection(root)?;
+    if let Some(diagnostic) = selection.diagnostic {
+        eprintln!("ai-hist: [codex] skipping SQLite history: {diagnostic}");
+    }
+    let Some((state, history)) = selection.pair else {
         return Ok((Vec::new(), HashSet::new()));
     };
     let context = AcquisitionContext::new("codex", roots);
