@@ -270,10 +270,13 @@ fn rewrite_retires_dropped_tools_results_and_markers() {
     let conn = crate::open_db(store.db_path()).unwrap();
     let mut payload = payload(&store, &path);
     normalize::write(&conn, &payload, &path).unwrap();
-    let bash_error = "SELECT is_error FROM tool_calls WHERE source='copilot' AND tool_use_id='toolu_fixture_bash'";
+    let bash_error =
+        "SELECT is_error FROM tool_calls WHERE source='copilot' AND tool_use_id='bash_1'";
     assert_eq!(count(&conn, bash_error), 1);
     payload["entries"].as_array_mut().unwrap().retain(|e| {
-        !(e["type"] == "tool.execution_complete" && e["data"]["toolCallId"] == "toolu_fixture_bash")
+        !(e["type"] == "tool.execution_complete"
+            && e["data"]["toolCallId"] == "bash_1"
+            && e["data"]["parentToolCallId"].is_null())
             && e["type"] != "session.shutdown"
     });
     normalize::write(&conn, &payload, &path).unwrap();
@@ -286,10 +289,9 @@ fn rewrite_retires_dropped_tools_results_and_markers() {
         ),
         0
     );
-    payload["entries"]
-        .as_array_mut()
-        .unwrap()
-        .retain(|e| e["data"]["toolCallId"] != "toolu_fixture_bash");
+    payload["entries"].as_array_mut().unwrap().retain(|e| {
+        e["data"]["toolCallId"] != "bash_1" || e["data"]["parentToolCallId"].is_string()
+    });
     for entry in payload["entries"].as_array_mut().unwrap() {
         if entry["type"] == "assistant.message" {
             entry["data"]["toolRequests"] = serde_json::json!([]);
@@ -299,7 +301,7 @@ fn rewrite_retires_dropped_tools_results_and_markers() {
     assert_eq!(
         count(
             &conn,
-            "SELECT count(*) FROM tool_calls WHERE source='copilot' AND tool_use_id='toolu_fixture_bash'"
+            "SELECT count(*) FROM tool_calls WHERE source='copilot' AND tool_use_id='bash_1'"
         ),
         0
     );

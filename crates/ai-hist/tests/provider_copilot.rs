@@ -207,9 +207,18 @@ fn copilot_usage_stays_verbatim_per_message_and_session_totals_stay_markers() {
     let failed = evidence
         .tool_results
         .iter()
-        .find(|r| r.tool_use_id.as_deref() == Some("toolu_fixture_bash"))
+        .find(|r| r.tool_use_id.as_deref() == Some("bash_1"))
         .unwrap();
     assert_eq!(failed.result_status.as_deref(), Some("errored"));
+    // The subagent numbers its calls independently: its `bash_1` is scoped
+    // by the delegating call, not merged into the main agent's.
+    let delegated = evidence
+        .tool_results
+        .iter()
+        .find(|r| r.tool_use_id.as_deref() == Some("call_fixture_task/bash_1"))
+        .unwrap();
+    assert_eq!(delegated.result_status.as_deref(), Some("completed"));
+    assert_eq!(evidence.tool_calls.len(), 4);
     assert_eq!(evidence.prompts.len(), 3);
     assert_eq!(evidence.session.git_branch.as_deref(), Some("main"));
 }

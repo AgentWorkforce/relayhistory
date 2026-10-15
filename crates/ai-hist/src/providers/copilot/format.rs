@@ -130,6 +130,16 @@ pub(super) fn tool_requests(data: &Value) -> Result<&[Value]> {
     }
 }
 
+/// A tool call's identity within the session. Subagents number their calls
+/// independently of the main agent (`bash_14` can name one call of each), so
+/// a call made under a delegating call is scoped by that call's ID.
+pub(super) fn call_id(data: &Value, raw: &str) -> String {
+    match data["parentToolCallId"].as_str() {
+        Some(parent) => format!("{parent}/{raw}"),
+        None => raw.to_owned(),
+    }
+}
+
 /// A user message a person typed, as opposed to one another agent delivered.
 pub(super) fn is_human_prompt(entry: &Value) -> bool {
     entry["type"] == "user.message" && entry["data"]["source"].is_null()

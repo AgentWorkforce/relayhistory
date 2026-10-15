@@ -33,7 +33,7 @@
       "files": [
         "copilot/cli-usage"
       ],
-      "quirk": "authored from the persisted shape of Copilot CLI 1.0.86 journals with synthetic values: per-message model, reasoningText and outputTokens, a failed bash tool, a mid-session model change, an explore subagent whose messages carry parentToolCallId, a usage checkpoint, and two cumulative session.shutdown modelMetrics totals across a resume."
+      "quirk": "authored from the persisted shape of Copilot CLI 1.0.86 journals with synthetic values: per-message model, reasoningText and outputTokens, a failed bash tool, a mid-session model change, an explore subagent whose messages carry parentToolCallId and reuse the main agent's bash_1 call ID, a usage checkpoint, and two cumulative session.shutdown modelMetrics totals across a resume."
     }
   ],
   "capture": [
@@ -43,7 +43,7 @@
     },
     {
       "evidence": "Tools and usage",
-      "coverage": "Assistant toolRequests and tool.execution_complete join by native toolCallId with success/error outcomes; assistant.message outputTokens kept verbatim as per-message usage (output only); session.shutdown modelMetrics and session.usage_checkpoint kept raw in markers as session-wide cumulative totals, excluded from request usage; no inferred file edits."
+      "coverage": "Assistant toolRequests and tool.execution_complete join by native toolCallId, scoped as <parentToolCallId>/<toolCallId> under a delegating call because subagents number calls independently; success/error outcomes; assistant.message outputTokens kept verbatim as per-message usage (output only); session.shutdown modelMetrics and session.usage_checkpoint kept raw in markers as session-wide cumulative totals, excluded from request usage; no inferred file edits."
     },
     {
       "evidence": "Control and lineage",

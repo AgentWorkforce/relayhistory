@@ -194,7 +194,7 @@ impl<'a> Writer<'a> {
             self.assistant = Some(text.into());
         }
         for request in format::tool_requests(data)? {
-            self.tool_use(&base, index, request)?;
+            self.tool_use(&base, index, data, request)?;
             index += 1;
         }
         // An assistant message with no content still carries its usage.
@@ -204,12 +204,18 @@ impl<'a> Writer<'a> {
         Ok(())
     }
 
-    fn tool_use(&mut self, base: &EventRow<'_>, index: usize, request: &Value) -> Result<()> {
-        let id = format::string(request, "toolCallId")?;
+    fn tool_use(
+        &mut self,
+        base: &EventRow<'_>,
+        index: usize,
+        message: &Value,
+        request: &Value,
+    ) -> Result<()> {
+        let id = format::call_id(message, format::string(request, "toolCallId")?);
         let name = format::string(request, "name")?;
-        self.call(base, id, name, &request["arguments"])?;
+        self.call(base, &id, name, &request["arguments"])?;
         let facts = ToolResultFacts {
-            tool_use_id: Some(id.into()),
+            tool_use_id: Some(id),
             ..Default::default()
         };
         let block = serde_json::to_string(request)?;
@@ -250,12 +256,12 @@ impl<'a> Writer<'a> {
     /// message requested it (a user-requested tool).
     fn tool_start(&mut self, entry: &'a Value) -> Result<()> {
         let data = &entry["data"];
-        let id = format::string(data, "toolCallId")?;
-        if !self.requested.contains(id) {
+        let id = format::call_id(data, format::string(data, "toolCallId")?);
+        if !self.requested.contains(&id) {
             let base = self.base(entry, "assistant")?;
             self.call(
                 &base,
-                id,
+                &id,
                 format::string(data, "toolName")?,
                 &data["arguments"],
             )?;
@@ -265,7 +271,7 @@ impl<'a> Writer<'a> {
 
     fn tool_result(&mut self, entry: &'a Value) -> Result<()> {
         let data = &entry["data"];
-        let id = format::string(data, "toolCallId")?;
+        let id = format::call_id(data, format::string(data, "toolCallId")?);
         let error = !data["success"].as_bool().unwrap_or_default();
         let payload = if error {
             &data["error"]["message"]
@@ -274,7 +280,7 @@ impl<'a> Writer<'a> {
         };
         let text = payload.as_str();
         let mut facts = ToolResultFacts::from_payload(payload);
-        facts.tool_use_id = Some(id.into());
+        facts.tool_use_id = Some(id.clone());
         facts.result_status = Some(if error { "errored" } else { "completed" }.into());
         facts.error_signal = error.then(|| "tool.execution_complete.success".into());
         let base = self.base(entry, "tool_result")?;
@@ -287,8 +293,8 @@ impl<'a> Writer<'a> {
             "tool_result",
             text,
         )?;
-        set_tool_call_error(self.conn, ID, self.sid, id, error)?;
-        self.keys.results.insert(id.into());
+        set_tool_call_error(self.conn, ID, self.sid, &id, error)?;
+        self.keys.results.insert(id);
         Ok(())
     }
 
