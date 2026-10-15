@@ -268,7 +268,7 @@
       "repo_url": "https://example.test/team/app",
       "session_id": "sqlite-parent",
       "source": "codex",
-      "source_stamp": "sha256:905a43e349f838b3ed2dc323f82e16b83829a<n>c13b1a1ca9a",
+      "source_stamp": "sha256:<content>",
       "title": "SQLite thread",
       "workspace_roots_json": null
     }

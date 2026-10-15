@@ -503,7 +503,7 @@
       "repo_url": "https://example.test/team/app",
       "session_id": "sqlite-pruned-all-items",
       "source": "codex",
-      "source_stamp": "sha256:3f12ebf8db30cf195cf02d909a5ed9f3996a3de4e852db894340a448ed25eef4",
+      "source_stamp": "sha256:<content>",
       "title": "SQLite thread",
       "workspace_roots_json": null
     }

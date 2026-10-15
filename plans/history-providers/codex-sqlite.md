@@ -136,6 +136,14 @@ thread. Invent every value.
 5. Negative control: disable the SQLite branch and record the conformance
    failures for a rollout-less fixture.
 
+Negative control result: with SQLite database detection temporarily disabled,
+`corpus_snapshots_match_committed_evidence` failed for
+`codex/sqlite-archived-thread` (missing history),
+`codex/sqlite-pruned-all-items` (missing file edits),
+`codex/sqlite-subagent-edge` (missing history), and
+`codex/sqlite-truncated-rollout` (missing projected assistant evidence).
+The temporary switch was removed after the check.
+
 ## Out of scope
 
 Pricing, token estimation, activity classification; any network or account

@@ -149,7 +149,7 @@
       "repo_url": "https://example.test/team/app",
       "session_id": "sqlite-truncated-rollout",
       "source": "codex",
-      "source_stamp": "sha256:fb6eb2b<n>f0d4d6b8ff5b52ceaddf2d3a0e4cee0d5d7ee2a669e79",
+      "source_stamp": "sha256:<content>",
       "title": "SQLite thread",
       "workspace_roots_json": null
     }

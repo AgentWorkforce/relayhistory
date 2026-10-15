@@ -620,6 +620,12 @@ fn redact_value(value: Value, homes: &[String], stamp: bool) -> Value {
 /// `args_json`, whose escapes are backslashes. Nothing this normalizes reaches
 /// the store — the ledger keeps the platform's own separators.
 fn redact_string(text: String, homes: &[String], stamp: bool) -> String {
+    // SQLite acquisition hashes include the staged rollout path. Its temp
+    // HOME changes on every run, so retain the hash kind rather than its
+    // fixture-specific digest in committed snapshots.
+    if stamp && text.starts_with("sha256:") {
+        return "sha256:<content>".into();
+    }
     let mut text = text;
     let mut replaced = false;
     for home in homes {
