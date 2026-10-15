@@ -2,13 +2,18 @@ use super::*;
 
 pub(super) fn resolve(home: &Path, use_env: bool) -> ResolvedProviderRoots {
     let env = |key| use_env.then(|| std::env::var(key).ok()).flatten();
+    let legacy_profile = env("PI_PROFILE");
     let values = RootValues {
         session: env("PI_CODING_AGENT_SESSION_DIR"),
         agent: env("PI_CODING_AGENT_DIR"),
         config: env("PI_CONFIG_DIR"),
-        profile: env("OMP_PROFILE").or_else(|| env("PI_PROFILE")),
+        profile: env("OMP_PROFILE").or_else(|| legacy_profile.clone()),
+        legacy_profile,
         data: env("XDG_DATA_HOME"),
     };
+    if nonempty(&values.session).is_some() {
+        return from_values(home, &values).into();
+    }
     let profile = values
         .profile
         .as_deref()
@@ -25,6 +30,7 @@ pub(super) struct RootValues {
     pub agent: Option<String>,
     pub config: Option<String>,
     pub profile: Option<String>,
+    pub legacy_profile: Option<String>,
     pub data: Option<String>,
 }
 fn nonempty(value: &Option<String>) -> Option<&str> {
@@ -56,7 +62,7 @@ pub(super) fn from_values(home: &Path, v: &RootValues) -> Vec<PathBuf> {
     let config = home.join(nonempty(&v.config).unwrap_or(".omp"));
     let config = profile.map_or_else(|| config.clone(), |p| config.join("profiles").join(p));
     let default_agent = config.join("agent");
-    let agent = if profile.is_some() {
+    let agent = if profile.is_some() || inherited_override(home, &config, v) {
         default_agent.clone()
     } else {
         nonempty(&v.agent)
@@ -86,4 +92,18 @@ fn valid_profile(p: &str) -> bool {
             .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b))
         && !p.ends_with('.')
         && !device
+}
+
+fn inherited_override(home: &Path, config: &Path, v: &RootValues) -> bool {
+    let Some(profile) = v
+        .legacy_profile
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| *p != "default" && valid_profile(p))
+    else {
+        return false;
+    };
+    nonempty(&v.agent).is_some_and(|agent| {
+        expand(home, agent) == config.join("profiles").join(profile).join("agent")
+    })
 }

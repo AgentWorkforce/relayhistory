@@ -446,3 +446,35 @@ fn omp_same_locator_identity_replacement_retires_old_only_after_complete_capture
     assert!(has(&replaced, "Reading a fixture"));
     assert_eq!(replaced.prompts.len(), 1);
 }
+
+#[test]
+fn omp_title_slot_clear_replaces_catalog_only_for_complete_capture() {
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path());
+    let store = open(home.path());
+    store
+        .discover(DiscoveryOptions::default().sources([Source::Omp]))
+        .unwrap();
+    hydrate(&store);
+    assert_eq!(
+        read(&store).session.title.as_deref(),
+        Some("Synthetic initial title")
+    );
+    let (first, body) = FIXTURE.split_once('\n').unwrap();
+    let mut slot: serde_json::Value = serde_json::from_str(first).unwrap();
+    let width = slot["title"].as_str().unwrap().len();
+    slot["title"] = "".into();
+    slot["pad"] = format!("{}{}", slot["pad"].as_str().unwrap(), " ".repeat(width)).into();
+    let prefix = format!("{slot}\n");
+    assert_eq!(prefix.len(), 256);
+    let cleared = format!("{prefix}{body}");
+    std::fs::write(&path, format!("{cleared}{{partial")).unwrap();
+    hydrate(&store);
+    assert_eq!(
+        read(&store).session.title.as_deref(),
+        Some("Synthetic initial title")
+    );
+    std::fs::write(&path, cleared).unwrap();
+    hydrate(&store);
+    assert_eq!(read(&store).session.title, None);
+}

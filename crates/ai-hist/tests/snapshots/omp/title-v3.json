@@ -194,7 +194,7 @@
       "repo_url": null,
       "session_id": "019b76da-a800-7000-8000-000000000001",
       "source": "omp",
-      "source_stamp": "omp_v3_2:sha256:c65cdc15a92943c6f3ecbadd538b8cd508edd45c7402c376d2c0304a22c8cff4",
+      "source_stamp": "omp_v3_3:sha256:c65cdc15a92943c6f3ecbadd538b8cd508edd45c7402c376d2c0304a22c8cff4",
       "title": "Synthetic initial title",
       "workspace_roots_json": null
     }

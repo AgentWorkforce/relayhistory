@@ -37,7 +37,7 @@ pub(crate) const METADATA: ProviderMetadata = ProviderMetadata {
     }),
 };
 pub(crate) const ADAPTER: Option<ProviderAdapter> = Some(ProviderAdapter {
-    generation: "omp_v3_2",
+    generation: "omp_v3_3",
     acquire,
     sweep,
     resolve_roots: |home, use_env| roots::resolve(home, use_env),

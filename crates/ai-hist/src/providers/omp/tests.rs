@@ -135,6 +135,9 @@ fn omp_environment_profile_precedence_and_frozen_errors() {
             .unwrap()
             .to_string()
             .contains("OMP_INVALID_PROFILE"));
+        } else if mode == "derived-default" {
+            assert_eq!(resolved.paths, [home.join(".omp/agent/sessions")]);
+            assert!(resolved.error.is_none());
         } else {
             assert_eq!(resolved.paths, [home.join("chosen/sessions")]);
             assert!(resolved.error.is_none());
@@ -146,7 +149,12 @@ fn omp_environment_profile_precedence_and_frozen_errors() {
         return;
     }
     let home = tempfile::tempdir().unwrap();
-    for (mode, profile) in [("invalid", "../escape"), ("empty-default", "")] {
+    for (mode, profile) in [
+        ("invalid", "../escape"),
+        ("empty-default", ""),
+        ("override", "../escape"),
+        ("derived-default", ""),
+    ] {
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .env_clear()
             .args(["--exact", "ingest::providers::omp::tests::omp_environment_profile_precedence_and_frozen_errors", "--nocapture"])
@@ -154,8 +162,8 @@ fn omp_environment_profile_precedence_and_frozen_errors() {
             .env("RH_OMP_ROOT_TEST_HOME", home.path())
             .env("OMP_PROFILE", profile)
             .env("PI_PROFILE", "legacy")
-            .env("PI_CODING_AGENT_DIR", home.path().join("chosen"))
-            .env_remove("PI_CODING_AGENT_SESSION_DIR")
+            .env("PI_CODING_AGENT_DIR", home.path().join(if mode=="derived-default" {".omp/profiles/legacy/agent"} else {"chosen"}))
+            .env("PI_CODING_AGENT_SESSION_DIR", if mode=="override" {home.path().join("chosen/sessions").to_string_lossy().into_owned()} else {String::new()})
             .env_remove("PI_CONFIG_DIR")
             .env_remove("XDG_DATA_HOME")
             .output().unwrap();

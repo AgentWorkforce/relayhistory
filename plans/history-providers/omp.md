@@ -264,3 +264,29 @@ At PR head 60ec5896, CI identified the two stale generation prefixes and a new
 complexity violation in `normalize::write`; both are fixed above. No automated
 inline review findings were present at that inspection. New CI/review feedback
 is handled against the final pushed head, separately from this capture record.
+
+
+## Review fixes at generation v3
+
+Concrete review regressions reproduced stale catalog titles after a complete
+empty title-slot rewrite and missing opaque evidence for image-only tool results.
+Both named `omp_review_` tests failed against the preceding implementation
+(two failures), then passed with explicit complete-capture title replacement and
+bounded opaque tool-result markers. Partial tails preserve the prior title and
+remote-shared event evidence. The tool-result capture records only its session
+file read; blob references remain opaque and removed blocks retire on rewrite.
+
+Explicit session-directory overrides now bypass irrelevant invalid profile
+selection, matching upstream directory precedence. Isolated process tests also
+cover canonical empty/default profile selection discarding an inherited legacy
+profile-derived agent override, as pinned upstream does. No shared title helper
+or Pi provider behavior changed.
+
+Final focused verification: **17** OMP unit/lifecycle cases, **10** public
+provider cases and **67** corpus cases passed. Actual corpus regeneration moved
+only the two source-stamp prefixes to `omp_v3_3`; payload hashes are unchanged.
+Generation v3 forces prior captures to reacquire the newly preserved evidence.
+Strict Rust 1.99 workspace Clippy, the unchanged quality ratchet and generated
+provider drift checks are checked again for this review batch. Earlier v2 SDK,
+package and broad-suite results above retain their stated compiled-tree scope;
+final-head CI supplies native/SDK and Linux workspace verification.

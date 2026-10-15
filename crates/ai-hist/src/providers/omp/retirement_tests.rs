@@ -230,3 +230,87 @@ fn omp_same_locator_identity_replacement_preserves_remote_share() {
     let new:i64=conn.query_row("SELECT count(*) FROM session_events WHERE source='omp' AND session_id='replacement-native'",[],|r|r.get(0)).unwrap();
     assert!(new > 0);
 }
+
+#[test]
+fn omp_review_complete_title_clear_preserves_partial_and_remote_evidence() {
+    let (_home, store, path) = fixture();
+    let conn = crate::open_db(store.db_path()).unwrap();
+    let mut payload = snapshot(&path, &AcquisitionContext::new(ID, store.roots()))
+        .unwrap()
+        .payload;
+    normalize::write(&conn, &payload, &path).unwrap();
+    let sid = payload["entries"][0]["id"].as_str().unwrap().to_owned();
+    conn.execute("UPDATE session_events SET location='both' WHERE source='omp' AND session_id=?1 AND role='user'",[&sid]).unwrap();
+    payload["entries"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("title");
+    payload["tail"] = serde_json::json!([123]);
+    normalize::write(&conn, &payload, &path).unwrap();
+    let title = || {
+        conn.query_row(
+            "SELECT title FROM sessions WHERE source='omp' AND session_id=?1",
+            [&sid],
+            |r| r.get::<_, Option<String>>(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(title().as_deref(), Some("Synthetic initial title"));
+    payload["tail"] = serde_json::json!([]);
+    normalize::write(&conn, &payload, &path).unwrap();
+    assert_eq!(
+        title(),
+        None,
+        "complete native title removal must replace catalog title"
+    );
+    let shared:i64=conn.query_row("SELECT count(*) FROM session_events WHERE source='omp' AND session_id=?1 AND location='both'",[&sid],|r|r.get(0)).unwrap();
+    assert_eq!(shared, 1);
+}
+
+#[test]
+fn omp_review_tool_result_image_ref_survives_public_evidence_without_blob_read() {
+    let (_home, store, path) = fixture();
+    let conn = crate::open_db(store.db_path()).unwrap();
+    let reference = format!("blob:sha256:{}", "b".repeat(64));
+    let content = serde_json::json!([{"type":"image","data":reference,"mimeType":"image/png"}]);
+    let original = "\"content\":[{\"type\":\"text\",\"text\":\"fixture bytes\"}]";
+    let bytes = FIXTURE.replacen(original, &format!("\"content\":{content}"), 1);
+    assert_ne!(bytes, FIXTURE);
+    std::fs::write(&path, bytes).unwrap();
+    let captured = snapshot(&path, &AcquisitionContext::new(ID, store.roots())).unwrap();
+    assert_eq!(captured.read_paths.as_slice(), std::slice::from_ref(&path));
+    let mut payload = captured.payload;
+    normalize::write(&conn, &payload, &path).unwrap();
+    let evidence = store
+        .session(
+            &crate::SessionRef::id(crate::Source::Omp, "019b76da-a800-7000-8000-000000000001"),
+            crate::SessionQuery::default(),
+        )
+        .unwrap()
+        .unwrap();
+    assert!(
+        evidence
+            .markers
+            .iter()
+            .any(|m| m.raw_payload().is_some_and(|p| p.contains(&reference))),
+        "image-only tool result must keep its native blob reference in public evidence"
+    );
+    assert_eq!(evidence.tool_results.len(), 1);
+    payload["entries"][3]["message"]["content"] =
+        serde_json::json!([{"type":"text","text":"text-only rewritten result"}]);
+    normalize::write(&conn, &payload, &path).unwrap();
+    let evidence = store
+        .session(
+            &crate::SessionRef::id(crate::Source::Omp, "019b76da-a800-7000-8000-000000000001"),
+            crate::SessionQuery::default(),
+        )
+        .unwrap()
+        .unwrap();
+    assert!(
+        !evidence
+            .markers
+            .iter()
+            .any(|m| m.raw_payload().is_some_and(|p| p.contains(&reference))),
+        "complete rewrite must retire removed result image markers"
+    );
+}

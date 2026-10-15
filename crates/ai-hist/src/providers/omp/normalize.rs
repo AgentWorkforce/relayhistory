@@ -66,9 +66,8 @@ pub(super) fn write(conn: &Connection, payload: &Value, path: &Path) -> Result<u
     Ok(inserted)
 }
 fn refresh_metadata(conn: &Connection, sid: &str, header: &Value, entries: &[Value]) -> Result<()> {
-    crate::ingest::set_session_title(conn, ID, sid, header["title"].as_str())?;
     let first_prompt = format::first_prompt(entries);
-    conn.execute("UPDATE sessions SET first_prompt=?2 WHERE source='omp' AND session_id=?1 AND first_prompt IS NOT ?2", rusqlite::params![sid,first_prompt])?;
+    conn.execute("UPDATE sessions SET title=?2,first_prompt=?3 WHERE source='omp' AND session_id=?1 AND (title IS NOT ?2 OR first_prompt IS NOT ?3)", rusqlite::params![sid,header["title"].as_str(),first_prompt])?;
     Ok(())
 }
 fn marker(conn: &Connection, sid: &str, entry: &Value, id: &str, keys: &mut Keys) -> Result<()> {
@@ -272,6 +271,17 @@ fn result(conn: &Connection, base: &EventRow<'_>, msg: &Value, keys: &mut Keys) 
     let error = msg["isError"]
         .as_bool()
         .context("OMP_INVALID_RECORD: tool isError")?;
+    for (index, block) in msg["content"].as_array().into_iter().flatten().enumerate() {
+        if block["type"] != "text" {
+            opaque_block(
+                conn,
+                base,
+                block,
+                &format!("{}:{index}", base.message_id),
+                keys,
+            )?;
+        }
+    }
     let text = format::text(&msg["content"]);
     let mut facts = ToolResultFacts::from_payload(&msg["content"]);
     facts.tool_use_id = Some(id.into());

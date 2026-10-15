@@ -224,7 +224,7 @@
       "repo_url": null,
       "session_id": "019b76da-a800-7000-8000-000000000002",
       "source": "omp",
-      "source_stamp": "omp_v3_2:sha256:23ab4a49630cbad00369880a574b73fb2f2c79bb715ea4ff5af6bd2f6f449ba9",
+      "source_stamp": "omp_v3_3:sha256:23ab4a49630cbad00369880a574b73fb2f2c79bb715ea4ff5af6bd2f6f449ba9",
       "title": "Synthetic writer title",
       "workspace_roots_json": null
     }
