@@ -5957,15 +5957,7 @@ fn ingest_codex_rollout_incremental(
     let cwd = Some(meta.cwd.as_str());
     let branch = meta.git_branch.as_deref();
     let mut outcome = CodexIngestOutcome::default();
-    // A position an older parser committed sits past records whose state
-    // markers it never wrote: read the rollout again from byte zero.
-    if cursor
-        .codex
-        .as_ref()
-        .is_some_and(|codex| codex.state_markers < CODEX_STATE_MARKER_GENERATION)
-    {
-        *cursor = transcript_cursor::TranscriptCursorState::default();
-    }
+    cursor.restart_unresumable_codex(meta.fork_parent_id.is_some());
     // Codex keeps its existing rule for a trailing line with no newline: it
     // is the half-written tail of a live rollout and the next pass re-reads
     // it. Unlike Claude, no Codex writer leaves its last line unterminated.
@@ -6671,6 +6663,7 @@ fn ingest_codex_rollout_incremental(
                                 previous_human_message: human_messages.remembered(),
                                 inherited_baseline_marker: inherited_baseline_marker.clone(),
                                 state_markers: CODEX_STATE_MARKER_GENERATION,
+                                fork_replay: CODEX_FORK_REPLAY_GENERATION,
                             },
                         );
                     }
@@ -37322,6 +37315,76 @@ mod codex_fork_replay_tests {
             state.get(CODEX_FORK_REPLAY_KEY),
             Some(&json!(CODEX_FORK_REPLAY_GENERATION))
         );
+    }
+
+    /// A fork's position an older replay gate committed is not resumed from:
+    /// that gate may have retired the child's own first turn and committed
+    /// past it, so the pass reads from byte zero, restores the turn and
+    /// retires the stale marker. A position the current gate committed is
+    /// resumed from.
+    #[test]
+    fn a_fork_cursor_an_older_gate_committed_is_read_again_from_byte_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-child.jsonl");
+        fs::write(
+            &rollout,
+            unpaginated_subagent() + &child_turn(CHILD_TURN, 1600),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let meta = read_codex_session_meta(&rollout).unwrap().unwrap();
+        let mut cursor = transcript_cursor::TranscriptCursorState::default();
+        ingest_codex_rollout_incremental(&conn, &rollout, &meta, &mut cursor).unwrap();
+        let own = vec![
+            "find why test_x fails",
+            "test_x reads a stale fixture",
+            "child prompt",
+            "child answer",
+        ];
+        assert_eq!(texts(&conn, CHILD), own);
+        assert!(cursor.file.as_ref().is_some_and(|file| file.offset > 0));
+
+        // What an older gate left: the first turn retired under a
+        // `copied_history` marker, and a position past it.
+        conn.execute(
+            "DELETE FROM session_events WHERE source = 'codex' AND session_id = ? \
+             AND text IN ('find why test_x fails', 'test_x reads a stale fixture')",
+            [CHILD],
+        )
+        .unwrap();
+        insert_session_marker(
+            &conn,
+            "codex",
+            CHILD,
+            &NewSessionMarker {
+                marker_uid: "1:fork_replay",
+                ts_ms: None,
+                message_id: None,
+                parent_id: Some(PARENT),
+                turn_id: Some(CHILD_TURN),
+                kind: "fork_replay_boundary",
+                subkind: Some("copied_history"),
+                text: None,
+                payload_json: Some("{}"),
+            },
+        )
+        .unwrap();
+        let resumed = |generation: i64| {
+            let mut stale = cursor.clone();
+            stale.codex.as_mut().unwrap().fork_replay = generation;
+            ingest_codex_rollout_incremental(&conn, &rollout, &meta, &mut stale).unwrap();
+        };
+        // The current gate's position resumes at the end and reads nothing.
+        resumed(CODEX_FORK_REPLAY_GENERATION);
+        assert_eq!(texts(&conn, CHILD), vec!["child prompt", "child answer"]);
+        resumed(CODEX_FORK_REPLAY_GENERATION - 1);
+        let mut restored = texts(&conn, CHILD);
+        restored.sort();
+        let mut expected = own.clone();
+        expected.sort();
+        assert_eq!(restored, expected);
+        assert!(replay_marker(&conn, CHILD).is_none());
     }
 
     /// A signature marker's request identity is stored whole or not at all.

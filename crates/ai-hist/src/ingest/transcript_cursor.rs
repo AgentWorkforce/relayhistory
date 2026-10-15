@@ -360,6 +360,36 @@ pub(crate) struct CodexCursorState {
     /// it.
     #[serde(default)]
     pub state_markers: i64,
+    /// The fork replay gate generation that decided which of this rollout's
+    /// lines were copied parent history. A fork's cursor from an older gate
+    /// may sit past a span this gate does not open, whose lines are the
+    /// child's own, so it is not resumed from either.
+    #[serde(default)]
+    pub fork_replay: i64,
+}
+
+impl CodexCursorState {
+    /// Whether a pass may resume from this position: the rows behind it were
+    /// indexed by the current state-marker generation and, for a fork
+    /// (`fork`), by the current replay gate.
+    fn resumable(&self, fork: bool) -> bool {
+        self.state_markers >= super::CODEX_STATE_MARKER_GENERATION
+            && (!fork || self.fork_replay >= super::CODEX_FORK_REPLAY_GENERATION)
+    }
+}
+
+impl TranscriptCursorState {
+    /// Forget a Codex position an older parser committed, so the pass reads
+    /// the rollout again from byte zero (see [`CodexCursorState::resumable`]).
+    pub(crate) fn restart_unresumable_codex(&mut self, fork: bool) {
+        if self
+            .codex
+            .as_ref()
+            .is_some_and(|codex| !codex.resumable(fork))
+        {
+            *self = Self::default();
+        }
+    }
 }
 
 /// A stat under which a cursor's positions were proven by their digests.
