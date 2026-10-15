@@ -29,7 +29,7 @@
     "status": {
       "type": "idle"
     },
-    "path": "/synthetic/codex-home/codex/sessions/2026/01/01/rollout-2026-01-01T00:00:00.000Zb76da-a800-7000-8000-000000000161.jsonl",
+    "path": "/synthetic/codex-home/codex/sessions/2026/01/01/rollout-2026-01-01T00-00-00-019b76da-a800-7000-8000-000000000161.jsonl",
     "cwd": "/synthetic/codex-home/workspace",
     "cliVersion": "0.161.0",
     "originator": "relayhistory-offline-fixture",

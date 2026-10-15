@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Native offline Codex persistence probe. Never sends turn/start or model requests."""
-import json, os, pathlib, selectors, subprocess, sys, tempfile, time
+import json, os, pathlib, subprocess, sys, tempfile
+from rpc_reader import RpcReplies
 binary=sys.argv[1] if len(sys.argv)>1 else None
 if not binary:raise RuntimeError('Pass the pinned Codex 0.161.0 binary')
 output=pathlib.Path(sys.argv[2] if len(sys.argv)>2 else '/private/tmp/rh-codex-offline-capture')
@@ -10,6 +11,7 @@ with tempfile.TemporaryDirectory(prefix='rh-codex-offline-') as td:
  env={'PATH':'/usr/bin:/bin:/usr/sbin:/sbin','TMPDIR':str(temp),'HOME':str(home),'USERPROFILE':str(home),'CODEX_HOME':str(agent),'CODEX_DISABLE_TELEMETRY':'1','RUST_LOG':'off'}
  stderr=open(output/'stderr.log','w')
  proc=subprocess.Popen([binary,'app-server','--listen','stdio://'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=stderr,text=True,env=env,cwd=work,bufsize=1)
+ responses=RpcReplies(proc.stdout)
  transcript=[];idx=0
  def send(method,params,notification=False):
   global idx
@@ -17,19 +19,7 @@ with tempfile.TemporaryDirectory(prefix='rh-codex-offline-') as td:
   if not notification:request['id']=idx
   proc.stdin.write(json.dumps(request)+'\n');proc.stdin.flush();transcript.append({'request':request})
   if notification:return
-  deadline=time.monotonic()+25
-  selector=selectors.DefaultSelector();selector.register(proc.stdout,selectors.EVENT_READ)
-  while time.monotonic()<deadline:
-   if not selector.select(timeout=.3):
-    if proc.poll() is not None:raise RuntimeError('app-server exited')
-    continue
-   line=proc.stdout.readline()
-   if not line:raise RuntimeError('app-server stdout closed')
-   response=json.loads(line);transcript.append({'response':response})
-   if response.get('id')==idx:
-    if 'error' in response:raise RuntimeError(json.dumps(response))
-    return response.get('result')
-  raise TimeoutError(method)
+  return responses.response(idx,25,lambda response:transcript.append({'response':response}))
  try:
   send('initialize',{'clientInfo':{'name':'relayhistory-offline-fixture','version':'1.0.0'},'capabilities':{'experimentalApi':True}})
   send('initialized',{},True)
@@ -45,6 +35,7 @@ with tempfile.TemporaryDirectory(prefix='rh-codex-offline-') as td:
   (output/'items.json').write_text(json.dumps(entries,indent=2)+'\n')
   proc.stdin.close();proc.wait(timeout=10)
   proc=subprocess.Popen([binary,'app-server','--listen','stdio://'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=stderr,text=True,env=env,cwd=work,bufsize=1)
+  responses=RpcReplies(proc.stdout)
   send('initialize',{'clientInfo':{'name':'relayhistory-offline-fixture','version':'1.0.0'},'capabilities':{'experimentalApi':True}})
   send('initialized',{},True)
   send('thread/resume',{'threadId':sid,'cwd':str(work),'model':'synthetic-fixture','modelProvider':'synthetic','approvalPolicy':'never','sandbox':'read-only','excludeTurns':True,'config':{'model_providers':{'synthetic':{'name':'Offline synthetic','base_url':'http://127.0.0.1:9/v1','wire_api':'responses','requires_openai_auth':False}}}})

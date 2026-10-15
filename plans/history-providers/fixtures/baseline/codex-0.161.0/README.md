@@ -33,3 +33,21 @@ while retaining this reader limitation explicitly.
 No SQLite database, credentials or operator history is included. The full
 sanitized RPC transcript records the exact methods requested; no turn/start is
 present. No authentication or model runtime is needed to reproduce the writer.
+
+## Capture helper regressions
+
+The stdout reader continuously queues complete JSON-RPC records, so a notification
+and response coalesced into one pipe write cannot strand a buffered reply. The
+sanitizer handles rollout filenames before ISO timestamps, normalizes arbitrary
+capture dates and session date directories, and replaces `serverName` with
+`synthetic-host.local`. Manifest digests are regenerated with the sanitized data.
+
+```sh
+python3 plans/history-providers/fixtures/baseline/codex-0.161.0/test_capture_helpers.py
+```
+
+The three offline tests cover coalesced notification/replies, filename/session-ID
+integrity, and October/November/next-year captures with timezone offsets and a
+synthetic test hostname. Reverting the filename/date rules makes the sanitizer
+regression fail; the native app-server capture was also rerun with the queued
+reader before regenerating these artifacts.

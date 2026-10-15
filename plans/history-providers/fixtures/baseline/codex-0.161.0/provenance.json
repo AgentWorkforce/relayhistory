@@ -12,12 +12,12 @@
   "files": {
     "session.jsonl": "a247eb51ae06072977674470e1feceeb7988aa45bd01066a2a35e1c05de74239",
     "expected-messages.json": "999e98a5a2d2b6d33abe471df7263739d06401a4b0ee1d62a5a78fb73a4ab827",
-    "reader.json": "9f38491318e23219e6d959f11bb50027ad435aae82b54d732cf59dfe2d480a1b",
+    "reader.json": "854338fefa6dc74c34da5abe3b3b2fdb38f66b4fe8e4d8e47faa66e389e54887",
     "items.json": "5ee42a36bcbb191e686d444a498d18bafc76f87940e4b00e545abde18c09413e",
     "turns.json": "5ee42a36bcbb191e686d444a498d18bafc76f87940e4b00e545abde18c09413e",
     "reopened-items.json": "5ee42a36bcbb191e686d444a498d18bafc76f87940e4b00e545abde18c09413e",
     "resumed-items.json": "5ee42a36bcbb191e686d444a498d18bafc76f87940e4b00e545abde18c09413e",
-    "rpc-transcript.json": "42abdfa08b055791a95b0ca4321d6bfbe1d5e3771811d9d0435df6410b6f7339"
+    "rpc-transcript.json": "424e951dbd92e62d41e8bf960c72f2468bc4ae331fb02146343f8da28d409675"
   },
   "schema_sha256": {
     "ThreadStartParams.json": "e9c6d3cc18d049bfbc0249add3808fb8e5a27e1a0b5a423767aafbc3859a9428",
@@ -35,5 +35,11 @@
     "TMPDIR": "isolated synthetic home/tmp",
     "CODEX_DISABLE_TELEMETRY": "1",
     "RUST_LOG": "off"
+  },
+  "reproduction_files": {
+    "capture.py": "277909044dc3aabe0d4b1369d5c253eb8a429982d147691ce2f107e6f105050a",
+    "sanitize.py": "68388464cbf343a351d3afd4d047767507065e316cbfcc47c52d61bc130ce350",
+    "rpc_reader.py": "80372e4f2c465b8926d8d9cc89516794ed2b28f5f80a7e33995b233d935cf241",
+    "test_capture_helpers.py": "08f3c14d2243952fcd9a880148e2f661e5c12d3631a9a1cce9b7ab2c77e60cdc"
   }
 }

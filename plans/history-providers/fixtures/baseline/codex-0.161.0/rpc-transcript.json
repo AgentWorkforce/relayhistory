@@ -62,11 +62,11 @@
       "method": "remoteControl/status/changed",
       "params": {
         "status": "disabled",
-        "serverName": "Wills-MacBook-Pro-2.local",
+        "serverName": "synthetic-host.local",
         "installationId": "019b76da-a800-7000-8000-000000000177",
         "environmentId": null
       },
-      "emittedAtMs": 1792044894977
+      "emittedAtMs": 1792045435881
     }
   },
   {
@@ -103,7 +103,7 @@
           "status": {
             "type": "idle"
           },
-          "path": "/synthetic/codex-home/codex/sessions/2026/01/01/rollout-2026-01-01T00:00:00.000Zb76da-a800-7000-8000-000000000161.jsonl",
+          "path": "/synthetic/codex-home/codex/sessions/2026/01/01/rollout-2026-01-01T00-00-00-019b76da-a800-7000-8000-000000000161.jsonl",
           "cwd": "/synthetic/codex-home/workspace",
           "cliVersion": "0.161.0",
           "originator": "relayhistory-offline-fixture",
@@ -224,7 +224,7 @@
           "status": {
             "type": "idle"
           },
-          "path": "/synthetic/codex-home/codex/sessions/2026/01/01/rollout-2026-01-01T00:00:00.000Zb76da-a800-7000-8000-000000000161.jsonl",
+          "path": "/synthetic/codex-home/codex/sessions/2026/01/01/rollout-2026-01-01T00-00-00-019b76da-a800-7000-8000-000000000161.jsonl",
           "cwd": "/synthetic/codex-home/workspace",
           "cliVersion": "0.161.0",
           "originator": "relayhistory-offline-fixture",
@@ -239,7 +239,7 @@
           "turns": []
         }
       },
-      "emittedAtMs": 1792044895246
+      "emittedAtMs": 1792045436363
     }
   },
   {
@@ -265,7 +265,7 @@
         "summary": "Full-history hydration is deprecated for paginated threads; omit `includeTurns` or set it to `false`, then page with `thread/turns/list` and `thread/items/list`.",
         "details": null
       },
-      "emittedAtMs": 1792044895471
+      "emittedAtMs": 1792045436659
     }
   },
   {
@@ -302,7 +302,7 @@
           "status": {
             "type": "idle"
           },
-          "path": "/synthetic/codex-home/codex/sessions/2026/01/01/rollout-2026-01-01T00:00:00.000Zb76da-a800-7000-8000-000000000161.jsonl",
+          "path": "/synthetic/codex-home/codex/sessions/2026/01/01/rollout-2026-01-01T00-00-00-019b76da-a800-7000-8000-000000000161.jsonl",
           "cwd": "/synthetic/codex-home/workspace",
           "cliVersion": "0.161.0",
           "originator": "relayhistory-offline-fixture",
@@ -422,11 +422,11 @@
       "method": "remoteControl/status/changed",
       "params": {
         "status": "disabled",
-        "serverName": "Wills-MacBook-Pro-2.local",
+        "serverName": "synthetic-host.local",
         "installationId": "019b76da-a800-7000-8000-000000000177",
         "environmentId": null
       },
-      "emittedAtMs": 1792044895555
+      "emittedAtMs": 1792045437063
     }
   },
   {
@@ -438,7 +438,7 @@
           "type": "idle"
         }
       },
-      "emittedAtMs": 1792044895604
+      "emittedAtMs": 1792045437286
     }
   },
   {
@@ -475,7 +475,7 @@
           "status": {
             "type": "idle"
           },
-          "path": "/synthetic/codex-home/codex/sessions/2026/01/01/rollout-2026-01-01T00:00:00.000Zb76da-a800-7000-8000-000000000161.jsonl",
+          "path": "/synthetic/codex-home/codex/sessions/2026/01/01/rollout-2026-01-01T00-00-00-019b76da-a800-7000-8000-000000000161.jsonl",
           "cwd": "/synthetic/codex-home/workspace",
           "cliVersion": "0.161.0",
           "originator": "relayhistory-offline-fixture",
@@ -537,7 +537,7 @@
       "params": {
         "threadId": "019b76da-a800-7000-8000-000000000161"
       },
-      "emittedAtMs": 1792044895607
+      "emittedAtMs": 1792045437293
     }
   },
   {

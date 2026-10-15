@@ -178,6 +178,21 @@ probe is an upstream-supported way to materialize/read injected turns, or an
 independent public rollout reader pinned to this writer. This remains feasible
 public-source research, not an authentication requirement.
 
+## Capture-helper review corrections
+
+The Codex reproduction now drains stdout independently into a JSON-RPC queue;
+a coalesced notification/reply cannot wait on an empty underlying pipe while a
+reply is already buffered. Sanitization processes native rollout filenames before
+RFC3339 timestamps, accepts arbitrary capture dates/session date directories,
+and replaces the local `serverName` with `synthetic-host.local`. The native
+app-server probe was rerun, artifacts regenerated and digests refreshed.
+
+`python3 plans/history-providers/fixtures/baseline/codex-0.161.0/test_capture_helpers.py`
+— three offline regressions succeed. Reverting the filename normalization makes
+one regression fail on the malformed basename. The date/hostname case covers
+October 15, November and a subsequent year, including timezone offsets.
+The 15 public baseline cases are rerun against regenerated artifacts.
+
 ## Remaining acceptance work
 
 Keep #427 open. Use the per-provider matrix above for the remaining writer/export probes and

@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Sanitize only synthetic capture paths, generated UUIDs and wall-clock values."""
 import hashlib,json,pathlib,re,sys
-src=pathlib.Path(sys.argv[1]);out=pathlib.Path(__file__).parent
+src=pathlib.Path(sys.argv[1]);out=pathlib.Path(sys.argv[2]) if len(sys.argv)>2 else pathlib.Path(__file__).parent
+out.mkdir(parents=True,exist_ok=True)
 sid=src.joinpath('native-id.txt').read_text().strip();mapped={sid:'019b76da-a800-7000-8000-000000000161'}
 rows=[json.loads(line) for line in src.joinpath('rollout-0.jsonl').read_text().splitlines()]
 cwd=rows[0]['payload']['cwd'];home=str(pathlib.Path(cwd).parent)
@@ -12,13 +13,19 @@ def text(value):
   if original not in mapped:mapped[original]=f'019b76da-a800-7000-8000-{len(mapped)+161:012d}'
   return mapped[original]
  value=re.sub(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}',replace,value)
- value=re.sub(r'2026-10-\d{2}[T ][0-9:.+-]+Z?', '2026-01-01T00:00:00.000Z',value)
- value=re.sub(r'rollout-2026-10-\d{2}T\d{2}-\d{2}-\d{2}-','rollout-2026-01-01T00-00-00-',value)
- return value.replace("2026-10-14", "2026-01-01").replace("/sessions/2026/10/14/", "/sessions/2026/01/01/")
+ # Filename clocks use hyphens, unlike RFC3339 timestamps. Normalize the
+ # filename first and require colon-delimited clocks in the general rule.
+ value=re.sub(r'rollout-\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}-','rollout-2026-01-01T00-00-00-',value)
+ value=re.sub(r'\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})?', '2026-01-01T00:00:00.000Z',value)
+ value=re.sub(r'/sessions/\d{4}/\d{2}/\d{2}/', '/sessions/2026/01/01/',value)
+ return re.sub(r'\b\d{4}-\d{2}-\d{2}\b', '2026-01-01', value)
+
 def clean(v,key=''):
  if isinstance(v,dict):return {k:clean(x,k) for k,x in v.items()}
  if isinstance(v,list):return [clean(x,key) for x in v]
- if isinstance(v,str):return '2026-01-01' if key=='current_date' else text(v)
+ if isinstance(v,str):
+  if key=='serverName':return 'synthetic-host.local'
+  return '2026-01-01' if key=='current_date' else text(v)
  if isinstance(v,(int,float)) and key in ('createdAt','updatedAt','recencyAt','create_time'):return 1767225600
  return v
 rows=clean(rows)
