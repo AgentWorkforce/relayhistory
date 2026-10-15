@@ -626,6 +626,9 @@ fn redact_string(text: String, homes: &[String], stamp: bool) -> String {
     if stamp && text.starts_with("sha256:") {
         return "sha256:<content>".into();
     }
+    if stamp && text.starts_with("codex-sqlite-v2:sha256:") {
+        return "codex-sqlite-v2:sha256:<content>".into();
+    }
     let mut text = text;
     let mut replaced = false;
     for home in homes {
@@ -692,6 +695,14 @@ fn flush_digits(digits: &mut String, out: &mut String) {
 /// harness locally must see "no parser changed", not 46 stale snapshots.
 #[test]
 fn redaction_normalizes_windows_locators_to_the_committed_form() {
+    assert_eq!(
+        redact_string(
+            "codex-sqlite-v2:sha256:staged-path-digest".into(),
+            &[],
+            true
+        ),
+        "codex-sqlite-v2:sha256:<content>"
+    );
     let windows = vec![r"C:\Users\dev\AppData\Local\Temp\.tmpAbCd\claude__simple-turn".to_string()];
     assert_eq!(
         redact_string(

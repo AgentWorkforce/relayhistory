@@ -353,7 +353,7 @@
       "marker_uid": "sqlite:thread",
       "message_id": null,
       "parent_id": null,
-      "payload_json": "{\"agent_nickname\":null,\"agent_role\":null,\"archived\":false,\"name\":\"SQLite thread\",\"next_rollout_byte_offset\":0,\"source\":\"cli\"}",
+      "payload_json": "{\"agent_nickname\":null,\"agent_role\":null,\"archived\":false,\"content_hash\":\"fce1205a9da9ca9a7b5a442d9ea69b50ffd7924ee3ae20870f3da61b45058e1a\",\"history_ids\":[1],\"name\":\"SQLite thread\",\"next_rollout_byte_offset\":0,\"source\":\"cli\"}",
       "session_id": "sqlite-pruned-all-items",
       "source": "codex",
       "subkind": "sqlite",
@@ -503,7 +503,7 @@
       "repo_url": "https://example.test/team/app",
       "session_id": "sqlite-pruned-all-items",
       "source": "codex",
-      "source_stamp": "sha256:<content>",
+      "source_stamp": "codex-sqlite-v2:sha256:<content>",
       "title": "SQLite thread",
       "workspace_roots_json": null
     }
