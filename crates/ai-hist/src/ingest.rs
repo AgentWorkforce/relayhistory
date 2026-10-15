@@ -30,6 +30,7 @@ pub(crate) mod cold_read;
 pub(crate) mod control;
 pub(crate) mod cursor;
 pub(crate) mod devin;
+mod event_insert;
 mod evidence_probe;
 pub(crate) mod evidence_reconcile;
 mod evidence_upserts;
@@ -51,6 +52,7 @@ pub(crate) mod tool_result_facts;
 pub(crate) mod transcript_cursor;
 pub(crate) mod transcript_file;
 
+use event_insert::insert_session_event;
 pub(crate) use evidence_probe::note_deleted;
 use evidence_probe::{
     claude_sidecar_evidence_exists, claude_transcript_events_exist, codex_session_evidence_exists,
@@ -11182,10 +11184,6 @@ struct EventRow<'a> {
 
 /// Write one normalized event, including the columns only some providers can
 /// fill.
-fn insert_session_event(conn: &Connection, row: &EventRow<'_>) -> Result<()> {
-    sweep_session::write_event(conn, row)
-}
-
 /// One tool call as a provider record names it, with the record context its
 /// rows are written under.
 ///

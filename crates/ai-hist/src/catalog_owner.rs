@@ -37,7 +37,12 @@ pub(crate) fn incoming_must_not_replace(
     if stored == incoming || shared_sqlite_store(source, &stored) {
         return Ok(false);
     }
-    // A Codex rollout compressed since it was catalogued is still there.
+    // A Codex rollout can survive with fewer bytes than its SQLite history
+    // projection. Discovery only offers this locator for that case.
+    if source == "codex" && incoming.starts_with("sqlite:") {
+        return Ok(false);
+    }
+    // A compressed Codex rollout is present under its plain locator.
     Ok(crate::ingest::transcript_file::exists(Path::new(&stored)))
 }
 

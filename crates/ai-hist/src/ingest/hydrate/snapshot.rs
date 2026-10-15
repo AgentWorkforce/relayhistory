@@ -13,6 +13,34 @@ pub(super) fn source_snapshot(
     if let Some(refusal) = crate::sources::catalog::hydration_refusal(&options.source) {
         return Err(hydration_error("HYDRATION_UNSUPPORTED", refusal));
     }
+    if options.source == "codex" {
+        if let Some((path, id)) = target
+            .locator
+            .as_deref()
+            .and_then(crate::providers::codex::sqlite::parse_locator)
+        {
+            anyhow::ensure!(
+                id == options.session_id,
+                "SESSION_SOURCE_MISMATCH: Codex SQLite thread identity changed"
+            );
+            let acquired = crate::providers::codex::sqlite::capture(roots, &path, id)?;
+            return Ok(SourceSnapshot {
+                stamp: acquired.stamp.clone(),
+                bytes: 0,
+                records: SnapshotRecords::Counted(acquired.records),
+                path: Some(path),
+                claude_transcript: None,
+                devin_session: None,
+                scanned_bytes: 0,
+                provider_session: Some(acquired),
+                claude_subagents: Vec::new(),
+                scanned_superseded: false,
+                stamped_cursors: Vec::new(),
+                opencode_layout: None,
+                codex_relationship_complete: true,
+            });
+        }
+    }
     if let Some(adapter) = crate::providers::adapter(&options.source) {
         let locator = target.locator.as_deref().ok_or_else(|| {
             hydration_error(

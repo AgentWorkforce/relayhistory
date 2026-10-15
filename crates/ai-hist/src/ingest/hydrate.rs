@@ -9,10 +9,12 @@ use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::time::Instant;
 
+mod codex_selected;
 mod probe;
 mod snapshot;
 mod unified_diff;
 
+pub(crate) use codex_selected::ingest_selected_codex;
 pub(crate) use probe::HydrationProbe;
 use snapshot::source_snapshot;
 use unified_diff::split_unified_diff;
@@ -1788,6 +1790,12 @@ fn unchanged_cursor_check(
     options: &HydrateSessionOptions,
     snapshot: &SourceSnapshot,
 ) -> Result<UnchangedCursorCheck> {
+    if snapshot.provider_session.is_some() {
+        return Ok(UnchangedCursorCheck {
+            valid: true,
+            bytes_read: 0,
+        });
+    }
     if !matches!(options.source.as_str(), "claude" | "codex") {
         return Ok(UnchangedCursorCheck {
             valid: true,
@@ -2318,12 +2326,6 @@ pub(crate) fn ingest_selected_claude(ctx: SelectedIngest<'_>) -> Result<Selected
         ctx.parser_upgrade,
     )
     .map(|outcome| (outcome, Vec::new(), None))
-}
-
-pub(crate) fn ingest_selected_codex(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
-    let path = ctx.file();
-    ingest_codex(ctx.conn, ctx.options, path, ctx.cursor, ctx.parser_upgrade)
-        .map(|outcome| (outcome, Vec::new(), None))
 }
 
 pub(crate) fn ingest_selected_cursor(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
@@ -3083,60 +3085,6 @@ pub(crate) fn claude_subagent_meta_path(transcript: &Path) -> PathBuf {
 fn claude_subagent_meta(transcript: &Path) -> Option<Value> {
     let path = claude_subagent_meta_path(transcript);
     serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
-}
-
-fn ingest_codex(
-    conn: &Connection,
-    options: &HydrateSessionOptions,
-    path: &Path,
-    cursor: &mut TranscriptCursorState,
-    parser_upgrade: bool,
-) -> Result<IngestOutcome> {
-    let (meta, meta_bytes) = read_codex_session_meta_counted(path)?;
-    let meta = meta.ok_or_else(|| {
-        hydration_error(
-            "SESSION_SOURCE_MISMATCH",
-            "Codex rollout has no session metadata",
-        )
-    })?;
-    if meta.session_id != options.session_id || meta.is_subagent {
-        return Err(hydration_error(
-            "SESSION_SOURCE_MISMATCH",
-            "Codex rollout identity does not match the selected root session",
-        ));
-    }
-    let mut indexed = IngestOutcome {
-        bytes_read: meta_bytes as i64,
-        ..Default::default()
-    };
-    let (outcome, pass) = ingest_codex_rollout_incremental(conn, path, &meta, cursor)?;
-    indexed.absorb(pass);
-    if let Some(first) = outcome.first_ts {
-        upsert_session(
-            conn,
-            &SessionCatalogRow {
-                session_id: &meta.session_id,
-                source: "codex",
-                cwd: Some(&meta.cwd),
-                git_branch: meta.git_branch.as_deref(),
-                first_ts: first,
-                last_ts: outcome.last_ts.unwrap_or(first),
-                last_assistant_text: outcome.last_assistant_text.as_deref(),
-                raw_path: Some(&path.to_string_lossy()),
-            },
-        )?;
-    }
-    if options.include_related {
-        // Codex records continuity only when a producer writes explicit
-        // fields on `session_meta`; a plain `codex resume` leaves no signal.
-        indexed.bytes_read += crate::continuity::capture_codex_rollout(conn, path)? as i64;
-        // Each child's own continuity is captured with it (a spawned
-        // subagent's `thread_spawn` parent is a fork edge that lives only in
-        // the child's `session_meta`), so reconcile once they are all banked.
-        indexed.absorb_outcome(ingest_codex_children(conn, options, path, parser_upgrade)?);
-        crate::continuity::reconcile(conn, "codex")?;
-    }
-    Ok(indexed)
 }
 
 /// Rollout files that could hold a child of a session started in `directory`.

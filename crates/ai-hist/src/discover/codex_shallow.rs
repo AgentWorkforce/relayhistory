@@ -29,7 +29,10 @@ impl CodexProvider {
             };
             state.names = Some(names);
         }
-        Ok(state.names.as_ref().and_then(|names| names.get(session_id).cloned()))
+        Ok(state
+            .names
+            .as_ref()
+            .and_then(|names| names.get(session_id).cloned()))
     }
 }
 
@@ -54,7 +57,26 @@ impl ShallowSessionProvider for CodexProvider {
         vec![
             WatchRoot::tree(roots.codex.join("sessions")),
             WatchRoot::tree(roots.codex.join("archived_sessions")),
+            WatchRoot::directory_of(roots.codex, WatchEntries::CodexStores),
         ]
+    }
+
+    fn fingerprint_inputs(&self, env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
+        let mut inputs = Vec::new();
+        for root in [
+            env.codex_home.join("sessions"),
+            env.codex_home.join("archived_sessions"),
+        ] {
+            inputs.extend(file_candidates(
+                "codex",
+                crate::collect_matching_files(&root, "rollout-", "jsonl")?,
+                crate::file_stamp_and_modified,
+            )?);
+        }
+        inputs.extend(crate::providers::codex::sqlite::fingerprint(
+            &env.codex_home,
+        )?);
+        Ok(inputs)
     }
 
     fn enumerate(
@@ -63,7 +85,9 @@ impl ShallowSessionProvider for CodexProvider {
         _requested_limit: Option<usize>,
     ) -> Result<Vec<Candidate>> {
         *self.thread_names.lock().expect("codex thread names lock") = CodexThreadNames {
-            index: Some(crate::ingest::codex_thread_names::session_index_path(&env.codex_home)),
+            index: Some(crate::ingest::codex_thread_names::session_index_path(
+                &env.codex_home,
+            )),
             names: None,
         };
         let mut files = Vec::new();
@@ -74,7 +98,12 @@ impl ShallowSessionProvider for CodexProvider {
         ] {
             files.extend(crate::ingest::codex_rollout_locators(&root, scope)?);
         }
-        file_candidates("codex", files, crate::file_stamp_and_modified)
+        let (sqlite, incomplete_rollouts) =
+            crate::providers::codex::sqlite::enumerate(&env.codex_home, &env.provider_roots)?;
+        files.retain(|path| !incomplete_rollouts.contains(path));
+        let mut candidates = file_candidates("codex", files, crate::file_stamp_and_modified)?;
+        candidates.extend(sqlite);
+        Ok(candidates)
     }
 
     fn read_shallow(
@@ -83,6 +112,9 @@ impl ShallowSessionProvider for CodexProvider {
         _catalog: Option<&Connection>,
         candidate: &Candidate,
     ) -> Result<Option<ShallowSession>> {
+        if crate::providers::codex::sqlite::parse_locator(&candidate.locator).is_some() {
+            return crate::providers::codex::sqlite::shallow(scan, candidate);
+        }
         let path = PathBuf::from(&candidate.locator);
         let bounded = read_bounded_jsonl(scan, &path)?;
         let Some(meta) = bounded.head_records().next().and_then(|line| {

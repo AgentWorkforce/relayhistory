@@ -41,6 +41,7 @@ fn sync_codex_rollouts_and_history(
     let (cwds, branches, mut inserted) = sync_codex_rollouts_with_repairs_and_coverage(
         conn, state, root, repairs, coverage, touched, paths,
     )?;
+    inserted += sync_codex_sqlite_scoped(conn, state, root, repairs, coverage, touched, paths)?;
     let path = root.join("history.jsonl");
     // One incremental file. A tick whose paths are rollouts has nothing new
     // in it, and opening it on every append is a read the backstop still does.
@@ -95,6 +96,44 @@ fn sync_codex_rollouts_and_history(
         sync_note!("  [codex] {}", parts.join(", "));
     }
     Ok(inserted)
+}
+
+fn sync_codex_sqlite_scoped(
+    conn: &Connection,
+    state: &mut Map<String, Value>,
+    root: &Path,
+    repairs: &SweepRepairs,
+    coverage: &mut SweepCoverage,
+    touched: &mut HashSet<String>,
+    paths: Option<&super::path_scope::PathScope>,
+) -> Result<usize> {
+    let Some((state_db, history_db)) = crate::providers::codex::sqlite::databases(root)? else {
+        return Ok(0);
+    };
+    let changed = paths.is_none()
+        || !repairs.is_empty()
+        || paths.is_some_and(|scope| {
+            scope.mentions(&root.join("sessions"))
+                || scope.mentions(&root.join("archived_sessions"))
+        })
+        || [state_db, history_db].iter().any(|file| {
+            ["", "-wal", "-shm", "-journal"].iter().any(|suffix| {
+                super::path_scope::file_in_scope(
+                    paths,
+                    &PathBuf::from(format!("{}{suffix}", file.display())),
+                )
+            })
+        });
+    if changed {
+        let (inserted, read) = crate::providers::codex::sqlite::sync(conn, state, root, repairs)?;
+        for id in read {
+            coverage.note_read("codex", &id, true);
+            touched.insert(id);
+        }
+        Ok(inserted)
+    } else {
+        Ok(0)
+    }
 }
 
 /// What one pass over the new lines of Codex's `history.jsonl` did.
