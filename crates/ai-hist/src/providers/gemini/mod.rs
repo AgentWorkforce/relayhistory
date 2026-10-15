@@ -5,6 +5,7 @@ use crate::hydrate::{IngestOutcome, SelectedIngest, SelectedIngestResult};
 use crate::sources::catalog::{Discovery, Fixtures, Hydration, LocalSource, Relationships};
 use crate::EvidenceKind;
 use anyhow::Context;
+use sha2::{Digest, Sha256};
 use std::io::Read;
 mod format;
 mod normalize;
@@ -33,7 +34,7 @@ pub(crate) const METADATA: ProviderMetadata = ProviderMetadata {
     }),
 };
 pub(crate) const ADAPTER: Option<ProviderAdapter> = Some(ProviderAdapter {
-    generation: "gemini_journal_v3",
+    generation: "gemini_journal_v4",
     acquire,
     sweep,
     resolve_roots,
@@ -172,7 +173,7 @@ fn snapshot(path: &Path, context: &AcquisitionContext<'_>) -> Result<AcquiredSes
                 == legacy.payload["conversation"]["projectHash"],
         "GEMINI_ID_COLLISION: migration sibling metadata mismatch"
     );
-    journal.payload["legacyBytes"] = legacy.payload["bytes"].clone();
+    journal.payload["legacyBytesSha256"] = legacy.payload["bytesSha256"].clone();
     journal.payload["legacyPath"] = legacy.read_paths[0].to_string_lossy().to_string().into();
     journal.payload["migrationJournal"] =
         journal.read_paths[0].to_string_lossy().to_string().into();
@@ -195,7 +196,7 @@ fn snapshot_file(path: &Path, context: &AcquisitionContext<'_>) -> Result<Acquir
     payload["ledgerId"] = sid.into();
     let records = payload["records"].as_array().map_or(0, Vec::len) as i64;
     // Exact bytes, including whitespace and the incomplete tail, enter the stamp.
-    payload["bytes"] = serde_json::to_value(&bytes)?;
+    payload["bytesSha256"] = format!("{:x}", Sha256::digest(&bytes)).into();
     Ok(AcquiredSession::new(
         payload,
         bytes.len() as i64,

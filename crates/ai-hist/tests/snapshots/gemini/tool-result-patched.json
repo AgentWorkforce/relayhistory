@@ -445,7 +445,7 @@
       "repo_url": null,
       "session_id": "11111111-1111-4111-8111-111111111111",
       "source": "gemini",
-      "source_stamp": "gemini_journal_v3:sha256:42ed287e1bd434bd1cbfc3f<n>b65a4f05ebc8eb4bfe508409488f06a",
+      "source_stamp": "gemini_journal_v4:sha256:47635685bf8a3daf666bf2d6ebdc287ea299ee40c844638bbdc12ac2cfc3e3d2",
       "title": null,
       "workspace_roots_json": null
     }

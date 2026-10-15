@@ -173,7 +173,7 @@
       "repo_url": null,
       "session_id": "33333333-3333-4333-8333-333333333333",
       "source": "gemini",
-      "source_stamp": "gemini_journal_v3:sha256:416618e9064dbab71f3b5f55931283ee7c74155cf3dcae5004892cfbc555f020",
+      "source_stamp": "gemini_journal_v4:sha256:bea22228e934c8149c796a0977fb0455f2802942b01386a18b<n>fe24",
       "title": null,
       "workspace_roots_json": null
     }

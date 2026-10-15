@@ -318,7 +318,7 @@ fn tool(
         keys.results.insert(id.into());
     }
     let uid = format!("{}:result:{index}", base.message_id);
-    insert_session_event(
+    crate::ingest::sweep_session::write_event_with_message_id(
         conn,
         &EventRow {
             event_uid: &uid,
@@ -331,6 +331,7 @@ fn tool(
             tool_result_facts: Some(&facts),
             ..*base
         },
+        result_message.map(|(id, _)| id.as_str()),
     )?;
     keys.events.insert(uid);
     Ok(())

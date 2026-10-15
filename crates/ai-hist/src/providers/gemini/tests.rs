@@ -426,3 +426,44 @@ fn shallow_recency_distinguishes_real_eof_from_truncated_window() {
     );
     assert!(format::recent_time(b"garbage", false, true, &header).is_err());
 }
+
+#[test]
+fn source_stamp_hashes_exact_bytes_without_expanding_them() {
+    let (_home, roots, path) = fixture();
+    let context = AcquisitionContext::new(ID, &roots);
+    let first = snapshot(&path, &context).unwrap();
+    assert!(first.payload.get("bytes").is_none());
+    assert_eq!(first.payload["bytesSha256"].as_str().unwrap().len(), 64);
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes.push(b' ');
+    std::fs::write(&path, bytes).unwrap();
+    let second = snapshot(&path, &context).unwrap();
+    assert_ne!(first.stamp, second.stamp);
+    assert_ne!(first.payload["bytesSha256"], second.payload["bytesSha256"]);
+}
+
+#[test]
+fn inline_result_without_response_record_has_absent_message_identity() {
+    let (home, roots, path) = fixture();
+    let mut payload = snapshot(&path, &AcquisitionContext::new(ID, &roots))
+        .unwrap()
+        .payload;
+    payload["conversation"]["messages"]
+        .as_array_mut()
+        .unwrap()
+        .retain(|m| {
+            !m["content"]
+                .as_array()
+                .is_some_and(|parts| parts.iter().any(|p| p.get("functionResponse").is_some()))
+        });
+    let conn = crate::open_db(&home.path().join("test.db")).unwrap();
+    normalize::write(&conn, &payload, &path).unwrap();
+    let identity: Option<String> = conn
+        .query_row(
+            "SELECT message_id FROM session_events WHERE source='gemini' AND kind='tool_result'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(identity, None);
+}

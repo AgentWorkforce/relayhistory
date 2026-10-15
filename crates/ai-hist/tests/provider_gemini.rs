@@ -530,3 +530,42 @@ fn gemini_complete_unterminated_final_activity_is_discovered() {
         assert!(has(&read(&store), "Found the synthetic Gemini needle."));
     }
 }
+
+#[test]
+fn gemini_anonymous_inline_result_remains_absent_and_stable() {
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path());
+    let records = FIXTURE
+        .lines()
+        .filter(|line| {
+            let row: serde_json::Value = serde_json::from_str(line).unwrap();
+            !row["content"]
+                .as_array()
+                .is_some_and(|parts| parts.iter().any(|p| p.get("functionResponse").is_some()))
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    std::fs::write(&path, records).unwrap();
+    let store = open(home.path());
+    discover(&store);
+    hydrate(&store);
+    let first = read(&store);
+    assert_eq!(first.tool_results[0].message_id, None);
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    let watermark = store.head_revision().unwrap();
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    assert_eq!(read(&store).messages, first.messages);
+    assert_eq!(
+        store
+            .changes_since(
+                watermark,
+                ai_hist::ChangeQuery::default()
+                    .session("gemini", SID)
+                    .kinds([ai_hist::ChangeKind::SessionEvent])
+            )
+            .unwrap()
+            .count(),
+        0
+    );
+}
