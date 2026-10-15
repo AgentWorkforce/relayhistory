@@ -21,10 +21,8 @@ fn a_pruned_rollout_is_read_again_after_it_was_restored() {
     let rollout = codex.join("sessions/2026/04/20/rollout-rollout-primary.jsonl");
     std::fs::create_dir_all(rollout.parent().unwrap()).unwrap();
     std::fs::write(&rollout, "complete rollout").unwrap();
-    let mut roots = crate::ProviderRoots::from_home(
-        dir.path().to_path_buf(),
-        dir.path().join("opencode.db"),
-    );
+    let home = dir.path().to_path_buf();
+    let mut roots = crate::ProviderRoots::from_home(home, dir.path().join("opencode.db"));
     roots.codex = codex.clone();
     assert!(enumerate(&codex, &roots).unwrap().0.is_empty());
 
