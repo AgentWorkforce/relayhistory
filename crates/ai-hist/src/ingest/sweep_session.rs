@@ -155,6 +155,16 @@ pub(super) fn note_presence(conn: &Connection, source: &str, session_id: &str) -
 /// Inside a sweep guard the catalog arm is the cached lookup, bound as
 /// `?41` / `?42`, instead of a `sessions` subquery on every row.
 pub(super) fn write_event(conn: &Connection, row: &super::EventRow<'_>) -> Result<()> {
+    write_event_with_message_id(conn, row, Some(row.message_id))
+}
+
+/// Bind an explicitly absent native message ID without an insert/update cycle.
+/// Existing callers retain their string identity semantics through `write_event`.
+pub(super) fn write_event_with_message_id(
+    conn: &Connection,
+    row: &super::EventRow<'_>,
+    message_id: Option<&str>,
+) -> Result<()> {
     let bound = touch(conn, row.source, row.session_id)?;
     let resolved = row
         .cwd
@@ -166,7 +176,14 @@ pub(super) fn write_event(conn: &Connection, row: &super::EventRow<'_>) -> Resul
         CatalogBind::Subquery => None,
         CatalogBind::Cached(project) => Some(project),
     };
-    execute_event(conn, row, resolved_key, resolved_method, catalog)
+    execute_event(
+        conn,
+        row,
+        resolved_key,
+        resolved_method,
+        catalog,
+        message_id,
+    )
 }
 
 fn touch(conn: &Connection, source: &str, session_id: &str) -> Result<CatalogBind> {
@@ -294,6 +311,7 @@ fn execute_event(
     resolved_key: Option<&str>,
     resolved_method: Option<&str>,
     catalog: Option<&Project>,
+    message_id: Option<&str>,
 ) -> Result<()> {
     let &super::EventRow {
         source,
@@ -301,7 +319,7 @@ fn execute_event(
         project,
         cwd,
         git_branch,
-        message_id,
+        message_id: _,
         parent_id,
         ts_ms,
         role,
@@ -475,6 +493,54 @@ mod tests {
         )
         .unwrap();
         dir.to_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn explicit_missing_message_identity_is_null_and_repeat_write_is_unchanged() {
+        for cached in [false, true] {
+            let (_dir, conn) = store();
+            let guard = cached.then(|| SweepWrite::begin(&conn).unwrap());
+            let row = event("session", "anonymous", None);
+            super::write_event_with_message_id(&conn, &row, None).unwrap();
+            let before: (Option<String>, i64) = conn
+                .query_row(
+                    "SELECT message_id, revision FROM session_events WHERE event_uid='anonymous'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(before.0, None);
+            super::write_event_with_message_id(&conn, &row, None).unwrap();
+            let after: (Option<String>, i64) = conn
+                .query_row(
+                    "SELECT message_id, revision FROM session_events WHERE event_uid='anonymous'",
+                    [],
+                    |r| Ok((r.get(0)?, r.get(1)?)),
+                )
+                .unwrap();
+            assert_eq!(
+                after, before,
+                "an unchanged anonymous event cannot churn revisions"
+            );
+            let legacy = super::super::EventRow {
+                message_id: "",
+                ..event("session", "legacy", None)
+            };
+            insert_session_event(&conn, &legacy).unwrap();
+            let stored: Option<String> = conn
+                .query_row(
+                    "SELECT message_id FROM session_events WHERE event_uid='legacy'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(
+                stored.as_deref(),
+                Some(""),
+                "existing writer semantics stay unchanged"
+            );
+            drop(guard);
+        }
     }
 
     #[test]
