@@ -419,6 +419,13 @@ mod tests {
             "INVALID_PROFILE: invalid profile name"
         );
         assert!(frozen.ensure_provider_roots("pi").is_ok());
+        let missing = Path::new("/nonexistent-provider-evidence");
+        assert_eq!(
+            crate::providers::validate_provider_path("test-fixture", missing, &frozen)
+                .unwrap_err()
+                .to_string(),
+            "INVALID_PROFILE: invalid profile name"
+        );
         let mut legacy = serde_json::to_value(ProviderRoots::from_home(
             "/tmp/legacy".into(),
             "/tmp/legacy/opencode.db".into(),
