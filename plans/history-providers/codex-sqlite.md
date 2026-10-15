@@ -79,8 +79,10 @@ Item types observed (kjg-lap counts): `reasoning` 233967, `commandExecution`
 | `thread_turns.error_json` | `message, codexErrorInfo` | turn error marker (e.g. `usageLimitExceeded`) |
 
 Item ids are Codex's native ids (`msg_…`, `rs_…`, `exec-…`, UUIDv7 for user
-messages), the same ids the rollout parser sees, so a thread read from both
-layouts dedupes on `event_uid`.
+messages). The rollout parser often uses a line-derived `event_uid`, and a
+patch's file-edit id can differ from the SQLite `fileChange` id. Reconciliation
+therefore uses the projection's byte offset when a rollout finishes instead
+of assuming every ledger key matches across layouts.
 
 ## Design
 
@@ -107,8 +109,11 @@ layouts dedupes on `event_uid`.
 - **Usage.** No per-request usage exists; expose `threads.tokens_used` as a
   single cumulative snapshot marker and nothing else. Do not synthesize
   per-message usage.
-- **Writes.** Upsert by native id; an item that later appears in a rollout
-  re-read must not duplicate.
+- **Writes.** Upsert SQLite items by native id. The SQLite provenance marker
+  records `next_rollout_byte_offset`; once the rollout reaches that offset,
+  retire provisional SQLite events, tools, edits and markers in one
+  per-session pass. Relationship rows share the provider child identity and
+  remain one row when the rollout records the same delegation.
 - **Resume.** `codex resume <id>` still applies.
 
 ## Fixtures

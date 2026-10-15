@@ -189,7 +189,7 @@ pub(crate) fn normalize(conn: &Connection, capture: &Capture, state: &Path) -> R
         "sqlite:thread",
         t.created,
         "session_metadata",
-        &json!({"archived":t.archived,"source":t.source,"name":t.name,"agent_nickname":t.agent_nickname,"agent_role":t.agent_role}),
+        &json!({"archived":t.archived,"source":t.source,"name":t.name,"agent_nickname":t.agent_nickname,"agent_role":t.agent_role,"next_rollout_byte_offset":t.next_offset}),
         None,
     )?;
     for edge in &capture.edges {

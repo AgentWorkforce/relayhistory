@@ -5960,7 +5960,7 @@ fn ingest_codex_rollout_incremental(
     // is the half-written tail of a live rollout and the next pass re-reads
     // it. Unlike Claude, no Codex writer leaves its last line unterminated.
     let (mut reader, mut replay_gate, probe_bytes) =
-        rollout_head::open_codex_walk(path, cursor.file.as_ref(), meta)?;
+        rollout_head::open_codex_walk(conn, path, cursor, meta)?;
     let mut pass = transcript_cursor::IncrementalPass {
         rotated: reader.rotated,
         ..Default::default()
