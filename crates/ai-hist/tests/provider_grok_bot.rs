@@ -1,64 +1,15 @@
 //! Public Grok Bot acquisition acceptance, using only invented local blobs.
+#[path = "provider_support/grok_bot_fixture.rs"]
+mod grok_bot_fixture;
 mod provider_support;
 
 use ai_hist::{
     DiscoveryOptions, HydrateOptions, ProviderRoots, Role, SessionQuery, SessionRef, SessionStore,
     Source, StoreOptions, SyncOptions,
 };
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 const SID: &str = "fixture-bot-complete";
-
-fn fixture_root() -> PathBuf {
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/grok-bot/replicas");
-    #[cfg(target_os = "macos")]
-    {
-        root.join("Library/Application Support/Grok Bot/sand-client-persistence")
-    }
-    #[cfg(target_os = "windows")]
-    {
-        root.join("AppData/Roaming/Grok Bot/sand-client-persistence")
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        root.join(".config/Grok Bot/sand-client-persistence")
-    }
-}
-
-fn persistence(home: &Path) -> PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        home.join("Library/Application Support/Grok Bot/sand-client-persistence")
-    }
-    #[cfg(target_os = "windows")]
-    {
-        home.join("AppData/Roaming/Grok Bot/sand-client-persistence")
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        home.join(".config/Grok Bot/sand-client-persistence")
-    }
-}
-
-fn stage(home: &Path) -> PathBuf {
-    let source = fixture_root();
-    let target = persistence(home);
-    std::fs::create_dir_all(&target).unwrap();
-    let mut complete = None;
-    for entry in std::fs::read_dir(source).unwrap() {
-        let path = entry.unwrap().path();
-        let bytes = std::fs::read(&path).unwrap();
-        let dest = target.join(path.file_name().unwrap());
-        if bytes
-            .windows(b"Plan a fixture picnic.".len())
-            .any(|w| w == b"Plan a fixture picnic.")
-        {
-            complete = Some(dest.clone());
-        }
-        std::fs::write(dest, bytes).unwrap();
-    }
-    complete.unwrap()
-}
 
 fn open(home: &Path) -> SessionStore {
     SessionStore::open(
@@ -75,7 +26,7 @@ fn open(home: &Path) -> SessionStore {
 #[test]
 fn grok_bot_discover_hydrate_read_reopen_changes_export_fullsync() {
     let home = tempfile::tempdir().unwrap();
-    stage(home.path());
+    grok_bot_fixture::stage(home.path());
     let evidence = provider_support::assert_history_conformance(
         home.path(),
         provider_support::HistoryCase {
@@ -114,11 +65,18 @@ fn grok_bot_discover_hydrate_read_reopen_changes_export_fullsync() {
 #[test]
 fn grok_bot_sliding_window_accumulates_and_ignores_unrelated_files() {
     let home = tempfile::tempdir().unwrap();
-    let path = stage(home.path());
-    let user_data = persistence(home.path()).parent().unwrap().to_path_buf();
+    let path = grok_bot_fixture::stage(home.path());
+    let user_data = grok_bot_fixture::persistence(home.path())
+        .parent()
+        .unwrap()
+        .to_path_buf();
     std::fs::write(user_data.join("sand-secrets.json"), b"not JSON credentials").unwrap();
     std::fs::write(user_data.join("Cookies"), b"not a transcript").unwrap();
-    std::fs::write(persistence(home.path()).join("unrelated.blob"), b"not JSON").unwrap();
+    std::fs::write(
+        grok_bot_fixture::persistence(home.path()).join("unrelated.blob"),
+        b"not JSON",
+    )
+    .unwrap();
     let store = open(home.path());
     let discovered = store
         .discover(DiscoveryOptions::default().sources([Source::GrokBot]))

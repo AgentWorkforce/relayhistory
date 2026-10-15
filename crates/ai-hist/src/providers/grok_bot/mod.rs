@@ -47,7 +47,29 @@ pub(crate) const ADAPTER: Option<ProviderAdapter> = Some(ProviderAdapter {
     },
 });
 
+#[derive(Clone, Copy)]
+#[allow(dead_code)] // All variants are exercised by the cross-platform root test.
+enum DesktopPlatform {
+    Macos,
+    Windows,
+    Linux,
+}
+
 fn resolve_roots(home: &Path, use_env: bool) -> ResolvedProviderRoots {
+    #[cfg(target_os = "macos")]
+    let platform = DesktopPlatform::Macos;
+    #[cfg(target_os = "windows")]
+    let platform = DesktopPlatform::Windows;
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let platform = DesktopPlatform::Linux;
+    resolve_roots_for_platform(home, use_env, platform)
+}
+
+fn resolve_roots_for_platform(
+    home: &Path,
+    use_env: bool,
+    platform: DesktopPlatform,
+) -> ResolvedProviderRoots {
     let override_dir = use_env
         .then(|| std::env::var("GROK_BOT_USER_DATA").ok())
         .flatten()
@@ -56,35 +78,54 @@ fn resolve_roots(home: &Path, use_env: bool) -> ResolvedProviderRoots {
         Some(value) if value == "~" => home.to_path_buf(),
         Some(value) if value.starts_with("~/") => home.join(&value[2..]),
         Some(value) => PathBuf::from(value),
-        None => default_user_data(home, use_env),
+        None => default_user_data(home, use_env, platform),
     };
     vec![user_data.join("sand-client-persistence")].into()
 }
 
-fn default_user_data(home: &Path, use_env: bool) -> PathBuf {
-    #[cfg(target_os = "macos")]
-    {
-        let _ = use_env;
-        home.join("Library/Application Support/Grok Bot")
-    }
-    #[cfg(target_os = "windows")]
-    {
-        use_env
+fn default_user_data(home: &Path, use_env: bool, platform: DesktopPlatform) -> PathBuf {
+    match platform {
+        DesktopPlatform::Macos => home.join("Library/Application Support/Grok Bot"),
+        DesktopPlatform::Windows => use_env
             .then(|| std::env::var_os("APPDATA"))
             .flatten()
             .map(PathBuf::from)
             .unwrap_or_else(|| home.join("AppData/Roaming"))
-            .join("Grok Bot")
-    }
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    {
-        use_env
+            .join("Grok Bot"),
+        DesktopPlatform::Linux => use_env
             .then(|| std::env::var_os("XDG_CONFIG_HOME"))
             .flatten()
             .map(PathBuf::from)
             .filter(|path| path.is_absolute())
             .unwrap_or_else(|| home.join(".config"))
-            .join("Grok Bot")
+            .join("Grok Bot"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_roots_covers_desktop_platforms() {
+        let home = Path::new("/fixture-home");
+        for (platform, relative) in [
+            (
+                DesktopPlatform::Macos,
+                "Library/Application Support/Grok Bot/sand-client-persistence",
+            ),
+            (
+                DesktopPlatform::Windows,
+                "AppData/Roaming/Grok Bot/sand-client-persistence",
+            ),
+            (
+                DesktopPlatform::Linux,
+                ".config/Grok Bot/sand-client-persistence",
+            ),
+        ] {
+            let roots = resolve_roots_for_platform(home, false, platform);
+            assert_eq!(roots.paths, vec![home.join(relative)]);
+        }
     }
 }
 

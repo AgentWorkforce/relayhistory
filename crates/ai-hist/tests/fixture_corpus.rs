@@ -32,6 +32,9 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime};
 
+#[path = "provider_support/grok_bot_fixture.rs"]
+mod grok_bot_fixture;
+
 // ---------------------------------------------------------------------------
 // manifest
 // ---------------------------------------------------------------------------
@@ -47,6 +50,8 @@ enum Layout {
     /// A directory whose contents are copied verbatim into `HOME`. Used for
     /// every fixture whose provider layout is itself part of the fixture.
     HomeTree,
+    /// Short synthetic Grok Bot JSON files staged under native base32 keys.
+    GrokBotReplicas,
     /// SQL fixture applied at a provider-owned relative home path.
     #[allow(dead_code)] // Used by admitted SQLite providers.
     Sqlite(&'static str),
@@ -203,6 +208,9 @@ fn stage(fixture: &Fixture, home: &Path) {
                 copy_tree(&root.join(file), home);
             }
         }
+        Layout::GrokBotReplicas => {
+            grok_bot_fixture::stage(home);
+        }
         Layout::Sqlite(relative) => {
             let path = home.join(relative);
             fs::create_dir_all(path.parent().expect("SQLite parent")).unwrap();
@@ -317,6 +325,8 @@ fn capture(fixture: &Fixture, home: &Path) -> Value {
     let opencode_db = home.join(".local/share/opencode/opencode.db");
     std::env::set_var("HOME", home);
     std::env::set_var("USERPROFILE", home);
+    std::env::set_var("APPDATA", home.join("AppData/Roaming"));
+    std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
     std::env::set_var("OPENCODE_DB", &opencode_db);
     // Devin's root follows `XDG_DATA_HOME`; pin it to the staged home so a
     // host that sets the variable does not leak its real store into a
@@ -593,7 +603,7 @@ fn redact_string(text: String, homes: &[String], stamp: bool) -> String {
     if replaced {
         text = text.replace('\\', "/");
         // Grok Bot follows Electron's platform-specific userData convention.
-        // Its three synthetic fixture trees represent the same store.
+        // Normalize the one staged fixture across each runner's path.
         for user_data in [
             "Library/Application Support/Grok Bot",
             ".config/Grok Bot",

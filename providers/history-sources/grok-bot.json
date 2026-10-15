@@ -8,7 +8,7 @@
     {
       "source": "grok-bot",
       "name": "replicas",
-      "layout": "HomeTree",
+      "layout": "GrokBotReplicas",
       "origin": "RelayHistory",
       "files": ["grok-bot/replicas"],
       "quirk": "Synthetic complete and truncated transcript tails in two account slots, roster titles, widget response, cloud-agent round trip, and voice turns."

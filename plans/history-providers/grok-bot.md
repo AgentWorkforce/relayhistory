@@ -130,10 +130,10 @@ runs host-side and only surfaces as text, widgets and approvals.
    overridable by `GROK_BOT_USER_DATA`), bounded shallow read (decode key,
    parse envelope header and the last entry only), and the upsert-only
    normalization above.
-4. Synthetic fixture under `crates/ai-hist/tests/fixtures/grok-bot/` (`HomeTree`
-   layout, base32 file names generated, every value invented) covering: a
-   complete replica from `tbs0`, a truncated replica with
-   `precedingTimestampMs`, a widget with `respondedValue`, a cloud-agent
+4. Synthetic fixture under `crates/ai-hist/tests/fixtures/grok-bot/` (short
+   JSON files and a key manifest staged under base32 names at test time,
+   every value invented) covering: a complete replica from `tbs0`, a truncated
+   replica with `precedingTimestampMs`, a widget with `respondedValue`, a cloud-agent
    round trip, a voice call and a second account slot.
 5. Snapshot, `provider_grok_bot.rs` conformance test, generator run, capture
    cells, changelog entry.
