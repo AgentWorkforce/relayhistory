@@ -405,3 +405,24 @@ fn nested_patch_extensions_fail_even_when_target_is_unknown() {
         "direct patch"
     );
 }
+
+#[test]
+fn shallow_recency_distinguishes_real_eof_from_truncated_window() {
+    let header = serde_json::json!({"lastUpdated":"2026-10-11T12:00:00Z", "sessionId":"s"});
+    let bytes = b"{\"$set\":{\"lastUpdated\":\"2026-10-12T12:30:00Z\"}}";
+    assert_eq!(
+        format::recent_time(bytes, false, true, &header).unwrap().0,
+        1791808200000
+    );
+    assert_eq!(
+        format::recent_time(bytes, false, false, &header).unwrap().0,
+        format::date(&header, "lastUpdated").unwrap()
+    );
+    assert_eq!(
+        format::recent_time(b"{\"$set\":", false, true, &header)
+            .unwrap()
+            .0,
+        format::date(&header, "lastUpdated").unwrap()
+    );
+    assert!(format::recent_time(b"garbage", false, true, &header).is_err());
+}

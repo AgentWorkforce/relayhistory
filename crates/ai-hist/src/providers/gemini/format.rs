@@ -356,28 +356,38 @@ fn records(bytes: &[u8], legacy: bool) -> Result<(Vec<Value>, bool)> {
 pub(super) fn recent_time(
     bytes: &[u8],
     starts_mid_record: bool,
+    ends_at_eof: bool,
     header: &Value,
 ) -> Result<(i64, u64)> {
     let mut latest = date(header, "lastUpdated")?;
     let mut records = 0;
-    let Some(end) = bytes.iter().rposition(|b| *b == b'\n') else {
-        return Ok((latest, records));
+    let end = if ends_at_eof {
+        bytes.len()
+    } else {
+        bytes.iter().rposition(|b| *b == b'\n').unwrap_or(0)
     };
     let start = if starts_mid_record {
-        bytes.iter().position(|b| *b == b'\n').unwrap() + 1
+        let Some(boundary) = bytes.iter().position(|b| *b == b'\n') else {
+            return Ok((latest, records));
+        };
+        boundary + 1
     } else {
         0
     };
-    if start > end {
+    if start >= end {
         return Ok((latest, records));
     }
-    for line in bytes[start..end].split(|b| *b == b'\n') {
+    let lines: Vec<_> = bytes[start..end].split(|b| *b == b'\n').collect();
+    for (index, line) in lines.iter().enumerate() {
         if line.iter().all(u8::is_ascii_whitespace) {
             continue;
         }
+        let record: Value = match serde_json::from_slice(line) {
+            Ok(record) => record,
+            Err(error) if ends_at_eof && index + 1 == lines.len() && error.is_eof() => break,
+            Err(error) => return Err(error).context("GEMINI_INVALID_RECORD: shallow tail record"),
+        };
         records += 1;
-        let record: Value =
-            serde_json::from_slice(line).context("GEMINI_INVALID_RECORD: shallow tail record")?;
         if let Some(update) = record.get("$set") {
             if let Some(sid) = update.get("sessionId") {
                 anyhow::ensure!(

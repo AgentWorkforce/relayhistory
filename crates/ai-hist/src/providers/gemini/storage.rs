@@ -156,7 +156,8 @@ pub(super) fn recent_time(
     if path_is_legacy(path) {
         return format::date(header, "lastUpdated");
     }
-    let (head_latest, records) = format::recent_time(head, false, header)?;
+    let (head_latest, records) =
+        format::recent_time(head, false, head.len() < HEAD_LIMIT as usize, header)?;
     scan.note_records(records);
     if head.len() < HEAD_LIMIT as usize {
         return Ok(head_latest);
@@ -176,7 +177,7 @@ pub(super) fn recent_time(
         scan.note_bytes(tail.len() as u64);
         (tail, offset)
     };
-    let (latest, records) = format::recent_time(&tail, offset > 0, header)?;
+    let (latest, records) = format::recent_time(&tail, offset > 0, true, header)?;
     scan.note_records(records);
     Ok(latest.max(head_latest))
 }

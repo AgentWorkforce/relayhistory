@@ -509,3 +509,24 @@ fn gemini_fresh_migration_pair_discovers_and_hydrates_journal() {
         "jsonl"
     );
 }
+
+#[test]
+fn gemini_complete_unterminated_final_activity_is_discovered() {
+    for padding in [
+        String::new(),
+        serde_json::json!({"$set":{"memoryScratchpad":"p".repeat(80_000)}}).to_string() + "\n",
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let path = stage(home.path());
+        std::fs::write(
+            &path,
+            format!("{FIXTURE}{padding}{{\"$set\":{{\"lastUpdated\":\"2026-10-12T12:30:00Z\"}}}}"),
+        )
+        .unwrap();
+        let store = open(home.path());
+        discover(&store);
+        assert_eq!(read(&store).session.last_activity_ms, Some(1791808200000));
+        hydrate(&store);
+        assert!(has(&read(&store), "Found the synthetic Gemini needle."));
+    }
+}
