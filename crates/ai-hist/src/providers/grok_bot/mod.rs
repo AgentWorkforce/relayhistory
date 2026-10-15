@@ -102,33 +102,6 @@ fn default_user_data(home: &Path, use_env: bool, platform: DesktopPlatform) -> P
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn resolve_roots_covers_desktop_platforms() {
-        let home = Path::new("/fixture-home");
-        for (platform, relative) in [
-            (
-                DesktopPlatform::Macos,
-                "Library/Application Support/Grok Bot/sand-client-persistence",
-            ),
-            (
-                DesktopPlatform::Windows,
-                "AppData/Roaming/Grok Bot/sand-client-persistence",
-            ),
-            (
-                DesktopPlatform::Linux,
-                ".config/Grok Bot/sand-client-persistence",
-            ),
-        ] {
-            let roots = resolve_roots_for_platform(home, false, platform);
-            assert_eq!(roots.paths, vec![home.join(relative)]);
-        }
-    }
-}
-
 fn read_window(context: &AcquisitionContext<'_>, path: &Path) -> Result<(Vec<u8>, Vec<u8>)> {
     context.validate(path)?;
     let mut file = std::fs::File::open(path)?;
@@ -401,4 +374,31 @@ fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
     }
     ctx.state.insert(cache_key.into(), Value::Object(cache));
     Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_roots_covers_desktop_platforms() {
+        let home = Path::new("/fixture-home");
+        for (platform, relative) in [
+            (
+                DesktopPlatform::Macos,
+                "Library/Application Support/Grok Bot/sand-client-persistence",
+            ),
+            (
+                DesktopPlatform::Windows,
+                "AppData/Roaming/Grok Bot/sand-client-persistence",
+            ),
+            (
+                DesktopPlatform::Linux,
+                ".config/Grok Bot/sand-client-persistence",
+            ),
+        ] {
+            let roots = resolve_roots_for_platform(home, false, platform);
+            assert_eq!(roots.paths, vec![home.join(relative)]);
+        }
+    }
 }
