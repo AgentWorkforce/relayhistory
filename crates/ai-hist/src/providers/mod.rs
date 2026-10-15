@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 include!("generated_modules.rs");
 mod acquisition;
+pub(crate) mod file_history;
 mod sweep;
 pub(crate) use acquisition::*;
 pub(crate) use sweep::sweep_generation;

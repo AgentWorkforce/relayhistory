@@ -3,39 +3,10 @@ use crate::ingest::{
     insert_session_event, insert_tool_call, set_tool_call_error, upsert_session_rebuilt, EventRow,
     RawMessageFacts, SessionCatalogRow, ToolCallRef, ToolResultFacts,
 };
+use crate::providers::file_history::{self, Keys};
 use crate::{insert_history, insert_session_marker, HistoryEntry, NewSessionMarker};
-use rusqlite::OptionalExtension;
-use std::collections::BTreeSet;
-#[derive(Default)]
-struct Keys {
-    events: BTreeSet<String>,
-    tools: BTreeSet<String>,
-    results: BTreeSet<String>,
-    markers: BTreeSet<String>,
-    prompts: BTreeSet<String>,
-}
 pub(super) fn check_identity(conn: &Connection, sid: &str, path: &Path) -> Result<()> {
-    let old: Option<String> = conn
-        .query_row(
-            "SELECT raw_path FROM sessions WHERE source = 'pi' AND session_id = ?1",
-            [sid],
-            |r| r.get(0),
-        )
-        .optional()?
-        .flatten();
-    if let Some(old) = old {
-        let same = Path::new(&old) == path
-            || std::fs::canonicalize(&old)
-                .ok()
-                .zip(std::fs::canonicalize(path).ok())
-                .is_some_and(|(a, b)| a == b);
-        anyhow::ensure!(
-            same || !Path::new(&old).exists(),
-            "PI_ID_COLLISION: native session {sid:?} at {} conflicts with {old}",
-            path.display()
-        );
-    }
-    Ok(())
+    file_history::check_identity(conn, ID, "PI", sid, path)
 }
 pub(super) fn write(conn: &Connection, payload: &Value, path: &Path) -> Result<usize> {
     let entries = payload["entries"]
@@ -68,7 +39,7 @@ pub(super) fn write(conn: &Connection, payload: &Value, path: &Path) -> Result<u
     }
     let complete = payload["tail"].as_array().is_some_and(Vec::is_empty);
     if complete {
-        retire(conn, sid, &keys)?;
+        file_history::retire(conn, ID, sid, &keys)?;
     }
     let catalog_writer = if complete {
         upsert_session_rebuilt
@@ -320,92 +291,5 @@ fn result(conn: &Connection, base: &EventRow<'_>, msg: &Value, keys: &mut Keys) 
     set_tool_call_error(conn, ID, base.session_id, id, error)?;
     keys.results.insert(id.into());
     keys.events.insert(uid);
-    Ok(())
-}
-fn retire(conn: &Connection, sid: &str, keys: &Keys) -> Result<()> {
-    let prompts = serde_json::to_string(&keys.prompts)?;
-    let results = serde_json::to_string(&keys.results)?;
-    conn.execute("UPDATE tool_calls SET is_error = NULL WHERE source = 'pi' AND session_id = ?1 AND location = 'local' AND is_error IS NOT NULL AND tool_use_id NOT IN (SELECT value FROM json_each(?2))", rusqlite::params![sid, results])?;
-
-    for (table, key, present) in [
-        ("session_events", "event_uid", &keys.events),
-        ("tool_calls", "tool_use_id", &keys.tools),
-        ("session_markers", "marker_uid", &keys.markers),
-    ] {
-        let condition = format!(
-            "source = 'pi' AND session_id = ?1 AND {key} NOT IN (SELECT value FROM json_each(?2))"
-        );
-        let keep = serde_json::to_string(present)?;
-        crate::store::retire_evidence_share(
-            conn,
-            table,
-            &condition,
-            &[&sid, &keep],
-            crate::SessionLocation::Local,
-        )?;
-    }
-    reconcile_prompts(conn, sid, &prompts)?;
-    Ok(())
-}
-
-// Reconcile after local shares retire: surviving remote events in this session
-// and other sessions still support prompt rows. Compare complete ordered user
-// text projections, and prefer the existing owner when its evidence survives.
-fn reconcile_prompts(conn: &Connection, sid: &str, keep: &str) -> Result<()> {
-    let reference = "SELECT e.session_id FROM session_events e \
-        WHERE e.source = 'pi' AND e.role = 'user' \
-          AND e.kind = 'text' AND e.ts_ms = history.timestamp_ms \
-        GROUP BY e.session_id, e.message_id \
-        HAVING (SELECT group_concat(text, char(10)) FROM \
-          (SELECT text FROM session_events b WHERE b.source = 'pi' \
-           AND b.session_id = e.session_id AND b.message_id = e.message_id \
-           AND b.role = 'user' AND b.kind = 'text' \
-           ORDER BY CAST(substr(b.event_uid, length(b.message_id) + 2) AS INTEGER))) = history.prompt \
-        ORDER BY (e.session_id = ?1) DESC, e.session_id LIMIT 1";
-    let project = reference.replacen("SELECT e.session_id", "SELECT e.project", 1);
-    // Retained prompt rows keep their owner; refresh that owner's finalized
-    // project projection even when INSERT OR IGNORE saw the same prompt again.
-    conn.execute(&format!("UPDATE history SET project = ({project}) WHERE source='pi' AND session_id=?1 AND EXISTS ({reference}) AND project IS NOT ({project})"), [sid])?;
-    conn.execute(&format!("UPDATE history SET project = ({project}), session_id = ({reference}) \
-        WHERE source = 'pi' AND session_id = ?1 \
-        AND (timestamp_ms || ':' || coalesce(prompt_hash, '')) NOT IN (SELECT value FROM json_each(?2)) \
-        AND EXISTS ({reference}) AND session_id IS NOT ({reference})"), rusqlite::params![sid, keep])?;
-    conn.execute(&format!("DELETE FROM history WHERE source = 'pi' AND session_id = ?1 \
-        AND (timestamp_ms || ':' || coalesce(prompt_hash, '')) NOT IN (SELECT value FROM json_each(?2)) \
-        AND NOT EXISTS ({reference})"), rusqlite::params![sid, keep])?;
-    Ok(())
-}
-
-pub(super) fn retire_missing_locator(conn: &Connection, path: &Path) -> Result<()> {
-    let local = maintenance::local_footprint();
-    let mut stmt = conn.prepare(&format!(
-        "SELECT session_id FROM sessions s WHERE source='pi' AND raw_path=?1 AND ({local})"
-    ))?;
-    let sessions = stmt
-        .query_map([path.to_string_lossy()], |r| r.get::<_, String>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    for sid in sessions {
-        crate::ingest::retire_local_session_evidence(conn, ID, &sid)?;
-        reconcile_prompts(conn, &sid, "[]")?;
-        conn.execute("DELETE FROM session_observations WHERE source='pi' AND session_id=?1 AND location='local'", [&sid])?;
-        conn.execute("DELETE FROM session_hydration_checkpoints WHERE source='pi' AND session_id=?1 AND location='local'", [&sid])?;
-        conn.execute("DELETE FROM session_presences WHERE source='pi' AND session_id=?1 AND location='local'", [&sid])?;
-        conn.execute("DELETE FROM sessions WHERE source='pi' AND session_id=?1 AND NOT EXISTS(SELECT 1 FROM session_observations WHERE source='pi' AND session_id=?1 AND location='remote') AND NOT EXISTS(SELECT 1 FROM session_presences WHERE source='pi' AND session_id=?1 AND location='remote') AND NOT EXISTS(SELECT 1 FROM session_events WHERE source='pi' AND session_id=?1) AND NOT EXISTS(SELECT 1 FROM tool_calls WHERE source='pi' AND session_id=?1) AND NOT EXISTS(SELECT 1 FROM session_markers WHERE source='pi' AND session_id=?1) AND NOT EXISTS(SELECT 1 FROM file_edits WHERE source='pi' AND session_id=?1)", [&sid])?;
-        refresh_remote_catalog(conn, &sid)?;
-    }
-    Ok(())
-}
-
-fn refresh_remote_catalog(conn: &Connection, sid: &str) -> Result<()> {
-    for (column, recorded, fallback) in [
-        ("raw_path", "raw_locator", "SELECT raw_locator FROM session_presences WHERE source='pi' AND session_id=?1 AND location='remote' LIMIT 1"),
-        ("source_stamp", "source_stamp", "SELECT source_stamp FROM session_presences WHERE source='pi' AND session_id=?1 AND location='remote' LIMIT 1"),
-        ("first_prompt", "first_prompt", "SELECT prompt FROM history h WHERE source='pi' AND session_id=?1 AND EXISTS(SELECT 1 FROM session_events e WHERE e.source=h.source AND e.session_id=h.session_id AND e.role='user' AND e.location='remote' AND e.ts_ms=h.timestamp_ms) ORDER BY timestamp_ms,id LIMIT 1"),
-        ("last_assistant_text", "last_assistant_text", "SELECT text FROM session_events WHERE source='pi' AND session_id=?1 AND location='remote' AND role='assistant' AND kind='text' ORDER BY ts_ms DESC,id DESC LIMIT 1"),
-    ] {
-        let value = format!("COALESCE((SELECT {recorded} FROM session_observations WHERE source='pi' AND session_id=?1 AND location='remote' AND {recorded} IS NOT NULL ORDER BY connector_id='legacy-unknown',access_state!='available',connector_id,connector_instance LIMIT 1),({fallback}))");
-        conn.execute(&format!("UPDATE sessions SET {column}={value} WHERE source='pi' AND session_id=?1 AND {column} IS NOT {value}"), [sid])?;
-    }
-    conn.execute("UPDATE sessions SET discovery_state=CASE WHEN EXISTS(SELECT 1 FROM session_events WHERE source='pi' AND session_id=?1) OR EXISTS(SELECT 1 FROM session_observations WHERE source='pi' AND session_id=?1 AND location='remote' AND discovery_state='full') OR EXISTS(SELECT 1 FROM session_presences WHERE source='pi' AND session_id=?1 AND location='remote' AND discovery_state='full') THEN 'full' ELSE 'shallow' END WHERE source='pi' AND session_id=?1", [sid])?;
     Ok(())
 }

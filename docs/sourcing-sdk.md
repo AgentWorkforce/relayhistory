@@ -993,6 +993,7 @@ handle.
 | --- | --- | --- | --- | --- | --- | --- |
 | claude | ✓ | ✓ | ✓ | ✓ | ✓ | per-message |
 | codex | ✓ | ✓ | ✓ | ✓ | ✓ | cumulative-delta |
+| copilot | ✓ | ✓ | ✓ | — | — | per-message |
 | cursor | ✓ | ✓ | ✓ | ✓ | — | none |
 | devin | ✓ | ✓ | ✓ | ✓ | — | none |
 | grok | ✓ | ✓ | ✓ | ✓ | ✓ | per-request |

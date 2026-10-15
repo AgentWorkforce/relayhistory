@@ -1,0 +1,6 @@
+{"type": "session", "externalId": "copilot-tool-research-432", "createdAt": "2026-01-01T00:00:00Z", "workingDirectory": "/fixture/copilot", "version": 1}
+{"type": "message", "id": "user-1", "role": "user", "content": [{"type": "text", "text": "Inspect the synthetic greeting."}], "timestamp": "2026-01-01T00:00:01Z"}
+{"type": "message", "id": "assistant-1", "role": "assistant", "content": [{"type": "text", "text": "I will read the synthetic greeting."}], "timestamp": "2026-01-01T00:00:02Z"}
+{"type": "tool-call", "id": "call-record", "toolCallId": "call-fixture", "name": "read", "arguments": {"path": "greeting.txt"}, "timestamp": "2026-01-01T00:00:03Z"}
+{"type": "tool-result", "toolCallId": "call-record", "content": "Hello synthetic fixture", "success": true, "id": "record-4", "timestamp": "2026-01-01T00:00:04Z"}
+{"type": "message", "role": "assistant", "content": [{"type": "text", "text": "The greeting says Hello synthetic fixture."}], "id": "record-5", "timestamp": "2026-01-01T00:00:05Z"}

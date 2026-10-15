@@ -497,6 +497,9 @@ Generated from provider-owned acquisition records; these cells describe fixture-
 | pi | Control and lineage | Compaction, branch summaries, labels, metadata and parentSession retained as markers; no active-context projection, inferred relationship, resume command or live execution. |
 | hermes | Messages and tools | SQLite schema 31 native rows, tool IDs/results and reasoning; profile identity namespaced. |
 | hermes | Usage and relationships | Session totals are not request usage. Parent native identity retained as metadata; no delegation or native resume advertised. Legacy JSONL unsupported. |
+| copilot | Messages and identity | Journal version 1 session.start header identity, native event UUIDs with parentId chain, user/assistant text, reasoningText, per-message model, provider messageId and requestId, turnId, cwd and branch from the header context, copilotVersion; other journal versions rejected with diagnostic; duplicate native IDs at distinct live paths rejected. |
+| copilot | Tools and usage | Assistant toolRequests and tool.execution_complete join by native toolCallId with success/error outcomes; assistant.message outputTokens kept verbatim as per-message usage (output only); session.shutdown modelMetrics and session.usage_checkpoint kept raw in markers as session-wide cumulative totals, excluded from request usage; no inferred file edits. |
+| copilot | Control and lineage | Turn boundaries, model changes, resume, permissions, system messages, subagent lifecycle and unknown event types retained as markers; subagent messages flagged sidechain by parentToolCallId; agent-delivered user messages are events, not prompts; no child session, relationship, resume command or live execution. |
 <!-- END GENERATED PROVIDER CAPTURE -->
 
 ### Embedded Codex image evidence

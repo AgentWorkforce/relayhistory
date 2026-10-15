@@ -45,6 +45,11 @@ const REGISTRATIONS: &[Registration] = &[
         metadata: hermes::METADATA,
         adapter: hermes::ADAPTER,
     },
+    Registration {
+        id: "copilot",
+        metadata: copilot::METADATA,
+        adapter: copilot::ADAPTER,
+    },
     #[cfg(test)]
     Registration {
         id: "test-fixture",

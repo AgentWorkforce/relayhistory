@@ -1,0 +1,12 @@
+id: 5f0c2a8e-1d4b-4c6e-9a7f-3b2d1e0c9a81
+cwd: /fixture/copilot-usage
+git_root: /fixture/copilot-usage
+repository: fixture/copilot-usage
+host_type: github
+branch: main
+name: Fix the failing fixture test
+user_named: false
+summary_count: 0
+client_name: github/cli
+created_at: 2026-09-18T21:30:00.000Z
+updated_at: 2026-09-18T22:00:10.000Z
