@@ -4611,7 +4611,7 @@ fn cleanup_subagent_registration(conn: &Connection, source: &str, session_id: &s
          WHERE source = ?1 AND child_session_id = ?2 AND parent_session_id <> ?2",
         params![source, session_id],
     )?;
-    conn.execute(
+    let sessions = conn.execute(
         "DELETE FROM sessions \
          WHERE source = ? AND session_id = ? \
            AND NOT EXISTS (\
@@ -4624,8 +4624,15 @@ fn cleanup_subagent_registration(conn: &Connection, source: &str, session_id: &s
         "INSERT OR IGNORE INTO session_relationships SELECT * FROM retained_relationships; \
          DELETE FROM retained_relationships;",
     )?;
-    // The session delete drops the relationships and markers the probes join.
-    evidence_probe::note_evidence_changed(conn);
+    // The session delete drops the relationships and markers the probes join;
+    // a presence is not evidence they read. A thread that was never
+    // registered has no session row to delete and keeps the probes' snapshot:
+    // every changed rollout of a delegated thread passes through here, and
+    // releasing on each made a sweep over many of them re-read every evidence
+    // key once per thread.
+    if sessions > 0 {
+        evidence_probe::note_evidence_changed(conn);
+    }
     Ok(())
 }
 
