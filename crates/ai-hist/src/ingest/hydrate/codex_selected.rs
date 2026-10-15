@@ -7,7 +7,11 @@ pub(crate) fn ingest_selected_codex(ctx: SelectedIngest<'_>) -> Result<SelectedI
         let path = ctx
             .path
             .ok_or_else(|| anyhow::anyhow!("Codex SQLite capture has no state path"))?;
-        crate::providers::codex::sqlite::retire_if_changed(ctx.conn, &capture)?;
+        crate::providers::codex::sqlite::retire_if_changed(
+            ctx.conn,
+            &capture,
+            ctx.options.include_related,
+        )?;
         crate::providers::codex::sqlite::normalize_with_relationships(
             ctx.conn,
             &capture,
@@ -16,7 +20,7 @@ pub(crate) fn ingest_selected_codex(ctx: SelectedIngest<'_>) -> Result<SelectedI
         )?;
         if ctx.options.include_related {
             for child in &capture.related {
-                crate::providers::codex::sqlite::retire_if_changed(ctx.conn, child)?;
+                crate::providers::codex::sqlite::retire_if_changed(ctx.conn, child, true)?;
                 crate::providers::codex::sqlite::normalize(ctx.conn, child, path)?;
             }
             for child in &capture.related_rollouts {

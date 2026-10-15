@@ -5310,10 +5310,10 @@ fn codex_session_events_exist(conn: &Connection, session_id: &str) -> Result<boo
 }
 
 pub(crate) struct CodexSessionMeta {
-    session_id: String,
+    pub(crate) session_id: String,
     cwd: String,
     git_branch: Option<String>,
-    is_subagent: bool,
+    pub(crate) is_subagent: bool,
     /// The parent this thread was delegated by, from whichever field the
     /// provider recorded it in.
     parent_session_id: Option<String>,

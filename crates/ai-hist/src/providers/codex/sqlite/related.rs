@@ -1,5 +1,7 @@
 //! Related Codex SQLite capture and rollout restoration.
 use super::*;
+use sha2::{Digest, Sha256};
+use std::io::Read as _;
 
 const MAX_RELATED_THREADS: usize = 1_024;
 
@@ -10,8 +12,9 @@ pub(crate) fn restored_rollout(
     state: &Path,
     id: &str,
 ) -> Result<Option<PathBuf>> {
-    let (current_state, history) =
-        databases(&roots.codex)?.context("Codex SQLite history unavailable")?;
+    let Some((current_state, history)) = databases(&roots.codex)? else {
+        return Ok(None);
+    };
     ensure!(
         std::fs::canonicalize(state)? == std::fs::canonicalize(current_state)?,
         "SESSION_SOURCE_MISMATCH: stale Codex SQLite locator"
@@ -19,7 +22,7 @@ pub(crate) fn restored_rollout(
     let context = AcquisitionContext::new("codex", roots);
     let rollout_path: Option<String> = sqlite_snapshot(&context, state, |db| {
         db.query_row(
-            "SELECT rollout_path FROM threads WHERE id=?1 AND history_mode='paginated'",
+            "SELECT rollout_path FROM threads WHERE id=?1",
             [id],
             |row| row.get(0),
         )
@@ -39,16 +42,97 @@ pub(crate) fn restored_rollout(
         .optional()
         .map_err(Into::into)
     })?;
-    if !offset.is_some_and(|offset| {
-        offset >= 0
-            && path
-                .metadata()
-                .is_ok_and(|meta| meta.len() >= offset as u64)
-    }) {
+    let Ok(metadata) = path.metadata() else {
+        return Ok(None);
+    };
+    context.validate(&path)?;
+    if !metadata.is_file()
+        || offset.is_some_and(|offset| offset < 0 || metadata.len() < offset as u64)
+    {
         return Ok(None);
     }
-    context.validate(&path)?;
     Ok(Some(path))
+}
+
+fn spawn_children(
+    context: &AcquisitionContext<'_>,
+    state: &Path,
+    parent: &str,
+) -> Result<Vec<String>> {
+    sqlite_snapshot(context, state, |db| {
+        let mut stmt = db.prepare("SELECT child_thread_id FROM thread_spawn_edges WHERE parent_thread_id=?1 ORDER BY child_thread_id LIMIT 100001")?;
+        let children = stmt
+            .query_map([parent], |row| row.get(0))?
+            .collect::<rusqlite::Result<Vec<String>>>()?;
+        ensure!(
+            children.len() <= MAX_THREADS,
+            "Codex edges exceed safety limit"
+        );
+        Ok(children)
+    })
+}
+
+fn child_ids(capture: &Capture) -> Vec<String> {
+    let mut children = capture
+        .edges
+        .iter()
+        .filter(|edge| edge.parent == capture.thread.id)
+        .map(|edge| edge.child.clone())
+        .collect::<Vec<_>>();
+    for item in &capture.items {
+        match item.kind.as_str() {
+            "subAgentActivity" => {
+                if let Some(id) = item.value["agentThreadId"].as_str() {
+                    children.push(id.to_owned());
+                }
+            }
+            "collabAgentToolCall" => {
+                if let Some(ids) = item.value["receiverThreadIds"].as_array() {
+                    children.extend(ids.iter().filter_map(Value::as_str).map(str::to_owned));
+                }
+            }
+            _ => {}
+        }
+    }
+    children
+}
+
+fn rollout_content_stamp(path: &Path) -> Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut digest = Sha256::new();
+    let mut chunk = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&chunk[..read]);
+    }
+    Ok(format!("sha256:{:x}", digest.finalize()))
+}
+
+fn related_rollout(
+    context: &AcquisitionContext<'_>,
+    state: &Path,
+    id: &str,
+    path: PathBuf,
+) -> Result<Option<(RelatedRollout, Vec<String>)>> {
+    let Some(meta) = crate::ingest::read_codex_session_meta(&path)? else {
+        return Ok(None);
+    };
+    if meta.session_id != id || !meta.is_subagent {
+        return Ok(None);
+    }
+    let children = spawn_children(context, state, id)?;
+    let stamp = rollout_content_stamp(&path)?;
+    Ok(Some((
+        RelatedRollout {
+            id: id.to_owned(),
+            path,
+            stamp,
+        },
+        children,
+    )))
 }
 
 /// Selected hydration captures every SQLite descendant named by spawn edges.
@@ -62,12 +146,8 @@ pub(crate) fn capture_related(
     let mut root_acquired = capture(roots, state, id)?;
     let mut root: Capture = serde_json::from_value(root_acquired.payload)?;
     let mut seen = HashSet::from([id.to_string()]);
-    let mut pending = root
-        .edges
-        .iter()
-        .filter(|edge| edge.parent == id)
-        .map(|edge| edge.child.clone())
-        .collect::<Vec<_>>();
+    let mut pending = child_ids(&root);
+    let context = AcquisitionContext::new("codex", roots);
     while let Some(child) = pending.pop() {
         if !seen.insert(child.clone()) {
             continue;
@@ -76,33 +156,47 @@ pub(crate) fn capture_related(
             seen.len() <= MAX_RELATED_THREADS,
             "Codex related thread capture exceeds safety limit"
         );
-        if let Some(path) = restored_rollout(roots, state, &child)? {
-            let context = AcquisitionContext::new("codex", roots);
-            let (_, edges) = thread_and_edges(&context, state, &child)?;
-            pending.extend(
-                edges
-                    .iter()
-                    .filter(|edge| edge.parent == child)
-                    .map(|edge| edge.child.clone()),
-            );
-            let (stamp, _) = crate::file_stamp_and_modified(&path)?;
-            root.related_rollouts.push(RelatedRollout {
-                id: child,
-                path: path.clone(),
-                stamp,
-            });
-            root_acquired.read_paths.push(path);
+        let rollout = match restored_rollout(roots, state, &child) {
+            Ok(rollout) => rollout,
+            Err(error) if error.is::<crate::ingest::CaptureCancelled>() => return Err(error),
+            Err(error) => {
+                eprintln!("ai-hist: [codex] skipping related thread {child}: {error:#}");
+                root.related_incomplete = true;
+                continue;
+            }
+        };
+        if let Some(path) = rollout {
+            match related_rollout(&context, state, &child, path) {
+                Ok(Some((rollout, children))) => {
+                    pending.extend(children);
+                    root_acquired.read_paths.push(rollout.path.clone());
+                    root.related_rollouts.push(rollout);
+                }
+                Ok(None) => {
+                    eprintln!(
+                        "ai-hist: [codex] skipping related rollout {child}: not a delegated child"
+                    );
+                    root.related_incomplete = true;
+                }
+                Err(error) if error.is::<crate::ingest::CaptureCancelled>() => return Err(error),
+                Err(error) => {
+                    eprintln!("ai-hist: [codex] skipping related rollout {child}: {error:#}");
+                    root.related_incomplete = true;
+                }
+            }
             continue;
         }
-        let acquired = capture(roots, state, &child)?;
+        let acquired = match capture(roots, state, &child) {
+            Ok(acquired) => acquired,
+            Err(error) if error.is::<crate::ingest::CaptureCancelled>() => return Err(error),
+            Err(error) => {
+                eprintln!("ai-hist: [codex] skipping related thread {child}: {error:#}");
+                root.related_incomplete = true;
+                continue;
+            }
+        };
         let capture: Capture = serde_json::from_value(acquired.payload)?;
-        pending.extend(
-            capture
-                .edges
-                .iter()
-                .filter(|edge| edge.parent == child)
-                .map(|edge| edge.child.clone()),
-        );
+        pending.extend(child_ids(&capture));
         root_acquired.records += acquired.records;
         ensure!(
             root_acquired.records <= MAX_ITEMS as i64,

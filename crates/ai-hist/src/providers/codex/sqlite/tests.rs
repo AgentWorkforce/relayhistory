@@ -50,6 +50,99 @@ fn guardian_requires_a_parent_before_it_is_hidden_from_the_catalog() {
 }
 
 #[test]
+fn related_capture_keeps_supported_children_when_other_edges_are_unavailable() {
+    let dir = tempfile::tempdir().unwrap();
+    let codex = dir.path().join(".codex");
+    install_fixture(&codex, "subagent-edge");
+    let state = Connection::open(codex.join("state_5.sqlite")).unwrap();
+    let history = Connection::open(codex.join("thread_history_1.sqlite")).unwrap();
+    state
+        .execute_batch(
+            "INSERT INTO thread_spawn_edges VALUES ('sqlite-parent','missing-child','running');
+         INSERT INTO threads (id,created_at_ms,updated_at_ms,source,archived,history_mode)
+         VALUES ('item-child',1776643200000,1776643300000,'cli',0,'paginated');",
+        )
+        .unwrap();
+    history
+        .execute_batch("INSERT INTO thread_history_projection_state VALUES ('item-child',1,0);")
+        .unwrap();
+    history.execute(
+        "INSERT INTO thread_items VALUES ('sqlite-parent','turn-1','item-link',50,1776643250000,'subAgentActivity',?1)",
+        [json!({"type":"subAgentActivity","id":"item-link","agentThreadId":"item-child"}).to_string()],
+    ).unwrap();
+    history.execute(
+        "INSERT INTO thread_items VALUES ('item-child','turn-1','item-answer',0,1776643251000,'agentMessage',?1)",
+        [json!({"type":"agentMessage","id":"item-answer","text":"Item-linked answer"}).to_string()],
+    ).unwrap();
+    let rollout = codex.join("sessions/2026/04/20/rollout-legacy-child.jsonl");
+    std::fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+    let first = json!({"timestamp":"2026-04-20T00:00:00Z","type":"session_meta","payload":{"id":"legacy-child","cwd":"/work/app","source":{"subagent":{"thread_spawn":{"parent_thread_id":"sqlite-parent"}}}}}).to_string()
+        + "\n" + &json!({"timestamp":"2026-04-20T00:00:01Z","type":"event_msg","payload":{"type":"agent_message","message":"alpha"}}).to_string() + "\n";
+    std::fs::write(&rollout, &first).unwrap();
+    state.execute(
+        "INSERT INTO threads (id,rollout_path,created_at_ms,updated_at_ms,source,archived,history_mode) VALUES ('legacy-child',?1,1776643200000,1776643300000,'cli',0,'legacy')",
+        [rollout.to_string_lossy().as_ref()],
+    ).unwrap();
+    state
+        .execute(
+            "INSERT INTO thread_spawn_edges VALUES ('sqlite-parent','legacy-child','completed')",
+            [],
+        )
+        .unwrap();
+    let guardian = codex.join("sessions/2026/04/20/rollout-guardian.jsonl");
+    std::fs::write(&guardian, json!({"timestamp":"2026-04-20T00:00:00Z","type":"session_meta","payload":{"id":"guardian","cwd":"/work/app","thread_source":"guardian_review"}}).to_string() + "\n").unwrap();
+    state.execute(
+        "INSERT INTO threads (id,rollout_path,created_at_ms,updated_at_ms,source,archived,history_mode) VALUES ('guardian',?1,1776643200000,1776643300000,'cli',0,'legacy')",
+        [guardian.to_string_lossy().as_ref()],
+    ).unwrap();
+    state
+        .execute(
+            "INSERT INTO thread_spawn_edges VALUES ('sqlite-parent','guardian','completed')",
+            [],
+        )
+        .unwrap();
+    let mut roots =
+        crate::ProviderRoots::from_home(dir.path().to_path_buf(), dir.path().join("opencode.db"));
+    roots.codex = codex.clone();
+    let state_path = codex.join("state_5.sqlite");
+    let first_capture = capture_related(&roots, &state_path, "sqlite-parent").unwrap();
+    let captured: Capture = serde_json::from_value(first_capture.payload).unwrap();
+    assert!(
+        captured.related_incomplete,
+        "the missing edge remains incomplete"
+    );
+    assert!(captured
+        .related
+        .iter()
+        .any(|child| child.thread.id == "item-child" && !child.items.is_empty()));
+    assert!(captured
+        .related_rollouts
+        .iter()
+        .any(|child| child.id == "legacy-child"));
+    assert!(!captured
+        .related_rollouts
+        .iter()
+        .any(|child| child.id == "guardian"));
+
+    let modified = rollout.metadata().unwrap().modified().unwrap();
+    let rewritten = first.replace("alpha", "bravo");
+    assert_eq!(rewritten.len(), first.len());
+    std::fs::write(&rollout, rewritten).unwrap();
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&rollout)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(modified))
+        .unwrap();
+    let second_capture = capture_related(&roots, &state_path, "sqlite-parent").unwrap();
+    let second: Capture = serde_json::from_value(second_capture.payload).unwrap();
+    assert_ne!(
+        captured.related_rollouts[0].stamp, second.related_rollouts[0].stamp,
+        "a same-size rewrite with restored mtime must change the related stamp"
+    );
+}
+
+#[test]
 fn image_only_sqlite_user_item_keeps_its_embedded_image() {
     let dir = tempfile::tempdir().unwrap();
     let codex = dir.path().join(".codex");

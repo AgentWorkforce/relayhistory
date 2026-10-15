@@ -18,7 +18,11 @@ fn content_hash(capture: &Capture) -> Result<String> {
 
 /// The selected stamp includes descendants. Keep this thread's row IDs when
 /// only a child changed, while still replacing a rewritten projection.
-pub(crate) fn retire_if_changed(conn: &Connection, capture: &Capture) -> Result<()> {
+pub(crate) fn retire_if_changed(
+    conn: &Connection,
+    capture: &Capture,
+    include_related: bool,
+) -> Result<()> {
     let prior: Option<String> = conn
         .query_row(
             "SELECT json_extract(payload_json, '$.content_hash') FROM session_markers \
@@ -29,7 +33,9 @@ pub(crate) fn retire_if_changed(conn: &Connection, capture: &Capture) -> Result<
         .optional()?
         .flatten();
     if prior.as_deref() != Some(content_hash(capture)?.as_str()) {
-        retire(conn, &capture.thread.id, true)?;
+        retire(conn, &capture.thread.id, include_related)?;
+    } else if include_related {
+        retire_relationships(conn, &capture.thread.id)?;
     }
     Ok(())
 }
@@ -47,6 +53,45 @@ fn prior_history_ids(conn: &Connection, session_id: &str) -> Result<Vec<i64>> {
     raw.map(|raw| serde_json::from_str(&raw).map_err(Into::into))
         .transpose()
         .map(Option::unwrap_or_default)
+}
+
+/// A duplicate in history.jsonl claims the existing SQLite prompt row. The
+/// log cursor will not replay it, so later projection retirement must keep it.
+pub(crate) fn claim_history_log_prompt(conn: &Connection, entry: &HistoryEntry) -> Result<()> {
+    let Some(session_id) = entry.session_id.as_deref() else {
+        return Ok(());
+    };
+    let id: Option<i64> = conn
+        .query_row(
+            "SELECT id FROM history WHERE source='codex' AND timestamp_ms=?1 AND prompt=?2",
+            params![entry.timestamp_ms, entry.prompt],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(id) = id else {
+        return Ok(());
+    };
+    let raw: Option<String> = conn.query_row(
+        "SELECT payload_json FROM session_markers WHERE source='codex' AND session_id=?1 AND marker_uid='sqlite:thread'",
+        [session_id],
+        |row| row.get(0),
+    ).optional()?;
+    let Some(raw) = raw else {
+        return Ok(());
+    };
+    let mut payload: Value = serde_json::from_str(&raw)?;
+    let Some(ids) = payload.get_mut("history_ids").and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    let before = ids.len();
+    ids.retain(|value| value.as_i64() != Some(id));
+    if ids.len() != before {
+        conn.execute(
+            "UPDATE session_markers SET payload_json=?1 WHERE source='codex' AND session_id=?2 AND marker_uid='sqlite:thread'",
+            params![payload.to_string(), session_id],
+        )?;
+    }
+    Ok(())
 }
 
 fn thread_payload(capture: &Capture, history_ids: Vec<i64>) -> Result<Value> {
@@ -204,13 +249,18 @@ pub(crate) fn retire(conn: &Connection, session_id: &str, relationships: bool) -
         [session_id],
     )?;
     if relationships {
-        conn.execute(
-            "DELETE FROM session_relationships WHERE source='codex' AND \
-             ((parent_session_id=?1 AND evidence_kind IN ('codex_sqlite_item','codex_thread_spawn_edge')) \
-             OR (child_session_id=?1 AND evidence_kind IN ('codex_thread_spawn_edge','codex_sqlite_thread_source')))",
-            [session_id],
-        )?;
+        retire_relationships(conn, session_id)?;
     }
+    Ok(())
+}
+
+fn retire_relationships(conn: &Connection, session_id: &str) -> Result<()> {
+    conn.execute(
+        "DELETE FROM session_relationships WHERE source='codex' AND \
+         ((parent_session_id=?1 AND evidence_kind IN ('codex_sqlite_item','codex_thread_spawn_edge')) \
+         OR (child_session_id=?1 AND evidence_kind IN ('codex_thread_spawn_edge','codex_sqlite_thread_source')))",
+        [session_id],
+    )?;
     Ok(())
 }
 

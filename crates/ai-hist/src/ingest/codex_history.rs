@@ -182,7 +182,11 @@ fn ingest_codex_history_lines(
                     }
                     touched.insert(session_id.to_string());
                 }
-                read.inserted += insert_history(conn, &entry)?;
+                let inserted = insert_history(conn, &entry)?;
+                if inserted == 0 {
+                    crate::providers::codex::sqlite::claim_history_log_prompt(conn, &entry)?;
+                }
+                read.inserted += inserted;
             }
             Ok(None) => {}
             Err(_) => read.errors += 1,
@@ -298,5 +302,72 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn a_history_log_duplicate_survives_sqlite_projection_pruning() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".codex");
+        std::fs::create_dir_all(&root).unwrap();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex/sqlite");
+        for (script, database) in [
+            ("pruned-all-items-state.sql", "state_5.sqlite"),
+            ("pruned-all-items-history.sql", "thread_history_1.sqlite"),
+        ] {
+            let sql = std::fs::read_to_string(fixtures.join(script))
+                .unwrap()
+                .replace("{{CODEX_HOME}}", &root.to_string_lossy());
+            Connection::open(root.join(database))
+                .unwrap()
+                .execute_batch(&sql)
+                .unwrap();
+        }
+        std::fs::write(
+            root.join("history.jsonl"),
+            serde_json::json!({"session_id":"sqlite-pruned-all-items","ts":1776643200,"text":"Please inspect the project"}).to_string() + "\n",
+        ).unwrap();
+        let conn = crate::open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        let mut coverage = SweepCoverage::default();
+        let mut touched = HashSet::new();
+        let repairs = SweepRepairs::default();
+        sync_codex_sources(
+            &conn,
+            &mut state,
+            &root,
+            &repairs,
+            &mut coverage,
+            &mut touched,
+            None,
+        )
+        .unwrap();
+        Connection::open(root.join("thread_history_1.sqlite"))
+            .unwrap()
+            .execute(
+                "DELETE FROM thread_items WHERE item_id='sqlite-sqlite-pruned-all-items-0'",
+                [],
+            )
+            .unwrap();
+        Connection::open(root.join("state_5.sqlite")).unwrap().execute(
+            "UPDATE threads SET updated_at_ms=updated_at_ms+1 WHERE id='sqlite-pruned-all-items'", [],
+        ).unwrap();
+        sync_codex_sources(
+            &conn,
+            &mut state,
+            &root,
+            &repairs,
+            &mut coverage,
+            &mut touched,
+            None,
+        )
+        .unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT count(*) FROM history WHERE source='codex' AND prompt='Please inspect the project'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(
+            count, 1,
+            "the consumed history.jsonl prompt remains searchable"
+        );
     }
 }

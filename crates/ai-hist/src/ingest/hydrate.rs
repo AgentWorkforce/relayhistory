@@ -3932,7 +3932,7 @@ fn build_local_result(
     if options.source == "codex" && options.include_related && !codex_relationship_complete {
         diagnostics.push(HydrationDiagnostic {
             code: "HYDRATION_BOUNDED_RELATIONSHIPS".to_string(),
-            message: "Codex child search examined the session's date and the next date; newer rollout dates exist, so relationship coverage is incomplete".to_string(),
+            message: "Codex related thread search or acquisition was incomplete".to_string(),
             duration_ms: None,
             source_bytes: None,
             records_parsed: None,
@@ -4863,6 +4863,33 @@ mod tests {
             [], |row| row.get(0),
         ).unwrap();
         assert_eq!(retained_event_id, root_event_id);
+
+        request.include_related = false;
+        Connection::open(codex.join("state_5.sqlite"))
+            .unwrap()
+            .execute(
+                "UPDATE threads SET model='gpt-synthetic-updated' WHERE id='sqlite-parent'",
+                [],
+            )
+            .unwrap();
+        hydrate_session_at_with_home(&db, &request, home.path()).unwrap();
+        let retained_links: i64 = open_db(&db)
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM session_relationships WHERE source='codex' AND parent_session_id='sqlite-parent'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            retained_links > 0,
+            "parent-only hydration retains existing child links"
+        );
+        request.include_related = true;
+        let related_again = hydrate_session_at_with_home(&db, &request, home.path()).unwrap();
+        assert!(related_again
+            .related_session_ids
+            .contains(&"sqlite-child".to_string()));
 
         let rollout = codex.join("sessions/2026/04/20/rollout-sqlite-parent.jsonl");
         fs::create_dir_all(rollout.parent().unwrap()).unwrap();

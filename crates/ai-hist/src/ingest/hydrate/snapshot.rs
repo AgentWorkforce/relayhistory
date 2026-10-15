@@ -28,6 +28,9 @@ pub(super) fn source_snapshot(
             } else {
                 crate::providers::codex::sqlite::capture(roots, &path, id)?
             };
+            let relationship_complete = !acquired.payload["related_incomplete"]
+                .as_bool()
+                .unwrap_or(false);
             return Ok(SourceSnapshot {
                 stamp: format!("codex-sqlite-v2:{}", acquired.stamp),
                 bytes: 0,
@@ -41,7 +44,7 @@ pub(super) fn source_snapshot(
                 scanned_superseded: false,
                 stamped_cursors: Vec::new(),
                 opencode_layout: None,
-                codex_relationship_complete: true,
+                codex_relationship_complete: relationship_complete,
             });
         }
     }

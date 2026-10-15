@@ -75,6 +75,12 @@ pub(crate) struct Capture {
     pub(crate) related: Vec<Capture>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) related_rollouts: Vec<RelatedRollout>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub(super) related_incomplete: bool,
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Serialize, Deserialize)]
@@ -371,6 +377,7 @@ pub(crate) fn capture(
         edges,
         related: Vec::new(),
         related_rollouts: Vec::new(),
+        related_incomplete: false,
     })?;
     let mut read_paths = vec![state.to_path_buf(), history.clone()];
     for path in [state, history.as_path()] {
@@ -389,7 +396,9 @@ mod related;
 pub(crate) use related::{capture_related, restored_rollout};
 
 mod normalize;
-pub(crate) use normalize::{normalize, normalize_with_relationships, retire, retire_if_changed};
+pub(crate) use normalize::{
+    claim_history_log_prompt, normalize, normalize_with_relationships, retire, retire_if_changed,
+};
 
 pub(crate) fn decode(acquired: &AcquiredSession) -> Result<Capture> {
     serde_json::from_value(acquired.payload.clone()).map_err(Into::into)
@@ -432,7 +441,7 @@ pub(crate) fn sync(
         let acquired = capture(&roots, &state_db, &t.id)?;
         let captured = decode(&acquired)?;
         let tx = conn.unchecked_transaction()?;
-        retire_if_changed(&tx, &captured)?;
+        retire_if_changed(&tx, &captured, true)?;
         inserted += normalize(&tx, &captured, &state_db)?;
         tx.commit()?;
         read.push(t.id.clone());
