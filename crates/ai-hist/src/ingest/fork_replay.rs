@@ -243,18 +243,31 @@ pub(super) fn record_codex_fork_replay(
     Ok(())
 }
 
-/// Retire the `fork_replay_boundary` markers on a Codex session other than
-/// `kept`, after a pass that read its rollout from byte zero.
+/// End a pass's replay accounting. `open` is a span the readable file ended
+/// inside -- a live fork whose first own turn is not written yet: it is still
+/// accounted for, and the next pass, which re-reads it, closes it.
 ///
-/// Such a pass opens every span the gate finds in the file and writes each
-/// one's marker, so a marker it did not write stands for a span an earlier
-/// parser opened and this gate does not -- lines that are the child's own and
-/// are now indexed under it.
-pub(super) fn retire_stale_fork_replay_markers(
+/// `written` holds the markers of the spans this pass closed. A pass from
+/// byte zero (`outcome.from_start`) opens every span the gate finds, so a
+/// replay marker it did not write stands for a span an earlier parser opened
+/// and this gate does not -- lines that are the child's own and are now
+/// indexed under it -- and is retired.
+pub(super) fn finish_codex_replay(
     conn: &Connection,
-    session_id: &str,
-    kept: &[String],
+    meta: &CodexSessionMeta,
+    open: Option<ForkReplaySpan>,
+    mut written: Vec<String>,
+    outcome: &mut CodexIngestOutcome,
 ) -> Result<()> {
+    if let Some(span) = open {
+        outcome.saw_fork_replay = true;
+        written.push(span.marker_uid());
+        record_codex_fork_replay(conn, meta, &span, None, None)?;
+    }
+    if !outcome.from_start {
+        return Ok(());
+    }
+    let session_id = meta.session_id.as_str();
     let stale = conn
         .prepare_cached(
             "SELECT marker_uid FROM session_markers \
@@ -263,7 +276,7 @@ pub(super) fn retire_stale_fork_replay_markers(
         .query_map([session_id], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?
         .into_iter()
-        .filter(|uid| !kept.contains(uid));
+        .filter(|uid| !written.contains(uid));
     for uid in stale {
         crate::store::retire_evidence_share(
             conn,

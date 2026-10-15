@@ -140,10 +140,7 @@ mod codex_history;
 mod fork_replay;
 mod rederived;
 mod rollout_head;
-use fork_replay::{
-    inherited_baseline_verdict, record_codex_fork_replay, retire_stale_fork_replay_markers,
-    ForkReplaySpan,
-};
+use fork_replay::{inherited_baseline_verdict, record_codex_fork_replay, ForkReplaySpan};
 pub(crate) use rollout_head::read_codex_session_meta;
 #[cfg(test)]
 use rollout_head::LEADING_BYTE_LIMIT;
@@ -5335,9 +5332,7 @@ pub(crate) struct CodexSessionMeta {
     /// UUIDv7 thread id's timestamp, else `payload.timestamp`, else the
     /// record's own timestamp.
     fork_origin_ms: Option<i64>,
-    /// The `session_meta` declares paginated history, the only shape whose
-    /// fork copy follows the child's `session_meta` directly
-    /// (`codex::pages_history`).
+    /// `history_mode: "paginated"` (`codex::pages_history`).
     fork_pages_history: bool,
 }
 
@@ -6094,9 +6089,6 @@ fn ingest_codex_rollout_incremental(
     // `task_complete` the cursor could commit at, because its lines are
     // skipped before the arms that would.
     let mut fork_replay: Option<ForkReplaySpan> = None;
-    // The replay markers this pass wrote. A pass from byte zero reads every
-    // span the file holds, so any other replay marker on the session is one an
-    // earlier parser wrote for a span this gate does not open.
     let mut replay_markers: Vec<String> = Vec::new();
     // The replay marker whose inherited baseline no child snapshot has
     // confirmed yet (see `inherited_baseline_verdict`). Carried across passes
@@ -6961,17 +6953,7 @@ fn ingest_codex_rollout_incremental(
         &mut unwritten_line,
         conn.total_changes() == changes_before_line,
     )?;
-    // The readable file ended inside a replay: the fork's first own turn is
-    // not written yet. The span is still accounted for, and the next pass,
-    // which re-reads it, closes it.
-    if let Some(span) = fork_replay.take() {
-        outcome.saw_fork_replay = true;
-        replay_markers.push(span.marker_uid());
-        record_codex_fork_replay(conn, meta, &span, None, None)?;
-    }
-    if start_offset == 0 {
-        retire_stale_fork_replay_markers(conn, session_id, &replay_markers)?;
-    }
+    fork_replay::finish_codex_replay(conn, meta, fork_replay.take(), replay_markers, &mut outcome)?;
     // Collapse each measured run onto its first span, so the rows a single
     // delta accounted for read as the one request it measured rather than as
     // one measured request and a trail of unmeasured ones.
