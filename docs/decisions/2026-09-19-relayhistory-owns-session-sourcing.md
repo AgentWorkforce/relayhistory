@@ -128,6 +128,12 @@ Legend:
 sources themselves; relayhistory no longer ingests either, and a writable open
 deletes what an earlier release stored for them.
 
+**Update (2026-10-15):** every **codex** cell covers rollouts in both encodings
+Codex stores: plain `rollout-*.jsonl` and the zstd-compressed
+`rollout-*.jsonl.zst` it writes for a finished session. A rollout is captured
+under its `.jsonl` locator either way and keeps that identity when Codex
+compresses it ([session catalog](../session-catalog.md)).
+
 | Record type                                                        | claude | codex | cursor | grok | muse | opencode | devin | Owner / closes                                                                                                                                                                                                                                                                |
 | ------------------------------------------------------------------ | ------ | ----- | ------ | ---- | ---- | -------- | ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Prompt / `history` row                                             | ✓      | ✓     | ✓      | ◐    | ✓    | ✓        | ✓     | grok timestamps: [#167](https://github.com/AgentWorkforce/relayhistory/issues/167)                                                                                                                                                                                            |

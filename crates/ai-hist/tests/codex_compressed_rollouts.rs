@@ -227,3 +227,59 @@ fn a_rollout_compressed_after_ingest_keeps_its_identity() {
         .count();
     assert_eq!(codex_sessions, 1);
 }
+
+/// A second rollout naming the same session does not take the catalog row
+/// from a rollout that was compressed: the compressed copy is still its
+/// source.
+#[test]
+fn a_compressed_rollout_keeps_its_catalog_row_from_a_sibling() {
+    let home = Home::new();
+    let rollout = home.stage_rollout();
+    let store = home.store();
+    store.sync(Default::default()).unwrap();
+    compress(&rollout);
+    let sibling = rollout.with_file_name("rollout-2026-04-20T09-00-00-multi-turn-copy.jsonl");
+    fs::copy(fixture("multi-turn.jsonl"), &sibling).unwrap();
+
+    store.sync(Default::default()).unwrap();
+    store.discover(DiscoveryOptions::default()).unwrap();
+    assert_eq!(evidence(&store).0.as_deref(), Some(rollout.as_path()));
+}
+
+/// A rollout whose records carry no timestamps is dated by its file, and a
+/// compressed one by its compressed copy.
+#[test]
+fn a_compressed_rollout_without_timestamps_is_dated_by_its_copy() {
+    let home = Home::new();
+    let day = home.dir.path().join(".codex/sessions/2026/04/20");
+    fs::create_dir_all(&day).unwrap();
+    let rollout = day.join("rollout-2026-04-20T00-00-00-undated.jsonl");
+    fs::write(
+        &rollout,
+        concat!(
+            r#"{"type":"session_meta","payload":{"id":"sess_undated","cwd":"/tmp/project"}}"#,
+            "\n",
+            r#"{"type":"event_msg","payload":{"type":"user_message","message":"hello"}}"#,
+            "\n",
+        ),
+    )
+    .unwrap();
+    let when = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_790_000_000);
+    fs::File::options()
+        .write(true)
+        .open(&rollout)
+        .unwrap()
+        .set_modified(when)
+        .unwrap();
+    compress(&rollout);
+    let store = home.store();
+    store.discover(DiscoveryOptions::default()).unwrap();
+    let session = store
+        .session(
+            &SessionRef::id(Source::Codex, "sess_undated"),
+            SessionQuery::default(),
+        )
+        .unwrap()
+        .expect("the compressed rollout is catalogued");
+    assert_eq!(session.session.last_activity_ms, Some(1_790_000_000_000));
+}

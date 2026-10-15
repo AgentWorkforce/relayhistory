@@ -436,18 +436,29 @@ pub(crate) fn codex_rollout_locators(
             collect_codex_rollouts(root, &mut files)?;
             (files, Vec::new(), Vec::new())
         }
-        RootWalk::Partial(scope) => (
-            collect_matching_files_scoped(root, CODEX_ROLLOUT_PREFIX, "jsonl", Some(scope))?,
-            collect_matching_files_scoped(root, CODEX_ROLLOUT_PREFIX, "zst", Some(scope))?,
-            scope
-                .paths()
-                .iter()
-                .filter(|path| path.starts_with(root))
-                .map(|path| super::transcript_file::locator_of(path))
-                .filter(|locator| is_codex_rollout_locator(locator))
-                .filter(|locator| super::transcript_file::exists(locator))
-                .collect(),
-        ),
+        RootWalk::Partial(scope) => {
+            let compressed_scope = codex_scope_as(scope, |locator| {
+                super::transcript_file::compressed_path(locator)
+            });
+            let scope = codex_locator_scope(scope);
+            (
+                collect_matching_files_scoped(root, CODEX_ROLLOUT_PREFIX, "jsonl", Some(&scope))?,
+                collect_matching_files_scoped(
+                    root,
+                    CODEX_ROLLOUT_PREFIX,
+                    "zst",
+                    Some(&compressed_scope),
+                )?,
+                scope
+                    .paths()
+                    .iter()
+                    .filter(|path| path.starts_with(root))
+                    .filter(|locator| is_codex_rollout_locator(locator))
+                    .filter(|locator| super::transcript_file::exists(locator))
+                    .cloned()
+                    .collect(),
+            )
+        }
     };
     let mut locators: Vec<PathBuf> = listed
         .iter()
@@ -488,6 +499,29 @@ fn collect_codex_rollouts(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// A tick's changed paths with every compressed rollout named by its
+/// locator. A changed `.jsonl.zst` is the rollout itself, not a sidecar whose
+/// directory has to be listed: read as a sidecar, it put every rollout beside
+/// it in scope while the listing found only the plain ones, so a compressed
+/// sibling looked gone.
+fn codex_locator_scope(scope: &PathScope) -> PathScope {
+    codex_scope_as(scope, Path::to_path_buf)
+}
+
+/// The scope with every rollout it names spelled by `encode` from its
+/// locator, so each encoding's listing takes a named rollout as itself.
+fn codex_scope_as(scope: &PathScope, encode: impl Fn(&Path) -> PathBuf) -> PathScope {
+    PathScope::from_paths(scope.paths().iter().map(|path| {
+        let locator = super::transcript_file::locator_of(path);
+        if is_codex_rollout_locator(&locator) {
+            encode(&locator)
+        } else {
+            path.clone()
+        }
+    }))
+    .unwrap_or_else(|| scope.clone())
+}
+
 fn is_codex_rollout_locator(path: &Path) -> bool {
     path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
         && path
@@ -522,6 +556,7 @@ pub(super) fn codex_unobserved(
     match PathScope::walk_of(paths, root) {
         RootWalk::Skip => Vec::new(),
         RootWalk::Partial(scope) => {
+            let scope = codex_locator_scope(scope);
             let mut missing = super::unobserved_known_paths(seen, root, rollouts);
             missing.retain(|key| scope.include_file(Path::new(key), "rollout-", "jsonl"));
             missing
@@ -607,5 +642,28 @@ mod codex_rollout_tests {
             codex_rollout_locators(&root, Some(&scope)).unwrap(),
             vec![removed]
         );
+    }
+
+    /// A tick naming one compressed rollout lists that rollout, and the
+    /// compressed sibling it did not name is neither listed nor taken for gone.
+    #[test]
+    fn a_tick_naming_one_compressed_rollout_leaves_its_siblings_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sessions");
+        let day = root.join("2026/07/01");
+        touch(&day.join("rollout-a.jsonl.zst"));
+        touch(&day.join("rollout-b.jsonl.zst"));
+        let scope = PathScope::from_paths([day.join("rollout-a.jsonl.zst")]).unwrap();
+        let listed = codex_rollout_locators(&root, Some(&scope)).unwrap();
+        assert_eq!(listed, vec![day.join("rollout-a.jsonl")]);
+
+        let mut seen = serde_json::Map::new();
+        for name in ["rollout-a.jsonl", "rollout-b.jsonl"] {
+            seen.insert(
+                day.join(name).to_string_lossy().to_string(),
+                serde_json::json!({}),
+            );
+        }
+        assert!(codex_unobserved(&seen, &root, &listed, Some(&scope)).is_empty());
     }
 }

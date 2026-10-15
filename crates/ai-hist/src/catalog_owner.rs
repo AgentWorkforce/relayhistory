@@ -37,7 +37,8 @@ pub(crate) fn incoming_must_not_replace(
     if stored == incoming || shared_sqlite_store(source, &stored) {
         return Ok(false);
     }
-    Ok(Path::new(&stored).is_file())
+    // A Codex rollout compressed since it was catalogued is still there.
+    Ok(crate::ingest::transcript_file::exists(Path::new(&stored)))
 }
 
 /// Whether the catalog row's `raw_path` is `path`.

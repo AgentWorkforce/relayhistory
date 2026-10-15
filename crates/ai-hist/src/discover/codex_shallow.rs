@@ -169,7 +169,10 @@ impl ShallowSessionProvider for CodexProvider {
                 break;
             }
         }
-        let mtime = crate::file_modified_ms(&path);
+        // The locator of a compressed rollout names no file; its copy does.
+        let mtime = crate::ingest::transcript_file::stored_path(&path)
+            .ok()
+            .and_then(|stored| crate::file_modified_ms(&stored));
         Ok(Some(ShallowSession {
             source: "codex".into(),
             session_id: session_id.to_string(),
