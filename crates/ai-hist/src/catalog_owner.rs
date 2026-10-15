@@ -312,5 +312,12 @@ mod tests {
         assert!(incoming_must_not_replace(&conn, "codex", "shared", Some(&incoming)).unwrap());
         std::fs::remove_file(newer_state).unwrap();
         assert!(!incoming_must_not_replace(&conn, "codex", "shared", Some(&incoming)).unwrap());
+
+        // A broken projection must not prevent an existing rollout from
+        // keeping its catalog row, or a missing rollout from yielding it.
+        state_db.execute_batch("DROP TABLE threads").unwrap();
+        assert!(incoming_must_not_replace(&conn, "codex", "shared", Some(&incoming)).unwrap());
+        std::fs::remove_file(&rollout).unwrap();
+        assert!(!incoming_must_not_replace(&conn, "codex", "shared", Some(&incoming)).unwrap());
     }
 }

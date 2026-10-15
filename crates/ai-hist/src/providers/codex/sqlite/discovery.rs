@@ -25,7 +25,20 @@ pub(crate) fn incomplete_projection_owns_rollout(incoming: &str, observed: &str)
         home.join(".local/share/opencode/opencode.db"),
     );
     roots.codex = root.to_path_buf();
-    Ok(current_locator(&roots, id, observed)?.as_deref() == Some(incoming))
+    match current_locator(&roots, id, observed) {
+        Ok(current) => Ok(current.as_deref() == Some(incoming)),
+        Err(error)
+            if error
+                .chain()
+                .any(|cause| cause.is::<crate::ingest::CaptureCancelled>()) =>
+        {
+            Err(error)
+        }
+        Err(error) => {
+            eprintln!("ai-hist: [codex] SQLite catalog ownership unavailable: {error:#}");
+            Ok(false)
+        }
+    }
 }
 
 pub(crate) fn enumerate(
