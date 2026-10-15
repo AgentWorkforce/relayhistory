@@ -13157,6 +13157,10 @@ mod tests {
             Some(Path::new("/work/racing.jsonl")),
         );
         let options = options("claude", "racing");
+        let roots = crate::ProviderRoots::from_home(
+            dir.path().to_path_buf(),
+            dir.path().join("opencode.db"),
+        );
         let key = ObservationKey {
             source: "claude".into(),
             session_id: "racing".into(),
@@ -13182,7 +13186,7 @@ mod tests {
                 false
             }),
         );
-        let unobserved = observe_local_target(&conn, &options, &mut target, &key).unwrap();
+        let unobserved = observe_local_target(&conn, &options, &roots, &mut target, &key).unwrap();
         conn.progress_handler(0, None::<fn() -> bool>);
         assert!(unobserved.is_none());
         let total = ticks.load(Ordering::SeqCst);
@@ -13210,7 +13214,7 @@ mod tests {
                     false
                 }),
             );
-            let observed = observe_local_target(&conn, &options, &mut target, &key);
+            let observed = observe_local_target(&conn, &options, &roots, &mut target, &key);
             conn.progress_handler(0, None::<fn() -> bool>);
             let observed = observed.unwrap_or_else(|error| panic!("tick {at}/{total}: {error:#}"));
             assert!(

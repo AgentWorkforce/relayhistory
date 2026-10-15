@@ -42,7 +42,7 @@ pub(crate) fn restored_rollout(
         .optional()
         .map_err(Into::into)
     })?;
-    let Ok(metadata) = path.metadata() else {
+    let Ok(metadata) = crate::ingest::transcript_file::metadata(&path) else {
         return Ok(None);
     };
     context.validate(&path)?;
@@ -98,7 +98,7 @@ fn child_ids(capture: &Capture) -> Vec<String> {
 }
 
 fn rollout_content_stamp(path: &Path) -> Result<String> {
-    let mut file = std::fs::File::open(path)?;
+    let mut file = crate::ingest::transcript_file::open(path)?;
     let mut digest = Sha256::new();
     let mut chunk = [0_u8; 64 * 1024];
     loop {

@@ -60,7 +60,8 @@ impl Thread {
     }
     fn rollout_complete(&self) -> bool {
         self.rollout_path.as_deref().is_some_and(|path| {
-            std::fs::metadata(path).is_ok_and(|meta| meta.len() >= self.next_offset as u64)
+            crate::ingest::transcript_file::metadata(Path::new(path))
+                .is_ok_and(|meta| meta.is_file() && meta.len() >= self.next_offset as u64)
         })
     }
 }
@@ -198,7 +199,7 @@ pub(crate) fn current_locator(
     };
     // Catalog ownership wins when another live rollout uses this session id.
     // Only the observed file's own projection may replace it with SQLite.
-    if Path::new(observed).exists()
+    if crate::ingest::transcript_file::exists(Path::new(observed))
         && rollout_path
             .as_deref()
             .is_none_or(|path| Path::new(path) != Path::new(observed))
@@ -220,8 +221,7 @@ pub(crate) fn current_locator(
     ensure!(offset >= 0, "invalid Codex rollout projection offset");
     if let Some(path) = rollout_path {
         let path = PathBuf::from(path);
-        if path
-            .metadata()
+        if crate::ingest::transcript_file::metadata(&path)
             .is_ok_and(|metadata| metadata.is_file() && metadata.len() >= offset as u64)
         {
             context.validate(&path)?;

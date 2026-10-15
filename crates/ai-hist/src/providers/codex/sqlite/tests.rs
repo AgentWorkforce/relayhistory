@@ -394,3 +394,56 @@ fn a_pruned_rollout_is_read_again_after_it_was_restored() {
         vec!["sqlite-rollout-primary".to_string()]
     );
 }
+
+#[test]
+fn compressed_rollout_completeness_uses_decoded_projection_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let codex = dir.path().join(".codex");
+    install_fixture(&codex, "rollout-primary");
+    let rollout = codex.join("sessions/2026/04/20/rollout-rollout-primary.jsonl");
+    std::fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+    let decoded = format!("{}\n", "complete rollout content".repeat(128));
+    let compressed = zstd::bulk::compress(decoded.as_bytes(), 3).unwrap();
+    assert!(compressed.len() < decoded.len());
+    let compressed_path = crate::ingest::transcript_file::compressed_path(&rollout);
+    std::fs::write(&compressed_path, compressed).unwrap();
+    Connection::open(codex.join("thread_history_1.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE thread_history_projection_state SET next_rollout_byte_offset=?1 WHERE thread_id='sqlite-rollout-primary'",
+            [decoded.len() as i64],
+        )
+        .unwrap();
+    let mut roots =
+        crate::ProviderRoots::from_home(dir.path().to_path_buf(), dir.path().join("opencode.db"));
+    roots.codex = codex.clone();
+    let state = codex.join("state_5.sqlite");
+    assert!(enumerate(&codex, &roots).unwrap().0.is_empty());
+    assert_eq!(
+        restored_rollout(&roots, &state, "sqlite-rollout-primary").unwrap(),
+        Some(rollout.clone())
+    );
+    assert_eq!(
+        current_locator(&roots, "sqlite-rollout-primary", &rollout.to_string_lossy()).unwrap(),
+        Some(rollout.to_string_lossy().into_owned())
+    );
+
+    std::fs::write(
+        &compressed_path,
+        zstd::bulk::compress(b"short\n", 3).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        enumerate(&codex, &roots).unwrap().0.len(),
+        1,
+        "a decoded rollout shorter than the projection uses SQLite"
+    );
+    assert_eq!(
+        restored_rollout(&roots, &state, "sqlite-rollout-primary").unwrap(),
+        None
+    );
+    assert_eq!(
+        current_locator(&roots, "sqlite-rollout-primary", &rollout.to_string_lossy()).unwrap(),
+        Some(locator(&state, "sqlite-rollout-primary"))
+    );
+}
