@@ -328,7 +328,7 @@ otherwise `relationship_capture` records it as `identity_status = 'unlinked'`
 with a null child id. A linked child's edge names the session whose tool call
 started it (a nested subagent's parent is the subagent that spawned it), and
 its evidence is read by id through `SessionStore::session`. `relationship_capabilities().stable_child_identity` is
-`always` for codex, opencode and muse, `sometimes` for claude and grok, and
+`always` for codex, grok-bot, opencode and muse, `sometimes` for claude and grok, and
 `never` for cursor/devin. Codex fork is `✓`:
 the `fork` edge is recorded from the fields Codex actually writes on
 `session_meta` — `forked_from_id` for a human fork, and
@@ -500,6 +500,9 @@ Generated from provider-owned acquisition records; these cells describe fixture-
 | copilot | Messages and identity | Journal version 1 session.start header identity, native event UUIDs, user/assistant text, reasoningText, per-message model, provider messageId and requestId, turnId, cwd and branch from the header context, copilotVersion, every model the journal names; an event's parent is its nearest parentId ancestor stored as an event (markers between them are skipped); agent- and skill-delivered user messages are synthetic, not prompts or user turns; other journal versions rejected with diagnostic; duplicate native IDs at distinct live paths rejected and a journal declaring a new identity retires the old one. |
 | copilot | Tools and usage | Assistant toolRequests and tool.execution_complete join by native toolCallId, scoped as <parentToolCallId>/<toolCallId> under a delegating call because subagents number calls independently; success/error outcomes; assistant.message outputTokens kept verbatim as per-message usage (output only); session.shutdown modelMetrics and session.usage_checkpoint kept raw in markers as session-wide cumulative totals, excluded from request usage; no inferred file edits. |
 | copilot | Control and lineage | Turn boundaries, model changes, resume, permissions, system messages, subagent lifecycle and unknown event types retained as markers with their raw parentId; subagent messages flagged sidechain by parentToolCallId and never the session preview; no child session, relationship, resume command or live execution. |
+| grok-bot | Messages and identity | Base32 transcript keys, native agent and entry IDs, roster titles, complete and truncated tails across account slots; bounded local window accumulates across captures. |
+| grok-bot | Control and lineage | Widget responses, voice turns, approvals, attachments and app events retained; Cursor cloud-agent IDs recorded as observed delegation without a local child transcript. |
+| grok-bot | Usage and acquisition | No local model, token or cost usage; passive local blobs only, with no host backfill, network calls or credential reads. |
 <!-- END GENERATED PROVIDER CAPTURE -->
 
 ### Embedded Codex image evidence

@@ -489,6 +489,14 @@ mark captured is missing for every consumer, not just for `ai-hist`.
 | **opencode** | ✓ | ✓ (directory / message `path.cwd`) | – | ✓ | ✓ | ✓ | ✓ (`providerID/modelID`) | – | – | – | – | – |
 | **devin** | ✓ | ✓ (`working_directory`) | – | ✓ (`created_at`, seconds→ms) | ✓ (`last_activity_at`, seconds→ms) | ✓ | ✓ (`model` / `generation_model`) | – | – (transcript `agent.version` rides a marker) | – | – | ✓ (`workspace_dirs`) |
 | **copilot** | ✓ (`session.start` `sessionId`) | ✓ (header `context.cwd`) | ✓ (header `context.branch`) | ✓ (header `timestamp`) | ✓ (16 KiB tail) | ✓ (first typed `user.message` in the 64 KiB head) | ✓ (`selectedModel`) | – | ✓ (`copilotVersion`) | – | – | – |
+| **grok-bot** | ✓ (decoded replica key) | – (hosted bot) | – | ✓ (bounded head) | ✓ (bounded tail) | – (full capture only) | – | – | – | – | – | – |
+
+Grok Bot reads `sand-client-persistence/` under the Electron user-data directory
+(`~/Library/Application Support/Grok Bot/` on macOS). Set
+`GROK_BOT_USER_DATA` to override that directory. The app keeps a bounded
+transcript tail, so repeated syncs retain entries that later leave its local
+window; older history already absent at the first sync cannot be recovered
+from this passive source.
 
 ### Session markers
 

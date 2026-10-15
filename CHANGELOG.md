@@ -8,11 +8,13 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Grok Bot desktop transcript replicas are discoverable from the local Electron persistence store, including messages, widgets, voice turns, markers and cloud-agent delegation; repeated captures retain entries after the app's local window moves on.
 - GitHub Copilot CLI session history is discoverable and searchable from `$COPILOT_HOME/session-state/<id>/events.jsonl` (default `~/.copilot`), with per-message models, reasoning, tool calls and results, verbatim per-message `outputTokens`, and every other journal event — including the cumulative `session.shutdown` usage totals — as session markers.
 - `remote::send_remote_message_with` and `RemoteCredential` let a host send a remote-session message with its own resolved Devin credential instead of the connector's file/env lookup. The error-code contract is unchanged: an unusable credential fails `INVALID_ARGUMENT`, never `CONNECTOR_NOT_CONFIGURED`.
 
 ### Rust API
 
+- Added `Source::GrokBot` for filtering and reading persisted Grok Bot desktop history.
 - Added `Source::Copilot` for filtering and reading persisted GitHub Copilot CLI session history.
 
 ## [0.44.0] - 2026-10-14
