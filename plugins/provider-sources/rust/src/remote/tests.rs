@@ -1020,6 +1020,35 @@ fn devin_mapping_stamp_tracks_the_mapped_listing_fields() {
 }
 
 #[test]
+fn devin_mapping_skips_review_sessions_and_keeps_uncategorized_work() {
+    // Devin Review and push-review automations are `automation`-origin
+    // sessions the classifier files under the review categories; they carry
+    // no conversational history worth keeping.
+    for category in ["code_review", "code_review_and_analysis"] {
+        let mut entry = devin_session(DEVIN_SESSION_ID, "Review this push");
+        entry["category"] = serde_json::json!(category);
+        assert!(
+            map_devin_session(&entry).is_none(),
+            "{category} must not map"
+        );
+    }
+    // Uncategorized and non-review sessions still map: `category` is only
+    // populated once Cognition's classifier has run.
+    for category in [
+        serde_json::Value::Null,
+        serde_json::json!("bug_fixing"),
+        serde_json::json!("other"),
+    ] {
+        let mut entry = devin_session(DEVIN_SESSION_ID, "t");
+        entry["category"] = category.clone();
+        assert!(
+            map_devin_session(&entry).is_some(),
+            "{category} must still map"
+        );
+    }
+}
+
+#[test]
 fn devin_mapping_skips_malformed_ids_and_normalizes_the_prefixed_form() {
     for bad_id in [
         "",

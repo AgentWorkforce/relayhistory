@@ -168,10 +168,24 @@ fn ensure_devin_status(what: &str, scope: &str, status: u16, body: &str) -> Resu
     }
 }
 
+/// `category` values the v3 listing assigns to code-review work. Cognition's
+/// review sessions — Devin Review and push-review automations — run inside the
+/// org as `automation`-origin sessions, so `origin` cannot tell them apart from
+/// other automations; the classifier's category is the listing's only field
+/// that names the work itself.
+const REVIEW_CATEGORIES: [&str; 2] = ["code_review", "code_review_and_analysis"];
+
 /// Map one session object from `GET /v3/organizations/{org}/sessions` into a
 /// catalog row. The listing's `title` is the only human-readable identifier
-/// the endpoint offers; `None` for a malformed id.
+/// the endpoint offers; `None` for a malformed id or a review session, which
+/// is an automation artifact rather than work a person directed.
 pub(super) fn map_devin_session(value: &Value) -> Option<(Candidate, ShallowSession)> {
+    if REVIEW_CATEGORIES
+        .iter()
+        .any(|category| string_field(value, "category").as_deref() == Some(category))
+    {
+        return None;
+    }
     let id = string_field(value, "session_id")?;
     let id = devin_session_hex(&id)?.to_string();
     let created_ms = value
