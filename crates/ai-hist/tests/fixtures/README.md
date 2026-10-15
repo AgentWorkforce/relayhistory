@@ -70,6 +70,7 @@ they are a real fact about the fixture.
 | --- | --- |
 | `ClaudeTranscript` | flat `.jsonl` into `~/.claude/projects/corpus/` |
 | `CodexRollout` | flat `.jsonl` into `~/.codex/sessions/2026/04/20/`, renamed to the `rollout-` prefix the codex adapter enumerates |
+| `Sqlite` (Codex) | paired SQL scripts executed into `~/.codex/state_5.sqlite` and `~/.codex/thread_history_1.sqlite`; optional rollout staged beside them |
 | `HomeTree` | directory copied verbatim into `HOME` — for fixtures whose provider layout is itself the point |
 | `OpencodeSqlite` | `.sql` executed into `~/.local/share/opencode/opencode.db` |
 | `OpencodeLegacyJson` | burn's older OpenCode JSON layout, copied under `~/.local/share/opencode/` |
@@ -166,6 +167,12 @@ source without deciding which one fails the test.
 | `codex/fork-paginated` | relayhistory | `codex/fork-paginated/parent.jsonl`, `codex/fork-paginated/child.jsonl` | a Codex 0.144 human fork (`history_mode: paginated`) whose rollout copies both parent turns and their cumulative `token_count` straight after its own `session_meta`, without the parent's |
 | `codex/fork-subagent` | relayhistory | `codex/fork-subagent/root.jsonl`, `codex/fork-subagent/subagent.jsonl` | a spawned subagent naming its parent in `source.subagent.thread_spawn.parent_thread_id`, replaying the parent's open turn (with a tool call) and starting its own turn in the thread id's own millisecond |
 | `codex/guardian-review` | relayhistory | `codex/guardian-review/parent.jsonl`, `codex/guardian-review/guardian.jsonl` | a Codex 0.150+ `thread_source: guardian_review` rollout with `parent_thread_id` that opens on a `compaction` item rather than a replay |
+| `codex/sqlite-pruned-all-items` | relayhistory | `codex/sqlite/pruned-all-items-{state,history}.sql` | A pruned paginated rollout leaves every native item type, a failed command and a turn error in paired SQLite stores. |
+| `codex/sqlite-rollout-primary` | relayhistory | `codex/sqlite/rollout-primary-{state,history}.sql`, `codex/sqlite/rollout-rollout-primary.jsonl` | A complete rollout is primary even when SQLite contains conflicting text for the same thread. |
+| `codex/sqlite-truncated-rollout` | relayhistory | `codex/sqlite/truncated-rollout-{state,history}.sql`, `codex/sqlite/rollout-truncated-rollout.jsonl` | A truncated rollout overlaps one native user item with SQLite, which supplies the missing assistant item once. |
+| `codex/sqlite-legacy-no-items` | relayhistory | `codex/sqlite/legacy-no-items-{state,history}.sql` | A legacy thread has no paginated items and is excluded from SQLite fallback. |
+| `codex/sqlite-subagent-edge` | relayhistory | `codex/sqlite/subagent-edge-{state,history}.sql` | A child thread names its parent in source JSON and thread_spawn_edges while remaining outside the root catalog. |
+| `codex/sqlite-archived-thread` | relayhistory | `codex/sqlite/archived-thread-{state,history}.sql` | An archived paginated thread with no rollout still appears in the catalog and ledger. |
 
 ### `cursor`
 

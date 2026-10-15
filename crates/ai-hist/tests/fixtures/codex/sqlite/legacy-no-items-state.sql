@@ -1,0 +1,3 @@
+CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, created_at_ms INTEGER, updated_at_ms INTEGER, source TEXT, cwd TEXT, git_branch TEXT, git_origin_url TEXT, title TEXT, name TEXT, first_user_message TEXT, originator TEXT, cli_version TEXT, model TEXT, tokens_used INTEGER, archived INTEGER, agent_nickname TEXT, agent_role TEXT, history_mode TEXT);
+CREATE TABLE thread_spawn_edges(parent_thread_id TEXT,child_thread_id TEXT,status TEXT);
+INSERT INTO threads VALUES ('sqlite-legacy-no-items',NULL,1776643200000,1776643300000,'cli','/work/app','feature/sqlite','https://example.test/team/app','SQLite thread','SQLite thread','Please inspect the project','codex_cli_rs','0.151.0','gpt-synthetic',12345,0,NULL,NULL,'legacy');

@@ -319,6 +319,80 @@
         "codex/guardian-review/parent.jsonl",
         "codex/guardian-review/guardian.jsonl"
       ]
+    },
+    {
+      "source": "codex",
+      "name": "sqlite-pruned-all-items",
+      "layout": "Sqlite",
+      "target": ".codex/state_5.sqlite",
+      "origin": "RelayHistory",
+      "files": [
+        "codex/sqlite/pruned-all-items-state.sql",
+        "codex/sqlite/pruned-all-items-history.sql"
+      ],
+      "quirk": "A pruned paginated rollout leaves every native item type, a failed command and a turn error in paired SQLite stores."
+    },
+    {
+      "source": "codex",
+      "name": "sqlite-rollout-primary",
+      "layout": "Sqlite",
+      "target": ".codex/state_5.sqlite",
+      "origin": "RelayHistory",
+      "files": [
+        "codex/sqlite/rollout-primary-state.sql",
+        "codex/sqlite/rollout-primary-history.sql",
+        "codex/sqlite/rollout-rollout-primary.jsonl"
+      ],
+      "quirk": "A complete rollout is primary even when SQLite contains conflicting text for the same thread."
+    },
+    {
+      "source": "codex",
+      "name": "sqlite-truncated-rollout",
+      "layout": "Sqlite",
+      "target": ".codex/state_5.sqlite",
+      "origin": "RelayHistory",
+      "files": [
+        "codex/sqlite/truncated-rollout-state.sql",
+        "codex/sqlite/truncated-rollout-history.sql",
+        "codex/sqlite/rollout-truncated-rollout.jsonl"
+      ],
+      "quirk": "A truncated rollout overlaps one native user item with SQLite, which supplies the missing assistant item once."
+    },
+    {
+      "source": "codex",
+      "name": "sqlite-legacy-no-items",
+      "layout": "Sqlite",
+      "target": ".codex/state_5.sqlite",
+      "origin": "RelayHistory",
+      "files": [
+        "codex/sqlite/legacy-no-items-state.sql",
+        "codex/sqlite/legacy-no-items-history.sql"
+      ],
+      "quirk": "A legacy thread has no paginated items and is excluded from SQLite fallback."
+    },
+    {
+      "source": "codex",
+      "name": "sqlite-subagent-edge",
+      "layout": "Sqlite",
+      "target": ".codex/state_5.sqlite",
+      "origin": "RelayHistory",
+      "files": [
+        "codex/sqlite/subagent-edge-state.sql",
+        "codex/sqlite/subagent-edge-history.sql"
+      ],
+      "quirk": "A child thread names its parent in source JSON and thread_spawn_edges while remaining outside the root catalog."
+    },
+    {
+      "source": "codex",
+      "name": "sqlite-archived-thread",
+      "layout": "Sqlite",
+      "target": ".codex/state_5.sqlite",
+      "origin": "RelayHistory",
+      "files": [
+        "codex/sqlite/archived-thread-state.sql",
+        "codex/sqlite/archived-thread-history.sql"
+      ],
+      "quirk": "An archived paginated thread with no rollout still appears in the catalog and ledger."
     }
   ],
   "population": {
@@ -330,5 +404,15 @@
       "relationship"
     ],
     "usage_accounting": "cumulative-delta"
-  }
+  },
+  "capture": [
+    {
+      "evidence": "Rollout",
+      "coverage": "Existing rollout fixtures retain primary parsing and snapshots."
+    },
+    {
+      "evidence": "SQLite thread history",
+      "coverage": "Six synthetic cases cover pruned, primary, truncated, legacy, child, and archived threads; native items, tools, edits, markers, and cumulative token total."
+    }
+  ]
 }

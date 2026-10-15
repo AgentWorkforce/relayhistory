@@ -216,8 +216,37 @@ fn stage(fixture: &Fixture, home: &Path) {
             fs::create_dir_all(path.parent().expect("SQLite parent")).unwrap();
             let db = Connection::open(path).unwrap();
             for file in fixture.files {
-                db.execute_batch(&fs::read_to_string(root.join(file)).unwrap())
-                    .unwrap();
+                let from = root.join(file);
+                if relative == ".codex/state_5.sqlite" {
+                    if from.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+                        let rollout = home
+                            .join(".codex/sessions/2026/04/20")
+                            .join(from.file_name().unwrap());
+                        fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+                        fs::copy(from, rollout).unwrap();
+                        continue;
+                    }
+                    let target = if from
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .contains("history")
+                    {
+                        home.join(".codex/thread_history_1.sqlite")
+                    } else {
+                        home.join(".codex/state_5.sqlite")
+                    };
+                    let sql = fs::read_to_string(from)
+                        .unwrap()
+                        .replace("{{CODEX_HOME}}", &home.join(".codex").to_string_lossy());
+                    Connection::open(target)
+                        .unwrap()
+                        .execute_batch(&sql)
+                        .unwrap();
+                } else {
+                    db.execute_batch(&fs::read_to_string(from).unwrap())
+                        .unwrap();
+                }
             }
         }
         Layout::OpencodeSqlite => {
