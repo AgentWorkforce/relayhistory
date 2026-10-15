@@ -146,6 +146,7 @@ source without deciding which one fails the test.
 | `codex/oversized-shell-output` | burn | `codex/oversized-shell-output.jsonl` | an 80 KB shell function-call output |
 | `codex/parent-thread-id` | relayhistory | `codex/parent-thread-id` | a subagent rollout naming its root through `parent_thread_id` plus `thread_source: subagent` |
 | `codex/archived-session` | relayhistory | `codex/archived-session` | a rollout under `~/.codex/archived_sessions/`, the second codex discovery root |
+| `codex/compressed-rollout` | relayhistory | `codex/compressed-rollout` | the `multi-turn` rollout as Codex stores a finished one, zstd-compressed to `rollout-….jsonl.zst` |
 | `codex/counter-regressed` | relayhistory | `codex/counter-regressed.jsonl` | a cached-input counter grows faster than total input, making the cumulative delta unnormalizable |
 | `codex/counter-negative` | relayhistory | `codex/counter-negative.jsonl` | a cumulative snapshot contains a negative input counter that must be preserved and refused |
 | `codex/counter-fractional` | relayhistory | `codex/counter-fractional.jsonl` | a cumulative snapshot contains a fractional output counter that must be preserved and refused |

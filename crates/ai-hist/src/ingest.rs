@@ -49,6 +49,7 @@ mod sweep_write;
 pub(crate) mod titles;
 pub(crate) mod tool_result_facts;
 pub(crate) mod transcript_cursor;
+pub(crate) mod transcript_file;
 
 pub(crate) use evidence_probe::note_deleted;
 use evidence_probe::{
@@ -150,8 +151,8 @@ pub(crate) mod scoped_files;
 #[cfg(test)]
 pub(crate) use scoped_files::take_dirs_read;
 pub(crate) use scoped_files::{
-    collect_matching_files, collect_matching_files_scoped, collect_muse_transcripts,
-    collect_muse_transcripts_scoped, grok_transcripts_for,
+    codex_rollout_locators, collect_matching_files, collect_matching_files_scoped,
+    collect_muse_transcripts, collect_muse_transcripts_scoped, grok_transcripts_for,
 };
 use sweep_phases::SweepPhases;
 pub(crate) use sweep_phases::SweepScope;
@@ -4111,7 +4112,7 @@ fn metadata_identity(_metadata: &fs::Metadata) -> (Option<u64>, Option<u64>) {
 
 struct CompleteJsonlReader {
     path: PathBuf,
-    reader: BufReader<fs::File>,
+    reader: BufReader<transcript_file::TranscriptFile>,
     cursor: FileCursor,
     position: u64,
     prefix_hasher: Sha256,
@@ -5854,13 +5855,16 @@ fn repair_codex_rollout_user_messages(
             [meta.session_id.as_str()],
         )?;
     }
-    let outcome = ingest_codex_rollout(conn, path, meta)?;
+    // A read from byte zero like any other: the cursor it ends on is stored,
+    // so the rollout's next change resumes rather than re-reading it.
+    let outcome = ingest_codex_rollout_at_locator(conn, path, meta, false)?;
     if let Some(tx) = tx {
         tx.commit()?;
     }
     Ok(outcome)
 }
 
+#[cfg(test)]
 pub(crate) fn ingest_codex_rollout(
     conn: &Connection,
     path: &Path,
@@ -5911,10 +5915,16 @@ fn ingest_codex_rollout_at_locator(
     // in the same interval between two passes. Codex appends to its rollouts
     // and never rewrites them, which is the same trade the Claude walk's
     // cursor already makes.
+    //
+    // Compressing a rollout, or writing it back out, stamps it anew without
+    // touching its records: a change of encoding over records at least as long
+    // as the cursor's resumes too, and the reader's windows confirm the bytes.
     if let Some(file) = cursor.file.as_ref() {
-        let grew = path
-            .metadata()
-            .map(|now| now.len() > file.size)
+        let grew = transcript_file::metadata(path)
+            .map(|now| {
+                now.len() > file.size
+                    || (now.compressed() != file.compressed && now.len() >= file.size)
+            })
             .unwrap_or(false);
         if !grew {
             cursor = transcript_cursor::TranscriptCursorState::default();
@@ -11837,14 +11847,16 @@ pub(crate) fn validate_opened_file_identity(path: &Path, opened: &fs::File) -> R
     Ok(())
 }
 
+/// The stored file's stat: a transcript compressed under its locator stamps
+/// as its compressed copy, so a change of encoding is a change of stamp.
 fn file_stamp(path: &Path) -> Result<String> {
-    Ok(stamp_of(&path.metadata()?))
+    Ok(stamp_of(&transcript_file::stored(path)?.1))
 }
 
 /// The change stamp and recency hint discovery needs per enumerated file,
 /// from one stat. Errors for anything that is not a regular file.
 pub(crate) fn file_stamp_and_modified(path: &Path) -> Result<(String, Option<i64>)> {
-    let metadata = path.metadata()?;
+    let (_, metadata) = transcript_file::stored(path)?;
     anyhow::ensure!(
         metadata.is_file(),
         "{} is not a regular file",
@@ -27251,6 +27263,248 @@ mod tests {
             )
             .unwrap();
         assert_eq!(rewritten, 1, "the walk resumed past an in-place edit");
+    }
+
+    /// A two-turn rollout for the compression tests, and the row of its first
+    /// turn that only a read from byte zero writes back.
+    fn compressible_rollout(day: &Path, session: &str) -> (PathBuf, String) {
+        let rollout = day.join(format!("rollout-2026-04-20T05-00-00-{session}.jsonl"));
+        let event = |at: &str, payload: Value| {
+            format!(
+                "{}\n",
+                json!({"timestamp": at, "type": "event_msg", "payload": payload})
+            )
+        };
+        let mut text = format!(
+            "{}\n",
+            json!({"timestamp": "2026-04-20T05:00:00.000Z", "type": "session_meta",
+                   "payload": {"id": session, "cwd": "/tmp/project"}})
+        );
+        for n in 1..=2u32 {
+            text.push_str(&event(
+                &format!("2026-04-20T05:0{n}:01.000Z"),
+                json!({"type": "user_message", "message": format!("run {n}")}),
+            ));
+            text.push_str(&event(
+                &format!("2026-04-20T05:0{n}:02.000Z"),
+                json!({"type": "agent_message", "message": format!("done {n}")}),
+            ));
+            text.push_str(&event(
+                &format!("2026-04-20T05:0{n}:03.000Z"),
+                json!({"type": "task_complete", "turn_id": format!("t{n}")}),
+            ));
+        }
+        (rollout, text)
+    }
+
+    /// Replace `rollout` by its zstd-compressed copy the way Codex does: same
+    /// records, same mtime, a new file under `.jsonl.zst`.
+    fn compress_rollout(rollout: &Path) -> PathBuf {
+        let modified = fs::metadata(rollout).unwrap().modified().unwrap();
+        let compressed = transcript_file::compressed_path(rollout);
+        let bytes = zstd::bulk::compress(&fs::read(rollout).unwrap(), 3).unwrap();
+        fs::write(&compressed, bytes).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&compressed)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        fs::remove_file(rollout).unwrap();
+        compressed
+    }
+
+    fn codex_rows(conn: &Connection, sql: &str) -> i64 {
+        conn.query_row(sql, [], |row| row.get(0)).unwrap()
+    }
+
+    /// A rollout Codex compresses after it was indexed is the same rollout:
+    /// its stamp-map key, cursor and catalog locator stay the plain name, and
+    /// the walk resumes from the committed position instead of indexing the
+    /// records again. The compressed copy is immutable, so the next pass
+    /// skips it on its stamp.
+    #[test]
+    fn a_rollout_compressed_after_ingest_keeps_its_identity_and_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("codex");
+        let day = root.join("sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        let (rollout, text) = compressible_rollout(&day, "sess_zst");
+        fs::write(&rollout, &text).unwrap();
+        let locator = rollout.to_string_lossy().to_string();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        state.insert("codex_rollouts_v7".into(), json!({}));
+        sync_codex(&conn, &mut state, &root).unwrap();
+        let events = codex_rows(
+            &conn,
+            "SELECT COUNT(*) FROM session_events WHERE source = 'codex'",
+        );
+        assert!(events > 0);
+        // A row behind the cursor: a resumed pass never writes it back.
+        conn.execute(
+            "DELETE FROM session_events WHERE source = 'codex' AND text = 'done 1'",
+            [],
+        )
+        .unwrap();
+
+        compress_rollout(&rollout);
+        sync_codex(&conn, &mut state, &root).unwrap();
+        let behind =
+            "SELECT COUNT(*) FROM session_events WHERE source = 'codex' AND text = 'done 1'";
+        assert_eq!(
+            codex_rows(&conn, behind),
+            0,
+            "compressing the rollout re-read it from zero"
+        );
+        let seen = state["codex_rollouts_v7"].as_object().unwrap();
+        assert_eq!(seen.keys().collect::<Vec<_>>(), vec![&locator]);
+        assert_eq!(seen[&locator]["session"], "sess_zst");
+        let (cursor_locator, document, committed): (String, String, i64) = conn
+            .query_row(
+                "SELECT locator, parser_state_json, committed_offset FROM transcript_cursors \
+                 WHERE source = 'codex'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(cursor_locator, locator);
+        assert_eq!(committed as usize, text.len());
+        let cursor = transcript_cursor::TranscriptCursorState::decode(Some(&document));
+        assert!(cursor.file.unwrap().compressed);
+        let raw_path: String = conn
+            .query_row(
+                "SELECT raw_path FROM sessions WHERE source = 'codex' AND session_id = 'sess_zst'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw_path, locator);
+
+        // Unchanged and immutable: skipped on its stamp, nothing re-read.
+        conn.execute("DELETE FROM transcript_cursors", []).unwrap();
+        sync_codex(&conn, &mut state, &root).unwrap();
+        assert_eq!(
+            codex_rows(&conn, "SELECT COUNT(*) FROM transcript_cursors"),
+            0,
+            "an unchanged compressed rollout was opened again"
+        );
+
+        // A store that only ever saw the compressed copy holds every row.
+        let fresh = Connection::open_in_memory().unwrap();
+        init_db(&fresh).unwrap();
+        let mut fresh_state = Map::new();
+        fresh_state.insert("codex_rollouts_v7".into(), json!({}));
+        sync_codex(&fresh, &mut fresh_state, &root).unwrap();
+        assert_eq!(
+            codex_rows(
+                &fresh,
+                "SELECT COUNT(*) FROM session_events WHERE source = 'codex'"
+            ),
+            events
+        );
+        assert_eq!(codex_rows(&fresh, behind), 1);
+    }
+
+    /// Resuming a compressed session writes the rollout back out as plain
+    /// JSONL and appends to it. The walk continues from the cursor it took
+    /// over the compressed copy and indexes only the new turn.
+    #[test]
+    fn a_compressed_rollout_written_back_out_and_appended_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("codex");
+        let day = root.join("sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        let (rollout, text) = compressible_rollout(&day, "sess_unzst");
+        fs::write(&rollout, &text).unwrap();
+        let compressed = compress_rollout(&rollout);
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        state.insert("codex_rollouts_v7".into(), json!({}));
+        sync_codex(&conn, &mut state, &root).unwrap();
+        let behind =
+            "SELECT COUNT(*) FROM session_events WHERE source = 'codex' AND text = 'done 1'";
+        assert_eq!(codex_rows(&conn, behind), 1);
+        conn.execute(
+            "DELETE FROM session_events WHERE source = 'codex' AND text = 'done 1'",
+            [],
+        )
+        .unwrap();
+
+        let appended = [
+            json!({"timestamp": "2026-04-20T05:03:01.000Z", "type": "event_msg",
+                   "payload": {"type": "user_message", "message": "run 3"}}),
+            json!({"timestamp": "2026-04-20T05:03:02.000Z", "type": "event_msg",
+                   "payload": {"type": "agent_message", "message": "done 3"}}),
+            json!({"timestamp": "2026-04-20T05:03:03.000Z", "type": "event_msg",
+                   "payload": {"type": "task_complete", "turn_id": "t3"}}),
+        ]
+        .iter()
+        .map(|record| format!("{record}\n"))
+        .collect::<String>();
+        fs::write(&rollout, format!("{text}{appended}")).unwrap();
+        fs::remove_file(&compressed).unwrap();
+        sync_codex(&conn, &mut state, &root).unwrap();
+        assert_eq!(
+            codex_rows(&conn, behind),
+            0,
+            "writing the rollout back out re-read it from zero"
+        );
+        assert_eq!(
+            codex_rows(
+                &conn,
+                "SELECT COUNT(*) FROM session_events WHERE source = 'codex' AND text = 'done 3'"
+            ),
+            1
+        );
+        let committed = codex_rows(
+            &conn,
+            "SELECT committed_offset FROM transcript_cursors WHERE source = 'codex'",
+        );
+        assert_eq!(committed as usize, text.len() + appended.len());
+    }
+
+    /// Between writing the compressed copy and removing the original, both
+    /// encodings are on disk. They are one rollout: one stamp-map key, one
+    /// cursor, and the rows one read of either writes.
+    #[test]
+    fn a_rollout_in_both_encodings_is_one_rollout() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("codex");
+        let day = root.join("sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        let (rollout, text) = compressible_rollout(&day, "sess_both");
+        fs::write(&rollout, &text).unwrap();
+        fs::write(
+            transcript_file::compressed_path(&rollout),
+            zstd::bulk::compress(text.as_bytes(), 3).unwrap(),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        state.insert("codex_rollouts_v7".into(), json!({}));
+        sync_codex(&conn, &mut state, &root).unwrap();
+        assert_eq!(state["codex_rollouts_v7"].as_object().unwrap().len(), 1);
+        assert_eq!(
+            codex_rows(
+                &conn,
+                "SELECT COUNT(*) FROM transcript_cursors WHERE source = 'codex'"
+            ),
+            1
+        );
+        assert_eq!(
+            codex_rows(
+                &conn,
+                "SELECT COUNT(*) FROM session_events WHERE source = 'codex' AND text = 'done 2'"
+            ),
+            1
+        );
     }
 
     /// An install already at the recorded generation must still re-read its

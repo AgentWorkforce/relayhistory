@@ -413,14 +413,65 @@ pub(super) fn codex_rollouts_for_root(
     root: &Path,
     paths: Option<&PathScope>,
 ) -> Result<(Vec<PathBuf>, bool)> {
-    match PathScope::walk_of(paths, root) {
-        RootWalk::Skip => Ok((Vec::new(), false)),
-        RootWalk::Partial(scope) => Ok((
-            collect_matching_files_scoped(root, "rollout-", "jsonl", Some(scope))?,
-            false,
-        )),
-        RootWalk::Full => Ok((collect_matching_files(root, "rollout-", "jsonl")?, true)),
-    }
+    let complete = matches!(PathScope::walk_of(paths, root), RootWalk::Full);
+    Ok((codex_rollout_locators(root, paths)?, complete))
+}
+
+/// The Codex rollouts under `root` this scope names, by locator.
+///
+/// Codex compresses a finished rollout to `rollout-….jsonl.zst`. Both
+/// encodings list under the plain `.jsonl` name, once, so discovery, the sync
+/// walk and hydration all key a rollout the same way before and after it is
+/// compressed (see [`super::transcript_file`]). A scoped tick that names either
+/// encoding lists the rollout, so the event for the one that disappeared does
+/// not forget a rollout that is still on disk in the other.
+pub(crate) fn codex_rollout_locators(
+    root: &Path,
+    scope: Option<&PathScope>,
+) -> Result<Vec<PathBuf>> {
+    let (plain, compressed, named) = match PathScope::walk_of(scope, root) {
+        RootWalk::Skip => return Ok(Vec::new()),
+        RootWalk::Full => (
+            collect_matching_files(root, CODEX_ROLLOUT_PREFIX, "jsonl")?,
+            collect_matching_files(root, CODEX_ROLLOUT_PREFIX, "zst")?,
+            Vec::new(),
+        ),
+        RootWalk::Partial(scope) => (
+            collect_matching_files_scoped(root, CODEX_ROLLOUT_PREFIX, "jsonl", Some(scope))?,
+            collect_matching_files_scoped(root, CODEX_ROLLOUT_PREFIX, "zst", Some(scope))?,
+            scope
+                .paths()
+                .iter()
+                .filter(|path| path.starts_with(root))
+                .map(|path| super::transcript_file::locator_of(path))
+                .filter(|locator| is_codex_rollout_locator(locator))
+                .filter(|locator| super::transcript_file::exists(locator))
+                .collect(),
+        ),
+    };
+    let mut locators: Vec<PathBuf> = plain
+        .into_iter()
+        .chain(
+            compressed
+                .iter()
+                .map(|path| super::transcript_file::locator_of(path)),
+        )
+        .filter(|locator| is_codex_rollout_locator(locator))
+        .chain(named)
+        .collect();
+    locators.sort();
+    locators.dedup();
+    Ok(locators)
+}
+
+const CODEX_ROLLOUT_PREFIX: &str = "rollout-";
+
+fn is_codex_rollout_locator(path: &Path) -> bool {
+    path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
+        && path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with(CODEX_ROLLOUT_PREFIX))
 }
 
 /// Whether this root may count as fully seen for a backfill generation.
@@ -483,3 +534,56 @@ pub(super) fn sweep_repairs(
 }
 
 pub(super) use claude_scope::{claude_holding_flag, claude_missing_cursors};
+
+#[cfg(test)]
+mod codex_rollout_tests {
+    use super::*;
+
+    fn touch(path: &Path) {
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path, b"{}\n").unwrap();
+    }
+
+    /// Both encodings list once, under the plain name; anything else under
+    /// the root is not a rollout.
+    #[test]
+    fn rollouts_list_by_locator_whatever_their_encoding() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sessions");
+        let day = root.join("2026/07/01");
+        touch(&day.join("rollout-a.jsonl"));
+        touch(&day.join("rollout-b.jsonl.zst"));
+        touch(&day.join("rollout-c.jsonl"));
+        touch(&day.join("rollout-c.jsonl.zst"));
+        touch(&day.join("rollout-d.zst"));
+        touch(&day.join("notes.jsonl.zst"));
+
+        assert_eq!(
+            codex_rollout_locators(&root, None).unwrap(),
+            vec![
+                day.join("rollout-a.jsonl"),
+                day.join("rollout-b.jsonl"),
+                day.join("rollout-c.jsonl"),
+            ]
+        );
+    }
+
+    /// A tick whose events name only the plain file Codex just removed still
+    /// lists the rollout its compressed copy now holds, so the walk does not
+    /// forget a rollout that is still on disk.
+    #[test]
+    fn a_tick_naming_the_removed_plain_file_lists_its_compressed_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sessions");
+        let day = root.join("2026/07/01");
+        touch(&day.join("rollout-a.jsonl.zst"));
+        touch(&day.join("rollout-b.jsonl"));
+        let removed = day.join("rollout-a.jsonl");
+        let scope = PathScope::from_paths([removed.clone()]).unwrap();
+
+        assert_eq!(
+            codex_rollout_locators(&root, Some(&scope)).unwrap(),
+            vec![removed]
+        );
+    }
+}

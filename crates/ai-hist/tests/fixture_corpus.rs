@@ -1299,6 +1299,32 @@ fn codex_archived_rollouts_are_discovered() {
     assert_eq!(text(&sessions[0], "session_id"), "sess_archived_1");
 }
 
+/// A rollout Codex compressed to `.jsonl.zst` holds the evidence the plain
+/// rollout does, row for row. Only the change stamp, which measures the
+/// stored file, tells them apart.
+#[test]
+fn codex_compressed_rollout_matches_the_plain_one() {
+    let evidence = |key: &str| {
+        let mut evidence = snapshot(key).clone();
+        let evidence = evidence.as_object_mut().expect("snapshot object");
+        for describes_the_fixture in ["corpus_files", "fixture", "layout", "origin", "quirk"] {
+            evidence.remove(describes_the_fixture);
+        }
+        for session in evidence["sessions"].as_array_mut().expect("sessions") {
+            session
+                .as_object_mut()
+                .expect("session row")
+                .remove("source_stamp");
+        }
+        Value::Object(evidence.clone())
+    };
+    assert_eq!(
+        evidence("codex/compressed-rollout"),
+        evidence("codex/multi-turn")
+    );
+    assert!(!rows("codex/compressed-rollout", "session_events").is_empty());
+}
+
 /// `parent_thread_id` in a subagent rollout's `session_meta` is a delegation
 /// edge, and the delegated thread is evidence rather than a catalog row.
 #[test]
