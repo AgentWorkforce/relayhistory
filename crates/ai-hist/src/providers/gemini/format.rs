@@ -168,25 +168,50 @@ fn strings<'a>(value: &'a Value, key: &str) -> Result<Vec<&'a str>> {
         })
         .collect()
 }
+fn fields(value: &Value, allowed: &[&str], kind: &str) -> Result<()> {
+    let object = value
+        .as_object()
+        .with_context(|| format!("GEMINI_INVALID_RECORD: {kind} object"))?;
+    anyhow::ensure!(
+        object.keys().all(|key| allowed.contains(&key.as_str())),
+        "GEMINI_UNSUPPORTED_SCHEMA: {kind} field"
+    );
+    Ok(())
+}
 fn update(messages: &mut Journal, patch: &Value) -> Result<()> {
+    fields(patch, &["id", "content", "toolCalls"], "message patch")?;
     let id = string(patch, "id")?;
+    if let Some(content) = patch.get("content") {
+        anyhow::ensure!(
+            content.is_string() || content.is_array(),
+            "GEMINI_INVALID_RECORD: patch content"
+        );
+    }
+    let calls = patch
+        .get("toolCalls")
+        .map(|v| {
+            v.as_array()
+                .context("GEMINI_INVALID_RECORD: patch toolCalls")
+        })
+        .transpose()?;
+    // Validate the complete schema even when upstream's logical no-op targets
+    // an unknown message/call. New operations cannot become cached omissions.
+    for call in calls.into_iter().flatten() {
+        fields(call, &["id", "result"], "tool-call patch")?;
+        string(call, "id")?;
+    }
     if let Some(msg) = messages.messages.get_mut(id) {
         if let Some(content) = patch.get("content") {
             msg["content"] = content.clone();
         }
-        if let Some(calls) = patch.get("toolCalls") {
-            for call in calls
-                .as_array()
-                .context("GEMINI_INVALID_RECORD: patch toolCalls")?
+        for call in calls.into_iter().flatten() {
+            let id = string(call, "id")?;
+            if let Some(old) = msg["toolCalls"]
+                .as_array_mut()
+                .and_then(|a| a.iter_mut().find(|m| m["id"].as_str() == Some(id)))
             {
-                let id = string(call, "id")?;
-                if let Some(old) = msg["toolCalls"]
-                    .as_array_mut()
-                    .and_then(|a| a.iter_mut().find(|m| m["id"].as_str() == Some(id)))
-                {
-                    if let Some(result) = call.get("result") {
-                        old["result"] = result.clone();
-                    }
+                if let Some(result) = call.get("result") {
+                    old["result"] = result.clone();
                 }
             }
         }
@@ -209,7 +234,11 @@ fn patch(messages: &mut Journal, p: &Value) -> Result<()> {
         "GEMINI_UNSUPPORTED_SCHEMA: patch field"
     );
     if p.get("id").is_some() {
-        update(messages, p)?;
+        let direct = ["id", "content", "toolCalls"]
+            .into_iter()
+            .filter_map(|key| p.get(key).map(|v| (key.to_owned(), v.clone())))
+            .collect();
+        update(messages, &Value::Object(direct))?;
     }
     if let Some(updates) = p.get("updates") {
         for u in updates
@@ -322,4 +351,47 @@ fn records(bytes: &[u8], legacy: bool) -> Result<(Vec<Value>, bool)> {
         }
     }
     Ok((records, partial))
+}
+
+pub(super) fn recent_time(
+    bytes: &[u8],
+    starts_mid_record: bool,
+    header: &Value,
+) -> Result<(i64, u64)> {
+    let mut latest = date(header, "lastUpdated")?;
+    let mut records = 0;
+    let Some(end) = bytes.iter().rposition(|b| *b == b'\n') else {
+        return Ok((latest, records));
+    };
+    let start = if starts_mid_record {
+        bytes.iter().position(|b| *b == b'\n').unwrap() + 1
+    } else {
+        0
+    };
+    if start > end {
+        return Ok((latest, records));
+    }
+    for line in bytes[start..end].split(|b| *b == b'\n') {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            continue;
+        }
+        records += 1;
+        let record: Value =
+            serde_json::from_slice(line).context("GEMINI_INVALID_RECORD: shallow tail record")?;
+        if let Some(update) = record.get("$set") {
+            if let Some(sid) = update.get("sessionId") {
+                anyhow::ensure!(
+                    sid == &header["sessionId"],
+                    "GEMINI_ID_COLLISION: shallow tail identity changed"
+                );
+            }
+            if update.get("lastUpdated").is_some() {
+                latest = latest.max(date(update, "lastUpdated")?);
+            }
+        } else if record.get("id").is_some() {
+            message(&record)?;
+            latest = latest.max(date(&record, "timestamp")?);
+        }
+    }
+    Ok((latest, records))
 }

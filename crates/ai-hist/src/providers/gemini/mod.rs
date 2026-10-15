@@ -33,7 +33,7 @@ pub(crate) const METADATA: ProviderMetadata = ProviderMetadata {
     }),
 };
 pub(crate) const ADAPTER: Option<ProviderAdapter> = Some(ProviderAdapter {
-    generation: "gemini_journal_v2",
+    generation: "gemini_journal_v3",
     acquire,
     sweep,
     resolve_roots,
@@ -134,7 +134,12 @@ impl ShallowSessionProvider for Provider {
             source: ID.into(),
             session_id: sid,
             first_activity_ms: Some(format::date(&header, "startTime")?),
-            last_activity_ms: Some(format::date(&header, "lastUpdated")?),
+            last_activity_ms: Some(storage::recent_time(
+                scan,
+                Path::new(&c.locator),
+                &bytes,
+                &header,
+            )?),
             raw_path: Some(c.locator.clone()),
             source_stamp: Some(c.stamp.clone()),
             discovery_state: "shallow".into(),
@@ -146,27 +151,44 @@ fn path_is_legacy(path: &Path) -> bool {
     path.extension().is_some_and(|e| e == "json")
 }
 fn snapshot(path: &Path, context: &AcquisitionContext<'_>) -> Result<AcquiredSession> {
-    let bytes = context.read(path)?;
-    if path_is_legacy(path) && path.with_extension("jsonl").try_exists()? {
-        let legacy = format::parse(&bytes, true)?;
-        let mut migrated = snapshot(&path.with_extension("jsonl"), context)?;
-        anyhow::ensure!(
-            legacy["conversation"]["sessionId"] == migrated.payload["conversation"]["sessionId"]
-                && legacy["conversation"]["projectHash"]
-                    == migrated.payload["conversation"]["projectHash"],
-            "GEMINI_ID_COLLISION: migration sibling metadata mismatch"
-        );
-        migrated.payload["legacyBytes"] = serde_json::to_value(&bytes)?;
-        migrated.payload["legacyPath"] = path.to_string_lossy().to_string().into();
-        let mut paths = vec![path.to_path_buf()];
-        paths.extend(migrated.read_paths);
-        return Ok(AcquiredSession::new(
-            migrated.payload,
-            migrated.bytes + bytes.len() as i64,
-            migrated.records,
-            paths,
-        ));
+    let primary = snapshot_file(path, context)?;
+    let sibling = path.with_extension(if path_is_legacy(path) {
+        "jsonl"
+    } else {
+        "json"
+    });
+    if !sibling.try_exists()? {
+        return Ok(primary);
     }
+    let secondary = snapshot_file(&sibling, context)?;
+    let (mut journal, legacy) = if path_is_legacy(path) {
+        (secondary, primary)
+    } else {
+        (primary, secondary)
+    };
+    anyhow::ensure!(
+        journal.payload["conversation"]["sessionId"] == legacy.payload["conversation"]["sessionId"]
+            && journal.payload["conversation"]["projectHash"]
+                == legacy.payload["conversation"]["projectHash"],
+        "GEMINI_ID_COLLISION: migration sibling metadata mismatch"
+    );
+    journal.payload["legacyBytes"] = legacy.payload["bytes"].clone();
+    journal.payload["legacyPath"] = legacy.read_paths[0].to_string_lossy().to_string().into();
+    journal.payload["migrationJournal"] =
+        journal.read_paths[0].to_string_lossy().to_string().into();
+    let bytes = journal.bytes + legacy.bytes;
+    let mut paths = journal.read_paths;
+    paths.extend(legacy.read_paths);
+    paths.sort();
+    Ok(AcquiredSession::new(
+        journal.payload,
+        bytes,
+        journal.records,
+        paths,
+    ))
+}
+fn snapshot_file(path: &Path, context: &AcquisitionContext<'_>) -> Result<AcquiredSession> {
+    let bytes = context.read(path)?;
     let mut payload = format::parse(&bytes, path_is_legacy(path))?;
     let native = format::string(&payload["conversation"], "sessionId")?;
     let sid = storage::identity(context.roots, path, native)?;

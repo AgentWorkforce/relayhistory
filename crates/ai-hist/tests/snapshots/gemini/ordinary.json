@@ -113,9 +113,9 @@
       "stop_reason": null,
       "subagent_session_id": null,
       "text": "{\"args\":{\"path\":\"/synthetic/needle.txt\"},\"description\":\"\",\"displayName\":\"read_file\",\"id\":\"call-real-id\",\"name\":\"read_file\",\"renderOutputAsMarkdown\":false,\"result\":[{\"functionResponse\":{\"id\":\"call-real-id\",\"name\":\"read_file\",\"response\":{\"output\":\"synthetic needle result\"}}}],\"status\":\"success\",\"timestamp\":\"2026-10-11T12:00:08.000Z\"}",
-      "token_json": "{\"cached\":30,\"input\":120,\"output\":20,\"thoughts\":4,\"tool\":2,\"total\":146}",
+      "token_json": null,
       "tool_use_id": "call-real-id",
-      "ts_ms": 1791720008000
+      "ts_ms": 1791720006000
     },
     {
       "agent_id": null,
@@ -128,7 +128,7 @@
       "event_uid": "assistant-one:result:0",
       "git_branch": null,
       "kind": "tool_result",
-      "message_id": "assistant-one",
+      "message_id": "tool-response",
       "model": "gemini-fixture-model",
       "parent_id": null,
       "payload_bytes": 111,
@@ -145,7 +145,7 @@
       "text": "[{\"functionResponse\":{\"id\":\"call-real-id\",\"name\":\"read_file\",\"response\":{\"output\":\"synthetic needle result\"}}}]",
       "token_json": null,
       "tool_use_id": "call-real-id",
-      "ts_ms": 1791720008000
+      "ts_ms": 1791720009000
     },
     {
       "agent_id": null,
@@ -419,7 +419,7 @@
       "repo_url": null,
       "session_id": "11111111-1111-4111-8111-111111111111",
       "source": "gemini",
-      "source_stamp": "gemini_journal_v2:sha256:b462866edf8888f11766f1d2ce1ff64681579e45e964f982547c9d25225b0b9d",
+      "source_stamp": "gemini_journal_v3:sha256:b462866edf8888f11766f1d2ce1ff64681579e45e964f982547c9d25225b0b9d",
       "title": null,
       "workspace_roots_json": null
     }

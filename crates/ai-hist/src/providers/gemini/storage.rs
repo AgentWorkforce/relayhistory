@@ -39,7 +39,11 @@ pub(super) fn enumerate(env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
                 if !(parts.len() == 3 || parts.len() == 4) || parts[1].as_os_str() != "chats" {
                     continue;
                 }
-                if skip_legacy(&context, &path)? {
+                crate::ingest::check_capture_cancelled()?;
+                // A bad pair must remain a candidate so shallow discovery reports
+                // its per-file diagnostic and sweep counts it unread, without
+                // preventing unrelated healthy sessions from being acquired.
+                if skip_legacy(&context, &path).unwrap_or(false) {
                     continue;
                 }
                 let (stamp, recency_hint_ms) = crate::file_stamp_and_modified(&path)?;
@@ -64,11 +68,16 @@ pub(super) fn superseded(
     native: &str,
     project: &str,
 ) -> Result<bool> {
-    if !path_is_legacy(path) || !path.with_extension("jsonl").try_exists()? {
+    let sibling = path.with_extension(if path_is_legacy(path) {
+        "jsonl"
+    } else {
+        "json"
+    });
+    if !sibling.try_exists()? {
         return Ok(false);
     }
-    let bytes = prefix(context, &path.with_extension("jsonl"))?;
-    let header = format::header(&bytes, false)?;
+    let bytes = prefix(context, &sibling)?;
+    let header = format::header(&bytes, path_is_legacy(&sibling))?;
     anyhow::ensure!(
         format::string(&header, "sessionId")? == native
             && format::string(&header, "projectHash")? == project,
@@ -135,4 +144,39 @@ fn legacy_missing(roots: &ProviderRoots, path: &Path) -> Result<bool> {
         parent = dir.parent();
     }
     Ok(false)
+}
+
+pub(super) fn recent_time(
+    scan: &ScanEnv<'_>,
+    path: &Path,
+    head: &[u8],
+    header: &Value,
+) -> Result<i64> {
+    use std::io::Seek;
+    if path_is_legacy(path) {
+        return format::date(header, "lastUpdated");
+    }
+    let (head_latest, records) = format::recent_time(head, false, header)?;
+    scan.note_records(records);
+    if head.len() < HEAD_LIMIT as usize {
+        return Ok(head_latest);
+    }
+    let context = AcquisitionContext::new(ID, scan.provider_roots);
+    context.validate(path)?;
+    let mut file = std::fs::File::open(path)?;
+    scan.note_open();
+    let length = file.metadata()?.len();
+    let (tail, offset) = if length <= head.len() as u64 {
+        (head.to_vec(), 0)
+    } else {
+        let offset = length.saturating_sub(HEAD_LIMIT);
+        file.seek(std::io::SeekFrom::Start(offset))?;
+        let mut tail = Vec::new();
+        file.take(HEAD_LIMIT).read_to_end(&mut tail)?;
+        scan.note_bytes(tail.len() as u64);
+        (tail, offset)
+    };
+    let (latest, records) = format::recent_time(&tail, offset > 0, header)?;
+    scan.note_records(records);
+    Ok(latest.max(head_latest))
 }

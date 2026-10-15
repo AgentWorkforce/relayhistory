@@ -309,3 +309,170 @@ fn gemini_complete_identity_rewrite_retires_old_local_session_and_guards_selecte
         .unwrap();
     assert!(has(&e, "Found the synthetic Gemini needle."));
 }
+#[test]
+fn gemini_unsupported_nested_patches_preserve_indexed_evidence_and_remain_retryable() {
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path());
+    let store = open(home.path());
+    discover(&store);
+    hydrate(&store);
+    let patch="{\"$patch\":{\"updates\":[{\"id\":\"assistant-one\",\"toolCalls\":[{\"id\":\"call-real-id\",\"futureField\":true}]}]}}\n";
+    std::fs::write(&path, format!("{FIXTURE}{patch}")).unwrap();
+    for _ in 0..2 {
+        let error = store
+            .hydrate(
+                &SessionRef::id(Source::Gemini, SID),
+                HydrateOptions::default(),
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("GEMINI_UNSUPPORTED_SCHEMA"));
+        let evidence = read(&store);
+        assert!(has(&evidence, "Found the synthetic Gemini needle."));
+        assert_eq!(evidence.tool_results.len(), 1);
+    }
+    std::fs::write(&path, FIXTURE).unwrap();
+    hydrate(&store);
+    assert!(has(&read(&store), "Found the synthetic Gemini needle."));
+}
+#[test]
+fn gemini_shallow_tail_observes_resumed_activity_and_complete_rewrites_clear_title() {
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path());
+    let store = open(home.path());
+    let padding = serde_json::json!({"$set":{"memoryScratchpad":"p".repeat(80_000)}}).to_string();
+    let updated = "2026-10-12T12:30:00Z";
+    std::fs::write(&path,format!("{FIXTURE}{padding}\n{{\"$set\":{{\"lastUpdated\":\"{updated}\",\"summary\":\"A temporary title\"}}}}\n{{\"$set\":" )).unwrap();
+    discover(&store);
+    let e = read(&store);
+    assert_eq!(e.session.last_activity_ms, Some(1791808200000));
+    hydrate(&store);
+    // Partial captures preserve a prior title. A complete capture assigns it.
+    std::fs::write(
+        &path,
+        format!("{FIXTURE}{{\"$set\":{{\"summary\":\"A temporary title\"}}}}\n"),
+    )
+    .unwrap();
+    hydrate(&store);
+    assert_eq!(
+        read(&store).session.title.as_deref(),
+        Some("A temporary title")
+    );
+    std::fs::write(&path, FIXTURE).unwrap();
+    hydrate(&store);
+    assert_eq!(read(&store).session.title, None);
+}
+#[test]
+fn gemini_sync_only_migration_survives_legacy_deletion_and_cached_journal() {
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path());
+    std::fs::remove_file(&path).unwrap();
+    let legacy_path = path.with_extension("json");
+    std::fs::write(
+        &legacy_path,
+        include_str!(
+            "fixtures/gemini/legacy/.gemini/tmp/gemini-project/chats/session-legacy-22222222.json"
+        ),
+    )
+    .unwrap();
+    let store = open(home.path());
+    let reference = SessionRef::id(Source::Gemini, "22222222-2222-4222-8222-222222222222");
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    std::fs::write(&path,include_str!("fixtures/gemini/legacy-migrated/.gemini/tmp/gemini-project/chats/session-legacy-22222222.jsonl")).unwrap();
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    let before = store
+        .session(&reference, SessionQuery::default())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        before
+            .session
+            .raw_path
+            .as_deref()
+            .unwrap()
+            .extension()
+            .unwrap(),
+        "jsonl"
+    );
+    std::fs::remove_file(&legacy_path).unwrap();
+    for _ in 0..2 {
+        store.sync(SyncOptions::default().force(true)).unwrap();
+        let after = store
+            .session(&reference, SessionQuery::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(before.messages, after.messages);
+        assert!(has(&after, "Continue the synthetic legacy session."));
+    }
+}
+#[test]
+fn gemini_tool_and_opaque_usage_stays_measured_without_inferred_prompt_ownership() {
+    for (opaque, tools) in [(false, true), (true, false), (true, true)] {
+        let home = tempfile::tempdir().unwrap();
+        let path = stage(home.path());
+        let records=FIXTURE.lines().map(|line| {let mut row:serde_json::Value=serde_json::from_str(line).unwrap();if row["id"]=="assistant-one" {
+            if opaque {row["content"]=serde_json::json!([{"inlineData":{"mimeType":"image/png","data":"AA=="}}]);}
+            else {row["content"]=serde_json::json!([]);}
+            if !tools {row["toolCalls"]=serde_json::json!([]);}
+        }row.to_string()}).collect::<Vec<_>>().join("\n")+"\n";
+        std::fs::write(&path, records).unwrap();
+        let store = open(home.path());
+        discover(&store);
+        hydrate(&store);
+        let evidence = read(&store);
+        let usage = evidence.usage.as_ref().unwrap().usage.as_ref().unwrap();
+        assert_eq!(
+            (
+                usage.input_tokens,
+                usage.cache_read_tokens,
+                usage.output_tokens
+            ),
+            (90, 30, 20)
+        );
+        let conn = ai_hist::open_db(store.db_path()).unwrap();
+        let events = ai_hist::session_events(&conn, SID, Some("gemini")).unwrap();
+        let assistant: Vec<_> = events
+            .iter()
+            .filter(|e| e.message_id.as_deref() == Some("assistant-one"))
+            .collect();
+        assert!(assistant.iter().any(|e| e.token_json.is_some()));
+        assert!(assistant
+            .iter()
+            .all(|e| e.role == "assistant" && e.ts_ms == 1791720006000));
+        assert!(
+            ai_hist::attribute_usage_to_prompts(&events, "gemini").is_empty(),
+            "upstream records no ownership links; attribution must remain unavailable"
+        );
+        if tools {
+            assert_eq!(evidence.tool_calls[0].ts_ms, Some(1791720008000));
+        }
+    }
+}
+#[test]
+fn gemini_bad_migration_pair_does_not_block_healthy_sessions() {
+    let home = tempfile::tempdir().unwrap();
+    stage(home.path());
+    let directory = home.path().join(".gemini/tmp/other-project/chats");
+    std::fs::create_dir_all(&directory).unwrap();
+    let legacy = include_str!(
+        "fixtures/gemini/legacy/.gemini/tmp/gemini-project/chats/session-legacy-22222222.json"
+    );
+    let journal=include_str!("fixtures/gemini/legacy-migrated/.gemini/tmp/gemini-project/chats/session-legacy-22222222.jsonl");
+    std::fs::write(directory.join("bad.json"), legacy).unwrap();
+    std::fs::write(
+        directory.join("bad.jsonl"),
+        journal.replace(
+            "52e30737efc78fb781017102c6074d53ab432a8cc4edc0a26b2b9756700cd3a0",
+            "mismatched-project",
+        ),
+    )
+    .unwrap();
+    let store = open(home.path());
+    let report = store
+        .discover(DiscoveryOptions::default().sources([Source::Gemini]))
+        .unwrap();
+    assert!(!report.diagnostics.is_empty());
+    hydrate(&store);
+    assert!(has(&read(&store), "Found the synthetic Gemini needle."));
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    assert!(has(&read(&store), "Found the synthetic Gemini needle."));
+}

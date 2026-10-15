@@ -100,8 +100,8 @@ fn rewrite_retires_local_evidence_but_keeps_remote_shares() {
     normalize::write(&conn, &rewritten, &path).unwrap();
     let count:i64=conn.query_row("SELECT count(*) FROM session_events WHERE source='gemini' AND message_id='assistant-one' AND location='remote'",[],|r|r.get(0)).unwrap();
     assert_eq!(
-        count, 3,
-        "text + tool use + result remote shares survive local rewrite"
+        count, 2,
+        "assistant text + tool use remote shares survive local rewrite"
     );
     assert_eq!(
         conn.query_row(
@@ -188,7 +188,7 @@ fn scoped_sweep_preserves_unvisited_sessions_and_repairs_lost_evidence() {
         .unwrap(),
         original
     );
-    // The v2 retirement fix must replay unchanged bytes cached by v1.
+    // New parser generations must replay unchanged bytes cached by v1.
     state["gemini_file_stamps"][path.to_string_lossy().as_ref()]["generation"] =
         "gemini_journal_v1".into();
     conn.execute("DELETE FROM session_events WHERE source='gemini'", [])
@@ -278,7 +278,7 @@ fn deleted_legacy_locator_retires_only_local_share_when_root_is_accessible() {
         )
         .unwrap();
     assert_eq!(local, 0);
-    assert_eq!(remote, 3);
+    assert_eq!(remote, 2);
 }
 #[test]
 fn native_inclusive_input_becomes_cache_exclusive_without_inventing_missing_input() {
@@ -365,6 +365,43 @@ fn native_identity_rewrite_retires_local_share_and_preserves_remote_share() {
         "identity rewrite transfers canonical prompt ownership without delete/reinsert"
     );
     assert_eq!(local, 0);
-    assert_eq!(remote, 3);
+    assert_eq!(remote, 2);
     assert!(added > 0);
+}
+#[test]
+fn nested_patch_extensions_fail_even_when_target_is_unknown() {
+    let (_home, roots, path) = fixture();
+    let bytes = AcquisitionContext::new(ID, &roots).read(&path).unwrap();
+    for message_id in ["assistant-one", "unknown-message"] {
+        for tool_id in ["call-real-id", "unknown-call"] {
+            let patches = [
+                serde_json::json!({"updates":[{"id":message_id,"futureField":true}]}),
+                serde_json::json!({"updates":[{"id":message_id,"toolCalls":[{"id":tool_id,"futureField":true}]}]}),
+                serde_json::json!({"id":message_id,"toolCalls":[{"id":tool_id,"futureField":true}]}),
+            ];
+            for patch in patches {
+                let mut input = bytes.clone();
+                input.extend(serde_json::to_vec(&serde_json::json!({"$patch":patch})).unwrap());
+                input.push(b'\n');
+                assert!(
+                    format::parse(&input, false)
+                        .unwrap_err()
+                        .to_string()
+                        .contains("GEMINI_UNSUPPORTED_SCHEMA"),
+                    "{patch}"
+                );
+            }
+        }
+    }
+    let mut known = bytes;
+    known.extend_from_slice(b"{\"$patch\":{\"id\":\"assistant-two\",\"content\":\"direct patch\",\"removeIds\":[\"info-one\"],\"orderIds\":[\"assistant-two\"]}}\n");
+    let projection = format::parse(&known, false).unwrap();
+    assert_eq!(
+        projection["conversation"]["messages"]
+            .as_array()
+            .unwrap()
+            .last()
+            .unwrap()["content"],
+        "direct patch"
+    );
 }
