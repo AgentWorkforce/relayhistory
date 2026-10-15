@@ -207,9 +207,10 @@ pub(crate) fn current_locator(roots: &crate::ProviderRoots, id: &str) -> Result<
     ensure!(offset >= 0, "invalid Codex rollout projection offset");
     if let Some(path) = rollout_path {
         let path = PathBuf::from(path);
-        if path.metadata().is_ok_and(|metadata| {
-            metadata.is_file() && metadata.len() >= offset as u64
-        }) {
+        if path
+            .metadata()
+            .is_ok_and(|metadata| metadata.is_file() && metadata.len() >= offset as u64)
+        {
             context.validate(&path)?;
             return Ok(Some(path.to_string_lossy().into_owned()));
         }
