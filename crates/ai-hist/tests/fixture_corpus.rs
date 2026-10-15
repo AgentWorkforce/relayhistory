@@ -32,6 +32,9 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime};
 
+#[path = "provider_support/grok_bot_fixture.rs"]
+mod grok_bot_fixture;
+
 // ---------------------------------------------------------------------------
 // manifest
 // ---------------------------------------------------------------------------
@@ -47,6 +50,8 @@ enum Layout {
     /// A directory whose contents are copied verbatim into `HOME`. Used for
     /// every fixture whose provider layout is itself part of the fixture.
     HomeTree,
+    /// Short synthetic Grok Bot JSON files staged under native base32 keys.
+    GrokBotReplicas,
     /// SQL fixture applied at a provider-owned relative home path.
     #[allow(dead_code)] // Used by admitted SQLite providers.
     Sqlite(&'static str),
@@ -203,6 +208,9 @@ fn stage(fixture: &Fixture, home: &Path) {
                 copy_tree(&root.join(file), home);
             }
         }
+        Layout::GrokBotReplicas => {
+            grok_bot_fixture::stage(home);
+        }
         Layout::Sqlite(relative) => {
             let path = home.join(relative);
             fs::create_dir_all(path.parent().expect("SQLite parent")).unwrap();
@@ -317,6 +325,8 @@ fn capture(fixture: &Fixture, home: &Path) -> Value {
     let opencode_db = home.join(".local/share/opencode/opencode.db");
     std::env::set_var("HOME", home);
     std::env::set_var("USERPROFILE", home);
+    std::env::set_var("APPDATA", home.join("AppData/Roaming"));
+    std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
     std::env::set_var("OPENCODE_DB", &opencode_db);
     // Devin's root follows `XDG_DATA_HOME`; pin it to the staged home so a
     // host that sets the variable does not leak its real store into a
@@ -592,6 +602,15 @@ fn redact_string(text: String, homes: &[String], stamp: bool) -> String {
     }
     if replaced {
         text = text.replace('\\', "/");
+        // Grok Bot follows Electron's platform-specific userData convention.
+        // Normalize the one staged fixture across each runner's path.
+        for user_data in [
+            "Library/Application Support/Grok Bot",
+            ".config/Grok Bot",
+            "AppData/Roaming/Grok Bot",
+        ] {
+            text = text.replace(user_data, "<grok-bot-user-data>");
+        }
     }
     if stamp {
         text = mask_long_digit_runs(&text);
@@ -1278,6 +1297,32 @@ fn codex_archived_rollouts_are_discovered() {
     let sessions = rows("codex/archived-session", "sessions");
     assert_eq!(sessions.len(), 1, "{sessions:?}");
     assert_eq!(text(&sessions[0], "session_id"), "sess_archived_1");
+}
+
+/// A rollout Codex compressed to `.jsonl.zst` holds the evidence the plain
+/// rollout does, row for row. Only the change stamp, which measures the
+/// stored file, tells them apart.
+#[test]
+fn codex_compressed_rollout_matches_the_plain_one() {
+    let evidence = |key: &str| {
+        let mut evidence = snapshot(key).clone();
+        let evidence = evidence.as_object_mut().expect("snapshot object");
+        for describes_the_fixture in ["corpus_files", "fixture", "layout", "origin", "quirk"] {
+            evidence.remove(describes_the_fixture);
+        }
+        for session in evidence["sessions"].as_array_mut().expect("sessions") {
+            session
+                .as_object_mut()
+                .expect("session row")
+                .remove("source_stamp");
+        }
+        Value::Object(evidence.clone())
+    };
+    assert_eq!(
+        evidence("codex/compressed-rollout"),
+        evidence("codex/multi-turn")
+    );
+    assert!(!rows("codex/compressed-rollout", "session_events").is_empty());
 }
 
 /// `parent_thread_id` in a subagent rollout's `session_meta` is a delegation

@@ -41,6 +41,9 @@ serde_json = "1"
 sha2 = "0.10"
 tempfile = { version = "3", optional = true }
 url = { version = "2", optional = true }
+# Codex compresses finished rollouts to `.jsonl.zst`; read with the same
+# libzstd binding Codex writes them with.
+zstd = { version = "0.13", default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 fs2 = "0.4"

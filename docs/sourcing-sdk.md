@@ -997,6 +997,7 @@ handle.
 | cursor | ✓ | ✓ | ✓ | ✓ | — | none |
 | devin | ✓ | ✓ | ✓ | ✓ | — | none |
 | grok | ✓ | ✓ | ✓ | ✓ | ✓ | per-request |
+| grok-bot | ✓ | ✓ | — | — | ✓ | none |
 | hermes | ✓ | ✓ | ✓ | — | — | none |
 | muse | ✓ | ✓ | ✓ | ✓ | ✓ | per-request |
 | opencode | ✓ | ✓ | ✓ | ✓ | ✓ | none |
