@@ -231,6 +231,39 @@ pub(crate) fn current_locator(
     Ok(Some(locator(&state, id)))
 }
 
+/// A cataloged rollout yields to SQLite only when that same thread's
+/// projection extends beyond the rollout. A sibling with the same id retains
+/// catalog ownership. A malformed or unreadable locator cannot take it over.
+pub(crate) fn incomplete_projection_owns_rollout(incoming: &str, observed: &str) -> bool {
+    let Some((state, id)) = parse_locator(incoming) else {
+        return false;
+    };
+    if state
+        .file_name()
+        .is_none_or(|name| name != "state_5.sqlite")
+    {
+        return false;
+    }
+    let Some(root) = state.parent() else {
+        return false;
+    };
+    let observed_path = Path::new(observed);
+    if !observed_path.starts_with(root.join("sessions"))
+        && !observed_path.starts_with(root.join("archived_sessions"))
+    {
+        return false;
+    }
+    let Some(home) = root.parent() else {
+        return false;
+    };
+    let mut roots = crate::ProviderRoots::from_home(
+        home.to_path_buf(),
+        home.join(".local/share/opencode/opencode.db"),
+    );
+    roots.codex = root.to_path_buf();
+    current_locator(&roots, id, observed).is_ok_and(|current| current.as_deref() == Some(incoming))
+}
+
 fn projection(
     context: &AcquisitionContext<'_>,
     path: &Path,
