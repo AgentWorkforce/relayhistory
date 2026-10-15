@@ -8,6 +8,7 @@
 //! from a cursor, or a file too large to hold, keeps the streaming reader.
 
 use std::collections::HashMap;
+#[cfg(test)]
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -17,6 +18,7 @@ use crate::discover::{HEAD_SCAN_MAX_BYTES, TAIL_SCAN_MAX_BYTES};
 
 use super::metadata_mtime_ns;
 use super::transcript_cursor::{change_time_ns, file_identity, filesystem_keeps_change_time};
+use super::transcript_file::{self, TranscriptFile, TranscriptMetadata};
 
 /// Largest transcript retained so a second pass can reuse the first read.
 ///
@@ -53,7 +55,7 @@ struct Bounded {
 
 struct Parked {
     path: PathBuf,
-    file: fs::File,
+    file: TranscriptFile,
     stat: Stat,
 }
 
@@ -180,19 +182,24 @@ pub(crate) fn capture_walked(walked: &mut Vec<u8>, raw: &[u8], opened_len: u64) 
 }
 
 fn stat_of(path: &Path) -> io::Result<Stat> {
-    let metadata = fs::metadata(path)?;
-    Ok(Stat {
+    Ok(stat_from(&transcript_file::metadata(path)?))
+}
+
+/// Lengths are the records' length, so a compressed transcript compares
+/// against the bytes it decompresses to.
+fn stat_from(metadata: &TranscriptMetadata) -> Stat {
+    Stat {
         len: metadata.len(),
-        mtime_ns: metadata_mtime_ns(&metadata),
-        ctime_ns: change_time_ns(&metadata),
-        device: file_identity(&metadata).0,
-        inode: file_identity(&metadata).1,
-    })
+        mtime_ns: metadata_mtime_ns(metadata),
+        ctime_ns: change_time_ns(metadata),
+        device: file_identity(metadata).0,
+        inode: file_identity(metadata).1,
+    }
 }
 
 /// `Some(len)` when `path` is a regular file small enough to retain.
 pub(crate) fn small_file_len(path: &Path) -> io::Result<Option<u64>> {
-    let metadata = fs::metadata(path)?;
+    let metadata = transcript_file::metadata(path)?;
     if !metadata.is_file() {
         return Ok(None);
     }
@@ -291,14 +298,8 @@ fn retain_bounded(state: &mut State, capture: Capture) {
     );
 }
 
-pub(crate) fn publish(path: &Path, bytes: Arc<[u8]>, stat_at_read: &fs::Metadata) {
-    let stat = Stat {
-        len: stat_at_read.len(),
-        mtime_ns: metadata_mtime_ns(stat_at_read),
-        ctime_ns: change_time_ns(stat_at_read),
-        device: file_identity(stat_at_read).0,
-        inode: file_identity(stat_at_read).1,
-    };
+pub(crate) fn publish(path: &Path, bytes: Arc<[u8]>, stat_at_read: &TranscriptMetadata) {
+    let stat = stat_from(stat_at_read);
     if stat.len != bytes.len() as u64 {
         return;
     }
@@ -312,7 +313,7 @@ pub(crate) fn read_all(path: &Path) -> io::Result<Arc<[u8]>> {
     if let Some(bytes) = fresh(path) {
         return Ok(bytes);
     }
-    let before = fs::metadata(path)?;
+    let before = transcript_file::metadata(path)?;
     if !before.is_file() || before.len() > CAPTURE_MAX_BYTES {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -323,7 +324,7 @@ pub(crate) fn read_all(path: &Path) -> io::Result<Arc<[u8]>> {
     let mut buf = Vec::with_capacity(before.len() as usize);
     shared.file().read_to_end(&mut buf)?;
     drop(shared.into_file());
-    let after = fs::metadata(path)?;
+    let after = transcript_file::metadata(path)?;
     let bytes: Arc<[u8]> = buf.into();
     if metadata_mtime_ns(&before) == metadata_mtime_ns(&after)
         && before.len() == after.len()
@@ -438,7 +439,7 @@ pub(crate) fn publish_walk(path: &Path, walked: &[u8], opened_len: u64, opened_m
         return;
     }
     let opened_ctime = take_opened_ctime(path);
-    let Ok(metadata) = fs::metadata(path) else {
+    let Ok(metadata) = transcript_file::metadata(path) else {
         return;
     };
     if metadata.len() != opened_len || metadata_mtime_ns(&metadata) != opened_mtime_ns {
@@ -457,14 +458,8 @@ fn take_opened_ctime(path: &Path) -> Option<i64> {
     lock().opened.remove(path).and_then(|stat| stat.ctime_ns)
 }
 
-fn remember_open(path: &Path, metadata: &fs::Metadata) {
-    let stat = Stat {
-        len: metadata.len(),
-        mtime_ns: metadata_mtime_ns(metadata),
-        ctime_ns: change_time_ns(metadata),
-        device: file_identity(metadata).0,
-        inode: file_identity(metadata).1,
-    };
+fn remember_open(path: &Path, metadata: &TranscriptMetadata) {
+    let stat = stat_from(metadata);
     lock().opened.entry(path.to_path_buf()).or_insert(stat);
 }
 
@@ -505,16 +500,16 @@ pub(crate) fn probe(path: &Path) -> bool {
 /// the handle for a reader that keeps it.
 pub(crate) struct SharedFile {
     path: PathBuf,
-    file: Option<fs::File>,
+    file: Option<TranscriptFile>,
     repark: bool,
 }
 
 impl SharedFile {
-    pub(crate) fn file(&mut self) -> &mut fs::File {
+    pub(crate) fn file(&mut self) -> &mut TranscriptFile {
         self.file.as_mut().expect("shared file is live")
     }
 
-    pub(crate) fn into_file(mut self) -> fs::File {
+    pub(crate) fn into_file(mut self) -> TranscriptFile {
         self.repark = false;
         self.file.take().expect("shared file is live")
     }
@@ -531,7 +526,7 @@ impl Drop for SharedFile {
     }
 }
 
-pub(crate) fn open_file(path: &Path) -> io::Result<fs::File> {
+pub(crate) fn open_file(path: &Path) -> io::Result<TranscriptFile> {
     open_shared(path).map(SharedFile::into_file)
 }
 
@@ -543,7 +538,7 @@ pub(crate) fn open_shared(path: &Path) -> io::Result<SharedFile> {
             repark: true,
         });
     }
-    let file = fs::File::open(path)?;
+    let file = transcript_file::open(path)?;
     if let Ok(metadata) = file.metadata() {
         remember_open(path, &metadata);
     }
@@ -558,7 +553,7 @@ pub(crate) fn open_shared(path: &Path) -> io::Result<SharedFile> {
 /// The handle parked for `path`, when it still names the same file. A take
 /// for another path leaves the parked handle where it is: it belongs to the
 /// read that parked it.
-fn take_parked(path: &Path) -> Option<fs::File> {
+fn take_parked(path: &Path) -> Option<TranscriptFile> {
     let current = stat_of(path).ok()?;
     let mut state = lock();
     match state.parked.take()? {
@@ -571,7 +566,7 @@ fn take_parked(path: &Path) -> Option<fs::File> {
     }
 }
 
-fn park(path: &Path, file: fs::File) {
+fn park(path: &Path, file: TranscriptFile) {
     let Ok(stat) = stat_of(path) else {
         return;
     };

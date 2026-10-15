@@ -38,7 +38,10 @@ fn filesystem_keeps_change_time_cached(path: &Path, metadata: &fs::Metadata) -> 
     if let Some(known) = cache.lock().ok().and_then(|map| map.get(&device).copied()) {
         return known;
     }
-    let keeps = statfs_keeps_change_time(path);
+    // A locator whose transcript is stored compressed names no file itself;
+    // the stored copy is what sits on the filesystem being asked about.
+    let stored = crate::ingest::transcript_file::stored_path(path);
+    let keeps = statfs_keeps_change_time(stored.as_deref().unwrap_or(path));
     if let Ok(mut map) = cache.lock() {
         map.insert(device, keeps);
     }

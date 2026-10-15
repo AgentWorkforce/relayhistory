@@ -180,7 +180,10 @@ records onto the child). Retention/compaction deletion of a large database is
 explicit and opt-in, never a side effect of re-parsing. Codex rollout events
 are keyed by line position rather than provider identity, so the pinned
 guarantee there covers relocation (the `sessions/` to `archived_sessions/`
-move re-ingests under the same session id with no loss or duplication);
+move re-ingests under the same session id with no loss or duplication) and
+compression (Codex rewriting a finished `rollout-*.jsonl` as
+`rollout-*.jsonl.zst` keeps the rollout's locator and cursor, so nothing is
+re-ingested);
 content-stable identity for prefix-dropping rollout rewrites is future work
 for incremental hydration. `crates/ai-hist/tests/claude_rewrite_retention.rs`
 pins all of this: in-place compaction through `sync` and through targeted

@@ -93,9 +93,13 @@
 //! watermark, a source fingerprint — adds a key and does not need a column or
 //! a migration, and two such changes do not overwrite each other.
 
+use super::transcript_file::TranscriptMetadata;
 use super::*;
 
 mod change_time;
+mod encoding;
+pub(crate) use encoding::stored_window;
+use encoding::stored_window_matches;
 mod prefix;
 pub(crate) use prefix::prefix_window_digest_of;
 use prefix::{prefix_window_spans, PrefixSpans};
@@ -169,6 +173,19 @@ pub(crate) struct TranscriptFileCursor {
     pub unchanged_since_ms: i64,
     /// See the module docs: a bounded window, not the whole prefix.
     pub prefix_hash: String,
+    /// Taken over the transcript's zstd-compressed copy. Offsets and the
+    /// prefix window describe the decompressed records in either encoding,
+    /// but compressing a transcript stores it in a new file, so device and
+    /// inode are compared only between cursors of one encoding.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub compressed: bool,
+    /// For a compressed transcript, the bounded window over the stored file
+    /// itself. Codex writes the compressed copy once and never appends to it,
+    /// so its bytes standing still prove the records standing still, and
+    /// checking that reads two windows instead of decompressing every record
+    /// up to `offset`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stored_hash: Option<String>,
 }
 
 fn is_zero(value: &i64) -> bool {
@@ -479,7 +496,7 @@ impl TranscriptCursorState {
     }
 }
 
-fn prefix_window_digest(file: &mut fs::File, offset: u64) -> Result<String> {
+fn prefix_window_digest(file: &mut (impl Read + Seek), offset: u64) -> Result<String> {
     Ok(prefix_window_digest_counted(file, offset)?.0)
 }
 
@@ -489,7 +506,10 @@ fn prefix_window_digest(file: &mut fs::File, offset: u64) -> Result<String> {
 /// documented as the provider bytes a pass could not avoid reading. Counting
 /// them at the one place they are spent is what stops the next reader of this
 /// code having to remember a second list.
-fn prefix_window_digest_counted(file: &mut fs::File, offset: u64) -> Result<(String, u64)> {
+fn prefix_window_digest_counted(
+    file: &mut (impl Read + Seek),
+    offset: u64,
+) -> Result<(String, u64)> {
     let mut hasher = Sha256::new();
     // v2: the two windows are hashed as one span whenever they meet, so a
     // committed prefix of 128 KiB or less is covered by a single read rather
@@ -571,6 +591,8 @@ pub(crate) fn whole_file_cursor(path: &Path) -> Result<(TranscriptFileCursor, u6
             // observation.
             unchanged_since_ms: 0,
             prefix_hash,
+            compressed: false,
+            stored_hash: None,
         },
         bytes_read,
     ))
@@ -617,20 +639,19 @@ pub(crate) fn prefix_window_bytes(offset: u64) -> u64 {
 /// identical stat. Every skip path needs the same bounded window check, and
 /// none of them may advance parser state to get it.
 pub(crate) fn committed_prefix_matches(cursor: &TranscriptFileCursor, path: &Path) -> PrefixCheck {
-    let Ok(metadata) = path.metadata() else {
+    let Ok(metadata) = transcript_file::metadata(path) else {
         return PrefixCheck::UNVALIDATED;
     };
-    let (device, inode) = file_identity(&metadata);
-    let identity_changed = cursor.device.is_some()
-        && device.is_some()
-        && (cursor.device, cursor.inode) != (device, inode);
-    if identity_changed
+    if cursor.identity_moved(&metadata)
         || metadata.len() < cursor.offset
         || super::metadata_mtime_ns(&metadata) < cursor.mtime_ns
     {
         return PrefixCheck::UNVALIDATED;
     }
-    let Ok(mut handle) = fs::File::open(path) else {
+    if let Some(check) = stored_window_matches(cursor, path, &metadata) {
+        return check;
+    }
+    let Ok(mut handle) = transcript_file::open(path) else {
         return PrefixCheck::UNVALIDATED;
     };
     let bytes_read = prefix_window_bytes(cursor.offset);
@@ -660,11 +681,12 @@ pub(crate) fn transcript_unchanged(conn: &Connection, source: &str, path: &Path)
     let Some(file) = cursor.file.as_ref() else {
         return Ok(false);
     };
-    let Ok(metadata) = path.metadata() else {
+    let Ok(metadata) = transcript_file::metadata(path) else {
         return Ok(false);
     };
     if file.offset != metadata.len()
         || file.mtime_ns != super::metadata_mtime_ns(&metadata)
+        || file.compressed != metadata.compressed()
         || (file.device, file.inode) != file_identity(&metadata)
     {
         return Ok(false);
@@ -764,7 +786,7 @@ fn settled_proves_unchanged(
     cursor: &TranscriptCursorState,
     file: &TranscriptFileCursor,
     path: &Path,
-    metadata: &fs::Metadata,
+    metadata: &TranscriptMetadata,
 ) -> bool {
     let Some(settled) = cursor.settled.as_ref() else {
         return false;
