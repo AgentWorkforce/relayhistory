@@ -4,8 +4,8 @@ mod grok_bot_fixture;
 mod provider_support;
 
 use ai_hist::{
-    relationships::relationship_capabilities, CatalogQuery, DiscoveryOptions, HydrateOptions,
-    ProviderRoots, Role, SessionQuery, SessionRef, SessionStore, Source, StoreOptions, SyncOptions,
+    CatalogQuery, DiscoveryOptions, HydrateOptions, ProviderRoots, Role, SessionQuery, SessionRef,
+    SessionStore, Source, StoreOptions, SyncOptions,
 };
 use std::path::Path;
 
@@ -60,7 +60,7 @@ fn grok_bot_discover_hydrate_read_reopen_changes_export_fullsync() {
         .user_turns
         .iter()
         .any(|turn| turn.message_id.as_deref() == Some("t0s5")));
-    let capabilities = relationship_capabilities("grok-bot");
+    let capabilities = Source::GrokBot.capabilities().relationships;
     assert_eq!(capabilities.stable_child_identity, "always");
     assert!(capabilities.records_agent_type);
     assert!(capabilities.records_spawn_time);
