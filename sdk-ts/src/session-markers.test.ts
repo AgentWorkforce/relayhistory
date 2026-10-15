@@ -129,7 +129,7 @@ test('marker pages read unknown sessions empty and require a valid identity', as
       (error: unknown) => error instanceof InvalidArgumentError,
     );
     await assert.rejects(
-      getSessionMarkersPage('gemini' as never, SESSION, { dbPath }),
+      getSessionMarkersPage('unknown-provider' as never, SESSION, { dbPath }),
       (error: unknown) => error instanceof InvalidArgumentError,
     );
     await assert.rejects(
