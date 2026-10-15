@@ -25,6 +25,8 @@ pub enum Source {
     Hermes,
     #[serde(rename = "copilot")]
     Copilot,
+    #[serde(rename = "gemini")]
+    Gemini,
     #[cfg(test)]
     #[serde(rename = "test-fixture")]
     TestFixture,
@@ -43,6 +45,7 @@ impl Source {
         Self::Pi,
         Self::Hermes,
         Self::Copilot,
+        Self::Gemini,
         #[cfg(test)]
         Self::TestFixture,
     ];
@@ -60,6 +63,7 @@ impl Source {
             Self::Pi => "pi",
             Self::Hermes => "hermes",
             Self::Copilot => "copilot",
+            Self::Gemini => "gemini",
             #[cfg(test)]
             Self::TestFixture => "test-fixture",
         }
@@ -78,6 +82,7 @@ impl Source {
             "pi" => Some(Self::Pi),
             "hermes" => Some(Self::Hermes),
             "copilot" => Some(Self::Copilot),
+            "gemini" | "gemini-cli" => Some(Self::Gemini),
             #[cfg(test)]
             "test-fixture" | "test-fixture-alias" => Some(Self::TestFixture),
             _ => None,

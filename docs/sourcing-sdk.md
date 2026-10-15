@@ -996,6 +996,7 @@ handle.
 | copilot | ✓ | ✓ | ✓ | — | — | per-message |
 | cursor | ✓ | ✓ | ✓ | ✓ | — | none |
 | devin | ✓ | ✓ | ✓ | ✓ | — | none |
+| gemini | ✓ | ✓ | ✓ | — | — | per-message |
 | grok | ✓ | ✓ | ✓ | ✓ | ✓ | per-request |
 | hermes | ✓ | ✓ | ✓ | — | — | none |
 | muse | ✓ | ✓ | ✓ | ✓ | ✓ | per-request |

@@ -1,0 +1,674 @@
+{
+  "ordinary": {
+    "sessionId": "11111111-1111-4111-8111-111111111111",
+    "projectHash": "52e30737efc78fb781017102c6074d53ab432a8cc4edc0a26b2b9756700cd3a0",
+    "startTime": "2026-10-11T12:00:01.000Z",
+    "lastUpdated": "2026-10-11T12:00:14.000Z",
+    "kind": "main",
+    "messages": [
+      {
+        "id": "user-one",
+        "timestamp": "2026-10-11T12:00:03.000Z",
+        "type": "user",
+        "content": "Find the synthetic Gemini needle"
+      },
+      {
+        "id": "assistant-one",
+        "timestamp": "2026-10-11T12:00:06.000Z",
+        "type": "gemini",
+        "content": [
+          {
+            "text": "Searching the fixture."
+          }
+        ],
+        "thoughts": [
+          {
+            "subject": "Search",
+            "description": "Inspect the synthetic fixture",
+            "timestamp": "2026-10-11T12:00:05.000Z"
+          }
+        ],
+        "tokens": {
+          "input": 120,
+          "output": 20,
+          "cached": 30,
+          "thoughts": 4,
+          "tool": 2,
+          "total": 146
+        },
+        "model": "gemini-fixture-model",
+        "toolCalls": [
+          {
+            "id": "call-real-id",
+            "name": "read_file",
+            "args": {
+              "path": "/synthetic/needle.txt"
+            },
+            "timestamp": "2026-10-11T12:00:08.000Z",
+            "status": "success",
+            "displayName": "read_file",
+            "description": "",
+            "renderOutputAsMarkdown": false,
+            "result": [
+              {
+                "functionResponse": {
+                  "id": "call-real-id",
+                  "name": "read_file",
+                  "response": {
+                    "output": "synthetic needle result"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "tool-response",
+        "timestamp": "2026-10-11T12:00:09.000Z",
+        "type": "user",
+        "content": [
+          {
+            "functionResponse": {
+              "id": "call-real-id",
+              "name": "read_file",
+              "response": {
+                "output": "synthetic needle result"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "id": "assistant-two",
+        "timestamp": "2026-10-11T12:00:11.000Z",
+        "type": "gemini",
+        "content": "Found the synthetic Gemini needle.",
+        "thoughts": [],
+        "tokens": null,
+        "model": "gemini-fixture-model"
+      },
+      {
+        "id": "info-one",
+        "timestamp": "2026-10-11T12:00:13.000Z",
+        "type": "info",
+        "content": "Synthetic status notification"
+      }
+    ],
+    "messageCount": 5,
+    "userMessageCount": 2,
+    "firstUserMessage": "Find the synthetic Gemini needle",
+    "hasResumableContent": true
+  },
+  "short-prefix-collision": {
+    "sessionId": "11111111-2222-4222-8222-222222222222",
+    "projectHash": "52e30737efc78fb781017102c6074d53ab432a8cc4edc0a26b2b9756700cd3a0",
+    "startTime": "2026-10-11T12:00:16.000Z",
+    "lastUpdated": "2026-10-11T12:00:19.000Z",
+    "kind": "main",
+    "messages": [
+      {
+        "id": "collision-user",
+        "timestamp": "2026-10-11T12:00:18.000Z",
+        "type": "user",
+        "content": "Different full UUID with the same short prefix."
+      }
+    ],
+    "messageCount": 1,
+    "userMessageCount": 1,
+    "firstUserMessage": "Different full UUID with the same short prefix.",
+    "hasResumableContent": true
+  },
+  "tool-result-patched": {
+    "sessionId": "11111111-1111-4111-8111-111111111111",
+    "projectHash": "52e30737efc78fb781017102c6074d53ab432a8cc4edc0a26b2b9756700cd3a0",
+    "startTime": "2026-10-11T12:00:01.000Z",
+    "lastUpdated": "2026-10-11T12:00:20.000Z",
+    "kind": "main",
+    "messages": [
+      {
+        "id": "user-one",
+        "timestamp": "2026-10-11T12:00:03.000Z",
+        "type": "user",
+        "content": [
+          {
+            "text": "Find the synthetic Gemini needle"
+          }
+        ]
+      },
+      {
+        "id": "assistant-one",
+        "timestamp": "2026-10-11T12:00:06.000Z",
+        "type": "gemini",
+        "content": [
+          {
+            "text": "Searching the fixture."
+          }
+        ],
+        "thoughts": [
+          {
+            "subject": "Search",
+            "description": "Inspect the synthetic fixture",
+            "timestamp": "2026-10-11T12:00:05.000Z"
+          }
+        ],
+        "tokens": {
+          "input": 120,
+          "output": 20,
+          "cached": 30,
+          "thoughts": 4,
+          "tool": 2,
+          "total": 146
+        },
+        "model": "gemini-fixture-model",
+        "toolCalls": [
+          {
+            "id": "call-real-id",
+            "name": "read_file",
+            "args": {
+              "path": "/synthetic/needle.txt"
+            },
+            "timestamp": "2026-10-11T12:00:08.000Z",
+            "status": "success",
+            "displayName": "read_file",
+            "description": "",
+            "renderOutputAsMarkdown": false,
+            "result": [
+              {
+                "functionResponse": {
+                  "id": "call-real-id",
+                  "name": "read_file",
+                  "response": {
+                    "output": "synthetic masked result"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "tool-response",
+        "timestamp": "2026-10-11T12:00:09.000Z",
+        "type": "user",
+        "content": [
+          {
+            "functionResponse": {
+              "id": "call-real-id",
+              "name": "read_file",
+              "response": {
+                "output": "synthetic masked result"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "id": "assistant-two",
+        "timestamp": "2026-10-11T12:00:11.000Z",
+        "type": "gemini",
+        "content": [
+          {
+            "text": "Found the synthetic Gemini needle."
+          }
+        ],
+        "thoughts": [],
+        "tokens": null,
+        "model": "gemini-fixture-model"
+      },
+      {
+        "id": "info-one",
+        "timestamp": "2026-10-11T12:00:13.000Z",
+        "type": "info",
+        "content": [
+          {
+            "text": "Synthetic status notification"
+          }
+        ]
+      }
+    ],
+    "messageCount": 5,
+    "userMessageCount": 2,
+    "firstUserMessage": "Find the synthetic Gemini needle",
+    "hasResumableContent": true
+  },
+  "resumed": {
+    "sessionId": "11111111-1111-4111-8111-111111111111",
+    "projectHash": "52e30737efc78fb781017102c6074d53ab432a8cc4edc0a26b2b9756700cd3a0",
+    "startTime": "2026-10-11T12:00:01.000Z",
+    "lastUpdated": "2026-10-11T12:00:24.000Z",
+    "kind": "main",
+    "messages": [
+      {
+        "id": "user-one",
+        "timestamp": "2026-10-11T12:00:03.000Z",
+        "type": "user",
+        "content": [
+          {
+            "text": "Find the synthetic Gemini needle"
+          }
+        ]
+      },
+      {
+        "id": "assistant-one",
+        "timestamp": "2026-10-11T12:00:06.000Z",
+        "type": "gemini",
+        "content": [
+          {
+            "text": "Searching the fixture."
+          }
+        ],
+        "thoughts": [
+          {
+            "subject": "Search",
+            "description": "Inspect the synthetic fixture",
+            "timestamp": "2026-10-11T12:00:05.000Z"
+          }
+        ],
+        "tokens": {
+          "input": 120,
+          "output": 20,
+          "cached": 30,
+          "thoughts": 4,
+          "tool": 2,
+          "total": 146
+        },
+        "model": "gemini-fixture-model",
+        "toolCalls": [
+          {
+            "id": "call-real-id",
+            "name": "read_file",
+            "args": {
+              "path": "/synthetic/needle.txt"
+            },
+            "timestamp": "2026-10-11T12:00:08.000Z",
+            "status": "success",
+            "displayName": "read_file",
+            "description": "",
+            "renderOutputAsMarkdown": false,
+            "result": [
+              {
+                "functionResponse": {
+                  "id": "call-real-id",
+                  "name": "read_file",
+                  "response": {
+                    "output": "synthetic masked result"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "tool-response",
+        "timestamp": "2026-10-11T12:00:09.000Z",
+        "type": "user",
+        "content": [
+          {
+            "functionResponse": {
+              "id": "call-real-id",
+              "name": "read_file",
+              "response": {
+                "output": "synthetic masked result"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "id": "assistant-two",
+        "timestamp": "2026-10-11T12:00:11.000Z",
+        "type": "gemini",
+        "content": [
+          {
+            "text": "Found the synthetic Gemini needle."
+          }
+        ],
+        "thoughts": [],
+        "tokens": null,
+        "model": "gemini-fixture-model"
+      },
+      {
+        "id": "info-one",
+        "timestamp": "2026-10-11T12:00:13.000Z",
+        "type": "info",
+        "content": [
+          {
+            "text": "Synthetic status notification"
+          }
+        ]
+      },
+      {
+        "id": "user-resumed",
+        "timestamp": "2026-10-11T12:00:21.000Z",
+        "type": "user",
+        "content": "Continue after synthetic restart."
+      },
+      {
+        "id": "assistant-resumed",
+        "timestamp": "2026-10-11T12:00:23.000Z",
+        "type": "gemini",
+        "content": "The prior synthetic answer is preserved.",
+        "thoughts": [],
+        "tokens": null,
+        "model": "gemini-fixture-model"
+      }
+    ],
+    "messageCount": 7,
+    "userMessageCount": 3,
+    "firstUserMessage": "Find the synthetic Gemini needle",
+    "hasResumableContent": true
+  },
+  "compacted": {
+    "sessionId": "11111111-1111-4111-8111-111111111111",
+    "projectHash": "52e30737efc78fb781017102c6074d53ab432a8cc4edc0a26b2b9756700cd3a0",
+    "startTime": "2026-10-11T12:00:01.000Z",
+    "lastUpdated": "2026-10-11T12:00:26.000Z",
+    "summary": "Synthetic compacted session",
+    "kind": "main",
+    "messages": [
+      {
+        "id": "summary-control",
+        "timestamp": "2026-10-11T12:00:25.000Z",
+        "type": "user",
+        "content": [
+          {
+            "text": "<state_snapshot>Synthetic context summary</state_snapshot>"
+          }
+        ]
+      },
+      {
+        "id": "assistant-resumed",
+        "timestamp": "2026-10-11T12:00:23.000Z",
+        "type": "gemini",
+        "content": [
+          {
+            "text": "Response after synthetic compaction."
+          }
+        ],
+        "thoughts": [],
+        "tokens": null,
+        "model": "gemini-fixture-model"
+      }
+    ],
+    "messageCount": 2,
+    "userMessageCount": 1,
+    "firstUserMessage": "Find the synthetic Gemini needle",
+    "hasResumableContent": true
+  },
+  "rewound": {
+    "sessionId": "11111111-1111-4111-8111-111111111111",
+    "projectHash": "52e30737efc78fb781017102c6074d53ab432a8cc4edc0a26b2b9756700cd3a0",
+    "startTime": "2026-10-11T12:00:01.000Z",
+    "lastUpdated": "2026-10-11T12:00:30.000Z",
+    "summary": "Synthetic compacted session",
+    "kind": "main",
+    "messages": [
+      {
+        "id": "summary-control",
+        "timestamp": "2026-10-11T12:00:25.000Z",
+        "type": "user",
+        "content": [
+          {
+            "text": "<state_snapshot>Synthetic context summary</state_snapshot>"
+          }
+        ]
+      },
+      {
+        "id": "assistant-resumed",
+        "timestamp": "2026-10-11T12:00:23.000Z",
+        "type": "gemini",
+        "content": [
+          {
+            "text": "Response after synthetic compaction."
+          }
+        ],
+        "thoughts": [],
+        "tokens": null,
+        "model": "gemini-fixture-model"
+      }
+    ],
+    "messageCount": 2,
+    "userMessageCount": 1,
+    "firstUserMessage": "Find the synthetic Gemini needle",
+    "hasResumableContent": true
+  },
+  "child": {
+    "sessionId": "33333333-3333-4333-8333-333333333333",
+    "projectHash": "52e30737efc78fb781017102c6074d53ab432a8cc4edc0a26b2b9756700cd3a0",
+    "startTime": "2026-10-11T12:00:32.000Z",
+    "lastUpdated": "2026-10-11T12:00:37.000Z",
+    "directories": [
+      "/synthetic/gemini-project"
+    ],
+    "kind": "subagent",
+    "messages": [
+      {
+        "id": "child-user",
+        "timestamp": "2026-10-11T12:00:34.000Z",
+        "type": "user",
+        "content": "Investigate the synthetic child task."
+      },
+      {
+        "id": "child-assistant",
+        "timestamp": "2026-10-11T12:00:36.000Z",
+        "type": "gemini",
+        "content": "Synthetic child task finished.",
+        "thoughts": [],
+        "tokens": null,
+        "model": "gemini-fixture-model"
+      }
+    ],
+    "messageCount": 2,
+    "userMessageCount": 1,
+    "firstUserMessage": "Investigate the synthetic child task.",
+    "hasResumableContent": true
+  },
+  "legacy": {
+    "sessionId": "22222222-2222-4222-8222-222222222222",
+    "projectHash": "52e30737efc78fb781017102c6074d53ab432a8cc4edc0a26b2b9756700cd3a0",
+    "startTime": "2026-10-11T12:00:01.000Z",
+    "lastUpdated": "2026-10-11T12:00:14.000Z",
+    "kind": "main",
+    "messages": [
+      {
+        "id": "user-one",
+        "timestamp": "2026-10-11T12:00:03.000Z",
+        "type": "user",
+        "content": "Find the synthetic Gemini needle"
+      },
+      {
+        "id": "assistant-one",
+        "timestamp": "2026-10-11T12:00:06.000Z",
+        "type": "gemini",
+        "content": [
+          {
+            "text": "Searching the fixture."
+          }
+        ],
+        "thoughts": [
+          {
+            "subject": "Search",
+            "description": "Inspect the synthetic fixture",
+            "timestamp": "2026-10-11T12:00:05.000Z"
+          }
+        ],
+        "tokens": {
+          "input": 120,
+          "output": 20,
+          "cached": 30,
+          "thoughts": 4,
+          "tool": 2,
+          "total": 146
+        },
+        "model": "gemini-fixture-model",
+        "toolCalls": [
+          {
+            "id": "call-real-id",
+            "name": "read_file",
+            "args": {
+              "path": "/synthetic/needle.txt"
+            },
+            "timestamp": "2026-10-11T12:00:08.000Z",
+            "status": "success",
+            "displayName": "read_file",
+            "description": "",
+            "renderOutputAsMarkdown": false,
+            "result": [
+              {
+                "functionResponse": {
+                  "id": "call-real-id",
+                  "name": "read_file",
+                  "response": {
+                    "output": "synthetic needle result"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "tool-response",
+        "timestamp": "2026-10-11T12:00:09.000Z",
+        "type": "user",
+        "content": [
+          {
+            "functionResponse": {
+              "id": "call-real-id",
+              "name": "read_file",
+              "response": {
+                "output": "synthetic needle result"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "id": "assistant-two",
+        "timestamp": "2026-10-11T12:00:11.000Z",
+        "type": "gemini",
+        "content": "Found the synthetic Gemini needle.",
+        "thoughts": [],
+        "tokens": null,
+        "model": "gemini-fixture-model"
+      },
+      {
+        "id": "info-one",
+        "timestamp": "2026-10-11T12:00:13.000Z",
+        "type": "info",
+        "content": "Synthetic status notification"
+      }
+    ],
+    "userMessageCount": 2,
+    "hasResumableContent": true
+  },
+  "legacy-migrated": {
+    "sessionId": "22222222-2222-4222-8222-222222222222",
+    "projectHash": "52e30737efc78fb781017102c6074d53ab432a8cc4edc0a26b2b9756700cd3a0",
+    "startTime": "2026-10-11T12:00:01.000Z",
+    "lastUpdated": "2026-10-11T12:00:39.000Z",
+    "kind": "main",
+    "messages": [
+      {
+        "id": "user-one",
+        "timestamp": "2026-10-11T12:00:03.000Z",
+        "type": "user",
+        "content": "Find the synthetic Gemini needle"
+      },
+      {
+        "id": "assistant-one",
+        "timestamp": "2026-10-11T12:00:06.000Z",
+        "type": "gemini",
+        "content": [
+          {
+            "text": "Searching the fixture."
+          }
+        ],
+        "thoughts": [
+          {
+            "subject": "Search",
+            "description": "Inspect the synthetic fixture",
+            "timestamp": "2026-10-11T12:00:05.000Z"
+          }
+        ],
+        "tokens": {
+          "input": 120,
+          "output": 20,
+          "cached": 30,
+          "thoughts": 4,
+          "tool": 2,
+          "total": 146
+        },
+        "model": "gemini-fixture-model",
+        "toolCalls": [
+          {
+            "id": "call-real-id",
+            "name": "read_file",
+            "args": {
+              "path": "/synthetic/needle.txt"
+            },
+            "timestamp": "2026-10-11T12:00:08.000Z",
+            "status": "success",
+            "displayName": "read_file",
+            "description": "",
+            "renderOutputAsMarkdown": false,
+            "result": [
+              {
+                "functionResponse": {
+                  "id": "call-real-id",
+                  "name": "read_file",
+                  "response": {
+                    "output": "synthetic needle result"
+                  }
+                }
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "tool-response",
+        "timestamp": "2026-10-11T12:00:09.000Z",
+        "type": "user",
+        "content": [
+          {
+            "functionResponse": {
+              "id": "call-real-id",
+              "name": "read_file",
+              "response": {
+                "output": "synthetic needle result"
+              }
+            }
+          }
+        ]
+      },
+      {
+        "id": "assistant-two",
+        "timestamp": "2026-10-11T12:00:11.000Z",
+        "type": "gemini",
+        "content": "Found the synthetic Gemini needle.",
+        "thoughts": [],
+        "tokens": null,
+        "model": "gemini-fixture-model"
+      },
+      {
+        "id": "info-one",
+        "timestamp": "2026-10-11T12:00:13.000Z",
+        "type": "info",
+        "content": "Synthetic status notification"
+      },
+      {
+        "id": "legacy-resumed",
+        "timestamp": "2026-10-11T12:00:38.000Z",
+        "type": "user",
+        "content": "Continue the synthetic legacy session."
+      }
+    ],
+    "messageCount": 6,
+    "userMessageCount": 3,
+    "firstUserMessage": "Find the synthetic Gemini needle",
+    "hasResumableContent": true
+  }
+}

@@ -4,6 +4,7 @@ pub(crate) mod codex;
 pub(crate) mod copilot;
 pub(crate) mod cursor;
 pub(crate) mod devin;
+pub(crate) mod gemini;
 pub(crate) mod grok;
 pub(crate) mod hermes;
 pub(crate) mod muse;
