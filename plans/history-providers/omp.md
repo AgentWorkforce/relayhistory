@@ -205,3 +205,20 @@ increments unread and blocks whole-source retirement. The added public
 `omp_shared_root_pi_file_does_not_block_missing_omp_retirement` case exercises
 OMP+Pi → delete OMP → full sync while retaining Pi. Final broad checks are
 recorded in the implementation handoff after they complete.
+
+Final identity-replacement repair: changing a complete locator's native header
+from A to B now retires A's local share in the same capture transaction, after
+B's events have been written. Partial replacement preserves A, independent
+remote shares survive, and shared prompt ownership can move to B. Generation
+`omp_v3_2` forces old unchanged-byte checkpoints to run the repaired normalizer.
+The public suite now has nine cases; the provider unit/lifecycle suite has
+fifteen, including explicit denied-root and primary-only blob-reference reads.
+
+The native SDK red probe `same_locator_native_identity_replacement_control`
+reproduced A+B surviving one locator before the fix. Omitting the single
+`retire_locator_sessions` call makes
+`omp_same_locator_identity_replacement_preserves_remote_share` fail: A wrongly
+retains `[local, remote]` instead of `[remote]`. Restoring the call restores that
+case and the named public complete-versus-partial replacement regression. A
+fresh independent review approved the complete-only helper ordering, remote
+preservation and generation bump without findings.

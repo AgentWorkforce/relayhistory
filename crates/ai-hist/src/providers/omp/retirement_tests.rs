@@ -197,3 +197,36 @@ fn omp_moved_locator_and_new_fork_preserve_prompt_identity_before_deletion() {
         .unwrap();
     assert_eq!(owner, ("surviving-fork".into(), Some("/fork/final".into())));
 }
+
+#[test]
+fn omp_same_locator_identity_replacement_preserves_remote_share() {
+    let (_home, store, path) = fixture();
+    let conn = crate::open_db(store.db_path()).unwrap();
+    let mut payload = snapshot(&path, &AcquisitionContext::new(ID, store.roots()))
+        .unwrap()
+        .payload;
+    normalize::write(&conn, &payload, &path).unwrap();
+    let old = payload["entries"][0]["id"].as_str().unwrap().to_owned();
+    conn.execute("UPDATE session_events SET location='both' WHERE source='omp' AND session_id=?1 AND role='user'",[&old]).unwrap();
+    crate::mark_session_presence(&conn, ID, &old, crate::SessionLocation::Remote).unwrap();
+    payload["entries"][0]["id"] = "replacement-native".into();
+    normalize::write(&conn, &payload, &path).unwrap();
+    assert_eq!(
+        crate::session_locations(&conn, ID, &old).unwrap(),
+        ["remote"]
+    );
+    let local:i64=conn.query_row("SELECT count(*) FROM session_events WHERE source='omp' AND session_id=?1 AND location!='remote'",[&old],|r|r.get(0)).unwrap();
+    assert_eq!(local, 0);
+    let remote:i64=conn.query_row("SELECT count(*) FROM session_events WHERE source='omp' AND session_id=?1 AND location='remote'",[&old],|r|r.get(0)).unwrap();
+    assert_eq!(remote, 1);
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT raw_path FROM sessions WHERE source='omp' AND session_id=?1",
+            [&old],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(raw.is_none());
+    let new:i64=conn.query_row("SELECT count(*) FROM session_events WHERE source='omp' AND session_id='replacement-native'",[],|r|r.get(0)).unwrap();
+    assert!(new > 0);
+}

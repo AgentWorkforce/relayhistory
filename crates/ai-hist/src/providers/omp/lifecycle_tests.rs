@@ -246,7 +246,7 @@ fn omp_denied_root_is_reported_and_blob_references_are_not_opened() {
     assert!(capture.payload.to_string().contains("blob:sha256:"));
     let root = path.parent().unwrap();
     let permissions = std::fs::metadata(root).unwrap().permissions();
-    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0)).unwrap();
+    std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o0)).unwrap();
     let conn = crate::open_db(store.db_path()).unwrap();
     let env = DiscoveryEnv::with_provider_roots(&conn, store.roots().clone());
     let result = Provider.enumerate(&env, None);

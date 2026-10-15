@@ -406,3 +406,43 @@ fn omp_shared_root_pi_file_does_not_block_missing_omp_retirement() {
         .unwrap();
     assert!(has(&pi, "Reading a fixture"));
 }
+
+#[test]
+fn omp_same_locator_identity_replacement_retires_old_only_after_complete_capture() {
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path());
+    let store = open(home.path());
+    store
+        .discover(DiscoveryOptions::default().sources([Source::Omp]))
+        .unwrap();
+    hydrate(&store);
+    let replacement = "replacement-native";
+    let rewritten = FIXTURE.replace(SID, replacement);
+    std::fs::write(&path, format!("{rewritten}{{partial")).unwrap();
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    assert!(
+        store
+            .session(&SessionRef::id(Source::Omp, SID), SessionQuery::default())
+            .unwrap()
+            .is_some(),
+        "partial replacement must retain prior identity evidence"
+    );
+    std::fs::write(&path, rewritten).unwrap();
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    assert!(
+        store
+            .session(&SessionRef::id(Source::Omp, SID), SessionQuery::default())
+            .unwrap()
+            .is_none(),
+        "one complete locator cannot continue backing its previous native identity"
+    );
+    let replaced = store
+        .session(
+            &SessionRef::id(Source::Omp, replacement),
+            SessionQuery::default(),
+        )
+        .unwrap()
+        .unwrap();
+    assert!(has(&replaced, "Reading a fixture"));
+    assert_eq!(replaced.prompts.len(), 1);
+}

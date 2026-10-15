@@ -40,6 +40,7 @@ pub(super) fn write(conn: &Connection, payload: &Value, path: &Path) -> Result<u
     let complete = payload["tail"].as_array().is_some_and(Vec::is_empty);
     if complete {
         file_history::retire(conn, ID, sid, &keys)?;
+        file_history::retire_locator_sessions(conn, ID, path, Some(sid))?;
     }
     let catalog_writer = if complete {
         upsert_session_rebuilt
