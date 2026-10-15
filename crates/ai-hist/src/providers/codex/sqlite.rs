@@ -173,6 +173,50 @@ pub(crate) fn databases(root: &Path) -> Result<Option<(PathBuf, PathBuf)>> {
     Ok(database_selection(root)?.pair)
 }
 
+/// Refresh a saved rollout observation against the current projection. Query
+/// only this thread and its checkpoint; capture reads items after selection.
+pub(crate) fn current_locator(roots: &crate::ProviderRoots, id: &str) -> Result<Option<String>> {
+    let Some((state, history)) = databases(&roots.codex)? else {
+        return Ok(None);
+    };
+    let context = AcquisitionContext::new("codex", roots);
+    let rollout_path: Option<Option<String>> = sqlite_snapshot(&context, &state, |db| {
+        db.query_row(
+            "SELECT rollout_path FROM threads WHERE id=?1 AND history_mode='paginated'",
+            [id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    })?;
+    let Some(rollout_path) = rollout_path else {
+        return Ok(None);
+    };
+    let offset: Option<i64> = sqlite_snapshot(&context, &history, |db| {
+        db.query_row(
+            "SELECT next_rollout_byte_offset FROM thread_history_projection_state WHERE thread_id=?1",
+            [id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+    })?;
+    let Some(offset) = offset else {
+        return Ok(None);
+    };
+    ensure!(offset >= 0, "invalid Codex rollout projection offset");
+    if let Some(path) = rollout_path {
+        let path = PathBuf::from(path);
+        if path.metadata().is_ok_and(|metadata| {
+            metadata.is_file() && metadata.len() >= offset as u64
+        }) {
+            context.validate(&path)?;
+            return Ok(Some(path.to_string_lossy().into_owned()));
+        }
+    }
+    Ok(Some(locator(&state, id)))
+}
+
 fn projection(
     context: &AcquisitionContext<'_>,
     path: &Path,

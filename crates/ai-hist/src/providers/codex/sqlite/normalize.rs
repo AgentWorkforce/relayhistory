@@ -63,8 +63,8 @@ pub(crate) fn claim_history_log_prompt(conn: &Connection, entry: &HistoryEntry) 
     };
     let id: Option<i64> = conn
         .query_row(
-            "SELECT id FROM history WHERE source='codex' AND timestamp_ms=?1 AND prompt=?2",
-            params![entry.timestamp_ms, entry.prompt],
+            "SELECT id FROM history WHERE source='codex' AND session_id=?1 AND timestamp_ms=?2 AND prompt=?3",
+            params![session_id, entry.timestamp_ms, entry.prompt],
             |row| row.get(0),
         )
         .optional()?;

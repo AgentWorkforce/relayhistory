@@ -535,6 +535,7 @@ fn prefer_restored_codex_rollout(
     if options.source != "codex" {
         return Ok(());
     }
+    codex_selected::refresh_catalog_codex_locator(options, roots, target, observation)?;
     let Some((state, id)) = target
         .locator
         .as_deref()
@@ -4842,7 +4843,14 @@ mod tests {
             "sqlite-parent",
         );
         catalog_row(&conn, "codex", "sqlite-parent", Some(Path::new(&locator)));
-        catalog_row(&conn, "codex", "guardian", Some(&guardian_rollout));
+        let guardian_before: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sessions WHERE source='codex' AND session_id='guardian'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(guardian_before, 0, "guardian has not been discovered yet");
         drop(conn);
 
         let mut request = options("codex", "sqlite-parent");
@@ -4885,6 +4893,18 @@ mod tests {
             )
             .unwrap();
         assert_eq!(guardian_catalog, 1, "guardian remains a catalog root");
+        let guardian_link_has_events: bool = open_db(&db)
+            .unwrap()
+            .query_row(
+                "SELECT child_has_events FROM session_relationships WHERE source='codex' AND parent_session_id='sqlite-parent' AND child_session_id='guardian' AND evidence_kind='codex_thread_spawn_edge'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            guardian_link_has_events,
+            "the guardian edge has child evidence"
+        );
         let root_event_id: i64 = open_db(&db).unwrap().query_row(
             "SELECT id FROM session_events WHERE source='codex' AND session_id='sqlite-parent' ORDER BY id LIMIT 1",
             [], |row| row.get(0),
@@ -4968,6 +4988,22 @@ mod tests {
             [], |row| row.get(0),
         ).unwrap();
         assert_eq!(observation, rollout.to_string_lossy());
+        fs::remove_file(&rollout).unwrap();
+        let recovered = hydrate_session_at_with_home(&db, &request, home.path()).unwrap();
+        assert_eq!(recovered.status, "updated");
+        let observation: String = open_db(&db).unwrap().query_row(
+            "SELECT raw_locator FROM session_presences WHERE source='codex' AND session_id='sqlite-parent' AND location='local'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(observation, locator);
+        let recovered_events: i64 = open_db(&db).unwrap().query_row(
+            "SELECT count(*) FROM session_events WHERE source='codex' AND session_id='sqlite-parent' AND message_id='sqlite-sqlite-parent-1'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(
+            recovered_events > 0,
+            "pruned rollout recovers SQLite evidence"
+        );
     }
 
     /// `<claude root>/transcripts/` is not a Claude root (#208, see the claude
