@@ -340,8 +340,8 @@ one `fork_replay_boundary` marker instead of re-indexing the parent's prompts,
 events and token baseline under the child
 ([#210](https://github.com/AgentWorkforce/relayhistory/issues/210)). Codex
 0.133–0.148 (`history_mode: "paginated"`) copy that history straight after the
-child's own `session_meta`, without the parent's; there the span opens at line
-1 when a record before the child's first own turn is one only a copy can hold
+child's own `session_meta`, without the parent's; in a rollout that declares
+that `history_mode` the span opens at line 1 when a record before the child's first own turn is one only a copy can hold
 (a turn ordered before the fork, a `token_count`, a `compacted` record), closes
 at the first UUIDv7 turn at or after the fork, and its marker's `subkind` is
 `copied_history`. The `✓` is for spans the evidence can bound: in a span opened

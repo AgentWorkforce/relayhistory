@@ -301,6 +301,17 @@
     },
     {
       "source": "codex",
+      "name": "subagent-unpaginated",
+      "quirk": "a Codex 0.95 subagent spawned without fork mode (`source.subagent.thread_spawn.parent_thread_id`, no `history_mode`): it copies no parent history, persists no `task_started`, and its `turn_context` carries no `turn_id`, so nothing orders its own turn against the spawn",
+      "layout": "CodexRollout",
+      "origin": "RelayHistory",
+      "files": [
+        "codex/subagent-unpaginated/root.jsonl",
+        "codex/subagent-unpaginated/subagent.jsonl"
+      ]
+    },
+    {
+      "source": "codex",
       "name": "guardian-review",
       "quirk": "a Codex 0.150+ `thread_source: guardian_review` rollout with `parent_thread_id` that opens on a `compaction` item rather than a replay",
       "layout": "CodexRollout",

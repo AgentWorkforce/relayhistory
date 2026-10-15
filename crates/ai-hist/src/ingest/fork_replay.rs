@@ -242,3 +242,36 @@ pub(super) fn record_codex_fork_replay(
     }
     Ok(())
 }
+
+/// Retire the `fork_replay_boundary` markers on a Codex session other than
+/// `kept`, after a pass that read its rollout from byte zero.
+///
+/// Such a pass opens every span the gate finds in the file and writes each
+/// one's marker, so a marker it did not write stands for a span an earlier
+/// parser opened and this gate does not -- lines that are the child's own and
+/// are now indexed under it.
+pub(super) fn retire_stale_fork_replay_markers(
+    conn: &Connection,
+    session_id: &str,
+    kept: &[String],
+) -> Result<()> {
+    let stale = conn
+        .prepare_cached(
+            "SELECT marker_uid FROM session_markers \
+             WHERE source = 'codex' AND session_id = ? AND kind = 'fork_replay_boundary'",
+        )?
+        .query_map([session_id], |row| row.get::<_, String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?
+        .into_iter()
+        .filter(|uid| !kept.contains(uid));
+    for uid in stale {
+        crate::store::retire_evidence_share(
+            conn,
+            "session_markers",
+            "source = 'codex' AND session_id = ? AND marker_uid = ?",
+            params![session_id, uid],
+            SessionLocation::Local,
+        )?;
+    }
+    Ok(())
+}

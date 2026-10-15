@@ -403,12 +403,18 @@ into the child's file. The rollout walk gates that copy (`ForkReplaySpan` in
   `payload.id` is the parent the opening `session_meta` named in
   `forked_from_id` or `thread_spawn.parent_thread_id` (Codex 0.151 and later).
   Codex 0.133--0.148 (`history_mode: "paginated"`) copy the parent's history
-  straight after the child's `session_meta`, without the parent's: there the
-  span opens at line 1 when `codex::CopiedHistoryProbe` finds, before the
+  straight after the child's `session_meta`, without the parent's: in a
+  rollout whose `session_meta` declares that `history_mode`, the span opens at
+  line 1 when `codex::CopiedHistoryProbe` finds, before the
   child's first own turn, a record only a copy can hold -- a turn ordered
   before the fork, a `token_count`, or a `compacted` record (the child makes
   no request and compacts nothing before its first turn). The probe reads the
-  head of a fork once, on a read from byte zero, and stops at its verdict.
+  head of a fork once, on a read from byte zero, and stops at its verdict. A
+  rollout without paginated history is never probed: a subagent spawned
+  without fork mode copies nothing, and its own turn may carry nothing that
+  orders it (Codex 0.90--0.99 write `turn_context` without a `turn_id`), so a
+  probe would read the child's own `token_count` as the copy's. A pass from
+  byte zero retires any `fork_replay_boundary` marker it did not write.
   `subagent_history_start_ordinal` is not used: 0.151+ writes the line of the
   `thread_settings_applied` after the copy, 0.124--0.148 the file's line
   count. A rollout that names no such parent is never gated.

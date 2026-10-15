@@ -97,7 +97,7 @@ pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 6;
 /// invalidates every stored stamp, so a scanner that learns to extract a new
 /// field re-reads sources whose bytes never changed. `parser_version` keeps its
 /// existing meaning (full-ingest parser generation) and is untouched.
-pub const SHALLOW_SCANNER_VERSION: u32 = 14;
+pub const SHALLOW_SCANNER_VERSION: u32 = 15;
 
 /// Version 2 shipped the classification that hid standalone guardians (see
 /// [`crate::codex_is_subagent`]). Their rollouts never change on disk, so the
@@ -189,6 +189,11 @@ const _: () = assert!(SHALLOW_SCANNER_VERSION > 12);
 /// prompt. A finished fork never changes on disk, so only this bump sends its
 /// cached row through the gate; it also moves the sweep generation.
 const _: () = assert!(SHALLOW_SCANNER_VERSION > 13);
+
+/// Version 15 probes for that copy only in a rollout that declares paginated
+/// history (`codex::pages_history`), so a fork of any other build whose own
+/// first turn nothing orders is catalogued under its own first prompt again.
+const _: () = assert!(SHALLOW_SCANNER_VERSION > 14);
 
 /// Most bytes a shallow head read may consume from one transcript.
 pub const HEAD_SCAN_MAX_BYTES: u64 = 256 * 1024;

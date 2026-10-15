@@ -15,6 +15,10 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Added `Source::Copilot` for filtering and reading persisted GitHub Copilot CLI session history.
 
+### Fixed
+
+- Codex forks and subagents keep their own turns: only a rollout whose `session_meta` declares `history_mode: "paginated"` is checked for parent history copied straight after the child's `session_meta`, so a subagent whose first turn carries no ordering evidence (Codex 0.90–0.99 write `turn_context` without a `turn_id`) is indexed under its own id rather than retired whole as copied history. The first `sync` (or `hydrate`) re-reads existing forks once and retires the stale `fork_replay_boundary` marker.
+
 ## [0.44.0] - 2026-10-14
 
 ### Added

@@ -153,7 +153,11 @@ pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 3;
 /// images, including checkpoints written by generation 17's fork replay fix.
 /// Version 19: capture native Codex CommandExecution command/output pairs so
 /// PR evidence in existing sessions reaches History after a re-upload.
-pub(crate) const HYDRATION_PARSER_VERSION: i64 = 19;
+/// Version 20: a checkpoint at 19 re-parses once, so an embedder that only
+/// hydrates restores the Codex forks and subagents without paginated history
+/// that generation 17's probe read whole as copied parent history, which
+/// sync's `codex_fork_replay_gate` generation 3 restores.
+pub(crate) const HYDRATION_PARSER_VERSION: i64 = 20;
 
 #[derive(Debug, Clone)]
 pub struct HydrateSessionOptions {
