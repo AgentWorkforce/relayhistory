@@ -708,11 +708,8 @@ fn commit_local_pass(
 
 /// The builtin local adapter's observation of the session, which locates the
 /// target; without one, no other configured local adapter may have seen it.
-///
-/// Both answers come from one read: a concurrent first hydration commits the
-/// builtin observation at any moment, and a lookup split across two
-/// statements would miss it in the first and count it as another adapter's
-/// in the second.
+/// One read answers both, so a concurrent first hydration's builtin
+/// observation is never missed and then counted as another adapter's.
 fn observe_local_target(
     conn: &Connection,
     options: &HydrateSessionOptions,
@@ -720,10 +717,7 @@ fn observe_local_target(
     local_key: &ObservationKey,
 ) -> Result<Option<SessionObservation>> {
     let observed = observations::list(conn, &options.source, &options.session_id)?;
-    let local_observation = observed
-        .iter()
-        .find(|observation| &observation.key == local_key)
-        .cloned();
+    let local_observation = observed.iter().find(|seen| &seen.key == local_key).cloned();
     if let Some(observation) = &local_observation {
         // OpenCode and Devin enumerate by session id, while their local
         // parsers need the separately recorded provider database path from
