@@ -70,10 +70,9 @@ fn roots_from_values(
         base_path.join(".gemini")
     };
     let root = runtime.join("tmp");
-    ResolvedProviderRoots {
-        paths: vec![root.clone()],
-        default_root: base.is_none().then_some(root),
-    }
+    let mut resolved: ResolvedProviderRoots = vec![root.clone()].into();
+    resolved.default_root = base.is_none().then_some(root);
+    resolved
 }
 fn prefix(context: &AcquisitionContext<'_>, path: &Path) -> Result<Vec<u8>> {
     context.validate(path)?;
