@@ -1,0 +1,610 @@
+[
+  {
+    "request": {
+      "method": "initialize",
+      "params": {
+        "clientInfo": {
+          "name": "relayhistory-offline-fixture",
+          "version": "1.0.0"
+        },
+        "capabilities": {
+          "experimentalApi": true
+        }
+      },
+      "id": 1
+    }
+  },
+  {
+    "response": {
+      "id": 1,
+      "result": {
+        "userAgent": "relayhistory-offline-fixture/0.161.0 (Mac OS 26.6.2; arm64) unknown (relayhistory-offline-fixture; 1.0.0)",
+        "codexHome": "/synthetic/codex-home/codex",
+        "platformFamily": "unix",
+        "platformOs": "macos"
+      }
+    }
+  },
+  {
+    "request": {
+      "method": "initialized",
+      "params": {}
+    }
+  },
+  {
+    "request": {
+      "method": "thread/start",
+      "params": {
+        "cwd": "/synthetic/codex-home/workspace",
+        "model": "synthetic-fixture",
+        "modelProvider": "synthetic",
+        "approvalPolicy": "never",
+        "sandbox": "read-only",
+        "ephemeral": false,
+        "baseInstructions": "Synthetic offline fixture instructions.",
+        "developerInstructions": "Retain synthetic history only.",
+        "config": {
+          "model_providers": {
+            "synthetic": {
+              "name": "Offline synthetic",
+              "base_url": "http://127.0.0.1:9/v1",
+              "wire_api": "responses",
+              "requires_openai_auth": false
+            }
+          }
+        }
+      },
+      "id": 3
+    }
+  },
+  {
+    "response": {
+      "method": "remoteControl/status/changed",
+      "params": {
+        "status": "disabled",
+        "serverName": "Wills-MacBook-Pro-2.local",
+        "installationId": "019b76da-a800-7000-8000-000000000177",
+        "environmentId": null
+      },
+      "emittedAtMs": 1792044894977
+    }
+  },
+  {
+    "response": {
+      "id": 3,
+      "result": {
+        "thread": {
+          "id": "019b76da-a800-7000-8000-000000000161",
+          "environments": [
+            {
+              "environmentId": "local",
+              "cwd": "/synthetic/codex-home/workspace",
+              "runtimeWorkspaceRoots": [
+                "/synthetic/codex-home/workspace"
+              ]
+            }
+          ],
+          "extra": null,
+          "sessionId": "019b76da-a800-7000-8000-000000000161",
+          "forkedFromId": null,
+          "parentThreadId": null,
+          "preview": "",
+          "ephemeral": false,
+          "section": null,
+          "sectionEnteredAt": null,
+          "projectId": null,
+          "historyMode": "paginated",
+          "modelProvider": "synthetic",
+          "model": "synthetic-fixture",
+          "reasoningEffort": null,
+          "createdAt": 1767225600,
+          "updatedAt": 1767225600,
+          "recencyAt": 1767225600,
+          "status": {
+            "type": "idle"
+          },
+          "path": "/synthetic/codex-home/codex/sessions/2026/01/01/rollout-2026-01-01T00:00:00.000Zb76da-a800-7000-8000-000000000161.jsonl",
+          "cwd": "/synthetic/codex-home/workspace",
+          "cliVersion": "0.161.0",
+          "originator": "relayhistory-offline-fixture",
+          "source": "vscode",
+          "canAcceptDirectInput": true,
+          "threadSource": null,
+          "agentNickname": null,
+          "agentRole": null,
+          "gitInfo": null,
+          "name": null,
+          "daybreakEnabled": null,
+          "turns": []
+        },
+        "model": "synthetic-fixture",
+        "modelProvider": "synthetic",
+        "serviceTier": null,
+        "disabledPluginIds": [],
+        "cwd": "/synthetic/codex-home/workspace",
+        "runtimeWorkspaceRoots": [
+          "/synthetic/codex-home/workspace"
+        ],
+        "instructionSources": [],
+        "approvalPolicy": "never",
+        "approvalsReviewer": "user",
+        "sandbox": {
+          "type": "readOnly",
+          "networkAccess": false
+        },
+        "activePermissionProfile": null,
+        "reasoningEffort": null,
+        "multiAgentMode": "explicitRequestOnly"
+      }
+    }
+  },
+  {
+    "request": {
+      "method": "thread/inject_items",
+      "params": {
+        "threadId": "019b76da-a800-7000-8000-000000000161",
+        "items": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "Inspect the native Codex fixture."
+              }
+            ]
+          },
+          {
+            "type": "message",
+            "role": "assistant",
+            "content": [
+              {
+                "type": "output_text",
+                "text": "Reading the native Codex fixture."
+              }
+            ]
+          },
+          {
+            "type": "function_call",
+            "call_id": "offline-call-1",
+            "name": "read",
+            "arguments": "{\"path\":\"fixture.txt\"}"
+          },
+          {
+            "type": "function_call_output",
+            "call_id": "offline-call-1",
+            "output": "native fixture bytes"
+          },
+          {
+            "type": "message",
+            "role": "assistant",
+            "content": [
+              {
+                "type": "output_text",
+                "text": "The native fixture remains readable."
+              }
+            ]
+          }
+        ]
+      },
+      "id": 4
+    }
+  },
+  {
+    "response": {
+      "method": "thread/started",
+      "params": {
+        "thread": {
+          "id": "019b76da-a800-7000-8000-000000000161",
+          "environments": [
+            {
+              "environmentId": "local",
+              "cwd": "/synthetic/codex-home/workspace",
+              "runtimeWorkspaceRoots": [
+                "/synthetic/codex-home/workspace"
+              ]
+            }
+          ],
+          "extra": null,
+          "sessionId": "019b76da-a800-7000-8000-000000000161",
+          "forkedFromId": null,
+          "parentThreadId": null,
+          "preview": "",
+          "ephemeral": false,
+          "section": null,
+          "sectionEnteredAt": null,
+          "projectId": null,
+          "historyMode": "paginated",
+          "modelProvider": "synthetic",
+          "model": "synthetic-fixture",
+          "reasoningEffort": null,
+          "createdAt": 1767225600,
+          "updatedAt": 1767225600,
+          "recencyAt": 1767225600,
+          "status": {
+            "type": "idle"
+          },
+          "path": "/synthetic/codex-home/codex/sessions/2026/01/01/rollout-2026-01-01T00:00:00.000Zb76da-a800-7000-8000-000000000161.jsonl",
+          "cwd": "/synthetic/codex-home/workspace",
+          "cliVersion": "0.161.0",
+          "originator": "relayhistory-offline-fixture",
+          "source": "vscode",
+          "canAcceptDirectInput": true,
+          "threadSource": null,
+          "agentNickname": null,
+          "agentRole": null,
+          "gitInfo": null,
+          "name": null,
+          "daybreakEnabled": null,
+          "turns": []
+        }
+      },
+      "emittedAtMs": 1792044895246
+    }
+  },
+  {
+    "response": {
+      "id": 4,
+      "result": {}
+    }
+  },
+  {
+    "request": {
+      "method": "thread/read",
+      "params": {
+        "threadId": "019b76da-a800-7000-8000-000000000161",
+        "includeTurns": true
+      },
+      "id": 5
+    }
+  },
+  {
+    "response": {
+      "method": "deprecationNotice",
+      "params": {
+        "summary": "Full-history hydration is deprecated for paginated threads; omit `includeTurns` or set it to `false`, then page with `thread/turns/list` and `thread/items/list`.",
+        "details": null
+      },
+      "emittedAtMs": 1792044895471
+    }
+  },
+  {
+    "response": {
+      "id": 5,
+      "result": {
+        "thread": {
+          "id": "019b76da-a800-7000-8000-000000000161",
+          "environments": [
+            {
+              "environmentId": "local",
+              "cwd": "/synthetic/codex-home/workspace",
+              "runtimeWorkspaceRoots": [
+                "/synthetic/codex-home/workspace"
+              ]
+            }
+          ],
+          "extra": null,
+          "sessionId": "019b76da-a800-7000-8000-000000000161",
+          "forkedFromId": null,
+          "parentThreadId": null,
+          "preview": "",
+          "ephemeral": false,
+          "section": null,
+          "sectionEnteredAt": null,
+          "projectId": null,
+          "historyMode": "paginated",
+          "modelProvider": "synthetic",
+          "model": "synthetic-fixture",
+          "reasoningEffort": null,
+          "createdAt": 1767225600,
+          "updatedAt": 1767225600,
+          "recencyAt": 1767225600,
+          "status": {
+            "type": "idle"
+          },
+          "path": "/synthetic/codex-home/codex/sessions/2026/01/01/rollout-2026-01-01T00:00:00.000Zb76da-a800-7000-8000-000000000161.jsonl",
+          "cwd": "/synthetic/codex-home/workspace",
+          "cliVersion": "0.161.0",
+          "originator": "relayhistory-offline-fixture",
+          "source": "vscode",
+          "canAcceptDirectInput": true,
+          "threadSource": null,
+          "agentNickname": null,
+          "agentRole": null,
+          "gitInfo": null,
+          "name": null,
+          "daybreakEnabled": null,
+          "turns": []
+        }
+      }
+    }
+  },
+  {
+    "request": {
+      "method": "thread/turns/list",
+      "params": {
+        "threadId": "019b76da-a800-7000-8000-000000000161",
+        "itemsView": "full",
+        "limit": 100
+      },
+      "id": 6
+    }
+  },
+  {
+    "response": {
+      "id": 6,
+      "result": {
+        "data": [],
+        "nextCursor": null,
+        "backwardsCursor": null
+      }
+    }
+  },
+  {
+    "request": {
+      "method": "thread/items/list",
+      "params": {
+        "threadId": "019b76da-a800-7000-8000-000000000161",
+        "limit": 100
+      },
+      "id": 7
+    }
+  },
+  {
+    "response": {
+      "id": 7,
+      "result": {
+        "data": [],
+        "nextCursor": null,
+        "backwardsCursor": null
+      }
+    }
+  },
+  {
+    "request": {
+      "method": "initialize",
+      "params": {
+        "clientInfo": {
+          "name": "relayhistory-offline-fixture",
+          "version": "1.0.0"
+        },
+        "capabilities": {
+          "experimentalApi": true
+        }
+      },
+      "id": 8
+    }
+  },
+  {
+    "response": {
+      "id": 8,
+      "result": {
+        "userAgent": "relayhistory-offline-fixture/0.161.0 (Mac OS 26.6.2; arm64) unknown (relayhistory-offline-fixture; 1.0.0)",
+        "codexHome": "/synthetic/codex-home/codex",
+        "platformFamily": "unix",
+        "platformOs": "macos"
+      }
+    }
+  },
+  {
+    "request": {
+      "method": "initialized",
+      "params": {}
+    }
+  },
+  {
+    "request": {
+      "method": "thread/resume",
+      "params": {
+        "threadId": "019b76da-a800-7000-8000-000000000161",
+        "cwd": "/synthetic/codex-home/workspace",
+        "model": "synthetic-fixture",
+        "modelProvider": "synthetic",
+        "approvalPolicy": "never",
+        "sandbox": "read-only",
+        "excludeTurns": true,
+        "config": {
+          "model_providers": {
+            "synthetic": {
+              "name": "Offline synthetic",
+              "base_url": "http://127.0.0.1:9/v1",
+              "wire_api": "responses",
+              "requires_openai_auth": false
+            }
+          }
+        }
+      },
+      "id": 10
+    }
+  },
+  {
+    "response": {
+      "method": "remoteControl/status/changed",
+      "params": {
+        "status": "disabled",
+        "serverName": "Wills-MacBook-Pro-2.local",
+        "installationId": "019b76da-a800-7000-8000-000000000177",
+        "environmentId": null
+      },
+      "emittedAtMs": 1792044895555
+    }
+  },
+  {
+    "response": {
+      "method": "thread/status/changed",
+      "params": {
+        "threadId": "019b76da-a800-7000-8000-000000000161",
+        "status": {
+          "type": "idle"
+        }
+      },
+      "emittedAtMs": 1792044895604
+    }
+  },
+  {
+    "response": {
+      "id": 10,
+      "result": {
+        "thread": {
+          "id": "019b76da-a800-7000-8000-000000000161",
+          "environments": [
+            {
+              "environmentId": "local",
+              "cwd": "/synthetic/codex-home/workspace",
+              "runtimeWorkspaceRoots": [
+                "/synthetic/codex-home/workspace"
+              ]
+            }
+          ],
+          "extra": null,
+          "sessionId": "019b76da-a800-7000-8000-000000000161",
+          "forkedFromId": null,
+          "parentThreadId": null,
+          "preview": "",
+          "ephemeral": false,
+          "section": null,
+          "sectionEnteredAt": null,
+          "projectId": null,
+          "historyMode": "paginated",
+          "modelProvider": "synthetic",
+          "model": "synthetic-fixture",
+          "reasoningEffort": null,
+          "createdAt": 1767225600,
+          "updatedAt": 1767225600,
+          "recencyAt": 1767225600,
+          "status": {
+            "type": "idle"
+          },
+          "path": "/synthetic/codex-home/codex/sessions/2026/01/01/rollout-2026-01-01T00:00:00.000Zb76da-a800-7000-8000-000000000161.jsonl",
+          "cwd": "/synthetic/codex-home/workspace",
+          "cliVersion": "0.161.0",
+          "originator": "relayhistory-offline-fixture",
+          "source": "vscode",
+          "canAcceptDirectInput": true,
+          "threadSource": null,
+          "agentNickname": null,
+          "agentRole": null,
+          "gitInfo": null,
+          "name": null,
+          "daybreakEnabled": null,
+          "turns": []
+        },
+        "model": "synthetic-fixture",
+        "modelProvider": "synthetic",
+        "serviceTier": null,
+        "disabledPluginIds": [],
+        "cwd": "/synthetic/codex-home/workspace",
+        "runtimeWorkspaceRoots": [
+          "/synthetic/codex-home/workspace"
+        ],
+        "instructionSources": [],
+        "approvalPolicy": "never",
+        "approvalsReviewer": "user",
+        "sandbox": {
+          "type": "readOnly",
+          "networkAccess": false
+        },
+        "activePermissionProfile": null,
+        "reasoningEffort": null,
+        "collaborationMode": {
+          "mode": "default",
+          "settings": {
+            "model": "synthetic-fixture",
+            "reasoning_effort": null,
+            "developer_instructions": null
+          }
+        },
+        "multiAgentMode": "explicitRequestOnly",
+        "initialTurnsPage": null,
+        "turnsBackwardsCursor": null,
+        "itemsBackwardsCursor": null
+      }
+    }
+  },
+  {
+    "request": {
+      "method": "thread/items/list",
+      "params": {
+        "threadId": "019b76da-a800-7000-8000-000000000161",
+        "limit": 100
+      },
+      "id": 11
+    }
+  },
+  {
+    "response": {
+      "method": "thread/goal/cleared",
+      "params": {
+        "threadId": "019b76da-a800-7000-8000-000000000161"
+      },
+      "emittedAtMs": 1792044895607
+    }
+  },
+  {
+    "response": {
+      "id": 11,
+      "result": {
+        "data": [],
+        "nextCursor": null,
+        "backwardsCursor": null
+      }
+    }
+  },
+  {
+    "request": {
+      "method": "thread/inject_items",
+      "params": {
+        "threadId": "019b76da-a800-7000-8000-000000000161",
+        "items": [
+          {
+            "type": "message",
+            "role": "user",
+            "content": [
+              {
+                "type": "input_text",
+                "text": "Resume the native Codex fixture."
+              }
+            ]
+          },
+          {
+            "type": "message",
+            "role": "assistant",
+            "content": [
+              {
+                "type": "output_text",
+                "text": "The restarted native fixture is readable."
+              }
+            ]
+          }
+        ]
+      },
+      "id": 12
+    }
+  },
+  {
+    "response": {
+      "id": 12,
+      "result": {}
+    }
+  },
+  {
+    "request": {
+      "method": "thread/items/list",
+      "params": {
+        "threadId": "019b76da-a800-7000-8000-000000000161",
+        "limit": 100
+      },
+      "id": 13
+    }
+  },
+  {
+    "response": {
+      "id": 13,
+      "result": {
+        "data": [],
+        "nextCursor": null,
+        "backwardsCursor": null
+      }
+    }
+  }
+]
