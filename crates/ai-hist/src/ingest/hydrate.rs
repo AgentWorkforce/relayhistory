@@ -4876,6 +4876,15 @@ mod tests {
             .contains(&"sqlite-child".to_string()));
         assert!(full.related_session_ids.contains(&"guardian".to_string()));
         assert!(child_events() > 0);
+        let sqlite_child_link_has_events: bool = open_db(&db)
+            .unwrap()
+            .query_row(
+                "SELECT child_has_events FROM session_relationships WHERE source='codex' AND parent_session_id='sqlite-parent' AND child_session_id='sqlite-child' AND evidence_kind='codex_thread_spawn_edge'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(sqlite_child_link_has_events);
         let guardian_events: i64 = open_db(&db).unwrap().query_row(
             "SELECT count(*) FROM session_events WHERE source='codex' AND session_id='guardian'",
             [], |row| row.get(0),

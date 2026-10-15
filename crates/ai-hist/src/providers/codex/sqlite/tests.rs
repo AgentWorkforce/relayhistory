@@ -447,3 +447,35 @@ fn compressed_rollout_completeness_uses_decoded_projection_bytes() {
         Some(locator(&state, "sqlite-rollout-primary"))
     );
 }
+
+#[test]
+fn a_malformed_thread_does_not_block_other_sqlite_threads() {
+    let dir = tempfile::tempdir().unwrap();
+    let codex = dir.path().join(".codex");
+    install_fixture(&codex, "pruned-all-items");
+    let state_db = Connection::open(codex.join("state_5.sqlite")).unwrap();
+    let history_db = Connection::open(codex.join("thread_history_1.sqlite")).unwrap();
+    state_db.execute_batch(
+        "INSERT INTO threads SELECT 'sqlite-zz-good',rollout_path,created_at_ms,updated_at_ms,source,cwd,git_branch,git_origin_url,title,name,first_user_message,originator,cli_version,model,tokens_used,archived,agent_nickname,agent_role,history_mode,thread_source FROM threads WHERE id='sqlite-pruned-all-items';"
+    ).unwrap();
+    history_db.execute_batch(
+        "INSERT INTO thread_history_projection_state SELECT 'sqlite-zz-good',next_rollout_ordinal,next_rollout_byte_offset FROM thread_history_projection_state WHERE thread_id='sqlite-pruned-all-items';
+         INSERT INTO thread_items SELECT 'sqlite-zz-good',turn_id,item_id,rollout_ordinal,created_at_ms,item_type,item_json FROM thread_items WHERE thread_id='sqlite-pruned-all-items';
+         INSERT INTO thread_turns SELECT 'sqlite-zz-good',turn_id,rollout_ordinal,started_at,error_json FROM thread_turns WHERE thread_id='sqlite-pruned-all-items';
+         UPDATE thread_items SET item_json='not-json' WHERE thread_id='sqlite-pruned-all-items' AND rollout_ordinal=0;"
+    ).unwrap();
+    let conn = crate::open_db(&dir.path().join("history.db")).unwrap();
+    let mut state = serde_json::Map::new();
+    let (inserted, read) = sync(
+        &conn,
+        &mut state,
+        &codex,
+        &crate::ingest::SweepRepairs::default(),
+    )
+    .unwrap();
+    assert!(inserted > 0);
+    assert_eq!(read, ["sqlite-zz-good"]);
+    let stamps = state["codex_sqlite_v2"].as_object().unwrap();
+    assert!(stamps.contains_key("sqlite-zz-good"));
+    assert!(!stamps.contains_key("sqlite-pruned-all-items"));
+}

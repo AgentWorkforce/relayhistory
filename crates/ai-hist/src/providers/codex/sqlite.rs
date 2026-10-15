@@ -496,12 +496,26 @@ pub(crate) fn sync(
         {
             continue;
         }
-        let acquired = capture(&roots, &state_db, &t.id)?;
-        let captured = decode(&acquired)?;
-        let tx = conn.unchecked_transaction()?;
-        retire_if_changed(&tx, &captured, true)?;
-        inserted += normalize(&tx, &captured, &state_db)?;
-        tx.commit()?;
+        let result = (|| -> Result<usize> {
+            let acquired = capture(&roots, &state_db, &t.id)?;
+            let captured = decode(&acquired)?;
+            let tx = conn.unchecked_transaction()?;
+            retire_if_changed(&tx, &captured, true)?;
+            let count = normalize(&tx, &captured, &state_db)?;
+            tx.commit()?;
+            Ok(count)
+        })();
+        match result {
+            Ok(count) => inserted += count,
+            Err(error) if error.is::<crate::ingest::CaptureCancelled>() => return Err(error),
+            Err(error) => {
+                eprintln!(
+                    "ai-hist: [codex] skipping SQLite thread {}: {error:#}",
+                    t.id
+                );
+                continue;
+            }
+        }
         read.push(t.id.clone());
         stamps.insert(t.id, json!(stamp));
     }

@@ -29,10 +29,7 @@ pub(super) fn reconcile_codex_sqlite(
     let Some(offset) = offset.filter(|value| *value >= 0) else {
         return Ok(());
     };
-    if !rollout
-        .metadata()
-        .is_ok_and(|metadata| metadata.len() >= offset as u64)
-    {
+    if !transcript_file::metadata(rollout).is_ok_and(|metadata| metadata.len() >= offset as u64) {
         return Ok(());
     }
     crate::providers::codex::sqlite::retire(conn, session_id, true)?;
@@ -44,8 +41,7 @@ pub(super) fn reconcile_codex_sqlite(
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_finished_rollout_replaces_sqlite_tools_edits_and_events_without_repeating_an_edge() {
+    fn assert_finished_rollout_replaces_sqlite(compressed: bool) {
         let dir = tempfile::tempdir().unwrap();
         let codex = dir.path().join(".codex");
         std::fs::create_dir_all(&codex).unwrap();
@@ -115,7 +111,14 @@ mod tests {
             "the short rollout keeps SQLite's tail"
         );
 
-        std::fs::write(&rollout, full).unwrap();
+        if compressed {
+            let encoded = zstd::bulk::compress(full.as_bytes(), 3).unwrap();
+            assert!(encoded.len() < full.len());
+            std::fs::write(transcript_file::compressed_path(&rollout), encoded).unwrap();
+            std::fs::remove_file(&rollout).unwrap();
+        } else {
+            std::fs::write(&rollout, full).unwrap();
+        }
         ingest_codex_rollout(&conn, &rollout, &meta).unwrap();
         assert_eq!(count("tool_calls"), 2);
         assert_eq!(count("file_edits"), 1);
@@ -141,5 +144,15 @@ mod tests {
             "SELECT relationship_uid FROM session_relationships WHERE source='codex' AND parent_session_id='sqlite-pruned-all-items'"
         ).unwrap().query_map([], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
         assert_eq!(relationships, ["child:sqlite-child"]);
+    }
+
+    #[test]
+    fn a_finished_rollout_replaces_sqlite_tools_edits_and_events_without_repeating_an_edge() {
+        assert_finished_rollout_replaces_sqlite(false);
+    }
+
+    #[test]
+    fn a_compressed_finished_rollout_replaces_sqlite_tools_edits_and_events() {
+        assert_finished_rollout_replaces_sqlite(true);
     }
 }

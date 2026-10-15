@@ -37,11 +37,9 @@ pub(crate) fn incoming_must_not_replace(
     if stored == incoming || shared_sqlite_store(source, &stored) {
         return Ok(false);
     }
-    // A Codex rollout can survive with fewer bytes than its SQLite history
-    // projection. Discovery only offers this locator for that case.
-    if source == "codex" && incoming.starts_with("sqlite:") {
-        return Ok(false);
-    }
+    // A live rollout keeps catalog ownership even when the same thread's
+    // incomplete projection is offered through SQLite. Selected hydration
+    // resolves that rollout locator to SQLite when it needs the longer tail.
     // A compressed Codex rollout is present under its plain locator.
     Ok(crate::ingest::transcript_file::exists(Path::new(&stored)))
 }
@@ -202,4 +200,38 @@ pub(crate) fn retained_observation(
     )
     .optional()
     .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_compressed_rollout_keeps_catalog_ownership_from_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::open_db(&dir.path().join("history.db")).unwrap();
+        let rollout = dir.path().join("sibling.jsonl");
+        let compressed = crate::ingest::transcript_file::compressed_path(&rollout);
+        std::fs::write(&compressed, b"stored transcript").unwrap();
+        conn.execute(
+            "INSERT INTO sessions (source, session_id, raw_path) VALUES ('codex', 'shared', ?1)",
+            [rollout.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+        assert!(incoming_must_not_replace(
+            &conn,
+            "codex",
+            "shared",
+            Some("sqlite:/elsewhere/state_5.sqlite#shared")
+        )
+        .unwrap());
+        std::fs::remove_file(compressed).unwrap();
+        assert!(!incoming_must_not_replace(
+            &conn,
+            "codex",
+            "shared",
+            Some("sqlite:/elsewhere/state_5.sqlite#shared")
+        )
+        .unwrap());
+    }
 }

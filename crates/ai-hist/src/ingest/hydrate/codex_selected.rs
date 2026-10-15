@@ -66,16 +66,7 @@ pub(crate) fn ingest_selected_codex(ctx: SelectedIngest<'_>) -> Result<SelectedI
                     meta.session_id == child.id,
                     "SESSION_SOURCE_MISMATCH: Codex related rollout identity changed"
                 );
-                let outcome = ingest_codex_rollout(ctx.conn, &child.path, &meta)?;
-                // The parent's spawn edge was recorded before this rollout's
-                // events. Refresh its public coverage flag after ingestion.
-                ctx.conn.execute(
-                    "UPDATE session_relationships SET child_has_events=1 \
-                     WHERE source='codex' AND child_session_id=?1 AND child_has_events=0 \
-                     AND EXISTS (SELECT 1 FROM session_events \
-                                 WHERE source='codex' AND session_id=?1)",
-                    [&child.id],
-                )?;
+                let outcome = ingest_codex_rollout_at_locator(ctx.conn, &child.path, &meta, false)?;
                 if meta.is_subagent {
                     cleanup_codex_subagent_history(ctx.conn, &meta.session_id)?;
                     cleanup_codex_subagent_registration(ctx.conn, &meta.session_id)?;
@@ -98,6 +89,14 @@ pub(crate) fn ingest_selected_codex(ctx: SelectedIngest<'_>) -> Result<SelectedI
                     )?;
                 }
             }
+            // Parent edges precede both SQLite and rollout child events.
+            ctx.conn.execute(
+                "UPDATE session_relationships SET child_has_events=1 \
+                 WHERE source='codex' AND parent_session_id=?1 AND child_has_events=0 \
+                 AND EXISTS (SELECT 1 FROM session_events \
+                             WHERE source='codex' AND session_id=child_session_id)",
+                [&capture.thread.id],
+            )?;
         }
         return Ok((
             IngestOutcome {
