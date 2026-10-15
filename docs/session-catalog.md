@@ -488,6 +488,7 @@ mark captured is missing for every consumer, not just for `ai-hist`.
 | **muse** | ✓ (metadata `stream.id`) | ✓ (`workspace_root`) | – (never) | ✓ (metadata `recorded_at`) | ✓ (tail `recorded_at`) | ✓ (first `started` prompt) | ✓ (metadata, then `model_completed`) | – | ✓ (`build.semver`) | – | – | – |
 | **opencode** | ✓ | ✓ (directory / message `path.cwd`) | – | ✓ | ✓ | ✓ | ✓ (`providerID/modelID`) | – | – | – | – | – |
 | **devin** | ✓ | ✓ (`working_directory`) | – | ✓ (`created_at`, seconds→ms) | ✓ (`last_activity_at`, seconds→ms) | ✓ | ✓ (`model` / `generation_model`) | – | – (transcript `agent.version` rides a marker) | – | – | ✓ (`workspace_dirs`) |
+| **copilot** | ✓ (`session.start` `sessionId`) | ✓ (header `context.cwd`) | ✓ (header `context.branch`) | ✓ (header `timestamp`) | ✓ (16 KiB tail) | ✓ (first typed `user.message` in the 64 KiB head) | ✓ (`selectedModel`) | – | ✓ (`copilotVersion`) | – | – | – |
 
 ### Session markers
 

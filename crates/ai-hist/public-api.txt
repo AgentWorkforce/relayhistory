@@ -179,6 +179,7 @@ pub ai_hist::SessionScope::Remote
 #[non_exhaustive] pub enum ai_hist::Source
 pub ai_hist::Source::Claude
 pub ai_hist::Source::Codex
+pub ai_hist::Source::Copilot
 pub ai_hist::Source::Cursor
 pub ai_hist::Source::Devin
 pub ai_hist::Source::Grok

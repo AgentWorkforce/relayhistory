@@ -1,0 +1,62 @@
+{
+  "id": "copilot",
+  "rust_id": "copilot",
+  "variant": "Copilot",
+  "order": 432,
+  "aliases": [],
+  "fixtures": [
+    {
+      "source": "copilot",
+      "name": "official-importer",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "copilot/official-importer"
+      ],
+      "quirk": "Copilot CLI 1.0.95 official offline importer writing a native session-state journal: session.start v1 header, native event/message UUIDs with parentId chain, one read tool joined start-to-complete by toolCallId; no model or usage recorded, and the workspace.yaml sidecar is not read."
+    },
+    {
+      "source": "copilot",
+      "name": "official-reader",
+      "layout": "Reference",
+      "origin": "RelayHistory",
+      "files": [
+        "copilot/official-reader.json"
+      ],
+      "quirk": "Copilot CLI 1.0.95 session.getMessages after a separate headless resume: an independent reader oracle that matches the imported journal record for record, plus one in-memory session.resume event the journal never persisted."
+    },
+    {
+      "source": "copilot",
+      "name": "cli-usage",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "copilot/cli-usage"
+      ],
+      "quirk": "authored from the persisted shape of Copilot CLI 1.0.86 journals with synthetic values: per-message model, reasoningText and outputTokens, a failed bash tool, a mid-session model change, an explore subagent whose messages carry parentToolCallId and reuse the main agent's bash_1 call ID, a usage checkpoint, and two cumulative session.shutdown modelMetrics totals across a resume."
+    }
+  ],
+  "capture": [
+    {
+      "evidence": "Messages and identity",
+      "coverage": "Journal version 1 session.start header identity, native event UUIDs, user/assistant text, reasoningText, per-message model, provider messageId and requestId, turnId, cwd and branch from the header context, copilotVersion, every model the journal names; an event's parent is its nearest parentId ancestor stored as an event (markers between them are skipped); agent- and skill-delivered user messages are synthetic, not prompts or user turns; other journal versions rejected with diagnostic; duplicate native IDs at distinct live paths rejected and a journal declaring a new identity retires the old one."
+    },
+    {
+      "evidence": "Tools and usage",
+      "coverage": "Assistant toolRequests and tool.execution_complete join by native toolCallId, scoped as <parentToolCallId>/<toolCallId> under a delegating call because subagents number calls independently; success/error outcomes; assistant.message outputTokens kept verbatim as per-message usage (output only); session.shutdown modelMetrics and session.usage_checkpoint kept raw in markers as session-wide cumulative totals, excluded from request usage; no inferred file edits."
+    },
+    {
+      "evidence": "Control and lineage",
+      "coverage": "Turn boundaries, model changes, resume, permissions, system messages, subagent lifecycle and unknown event types retained as markers with their raw parentId; subagent messages flagged sidechain by parentToolCallId and never the session preview; no child session, relationship, resume command or live execution."
+    }
+  ],
+  "population": {
+    "evidence": [
+      "history",
+      "session_event",
+      "tool_call",
+      "session_marker"
+    ],
+    "usage_accounting": "per-message"
+  }
+}

@@ -7,7 +7,6 @@ use crate::EvidenceKind;
 use anyhow::Context;
 use std::io::Read;
 mod format;
-mod maintenance;
 mod normalize;
 #[cfg(test)]
 mod tests;
@@ -305,7 +304,7 @@ fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
         }
     }
     if ctx.paths.is_none() && result.unread == 0 {
-        maintenance::retire_missing(ctx.conn, ctx.roots)?;
+        crate::providers::file_history::retire_missing(ctx.conn, ID, ctx.roots)?;
     }
     ctx.state.insert(cache_key.into(), Value::Object(cache));
     Ok(result)
