@@ -708,13 +708,16 @@ fn commit_local_pass(
 
 /// The builtin local adapter's observation of the session, which locates the
 /// target; without one, no other configured local adapter may have seen it.
+/// One read answers both, so a concurrent first hydration's builtin
+/// observation is never missed and then counted as another adapter's.
 fn observe_local_target(
     conn: &Connection,
     options: &HydrateSessionOptions,
     target: &mut CatalogTarget,
     local_key: &ObservationKey,
 ) -> Result<Option<SessionObservation>> {
-    let local_observation = observations::get(conn, local_key)?;
+    let observed = observations::list(conn, &options.source, &options.session_id)?;
+    let local_observation = observed.iter().find(|seen| &seen.key == local_key).cloned();
     if let Some(observation) = &local_observation {
         // OpenCode and Devin enumerate by session id, while their local
         // parsers need the separately recorded provider database path from
@@ -725,12 +728,10 @@ fn observe_local_target(
         target.discovery_state = Some(observation.discovery_state.clone());
     } else {
         anyhow::ensure!(
-            !observations::list(conn, &options.source, &options.session_id)?
-                .iter()
-                .any(
-                    |observation| observation.key.location == SessionLocation::Local
-                        && observation.key.connector_id != "legacy-unknown"
-                ),
+            !observed.iter().any(
+                |observation| observation.key.location == SessionLocation::Local
+                    && observation.key.connector_id != "legacy-unknown"
+            ),
             "CONNECTOR_NOT_CONFIGURED: the builtin local adapter has not observed this session"
         );
     }
@@ -12941,6 +12942,87 @@ mod tests {
             )
             .unwrap();
         assert_eq!(counts, (1, 1));
+    }
+
+    /// A concurrent first hydration commits the builtin local observation
+    /// while this one is still deciding whether the session is observed. Every
+    /// interleaving must read either no local observation or the builtin one:
+    /// taking the builtin row for another local adapter's refuses a session
+    /// the builtin adapter did observe.
+    #[test]
+    fn builtin_observation_committed_mid_lookup_is_never_a_foreign_adapter() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(
+            &conn,
+            "claude",
+            "racing",
+            Some(Path::new("/work/racing.jsonl")),
+        );
+        let options = options("claude", "racing");
+        let key = ObservationKey {
+            source: "claude".into(),
+            session_id: "racing".into(),
+            location: SessionLocation::Local,
+            connector_id: "claude".into(),
+            connector_instance: "default".into(),
+        };
+        let observation = fresh_local_observation(
+            &conn,
+            key.clone(),
+            &catalog_target(&conn, &options).unwrap(),
+            &options,
+        );
+
+        // What the lookup costs against a session nothing has observed.
+        let ticks = std::sync::Arc::new(AtomicU64::new(0));
+        let tick = std::sync::Arc::clone(&ticks);
+        let mut target = catalog_target(&conn, &options).unwrap();
+        conn.progress_handler(
+            1,
+            Some(move || {
+                tick.fetch_add(1, Ordering::SeqCst);
+                false
+            }),
+        );
+        let unobserved = observe_local_target(&conn, &options, &mut target, &key).unwrap();
+        conn.progress_handler(0, None::<fn() -> bool>);
+        assert!(unobserved.is_none());
+        let total = ticks.load(Ordering::SeqCst);
+        assert!(total > 0, "the lookup must cost some ticks");
+
+        // Commit the builtin observation from a second connection at every
+        // tick of the lookup in turn.
+        for at in 0..total {
+            conn.execute(
+                "DELETE FROM session_observations WHERE source='claude' AND session_id='racing'",
+                [],
+            )
+            .unwrap();
+            let mut target = catalog_target(&conn, &options).unwrap();
+            let writer_path = db.clone();
+            let observation = observation.clone();
+            let tick = AtomicU64::new(0);
+            conn.progress_handler(
+                1,
+                Some(move || {
+                    if tick.fetch_add(1, Ordering::SeqCst) == at {
+                        let writer = open_db(&writer_path).unwrap();
+                        observations::upsert(&writer, &observation).unwrap();
+                    }
+                    false
+                }),
+            );
+            let observed = observe_local_target(&conn, &options, &mut target, &key);
+            conn.progress_handler(0, None::<fn() -> bool>);
+            let observed = observed.unwrap_or_else(|error| panic!("tick {at}/{total}: {error:#}"));
+            assert!(
+                observed.is_none_or(|observed| observed.key == key),
+                "tick {at}/{total}"
+            );
+        }
     }
 
     fn remote_catalog_row(conn: &Connection, source: &str, session_id: &str) {
