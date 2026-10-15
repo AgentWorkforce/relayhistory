@@ -305,7 +305,7 @@ fn migration_sibling_must_match_project_and_native_session() {
     let (_home, roots, path) = fixture();
     let legacy_path = path.with_extension("json");
     let mut input: Value = serde_json::from_slice(
-        &std::fs::read(&path)
+        std::fs::read(&path)
             .unwrap()
             .split(|b| *b == b'\n')
             .next()
