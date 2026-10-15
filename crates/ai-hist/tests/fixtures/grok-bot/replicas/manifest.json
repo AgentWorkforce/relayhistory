@@ -1,0 +1,22 @@
+[
+  {
+    "file": "primary-roster.json",
+    "key": "sand.client.slice.account.fixture%7Cp.roster.last-roster"
+  },
+  {
+    "file": "primary-complete.json",
+    "key": "sand.client.slice.account.fixture%7Cp.transcript.replicas.fixture-bot-complete"
+  },
+  {
+    "file": "primary-window.json",
+    "key": "sand.client.slice.account.fixture%7Cp.transcript.replicas.fixture-bot-window"
+  },
+  {
+    "file": "secondary-roster.json",
+    "key": "sand.client.slice.account.fixture%7Cs.roster.last-roster"
+  },
+  {
+    "file": "secondary-complete.json",
+    "key": "sand.client.slice.account.fixture%7Cs.transcript.replicas.fixture-bot-second"
+  }
+]

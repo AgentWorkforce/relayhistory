@@ -994,6 +994,93 @@ mod tests {
         assert_eq!(marker, "POISON");
     }
 
+    /// Every changed rollout of an already-indexed delegated thread passes
+    /// through the subagent cleanup, which removes nothing for a thread that
+    /// was never registered. A sweep over many of them -- Codex compressing a
+    /// batch of finished rollouts -- reads the evidence keys once, not once
+    /// per thread.
+    #[test]
+    fn evidence_memo_a_sweep_over_changed_subagent_rollouts_reads_evidence_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        let record = |at: &str, kind: &str, payload: serde_json::Value| {
+            format!(
+                "{}\n",
+                json!({"timestamp": at, "type": kind, "payload": payload})
+            )
+        };
+        let turn = |n: u32| {
+            [
+                record(
+                    "2026-04-20T00:00:01.000Z",
+                    "event_msg",
+                    json!({"type": "user_message", "message": format!("task {n}")}),
+                ),
+                record(
+                    "2026-04-20T00:00:02.000Z",
+                    "event_msg",
+                    json!({"type": "task_complete", "turn_id": format!("t{n}")}),
+                ),
+            ]
+            .concat()
+        };
+        let parent = day.join("rollout-2026-04-20T00-00-00-root.jsonl");
+        fs::write(
+            &parent,
+            format!(
+                "{}{}",
+                record(
+                    "2026-04-20T00:00:00.000Z",
+                    "session_meta",
+                    json!({"id": "root", "cwd": "/tmp/p"})
+                ),
+                turn(0)
+            ),
+        )
+        .unwrap();
+        let children: Vec<PathBuf> = (0..12)
+            .map(|index| {
+                let path = day.join(format!(
+                    "rollout-2026-04-20T00-01-{index:02}-child{index}.jsonl"
+                ));
+                let meta = json!({"id": format!("child{index}"), "parent_thread_id": "root",
+                                  "cwd": "/tmp/p", "thread_source": "subagent",
+                                  "source": {"subagent": {"other": "reviewer"}}});
+                fs::write(
+                    &path,
+                    format!(
+                        "{}{}",
+                        record("2026-04-20T00:01:00.000Z", "session_meta", meta),
+                        turn(1)
+                    ),
+                )
+                .unwrap();
+                path
+            })
+            .collect();
+        let conn = db();
+        let root = dir.path().join(".codex");
+        let mut state = Map::new();
+        super::super::sync_codex_rollouts(&conn, &mut state, &root).unwrap();
+        for child in &children {
+            let mut file = fs::OpenOptions::new().append(true).open(child).unwrap();
+            std::io::Write::write_all(&mut file, turn(2).as_bytes()).unwrap();
+        }
+
+        reset_counts();
+        super::super::sync_codex_rollouts(&conn, &mut state, &root).unwrap();
+        assert!(load_count() <= 2, "loads {}", load_count());
+        let appended: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_events WHERE source = 'codex' AND text = 'task 2'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(appended, 12);
+    }
+
     fn scoped_home() -> (tempfile::TempDir, PathBuf, crate::ProviderRoots, Connection) {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("store/ai-history.db");

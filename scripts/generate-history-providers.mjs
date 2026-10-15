@@ -19,7 +19,7 @@ function readDescriptors(root, directory, testOnly) {
     if (!fs.existsSync(path.join(root, `crates/ai-hist/src/providers/${item.rust_id}/mod.rs`))) throw new Error(`Missing provider module: ${name}`);
     for (const fixture of item.fixtures) {
       if (fixture.source !== item.id || !/^[a-z0-9-]+$/.test(fixture.name) || !fixture.quirk || !fixture.files?.length) throw new Error(`Invalid fixture for ${item.id}`);
-      const layouts = ['ClaudeTranscript', 'CodexRollout', 'HomeTree', 'OpencodeSqlite', 'DevinSqlite', 'OpencodeLegacyJson', 'Reference', 'Sqlite'];
+      const layouts = ['ClaudeTranscript', 'CodexRollout', 'HomeTree', 'GrokBotReplicas', 'OpencodeSqlite', 'DevinSqlite', 'OpencodeLegacyJson', 'Reference', 'Sqlite'];
       if (!layouts.includes(fixture.layout) || !['Burn', 'RelayHistory', 'SessionMigrate'].includes(fixture.origin)) throw new Error(`Invalid fixture layout/origin: ${item.id}/${fixture.name}`);
       for (const file of fixture.files) {
         if (!file.startsWith(`${item.id}/`) || file.split('/').includes('..') || !fs.existsSync(path.join(root, 'crates/ai-hist/tests', testOnly ? 'provider-fixtures' : 'fixtures', file))) throw new Error(`Missing or unowned fixture: ${file}`);

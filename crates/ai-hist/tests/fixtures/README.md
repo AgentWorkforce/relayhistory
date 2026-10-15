@@ -146,6 +146,7 @@ source without deciding which one fails the test.
 | `codex/oversized-shell-output` | burn | `codex/oversized-shell-output.jsonl` | an 80 KB shell function-call output |
 | `codex/parent-thread-id` | relayhistory | `codex/parent-thread-id` | a subagent rollout naming its root through `parent_thread_id` plus `thread_source: subagent` |
 | `codex/archived-session` | relayhistory | `codex/archived-session` | a rollout under `~/.codex/archived_sessions/`, the second codex discovery root |
+| `codex/compressed-rollout` | relayhistory | `codex/compressed-rollout` | the `multi-turn` rollout as Codex stores a finished one, zstd-compressed to `rollout-….jsonl.zst` |
 | `codex/counter-regressed` | relayhistory | `codex/counter-regressed.jsonl` | a cached-input counter grows faster than total input, making the cumulative delta unnormalizable |
 | `codex/counter-negative` | relayhistory | `codex/counter-negative.jsonl` | a cumulative snapshot contains a negative input counter that must be preserved and refused |
 | `codex/counter-fractional` | relayhistory | `codex/counter-fractional.jsonl` | a cumulative snapshot contains a fractional output counter that must be preserved and refused |
@@ -220,4 +221,5 @@ source without deciding which one fails the test.
 | copilot/official-importer | Copilot CLI 1.0.95 official offline importer writing a native session-state journal: session.start v1 header, native event/message UUIDs with parentId chain, one read tool joined start-to-complete by toolCallId; no model or usage recorded, and the workspace.yaml sidecar is not read. |
 | copilot/official-reader | Copilot CLI 1.0.95 session.getMessages after a separate headless resume: an independent reader oracle that matches the imported journal record for record, plus one in-memory session.resume event the journal never persisted. |
 | copilot/cli-usage | authored from the persisted shape of Copilot CLI 1.0.86 journals with synthetic values: per-message model, reasoningText and outputTokens, a failed bash tool, a mid-session model change, an explore subagent whose messages carry parentToolCallId and reuse the main agent's bash_1 call ID, a usage checkpoint, and two cumulative session.shutdown modelMetrics totals across a resume. |
+| grok-bot/replicas | Synthetic complete and truncated transcript tails in two account slots, roster titles, widget response, cloud-agent round trip, and voice turns. |
 <!-- END GENERATED PROVIDER FIXTURES -->

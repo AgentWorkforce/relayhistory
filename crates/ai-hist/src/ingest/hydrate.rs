@@ -3156,16 +3156,12 @@ fn ingest_codex(
 /// from claiming complete relationship coverage.
 fn codex_child_candidates(directory: &Path) -> Result<Vec<PathBuf>> {
     let Some((from, through)) = codex_child_scan_dates(directory) else {
-        return collect_matching_files(directory, "rollout-", "jsonl");
+        return codex_rollout_locators(directory, None);
     };
     let mut candidates = Vec::new();
     for root in codex_rollout_roots(directory) {
         for date in [&from, &through] {
-            candidates.extend(collect_matching_files(
-                &root.join(date),
-                "rollout-",
-                "jsonl",
-            )?);
+            candidates.extend(codex_rollout_locators(&root.join(date), None)?);
         }
     }
     candidates.sort();
@@ -3395,7 +3391,7 @@ fn recorded_codex_child_rollouts(
     Ok(locators
         .into_iter()
         .map(PathBuf::from)
-        .filter(|path| path.is_file())
+        .filter(|path| crate::ingest::transcript_file::exists(path))
         .collect())
 }
 

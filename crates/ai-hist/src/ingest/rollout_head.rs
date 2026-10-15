@@ -131,7 +131,7 @@ pub(super) fn open_codex_walk(
     } else {
         // Its own handle, not the sweep's parked one: the walk's reader holds
         // that, and the probe must not take a handle parked for another file.
-        let file = BufReader::new(std::fs::File::open(path)?);
+        let file = BufReader::new(super::transcript_file::open(path)?);
         gate.probe_copied_history(records_after_first(file, &read, &failed), reached_end);
     }
     // A head the probe could not read proves nothing either way.
