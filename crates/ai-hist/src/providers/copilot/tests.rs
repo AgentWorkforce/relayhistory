@@ -373,3 +373,129 @@ fn deleted_journal_retires_only_after_an_accessible_full_sweep() {
     );
     assert!(other.exists());
 }
+
+#[test]
+fn a_journal_declaring_another_identity_retires_the_old_one() {
+    let (_temp, store, path) = fixture();
+    let conn = crate::open_db(store.db_path()).unwrap();
+    let mut state = Map::new();
+    run(&conn, &store, &mut state, None);
+    std::fs::write(&path, FIXTURE.replace(SID, "replacement-session")).unwrap();
+    run(&conn, &store, &mut state, None);
+    let sessions: Vec<String> = conn
+        .prepare("SELECT session_id FROM sessions WHERE source='copilot'")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(sessions, ["replacement-session"]);
+    assert_eq!(
+        count(
+            &conn,
+            &format!("SELECT count(*) FROM history WHERE source='copilot' AND session_id='{SID}'")
+        ),
+        0
+    );
+}
+
+#[test]
+fn shallow_reads_cover_compact_journals_and_every_model() {
+    let (_temp, store, path) = fixture();
+    let header = FIXTURE.lines().next().unwrap();
+    let mut journal = format!("{header}\n");
+    for i in 0..200 {
+        journal.push_str(&format!(
+            "{}\n",
+            serde_json::json!({"type":"session.info","data":{"infoType":"notice"},
+                "id":format!("info-{i}"),"timestamp":format!("2026-09-18T22:{:02}:{:02}Z", i / 60, i % 60),"parentId":null})
+        ));
+    }
+    std::fs::write(&path, &journal).unwrap();
+    assert!(journal.len() < HEAD_LIMIT as usize);
+    let conn = crate::open_db(store.db_path()).unwrap();
+    let env = DiscoveryEnv::with_provider_roots(&conn, store.roots().clone());
+    let candidate = Provider.enumerate(&env, None).unwrap().remove(0);
+    let shallow = Provider
+        .read_shallow(&env.scan(), Some(&conn), &candidate)
+        .unwrap()
+        .unwrap();
+    let last = chrono::DateTime::parse_from_rfc3339("2026-09-18T22:03:19Z")
+        .unwrap()
+        .timestamp_millis();
+    assert_eq!(shallow.last_activity_ms, Some(last));
+    std::fs::write(&path, FIXTURE).unwrap();
+    let models = format::models(&format::parse(FIXTURE.as_bytes(), false).unwrap());
+    assert_eq!(models, ["claude-sonnet-4.6", "gpt-5.4", "gpt-5.4-mini"]);
+    run(&conn, &store, &mut Map::new(), None);
+    let stored: String = conn
+        .query_row(
+            "SELECT models_json FROM sessions WHERE source='copilot'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored, serde_json::to_string(&models).unwrap());
+}
+
+#[test]
+fn message_parents_skip_markers_and_previews_skip_subagents() {
+    let (_temp, store, path) = fixture();
+    let conn = crate::open_db(store.db_path()).unwrap();
+    let mut payload = payload(&store, &path);
+    let entries = payload["entries"].as_array().unwrap();
+    let id_of = |kind: &str, n: usize| {
+        entries.iter().filter(|e| e["type"] == kind).nth(n).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let (user, assistant) = (id_of("user.message", 0), id_of("assistant.message", 0));
+    let entries = payload["entries"].as_array_mut().unwrap();
+    entries.push(serde_json::json!({"type":"assistant.message","data":{"messageId":"late-sub","content":"Subagent aside","parentToolCallId":"call_fixture_task"},"id":"late-sub","timestamp":"2026-09-18T21:31:00Z","parentId":null}));
+    normalize::write(&conn, &payload, &path).unwrap();
+    let parent: String = conn
+        .query_row(
+            "SELECT parent_id FROM session_events WHERE source='copilot' AND message_id=?1 LIMIT 1",
+            [&assistant],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        parent, user,
+        "the turn_start marker between them is skipped"
+    );
+    let preview: String = conn
+        .query_row(
+            "SELECT last_assistant_text FROM sessions WHERE source='copilot'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(preview, "You're welcome.");
+}
+
+#[test]
+fn agent_delivered_messages_are_synthetic_not_user_turns() {
+    let (_temp, store, path) = fixture();
+    let conn = crate::open_db(store.db_path()).unwrap();
+    let mut payload = payload(&store, &path);
+    payload["entries"].as_array_mut().unwrap().push(serde_json::json!({"type":"user.message","data":{"content":"Injected skill text","source":"skill-pdf"},"id":"injected","timestamp":"2026-09-18T21:31:01Z","parentId":null}));
+    normalize::write(&conn, &payload, &path).unwrap();
+    let kind: Option<String> = conn
+        .query_row(
+            "SELECT control_kind FROM session_events WHERE source='copilot' AND message_id='injected'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(kind.as_deref(), Some("synthetic"));
+    let evidence = store
+        .session(
+            &crate::SessionRef::id(crate::Source::Copilot, SID),
+            crate::SessionQuery::default(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(evidence.user_turns.len(), 3, "only the three typed prompts");
+}

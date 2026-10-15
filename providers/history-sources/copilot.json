@@ -39,7 +39,7 @@
   "capture": [
     {
       "evidence": "Messages and identity",
-      "coverage": "Journal version 1 session.start header identity, native event UUIDs with parentId chain, user/assistant text, reasoningText, per-message model, provider messageId and requestId, turnId, cwd and branch from the header context, copilotVersion; other journal versions rejected with diagnostic; duplicate native IDs at distinct live paths rejected."
+      "coverage": "Journal version 1 session.start header identity, native event UUIDs, user/assistant text, reasoningText, per-message model, provider messageId and requestId, turnId, cwd and branch from the header context, copilotVersion, every model the journal names; an event's parent is its nearest parentId ancestor stored as an event (markers between them are skipped); agent- and skill-delivered user messages are synthetic, not prompts or user turns; other journal versions rejected with diagnostic; duplicate native IDs at distinct live paths rejected and a journal declaring a new identity retires the old one."
     },
     {
       "evidence": "Tools and usage",
@@ -47,7 +47,7 @@
     },
     {
       "evidence": "Control and lineage",
-      "coverage": "Turn boundaries, model changes, resume, permissions, system messages, subagent lifecycle and unknown event types retained as markers; subagent messages flagged sidechain by parentToolCallId; agent-delivered user messages are events, not prompts; no child session, relationship, resume command or live execution."
+      "coverage": "Turn boundaries, model changes, resume, permissions, system messages, subagent lifecycle and unknown event types retained as markers with their raw parentId; subagent messages flagged sidechain by parentToolCallId and never the session preview; no child session, relationship, resume command or live execution."
     }
   ],
   "population": {

@@ -97,6 +97,28 @@ fn copilot_imported_journal_discover_hydrate_read_reopen_changes_export_fullsync
     assert!(evidence.relationships.is_empty());
 }
 
+/// The nearest record up the oracle's `parentId` chain that is stored as an
+/// event rather than a marker.
+fn event_parent<'a>(
+    records: &'a [serde_json::Value],
+    record: &'a serde_json::Value,
+) -> Option<&'a str> {
+    let events = [
+        "user.message",
+        "assistant.message",
+        "tool.execution_complete",
+    ];
+    let mut parent = record["parentId"].as_str();
+    while let Some(id) = parent {
+        let found = records.iter().find(|r| r["id"] == id)?;
+        if events.contains(&found["type"].as_str().unwrap_or_default()) {
+            return Some(id);
+        }
+        parent = found["parentId"].as_str();
+    }
+    None
+}
+
 #[test]
 fn copilot_messages_match_the_official_reader_oracle() {
     let home = tempfile::tempdir().unwrap();
@@ -135,7 +157,10 @@ fn copilot_messages_match_the_official_reader_oracle() {
             Role::Assistant
         };
         assert_eq!(message.role, role);
-        assert_eq!(message.parent_id.as_deref(), record["parentId"].as_str());
+        assert_eq!(
+            message.parent_id.as_deref(),
+            event_parent(persisted, record)
+        );
         assert!(has(&evidence, record["data"]["content"].as_str().unwrap()));
     }
     let result = persisted

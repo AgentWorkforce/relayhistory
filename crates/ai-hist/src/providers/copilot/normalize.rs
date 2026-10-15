@@ -9,7 +9,7 @@ use crate::ingest::{
 };
 use crate::providers::file_history::{self, Keys};
 use crate::{insert_history, insert_session_marker, HistoryEntry, NewSessionMarker};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub(super) fn check_identity(conn: &Connection, sid: &str, path: &Path) -> Result<()> {
     file_history::check_identity(conn, ID, "COPILOT", sid, path)
@@ -31,6 +31,7 @@ pub(super) fn write(conn: &Connection, payload: &Value, path: &Path) -> Result<u
         version: header["data"]["copilotVersion"].as_str(),
         keys: Keys::default(),
         requested: HashSet::new(),
+        markers: HashMap::new(),
         assistant: None,
         inserted: 0,
     };
@@ -44,6 +45,8 @@ pub(super) fn write(conn: &Connection, payload: &Value, path: &Path) -> Result<u
     let complete = payload["tail"].as_array().is_some_and(Vec::is_empty);
     if complete {
         file_history::retire(conn, ID, sid, &writer.keys)?;
+        // A journal now declaring another identity no longer backs the old one.
+        file_history::retire_locator_sessions(conn, ID, path, Some(sid))?;
     }
     let catalog_writer = if complete {
         upsert_session_rebuilt
@@ -66,7 +69,8 @@ pub(super) fn write(conn: &Connection, payload: &Value, path: &Path) -> Result<u
     if complete {
         crate::ingest::set_session_title(conn, ID, sid, format::title(entries))?;
         let first_prompt = format::first_prompt(entries);
-        conn.execute("UPDATE sessions SET first_prompt=?2 WHERE source='copilot' AND session_id=?1 AND first_prompt IS NOT ?2", rusqlite::params![sid, first_prompt])?;
+        let models = serde_json::to_string(&format::models(entries))?;
+        conn.execute("UPDATE sessions SET first_prompt=?2, models_json=?3 WHERE source='copilot' AND session_id=?1 AND (first_prompt IS NOT ?2 OR models_json IS NOT ?3)", rusqlite::params![sid, first_prompt, models])?;
     }
     Ok(writer.inserted)
 }
@@ -80,6 +84,9 @@ struct Writer<'a> {
     keys: Keys,
     /// Tool call IDs an assistant message already requested.
     requested: HashSet<String>,
+    /// Marker record ID → its `parentId`, so an event's parent can skip the
+    /// turn boundaries and other markers between it and the record before.
+    markers: HashMap<&'a str, Option<&'a str>>,
     assistant: Option<String>,
     inserted: usize,
 }
@@ -104,7 +111,7 @@ impl<'a> Writer<'a> {
             source: ID,
             session_id: self.sid,
             message_id: format::string(entry, "id")?,
-            parent_id: entry["parentId"].as_str(),
+            parent_id: self.parent(entry),
             cwd: self.cwd,
             project: self.cwd,
             git_branch: self.branch,
@@ -116,10 +123,28 @@ impl<'a> Writer<'a> {
                 agent_version: self.version,
                 turn_id: data["turnId"].as_str(),
                 is_sidechain: data["parentToolCallId"].is_string().then_some(true),
+                control_kind: (entry["type"] == "user.message" && !format::is_human_prompt(entry))
+                    .then_some(crate::ingest::control::ControlKind::Synthetic.as_str()),
                 ..Default::default()
             },
             ..Default::default()
         })
+    }
+
+    /// The nearest record up the `parentId` chain that is stored as an event.
+    /// Copilot chains every record to the one before it, so a message's
+    /// `parentId` often names a turn boundary or another marker.
+    fn parent(&self, entry: &'a Value) -> Option<&'a str> {
+        let mut parent = entry["parentId"].as_str();
+        let mut hops = 0;
+        while let Some(grandparent) = parent.and_then(|id| self.markers.get(id)) {
+            parent = *grandparent;
+            hops += 1;
+            if hops > self.markers.len() {
+                return None;
+            }
+        }
+        parent
     }
 
     fn event(
@@ -191,7 +216,10 @@ impl<'a> Writer<'a> {
         if !text.is_empty() {
             self.event(base, index, "text", Some(text))?;
             index += 1;
-            self.assistant = Some(text.into());
+            // A subagent's reply is not the conversation's latest answer.
+            if base.raw_facts.is_sidechain.is_none() {
+                self.assistant = Some(text.into());
+            }
         }
         for request in format::tool_requests(data)? {
             self.tool_use(&base, index, data, request)?;
@@ -298,8 +326,9 @@ impl<'a> Writer<'a> {
         Ok(())
     }
 
-    fn marker(&mut self, entry: &Value) -> Result<()> {
+    fn marker(&mut self, entry: &'a Value) -> Result<()> {
         let id = format::string(entry, "id")?;
+        self.markers.insert(id, entry["parentId"].as_str());
         let data = &entry["data"];
         let payload = serde_json::to_string(&crate::ingest::bound_marker_value(entry.clone()))?;
         insert_session_marker(

@@ -154,6 +154,27 @@ pub(super) fn first_prompt(entries: &[Value]) -> Option<String> {
         .map(|value| value.chars().take(4096).collect())
 }
 
+/// Every model the records name, in first-seen order: the header's
+/// selection, model changes and the models assistant messages report.
+pub(super) fn models(entries: &[Value]) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for entry in entries {
+        let data = &entry["data"];
+        let named = match entry["type"].as_str() {
+            Some("session.start") | Some("session.resume") => data["selectedModel"].as_str(),
+            Some("session.model_change") => data["newModel"].as_str(),
+            Some("assistant.message") => data["model"].as_str(),
+            _ => None,
+        };
+        if let Some(model) = named.filter(|m| !m.is_empty()) {
+            if !out.iter().any(|seen| seen == model) {
+                out.push(model.to_owned());
+            }
+        }
+    }
+    out
+}
+
 pub(super) fn title(entries: &[Value]) -> Option<&str> {
     entries
         .iter()

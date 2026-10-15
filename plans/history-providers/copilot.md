@@ -53,7 +53,7 @@ and a 16 KiB tail (last activity).
 
 | Journal record | Stored as |
 | --- | --- |
-| `user.message` | user `text` event; a history prompt only when `data.source` is absent (a person typed it) |
+| `user.message` | user `text` event; a history prompt only when `data.source` is absent (a person typed it); otherwise (`agent-<id>`, `skill-<name>`) `control_kind: synthetic`, outside prompts and user turns |
 | `assistant.message` | assistant `thinking` (`reasoningText`), `text` (`content`) and `tool_use` (`toolRequests`) events; `model`, `messageId` as provider message ID, `requestId`, `turnId`; `parentToolCallId` marks a subagent message as sidechain |
 | `tool.execution_complete` | `tool_result` event joined by `toolCallId`; `success: false` is `errored` with `error.message` as its text |
 
@@ -66,7 +66,12 @@ same parent, so the join stays exact.
 | everything else | raw marker, `kind` = the native event type |
 
 Every event carries `copilotVersion` as agent version and the header
-context's `cwd` / `branch`.
+context's `cwd` / `branch`. `parentId` names the chronologically preceding
+record, often a turn boundary or other marker; an event's parent is the
+nearest record up that chain stored as an event, while markers keep their raw
+`parentId`. A subagent's reply never becomes the session preview, and a
+journal that starts declaring another `sessionId` retires the identity it
+used to back.
 
 ## Usage
 

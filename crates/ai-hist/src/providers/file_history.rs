@@ -111,14 +111,27 @@ fn reconcile_prompts(conn: &Connection, source: &str, sid: &str, keep: &str) -> 
 
 /// Retire every local share of the sessions recorded at `path`.
 pub(crate) fn retire_missing_locator(conn: &Connection, source: &str, path: &Path) -> Result<()> {
+    retire_locator_sessions(conn, source, path, None)
+}
+
+/// Retire the local share of every session recorded at `path` except `keep`:
+/// the sessions a locator no longer backs.
+pub(crate) fn retire_locator_sessions(
+    conn: &Connection,
+    source: &str,
+    path: &Path,
+    keep: Option<&str>,
+) -> Result<()> {
     let local = local_footprint();
     let mut stmt = conn.prepare(&format!(
-        "SELECT session_id FROM sessions s WHERE source = ?1 AND raw_path = ?2 AND ({local})"
+        "SELECT session_id FROM sessions s WHERE source = ?1 AND raw_path = ?2 \
+         AND session_id IS NOT ?3 AND ({local})"
     ))?;
     let sessions = stmt
-        .query_map(rusqlite::params![source, path.to_string_lossy()], |r| {
-            r.get::<_, String>(0)
-        })?
+        .query_map(
+            rusqlite::params![source, path.to_string_lossy(), keep],
+            |r| r.get::<_, String>(0),
+        )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for sid in sessions {
         crate::ingest::retire_local_session_evidence(conn, source, &sid)?;

@@ -167,12 +167,11 @@ impl ShallowSessionProvider for Provider {
             git_branch: data["context"]["branch"].as_str().map(str::to_owned),
             first_prompt: format::first_prompt(&entries),
             first_activity_ms: Some(format::time(header)?),
-            last_activity_ms: format::last_time(&tail).max(head_last),
+            // A journal that fits the head has no separate tail window.
+            last_activity_ms: format::last_time(if tail.is_empty() { &head } else { &tail })
+                .max(head_last),
             title: format::title(&entries).map(str::to_owned),
-            models: data["selectedModel"]
-                .as_str()
-                .map(|m| vec![m.to_owned()])
-                .unwrap_or_default(),
+            models: format::models(&entries),
             agent_version: data["copilotVersion"].as_str().map(str::to_owned),
             raw_path: Some(c.locator.clone()),
             source_stamp: Some(c.stamp.clone()),
