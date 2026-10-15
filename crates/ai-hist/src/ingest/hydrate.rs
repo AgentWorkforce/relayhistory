@@ -4808,6 +4808,33 @@ mod tests {
                 .execute_batch(&sql)
                 .unwrap();
         }
+        let guardian_rollout = codex.join("sessions/2026/04/20/rollout-guardian.jsonl");
+        fs::create_dir_all(guardian_rollout.parent().unwrap()).unwrap();
+        let guardian_lines = [
+            json!({"timestamp":"2026-04-20T00:00:00Z","type":"session_meta","payload":{"id":"guardian","cwd":"/work/app","thread_source":"guardian_review"}}),
+            json!({"timestamp":"2026-04-20T00:00:01Z","type":"event_msg","payload":{"type":"agent_message","message":"Guardian review"}}),
+        ];
+        fs::write(
+            &guardian_rollout,
+            guardian_lines
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        let state = Connection::open(codex.join("state_5.sqlite")).unwrap();
+        state.execute(
+            "INSERT INTO threads (id,rollout_path,created_at_ms,updated_at_ms,source,archived,history_mode) VALUES ('guardian',?1,1776643200000,1776643300000,'cli',0,'legacy')",
+            [guardian_rollout.to_string_lossy().as_ref()],
+        ).unwrap();
+        state
+            .execute(
+                "INSERT INTO thread_spawn_edges VALUES ('sqlite-parent','guardian','completed')",
+                [],
+            )
+            .unwrap();
         let db = home.path().join("history.db");
         let conn = open_db(&db).unwrap();
         let locator = crate::providers::codex::sqlite::locator(
@@ -4815,6 +4842,7 @@ mod tests {
             "sqlite-parent",
         );
         catalog_row(&conn, "codex", "sqlite-parent", Some(Path::new(&locator)));
+        catalog_row(&conn, "codex", "guardian", Some(&guardian_rollout));
         drop(conn);
 
         let mut request = options("codex", "sqlite-parent");
@@ -4838,7 +4866,25 @@ mod tests {
         assert!(full
             .related_session_ids
             .contains(&"sqlite-child".to_string()));
+        assert!(full.related_session_ids.contains(&"guardian".to_string()));
         assert!(child_events() > 0);
+        let guardian_events: i64 = open_db(&db).unwrap().query_row(
+            "SELECT count(*) FROM session_events WHERE source='codex' AND session_id='guardian'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(
+            guardian_events > 0,
+            "the linked guardian rollout is acquired"
+        );
+        let guardian_catalog: i64 = open_db(&db)
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM sessions WHERE source='codex' AND session_id='guardian'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(guardian_catalog, 1, "guardian remains a catalog root");
         let root_event_id: i64 = open_db(&db).unwrap().query_row(
             "SELECT id FROM session_events WHERE source='codex' AND session_id='sqlite-parent' ORDER BY id LIMIT 1",
             [], |row| row.get(0),

@@ -116,23 +116,23 @@ fn related_rollout(
     state: &Path,
     id: &str,
     path: PathBuf,
-) -> Result<Option<(RelatedRollout, Vec<String>)>> {
-    let Some(meta) = crate::ingest::read_codex_session_meta(&path)? else {
-        return Ok(None);
-    };
-    if meta.session_id != id || !meta.is_subagent {
-        return Ok(None);
-    }
+) -> Result<(RelatedRollout, Vec<String>)> {
+    let meta = crate::ingest::read_codex_session_meta(&path)?
+        .ok_or_else(|| anyhow::anyhow!("related Codex rollout has no session metadata"))?;
+    ensure!(
+        meta.session_id == id,
+        "related Codex rollout session id mismatch"
+    );
     let children = spawn_children(context, state, id)?;
     let stamp = rollout_content_stamp(&path)?;
-    Ok(Some((
+    Ok((
         RelatedRollout {
             id: id.to_owned(),
             path,
             stamp,
         },
         children,
-    )))
+    ))
 }
 
 /// Selected hydration captures every SQLite descendant named by spawn edges.
@@ -167,16 +167,10 @@ pub(crate) fn capture_related(
         };
         if let Some(path) = rollout {
             match related_rollout(&context, state, &child, path) {
-                Ok(Some((rollout, children))) => {
+                Ok((rollout, children)) => {
                     pending.extend(children);
                     root_acquired.read_paths.push(rollout.path.clone());
                     root.related_rollouts.push(rollout);
-                }
-                Ok(None) => {
-                    eprintln!(
-                        "ai-hist: [codex] skipping related rollout {child}: not a delegated child"
-                    );
-                    root.related_incomplete = true;
                 }
                 Err(error) if error.is::<crate::ingest::CaptureCancelled>() => return Err(error),
                 Err(error) => {

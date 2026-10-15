@@ -27,14 +27,16 @@ pub(crate) fn ingest_selected_codex(ctx: SelectedIngest<'_>) -> Result<SelectedI
                 let meta = read_codex_session_meta(&child.path)?
                     .ok_or_else(|| anyhow::anyhow!("Codex related rollout has no metadata"))?;
                 anyhow::ensure!(
-                    meta.session_id == child.id && meta.is_subagent,
+                    meta.session_id == child.id,
                     "SESSION_SOURCE_MISMATCH: Codex related rollout identity changed"
                 );
                 ingest_codex_rollout(ctx.conn, &child.path, &meta)?;
-                cleanup_codex_subagent_history(ctx.conn, &meta.session_id)?;
-                cleanup_codex_subagent_registration(ctx.conn, &meta.session_id)?;
-                if let Some(parent) = meta.parent_session_id.as_deref() {
-                    record_codex_delegation(ctx.conn, parent, &meta, &child.path)?;
+                if meta.is_subagent {
+                    cleanup_codex_subagent_history(ctx.conn, &meta.session_id)?;
+                    cleanup_codex_subagent_registration(ctx.conn, &meta.session_id)?;
+                    if let Some(parent) = meta.parent_session_id.as_deref() {
+                        record_codex_delegation(ctx.conn, parent, &meta, &child.path)?;
+                    }
                 }
             }
         }

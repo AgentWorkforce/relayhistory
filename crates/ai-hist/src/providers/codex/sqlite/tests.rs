@@ -119,10 +119,27 @@ fn related_capture_keeps_supported_children_when_other_edges_are_unavailable() {
         .related_rollouts
         .iter()
         .any(|child| child.id == "legacy-child"));
-    assert!(!captured
+    assert!(captured
         .related_rollouts
         .iter()
         .any(|child| child.id == "guardian"));
+
+    state
+        .execute(
+            "DELETE FROM thread_spawn_edges WHERE child_thread_id='missing-child'",
+            [],
+        )
+        .unwrap();
+    let guardian_only: Capture = serde_json::from_value(
+        capture_related(&roots, &state_path, "sqlite-parent")
+            .unwrap()
+            .payload,
+    )
+    .unwrap();
+    assert!(
+        !guardian_only.related_incomplete,
+        "a valid standalone guardian rollout completes the explicit edge"
+    );
 
     let modified = rollout.metadata().unwrap().modified().unwrap();
     let rewritten = first.replace("alpha", "bravo");
