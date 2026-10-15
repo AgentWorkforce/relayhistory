@@ -83,7 +83,7 @@ pub(super) fn superseded(
             && format::string(&header, "projectHash")? == project,
         "GEMINI_ID_COLLISION: legacy migration sibling identity differs"
     );
-    Ok(true)
+    Ok(path_is_legacy(path))
 }
 
 fn skip_legacy(context: &AcquisitionContext<'_>, path: &Path) -> Result<bool> {

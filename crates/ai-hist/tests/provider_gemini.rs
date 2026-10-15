@@ -476,3 +476,32 @@ fn gemini_bad_migration_pair_does_not_block_healthy_sessions() {
     store.sync(SyncOptions::default().force(true)).unwrap();
     assert!(has(&read(&store), "Found the synthetic Gemini needle."));
 }
+
+#[test]
+fn gemini_fresh_migration_pair_discovers_and_hydrates_journal() {
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path());
+    std::fs::write(&path, include_str!("fixtures/gemini/legacy-migrated/.gemini/tmp/gemini-project/chats/session-legacy-22222222.jsonl")).unwrap();
+    std::fs::write(
+        path.with_extension("json"),
+        include_str!(
+            "fixtures/gemini/legacy/.gemini/tmp/gemini-project/chats/session-legacy-22222222.json"
+        ),
+    )
+    .unwrap();
+    let store = open(home.path());
+    discover(&store);
+    let reference = SessionRef::id(Source::Gemini, "22222222-2222-4222-8222-222222222222");
+    store
+        .hydrate(&reference, HydrateOptions::default())
+        .unwrap();
+    let evidence = store
+        .session(&reference, SessionQuery::default())
+        .unwrap()
+        .unwrap();
+    assert!(has(&evidence, "Continue the synthetic legacy session."));
+    assert_eq!(
+        evidence.session.raw_path.unwrap().extension().unwrap(),
+        "jsonl"
+    );
+}
