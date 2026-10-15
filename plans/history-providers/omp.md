@@ -1,6 +1,6 @@
 # OMP acquisition research (#430)
 
-Status: implementation and acceptance verification in progress. OMP is separate
+Status: implementation complete; PR review and final CI in progress. OMP is separate
 from Pi. Inspection on macOS arm64, 2026-10-11 pins
 [`bd4dffd5e617ce732f8a14249b0be1e6c7621886`](https://github.com/can1357/oh-my-pi/tree/bd4dffd5e617ce732f8a14249b0be1e6c7621886),
 `@oh-my-pi/pi-coding-agent` 18.9.2. Sources and executed-helper digests are in
@@ -222,3 +222,45 @@ retains `[local, remote]` instead of `[remote]`. Restoring the call restores tha
 case and the named public complete-versus-partial replacement regression. A
 fresh independent review approved the complete-only helper ordering, remote
 preservation and generation bump without findings.
+
+## Final local checks and CI follow-up
+
+After the identity repair, the nine public OMP cases and fifteen provider unit
+cases passed, including both identity-replacement regressions after restoring
+the omitted-helper negative control. Strict Rust **1.99.0** Clippy passed with
+`--workspace --all-targets --all-features -- -D warnings`; the CI-only octal
+permissions lint was corrected. The quality gate passes without a baseline
+increase after extracting complete-capture title/first-prompt refresh into a
+small private helper. Generation-v2 corpus regeneration changed only the stamp
+prefix in the two owned snapshots; the payload SHA256 values stayed identical.
+The final corpus run passed all 67 cases and the public OMP run passed all nine.
+
+Native bindings were rebuilt for the v2 identity repair. The full SDK suite
+passed **280**, failed **0**, skipped **1**. The strictly isolated SDK/CLI/MCP
+surface proof additionally verifies replacing the native identity at the same
+locator removes the old catalog identity. Native contract **28** remains valid.
+Rust 1.99 formatting, provider generation checks, public API (1059 items), the
+six research controls and both official writer/reader fixture oracles passed.
+The public API addition is the non-exhaustive `Source::Omp` variant.
+
+Broader local runs are deliberately distinguished from those final focused
+checks. With elevated local socket permissions and canonical
+`TMPDIR=/private/tmp`, the no-default-features run completed **1558 passed, zero
+failed, two ignored** on the tree compiled before the identity repair. The full
+workspace run on that earlier tree reached **1706 passed**, then stopped at four
+timing-sensitive live-capture failures under concurrent build/test load. A
+serial rerun of the entire live-capture target passed **75/75**. This is not a
+claim of a clean final-head full workspace run; the PR's Linux CI supplies that
+separate gate. Initial runs using macOS's long aliased temporary path also hit
+socket-length and gitdir-alias failures; canonical short TMPDIR eliminated them.
+
+`cargo publish --dry-run -p ai-hist --allow-dirty` completed package verification
+without publishing (188 files, 6.0 MiB uncompressed). The package's OMP source
+members were checked byte-for-byte against the v2 identity-repair source before
+the private quality-only helper extraction. No package versions, credentials,
+remote services, merge switches or deployment state were changed.
+
+At PR head 60ec5896, CI identified the two stale generation prefixes and a new
+complexity violation in `normalize::write`; both are fixed above. No automated
+inline review findings were present at that inspection. New CI/review feedback
+is handled against the final pushed head, separately from this capture record.

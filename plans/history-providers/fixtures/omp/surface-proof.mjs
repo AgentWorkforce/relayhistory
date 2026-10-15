@@ -8,7 +8,8 @@ import {spawnSync} from 'node:child_process';
 const root=path.resolve(process.argv[2]??'.');
 if(!process.env.RH_OMP_SURFACE_CHILD){
  const home=fs.mkdtempSync(path.join(os.tmpdir(),'omp-surfaces-'));
- const env={...process.env,HOME:home,USERPROFILE:home,AI_HIST_DB:path.join(home,'history.db'),RELAYHISTORY_HOME:path.join(home,'commercial'),RH_OMP_SURFACE_CHILD:'1'};
+ const temporary=path.join(home,'tmp');fs.mkdirSync(temporary);
+ const env={PATH:'/usr/bin:/bin:/usr/sbin:/sbin',HOME:home,USERPROFILE:home,TMPDIR:temporary,AI_HIST_DB:path.join(home,'history.db'),RELAYHISTORY_HOME:path.join(home,'commercial'),RH_OMP_SURFACE_CHILD:'1'};
  for(const key of ['PI_CODING_AGENT_DIR','PI_CODING_AGENT_SESSION_DIR','PI_CONFIG_DIR','OMP_PROFILE','PI_PROFILE','XDG_DATA_HOME','AI_HIST_PLUGIN_CONFIG','CLAUDE_CONFIG_DIR','CODEX_HOME','GROK_HOME','OPENCODE_DB','OPENCODE_STORAGE_DIR']) delete env[key];
  const target=path.join(home,'.omp/agent/sessions/synthetic/session.jsonl');fs.mkdirSync(path.dirname(target),{recursive:true});
  fs.copyFileSync(path.join(root,'crates/ai-hist/tests/fixtures/omp/writer-v3/.omp/agent/sessions/--fixture--/session.jsonl'),target);
@@ -33,5 +34,13 @@ if(!process.env.RH_OMP_SURFACE_CHILD){
   const result=await client.callTool({name:'search_history',arguments:{query:'writer fixture',source:'omp'}});assert.ok(!result.isError);assert.ok(JSON.parse(result.content[0].text).length>0);
   const filtered=await client.callTool({name:'search_history',arguments:{query:'writer fixture',source:'pi'}});assert.deepEqual(JSON.parse(filtered.content[0].text),[]);
  }finally{await client.close();}
- console.log('OMP public SDK discover/hydrate/read/search + CLI search + MCP descriptor/capabilities/search/source filtering passed');
+ const nativeFile=path.join(process.env.HOME,'.omp/agent/sessions/synthetic/session.jsonl');
+ const replacement='replacement-native-sdk';
+ fs.writeFileSync(nativeFile,fs.readFileSync(nativeFile,'utf8').replace(sid,replacement));
+ await sdk.sync({dbPath});
+ const replaced=await sdk.listSessionCatalogPage({dbPath,sources:['omp']});
+ assert.ok(!replaced.sessions.some(s=>s.sessionId===sid));
+ assert.ok(replaced.sessions.some(s=>s.sessionId===replacement));
+ assert.ok((await sdk.getSessionEvents(replacement,{dbPath,source:'omp'})).length>0);
+ console.log('OMP public SDK discover/hydrate/read/search/identity replacement + CLI search + MCP descriptor/capabilities/search/source filtering passed');
 }

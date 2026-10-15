@@ -60,13 +60,16 @@ pub(super) fn write(conn: &Connection, payload: &Value, path: &Path) -> Result<u
             raw_path: Some(&path.to_string_lossy()),
         },
     )?;
-    let title = header["title"].as_str();
     if complete {
-        crate::ingest::set_session_title(conn, ID, sid, title)?;
-        let first_prompt = format::first_prompt(entries);
-        conn.execute("UPDATE sessions SET first_prompt=?2 WHERE source='omp' AND session_id=?1 AND first_prompt IS NOT ?2", rusqlite::params![sid,first_prompt])?;
+        refresh_metadata(conn, sid, header, entries)?;
     }
     Ok(inserted)
+}
+fn refresh_metadata(conn: &Connection, sid: &str, header: &Value, entries: &[Value]) -> Result<()> {
+    crate::ingest::set_session_title(conn, ID, sid, header["title"].as_str())?;
+    let first_prompt = format::first_prompt(entries);
+    conn.execute("UPDATE sessions SET first_prompt=?2 WHERE source='omp' AND session_id=?1 AND first_prompt IS NOT ?2", rusqlite::params![sid,first_prompt])?;
+    Ok(())
 }
 fn marker(conn: &Connection, sid: &str, entry: &Value, id: &str, keys: &mut Keys) -> Result<()> {
     let kind = format::string(entry, "type")?;
