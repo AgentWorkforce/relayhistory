@@ -140,6 +140,50 @@ fn sync_codex_sqlite_scoped(
     }
 }
 
+/// What one pass over the new lines of Codex's `history.jsonl` did.
+struct CodexHistoryRead {
+    /// The position after the last line read.
+    consumed: u64,
+    inserted: usize,
+    errors: usize,
+}
+
+/// Inserts every prompt in the unread tail of Codex's `history.jsonl`, naming
+/// a prompt's project from its session's rollout when the log does not.
+fn ingest_codex_history_lines(
+    conn: &Connection,
+    source: &mut CompleteJsonlReader,
+    cwds: &HashMap<String, String>,
+    touched: &mut HashSet<String>,
+) -> Result<CodexHistoryRead> {
+    let mut read = CodexHistoryRead {
+        consumed: source.position,
+        inserted: 0,
+        errors: 0,
+    };
+    let mut line = String::new();
+    while let Some(position) = source.next_line(&mut line)? {
+        read.consumed = position;
+        if line.trim().is_empty() {
+            continue;
+        }
+        match parse_codex_line(&line) {
+            Ok(Some(mut entry)) => {
+                if let Some(session_id) = entry.session_id.as_deref() {
+                    if entry.project.is_none() {
+                        entry.project = cwds.get(session_id).cloned();
+                    }
+                    touched.insert(session_id.to_string());
+                }
+                read.inserted += insert_history(conn, &entry)?;
+            }
+            Ok(None) => {}
+            Err(_) => read.errors += 1,
+        }
+    }
+    Ok(read)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,48 +242,4 @@ mod tests {
             .unwrap();
         assert_eq!(count, 1);
     }
-}
-
-/// What one pass over the new lines of Codex's `history.jsonl` did.
-struct CodexHistoryRead {
-    /// The position after the last line read.
-    consumed: u64,
-    inserted: usize,
-    errors: usize,
-}
-
-/// Inserts every prompt in the unread tail of Codex's `history.jsonl`, naming
-/// a prompt's project from its session's rollout when the log does not.
-fn ingest_codex_history_lines(
-    conn: &Connection,
-    source: &mut CompleteJsonlReader,
-    cwds: &HashMap<String, String>,
-    touched: &mut HashSet<String>,
-) -> Result<CodexHistoryRead> {
-    let mut read = CodexHistoryRead {
-        consumed: source.position,
-        inserted: 0,
-        errors: 0,
-    };
-    let mut line = String::new();
-    while let Some(position) = source.next_line(&mut line)? {
-        read.consumed = position;
-        if line.trim().is_empty() {
-            continue;
-        }
-        match parse_codex_line(&line) {
-            Ok(Some(mut entry)) => {
-                if let Some(session_id) = entry.session_id.as_deref() {
-                    if entry.project.is_none() {
-                        entry.project = cwds.get(session_id).cloned();
-                    }
-                    touched.insert(session_id.to_string());
-                }
-                read.inserted += insert_history(conn, &entry)?;
-            }
-            Ok(None) => {}
-            Err(_) => read.errors += 1,
-        }
-    }
-    Ok(read)
 }
