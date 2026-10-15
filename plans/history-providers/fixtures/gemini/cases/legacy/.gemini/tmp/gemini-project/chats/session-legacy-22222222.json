@@ -1,0 +1,97 @@
+{
+  "sessionId": "22222222-2222-4222-8222-222222222222",
+  "projectHash": "52e30737efc78fb781017102c6074d53ab432a8cc4edc0a26b2b9756700cd3a0",
+  "startTime": "2026-10-11T12:00:01.000Z",
+  "lastUpdated": "2026-10-11T12:00:14.000Z",
+  "kind": "main",
+  "messages": [
+    {
+      "id": "user-one",
+      "timestamp": "2026-10-11T12:00:03.000Z",
+      "type": "user",
+      "content": "Find the synthetic Gemini needle"
+    },
+    {
+      "id": "assistant-one",
+      "timestamp": "2026-10-11T12:00:06.000Z",
+      "type": "gemini",
+      "content": [
+        {
+          "text": "Searching the fixture."
+        }
+      ],
+      "thoughts": [
+        {
+          "subject": "Search",
+          "description": "Inspect the synthetic fixture",
+          "timestamp": "2026-10-11T12:00:05.000Z"
+        }
+      ],
+      "tokens": {
+        "input": 120,
+        "output": 20,
+        "cached": 30,
+        "thoughts": 4,
+        "tool": 2,
+        "total": 146
+      },
+      "model": "gemini-fixture-model",
+      "toolCalls": [
+        {
+          "id": "call-real-id",
+          "name": "read_file",
+          "args": {
+            "path": "/synthetic/needle.txt"
+          },
+          "timestamp": "2026-10-11T12:00:08.000Z",
+          "status": "success",
+          "displayName": "read_file",
+          "description": "",
+          "renderOutputAsMarkdown": false,
+          "result": [
+            {
+              "functionResponse": {
+                "id": "call-real-id",
+                "name": "read_file",
+                "response": {
+                  "output": "synthetic needle result"
+                }
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "tool-response",
+      "timestamp": "2026-10-11T12:00:09.000Z",
+      "type": "user",
+      "content": [
+        {
+          "functionResponse": {
+            "id": "call-real-id",
+            "name": "read_file",
+            "response": {
+              "output": "synthetic needle result"
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "assistant-two",
+      "timestamp": "2026-10-11T12:00:11.000Z",
+      "type": "gemini",
+      "content": "Found the synthetic Gemini needle.",
+      "thoughts": [],
+      "tokens": null,
+      "model": "gemini-fixture-model"
+    },
+    {
+      "id": "info-one",
+      "timestamp": "2026-10-11T12:00:13.000Z",
+      "type": "info",
+      "content": "Synthetic status notification"
+    }
+  ]
+}

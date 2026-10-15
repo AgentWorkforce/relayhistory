@@ -1,0 +1,124 @@
+{
+  "id": "gemini",
+  "rust_id": "gemini",
+  "variant": "Gemini",
+  "order": 433,
+  "aliases": [
+    "gemini-cli"
+  ],
+  "fixtures": [
+    {
+      "source": "gemini",
+      "name": "child",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "gemini/child"
+      ],
+      "quirk": "Pinned Gemini CLI recorder/official-reader synthetic child journal projection; legacy JSON is authored input accepted by the current reader, not an old-writer capture."
+    },
+    {
+      "source": "gemini",
+      "name": "compacted",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "gemini/compacted"
+      ],
+      "quirk": "Pinned Gemini CLI recorder/official-reader synthetic compacted journal projection; legacy JSON is authored input accepted by the current reader, not an old-writer capture."
+    },
+    {
+      "source": "gemini",
+      "name": "legacy",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "gemini/legacy"
+      ],
+      "quirk": "Pinned Gemini CLI recorder/official-reader synthetic legacy journal projection; legacy JSON is authored input accepted by the current reader, not an old-writer capture."
+    },
+    {
+      "source": "gemini",
+      "name": "legacy-migrated",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "gemini/legacy-migrated"
+      ],
+      "quirk": "Pinned Gemini CLI recorder/official-reader synthetic legacy-migrated journal projection; legacy JSON is authored input accepted by the current reader, not an old-writer capture."
+    },
+    {
+      "source": "gemini",
+      "name": "ordinary",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "gemini/ordinary"
+      ],
+      "quirk": "Pinned Gemini CLI recorder/official-reader synthetic ordinary journal projection; legacy JSON is authored input accepted by the current reader, not an old-writer capture."
+    },
+    {
+      "source": "gemini",
+      "name": "resumed",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "gemini/resumed"
+      ],
+      "quirk": "Pinned Gemini CLI recorder/official-reader synthetic resumed journal projection; legacy JSON is authored input accepted by the current reader, not an old-writer capture."
+    },
+    {
+      "source": "gemini",
+      "name": "rewound",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "gemini/rewound"
+      ],
+      "quirk": "Pinned Gemini CLI recorder/official-reader synthetic rewound journal projection; legacy JSON is authored input accepted by the current reader, not an old-writer capture."
+    },
+    {
+      "source": "gemini",
+      "name": "short-prefix-collision",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "gemini/short-prefix-collision"
+      ],
+      "quirk": "Pinned Gemini CLI recorder/official-reader synthetic short-prefix-collision journal projection; legacy JSON is authored input accepted by the current reader, not an old-writer capture."
+    },
+    {
+      "source": "gemini",
+      "name": "tool-result-patched",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "gemini/tool-result-patched"
+      ],
+      "quirk": "Pinned Gemini CLI recorder/official-reader synthetic tool-result-patched journal projection; legacy JSON is authored input accepted by the current reader, not an old-writer capture."
+    }
+  ],
+  "capture": [
+    {
+      "evidence": "Messages and identity",
+      "coverage": "Pinned current JSONL journal replay and current-reader legacy JSON; full native IDs, slug/hash project trees, frozen home/seatbelt roots, namespaced custom roots. Finalized recorded roles; no reliable synthetic summary discriminator."
+    },
+    {
+      "evidence": "Tools and usage",
+      "coverage": "Actual call IDs and patched results, success outcomes, per-message measured input/output/cached/thought/total counters. Missing usage unavailable; opaque/tool-only responses retain measured usage; thoughts are summary markers; prompt attribution unavailable without upstream ownership links; no inferred edits or pricing."
+    },
+    {
+      "evidence": "Control and lineage",
+      "coverage": "All journal mutations, superseded revisions, status records, workspaces and subagent metadata preserved as markers. No inferred compaction boundary, parent relationship, cwd, resume or live execution."
+    }
+  ],
+  "population": {
+    "evidence": [
+      "history",
+      "session_event",
+      "tool_call",
+      "session_marker"
+    ],
+    "usage_accounting": "per-message"
+  }
+}

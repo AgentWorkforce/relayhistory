@@ -50,6 +50,11 @@ const REGISTRATIONS: &[Registration] = &[
         metadata: copilot::METADATA,
         adapter: copilot::ADAPTER,
     },
+    Registration {
+        id: "gemini",
+        metadata: gemini::METADATA,
+        adapter: gemini::ADAPTER,
+    },
     #[cfg(test)]
     Registration {
         id: "test-fixture",

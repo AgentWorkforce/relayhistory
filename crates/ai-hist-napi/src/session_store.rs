@@ -515,7 +515,11 @@ mod tests {
         let error = call("markers", json!({ "source": "claude", "sessionId": " s " })).unwrap_err();
         assert!(error.contains("padded"), "{error}");
 
-        let error = call("markers", json!({ "source": "gemini", "sessionId": "s" })).unwrap_err();
+        let error = call(
+            "markers",
+            json!({ "source": "unknown-provider", "sessionId": "s" }),
+        )
+        .unwrap_err();
         assert!(error.contains("source must be one of"), "{error}");
 
         // A dated-cursor op will not guess where an undated cursor starts.
