@@ -24,7 +24,7 @@ pub(super) fn normalize_item(
 
 fn user(conn: &Connection, t: &Thread, item: &Item) -> Result<usize> {
     let text = text_blocks(&item.value["content"]);
-    event(conn, t, item, &item.id, "user", "text", Some(&text), None)?;
+    event(conn, t, item, &item.id, ("user", "text"), Some(&text), None)?;
     if t.is_child() || text.is_empty() {
         return Ok(0);
     }
@@ -49,8 +49,7 @@ fn agent(conn: &Connection, t: &Thread, item: &Item) -> Result<usize> {
         t,
         item,
         &item.id,
-        "assistant",
-        "text",
+        ("assistant", "text"),
         value["text"].as_str(),
         None,
     )?;
@@ -91,8 +90,7 @@ fn reasoning(conn: &Connection, t: &Thread, item: &Item) -> Result<usize> {
             t,
             item,
             &item.id,
-            "assistant",
-            "thinking",
+            ("assistant", "thinking"),
             Some(&text),
             None,
         )?;
@@ -136,8 +134,7 @@ fn tool(
         t,
         item,
         &item.id,
-        "assistant",
-        "tool_use",
+        ("assistant", "tool_use"),
         target,
         None,
     )? {
@@ -189,8 +186,7 @@ fn tool(
             t,
             item,
             &format!("{}:result", item.id),
-            "tool_result",
-            "tool_result",
+            ("tool_result", "tool_result"),
             Some(&text),
             Some(&facts),
         )?;
@@ -211,8 +207,7 @@ fn file_change(conn: &Connection, t: &Thread, item: &Item) -> Result<usize> {
         t,
         item,
         &item.id,
-        "assistant",
-        "tool_use",
+        ("assistant", "tool_use"),
         Some("file changes"),
         None,
     )? {

@@ -35,11 +35,11 @@ fn event(
     t: &Thread,
     item: &Item,
     uid: &str,
-    role: &str,
-    kind: &str,
+    role_and_kind: (&str, &str),
     text: Option<&str>,
     result_facts: Option<&ToolResultFacts>,
 ) -> Result<bool> {
+    let (role, kind) = role_and_kind;
     let rollout_has_item = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM session_events WHERE source='codex' AND session_id=?1 AND event_uid<>?2 AND role=?3 AND kind=?4 AND (message_id=?5 OR provider_message_id=?5))",
         params![t.id, uid, role, kind, item.id],

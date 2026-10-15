@@ -182,13 +182,11 @@ fn threads(context: &AcquisitionContext<'_>, state: &Path, history: &Path) -> Re
     sqlite_snapshot(context, state, |db| {
         let mut stmt = db.prepare(&format!("{THREAD_SQL} LIMIT 100001"))?;
         let mut out = Vec::new();
-        let mut scanned = 0;
-        for row in stmt.query_map([], thread_row)? {
+        for (scanned, row) in stmt.query_map([], thread_row)?.enumerate() {
             ensure!(
                 scanned < MAX_THREADS,
                 "Codex thread discovery exceeds safety limit"
             );
-            scanned += 1;
             let mut thread = row?;
             if let Some((ordinal, offset)) = offsets.get(&thread.id) {
                 thread.next_ordinal = *ordinal;

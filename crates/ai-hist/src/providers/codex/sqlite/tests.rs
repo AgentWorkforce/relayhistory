@@ -25,7 +25,10 @@ fn a_pruned_rollout_is_read_again_after_it_was_restored() {
     let conn = crate::open_db(&dir.path().join("ai-history.db")).unwrap();
     let mut state = serde_json::Map::new();
     let repairs = crate::ingest::SweepRepairs::default();
-    assert!(sync(&conn, &mut state, &codex, &repairs).unwrap().1.is_empty());
+    assert!(sync(&conn, &mut state, &codex, &repairs)
+        .unwrap()
+        .1
+        .is_empty());
 
     std::fs::remove_file(&rollout).unwrap();
     assert_eq!(
@@ -33,7 +36,10 @@ fn a_pruned_rollout_is_read_again_after_it_was_restored() {
         vec!["sqlite-rollout-primary".to_string()]
     );
     std::fs::write(&rollout, "complete rollout").unwrap();
-    assert!(sync(&conn, &mut state, &codex, &repairs).unwrap().1.is_empty());
+    assert!(sync(&conn, &mut state, &codex, &repairs)
+        .unwrap()
+        .1
+        .is_empty());
 
     std::fs::remove_file(&rollout).unwrap();
     assert_eq!(
