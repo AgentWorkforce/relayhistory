@@ -35,28 +35,7 @@ pub(super) fn reconcile_codex_sqlite(
     {
         return Ok(());
     }
-    const NATIVE_EVENTS: &str = "source='codex' AND session_id=?1 \
-        AND raw_kind IN ('userMessage','agentMessage','reasoning','commandExecution', \
-        'mcpToolCall','collabAgentToolCall','webSearch','fileChange') \
-        AND (event_uid=message_id OR event_uid=message_id||':result')";
-    for table in ["tool_calls", "file_edits"] {
-        conn.execute(
-            &format!(
-                "DELETE FROM {table} WHERE source='codex' AND session_id=?1 \
-                 AND message_id IN (SELECT message_id FROM session_events WHERE {NATIVE_EVENTS})"
-            ),
-            [session_id],
-        )?;
-    }
-    conn.execute(
-        &format!("DELETE FROM session_events WHERE {NATIVE_EVENTS}"),
-        [session_id],
-    )?;
-    conn.execute(
-        "DELETE FROM session_markers WHERE source='codex' AND session_id=?1 \
-         AND subkind='sqlite'",
-        [session_id],
-    )?;
+    crate::providers::codex::sqlite::retire(conn, session_id, true)?;
     *cursor = transcript_cursor::TranscriptCursorState::default();
     Ok(())
 }
@@ -126,6 +105,7 @@ mod tests {
         };
         assert!(count("tool_calls") >= 4);
         assert_eq!(count("file_edits"), 1);
+        assert_eq!(count("history"), 1);
 
         std::fs::write(&rollout, format!("{}\n", lines[0])).unwrap();
         let meta = read_codex_session_meta(&rollout).unwrap().unwrap();
@@ -139,6 +119,7 @@ mod tests {
         ingest_codex_rollout(&conn, &rollout, &meta).unwrap();
         assert_eq!(count("tool_calls"), 2);
         assert_eq!(count("file_edits"), 1);
+        assert_eq!(count("history"), 0);
         let native_events: i64 = conn.query_row(
             "SELECT COUNT(*) FROM session_events WHERE source='codex' AND session_id='sqlite-pruned-all-items' AND raw_kind IN ('userMessage','agentMessage','commandExecution','fileChange')",
             [],

@@ -3,3 +3,4 @@ CREATE TABLE thread_spawn_edges(parent_thread_id TEXT,child_thread_id TEXT,statu
 INSERT INTO threads VALUES ('sqlite-parent',NULL,1776643200000,1776643300000,'cli','/work/app','feature/sqlite','https://example.test/team/app','SQLite thread','SQLite thread','Please inspect the project','codex_cli_rs','0.151.0','gpt-synthetic',12345,0,NULL,NULL,'paginated');
 INSERT INTO threads VALUES ('sqlite-child',NULL,1776643200000,1776643300000,'{"subagent": {"thread_spawn": {"parent_thread_id": "sqlite-parent"}}}','/work/app','feature/sqlite','https://example.test/team/app','SQLite thread','SQLite thread','Please inspect the project','codex_cli_rs','0.151.0','gpt-synthetic',12345,0,'reviewer','explorer','paginated');
 INSERT INTO thread_spawn_edges VALUES ('sqlite-parent','sqlite-child','completed');
+ALTER TABLE threads ADD COLUMN thread_source TEXT;

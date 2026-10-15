@@ -39,6 +39,7 @@ mod grok_unified;
 pub(crate) mod hook;
 pub(crate) mod hydrate;
 mod images;
+pub(crate) use images::image_markdown;
 pub(crate) mod incremental;
 pub(crate) mod jsonl;
 pub(crate) mod muse;

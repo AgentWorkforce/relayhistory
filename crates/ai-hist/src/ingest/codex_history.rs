@@ -41,7 +41,14 @@ fn sync_codex_rollouts_and_history(
     let (cwds, branches, mut inserted) = sync_codex_rollouts_with_repairs_and_coverage(
         conn, state, root, repairs, coverage, touched, paths,
     )?;
-    inserted += sync_codex_sqlite_scoped(conn, state, root, repairs, coverage, touched, paths)?;
+    match sync_codex_sqlite_scoped(conn, state, root, repairs, coverage, touched, paths) {
+        Ok(sqlite_inserted) => inserted += sqlite_inserted,
+        Err(error) if error.is::<CaptureCancelled>() => return Err(error),
+        Err(error) => {
+            coverage.note_unread();
+            sync_note!("  [codex] SQLite history unavailable: {error:#}");
+        }
+    }
     let path = root.join("history.jsonl");
     // One incremental file. A tick whose paths are rollouts has nothing new
     // in it, and opening it on every append is a read the backstop still does.
@@ -236,6 +243,56 @@ mod tests {
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sessions WHERE source='codex' AND session_id='sqlite-rollout-primary'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn unreadable_sqlite_tables_do_not_hide_rollouts_or_history_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".codex");
+        std::fs::create_dir_all(&root).unwrap();
+        Connection::open(root.join("state_5.sqlite")).unwrap();
+        Connection::open(root.join("thread_history_1.sqlite")).unwrap();
+        let rollout = root.join("sessions/2026/04/20/rollout-primary.jsonl");
+        std::fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/codex/sqlite/rollout-rollout-primary.jsonl");
+        std::fs::copy(fixture, &rollout).unwrap();
+        std::fs::write(
+            root.join("history.jsonl"),
+            "{\"display\":\"history-only\",\"timestamp\":1776643300,\"project\":\"/work/app\",\"sessionId\":\"sqlite-rollout-primary\"}\n",
+        ).unwrap();
+
+        let conn = crate::open_db(&dir.path().join("history.db")).unwrap();
+        let mut roots = crate::ProviderRoots::from_home(
+            dir.path().to_path_buf(),
+            dir.path().join("opencode.db"),
+        );
+        roots.codex = root.clone();
+        let env = DiscoveryEnv::with_provider_roots(&conn, roots);
+        let candidates = CodexProvider::default().enumerate(&env, None).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].locator, rollout.to_string_lossy());
+
+        let mut state = Map::new();
+        let mut coverage = SweepCoverage::default();
+        sync_codex_sources(
+            &conn,
+            &mut state,
+            &root,
+            &SweepRepairs::default(),
+            &mut coverage,
+            &mut HashSet::new(),
+            None,
+        )
+        .unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM history WHERE source='codex' AND prompt='history-only'",
                 [],
                 |row| row.get(0),
             )

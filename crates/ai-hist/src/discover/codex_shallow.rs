@@ -73,9 +73,11 @@ impl ShallowSessionProvider for CodexProvider {
                 crate::file_stamp_and_modified,
             )?);
         }
-        inputs.extend(crate::providers::codex::sqlite::fingerprint(
-            &env.codex_home,
-        )?);
+        match crate::providers::codex::sqlite::fingerprint(&env.codex_home) {
+            Ok(sqlite) => inputs.extend(sqlite),
+            Err(error) if error.is::<crate::ingest::CaptureCancelled>() => return Err(error),
+            Err(error) => eprintln!("ai-hist: [codex] skipping SQLite history: {error:#}"),
+        }
         Ok(inputs)
     }
 
@@ -99,7 +101,14 @@ impl ShallowSessionProvider for CodexProvider {
             files.extend(crate::ingest::codex_rollout_locators(&root, scope)?);
         }
         let (sqlite, incomplete_rollouts) =
-            crate::providers::codex::sqlite::enumerate(&env.codex_home, &env.provider_roots)?;
+            match crate::providers::codex::sqlite::enumerate(&env.codex_home, &env.provider_roots) {
+                Ok(found) => found,
+                Err(error) if error.is::<crate::ingest::CaptureCancelled>() => return Err(error),
+                Err(error) => {
+                    eprintln!("ai-hist: [codex] skipping SQLite history: {error:#}");
+                    (Vec::new(), Default::default())
+                }
+            };
         files.retain(|path| !incomplete_rollouts.contains(path));
         let mut candidates = file_candidates("codex", files, crate::file_stamp_and_modified)?;
         candidates.extend(sqlite);

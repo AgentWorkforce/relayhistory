@@ -7,7 +7,33 @@ pub(crate) fn ingest_selected_codex(ctx: SelectedIngest<'_>) -> Result<SelectedI
         let path = ctx
             .path
             .ok_or_else(|| anyhow::anyhow!("Codex SQLite capture has no state path"))?;
-        crate::providers::codex::sqlite::normalize(ctx.conn, &capture, path)?;
+        crate::providers::codex::sqlite::retire_if_changed(ctx.conn, &capture)?;
+        crate::providers::codex::sqlite::normalize_with_relationships(
+            ctx.conn,
+            &capture,
+            path,
+            ctx.options.include_related,
+        )?;
+        if ctx.options.include_related {
+            for child in &capture.related {
+                crate::providers::codex::sqlite::retire_if_changed(ctx.conn, child)?;
+                crate::providers::codex::sqlite::normalize(ctx.conn, child, path)?;
+            }
+            for child in &capture.related_rollouts {
+                let meta = read_codex_session_meta(&child.path)?
+                    .ok_or_else(|| anyhow::anyhow!("Codex related rollout has no metadata"))?;
+                anyhow::ensure!(
+                    meta.session_id == child.id && meta.is_subagent,
+                    "SESSION_SOURCE_MISMATCH: Codex related rollout identity changed"
+                );
+                ingest_codex_rollout(ctx.conn, &child.path, &meta)?;
+                cleanup_codex_subagent_history(ctx.conn, &meta.session_id)?;
+                cleanup_codex_subagent_registration(ctx.conn, &meta.session_id)?;
+                if let Some(parent) = meta.parent_session_id.as_deref() {
+                    record_codex_delegation(ctx.conn, parent, &meta, &child.path)?;
+                }
+            }
+        }
         return Ok((
             IngestOutcome {
                 records: acquired.records,

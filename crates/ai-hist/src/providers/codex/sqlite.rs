@@ -17,11 +17,13 @@ const MAX_ITEMS: usize = 100_000;
 
 #[derive(Clone, Serialize, Deserialize)]
 pub(crate) struct Thread {
-    pub(super) id: String,
+    pub(crate) id: String,
     pub(super) rollout_path: Option<String>,
     pub(super) created: i64,
     pub(super) updated: i64,
     pub(super) source: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(super) thread_source: Option<String>,
     pub(super) cwd: Option<String>,
     pub(super) branch: Option<String>,
     pub(super) repo: Option<String>,
@@ -41,9 +43,14 @@ pub(crate) struct Thread {
 
 impl Thread {
     fn is_child(&self) -> bool {
-        self.source
+        let source = self
+            .source
             .as_deref()
-            .is_some_and(|s| s.contains("\"subagent\""))
+            .and_then(|s| serde_json::from_str::<Value>(s).ok());
+        crate::ingest::codex_is_subagent(
+            Some(&json!({"source": source, "thread_source": self.thread_source})),
+            &self.id,
+        )
     }
     fn stamp(&self) -> String {
         format!(
@@ -60,10 +67,21 @@ impl Thread {
 
 #[derive(Serialize, Deserialize)]
 pub(crate) struct Capture {
-    pub(super) thread: Thread,
+    pub(crate) thread: Thread,
     pub(super) items: Vec<Item>,
     pub(super) turns: Vec<Turn>,
     pub(super) edges: Vec<Edge>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) related: Vec<Capture>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) related_rollouts: Vec<RelatedRollout>,
+}
+
+#[derive(Serialize, Deserialize)]
+pub(crate) struct RelatedRollout {
+    pub(crate) id: String,
+    pub(crate) path: PathBuf,
+    pub(super) stamp: String,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -176,6 +194,7 @@ fn thread_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Thread> {
         created: r.get(2)?,
         updated: r.get(3)?,
         source: r.get(4)?,
+        thread_source: r.get(18)?,
         cwd: r.get(5)?,
         branch: r.get(6)?,
         repo: r.get(7)?,
@@ -194,7 +213,7 @@ fn thread_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Thread> {
     })
 }
 
-const THREAD_SQL: &str = "SELECT id,rollout_path,created_at_ms,updated_at_ms,source,cwd,git_branch,git_origin_url,title,name,first_user_message,originator,cli_version,model,tokens_used,archived,agent_nickname,agent_role FROM threads WHERE history_mode='paginated'";
+const THREAD_SQL: &str = "SELECT id,rollout_path,created_at_ms,updated_at_ms,source,cwd,git_branch,git_origin_url,title,name,first_user_message,originator,cli_version,model,tokens_used,archived,agent_nickname,agent_role,thread_source FROM threads WHERE history_mode='paginated'";
 
 fn threads(context: &AcquisitionContext<'_>, state: &Path, history: &Path) -> Result<Vec<Thread>> {
     let offsets = projection(context, history)?;
@@ -228,114 +247,8 @@ pub(crate) fn parse_locator(locator: &str) -> Option<(PathBuf, &str)> {
     (!id.is_empty()).then(|| (PathBuf::from(path), id))
 }
 
-pub(crate) fn enumerate(
-    root: &Path,
-    roots: &crate::ProviderRoots,
-) -> Result<(Vec<Candidate>, HashSet<PathBuf>)> {
-    let selection = database_selection(root)?;
-    if let Some(diagnostic) = selection.diagnostic {
-        eprintln!("ai-hist: [codex] skipping SQLite history: {diagnostic}");
-    }
-    let Some((state, history)) = selection.pair else {
-        return Ok((Vec::new(), HashSet::new()));
-    };
-    let context = AcquisitionContext::new("codex", roots);
-    let threads = threads(&context, &state, &history)?;
-    let incomplete_rollouts = threads
-        .iter()
-        .filter_map(|t| t.rollout_path.as_ref().map(PathBuf::from))
-        .collect();
-    let candidates = threads
-        .into_iter()
-        .filter(|t| !t.is_child())
-        .map(|t| Candidate {
-            source: "codex",
-            locator: locator(&state, &t.id),
-            session_id: Some(t.id.clone()),
-            recency_hint_ms: Some(t.updated),
-            stamp: t.stamp(),
-        })
-        .collect();
-    Ok((candidates, incomplete_rollouts))
-}
-
-pub(crate) fn fingerprint(root: &Path) -> Result<Vec<Candidate>> {
-    let Some((state, history)) = databases(root)? else {
-        return Ok(Vec::new());
-    };
-    let mut out = Vec::new();
-    for path in [state, history] {
-        for suffix in ["", "-wal", "-journal"] {
-            let sidecar = PathBuf::from(format!("{}{suffix}", path.display()));
-            if sidecar.exists() {
-                let (stamp, recency_hint_ms) = crate::file_stamp_and_modified(&sidecar)?;
-                out.push(Candidate {
-                    source: "codex",
-                    locator: sidecar.to_string_lossy().into_owned(),
-                    session_id: None,
-                    recency_hint_ms,
-                    stamp,
-                });
-            }
-        }
-    }
-    Ok(out)
-}
-
-pub(crate) fn shallow(scan: &ScanEnv<'_>, c: &Candidate) -> Result<Option<ShallowSession>> {
-    let Some((state, id)) = parse_locator(&c.locator) else {
-        return Ok(None);
-    };
-    let context = AcquisitionContext::new("codex", scan.provider_roots);
-    scan.note_open();
-    scan.note_query();
-    let thread = sqlite_snapshot(&context, &state, |db| {
-        db.query_row(&format!("{THREAD_SQL} AND id=?1"), [id], thread_row)
-            .optional()
-            .map_err(Into::into)
-    })?;
-    let Some(mut t) = thread else {
-        return Ok(None);
-    };
-    let Some((_, history)) = databases(&scan.provider_roots.codex)? else {
-        return Ok(None);
-    };
-    scan.note_open();
-    scan.note_query();
-    if let Some((ordinal, offset)) = sqlite_snapshot(&context, &history, |db| {
-        db.query_row(
-            "SELECT next_rollout_ordinal,next_rollout_byte_offset FROM thread_history_projection_state WHERE thread_id=?1",
-            [id],
-            |r| Ok((r.get::<_, i64>(0)?, r.get::<_, i64>(1)?)),
-        )
-        .optional()
-        .map_err(Into::into)
-    })? {
-        t.next_ordinal = ordinal;
-        t.next_offset = offset;
-    }
-    scan.note_records(1);
-    if t.rollout_complete() || t.is_child() {
-        return Ok(None);
-    }
-    Ok(Some(ShallowSession {
-        source: "codex".into(),
-        session_id: t.id,
-        cwd: t.cwd,
-        git_branch: t.branch,
-        first_activity_ms: Some(t.created),
-        last_activity_ms: Some(t.updated),
-        first_prompt: t.first_user_message.map(|s| s.chars().take(512).collect()),
-        models: t.model.into_iter().collect(),
-        originator: t.originator,
-        agent_version: t.version,
-        repo_url: t.repo,
-        title: t.name.or(t.title),
-        raw_path: Some(c.locator.clone()),
-        source_stamp: Some(c.stamp.clone()),
-        ..Default::default()
-    }))
-}
+mod discovery;
+pub(crate) use discovery::{enumerate, fingerprint, shallow};
 
 fn items(db: &Connection, id: &str) -> Result<(Vec<Item>, Vec<Turn>)> {
     let mut items = Vec::new();
@@ -456,6 +369,8 @@ pub(crate) fn capture(
         items,
         turns,
         edges,
+        related: Vec::new(),
+        related_rollouts: Vec::new(),
     })?;
     let mut read_paths = vec![state.to_path_buf(), history.clone()];
     for path in [state, history.as_path()] {
@@ -470,8 +385,11 @@ pub(crate) fn capture(
     Ok(AcquiredSession::new(payload, 0, records, read_paths))
 }
 
+mod related;
+pub(crate) use related::{capture_related, restored_rollout};
+
 mod normalize;
-pub(crate) use normalize::normalize;
+pub(crate) use normalize::{normalize, normalize_with_relationships, retire, retire_if_changed};
 
 pub(crate) fn decode(acquired: &AcquiredSession) -> Result<Capture> {
     serde_json::from_value(acquired.payload.clone()).map_err(Into::into)
@@ -494,7 +412,7 @@ pub(crate) fn sync(
     roots.codex = root.to_path_buf();
     let context = AcquisitionContext::new("codex", &roots);
     let mut stamps = state
-        .get("codex_sqlite_v1")
+        .get("codex_sqlite_v2")
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
@@ -514,12 +432,13 @@ pub(crate) fn sync(
         let acquired = capture(&roots, &state_db, &t.id)?;
         let captured = decode(&acquired)?;
         let tx = conn.unchecked_transaction()?;
+        retire_if_changed(&tx, &captured)?;
         inserted += normalize(&tx, &captured, &state_db)?;
         tx.commit()?;
         read.push(t.id.clone());
         stamps.insert(t.id, json!(stamp));
     }
-    state.insert("codex_sqlite_v1".into(), Value::Object(stamps));
+    state.insert("codex_sqlite_v2".into(), Value::Object(stamps));
     Ok((inserted, read))
 }
 

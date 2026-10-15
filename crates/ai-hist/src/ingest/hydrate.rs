@@ -423,7 +423,7 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
         connector_id: options.source.clone(),
         connector_instance: "default".into(),
     };
-    let local_observation = observe_local_target(&conn, options, &mut target, &local_key)?;
+    let local_observation = observe_local_target(&conn, options, roots, &mut target, &local_key)?;
     // Before the stamp short-circuit: see `read_grok_unified_log_for_hydration`.
     let log_diagnostics = read_grok_unified_log_for_hydration(&conn, options, &roots.grok)?;
     let mut snapshot = source_snapshot(&conn, options, &target, roots, claude_snapshot)?;
@@ -524,6 +524,35 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
         source_diagnostics,
         snapshot.codex_relationship_complete,
     )
+}
+
+fn prefer_restored_codex_rollout(
+    options: &HydrateSessionOptions,
+    roots: &crate::ProviderRoots,
+    target: &mut CatalogTarget,
+    observation: &mut Option<SessionObservation>,
+) -> Result<()> {
+    if options.source != "codex" {
+        return Ok(());
+    }
+    let Some((state, id)) = target
+        .locator
+        .as_deref()
+        .and_then(crate::providers::codex::sqlite::parse_locator)
+    else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        id == options.session_id,
+        "SESSION_SOURCE_MISMATCH: Codex SQLite thread identity changed"
+    );
+    if let Some(rollout) = crate::providers::codex::sqlite::restored_rollout(roots, &state, id)? {
+        target.locator = Some(rollout.to_string_lossy().into_owned());
+        if let Some(observation) = observation.as_mut() {
+            observation.raw_locator = target.locator.clone();
+        }
+    }
+    Ok(())
 }
 
 /// Refuse a cancelled or invalid request, and a remote one whose connector is
@@ -715,11 +744,12 @@ fn commit_local_pass(
 fn observe_local_target(
     conn: &Connection,
     options: &HydrateSessionOptions,
+    roots: &crate::ProviderRoots,
     target: &mut CatalogTarget,
     local_key: &ObservationKey,
 ) -> Result<Option<SessionObservation>> {
     let observed = observations::list(conn, &options.source, &options.session_id)?;
-    let local_observation = observed.iter().find(|seen| &seen.key == local_key).cloned();
+    let mut local_observation = observed.iter().find(|seen| &seen.key == local_key).cloned();
     if let Some(observation) = &local_observation {
         // OpenCode and Devin enumerate by session id, while their local
         // parsers need the separately recorded provider database path from
@@ -737,6 +767,7 @@ fn observe_local_target(
             "CONNECTOR_NOT_CONFIGURED: the builtin local adapter has not observed this session"
         );
     }
+    prefer_restored_codex_rollout(options, roots, target, &mut local_observation)?;
     Ok(local_observation)
 }
 
@@ -4757,6 +4788,113 @@ mod tests {
             ],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn selected_sqlite_hydration_loads_children_and_follows_a_restored_rollout() {
+        let home = tempfile::tempdir().unwrap();
+        let codex = home.path().join(".codex");
+        fs::create_dir_all(&codex).unwrap();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex/sqlite");
+        for (script, database) in [
+            ("subagent-edge-state.sql", "state_5.sqlite"),
+            ("subagent-edge-history.sql", "thread_history_1.sqlite"),
+        ] {
+            let sql = fs::read_to_string(fixtures.join(script))
+                .unwrap()
+                .replace("{{CODEX_HOME}}", &codex.to_string_lossy());
+            Connection::open(codex.join(database))
+                .unwrap()
+                .execute_batch(&sql)
+                .unwrap();
+        }
+        let db = home.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        let locator = crate::providers::codex::sqlite::locator(
+            &codex.join("state_5.sqlite"),
+            "sqlite-parent",
+        );
+        catalog_row(&conn, "codex", "sqlite-parent", Some(Path::new(&locator)));
+        drop(conn);
+
+        let mut request = options("codex", "sqlite-parent");
+        request.include_related = false;
+        hydrate_session_at_with_home(&db, &request, home.path()).unwrap();
+        let child_events = || -> i64 {
+            open_db(&db).unwrap().query_row(
+                "SELECT count(*) FROM session_events WHERE source='codex' AND session_id='sqlite-child'",
+                [], |row| row.get(0),
+            ).unwrap()
+        };
+        assert_eq!(child_events(), 0);
+        let related: i64 = open_db(&db).unwrap().query_row(
+            "SELECT count(*) FROM session_relationships WHERE source='codex' AND parent_session_id='sqlite-parent'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(related, 0);
+
+        request.include_related = true;
+        let full = hydrate_session_at_with_home(&db, &request, home.path()).unwrap();
+        assert!(full
+            .related_session_ids
+            .contains(&"sqlite-child".to_string()));
+        assert!(child_events() > 0);
+        let root_event_id: i64 = open_db(&db).unwrap().query_row(
+            "SELECT id FROM session_events WHERE source='codex' AND session_id='sqlite-parent' ORDER BY id LIMIT 1",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(
+            hydrate_session_at_with_home(&db, &request, home.path())
+                .unwrap()
+                .status,
+            "unchanged"
+        );
+
+        let history = Connection::open(codex.join("thread_history_1.sqlite")).unwrap();
+        history.execute(
+            "INSERT INTO thread_items VALUES ('sqlite-child','turn-2','child-new',21,1776643221000,'agentMessage',?1)",
+            [json!({"type":"agentMessage","id":"child-new","text":"New child answer"}).to_string()],
+        ).unwrap();
+        let updated = hydrate_session_at_with_home(&db, &request, home.path()).unwrap();
+        assert_eq!(updated.status, "updated");
+        assert!(child_events() > 1);
+        let retained_event_id: i64 = open_db(&db).unwrap().query_row(
+            "SELECT id FROM session_events WHERE source='codex' AND session_id='sqlite-parent' ORDER BY id LIMIT 1",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(retained_event_id, root_event_id);
+
+        let rollout = codex.join("sessions/2026/04/20/rollout-sqlite-parent.jsonl");
+        fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+        let lines = [
+            json!({"timestamp":"2026-04-20T00:00:00Z","type":"session_meta","payload":{"id":"sqlite-parent","cwd":"/work/app"}}),
+            json!({"timestamp":"2026-04-20T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Restored prompt"}}),
+        ];
+        let text = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(&rollout, &text).unwrap();
+        Connection::open(codex.join("state_5.sqlite"))
+            .unwrap()
+            .execute(
+                "UPDATE threads SET rollout_path=?1 WHERE id='sqlite-parent'",
+                [rollout.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        history.execute(
+            "UPDATE thread_history_projection_state SET next_rollout_byte_offset=?1 WHERE thread_id='sqlite-parent'",
+            [text.len() as i64],
+        ).unwrap();
+        let restored = hydrate_session_at_with_home(&db, &request, home.path()).unwrap();
+        assert_eq!(restored.status, "updated");
+        let observation: String = open_db(&db).unwrap().query_row(
+            "SELECT raw_locator FROM session_presences WHERE source='codex' AND session_id='sqlite-parent' AND location='local'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(observation, rollout.to_string_lossy());
     }
 
     /// `<claude root>/transcripts/` is not a Claude root (#208, see the claude

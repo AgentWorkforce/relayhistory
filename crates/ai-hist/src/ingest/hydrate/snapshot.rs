@@ -23,9 +23,13 @@ pub(super) fn source_snapshot(
                 id == options.session_id,
                 "SESSION_SOURCE_MISMATCH: Codex SQLite thread identity changed"
             );
-            let acquired = crate::providers::codex::sqlite::capture(roots, &path, id)?;
+            let acquired = if options.include_related {
+                crate::providers::codex::sqlite::capture_related(roots, &path, id)?
+            } else {
+                crate::providers::codex::sqlite::capture(roots, &path, id)?
+            };
             return Ok(SourceSnapshot {
-                stamp: acquired.stamp.clone(),
+                stamp: format!("codex-sqlite-v2:{}", acquired.stamp),
                 bytes: 0,
                 records: SnapshotRecords::Counted(acquired.records),
                 path: Some(path),
