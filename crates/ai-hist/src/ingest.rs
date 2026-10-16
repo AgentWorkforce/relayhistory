@@ -322,7 +322,7 @@ pub(crate) fn with_capture_observer<T>(
     run()
 }
 
-fn capture_progress(source: &str, processed_files: usize, total_files: Option<usize>) {
+pub(crate) fn capture_progress(source: &str, processed_files: usize, total_files: Option<usize>) {
     CAPTURE_OBSERVER.with(|slot| {
         let observer = slot.borrow().clone();
         if let Some(observer) = observer {
@@ -887,7 +887,7 @@ const OPENCODE_NORMALIZER_GENERATION: &str = "opencode_normalizer_v2";
 /// The one-time backfill generations are part of it for the same reason as
 /// the keys above: each is recorded in sync state and re-reads unchanged
 /// sources when it moves, which it can only do if the sweep runs.
-use crate::providers::sweep_generation;
+use crate::providers::{qualify_source_fingerprint, sweep_generation};
 
 /// Version tag of the destination marker's encoding, so a marker written by a
 /// build with a different shape is rejected rather than misread.
@@ -2098,7 +2098,7 @@ fn sweep_fingerprint(
         .collect::<Vec<_>>();
     let inputs = sweep_only_fingerprint_inputs(roots);
     match discover::source_fingerprint_with(&env, &providers, &inputs) {
-        Ok(sources) => Some(format!("{}/{sources}", sweep_generation())),
+        Ok(sources) => qualify_source_fingerprint(sources),
         Err(error) => {
             sync_note!("  [sync] source fingerprint unavailable: {error:#}");
             None
@@ -3385,7 +3385,7 @@ const FORGOTTEN_PATHS_KEY: &str = "forgotten_paths";
 /// holds the pass open for one more sync, then it is no longer a path the
 /// state knows about and the generation is recorded normally, instead of the
 /// pass staying pending for the life of the install.
-fn forget_unobserved_paths(
+pub(crate) fn forget_unobserved_paths(
     state: &mut Map<String, Value>,
     stamps: &mut Map<String, Value>,
     stamp_map_key: &str,

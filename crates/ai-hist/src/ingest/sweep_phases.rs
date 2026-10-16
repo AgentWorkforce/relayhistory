@@ -126,50 +126,47 @@ pub(super) struct SweepPhases<'s, 'c> {
 }
 
 impl SweepPhases<'_, '_> {
-    /// Run every phase `scope` includes, in the order a full sweep runs them.
+    /// Run uncatalogued sources first, then every remaining source in registry
+    /// order. A new adapter therefore gets its first row before a large
+    /// backlog in an established source can delay it.
     pub(super) fn run(&mut self, scope: &SweepScope) -> Result<()> {
-        if scope.includes("claude") {
-            self.claude(scope)?;
-        }
-        if scope.includes("codex") {
-            self.codex(scope)?;
-        }
-        if scope.includes("cursor") {
-            self.cursor(scope)?;
-        }
-        if scope.includes("grok") {
-            self.grok(scope)?;
-        }
-        if scope.includes("muse") {
-            self.muse(scope)?;
-        }
-        if scope.includes("opencode") {
-            self.opencode()?;
-        }
-        if scope.includes("devin") {
-            self.devin()?;
-        }
-        for (source, adapter) in crate::providers::adapters() {
-            if !scope.includes(source) {
-                continue;
-            }
-            check_capture_cancelled()?;
-            let result = (adapter.sweep)(crate::providers::SweepContext {
-                conn: self.conn,
-                state: self.state,
-                roots: self.roots,
-                repairs: self.repairs,
-                paths: scope.paths(),
-            });
-            if let Some(result) = self.report.capture(source, result) {
-                self.inserted += result.inserted;
-                if result.unread > 0 {
-                    self.coverage.note_unread();
-                }
-                self.checkpoints.save(self.state);
-            }
+        for source in source_order(self.conn, scope)? {
+            self.run_source(source, scope)?;
         }
         check_capture_cancelled()
+    }
+
+    fn run_source(&mut self, source: &'static str, scope: &SweepScope) -> Result<()> {
+        match source {
+            "claude" => self.claude(scope),
+            "codex" => self.codex(scope),
+            "cursor" => self.cursor(scope),
+            "grok" => self.grok(scope),
+            "opencode" => self.opencode(),
+            "muse" => self.muse(scope),
+            "devin" => self.devin(),
+            source => {
+                let Some(adapter) = crate::providers::adapter(source) else {
+                    return Ok(());
+                };
+                check_capture_cancelled()?;
+                let result = (adapter.sweep)(crate::providers::SweepContext {
+                    conn: self.conn,
+                    state: self.state,
+                    roots: self.roots,
+                    repairs: self.repairs,
+                    paths: scope.paths(),
+                });
+                if let Some(result) = self.report.capture(source, result) {
+                    self.inserted += result.inserted;
+                    if result.unread > 0 {
+                        self.coverage.note_unread();
+                    }
+                    self.checkpoints.save(self.state);
+                }
+                Ok(())
+            }
+        }
     }
 
     /// Count a phase that returns rows inserted, checkpointing its state.
@@ -311,6 +308,29 @@ impl SweepPhases<'_, '_> {
     }
 }
 
+fn source_order(conn: &Connection, scope: &SweepScope) -> Result<Vec<&'static str>> {
+    let occupied: HashSet<String> = conn
+        .prepare("SELECT DISTINCT source FROM sessions")?
+        .query_map([], |row| row.get(0))?
+        .collect::<rusqlite::Result<_>>()?;
+    let selected: Vec<_> = crate::store::SOURCE_CHOICES
+        .iter()
+        .copied()
+        .filter(|source| scope.includes(source))
+        .collect();
+    Ok(selected
+        .iter()
+        .copied()
+        .filter(|source| !occupied.contains(*source))
+        .chain(
+            selected
+                .iter()
+                .copied()
+                .filter(|source| occupied.contains(*source)),
+        )
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -334,6 +354,20 @@ mod tests {
                 "{source} has no sweep phase, so a scoped sweep could never read it"
             );
         }
+    }
+
+    #[test]
+    fn sources_without_catalog_rows_run_before_registry_order() {
+        let conn = Connection::open_in_memory().unwrap();
+        crate::init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (source, session_id, discovery_state) VALUES ('claude', 'known', 'full')",
+            [],
+        )
+        .unwrap();
+        let order = source_order(&conn, &SweepScope::everything()).unwrap();
+        assert_eq!(order.last(), Some(&"claude"));
+        assert_eq!(order[..order.len() - 1], crate::store::SOURCE_CHOICES[1..]);
     }
 
     fn append(path: &Path, line: &str) {

@@ -3,7 +3,7 @@ use anyhow::{ensure, Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 use crate::discover::{Candidate, ScanEnv, ShallowSession};
@@ -231,26 +231,6 @@ pub(crate) fn current_locator(
     Ok(Some(locator(&state, id)))
 }
 
-fn projection(
-    context: &AcquisitionContext<'_>,
-    path: &Path,
-) -> Result<HashMap<String, (i64, i64)>> {
-    sqlite_snapshot(context, path, |db| {
-        let mut stmt = db.prepare("SELECT thread_id,next_rollout_ordinal,next_rollout_byte_offset FROM thread_history_projection_state LIMIT 100001")?;
-        let rows = stmt.query_map([], |r| Ok((r.get::<_, String>(0)?, r.get(1)?, r.get(2)?)))?;
-        let mut map = HashMap::new();
-        for row in rows {
-            let (id, ordinal, offset) = row?;
-            ensure!(
-                map.len() < MAX_THREADS,
-                "Codex projection exceeds safety limit"
-            );
-            map.insert(id, (ordinal, offset));
-        }
-        Ok(map)
-    })
-}
-
 fn thread_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Thread> {
     Ok(Thread {
         id: r.get(0)?,
@@ -279,29 +259,6 @@ fn thread_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Thread> {
 
 const THREAD_SQL: &str = "SELECT id,rollout_path,created_at_ms,updated_at_ms,source,cwd,git_branch,git_origin_url,title,name,first_user_message,originator,cli_version,model,tokens_used,archived,agent_nickname,agent_role,thread_source FROM threads WHERE history_mode='paginated'";
 
-fn threads(context: &AcquisitionContext<'_>, state: &Path, history: &Path) -> Result<Vec<Thread>> {
-    let offsets = projection(context, history)?;
-    sqlite_snapshot(context, state, |db| {
-        let mut stmt = db.prepare(&format!("{THREAD_SQL} LIMIT 100001"))?;
-        let mut out = Vec::new();
-        for (scanned, row) in stmt.query_map([], thread_row)?.enumerate() {
-            ensure!(
-                scanned < MAX_THREADS,
-                "Codex thread discovery exceeds safety limit"
-            );
-            let mut thread = row?;
-            if let Some((ordinal, offset)) = offsets.get(&thread.id) {
-                thread.next_ordinal = *ordinal;
-                thread.next_offset = *offset;
-            }
-            if !thread.rollout_complete() {
-                out.push(thread);
-            }
-        }
-        Ok(out)
-    })
-}
-
 pub(crate) fn locator(state: &Path, id: &str) -> String {
     format!("sqlite:{}#{id}", state.display())
 }
@@ -313,6 +270,13 @@ pub(crate) fn parse_locator(locator: &str) -> Option<(PathBuf, &str)> {
 
 mod discovery;
 pub(crate) use discovery::{enumerate, fingerprint, incomplete_projection_owns_rollout, shallow};
+mod sweep;
+pub(crate) use sweep::{
+    backlog_pending, fingerprint_component, remember_source_fingerprint, reset_backlog, sync,
+    with_sweep_policy, SyncPass,
+};
+#[cfg(test)]
+use sweep::{sync_with_policy, with_test_policy, SweepPolicy, DEFAULT_SWEEP_THREADS};
 
 fn items(db: &Connection, id: &str) -> Result<(Vec<Item>, Vec<Turn>)> {
     let mut items = Vec::new();
@@ -460,67 +424,6 @@ pub(crate) use normalize::{
 
 pub(crate) fn decode(acquired: &AcquiredSession) -> Result<Capture> {
     serde_json::from_value(acquired.payload.clone()).map_err(Into::into)
-}
-
-pub(crate) fn sync(
-    conn: &Connection,
-    state: &mut serde_json::Map<String, Value>,
-    root: &Path,
-    repairs: &crate::ingest::SweepRepairs,
-) -> Result<(usize, Vec<String>)> {
-    let Some((state_db, history)) = databases(root)? else {
-        return Ok((0, Vec::new()));
-    };
-    let home = root.parent().unwrap_or(root).to_path_buf();
-    let mut roots = crate::ProviderRoots::from_home(
-        home.clone(),
-        home.join(".local/share/opencode/opencode.db"),
-    );
-    roots.codex = root.to_path_buf();
-    let context = AcquisitionContext::new("codex", &roots);
-    let mut stamps = state
-        .get("codex_sqlite_v2")
-        .and_then(Value::as_object)
-        .cloned()
-        .unwrap_or_default();
-    let candidates = threads(&context, &state_db, &history)?;
-    let active: HashSet<&str> = candidates.iter().map(|t| t.id.as_str()).collect();
-    stamps.retain(|id, _| active.contains(id.as_str()));
-    let mut inserted = 0;
-    let mut read = Vec::new();
-    for t in candidates {
-        crate::ingest::check_capture_cancelled()?;
-        let stamp = t.stamp();
-        if stamps.get(&t.id).and_then(Value::as_str) == Some(&stamp)
-            && !repairs.contains("codex", &t.id)
-        {
-            continue;
-        }
-        let result = (|| -> Result<usize> {
-            let acquired = capture(&roots, &state_db, &t.id)?;
-            let captured = decode(&acquired)?;
-            let tx = conn.unchecked_transaction()?;
-            retire_if_changed(&tx, &captured, true)?;
-            let count = normalize(&tx, &captured, &state_db)?;
-            tx.commit()?;
-            Ok(count)
-        })();
-        match result {
-            Ok(count) => inserted += count,
-            Err(error) if error.is::<crate::ingest::CaptureCancelled>() => return Err(error),
-            Err(error) => {
-                eprintln!(
-                    "ai-hist: [codex] skipping SQLite thread {}: {error:#}",
-                    t.id
-                );
-                continue;
-            }
-        }
-        read.push(t.id.clone());
-        stamps.insert(t.id, json!(stamp));
-    }
-    state.insert("codex_sqlite_v2".into(), Value::Object(stamps));
-    Ok((inserted, read))
 }
 
 #[cfg(test)]

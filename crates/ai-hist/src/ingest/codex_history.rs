@@ -119,10 +119,12 @@ fn sync_codex_sqlite_scoped(
         sync_note!("  [codex] skipping SQLite history: {diagnostic}");
     }
     let Some((state_db, history_db)) = selection.pair else {
+        crate::providers::codex::sqlite::reset_backlog(state);
         return Ok(0);
     };
     let changed = paths.is_none()
         || !repairs.is_empty()
+        || crate::providers::codex::sqlite::backlog_pending(state)
         || paths.is_some_and(|scope| {
             scope.mentions(&root.join("sessions"))
                 || scope.mentions(&root.join("archived_sessions"))
@@ -136,12 +138,15 @@ fn sync_codex_sqlite_scoped(
             })
         });
     if changed {
-        let (inserted, read) = crate::providers::codex::sqlite::sync(conn, state, root, repairs)?;
-        for id in read {
+        let outcome = crate::providers::codex::sqlite::sync(conn, state, root, repairs)?;
+        for id in outcome.read {
             coverage.note_read("codex", &id, true);
             touched.insert(id);
         }
-        Ok(inserted)
+        if outcome.incomplete {
+            coverage.note_unread();
+        }
+        Ok(outcome.inserted)
     } else {
         Ok(0)
     }
@@ -201,6 +206,53 @@ mod tests {
     use crate::discover::{CodexProvider, DiscoveryEnv, ShallowSessionProvider};
 
     #[test]
+    fn scoped_history_tick_continues_a_pending_sqlite_backlog() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".codex");
+        std::fs::create_dir_all(&root).unwrap();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex/sqlite");
+        for (script, database) in [
+            ("pruned-all-items-state.sql", "state_5.sqlite"),
+            ("pruned-all-items-history.sql", "thread_history_1.sqlite"),
+        ] {
+            let sql = std::fs::read_to_string(fixtures.join(script))
+                .unwrap()
+                .replace("{{CODEX_HOME}}", &root.to_string_lossy());
+            Connection::open(root.join(database))
+                .unwrap()
+                .execute_batch(&sql)
+                .unwrap();
+        }
+        let conn = crate::open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        state.insert(
+            "codex_sqlite_sweep_cursor_v1".into(),
+            Value::String(
+                serde_json::json!({
+                    "updated_at_ms": i64::MAX,
+                    "thread_id": "cursor",
+                    "restart": true
+                })
+                .to_string(),
+            ),
+        );
+        let scope = crate::ingest::path_scope::PathScope::from_paths([root.join("history.jsonl")]);
+        let mut touched = HashSet::new();
+
+        sync_codex_sources(
+            &conn,
+            &mut state,
+            &root,
+            &SweepRepairs::default(),
+            &mut SweepCoverage::default(),
+            &mut touched,
+            scope.as_ref(),
+        )
+        .unwrap();
+        assert!(touched.contains("sqlite-pruned-all-items"));
+    }
+
+    #[test]
     fn newer_sqlite_schema_skips_fallback_without_losing_rollouts() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join(".codex");
@@ -234,6 +286,16 @@ mod tests {
         assert_eq!(candidates[0].locator, rollout.to_string_lossy());
 
         let mut state = Map::new();
+        state.insert(
+            "codex_sqlite_sweep_cursor_v1".into(),
+            Value::String(
+                serde_json::json!({
+                    "updated_at_ms": 1,
+                    "thread_id": "stale"
+                })
+                .to_string(),
+            ),
+        );
         sync_codex_sources(
             &conn,
             &mut state,
@@ -244,6 +306,7 @@ mod tests {
             None,
         )
         .unwrap();
+        assert!(state["codex_sqlite_sweep_cursor_v1"].is_null());
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sessions WHERE source='codex' AND session_id='sqlite-rollout-primary'",

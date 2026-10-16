@@ -4,7 +4,15 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Patch]
+
+### Fixed
+
+- Codex SQLite recovery processes at most 50 recent threads per sweep, resumes the backlog newest-first, reports thread progress and lets uncatalogued sources run first instead of blocking later providers behind an unbounded pass.
+
+### Rust API
+
+- `SyncOptions::codex_sqlite_max_age_days` and its builder override the 30-day Codex SQLite recovery window; zero disables the cutoff and `AI_HIST_CODEX_SQLITE_MAX_AGE_DAYS` supplies the process default.
 
 ## [0.45.0] - 2026-10-16
 

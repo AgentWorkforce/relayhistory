@@ -108,6 +108,7 @@ fn state() -> &'static Mutex<State> {
 /// Dropping it forgets those bytes. Open counts stay, for the test that reads
 /// them after the sweep returns.
 pub(crate) struct SweepGuard {
+    _codex_sqlite: crate::providers::codex::sqlite::SyncPass,
     /// Tests sweep many stores in one process, and this state is the
     /// process's: one sweep at a time keeps each sweep's open counts its own.
     #[cfg(test)]
@@ -144,6 +145,7 @@ pub(crate) fn begin_sweep() -> SweepGuard {
     state.parked = None;
     state.opened.clear();
     SweepGuard {
+        _codex_sqlite: crate::providers::codex::sqlite::SyncPass::begin(),
         #[cfg(test)]
         _serial: serial,
     }

@@ -645,9 +645,14 @@ impl SessionStore {
             None => SweepScope::everything(),
             Some(sources) => SweepScope::only(sources.iter().map(|source| source.as_str())),
         };
-        let (tick, changed) = controlled(opts.stop.as_ref(), opts.progress.as_ref(), || {
-            self.sync_tick(opts.force, opts.lock_timeout_ms, &scope)
-        })?;
+        let (tick, changed) = crate::providers::codex::sqlite::with_sweep_policy(
+            opts.codex_sqlite_max_age_days,
+            || {
+                controlled(opts.stop.as_ref(), opts.progress.as_ref(), || {
+                    self.sync_tick(opts.force, opts.lock_timeout_ms, &scope)
+                })
+            },
+        )?;
         Ok(SyncReport {
             swept: tick.swept,
             changed,

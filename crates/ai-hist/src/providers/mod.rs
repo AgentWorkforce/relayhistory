@@ -13,7 +13,7 @@ mod acquisition;
 pub(crate) mod file_history;
 mod sweep;
 pub(crate) use acquisition::*;
-pub(crate) use sweep::sweep_generation;
+pub(crate) use sweep::{qualify_source_fingerprint, sweep_generation};
 
 /// Provider code owns capability declarations beside the implementation.
 #[derive(Clone, Copy)]

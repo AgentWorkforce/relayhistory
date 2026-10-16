@@ -933,7 +933,12 @@ How each adapter works:
   rollouts remain primary. The SQLite layout has only a cumulative
   `threads.tokens_used` total, so it supplies one snapshot marker and no
   per-message usage. A newer store version or an incomplete pair skips SQLite
-  with a diagnostic while rollout capture continues.
+  with a diagnostic while rollout capture continues. Recovery walks eligible
+  threads newest-first in batches of 50 and resumes from a persisted sweep
+  cursor, allowing every other provider to run between batches. The default
+  eligibility window is 30 days; embedders can set
+  `SyncOptions::codex_sqlite_max_age_days`, and processes can set
+  `AI_HIST_CODEX_SQLITE_MAX_AGE_DAYS` (`0` disables the cutoff).
 
   A rollout is a **delegated child thread** exactly when its `session_meta`
   carries a subagent marker (`thread_source` `subagent` or `guardian_review`,

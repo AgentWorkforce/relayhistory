@@ -362,6 +362,9 @@ fn capture(fixture: &Fixture, home: &Path) -> Value {
     // fixture run.
     std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
     std::env::remove_var("AI_HIST_DB");
+    // Historical fixtures deliberately predate the production 30-day Codex
+    // SQLite recovery window; the corpus tests parser fidelity, not recency.
+    std::env::set_var("AI_HIST_CODEX_SQLITE_MAX_AGE_DAYS", "0");
     // Muse Code's root follows `XDG_DATA_HOME`; the fixture's own `HOME`
     // layout has to win over whatever the machine running the tests sets.
     std::env::remove_var("XDG_DATA_HOME");
