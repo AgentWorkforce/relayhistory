@@ -53,7 +53,7 @@ pub(super) fn capture_rollout(
 
 const MAX_IMAGE_BYTES: usize = 1_048_576;
 
-fn image_markdown(url: &str) -> Option<String> {
+pub(crate) fn image_markdown(url: &str) -> Option<String> {
     if url.len() > MAX_IMAGE_BYTES.div_ceil(3) * 4 + 64 {
         return None;
     }

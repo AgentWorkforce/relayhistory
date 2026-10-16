@@ -16,12 +16,12 @@ use std::path::Path;
 /// Whether `incoming` is a different transcript from the one `sessions.raw_path`
 /// already names, and that file is still present.
 ///
-/// One stat of the stored path, and only when the paths differ. Same path, no
-/// stored path (including NULL), a SQLite store, and a stored path that is no
-/// longer a file all return false so the caller writes normally. OpenCode and
-/// Devin name that store however it was configured; the file stays on disk
-/// after it drops a session, and the session's next store claims the row. A
-/// JSON session file is the transcript, so a sibling file still leaves it.
+/// Same path, no stored path (including NULL), a shared SQLite store, and a
+/// stored path that is no longer a file all return false so the caller writes
+/// normally. A Codex SQLite projection may also claim its own incomplete
+/// rollout. OpenCode and Devin name their store however it was configured;
+/// the file stays on disk after it drops a session, and the session's next
+/// store claims the row. A sibling JSON transcript keeps its catalog row.
 pub(crate) fn incoming_must_not_replace(
     conn: &Connection,
     source: &str,
@@ -37,7 +37,15 @@ pub(crate) fn incoming_must_not_replace(
     if stored == incoming || shared_sqlite_store(source, &stored) {
         return Ok(false);
     }
-    // A Codex rollout compressed since it was catalogued is still there.
+    // A projection may replace its own incomplete rollout, but not a live
+    // sibling transcript that happens to share the session id.
+    if source == "codex"
+        && incoming.starts_with("sqlite:")
+        && crate::providers::codex::sqlite::incomplete_projection_owns_rollout(incoming, &stored)?
+    {
+        return Ok(false);
+    }
+    // A compressed Codex rollout is present under its plain locator.
     Ok(crate::ingest::transcript_file::exists(Path::new(&stored)))
 }
 
@@ -197,4 +205,119 @@ pub(crate) fn retained_observation(
     )
     .optional()
     .map_err(Into::into)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_compressed_rollout_keeps_catalog_ownership_from_sqlite() {
+        let dir = tempfile::tempdir().unwrap();
+        let conn = crate::open_db(&dir.path().join("history.db")).unwrap();
+        let rollout = dir.path().join("sibling.jsonl");
+        let compressed = crate::ingest::transcript_file::compressed_path(&rollout);
+        std::fs::write(&compressed, b"stored transcript").unwrap();
+        conn.execute(
+            "INSERT INTO sessions (source, session_id, raw_path) VALUES ('codex', 'shared', ?1)",
+            [rollout.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+        assert!(incoming_must_not_replace(
+            &conn,
+            "codex",
+            "shared",
+            Some("sqlite:/elsewhere/state_5.sqlite#shared")
+        )
+        .unwrap());
+        std::fs::remove_file(compressed).unwrap();
+        assert!(!incoming_must_not_replace(
+            &conn,
+            "codex",
+            "shared",
+            Some("sqlite:/elsewhere/state_5.sqlite#shared")
+        )
+        .unwrap());
+    }
+
+    #[test]
+    fn sqlite_projection_replaces_only_its_own_incomplete_rollout() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".codex");
+        let sessions = root.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let rollout = sessions.join("own.jsonl");
+        let sibling = sessions.join("sibling.jsonl");
+        std::fs::write(&rollout, b"short").unwrap();
+        std::fs::write(&sibling, b"sibling").unwrap();
+        let state = root.join("state_5.sqlite");
+        let history = root.join("thread_history_1.sqlite");
+        let state_db = Connection::open(&state).unwrap();
+        state_db
+            .execute_batch("CREATE TABLE threads (id TEXT, rollout_path TEXT, history_mode TEXT);")
+            .unwrap();
+        state_db
+            .execute(
+                "INSERT INTO threads VALUES ('shared', ?1, 'paginated')",
+                [rollout.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        let history_db = Connection::open(&history).unwrap();
+        history_db
+            .execute_batch("CREATE TABLE thread_history_projection_state (thread_id TEXT, next_rollout_byte_offset INTEGER);")
+            .unwrap();
+        history_db
+            .execute(
+                "INSERT INTO thread_history_projection_state VALUES ('shared', 100)",
+                [],
+            )
+            .unwrap();
+        let conn = crate::open_db(&dir.path().join("history.db")).unwrap();
+        conn.execute(
+            "INSERT INTO sessions (source, session_id, raw_path) VALUES ('codex', 'shared', ?1)",
+            [rollout.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+        let incoming = crate::providers::codex::sqlite::locator(&state, "shared");
+        assert!(!incoming_must_not_replace(&conn, "codex", "shared", Some(&incoming)).unwrap());
+        conn.execute(
+            "UPDATE sessions SET raw_path=?1 WHERE source='codex' AND session_id='shared'",
+            [sibling.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+        assert!(incoming_must_not_replace(&conn, "codex", "shared", Some(&incoming)).unwrap());
+        conn.execute(
+            "UPDATE sessions SET raw_path=?1 WHERE source='codex' AND session_id='shared'",
+            [rollout.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+        history_db
+            .execute(
+                "UPDATE thread_history_projection_state SET next_rollout_byte_offset=1",
+                [],
+            )
+            .unwrap();
+        assert!(incoming_must_not_replace(&conn, "codex", "shared", Some(&incoming)).unwrap());
+        history_db
+            .execute(
+                "UPDATE thread_history_projection_state SET next_rollout_byte_offset=100",
+                [],
+            )
+            .unwrap();
+        let newer_state = root.join("state_6.sqlite");
+        Connection::open(&newer_state).unwrap();
+        let newer_locator = crate::providers::codex::sqlite::locator(&newer_state, "shared");
+        // A newer schema is not admitted until discovery supports it.
+        assert!(incoming_must_not_replace(&conn, "codex", "shared", Some(&newer_locator)).unwrap());
+        assert!(incoming_must_not_replace(&conn, "codex", "shared", Some(&incoming)).unwrap());
+        std::fs::remove_file(newer_state).unwrap();
+        assert!(!incoming_must_not_replace(&conn, "codex", "shared", Some(&incoming)).unwrap());
+
+        // A broken projection must not prevent an existing rollout from
+        // keeping its catalog row, or a missing rollout from yielding it.
+        state_db.execute_batch("DROP TABLE threads").unwrap();
+        assert!(incoming_must_not_replace(&conn, "codex", "shared", Some(&incoming)).unwrap());
+        std::fs::remove_file(&rollout).unwrap();
+        assert!(!incoming_must_not_replace(&conn, "codex", "shared", Some(&incoming)).unwrap());
+    }
 }
