@@ -1046,6 +1046,18 @@ fn devin_mapping_skips_review_sessions_and_keeps_uncategorized_work() {
             "{category} must still map"
         );
     }
+    // The review filter is scoped to automation-spawned sessions: a
+    // person-directed session whose work the classifier files as review
+    // still belongs in the catalog.
+    for origin in ["webapp", "api", "desktop", "cli"] {
+        let mut entry = devin_session(DEVIN_SESSION_ID, "Review my PR");
+        entry["origin"] = serde_json::json!(origin);
+        entry["category"] = serde_json::json!("code_review");
+        assert!(
+            map_devin_session(&entry).is_some(),
+            "{origin} review work must still map"
+        );
+    }
 }
 
 #[test]
@@ -1101,6 +1113,44 @@ fn devin_credentials_parse_the_flat_toml() {
     assert_eq!(devin_org_id(&config).as_deref(), Some("org-x"));
     std::fs::write(&config, "not json").unwrap();
     assert!(devin_org_id(&config).is_none());
+}
+
+#[test]
+fn devin_enumeration_keeps_walking_past_review_only_pages() {
+    // An org whose recent history is dense with Devin Review automations
+    // must not exhaust the page bound on filtered sessions: pages that yield
+    // nothing do not count toward it, while an absolute fetch bound still
+    // terminates the walk.
+    let _cleared = without_credentials_override();
+    let home = tempfile::tempdir().unwrap();
+    let mut review = devin_session(DEVIN_SESSION_ID, "Review this push");
+    review["category"] = serde_json::json!("code_review");
+    let mut script: Vec<(u16, String)> = (0..MAX_LIST_PAGES + 20)
+        .map(|page| {
+            (
+                200,
+                devin_page(&[review.clone()], Some(&format!("cursor+{page}")), true),
+            )
+        })
+        .collect();
+    script.push((
+        200,
+        devin_page(
+            &[devin_session("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "real")],
+            None,
+            false,
+        ),
+    ));
+    let transport = Arc::new(ScriptedDevinTransport::new(script));
+    let provider = devin_provider(home.path(), &transport, None);
+    let conn = catalog();
+    let env = env_at(&conn, home.path());
+    let candidates = provider.enumerate(&env, None).unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(
+        candidates[0].session_id.as_deref(),
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    );
 }
 
 #[test]
