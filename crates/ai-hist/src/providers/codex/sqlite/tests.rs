@@ -161,10 +161,8 @@ fn full_sync_persists_multiple_cursor_pages_and_restarts_for_a_new_arrival() {
     }
     assert!(settled, "a stable traversal eventually arms the fast path");
     assert_eq!(count(), 8);
-    let persisted: Value = serde_json::from_slice(
-        &std::fs::read(dir.path().join(".sync-state.json")).unwrap(),
-    )
-    .unwrap();
+    let persisted_bytes = std::fs::read(dir.path().join(".sync-state.json")).unwrap();
+    let persisted: Value = serde_json::from_slice(&persisted_bytes).unwrap();
     assert!(persisted["codex_sqlite_sweep_cursor_v1"].is_null());
 }
 
@@ -630,12 +628,8 @@ fn a_pruned_rollout_is_read_again_after_it_was_restored() {
         .is_empty());
 
     std::fs::remove_file(&rollout).unwrap();
-    assert_eq!(
-        sync(&conn, &mut state, &codex, &repairs)
-            .unwrap()
-            .read,
-        vec!["sqlite-rollout-primary".to_string()]
-    );
+    let pruned = sync(&conn, &mut state, &codex, &repairs).unwrap().read;
+    assert_eq!(pruned, vec!["sqlite-rollout-primary".to_string()]);
     std::fs::write(&rollout, "complete rollout").unwrap();
     assert!(sync(&conn, &mut state, &codex, &repairs)
         .unwrap()
@@ -643,12 +637,8 @@ fn a_pruned_rollout_is_read_again_after_it_was_restored() {
         .is_empty());
 
     std::fs::remove_file(&rollout).unwrap();
-    assert_eq!(
-        sync(&conn, &mut state, &codex, &repairs)
-            .unwrap()
-            .read,
-        vec!["sqlite-rollout-primary".to_string()]
-    );
+    let repruned = sync(&conn, &mut state, &codex, &repairs).unwrap().read;
+    assert_eq!(repruned, vec!["sqlite-rollout-primary".to_string()]);
 }
 
 #[test]

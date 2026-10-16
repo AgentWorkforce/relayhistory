@@ -112,8 +112,9 @@ impl SyncPass {
 impl Drop for SyncPass {
     fn drop(&mut self) {
         SWEEP_DISCOVERY_IDS.with(|slot| *slot.borrow_mut() = self.ids.take());
-        SWEEP_SOURCE_FINGERPRINT
-            .with(|slot| *slot.borrow_mut() = self.source_fingerprint.take());
+        SWEEP_SOURCE_FINGERPRINT.with(|slot| {
+            *slot.borrow_mut() = self.source_fingerprint.take();
+        });
     }
 }
 
@@ -232,9 +233,7 @@ fn select_threads(
     source_fingerprint: Option<&str>,
 ) -> Result<Selection> {
     sqlite_snapshot(context, state_db, |db| {
-        let retry_required = start
-            .as_ref()
-            .is_some_and(|cursor| cursor.retry_required);
+        let retry_required = matches!(start.as_ref(), Some(cursor) if cursor.retry_required);
         let mut selected = Vec::new();
         let mut clear_stamps = Vec::new();
         let mut after = start.filter(|cursor| !cursor.restart);
@@ -441,9 +440,7 @@ pub(crate) fn sync(
         Some(cursor) => cursor.source_fingerprint.clone(),
         None => source_fingerprint.clone(),
     };
-    let retry_required = start
-        .as_ref()
-        .is_some_and(|cursor| cursor.retry_required);
+    let retry_required = matches!(start.as_ref(), Some(cursor) if cursor.retry_required);
     let mut selection = select_threads(
         &context,
         &state_db,

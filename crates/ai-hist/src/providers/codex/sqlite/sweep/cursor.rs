@@ -1,5 +1,5 @@
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value};
 
 const KEY: &str = "codex_sqlite_sweep_cursor_v1";
 
@@ -30,7 +30,8 @@ pub(super) fn load(state: &Map<String, Value>) -> Option<SweepCursor> {
 pub(super) fn store(state: &mut Map<String, Value>, cursor: Option<SweepCursor>) {
     match cursor {
         Some(cursor) => {
-            state.insert(KEY.into(), json!(serde_json::to_string(&cursor).expect("cursor")));
+            let encoded = serde_json::to_string(&cursor).expect("cursor");
+            state.insert(KEY.into(), Value::String(encoded));
         }
         None => {
             // Sync-state checkpoints merge keys forward. An explicit scalar
