@@ -237,6 +237,12 @@ pub struct SyncOptions {
     /// JSON written before the field existed, which means a full sweep.
     #[serde(default)]
     pub sources: Option<Vec<Source>>,
+    /// Maximum age, in days, of a Codex thread whose rollout is gone before
+    /// its SQLite projection is skipped. `None` uses
+    /// `AI_HIST_CODEX_SQLITE_MAX_AGE_DAYS`, then 30 days. `Some(0)` disables
+    /// the age cutoff. Each sweep still reads at most 50 projected threads.
+    #[serde(default)]
+    pub codex_sqlite_max_age_days: Option<u64>,
 }
 
 impl SyncOptions {
@@ -251,6 +257,14 @@ impl SyncOptions {
     #[must_use]
     pub fn force(mut self, force: bool) -> Self {
         self.force = force;
+        self
+    }
+
+    /// Set the Codex SQLite-only thread cutoff; see
+    /// [`SyncOptions::codex_sqlite_max_age_days`].
+    #[must_use]
+    pub fn codex_sqlite_max_age_days(mut self, days: u64) -> Self {
+        self.codex_sqlite_max_age_days = Some(days);
         self
     }
 

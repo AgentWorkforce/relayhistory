@@ -53,11 +53,8 @@ pub(crate) fn enumerate(
         return Ok((Vec::new(), HashSet::new()));
     };
     let context = AcquisitionContext::new("codex", roots);
-    let threads = threads(&context, &state, &history)?;
-    let incomplete_rollouts = threads
-        .iter()
-        .filter_map(|t| t.rollout_path.as_ref().map(PathBuf::from))
-        .collect();
+    let threads = super::sweep::discovery_threads(&context, &state, &history)?;
+    let incomplete_rollouts = super::sweep::incomplete_rollout_paths(&context, &state, &history)?;
     let candidates = threads
         .into_iter()
         .filter(|t| !t.is_child())

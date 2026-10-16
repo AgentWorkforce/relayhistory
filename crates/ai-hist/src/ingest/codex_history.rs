@@ -136,12 +136,15 @@ fn sync_codex_sqlite_scoped(
             })
         });
     if changed {
-        let (inserted, read) = crate::providers::codex::sqlite::sync(conn, state, root, repairs)?;
-        for id in read {
+        let outcome = crate::providers::codex::sqlite::sync(conn, state, root, repairs)?;
+        for id in outcome.read {
             coverage.note_read("codex", &id, true);
             touched.insert(id);
         }
-        Ok(inserted)
+        if outcome.incomplete {
+            coverage.note_unread();
+        }
+        Ok(outcome.inserted)
     } else {
         Ok(0)
     }

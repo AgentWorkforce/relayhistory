@@ -10,8 +10,70 @@ use crate::observations::ObservationKey;
 use crate::SessionLocation;
 use anyhow::Result;
 use rusqlite::{params, Connection, OptionalExtension};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::io::Read;
 use std::path::Path;
+
+thread_local! {
+    static RAW_PATH_CACHE: RefCell<Vec<RawPathCache>> = const { RefCell::new(Vec::new()) };
+}
+
+struct RawPathCache {
+    conn: usize,
+    source: String,
+    paths: HashMap<String, Option<String>>,
+    codex_rollouts: HashMap<String, Option<String>>,
+}
+
+fn conn_id(conn: &Connection) -> usize {
+    std::ptr::from_ref(conn) as usize
+}
+
+/// Read one source's catalog owners in one statement and reuse them for a
+/// bounded sweep. The cached value is deliberately the path at sweep start:
+/// each incoming transcript is judged against the owner that preceded this
+/// pass, not against an earlier candidate from the same pass.
+pub(crate) fn with_raw_path_cache<T>(
+    conn: &Connection,
+    source: &str,
+    sessions: &[(String, Option<String>)],
+    run: impl FnOnce() -> Result<T>,
+) -> Result<T> {
+    let session_ids: Vec<_> = sessions.iter().map(|(id, _)| id.clone()).collect();
+    let ids = serde_json::to_string(&session_ids)?;
+    let mut paths: HashMap<String, Option<String>> =
+        session_ids.iter().cloned().map(|id| (id, None)).collect();
+    let mut stmt = conn.prepare_cached(
+        "SELECT session_id,raw_path FROM sessions WHERE source=?1 \
+         AND session_id IN (SELECT value FROM json_each(?2))",
+    )?;
+    let rows = stmt.query_map(params![source, ids], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+    })?;
+    for row in rows {
+        let (id, path) = row?;
+        paths.insert(id, path.filter(|path| !path.is_empty()));
+    }
+    RAW_PATH_CACHE.with(|cache| {
+        cache.borrow_mut().push(RawPathCache {
+            conn: conn_id(conn),
+            source: source.to_string(),
+            paths,
+            codex_rollouts: sessions.iter().cloned().collect(),
+        });
+    });
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            RAW_PATH_CACHE.with(|cache| {
+                cache.borrow_mut().pop();
+            });
+        }
+    }
+    let _restore = Restore;
+    run()
+}
 
 /// Whether `incoming` is a different transcript from the one `sessions.raw_path`
 /// already names, and that file is still present.
@@ -36,6 +98,24 @@ pub(crate) fn incoming_must_not_replace(
     };
     if stored == incoming || shared_sqlite_store(source, &stored) {
         return Ok(false);
+    }
+    // The bounded Codex selection already joined each thread to its
+    // projection checkpoint and proved the current rollout incomplete. Reuse
+    // that sweep snapshot instead of reopening both Codex databases for every
+    // catalog upsert. A different live sibling still keeps ownership.
+    if source == "codex" && incoming.starts_with("sqlite:") {
+        let rollout = RAW_PATH_CACHE.with(|cache| {
+            cache
+                .borrow()
+                .iter()
+                .rev()
+                .find(|entry| entry.conn == conn_id(conn) && entry.source == source)
+                .and_then(|entry| entry.codex_rollouts.get(session_id).cloned())
+        });
+        if let Some(rollout) = rollout {
+            return Ok(crate::ingest::transcript_file::exists(Path::new(&stored))
+                && rollout.as_deref() != Some(stored.as_str()));
+        }
     }
     // A projection may replace its own incomplete rollout, but not a live
     // sibling transcript that happens to share the session id.
@@ -65,6 +145,16 @@ pub(crate) fn recorded_path_is(
 /// `raw_path` as stored, or `None` when the row is missing or the column is
 /// NULL or empty.
 fn catalog_raw_path(conn: &Connection, source: &str, session_id: &str) -> Result<Option<String>> {
+    if let Some(path) = RAW_PATH_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .iter()
+            .rev()
+            .find(|entry| entry.conn == conn_id(conn) && entry.source == source)
+            .and_then(|entry| entry.paths.get(session_id).cloned())
+    }) {
+        return Ok(path);
+    }
     let stored = conn
         .query_row(
             "SELECT raw_path FROM sessions WHERE source = ?1 AND session_id = ?2",

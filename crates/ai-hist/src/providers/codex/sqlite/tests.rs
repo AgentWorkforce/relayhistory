@@ -19,6 +19,256 @@ fn install_fixture(codex: &Path, stem: &str) {
     }
 }
 
+fn install_thread_set(codex: &Path, updated: &[i64]) {
+    std::fs::create_dir_all(codex).unwrap();
+    let state = Connection::open(codex.join("state_5.sqlite")).unwrap();
+    state
+        .execute_batch(
+            "CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, created_at_ms INTEGER, \
+             updated_at_ms INTEGER, source TEXT, cwd TEXT, git_branch TEXT, git_origin_url TEXT, \
+             title TEXT, name TEXT, first_user_message TEXT, originator TEXT, cli_version TEXT, \
+             model TEXT, tokens_used INTEGER, archived INTEGER, agent_nickname TEXT, \
+             agent_role TEXT, history_mode TEXT, thread_source TEXT); \
+             CREATE TABLE thread_spawn_edges(parent_thread_id TEXT,child_thread_id TEXT,status TEXT);",
+        )
+        .unwrap();
+    let history = Connection::open(codex.join("thread_history_1.sqlite")).unwrap();
+    history
+        .execute_batch(
+            "CREATE TABLE thread_history_projection_state(thread_id TEXT PRIMARY KEY, \
+             next_rollout_ordinal INTEGER,next_rollout_byte_offset INTEGER); \
+             CREATE TABLE thread_items(thread_id TEXT,turn_id TEXT,item_id TEXT, \
+             rollout_ordinal INTEGER,created_at_ms INTEGER,item_type TEXT,item_json TEXT); \
+             CREATE TABLE thread_turns(thread_id TEXT,turn_id TEXT,rollout_ordinal INTEGER, \
+             started_at INTEGER,error_json TEXT);",
+        )
+        .unwrap();
+    for (index, updated) in updated.iter().enumerate() {
+        let id = format!("thread-{index:03}");
+        state
+            .execute(
+                "INSERT INTO threads (id,created_at_ms,updated_at_ms,source,archived,history_mode) \
+                 VALUES (?1,?2,?2,'cli',0,'paginated')",
+                params![id, updated],
+            )
+            .unwrap();
+        history
+            .execute(
+                "INSERT INTO thread_history_projection_state VALUES (?1,0,0)",
+                [id],
+            )
+            .unwrap();
+    }
+}
+
+fn insert_thread(codex: &Path, id: &str, updated: i64) {
+    Connection::open(codex.join("state_5.sqlite"))
+        .unwrap()
+        .execute(
+            "INSERT INTO threads (id,created_at_ms,updated_at_ms,source,archived,history_mode) \
+             VALUES (?1,?2,?2,'cli',0,'paginated')",
+            params![id, updated],
+        )
+        .unwrap();
+    Connection::open(codex.join("thread_history_1.sqlite"))
+        .unwrap()
+        .execute(
+            "INSERT INTO thread_history_projection_state VALUES (?1,0,0)",
+            [id],
+        )
+        .unwrap();
+}
+
+#[test]
+fn sqlite_backlog_is_capped_newest_first_and_resumes_from_its_cursor() {
+    let dir = tempfile::tempdir().unwrap();
+    let codex = dir.path().join(".codex");
+    install_thread_set(&codex, &(0..60).map(|i| 2_000_000 + i).collect::<Vec<_>>());
+    let conn = crate::open_db(&dir.path().join("history.db")).unwrap();
+    let mut state = serde_json::Map::new();
+    let policy = SweepPolicy::unbounded();
+    let repairs = crate::ingest::SweepRepairs::default();
+
+    let first = sync_with_policy(&conn, &mut state, &codex, &repairs, policy).unwrap();
+    let first = first.read;
+    assert_eq!(first.len(), DEFAULT_SWEEP_THREADS);
+    assert_eq!(first.first().map(String::as_str), Some("thread-059"));
+    assert_eq!(first.last().map(String::as_str), Some("thread-010"));
+    assert!(state.get("codex_sqlite_sweep_cursor_v1").is_some());
+
+    let second = sync_with_policy(&conn, &mut state, &codex, &repairs, policy).unwrap();
+    let second = second.read;
+    assert_eq!(second.len(), 10);
+    assert_eq!(second.first().map(String::as_str), Some("thread-009"));
+    assert_eq!(second.last().map(String::as_str), Some("thread-000"));
+    assert!(state["codex_sqlite_sweep_cursor_v1"].is_null());
+    assert_eq!(
+        conn.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE source='codex'",
+            [],
+            |row| { row.get::<_, usize>(0) }
+        )
+        .unwrap(),
+        60
+    );
+}
+
+#[test]
+fn full_sync_persists_multiple_cursor_pages_and_restarts_for_a_new_arrival() {
+    let dir = tempfile::tempdir().unwrap();
+    let codex = dir.path().join(".codex");
+    install_thread_set(
+        &codex,
+        &[
+            2_000_000, 2_000_001, 2_000_002, 2_000_003, 2_000_004, 2_000_005, 2_000_006,
+        ],
+    );
+    let db = dir.path().join("history.db");
+    let conn = crate::open_db(&db).unwrap();
+    let mut roots =
+        crate::ProviderRoots::from_home(dir.path().to_path_buf(), dir.path().join("opencode.db"));
+    roots.codex = codex;
+    let scope = crate::ingest::SweepScope::everything();
+    let count = || {
+        conn.query_row(
+            "SELECT COUNT(*) FROM sessions WHERE source='codex'",
+            [],
+            |row| row.get::<_, usize>(0),
+        )
+        .unwrap()
+    };
+
+    let policy = SweepPolicy {
+        max_threads: 2,
+        min_updated_ms: None,
+        max_age_days: None,
+    };
+    let sync = || {
+        with_test_policy(policy, || {
+            crate::ingest::sync_basic(&conn, &db, &roots, false, &scope)
+        })
+        .unwrap()
+    };
+    assert!(sync());
+    assert_eq!(count(), 2);
+    insert_thread(&roots.codex, "thread-new", 3_000_000);
+    let mut settled = false;
+    for _ in 0..12 {
+        if !sync() {
+            settled = true;
+            break;
+        }
+    }
+    assert!(settled, "a stable traversal eventually arms the fast path");
+    assert_eq!(count(), 8);
+    let persisted: Value = serde_json::from_slice(
+        &std::fs::read(dir.path().join(".sync-state.json")).unwrap(),
+    )
+    .unwrap();
+    assert!(persisted["codex_sqlite_sweep_cursor_v1"].is_null());
+}
+
+#[test]
+fn sqlite_children_are_recovered_but_not_discovered_as_top_level_sessions() {
+    let dir = tempfile::tempdir().unwrap();
+    let codex = dir.path().join(".codex");
+    install_thread_set(&codex, &[2_000_000]);
+    Connection::open(codex.join("state_5.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE threads SET thread_source='subagent', \
+             source='{\"subagent\":{\"thread_spawn\":{\"parent_thread_id\":\"parent\"}}}' \
+             WHERE id='thread-000'",
+            [],
+        )
+        .unwrap();
+    let conn = crate::open_db(&dir.path().join("history.db")).unwrap();
+    let mut state = serde_json::Map::new();
+    let outcome = sync(
+        &conn,
+        &mut state,
+        &codex,
+        &crate::ingest::SweepRepairs::default(),
+    )
+    .unwrap();
+    assert_eq!(outcome.read, ["thread-000"]);
+
+    let mut roots =
+        crate::ProviderRoots::from_home(dir.path().to_path_buf(), dir.path().join("opencode.db"));
+    roots.codex = codex.clone();
+    assert!(enumerate(&codex, &roots).unwrap().0.is_empty());
+}
+
+#[test]
+fn sqlite_cutoff_excludes_old_threads() {
+    let dir = tempfile::tempdir().unwrap();
+    let codex = dir.path().join(".codex");
+    install_thread_set(&codex, &[1_000, 2_000]);
+    let conn = crate::open_db(&dir.path().join("history.db")).unwrap();
+    let mut state = serde_json::Map::new();
+    let policy = SweepPolicy {
+        max_threads: DEFAULT_SWEEP_THREADS,
+        min_updated_ms: Some(1_500),
+        max_age_days: None,
+    };
+    let read = sync_with_policy(
+        &conn,
+        &mut state,
+        &codex,
+        &crate::ingest::SweepRepairs::default(),
+        policy,
+    )
+    .unwrap()
+    .read;
+    assert_eq!(read, ["thread-001"]);
+}
+
+#[test]
+fn sqlite_cutoff_change_moves_the_source_fingerprint() {
+    let fingerprint = |max_age_days| {
+        with_test_policy(
+            SweepPolicy {
+                max_threads: DEFAULT_SWEEP_THREADS,
+                min_updated_ms: None,
+                max_age_days,
+            },
+            || Ok(fingerprint_component()),
+        )
+        .unwrap()
+    };
+    assert_ne!(fingerprint(Some(30)), fingerprint(None));
+}
+
+#[test]
+fn sqlite_threads_report_bounded_capture_progress() {
+    let dir = tempfile::tempdir().unwrap();
+    let codex = dir.path().join(".codex");
+    install_thread_set(&codex, &[1_000, 2_000, 3_000]);
+    let conn = crate::open_db(&dir.path().join("history.db")).unwrap();
+    let mut state = serde_json::Map::new();
+    let updates = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+    let observed = updates.clone();
+    crate::ingest::with_capture_observer(
+        move |progress| observed.borrow_mut().push(progress),
+        || {
+            sync_with_policy(
+                &conn,
+                &mut state,
+                &codex,
+                &crate::ingest::SweepRepairs::default(),
+                SweepPolicy::unbounded(),
+            )
+            .map(|_| ())
+        },
+    )
+    .unwrap();
+    let updates = updates.borrow();
+    assert_eq!(updates.first().unwrap().source, "codex-sqlite");
+    assert_eq!(updates.first().unwrap().processed_files, 0);
+    assert_eq!(updates.last().unwrap().processed_files, 3);
+    assert_eq!(updates.last().unwrap().total_files, Some(3));
+}
+
 #[test]
 fn guardian_requires_a_parent_before_it_is_hidden_from_the_catalog() {
     let dir = tempfile::tempdir().unwrap();
@@ -376,25 +626,65 @@ fn a_pruned_rollout_is_read_again_after_it_was_restored() {
     let repairs = crate::ingest::SweepRepairs::default();
     assert!(sync(&conn, &mut state, &codex, &repairs)
         .unwrap()
-        .1
+        .read
         .is_empty());
 
     std::fs::remove_file(&rollout).unwrap();
     assert_eq!(
-        sync(&conn, &mut state, &codex, &repairs).unwrap().1,
+        sync(&conn, &mut state, &codex, &repairs)
+            .unwrap()
+            .read,
         vec!["sqlite-rollout-primary".to_string()]
     );
     std::fs::write(&rollout, "complete rollout").unwrap();
     assert!(sync(&conn, &mut state, &codex, &repairs)
         .unwrap()
-        .1
+        .read
         .is_empty());
 
     std::fs::remove_file(&rollout).unwrap();
     assert_eq!(
-        sync(&conn, &mut state, &codex, &repairs).unwrap().1,
+        sync(&conn, &mut state, &codex, &repairs)
+            .unwrap()
+            .read,
         vec!["sqlite-rollout-primary".to_string()]
     );
+}
+
+#[test]
+fn restored_rollouts_remove_recovery_stamps_from_persisted_sync_state() {
+    let dir = tempfile::tempdir().unwrap();
+    let codex = dir.path().join(".codex");
+    install_fixture(&codex, "rollout-primary");
+    let rollout = codex.join("sessions/2026/04/20/rollout-rollout-primary.jsonl");
+    let db = dir.path().join("ai-history.db");
+    let conn = crate::open_db(&db).unwrap();
+    let mut roots =
+        crate::ProviderRoots::from_home(dir.path().to_path_buf(), dir.path().join("opencode.db"));
+    roots.codex = codex;
+    let scope = crate::ingest::SweepScope::everything();
+    let sweep = || {
+        with_test_policy(SweepPolicy::unbounded(), || {
+            crate::ingest::sync_basic(&conn, &db, &roots, true, &scope)
+        })
+        .unwrap()
+    };
+    let stamps = || {
+        let state: Value =
+            serde_json::from_slice(&std::fs::read(dir.path().join(".sync-state.json")).unwrap())
+                .unwrap();
+        state["codex_sqlite_v2"].as_object().unwrap().clone()
+    };
+
+    assert!(sweep());
+    assert!(stamps().contains_key("sqlite-rollout-primary"));
+    std::fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+    std::fs::write(&rollout, "complete rollout").unwrap();
+    assert!(sweep());
+    assert!(!stamps().contains_key("sqlite-rollout-primary"));
+    std::fs::remove_file(&rollout).unwrap();
+    assert!(sweep());
+    assert!(stamps().contains_key("sqlite-rollout-primary"));
 }
 
 #[test]
@@ -468,16 +758,87 @@ fn a_malformed_thread_does_not_block_other_sqlite_threads() {
     ).unwrap();
     let conn = crate::open_db(&dir.path().join("history.db")).unwrap();
     let mut state = serde_json::Map::new();
-    let (inserted, read) = sync(
+    let outcome = sync(
         &conn,
         &mut state,
         &codex,
         &crate::ingest::SweepRepairs::default(),
     )
     .unwrap();
-    assert!(inserted > 0);
-    assert_eq!(read, ["sqlite-zz-good"]);
+    assert!(outcome.inserted > 0);
+    assert_eq!(outcome.read, ["sqlite-zz-good"]);
+    assert!(outcome.incomplete);
     let stamps = state["codex_sqlite_v2"].as_object().unwrap();
     assert!(stamps.contains_key("sqlite-zz-good"));
     assert!(!stamps.contains_key("sqlite-pruned-all-items"));
+    let completion = sync(
+        &conn,
+        &mut state,
+        &codex,
+        &crate::ingest::SweepRepairs::default(),
+    )
+    .unwrap();
+    assert!(completion.read.is_empty());
+    assert!(
+        completion.incomplete,
+        "a failure on an earlier cursor page survives through completion"
+    );
+}
+
+#[test]
+fn failed_thread_retries_with_the_original_cutoff_after_the_backlog_drains() {
+    let dir = tempfile::tempdir().unwrap();
+    let codex = dir.path().join(".codex");
+    install_fixture(&codex, "pruned-all-items");
+    let state_db = Connection::open(codex.join("state_5.sqlite")).unwrap();
+    let history_db = Connection::open(codex.join("thread_history_1.sqlite")).unwrap();
+    state_db.execute_batch(
+        "INSERT INTO threads SELECT 'sqlite-zz-good',rollout_path,created_at_ms,updated_at_ms,source,cwd,git_branch,git_origin_url,title,name,first_user_message,originator,cli_version,model,tokens_used,archived,agent_nickname,agent_role,history_mode,thread_source FROM threads WHERE id='sqlite-pruned-all-items';"
+    ).unwrap();
+    history_db.execute_batch(
+        "INSERT INTO thread_history_projection_state SELECT 'sqlite-zz-good',next_rollout_ordinal,next_rollout_byte_offset FROM thread_history_projection_state WHERE thread_id='sqlite-pruned-all-items';
+         INSERT INTO thread_items SELECT 'sqlite-zz-good',turn_id,item_id,rollout_ordinal,created_at_ms,item_type,item_json FROM thread_items WHERE thread_id='sqlite-pruned-all-items';
+         INSERT INTO thread_turns SELECT 'sqlite-zz-good',turn_id,rollout_ordinal,started_at,error_json FROM thread_turns WHERE thread_id='sqlite-pruned-all-items';
+         UPDATE thread_items SET item_json='not-json' WHERE thread_id='sqlite-pruned-all-items' AND rollout_ordinal=0;"
+    ).unwrap();
+    let conn = crate::open_db(&dir.path().join("history.db")).unwrap();
+    let mut state = serde_json::Map::new();
+    let repairs = crate::ingest::SweepRepairs::default();
+    let original = SweepPolicy {
+        max_threads: 1,
+        min_updated_ms: Some(0),
+        max_age_days: None,
+    };
+
+    assert_eq!(
+        sync_with_policy(&conn, &mut state, &codex, &repairs, original)
+            .unwrap()
+            .read,
+        ["sqlite-zz-good"]
+    );
+    let failed = sync_with_policy(&conn, &mut state, &codex, &repairs, original).unwrap();
+    assert!(failed.incomplete);
+    let drained = sync_with_policy(&conn, &mut state, &codex, &repairs, original).unwrap();
+    assert!(drained.incomplete);
+    assert!(state["codex_sqlite_sweep_cursor_v1"]
+        .as_str()
+        .unwrap()
+        .contains("\"restart\":true"));
+
+    history_db
+        .execute(
+            "UPDATE thread_items SET item_json=(SELECT item_json FROM thread_items WHERE thread_id='sqlite-zz-good' AND rollout_ordinal=0) WHERE thread_id='sqlite-pruned-all-items' AND rollout_ordinal=0",
+            [],
+        )
+        .unwrap();
+    let aged_out = SweepPolicy {
+        max_threads: 1,
+        min_updated_ms: Some(i64::MAX),
+        max_age_days: None,
+    };
+    let _ = sync_with_policy(&conn, &mut state, &codex, &repairs, aged_out).unwrap();
+    let retried = sync_with_policy(&conn, &mut state, &codex, &repairs, aged_out).unwrap();
+    assert_eq!(retried.read, ["sqlite-pruned-all-items"]);
+    let _ = sync_with_policy(&conn, &mut state, &codex, &repairs, aged_out).unwrap();
+    assert!(state["codex_sqlite_sweep_cursor_v1"].is_null());
 }
