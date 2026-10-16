@@ -1,0 +1,21 @@
+{
+  "corpus_files": [
+    "codex/sqlite/legacy-no-items-state.sql",
+    "codex/sqlite/legacy-no-items-history.sql"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "codex/sqlite-legacy-no-items",
+  "history": [],
+  "hydration": [],
+  "layout": "Sqlite(\".codex/state_5.sqlite\")",
+  "notes": [],
+  "origin": "relayhistory",
+  "quirk": "A legacy thread has no paginated items and is excluded from SQLite fallback.",
+  "session_events": [],
+  "session_markers": [],
+  "session_relationships": [],
+  "sessions": [],
+  "source": "codex",
+  "tool_calls": []
+}

@@ -1,6 +1,7 @@
 //! The first records of a rollout, from bytes a cold sweep already holds.
 
 use anyhow::Result;
+use rusqlite::Connection;
 use serde_json::Value;
 use std::cell::Cell;
 use std::io::{self, BufRead, BufReader};
@@ -9,7 +10,7 @@ use std::sync::atomic::Ordering as AtomicOrdering;
 
 use super::codex;
 use super::cold_read;
-use super::transcript_cursor::{TranscriptFileCursor, TranscriptReader};
+use super::transcript_cursor::{TranscriptCursorState, TranscriptReader};
 use super::{
     codex_is_subagent, codex_parent_session_id, codex_parent_thread_id, parse_iso_ms,
     CodexSessionMeta, SYNC_QUIET,
@@ -106,12 +107,16 @@ fn collect_head_records(
 /// decided at the child's first own turn, which every observed paginated fork
 /// reaches within its first 400 KiB; a longer copy is still proven by a
 /// replayed turn ordered by UUIDv7, which comes in its first records.
+/// A completed SQLite-to-rollout transition retires its provisional rows and
+/// resets the cursor before opening this reader.
 pub(super) fn open_codex_walk(
+    conn: &Connection,
     path: &Path,
-    saved: Option<&TranscriptFileCursor>,
+    cursor: &mut TranscriptCursorState,
     meta: &CodexSessionMeta,
 ) -> Result<(TranscriptReader, codex::ForkReplayGate, u64)> {
-    let reader = TranscriptReader::open(path, saved, None)?;
+    super::event_insert::reconcile_codex_sqlite(conn, &meta.session_id, path, cursor)?;
+    let reader = TranscriptReader::open(path, cursor.file.as_ref(), None)?;
     let mut gate = codex::ForkReplayGate::new(
         meta.fork_parent_id.clone(),
         meta.fork_origin_ms,

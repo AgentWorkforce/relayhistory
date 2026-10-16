@@ -673,6 +673,8 @@ pub enum WatchEntries {
         primary: std::ffi::OsString,
         channels: bool,
     },
+    /// Codex's versioned state and thread-history databases and WAL sidecars.
+    CodexStores,
 }
 
 /// The SQLite sidecars that move with a database file.
@@ -684,6 +686,14 @@ impl WatchEntries {
         let (primary, channels) = match self {
             WatchEntries::All => return true,
             WatchEntries::OpencodeStores { primary, channels } => (primary, *channels),
+            WatchEntries::CodexStores => {
+                let Some(name) = name.to_str() else { return false };
+                let store = SQLITE_SIDECARS.iter().find_map(|suffix| name.strip_suffix(suffix)).unwrap_or(name);
+                return ["state_", "thread_history_"].iter().any(|prefix| {
+                    store.strip_prefix(prefix).and_then(|s| s.strip_suffix(".sqlite"))
+                        .is_some_and(|version| !version.is_empty() && version.bytes().all(|b| b.is_ascii_digit()))
+                });
+            }
         };
         // The configured name and its sidecars first, compared as `OsStr`
         // rather than stripped as text: the configured file may itself end in

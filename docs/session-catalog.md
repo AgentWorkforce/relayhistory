@@ -926,6 +926,15 @@ How each adapter works:
   and writes no evidence again. A compressed rollout does not change after
   that, so later passes skip it on its stamp.
 
+  Codex's `state_5.sqlite` and `thread_history_1.sqlite` under the same home
+  provide a second local layout for paginated threads whose rollout is missing
+  or shorter than its recorded projection offset. RelayHistory reads both stores
+  read-only with pinned transactions and retains the native item ids. Complete
+  rollouts remain primary. The SQLite layout has only a cumulative
+  `threads.tokens_used` total, so it supplies one snapshot marker and no
+  per-message usage. A newer store version or an incomplete pair skips SQLite
+  with a diagnostic while rollout capture continues.
+
   A rollout is a **delegated child thread** exactly when its `session_meta`
   carries a subagent marker (`thread_source` `subagent` or `guardian_review`,
   or the object form of `source.subagent`) *and* names a parent thread

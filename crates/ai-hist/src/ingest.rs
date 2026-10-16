@@ -30,6 +30,7 @@ pub(crate) mod cold_read;
 pub(crate) mod control;
 pub(crate) mod cursor;
 pub(crate) mod devin;
+mod event_insert;
 mod evidence_probe;
 pub(crate) mod evidence_reconcile;
 mod evidence_upserts;
@@ -38,6 +39,7 @@ mod grok_unified;
 pub(crate) mod hook;
 pub(crate) mod hydrate;
 mod images;
+pub(crate) use images::image_markdown;
 pub(crate) mod incremental;
 pub(crate) mod jsonl;
 pub(crate) mod muse;
@@ -51,6 +53,7 @@ pub(crate) mod tool_result_facts;
 pub(crate) mod transcript_cursor;
 pub(crate) mod transcript_file;
 
+use event_insert::insert_session_event;
 pub(crate) use evidence_probe::note_deleted;
 use evidence_probe::{
     claude_sidecar_evidence_exists, claude_transcript_events_exist, codex_session_evidence_exists,
@@ -5310,10 +5313,10 @@ fn codex_session_events_exist(conn: &Connection, session_id: &str) -> Result<boo
 }
 
 pub(crate) struct CodexSessionMeta {
-    session_id: String,
+    pub(crate) session_id: String,
     cwd: String,
     git_branch: Option<String>,
-    is_subagent: bool,
+    pub(crate) is_subagent: bool,
     /// The parent this thread was delegated by, from whichever field the
     /// provider recorded it in.
     parent_session_id: Option<String>,
@@ -5955,7 +5958,7 @@ fn ingest_codex_rollout_incremental(
     // is the half-written tail of a live rollout and the next pass re-reads
     // it. Unlike Claude, no Codex writer leaves its last line unterminated.
     let (mut reader, mut replay_gate, probe_bytes) =
-        rollout_head::open_codex_walk(path, cursor.file.as_ref(), meta)?;
+        rollout_head::open_codex_walk(conn, path, cursor, meta)?;
     let mut pass = transcript_cursor::IncrementalPass {
         rotated: reader.rotated,
         ..Default::default()
@@ -11176,10 +11179,6 @@ struct EventRow<'a> {
 
 /// Write one normalized event, including the columns only some providers can
 /// fill.
-fn insert_session_event(conn: &Connection, row: &EventRow<'_>) -> Result<()> {
-    sweep_session::write_event(conn, row)
-}
-
 /// One tool call as a provider record names it, with the record context its
 /// rows are written under.
 ///
