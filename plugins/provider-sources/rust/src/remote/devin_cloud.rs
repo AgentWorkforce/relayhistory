@@ -170,19 +170,26 @@ fn ensure_devin_status(what: &str, scope: &str, status: u16, body: &str) -> Resu
 
 /// `category` values the v3 listing assigns to code-review work. Cognition's
 /// review sessions — Devin Review and push-review automations — run inside the
-/// org as `automation`-origin sessions, so `origin` cannot tell them apart from
-/// other automations; the classifier's category is the listing's only field
-/// that names the work itself.
+/// org as `automation`-origin sessions, so a review category only skips a row
+/// when automation spawned it: a person-directed session whose work Cognition
+/// classifies as review still belongs in the catalog.
 const REVIEW_CATEGORIES: [&str; 2] = ["code_review", "code_review_and_analysis"];
+
+/// The absolute fetch bound on one session-list enumeration. Pages where
+/// every item is filtered out — review automations — still count toward this
+/// backstop, so the walk always terminates; only yielding pages count toward
+/// `MAX_LIST_PAGES`, the shared bound that bounds catalogable results.
+const MAX_LIST_FETCHES: usize = MAX_LIST_PAGES * 4;
 
 /// Map one session object from `GET /v3/organizations/{org}/sessions` into a
 /// catalog row. The listing's `title` is the only human-readable identifier
 /// the endpoint offers; `None` for a malformed id or a review session, which
 /// is an automation artifact rather than work a person directed.
 pub(super) fn map_devin_session(value: &Value) -> Option<(Candidate, ShallowSession)> {
-    if REVIEW_CATEGORIES
-        .iter()
-        .any(|category| string_field(value, "category").as_deref() == Some(category))
+    if string_field(value, "origin").as_deref() == Some("automation")
+        && REVIEW_CATEGORIES
+            .iter()
+            .any(|category| string_field(value, "category").as_deref() == Some(category))
     {
         return None;
     }
@@ -481,7 +488,8 @@ impl ShallowSessionProvider for DevinCloudProvider {
         let mut candidates = Vec::new();
         let mut rows = BTreeMap::new();
         let mut cursor: Option<String> = None;
-        for _ in 0..MAX_LIST_PAGES {
+        let mut yielding_pages = 0usize;
+        for _ in 0..MAX_LIST_FETCHES {
             let page_limit = match self.limit {
                 Some(limit) => limit
                     .saturating_sub(candidates.len())
@@ -497,15 +505,18 @@ impl ShallowSessionProvider for DevinCloudProvider {
                 &response.body,
             )?;
             let page = parse_devin_page(&response.body, "session list")?;
+            let before = candidates.len();
             for item in &page.items {
                 if let Some((candidate, session)) = map_devin_session(item) {
                     rows.insert(candidate.locator.clone(), session);
                     candidates.push(candidate);
                 }
             }
+            yielding_pages += usize::from(candidates.len() > before);
             cursor = page.end_cursor.filter(|_| page.has_next_page);
             let done = cursor.is_none()
                 || page.items.is_empty()
+                || yielding_pages >= MAX_LIST_PAGES
                 || self.limit.is_some_and(|limit| candidates.len() >= limit);
             if done {
                 break;
@@ -516,7 +527,7 @@ impl ShallowSessionProvider for DevinCloudProvider {
         // caller-specified limit that was reached is not truncation.
         anyhow::ensure!(
             cursor.is_none() || self.limit.is_some_and(|limit| candidates.len() >= limit),
-            "EVIDENCE_PARTIAL: Devin session list exceeded the 100-page bound"
+            "EVIDENCE_PARTIAL: Devin session list exceeded the page bound"
         );
         *self.fetched.lock().expect("remote connector row cache") = rows;
         Ok(candidates)
