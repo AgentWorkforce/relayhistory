@@ -776,7 +776,7 @@ fn a_malformed_thread_does_not_block_other_sqlite_threads() {
 }
 
 #[test]
-fn failed_thread_retries_with_the_original_cutoff_after_the_backlog_drains() {
+fn failed_thread_retries_after_the_backlog_drains() {
     let dir = tempfile::tempdir().unwrap();
     let codex = dir.path().join(".codex");
     install_fixture(&codex, "pruned-all-items");
@@ -821,14 +821,53 @@ fn failed_thread_retries_with_the_original_cutoff_after_the_backlog_drains() {
             [],
         )
         .unwrap();
-    let aged_out = SweepPolicy {
+    let retry = SweepPolicy {
         max_threads: 1,
-        min_updated_ms: Some(i64::MAX),
+        min_updated_ms: Some(0),
         max_age_days: None,
     };
-    let _ = sync_with_policy(&conn, &mut state, &codex, &repairs, aged_out).unwrap();
-    let retried = sync_with_policy(&conn, &mut state, &codex, &repairs, aged_out).unwrap();
+    let _ = sync_with_policy(&conn, &mut state, &codex, &repairs, retry).unwrap();
+    let retried = sync_with_policy(&conn, &mut state, &codex, &repairs, retry).unwrap();
     assert_eq!(retried.read, ["sqlite-pruned-all-items"]);
-    let _ = sync_with_policy(&conn, &mut state, &codex, &repairs, aged_out).unwrap();
+    let _ = sync_with_policy(&conn, &mut state, &codex, &repairs, retry).unwrap();
+    assert!(state["codex_sqlite_sweep_cursor_v1"].is_null());
+}
+
+#[test]
+fn retry_restart_uses_the_current_cutoff() {
+    let dir = tempfile::tempdir().unwrap();
+    let codex = dir.path().join(".codex");
+    install_thread_set(&codex, &[100]);
+    let conn = crate::open_db(&dir.path().join("history.db")).unwrap();
+    let mut state = serde_json::Map::new();
+    state.insert(
+        "codex_sqlite_sweep_cursor_v1".into(),
+        Value::String(
+            json!({
+                "updated_at_ms": 100,
+                "thread_id": "thread-000",
+                "retry_required": false,
+                "restart": true,
+                "min_updated_ms": 0
+            })
+            .to_string(),
+        ),
+    );
+    let expired = SweepPolicy {
+        max_threads: 1,
+        min_updated_ms: Some(101),
+        max_age_days: None,
+    };
+
+    let outcome = sync_with_policy(
+        &conn,
+        &mut state,
+        &codex,
+        &crate::ingest::SweepRepairs::default(),
+        expired,
+    )
+    .unwrap();
+    assert!(!outcome.incomplete);
+    assert!(outcome.read.is_empty());
     assert!(state["codex_sqlite_sweep_cursor_v1"].is_null());
 }

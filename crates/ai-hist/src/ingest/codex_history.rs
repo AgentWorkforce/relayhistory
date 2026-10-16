@@ -123,6 +123,7 @@ fn sync_codex_sqlite_scoped(
     };
     let changed = paths.is_none()
         || !repairs.is_empty()
+        || crate::providers::codex::sqlite::backlog_pending(state)
         || paths.is_some_and(|scope| {
             scope.mentions(&root.join("sessions"))
                 || scope.mentions(&root.join("archived_sessions"))
@@ -202,6 +203,53 @@ fn ingest_codex_history_lines(
 mod tests {
     use super::*;
     use crate::discover::{CodexProvider, DiscoveryEnv, ShallowSessionProvider};
+
+    #[test]
+    fn scoped_history_tick_continues_a_pending_sqlite_backlog() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".codex");
+        std::fs::create_dir_all(&root).unwrap();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex/sqlite");
+        for (script, database) in [
+            ("pruned-all-items-state.sql", "state_5.sqlite"),
+            ("pruned-all-items-history.sql", "thread_history_1.sqlite"),
+        ] {
+            let sql = std::fs::read_to_string(fixtures.join(script))
+                .unwrap()
+                .replace("{{CODEX_HOME}}", &root.to_string_lossy());
+            Connection::open(root.join(database))
+                .unwrap()
+                .execute_batch(&sql)
+                .unwrap();
+        }
+        let conn = crate::open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        state.insert(
+            "codex_sqlite_sweep_cursor_v1".into(),
+            Value::String(
+                serde_json::json!({
+                    "updated_at_ms": i64::MAX,
+                    "thread_id": "cursor",
+                    "restart": true
+                })
+                .to_string(),
+            ),
+        );
+        let scope = crate::ingest::path_scope::PathScope::from_paths([root.join("history.jsonl")]);
+        let mut touched = HashSet::new();
+
+        sync_codex_sources(
+            &conn,
+            &mut state,
+            &root,
+            &SweepRepairs::default(),
+            &mut SweepCoverage::default(),
+            &mut touched,
+            scope.as_ref(),
+        )
+        .unwrap();
+        assert!(touched.contains("sqlite-pruned-all-items"));
+    }
 
     #[test]
     fn newer_sqlite_schema_skips_fallback_without_losing_rollouts() {

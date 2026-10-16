@@ -13,8 +13,6 @@ pub(super) struct SweepCursor {
     pub(super) retry_required: bool,
     #[serde(default)]
     pub(super) restart: bool,
-    #[serde(default)]
-    pub(super) min_updated_ms: Option<i64>,
 }
 
 pub(super) fn load(state: &Map<String, Value>) -> Option<SweepCursor> {

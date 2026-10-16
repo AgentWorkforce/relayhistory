@@ -263,7 +263,6 @@ fn select_threads(
                     source_fingerprint: source_fingerprint.map(str::to_owned),
                     retry_required,
                     restart: false,
-                    min_updated_ms: policy.min_updated_ms,
                 });
                 if thread.rollout_complete() {
                     clear_stamps.push(thread.id);
@@ -382,6 +381,10 @@ pub(crate) struct SyncOutcome {
     pub(crate) incomplete: bool,
 }
 
+pub(crate) fn backlog_pending(state: &serde_json::Map<String, Value>) -> bool {
+    load_cursor(state).is_some()
+}
+
 fn traversal_changed(
     cursor_pending: bool,
     traversal: &Option<String>,
@@ -431,10 +434,6 @@ pub(crate) fn sync(
     roots.codex = root.to_path_buf();
     let context = AcquisitionContext::new("codex", &roots);
     let start = load_cursor(state);
-    let mut policy = sweep_policy();
-    if let Some(cutoff) = start.as_ref().and_then(|cursor| cursor.min_updated_ms) {
-        policy.min_updated_ms = Some(cutoff);
-    }
     let source_fingerprint = source_fingerprint();
     let traversal_fingerprint = match start.as_ref() {
         Some(cursor) => cursor.source_fingerprint.clone(),
@@ -446,7 +445,7 @@ pub(crate) fn sync(
         &state_db,
         &history,
         start,
-        policy,
+        sweep_policy(),
         traversal_fingerprint.as_deref(),
     )?;
     remember_sweep_threads(&selection.threads);
