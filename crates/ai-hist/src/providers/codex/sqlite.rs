@@ -272,8 +272,8 @@ mod discovery;
 pub(crate) use discovery::{enumerate, fingerprint, incomplete_projection_owns_rollout, shallow};
 mod sweep;
 pub(crate) use sweep::{
-    backlog_pending, fingerprint_component, remember_source_fingerprint, sync, with_sweep_policy,
-    SyncPass,
+    backlog_pending, fingerprint_component, remember_source_fingerprint, reset_backlog, sync,
+    with_sweep_policy, SyncPass,
 };
 #[cfg(test)]
 use sweep::{sync_with_policy, with_test_policy, SweepPolicy, DEFAULT_SWEEP_THREADS};

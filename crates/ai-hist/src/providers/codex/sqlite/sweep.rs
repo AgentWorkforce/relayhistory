@@ -385,6 +385,10 @@ pub(crate) fn backlog_pending(state: &serde_json::Map<String, Value>) -> bool {
     load_cursor(state).is_some()
 }
 
+pub(crate) fn reset_backlog(state: &mut serde_json::Map<String, Value>) {
+    store_cursor(state, None);
+}
+
 fn traversal_changed(
     cursor_pending: bool,
     traversal: &Option<String>,
@@ -420,6 +424,7 @@ pub(crate) fn sync(
     repairs: &crate::ingest::SweepRepairs,
 ) -> Result<SyncOutcome> {
     let Some((state_db, history)) = databases(root)? else {
+        reset_backlog(state);
         return Ok(SyncOutcome {
             inserted: 0,
             read: Vec::new(),

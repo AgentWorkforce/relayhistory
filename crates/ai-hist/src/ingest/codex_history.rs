@@ -119,6 +119,7 @@ fn sync_codex_sqlite_scoped(
         sync_note!("  [codex] skipping SQLite history: {diagnostic}");
     }
     let Some((state_db, history_db)) = selection.pair else {
+        crate::providers::codex::sqlite::reset_backlog(state);
         return Ok(0);
     };
     let changed = paths.is_none()
@@ -285,6 +286,16 @@ mod tests {
         assert_eq!(candidates[0].locator, rollout.to_string_lossy());
 
         let mut state = Map::new();
+        state.insert(
+            "codex_sqlite_sweep_cursor_v1".into(),
+            Value::String(
+                serde_json::json!({
+                    "updated_at_ms": 1,
+                    "thread_id": "stale"
+                })
+                .to_string(),
+            ),
+        );
         sync_codex_sources(
             &conn,
             &mut state,
@@ -295,6 +306,7 @@ mod tests {
             None,
         )
         .unwrap();
+        assert!(state["codex_sqlite_sweep_cursor_v1"].is_null());
         let count: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM sessions WHERE source='codex' AND session_id='sqlite-rollout-primary'",
