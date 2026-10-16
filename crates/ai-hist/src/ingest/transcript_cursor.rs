@@ -97,6 +97,7 @@ use super::transcript_file::TranscriptMetadata;
 use super::*;
 
 mod change_time;
+mod codex_resume;
 mod encoding;
 pub(crate) use encoding::stored_window;
 use encoding::stored_window_matches;
@@ -377,6 +378,12 @@ pub(crate) struct CodexCursorState {
     /// it.
     #[serde(default)]
     pub state_markers: i64,
+    /// The fork replay gate generation that decided which of this rollout's
+    /// lines were copied parent history. A fork's cursor from an older gate
+    /// may sit past a span this gate does not open, whose lines are the
+    /// child's own, so it is not resumed from either.
+    #[serde(default)]
+    pub fork_replay: i64,
 }
 
 /// A stat under which a cursor's positions were proven by their digests.

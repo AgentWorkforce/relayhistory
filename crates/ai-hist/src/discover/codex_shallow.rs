@@ -169,6 +169,7 @@ impl ShallowSessionProvider for CodexProvider {
         let mut replay_gate = crate::codex::ForkReplayGate::new(
             crate::codex::fork_parent_id(payload, session_id),
             crate::codex::fork_origin_ms(payload, session_id, claude_timestamp(&meta)),
+            crate::codex::pages_history(payload),
         );
         replay_gate.probe_copied_history(
             bounded.head_records().skip(1).filter_map(parse_record),

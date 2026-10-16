@@ -31,6 +31,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Codex rollouts that Codex has compressed to `rollout-*.jsonl.zst` are discovered, synced, hydrated and fed to the change feed as evidence under their `.jsonl` locator; a rollout compressed after it was indexed keeps its session, locator and cursor and is not ingested again.
 - The first sync of a new store records each Codex rollout's cursor, so the rollout's next append resumes instead of re-reading it from the start.
 - A sync over many changed delegated Codex threads no longer re-reads every stored Codex evidence key once per thread; on a 3,858-rollout archive, a sweep after Codex compressed 3,238 of them drops from 430 s to 33 s of CPU.
+- Codex forks and subagents keep their own turns: only a rollout whose `session_meta` declares `history_mode: "paginated"` is checked for parent history copied straight after the child's `session_meta`, so a subagent whose first turn carries no ordering evidence (Codex 0.90–0.99 write `turn_context` without a `turn_id`) is indexed under its own id rather than retired whole as copied history. The first `sync` (or `hydrate`) re-reads existing forks once and retires the stale `fork_replay_boundary` marker.
 
 ### Rust API
 

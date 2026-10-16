@@ -100,7 +100,8 @@ fn collect_head_records(
 /// steps, with the bytes the gate's head probe read.
 ///
 /// The gate is armed by [`codex::CopiedHistoryProbe`] over the records after
-/// the rollout's first when the read starts at byte zero: a copy that follows
+/// the rollout's first when the read starts at byte zero and the rollout
+/// declares paginated history ([`codex::pages_history`]): a copy that follows
 /// the child's own `session_meta` starts at line 1, which a resumed read never
 /// meets. The probe reads up to its verdict or [`LEADING_BYTE_LIMIT`]. It is
 /// decided at the child's first own turn, which every observed paginated fork
@@ -116,8 +117,12 @@ pub(super) fn open_codex_walk(
 ) -> Result<(TranscriptReader, codex::ForkReplayGate, u64)> {
     super::event_insert::reconcile_codex_sqlite(conn, &meta.session_id, path, cursor)?;
     let reader = TranscriptReader::open(path, cursor.file.as_ref(), None)?;
-    let mut gate = codex::ForkReplayGate::new(meta.fork_parent_id.clone(), meta.fork_origin_ms);
-    if reader.start_offset() != 0 || meta.fork_parent_id.is_none() {
+    let mut gate = codex::ForkReplayGate::new(
+        meta.fork_parent_id.clone(),
+        meta.fork_origin_ms,
+        meta.fork_pages_history,
+    );
+    if reader.start_offset() != 0 || gate.copied_history_probe().is_none() {
         return Ok((reader, gate, 0));
     }
     // The window reads one byte past the limit, so a file of exactly the
@@ -272,6 +277,7 @@ fn codex_session_meta_from_record(value: &Value) -> Option<CodexSessionMeta> {
         .and_then(parse_iso_ms);
     let fork_parent_id = codex::fork_parent_id(payload_value, session_id);
     let fork_origin_ms = codex::fork_origin_ms(payload_value, session_id, meta_ts_ms);
+    let fork_pages_history = codex::pages_history(payload_value);
     Some(CodexSessionMeta {
         session_id: session_id.to_string(),
         cwd: cwd.to_string(),
@@ -283,5 +289,6 @@ fn codex_session_meta_from_record(value: &Value) -> Option<CodexSessionMeta> {
         meta_ts_ms,
         fork_parent_id,
         fork_origin_ms,
+        fork_pages_history,
     })
 }
