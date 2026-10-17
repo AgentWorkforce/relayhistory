@@ -4,7 +4,11 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Patch]
+
+### Fixed
+
+- Devin remote capture skips provider-classified `code_review` and `code_review_and_analysis` sessions only when their origin is `automation`; person-started reviews and other work remain discoverable.
 
 ## [0.45.2] - 2026-10-17
 
@@ -33,7 +37,6 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- Devin remote capture skips sessions the v3 listing classifies as `code_review` or `code_review_and_analysis` — Cognition's Devin Review / push-review automations — so org review traffic no longer fills the catalog.
 - Two simultaneous first hydrations of one local session both succeed; the slower one no longer fails `CONNECTOR_NOT_CONFIGURED` when the other records the session's local observation mid-lookup.
 - Codex rollouts that Codex has compressed to `rollout-*.jsonl.zst` are discovered, synced, hydrated and fed to the change feed as evidence under their `.jsonl` locator; a rollout compressed after it was indexed keeps its session, locator and cursor and is not ingested again.
 - The first sync of a new store records each Codex rollout's cursor, so the rollout's next append resumes instead of re-reading it from the start.

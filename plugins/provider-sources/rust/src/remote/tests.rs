@@ -1049,14 +1049,24 @@ fn devin_mapping_skips_review_sessions_and_keeps_uncategorized_work() {
     // The review filter is scoped to automation-spawned sessions: a
     // person-directed session whose work the classifier files as review
     // still belongs in the catalog.
-    for origin in ["webapp", "api", "desktop", "cli"] {
-        let mut entry = devin_session(DEVIN_SESSION_ID, "Review my PR");
-        entry["origin"] = serde_json::json!(origin);
-        entry["category"] = serde_json::json!("code_review");
-        assert!(
-            map_devin_session(&entry).is_some(),
-            "{origin} review work must still map"
-        );
+    for category in ["code_review", "code_review_and_analysis"] {
+        for origin in [
+            None,
+            Some("webapp"),
+            Some("slack"),
+            Some("teams"),
+            Some("api"),
+            Some("desktop"),
+            Some("cli"),
+        ] {
+            let mut entry = devin_session(DEVIN_SESSION_ID, "Review my PR");
+            entry["origin"] = serde_json::json!(origin);
+            entry["category"] = serde_json::json!(category);
+            assert!(
+                map_devin_session(&entry).is_some(),
+                "{origin:?} {category} work must still map"
+            );
+        }
     }
 }
 
