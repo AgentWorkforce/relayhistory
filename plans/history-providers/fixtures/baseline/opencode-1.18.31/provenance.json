@@ -1,0 +1,14 @@
+{
+  "product": "OpenCode CLI",
+  "version": "1.18.31",
+  "platform": "macOS-26.6.2-arm64-arm-64bit-Mach-O",
+  "procedure": "Native offline import --pure of authored input.json, then independent export --pure in a new process; no agent turn/auth/model call",
+  "binary_sha256": "16c960ba77421da11b53e785f359b73f328a86118b48feb4af143db5d9afb198",
+  "writer_source": "https://github.com/anomalyco/opencode/blob/v1.18.31/packages/opencode/src/cli/cmd/import.ts",
+  "files": {
+    "input.json": "8c5d37d5a3465ac3171eab5c95883268e19b734e7ecd4ceba7455a020b2e9a31",
+    "native-store.sql": "c6240e4e4d53bd7f075490ea80ebc5e1855d54cc2386bdde2268667c819cf3d5",
+    "official-export.json": "ed0c5bffa665a234e4fe7955da5daf2595edc38c1ef6cc6543a346ad84b82654"
+  },
+  "environment": "Minimal system PATH/TMPDIR plus isolated HOME/XDG data/config/cache and offline flags; no inherited provider config/root variables"
+}
