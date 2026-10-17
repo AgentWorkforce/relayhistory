@@ -4,7 +4,11 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Patch]
+
+### Fixed
+
+- Grok Bot sessions no longer fail to open on one unmapped entry: entries without a usable id or time are skipped, unknown roles and message types become markers, messages to non-cloud-agent peers keep their text without a delegation edge, and an unreadable or newer roster leaves the transcript readable.
 
 ## [0.45.1] - 2026-10-16
 

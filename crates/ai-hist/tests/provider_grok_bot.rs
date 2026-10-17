@@ -231,3 +231,152 @@ fn grok_bot_explicitly_cleared_roster_title_is_removed() {
         .unwrap();
     assert_eq!(catalog.title, None);
 }
+
+#[test]
+fn grok_bot_unmapped_entry_shapes_and_newer_roster_still_hydrate() {
+    let home = tempfile::tempdir().unwrap();
+    let path = grok_bot_fixture::stage(home.path());
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/grok-bot/replicas");
+    std::fs::copy(fixtures.join("drift-replica.json"), &path).unwrap();
+    std::fs::copy(
+        fixtures.join("drift-roster.json"),
+        grok_bot_fixture::persistence(home.path()).join(format!(
+            "{}.blob",
+            grok_bot_fixture::encode_key(
+                "sand.client.slice.account.fixture%7Cp.roster.last-roster"
+            )
+        )),
+    )
+    .unwrap();
+    let store = open(home.path());
+    store
+        .discover(DiscoveryOptions::default().sources([Source::GrokBot]))
+        .unwrap();
+    store
+        .hydrate(
+            &SessionRef::id(Source::GrokBot, SID),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    let evidence = store
+        .session(
+            &SessionRef::id(Source::GrokBot, SID),
+            SessionQuery::default(),
+        )
+        .unwrap()
+        .unwrap();
+    let texts: Vec<_> = evidence
+        .messages
+        .iter()
+        .flat_map(|m| &m.blocks)
+        .filter_map(|b| b.text.as_deref())
+        .collect();
+    assert_eq!(
+        texts,
+        [
+            "Draft the fixture plan.",
+            "Handing the fixture plan to a peer.",
+            "The fixture plan is drafted."
+        ]
+    );
+    assert_eq!(evidence.session.title.as_deref(), Some("Fixture Drift Bot"));
+    for (kind, id) in [("message", "t0n1"), ("send-message", "t0s1")] {
+        assert!(
+            evidence
+                .markers
+                .iter()
+                .any(|marker| marker.kind == kind && marker.message_id.as_deref() == Some(id)),
+            "{id} is kept as a {kind} marker"
+        );
+    }
+    assert!(evidence.relationships.is_empty());
+}
+
+#[test]
+fn grok_bot_unusable_roster_keeps_transcript_and_last_title() {
+    let home = tempfile::tempdir().unwrap();
+    grok_bot_fixture::stage(home.path());
+    let roster = grok_bot_fixture::persistence(home.path()).join(format!(
+        "{}.blob",
+        grok_bot_fixture::encode_key("sand.client.slice.account.fixture%7Cp.roster.last-roster")
+    ));
+    let store = open(home.path());
+    store
+        .discover(DiscoveryOptions::default().sources([Source::GrokBot]))
+        .unwrap();
+    store
+        .hydrate(
+            &SessionRef::id(Source::GrokBot, SID),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    let title = || {
+        store
+            .sessions(CatalogQuery::default())
+            .map(Result::unwrap)
+            .find(|session| session.session_id == SID)
+            .unwrap()
+            .title
+    };
+    assert_eq!(title().as_deref(), Some("Fixture Research Bot"));
+    for contents in [
+        &br#"{"schemaVersion":6,"value":{"rows":[{"id":"fixture-bot-complete","displayName":"Renamed"}]}}"#[..],
+        b"not JSON",
+    ] {
+        std::fs::write(&roster, contents).unwrap();
+        store.sync(SyncOptions::default().force(true)).unwrap();
+        assert_eq!(title().as_deref(), Some("Fixture Research Bot"));
+    }
+    std::fs::remove_file(&roster).unwrap();
+    std::fs::create_dir(&roster).unwrap();
+    let fresh = SessionStore::open(
+        StoreOptions::default()
+            .db_path(home.path().join("fresh.db"))
+            .roots(ProviderRoots::from_home(
+                home.path().into(),
+                home.path().join("opencode.db"),
+            )),
+    )
+    .unwrap();
+    let discovered = fresh
+        .discover(DiscoveryOptions::default().sources([Source::GrokBot]))
+        .unwrap();
+    assert_eq!(discovered.discovered, 3);
+    fresh
+        .hydrate(
+            &SessionRef::id(Source::GrokBot, SID),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+}
+
+#[test]
+fn grok_bot_skipped_opening_entry_is_not_a_truncated_window() {
+    let home = tempfile::tempdir().unwrap();
+    let path = grok_bot_fixture::stage(home.path());
+    let mut replica: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    replica["value"]["entries"][0]["timestampMs"] = "not a time".into();
+    std::fs::write(&path, serde_json::to_vec(&replica).unwrap()).unwrap();
+    let store = open(home.path());
+    store
+        .discover(DiscoveryOptions::default().sources([Source::GrokBot]))
+        .unwrap();
+    store
+        .hydrate(
+            &SessionRef::id(Source::GrokBot, SID),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    let evidence = store
+        .session(
+            &SessionRef::id(Source::GrokBot, SID),
+            SessionQuery::default(),
+        )
+        .unwrap()
+        .unwrap();
+    assert!(!evidence
+        .markers
+        .iter()
+        .any(|marker| marker.kind == "truncated_tail"));
+}
