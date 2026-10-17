@@ -4,7 +4,11 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Patch]
+
+### Fixed
+
+- Devin remote capture skips provider-classified `code_review` and `code_review_and_analysis` sessions only when their origin is `automation`; person-started reviews and other work remain discoverable.
 
 ## [0.45.2] - 2026-10-17
 
