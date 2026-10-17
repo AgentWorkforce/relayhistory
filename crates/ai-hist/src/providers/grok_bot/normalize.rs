@@ -81,7 +81,8 @@ pub(super) fn write(conn: &Connection, payload: &Value, path: &Path) -> Result<u
     )?;
     // An explicit blank title clears it. A missing roster row, or one whose
     // newer schema omits both fields, keeps the last known name.
-    if let Some(row) = roster.filter(|row| row.get("name").is_some() || row.get("title").is_some()) {
+    let named = |row: &&Value| row.get("name").is_some() || row.get("title").is_some();
+    if let Some(row) = roster.filter(named) {
         if let Some(title) = row["name"]
             .as_str()
             .filter(|name| !name.trim().is_empty())
