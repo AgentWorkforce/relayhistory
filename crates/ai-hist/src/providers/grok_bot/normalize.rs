@@ -41,8 +41,11 @@ pub(super) fn write(conn: &Connection, payload: &Value, path: &Path) -> Result<u
         crate::ingest::check_capture_cancelled()?;
         inserted += write_entry(conn, sid, path, entry, &mut linked_children)?;
     }
+    // Truncation is judged from the native first entry, so a malformed `tbs0`
+    // that was skipped above does not read as a trimmed window.
     if let Some(head) = entries.first() {
-        if head["id"] != "tbs0" || replica["value"]["precedingTimestampMs"].is_number() {
+        let native_head = &replica["value"]["entries"][0]["id"];
+        if native_head != "tbs0" || replica["value"]["precedingTimestampMs"].is_number() {
             let uid = format!("window:{}", format::string(head, "id")?);
             let details = serde_json::json!({
                 "firstEntryId": head["id"],
@@ -76,9 +79,9 @@ pub(super) fn write(conn: &Connection, payload: &Value, path: &Path) -> Result<u
             raw_path: Some(&path.to_string_lossy()),
         },
     )?;
-    // An explicit blank title clears it. A missing roster row does not erase
-    // the last known name of a transcript whose local tail we still retain.
-    if let Some(row) = roster {
+    // An explicit blank title clears it. A missing roster row, or one whose
+    // newer schema omits both fields, keeps the last known name.
+    if let Some(row) = roster.filter(|row| row.get("name").is_some() || row.get("title").is_some()) {
         if let Some(title) = row["name"]
             .as_str()
             .filter(|name| !name.trim().is_empty())

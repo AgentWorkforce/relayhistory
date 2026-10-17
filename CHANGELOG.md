@@ -8,7 +8,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- Grok Bot sessions open again when the app records an entry shape, message role, delegation peer or roster schema the adapter does not map: those entries are kept as markers or skipped instead of failing the whole transcript read.
+- Grok Bot sessions no longer fail to open on one unmapped entry: entries without a usable id or time are skipped, unknown roles and message types become markers, messages to non-cloud-agent peers keep their text without a delegation edge, and an unreadable or newer roster leaves the transcript readable.
 
 ## [0.45.1] - 2026-10-16
 

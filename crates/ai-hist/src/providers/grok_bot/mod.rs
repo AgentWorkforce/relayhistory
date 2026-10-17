@@ -126,8 +126,9 @@ fn read_window(context: &AcquisitionContext<'_>, path: &Path) -> Result<(Vec<u8>
 fn candidate_stamp(path: &Path, slot: &str) -> Result<(String, Option<i64>)> {
     let (mut stamp, modified) = crate::file_stamp_and_modified(path)?;
     let roster = format::roster_path(path, slot);
-    if roster.exists() {
-        let (roster_stamp, _) = crate::file_stamp_and_modified(&roster)?;
+    // The roster is optional title metadata; an unreadable one never hides
+    // the transcript it describes.
+    if let Ok((roster_stamp, _)) = crate::file_stamp_and_modified(&roster) {
         stamp.push(':');
         stamp.push_str(&roster_stamp);
     }
@@ -256,7 +257,8 @@ fn snapshot(path: &Path, context: &AcquisitionContext<'_>) -> Result<AcquiredSes
 }
 
 fn read_roster(path: &Path, context: &AcquisitionContext<'_>) -> Option<(Value, usize)> {
-    if std::fs::metadata(path).ok()?.len() > ROSTER_LIMIT {
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() || metadata.len() > ROSTER_LIMIT {
         return None;
     }
     let bytes = context.read(path).ok()?;
