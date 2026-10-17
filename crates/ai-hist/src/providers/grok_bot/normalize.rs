@@ -23,6 +23,7 @@ pub(super) fn write(conn: &Connection, payload: &Value, path: &Path) -> Result<u
         .and_then(|rows| rows.iter().find(|row| row["id"].as_str() == Some(sid)));
     let first = entries
         .iter()
+        .copied()
         .filter_map(|e| e["timestampMs"].as_i64())
         .min()
         .or_else(|| roster.and_then(|row| row["createdAt"].as_i64()))
@@ -30,12 +31,13 @@ pub(super) fn write(conn: &Connection, payload: &Value, path: &Path) -> Result<u
         .context("GROK_BOT_INVALID_REPLICA: no timestamp")?;
     let last = entries
         .iter()
+        .copied()
         .filter_map(format::last_activity)
         .max()
         .unwrap_or(first);
     let mut inserted = 0;
     let mut linked_children = HashSet::new();
-    for entry in entries {
+    for &entry in &entries {
         crate::ingest::check_capture_cancelled()?;
         inserted += write_entry(conn, sid, path, entry, &mut linked_children)?;
     }
@@ -192,11 +194,14 @@ fn message(
     ts: i64,
     linked_children: &mut HashSet<String>,
 ) -> Result<usize> {
-    let role = format::string(entry, "role")?;
-    anyhow::ensure!(
-        role == "user" || role == "assistant",
-        "GROK_BOT_INVALID_RECORD: role"
-    );
+    let role = match entry["role"].as_str() {
+        Some(role @ ("user" | "assistant")) => role,
+        // A role this adapter does not map stays visible as a marker.
+        _ => {
+            marker(conn, sid, id, "message", Some(ts), None, entry)?;
+            return Ok(0);
+        }
+    };
     let text = entry["content"].as_str().unwrap_or_default();
     let from_agent = !entry["fromAgent"].is_null();
     let peer = entry["toAgent"]
@@ -235,7 +240,7 @@ fn sent(
     linked_children: &mut HashSet<String>,
 ) -> Result<usize> {
     let message = &entry["message"];
-    match format::string(message, "type")? {
+    match format::string(message, "type").unwrap_or("send-message") {
         "text" => {
             event(
                 conn,
@@ -312,17 +317,11 @@ fn sent(
             Ok(0)
         }
         "cursor-agent" => {
-            let peer = serde_json::json!({"id":message["bcId"],"name":message["title"]});
-            relationship(
-                conn,
-                sid,
-                path,
-                id,
-                ts,
-                peer.as_object()
-                    .context("GROK_BOT_INVALID_RECORD: cloud agent")?,
-                linked_children,
-            )?;
+            let peer = serde_json::Map::from_iter([
+                ("id".to_owned(), message["bcId"].clone()),
+                ("name".to_owned(), message["title"].clone()),
+            ]);
+            relationship(conn, sid, path, id, ts, &peer, linked_children)?;
             marker(conn, sid, id, "cursor-agent", Some(ts), None, entry)?;
             Ok(0)
         }
@@ -406,14 +405,15 @@ fn relationship(
     peer: &serde_json::Map<String, Value>,
     linked_children: &mut HashSet<String>,
 ) -> Result<()> {
-    let child = peer
+    // Only a Cursor cloud agent (`bc-…`) is a delegated child. Any other peer
+    // keeps its message evidence without inventing a relationship edge.
+    let Some(child) = peer
         .get("id")
         .and_then(Value::as_str)
-        .context("GROK_BOT_INVALID_RECORD: cloud agent id")?;
-    anyhow::ensure!(
-        child.starts_with("bc-") && !child.chars().any(char::is_control),
-        "GROK_BOT_INVALID_RECORD: cloud agent id"
-    );
+        .filter(|child| child.starts_with("bc-") && !child.chars().any(char::is_control))
+    else {
+        return Ok(());
+    };
     if !linked_children.insert(child.to_owned()) {
         return Ok(());
     }

@@ -231,3 +231,63 @@ fn grok_bot_explicitly_cleared_roster_title_is_removed() {
         .unwrap();
     assert_eq!(catalog.title, None);
 }
+
+#[test]
+fn grok_bot_unmapped_entry_shapes_and_newer_roster_still_hydrate() {
+    let home = tempfile::tempdir().unwrap();
+    let path = grok_bot_fixture::stage(home.path());
+    let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/grok-bot/replicas");
+    std::fs::copy(fixtures.join("drift-replica.json"), &path).unwrap();
+    std::fs::copy(
+        fixtures.join("drift-roster.json"),
+        grok_bot_fixture::persistence(home.path()).join(format!(
+            "{}.blob",
+            grok_bot_fixture::encode_key(
+                "sand.client.slice.account.fixture%7Cp.roster.last-roster"
+            )
+        )),
+    )
+    .unwrap();
+    let store = open(home.path());
+    store
+        .discover(DiscoveryOptions::default().sources([Source::GrokBot]))
+        .unwrap();
+    store
+        .hydrate(
+            &SessionRef::id(Source::GrokBot, SID),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    let evidence = store
+        .session(
+            &SessionRef::id(Source::GrokBot, SID),
+            SessionQuery::default(),
+        )
+        .unwrap()
+        .unwrap();
+    let texts: Vec<_> = evidence
+        .messages
+        .iter()
+        .flat_map(|m| &m.blocks)
+        .filter_map(|b| b.text.as_deref())
+        .collect();
+    assert_eq!(
+        texts,
+        [
+            "Draft the fixture plan.",
+            "Handing the fixture plan to a peer.",
+            "The fixture plan is drafted."
+        ]
+    );
+    assert_eq!(evidence.session.title.as_deref(), Some("Fixture Drift Bot"));
+    for (kind, id) in [("message", "t0n1"), ("send-message", "t0s1")] {
+        assert!(
+            evidence
+                .markers
+                .iter()
+                .any(|marker| marker.kind == kind && marker.message_id.as_deref() == Some(id)),
+            "{id} is kept as a {kind} marker"
+        );
+    }
+    assert!(evidence.relationships.is_empty());
+}

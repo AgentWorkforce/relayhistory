@@ -238,23 +238,14 @@ fn snapshot(path: &Path, context: &AcquisitionContext<'_>) -> Result<AcquiredSes
     let count = format::valid_replica(&replica)?.len() as i64;
     let roster_path = format::roster_path(path, &slot);
     let mut paths = vec![path.to_path_buf()];
-    let (roster, roster_bytes) = if roster_path.exists() {
-        context.validate(&roster_path)?;
-        anyhow::ensure!(
-            std::fs::metadata(&roster_path)?.len() <= ROSTER_LIMIT,
-            "GROK_BOT_ROSTER_TOO_LARGE"
-        );
-        let bytes = context.read(&roster_path)?;
-        let roster: Value =
-            serde_json::from_slice(&bytes).context("GROK_BOT_INVALID_ROSTER: JSON")?;
-        anyhow::ensure!(
-            roster["schemaVersion"] == 4,
-            "GROK_BOT_UNSUPPORTED_SCHEMA: roster version 4 required"
-        );
-        paths.push(roster_path);
-        (Some(roster), bytes.len())
-    } else {
-        (None, 0)
+    // The roster only supplies titles: one this adapter cannot read, or rows
+    // in a newer schema, leave the transcript readable without a title.
+    let (roster, roster_bytes) = match read_roster(&roster_path, context) {
+        Some((roster, bytes)) => {
+            paths.push(roster_path);
+            (Some(roster), bytes)
+        }
+        None => (None, 0),
     };
     Ok(AcquiredSession::new(
         serde_json::json!({"session_id":sid,"replica":replica,"roster":roster}),
@@ -262,6 +253,15 @@ fn snapshot(path: &Path, context: &AcquisitionContext<'_>) -> Result<AcquiredSes
         count,
         paths,
     ))
+}
+
+fn read_roster(path: &Path, context: &AcquisitionContext<'_>) -> Option<(Value, usize)> {
+    if std::fs::metadata(path).ok()?.len() > ROSTER_LIMIT {
+        return None;
+    }
+    let bytes = context.read(path).ok()?;
+    let roster = serde_json::from_slice(&bytes).ok()?;
+    Some((roster, bytes.len()))
 }
 
 fn acquire(

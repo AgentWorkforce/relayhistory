@@ -67,7 +67,10 @@ pub(super) fn roster_path(path: &Path, slot: &str) -> PathBuf {
     ))
 }
 
-pub(super) fn valid_replica(value: &Value) -> Result<&[Value]> {
+/// The replica's keyable entries. The app's entry union grows between
+/// releases, so an entry without a usable kind, id and time, or a repeated id,
+/// is skipped instead of failing every other entry in the session.
+pub(super) fn valid_replica(value: &Value) -> Result<Vec<&Value>> {
     anyhow::ensure!(
         value["schemaVersion"] == 1,
         "GROK_BOT_UNSUPPORTED_SCHEMA: transcript replica version 1 required"
@@ -76,16 +79,14 @@ pub(super) fn valid_replica(value: &Value) -> Result<&[Value]> {
         .as_array()
         .context("GROK_BOT_INVALID_REPLICA: entries missing")?;
     let mut ids = HashSet::new();
-    for entry in entries {
-        string(entry, "kind")?;
-        let id = string(entry, "id")?;
-        anyhow::ensure!(
-            ids.insert(id),
-            "GROK_BOT_INVALID_RECORD: duplicate entry id"
-        );
-        timestamp(entry)?;
-    }
-    Ok(entries)
+    Ok(entries
+        .iter()
+        .filter(|entry| {
+            string(entry, "kind").is_ok()
+                && timestamp(entry).is_ok()
+                && string(entry, "id").is_ok_and(|id| ids.insert(id))
+        })
+        .collect())
 }
 
 /// Parse the final native entry when its opening brace fits in the bounded
