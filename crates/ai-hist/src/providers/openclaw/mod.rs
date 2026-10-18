@@ -44,7 +44,7 @@ pub(crate) const ADAPTER: Option<ProviderAdapter> = Some(ProviderAdapter {
     resolve_roots: roots::resolve,
     watch_roots: storage::watch_roots,
 });
-const GENERATION: &str = "openclaw_agent24_v1";
+const GENERATION: &str = "openclaw_agent24_v2";
 #[derive(Debug, Serialize, Deserialize)]
 struct Session {
     id: String,
@@ -155,7 +155,11 @@ fn ingest(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
 }
 
 const STAMPS: &str = "openclaw_session_stamps";
+#[cfg(not(test))]
 const MAX_SWEEP: usize = 100_000;
+/// Small enough for a test to exceed.
+#[cfg(test)]
+const MAX_SWEEP: usize = 4;
 fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
     let mut result = SweepResult::default();
     let mut cache = ctx
@@ -178,11 +182,11 @@ fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
         }
         crate::ingest::check_capture_cancelled()?;
         let key = path.to_string_lossy().into_owned();
-        let previous = cache.remove(&key).and_then(|v| match v {
-            Value::Object(map) => Some(map),
-            _ => None,
-        });
-        match sweep_database(&ctx, path, previous.unwrap_or_default()) {
+        let previous = match cache.remove(&key) {
+            Some(Value::Object(map)) => map,
+            _ => Map::new(),
+        };
+        match sweep_database(&ctx, path, &previous) {
             Ok((inserted, unread, stamps)) => {
                 result.inserted += inserted;
                 result.unread += unread;
@@ -194,6 +198,7 @@ fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
                 // empty: its prior evidence and cursor stay in place.
                 eprintln!("OpenClaw {}: {error:#}", path.display());
                 result.unread += 1;
+                cache.insert(key, Value::Object(previous));
             }
         }
     }
@@ -210,14 +215,20 @@ fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
 fn sweep_database(
     ctx: &SweepContext<'_>,
     path: &Path,
-    previous: Map<String, Value>,
+    previous: &Map<String, Value>,
 ) -> Result<(usize, u64, Map<String, Value>)> {
     let context = AcquisitionContext::new(ID, ctx.roots);
     let mut stamps = Map::new();
     let mut inserted = 0;
     let mut unread = 0;
     let sessions = storage::read(&context, path, |conn, version| {
-        let mut sessions = storage::sessions(conn, ctx.roots, path, version, MAX_SWEEP, None)?;
+        let mut sessions = storage::sessions(conn, ctx.roots, path, version, MAX_SWEEP + 1, None)?;
+        // A truncated listing is not a complete snapshot: retiring against it
+        // would delete sessions past the bound.
+        anyhow::ensure!(
+            sessions.len() <= MAX_SWEEP,
+            "OpenClaw database exceeds {MAX_SWEEP} sessions"
+        );
         for s in &mut sessions {
             crate::ingest::check_capture_cancelled()?;
             let stamp = format!("{GENERATION}/{}", s.stamp);
@@ -247,6 +258,9 @@ fn sweep_database(
                         s.native_id
                     );
                     unread += 1;
+                    if let Some(cursor) = cursor {
+                        stamps.insert(s.id.clone(), cursor.clone());
+                    }
                     continue;
                 }
             }

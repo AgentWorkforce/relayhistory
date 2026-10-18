@@ -31,11 +31,11 @@
   "capture": [
     {
       "evidence": "Messages and tools",
-      "coverage": "Agent schema 24 transcript rows (JSON or zstd), full entry tree with native entry IDs, user/assistant/thinking/tool content, toolCallId joins and isError outcomes; session key, agent ID and channel retained as metadata."
+      "coverage": "Agent schema 24-31 transcript rows (JSON or zstd) and verified cold archives (file or SQLite), full entry tree with native entry IDs, user/assistant/thinking/tool content, toolCallId joins and isError outcomes; session key, agent ID and channel retained as metadata."
     },
     {
       "evidence": "Usage and relationships",
-      "coverage": "Assistant per-message usage with reported cost; delivery mirrors carry no request usage. Session windows, previous session and parent/spawn keys retained as metadata; no relationship, resume or live execution advertised. Legacy JSONL and cold archives unsupported."
+      "coverage": "Assistant per-message usage with reported cost, one request per provider responseId; delivery mirrors, transcript-only rows and CLI-harness rows carry no request usage. Session windows, previous session and parent/spawn keys retained as metadata; no relationship, resume or live execution advertised. Legacy JSONL and reset/delete archives unsupported."
     }
   ],
   "population": {

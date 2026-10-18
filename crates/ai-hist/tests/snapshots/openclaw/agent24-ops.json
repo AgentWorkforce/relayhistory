@@ -121,7 +121,7 @@
       "repo_url": null,
       "session_id": "ops:fixture-relay-0001",
       "source": "openclaw",
-      "source_stamp": "openclaw_agent24_v1:sha256:b14f74ff6401337a759659051abb71f7a216ea0f847328852cfca862ba295b2f",
+      "source_stamp": "openclaw_agent24_v2:sha256:94e9a6c7f2a50d05e7e79b58844ed23f312108de351c184ba338a8548c114e29",
       "title": null,
       "workspace_roots_json": null
     }

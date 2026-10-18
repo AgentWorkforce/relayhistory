@@ -219,7 +219,7 @@ pub(super) fn session_query(selected: bool) -> String {
          coalesce(e.latest, w.transcript_updated_at, w.updated_at), coalesce(e.first, w.created_at), \
          r.generation, w.updated_at, w.transcript_updated_at, w.account_id, \
          c.generation, c.archive_name, c.archive_sha256, c.event_count, c.raw_bytes, \
-         c.archive_bytes, c.last_seq, c.archived_at, c.storage \
+         c.archive_bytes, c.last_seq, c.archived_at, c.storage, n.updated_at \
          FROM session_windows w \
          LEFT JOIN (SELECT session_id, count(*) AS events, max(seq) AS last_seq, \
                max(created_at) AS latest, min(created_at) AS first \
@@ -247,7 +247,18 @@ pub(super) fn sessions(
     let mut result = vec![];
     while let Some(r) = rows.next()? {
         check_capture_cancelled()?;
-        result.push(session_row(r, &namespace, agent, schema_version)?);
+        let mut session = session_row(r, &namespace, agent, schema_version)?;
+        if let Some(archive) = session.cold.as_ref().filter(|c| c.storage == "file") {
+            // A file-backed archive changes outside the database: its stat
+            // (never its contents) is part of the session's stamp.
+            let file = cold::archive_path(path, &archive.name)?;
+            let stat = match crate::file_stamp_and_modified(&file) {
+                Ok((stamp, _)) => stamp,
+                Err(_) => "missing".into(),
+            };
+            session.stamp = format!("{}|{stat}", session.stamp);
+        }
+        result.push(session);
     }
     Ok(result)
 }
@@ -298,8 +309,8 @@ fn session_row(
     );
     let [previous, reason, status, chat_type, window_channel, model_provider, model, harness, parent, spawned_by, title, created_via, rewrite, account_id] =
         columns::<String, 14>(r, [2, 3, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 22, 25])?;
-    let [started, ended, hot, last_seq, latest, first, updated, transcript_updated] =
-        columns::<i64, 8>(r, [6, 7, 18, 19, 20, 21, 23, 24])?;
+    let [started, ended, hot, last_seq, latest, first, updated, transcript_updated, node_updated] =
+        columns::<i64, 9>(r, [6, 7, 18, 19, 20, 21, 23, 24, 35])?;
     let (latest, first) = (latest.unwrap_or_default(), first.unwrap_or_default());
     let cold = cold_archive(r, hot)?;
     // Every input that changes when upstream appends, rewrites, truncates,
@@ -311,6 +322,9 @@ fn session_row(
         rewrite,
         updated,
         transcript_updated,
+        // Node-only edits (label, display name) change the projected title.
+        node_updated,
+        title,
         cold.as_ref()
             .map(|c| (&c.sha256, c.last_seq, c.archived_at)),
     ])
@@ -422,20 +436,8 @@ pub(super) fn shallow(scan: &ScanEnv<'_>, c: &Candidate) -> Result<Option<Shallo
         };
         scan.note_records(1);
         scan.note_query();
-        let mut stmt = conn.prepare(
-            "SELECT event_json, event_zstd, event_utf8_bytes FROM transcript_events \
-             WHERE session_id=?1 ORDER BY seq LIMIT 64",
-        )?;
-        let mut rows = stmt.query([native])?;
-        let mut head = vec![];
-        while let Some(r) = rows.next()? {
-            let text = match r.get::<_, Option<String>>(0)? {
-                Some(json) => json,
-                None => events::decompress(r.get(1)?, r.get(2)?)?,
-            };
-            scan.note_bytes(text.len() as u64);
-            head.push(serde_json::from_str::<Value>(&text)?);
-        }
+        let head = head(&context, conn, path, &s)?;
+        scan.note_bytes(head.iter().map(|e| e.to_string().len() as u64).sum());
         scan.note_records(head.len() as u64);
         let cwd = head
             .first()
@@ -457,6 +459,34 @@ pub(super) fn shallow(scan: &ScanEnv<'_>, c: &Candidate) -> Result<Option<Shallo
             ..Default::default()
         }))
     })
+}
+
+/// The first 64 entries, for a bounded first prompt and cwd: hot rows, or
+/// the verified cold archive once upstream has moved them there.
+fn head(
+    context: &AcquisitionContext<'_>,
+    conn: &Connection,
+    path: &Path,
+    s: &Session,
+) -> Result<Vec<Value>> {
+    if let Some(archive) = &s.cold {
+        let events = cold::events(context, conn, path, &s.native_id, archive)?;
+        return Ok(events.into_iter().take(64).map(|e| e.entry).collect());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT event_json, event_zstd, event_utf8_bytes FROM transcript_events \
+         WHERE session_id=?1 ORDER BY seq LIMIT 64",
+    )?;
+    let mut rows = stmt.query([&s.native_id])?;
+    let mut head = vec![];
+    while let Some(r) = rows.next()? {
+        let text = match r.get::<_, Option<String>>(0)? {
+            Some(json) => json,
+            None => events::decompress(r.get(1)?, r.get(2)?)?,
+        };
+        head.push(serde_json::from_str::<Value>(&text)?);
+    }
+    Ok(head)
 }
 
 /// Read one selected session and all its events from a single snapshot.
@@ -500,8 +530,12 @@ pub(super) fn fingerprint_inputs(roots: &ProviderRoots) -> Result<Vec<Candidate>
     let mut result = vec![];
     for db in databases(roots)? {
         let namespace = namespace(roots, &db)?;
-        for suffix in ["", "-wal", "-journal"] {
-            let path = sidecar(&db, suffix);
+        let files: Vec<_> = ["", "-wal", "-journal"]
+            .iter()
+            .map(|suffix| sidecar(&db, suffix))
+            .chain(cold::files(&context, &db)?)
+            .collect();
+        for path in files {
             if path.try_exists()? {
                 context.validate(&path)?;
                 let (stamp, modified) = crate::file_stamp_and_modified(&path)?;

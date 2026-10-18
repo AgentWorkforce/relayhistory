@@ -36,10 +36,12 @@ pub(super) fn counts_usage(msg: &Value) -> bool {
 }
 /// Harness projections stamp commentary and tool-call rows with an all-zero
 /// snapshot; that is an unmeasured row, not a measured free request.
+/// A malformed counter is not zero: it stays for the usage normalizer to
+/// report.
 fn zero_usage(usage: &Value) -> bool {
     ["input", "output", "cacheRead", "cacheWrite", "totalTokens"]
         .iter()
-        .all(|key| usage[key].as_u64().unwrap_or(0) == 0)
+        .all(|key| usage.get(key).is_none_or(|n| n.as_u64() == Some(0)))
 }
 
 /// Assistant text OpenClaw copies into the transcript after channel delivery.

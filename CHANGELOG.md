@@ -12,6 +12,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Re-reading a long Pi or Copilot session no longer slows quadratically with its prompt count, and a prompt later marked as harness-written no longer keeps its history row.
 - Devin remote capture skips provider-classified `code_review` and `code_review_and_analysis` sessions only when their origin is `automation`; person-started reviews and other work remain discoverable.
 
 ### Rust API

@@ -430,7 +430,7 @@
       "repo_url": null,
       "session_id": "main:fixture-telegram-0001",
       "source": "openclaw",
-      "source_stamp": "openclaw_agent24_v1:sha256:7f5787f82abdc003874c1dc083b4b9522699b2a8f032cdb95a51f9dabde3d1c3",
+      "source_stamp": "openclaw_agent24_v2:sha256:1586adb481d6e44c0e69eae3089569a13b4ebd755b5a6e88a8d0767fd9150689",
       "title": null,
       "workspace_roots_json": null
     },
@@ -450,7 +450,7 @@
       "repo_url": null,
       "session_id": "main:fixture/main:α",
       "source": "openclaw",
-      "source_stamp": "openclaw_agent24_v1:sha256:58d6ef60b123f48acb1a9b5bb24fa329af00d58791f2506973fb9d33c0672c1a",
+      "source_stamp": "openclaw_agent24_v2:sha256:8367f3a5caf2ff68cb44b60f3118ef1653a6df047d0559ace5f6e7e32bd565bf",
       "title": null,
       "workspace_roots_json": null
     }

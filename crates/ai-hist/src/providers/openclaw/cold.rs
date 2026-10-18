@@ -32,6 +32,28 @@ pub(super) fn archive_path(database: &Path, name: &str) -> Result<PathBuf> {
     Ok(sessions.join("cold").join(name))
 }
 
+/// File-backed cold archives beside one agent database, by stat only.
+pub(super) fn files(context: &AcquisitionContext<'_>, db: &Path) -> Result<Vec<PathBuf>> {
+    let probe = "0".repeat(64) + ".jsonl.zst";
+    let Some(dir) = archive_path(db, &probe)?.parent().map(Path::to_path_buf) else {
+        return Ok(vec![]);
+    };
+    let entries = match std::fs::read_dir(&dir) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+        result => result?,
+    };
+    context.validate(&dir)?;
+    let mut files = vec![];
+    for entry in entries {
+        let path = entry?.path();
+        if path.to_string_lossy().ends_with(".jsonl.zst") {
+            files.push(path);
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
 pub(super) fn events(
     context: &AcquisitionContext<'_>,
     conn: &Connection,

@@ -1047,3 +1047,145 @@ fn branch_copies_of_one_response_are_one_request() {
     );
     assert_eq!(measured.iter().map(|u| u.input_tokens).sum::<u64>(), 230);
 }
+
+#[test]
+fn review_node_renames_restamp_and_failures_keep_cursors() {
+    let (home, roots, path, db) = fixture();
+    let mut ledger = Ledger::new(home.path());
+    ledger.sweep(&roots, None).unwrap();
+    // A node-only rename changes the title without touching the transcript.
+    db.execute(
+        "UPDATE session_nodes SET label='Renamed', updated_at=updated_at+1 WHERE session_key='agent:main:main'",
+        [],
+    )
+    .unwrap();
+    ledger.sweep(&roots, None).unwrap();
+    let title: String = ledger
+        .conn
+        .query_row(
+            "SELECT title FROM sessions WHERE source='openclaw' AND session_id=?1",
+            [SESSION],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(title, "Renamed");
+    // A locked database keeps every cursor: the next sweep re-reads nothing.
+    let cursors = ledger.state[STAMPS].clone();
+    db.execute_batch(
+        "PRAGMA journal_mode=DELETE; BEGIN EXCLUSIVE; UPDATE session_windows SET model=model;",
+    )
+    .unwrap();
+    assert_eq!(ledger.sweep(&roots, None).unwrap().unread, 1);
+    assert_eq!(ledger.state[STAMPS], cursors);
+    db.execute_batch("ROLLBACK").unwrap();
+    drop(path);
+}
+
+#[test]
+fn review_over_limit_listing_fails_without_retiring() {
+    let (home, roots, _path, db) = fixture();
+    let mut ledger = Ledger::new(home.path());
+    ledger.sweep(&roots, None).unwrap();
+    for i in 0..MAX_SWEEP {
+        let sid = format!("extra-{i}");
+        let key = format!("agent:main:cron:extra-{i}");
+        db.execute("INSERT INTO session_nodes (session_key,current_session_id,entry_json,updated_at) VALUES (?1,?2,'{}',1)", [&key, &sid]).unwrap();
+        db.execute("INSERT INTO session_windows (session_id,session_key,created_at,updated_at) VALUES (?1,?2,1790000000000,1790000000000)", [&sid, &key]).unwrap();
+        db.execute(
+            "INSERT INTO transcript_events (session_id,seq,event_json,created_at) VALUES (?1,0,?2,1790000000000)",
+            params![sid, format!(r#"{{"type":"session","version":4,"id":"{sid}","timestamp":"2026-09-21T14:13:20.000Z","cwd":"/f"}}"#)],
+        )
+        .unwrap();
+    }
+    assert_eq!(ledger.sweep(&roots, None).unwrap().unread, 1);
+    assert_eq!(
+        count(
+            &ledger.conn,
+            "SELECT count(*) FROM sessions WHERE source='openclaw'"
+        ),
+        2,
+        "a truncated listing retires nothing"
+    );
+}
+
+#[test]
+fn review_malformed_zero_counters_reach_the_usage_normalizer() {
+    let msg = |usage: Value| serde_json::json!({"role":"assistant","provider":"openai","model":"m","api":"openai-responses","usage":usage});
+    assert!(!format::counts_usage(&msg(
+        serde_json::json!({"input":0,"output":0,"totalTokens":0})
+    )));
+    assert!(format::counts_usage(&msg(
+        serde_json::json!({"input":-1,"output":0,"totalTokens":0})
+    )));
+    assert!(format::counts_usage(&msg(
+        serde_json::json!({"input":0.5,"output":0})
+    )));
+}
+
+#[test]
+fn review_cold_archive_file_changes_restamp_and_fingerprint() {
+    let (home, roots, path, db) = fixture();
+    let (_, file) = make_cold(&db, &roots, &path, NATIVE, "file");
+    let catalog = Connection::open_in_memory().unwrap();
+    let fingerprint = || {
+        let env = DiscoveryEnv::with_provider_roots(&catalog, roots.clone());
+        Provider.fingerprint_inputs(&env).unwrap()
+    };
+    let stamp = || {
+        storage::enumerate(&roots, None)
+            .unwrap()
+            .into_iter()
+            .find(|c| c.session_id.as_deref() == Some(SESSION))
+            .unwrap()
+            .stamp
+    };
+    let (before, before_stamp) = (fingerprint(), stamp());
+    assert!(before.iter().any(|c| Path::new(&c.locator) == file));
+    std::fs::remove_file(&file).unwrap();
+    assert_ne!(fingerprint(), before);
+    assert_ne!(stamp(), before_stamp);
+    let mut ledger = Ledger::new(home.path());
+    assert_eq!(ledger.sweep(&roots, None).unwrap().unread, 1);
+}
+
+#[test]
+fn review_cold_sessions_shallow_read_their_archive_and_prompt_rewrites_retire() {
+    let (home, roots, path, db) = fixture();
+    // A human prompt later rewritten as harness input loses its history row.
+    let mut ledger = Ledger::new(home.path());
+    ledger.sweep(&roots, None).unwrap();
+    let prompt = "SELECT count(*) FROM history WHERE prompt='Find the OpenClaw fixture needle'";
+    assert_eq!(count(&ledger.conn, prompt), 1);
+    db.execute(
+        "UPDATE transcript_events SET event_json=json_set(event_json,'$.message.excludeFromContext',json('true')) WHERE session_id=?1 AND seq=1",
+        [NATIVE],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE transcript_rewrite_watermarks SET generation='rewritten' WHERE session_id=?1",
+        [NATIVE],
+    )
+    .unwrap();
+    ledger.sweep(&roots, None).unwrap();
+    assert_eq!(
+        count(&ledger.conn, prompt),
+        0,
+        "a control row supports no prompt"
+    );
+    // Cold sessions keep their first prompt and cwd in discovery.
+    make_cold(&db, &roots, &path, "fixture-telegram-0001", "file");
+    let catalog = crate::open_db(&home.path().join("catalog.db")).unwrap();
+    let env = DiscoveryEnv::with_provider_roots(&catalog, roots.clone());
+    let scan = env.scan();
+    let candidate = storage::enumerate(&roots, None)
+        .unwrap()
+        .into_iter()
+        .find(|c| c.session_id.as_deref() == Some(TELEGRAM))
+        .unwrap();
+    let shallow = storage::shallow(&scan, &candidate).unwrap().unwrap();
+    assert_eq!(
+        shallow.first_prompt.as_deref(),
+        Some("Run the failing fixture command")
+    );
+    assert_eq!(shallow.cwd.as_deref(), Some("/fixture/project"));
+}
