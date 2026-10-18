@@ -1,6 +1,6 @@
 {
   "name": "ai-hist",
-  "version": "0.45.2",
+  "version": "0.46.0",
   "description": "Local history ingestion, storage, evidence, SDK, CLI and MCP server.",
   "license": "MIT",
   "private": false,

@@ -4,7 +4,9 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased - Minor]
+## [Unreleased]
+
+## [0.46.0] - 2026-10-18
 
 ### Added
 
@@ -1040,7 +1042,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - The SDK reads provider JSONL natively and works without the Python CLI.
 
-[Unreleased]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.45.2...HEAD
+[Unreleased]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.46.0...HEAD
+[0.46.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.45.2...sdk-ts-v0.46.0
 [0.45.2]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.45.1...sdk-ts-v0.45.2
 [0.45.1]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.45.0...sdk-ts-v0.45.1
 [0.45.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.44.0...sdk-ts-v0.45.0
