@@ -272,18 +272,27 @@ pub(super) fn session(
     entry: Option<&Entry>,
     stamp: String,
 ) -> Result<(Session, bool)> {
-    // One handle, read with the bound itself: a file still growing past the
-    // limit is rejected without allocating beyond it.
+    // One handle: its size rejects an oversized file before any read, and
+    // the bounded read rejects one still growing past the limit.
     context.validate(path)?;
+    let file = std::fs::File::open(path)?;
+    let too_large = || {
+        anyhow::anyhow!(
+            "OpenClaw transcript {} exceeds {MAX_TRANSCRIPT_BYTES} bytes",
+            path.display()
+        )
+    };
+    if file.metadata()?.len() > MAX_TRANSCRIPT_BYTES {
+        return Err(too_large());
+    }
     let mut bytes = vec![];
-    std::fs::File::open(path)?
-        .take(MAX_TRANSCRIPT_BYTES + 1)
+    file.take(MAX_TRANSCRIPT_BYTES + 1)
         .read_to_end(&mut bytes)?;
-    ensure!(
-        bytes.len() as u64 <= MAX_TRANSCRIPT_BYTES,
-        "OpenClaw transcript {} exceeds {MAX_TRANSCRIPT_BYTES} bytes",
-        path.display()
-    );
+    #[cfg(test)]
+    TRANSCRIPT_READS.with(|r| r.set(r.get() + 1));
+    if bytes.len() as u64 > MAX_TRANSCRIPT_BYTES {
+        return Err(too_large());
+    }
     let (entries, partial) = parse(&bytes, MAX_EVENTS + 1)?;
     ensure!(
         entries.len() <= MAX_EVENTS,
@@ -354,6 +363,15 @@ thread_local! {
 #[cfg(test)]
 thread_local! {
     static PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+thread_local! {
+    static TRANSCRIPT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+/// Whole-transcript reads on this thread.
+#[cfg(test)]
+pub(super) fn transcript_reads() -> usize {
+    TRANSCRIPT_READS.with(std::cell::Cell::get)
 }
 #[cfg(test)]
 pub(super) fn index_parses() -> usize {

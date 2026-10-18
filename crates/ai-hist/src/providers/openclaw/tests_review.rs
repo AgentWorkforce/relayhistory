@@ -212,8 +212,11 @@ fn review_an_oversized_transcript_is_unread_and_keeps_its_history() {
         text.push('\n');
     }
     std::fs::write(&path, text).unwrap();
+    let reads = legacy::transcript_reads();
     assert_eq!(ledger.sweep(&roots, None).unread, 1);
     assert_eq!(events(&ledger, MAIN), before);
+    // Rejected by its size alone: the oversized file is never read.
+    assert_eq!(legacy::transcript_reads(), reads);
     assert!(format!(
         "{:#}",
         storage::capture(&context(&roots), &path, MAIN).unwrap_err()
