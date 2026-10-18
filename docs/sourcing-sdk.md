@@ -1010,6 +1010,7 @@ handle.
 | grok-bot | ✓ | ✓ | — | — | ✓ | none |
 | hermes | ✓ | ✓ | ✓ | — | — | none |
 | muse | ✓ | ✓ | ✓ | ✓ | ✓ | per-request |
+| openclaw | ✓ | ✓ | ✓ | — | — | per-message |
 | opencode | ✓ | ✓ | ✓ | ✓ | ✓ | none |
 | pi | ✓ | ✓ | ✓ | — | — | per-message |
 <!-- sourcing-sdk-population-table:end -->

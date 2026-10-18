@@ -1,0 +1,111 @@
+{
+  "package": "openclaw@2026.10.4",
+  "reader": "plugin-sdk/session-transcript-runtime readSessionTranscriptEvents",
+  "sessions": [
+    {
+      "agentId": "main",
+      "sessionKey": "agent:main:main",
+      "sessionId": "fixture/main:α",
+      "events": [
+        {
+          "type": "session",
+          "id": "fixture/main:α",
+          "role": null,
+          "toolCallId": null
+        },
+        {
+          "type": "message",
+          "id": "00000000-0000-4000-8000-000000000008",
+          "role": "user",
+          "toolCallId": null
+        },
+        {
+          "type": "message",
+          "id": "00000000-0000-4000-8000-000000000011",
+          "role": "assistant",
+          "toolCallId": null
+        },
+        {
+          "type": "message",
+          "id": "00000000-0000-4000-8000-000000000013",
+          "role": "toolResult",
+          "toolCallId": "call_fixture|read:1"
+        },
+        {
+          "type": "message",
+          "id": "00000000-0000-4000-8000-000000000015",
+          "role": "assistant",
+          "toolCallId": null
+        },
+        {
+          "type": "message",
+          "id": "00000000-0000-4000-8000-000000000017",
+          "role": "assistant",
+          "toolCallId": null
+        }
+      ]
+    },
+    {
+      "agentId": "main",
+      "sessionKey": "agent:main:telegram:direct:fixture-peer",
+      "sessionId": "fixture-telegram-0001",
+      "events": [
+        {
+          "type": "session",
+          "id": "fixture-telegram-0001",
+          "role": null,
+          "toolCallId": null
+        },
+        {
+          "type": "message",
+          "id": "00000000-0000-4000-8000-000000000019",
+          "role": "user",
+          "toolCallId": null
+        },
+        {
+          "type": "message",
+          "id": "00000000-0000-4000-8000-000000000022",
+          "role": "assistant",
+          "toolCallId": null
+        },
+        {
+          "type": "message",
+          "id": "00000000-0000-4000-8000-000000000024",
+          "role": "toolResult",
+          "toolCallId": "call_fixture_exec"
+        },
+        {
+          "type": "message",
+          "id": "00000000-0000-4000-8000-000000000026",
+          "role": "assistant",
+          "toolCallId": null
+        }
+      ]
+    },
+    {
+      "agentId": "ops",
+      "sessionKey": "agent:ops:relay:dm:fixture-sender",
+      "sessionId": "fixture-relay-0001",
+      "events": [
+        {
+          "type": "session",
+          "id": "fixture-relay-0001",
+          "role": null,
+          "toolCallId": null
+        },
+        {
+          "type": "message",
+          "id": "00000000-0000-4000-8000-000000000037",
+          "role": "user",
+          "toolCallId": null
+        },
+        {
+          "type": "message",
+          "id": "00000000-0000-4000-8000-000000000040",
+          "role": "assistant",
+          "toolCallId": null
+        }
+      ]
+    }
+  ]
+}
