@@ -272,14 +272,18 @@ pub(super) fn session(
     entry: Option<&Entry>,
     stamp: String,
 ) -> Result<(Session, bool)> {
+    // One handle, read with the bound itself: a file still growing past the
+    // limit is rejected without allocating beyond it.
     context.validate(path)?;
-    let size = std::fs::metadata(path)?.len();
+    let mut bytes = vec![];
+    std::fs::File::open(path)?
+        .take(MAX_TRANSCRIPT_BYTES + 1)
+        .read_to_end(&mut bytes)?;
     ensure!(
-        size <= MAX_TRANSCRIPT_BYTES,
+        bytes.len() as u64 <= MAX_TRANSCRIPT_BYTES,
         "OpenClaw transcript {} exceeds {MAX_TRANSCRIPT_BYTES} bytes",
         path.display()
     );
-    let bytes = context.read(path)?;
     let (entries, partial) = parse(&bytes, MAX_EVENTS + 1)?;
     ensure!(
         entries.len() <= MAX_EVENTS,
@@ -360,13 +364,30 @@ pub(super) fn reset_index_parses() {
     PARSES.with(|p| p.set(0));
     INDEX_CACHE.with(|c| c.borrow_mut().take());
 }
+/// The index file's identity: size and mtime, plus on Unix its inode and
+/// change time, which no rewrite can preserve (an mtime can be restored).
+fn index_identity(path: &Path) -> Result<String> {
+    let metadata = match std::fs::metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok("absent".into()),
+        result => result?,
+    };
+    let (stamp, _) = crate::file_stamp_and_modified(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let (ino, ctime, ns) = (metadata.ino(), metadata.ctime(), metadata.ctime_nsec());
+        Ok(format!("{stamp}/{ino}/{ctime}.{ns}"))
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = metadata;
+        Ok(stamp)
+    }
+}
+/// Discovery's index: one parse per directory while the file is unchanged.
 fn cached_index(context: &AcquisitionContext<'_>, dir: &Path) -> Result<Index> {
     let path = dir.join(INDEX);
-    let stamp = match crate::file_stamp_and_modified(&path) {
-        Ok((stamp, _)) => stamp,
-        Err(_) if !path.try_exists()? => "absent".into(),
-        Err(error) => return Err(error),
-    };
+    let stamp = index_identity(&path)?;
     let hit = INDEX_CACHE.with(|c| {
         c.borrow()
             .as_ref()
@@ -385,6 +406,13 @@ fn entry_for(context: &AcquisitionContext<'_>, path: &Path) -> Result<Option<Ent
         .parent()
         .context("OpenClaw transcript has no directory")?;
     Ok(cached_index(context, dir)?.get(file_name(path)).cloned())
+}
+/// An explicit selected read always parses the index it captures.
+fn fresh_entry(context: &AcquisitionContext<'_>, path: &Path) -> Result<Option<Entry>> {
+    let dir = path
+        .parent()
+        .context("OpenClaw transcript has no directory")?;
+    Ok(index(context, dir)?.remove(file_name(path)))
 }
 
 /// Bounded discovery read: the index entry plus the first prompt from the
@@ -426,7 +454,7 @@ pub(super) fn capture(
     path: &Path,
     id: &str,
 ) -> Result<AcquiredSession> {
-    let entry = entry_for(context, path)?;
+    let entry = fresh_entry(context, path)?;
     let (stamp, _) = stamp(path, entry.as_ref())?;
     let (session, _) = session(context, path, entry.as_ref(), stamp)?;
     ensure!(

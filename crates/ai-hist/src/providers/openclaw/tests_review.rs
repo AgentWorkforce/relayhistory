@@ -178,6 +178,22 @@ fn review_shallow_discovery_parses_each_index_once() {
     let shallow = storage::shallow(&scan, main).unwrap().unwrap();
     assert_eq!(shallow.title.as_deref(), Some("Renamed"));
     assert_eq!(legacy::index_parses(), 2);
+    // A same-length rewrite that restores the mtime is still seen, by
+    // discovery and by a selected capture.
+    let modified = std::fs::metadata(&index).unwrap().modified().unwrap();
+    let text = std::fs::read_to_string(&index).unwrap();
+    std::fs::write(&index, text.replace("Renamed", "Retitle")).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&index)
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    let shallow = storage::shallow(&scan, main).unwrap().unwrap();
+    assert_eq!(shallow.title.as_deref(), Some("Retitle"));
+    let path = std::path::PathBuf::from(&main.locator);
+    let acquired = storage::capture(&context(&roots), &path, MAIN).unwrap();
+    assert_eq!(acquired.payload["title"], "Retitle");
 }
 
 #[test]
@@ -205,6 +221,7 @@ fn review_an_oversized_transcript_is_unread_and_keeps_its_history() {
     .contains("exceeds"));
 }
 
+#[cfg(unix)]
 #[test]
 fn review_one_unlistable_sessions_directory_does_not_fail_the_sweep() {
     let (home, roots) = home();
