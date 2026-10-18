@@ -108,6 +108,7 @@ fn title(s: &Session) -> Option<&str> {
 /// field, so evidence the transcript no longer holds is retired.
 pub(super) fn session(conn: &Connection, s: &Session, path: &Path) -> Result<usize> {
     let written = write(conn, s)?;
+    super::legacy::claim(conn, s, path)?;
     file_history::retire(conn, ID, &s.id, &written.keys)?;
     let cwd = cwd(header(s)?);
     upsert_session_rebuilt(
@@ -139,6 +140,7 @@ pub(super) fn session(conn: &Connection, s: &Session, path: &Path) -> Result<usi
 /// the earlier rows were not re-read.
 pub(super) fn append(conn: &Connection, s: &Session, path: &Path) -> Result<usize> {
     let written = write(conn, s)?;
+    super::legacy::claim(conn, s, path)?;
     let cwd = cwd(header(s)?);
     crate::ingest::upsert_session(
         conn,
@@ -182,7 +184,7 @@ fn models(s: &Session) -> Vec<String> {
 
 /// The session header plus the OpenClaw catalog row it belongs to.
 fn session_marker(conn: &Connection, s: &Session, header: &Event, keys: &mut Keys) -> Result<()> {
-    let payload = serde_json::json!({
+    let mut payload = serde_json::json!({
         "header": header.entry,
         "native_session_id": s.native_id,
         "agent_id": s.agent_id,
@@ -205,6 +207,7 @@ fn session_marker(conn: &Connection, s: &Session, header: &Event, keys: &mut Key
         "schema_version": s.schema_version,
         "cold_archive": s.cold.as_ref().map(|c| serde_json::json!({"name": c.name, "storage": c.storage, "archived_at_ms": c.archived_at, "event_count": c.event_count})),
     });
+    super::legacy::mark(&mut payload, s);
     let payload = serde_json::to_string(&crate::ingest::bound_marker_value(payload))?;
     insert_session_marker(
         conn,

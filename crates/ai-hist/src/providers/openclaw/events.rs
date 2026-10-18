@@ -1,5 +1,6 @@
 //! Transcript rows: hot `transcript_events` (JSON or zstd), or a verified
 //! cold archive, decoded into validated entries.
+use super::schema::Schema;
 use super::*;
 use crate::ingest::check_capture_cancelled;
 use anyhow::{ensure, Context};
@@ -14,18 +15,20 @@ pub(super) fn events(
     context: &AcquisitionContext<'_>,
     conn: &Connection,
     path: &Path,
+    schema: &Schema,
     s: &Session,
 ) -> Result<Vec<Event>> {
     let native = s.native_id.as_str();
     if let Some(cold) = &s.cold {
         return cold::events(context, conn, path, native, cold);
     }
-    let mut stmt = conn.prepare(
-        "SELECT e.seq, e.event_json, e.event_zstd, e.event_utf8_bytes, e.created_at, \
+    let mut stmt = conn.prepare(&format!(
+        "SELECT e.seq, e.event_json, {}, e.created_at, \
          a.event_seq IS NOT NULL FROM transcript_events e \
          LEFT JOIN session_transcript_active_events a ON a.session_id=e.session_id AND a.event_seq=e.seq \
          WHERE e.session_id=?1 ORDER BY e.seq LIMIT ?2",
-    )?;
+        schema.payload_columns()
+    ))?;
     let mut rows = stmt.query(rusqlite::params![native, (MAX_EVENTS + 1) as i64])?;
     let mut result = vec![];
     while let Some(r) = rows.next()? {
@@ -53,14 +56,20 @@ pub(super) fn events(
 }
 /// The header and every hot event from `from_seq` on: the part of a grown
 /// transcript an append-only pass re-reads.
-pub(super) fn tail(conn: &Connection, native: &str, from_seq: i64) -> Result<Vec<Event>> {
-    let mut stmt = conn.prepare(
-        "SELECT e.seq, e.event_json, e.event_zstd, e.event_utf8_bytes, e.created_at, \
+pub(super) fn tail(
+    conn: &Connection,
+    schema: &Schema,
+    native: &str,
+    from_seq: i64,
+) -> Result<Vec<Event>> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT e.seq, e.event_json, {}, e.created_at, \
          a.event_seq IS NOT NULL FROM transcript_events e \
          LEFT JOIN session_transcript_active_events a ON a.session_id=e.session_id AND a.event_seq=e.seq \
          WHERE e.session_id=?1 AND (e.seq=(SELECT min(seq) FROM transcript_events WHERE session_id=?1) OR e.seq>=?2) \
          ORDER BY e.seq LIMIT ?3",
-    )?;
+        schema.payload_columns()
+    ))?;
     let mut rows = stmt.query(rusqlite::params![native, from_seq, (MAX_EVENTS + 1) as i64])?;
     let mut result = vec![];
     while let Some(r) = rows.next()? {

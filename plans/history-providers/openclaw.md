@@ -33,9 +33,20 @@ Schema, verified against the released writer and a real 2026.10.4 install:
 - `schema_meta` (`meta_key='primary'`, `role='agent'`, `schema_version`,
   `agent_id`) and `PRAGMA user_version` must agree; the owner must be the
   directory's agent; an `openclaw_engine_anchor` table (PostgreSQL-backed
-  store) is refused. Schemas 24–31 are accepted: 25–31 only add columns at
-  table ends, triggers and indexes outside the selected columns, and every
-  column is selected by name.
+  store) is refused. Schemas 19–31 are accepted and every column is
+  selected by name. Released writers, each diffed against 24 from a database
+  it wrote: 19 (2026.8.1–2026.9.4) has no `event_zstd`/`event_utf8_bytes`
+  columns and no cold-archive table; 21 (2026.9.5) adds
+  `session_transcript_cold_archives` (same codec as 2026.10.4); 23 (2026.9.6)
+  adds the zstd columns; 24 (2026.9.7–2026.10.4) only adds
+  `session_nodes.snapshot_revision`/`legacy_acp_migration_json`. 20 and 22
+  were development schemas between releases. Those two features are detected
+  by table and column, not by version. 25–31 only add columns at table ends,
+  triggers and indexes outside the selected columns.
+- A database before schema 19 (1 in 2026.6.5–2026.7.35: auth profiles and
+  caches only) with no transcript tables holds no sessions; its agent's
+  sessions are the JSONL store below. An older schema that has transcript
+  tables is refused.
 - `session_windows`: one row per transcript (`session_id`), with its
   `session_key`, previous window, reason, scope, chat type, channel, account,
   model, harness, parent/spawn keys and timestamps (epoch ms).
@@ -56,6 +67,61 @@ Schema, verified against the released writer and a real 2026.10.4 install:
 - `transcript_rewrite_watermarks.generation` rotates when admitted content is
   rewritten; `session_windows.transcript_updated_at` advances on every append
   or rewrite.
+
+## Legacy JSONL store (2026.7.x and earlier)
+
+Until 2026.8.1 every agent kept `agents/<id>/sessions/sessions.json` (an
+object of session key → entry: `sessionId`, `updatedAt`, `sessionFile`,
+`label`, `displayName`, `chatType`, `channel` — `provider` before 2026.2 —,
+`model`, `modelProvider`, `agentHarnessId`, `parentSessionKey`,
+`spawnedBy`, `status`, `endedAt`, ...) beside one JSONL transcript per
+session, `<sessionId>.jsonl` (or `<sessionId>-topic-<topic>.jsonl`). Lines
+are the same Pi v3 entries the database rows hold (header first; Pi's own
+`SessionManager` wrote them before 2026.6.1, OpenClaw's agent-core after,
+both at version 3). Captured from the 2026.7.35 writer; the 2026.2.22 dist
+(Pi 0.54.1) was checked for the same header version, index shape and paths.
+Each agent's `sessions/` directory is watched.
+
+- Live transcripts follow upstream's `isPrimarySessionTranscriptFileName`:
+  `*.jsonl` except `*.trajectory.jsonl` and
+  `<id>.checkpoint.<uuid>.jsonl` compaction checkpoints. Reset/delete
+  archives (`*.jsonl.reset.<ts>`, `*.jsonl.deleted.<ts>`), index backups and
+  `sessions.json.<uuid>.tmp` files are never read; a session whose live file
+  is gone retires like any deleted session.
+- An index entry names its transcript by the file name of `sessionFile`
+  (an absolute path upstream keeps inside the directory), else
+  `<sessionId>.jsonl`. The identity is the header `id` under the agent's
+  namespace, the same `<agentId>:<sessionId>` the database uses.
+- The active branch is resolved as upstream's session storage does (visible
+  leaf after each entry including `leaf` controls and side appends, then the
+  path to the root), so off-branch messages carry the same marker as in the
+  database.
+- Window/node fields map as the doctor's import fills them: title from
+  `label` else `displayName`, chat type, channel, account, model, harness,
+  parent/spawn keys, status, end time. The header marker records
+  `layout: "jsonl"` and no schema version.
+- An unterminated final line is deferred (Pi semantics): the complete lines
+  only add evidence, as an append does, and nothing of the session retires
+  until the file is complete again; the file counts as unread. A changed
+  transcript or index entry (its stamp is the file stat plus a digest of its
+  entry) is re-read whole. A transcript over 512 MiB or 1M records is unread.
+  One parse of `sessions.json` serves every shallow read of its directory.
+
+Upgrade: the 2026.8.1+ doctor (`openclaw doctor --session-sqlite import`,
+also run at startup) imports each transcript under the same session ID and
+entry IDs, seq 0 being the header, then moves the files to
+`agents/<id>/session-sqlite-import-archive/` (checked by running the
+2026.9.6 doctor on the 2026.7.35 capture). The database owns every session
+it holds a transcript for: discovery and sweeps skip such a JSONL file even
+while it is still in place, and the first database normalization moves the
+catalog's `raw_path` from the JSONL file to the database. A JSONL transcript
+found missing is checked against its agent's database before anything
+retires: a session the database holds moves to it with its evidence (also
+when that database failed to normalize it, or was out of a scoped sweep's
+reach), and while the database cannot be read nothing of that agent retires,
+whether or not its `sessions/` directory still exists. Discovery checks
+ownership against every session the database holds, not just the bounded
+listing.
 
 ## Acquisition
 
@@ -126,25 +192,32 @@ timestamps are the integer `message.timestamp`, else the entry's ISO time.
 - Titles: node label/display name, else window display name, else the last
   `session_info` name. Paths in tool arguments are text, never opened.
 
-Unsupported: legacy pre-SQLite `agents/<id>/sessions/*.jsonl` (upstream's
-doctor/startup migration imports and moves them), reset/delete archives
-(deleted sessions retire, as for every provider), `agentDir` relocation,
-PostgreSQL stores, relationships, native resume and live execution.
+Unsupported: reset/delete archives and the doctor's import archive (deleted
+sessions retire, as for every provider), JSONL headers before Pi version 3,
+`agentDir` relocation, PostgreSQL stores, relationships, native resume and
+live execution.
 
 ## Fixtures
 
 `crates/ai-hist/src/providers/openclaw/capture_fixture.mjs` writes synthetic
-sessions with the released writer's own plugin-SDK APIs
+sessions with a released writer's own plugin-SDK APIs
 (`upsertSessionEntry`, `appendSessionTranscriptMessageByIdentity`,
 `appendAssistantMirrorMessageByIdentity`) into an isolated state directory,
 with a synthetic clock and sequential UUIDs so reruns are byte-identical.
 The writer itself zstd-compresses the long tool result. It then dumps the
 transcript tables as SQL, and the released reader
-(`readSessionTranscriptEvents`) re-reads the result into `oracle.json`. Run:
+(`readSessionTranscriptEvents`) re-reads the result into `oracle.json`.
+Writers: 2026.10.4 (schema 24, `main`/`ops`, `oracle.json`), 2026.9.6 (23),
+2026.9.5 (21) and 2026.8.1 (19), each `main-schema<N>.sql` with
+`oracle-schema<N>.json`, and 2026.7.35, whose sessions directories are copied
+to `legacy-jsonl/` (the index's absolute `sessionFile` rewritten to
+`/fixture/state`) with `oracle-legacy.json`; that writer only accepts
+file-safe session IDs, so its main session is `fixture-main-0001`. Run, per
+version:
 
 ```sh
-npm install --prefix ~/Projects/scratch-openclaw/pkg --ignore-scripts openclaw@2026.10.4
-OPENCLAW_WRITER=~/Projects/scratch-openclaw/pkg node crates/ai-hist/src/providers/openclaw/capture_fixture.mjs
+npm install --prefix ~/Projects/scratch-openclaw/writers/<version> --ignore-scripts openclaw@<version>
+OPENCLAW_WRITER=~/Projects/scratch-openclaw/writers/<version> node crates/ai-hist/src/providers/openclaw/capture_fixture.mjs
 ```
 
 `upstream-agent-v2026.9.9.sql` is upstream's own MIT-licensed dump of a

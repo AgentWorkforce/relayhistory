@@ -22,7 +22,13 @@ pub(super) fn retire_absent(conn: &Connection, path: &Path, sessions: &[Session]
     }
     Ok(())
 }
-pub(super) fn retire_missing_databases(ctx: &SweepContext<'_>) -> Result<()> {
+/// Retire sessions recorded at an agent database or legacy transcript that
+/// is confirmed gone, for each kind only when every store of it was read.
+pub(super) fn retire_missing_locators(
+    ctx: &SweepContext<'_>,
+    databases: bool,
+    transcripts: bool,
+) -> Result<()> {
     // A missing configured root is unavailable, not proof of deletion.
     let mut stmt = ctx.conn.prepare(
         "SELECT DISTINCT raw_path FROM sessions WHERE source=?1 AND raw_path IS NOT NULL",
@@ -30,13 +36,71 @@ pub(super) fn retire_missing_databases(ctx: &SweepContext<'_>) -> Result<()> {
     let paths = stmt
         .query_map([ID], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut held = Held::new();
     for path in paths {
         let path = PathBuf::from(path);
-        if in_scope(&path, ctx.paths) && confirmed_missing(ctx.roots, &path)? {
+        let proven = if path.file_name().is_some_and(|n| n == storage::DATABASE) {
+            databases
+        } else {
+            transcripts
+        };
+        if proven && in_scope(&path, ctx.paths) && confirmed_missing(ctx.roots, &path)? {
             crate::ingest::check_capture_cancelled()?;
             let tx = ctx.conn.unchecked_transaction()?;
-            retire_absent(&tx, &path, &[])?;
+            if path.file_name().is_some_and(|n| n == storage::DATABASE) {
+                retire_absent(&tx, &path, &[])?;
+            } else {
+                retire_transcript(&tx, ctx.roots, &path, &mut held)?;
+            }
             tx.commit()?;
+        }
+    }
+    Ok(())
+}
+
+/// Agent directory -> the native IDs its database holds, or None when that
+/// database is unreadable.
+type Held = std::collections::BTreeMap<PathBuf, Option<std::collections::BTreeSet<String>>>;
+
+/// A JSONL transcript that is gone: its sessions retire unless the agent's
+/// database holds them (the doctor imported, then archived, the file), in
+/// which case the row moves to the database with its evidence. While that
+/// database cannot be read nothing retires: it may hold any of them. This
+/// holds whether or not the database was swept, normalized cleanly, or its
+/// `sessions/` directory still exists.
+fn retire_transcript(
+    conn: &Connection,
+    roots: &ProviderRoots,
+    path: &Path,
+    held: &mut Held,
+) -> Result<()> {
+    let Some(agent) = path.parent().and_then(Path::parent) else {
+        return Ok(());
+    };
+    let ids = held.entry(agent.to_path_buf()).or_insert_with(|| {
+        stores::held(&AcquisitionContext::new(ID, roots), agent)
+            .inspect_err(|error| eprintln!("OpenClaw {}: {error:#}", agent.display()))
+            .ok()
+    });
+    let Some(ids) = ids else {
+        return Ok(());
+    };
+    let database = agent.join("agent").join(storage::DATABASE);
+    let prefix = format!("{}:", storage::namespace(roots, path)?);
+    let mut stmt =
+        conn.prepare("SELECT session_id FROM sessions WHERE source=?1 AND raw_path=?2")?;
+    let recorded = stmt
+        .query_map(rusqlite::params![ID, path.to_string_lossy()], |r| {
+            r.get::<_, String>(0)
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    for id in recorded {
+        crate::ingest::check_capture_cancelled()?;
+        let native = id.strip_prefix(&prefix).unwrap_or_default();
+        if ids.contains(native) {
+            legacy::transfer(conn, &id, &database)?;
+        } else {
+            file_history::retire_local_session(conn, ID, &id)?;
         }
     }
     Ok(())
@@ -61,7 +125,9 @@ pub(super) fn confirmed_missing(roots: &ProviderRoots, path: &Path) -> Result<bo
         let Ok(relative) = path.strip_prefix(root) else {
             continue;
         };
-        if !native_database_path(relative) || !root.try_exists()? {
+        if !(native_database_path(relative) || legacy::native_path(relative))
+            || !root.try_exists()?
+        {
             continue;
         }
         match std::fs::symlink_metadata(path) {

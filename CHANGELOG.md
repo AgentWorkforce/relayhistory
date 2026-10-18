@@ -4,7 +4,11 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Minor]
+
+### Added
+
+- OpenClaw history from older installs is read too: agent databases written by OpenClaw 2026.8.1 through 2026.9.6 (schemas 19–23), and the pre-2026.8 JSONL session store (`agents/<id>/sessions/*.jsonl` with `sessions.json`); a session already imported into the agent database is read only from there.
 
 ## [0.46.0] - 2026-10-18
 

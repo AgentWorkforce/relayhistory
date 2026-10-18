@@ -26,16 +26,59 @@
         "openclaw/ops-schema24.sql"
       ],
       "quirk": "Second agent database from the same writer run: relay DM session key under a non-main agent ID, namespaced by agent."
+    },
+    {
+      "source": "openclaw",
+      "name": "agent19",
+      "layout": "Sqlite",
+      "target": ".openclaw/agents/main/agent/openclaw-agent.sqlite",
+      "origin": "RelayHistory",
+      "files": [
+        "openclaw/main-schema19.sql"
+      ],
+      "quirk": "OpenClaw 2026.8.1 writer, agent schema 19 (2026.8.1-2026.9.4): the first database layout, plain-JSON transcript_events without zstd columns and no cold-archive table; same synthetic sessions as agent24."
+    },
+    {
+      "source": "openclaw",
+      "name": "agent21",
+      "layout": "Sqlite",
+      "target": ".openclaw/agents/main/agent/openclaw-agent.sqlite",
+      "origin": "RelayHistory",
+      "files": [
+        "openclaw/main-schema21.sql"
+      ],
+      "quirk": "OpenClaw 2026.9.5 writer, agent schema 21: cold-archive table added, transcript rows still plain JSON."
+    },
+    {
+      "source": "openclaw",
+      "name": "agent23",
+      "layout": "Sqlite",
+      "target": ".openclaw/agents/main/agent/openclaw-agent.sqlite",
+      "origin": "RelayHistory",
+      "files": [
+        "openclaw/main-schema23.sql"
+      ],
+      "quirk": "OpenClaw 2026.9.6 writer, agent schema 23: writer-compressed zstd rows, the transcript layout schema 24 keeps."
+    },
+    {
+      "source": "openclaw",
+      "name": "legacy-jsonl",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "openclaw/legacy-jsonl"
+      ],
+      "quirk": "OpenClaw 2026.7.35 writer, the pre-database store: per-agent `sessions/sessions.json` index (label, chat type, channel, model, absolute `sessionFile`) beside Pi v3 JSONL transcripts, for main and ops agents; same synthetic turns as agent24."
     }
   ],
   "capture": [
     {
       "evidence": "Messages and tools",
-      "coverage": "Agent schema 24-31 transcript rows (JSON or zstd) and verified cold archives (file or SQLite), full entry tree with native entry IDs, user/assistant/thinking/tool content, toolCallId joins and isError outcomes; session key, agent ID and channel retained as metadata."
+      "coverage": "Agent schema 19-31 transcript rows (JSON, or zstd from schema 23) and verified cold archives (file or SQLite, from schema 21), plus the pre-2026.8 JSONL store (`sessions/*.jsonl` with its `sessions.json` index), full entry tree with native entry IDs, user/assistant/thinking/tool content, toolCallId joins and isError outcomes; session key, agent ID and channel retained as metadata. A session the agent database holds is read from it, never also from JSONL."
     },
     {
       "evidence": "Usage and relationships",
-      "coverage": "Assistant per-message usage with reported cost, one request per provider responseId; delivery mirrors, transcript-only rows and CLI-harness rows carry no request usage. Session windows, previous session and parent/spawn keys retained as metadata; no relationship, resume or live execution advertised. Legacy JSONL and reset/delete archives unsupported."
+      "coverage": "Assistant per-message usage with reported cost, one request per provider responseId; delivery mirrors, transcript-only rows and CLI-harness rows carry no request usage. Session windows, previous session and parent/spawn keys retained as metadata; no relationship, resume or live execution advertised. Reset/delete archives, compaction checkpoints and the doctor's import archive are not read; a deleted session retires."
     }
   ],
   "population": {

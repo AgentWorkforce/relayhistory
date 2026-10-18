@@ -1,0 +1,24 @@
+{
+  "agent:main:main": {
+    "sessionId": "fixture-main-0001",
+    "updatedAt": 1790000000049,
+    "label": "Fixture main session",
+    "chatType": "direct",
+    "modelProvider": "openai",
+    "model": "fixture-model",
+    "sessionFile": "/fixture/state/agents/main/sessions/fixture-main-0001.jsonl"
+  },
+  "agent:main:telegram:direct:fixture-peer": {
+    "sessionId": "fixture-telegram-0001",
+    "updatedAt": 1789999991000,
+    "chatType": "direct",
+    "channel": "telegram",
+    "route": {
+      "channel": "telegram"
+    },
+    "deliveryContext": {
+      "channel": "telegram"
+    },
+    "lastChannel": "telegram"
+  }
+}
