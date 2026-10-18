@@ -1,5 +1,6 @@
 //! Public OpenClaw acquisition acceptance, using only synthetic fixture homes
-//! written by the released 2026.10.4 writer.
+//! written by released writers: 2026.10.4 (agent schema 24), 2026.8.1
+//! (schema 19) and 2026.7.35 (the JSONL store).
 mod provider_support;
 use ai_hist::{BlockKind, Role, Source};
 use provider_support::{assert_history_conformance, HistoryCase};
@@ -75,4 +76,69 @@ fn openclaw_public_history_conformance() {
         },
     );
     assert!(relay.tool_calls.is_empty());
+}
+
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap() {
+        let entry = entry.unwrap();
+        let target = to.join(entry.file_name());
+        if entry.file_type().unwrap().is_dir() {
+            copy_tree(&entry.path(), &target);
+        } else {
+            std::fs::copy(entry.path(), target).unwrap();
+        }
+    }
+}
+
+#[test]
+fn openclaw_older_layouts_public_history_conformance() {
+    let schema19 = tempfile::tempdir().unwrap();
+    stage(
+        schema19.path(),
+        "main",
+        include_str!("fixtures/openclaw/main-schema19.sql"),
+    );
+    let first = assert_history_conformance(
+        schema19.path(),
+        HistoryCase {
+            source: Source::OpenClaw,
+            session_id: "main:fixture/main:α",
+            messages: &[
+                (Role::User, "Find the OpenClaw fixture needle"),
+                (Role::Assistant, "I will read the notes."),
+                (Role::Assistant, "Found the OpenClaw fixture needle."),
+            ],
+        },
+    );
+    assert_eq!(first.tool_calls.len(), 1);
+
+    let legacy = tempfile::tempdir().unwrap();
+    copy_tree(
+        &std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/openclaw/legacy-jsonl"),
+        legacy.path(),
+    );
+    let evidence = assert_history_conformance(
+        legacy.path(),
+        HistoryCase {
+            source: Source::OpenClaw,
+            session_id: "main:fixture-main-0001",
+            messages: &[
+                (Role::User, "Find the OpenClaw fixture needle"),
+                (Role::Assistant, "I will read the notes."),
+                (Role::Assistant, "Found the OpenClaw fixture needle."),
+            ],
+        },
+    );
+    assert_eq!(evidence.tool_calls.len(), 1);
+    assert_eq!(evidence.tool_results.len(), 1);
+    // The same requests as the database layout; the mirror stays unmetered.
+    let measured: Vec<_> = evidence
+        .requests
+        .iter()
+        .filter_map(|r| r.usage.as_ref())
+        .collect();
+    assert_eq!(measured.len(), 2);
+    assert_eq!(measured.iter().map(|u| u.input_tokens).sum::<u64>(), 230);
 }

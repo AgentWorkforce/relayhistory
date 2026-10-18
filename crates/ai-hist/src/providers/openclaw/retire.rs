@@ -22,7 +22,13 @@ pub(super) fn retire_absent(conn: &Connection, path: &Path, sessions: &[Session]
     }
     Ok(())
 }
-pub(super) fn retire_missing_databases(ctx: &SweepContext<'_>) -> Result<()> {
+/// Retire sessions recorded at an agent database or legacy transcript that
+/// is confirmed gone, for each kind only when every store of it was read.
+pub(super) fn retire_missing_locators(
+    ctx: &SweepContext<'_>,
+    databases: bool,
+    transcripts: bool,
+) -> Result<()> {
     // A missing configured root is unavailable, not proof of deletion.
     let mut stmt = ctx.conn.prepare(
         "SELECT DISTINCT raw_path FROM sessions WHERE source=?1 AND raw_path IS NOT NULL",
@@ -32,7 +38,12 @@ pub(super) fn retire_missing_databases(ctx: &SweepContext<'_>) -> Result<()> {
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for path in paths {
         let path = PathBuf::from(path);
-        if in_scope(&path, ctx.paths) && confirmed_missing(ctx.roots, &path)? {
+        let proven = if path.file_name().is_some_and(|n| n == storage::DATABASE) {
+            databases
+        } else {
+            transcripts
+        };
+        if proven && in_scope(&path, ctx.paths) && confirmed_missing(ctx.roots, &path)? {
             crate::ingest::check_capture_cancelled()?;
             let tx = ctx.conn.unchecked_transaction()?;
             retire_absent(&tx, &path, &[])?;
@@ -61,7 +72,9 @@ pub(super) fn confirmed_missing(roots: &ProviderRoots, path: &Path) -> Result<bo
         let Ok(relative) = path.strip_prefix(root) else {
             continue;
         };
-        if !native_database_path(relative) || !root.try_exists()? {
+        if !(native_database_path(relative) || legacy::native_path(relative))
+            || !root.try_exists()?
+        {
             continue;
         }
         match std::fs::symlink_metadata(path) {

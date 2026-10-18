@@ -8,17 +8,20 @@ use serde::{Deserialize, Serialize};
 mod cold;
 mod events;
 mod format;
+mod legacy;
+mod legacy_sweep;
 mod normalize;
 mod retire;
 mod roots;
+mod schema;
 mod storage;
+mod stores;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_legacy;
+mod tree;
 const ID: &str = "openclaw";
-/// Agent-database schemas whose transcript tables this reader was verified on.
-/// 24 is the released 2026.10.4 writer; 25-31 only add columns and indexes
-/// outside the transcript tables this reader selects by name.
-const SUPPORTED_SCHEMAS: std::ops::RangeInclusive<i64> = 24..=31;
 pub(crate) const LOCAL_SOURCE: LocalSource = LocalSource {
     id: ID,
     discovery: Discovery::Provider(|| Box::new(Provider)),
@@ -42,7 +45,7 @@ pub(crate) const ADAPTER: Option<ProviderAdapter> = Some(ProviderAdapter {
     acquire,
     sweep,
     resolve_roots: roots::resolve,
-    watch_roots: storage::watch_roots,
+    watch_roots: stores::watch_roots,
 });
 const GENERATION: &str = "openclaw_agent24_v2";
 #[derive(Debug, Serialize, Deserialize)]
@@ -55,7 +58,7 @@ struct Session {
     window_channel: Option<String>,
     account_id: Option<String>,
     chat_type: Option<String>,
-    scope: String,
+    scope: Option<String>,
     reason: Option<String>,
     previous_session_id: Option<String>,
     parent_session_key: Option<String>,
@@ -75,7 +78,11 @@ struct Session {
     rewrite: Option<String>,
     /// Present when the transcript lives only in a cold archive.
     cold: Option<ColdArchive>,
-    schema_version: i64,
+    /// Agent-database schema; None for a legacy JSONL transcript.
+    schema_version: Option<i64>,
+    /// Read from the pre-2026.8 JSONL store rather than the agent database.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    legacy: bool,
     /// Change stamp of this session's rows; drives incremental sweeps.
     stamp: String,
     events: Vec<Event>,
@@ -117,7 +124,7 @@ impl ShallowSessionProvider for Provider {
         storage::enumerate(&env.provider_roots, limit)
     }
     fn fingerprint_inputs(&self, env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
-        storage::fingerprint_inputs(&env.provider_roots)
+        stores::fingerprint_inputs(&env.provider_roots)
     }
     fn read_shallow(
         &self,
@@ -160,7 +167,7 @@ const MAX_SWEEP: usize = 100_000;
 /// Small enough for a test to exceed.
 #[cfg(test)]
 const MAX_SWEEP: usize = 4;
-fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
+fn sweep(mut ctx: SweepContext<'_>) -> Result<SweepResult> {
     let mut result = SweepResult::default();
     // Only an unread database withholds deletion proof; a failed session
     // inside a readable one says nothing about other databases.
@@ -171,7 +178,7 @@ fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    let databases = storage::databases(ctx.roots)?;
+    let databases = stores::databases(ctx.roots)?;
     if ctx.paths.is_none() {
         let visited: std::collections::BTreeSet<_> = databases
             .iter()
@@ -206,10 +213,13 @@ fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
             }
         }
     }
-    if unread_databases == 0 {
-        retire::retire_missing_databases(&ctx)?;
-    }
     ctx.state.insert(STAMPS.into(), Value::Object(cache));
+    // After every database pass: a session a database now holds is claimed
+    // by it before its JSONL transcript is considered.
+    let (inserted, unread_transcripts, unread_stores) = legacy_sweep::sweep(&mut ctx)?;
+    result.inserted += inserted;
+    result.unread += unread_transcripts;
+    retire::retire_missing_locators(&ctx, unread_databases == 0, !unread_stores)?;
     Ok(result)
 }
 
@@ -225,8 +235,8 @@ fn sweep_database(
     let mut stamps = Map::new();
     let mut inserted = 0;
     let mut unread = 0;
-    let sessions = storage::read(&context, path, |conn, version| {
-        let mut sessions = storage::sessions(conn, ctx.roots, path, version, MAX_SWEEP + 1, None)?;
+    let sessions = storage::read(&context, path, |conn, schema| {
+        let mut sessions = storage::sessions(conn, ctx.roots, path, schema, MAX_SWEEP + 1, None)?;
         // A truncated listing is not a complete snapshot: retiring against it
         // would delete sessions past the bound.
         anyhow::ensure!(
@@ -247,7 +257,7 @@ fn sweep_database(
                 .map(|c| appended_from(conn, s, c))
                 .transpose()?
                 .flatten();
-            let normalized = normalize_one(ctx, &context, conn, path, s, from);
+            let normalized = normalize_one(ctx, &context, (conn, schema), path, s, from);
             // Each session's events are released before the next is read.
             s.events = vec![];
             match normalized {
@@ -286,14 +296,14 @@ const TAIL: usize = 32;
 fn normalize_one(
     ctx: &SweepContext<'_>,
     context: &AcquisitionContext<'_>,
-    conn: &Connection,
+    (conn, schema): (&Connection, &schema::Schema),
     path: &Path,
     s: &mut Session,
     from: Option<i64>,
 ) -> Result<usize> {
     s.events = match from {
-        Some(seq) => events::tail(conn, &s.native_id, seq)?,
-        None => events::events(context, conn, path, s)?,
+        Some(seq) => events::tail(conn, schema, &s.native_id, seq)?,
+        None => events::events(context, conn, path, schema, s)?,
     };
     let tx = ctx.conn.unchecked_transaction()?;
     let n = match from {

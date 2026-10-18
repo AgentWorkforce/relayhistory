@@ -65,7 +65,7 @@ fn fixture_capture_reads_pi_entries_and_openclaw_window_metadata() {
     assert_eq!(s.agent_id, "main");
     assert_eq!(s.session_key, "agent:main:main");
     assert_eq!(s.channel.as_deref(), Some("main"));
-    assert_eq!(s.schema_version, 24);
+    assert_eq!(s.schema_version, Some(24));
     let types: Vec<_> = s.events.iter().map(|e| e.entry["type"].clone()).collect();
     assert_eq!(types[0], "session");
     assert_eq!(s.events.len(), 6);
@@ -571,7 +571,7 @@ fn deleted_sessions_and_databases_retire_only_confirmed_local_evidence() {
 #[test]
 fn watches_cover_databases_and_new_agents_without_agent_directories() {
     let (home, roots, path, _db) = fixture();
-    let watches = storage::watch_roots(&roots);
+    let watches = stores::watch_roots(&roots);
     let dirs: Vec<_> = watches.iter().map(|w| w.path.clone()).collect();
     assert!(dirs.contains(&path.parent().unwrap().to_path_buf()));
     assert!(dirs.contains(&home.path().join(".openclaw/agents")));
@@ -635,9 +635,10 @@ fn session_query_aggregates_events_once_and_bounds_selected_capture() {
             .unwrap();
         rows.map(Result::unwrap).collect::<Vec<_>>().join("\n")
     };
-    let all = plan(&storage::session_query(false));
+    let schema = schema::detect(&db, "main").unwrap();
+    let all = plan(&storage::session_query(false, &schema));
     assert!(!all.contains("CORRELATED"), "{all}");
-    let selected = storage::session_query(true);
+    let selected = storage::session_query(true, &schema);
     let mut stmt = db
         .prepare(&format!("EXPLAIN QUERY PLAN {selected}"))
         .unwrap();
@@ -693,7 +694,7 @@ fn later_additive_schemas_are_read_by_column_name_and_postgres_stores_refused() 
     )
     .unwrap();
     let s = capture(&roots, &path, SESSION);
-    assert_eq!(s.schema_version, 31);
+    assert_eq!(s.schema_version, Some(31));
     assert_eq!(s.events.len(), 6);
     db.execute_batch("UPDATE schema_meta SET schema_version=32; PRAGMA user_version=32")
         .unwrap();

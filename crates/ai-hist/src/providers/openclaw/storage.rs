@@ -1,12 +1,10 @@
+use super::schema::Schema;
 use super::*;
-use crate::discover::WatchEntries;
 use crate::ingest::check_capture_cancelled;
 use anyhow::{ensure, Context};
-use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
 pub(super) const DATABASE: &str = "openclaw-agent.sqlite";
 const MAX_SESSIONS: usize = 100_000;
-const MAX_AGENTS: usize = 1024;
 
 /// Ledger namespace for one agent database: the agent ID under the native
 /// state directory, else that ID qualified by a hash of the custom root.
@@ -51,68 +49,6 @@ fn native_id<'a>(namespace: &str, id: &'a str) -> Result<&'a str> {
         .context("SESSION_SOURCE_MISMATCH: OpenClaw session not in this agent database")
 }
 
-pub(super) fn databases(roots: &ProviderRoots) -> Result<Vec<PathBuf>> {
-    let context = AcquisitionContext::new(ID, roots);
-    let mut paths = vec![];
-    for root in roots.for_provider(ID) {
-        check_capture_cancelled()?;
-        match std::fs::metadata(root) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e.into()),
-            Ok(_) => context.validate(root)?,
-        }
-        let agents = root.join("agents");
-        if !agents.try_exists()? {
-            continue;
-        }
-        context.validate(&agents)?;
-        for (index, entry) in std::fs::read_dir(&agents)?.enumerate() {
-            check_capture_cancelled()?;
-            ensure!(
-                index < MAX_AGENTS,
-                "OpenClaw agent enumeration exceeds {MAX_AGENTS} entries"
-            );
-            let dir = entry?.path();
-            context.validate(&dir)?;
-            if !dir.is_dir() {
-                continue;
-            }
-            let db = dir.join("agent").join(DATABASE);
-            if db.try_exists()? {
-                agent_id(&db)?;
-                paths.push(db);
-            }
-        }
-    }
-    paths.sort();
-    paths.dedup();
-    Ok(paths)
-}
-pub(super) fn watch_roots(roots: &ProviderRoots) -> Vec<WatchRoot> {
-    let mut watches: Vec<_> = databases(roots)
-        .unwrap_or_default()
-        .iter()
-        .filter_map(|p| p.parent())
-        .map(|dir| {
-            // Narrow to the database and its sidecars: the agent directory
-            // also holds credentials and Codex homes.
-            WatchRoot::directory_of(
-                dir,
-                WatchEntries::OpencodeStores {
-                    primary: DATABASE.into(),
-                    channels: false,
-                },
-            )
-        })
-        .collect();
-    // New agents appear under agents/; the watcher backstop then installs
-    // their narrow database watches.
-    for root in roots.for_provider(ID) {
-        watches.push(WatchRoot::directory(root.join("agents")));
-    }
-    watches
-}
-
 pub(super) fn sidecar(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_os_string();
     name.push(suffix);
@@ -145,7 +81,7 @@ fn is_not_found(error: &anyhow::Error) -> bool {
 pub(super) fn read<T>(
     context: &AcquisitionContext<'_>,
     path: &Path,
-    f: impl FnOnce(&Connection, i64) -> Result<T>,
+    f: impl FnOnce(&Connection, &Schema) -> Result<T>,
 ) -> Result<T> {
     check_capture_cancelled()?;
     context.validate(path)?;
@@ -158,58 +94,17 @@ pub(super) fn read<T>(
     }
     let agent = agent_id(path)?;
     sqlite_snapshot(context, path, |conn| {
-        let version = schema_version(conn, agent)?;
-        f(conn, version)
+        let schema = schema::detect(conn, agent)?;
+        f(conn, &schema)
     })
-}
-fn schema_version(conn: &Connection, agent: &str) -> Result<i64> {
-    let anchored: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type='table' AND name='openclaw_engine_anchor')",
-        [],
-        |r| r.get(0),
-    )?;
-    ensure!(
-        !anchored,
-        "OpenClaw agent {agent:?} stores sessions in PostgreSQL; only SQLite agent databases are read"
-    );
-    let meta: Option<(String, i64, Option<String>)> = conn
-        .query_row(
-            "SELECT role, schema_version, agent_id FROM schema_meta WHERE meta_key='primary'",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .optional()
-        .context("unsupported OpenClaw agent database: missing schema_meta")?;
-    let (role, version, owner) =
-        meta.context("unsupported OpenClaw agent database: no primary schema_meta row")?;
-    ensure!(
-        role == "agent",
-        "OpenClaw database role {role:?} is not an agent database"
-    );
-    // Upstream refuses a database whose recorded owner is another agent.
-    ensure!(
-        owner.as_deref().is_none_or(|owner| owner == agent),
-        "OpenClaw database under agents/{agent} belongs to agent {owner:?}"
-    );
-    let user_version: i64 = conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-    ensure!(
-        user_version == version,
-        "OpenClaw agent database is mid-migration (user_version {user_version}, schema_meta {version})"
-    );
-    ensure!(
-        SUPPORTED_SCHEMAS.contains(&version),
-        "unsupported OpenClaw agent schema {version}; supported: {}-{}",
-        SUPPORTED_SCHEMAS.start(),
-        SUPPORTED_SCHEMAS.end()
-    );
-    Ok(version)
 }
 
 /// One window per transcript, hot (rows in `transcript_events`) or cold
 /// (moved into a verified archive). Recency aggregates the event table once;
 /// a selected capture aggregates only that session.
-pub(super) fn session_query(selected: bool) -> String {
+pub(super) fn session_query(selected: bool, schema: &Schema) -> String {
     let predicate = if selected { "WHERE session_id=?1" } else { "" };
+    let cold = schema.cold_archives();
     format!(
         "SELECT w.session_id, w.session_key, w.previous_session_id, w.reason, w.session_scope, \
          w.created_at, w.started_at, w.ended_at, w.status, w.chat_type, w.channel, \
@@ -226,7 +121,7 @@ pub(super) fn session_query(selected: bool) -> String {
                FROM transcript_events {predicate} GROUP BY session_id) e ON e.session_id=w.session_id \
          LEFT JOIN session_nodes n ON n.session_key=w.session_key \
          LEFT JOIN transcript_rewrite_watermarks r ON r.session_id=w.session_id \
-         LEFT JOIN session_transcript_cold_archives c ON c.session_id=w.session_id \
+         LEFT JOIN {cold} c ON c.session_id=w.session_id \
          WHERE (?1 IS NULL OR w.session_id=?1) AND (e.events IS NOT NULL OR c.session_id IS NOT NULL) \
          ORDER BY 21 DESC, w.session_id LIMIT ?2"
     )
@@ -236,18 +131,21 @@ pub(super) fn sessions(
     conn: &Connection,
     roots: &ProviderRoots,
     path: &Path,
-    schema_version: i64,
+    schema: &Schema,
     limit: usize,
     native: Option<&str>,
 ) -> Result<Vec<Session>> {
+    if !schema.transcripts {
+        return Ok(vec![]);
+    }
     let namespace = namespace(roots, path)?;
     let agent = agent_id(path)?;
-    let mut stmt = conn.prepare(&session_query(native.is_some()))?;
+    let mut stmt = conn.prepare(&session_query(native.is_some(), schema))?;
     let mut rows = stmt.query(rusqlite::params![native, limit as i64])?;
     let mut result = vec![];
     while let Some(r) = rows.next()? {
         check_capture_cancelled()?;
-        let mut session = session_row(r, &namespace, agent, schema_version)?;
+        let mut session = session_row(r, &namespace, agent, schema.version)?;
         if let Some(archive) = session.cold.as_ref().filter(|c| c.storage == "file") {
             // A file-backed archive changes outside the database: its stat
             // (never its contents) is part of the session's stamp.
@@ -337,7 +235,7 @@ fn session_row(
         session_key,
         previous_session_id: previous,
         reason,
-        scope: scope.unwrap_or_default(),
+        scope,
         started: timestamp(started.unwrap_or(first).min(first))?,
         ended: ended.map(timestamp).transpose()?,
         status,
@@ -356,7 +254,8 @@ fn session_row(
         last_seq,
         rewrite,
         cold,
-        schema_version,
+        schema_version: Some(schema_version),
+        legacy: false,
         stamp,
         events: vec![],
     })
@@ -379,8 +278,8 @@ pub(super) fn channel(key: &str) -> Option<String> {
 
 /// Session list of one agent database, captured in one snapshot.
 fn list(context: &AcquisitionContext<'_>, path: &Path, limit: usize) -> Result<Vec<Session>> {
-    read(context, path, |conn, version| {
-        sessions(conn, context.roots, path, version, limit, None)
+    read(context, path, |conn, schema| {
+        sessions(conn, context.roots, path, schema, limit, None)
     })
 }
 
@@ -388,18 +287,27 @@ pub(super) fn enumerate(roots: &ProviderRoots, limit: Option<usize>) -> Result<V
     let context = AcquisitionContext::new(ID, roots);
     let cap = limit.unwrap_or(MAX_SESSIONS).min(MAX_SESSIONS) + 1;
     let mut candidates = vec![];
-    for path in databases(roots)? {
+    for agent in stores::agent_dirs(roots)? {
         check_capture_cancelled()?;
-        for s in list(&context, &path, cap)? {
-            candidates.push(Candidate {
-                source: ID,
-                locator: path.to_string_lossy().into_owned(),
-                session_id: Some(s.id),
-                recency_hint_ms: Some(s.latest),
-                // Per-session change stamp: other sessions' writes to the
-                // same database do not force a shallow re-read.
-                stamp: s.stamp,
-            });
+        let mut held = std::collections::BTreeSet::new();
+        if let Some(path) = stores::database_of(&agent)? {
+            for s in list(&context, &path, cap)? {
+                held.insert(s.native_id);
+                candidates.push(Candidate {
+                    source: ID,
+                    locator: path.to_string_lossy().into_owned(),
+                    session_id: Some(s.id),
+                    recency_hint_ms: Some(s.latest),
+                    // Per-session change stamp: other sessions' writes to the
+                    // same database do not force a shallow re-read.
+                    stamp: s.stamp,
+                });
+            }
+        }
+        // The database owns every session it holds, imported or not.
+        let dir = agent.join(legacy::DIR);
+        if dir.is_dir() {
+            candidates.extend(legacy::candidates(&context, &dir, &held)?);
         }
     }
     ensure!(
@@ -418,6 +326,12 @@ pub(super) fn enumerate(roots: &ProviderRoots, limit: Option<usize>) -> Result<V
 /// Bounded discovery read: catalog row plus the first prompt from at most
 /// the first 64 events.
 pub(super) fn shallow(scan: &ScanEnv<'_>, c: &Candidate) -> Result<Option<ShallowSession>> {
+    if Path::new(&c.locator)
+        .file_name()
+        .is_some_and(|n| n != DATABASE)
+    {
+        return legacy::shallow(scan, c);
+    }
     let context = AcquisitionContext::new(ID, scan.provider_roots);
     let path = Path::new(&c.locator);
     let namespace = namespace(scan.provider_roots, path)?;
@@ -427,8 +341,8 @@ pub(super) fn shallow(scan: &ScanEnv<'_>, c: &Candidate) -> Result<Option<Shallo
     let native = native_id(&namespace, id)?;
     scan.note_open();
     scan.note_query();
-    read(&context, path, |conn, version| {
-        let Some(s) = sessions(conn, scan.provider_roots, path, version, 1, Some(native))?
+    read(&context, path, |conn, schema| {
+        let Some(s) = sessions(conn, scan.provider_roots, path, schema, 1, Some(native))?
             .into_iter()
             .next()
         else {
@@ -436,7 +350,7 @@ pub(super) fn shallow(scan: &ScanEnv<'_>, c: &Candidate) -> Result<Option<Shallo
         };
         scan.note_records(1);
         scan.note_query();
-        let head = head(&context, conn, path, &s)?;
+        let head = head(&context, conn, path, schema, &s)?;
         scan.note_bytes(head.iter().map(|e| e.to_string().len() as u64).sum());
         scan.note_records(head.len() as u64);
         let cwd = head
@@ -467,16 +381,18 @@ fn head(
     context: &AcquisitionContext<'_>,
     conn: &Connection,
     path: &Path,
+    schema: &Schema,
     s: &Session,
 ) -> Result<Vec<Value>> {
     if let Some(archive) = &s.cold {
         let events = cold::events(context, conn, path, &s.native_id, archive)?;
         return Ok(events.into_iter().take(64).map(|e| e.entry).collect());
     }
-    let mut stmt = conn.prepare(
-        "SELECT event_json, event_zstd, event_utf8_bytes FROM transcript_events \
-         WHERE session_id=?1 ORDER BY seq LIMIT 64",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT e.event_json, {} FROM transcript_events e \
+         WHERE e.session_id=?1 ORDER BY e.seq LIMIT 64",
+        schema.payload_columns()
+    ))?;
     let mut rows = stmt.query([&s.native_id])?;
     let mut head = vec![];
     while let Some(r) = rows.next()? {
@@ -495,14 +411,17 @@ pub(super) fn capture(
     path: &Path,
     id: &str,
 ) -> Result<AcquiredSession> {
+    if path.file_name().is_some_and(|n| n != DATABASE) {
+        return legacy::capture(context, path, id);
+    }
     let namespace = namespace(context.roots, path)?;
     let native = native_id(&namespace, id)?;
-    let session = read(context, path, |conn, version| {
-        let mut s = sessions(conn, context.roots, path, version, 1, Some(native))?
+    let session = read(context, path, |conn, schema| {
+        let mut s = sessions(conn, context.roots, path, schema, 1, Some(native))?
             .into_iter()
             .next()
             .context("SESSION_SOURCE_MISMATCH: OpenClaw session not in this agent database")?;
-        s.events = events::events(context, conn, path, &s)?;
+        s.events = events::events(context, conn, path, schema, &s)?;
         Ok(s)
     })?;
     let records = session.events.len() as i64;
@@ -523,33 +442,4 @@ pub(super) fn capture(
         records,
         read_paths,
     ))
-}
-
-pub(super) fn fingerprint_inputs(roots: &ProviderRoots) -> Result<Vec<Candidate>> {
-    let context = AcquisitionContext::new(ID, roots);
-    let mut result = vec![];
-    for db in databases(roots)? {
-        let namespace = namespace(roots, &db)?;
-        let files: Vec<_> = ["", "-wal", "-journal"]
-            .iter()
-            .map(|suffix| sidecar(&db, suffix))
-            .chain(cold::files(&context, &db)?)
-            .collect();
-        for path in files {
-            if path.try_exists()? {
-                context.validate(&path)?;
-                let (stamp, modified) = crate::file_stamp_and_modified(&path)?;
-                result.push(Candidate {
-                    source: ID,
-                    locator: path.to_string_lossy().into_owned(),
-                    session_id: None,
-                    recency_hint_ms: modified,
-                    // The namespace is frozen identity metadata; keep the stat
-                    // length last for the shared byte fold.
-                    stamp: format!("{namespace}/{stamp}"),
-                });
-            }
-        }
-    }
-    Ok(result)
 }
