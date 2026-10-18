@@ -30,6 +30,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Agent Relay's native Buzz ACP captures are discoverable and searchable as Buzz sessions, with prompts, assistant text, MCP tool calls and results, and cumulative usage snapshots.
 - Grok Bot desktop transcript replicas are discoverable from the local Electron persistence store, including messages, widgets, voice turns, markers and cloud-agent delegation; repeated captures retain entries after the app's local window moves on.
 - Codex threads whose rollout was pruned or truncated are recovered from local SQLite thread history, including assistant messages, tools, edits, relationships and a cumulative token snapshot.
 - GitHub Copilot CLI session history is discoverable and searchable from `$COPILOT_HOME/session-state/<id>/events.jsonl` (default `~/.copilot`), with per-message models, reasoning, tool calls and results, verbatim per-message `outputTokens`, and every other journal event — including the cumulative `session.shutdown` usage totals — as session markers.
@@ -44,6 +45,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Rust API
 
+- Added `Source::Buzz` for filtering and reading Agent Relay's native Buzz ACP captures.
 - Added `Source::GrokBot` for filtering and reading persisted Grok Bot desktop history.
 - Added `Source::Copilot` for filtering and reading persisted GitHub Copilot CLI session history.
 

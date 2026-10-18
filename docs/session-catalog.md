@@ -489,7 +489,17 @@ mark captured is missing for every consumer, not just for `ai-hist`.
 | **opencode** | ✓ | ✓ (directory / message `path.cwd`) | – | ✓ | ✓ | ✓ | ✓ (`providerID/modelID`) | – | – | – | – | – |
 | **devin** | ✓ | ✓ (`working_directory`) | – | ✓ (`created_at`, seconds→ms) | ✓ (`last_activity_at`, seconds→ms) | ✓ | ✓ (`model` / `generation_model`) | – | – (transcript `agent.version` rides a marker) | – | – | ✓ (`workspace_dirs`) |
 | **copilot** | ✓ (`session.start` `sessionId`) | ✓ (header `context.cwd`) | ✓ (header `context.branch`) | ✓ (header `timestamp`) | ✓ (16 KiB tail) | ✓ (first typed `user.message` in the 64 KiB head) | ✓ (`selectedModel`) | – | ✓ (`copilotVersion`) | – | – | – |
+| **buzz** | ✓ (ACP `sessionId`) | ✓ (Agent Relay capture header) | – | ✓ (capture timestamp) | ✓ (bounded head) | ✓ (first original request in bounded head) | – | – | – | – | – | – |
 | **grok-bot** | ✓ (decoded replica key) | – (hosted bot) | – | ✓ (bounded head) | ✓ (bounded tail) | – (full capture only) | – | – | – | – | – | – |
+
+Buzz reads Agent Relay's private native ACP captures from
+`~/Library/Application Support/com.agentrelay.desktop/spawned-agents/buzz`
+on macOS and `$XDG_DATA_HOME/com.agentrelay.desktop/spawned-agents/buzz`
+(default `~/.local/share/...`) on Linux. The matching `.dev` app folders are
+also scanned. `RELAYHISTORY_BUZZ_HOME` points to
+another capture directory, including a custom Agent Relay app data directory.
+Buzz's separate `buzz-acp` relay host does not write this format; sessions
+outside Agent Relay's native Buzz host are not imported by this source.
 
 Grok Bot reads `sand-client-persistence/` under the Electron user-data directory
 (`~/Library/Application Support/Grok Bot/` on macOS). Set

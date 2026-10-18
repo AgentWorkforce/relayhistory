@@ -1,0 +1,35 @@
+{
+  "id": "buzz",
+  "rust_id": "buzz",
+  "variant": "Buzz",
+  "order": 433,
+  "aliases": [],
+  "fixtures": [
+    {
+      "source": "buzz",
+      "name": "native-acp",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": ["buzz/native-acp"],
+      "quirk": "Agent Relay host capture of original requests beside transport prompts, reasoning and answer chunks, completed and failed MCP tools, and cumulative usage notices"
+    }
+  ],
+  "capture": [
+    {
+      "evidence": "Native session and messages",
+      "coverage": "Agent Relay-owned Buzz ACP sessions only; original request records, agent_thought_chunk and agent_message_chunk updates carry message text. The ACP transport preamble is not indexed as a prompt. Buzz's own process does not persist sessions."
+    },
+    {
+      "evidence": "Tools",
+      "coverage": "tool_call and terminal tool_call_update records carry native tool IDs, inputs, results and failure status."
+    },
+    {
+      "evidence": "Usage and control",
+      "coverage": "Cumulative _goose/unstable/session/update frames, ACP transport frames and intermediate updates become bounded markers; cumulative counts are not yet normalized into usage records. Arbitrary buzz-acp hosted sessions are not captured."
+    }
+  ],
+  "population": {
+    "evidence": ["history", "session_event", "tool_call", "session_marker"],
+    "usage_accounting": "none"
+  }
+}

@@ -46,6 +46,10 @@ test('an omitted owned module fails registration',t=>{
   const root=sandbox(t);fs.unlinkSync(path.join(root,'providers/history-sources/codex.json'));
   assert.throws(()=>generate(root),/omitted from registration: codex/);
 });
+test('Buzz cannot be dropped from the owned provider registry',t=>{
+  const root=sandbox(t);fs.unlinkSync(path.join(root,'providers/history-sources/buzz.json'));
+  assert.throws(()=>generate(root),/omitted from registration: buzz/);
+});
 test('missing fixtures and normalized snapshots fail admission',t=>{
   const root=sandbox(t);
   fs.unlinkSync(path.join(root,'crates/ai-hist/tests/fixtures/claude/simple-turn.jsonl'));

@@ -25,6 +25,7 @@ export const SOURCES = Object.freeze([
   'pi',
   'hermes',
   'copilot',
+  'buzz',
   'grok-bot',
 ] as const);
 // END GENERATED PROVIDER SOURCES

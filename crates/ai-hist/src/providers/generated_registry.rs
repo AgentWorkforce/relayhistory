@@ -51,6 +51,11 @@ const REGISTRATIONS: &[Registration] = &[
         adapter: copilot::ADAPTER,
     },
     Registration {
+        id: "buzz",
+        metadata: buzz::METADATA,
+        adapter: buzz::ADAPTER,
+    },
+    Registration {
         id: "grok-bot",
         metadata: grok_bot::METADATA,
         adapter: grok_bot::ADAPTER,
