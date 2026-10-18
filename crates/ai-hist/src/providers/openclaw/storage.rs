@@ -256,6 +256,7 @@ fn session_row(
         cold,
         schema_version: Some(schema_version),
         legacy: false,
+        partial: false,
         stamp,
         events: vec![],
     })
@@ -289,10 +290,8 @@ pub(super) fn enumerate(roots: &ProviderRoots, limit: Option<usize>) -> Result<V
     let mut candidates = vec![];
     for agent in stores::agent_dirs(roots)? {
         check_capture_cancelled()?;
-        let mut held = std::collections::BTreeSet::new();
         if let Some(path) = stores::database_of(&agent)? {
             for s in list(&context, &path, cap)? {
-                held.insert(s.native_id);
                 candidates.push(Candidate {
                     source: ID,
                     locator: path.to_string_lossy().into_owned(),
@@ -304,9 +303,11 @@ pub(super) fn enumerate(roots: &ProviderRoots, limit: Option<usize>) -> Result<V
                 });
             }
         }
-        // The database owns every session it holds, imported or not.
+        // The database owns every session it holds, imported or not, however
+        // few of them the bounded listing above returned.
         let dir = agent.join(legacy::DIR);
         if dir.is_dir() {
+            let held = stores::held(&context, &agent)?;
             candidates.extend(legacy::candidates(&context, &dir, &held)?);
         }
     }

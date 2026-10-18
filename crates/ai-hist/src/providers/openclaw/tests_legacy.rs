@@ -5,16 +5,17 @@ use crate::ingest::path_scope::PathScope;
 const SCHEMA19: &str = include_str!("../../../tests/fixtures/openclaw/main-schema19.sql");
 const SCHEMA21: &str = include_str!("../../../tests/fixtures/openclaw/main-schema21.sql");
 const SCHEMA23: &str = include_str!("../../../tests/fixtures/openclaw/main-schema23.sql");
-const SCHEMA24: &str = include_str!("../../../tests/fixtures/openclaw/main-schema24.sql");
-const MAIN: &str = "main:fixture-main-0001";
-const TELEGRAM: &str = "main:fixture-telegram-0001";
+pub(super) const SCHEMA24: &str =
+    include_str!("../../../tests/fixtures/openclaw/main-schema24.sql");
+pub(super) const MAIN: &str = "main:fixture-main-0001";
+pub(super) const TELEGRAM: &str = "main:fixture-telegram-0001";
 
-fn home() -> (tempfile::TempDir, ProviderRoots) {
+pub(super) fn home() -> (tempfile::TempDir, ProviderRoots) {
     let home = tempfile::tempdir().unwrap();
     let roots = ProviderRoots::from_home(home.path().into(), home.path().join("opencode.db"));
     (home, roots)
 }
-fn database(home: &Path, sql: &str) -> (PathBuf, Connection) {
+pub(super) fn database(home: &Path, sql: &str) -> (PathBuf, Connection) {
     let path = home.join(".openclaw/agents/main/agent/openclaw-agent.sqlite");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     let db = Connection::open(&path).unwrap();
@@ -22,7 +23,7 @@ fn database(home: &Path, sql: &str) -> (PathBuf, Connection) {
     (path, db)
 }
 /// The 2026.7.35 writer's sessions directories, copied into `home`.
-fn legacy(home: &Path) -> PathBuf {
+pub(super) fn legacy(home: &Path) -> PathBuf {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/openclaw/legacy-jsonl/.openclaw/agents");
     for agent in ["main", "ops"] {
@@ -35,13 +36,13 @@ fn legacy(home: &Path) -> PathBuf {
     }
     home.join(".openclaw/agents/main/sessions")
 }
-fn context(roots: &ProviderRoots) -> AcquisitionContext<'_> {
+pub(super) fn context(roots: &ProviderRoots) -> AcquisitionContext<'_> {
     AcquisitionContext::new(ID, roots)
 }
 fn capture(roots: &ProviderRoots, path: &Path, id: &str) -> Session {
     serde_json::from_value(storage::capture(&context(roots), path, id).unwrap().payload).unwrap()
 }
-fn count(conn: &Connection, sql: &str) -> i64 {
+pub(super) fn count(conn: &Connection, sql: &str) -> i64 {
     conn.query_row(sql, [], |r| r.get(0)).unwrap()
 }
 fn ids(roots: &ProviderRoots) -> Vec<String> {
@@ -66,20 +67,24 @@ fn summary(s: &Session) -> Vec<Value> {
         })
         .collect()
 }
-struct Ledger {
-    conn: Connection,
-    state: Map<String, Value>,
+pub(super) struct Ledger {
+    pub(super) conn: Connection,
+    pub(super) state: Map<String, Value>,
     repairs: crate::ingest::SweepRepairs,
 }
 impl Ledger {
-    fn new(home: &Path) -> Self {
+    pub(super) fn new(home: &Path) -> Self {
         Self {
             conn: crate::open_db(&home.join("ledger.db")).unwrap(),
             state: Map::new(),
             repairs: Default::default(),
         }
     }
-    fn sweep(&mut self, roots: &ProviderRoots, paths: Option<&PathScope>) -> SweepResult {
+    pub(super) fn sweep(
+        &mut self,
+        roots: &ProviderRoots,
+        paths: Option<&PathScope>,
+    ) -> SweepResult {
         sweep(SweepContext {
             conn: &self.conn,
             state: &mut self.state,
@@ -89,7 +94,7 @@ impl Ledger {
         })
         .unwrap()
     }
-    fn raw_path(&self, id: &str) -> Option<String> {
+    pub(super) fn raw_path(&self, id: &str) -> Option<String> {
         self.conn
             .query_row(
                 "SELECT raw_path FROM sessions WHERE source='openclaw' AND session_id=?1",
@@ -98,7 +103,7 @@ impl Ledger {
             )
             .ok()
     }
-    fn count(&self, sql: &str) -> i64 {
+    pub(super) fn count(&self, sql: &str) -> i64 {
         count(&self.conn, sql)
     }
 }

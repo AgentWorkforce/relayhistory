@@ -22,6 +22,14 @@ const MAX_FILES: usize = 100_000;
 const HEAD_LIMIT: u64 = 64 * 1024;
 /// Upstream bounds the store it loads; anything larger is not a session index.
 const MAX_INDEX_BYTES: u64 = 256 * 1024 * 1024;
+/// A transcript is read whole; past this it is unread rather than loaded.
+#[cfg(not(test))]
+pub(super) const MAX_TRANSCRIPT_BYTES: u64 = 512 * 1024 * 1024;
+/// Small enough for a test to exceed.
+#[cfg(test)]
+pub(super) const MAX_TRANSCRIPT_BYTES: u64 = 64 * 1024;
+/// The database layout's own per-session event bound.
+const MAX_EVENTS: usize = 1_000_000;
 
 /// `isPrimarySessionTranscriptFileName`: live transcripts only. Reset and
 /// delete archives (`*.jsonl.reset.<ts>`, `*.jsonl.deleted.<ts>`), index
@@ -116,6 +124,8 @@ pub(super) fn index(
     if !path.try_exists()? {
         return Ok(BTreeMap::new());
     }
+    #[cfg(test)]
+    PARSES.with(|p| p.set(p.get() + 1));
     context.validate(&path)?;
     ensure!(
         std::fs::metadata(&path)?.len() <= MAX_INDEX_BYTES,
@@ -262,8 +272,19 @@ pub(super) fn session(
     entry: Option<&Entry>,
     stamp: String,
 ) -> Result<(Session, bool)> {
+    context.validate(path)?;
+    let size = std::fs::metadata(path)?.len();
+    ensure!(
+        size <= MAX_TRANSCRIPT_BYTES,
+        "OpenClaw transcript {} exceeds {MAX_TRANSCRIPT_BYTES} bytes",
+        path.display()
+    );
     let bytes = context.read(path)?;
-    let (entries, partial) = parse(&bytes, usize::MAX)?;
+    let (entries, partial) = parse(&bytes, MAX_EVENTS + 1)?;
+    ensure!(
+        entries.len() <= MAX_EVENTS,
+        "OpenClaw transcript exceeds {MAX_EVENTS} records"
+    );
     let header = &entries[0];
     let native = string(header, "id")?.to_owned();
     let namespace = storage::namespace(context.roots, path)?;
@@ -312,16 +333,58 @@ pub(super) fn session(
         cold: None,
         schema_version: None,
         legacy: true,
+        partial,
         stamp,
         events,
     };
     Ok((session, partial))
 }
+type Index = std::rc::Rc<BTreeMap<String, Entry>>;
+thread_local! {
+    /// The last index a shallow or selected read parsed, by its file stamp:
+    /// discovery reads every transcript of a directory in turn, and each
+    /// needs only its own entry.
+    static INDEX_CACHE: std::cell::RefCell<Option<(PathBuf, String, Index)>> =
+        const { std::cell::RefCell::new(None) };
+}
+#[cfg(test)]
+thread_local! {
+    static PARSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+pub(super) fn index_parses() -> usize {
+    PARSES.with(std::cell::Cell::get)
+}
+#[cfg(test)]
+pub(super) fn reset_index_parses() {
+    PARSES.with(|p| p.set(0));
+    INDEX_CACHE.with(|c| c.borrow_mut().take());
+}
+fn cached_index(context: &AcquisitionContext<'_>, dir: &Path) -> Result<Index> {
+    let path = dir.join(INDEX);
+    let stamp = match crate::file_stamp_and_modified(&path) {
+        Ok((stamp, _)) => stamp,
+        Err(_) if !path.try_exists()? => "absent".into(),
+        Err(error) => return Err(error),
+    };
+    let hit = INDEX_CACHE.with(|c| {
+        c.borrow()
+            .as_ref()
+            .filter(|(p, s, _)| *p == path && *s == stamp)
+            .map(|(_, _, index)| index.clone())
+    });
+    if let Some(index) = hit {
+        return Ok(index);
+    }
+    let parsed = std::rc::Rc::new(index(context, dir)?);
+    INDEX_CACHE.with(|c| *c.borrow_mut() = Some((path, stamp, parsed.clone())));
+    Ok(parsed)
+}
 fn entry_for(context: &AcquisitionContext<'_>, path: &Path) -> Result<Option<Entry>> {
     let dir = path
         .parent()
         .context("OpenClaw transcript has no directory")?;
-    Ok(index(context, dir)?.remove(file_name(path)))
+    Ok(cached_index(context, dir)?.get(file_name(path)).cloned())
 }
 
 /// Bounded discovery read: the index entry plus the first prompt from the
@@ -390,6 +453,26 @@ pub(super) fn mark(payload: &mut Value, s: &Session) {
     }
 }
 
+/// A complete transcript replaces the session's evidence; a partial one
+/// (an unterminated final JSONL record) only adds to it, like an append.
+pub(super) fn complete_or_append(conn: &Connection, s: &Session, path: &Path) -> Result<usize> {
+    if s.partial {
+        normalize::append(conn, s, path)
+    } else {
+        normalize::session(conn, s, path)
+    }
+}
+
+/// Move a session's catalog row from its JSONL transcript to the agent
+/// database that holds it, keeping every row of evidence.
+pub(super) fn transfer(conn: &Connection, id: &str, database: &Path) -> Result<()> {
+    conn.execute(
+        "UPDATE sessions SET raw_path=?3 WHERE source=?1 AND session_id=?2",
+        rusqlite::params![ID, id, database.to_string_lossy()],
+    )?;
+    Ok(())
+}
+
 /// A database session the catalog still records at its imported JSONL
 /// transcript: the database now owns it, so the row follows the database
 /// and a later move of the transcript into the import archive retires
@@ -414,10 +497,7 @@ pub(super) fn claim(conn: &Connection, s: &Session, database: &Path) -> Result<(
         .optional()?
         .flatten();
     if stored.is_some_and(|p| Path::new(&p).parent() == Some(dir.as_path())) {
-        conn.execute(
-            "UPDATE sessions SET raw_path=?3 WHERE source=?1 AND session_id=?2",
-            rusqlite::params![ID, s.id, database.to_string_lossy()],
-        )?;
+        transfer(conn, &s.id, database)?;
     }
     Ok(())
 }

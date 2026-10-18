@@ -20,6 +20,8 @@ mod stores;
 mod tests;
 #[cfg(test)]
 mod tests_legacy;
+#[cfg(test)]
+mod tests_review;
 mod tree;
 const ID: &str = "openclaw";
 pub(crate) const LOCAL_SOURCE: LocalSource = LocalSource {
@@ -83,6 +85,10 @@ struct Session {
     /// Read from the pre-2026.8 JSONL store rather than the agent database.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     legacy: bool,
+    /// A JSONL transcript whose final record was still being written: its
+    /// complete records only add evidence and never retire any.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    partial: bool,
     /// Change stamp of this session's rows; drives incremental sweeps.
     stamp: String,
     events: Vec<Event>,
@@ -150,7 +156,7 @@ fn ingest(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
     let path = ctx
         .path
         .ok_or_else(|| anyhow::anyhow!("missing OpenClaw path"))?;
-    normalize::session(ctx.conn, &session, path)?;
+    legacy::complete_or_append(ctx.conn, &session, path)?;
     Ok((
         IngestOutcome {
             records: snapshot.records,

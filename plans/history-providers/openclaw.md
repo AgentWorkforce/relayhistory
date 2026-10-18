@@ -101,9 +101,11 @@ Each agent's `sessions/` directory is watched.
   parent/spawn keys, status, end time. The header marker records
   `layout: "jsonl"` and no schema version.
 - An unterminated final line is deferred (Pi semantics): the complete lines
-  are normalized and the file counts as unread, so nothing retires. A
-  changed transcript or index entry (its stamp is the file stat plus a digest
-  of its entry) is re-read whole.
+  only add evidence, as an append does, and nothing of the session retires
+  until the file is complete again; the file counts as unread. A changed
+  transcript or index entry (its stamp is the file stat plus a digest of its
+  entry) is re-read whole. A transcript over 512 MiB or 1M records is unread.
+  One parse of `sessions.json` serves every shallow read of its directory.
 
 Upgrade: the 2026.8.1+ doctor (`openclaw doctor --session-sqlite import`,
 also run at startup) imports each transcript under the same session ID and
@@ -112,9 +114,14 @@ entry IDs, seq 0 being the header, then moves the files to
 2026.9.6 doctor on the 2026.7.35 capture). The database owns every session
 it holds a transcript for: discovery and sweeps skip such a JSONL file even
 while it is still in place, and the first database normalization moves the
-catalog's `raw_path` from the JSONL file to the database, so the archive move
-retires nothing. If an agent's database is unreadable its JSONL files are not
-read either (unread, no retirement).
+catalog's `raw_path` from the JSONL file to the database. A JSONL transcript
+found missing is checked against its agent's database before anything
+retires: a session the database holds moves to it with its evidence (also
+when that database failed to normalize it, or was out of a scoped sweep's
+reach), and while the database cannot be read nothing of that agent retires,
+whether or not its `sessions/` directory still exists. Discovery checks
+ownership against every session the database holds, not just the bounded
+listing.
 
 ## Acquisition
 

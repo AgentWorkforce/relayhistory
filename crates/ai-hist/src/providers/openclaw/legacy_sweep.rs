@@ -37,7 +37,20 @@ pub(super) fn sweep(ctx: &mut SweepContext<'_>) -> Result<(usize, u64, bool)> {
     let (mut inserted, mut unread, mut failed) = (0, 0, false);
     for dir in legacy::dirs(ctx.roots)? {
         check_capture_cancelled()?;
-        let files = legacy::transcripts(&context, &dir)?;
+        let files = match legacy::transcripts(&context, &dir) {
+            Ok(files) => files,
+            Err(error) => {
+                check_capture_cancelled()?;
+                // This agent alone is unread: its stamps stay, and no
+                // transcript absence is trusted this sweep.
+                eprintln!("OpenClaw {}: {error:#}", dir.display());
+                unread += 1;
+                failed = true;
+                let kept = cache.keys().filter(|p| Path::new(p).starts_with(&dir));
+                visited.extend(kept.cloned());
+                continue;
+            }
+        };
         visited.extend(files.iter().map(|p| p.to_string_lossy().into_owned()));
         let files: Vec<_> = files
             .into_iter()
@@ -112,9 +125,12 @@ fn sweep_dir(
                 return Ok((0, false, native));
             }
             let tx = ctx.conn.unchecked_transaction()?;
-            let n = normalize::session(&tx, &s, path)?;
-            // A rewritten file that now holds another session drops the old.
-            file_history::retire_locator_sessions(&tx, ID, path, Some(&s.id))?;
+            let n = legacy::complete_or_append(&tx, &s, path)?;
+            // A rewritten file that now holds another session drops the old,
+            // once the rewrite is complete.
+            if !partial {
+                file_history::retire_locator_sessions(&tx, ID, path, Some(&s.id))?;
+            }
             tx.commit()?;
             Ok((n, partial, native))
         };
