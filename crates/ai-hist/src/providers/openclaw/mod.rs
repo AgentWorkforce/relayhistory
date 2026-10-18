@@ -162,6 +162,9 @@ const MAX_SWEEP: usize = 100_000;
 const MAX_SWEEP: usize = 4;
 fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
     let mut result = SweepResult::default();
+    // Only an unread database withholds deletion proof; a failed session
+    // inside a readable one says nothing about other databases.
+    let mut unread_databases = 0u64;
     let mut cache = ctx
         .state
         .get(STAMPS)
@@ -198,11 +201,12 @@ fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
                 // empty: its prior evidence and cursor stay in place.
                 eprintln!("OpenClaw {}: {error:#}", path.display());
                 result.unread += 1;
+                unread_databases += 1;
                 cache.insert(key, Value::Object(previous));
             }
         }
     }
-    if result.unread == 0 {
+    if unread_databases == 0 {
         retire::retire_missing_databases(&ctx)?;
     }
     ctx.state.insert(STAMPS.into(), Value::Object(cache));

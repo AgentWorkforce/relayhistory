@@ -1189,3 +1189,34 @@ fn review_cold_sessions_shallow_read_their_archive_and_prompt_rewrites_retire() 
     );
     assert_eq!(shallow.cwd.as_deref(), Some("/fixture/project"));
 }
+
+#[test]
+fn review_a_malformed_session_does_not_block_deleted_database_retirement() {
+    let (home, roots, _path, db) = fixture();
+    let (ops, ops_db) = database(home.path(), "ops", OPS);
+    let mut ledger = Ledger::new(home.path());
+    ledger.sweep(&roots, None).unwrap();
+    let relay = "SELECT count(*) FROM sessions WHERE source='openclaw' AND session_id='ops:fixture-relay-0001'";
+    assert_eq!(count(&ledger.conn, relay), 1);
+    // A session in main stays malformed across sweeps.
+    db.execute(
+        "UPDATE transcript_events SET event_json=json_set(event_json,'$.message.content',json('[{\"type\":\"toolCall\",\"name\":\"read\"}]')) WHERE session_id=?1 AND seq=2",
+        [NATIVE],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE session_windows SET transcript_updated_at=transcript_updated_at+1 WHERE session_id=?1",
+        [NATIVE],
+    )
+    .unwrap();
+    drop(ops_db);
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(storage::sidecar(&ops, suffix));
+    }
+    assert_eq!(ledger.sweep(&roots, None).unwrap().unread, 1);
+    assert_eq!(
+        count(&ledger.conn, relay),
+        0,
+        "the deleted agent database retires"
+    );
+}
