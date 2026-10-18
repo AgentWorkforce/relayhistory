@@ -512,6 +512,8 @@ Generated from provider-owned acquisition records; these cells describe fixture-
 | grok-bot | Messages and identity | Base32 transcript keys, native agent and entry IDs, roster titles, complete and truncated tails across account slots; bounded local window accumulates across captures. |
 | grok-bot | Control and lineage | Widget responses, voice turns, approvals, attachments and app events retained; Cursor cloud-agent IDs recorded as observed delegation without a local child transcript. |
 | grok-bot | Usage and acquisition | No local model, token or cost usage; passive local blobs only, with no host backfill, network calls or credential reads. |
+| openclaw | Messages and tools | Agent schema 24 transcript rows (JSON or zstd), full entry tree with native entry IDs, user/assistant/thinking/tool content, toolCallId joins and isError outcomes; session key, agent ID and channel retained as metadata. |
+| openclaw | Usage and relationships | Assistant per-message usage with reported cost; delivery mirrors carry no request usage. Session windows, previous session and parent/spawn keys retained as metadata; no relationship, resume or live execution advertised. Legacy JSONL and cold archives unsupported. |
 <!-- END GENERATED PROVIDER CAPTURE -->
 
 ### Embedded Codex image evidence

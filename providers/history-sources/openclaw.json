@@ -1,0 +1,50 @@
+{
+  "id": "openclaw",
+  "rust_id": "openclaw",
+  "variant": "OpenClaw",
+  "order": 511,
+  "aliases": [],
+  "fixtures": [
+    {
+      "source": "openclaw",
+      "name": "agent24",
+      "layout": "Sqlite",
+      "target": ".openclaw/agents/main/agent/openclaw-agent.sqlite",
+      "origin": "RelayHistory",
+      "files": [
+        "openclaw/main-schema24.sql"
+      ],
+      "quirk": "OpenClaw 2026.10.4 writer, agent schema 24, deterministic clock/UUIDs: Pi v4 entries in transcript_events incl. one writer-compressed zstd row, non-UUID session ID, main and Telegram session keys, thinking/tool calls/results with isError, per-message usage, zero-usage delivery mirror."
+    },
+    {
+      "source": "openclaw",
+      "name": "agent24-ops",
+      "layout": "Sqlite",
+      "target": ".openclaw/agents/ops/agent/openclaw-agent.sqlite",
+      "origin": "RelayHistory",
+      "files": [
+        "openclaw/ops-schema24.sql"
+      ],
+      "quirk": "Second agent database from the same writer run: relay DM session key under a non-main agent ID, namespaced by agent."
+    }
+  ],
+  "capture": [
+    {
+      "evidence": "Messages and tools",
+      "coverage": "Agent schema 24 transcript rows (JSON or zstd), full entry tree with native entry IDs, user/assistant/thinking/tool content, toolCallId joins and isError outcomes; session key, agent ID and channel retained as metadata."
+    },
+    {
+      "evidence": "Usage and relationships",
+      "coverage": "Assistant per-message usage with reported cost; delivery mirrors carry no request usage. Session windows, previous session and parent/spawn keys retained as metadata; no relationship, resume or live execution advertised. Legacy JSONL and cold archives unsupported."
+    }
+  ],
+  "population": {
+    "evidence": [
+      "history",
+      "session_event",
+      "tool_call",
+      "session_marker"
+    ],
+    "usage_accounting": "per-message"
+  }
+}

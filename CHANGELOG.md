@@ -4,11 +4,19 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased - Patch]
+## [Unreleased - Minor]
+
+### Added
+
+- OpenClaw session history is discoverable and searchable from every agent database under `$OPENCLAW_STATE_DIR` (default `~/.openclaw`, honoring `OPENCLAW_HOME` and `OPENCLAW_PROFILE`): messages, thinking, tool calls and results, per-message usage, cold-archived transcripts, and each session's key, agent and channel as metadata.
 
 ### Fixed
 
 - Devin remote capture skips provider-classified `code_review` and `code_review_and_analysis` sessions only when their origin is `automation`; person-started reviews and other work remain discoverable.
+
+### Rust API
+
+- Added `Source::OpenClaw` for filtering and reading persisted OpenClaw session history.
 
 ## [0.45.2] - 2026-10-17
 

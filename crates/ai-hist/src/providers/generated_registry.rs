@@ -55,6 +55,11 @@ const REGISTRATIONS: &[Registration] = &[
         metadata: grok_bot::METADATA,
         adapter: grok_bot::ADAPTER,
     },
+    Registration {
+        id: "openclaw",
+        metadata: openclaw::METADATA,
+        adapter: openclaw::ADAPTER,
+    },
     #[cfg(test)]
     Registration {
         id: "test-fixture",
