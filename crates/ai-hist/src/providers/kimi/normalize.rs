@@ -20,11 +20,9 @@ pub(super) fn write(conn: &Connection, payload: &Value) -> Result<usize> {
         return Ok(0);
     }
     let mut keys = Keys::default();
-    let mut inserted = 0;
+    let mut outcome = MessageOutcome::default();
     let mut first = i64::MAX;
     let mut last = i64::MIN;
-    let mut preview = None;
-    let mut assistant = None;
     let cwd = payload["state"]["cwd"].as_str();
     let live = format::active_messages(rows)?;
     let mut message_index = 0;
@@ -56,28 +54,70 @@ pub(super) fn write(conn: &Connection, payload: &Value) -> Result<usize> {
         }
         let result = message(conn, sid, cwd, row, message_index, &mut keys)?;
         message_index += 1;
-        inserted += result.inserted;
-        if preview.is_none() {
-            preview = result.preview;
-        }
-        if result.assistant.is_some() {
-            assistant = result.assistant;
-        }
+        outcome.absorb(result);
     }
     if complete {
         file_history::retire(conn, ID, sid, &keys)?;
         file_history::retire_locator_sessions(conn, ID, path, Some(sid))?;
+        let reordered = file_history::reconcile_event_order(conn, ID, sid, &outcome.events)?;
+        replay_buckets(conn, sid, cwd, rows, &live, &reordered, &mut keys)?;
     }
-    catalog(conn, payload, first, last, assistant.as_deref(), preview)?;
-    Ok(inserted)
+    catalog(
+        conn,
+        payload,
+        first,
+        last,
+        outcome.assistant.as_deref(),
+        outcome.preview,
+    )?;
+    Ok(outcome.inserted)
+}
+
+fn replay_buckets(
+    conn: &Connection,
+    sid: &str,
+    cwd: Option<&str>,
+    rows: &[Value],
+    live: &std::collections::BTreeSet<usize>,
+    reordered: &std::collections::BTreeSet<i64>,
+    keys: &mut Keys,
+) -> Result<()> {
+    if reordered.is_empty() {
+        return Ok(());
+    }
+    let mut message_index = 0;
+    for (index, row) in rows.iter().enumerate() {
+        if row["type"] != "agent.message.appended" || !live.contains(&index) {
+            continue;
+        }
+        if reordered.contains(&format::time(row)?) {
+            message(conn, sid, cwd, row, message_index, keys)?;
+        }
+        message_index += 1;
+    }
+    Ok(())
 }
 
 #[derive(Default)]
 struct MessageOutcome {
     inserted: usize,
+    events: Vec<(i64, String)>,
     preview: Option<String>,
     assistant: Option<String>,
 }
+impl MessageOutcome {
+    fn absorb(&mut self, next: Self) {
+        self.inserted += next.inserted;
+        self.events.extend(next.events);
+        if self.preview.is_none() {
+            self.preview = next.preview;
+        }
+        if next.assistant.is_some() {
+            self.assistant = next.assistant;
+        }
+    }
+}
+
 fn message(
     conn: &Connection,
     sid: &str,
@@ -130,7 +170,8 @@ fn message(
                 ..base
             },
         )?;
-        keys.events.insert(eid);
+        keys.events.insert(eid.clone());
+        result.events.push((ts, eid));
     }
     for (n, call) in msg["toolCalls"]
         .as_array()
@@ -175,7 +216,8 @@ fn message(
                 ..base
             },
         )?;
-        keys.events.insert(eid);
+        keys.events.insert(eid.clone());
+        result.events.push((ts, eid));
     }
     if let Some(prompt) = format::human_text(row) {
         result.preview = Some(prompt.chars().take(4096).collect());

@@ -776,3 +776,175 @@ fn bounded_partial_discovery_preserves_evidence_backed_catalog_metadata() {
     assert_eq!(observed.first_activity_ms, previous.first_activity_ms);
     assert_eq!(observed.last_activity_ms, previous.last_activity_ms);
 }
+
+fn tied_tool_rewrite(wire: &Path, rewritten: bool) -> Vec<serde_json::Value> {
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/kimi/tool");
+    let source = std::fs::read_dir(fixture.join(".kimi-code/sessions"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let source = std::fs::read_dir(source)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path()
+        .join("agents/main/wire.jsonl");
+    let original = rows(&source);
+    let mut call = original
+        .iter()
+        .find(|r| {
+            r["type"] == "agent.message.appended"
+                && r["message"]["message"]["toolCalls"]
+                    .as_array()
+                    .is_some_and(|v| !v.is_empty())
+        })
+        .unwrap()
+        .clone();
+    let mut hidden = original
+        .iter()
+        .find(|r| {
+            r["type"] == "agent.message.appended" && r["message"]["message"]["role"] == "user"
+        })
+        .unwrap()
+        .clone();
+    hidden["message"]["message"]["content"][0]["text"] = "Newly visible middle user.".into();
+    hidden["message"]["meta"]["origin"] =
+        serde_json::json!({"kind": if rewritten {"user"} else {"system_trigger"}});
+    if rewritten {
+        call["message"]["message"]["content"] =
+            serde_json::json!([{"type":"text","text":"New leading text before retained call."}]);
+    }
+    let mut later = original
+        .iter()
+        .rfind(|r| {
+            r["type"] == "agent.message.appended" && r["message"]["message"]["role"] == "assistant"
+        })
+        .unwrap()
+        .clone();
+    later["message"]["message"]["content"] =
+        serde_json::json!([{"type":"text","text":"Later retained same-clock answer."}]);
+    for row in [&mut call, &mut hidden, &mut later] {
+        row["time"] = 1791720000185i64.into();
+    }
+    let result = vec![original[0].clone(), call, hidden, later];
+    replace_rows(wire, &result);
+    result
+}
+
+#[test]
+fn complete_rewrite_preserves_same_clock_native_order_like_fresh_import() {
+    let home = tempfile::tempdir().unwrap();
+    let wire = stage(home.path(), "tool");
+    tied_tool_rewrite(&wire, false);
+    let store = open(home.path());
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    let rewritten = tied_tool_rewrite(&wire, true);
+    store
+        .hydrate(
+            &SessionRef::id(Source::Kimi, sid(2, "main")),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    let fresh_home = tempfile::tempdir().unwrap();
+    let fresh_wire = stage(fresh_home.path(), "tool");
+    replace_rows(&fresh_wire, &rewritten);
+    let fresh = open(fresh_home.path());
+    fresh.sync(SyncOptions::default().force(true)).unwrap();
+    assert_eq!(
+        evidence(&store, 2, "main").messages,
+        evidence(&fresh, 2, "main").messages
+    );
+    #[cfg(feature = "unstable-internal")]
+    {
+        fn events(home: &Path, limit: i64) -> Vec<String> {
+            let conn = ai_hist::open_db(&home.join("db")).unwrap();
+            let mut cursor = None;
+            let mut result = Vec::new();
+            loop {
+                let page = ai_hist::session_events_page(
+                    &conn,
+                    &sid(2, "main"),
+                    Some("kimi"),
+                    limit,
+                    cursor.as_ref(),
+                )
+                .unwrap();
+                result.extend(
+                    page.events
+                        .into_iter()
+                        .map(|e| format!("{}:{}", e.kind, e.text.unwrap_or_default())),
+                );
+                let Some(next) = page.next_cursor else { break };
+                cursor = Some(next);
+            }
+            result
+        }
+        let expected = events(fresh_home.path(), 100);
+        assert_eq!(events(home.path(), 100), expected);
+        assert_eq!(events(home.path(), 1), expected);
+    }
+    #[cfg(feature = "unstable-internal")]
+    let event_ids = || {
+        let conn = ai_hist::open_db(&home.path().join("db")).unwrap();
+        let mut statement = conn.prepare("SELECT id,event_uid FROM session_events WHERE source='kimi' AND session_id=?1 ORDER BY id").unwrap();
+        let result = statement
+            .query_map([sid(2, "main")], |r| {
+                Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        result
+    };
+    #[cfg(feature = "unstable-internal")]
+    let before_transition = event_ids();
+    // Sweep metadata uses its own parser/stamp; event IDs must remain stable.
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    #[cfg(feature = "unstable-internal")]
+    assert_eq!(event_ids(), before_transition);
+
+    let revision = store.head_revision().unwrap();
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    assert_eq!(store.head_revision().unwrap(), revision);
+}
+
+#[cfg(feature = "unstable-internal")]
+#[test]
+fn shared_same_clock_ordering_conflict_rolls_back_entire_replacement() {
+    let home = tempfile::tempdir().unwrap();
+    let wire = stage(home.path(), "tool");
+    tied_tool_rewrite(&wire, false);
+    let store = open(home.path());
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    store
+        .hydrate(
+            &SessionRef::id(Source::Kimi, sid(2, "main")),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    let conn = ai_hist::open_db(&home.path().join("db")).unwrap();
+    conn.execute(
+        "UPDATE session_events SET location='both' WHERE source='kimi' AND session_id=?1",
+        [sid(2, "main")],
+    )
+    .unwrap();
+    let before = evidence(&store, 2, "main");
+    let checkpoint: String=conn.query_row("SELECT source_stamp FROM session_hydration_checkpoints WHERE source='kimi' AND session_id=?1",[sid(2,"main")],|r|r.get(0)).unwrap();
+    tied_tool_rewrite(&wire, true);
+    assert!(store
+        .hydrate(
+            &SessionRef::id(Source::Kimi, sid(2, "main")),
+            HydrateOptions::default()
+        )
+        .is_err());
+    let after = evidence(&store, 2, "main");
+    assert_eq!(after.messages, before.messages);
+    assert_eq!(after.markers, before.markers);
+    assert_eq!(after.tool_calls, before.tool_calls);
+    assert_eq!(after.prompts, before.prompts);
+    let retained: String=conn.query_row("SELECT source_stamp FROM session_hydration_checkpoints WHERE source='kimi' AND session_id=?1",[sid(2,"main")],|r|r.get(0)).unwrap();
+    assert_eq!(retained, checkpoint);
+}

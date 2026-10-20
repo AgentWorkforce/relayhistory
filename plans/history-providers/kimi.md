@@ -35,3 +35,8 @@ evidence until hydration or sync applies the complete replacement. Incomplete
 wire replacements defer all positional evidence writes; a subsequent complete
 capture replaces it together. Catalog previews are limited to 4,096 characters;
 message evidence retains the full native text.
+
+Complete rewrites reconcile native event order within each recorded millisecond.
+Only affected local event buckets are replayed; unchanged buckets keep their IDs.
+If a reordered bucket also carries remote evidence, hydration reports a retryable
+ownership conflict and rolls back the replacement, retaining the prior snapshot.
