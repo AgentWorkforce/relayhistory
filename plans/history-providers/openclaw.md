@@ -16,10 +16,21 @@ OpenClaw keeps one SQLite database per agent at
 `<home>/.openclaw`, or `<home>/.openclaw-<profile>` when `OPENCLAW_PROFILE`
 names a non-default profile; `OPENCLAW_HOME` replaces the OS home
 (`src/config/state-dir.ts`, `src/infra/home-dir.ts`, `src/cli/profile.ts`).
-RelayHistory freezes those variables once; `from_home` ignores them. The native
-default root keeps portable IDs (`<agentId>:<sessionId>`); any override is
-namespaced by a hash of its path (`root-<12 hex>:<agentId>:<sessionId>`), as
-Hermes does.
+RelayHistory freezes those variables once; `from_home` ignores them.
+
+One ledger session is one OpenClaw **conversation**: a session key and every
+transcript window under it, as OpenClaw's own session list shows it. Resets,
+rollovers and each isolated cron or heartbeat run open a new window (session
+ID) on the same key (`heartbeat-runner-execution.ts`, `cron/isolated-agent`),
+and an exact-run key `agent:<id>:cron:<job>:run:<run>` belongs to its job
+(`parseCronRunScopeSuffix`). On the real install one cron job had 81 run
+windows; one row per window flooded the session list. The ledger ID is
+`<agentId>:<key after agent:<agentId>:>` (`main:main`,
+`main:telegram:direct:<peer>`, `main:cron:<job>`), or
+`<agentId>:key=<key>` for a key outside that prefix. The native default root
+keeps these portable; any override is namespaced by a hash of its path
+(`root-<12 hex>:<agentId>:...`), as Hermes does. Each window keeps its own
+header marker (`session:<sessionId>`) with its native session ID.
 
 Every directory under `agents/` holding `agent/openclaw-agent.sqlite` is an
 agent, enumerated at scan time so new agents are found after roots freeze.
@@ -91,7 +102,9 @@ Each agent's `sessions/` directory is watched.
 - An index entry names its transcript by the file name of `sessionFile`
   (an absolute path upstream keeps inside the directory), else
   `<sessionId>.jsonl`. The identity is the header `id` under the agent's
-  namespace, the same `<agentId>:<sessionId>` the database uses.
+  namespace, `<agentId>:<sessionId>`: one session per transcript. The index
+  maps a key only to its current transcript, so earlier runs of a key
+  cannot be folded the way the database's windows are.
 - The active branch is resolved as upstream's session storage does (visible
   leaf after each entry including `leaf` controls and side appends, then the
   path to the root), so off-branch messages carry the same marker as in the
@@ -113,13 +126,16 @@ entry IDs, seq 0 being the header, then moves the files to
 `agents/<id>/session-sqlite-import-archive/` (checked by running the
 2026.9.6 doctor on the 2026.7.35 capture). The database owns every session
 it holds a transcript for: discovery and sweeps skip such a JSONL file even
-while it is still in place, and the first database normalization moves the
-catalog's `raw_path` from the JSONL file to the database. A JSONL transcript
-found missing is checked against its agent's database before anything
-retires: a session the database holds moves to it with its evidence (also
-when that database failed to normalize it, or was out of a scoped sweep's
-reach), and while the database cannot be read nothing of that agent retires,
-whether or not its `sessions/` directory still exists. Discovery checks
+while it is still in place. The imported transcript becomes a window of its
+key's database conversation, so its JSONL ledger row (`<agentId>:<sessionId>`)
+retires into that conversation once the ledger holds the window (its
+`session:<sessionId>` header marker): the same evidence is never counted
+twice, and its prompts reattach to the conversation. A JSONL transcript found
+missing is checked against its agent's database before anything retires: a
+session the database holds keeps its JSONL row until the conversation holds
+that window (also when that database failed to normalize it, or was out of a
+scoped sweep's reach), and while the database cannot be read nothing of that
+agent retires, whether or not its `sessions/` directory still exists. Discovery checks
 ownership against every session the database holds, not just the bounded
 listing.
 
@@ -138,7 +154,9 @@ identity), so a write to one session does not re-read the others. The
 stat-only fingerprint covers the database, WAL and journal and carries the
 identity namespace.
 
-A sweep re-reads only sessions whose stamp changed. When a session only grew
+A sweep re-reads only conversations whose stamp changed, window by window:
+an unchanged window is not read, a new window is read whole, and a grown one
+only from its tail. When a window only grew
 (same rewrite generation, still hot, no deletions, and the identity index
 still holds the previous last 32 entry IDs), only those 32 entries and the new
 ones are normalized; nothing is retired and catalog fields only widen.
@@ -173,6 +191,18 @@ timestamps are the integer `message.timestamp`, else the entry's ISO time.
   `openclawDisplayContent`, `openclawStreamFallback`, `provenance`,
   `excludeFromContext`, `supersedesEntryId`, ...) and flags entries off the
   active branch.
+- Heartbeats (`src/auto-reply/heartbeat.ts`, `heartbeat-filter.ts`): a
+  shared-mode heartbeat appends into the agent's main session. Its user turn,
+  upstream's `isHeartbeatUserMessage` for an unconfigured prompt (an internal
+  wake marker such as `[OpenClaw heartbeat poll]`, the current or legacy
+  default prompt alone or followed by a newline, or the periodic-task prompt),
+  is a control row, never a prompt. On the real install 12,781 of 26,953
+  main-session user messages were the legacy prompt. The quiet
+  acknowledgement (`NO_REPLY`, or `HEARTBEAT_OK` at either edge of at most
+  300 characters) stays as an event with its usage (it was a model call) but
+  never becomes the session's last assistant text. A custom configured
+  heartbeat prompt is not read from config and stays a prompt unless it
+  carries `internal_system` provenance.
 - User messages OpenClaw wrote itself are `control_kind = "synthetic"`:
   `provenance.kind` `inter_session`/`internal_system`, `excludeFromContext`,
   `__openclaw.contextFreeCommand`. `external_user` provenance and Codex mirror
@@ -240,3 +270,17 @@ event of the source once per prompt row in `file_history::reconcile_prompts`;
 This also affects Pi and Copilot. A one-event append to a 40k-event session
 then took 1.85 s; the append path takes 49 ms (100k events: 7.5 s complete
 read, 113 ms append).
+
+## Conversation identity and heartbeats (generation v3)
+
+Reported from the dashboard: one row per heartbeat. Isolated cron and
+heartbeat runs open a new window on the same session key every run, and the
+first implementation emitted one ledger session per window. Generation v3
+emits one session per conversation key and treats heartbeat polls as
+controls. Real install, read-only, same probe as above: sessions 149 → 96
+(cron 59 → 7, one job holding 82 run windows), prompt history 13,979 → 8,143
+with no heartbeat prompt left, no session whose last assistant text is a
+quiet acknowledgement, and 21,301 usage requests (unchanged: run windows
+keep their usage). First sync 47 s, re-sync 0.65 s. Relay keys up to 4,096
+bytes long exceed the ledger's identity bound; such keys use a stable
+`sha=<SHA-256>` name and are resolved by listing.

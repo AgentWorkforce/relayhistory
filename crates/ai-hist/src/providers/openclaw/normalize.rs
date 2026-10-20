@@ -1,8 +1,10 @@
 //! OpenClaw transcript entries are Pi session entries (header, message,
 //! model_change, compaction, custom, ...) stored as SQLite rows. Messages carry
 //! OpenClaw's own delivery and run metadata beside the Pi fields.
+use super::conversation::Conversation;
 use super::format::{
-    control_kind, counts_usage, entry_time, first_prompt, is_delivery_mirror, string, text,
+    control_kind, counts_usage, entry_time, first_prompt, is_delivery_mirror, is_heartbeat_ack,
+    string, text,
 };
 use super::*;
 use crate::ingest::{
@@ -29,13 +31,24 @@ const OPENCLAW_FIELDS: &[&str] = &[
     "supersedesEntryId",
 ];
 
-/// What one pass over a run of events wrote.
+/// What one pass over a conversation's windows wrote.
 struct Written {
     keys: Keys,
     inserted: usize,
     first: i64,
     last: i64,
     assistant: Option<String>,
+}
+impl Written {
+    fn new(conv: &Conversation) -> Self {
+        Self {
+            keys: Keys::default(),
+            inserted: 0,
+            first: conv.started(),
+            last: conv.last_activity().max(conv.started()),
+            assistant: None,
+        }
+    }
 }
 
 fn header(s: &Session) -> Result<&Event> {
@@ -49,19 +62,11 @@ fn cwd(header: &Event) -> Option<&str> {
         .as_str()
         .filter(|c| !c.trim().is_empty())
 }
-
-/// Write the header marker and every captured event after it.
-fn write(conn: &Connection, s: &Session) -> Result<Written> {
+/// Write one window's header marker and every captured event after it.
+fn write(conn: &Connection, s: &Session, out: &mut Written) -> Result<()> {
     crate::ingest::check_capture_cancelled()?;
     let header = header(s)?;
     let cwd = cwd(header);
-    let mut out = Written {
-        keys: Keys::default(),
-        inserted: 0,
-        first: s.started,
-        last: s.latest.max(s.started),
-        assistant: None,
-    };
     session_marker(conn, s, header, &mut out.keys)?;
     for event in &s.events[1..] {
         crate::ingest::check_capture_cancelled()?;
@@ -75,7 +80,8 @@ fn write(conn: &Connection, s: &Session) -> Result<Written> {
             let msg = &entry["message"];
             if msg["role"] == "assistant" && !is_delivery_mirror(msg) {
                 let text = text(&msg["content"]);
-                if !text.trim().is_empty() {
+                // A quiet heartbeat acknowledgement is not the session's reply.
+                if !text.trim().is_empty() && !is_heartbeat_ack(&text) {
                     out.assistant = Some(text);
                 }
             }
@@ -91,31 +97,24 @@ fn write(conn: &Connection, s: &Session) -> Result<Written> {
             )?;
         }
     }
-    Ok(out)
+    Ok(())
 }
 
-fn title(s: &Session) -> Option<&str> {
-    s.title.as_deref().or_else(|| {
-        s.events
-            .iter()
-            .rev()
-            .find(|e| e.entry["type"] == "session_info")
-            .and_then(|e| e.entry["name"].as_str())
-    })
-}
-
-/// Normalize a complete transcript: authoritative for every row and catalog
-/// field, so evidence the transcript no longer holds is retired.
-pub(super) fn session(conn: &Connection, s: &Session, path: &Path) -> Result<usize> {
-    let written = write(conn, s)?;
-    super::legacy::claim(conn, s, path)?;
-    file_history::retire(conn, ID, &s.id, &written.keys)?;
-    let cwd = cwd(header(s)?);
+/// Normalize a complete conversation: authoritative for every row and
+/// catalog field, so evidence its windows no longer hold is retired.
+pub(super) fn session(conn: &Connection, conv: &Conversation, path: &Path) -> Result<usize> {
+    let mut written = Written::new(conv);
+    for window in &conv.windows {
+        write(conn, window, &mut written)?;
+    }
+    super::legacy::claim(conn, conv, path)?;
+    file_history::retire(conn, ID, &conv.id, &written.keys)?;
+    let cwd = conv.cwd();
     upsert_session_rebuilt(
         conn,
         &SessionCatalogRow {
             source: ID,
-            session_id: &s.id,
+            session_id: &conv.id,
             cwd,
             git_branch: None,
             first_ts: written.first,
@@ -124,30 +123,33 @@ pub(super) fn session(conn: &Connection, s: &Session, path: &Path) -> Result<usi
             raw_path: Some(&path.to_string_lossy()),
         },
     )?;
-    crate::ingest::set_session_title(conn, ID, &s.id, title(s))?;
-    let models = serde_json::to_string(&models(s))?;
-    let first_prompt = first_prompt(s.events.iter().map(|e| &e.entry));
+    crate::ingest::set_session_title(conn, ID, &conv.id, conv.title())?;
+    let models = serde_json::to_string(&conv.models())?;
+    let first_prompt = first_prompt(conv.entries());
     // A complete snapshot is authoritative even when metadata was cleared.
     conn.execute(
         "UPDATE sessions SET models_json=?3, first_prompt=?4, cwd=?5 WHERE source=?1 AND session_id=?2 AND (models_json IS NOT ?3 OR first_prompt IS NOT ?4 OR cwd IS NOT ?5)",
-        rusqlite::params![ID, s.id, models, first_prompt, cwd],
+        rusqlite::params![ID, conv.id, models, first_prompt, cwd],
     )?;
     Ok(written.inserted)
 }
 
-/// Normalize the header plus the tail of a transcript that only grew since
-/// its last complete read. Nothing is retired and catalog fields only widen:
-/// the earlier rows were not re-read.
-pub(super) fn append(conn: &Connection, s: &Session, path: &Path) -> Result<usize> {
-    let written = write(conn, s)?;
-    super::legacy::claim(conn, s, path)?;
-    let cwd = cwd(header(s)?);
+/// Normalize the windows of a conversation that only grew since its last
+/// complete read: each captured window's header plus its re-read tail, or a
+/// new window whole. Windows with no captured events were not re-read.
+/// Nothing is retired and catalog fields only widen.
+pub(super) fn append(conn: &Connection, conv: &Conversation, path: &Path) -> Result<usize> {
+    let mut written = Written::new(conv);
+    for window in conv.windows.iter().filter(|w| !w.events.is_empty()) {
+        write(conn, window, &mut written)?;
+    }
+    super::legacy::claim(conn, conv, path)?;
     crate::ingest::upsert_session(
         conn,
         &SessionCatalogRow {
             source: ID,
-            session_id: &s.id,
-            cwd,
+            session_id: &conv.id,
+            cwd: conv.cwd(),
             git_branch: None,
             first_ts: written.first,
             last_ts: written.last,
@@ -155,34 +157,19 @@ pub(super) fn append(conn: &Connection, s: &Session, path: &Path) -> Result<usiz
             raw_path: Some(&path.to_string_lossy()),
         },
     )?;
-    if let Some(title) = title(s) {
-        crate::ingest::set_session_title(conn, ID, &s.id, Some(title))?;
+    if let Some(title) = conv.title() {
+        crate::ingest::set_session_title(conn, ID, &conv.id, Some(title))?;
     }
-    let models = serde_json::to_string(&models(s))?;
+    let models = serde_json::to_string(&conv.models())?;
     conn.execute(
         "UPDATE sessions SET models_json=(SELECT json_group_array(value) FROM (SELECT value FROM json_each(coalesce(sessions.models_json,'[]')) UNION SELECT value FROM json_each(?3) ORDER BY value)), \
          first_prompt=coalesce(first_prompt, ?4) WHERE source=?1 AND session_id=?2",
-        rusqlite::params![ID, s.id, models, first_prompt(s.events.iter().map(|e| &e.entry))],
+        rusqlite::params![ID, conv.id, models, first_prompt(conv.entries())],
     )?;
     Ok(written.inserted)
 }
 
-fn models(s: &Session) -> Vec<String> {
-    let mut models: Vec<String> = s
-        .events
-        .iter()
-        .filter(|e| {
-            e.entry["message"]["role"] == "assistant" && !is_delivery_mirror(&e.entry["message"])
-        })
-        .filter_map(|e| e.entry["message"]["model"].as_str().map(str::to_owned))
-        .chain(s.model.clone())
-        .collect();
-    models.sort();
-    models.dedup();
-    models
-}
-
-/// The session header plus the OpenClaw catalog row it belongs to.
+/// One window's session header plus the OpenClaw catalog row it belongs to.
 fn session_marker(conn: &Connection, s: &Session, header: &Event, keys: &mut Keys) -> Result<()> {
     let mut payload = serde_json::json!({
         "header": header.entry,
@@ -209,12 +196,14 @@ fn session_marker(conn: &Connection, s: &Session, header: &Event, keys: &mut Key
     });
     super::legacy::mark(&mut payload, s);
     let payload = serde_json::to_string(&crate::ingest::bound_marker_value(payload))?;
+    // One header marker per window; the session ID is the window's own.
+    let uid = format!("session:{}", s.native_id);
     insert_session_marker(
         conn,
         ID,
         &s.id,
         &NewSessionMarker {
-            marker_uid: "session",
+            marker_uid: &uid,
             kind: "session_metadata",
             subkind: Some("openclaw"),
             ts_ms: Some(entry_time(&header.entry)?),
@@ -222,7 +211,7 @@ fn session_marker(conn: &Connection, s: &Session, header: &Event, keys: &mut Key
             ..Default::default()
         },
     )?;
-    keys.markers.insert("session".into());
+    keys.markers.insert(uid);
     Ok(())
 }
 

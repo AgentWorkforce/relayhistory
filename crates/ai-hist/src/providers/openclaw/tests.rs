@@ -3,8 +3,10 @@ use rusqlite::params;
 const MAIN: &str = include_str!("../../../tests/fixtures/openclaw/main-schema24.sql");
 const OPS: &str = include_str!("../../../tests/fixtures/openclaw/ops-schema24.sql");
 const NATIVE: &str = "fixture/main:α";
-const SESSION: &str = "main:fixture/main:α";
-const TELEGRAM: &str = "main:fixture-telegram-0001";
+const SESSION: &str = "main:main";
+const TELEGRAM: &str = "main:telegram:direct:fixture-peer";
+const RELAY: &str = "ops:relay:dm:fixture-sender";
+const CRON: &str = "ops:cron:fixture-job";
 fn database(home: &Path, agent: &str, sql: &str) -> (PathBuf, Connection) {
     let path = home.join(format!(
         ".openclaw/agents/{agent}/agent/openclaw-agent.sqlite"
@@ -23,8 +25,12 @@ fn fixture() -> (tempfile::TempDir, ProviderRoots, PathBuf, Connection) {
 fn context(roots: &ProviderRoots) -> AcquisitionContext<'_> {
     AcquisitionContext::new(ID, roots)
 }
-fn capture(roots: &ProviderRoots, path: &Path, id: &str) -> Session {
+fn conversation(roots: &ProviderRoots, path: &Path, id: &str) -> conversation::Conversation {
     serde_json::from_value(storage::capture(&context(roots), path, id).unwrap().payload).unwrap()
+}
+/// The newest window of a conversation, with its events.
+fn capture(roots: &ProviderRoots, path: &Path, id: &str) -> Session {
+    conversation(roots, path, id).windows.pop().unwrap()
 }
 fn count(conn: &Connection, sql: &str) -> i64 {
     conn.query_row(sql, [], |r| r.get(0)).unwrap()
@@ -68,7 +74,7 @@ fn fixture_capture_reads_pi_entries_and_openclaw_window_metadata() {
     assert_eq!(s.schema_version, Some(24));
     let types: Vec<_> = s.events.iter().map(|e| e.entry["type"].clone()).collect();
     assert_eq!(types[0], "session");
-    assert_eq!(s.events.len(), 6);
+    assert_eq!(s.events.len(), 10);
     assert!(s
         .events
         .iter()
@@ -93,11 +99,9 @@ fn agents_are_namespaced_and_discovered_after_roots_freeze() {
         after.iter().filter_map(|c| c.session_id.clone()).collect();
     assert_eq!(
         ids,
-        [SESSION, TELEGRAM, "ops:fixture-relay-0001"]
-            .map(String::from)
-            .into()
+        [SESSION, TELEGRAM, RELAY, CRON].map(String::from).into()
     );
-    let relay = capture(&roots, &ops, "ops:fixture-relay-0001");
+    let relay = capture(&roots, &ops, RELAY);
     assert_eq!(relay.channel.as_deref(), Some("relay"));
     // A session ID never resolves through another agent's database.
     let wrong = storage::capture(&context(&roots), &ops, SESSION);
@@ -108,7 +112,7 @@ fn agents_are_namespaced_and_discovered_after_roots_freeze() {
     // Non-agent entries under agents/ are ignored; malformed agent names are not.
     std::fs::write(home.path().join(".openclaw/agents/README"), "x").unwrap();
     std::fs::create_dir_all(home.path().join(".openclaw/agents/empty")).unwrap();
-    assert_eq!(storage::enumerate(&roots, None).unwrap().len(), 3);
+    assert_eq!(storage::enumerate(&roots, None).unwrap().len(), 4);
 }
 
 #[test]
@@ -166,13 +170,13 @@ fn wal_only_commits_change_the_session_stamp_and_captured_generation() {
         "another session's write is not this session's change"
     );
     db.execute(
-        "INSERT INTO transcript_events (session_id, seq, event_json, created_at) VALUES (?1, 6, ?2, 1790000099000)",
+        "INSERT INTO transcript_events (session_id, seq, event_json, created_at) VALUES (?1, 10, ?2, 1790000099000)",
         params![NATIVE, r#"{"type":"model_change","id":"entry-99","parentId":"entry-5","timestamp":"2026-09-21T14:15:00.000Z","provider":"openai","modelId":"fixture-model-2"}"#],
     )
     .unwrap();
     let second = storage::capture(&context(&roots), &path, SESSION).unwrap();
     assert_ne!(first.stamp, second.stamp);
-    assert_eq!(second.records, 7);
+    assert_eq!(second.records, 11);
     assert_eq!(second.bytes, 0, "SQLite bytes are unknown");
     assert!(second
         .read_paths
@@ -392,7 +396,9 @@ fn normalization_records_tools_usage_metadata_and_delivery_mirrors() {
         .unwrap();
     assert_eq!(call, ("exec".into(), 1));
     let usage = "SELECT count(*) FROM session_events WHERE source='openclaw' AND token_json IS NOT NULL AND kind='text' AND role='assistant'";
-    assert_eq!(count(conn, usage), 3);
+    // Two answers plus the two heartbeat acknowledgements, which were real
+    // model calls; the delivery mirror carries none.
+    assert_eq!(count(conn, usage), 5);
     let mirror: Option<String> = conn
         .query_row(
             "SELECT token_json FROM session_events WHERE source='openclaw' AND model='delivery-mirror'",
@@ -406,7 +412,7 @@ fn normalization_records_tools_usage_metadata_and_delivery_mirrors() {
     );
     let payload: String = conn
         .query_row(
-            "SELECT payload_json FROM session_markers WHERE source='openclaw' AND session_id=?1 AND marker_uid='session'",
+            "SELECT payload_json FROM session_markers WHERE source='openclaw' AND session_id=?1 AND marker_uid='session:fixture-telegram-0001'",
             [TELEGRAM],
             |r| r.get(0),
         )
@@ -435,7 +441,7 @@ fn openclaw_written_user_records_are_controls_not_prompts() {
     let control = r#"{"type":"message","id":"entry-control","parentId":"entry-5","timestamp":"2026-09-21T14:15:00.000Z","message":{"role":"user","content":[{"type":"text","text":"Inter-session note"}],"provenance":{"kind":"inter_session"},"timestamp":1790000099000}}"#;
     let custom = r#"{"type":"message","id":"entry-custom","parentId":"entry-control","timestamp":"2026-09-21T14:15:01.000Z","message":{"role":"custom","customType":"openclaw.nested-tool.v1","content":"nested","display":true,"timestamp":1790000099500}}"#;
     let external = r#"{"type":"message","id":"entry-external","parentId":"entry-custom","timestamp":"2026-09-21T14:15:02.000Z","message":{"role":"user","content":"A person on another channel","provenance":{"kind":"external_user"},"__openclaw":{"mirrorOrigin":"codex-app-server","mirrorIdentity":"m1","mirrorSourceFingerprint":"f1","upstreamUserText":""},"timestamp":1790000099700}}"#;
-    for (seq, json) in [(6, control), (7, custom), (8, external)] {
+    for (seq, json) in [(10, control), (11, custom), (12, external)] {
         db.execute(
             "INSERT INTO transcript_events (session_id, seq, event_json, created_at) VALUES (?1, ?2, ?3, 1790000099000)",
             params![NATIVE, seq, json],
@@ -459,7 +465,8 @@ fn openclaw_written_user_records_are_controls_not_prompts() {
     );
     assert_eq!(
         count(conn, "SELECT count(*) FROM session_events WHERE source='openclaw' AND control_kind='synthetic'"),
-        1
+        3,
+        "the inter-session note and both heartbeat polls"
     );
     assert_eq!(
         count(conn, "SELECT count(*) FROM history WHERE source='openclaw' AND prompt='A person on another channel'"),
@@ -581,7 +588,7 @@ fn watches_cover_databases_and_new_agents_without_agent_directories() {
 #[test]
 fn cancellation_inside_normalization_rolls_back_partial_evidence() {
     let (home, roots, path, _db) = fixture();
-    let session = capture(&roots, &path, SESSION);
+    let session = conversation(&roots, &path, SESSION);
     let conn = crate::open_db(&home.path().join("ledger.db")).unwrap();
     let calls = std::rc::Rc::new(std::cell::Cell::new(0));
     let counter = calls.clone();
@@ -664,7 +671,7 @@ fn published_2026_9_9_writer_catalog_is_read_without_extensions() {
     let (path, _db) = database(home.path(), "keeper", UPSTREAM_V2026_9_9);
     let candidates = storage::enumerate(&roots, None).unwrap();
     assert_eq!(candidates.len(), 1);
-    let id = "keeper:10000000-0000-4000-8000-000000000001";
+    let id = "keeper:stable-upgrade";
     let s = capture(&roots, &path, id);
     assert_eq!(s.title.as_deref(), Some("Stable keeper session"));
     assert_eq!(s.session_key, "agent:keeper:stable-upgrade");
@@ -674,11 +681,7 @@ fn published_2026_9_9_writer_catalog_is_read_without_extensions() {
     );
     // The same catalog under another agent's directory is refused, as upstream does.
     let (other, _db) = database(home.path(), "other", UPSTREAM_V2026_9_9);
-    let error = storage::capture(
-        &context(&roots),
-        &other,
-        "other:10000000-0000-4000-8000-000000000001",
-    );
+    let error = storage::capture(&context(&roots), &other, "other:stable-upgrade");
     assert!(format!("{:#}", error.unwrap_err()).contains("belongs to agent"));
 }
 
@@ -695,7 +698,7 @@ fn later_additive_schemas_are_read_by_column_name_and_postgres_stores_refused() 
     .unwrap();
     let s = capture(&roots, &path, SESSION);
     assert_eq!(s.schema_version, Some(31));
-    assert_eq!(s.events.len(), 6);
+    assert_eq!(s.events.len(), 10);
     db.execute_batch("UPDATE schema_meta SET schema_version=32; PRAGMA user_version=32")
         .unwrap();
     assert!(storage::enumerate(&roots, None).is_err());
@@ -715,7 +718,11 @@ fn make_cold(
     storage: &str,
 ) -> (Vec<u8>, PathBuf) {
     // Upstream archives decoded event JSON, whatever the row's encoding.
-    let rows: Vec<(i64, String, i64)> = capture(roots, path, &format!("main:{native}"))
+    let windows = [SESSION, TELEGRAM]
+        .into_iter()
+        .flat_map(|id| conversation(roots, path, id).windows);
+    let window = windows.into_iter().find(|w| w.native_id == native).unwrap();
+    let rows: Vec<(i64, String, i64)> = window
         .events
         .iter()
         .map(|e| (e.seq, e.entry.to_string(), e.created_at))
@@ -768,7 +775,7 @@ fn cold_archived_sessions_keep_their_history_and_verify_the_archive() {
     assert!(!blob.is_empty());
     let s = capture(&roots, &path, SESSION);
     assert!(s.cold.is_some());
-    assert_eq!(s.events.len(), 6);
+    assert_eq!(s.events.len(), 10);
     assert!(s.events[1..].iter().all(|e| e.active));
     let captured = storage::capture(&context(&roots), &path, SESSION).unwrap();
     assert!(captured.read_paths.contains(&file));
@@ -831,7 +838,7 @@ fn transcript_only_and_cli_harness_rows_carry_no_request_usage() {
         );
         db.execute(
             "INSERT INTO transcript_events (session_id, seq, event_json, created_at) VALUES (?1, ?2, ?3, 1790000099000)",
-            params![NATIVE, 6 + seq as i64, json],
+            params![NATIVE, 10 + seq as i64, json],
         )
         .unwrap();
     }
@@ -880,8 +887,13 @@ fn capture_matches_the_upstream_reader_oracle_including_compressed_rows() {
     let oracle: Value = serde_json::from_str(include_str!("oracle.json")).unwrap();
     for expected in oracle["sessions"].as_array().unwrap() {
         let agent = expected["agentId"].as_str().unwrap();
-        let id = format!("{agent}:{}", expected["sessionId"].as_str().unwrap());
-        let s = capture(&roots, if agent == "ops" { &ops } else { &path }, &id);
+        let key = expected["sessionKey"].as_str().unwrap();
+        let id = format!("{agent}:{}", conversation::native_name(key, agent));
+        let s = conversation(&roots, if agent == "ops" { &ops } else { &path }, &id)
+            .windows
+            .into_iter()
+            .find(|w| w.native_id == expected["sessionId"].as_str().unwrap())
+            .unwrap();
         assert_eq!(s.session_key, expected["sessionKey"]);
         let actual: Vec<Value> = s
             .events
@@ -935,7 +947,7 @@ fn appends_reread_only_the_tail_and_replaced_suffixes_reread_everything() {
         .unwrap();
     // Grow the session past the re-read window so its oldest rows fall outside it.
     let mut parent = last;
-    for seq in 6..(6 + TAIL as i64 + 4) {
+    for seq in 10..(10 + TAIL as i64 + 4) {
         let id = format!("entry-append-{seq}");
         append_event(&db, seq, &id, &parent, &format!("appended prompt {seq}"));
         parent = id;
@@ -952,7 +964,7 @@ fn appends_reread_only_the_tail_and_replaced_suffixes_reread_everything() {
             [SESSION],
         )
         .unwrap();
-    let next = 6 + TAIL as i64 + 4;
+    let next = 10 + TAIL as i64 + 4;
     append_event(&db, next, "entry-append-last", &parent, "the newest prompt");
     ledger.sweep(&roots, None).unwrap();
     let kept =
@@ -1016,7 +1028,7 @@ fn branch_copies_of_one_response_are_one_request() {
         )
         .unwrap();
     db.execute(
-        "INSERT INTO transcript_events (session_id, seq, event_json, created_at) VALUES (?1, 6, ?2, 1790000099000)",
+        "INSERT INTO transcript_events (session_id, seq, event_json, created_at) VALUES (?1, 10, ?2, 1790000099000)",
         params![NATIVE, copy],
     )
     .unwrap();
@@ -1043,10 +1055,10 @@ fn branch_copies_of_one_response_are_one_request() {
         .collect();
     assert_eq!(
         measured.len(),
-        2,
-        "the copy of resp-fixture-2 is not a third request"
+        4,
+        "two answers and two heartbeat acks; the copy of resp-fixture-2 is not another"
     );
-    assert_eq!(measured.iter().map(|u| u.input_tokens).sum::<u64>(), 230);
+    assert_eq!(measured.iter().map(|u| u.input_tokens).sum::<u64>(), 270);
 }
 
 #[test]
@@ -1197,7 +1209,7 @@ fn review_a_malformed_session_does_not_block_deleted_database_retirement() {
     let (ops, ops_db) = database(home.path(), "ops", OPS);
     let mut ledger = Ledger::new(home.path());
     ledger.sweep(&roots, None).unwrap();
-    let relay = "SELECT count(*) FROM sessions WHERE source='openclaw' AND session_id='ops:fixture-relay-0001'";
+    let relay = "SELECT count(*) FROM sessions WHERE source='openclaw' AND session_id='ops:relay:dm:fixture-sender'";
     assert_eq!(count(&ledger.conn, relay), 1);
     // A session in main stays malformed across sweeps.
     db.execute(
@@ -1220,4 +1232,185 @@ fn review_a_malformed_session_does_not_block_deleted_database_retirement() {
         0,
         "the deleted agent database retires"
     );
+}
+
+#[test]
+fn cron_runs_and_heartbeats_are_one_conversation_not_one_session_each() {
+    let home = tempfile::tempdir().unwrap();
+    let roots = ProviderRoots::from_home(home.path().into(), home.path().join("opencode.db"));
+    let (ops, db) = database(home.path(), "ops", OPS);
+    let (main, _main_db) = database(home.path(), "main", MAIN);
+    // Every isolated cron run is a window of the job's one conversation.
+    let cron = conversation(&roots, &ops, CRON);
+    assert_eq!(
+        cron.windows
+            .iter()
+            .map(|w| w.native_id.as_str())
+            .collect::<Vec<_>>(),
+        ["fixture-cron-run-1", "fixture-cron-run-2"]
+    );
+    let mut ledger = Ledger::new(home.path());
+    ledger.sweep(&roots, None).unwrap();
+    let conn = &ledger.conn;
+    assert_eq!(
+        count(
+            conn,
+            "SELECT count(*) FROM sessions WHERE source='openclaw'"
+        ),
+        4,
+        "main, telegram, relay and one cron job: no row per run"
+    );
+    assert_eq!(
+        count(conn, "SELECT count(*) FROM session_markers WHERE source='openclaw' AND session_id='ops:cron:fixture-job' AND kind='session_metadata'"),
+        2,
+        "one header marker per run window"
+    );
+    // Both runs' usage is kept: they were real model calls.
+    assert_eq!(
+        count(conn, "SELECT count(*) FROM session_events WHERE source='openclaw' AND session_id='ops:cron:fixture-job' AND token_json IS NOT NULL"),
+        2
+    );
+    // A quiet acknowledgement never becomes the conversation's reply.
+    let last = |conn: &Connection, id: &str| -> Option<String> {
+        conn.query_row(
+            "SELECT last_assistant_text FROM sessions WHERE source='openclaw' AND session_id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        last(conn, CRON).as_deref(),
+        Some("Cron run one checked the fixture queue.")
+    );
+    assert_eq!(
+        last(conn, SESSION).as_deref(),
+        Some("Found the OpenClaw fixture needle.")
+    );
+    // Heartbeat polls are OpenClaw's own input, not human prompts.
+    assert_eq!(
+        count(conn, "SELECT count(*) FROM history WHERE source='openclaw' AND (prompt LIKE '%heartbeat%' OR prompt LIKE '%HEARTBEAT%')"),
+        0
+    );
+    // A third run opens a new window: only it is read, the job keeps one row.
+    let header = r#"{"type":"session","version":4,"id":"fixture-cron-run-3","timestamp":"2026-09-21T14:20:00.000Z","cwd":"/fixture/project"}"#;
+    let reply = r#"{"type":"message","id":"cron-run-3-reply","parentId":null,"timestamp":"2026-09-21T14:20:01.000Z","message":{"role":"assistant","content":[{"type":"text","text":"Cron run three found work."}],"api":"openai-responses","provider":"openai","model":"fixture-model","usage":{"input":9,"output":2,"cacheRead":0,"cacheWrite":0,"totalTokens":11},"stopReason":"stop","timestamp":1790000501000}}"#;
+    db.execute(
+        "INSERT INTO session_windows (session_id, session_key, created_at, updated_at, transcript_updated_at) VALUES ('fixture-cron-run-3','agent:ops:cron:fixture-job',1789999995000,1790000501000,1790000501000)",
+        [],
+    )
+    .unwrap();
+    for (seq, (id, json)) in [("fixture-cron-run-3", header), ("cron-run-3-reply", reply)]
+        .into_iter()
+        .enumerate()
+    {
+        db.execute(
+            "INSERT INTO transcript_events (session_id, seq, event_json, created_at) VALUES ('fixture-cron-run-3', ?1, ?2, 1790000501000)",
+            params![seq as i64, json],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO transcript_event_identities (session_id, event_id, seq, event_type, created_at) VALUES ('fixture-cron-run-3', ?1, ?2, ?3, 1790000501000)",
+            params![id, seq as i64, if seq == 0 { "session" } else { "message" }],
+        )
+        .unwrap();
+    }
+    // Mark an older run's ledger row: the append pass must not re-read it.
+    ledger
+        .conn
+        .execute(
+            "UPDATE session_events SET text='kept' WHERE source='openclaw' AND session_id='ops:cron:fixture-job' AND text='NO_REPLY'",
+            [],
+        )
+        .unwrap();
+    ledger.sweep(&roots, None).unwrap();
+    let conn = &ledger.conn;
+    assert_eq!(
+        count(
+            conn,
+            "SELECT count(*) FROM sessions WHERE source='openclaw'"
+        ),
+        4
+    );
+    assert_eq!(
+        last(conn, CRON).as_deref(),
+        Some("Cron run three found work.")
+    );
+    assert_eq!(
+        count(conn, "SELECT count(*) FROM session_events WHERE source='openclaw' AND session_id='ops:cron:fixture-job' AND text='kept'"),
+        1,
+        "unchanged runs are not re-read"
+    );
+    drop(main);
+}
+
+#[test]
+fn heartbeat_prompts_and_acknowledgements_match_upstream_forms() {
+    for prompt in [
+        "[OpenClaw heartbeat poll]",
+        "  [OpenClaw cron wake]  ",
+        "[OpenClaw exec completion]\nDisable automatic completion turns",
+        "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly. Do not infer or repeat old tasks from prior chats. If nothing needs attention, reply HEARTBEAT_OK.\nCurrent time: now",
+        "Run the following periodic tasks (only those due based on their intervals):\n- x\nAfter completing all due tasks, reply HEARTBEAT_OK.",
+    ] {
+        assert!(format::is_heartbeat_prompt(prompt), "{prompt}");
+    }
+    for prompt in [
+        "Please read HEARTBEAT.md",
+        "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly. Do not infer or repeat old tasks from prior chats. If nothing needs attention, reply HEARTBEAT_OK. And more",
+        "[OpenClaw heartbeat poll] and a question",
+    ] {
+        assert!(!format::is_heartbeat_prompt(prompt), "{prompt}");
+    }
+    for ack in [
+        "NO_REPLY",
+        "HEARTBEAT_OK",
+        "**HEARTBEAT_OK**",
+        "HEARTBEAT_OK all quiet",
+    ] {
+        assert!(format::is_heartbeat_ack(ack), "{ack}");
+    }
+    let long = format!("HEARTBEAT_OK {}", "x".repeat(301));
+    for reply in ["Found the needle.", "NO_REPLY please", long.as_str()] {
+        assert!(!format::is_heartbeat_ack(reply), "{reply}");
+    }
+}
+
+#[test]
+fn keys_too_long_for_a_ledger_identity_are_hashed_and_still_hydrate() {
+    let (home, roots, path, db) = fixture();
+    let long = format!("agent:main:relay:dm:{}", "peer".repeat(300));
+    db.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+    db.execute(
+        "UPDATE session_nodes SET session_key=?1 WHERE session_key='agent:main:telegram:direct:fixture-peer'",
+        [&long],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE session_windows SET session_key=?1 WHERE session_id='fixture-telegram-0001'",
+        [&long],
+    )
+    .unwrap();
+    let id = format!("main:{}", conversation::native_name(&long, "main"));
+    assert!(id.len() < 100 && id.starts_with("main:sha="));
+    let conv = conversation(&roots, &path, &id);
+    assert_eq!(conv.key, long);
+    // The public sync and hydrate path accepts the identity end to end.
+    let store = crate::SessionStore::open(
+        crate::StoreOptions::default()
+            .db_path(home.path().join("store.db"))
+            .roots(roots),
+    )
+    .unwrap();
+    store
+        .sync(crate::SyncOptions::default().sources([crate::Source::OpenClaw]))
+        .unwrap();
+    let evidence = store
+        .session(
+            &crate::SessionRef::id(crate::Source::OpenClaw, &id),
+            crate::SessionQuery::default(),
+        )
+        .unwrap()
+        .unwrap();
+    assert!(!evidence.messages.is_empty());
 }

@@ -447,7 +447,7 @@
   "session_markers": [
     {
       "kind": "session_metadata",
-      "marker_uid": "session",
+      "marker_uid": "session:fixture-main-0001",
       "message_id": null,
       "parent_id": null,
       "payload_json": "{\"account_id\":null,\"agent_harness_id\":null,\"agent_id\":\"main\",\"channel\":\"main\",\"chat_type\":\"direct\",\"cold_archive\":null,\"created_via\":null,\"ended_at_ms\":null,\"header\":{\"cwd\":\"/fixture/project\",\"id\":\"fixture-main-0001\",\"timestamp\":\"2026-09-21T14:13:20.013Z\",\"type\":\"session\",\"version\":3},\"layout\":\"jsonl\",\"model\":\"fixture-model\",\"model_provider\":\"openai\",\"native_session_id\":\"fixture-main-0001\",\"parent_session_key\":null,\"previous_session_id\":null,\"schema_version\":null,\"session_key\":\"agent:main:main\",\"session_scope\":null,\"spawned_by\":null,\"status\":null,\"window_channel\":null,\"window_reason\":null}",
@@ -473,7 +473,7 @@
     },
     {
       "kind": "session_metadata",
-      "marker_uid": "session",
+      "marker_uid": "session:fixture-telegram-0001",
       "message_id": null,
       "parent_id": null,
       "payload_json": "{\"account_id\":null,\"agent_harness_id\":null,\"agent_id\":\"main\",\"channel\":\"telegram\",\"chat_type\":\"direct\",\"cold_archive\":null,\"created_via\":null,\"ended_at_ms\":null,\"header\":{\"cwd\":\"/fixture/project\",\"id\":\"fixture-telegram-0001\",\"timestamp\":\"2026-09-21T14:13:20.062Z\",\"type\":\"session\",\"version\":3},\"layout\":\"jsonl\",\"model\":null,\"model_provider\":null,\"native_session_id\":\"fixture-telegram-0001\",\"parent_session_key\":null,\"previous_session_id\":null,\"schema_version\":null,\"session_key\":\"agent:main:telegram:direct:fixture-peer\",\"session_scope\":null,\"spawned_by\":null,\"status\":null,\"window_channel\":\"telegram\",\"window_reason\":null}",
@@ -486,7 +486,7 @@
     },
     {
       "kind": "session_metadata",
-      "marker_uid": "session",
+      "marker_uid": "session:fixture-relay-0001",
       "message_id": null,
       "parent_id": null,
       "payload_json": "{\"account_id\":null,\"agent_harness_id\":null,\"agent_id\":\"ops\",\"channel\":\"relay\",\"chat_type\":null,\"cold_archive\":null,\"created_via\":null,\"ended_at_ms\":null,\"header\":{\"cwd\":\"/fixture/project\",\"id\":\"fixture-relay-0001\",\"timestamp\":\"2026-09-21T14:13:20.099Z\",\"type\":\"session\",\"version\":3},\"layout\":\"jsonl\",\"model\":null,\"model_provider\":null,\"native_session_id\":\"fixture-relay-0001\",\"parent_session_key\":null,\"previous_session_id\":null,\"schema_version\":null,\"session_key\":\"agent:ops:relay:dm:fixture-sender\",\"session_scope\":null,\"spawned_by\":null,\"status\":null,\"window_channel\":null,\"window_reason\":null}",
@@ -516,7 +516,7 @@
       "repo_url": null,
       "session_id": "main:fixture-main-0001",
       "source": "openclaw",
-      "source_stamp": "openclaw_agent24_v2:sha256:031f6a7e52819233aa60ef43535f529df5315379b18ab68fc195491bf4acfea1",
+      "source_stamp": "openclaw_agent24_v3:sha256:031f6a7e52819233aa60ef43535f529df5315379b18ab68fc195491bf4acfea1",
       "title": "Fixture main session",
       "workspace_roots_json": null
     },
@@ -536,7 +536,7 @@
       "repo_url": null,
       "session_id": "main:fixture-telegram-0001",
       "source": "openclaw",
-      "source_stamp": "openclaw_agent24_v2:sha256:7021ea9a15ae5b91dd04ad98890d0581984e7075cd9040ac37fdbdc5d31ba413",
+      "source_stamp": "openclaw_agent24_v3:sha256:7021ea9a15ae5b91dd04ad98890d0581984e7075cd9040ac37fdbdc5d31ba413",
       "title": null,
       "workspace_roots_json": null
     },
@@ -556,7 +556,7 @@
       "repo_url": null,
       "session_id": "ops:fixture-relay-0001",
       "source": "openclaw",
-      "source_stamp": "openclaw_agent24_v2:sha256:5af375edadbfd49140ba66609afc67392c077d11e7fc54b2ad1f9a389a490803",
+      "source_stamp": "openclaw_agent24_v3:sha256:5af375edadbfd49140ba66609afc67392c077d11e7fc54b2ad1f9a389a490803",
       "title": null,
       "workspace_roots_json": null
     }

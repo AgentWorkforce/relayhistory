@@ -1,3 +1,4 @@
+use super::conversation::{self, Conversation};
 use super::schema::Schema;
 use super::*;
 use crate::ingest::check_capture_cancelled;
@@ -101,9 +102,15 @@ pub(super) fn read<T>(
 
 /// One window per transcript, hot (rows in `transcript_events`) or cold
 /// (moved into a verified archive). Recency aggregates the event table once;
-/// a selected capture aggregates only that session.
+/// a selected capture aggregates only the windows of one conversation key
+/// (its own and its cron runs'; the caller keeps the exact canonical match).
 pub(super) fn session_query(selected: bool, schema: &Schema) -> String {
-    let predicate = if selected { "WHERE session_id=?1" } else { "" };
+    const KEY: &str = "(session_key=?1 OR substr(session_key,1,length(?1)+5)=?1||':run:')";
+    let predicate = if selected {
+        format!("WHERE session_id IN (SELECT session_id FROM session_windows WHERE {KEY})")
+    } else {
+        String::new()
+    };
     let cold = schema.cold_archives();
     format!(
         "SELECT w.session_id, w.session_key, w.previous_session_id, w.reason, w.session_scope, \
@@ -122,30 +129,35 @@ pub(super) fn session_query(selected: bool, schema: &Schema) -> String {
          LEFT JOIN session_nodes n ON n.session_key=w.session_key \
          LEFT JOIN transcript_rewrite_watermarks r ON r.session_id=w.session_id \
          LEFT JOIN {cold} c ON c.session_id=w.session_id \
-         WHERE (?1 IS NULL OR w.session_id=?1) AND (e.events IS NOT NULL OR c.session_id IS NOT NULL) \
+         WHERE (?1 IS NULL OR w.session_key=?1 OR substr(w.session_key,1,length(?1)+5)=?1||':run:') \
+         AND (e.events IS NOT NULL OR c.session_id IS NOT NULL) \
          ORDER BY 21 DESC, w.session_id LIMIT ?2"
     )
 }
-/// Sessions of one agent database, inside the caller's snapshot.
+/// Transcript windows of one agent database (all, or one conversation key's),
+/// inside the caller's snapshot.
 pub(super) fn sessions(
     conn: &Connection,
     roots: &ProviderRoots,
     path: &Path,
     schema: &Schema,
     limit: usize,
-    native: Option<&str>,
+    key: Option<&str>,
 ) -> Result<Vec<Session>> {
     if !schema.transcripts {
         return Ok(vec![]);
     }
     let namespace = namespace(roots, path)?;
     let agent = agent_id(path)?;
-    let mut stmt = conn.prepare(&session_query(native.is_some(), schema))?;
-    let mut rows = stmt.query(rusqlite::params![native, limit as i64])?;
+    let mut stmt = conn.prepare(&session_query(key.is_some(), schema))?;
+    let mut rows = stmt.query(rusqlite::params![key, limit as i64])?;
     let mut result = vec![];
     while let Some(r) = rows.next()? {
         check_capture_cancelled()?;
         let mut session = session_row(r, &namespace, agent, schema.version)?;
+        if key.is_some_and(|key| conversation::canonical_key(&session.session_key) != key) {
+            continue;
+        }
         if let Some(archive) = session.cold.as_ref().filter(|c| c.storage == "file") {
             // A file-backed archive changes outside the database: its stat
             // (never its contents) is part of the session's stamp.
@@ -227,8 +239,9 @@ fn session_row(
             .map(|c| (&c.sha256, c.last_seq, c.archived_at)),
     ])
     .to_string();
+    let conversation = conversation::canonical_key(&session_key);
     Ok(Session {
-        id: identity(namespace, &native_id),
+        id: identity(namespace, &conversation::native_name(&conversation, agent)),
         channel: channel(&session_key),
         native_id,
         agent_id: agent.into(),
@@ -277,34 +290,53 @@ pub(super) fn channel(key: &str) -> Option<String> {
         .map(str::to_ascii_lowercase)
 }
 
-/// Session list of one agent database, captured in one snapshot.
-fn list(context: &AcquisitionContext<'_>, path: &Path, limit: usize) -> Result<Vec<Session>> {
+/// Every conversation of one agent database, captured in one snapshot.
+fn list(context: &AcquisitionContext<'_>, path: &Path) -> Result<Vec<Conversation>> {
     read(context, path, |conn, schema| {
-        sessions(conn, context.roots, path, schema, limit, None)
+        let windows = sessions(conn, context.roots, path, schema, MAX_SESSIONS + 1, None)?;
+        ensure!(
+            windows.len() <= MAX_SESSIONS,
+            "OpenClaw discovery exceeds safety limit"
+        );
+        Ok(conversation::group(windows))
     })
+}
+/// One conversation's windows, by its ledger ID, inside the caller's snapshot.
+/// A hashed name resolves only against the full listing.
+pub(super) fn conversation_in(
+    conn: &Connection,
+    roots: &ProviderRoots,
+    path: &Path,
+    schema: &Schema,
+    id: &str,
+) -> Result<Option<Conversation>> {
+    let namespace = namespace(roots, path)?;
+    let key = conversation::key_of(native_id(&namespace, id)?, agent_id(path)?);
+    let windows = sessions(conn, roots, path, schema, MAX_SESSIONS + 1, key.as_deref())?;
+    Ok(conversation::group(windows)
+        .into_iter()
+        .find(|c| c.id == id))
 }
 
 pub(super) fn enumerate(roots: &ProviderRoots, limit: Option<usize>) -> Result<Vec<Candidate>> {
     let context = AcquisitionContext::new(ID, roots);
-    let cap = limit.unwrap_or(MAX_SESSIONS).min(MAX_SESSIONS) + 1;
     let mut candidates = vec![];
     for agent in stores::agent_dirs(roots)? {
         check_capture_cancelled()?;
         if let Some(path) = stores::database_of(&agent)? {
-            for s in list(&context, &path, cap)? {
+            for c in list(&context, &path)? {
                 candidates.push(Candidate {
                     source: ID,
                     locator: path.to_string_lossy().into_owned(),
-                    session_id: Some(s.id),
-                    recency_hint_ms: Some(s.latest),
-                    // Per-session change stamp: other sessions' writes to the
-                    // same database do not force a shallow re-read.
-                    stamp: s.stamp,
+                    recency_hint_ms: Some(c.last_activity()),
+                    // Per-conversation change stamp: other conversations'
+                    // writes to the same database do not force a shallow re-read.
+                    stamp: c.stamp(),
+                    session_id: Some(c.id),
                 });
             }
         }
-        // The database owns every session it holds, imported or not, however
-        // few of them the bounded listing above returned.
+        // The database owns every session it holds, imported or not.
         let dir = agent.join(legacy::DIR);
         if dir.is_dir() {
             let held = stores::held(&context, &agent)?;
@@ -324,8 +356,8 @@ pub(super) fn enumerate(roots: &ProviderRoots, limit: Option<usize>) -> Result<V
     Ok(candidates)
 }
 
-/// Bounded discovery read: catalog row plus the first prompt from at most
-/// the first 64 events.
+/// Bounded discovery read: the conversation's catalog row, its cwd from the
+/// newest window and its first prompt from at most 64 entries per window.
 pub(super) fn shallow(scan: &ScanEnv<'_>, c: &Candidate) -> Result<Option<ShallowSession>> {
     if Path::new(&c.locator)
         .file_name()
@@ -335,39 +367,41 @@ pub(super) fn shallow(scan: &ScanEnv<'_>, c: &Candidate) -> Result<Option<Shallo
     }
     let context = AcquisitionContext::new(ID, scan.provider_roots);
     let path = Path::new(&c.locator);
-    let namespace = namespace(scan.provider_roots, path)?;
     let Some(id) = c.session_id.as_deref() else {
         return Ok(None);
     };
-    let native = native_id(&namespace, id)?;
     scan.note_open();
     scan.note_query();
     read(&context, path, |conn, schema| {
-        let Some(s) = sessions(conn, scan.provider_roots, path, schema, 1, Some(native))?
-            .into_iter()
-            .next()
-        else {
+        let Some(conv) = conversation_in(conn, scan.provider_roots, path, schema, id)? else {
             return Ok(None);
         };
-        scan.note_records(1);
-        scan.note_query();
-        let head = head(&context, conn, path, schema, &s)?;
-        scan.note_bytes(head.iter().map(|e| e.to_string().len() as u64).sum());
-        scan.note_records(head.len() as u64);
-        let cwd = head
-            .first()
-            .and_then(|h| h["cwd"].as_str())
-            .filter(|c| !c.trim().is_empty())
-            .map(str::to_owned);
+        scan.note_records(conv.windows.len() as u64);
+        let (mut first_prompt, mut cwd) = (None, None);
+        // Newest window first: its cwd wins, and the oldest prompt wins.
+        for window in conv.windows.iter().rev() {
+            scan.note_query();
+            let head = head(&context, conn, path, schema, window)?;
+            scan.note_bytes(head.iter().map(|e| e.to_string().len() as u64).sum());
+            scan.note_records(head.len() as u64);
+            cwd = cwd.or_else(|| {
+                head.first()
+                    .and_then(|h| h["cwd"].as_str())
+                    .filter(|c| !c.trim().is_empty())
+                    .map(str::to_owned)
+            });
+            first_prompt = format::first_prompt(&head).or(first_prompt);
+        }
+        let latest = conv.latest();
         Ok(Some(ShallowSession {
             source: ID.into(),
-            session_id: s.id,
-            title: s.title,
+            session_id: conv.id.clone(),
+            title: conv.title().map(str::to_owned),
             cwd,
-            models: s.model.into_iter().collect(),
-            first_prompt: format::first_prompt(&head),
-            first_activity_ms: Some(s.started),
-            last_activity_ms: Some(s.latest),
+            models: latest.model.iter().cloned().collect(),
+            first_prompt,
+            first_activity_ms: Some(conv.started()),
+            last_activity_ms: Some(conv.last_activity()),
             raw_path: Some(c.locator.clone()),
             source_stamp: Some(c.stamp.clone()),
             discovery_state: "shallow".into(),
@@ -406,7 +440,8 @@ fn head(
     Ok(head)
 }
 
-/// Read one selected session and all its events from a single snapshot.
+/// Read one selected conversation and every window's events from a single
+/// snapshot.
 pub(super) fn capture(
     context: &AcquisitionContext<'_>,
     path: &Path,
@@ -415,20 +450,20 @@ pub(super) fn capture(
     if path.file_name().is_some_and(|n| n != DATABASE) {
         return legacy::capture(context, path, id);
     }
-    let namespace = namespace(context.roots, path)?;
-    let native = native_id(&namespace, id)?;
-    let session = read(context, path, |conn, schema| {
-        let mut s = sessions(conn, context.roots, path, schema, 1, Some(native))?
-            .into_iter()
-            .next()
+    let conv = read(context, path, |conn, schema| {
+        let mut conv = conversation_in(conn, context.roots, path, schema, id)?
             .context("SESSION_SOURCE_MISMATCH: OpenClaw session not in this agent database")?;
-        s.events = events::events(context, conn, path, schema, &s)?;
-        Ok(s)
+        for window in &mut conv.windows {
+            window.events = events::events(context, conn, path, schema, window)?;
+        }
+        Ok(conv)
     })?;
-    let records = session.events.len() as i64;
+    let records = conv.records() as i64;
     let mut read_paths = vec![path.to_path_buf()];
-    if let Some(archive) = session.cold.as_ref().filter(|c| c.storage == "file") {
-        read_paths.push(cold::archive_path(path, &archive.name)?);
+    for window in &conv.windows {
+        if let Some(archive) = window.cold.as_ref().filter(|c| c.storage == "file") {
+            read_paths.push(cold::archive_path(path, &archive.name)?);
+        }
     }
     for suffix in SIDECARS {
         let sidecar = sidecar(path, suffix);
@@ -438,7 +473,7 @@ pub(super) fn capture(
     }
     // SQLite bytes read are unknown; never report the file size.
     Ok(AcquiredSession::new(
-        serde_json::to_value(session)?,
+        serde_json::to_value(conv)?,
         0,
         records,
         read_paths,

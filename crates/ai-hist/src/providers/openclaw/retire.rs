@@ -5,8 +5,8 @@ use crate::providers::file_history;
 
 /// Retire local evidence of sessions recorded at `path` that a complete
 /// snapshot no longer contains.
-pub(super) fn retire_absent(conn: &Connection, path: &Path, sessions: &[Session]) -> Result<()> {
-    let keep: std::collections::BTreeSet<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+pub(super) fn retire_absent(conn: &Connection, path: &Path, ids: &[String]) -> Result<()> {
+    let keep: std::collections::BTreeSet<&str> = ids.iter().map(String::as_str).collect();
     let mut stmt =
         conn.prepare("SELECT session_id FROM sessions WHERE source=?1 AND raw_path=?2")?;
     let recorded = stmt
@@ -64,7 +64,8 @@ type Held = std::collections::BTreeMap<PathBuf, Option<std::collections::BTreeSe
 
 /// A JSONL transcript that is gone: its sessions retire unless the agent's
 /// database holds them (the doctor imported, then archived, the file), in
-/// which case the row moves to the database with its evidence. While that
+/// which case they retire into the database's conversation once it holds
+/// that window. While that
 /// database cannot be read nothing retires: it may hold any of them. This
 /// holds whether or not the database was swept, normalized cleanly, or its
 /// `sessions/` directory still exists.
@@ -85,7 +86,6 @@ fn retire_transcript(
     let Some(ids) = ids else {
         return Ok(());
     };
-    let database = agent.join("agent").join(storage::DATABASE);
     let prefix = format!("{}:", storage::namespace(roots, path)?);
     let mut stmt =
         conn.prepare("SELECT session_id FROM sessions WHERE source=?1 AND raw_path=?2")?;
@@ -98,7 +98,9 @@ fn retire_transcript(
         crate::ingest::check_capture_cancelled()?;
         let native = id.strip_prefix(&prefix).unwrap_or_default();
         if ids.contains(native) {
-            legacy::transfer(conn, &id, &database)?;
+            // The database's conversation owns it once that window is in the
+            // ledger; until then the row keeps its evidence.
+            legacy::supersede(conn, &id, native)?;
         } else {
             file_history::retire_local_session(conn, ID, &id)?;
         }

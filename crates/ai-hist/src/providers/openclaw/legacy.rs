@@ -501,32 +501,45 @@ pub(super) fn mark(payload: &mut Value, s: &Session) {
 
 /// A complete transcript replaces the session's evidence; a partial one
 /// (an unterminated final JSONL record) only adds to it, like an append.
-pub(super) fn complete_or_append(conn: &Connection, s: &Session, path: &Path) -> Result<usize> {
-    if s.partial {
-        normalize::append(conn, s, path)
+pub(super) fn complete_or_append(conn: &Connection, s: Session, path: &Path) -> Result<usize> {
+    let conv = conversation::Conversation::single(s);
+    if conv.partial() {
+        normalize::append(conn, &conv, path)
     } else {
-        normalize::session(conn, s, path)
+        normalize::session(conn, &conv, path)
     }
 }
 
-/// Move a session's catalog row from its JSONL transcript to the agent
-/// database that holds it, keeping every row of evidence.
-pub(super) fn transfer(conn: &Connection, id: &str, database: &Path) -> Result<()> {
-    conn.execute(
-        "UPDATE sessions SET raw_path=?3 WHERE source=?1 AND session_id=?2",
-        rusqlite::params![ID, id, database.to_string_lossy()],
+/// Retire the ledger row a JSONL transcript gave session `native` once the
+/// agent database's conversation holds that window: the doctor imported it,
+/// and the conversation now carries the same evidence. Returns whether it
+/// did; until then the JSONL row keeps its evidence.
+pub(super) fn supersede(conn: &Connection, legacy_id: &str, native: &str) -> Result<bool> {
+    // The same agent namespace: session IDs are only unique within one.
+    let namespace = legacy_id.strip_suffix(native).unwrap_or(legacy_id);
+    let captured: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM session_markers WHERE source=?1 AND marker_uid=?2 \
+         AND session_id<>?3 AND substr(session_id,1,length(?4))=?4)",
+        rusqlite::params![ID, format!("session:{native}"), legacy_id, namespace],
+        |r| r.get(0),
     )?;
-    Ok(())
+    if captured {
+        crate::providers::file_history::retire_local_session(conn, ID, legacy_id)?;
+    }
+    Ok(captured)
 }
 
-/// A database session the catalog still records at its imported JSONL
-/// transcript: the database now owns it, so the row follows the database
-/// and a later move of the transcript into the import archive retires
-/// nothing.
-pub(super) fn claim(conn: &Connection, s: &Session, database: &Path) -> Result<()> {
-    if s.legacy {
+/// After a database conversation is written: each of its windows the JSONL
+/// store also gave a ledger row (`<namespace>:<sessionId>` at this agent's
+/// `sessions/`) is now owned by the conversation.
+pub(super) fn claim(
+    conn: &Connection,
+    conv: &conversation::Conversation,
+    database: &Path,
+) -> Result<()> {
+    let Some(first) = conv.windows.first().filter(|w| !w.legacy) else {
         return Ok(());
-    }
+    };
     let Some(dir) = database
         .parent()
         .and_then(Path::parent)
@@ -534,16 +547,26 @@ pub(super) fn claim(conn: &Connection, s: &Session, database: &Path) -> Result<(
     else {
         return Ok(());
     };
-    let stored: Option<String> = conn
-        .query_row(
-            "SELECT raw_path FROM sessions WHERE source=?1 AND session_id=?2",
-            [ID, &s.id],
-            |r| r.get(0),
-        )
-        .optional()?
-        .flatten();
-    if stored.is_some_and(|p| Path::new(&p).parent() == Some(dir.as_path())) {
-        transfer(conn, &s.id, database)?;
+    let name = conversation::native_name(&conv.key, &first.agent_id);
+    let Some(namespace) = conv.id.strip_suffix(&format!(":{name}")) else {
+        return Ok(());
+    };
+    for window in &conv.windows {
+        let legacy_id = format!("{namespace}:{}", window.native_id);
+        if legacy_id == conv.id {
+            continue;
+        }
+        let stored: Option<String> = conn
+            .query_row(
+                "SELECT raw_path FROM sessions WHERE source=?1 AND session_id=?2",
+                [ID, &legacy_id],
+                |r| r.get(0),
+            )
+            .optional()?
+            .flatten();
+        if stored.is_some_and(|p| Path::new(&p).parent() == Some(dir.as_path())) {
+            supersede(conn, &legacy_id, &window.native_id)?;
+        }
     }
     Ok(())
 }
