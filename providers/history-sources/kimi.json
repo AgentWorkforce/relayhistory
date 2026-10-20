@@ -13,7 +13,7 @@
       "files": [
         "kimi/ordinary"
       ],
-      "quirk": "Kimi Code2.2.0 native protocol1.5 writer, localhost model fixture, independently restored by pinned official foldWireRecords; ordinary case."
+      "quirk": "Kimi Code 2.2.0 native protocol 1.5 writer, localhost model fixture, independently restored by pinned official foldWireRecords; ordinary case."
     },
     {
       "source": "kimi",
@@ -23,7 +23,7 @@
       "files": [
         "kimi/tool"
       ],
-      "quirk": "Kimi Code2.2.0 native protocol1.5 writer, localhost model fixture, independently restored by pinned official foldWireRecords; tool case."
+      "quirk": "Kimi Code 2.2.0 native protocol 1.5 writer, localhost model fixture, independently restored by pinned official foldWireRecords; tool case."
     },
     {
       "source": "kimi",
@@ -33,7 +33,7 @@
       "files": [
         "kimi/resumed"
       ],
-      "quirk": "Kimi Code2.2.0 native protocol1.5 writer, localhost model fixture, independently restored by pinned official foldWireRecords; resumed case."
+      "quirk": "Kimi Code 2.2.0 native protocol 1.5 writer, localhost model fixture, independently restored by pinned official foldWireRecords; resumed case."
     },
     {
       "source": "kimi",
@@ -43,7 +43,7 @@
       "files": [
         "kimi/subagent"
       ],
-      "quirk": "Kimi Code2.2.0 native protocol1.5 writer, localhost model fixture, independently restored by pinned official foldWireRecords; subagent case."
+      "quirk": "Kimi Code 2.2.0 native protocol 1.5 writer, localhost model fixture, independently restored by pinned official foldWireRecords; subagent case."
     },
     {
       "source": "kimi",
@@ -53,7 +53,7 @@
       "files": [
         "kimi/rewound"
       ],
-      "quirk": "Native2.2 binary journal plus pinned official buildUndoSwitchRecords writer constructor; official flattenChain+fold confirms prior messages are retired."
+      "quirk": "Native 2.2 binary journal plus pinned official buildUndoSwitchRecords writer constructor; official flattenChain+fold confirms prior messages are retired."
     },
     {
       "source": "kimi",
@@ -69,7 +69,7 @@
   "capture": [
     {
       "evidence": "Messages and tools",
-      "coverage": "Current Kimi Code2.2 native wire1.5 canonical message events, native tool IDs/results and separate subagent wires. Streaming/context duplicates are markers rather than duplicate human turns. Millisecond timestamps, state2 title/cwd and root/session/agent identity preserved."
+      "coverage": "Current Kimi Code 2.2 native wire 1.5 canonical message events, native tool IDs/results and separate subagent wires. Streaming/context duplicates are markers rather than duplicate human turns. Millisecond timestamps, state v2 title/cwd and root/session/agent identity preserved."
     },
     {
       "evidence": "Control and limits",

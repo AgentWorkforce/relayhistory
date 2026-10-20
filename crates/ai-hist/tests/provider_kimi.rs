@@ -25,7 +25,10 @@ fn stage(home: &Path, case: &str) -> PathBuf {
             .join(case),
         home,
     );
-    let bucket = std::fs::read_dir(home.join(".kimi-code/sessions"))
+    let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/kimi")
+        .join(case);
+    let bucket = std::fs::read_dir(fixture.join(".kimi-code/sessions"))
         .unwrap()
         .next()
         .unwrap()
@@ -37,7 +40,8 @@ fn stage(home: &Path, case: &str) -> PathBuf {
         .unwrap()
         .unwrap()
         .path();
-    session.join("agents/main/wire.jsonl")
+    home.join(session.strip_prefix(&fixture).unwrap())
+        .join("agents/main/wire.jsonl")
 }
 fn sid(n: usize, agent: &str) -> String {
     format!(
@@ -171,6 +175,14 @@ fn partial_tail_rewrite_and_metadata_changes_are_truthful() {
     std::fs::write(state, serde_json::to_vec(&value).unwrap()).unwrap();
     store
         .discover(DiscoveryOptions::default().sources([Source::Kimi]))
+        .unwrap();
+    // This native wire exceeds the bounded discovery window. Hydration
+    // applies the complete authoritative state after discovery observes it.
+    store
+        .hydrate(
+            &SessionRef::id(Source::Kimi, sid(1, "main")),
+            HydrateOptions::default(),
+        )
         .unwrap();
     assert_eq!(
         store
@@ -447,4 +459,320 @@ fn native_order_survives_more_than_ten_same_millisecond_messages_and_branch() {
     let watermark = store.head_revision().unwrap();
     store.sync(SyncOptions::default().force(true)).unwrap();
     assert_eq!(store.head_revision().unwrap(), watermark);
+}
+
+#[test]
+fn partial_replacement_defers_all_positional_evidence_until_complete() {
+    let home = tempfile::tempdir().unwrap();
+    let wire = stage(home.path(), "ordinary");
+    let store = open(home.path());
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    let before = evidence(&store, 1, "main");
+    let replacement = std::fs::read_to_string(&wire)
+        .unwrap()
+        .replace("blue", "replacement green");
+    std::fs::write(&wire, format!("{replacement}{{\"type\":")).unwrap();
+    store
+        .discover(DiscoveryOptions::default().sources([Source::Kimi]))
+        .unwrap();
+    assert_eq!(
+        store
+            .sessions(CatalogQuery::default())
+            .next()
+            .unwrap()
+            .unwrap()
+            .first_prompt
+            .as_deref(),
+        Some("Remember the synthetic ordinary color blue.")
+    );
+    store
+        .hydrate(
+            &SessionRef::id(Source::Kimi, sid(1, "main")),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    let partial = evidence(&store, 1, "main");
+    assert_eq!(partial.messages, before.messages);
+    assert_eq!(partial.markers, before.markers);
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    assert_eq!(evidence(&store, 1, "main").messages, before.messages);
+    std::fs::write(&wire, replacement).unwrap();
+    store
+        .hydrate(
+            &SessionRef::id(Source::Kimi, sid(1, "main")),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    assert!(evidence(&store, 1, "main")
+        .messages
+        .iter()
+        .flat_map(|m| &m.blocks)
+        .any(|b| b
+            .text
+            .as_deref()
+            .is_some_and(|s| s.contains("replacement green"))));
+}
+
+#[test]
+fn orphan_state_does_not_block_other_candidates_or_retire_prior_evidence() {
+    let home = tempfile::tempdir().unwrap();
+    let wire = stage(home.path(), "ordinary");
+    let orphan = stage(home.path(), "tool");
+    let store = open(home.path());
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    let previous = evidence(&store, 2, "main").messages;
+    std::fs::remove_file(
+        orphan
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("state.json"),
+    )
+    .unwrap();
+    let original = std::fs::read_to_string(&wire).unwrap();
+    std::fs::write(
+        &wire,
+        original.replace(
+            "Synthetic Kimi ordinary answer 1: blue.",
+            "Still imported beside orphan.",
+        ),
+    )
+    .unwrap();
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    assert_eq!(evidence(&store, 2, "main").messages, previous);
+    assert!(evidence(&store, 1, "main")
+        .messages
+        .iter()
+        .flat_map(|m| &m.blocks)
+        .any(|b| b.text.as_deref() == Some("Still imported beside orphan.")));
+    let fresh = SessionStore::open(
+        StoreOptions::default()
+            .db_path(home.path().join("fresh.db"))
+            .roots(ProviderRoots::from_home(
+                home.path().into(),
+                home.path().join("opencode.db"),
+            )),
+    )
+    .unwrap();
+    let report = fresh
+        .discover(DiscoveryOptions::default().sources([Source::Kimi]))
+        .unwrap();
+    assert!(!report.diagnostics.is_empty());
+    assert_eq!(fresh.sessions(CatalogQuery::default()).count(), 1);
+}
+
+#[test]
+fn catalog_preview_is_bounded_without_truncating_message_evidence() {
+    let home = tempfile::tempdir().unwrap();
+    let wire = stage(home.path(), "ordinary");
+    let original = rows(&wire);
+    let mut user = original
+        .iter()
+        .find(|r| {
+            r["type"] == "agent.message.appended" && r["message"]["message"]["role"] == "user"
+        })
+        .unwrap()
+        .clone();
+    let text = "界".repeat(5000);
+    user["message"]["message"]["content"][0]["text"] = text.clone().into();
+    replace_rows(&wire, &[original[0].clone(), user]);
+    let store = open(home.path());
+    store
+        .discover(DiscoveryOptions::default().sources([Source::Kimi]))
+        .unwrap();
+    assert_eq!(
+        store
+            .sessions(CatalogQuery::default())
+            .next()
+            .unwrap()
+            .unwrap()
+            .first_prompt
+            .unwrap()
+            .chars()
+            .count(),
+        4096
+    );
+    store
+        .hydrate(
+            &SessionRef::id(Source::Kimi, sid(1, "main")),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .sessions(CatalogQuery::default())
+            .next()
+            .unwrap()
+            .unwrap()
+            .first_prompt
+            .unwrap()
+            .chars()
+            .count(),
+        4096
+    );
+    assert!(evidence(&store, 1, "main")
+        .messages
+        .iter()
+        .flat_map(|m| &m.blocks)
+        .any(|b| b.text.as_deref() == Some(&text)));
+}
+
+#[test]
+fn discovery_refreshes_stamp_but_full_metadata_waits_for_hydration() {
+    let home = tempfile::tempdir().unwrap();
+    let wire = stage(home.path(), "ordinary");
+    let state = wire
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("state.json");
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
+    value["title"] = "Draft".into();
+    std::fs::write(&state, serde_json::to_vec(&value).unwrap()).unwrap();
+    let store = open(home.path());
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    let catalog = || {
+        store
+            .sessions(CatalogQuery::default())
+            .next()
+            .unwrap()
+            .unwrap()
+    };
+    let before = catalog();
+    assert_eq!(before.title.as_deref(), Some("Draft"));
+    value["title"] = "Final renamed title".into();
+    std::fs::write(&state, serde_json::to_vec(&value).unwrap()).unwrap();
+    store
+        .discover(DiscoveryOptions::default().sources([Source::Kimi]))
+        .unwrap();
+    assert_ne!(catalog().source_stamp, before.source_stamp);
+    assert_eq!(catalog().title.as_deref(), Some("Draft"));
+    store
+        .hydrate(
+            &SessionRef::id(Source::Kimi, sid(1, "main")),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(catalog().title.as_deref(), Some("Final renamed title"));
+    let before = catalog();
+    assert!(before.first_prompt.is_some());
+    let fixture = tempfile::tempdir().unwrap();
+    let rewind = rows(&stage(fixture.path(), "rewound"));
+    let mut rewritten = rows(&wire);
+    rewritten.extend_from_slice(&rewind[rewind.len() - 3..]);
+    replace_rows(&wire, &rewritten);
+    store
+        .discover(DiscoveryOptions::default().sources([Source::Kimi]))
+        .unwrap();
+    assert_ne!(catalog().source_stamp, before.source_stamp);
+    assert_eq!(catalog().first_prompt, before.first_prompt);
+    store
+        .hydrate(
+            &SessionRef::id(Source::Kimi, sid(1, "main")),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    assert!(catalog().first_prompt.is_none());
+    assert!(evidence(&store, 1, "main").messages.is_empty());
+    value["title"] = serde_json::Value::Null;
+    std::fs::write(&state, serde_json::to_vec(&value).unwrap()).unwrap();
+    store
+        .discover(DiscoveryOptions::default().sources([Source::Kimi]))
+        .unwrap();
+    assert_eq!(catalog().title.as_deref(), Some("Final renamed title"));
+    store
+        .hydrate(
+            &SessionRef::id(Source::Kimi, sid(1, "main")),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    assert!(catalog().title.is_none());
+}
+
+#[test]
+fn first_partial_capture_reports_deferral_and_complete_retry_indexes_evidence() {
+    let home = tempfile::tempdir().unwrap();
+    let wire = stage(home.path(), "ordinary");
+    let complete = std::fs::read_to_string(&wire).unwrap();
+    std::fs::write(&wire, format!("{complete}{{\"type\":")).unwrap();
+    let store = open(home.path());
+    store
+        .discover(DiscoveryOptions::default().sources([Source::Kimi]))
+        .unwrap();
+    let reference = SessionRef::id(Source::Kimi, sid(1, "main"));
+    for _ in 0..2 {
+        let report = store
+            .hydrate(&reference, HydrateOptions::default())
+            .unwrap();
+        assert!(report
+            .diagnostics
+            .iter()
+            .any(|d| d.code == "KIMI_INCOMPLETE_TRANSCRIPT"));
+        assert!(evidence(&store, 1, "main").messages.is_empty());
+    }
+    std::fs::write(&wire, complete).unwrap();
+    let report = store
+        .hydrate(&reference, HydrateOptions::default())
+        .unwrap();
+    assert!(!report
+        .diagnostics
+        .iter()
+        .any(|d| d.code == "KIMI_INCOMPLETE_TRANSCRIPT"));
+    assert_eq!(evidence(&store, 1, "main").messages.len(), 2);
+}
+
+#[test]
+fn bounded_partial_discovery_preserves_evidence_backed_catalog_metadata() {
+    let home = tempfile::tempdir().unwrap();
+    let wire = stage(home.path(), "ordinary");
+    let store = open(home.path());
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    let previous = store
+        .sessions(CatalogQuery::default())
+        .next()
+        .unwrap()
+        .unwrap();
+    assert!(previous.title.is_none());
+    let state = wire
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("state.json");
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
+    value["title"] = "Pending replacement title".into();
+    std::fs::write(&state, serde_json::to_vec(&value).unwrap()).unwrap();
+    let mut records = rows(&wire);
+    records.push(serde_json::json!({"type":"fixture.padding", "time":1791720099999i64,"value":"x".repeat(200000)}));
+    records.push(serde_json::json!({"type":"fixture.pending", "time":1791720199999i64}));
+    replace_rows(&wire, &records);
+    use std::io::Write;
+    std::fs::OpenOptions::new()
+        .append(true)
+        .open(&wire)
+        .unwrap()
+        .write_all(b"{\"type\":")
+        .unwrap();
+    store
+        .discover(DiscoveryOptions::default().sources([Source::Kimi]))
+        .unwrap();
+    let observed = store
+        .sessions(CatalogQuery::default())
+        .next()
+        .unwrap()
+        .unwrap();
+    assert_eq!(observed.title, previous.title);
+    assert_eq!(observed.first_prompt, previous.first_prompt);
+    assert_eq!(observed.first_activity_ms, previous.first_activity_ms);
+    assert_eq!(observed.last_activity_ms, previous.last_activity_ms);
 }

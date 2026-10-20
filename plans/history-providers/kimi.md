@@ -28,3 +28,10 @@ call IDs are retained; missing message IDs are explicitly synthesized. Native
 subagent wire storage is proven independently of a parent-link capability.
 
 Pinned primary artifacts: [official source](https://github.com/MoonshotAI/kimi-code/tree/472192c34c1efad89a369870eff0da0b708ce9bb) and [official CLI 2.2.0 release](https://github.com/MoonshotAI/kimi-code/releases/tag/%40moonshot-ai%2Fkimi-code%402.2.0).
+
+Discovery follows the shared catalog contract: a changed wire/state stamp is
+observed immediately, while hydrated titles and previews remain the last full
+evidence until hydration or sync applies the complete replacement. Incomplete
+wire replacements defer all positional evidence writes; a subsequent complete
+capture replaces it together. Catalog previews are limited to 4,096 characters;
+message evidence retains the full native text.

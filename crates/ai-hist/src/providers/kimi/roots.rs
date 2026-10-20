@@ -63,19 +63,40 @@ mod root_tests {
     use super::*;
     #[test]
     fn override_is_frozen_absolute_and_tilde_is_literal() {
-        let r = resolve_with(Path::new("/fixture/home"), Some("~/literal".into()));
+        let home = std::env::current_dir().unwrap().join("fixture-home");
+        let r = resolve_with(&home, Some("~/literal".into()));
         assert_eq!(
             r.paths,
             vec![std::env::current_dir().unwrap().join("~/literal/sessions")]
         );
-        let r = resolve_with(Path::new("/fixture/home"), Some("/custom/data".into()));
-        assert_eq!(r.paths, vec![PathBuf::from("/custom/data/sessions")]);
+        let absolute = std::env::current_dir().unwrap().join("custom/data");
+        let r = resolve_with(&home, Some(absolute.clone().into_os_string()));
+        assert_eq!(r.paths, vec![absolute.join("sessions")]);
     }
     #[test]
     fn empty_override_uses_canonical_default() {
+        let home = std::env::current_dir().unwrap().join("fixture-home");
         assert_eq!(
-            resolve_with(Path::new("/fixture/home"), Some("".into())).paths,
-            vec![PathBuf::from("/fixture/home/.kimi-code/sessions")]
+            resolve_with(&home, Some("".into())).paths,
+            vec![home.join(".kimi-code/sessions")]
+        );
+    }
+}
+
+#[cfg(test)]
+mod identity_tests {
+    use super::*;
+    #[test]
+    fn default_namespace_uses_portable_relative_slashes() {
+        let home = std::env::current_dir().unwrap().join("fixture-home");
+        let roots = ProviderRoots::from_home(home.clone(), home.join("opencode.db"));
+        let path = home.join(".kimi-code/sessions/bucket/session/agents/main/wire.jsonl");
+        assert_eq!(
+            identity(&roots, &path).unwrap(),
+            format!(
+                "root:{:x}:bucket:session:main",
+                Sha256::digest(b".kimi-code/sessions")
+            )
         );
     }
 }

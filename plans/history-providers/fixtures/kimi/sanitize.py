@@ -6,7 +6,9 @@ p=argparse.ArgumentParser();p.add_argument('raw',type=Path);a=p.parse_args();bas
 for number,name in enumerate(['ordinary','tool','resumed','subagent','rewound'],1):
  src=(a.raw/name).resolve();session=next((src/'home/.kimi-code/sessions').glob('*/*/state.json')).parent;state=json.loads((session/'state.json').read_text());sid=f'session_00000000-0000-4000-8000-{number:012d}';bucket=f'wd_fixture_{number:012d}';ids={state['id']:sid};shift=1791720000000-state['createdAt']
  def string(s):
-  s=s.replace(str(src),'/fixture/kimi/'+name).replace(session.parent.name,bucket)
+  s=s.replace(str(src),'/fixture/kimi/'+name)
+  if name=='rewound':s=s.replace(str((a.raw/'ordinary').resolve()),'/fixture/kimi/rewound')
+  s=s.replace(session.parent.name,bucket)
   for match in re.findall(r'(?:session_)?[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}|msg_[A-Z0-9]{26}',s):
    if match not in ids:ids[match]=('msg_' + f'{len(ids):026d}') if match.startswith('msg_') else f'00000000-0000-4000-9000-{len(ids):012d}'
    s=s.replace(match,ids[match])

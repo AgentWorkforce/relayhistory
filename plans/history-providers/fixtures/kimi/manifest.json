@@ -88,11 +88,11 @@
     "files": {
       "state.json": {
         "raw_sha256": "5f145bdc4487762ae2b50d1a33f7b6c7c2c25737ac8b59f3410c636e7666c7a2",
-        "sanitized_sha256": "e71a8a2f77413f5d6849e2f6e4de4fba6338cfc4565fd35d9ae8ea40a052924f"
+        "sanitized_sha256": "470de2b0422b8c93d678274589e05410720226514878bdda387ff357411f4759"
       },
       "agents/main/wire.jsonl": {
         "raw_sha256": "dfda7fa84337a3e979d997b89de006a16e315cbd6c442e24ed7edff71c88e5ea",
-        "sanitized_sha256": "8057bd27ff7370682009f0e413e62b2b9e70922743a20d88da850b85ec3cc747"
+        "sanitized_sha256": "f828386675e589a11bc6b3f98c45c131be4ccaa4a00a1fb5e4bc3c70aabd5b38"
       }
     },
     "agents": [

@@ -56,8 +56,11 @@ fn session_candidates(
         context.validate(&path)?;
         let (wire_stamp, recency_hint_ms) = crate::file_stamp_and_modified(&path)?;
         let state = session.join("state.json");
-        context.validate(&state)?;
-        let (state_stamp, _) = crate::file_stamp_and_modified(&state)?;
+        let (state_stamp, _) = (|| {
+            context.validate(&state)?;
+            crate::file_stamp_and_modified(&state)
+        })()
+        .unwrap_or_else(|_| ("unreadable-state".into(), None));
         let stamp = format!("{wire_stamp}:{state_stamp}");
         out.push(Candidate {
             source: ID,
@@ -134,7 +137,7 @@ pub(super) fn shallow(
             anyhow::bail!("KIMI_INVALID_RECORD: oversized metadata")
         }
     }
-    let (mut rows, _) = format::parse(&head)?;
+    let (mut rows, partial) = format::parse(&head)?;
     if length > 64 * 1024 {
         let offset = length.saturating_sub(64 * 1024).max(head.len() as u64);
         file.seek(SeekFrom::Start(offset.saturating_sub(1)))?;
@@ -161,7 +164,7 @@ pub(super) fn shallow(
     let sid = roots::identity(context.roots, &path)?;
     Ok(AcquiredSession {
         stamp: String::new(),
-        payload: serde_json::json!({"sid":sid,"path":path,"rows":rows,"state":state,"bounded":length>64*1024}),
+        payload: serde_json::json!({"sid":sid,"path":path,"rows":rows,"state":state,"bounded":length>64*1024,"partial":partial}),
         bytes: 0,
         records,
         read_paths: vec![path, state_path],

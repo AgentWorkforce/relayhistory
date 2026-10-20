@@ -82,6 +82,11 @@ impl ShallowSessionProvider for Provider {
             .to_owned();
         if let Some(conn) = conn {
             normalize::check_identity(conn, &sid, &path)?;
+            if captured.payload["partial"] == true || captured.payload["bounded"] == true {
+                if let Some(previous) = crate::discover::catalog_row(conn, ID, &sid, true)? {
+                    return Ok(Some(previous));
+                }
+            }
         }
         Ok(Some(ShallowSession {
             source: ID.into(),
@@ -93,7 +98,9 @@ impl ShallowSessionProvider for Provider {
                 .into_iter()
                 .min(),
             last_activity_ms: Some(latest),
-            first_prompt: if captured.payload["bounded"] == true {
+            first_prompt: if captured.payload["bounded"] == true
+                || captured.payload["partial"] == true
+            {
                 None
             } else {
                 let live = format::active_messages(rows)?;
@@ -101,6 +108,7 @@ impl ShallowSessionProvider for Provider {
                     .enumerate()
                     .filter(|(index, _)| live.contains(index))
                     .find_map(|(_, row)| format::human_text(row))
+                    .map(|text| text.chars().take(4096).collect())
             },
             cwd: captured.payload["state"]["cwd"].as_str().map(str::to_owned),
             title: captured.payload["state"]["title"]
@@ -131,7 +139,7 @@ fn ingest(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
     let diagnostics = if captured.payload["partial"] == true {
         vec![crate::hydrate::HydrationDiagnostic {
             code: "KIMI_INCOMPLETE_TRANSCRIPT".into(),
-            message: "Incomplete final wire record deferred; prior complete evidence retained"
+            message: "Incomplete final wire record; all replacement writes deferred until complete"
                 .into(),
             duration_ms: None,
             source_bytes: Some(captured.bytes),

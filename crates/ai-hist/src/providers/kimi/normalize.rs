@@ -14,6 +14,11 @@ pub(super) fn write(conn: &Connection, payload: &Value) -> Result<usize> {
     check_identity(conn, sid, path)?;
     let rows = payload["rows"].as_array().context("Kimi rows missing")?;
     let complete = payload["partial"] == false;
+    // Native rewrites and branch switches renumber positional evidence keys.
+    // Defer the entire replacement until its final record is complete.
+    if !complete {
+        return Ok(0);
+    }
     let mut keys = Keys::default();
     let mut inserted = 0;
     let mut first = i64::MAX;
@@ -173,7 +178,7 @@ fn message(
         keys.events.insert(eid);
     }
     if let Some(prompt) = format::human_text(row) {
-        result.preview = Some(prompt.clone());
+        result.preview = Some(prompt.chars().take(4096).collect());
         let hash = crate::prompt_hash(&prompt);
         keys.prompts.insert(format!("{ts}:{hash}"));
         result.inserted += insert_history(
