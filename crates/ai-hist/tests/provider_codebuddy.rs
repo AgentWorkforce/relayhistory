@@ -418,6 +418,10 @@ fn codebuddy_title_overlay_updates_without_message_churn() {
     store
         .discover(DiscoveryOptions::default().sources([Source::Codebuddy]))
         .unwrap();
+    assert_eq!(
+        read(&store, "metadata").session.title,
+        original.session.title
+    );
     store
         .hydrate(&reference("metadata"), HydrateOptions::default())
         .unwrap();
@@ -427,6 +431,30 @@ fn codebuddy_title_overlay_updates_without_message_churn() {
         Some("Synthetic updated custom title.")
     );
     assert_eq!(changed.messages, original.messages);
+    rows.retain(|r| {
+        !matches!(
+            r["type"].as_str(),
+            Some("custom-title" | "ai-title" | "topic")
+        )
+    });
+    for row in &mut rows {
+        if row["type"] == "session-meta" {
+            row["meta"]["codebuddy.ai/sessionTitle"] = serde_json::json!([]);
+        }
+    }
+    write(&path, &rows);
+    store
+        .discover(DiscoveryOptions::default().sources([Source::Codebuddy]))
+        .unwrap();
+    assert_eq!(
+        read(&store, "metadata").session.title,
+        changed.session.title
+    );
+    store
+        .hydrate(&reference("metadata"), HydrateOptions::default())
+        .unwrap();
+    assert_eq!(read(&store, "metadata").session.title, None);
+    assert_eq!(read(&store, "metadata").messages, original.messages);
     let revision = store.head_revision().unwrap();
     sync(&store);
     let changes = store
@@ -581,6 +609,83 @@ fn codebuddy_complete_same_time_rewrite_keeps_native_order() {
             .collect::<Vec<_>>(),
         vec![Role::Assistant, Role::User]
     );
+}
+#[test]
+fn codebuddy_review_upstream_response_identity_groups_native_records() {
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path(), "tool");
+    let mut rows: Vec<Value> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    for row in &mut rows {
+        if row["role"] == "assistant" || row["type"] == "function_call" {
+            row["providerData"]["messageId"] = Value::from("native-response-shared");
+        }
+    }
+    write(&path, &rows);
+    let store = open(home.path());
+    sync(&store);
+    let evidence = read(&store, "tool");
+    assert_eq!(evidence.requests.len(), 1);
+    assert_eq!(
+        evidence.requests[0].request_key,
+        "provider-message-id:native-response-shared"
+    );
+    assert!(evidence
+        .messages
+        .iter()
+        .filter(|m| m.role == Role::Assistant)
+        .all(|m| m.provider_message_id.as_deref() == Some("native-response-shared")));
+    assert_eq!(
+        evidence.requests[0].usage.as_ref().unwrap().input_tokens,
+        23
+    );
+}
+#[test]
+fn codebuddy_review_complete_unknown_outcome_clears_prior_native_result() {
+    for case in ["tool", "error"] {
+        let home = tempfile::tempdir().unwrap();
+        let path = stage(home.path(), case);
+        let store = open(home.path());
+        sync(&store);
+        let original = read(&store, case);
+        assert!(original.tool_calls[0].is_error.is_some());
+        let mut rows: Vec<Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        for row in &mut rows {
+            if row["type"] == "function_call_result" {
+                row["status"] = Value::from("incomplete");
+                row["providerData"]["toolResult"]["error"] = Value::Null;
+                row["providerData"]["toolResult"]["rawResponse"]["is_error"] = Value::Null;
+            }
+        }
+        write(&path, &rows);
+        sync(&store);
+        let evidence = read(&store, case);
+        assert_eq!(evidence.tool_calls[0].is_error, None);
+        assert_eq!(evidence.tool_results[0].result_status, None);
+        assert_eq!(evidence.tool_results[0].text, original.tool_results[0].text);
+        assert_eq!(
+            evidence.tool_results[0].event_uid,
+            original.tool_results[0].event_uid
+        );
+        assert_eq!(evidence.markers.len(), rows.len());
+        assert!(evidence
+            .markers
+            .iter()
+            .filter_map(|m| m.raw_payload())
+            .any(|raw| raw.contains("incomplete")));
+        sync(&store);
+        let revision = store.head_revision().unwrap();
+        sync(&store);
+        assert_eq!(store.head_revision().unwrap(), revision);
+        assert_eq!(read(&store, case), evidence);
+    }
 }
 #[test]
 fn codebuddy_authoritative_inline_result_preserves_literal_persisted_output_tag() {

@@ -15,6 +15,9 @@ may expose its complete prefix. Complete
 rewrites retire missing events, and successful partial reads do not prevent
 retiring unrelated deleted files. Failed captures prevent uncertain whole-root
 retirement. Change stamps use namespace plus exact bytes, not temporary HOME.
+Discovery follows the shared catalog contract: it fills missing titles and
+preserves a fully indexed title. Sync or selected hydration applies native
+renames and explicit removal from a complete transcript, even for small files.
 
 Native message IDs and millisecond clocks are preserved. A complete replacement
 repairs changed insertion order within a timestamp bucket by replaying its

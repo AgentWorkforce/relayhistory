@@ -9,6 +9,10 @@ fn first_embedded_sync_does_not_write_progress_to_stdout() {
     let transcript = dir.path().join(".claude/projects/app/first.jsonl");
     fs::create_dir_all(transcript.parent().unwrap()).unwrap();
     fs::write(&transcript, "{\"sessionId\":\"first\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"first native call\"},\"timestamp\":\"2026-09-13T00:00:00Z\"}\n").unwrap();
+    let foreign_config = dir.path().join("foreign-codebuddy");
+    let foreign_project = foreign_config.join("projects/fixture-workspace");
+    fs::create_dir_all(&foreign_project).unwrap();
+    fs::write(foreign_project.join("fixture-ordinary.jsonl"), include_str!("fixtures/codebuddy/ordinary/.codebuddy/projects/fixture-workspace/fixture-ordinary.jsonl")).unwrap();
     let db = dir.path().join("history.db");
     let output = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "embedded_sync_child", "--nocapture"])
@@ -17,9 +21,11 @@ fn first_embedded_sync_does_not_write_progress_to_stdout() {
         .env("USERPROFILE", dir.path())
         .env("XDG_DATA_HOME", dir.path().join("xdg"))
         .env("OPENCODE_DB", dir.path().join("absent-opencode.db"))
+        .env("CODEBUDDY_CONFIG_DIR", foreign_config)
         .env_remove("CLAUDE_CONFIG_DIR")
         .env_remove("CODEX_HOME")
         .env_remove("GROK_HOME")
+        .env_remove("CODEBUDDY_CONFIG_DIR")
         .output()
         .unwrap();
     assert!(
@@ -45,6 +51,17 @@ fn first_embedded_sync_does_not_write_progress_to_stdout() {
     assert_eq!(
         count, 1,
         "the silent operation must actually ingest the provider fixture"
+    );
+    let foreign: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sessions WHERE source='codebuddy'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        foreign, 0,
+        "the child must not inherit an external Codebuddy root"
     );
     let observations = ai_hist::observations::list(&conn, "claude", "first").unwrap();
     assert_eq!(

@@ -1,7 +1,7 @@
 use super::*;
 use crate::ingest::{
     insert_session_event, insert_tool_call, set_tool_call_error, upsert_session_rebuilt, EventRow,
-    SessionCatalogRow, ToolCallRef, ToolResultFacts,
+    RequestIdentity, SessionCatalogRow, ToolCallRef, ToolResultFacts,
 };
 use crate::providers::file_history::{self, Keys};
 use crate::{insert_history, insert_session_marker, HistoryEntry, NewSessionMarker};
@@ -214,8 +214,8 @@ fn result(conn: &Connection, base: &EventRow<'_>, row: &Value, keys: &mut Keys) 
     )?;
     if error || row["status"] == "completed" {
         set_tool_call_error(conn, ID, base.session_id, id, error)?;
+        keys.results.insert(id.into());
     }
-    keys.results.insert(id.into());
     keys.events.insert(base.event_uid.into());
     Ok(())
 }
@@ -247,7 +247,10 @@ fn event(
         _ => format::string(row, "role")?,
     };
     let usage = &row["providerData"]["rawUsage"];
-    let request = row["providerData"]["messageId"].as_str().unwrap_or(mid);
+    let provider_message_id = row["providerData"]["messageId"]
+        .as_str()
+        .filter(|id| !id.trim().is_empty());
+    let request = provider_message_id.unwrap_or(mid);
     let token = (!usage.is_null() && seen_usage.insert(request.to_owned()))
         .then(|| serde_json::to_string(usage))
         .transpose()?;
@@ -266,6 +269,10 @@ fn event(
         project: row["cwd"].as_str(),
         model: row["providerData"]["model"].as_str(),
         token_json: token.as_deref(),
+        identity: RequestIdentity {
+            provider_message_id,
+            ..Default::default()
+        },
         raw_kind: Some(kind),
         ..Default::default()
     };
