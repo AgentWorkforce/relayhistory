@@ -592,13 +592,6 @@ export async function hydrateSession(
   });
 }
 
-export async function discoverAndList(
-  options: DiscoverSessionsOptions & ListCatalogOptions = {},
-): Promise<SessionCatalogPage> {
-  await discoverSessions(options);
-  return listSessionCatalogPage(options);
-}
-
 export async function getSessionEventsPage(
   sessionId: string,
   options: EventsPageOptions = {},

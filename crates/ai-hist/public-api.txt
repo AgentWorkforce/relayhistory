@@ -20,7 +20,6 @@ pub fn ai_hist::project_identity::ProjectIdentityResolver::resolve(&self, &str) 
 pub fn ai_hist::project_identity::begin_acquisition_pass()
 pub fn ai_hist::project_identity::canonicalize_remote_url(&str) -> core::option::Option<alloc::string::String>
 pub fn ai_hist::project_identity::identity_for(core::option::Option<&str>, core::option::Option<&str>) -> core::option::Option<(alloc::string::String, ai_hist::project_identity::ProjectKeyMethod)>
-pub fn ai_hist::project_identity::origin_remote_url(&std::path::Path) -> core::option::Option<alloc::string::String>
 pub fn ai_hist::project_identity::parse_git_config(&str) -> ai_hist::project_identity::GitConfig
 pub fn ai_hist::project_identity::project_identity(&std::path::Path) -> ai_hist::project_identity::ProjectIdentity
 pub fn ai_hist::project_identity::resolve_project_identity(&str) -> ai_hist::project_identity::ProjectIdentity
