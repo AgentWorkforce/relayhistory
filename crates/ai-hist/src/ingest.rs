@@ -2,10 +2,9 @@ use crate::providers::{can_repair_source, repairable_event_sources, replayable_h
 #[path = "providers/mod.rs"]
 pub(crate) mod providers;
 use crate::{
-    default_db_path, insert_history, insert_session_marker, now_ms, open_db, open_db_readonly,
-    parse_cursor_text, prompt_hash, schema_is_catalog_read_current, sync_opencode_dbs,
-    sync_opencode_session, sync_opencode_storage_dir, HistoryEntry, NewSessionMarker,
-    SessionLocation, SessionScope,
+    insert_history, insert_session_marker, now_ms, open_db, open_db_readonly, parse_cursor_text,
+    prompt_hash, schema_is_catalog_read_current, sync_opencode_dbs, sync_opencode_session,
+    sync_opencode_storage_dir, HistoryEntry, NewSessionMarker, SessionLocation, SessionScope,
 };
 use anyhow::{Context, Result};
 use rusqlite::{params, Connection, OptionalExtension};
@@ -108,9 +107,9 @@ pub use hook::{
     HOOK_HARNESSES,
 };
 pub use hydrate::{
-    hydrate_session, hydrate_session_at, hydrate_session_at_with_connectors,
-    hydrate_session_at_with_home, HydrateSessionOptions, HydrateSessionResult, HydrationDiagnostic,
-    HydrationEvidence, HydrationIndexedThrough, SESSION_HYDRATION_CONTRACT_VERSION,
+    hydrate_session_at, hydrate_session_at_with_connectors, hydrate_session_at_with_home,
+    HydrateSessionOptions, HydrateSessionResult, HydrationDiagnostic, HydrationEvidence,
+    HydrationIndexedThrough, SESSION_HYDRATION_CONTRACT_VERSION,
 };
 pub use tool_result_facts::{
     content_hash, stable_stringify, ToolResultFacts, ToolResultIndexer, ERROR_SIGNAL_EXIT_CODE,
@@ -159,14 +158,6 @@ pub(crate) use scoped_files::{
 };
 use sweep_phases::SweepPhases;
 pub(crate) use sweep_phases::SweepScope;
-
-/// Refresh local agent history without performing any cloud operation.
-/// Embedding applications should use this before opening the local catalog.
-/// When another process owns the sync lock the refresh is skipped — the
-/// concurrent scan is already producing the fresh data this caller wants.
-pub fn sync_local() -> Result<()> {
-    sync_local_at(&default_db_path()).map(|_| ())
-}
 
 /// Refresh local history into an explicitly selected database.
 ///
@@ -255,26 +246,6 @@ pub(crate) fn check_capture_cancelled() -> Result<()> {
         return Err(CaptureCancelled.into());
     }
     Ok(())
-}
-
-/// Shallow local inventory with cooperative provider/file cancellation.
-pub fn discover_sessions_cancellable(
-    conn: &Connection,
-    options: &DiscoverOptions,
-    on_row: impl FnMut(&ShallowSession),
-    cancelled: impl Fn() -> bool + 'static,
-) -> Result<DiscoverySummary> {
-    with_capture_stop(cancelled, || discover_sessions(conn, options, on_row))
-}
-
-/// Targeted hydration with the same cooperative cancellation boundaries as
-/// sync. It retains the normal observation locks and checkpoint transaction.
-pub fn hydrate_session_at_cancellable(
-    db_path: &Path,
-    options: &HydrateSessionOptions,
-    cancelled: impl Fn() -> bool + 'static,
-) -> Result<HydrateSessionResult> {
-    with_capture_stop(cancelled, || hydrate_session_at(db_path, options))
 }
 
 /// Capture with cooperative cancellation at provider, file and record boundaries.
@@ -464,11 +435,6 @@ pub fn sync_tick_at(
     Ok(tick)
 }
 
-/// Full ingestion for a selected scope into the default database.
-pub fn sync_scoped(scope: SessionScope) -> Result<bool> {
-    sync_scoped_at(&default_db_path(), scope)
-}
-
 /// Full ingestion for a selected session-presence scope.
 ///
 /// The local distribution ingests local providers for `local` and `all`.
@@ -572,14 +538,12 @@ fn sync_scope_with_connectors(
     Ok(ran)
 }
 
-/// Run every configured remote connector's acquisition into the ledger.
+/// Remote acquisition stub for scoped sync.
 ///
-/// This is the discovery engine at remote scope with no row cap: stamp-guarded
-/// catalog upserts plus `remote` presences, so it deliberately does not take
-/// the sync advisory lock (the same concurrency argument as [`discover`]).
-/// Under `all` scope a machine with no connector configured skips quietly —
-/// that is the documented "runs whatever is available" contract; a remote-only
-/// request was already rejected by [`sync_scoped_at_with_connectors`] before this point.
+/// Local scope never reaches this function. `all` scope skips quietly when no
+/// connector is configured; an explicit `remote` request bails
+/// `CONNECTOR_NOT_CONFIGURED` because remote acquisition requires an
+/// explicitly registered source plugin composed through the SDK host.
 fn sync_remote_connectors(
     _db_path: &Path,
     scope: SessionScope,
@@ -589,15 +553,6 @@ fn sync_remote_connectors(
         return Ok(false);
     }
     anyhow::bail!("CONNECTOR_NOT_CONFIGURED: remote acquisition requires an explicitly registered source plugin")
-}
-
-/// Cache-only session catalog listing against the default database.
-///
-/// The in-process equivalent of `ai-hist sessions list`: one indexed query
-/// over `sessions`, no provider I/O. A database that does not exist yet is an
-/// empty catalog, not an error — the caller is expected to run discovery next.
-pub fn list_sessions_local(options: &CatalogListOptions) -> Result<SessionCatalogPage> {
-    list_sessions_local_at(&default_db_path(), options)
 }
 
 /// Cache-only catalog listing against an explicitly selected database.
@@ -610,11 +565,6 @@ pub fn list_sessions_local_at(
         "list_sessions_local_at only accepts local scope; use list_sessions_scoped_at for remote or all"
     );
     list_sessions_scoped_at(db_path, options)
-}
-
-/// Cache-only catalog listing for an explicit session-presence scope.
-pub fn list_sessions_scoped(options: &CatalogListOptions) -> Result<SessionCatalogPage> {
-    list_sessions_scoped_at(&default_db_path(), options)
 }
 
 /// Scoped cache-only catalog listing against an explicitly selected database.
@@ -637,17 +587,6 @@ pub fn list_sessions_scoped_at(
     list_session_catalog_page(&conn, options)
 }
 
-/// Shallow discovery against the default database, with the rows collected.
-///
-/// The in-process equivalent of `ai-hist sessions discover`. Upsert-only and
-/// stamp-guarded, so it does not take the sync lock and is safe to run beside
-/// `sync_local`.
-pub fn discover_sessions_local(
-    options: &DiscoverOptions,
-) -> Result<(Vec<ShallowSession>, DiscoverySummary)> {
-    discover_sessions_local_at(&default_db_path(), options)
-}
-
 /// Shallow discovery into an explicitly selected database.
 pub fn discover_sessions_local_at(
     db_path: &Path,
@@ -659,13 +598,6 @@ pub fn discover_sessions_local_at(
     );
     let conn = open_db(db_path)?;
     discover_sessions_collect(&conn, options)
-}
-
-/// Scoped discovery into the default database.
-pub fn discover_sessions_scoped(
-    options: &DiscoverOptions,
-) -> Result<(Vec<ShallowSession>, DiscoverySummary)> {
-    discover_sessions_scoped_at(&default_db_path(), options)
 }
 
 /// Scoped discovery into an explicitly selected database.

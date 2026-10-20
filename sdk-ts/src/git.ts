@@ -8,7 +8,7 @@ export interface GitHookOptions {
   prUrl?: string;
 }
 /** Install a local post-commit recorder for an explicit session. prUrl identifies
- * an existing GitHub PR; linkage is uploaded by the next cloud push. */
+ * an existing GitHub PR; linkage is recorded in the local database and git notes. */
 export async function installGitHooks(
   options: GitHookOptions,
 ): Promise<{ hookPath: string; prUrl: string | null }> {

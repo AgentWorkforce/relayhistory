@@ -146,15 +146,6 @@ pub fn project_identity(cwd: &Path) -> ProjectIdentity {
     }
 }
 
-/// The raw `origin` remote URL for `cwd`, without canonicalizing it.
-///
-/// The cloud outbox needs the URL itself (it derives an `owner/repo` slug on
-/// its own terms), so it reads it through here rather than shelling out to
-/// `git remote get-url`.
-pub fn origin_remote_url(cwd: &Path) -> Option<String> {
-    project_identity(cwd).repo_url
-}
-
 /// Pick the identity for a catalog row that may already carry a provider-
 /// recorded remote.
 ///
