@@ -1614,6 +1614,41 @@ fn codex_subagent_fork_records_lineage_and_gates_the_replay() {
     );
 }
 
+/// A Codex 0.95 subagent spawned without fork mode copies no parent history
+/// and declares no paginated history, so nothing in it is gated: its own
+/// turn, which nothing orders against the spawn, is indexed under it whole.
+#[test]
+fn codex_subagent_without_paginated_history_keeps_its_own_turn() {
+    let key = "codex/subagent-unpaginated";
+    let root = "019da89d-b100-7000-8000-0000000000e0";
+    let child = "019da89d-c488-7000-8000-0000000000f0";
+    let fork = rows(key, "session_relationships")
+        .iter()
+        .find(|edge| text(edge, "relationship") == "fork")
+        .expect("fork edge");
+    assert_eq!(text(fork, "parent_session_id"), root);
+    assert_eq!(text(fork, "child_session_id"), child);
+    assert_eq!(
+        session_texts(key, child),
+        vec![
+            ("user".to_string(), "find why test_x fails".to_string()),
+            (
+                "assistant".to_string(),
+                "test_x reads a stale fixture".to_string()
+            ),
+        ]
+    );
+    let child_usage = rows(key, "session_events")
+        .iter()
+        .filter(|event| text(event, "session_id") == child)
+        .filter_map(|event| field(event, "token_json").as_str())
+        .map(|raw| serde_json::from_str::<Value>(raw).expect("token json"))
+        .map(|usage| usage["total_tokens"].as_i64().expect("total"))
+        .collect::<Vec<_>>();
+    assert_eq!(child_usage, vec![920]);
+    assert!(fork_replay_marker(key, child).is_none());
+}
+
 /// #210: a Codex 0.150+ `guardian_review` thread that names its parent is a
 /// subagent -- hidden from the root catalog, delegated from its parent -- and
 /// it carries no Codex fork field, so it has no `fork` edge and nothing is

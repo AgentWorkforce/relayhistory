@@ -3241,7 +3241,10 @@ const CODEX_RAW_MESSAGE_FACTS_KEY: &str = "codex_raw_message_facts";
 ///
 /// Generation 2 gates the copy Codex 0.133--0.148 write straight after the
 /// child's `session_meta`, without the parent's (`codex::CopiedHistoryProbe`).
-const CODEX_FORK_REPLAY_GENERATION: i64 = 2;
+/// Generation 3 runs that probe only on rollouts that declare paginated
+/// history (`codex::pages_history`), restoring the forks and subagents of
+/// other builds whose own turns generation 2 retired as a copy.
+const CODEX_FORK_REPLAY_GENERATION: i64 = 3;
 const CODEX_FORK_REPLAY_KEY: &str = "codex_fork_replay_gate";
 
 /// One-time re-read of the Claude transcripts whose delegation evidence an
@@ -5335,6 +5338,8 @@ pub(crate) struct CodexSessionMeta {
     /// UUIDv7 thread id's timestamp, else `payload.timestamp`, else the
     /// record's own timestamp.
     fork_origin_ms: Option<i64>,
+    /// `history_mode: "paginated"` (`codex::pages_history`).
+    fork_pages_history: bool,
 }
 
 /// Resolve the parent identity from every Codex session-meta shape observed in
@@ -5948,15 +5953,7 @@ fn ingest_codex_rollout_incremental(
     let cwd = Some(meta.cwd.as_str());
     let branch = meta.git_branch.as_deref();
     let mut outcome = CodexIngestOutcome::default();
-    // A position an older parser committed sits past records whose state
-    // markers it never wrote: read the rollout again from byte zero.
-    if cursor
-        .codex
-        .as_ref()
-        .is_some_and(|codex| codex.state_markers < CODEX_STATE_MARKER_GENERATION)
-    {
-        *cursor = transcript_cursor::TranscriptCursorState::default();
-    }
+    cursor.restart_unresumable_codex(meta.fork_parent_id.is_some());
     // Codex keeps its existing rule for a trailing line with no newline: it
     // is the half-written tail of a live rollout and the next pass re-reads
     // it. Unlike Claude, no Codex writer leaves its last line unterminated.
@@ -6080,6 +6077,7 @@ fn ingest_codex_rollout_incremental(
     // `task_complete` the cursor could commit at, because its lines are
     // skipped before the arms that would.
     let mut fork_replay: Option<ForkReplaySpan> = None;
+    let mut replay_markers: Vec<String> = Vec::new();
     // The replay marker whose inherited baseline no child snapshot has
     // confirmed yet (see `inherited_baseline_verdict`). Carried across passes
     // on the cursor, so a pass may commit before the child's first snapshot
@@ -6149,6 +6147,7 @@ fn ingest_codex_rollout_incremental(
             codex::ReplayStep::Closed { turn_id, basis } => {
                 if let Some(span) = fork_replay.take() {
                     outcome.saw_fork_replay = true;
+                    replay_markers.push(span.marker_uid());
                     let seeded = prev_totals.is_none() && span.inherited.is_some();
                     record_codex_fork_replay(
                         conn,
@@ -6660,6 +6659,7 @@ fn ingest_codex_rollout_incremental(
                                 previous_human_message: human_messages.remembered(),
                                 inherited_baseline_marker: inherited_baseline_marker.clone(),
                                 state_markers: CODEX_STATE_MARKER_GENERATION,
+                                fork_replay: CODEX_FORK_REPLAY_GENERATION,
                             },
                         );
                     }
@@ -6942,13 +6942,7 @@ fn ingest_codex_rollout_incremental(
         &mut unwritten_line,
         conn.total_changes() == changes_before_line,
     )?;
-    // The readable file ended inside a replay: the fork's first own turn is
-    // not written yet. The span is still accounted for, and the next pass,
-    // which re-reads it, closes it.
-    if let Some(span) = fork_replay.take() {
-        outcome.saw_fork_replay = true;
-        record_codex_fork_replay(conn, meta, &span, None, None)?;
-    }
+    fork_replay::finish_codex_replay(conn, meta, fork_replay.take(), replay_markers, &mut outcome)?;
     // Collapse each measured run onto its first span, so the rows a single
     // delta accounted for read as the one request it measured rather than as
     // one measured request and a trail of unmeasured ones.
@@ -37496,7 +37490,10 @@ mod codex_fork_replay_tests {
         let conn = open_db(&dir.path().join("history.db")).unwrap();
         let mut state = Map::new();
         sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
-        assert_eq!(state.get(CODEX_FORK_REPLAY_KEY), Some(&json!(2)));
+        assert_eq!(
+            state.get(CODEX_FORK_REPLAY_KEY),
+            Some(&json!(CODEX_FORK_REPLAY_GENERATION))
+        );
         let at = parse_iso_ms("2026-04-20T00:01:00.000Z").unwrap();
         let plant_stale = || {
             conn.execute(
@@ -37516,7 +37513,10 @@ mod codex_fork_replay_tests {
             vec![format!("child prompt {CHILD_TURN}")]
         );
         assert_eq!(token_totals(&conn, CHILD), vec![300]);
-        assert_eq!(state.get(CODEX_FORK_REPLAY_KEY), Some(&json!(2)));
+        assert_eq!(
+            state.get(CODEX_FORK_REPLAY_KEY),
+            Some(&json!(CODEX_FORK_REPLAY_GENERATION))
+        );
 
         // Spent: an unchanged fork is not re-read again.
         plant_stale();
@@ -37528,6 +37528,179 @@ mod codex_fork_replay_tests {
                 "parent prompt".to_string()
             ]
         );
+    }
+
+    /// A Codex 0.95 subagent spawned without fork mode: its rollout copies
+    /// nothing and declares no paginated history, and its own turn carries
+    /// nothing that orders it -- a `turn_context` without a `turn_id`, and no
+    /// `task_started` (0.95 does not persist one).
+    fn unpaginated_subagent() -> String {
+        let at = "2026-04-20T00:01:00.000Z";
+        [
+            line(
+                at,
+                "session_meta",
+                json!({"id": CHILD, "cwd": "/tmp/project", "timestamp": at,
+                       "cli_version": "0.95.0",
+                       "source": {"subagent": {"thread_spawn": {"parent_thread_id": PARENT, "depth": 1}}}}),
+            ),
+            line(
+                "2026-04-20T00:01:00.100Z",
+                "turn_context",
+                json!({"cwd": "/tmp/project", "model": "gpt-5.2-codex"}),
+            ),
+            line(
+                "2026-04-20T00:01:00.200Z",
+                "event_msg",
+                json!({"type": "user_message", "message": "find why test_x fails"}),
+            ),
+            line(
+                "2026-04-20T00:01:03.000Z",
+                "event_msg",
+                json!({"type": "agent_message", "message": "test_x reads a stale fixture"}),
+            ),
+            line("2026-04-20T00:01:03.001Z", "event_msg", usage(920)),
+        ]
+        .concat()
+    }
+
+    /// The subagent's own turn is indexed under it, whole: nothing is gated.
+    #[test]
+    fn a_subagent_without_paginated_history_keeps_its_own_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(day.join("rollout-child.jsonl"), unpaginated_subagent()).unwrap();
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+        assert_eq!(
+            texts(&conn, CHILD),
+            vec!["find why test_x fails", "test_x reads a stale fixture"]
+        );
+        assert_eq!(token_totals(&conn, CHILD), vec![920]);
+        assert!(replay_marker(&conn, CHILD).is_none());
+    }
+
+    /// A store a generation-2 build wrote retired such a subagent's own turn
+    /// as copied history; the generation-3 re-read restores it and retires
+    /// that marker.
+    #[test]
+    fn a_generation_two_store_restores_a_subagent_it_read_as_a_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(day.join("rollout-child.jsonl"), unpaginated_subagent()).unwrap();
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+
+        // What generation 2 left: no events, one `copied_history` marker.
+        conn.execute(
+            "DELETE FROM session_events WHERE source = 'codex' AND session_id = ?",
+            [CHILD],
+        )
+        .unwrap();
+        insert_session_marker(
+            &conn,
+            "codex",
+            CHILD,
+            &NewSessionMarker {
+                marker_uid: "1:fork_replay",
+                ts_ms: None,
+                message_id: None,
+                parent_id: Some(PARENT),
+                turn_id: None,
+                kind: "fork_replay_boundary",
+                subkind: Some("copied_history"),
+                text: None,
+                payload_json: Some("{}"),
+            },
+        )
+        .unwrap();
+        state.insert(CODEX_FORK_REPLAY_KEY.to_string(), json!(2));
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+
+        assert_eq!(
+            texts(&conn, CHILD),
+            vec!["find why test_x fails", "test_x reads a stale fixture"]
+        );
+        assert_eq!(token_totals(&conn, CHILD), vec![920]);
+        assert!(replay_marker(&conn, CHILD).is_none());
+        assert_eq!(
+            state.get(CODEX_FORK_REPLAY_KEY),
+            Some(&json!(CODEX_FORK_REPLAY_GENERATION))
+        );
+    }
+
+    /// A fork's position an older replay gate committed is not resumed from:
+    /// that gate may have retired the child's own first turn and committed
+    /// past it, so the pass reads from byte zero, restores the turn and
+    /// retires the stale marker. A position the current gate committed is
+    /// resumed from.
+    #[test]
+    fn a_fork_cursor_an_older_gate_committed_is_read_again_from_byte_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-child.jsonl");
+        fs::write(
+            &rollout,
+            unpaginated_subagent() + &child_turn(CHILD_TURN, 1600),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let meta = read_codex_session_meta(&rollout).unwrap().unwrap();
+        let mut cursor = transcript_cursor::TranscriptCursorState::default();
+        ingest_codex_rollout_incremental(&conn, &rollout, &meta, &mut cursor).unwrap();
+        let own = vec![
+            "find why test_x fails",
+            "test_x reads a stale fixture",
+            "child prompt",
+            "child answer",
+        ];
+        assert_eq!(texts(&conn, CHILD), own);
+        assert!(cursor.file.as_ref().is_some_and(|file| file.offset > 0));
+
+        // What an older gate left: the first turn retired under a
+        // `copied_history` marker, and a position past it.
+        conn.execute(
+            "DELETE FROM session_events WHERE source = 'codex' AND session_id = ? \
+             AND text IN ('find why test_x fails', 'test_x reads a stale fixture')",
+            [CHILD],
+        )
+        .unwrap();
+        insert_session_marker(
+            &conn,
+            "codex",
+            CHILD,
+            &NewSessionMarker {
+                marker_uid: "1:fork_replay",
+                ts_ms: None,
+                message_id: None,
+                parent_id: Some(PARENT),
+                turn_id: Some(CHILD_TURN),
+                kind: "fork_replay_boundary",
+                subkind: Some("copied_history"),
+                text: None,
+                payload_json: Some("{}"),
+            },
+        )
+        .unwrap();
+        let resumed = |generation: i64| {
+            let mut stale = cursor.clone();
+            stale.codex.as_mut().unwrap().fork_replay = generation;
+            ingest_codex_rollout_incremental(&conn, &rollout, &meta, &mut stale).unwrap();
+        };
+        // The current gate's position resumes at the end and reads nothing.
+        resumed(CODEX_FORK_REPLAY_GENERATION);
+        assert_eq!(texts(&conn, CHILD), vec!["child prompt", "child answer"]);
+        resumed(CODEX_FORK_REPLAY_GENERATION - 1);
+        let mut restored = texts(&conn, CHILD);
+        restored.sort();
+        let mut expected = own.clone();
+        expected.sort();
+        assert_eq!(restored, expected);
+        assert!(replay_marker(&conn, CHILD).is_none());
     }
 
     /// A signature marker's request identity is stored whole or not at all.
