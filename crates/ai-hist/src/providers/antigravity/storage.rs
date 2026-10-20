@@ -115,7 +115,7 @@ pub(super) fn capture(path: &Path, context: &AcquisitionContext<'_>) -> Result<A
     })
 }
 
-pub(super) fn shallow_rows(scan: &ScanEnv<'_>, path: &Path) -> Result<(Vec<Value>, i64)> {
+pub(super) fn shallow_rows(scan: &ScanEnv<'_>, path: &Path) -> Result<(Vec<Value>, Option<i64>)> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path)?;
     let length = file.metadata()?.len();
@@ -153,10 +153,14 @@ pub(super) fn shallow_rows(scan: &ScanEnv<'_>, path: &Path) -> Result<(Vec<Value
             latest = Some(latest.map_or(time, |t| t.max(time)));
         }
     }
-    Ok((
-        rows,
-        latest.context(
-            "ANTIGRAVITY_INVALID_RECORD: bounded windows contain no complete timed steps",
-        )?,
-    ))
+    let oversized_record = length > HEAD_LIMIT
+        && prefix.iter().copied().find(|b| !b.is_ascii_whitespace()) == Some(b'{');
+    anyhow::ensure!(
+        latest.is_some() || oversized_record,
+        "ANTIGRAVITY_INVALID_RECORD: no complete timed steps in bounded transcript"
+    );
+    // A single step can span both bounded windows. Keep its path-derived
+    // conversation identity discoverable without inventing activity or text;
+    // explicit hydration validates and reads the complete record.
+    Ok((rows, latest))
 }

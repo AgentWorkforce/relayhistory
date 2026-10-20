@@ -81,10 +81,17 @@ impl ShallowSessionProvider for Provider {
                 .collect::<Result<Vec<_>>>()?
                 .into_iter()
                 .min(),
-            last_activity_ms: Some(latest),
+            last_activity_ms: latest,
             first_prompt: rows
                 .iter()
-                .find(|r| format::role(r) == Some("user"))
+                .find(|r| {
+                    format::role(r) == Some("user")
+                        && r["status"] == "DONE"
+                        && r["is_truncated"] != true
+                        && !r["truncated_fields"]
+                            .as_array()
+                            .is_some_and(|fields| !fields.is_empty())
+                })
                 .and_then(format::text)
                 .map(str::to_owned),
             raw_path: Some(path.to_string_lossy().into_owned()),
@@ -130,6 +137,7 @@ fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
         .with_path_scope(ctx.paths.cloned());
     let context = AcquisitionContext::new(ID, ctx.roots);
     let mut result = SweepResult::default();
+    let mut failed_capture = false;
     // Whole files are rewritten by the native writer. Replay the selected file
     // rather than trusting an append cursor or an ownership-blind stamp cache.
     for candidate in storage::enumerate(&env)? {
@@ -150,10 +158,14 @@ fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
                 crate::ingest::check_capture_cancelled()?;
                 eprintln!("Antigravity {}: {error:#}", candidate.locator);
                 result.unread += 1;
+                failed_capture = true;
             }
         }
     }
-    if ctx.paths.is_none() && result.unread == 0 {
+    // Successful partial captures keep the source fingerprint incomplete, but
+    // their live locators do not make unrelated missing conversations uncertain.
+    // Actual capture failures still prevent whole-source retirement.
+    if ctx.paths.is_none() && !failed_capture {
         crate::providers::file_history::retire_missing(ctx.conn, ID, ctx.roots)?;
     }
     Ok(result)

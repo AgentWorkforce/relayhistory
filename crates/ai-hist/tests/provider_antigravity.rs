@@ -293,3 +293,96 @@ fn antigravity_deleted_conversation_retires_after_complete_accessible_sweep() {
         .unwrap()
         .is_none());
 }
+
+#[test]
+fn antigravity_single_oversized_step_is_discoverable_without_invented_metadata() {
+    let home = tempfile::tempdir().unwrap();
+    let full = stage(home.path(), "ordinary");
+    let bytes = std::fs::read_to_string(&full).unwrap();
+    let mut row: serde_json::Value = serde_json::from_str(bytes.lines().next().unwrap()).unwrap();
+    let prompt = "Oversized single native-shaped request. ".repeat(4000);
+    row["content"] = prompt.clone().into();
+    std::fs::write(&full, format!("{row}\n")).unwrap();
+    let store = open(home.path());
+    store
+        .discover(DiscoveryOptions::default().sources([Source::Antigravity]))
+        .unwrap();
+    let shallow = read(&store);
+    assert!(shallow.session.first_activity_ms.is_none());
+    assert!(shallow.session.last_activity_ms.is_none());
+    assert!(shallow.session.first_prompt.is_none());
+    hydrate(&store);
+    let hydrated = read(&store);
+    assert!(hydrated
+        .messages
+        .iter()
+        .flat_map(|m| &m.blocks)
+        .any(|b| b.text.as_deref() == Some(&prompt)));
+}
+
+#[test]
+fn antigravity_partial_survivor_allows_unrelated_retirement_but_failed_capture_does_not() {
+    let home = tempfile::tempdir().unwrap();
+    let full = stage(home.path(), "ordinary");
+    let original = std::fs::read_to_string(&full).unwrap();
+    let deleted = full
+        .ancestors()
+        .nth(3)
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("deleted-native/.system_generated/logs/transcript_full.jsonl");
+    std::fs::create_dir_all(deleted.parent().unwrap()).unwrap();
+    std::fs::write(&deleted, &original).unwrap();
+    let store = open(home.path());
+    let other = SessionRef::id(Source::Antigravity, sid("deleted-native", "antigravity"));
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    assert!(store
+        .session(&other, SessionQuery::default())
+        .unwrap()
+        .is_some());
+    let before = read(&store);
+    std::fs::remove_file(&deleted).unwrap();
+    std::fs::write(&full, "{malformed}\n").unwrap();
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    assert!(
+        store
+            .session(&other, SessionQuery::default())
+            .unwrap()
+            .is_some(),
+        "failed capture must keep incomplete-source retirement guard"
+    );
+    std::fs::write(&full, format!("{original}{{\"step_index\":")).unwrap();
+    for _ in 0..2 {
+        store.sync(SyncOptions::default().force(true)).unwrap();
+        assert_eq!(read(&store).messages, before.messages);
+        assert!(
+            store
+                .session(&other, SessionQuery::default())
+                .unwrap()
+                .is_none(),
+            "successfully captured partial survivor cannot suppress unrelated confirmed deletion"
+        );
+    }
+}
+
+#[test]
+fn antigravity_empty_or_short_incomplete_transcript_is_diagnostic_not_shallow_success() {
+    for bytes in [b"".as_slice(), b"{".as_slice()] {
+        let home = tempfile::tempdir().unwrap();
+        let full = stage(home.path(), "ordinary");
+        std::fs::write(&full, bytes).unwrap();
+        let store = open(home.path());
+        let report = store
+            .discover(DiscoveryOptions::default().sources([Source::Antigravity]))
+            .unwrap();
+        assert!(
+            !report.diagnostics.is_empty(),
+            "short invalid input needs a diagnostic"
+        );
+        assert!(store
+            .session(&reference(), SessionQuery::default())
+            .unwrap()
+            .is_none());
+    }
+}
