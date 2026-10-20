@@ -27,6 +27,7 @@ export const SOURCES = Object.freeze([
   'omp',
   'antigravity',
   'copilot',
+  'qwen-code',
   'grok-bot',
   'openclaw',
 ] as const);

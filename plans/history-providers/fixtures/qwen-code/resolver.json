@@ -1,0 +1,7 @@
+{
+  "home": "/synthetic/qwen-home",
+  "configured": "/synthetic/configured",
+  "env": "/synthetic/runtime",
+  "contextWithEnv": "/synthetic/runtime",
+  "pinned": "/synthetic/pinned"
+}
