@@ -16,7 +16,7 @@ if (!process.env.RH_QWEN_SURFACE_CHILD) {
     TMPDIR: temporary, AI_HIST_DB: path.join(home, 'history.db'),
     RELAYHISTORY_HOME: path.join(home, 'commercial'), RH_QWEN_SURFACE_CHILD: '1',
   };
-  fs.cpSync(path.join(root, 'crates/ai-hist/tests/fixtures/qwen-code/ordinary/.qwen'),
+  fs.cpSync(path.join(root, 'crates/ai-hist/tests/fixtures/qwen-code/tool/.qwen'),
     path.join(home, '.qwen'), { recursive: true });
   try {
     const result = spawnSync(process.execPath, [import.meta.filename, root], { env, encoding: 'utf8' });
@@ -32,12 +32,17 @@ if (!process.env.RH_QWEN_SURFACE_CHILD) {
   const catalog = await sdk.listSessionCatalogPage({ dbPath, sources: ['qwen-code'] });
   assert.equal(catalog.sessions.length, 1);
   const sid = catalog.sessions[0].sessionId;
-  assert.match(sid, /^root:[a-f0-9]+:11111111-1111-4111-8111-000000000001$/);
+  assert.match(sid, /^root:[a-f0-9]+:11111111-1111-4111-8111-000000000002$/);
   await sdk.hydrateSession({ dbPath, source: 'qwen-code', sessionId: sid });
   const hits = await sdk.search('synthetic Qwen', { dbPath, source: 'qwen-code' });
   assert.ok(hits.length > 0);
   assert.ok(hits.every(hit => hit.source === 'qwen-code'));
   assert.ok((await sdk.getSessionEvents(sid, { dbPath, source: 'qwen-code' })).length > 0);
+  const calls = await sdk.getSessionToolCalls('qwen-code', sid, { dbPath });
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].toolUseId, 'fixture-call-001');
+  const events = await sdk.getSessionEvents(sid, { dbPath, source: 'qwen-code' });
+  assert.equal(events.filter(e => e.kind === 'tool_result' && e.toolUseId === 'fixture-call-001').length, 1);
   const caps = await sdk.getSourceCapabilities('qwen-code');
   assert.equal(caps.source, 'qwen-code');
   assert.ok(caps.evidenceKinds.includes('tool_call'));

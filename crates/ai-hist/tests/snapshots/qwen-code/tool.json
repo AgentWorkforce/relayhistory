@@ -84,7 +84,7 @@
       "subagent_session_id": null,
       "text": "{\"args\":{\"value\":\"blue\"},\"id\":\"fixture-call-001\",\"name\":\"fixture_lookup\"}",
       "token_json": null,
-      "tool_use_id": "fixture-call-001",
+      "tool_use_id": null,
       "ts_ms": 1791720000000
     },
     {

@@ -657,3 +657,149 @@ fn qwen_shared_order_collision_rolls_back_events_usage_metadata_and_revision() {
         assert_eq!(kept, ownership);
     }
 }
+
+#[cfg(all(feature = "unstable-internal", feature = "export"))]
+#[test]
+fn qwen_actual_tool_export_remote_intake_and_local_rehydrate() {
+    use ai_hist::export::{ExportLimits, ExportSelection, ExportSnapshot};
+    use ai_hist::{
+        EvidenceKind, EvidenceRecord, NormalizedSourceEvidence, ObservationKey, SessionLocation,
+        ShallowSession, SourceEvidenceSubmission, SourceObservation, SourceObservationBatch,
+    };
+    for (case, n) in [("tool", 2)] {
+        let origin = tempfile::tempdir().unwrap();
+        stage(origin.path(), case, n);
+        let source = open(origin.path());
+        source.sync(SyncOptions::default().force(true)).unwrap();
+        let expected = read(&source, n);
+        assert_eq!(expected.tool_calls.len(), 1);
+        assert_eq!(expected.tool_calls[0].tool_use_id, "fixture-call-001");
+        let result = expected
+            .messages
+            .iter()
+            .flat_map(|m| &m.blocks)
+            .find(|b| b.kind == ai_hist::BlockKind::ToolResult)
+            .unwrap();
+        assert_eq!(result.tool_use_id.as_deref(), Some("fixture-call-001"));
+        assert!(result.text.as_deref().unwrap().contains("blue"));
+        let kinds = vec![
+            EvidenceKind::SessionEvent,
+            EvidenceKind::SessionMarker,
+            EvidenceKind::ToolCall,
+        ];
+        let mut snapshot = ExportSnapshot::open(
+            rusqlite::Connection::open(origin.path().join("qwen.db")).unwrap(),
+            &ExportSelection {
+                sources: vec!["qwen-code".into()],
+                kinds: kinds.iter().map(|k| k.as_str().into()).collect(),
+                ..Default::default()
+            },
+            &ExportLimits::default(),
+            60_000,
+            1_000,
+        )
+        .unwrap();
+        let mut cursor = Some(snapshot.handle().cursor);
+        let mut records = vec![];
+        while let Some(value) = cursor {
+            let page = snapshot.page(&value, 1_000).unwrap();
+            cursor = page.next_cursor;
+            for record in page.records {
+                let mut payload = record.payload.as_object().unwrap().clone();
+                assert!(!payload.contains_key("raw_facts_version"));
+                payload.remove("id");
+                payload.remove("location");
+                records.push(EvidenceRecord {
+                    kind: serde_json::from_value(serde_json::json!(record.kind)).unwrap(),
+                    payload,
+                    record_id: Some(record.record_id),
+                    revision_id: Some(record.revision_id),
+                });
+            }
+        }
+        for derived_cache in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let store = open(home.path());
+            let key = ObservationKey {
+                source: "qwen-code".into(),
+                session_id: sid(n),
+                location: SessionLocation::Remote,
+                connector_id: "fixture-remote".into(),
+                connector_instance: "default".into(),
+            };
+            store
+                .apply_source_observations(SourceObservationBatch::new(
+                    "fixture-remote",
+                    "default",
+                    SessionLocation::Remote,
+                    vec![SourceObservation {
+                        session: ShallowSession {
+                            source: "qwen-code".into(),
+                            session_id: sid(n),
+                            source_stamp: Some("remote-fixture".into()),
+                            ..Default::default()
+                        },
+                        raw_locator: None,
+                    }],
+                ))
+                .unwrap();
+            let revision = store.source_observation(&key).unwrap().revision.unwrap();
+            store
+                .apply_source_evidence(
+                    SourceEvidenceSubmission::new(
+                        key,
+                        revision,
+                        NormalizedSourceEvidence {
+                            source_stamp: "remote-fixture".into(),
+                            source_bytes: 1,
+                            covered_kinds: kinds.clone(),
+                            records: records.clone(),
+                        },
+                    )
+                    .include_related(false),
+                )
+                .unwrap();
+            let conn = ai_hist::open_db(&home.path().join("qwen.db")).unwrap();
+            let unstamped: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM session_events WHERE raw_facts_version IS NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                unstamped > 0,
+                "receiver has only real remote intake before hydration"
+            );
+            if derived_cache {
+                conn.execute("UPDATE session_events SET project_key='receiver-derived-cache',project_key_method='path'", []).unwrap();
+            }
+            stage(home.path(), case, n);
+            store
+                .discover(DiscoveryOptions::default().sources([Source::QwenCode]))
+                .unwrap();
+            store
+                .hydrate(
+                    &SessionRef::id(Source::QwenCode, sid(n)),
+                    HydrateOptions::default(),
+                )
+                .unwrap();
+            let stamped: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM session_events WHERE raw_facts_version IS NOT NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(stamped, unstamped);
+            let before = read(&store, n);
+            hydrate(&store, n);
+            assert_eq!(read(&store, n).messages, before.messages);
+            let revision = store.head_revision().unwrap();
+            hydrate(&store, n);
+            assert_eq!(store.head_revision().unwrap(), revision);
+            assert_eq!(read(&store, n).messages, read(&source, n).messages);
+            assert_eq!(read(&store, n).tool_calls, read(&source, n).tool_calls);
+        }
+    }
+}
