@@ -51,7 +51,14 @@ it never invents file-mtime message timestamps or active-branch previews.
 
 UUID fragments concatenate parts; the last native conversation leaf selects
 its parent chain. Complete replay retires old normalized branch evidence while
-raw records remain markers. Typed tool arguments/results join only through
+raw records remain markers. Complete rewrites replay only local event timestamp
+buckets whose insertion order changed, preserving native UUID/part order across
+retained later messages. If a required bucket also has remote evidence, the whole
+capture fails retryably with `FILE_HISTORY_SHARED_ORDER_CONFLICT` and preserves
+the prior snapshot until ownership is reconciled. Unchanged replays keep IDs and
+revisions. Complete shallow activity follows the selected UUID chain; first-time
+bounded/partial branch activity remains unknown.
+Typed tool arguments/results join only through
 recorded IDs; opaque/missing-ID parts remain markers. Reasoning text stays raw.
 Unknown provenance is control evidence; absent legacy user/assistant provenance
 fails explicitly rather than pretending to recover human messages.

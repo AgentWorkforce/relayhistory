@@ -15,6 +15,7 @@ pub(super) fn write(conn: &Connection, payload: &Value) -> Result<usize> {
     let complete = payload["partial"] == false;
     anyhow::ensure!(complete || !has_evidence(conn,sid)?,"QWEN_CODE_PARTIAL_REPLACEMENT_DEFERRED: existing evidence retained until the transcript is complete; retry after the writer finishes");
     let mut keys = Keys::default();
+    let mut desired = Vec::new();
     markers(conn, sid, payload, &mut keys)?;
     let mut inserted = 0;
     let mut first = i64::MAX;
@@ -33,7 +34,7 @@ pub(super) fn write(conn: &Connection, payload: &Value) -> Result<usize> {
         last = last.max(ts);
         cwd = row["cwd"].as_str();
         branch = row["gitBranch"].as_str();
-        let (count, message) = message(conn, sid, row, &mut keys)?;
+        let (count, message) = message(conn, sid, row, &mut keys, &mut desired)?;
         inserted += count;
         if let Some((role, text)) = message {
             if role == "user" {
@@ -46,6 +47,7 @@ pub(super) fn write(conn: &Connection, payload: &Value) -> Result<usize> {
     if complete {
         file_history::retire(conn, ID, sid, &keys)?;
         file_history::retire_locator_sessions(conn, ID, path, Some(sid))?;
+        replay_changed_order(conn, sid, payload, &mut keys, &desired)?;
     }
     let writer = if complete {
         upsert_session_rebuilt
@@ -80,7 +82,35 @@ pub(super) fn write(conn: &Connection, payload: &Value) -> Result<usize> {
     Ok(inserted)
 }
 
-fn content(conn: &Connection, row: &Value, base: &EventRow<'_>, keys: &mut Keys) -> Result<bool> {
+fn replay_changed_order(
+    conn: &Connection,
+    sid: &str,
+    payload: &Value,
+    keys: &mut Keys,
+    desired: &[(i64, String)],
+) -> Result<()> {
+    let buckets = file_history::reconcile_event_order(conn, ID, sid, desired)?;
+    let mut replayed = Vec::new();
+    for row in payload["active"]
+        .as_array()
+        .context("Qwen active chain missing")?
+    {
+        if buckets.contains(&format::time(row)?) {
+            // Rebuild every message in the affected timestamp group, not
+            // just changed blocks. Do not count prompt insertion twice.
+            message(conn, sid, row, keys, &mut replayed)?;
+        }
+    }
+    Ok(())
+}
+
+fn content(
+    conn: &Connection,
+    row: &Value,
+    base: &EventRow<'_>,
+    keys: &mut Keys,
+    desired: &mut Vec<(i64, String)>,
+) -> Result<bool> {
     let mut emitted = false;
     for (index, part) in row["message"]["parts"]
         .as_array()
@@ -102,6 +132,7 @@ fn content(conn: &Connection, row: &Value, base: &EventRow<'_>, keys: &mut Keys)
                     ..*base
                 },
             )?;
+            desired.push((base.ts_ms, uid.clone()));
             keys.events.insert(uid);
             emitted = true;
             continue;
@@ -149,6 +180,7 @@ fn content(conn: &Connection, row: &Value, base: &EventRow<'_>, keys: &mut Keys)
                     ..*base
                 },
             )?;
+            desired.push((base.ts_ms, uid.clone()));
             keys.events.insert(uid);
             emitted = true;
         } else if let Some(result) = part
@@ -181,6 +213,7 @@ fn content(conn: &Connection, row: &Value, base: &EventRow<'_>, keys: &mut Keys)
                 set_tool_call_error(conn, ID, base.session_id, id, status == Some("error"))?;
                 keys.results.insert(id.into());
             }
+            desired.push((base.ts_ms, uid.clone()));
             keys.events.insert(uid);
             emitted = true;
         }
@@ -193,6 +226,7 @@ fn message(
     sid: &str,
     row: &Value,
     keys: &mut Keys,
+    desired: &mut Vec<(i64, String)>,
 ) -> Result<(usize, Option<(&'static str, String)>)> {
     let ts = format::time(row)?;
     let cwd = row["cwd"].as_str();
@@ -225,7 +259,7 @@ fn message(
         token_json: usage.as_deref(),
         ..Default::default()
     };
-    let emitted = content(conn, row, &base, keys)?;
+    let emitted = content(conn, row, &base, keys, desired)?;
     if role == "assistant" && emitted {
         return Ok((0, (!text.is_empty()).then_some((role, text))));
     }
@@ -258,6 +292,7 @@ fn message(
             ..Default::default()
         },
     )?;
+    desired.push((ts, uid.clone()));
     keys.events.insert(uid);
     let inserted = if role == "user" && !text.is_empty() {
         let hash = crate::prompt_hash(&text);

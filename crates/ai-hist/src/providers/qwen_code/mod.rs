@@ -76,7 +76,6 @@ impl ShallowSessionProvider for Provider {
         let path = Path::new(&candidate.locator).to_owned();
         let storage::ShallowRead {
             rows,
-            latest,
             partial,
             bounded,
         } = storage::shallow_rows(scan, &path)?;
@@ -109,16 +108,16 @@ impl ShallowSessionProvider for Provider {
         } else {
             None
         };
+        let activity = projected
+            .as_ref()
+            .map(|active| active.iter().map(format::time).collect::<Result<Vec<_>>>())
+            .transpose()?
+            .unwrap_or_default();
         Ok(Some(ShallowSession {
             source: ID.into(),
             session_id: sid,
-            first_activity_ms: rows
-                .iter()
-                .map(format::time)
-                .collect::<Result<Vec<_>>>()?
-                .into_iter()
-                .min(),
-            last_activity_ms: latest,
+            first_activity_ms: activity.iter().copied().min(),
+            last_activity_ms: activity.iter().copied().max(),
             first_prompt: projected
                 .as_ref()
                 .and_then(|active| active.iter().find(|r| format::role(r) == Some("user")))

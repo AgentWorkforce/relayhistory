@@ -491,3 +491,169 @@ fn qwen_first_partial_prefix_is_observable_then_complete_tail_hydrates() {
         ]
     );
 }
+
+#[test]
+fn qwen_discovery_keeps_active_branch_activity_after_hydration() {
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path(), "rewind", 4);
+    let mut rows: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    rows[0]["timestamp"] = "2026-10-01T12:00:00Z".into();
+    rows[1]["timestamp"] = "2026-10-20T12:00:00Z".into();
+    std::fs::write(
+        &path,
+        rows.iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+    let store = open(home.path());
+    store
+        .discover(DiscoveryOptions::default().sources([Source::QwenCode]))
+        .unwrap();
+    let before = read(&store, 4).session;
+    hydrate(&store, 4);
+    let full = read(&store, 4).session;
+    assert_eq!(before.first_activity_ms, full.first_activity_ms);
+    assert_eq!(before.last_activity_ms, full.last_activity_ms);
+    store
+        .discover(DiscoveryOptions::default().sources([Source::QwenCode]))
+        .unwrap();
+    let again = read(&store, 4).session;
+    assert_eq!(again.first_activity_ms, full.first_activity_ms);
+    assert_eq!(again.last_activity_ms, full.last_activity_ms);
+}
+
+#[test]
+fn qwen_complete_rewrite_matches_fresh_native_block_and_same_time_message_order() {
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path(), "tool", 2);
+    let store = open(home.path());
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    let mut rows: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let call = rows[1]["message"]["parts"][1].clone();
+    rows[1]["message"]["parts"] = serde_json::json!([
+        {"text":"Before retained native call."},call,{"text":"After retained native call."}]);
+    let bytes = rows
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&path, &bytes).unwrap();
+    hydrate(&store, 2);
+    let rewritten = read(&store, 2);
+    let fresh_home = tempfile::tempdir().unwrap();
+    let fresh_path = stage(fresh_home.path(), "tool", 2);
+    std::fs::write(fresh_path, &bytes).unwrap();
+    let fresh = open(fresh_home.path());
+    fresh.sync(SyncOptions::default().force(true)).unwrap();
+    assert_eq!(texts(&rewritten), texts(&read(&fresh, 2)));
+    assert_eq!(
+        rewritten
+            .messages
+            .iter()
+            .map(|m| &m.message_id)
+            .collect::<Vec<_>>(),
+        read(&fresh, 2)
+            .messages
+            .iter()
+            .map(|m| &m.message_id)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        rewritten.messages[1]
+            .blocks
+            .iter()
+            .map(|b| b.kind)
+            .collect::<Vec<_>>(),
+        [
+            ai_hist::BlockKind::Text,
+            ai_hist::BlockKind::ToolUse,
+            ai_hist::BlockKind::Text
+        ]
+    );
+    #[cfg(feature = "unstable-internal")]
+    {
+        let events = |store: &SessionStore| {
+            let conn = ai_hist::open_db(store.db_path()).unwrap();
+            let mut cursor = None;
+            let mut out = Vec::new();
+            loop {
+                let page = ai_hist::session_events_page(
+                    &conn,
+                    &sid(2),
+                    Some("qwen-code"),
+                    1,
+                    cursor.as_ref(),
+                )
+                .unwrap();
+                out.extend(
+                    page.events
+                        .into_iter()
+                        .map(|e| (e.event_uid, e.kind, e.text)),
+                );
+                cursor = page.next_cursor;
+                if cursor.is_none() {
+                    break;
+                }
+            }
+            out
+        };
+        assert_eq!(events(&store), events(&fresh));
+    }
+    let revision = store.head_revision().unwrap();
+    hydrate(&store, 2);
+    assert_eq!(store.head_revision().unwrap(), revision);
+    drop(store);
+    assert_eq!(texts(&read(&open(home.path()), 2)), texts(&rewritten));
+}
+
+#[cfg(feature = "unstable-internal")]
+#[test]
+fn qwen_shared_order_collision_rolls_back_events_usage_metadata_and_revision() {
+    for ownership in ["remote", "both"] {
+        let home = tempfile::tempdir().unwrap();
+        let path = stage(home.path(), "tool", 2);
+        let store = open(home.path());
+        store.sync(SyncOptions::default().force(true)).unwrap();
+        let conn = ai_hist::open_db(store.db_path()).unwrap();
+        conn.execute("UPDATE session_events SET location=?1 WHERE source='qwen-code' AND session_id=?2 AND kind='tool_use'",[ownership,&sid(2)]).unwrap();
+        let before = read(&store, 2);
+        let revision = store.head_revision().unwrap();
+        let mut rows: Vec<serde_json::Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        rows[0]["message"]["parts"][0]["text"] = "A changed request must roll back.".into();
+        rows[0]["cwd"] = "/synthetic/changed".into();
+        let call = rows[1]["message"]["parts"][1].clone();
+        rows[1]["message"]["parts"] = serde_json::json!([{"text":"New prefix."},call]);
+        rows[3]["usageMetadata"]["promptTokenCount"] = 200.into();
+        std::fs::write(
+            &path,
+            rows.iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let error = store
+            .hydrate(&reference(2), HydrateOptions::default())
+            .unwrap_err();
+        assert!(error.to_string().contains("SHARED_ORDER_CONFLICT"));
+        let after = read(&store, 2);
+        assert_eq!(after, before);
+        assert_eq!(store.head_revision().unwrap(), revision);
+        let kept:String=conn.query_row("SELECT location FROM session_events WHERE source='qwen-code' AND session_id=?1 AND kind='tool_use'",[sid(2)],|r|r.get(0)).unwrap();
+        assert_eq!(kept, ownership);
+    }
+}

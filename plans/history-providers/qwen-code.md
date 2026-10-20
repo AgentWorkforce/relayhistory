@@ -28,4 +28,8 @@ a first partial capture may expose its validated prefix with a diagnostic. Bound
 discovery preserves existing catalog metadata. Malformed records, missing parents, cycles,
 missing human provenance and root escapes fail visibly. Complete rewrites retire
 normalized evidence no longer on the selected branch. Tied recorded timestamps
-keep native chain insertion order, including one-event pagination.
+keep native chain insertion order, including one-event pagination and complete
+block rewrites. Changed local timestamp buckets replay atomically; remote-backed
+buckets fail retryably with `FILE_HISTORY_SHARED_ORDER_CONFLICT` and retain the
+prior snapshot. Complete discovery derives dates from the selected branch;
+first-time bounded/partial activity remains unknown.

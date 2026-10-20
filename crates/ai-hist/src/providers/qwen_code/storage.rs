@@ -1,7 +1,6 @@
 use super::*;
 pub(super) struct ShallowRead {
     pub rows: Vec<Value>,
-    pub latest: Option<i64>,
     pub partial: bool,
     pub bounded: bool,
 }
@@ -55,7 +54,6 @@ pub(super) fn shallow_rows(scan: &ScanEnv<'_>, path: &Path) -> Result<ShallowRea
     // explicit hydration validates and reads the complete record.
     Ok(ShallowRead {
         rows,
-        latest,
         partial,
         bounded: length > HEAD_LIMIT,
     })
