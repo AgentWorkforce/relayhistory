@@ -25,6 +25,7 @@ export const SOURCES = Object.freeze([
   'pi',
   'hermes',
   'omp',
+  'antigravity',
   'copilot',
   'grok-bot',
   'openclaw',

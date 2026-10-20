@@ -177,6 +177,7 @@ pub ai_hist::SessionScope::All
 pub ai_hist::SessionScope::Local
 pub ai_hist::SessionScope::Remote
 #[non_exhaustive] pub enum ai_hist::Source
+pub ai_hist::Source::Antigravity
 pub ai_hist::Source::Claude
 pub ai_hist::Source::Codex
 pub ai_hist::Source::Copilot

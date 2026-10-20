@@ -1,0 +1,87 @@
+{
+  "id": "antigravity",
+  "rust_id": "antigravity",
+  "variant": "Antigravity",
+  "order": 431,
+  "aliases": [],
+  "fixtures": [
+    {
+      "source": "antigravity",
+      "name": "ordinary",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "antigravity/ordinary"
+      ],
+      "quirk": "Official SDK 0.1.22 native harness transcript writer and independent restart reader; ordinary synthetic conversation, complete and compact projections. SDK capture only, not an App or CLI writer capture."
+    },
+    {
+      "source": "antigravity",
+      "name": "tool",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "antigravity/tool"
+      ],
+      "quirk": "Official SDK 0.1.22 native harness transcript writer and independent restart reader; tool synthetic conversation, complete and compact projections. SDK capture only, not an App or CLI writer capture."
+    },
+    {
+      "source": "antigravity",
+      "name": "resumed",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "antigravity/resumed"
+      ],
+      "quirk": "Official SDK 0.1.22 native harness transcript writer and independent restart reader; resumed synthetic conversation, complete and compact projections. SDK capture only, not an App or CLI writer capture."
+    },
+    {
+      "source": "antigravity",
+      "name": "literal-tags",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "antigravity/literal-tags"
+      ],
+      "quirk": "Official SDK 0.1.22 native harness transcript writer and independent restart reader; literal-tags synthetic conversation, complete and compact projections. SDK capture only, not an App or CLI writer capture."
+    },
+    {
+      "source": "antigravity",
+      "name": "long",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "antigravity/long"
+      ],
+      "quirk": "Official SDK 0.1.22 native harness transcript writer and independent restart reader; long synthetic conversation, complete and compact projections. SDK capture only, not an App or CLI writer capture."
+    },
+    {
+      "source": "antigravity",
+      "name": "official-reader",
+      "layout": "Reference",
+      "origin": "RelayHistory",
+      "files": [
+        "antigravity/official-reader.json"
+      ],
+      "quirk": "Independent official SDK restart-reader normalized text oracle for all five native captures; reader step numbering differs from transcript."
+    }
+  ],
+  "capture": [
+    {
+      "evidence": "Messages and identity",
+      "coverage": "Official SDK native harness JSONL steps with recorded timestamps and user/assistant text, safe user-envelope projection, frozen App/CLI/IDE brain roots and root-namespaced conversation IDs. Full transcript preferred; message IDs derived from step positions."
+    },
+    {
+      "evidence": "Control and limits",
+      "coverage": "Every native step retained as a marker, including tool arguments/results, reasoning, opaque media and compact truncation. No tool-call joins, measured usage, model, cwd, parent relationships, native resume or live execution inferred. SDK-native fixtures establish parsing; actual App/CLI writer captures remain unverified. New same-timestamp message suffixes behind truncated/nonterminal steps are deferred until complete; native step-index order is preserved without changing recorded timestamps."
+    }
+  ],
+  "population": {
+    "evidence": [
+      "history",
+      "session_event",
+      "session_marker"
+    ],
+    "usage_accounting": "none"
+  }
+}

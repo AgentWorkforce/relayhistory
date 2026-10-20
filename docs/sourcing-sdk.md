@@ -1001,6 +1001,7 @@ handle.
 <!-- sourcing-sdk-population-table:start -->
 | Source | history | session_event | tool_call | file_edit | relationship | usage accounting |
 | --- | --- | --- | --- | --- | --- | --- |
+| antigravity | ✓ | ✓ | — | — | — | none |
 | claude | ✓ | ✓ | ✓ | ✓ | ✓ | per-message |
 | codex | ✓ | ✓ | ✓ | ✓ | ✓ | cumulative-delta |
 | copilot | ✓ | ✓ | ✓ | — | — | per-message |
