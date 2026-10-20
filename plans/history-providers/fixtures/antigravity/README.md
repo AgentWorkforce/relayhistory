@@ -1,6 +1,6 @@
 # Antigravity native transcript captures
 
-These five synthetic cases were written by the native `localharness` bundled with the official `google-antigravity==0.1.22` Python SDK. After closing the writer, a fresh official SDK process restored the conversation; its `conversation.history` is the independent reader oracle. The model responses came from a loopback HTTP fixture server, not a live model. No operator history or credentials were used.
+These five synthetic cases were written by the native `localharness` bundled with the official `google-antigravity==0.1.22` Python SDK. After closing the writer, a fresh native harness process, started through the official SDK, restored the conversation; its `conversation.history` is the independent reader oracle. The model responses came from a loopback HTTP fixture server, not a live model. No operator history or credentials were used.
 
 The cases cover ordinary messages, a custom tool, resumed conversation, literal envelope tags, and a response long enough to trigger compact-transcript truncation. `manifest.json` records raw and sanitized transcript hashes. `oracle/` contains the restart-reader output; the Rust corpus reference combines these files.
 
