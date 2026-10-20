@@ -46,7 +46,9 @@ if (!process.env.RH_KIMI_SURFACE_CHILD) {
   const toolId=catalog.sessions.find(s=>s.sessionId.includes('session_00000000-0000-4000-8000-000000000002')).sessionId;
   await sdk.hydrateSession({dbPath,source:'kimi',sessionId:toolId});
   const toolEvents=await sdk.getSessionEvents(toolId,{dbPath,source:'kimi'});
-  assert.equal(toolEvents.filter(e=>e.kind==='tool_use'&&e.toolUseId==='fixture-tool-001').length,1);
+  assert.equal(toolEvents.filter(e=>e.kind==='tool_use').length,1);
+  const toolCalls=await sdk.getSessionToolCalls('kimi',toolId,{dbPath});
+  assert.equal(toolCalls.filter(t=>t.toolUseId==='fixture-tool-001').length,1);
   assert.equal(toolEvents.filter(e=>e.kind==='tool_result'&&e.toolUseId==='fixture-tool-001').length,1);
   const cli = spawnSync(process.execPath, [path.join(root, 'sdk-ts/dist/cli.js'),
     'search', 'synthetic ordinary', '--source', 'kimi', '--db', dbPath, '--json'],

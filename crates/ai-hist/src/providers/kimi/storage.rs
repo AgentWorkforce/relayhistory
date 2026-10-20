@@ -117,7 +117,7 @@ pub(super) fn shallow(
         .and_then(Path::parent)
         .context("Kimi parent")?
         .join("state.json");
-    let state_bytes = context.read(&state_path)?;
+    let state_bytes = shallow_state(scan, context, &state_path)?;
     let state: Value = serde_json::from_slice(&state_bytes)?;
     anyhow::ensure!(
         state["version"] == 2,
@@ -125,11 +125,12 @@ pub(super) fn shallow(
     );
     validate_state(&path, &state)?;
     let mut file = std::fs::File::open(&path)?;
+    scan.note_open();
     let length = file.metadata()?.len();
     let mut head = Vec::new();
-    (&mut file).take(64 * 1024).read_to_end(&mut head)?;
-    scan.note_open();
+    let read = (&mut file).take(64 * 1024).read_to_end(&mut head);
     scan.note_bytes(head.len() as u64);
+    read?;
     if length > head.len() as u64 {
         if let Some(end) = head.iter().rposition(|b| *b == b'\n') {
             head.truncate(end + 1)
@@ -142,8 +143,9 @@ pub(super) fn shallow(
         let offset = length.saturating_sub(64 * 1024).max(head.len() as u64);
         file.seek(SeekFrom::Start(offset.saturating_sub(1)))?;
         let mut tail = Vec::new();
-        file.read_to_end(&mut tail)?;
+        let read = (&mut file).take(64 * 1024 + 1).read_to_end(&mut tail);
         scan.note_bytes(tail.len() as u64);
+        read?;
         let start = tail
             .iter()
             .position(|b| *b == b'\n')
@@ -169,6 +171,29 @@ pub(super) fn shallow(
         records,
         read_paths: vec![path, state_path],
     })
+}
+
+// A discovery safety limit, not a native schema limit. Full capture remains
+// authoritative and may read a larger valid state document.
+const SHALLOW_STATE_MAX_BYTES: u64 = 64 * 1024;
+fn shallow_state(
+    scan: &ScanEnv<'_>,
+    context: &AcquisitionContext<'_>,
+    path: &Path,
+) -> Result<Vec<u8>> {
+    use std::io::Read;
+    context.validate(path)?;
+    let file = std::fs::File::open(path)?;
+    scan.note_open();
+    let mut bytes = Vec::new();
+    let read = file
+        .take(SHALLOW_STATE_MAX_BYTES + 1)
+        .read_to_end(&mut bytes);
+    scan.note_bytes(bytes.len() as u64);
+    read?;
+    anyhow::ensure!(bytes.len() as u64 <= SHALLOW_STATE_MAX_BYTES,
+        "KIMI_STATE_TOO_LARGE: discovery state exceeds 64 KiB; full hydration or sync can read the complete metadata");
+    Ok(bytes)
 }
 
 fn validate_state(path: &Path, state: &Value) -> Result<()> {

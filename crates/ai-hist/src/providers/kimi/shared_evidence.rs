@@ -2,6 +2,7 @@
 //! writers run in the caller's transaction; verify their effective persisted
 //! payloads before commit, rolling back the whole capture on a conflict.
 use super::*;
+use crate::EvidenceKind;
 use rusqlite::types::ValueRef;
 use std::collections::BTreeMap;
 
@@ -15,19 +16,15 @@ impl Snapshot {
             "KIMI_SHARED_GUARD_TRANSACTION_REQUIRED"
         );
         let mut rows = BTreeMap::new();
-        for (table, key) in [
-            ("session_events", "event_uid"),
-            ("session_markers", "marker_uid"),
-            ("tool_calls", "tool_use_id"),
+        for (kind, table, key) in [
+            (EvidenceKind::SessionEvent, "session_events", "event_uid"),
+            (EvidenceKind::SessionMarker, "session_markers", "marker_uid"),
+            (EvidenceKind::ToolCall, "tool_calls", "tool_use_id"),
         ] {
+            let columns = kind.owned_columns().map(str::to_owned).collect::<Vec<_>>();
             let mut statement = conn.prepare(&format!(
-                "SELECT * FROM {table} WHERE source=?1 AND session_id=?2 AND location IS NOT 'local'"
+                "SELECT {} FROM {table} WHERE source=?1 AND session_id=?2 AND location IS NOT 'local'", columns.join(",")
             ))?;
-            let columns = statement
-                .column_names()
-                .into_iter()
-                .map(str::to_owned)
-                .collect::<Vec<_>>();
             let key_index = columns
                 .iter()
                 .position(|name| name == key)
@@ -54,9 +51,6 @@ impl Snapshot {
 fn fingerprint(row: &rusqlite::Row<'_>, columns: &[String]) -> Result<[u8; 32]> {
     let mut digest = Sha256::new();
     for (index, name) in columns.iter().enumerate() {
-        if matches!(name.as_str(), "id" | "location" | "revision") {
-            continue;
-        }
         bytes(&mut digest, name.as_bytes());
         match row.get_ref(index)? {
             ValueRef::Null => digest.update(b"null"),

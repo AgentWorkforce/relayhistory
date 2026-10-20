@@ -47,3 +47,14 @@ payload; only adding a local ownership share is allowed. A differing positional
 identity, timestamp, text, nullable field, marker or tool payload raises
 `KIMI_SHARED_EVIDENCE_CONFLICT` and rolls back all evidence and checkpoint writes.
 This protects the stored remote snapshot even when event order does not change.
+The guard uses the intake contract’s owned-column projection: local parser
+generation and receiver-derived project caches may be refreshed by an identical
+local import; provider-reported evidence remains protected.
+
+Discovery limits `state.json` to 64 KiB, plus one oversize-probe byte, and reports
+`KIMI_STATE_TOO_LARGE` per candidate without blocking healthy neighbors. This is
+an adapter safety limit: the pinned native JSON document writer has no such
+schema ceiling, and full hydration/sync still reads larger valid state files.
+The separate wire windows read at most 128 KiB plus one boundary byte, so one
+candidate reads at most 192 KiB plus one byte across both files. Open and byte
+counters include sidecars, probes and bytes read before parse/read failures.

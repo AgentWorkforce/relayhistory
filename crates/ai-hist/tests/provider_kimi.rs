@@ -1118,3 +1118,297 @@ fn identical_remote_backed_imports_can_add_local_shares() {
         }
     }
 }
+
+#[cfg(feature = "unstable-internal")]
+fn shallow_state_discovery(
+    home: &Path,
+    limit: Option<usize>,
+) -> (Vec<ai_hist::ShallowSession>, ai_hist::DiscoverySummary) {
+    let conn = ai_hist::open_db(&home.join("db")).unwrap();
+    let env =
+        ai_hist::DiscoveryEnv::with_roots(&conn, home.to_owned(), home.join("missing-opencode.db"));
+    let mut rows = Vec::new();
+    let summary = ai_hist::discover_sessions_with_env(
+        &env,
+        &ai_hist::DiscoverOptions::new(ai_hist::SessionScope::Local, vec!["kimi".into()], limit),
+        |row| rows.push(row.clone()),
+    )
+    .unwrap();
+    (rows, summary)
+}
+#[cfg(feature = "unstable-internal")]
+fn state_path(wire: &Path) -> PathBuf {
+    wire.parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("state.json")
+}
+#[cfg(feature = "unstable-internal")]
+fn compact_wire(wire: &Path) {
+    let records = rows(wire)
+        .into_iter()
+        .filter(|r| r["type"] == "metadata" || r["type"] == "agent.message.appended")
+        .collect::<Vec<_>>();
+    replace_rows(wire, &records);
+}
+#[cfg(feature = "unstable-internal")]
+#[test]
+fn shallow_state_counts_both_files_and_exact_state_boundary_bytes() {
+    for padded in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let wire = stage(home.path(), "ordinary");
+        compact_wire(&wire);
+        let state = state_path(&wire);
+        if padded {
+            let mut bytes = std::fs::read(&state).unwrap();
+            bytes.resize(64 * 1024, b' ');
+            std::fs::write(&state, bytes).unwrap();
+        }
+        let expected =
+            std::fs::metadata(&state).unwrap().len() + std::fs::metadata(&wire).unwrap().len();
+        let (catalog, summary) = shallow_state_discovery(home.path(), Some(1));
+        assert_eq!(catalog.len(), 1);
+        assert!(summary.diagnostics.is_empty());
+        assert_eq!(summary.counters.files_opened, 2);
+        assert_eq!(summary.counters.bytes_read, expected);
+    }
+}
+#[cfg(feature = "unstable-internal")]
+#[test]
+fn shallow_state_oversize_is_bounded_and_does_not_block_healthy_neighbor_or_full_capture() {
+    let home = tempfile::tempdir().unwrap();
+    let bad = stage(home.path(), "ordinary");
+    let good = stage(home.path(), "tool");
+    compact_wire(&bad);
+    compact_wire(&good);
+    let state = state_path(&bad);
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&state).unwrap()).unwrap();
+    value["fixtureOversizedState"] = "x".repeat(512 * 1024).into();
+    std::fs::write(&state, serde_json::to_vec(&value).unwrap()).unwrap();
+    // Read the bad candidate first so a global row limit must advance past it.
+    std::fs::File::open(&bad)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(2))
+        .unwrap();
+    std::fs::File::open(&good)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1))
+        .unwrap();
+    let (catalog, summary) = shallow_state_discovery(home.path(), Some(1));
+    assert_eq!(
+        catalog
+            .iter()
+            .map(|s| s.session_id.as_str())
+            .collect::<Vec<_>>(),
+        [sid(2, "main")]
+    );
+    assert!(summary
+        .diagnostics
+        .iter()
+        .any(|d| d.error.contains("KIMI_STATE_TOO_LARGE")));
+    assert_eq!(summary.counters.files_opened, 3);
+    let healthy_bytes = std::fs::metadata(state_path(&good)).unwrap().len()
+        + std::fs::metadata(&good).unwrap().len();
+    assert_eq!(summary.counters.bytes_read, 64 * 1024 + 1 + healthy_bytes);
+    let store = open(home.path());
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    assert_eq!(evidence(&store, 1, "main").messages.len(), 2);
+    assert_eq!(store.sessions(CatalogQuery::default()).count(), 2);
+}
+#[cfg(feature = "unstable-internal")]
+#[test]
+fn shallow_state_parse_failure_still_accounts_for_open_and_bytes() {
+    let home = tempfile::tempdir().unwrap();
+    let wire = stage(home.path(), "ordinary");
+    std::fs::write(state_path(&wire), b"{").unwrap();
+    let (catalog, summary) = shallow_state_discovery(home.path(), Some(1));
+    assert!(catalog.is_empty());
+    assert!(!summary.diagnostics.is_empty());
+    assert_eq!(summary.counters.files_opened, 1);
+    assert_eq!(summary.counters.bytes_read, 1);
+}
+
+#[cfg(all(unix, feature = "unstable-internal"))]
+#[test]
+fn shallow_state_symlink_is_rejected_before_content_open_with_healthy_neighbor() {
+    let home = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let bad = stage(home.path(), "ordinary");
+    let good = stage(home.path(), "tool");
+    compact_wire(&good);
+    let state = state_path(&bad);
+    let external = outside.path().join("state.json");
+    std::fs::rename(&state, &external).unwrap();
+    std::os::unix::fs::symlink(&external, &state).unwrap();
+    std::fs::File::open(&bad)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(2))
+        .unwrap();
+    std::fs::File::open(&good)
+        .unwrap()
+        .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1))
+        .unwrap();
+    let (rows, summary) = shallow_state_discovery(home.path(), Some(1));
+    assert_eq!(
+        rows.iter()
+            .map(|s| s.session_id.as_str())
+            .collect::<Vec<_>>(),
+        [sid(2, "main")]
+    );
+    assert!(!summary.diagnostics.is_empty());
+    assert_eq!(summary.counters.files_opened, 2);
+    assert_eq!(
+        summary.counters.bytes_read,
+        std::fs::metadata(state_path(&good)).unwrap().len()
+            + std::fs::metadata(&good).unwrap().len()
+    );
+}
+
+#[cfg(all(feature = "unstable-internal", feature = "export"))]
+#[test]
+fn actual_remote_export_roundtrip_allows_local_parser_and_project_enrichment() {
+    use ai_hist::export::{ExportLimits, ExportSelection, ExportSnapshot};
+    use ai_hist::{
+        EvidenceKind, EvidenceRecord, NormalizedSourceEvidence, ObservationKey, SessionLocation,
+        ShallowSession, SourceEvidenceSubmission, SourceObservation, SourceObservationBatch,
+    };
+    for (case, n) in [("ordinary", 1), ("tool", 2)] {
+        let origin = tempfile::tempdir().unwrap();
+        stage(origin.path(), case);
+        let source = open(origin.path());
+        source.sync(SyncOptions::default().force(true)).unwrap();
+        if case == "tool" {
+            let native = evidence(&source, n, "main");
+            assert_eq!(native.tool_calls.len(), 1);
+            assert_eq!(native.tool_calls[0].tool_use_id, "fixture-tool-001");
+            assert!(native
+                .messages
+                .iter()
+                .flat_map(|m| &m.blocks)
+                .any(|b| b.text.as_deref() == Some("1\tSynthetic fixture file: blue.")));
+        }
+        let kinds = vec![
+            EvidenceKind::SessionEvent,
+            EvidenceKind::SessionMarker,
+            EvidenceKind::ToolCall,
+        ];
+        let mut snapshot = ExportSnapshot::open(
+            rusqlite::Connection::open(origin.path().join("db")).unwrap(),
+            &ExportSelection {
+                sources: vec!["kimi".into()],
+                kinds: kinds.iter().map(|k| k.as_str().into()).collect(),
+                ..Default::default()
+            },
+            &ExportLimits::default(),
+            60_000,
+            1_000,
+        )
+        .unwrap();
+        let mut cursor = Some(snapshot.handle().cursor);
+        let mut records = vec![];
+        while let Some(value) = cursor {
+            let page = snapshot.page(&value, 1_000).unwrap();
+            cursor = page.next_cursor;
+            for record in page.records {
+                let mut payload = record.payload.as_object().unwrap().clone();
+                assert!(!payload.contains_key("raw_facts_version"));
+                payload.remove("id");
+                payload.remove("location");
+                records.push(EvidenceRecord {
+                    kind: serde_json::from_value(serde_json::json!(record.kind)).unwrap(),
+                    payload,
+                    record_id: Some(record.record_id),
+                    revision_id: Some(record.revision_id),
+                });
+            }
+        }
+        for derived_cache in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let store = open(home.path());
+            let key = ObservationKey {
+                source: "kimi".into(),
+                session_id: sid(n, "main"),
+                location: SessionLocation::Remote,
+                connector_id: "fixture-remote".into(),
+                connector_instance: "default".into(),
+            };
+            store
+                .apply_source_observations(SourceObservationBatch::new(
+                    "fixture-remote",
+                    "default",
+                    SessionLocation::Remote,
+                    vec![SourceObservation {
+                        session: ShallowSession {
+                            source: "kimi".into(),
+                            session_id: sid(n, "main"),
+                            source_stamp: Some("remote-fixture".into()),
+                            ..Default::default()
+                        },
+                        raw_locator: None,
+                    }],
+                ))
+                .unwrap();
+            let revision = store.source_observation(&key).unwrap().revision.unwrap();
+            store
+                .apply_source_evidence(
+                    SourceEvidenceSubmission::new(
+                        key,
+                        revision,
+                        NormalizedSourceEvidence {
+                            source_stamp: "remote-fixture".into(),
+                            source_bytes: 1,
+                            covered_kinds: kinds.clone(),
+                            records: records.clone(),
+                        },
+                    )
+                    .include_related(false),
+                )
+                .unwrap();
+            let conn = ai_hist::open_db(&home.path().join("db")).unwrap();
+            let unstamped: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM session_events WHERE raw_facts_version IS NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                unstamped > 0,
+                "receiver has only real remote intake before hydration"
+            );
+            if derived_cache {
+                conn.execute("UPDATE session_events SET project_key='receiver-derived-cache',project_key_method='path'", []).unwrap();
+            }
+            stage(home.path(), case);
+            store
+                .discover(DiscoveryOptions::default().sources([Source::Kimi]))
+                .unwrap();
+            store
+                .hydrate(
+                    &SessionRef::id(Source::Kimi, sid(n, "main")),
+                    HydrateOptions::default(),
+                )
+                .unwrap();
+            let stamped: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM session_events WHERE raw_facts_version IS NOT NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(stamped, unstamped);
+            assert_eq!(
+                evidence(&store, n, "main").messages,
+                evidence(&source, n, "main").messages
+            );
+            assert_eq!(
+                evidence(&store, n, "main").tool_calls,
+                evidence(&source, n, "main").tool_calls
+            );
+        }
+    }
+}

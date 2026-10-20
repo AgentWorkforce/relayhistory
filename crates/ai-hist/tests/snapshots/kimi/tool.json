@@ -84,7 +84,7 @@
       "subagent_session_id": null,
       "text": "{\"path\": \"fixture.txt\"}",
       "token_json": null,
-      "tool_use_id": "fixture-tool-001",
+      "tool_use_id": null,
       "ts_ms": 1791720000185
     },
     {
