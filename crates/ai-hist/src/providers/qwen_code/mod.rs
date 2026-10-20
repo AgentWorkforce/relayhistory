@@ -74,7 +74,12 @@ impl ShallowSessionProvider for Provider {
         let context = AcquisitionContext::new(ID, scan.provider_roots);
         context.validate(Path::new(&candidate.locator))?;
         let path = Path::new(&candidate.locator).to_owned();
-        let (rows, latest) = storage::shallow_rows(scan, &path)?;
+        let storage::ShallowRead {
+            rows,
+            latest,
+            partial,
+            bounded,
+        } = storage::shallow_rows(scan, &path)?;
         let native = path
             .file_stem()
             .and_then(|v| v.to_str())
@@ -86,10 +91,15 @@ impl ShallowSessionProvider for Provider {
         let sid = roots::identity(scan.provider_roots, &path)?;
         if let Some(conn) = conn {
             normalize::check_identity(conn, &sid, &path)?;
+            if (partial || bounded) && normalize::has_evidence(conn, &sid)? {
+                if let Some(cached) = crate::discover::catalog_row(conn, ID, &sid, true)? {
+                    return Ok(Some(cached));
+                }
+            }
         }
         // A bounded prefix cannot prove the active branch: a later rewind
         // may select a different first prompt. Full projection errors stay visible.
-        let projected = if std::fs::metadata(&path)?.len() <= HEAD_LIMIT {
+        let projected = if !bounded && !partial {
             let active = format::project(&rows)?;
             anyhow::ensure!(
                 !active.is_empty(),
@@ -171,6 +181,11 @@ fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
         crate::ingest::check_capture_cancelled()?;
         let run = || -> Result<(usize, bool)> {
             let captured = storage::capture(Path::new(&candidate.locator), &context)?;
+            if captured.payload["partial"] == true
+                && normalize::has_evidence(ctx.conn, format::string(&captured.payload, "sid")?)?
+            {
+                return Ok((0, true));
+            }
             let tx = ctx.conn.unchecked_transaction()?;
             let n = normalize::write(&tx, &captured.payload)?;
             tx.commit()?;

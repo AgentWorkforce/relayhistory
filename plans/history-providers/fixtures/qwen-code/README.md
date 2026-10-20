@@ -40,7 +40,12 @@ configuration supplied through upstream static/async configuration APIs; those
 in-process settings cannot be discovered after a process exits. Identity combines
 runtime-root/project namespace with native session ID. Complete records at EOF
 without a newline are accepted; partial final JSON is deferred, malformed JSON
-fails. Missing parents and cycles fail without inserting a sparse answer first.
+fails. A first partial capture can expose its complete prefix with a diagnostic.
+Once evidence exists, any partial replacement preserves the whole stored snapshot;
+selected hydration returns retryable `QWEN_CODE_PARTIAL_REPLACEMENT_DEFERRED`
+until the writer completes, including append-only progress. Partial or bounded
+discovery preserves existing semantic catalog metadata; its observation stamp
+can still change with the file. Missing parents and cycles fail without inserting a sparse answer first.
 A bounded 64KiB prefix/tail may leave activity/preview unknown until hydration;
 it never invents file-mtime message timestamps or active-branch previews.
 

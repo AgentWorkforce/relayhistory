@@ -152,7 +152,11 @@ fn qwen_partial_tail_preserves_complete_evidence_then_rewrite_reconciles() {
     store.sync(SyncOptions::default().force(true)).unwrap();
     let initial = read(&store, 1);
     std::fs::write(&path, format!("{original}{{\"uuid\":")).unwrap();
-    hydrate(&store, 1);
+    assert!(store
+        .hydrate(&reference(1), HydrateOptions::default())
+        .unwrap_err()
+        .to_string()
+        .contains("PARTIAL_REPLACEMENT_DEFERRED"));
     assert_eq!(read(&store, 1).messages, initial.messages);
     std::fs::write(
         &path,
@@ -350,5 +354,140 @@ fn qwen_mixed_assistant_parts_keep_native_block_order_and_recorded_usage() {
             .unwrap()
             .input_tokens,
         90
+    );
+}
+#[test]
+fn qwen_partial_replacement_keeps_prior_messages_tools_markers_usage_and_catalog() {
+    assert_partial_replacement(false);
+}
+#[test]
+fn qwen_bounded_partial_replacement_keeps_prior_complete_snapshot() {
+    assert_partial_replacement(true);
+}
+fn assert_partial_replacement(large: bool) {
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path(), "tool", 2);
+    let mut rows = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|s| serde_json::from_str::<serde_json::Value>(s).unwrap())
+        .collect::<Vec<_>>();
+    let store = open(home.path());
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    hydrate(&store, 2);
+    let initial = read(&store, 2);
+    let request = if large {
+        "Replacement synthetic request. ".repeat(5000)
+    } else {
+        "Replacement synthetic request.".into()
+    };
+    rows[0]["message"]["parts"][0]["text"] = request.clone().into();
+    rows[0]["cwd"] = "/synthetic/replacement".into();
+    rows[1]["message"]["parts"][1]["functionCall"]["args"]["value"] = "red".into();
+    rows[2]["message"]["parts"][0]["functionResponse"]["response"]["result"] = "red".into();
+    rows[3]["message"]["parts"][0]["text"] = "Replacement complete answer.".into();
+    rows[3]["usageMetadata"] = serde_json::json!({"promptTokenCount":200,"cachedContentTokenCount":10,"candidatesTokenCount":30,"totalTokenCount":230});
+    let partial = rows[..3]
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n{\"uuid\":";
+    std::fs::write(&path, partial).unwrap();
+    let hydration = store.hydrate(&reference(2), HydrateOptions::default());
+    assert_eq!(
+        read(&store, 2).messages,
+        initial.messages,
+        "partial replacement must not mix a changed prefix with prior complete messages"
+    );
+    let error = hydration.unwrap_err();
+    assert!(error.to_string().contains("PARTIAL_REPLACEMENT_DEFERRED"));
+    for action in 0..3 {
+        if action == 1 {
+            store
+                .discover(DiscoveryOptions::default().sources([Source::QwenCode]))
+                .unwrap();
+        }
+        if action == 2 {
+            store.sync(SyncOptions::default().force(true)).unwrap();
+        }
+        let kept = read(&store, 2);
+        assert_eq!(kept.messages, initial.messages);
+        assert_eq!(kept.tool_calls, initial.tool_calls);
+        assert_eq!(kept.tool_results, initial.tool_results);
+        assert_eq!(kept.markers, initial.markers);
+        assert_eq!(kept.prompts, initial.prompts);
+        assert_eq!(kept.usage, initial.usage);
+        let mut expected = initial.session.clone();
+        // Shared discovery reports the current file-observation fingerprint;
+        // evidence-backed metadata remains the previous complete snapshot.
+        if action > 0 {
+            expected.source_stamp = kept.session.source_stamp.clone();
+        }
+        assert_eq!(kept.session, expected);
+    }
+    std::fs::write(
+        &path,
+        rows.iter()
+            .map(ToString::to_string)
+            .collect::<Vec<_>>()
+            .join("\n"),
+    )
+    .unwrap();
+    hydrate(&store, 2);
+    let complete = read(&store, 2);
+    assert_eq!(texts(&complete)[0], request);
+    assert!(texts(&complete).contains(&"Replacement complete answer.".into()));
+    assert_ne!(complete.tool_calls, initial.tool_calls);
+    assert_eq!(
+        complete
+            .usage
+            .as_ref()
+            .unwrap()
+            .usage
+            .as_ref()
+            .unwrap()
+            .input_tokens,
+        190
+    );
+    let revision = store.head_revision().unwrap();
+    hydrate(&store, 2);
+    assert_eq!(store.head_revision().unwrap(), revision);
+}
+
+#[test]
+fn qwen_first_partial_prefix_is_observable_then_complete_tail_hydrates() {
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path(), "ordinary", 1);
+    let full = std::fs::read_to_string(&path).unwrap();
+    std::fs::write(
+        &path,
+        full.lines().next().unwrap().to_owned() + "\n{\"uuid\":",
+    )
+    .unwrap();
+    let store = open(home.path());
+    store
+        .discover(DiscoveryOptions::default().sources([Source::QwenCode]))
+        .unwrap();
+    let report = store
+        .hydrate(&reference(1), HydrateOptions::default())
+        .unwrap();
+    assert!(report
+        .diagnostics
+        .iter()
+        .any(|d| d.code == "QWEN_CODE_INCOMPLETE_TRANSCRIPT"));
+    let prefix = read(&store, 1);
+    assert_eq!(texts(&prefix), ["Find the synthetic Qwen needle."]);
+    assert_eq!(prefix.markers.len(), 1);
+    hydrate(&store, 1);
+    assert_eq!(read(&store, 1).messages, prefix.messages);
+    std::fs::write(path, full).unwrap();
+    hydrate(&store, 1);
+    assert_eq!(
+        texts(&read(&store, 1)),
+        [
+            "Find the synthetic Qwen needle.",
+            "Found the synthetic Qwen needle."
+        ]
     );
 }

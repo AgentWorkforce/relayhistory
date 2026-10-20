@@ -70,7 +70,9 @@ fn artifact_only_and_missing_provenance_are_explicitly_unsupported() {
         .iter()
         .find(|r| r["subtype"] == "session_artifact_snapshot")
         .unwrap();
-    assert!(format::project(&[artifact.clone()]).unwrap().is_empty());
+    assert!(format::project(std::slice::from_ref(artifact))
+        .unwrap()
+        .is_empty());
     let home = tempfile::tempdir().unwrap();
     let path = home
         .path()

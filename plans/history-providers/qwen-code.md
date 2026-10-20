@@ -22,7 +22,10 @@ measured reasoning provenance do not survive native JSONL and remain unknown.
 Managed transactional journals are explicitly diagnosed as unsupported. Native
 resume execution, parent-session associations, compaction token semantics and
 attachment interpretation remain outside the captured contract. Partial tails
-preserve prior complete evidence; malformed records, missing parents, cycles,
+preserve the entire prior complete snapshot, including catalog metadata. Selected
+hydration defers partial replacements with a retryable source error until complete;
+a first partial capture may expose its validated prefix with a diagnostic. Bounded
+discovery preserves existing catalog metadata. Malformed records, missing parents, cycles,
 missing human provenance and root escapes fail visibly. Complete rewrites retire
 normalized evidence no longer on the selected branch. Tied recorded timestamps
 keep native chain insertion order, including one-event pagination.

@@ -104,13 +104,8 @@ mod tests {
             Some("/home".into())
         );
         assert_eq!(selected(None, None), None);
-        assert_eq!(
-            expand(Path::new("/fixture"), "~\\sub\\..\\runtime"),
-            PathBuf::from("/fixture/runtime")
-        );
-        assert_eq!(
-            expand(Path::new("/fixture"), "~/runtime"),
-            PathBuf::from("/fixture/runtime")
-        );
+        let home = std::env::current_dir().unwrap().join("fixture");
+        assert_eq!(expand(&home, "~\\sub\\..\\runtime"), home.join("runtime"));
+        assert_eq!(expand(&home, "~/runtime"), home.join("runtime"));
     }
 }

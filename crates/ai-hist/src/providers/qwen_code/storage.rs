@@ -1,5 +1,11 @@
 use super::*;
-pub(super) fn shallow_rows(scan: &ScanEnv<'_>, path: &Path) -> Result<(Vec<Value>, Option<i64>)> {
+pub(super) struct ShallowRead {
+    pub rows: Vec<Value>,
+    pub latest: Option<i64>,
+    pub partial: bool,
+    pub bounded: bool,
+}
+pub(super) fn shallow_rows(scan: &ScanEnv<'_>, path: &Path) -> Result<ShallowRead> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path)?;
     let length = file.metadata()?.len();
@@ -7,7 +13,7 @@ pub(super) fn shallow_rows(scan: &ScanEnv<'_>, path: &Path) -> Result<(Vec<Value
     (&mut file).take(HEAD_LIMIT).read_to_end(&mut prefix)?;
     scan.note_open();
     scan.note_bytes(prefix.len() as u64);
-    let (rows, _) = format::parse(&prefix, length > HEAD_LIMIT)?;
+    let (rows, mut partial) = format::parse(&prefix, length > HEAD_LIMIT)?;
     scan.note_records(rows.len() as u64);
     let mut latest = rows
         .iter()
@@ -30,7 +36,8 @@ pub(super) fn shallow_rows(scan: &ScanEnv<'_>, path: &Path) -> Result<(Vec<Value
                 .position(|b| *b == b'\n')
                 .map_or(tail.len(), |n| n + 1)
         };
-        let (last, _) = format::parse(&tail[start..], false)?;
+        let (last, tail_partial) = format::parse(&tail[start..], false)?;
+        partial |= tail_partial;
         scan.note_records(last.len() as u64);
         for row in &last {
             let time = format::time(row)?;
@@ -46,7 +53,12 @@ pub(super) fn shallow_rows(scan: &ScanEnv<'_>, path: &Path) -> Result<(Vec<Value
     // A single step can span both bounded windows. Keep its path-derived
     // conversation identity discoverable without inventing activity or text;
     // explicit hydration validates and reads the complete record.
-    Ok((rows, latest))
+    Ok(ShallowRead {
+        rows,
+        latest,
+        partial,
+        bounded: length > HEAD_LIMIT,
+    })
 }
 pub(super) fn enumerate(env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
     env.provider_roots.ensure_provider_roots(ID)?;

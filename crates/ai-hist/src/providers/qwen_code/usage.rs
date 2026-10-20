@@ -17,12 +17,8 @@ pub(super) fn normalize(v: &Value) -> std::result::Result<Option<NormalizedUsage
     let input = counter(v, "promptTokenCount")?;
     let output = counter(v, "candidatesTokenCount")?;
     let read = counter(v, "cachedContentTokenCount")?;
-    let write = None;
     let total = counter(v, "totalTokenCount")?;
-    if [input, output, read, write, total]
-        .iter()
-        .all(Option::is_none)
-    {
+    if [input, output, read, total].iter().all(Option::is_none) {
         return Ok(None);
     }
     // Native promptTokenCount includes cachedContentTokenCount. The native
@@ -43,7 +39,7 @@ pub(super) fn normalize(v: &Value) -> std::result::Result<Option<NormalizedUsage
         input_tokens: exclusive.unwrap_or(0),
         output_tokens: output.unwrap_or(0),
         cache_read_tokens: read.unwrap_or(0),
-        cache_write_tokens: write.unwrap_or(0),
+        cache_write_tokens: 0,
         reasoning_tokens: None,
         cache_write_5m_tokens: None,
         cache_write_1h_tokens: None,
@@ -54,7 +50,7 @@ pub(super) fn normalize(v: &Value) -> std::result::Result<Option<NormalizedUsage
             has_input_tokens: input.is_some(),
             has_output_tokens: output.is_some(),
             has_cache_read_tokens: read.is_some(),
-            has_cache_write_tokens: write.is_some(),
+            has_cache_write_tokens: false,
             has_reasoning_tokens: false,
         },
     }))

@@ -13,6 +13,7 @@ pub(super) fn write(conn: &Connection, payload: &Value) -> Result<usize> {
     let path = Path::new(format::string(payload, "path")?);
     check_identity(conn, sid, path)?;
     let complete = payload["partial"] == false;
+    anyhow::ensure!(complete || !has_evidence(conn,sid)?,"QWEN_CODE_PARTIAL_REPLACEMENT_DEFERRED: existing evidence retained until the transcript is complete; retry after the writer finishes");
     let mut keys = Keys::default();
     markers(conn, sid, payload, &mut keys)?;
     let mut inserted = 0;
@@ -305,4 +306,10 @@ fn markers(conn: &Connection, sid: &str, payload: &Value, keys: &mut Keys) -> Re
         keys.markers.insert(uid);
     }
     Ok(())
+}
+
+// A partial replacement must not overwrite existing native UUIDs while leaving
+// its unread suffix behind. Catalog-only discovery does not count as evidence.
+pub(super) fn has_evidence(conn: &Connection, sid: &str) -> Result<bool> {
+    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM session_events WHERE source=?1 AND session_id=?2 UNION ALL SELECT 1 FROM session_markers WHERE source=?1 AND session_id=?2 UNION ALL SELECT 1 FROM tool_calls WHERE source=?1 AND session_id=?2)",[ID,sid],|r|r.get(0))?)
 }
