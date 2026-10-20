@@ -1285,6 +1285,19 @@ fn actual_remote_export_roundtrip_allows_local_parser_and_project_enrichment() {
             let native = evidence(&source, n, "main");
             assert_eq!(native.tool_calls.len(), 1);
             assert_eq!(native.tool_calls[0].tool_use_id, "fixture-tool-001");
+            for kind in [ai_hist::BlockKind::ToolUse, ai_hist::BlockKind::ToolResult] {
+                let joined = native
+                    .messages
+                    .iter()
+                    .flat_map(|m| &m.blocks)
+                    .filter(|block| {
+                        block.kind == kind
+                            && block.tool_use_id.as_deref()
+                                == Some(native.tool_calls[0].tool_use_id.as_str())
+                    })
+                    .count();
+                assert_eq!(joined, 1, "{kind:?} joins the exact native tool call");
+            }
             assert!(native
                 .messages
                 .iter()

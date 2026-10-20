@@ -216,12 +216,17 @@ fn message(
         )?;
         keys.tools.insert(id.into());
         let eid = format!("{generated}:tool:{n}");
+        let facts = ToolResultFacts {
+            tool_use_id: Some(id.into()),
+            ..Default::default()
+        };
         insert_session_event(
             conn,
             &EventRow {
                 event_uid: &eid,
                 kind: "tool_use",
                 text: Some(args),
+                tool_result_facts: Some(&facts),
                 ..base
             },
         )?;

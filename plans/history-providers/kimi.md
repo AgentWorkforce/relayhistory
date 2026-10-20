@@ -50,6 +50,9 @@ This protects the stored remote snapshot even when event order does not change.
 The guard uses the intake contract’s owned-column projection: local parser
 generation and receiver-derived project caches may be refreshed by an identical
 local import; provider-reported evidence remains protected.
+Native tool-call IDs belong on both ToolUse and ToolResult blocks and join the
+dedicated ToolCall row. Intake permits that identity on either block kind;
+all other result-fidelity fields remain restricted to tool results.
 
 Discovery limits `state.json` to 64 KiB, plus one oversize-probe byte, and reports
 `KIMI_STATE_TOO_LARGE` per candidate without blocking healthy neighbors. This is
