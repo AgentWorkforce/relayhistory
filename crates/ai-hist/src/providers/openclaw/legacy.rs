@@ -348,6 +348,7 @@ pub(super) fn session(
         legacy: true,
         partial,
         stamp,
+        prompted: false,
         events,
     };
     Ok((session, partial))

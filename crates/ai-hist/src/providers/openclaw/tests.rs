@@ -1605,3 +1605,51 @@ fn review_an_older_window_growing_keeps_the_newest_reply_and_asked_acks_count() 
         .unwrap();
     assert_eq!(last, "HEARTBEAT_OK");
 }
+
+#[test]
+fn review_a_requested_ack_beyond_the_reread_tail_is_still_the_reply() {
+    let (home, roots, _path, db) = fixture();
+    let mut ledger = Ledger::new(home.path());
+    ledger.sweep(&roots, None).unwrap();
+    let insert = |seq: i64, id: &str, json: String| {
+        db.execute(
+            "INSERT INTO transcript_events (session_id, seq, event_json, created_at) VALUES ('fixture-telegram-0001', ?1, ?2, 1790000950000)",
+            params![seq, json],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO transcript_event_identities (session_id, event_id, seq, event_type, created_at) VALUES ('fixture-telegram-0001', ?1, ?2, 'message', 1790000950000)",
+            params![id, seq],
+        )
+        .unwrap();
+        db.execute(
+            "UPDATE session_windows SET transcript_updated_at=transcript_updated_at+1 WHERE session_id='fixture-telegram-0001'",
+            [],
+        )
+        .unwrap();
+    };
+    insert(5, "ask", r#"{"type":"message","id":"ask","parentId":null,"timestamp":"2026-09-21T15:10:00.000Z","message":{"role":"user","content":"Reply with exactly HEARTBEAT_OK when done","timestamp":1790000950000}}"#.into());
+    for seq in 6..(6 + TAIL as i64 + 8) {
+        insert(
+            seq,
+            &format!("work-{seq}"),
+            format!(
+                r#"{{"type":"custom","id":"work-{seq}","parentId":null,"timestamp":"2026-09-21T15:10:01.000Z","customType":"x"}}"#
+            ),
+        );
+    }
+    ledger.sweep(&roots, None).unwrap();
+    // The answer lands after the person's prompt has left the re-read tail.
+    let seq = 6 + TAIL as i64 + 8;
+    insert(seq, "answer", r#"{"type":"message","id":"answer","parentId":null,"timestamp":"2026-09-21T15:10:02.000Z","message":{"role":"assistant","content":[{"type":"text","text":"HEARTBEAT_OK"}],"api":"openai-responses","provider":"openai","model":"fixture-model","stopReason":"stop","timestamp":1790000952000}}"#.into());
+    ledger.sweep(&roots, None).unwrap();
+    let last: String = ledger
+        .conn
+        .query_row(
+            "SELECT last_assistant_text FROM sessions WHERE source='openclaw' AND session_id=?1",
+            [TELEGRAM],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(last, "HEARTBEAT_OK");
+}

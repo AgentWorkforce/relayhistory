@@ -55,7 +55,7 @@ fn write(conn: &Connection, s: &Session, scope: Option<&str>, out: &mut Written)
     // Whether the latest user turn came from a person: a quiet
     // acknowledgement is hidden only after a wake poll or in a run nobody
     // prompted, never when a person asked for that text.
-    let mut prompted = false;
+    let mut prompted = s.prompted;
     for event in &s.events[1..] {
         crate::ingest::check_capture_cancelled()?;
         let entry = &event.entry;

@@ -273,6 +273,7 @@ fn session_row(
         legacy: false,
         partial: false,
         stamp,
+        prompted: false,
         events: vec![],
     })
 }

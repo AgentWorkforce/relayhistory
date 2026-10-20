@@ -92,6 +92,10 @@ struct Session {
     partial: bool,
     /// Change stamp of this session's rows; drives incremental sweeps.
     stamp: String,
+    /// For a tail re-read: whether the newest user turn before the tail came
+    /// from a person.
+    #[serde(default, skip)]
+    prompted: bool,
     events: Vec<Event>,
 }
 #[derive(Debug, Serialize, Deserialize)]
@@ -334,7 +338,10 @@ fn normalize_one(
     for (i, window) in conv.windows.iter_mut().enumerate() {
         window.events = match plan.as_ref().map_or(Read::Whole, |p| p[i]) {
             Read::Unchanged => vec![],
-            Read::From(seq) => events::tail(conn, schema, &window.native_id, seq)?,
+            Read::From(seq) => {
+                window.prompted = events::prompted_before(conn, schema, &window.native_id, seq)?;
+                events::tail(conn, schema, &window.native_id, seq)?
+            }
             Read::Whole => events::events(context, conn, path, schema, window)?,
         };
     }
