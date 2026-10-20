@@ -12,6 +12,8 @@ RelayHistory owns the `antigravity` provider. Discover persisted conversations b
 
 Each native conversation folder contains `.system_generated/logs/transcript_full.jsonl` and/or `transcript.jsonl`. Prefer the full file, otherwise read the compact file. Do not ingest both. Freeze roots at store creation and namespace conversation IDs by root so variants cannot collide. Explicit provider roots are supported; undocumented environment override precedence is not assumed.
 
+Shallow discovery uses bounded head/tail reads. A sole oversized step can still be cataloged with unknown preview/activity time; selected hydration validates and reads its complete evidence.
+
 Parse timestamped JSONL steps with native `step_index`, `source`, `type`, `status` and `created_at`. Project recorded user text and completed assistant responses; remove only the validated native outer user envelope. Preserve every row as raw marker evidence, including control steps, reasoning, tool arguments/results and media references. Step-derived message IDs are synthesized, timestamps are recorded, and missing usage/model/cwd/parent information remains unknown. The JSONL omits tool-call IDs, so tool evidence cannot become joined tool-call rows.
 
 Native steps may be rewritten. Acquire an immutable byte snapshot and reconcile complete captures; do not use an append-only cache. Incomplete EOF or compact truncation cannot retire earlier complete evidence. A truncated message remains marker evidence rather than searchable complete text. If the selected full file disappears, discover/sync selects the compact fallback before direct hydration; direct hydration of a missing stored locator returns the existing source error.
