@@ -1,0 +1,607 @@
+{
+  "ordinary": {
+    "main": {
+      "replay": [
+        {
+          "type": "permission_updated",
+          "mode": "auto",
+          "time": 1791720000077
+        },
+        {
+          "type": "message",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Remember the synthetic ordinary color blue."
+              }
+            ],
+            "id": "msg_00000000000000000000000001",
+            "toolCalls": [],
+            "origin": {
+              "kind": "user"
+            }
+          },
+          "time": 1791720000086
+        },
+        {
+          "type": "message",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "<system-reminder>\nToday's date is 2026-10-20. The current date is restated in a reminder whenever it changes; rely on the latest such reminder for the current date. DO NOT mention this to the user explicitly.\n</system-reminder>"
+              }
+            ],
+            "toolCalls": [],
+            "origin": {
+              "kind": "injection",
+              "variant": "date_change",
+              "disclosure": {
+                "kind": "date",
+                "renderGeneration": 1,
+                "localDate": "2026-10-20",
+                "timeZone": "America/Los_Angeles"
+              }
+            }
+          },
+          "time": 1791720000112
+        },
+        {
+          "type": "message",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "<system-reminder>\nAuto permission mode is active. Tool approvals will be handled automatically while this mode remains enabled.\n  - Continue normally without pausing for approval prompts.\n  - Do NOT call AskUserQuestion while auto mode is active; decide and continue.\n  - ExitPlanMode is also approved automatically, without the user reviewing the plan. An auto-approved plan is NOT a signal from the user to start executing \u2014 follow the user's original instructions on whether to proceed.\n</system-reminder>"
+              }
+            ],
+            "toolCalls": [],
+            "origin": {
+              "kind": "injection",
+              "variant": "permission_mode"
+            }
+          },
+          "time": 1791720000112
+        },
+        {
+          "type": "message",
+          "message": {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "Synthetic Kimi ordinary answer 1: blue."
+              }
+            ],
+            "toolCalls": []
+          },
+          "time": 1791720000115
+        }
+      ],
+      "toolStore": {}
+    }
+  },
+  "tool": {
+    "main": {
+      "replay": [
+        {
+          "type": "permission_updated",
+          "mode": "auto",
+          "time": 1791720000081
+        },
+        {
+          "type": "message",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Remember the synthetic tool color blue."
+              }
+            ],
+            "id": "msg_00000000000000000000000001",
+            "toolCalls": [],
+            "origin": {
+              "kind": "user"
+            }
+          },
+          "time": 1791720000089
+        },
+        {
+          "type": "message",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "<system-reminder>\nToday's date is 2026-10-20. The current date is restated in a reminder whenever it changes; rely on the latest such reminder for the current date. DO NOT mention this to the user explicitly.\n</system-reminder>"
+              }
+            ],
+            "toolCalls": [],
+            "origin": {
+              "kind": "injection",
+              "variant": "date_change",
+              "disclosure": {
+                "kind": "date",
+                "renderGeneration": 1,
+                "localDate": "2026-10-20",
+                "timeZone": "America/Los_Angeles"
+              }
+            }
+          },
+          "time": 1791720000095
+        },
+        {
+          "type": "message",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "<system-reminder>\nAuto permission mode is active. Tool approvals will be handled automatically while this mode remains enabled.\n  - Continue normally without pausing for approval prompts.\n  - Do NOT call AskUserQuestion while auto mode is active; decide and continue.\n  - ExitPlanMode is also approved automatically, without the user reviewing the plan. An auto-approved plan is NOT a signal from the user to start executing \u2014 follow the user's original instructions on whether to proceed.\n</system-reminder>"
+              }
+            ],
+            "toolCalls": [],
+            "origin": {
+              "kind": "injection",
+              "variant": "permission_mode"
+            }
+          },
+          "time": 1791720000095
+        },
+        {
+          "type": "message",
+          "message": {
+            "role": "assistant",
+            "content": [],
+            "toolCalls": [
+              {
+                "type": "function",
+                "id": "fixture-tool-001",
+                "name": "Read",
+                "arguments": "{\"path\":\"fixture.txt\"}"
+              }
+            ],
+            "toolCallDisplays": {
+              "fixture-tool-001": {
+                "kind": "file_io",
+                "operation": "read",
+                "path": "/fixture/kimi/tool/workspace/fixture.txt"
+              }
+            }
+          },
+          "time": 1791720000098
+        },
+        {
+          "type": "message",
+          "message": {
+            "role": "tool",
+            "content": [
+              {
+                "type": "text",
+                "text": "1\tSynthetic fixture file: blue."
+              }
+            ],
+            "toolCalls": [],
+            "toolCallId": "fixture-tool-001",
+            "note": "<system>1 line read from file starting from line 1. Total lines in file: 1. Requested range complete. Effective max_chars: 100000. End of file reached.</system>"
+          },
+          "time": 1791720000176
+        },
+        {
+          "type": "message",
+          "message": {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "Synthetic Kimi tool answer 2: blue."
+              }
+            ],
+            "toolCalls": []
+          },
+          "time": 1791720000178
+        }
+      ],
+      "toolStore": {}
+    }
+  },
+  "resumed": {
+    "main": {
+      "replay": [
+        {
+          "type": "permission_updated",
+          "mode": "auto",
+          "time": 1791720000070
+        },
+        {
+          "type": "message",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Remember the synthetic resumed color blue."
+              }
+            ],
+            "id": "msg_00000000000000000000000001",
+            "toolCalls": [],
+            "origin": {
+              "kind": "user"
+            }
+          },
+          "time": 1791720000077
+        },
+        {
+          "type": "message",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "<system-reminder>\nToday's date is 2026-10-20. The current date is restated in a reminder whenever it changes; rely on the latest such reminder for the current date. DO NOT mention this to the user explicitly.\n</system-reminder>"
+              }
+            ],
+            "toolCalls": [],
+            "origin": {
+              "kind": "injection",
+              "variant": "date_change",
+              "disclosure": {
+                "kind": "date",
+                "renderGeneration": 1,
+                "localDate": "2026-10-20",
+                "timeZone": "America/Los_Angeles"
+              }
+            }
+          },
+          "time": 1791720000082
+        },
+        {
+          "type": "message",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "<system-reminder>\nAuto permission mode is active. Tool approvals will be handled automatically while this mode remains enabled.\n  - Continue normally without pausing for approval prompts.\n  - Do NOT call AskUserQuestion while auto mode is active; decide and continue.\n  - ExitPlanMode is also approved automatically, without the user reviewing the plan. An auto-approved plan is NOT a signal from the user to start executing \u2014 follow the user's original instructions on whether to proceed.\n</system-reminder>"
+              }
+            ],
+            "toolCalls": [],
+            "origin": {
+              "kind": "injection",
+              "variant": "permission_mode"
+            }
+          },
+          "time": 1791720000082
+        },
+        {
+          "type": "message",
+          "message": {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "Synthetic Kimi resumed answer 1: blue."
+              }
+            ],
+            "toolCalls": []
+          },
+          "time": 1791720000085
+        },
+        {
+          "type": "message",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Continue the same synthetic fixture."
+              }
+            ],
+            "id": "msg_00000000000000000000000004",
+            "toolCalls": [],
+            "origin": {
+              "kind": "user"
+            }
+          },
+          "time": 1791720000977
+        },
+        {
+          "type": "message",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "<system-reminder>\nAuto permission mode is active. Tool approvals will be handled automatically while this mode remains enabled.\n  - Continue normally without pausing for approval prompts.\n  - Do NOT call AskUserQuestion while auto mode is active; decide and continue.\n  - ExitPlanMode is also approved automatically, without the user reviewing the plan. An auto-approved plan is NOT a signal from the user to start executing \u2014 follow the user's original instructions on whether to proceed.\n</system-reminder>"
+              }
+            ],
+            "toolCalls": [],
+            "origin": {
+              "kind": "injection",
+              "variant": "permission_mode"
+            }
+          },
+          "time": 1791720000982
+        },
+        {
+          "type": "message",
+          "message": {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "Synthetic Kimi resumed answer 2: blue."
+              }
+            ],
+            "toolCalls": []
+          },
+          "time": 1791720000984
+        }
+      ],
+      "toolStore": {}
+    }
+  },
+  "subagent": {
+    "agent-0": {
+      "replay": [
+        {
+          "type": "permission_updated",
+          "mode": "auto",
+          "time": 1791720000184
+        },
+        {
+          "type": "message",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "<git-context status=\"unavailable\" reason=\"not-a-repo\"/>\n\nReturn the synthetic child answer."
+              }
+            ],
+            "id": "msg_00000000000000000000000001",
+            "toolCalls": [],
+            "origin": {
+              "kind": "system_trigger",
+              "name": "subagent"
+            }
+          },
+          "time": 1791720000381
+        },
+        {
+          "type": "message",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "<system-reminder>\nToday's date is 2026-10-20. The current date is restated in a reminder whenever it changes; rely on the latest such reminder for the current date. DO NOT mention this to the user explicitly.\n</system-reminder>"
+              }
+            ],
+            "toolCalls": [],
+            "origin": {
+              "kind": "injection",
+              "variant": "date_change",
+              "disclosure": {
+                "kind": "date",
+                "renderGeneration": 1,
+                "localDate": "2026-10-20",
+                "timeZone": "America/Los_Angeles"
+              }
+            }
+          },
+          "time": 1791720000382
+        },
+        {
+          "type": "message",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "<system-reminder>\nAuto permission mode is active. Tool approvals will be handled automatically while this mode remains enabled.\n  - Continue normally without pausing for approval prompts.\n  - Do NOT call AskUserQuestion while auto mode is active; decide and continue.\n  - ExitPlanMode is also approved automatically, without the user reviewing the plan. An auto-approved plan is NOT a signal from the user to start executing \u2014 follow the user's original instructions on whether to proceed.\n</system-reminder>"
+              }
+            ],
+            "toolCalls": [],
+            "origin": {
+              "kind": "injection",
+              "variant": "permission_mode"
+            }
+          },
+          "time": 1791720000383
+        },
+        {
+          "type": "message",
+          "message": {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "Synthetic Kimi subagent answer 2: blue."
+              }
+            ],
+            "toolCalls": []
+          },
+          "time": 1791720000383
+        }
+      ],
+      "toolStore": {}
+    },
+    "main": {
+      "replay": [
+        {
+          "type": "permission_updated",
+          "mode": "auto",
+          "time": 1791720000071
+        },
+        {
+          "type": "message",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "Remember the synthetic subagent color blue."
+              }
+            ],
+            "id": "msg_00000000000000000000000004",
+            "toolCalls": [],
+            "origin": {
+              "kind": "user"
+            }
+          },
+          "time": 1791720000078
+        },
+        {
+          "type": "message",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "<system-reminder>\nToday's date is 2026-10-20. The current date is restated in a reminder whenever it changes; rely on the latest such reminder for the current date. DO NOT mention this to the user explicitly.\n</system-reminder>"
+              }
+            ],
+            "toolCalls": [],
+            "origin": {
+              "kind": "injection",
+              "variant": "date_change",
+              "disclosure": {
+                "kind": "date",
+                "renderGeneration": 1,
+                "localDate": "2026-10-20",
+                "timeZone": "America/Los_Angeles"
+              }
+            }
+          },
+          "time": 1791720000083
+        },
+        {
+          "type": "message",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "<system-reminder>\nAuto permission mode is active. Tool approvals will be handled automatically while this mode remains enabled.\n  - Continue normally without pausing for approval prompts.\n  - Do NOT call AskUserQuestion while auto mode is active; decide and continue.\n  - ExitPlanMode is also approved automatically, without the user reviewing the plan. An auto-approved plan is NOT a signal from the user to start executing \u2014 follow the user's original instructions on whether to proceed.\n</system-reminder>"
+              }
+            ],
+            "toolCalls": [],
+            "origin": {
+              "kind": "injection",
+              "variant": "permission_mode"
+            }
+          },
+          "time": 1791720000083
+        },
+        {
+          "type": "message",
+          "message": {
+            "role": "assistant",
+            "content": [],
+            "toolCalls": [
+              {
+                "type": "function",
+                "id": "fixture-tool-001",
+                "name": "Agent",
+                "arguments": "{\"prompt\":\"Return the synthetic child answer.\",\"description\":\"Synthetic child fixture\",\"subagent_type\":\"explore\"}"
+              }
+            ],
+            "toolCallDisplays": {
+              "fixture-tool-001": {
+                "kind": "agent_call",
+                "agent_name": "explore",
+                "prompt": "Return the synthetic child answer."
+              }
+            }
+          },
+          "time": 1791720000085
+        },
+        {
+          "type": "message",
+          "message": {
+            "role": "tool",
+            "content": [
+              {
+                "type": "text",
+                "text": "agent_id: agent-0\nactual_subagent_type: explore\nstatus: completed\nstop_reason: completed\n\n[summary]\nSynthetic Kimi subagent answer 2: blue.\n\nresume_hint: Continue with Agent(resume=\"agent-0\", prompt=\"...\"). Use agent_id only; do not set subagent_type. The subagent retains its prior context; redo any unfinished tool call if its result was lost."
+              }
+            ],
+            "toolCalls": [],
+            "toolCallId": "fixture-tool-001"
+          },
+          "time": 1791720000397
+        },
+        {
+          "type": "message",
+          "message": {
+            "role": "assistant",
+            "content": [
+              {
+                "type": "text",
+                "text": "Synthetic Kimi subagent answer 3: blue."
+              }
+            ],
+            "toolCalls": []
+          },
+          "time": 1791720000398
+        }
+      ],
+      "toolStore": {}
+    }
+  },
+  "rewound": {
+    "main": {
+      "replay": [
+        {
+          "type": "message",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "<system-reminder>\nToday's date is 2026-10-20. The current date is restated in a reminder whenever it changes; rely on the latest such reminder for the current date. DO NOT mention this to the user explicitly.\n</system-reminder>"
+              }
+            ],
+            "toolCalls": [],
+            "origin": {
+              "kind": "injection",
+              "variant": "date_change",
+              "disclosure": {
+                "kind": "date",
+                "renderGeneration": 1,
+                "localDate": "2026-10-20",
+                "timeZone": "America/Los_Angeles"
+              }
+            }
+          },
+          "time": 1791720000112
+        },
+        {
+          "type": "message",
+          "message": {
+            "role": "user",
+            "content": [
+              {
+                "type": "text",
+                "text": "<system-reminder>\nAuto permission mode is active. Tool approvals will be handled automatically while this mode remains enabled.\n  - Continue normally without pausing for approval prompts.\n  - Do NOT call AskUserQuestion while auto mode is active; decide and continue.\n  - ExitPlanMode is also approved automatically, without the user reviewing the plan. An auto-approved plan is NOT a signal from the user to start executing \u2014 follow the user's original instructions on whether to proceed.\n</system-reminder>"
+              }
+            ],
+            "toolCalls": [],
+            "origin": {
+              "kind": "injection",
+              "variant": "permission_mode"
+            }
+          },
+          "time": 1791720000112
+        }
+      ],
+      "toolStore": {}
+    }
+  }
+}

@@ -1,0 +1,4 @@
+// Exercise the pinned native rewind-record constructor on a captured journal.
+import fs from'node:fs';import path from'node:path';import{pathToFileURL}from'node:url';
+const{buildUndoSwitchRecords}=await import(pathToFileURL(process.env.KIMI_SOURCE+'/packages/agent-core-v2/src/wire/tree/fork.ts'));
+const raw=process.argv[2],out=path.join(raw,'rewound');fs.cpSync(path.join(raw,'ordinary'),out,{recursive:true});const file=fs.readdirSync(path.join(out,'home/.kimi-code/sessions'),{recursive:true}).find(p=>p.endsWith('/wire.jsonl'));const wire=path.join(out,'home/.kimi-code/sessions',file),text=fs.readFileSync(wire,'utf8'),rows=text.trim().split('\n').map(JSON.parse);const records=buildUndoSwitchRecords({agentId:'main',branch:'undo-fixture',reason:'undo',base:{branch:'main',line:1},turns:1,edgeLine:rows.length+1,time:rows.at(-1).time+1});fs.appendFileSync(wire,[records.switched,records.legacyUndo,records.undone].map(JSON.stringify).join('\n')+'\n');
