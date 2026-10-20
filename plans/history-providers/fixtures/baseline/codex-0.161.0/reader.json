@@ -1,0 +1,46 @@
+{
+  "thread": {
+    "id": "019b76da-a800-7000-8000-000000000161",
+    "environments": [
+      {
+        "environmentId": "local",
+        "cwd": "/synthetic/codex-home/workspace",
+        "runtimeWorkspaceRoots": [
+          "/synthetic/codex-home/workspace"
+        ]
+      }
+    ],
+    "extra": null,
+    "sessionId": "019b76da-a800-7000-8000-000000000161",
+    "forkedFromId": null,
+    "parentThreadId": null,
+    "preview": "",
+    "ephemeral": false,
+    "section": null,
+    "sectionEnteredAt": null,
+    "projectId": null,
+    "historyMode": "paginated",
+    "modelProvider": "synthetic",
+    "model": "synthetic-fixture",
+    "reasoningEffort": null,
+    "createdAt": 1767225600,
+    "updatedAt": 1767225600,
+    "recencyAt": 1767225600,
+    "status": {
+      "type": "idle"
+    },
+    "path": "/synthetic/codex-home/codex/sessions/2026/01/01/rollout-2026-01-01T00-00-00-019b76da-a800-7000-8000-000000000161.jsonl",
+    "cwd": "/synthetic/codex-home/workspace",
+    "cliVersion": "0.161.0",
+    "originator": "relayhistory-offline-fixture",
+    "source": "vscode",
+    "canAcceptDirectInput": true,
+    "threadSource": null,
+    "agentNickname": null,
+    "agentRole": null,
+    "gitInfo": null,
+    "name": null,
+    "daybreakEnabled": null,
+    "turns": []
+  }
+}

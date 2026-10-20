@@ -1,0 +1,76 @@
+{
+  "exporter_version": {
+    "display": "Muse Code 1.4.7 (d8c53d25bd)",
+    "sha": "d8c53d25bd",
+    "semver": "1.4.7"
+  },
+  "export_schema_version": 1,
+  "full_export_sha256": "8f110acde0536779b64a19f176332781617b9be05013641faa6294a40eec5f47",
+  "source_fixture": "crates/ai-hist/tests/fixtures/muse/cli-capture/.local/share/muse/sessions/2026/09/01/74747474-7474-4747-8747-747474747474/session.jsonl",
+  "messages": [
+    {
+      "role": "user",
+      "text": "SM_CORPUS_7319 Inspect timeline.py and CORPUS_NOTE.txt with the native file tool. Then try missing-corpus-file.txt so the native log includes a failed tool result. Explain the interval boundary and quote the note marker."
+    },
+    {
+      "role": "assistant",
+      "id": "3a5a3d69-0f3b-4971-af76-38b3e569c76d",
+      "text": "The boundary comparison is strict, the note marker is COPPER_4821, and the missing-file failure was retained."
+    },
+    {
+      "role": "user",
+      "text": "Inspect the attached image and identify its shape and visible nonce."
+    },
+    {
+      "role": "assistant",
+      "id": "ab7a934d-2bd5-4915-a1ce-daa50835418a",
+      "text": "The image contains a blue triangle labeled BLUE_TRIANGLE_7319."
+    },
+    {
+      "role": "user",
+      "text": "Without tools, recall the task marker, note marker, image marker, and failed filename."
+    },
+    {
+      "role": "assistant",
+      "id": "5726f698-6d80-4a72-bf94-ac460d454acd",
+      "text": "Recall: SM_CORPUS_7319, COPPER_4821, BLUE_TRIANGLE_7319, and missing-corpus-file.txt."
+    }
+  ],
+  "tool_calls": [
+    {
+      "args": "{\"path\":\"timeline.py\"}",
+      "call_id": "call_muse_timeline",
+      "id": "fc_call_muse_timeline",
+      "name": "read_file"
+    },
+    {
+      "args": "{\"path\":\"CORPUS_NOTE.txt\"}",
+      "call_id": "call_muse_note",
+      "id": "fc_call_muse_note",
+      "name": "read_file"
+    },
+    {
+      "args": "{\"path\":\"missing-corpus-file.txt\"}",
+      "call_id": "call_muse_missing",
+      "id": "fc_call_muse_missing",
+      "name": "read_file"
+    }
+  ],
+  "tool_results": [
+    {
+      "text": "Read text file `timeline.py`.\n1|from dataclasses import dataclass\n2|\n3|\n4|@dataclass(frozen=True)\n5|class Event:\n6|    start_ms: int\n7|    end_ms: int\n8|\n9|\n10|def touches(previous: Event, current: Event) -> bool:\n11|    \"\"\"Return whether two closed intervals overlap or touch.\"\"\"\n12|    return current.start_ms < previous.end_ms",
+      "tool_call_id": "call_muse_timeline",
+      "tool_call_index": 0
+    },
+    {
+      "text": "Read text file `CORPUS_NOTE.txt`.\n1|Native corpus file marker: COPPER_4821\n2|\n3|This file belongs to a disposable session-migrate test workspace. It contains\n4|no credentials, user data, or repository source.",
+      "tool_call_id": "call_muse_note",
+      "tool_call_index": 0
+    },
+    {
+      "text": "tool failed: No such file or directory (os error 2)",
+      "tool_call_id": "call_muse_missing",
+      "tool_call_index": 0
+    }
+  ]
+}
