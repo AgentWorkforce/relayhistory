@@ -1,0 +1,60 @@
+{
+  "ordinary": {
+    "id": "019b76da-a800-7000-8000-000000000001",
+    "title": "Synthetic initial title",
+    "ids": [
+      "00000001",
+      "00000002",
+      "00000003"
+    ],
+    "malformedRecords": 0,
+    "invalidHeader": false,
+    "sourceSize": 1443
+  },
+  "title-rewrite": {
+    "id": "019b76da-a800-7000-8000-000000000001",
+    "title": "Synthetic changed title",
+    "ids": [
+      "00000001",
+      "00000002",
+      "00000003"
+    ],
+    "malformedRecords": 0,
+    "invalidHeader": false,
+    "sourceSize": 1443
+  },
+  "fork": {
+    "id": "019b76da-a800-7000-8000-000000000002",
+    "title": "Synthetic initial title",
+    "ids": [
+      "00000001",
+      "00000002",
+      "00000003"
+    ],
+    "malformedRecords": 0,
+    "invalidHeader": false,
+    "sourceSize": 1498
+  },
+  "rewrite": {
+    "id": "019b76da-a800-7000-8000-000000000001",
+    "title": "Synthetic initial title",
+    "ids": [
+      "00000001"
+    ],
+    "malformedRecords": 0,
+    "invalidHeader": false,
+    "sourceSize": 762
+  },
+  "partial-tail": {
+    "id": "019b76da-a800-7000-8000-000000000001",
+    "title": "Synthetic initial title",
+    "ids": [
+      "00000001",
+      "00000002",
+      "00000003"
+    ],
+    "malformedRecords": 1,
+    "invalidHeader": false,
+    "sourceSize": 1466
+  }
+}

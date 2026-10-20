@@ -16,6 +16,7 @@ pub(super) fn resolve_with(
         ResolvedProviderRoots {
             paths: vec![root.clone()],
             default_root: Some(root),
+            error: None,
         }
     };
     if !use_env {

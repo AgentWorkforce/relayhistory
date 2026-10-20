@@ -4,11 +4,15 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased - Patch]
+## [Unreleased - Minor]
 
 ### Fixed
 
 - Grok Build sessions show the name recorded in `generated_title` or `session_summary`; previously cached sessions refresh their missing titles on the next discovery, sync or hydration.
+
+### Added
+
+- Oh My Pi history is discoverable and searchable from its native title-slot session files, with recorded messages, tool calls and results, observed usage and control markers; shared Pi roots do not double-import these sessions.
 
 ## [0.47.0] - 2026-10-18
 

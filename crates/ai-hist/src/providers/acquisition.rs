@@ -97,6 +97,7 @@ pub(crate) fn validate_provider_path(
     path: &Path,
     provider_roots: &crate::ProviderRoots,
 ) -> Result<()> {
+    provider_roots.ensure_provider_roots(source)?;
     let roots = crate::sources::catalog::transcript_roots(source, provider_roots);
     // A locator whose transcript is stored compressed is checked by where its
     // bytes are.

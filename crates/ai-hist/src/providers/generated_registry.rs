@@ -46,6 +46,11 @@ const REGISTRATIONS: &[Registration] = &[
         adapter: hermes::ADAPTER,
     },
     Registration {
+        id: "omp",
+        metadata: omp::METADATA,
+        adapter: omp::ADAPTER,
+    },
+    Registration {
         id: "copilot",
         metadata: copilot::METADATA,
         adapter: copilot::ADAPTER,
