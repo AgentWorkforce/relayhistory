@@ -40,8 +40,7 @@ pub(crate) fn default_muse_sessions_dir(home: &Path) -> PathBuf {
 }
 
 pub fn opencode_db_path(home: &Path) -> PathBuf {
-    env_dir("OPENCODE_DB")
-        .unwrap_or_else(|| home.join(".local/share/opencode/opencode.db"))
+    env_dir("OPENCODE_DB").unwrap_or_else(|| home.join(".local/share/opencode/opencode.db"))
 }
 
 /// Whether `name` is an OpenCode SQLite store: `opencode.db`, or a
@@ -170,8 +169,7 @@ pub(crate) fn list_opencode_db_files(configured: &Path, pinned: bool) -> Opencod
 /// Where OpenCode's legacy JSON tree lives: `session/<scope>/<id>.json`,
 /// `message/<sessionId>/*.json`, `part/<messageId>/*.json`.
 pub fn opencode_storage_dir(home: &Path) -> PathBuf {
-    env_dir("OPENCODE_STORAGE_DIR")
-        .unwrap_or_else(|| home.join(".local/share/opencode/storage"))
+    env_dir("OPENCODE_STORAGE_DIR").unwrap_or_else(|| home.join(".local/share/opencode/storage"))
 }
 
 /// The Devin CLI data directory: `$XDG_DATA_HOME/devin/cli`, defaulting to
@@ -236,6 +234,8 @@ pub struct ProviderRoots {
     pub(crate) provider_roots: std::collections::BTreeMap<String, Vec<PathBuf>>,
     // Serialize even an empty map: explicit custom roots have no portable identity.
     pub(crate) provider_default_roots: std::collections::BTreeMap<String, PathBuf>,
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub(crate) provider_root_errors: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -256,6 +256,8 @@ struct ProviderRootsWire {
     provider_roots: std::collections::BTreeMap<String, Vec<PathBuf>>,
     #[serde(default)]
     provider_default_roots: Option<std::collections::BTreeMap<String, PathBuf>>,
+    #[serde(default)]
+    provider_root_errors: std::collections::BTreeMap<String, String>,
 }
 
 #[doc(hidden)]
@@ -268,16 +270,25 @@ impl<'de> Deserialize<'de> for ProviderRoots {
         let devin = wire
             .devin
             .unwrap_or_else(|| devin_cli_dir_under(&wire.home));
-        let (mut provider_roots, legacy_defaults) = crate::providers::resolve_roots(&wire.home, false);
+        let (mut provider_roots, legacy_defaults, _) =
+            crate::providers::resolve_roots(&wire.home, false);
         provider_roots.extend(wire.provider_roots);
         // Old wire values only identify the historical canonical default safely.
         // Never consult the current environment to infer relocated native roots.
         let provider_default_roots = wire.provider_default_roots.unwrap_or_else(|| {
-            legacy_defaults.into_iter().filter(|(id, root)| provider_roots.get(id).is_some_and(|paths| paths.contains(root))).collect()
+            legacy_defaults
+                .into_iter()
+                .filter(|(id, root)| {
+                    provider_roots
+                        .get(id)
+                        .is_some_and(|paths| paths.contains(root))
+                })
+                .collect()
         });
         Ok(Self {
             provider_roots,
             provider_default_roots,
+            provider_root_errors: wire.provider_root_errors,
             home: wire.home,
             claude: wire.claude,
             codex: wire.codex,
@@ -295,20 +306,36 @@ impl<'de> Deserialize<'de> for ProviderRoots {
 impl ProviderRoots {
     #[allow(dead_code)] // Provider-owned adapters use this frozen map.
     pub(crate) fn for_provider(&self, id: &str) -> &[PathBuf] {
-        self.provider_roots.get(id).map(Vec::as_slice).unwrap_or(&[])
+        self.provider_roots
+            .get(id)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Report the same configuration failure after serialization or environment changes.
+    pub(crate) fn ensure_provider_roots(&self, id: &str) -> anyhow::Result<()> {
+        if let Some(error) = self.provider_root_errors.get(id) {
+            anyhow::bail!("{error}");
+        }
+        Ok(())
     }
 
     pub(crate) fn default_for_provider(&self, id: &str) -> Option<&Path> {
-        self.provider_default_roots.get(id).filter(|path| self.for_provider(id).contains(path)).map(PathBuf::as_path)
+        self.provider_default_roots
+            .get(id)
+            .filter(|path| self.for_provider(id).contains(path))
+            .map(PathBuf::as_path)
     }
 
     /// Roots under `home`, with the process environment's provider overrides
     /// applied — the CLI's resolution.
     pub fn from_env(home: PathBuf) -> Self {
-        let (provider_roots, provider_default_roots) = crate::providers::resolve_roots(&home, true);
+        let (provider_roots, provider_default_roots, provider_root_errors) =
+            crate::providers::resolve_roots(&home, true);
         Self {
             provider_roots,
             provider_default_roots,
+            provider_root_errors,
             claude: claude_config_dir(&home),
             codex: codex_home(&home),
             grok: grok_home(&home),
@@ -329,10 +356,12 @@ impl ProviderRoots {
             .parent()
             .map(|parent| parent.join("storage"))
             .unwrap_or_else(|| home.join(".local/share/opencode/storage"));
-        let (provider_roots, provider_default_roots) = crate::providers::resolve_roots(&home, false);
+        let (provider_roots, provider_default_roots, provider_root_errors) =
+            crate::providers::resolve_roots(&home, false);
         Self {
             provider_roots,
             provider_default_roots,
+            provider_root_errors,
             claude: home.join(".claude"),
             codex: home.join(".codex"),
             grok: home.join(".grok"),
@@ -365,6 +394,50 @@ pub fn home_dir() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_configuration_errors_survive_round_trip_without_inventing_roots() {
+        let mut roots = ProviderRoots::from_home(
+            "/tmp/frozen-roots".into(),
+            "/tmp/frozen-roots/opencode.db".into(),
+        );
+        roots
+            .provider_roots
+            .insert("test-fixture".into(), Vec::new());
+        roots.provider_root_errors.insert(
+            "test-fixture".into(),
+            "INVALID_PROFILE: invalid profile name".into(),
+        );
+        let frozen: ProviderRoots =
+            serde_json::from_value(serde_json::to_value(&roots).unwrap()).unwrap();
+        assert!(frozen.for_provider("test-fixture").is_empty());
+        assert_eq!(
+            frozen
+                .ensure_provider_roots("test-fixture")
+                .unwrap_err()
+                .to_string(),
+            "INVALID_PROFILE: invalid profile name"
+        );
+        assert!(frozen.ensure_provider_roots("pi").is_ok());
+        let missing = Path::new("/nonexistent-provider-evidence");
+        assert_eq!(
+            crate::providers::validate_provider_path("test-fixture", missing, &frozen)
+                .unwrap_err()
+                .to_string(),
+            "INVALID_PROFILE: invalid profile name"
+        );
+        let mut legacy = serde_json::to_value(ProviderRoots::from_home(
+            "/tmp/legacy".into(),
+            "/tmp/legacy/opencode.db".into(),
+        ))
+        .unwrap();
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("provider_root_errors");
+        let legacy: ProviderRoots = serde_json::from_value(legacy).unwrap();
+        assert!(legacy.ensure_provider_roots("test-fixture").is_ok());
+    }
 
     #[test]
     fn roots_serialized_before_devin_gain_the_default_under_their_home() {

@@ -1,0 +1,95 @@
+{
+  "package": "@oh-my-pi/pi-coding-agent@18.9.2",
+  "writerSha256": "6ea1265b55a945b5ea9c9031497252b839960c37237e1f8c7c7284ddc2df6135",
+  "reader": "SessionManager.open().getEntries() and loadSessionMessagesReadOnly()",
+  "renderedMessages": [
+    {
+      "role": "user",
+      "content": "Inspect the writer fixture."
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "text",
+          "text": "Reading the writer fixture."
+        },
+        {
+          "type": "toolCall",
+          "id": "writer-call-1",
+          "name": "read",
+          "arguments": {
+            "path": "fixture.txt"
+          }
+        }
+      ]
+    },
+    {
+      "role": "toolResult",
+      "content": [
+        {
+          "type": "text",
+          "text": "writer fixture bytes"
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": [
+        {
+          "type": "text",
+          "text": "The fixture remains readable after reopen."
+        }
+      ]
+    }
+  ],
+  "messages": [
+    {
+      "id": "00000001",
+      "parentId": null,
+      "role": "user",
+      "content": "Inspect the writer fixture."
+    },
+    {
+      "id": "00000002",
+      "parentId": "00000001",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "text",
+          "text": "Reading the writer fixture."
+        },
+        {
+          "type": "toolCall",
+          "id": "writer-call-1",
+          "name": "read",
+          "arguments": {
+            "path": "fixture.txt"
+          }
+        }
+      ]
+    },
+    {
+      "id": "00000003",
+      "parentId": "00000002",
+      "role": "toolResult",
+      "content": [
+        {
+          "type": "text",
+          "text": "writer fixture bytes"
+        }
+      ]
+    },
+    {
+      "id": "00000005",
+      "parentId": "00000004",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "text",
+          "text": "The fixture remains readable after reopen."
+        }
+      ]
+    }
+  ]
+}

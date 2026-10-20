@@ -4,7 +4,15 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Minor]
+
+### Added
+
+- Oh My Pi history is discoverable and searchable from its native title-slot session files, with recorded messages, tool calls and results, observed usage and control markers; shared Pi roots do not double-import these sessions.
+
+### Rust API
+
+- Added `Source::Omp` for filtering and reading persisted Oh My Pi session history.
 
 ## [0.47.0] - 2026-10-18
 
