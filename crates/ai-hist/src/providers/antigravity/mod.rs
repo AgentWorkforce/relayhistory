@@ -29,7 +29,7 @@ pub(crate) const METADATA: ProviderMetadata = ProviderMetadata {
     usage: None,
 };
 pub(crate) const ADAPTER: Option<ProviderAdapter> = Some(ProviderAdapter {
-    generation: "antigravity_transcript_v1",
+    generation: "antigravity_transcript_v2",
     acquire,
     sweep,
     resolve_roots: roots::resolve,

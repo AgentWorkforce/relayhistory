@@ -73,7 +73,7 @@
     },
     {
       "evidence": "Control and limits",
-      "coverage": "Every native step retained as a marker, including tool arguments/results, reasoning, opaque media and compact truncation. No tool-call joins, measured usage, model, cwd, parent relationships, native resume or live execution inferred. SDK-native fixtures establish parsing; actual App/CLI writer captures remain unverified."
+      "coverage": "Every native step retained as a marker, including tool arguments/results, reasoning, opaque media and compact truncation. No tool-call joins, measured usage, model, cwd, parent relationships, native resume or live execution inferred. SDK-native fixtures establish parsing; actual App/CLI writer captures remain unverified. New same-timestamp message suffixes behind truncated/nonterminal steps are deferred until complete; native step-index order is preserved without changing recorded timestamps."
     }
   ],
   "population": {

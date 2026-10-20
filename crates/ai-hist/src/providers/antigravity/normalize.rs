@@ -33,18 +33,23 @@ pub(super) fn write(conn: &Connection, payload: &Value) -> Result<usize> {
         .as_array()
         .context("Antigravity steps missing")?;
     let complete = payload["partial"] == false;
+    let OrderedSteps {
+        rows: ordered,
+        gaps,
+    } = ordered_steps(rows)?;
     let mut keys = Keys::default();
     let mut inserted = 0;
     let mut last_assistant = None;
     let mut first = i64::MAX;
     let mut last = i64::MIN;
     let mut preview = None;
-    for row in rows {
+    for (index, row) in ordered {
         crate::ingest::check_capture_cancelled()?;
         let ts = format::time(row)?;
         first = first.min(ts);
         last = last.max(ts);
-        let Some((role, text)) = step(conn, sid, row, &mut keys)? else {
+        let defer_new = gaps.get(&ts).is_some_and(|gap| index >= *gap);
+        let Some((role, text)) = step(conn, sid, row, &mut keys, defer_new)? else {
             continue;
         };
         if role == "user" {
@@ -97,16 +102,7 @@ pub(super) fn write(conn: &Connection, payload: &Value) -> Result<usize> {
             raw_path: Some(&path.to_string_lossy()),
         },
     )?;
-    if complete {
-        conn.execute("UPDATE sessions SET first_prompt=?3 WHERE source=?1 AND session_id=?2 AND first_prompt IS NOT ?3",rusqlite::params![ID,sid,preview])?;
-    } else if let Some(preview) = preview {
-        // A complete user step remains useful when another step is partial.
-        // Such a capture cannot replace a preview from complete evidence.
-        conn.execute(
-            "UPDATE sessions SET first_prompt=?3 WHERE source=?1 AND session_id=?2 AND first_prompt IS NULL",
-            rusqlite::params![ID, sid, preview],
-        )?;
-    }
+    write_preview(conn, sid, preview, complete)?;
     Ok(inserted)
 }
 
@@ -115,6 +111,7 @@ fn step<'a>(
     sid: &str,
     row: &'a Value,
     keys: &mut Keys,
+    defer_new: bool,
 ) -> Result<Option<(&'static str, &'a str)>> {
     let index = format::index(row)?;
     let ts = format::time(row)?;
@@ -133,6 +130,17 @@ fn step<'a>(
         },
     )?;
     keys.markers.insert(mid.clone());
+    // Shared reads/pages break equal timestamps by database insertion order.
+    // Do not insert a new suffix ahead of an omitted native step in that same
+    // timestamp group. Markers and previously complete messages stay readable.
+    let uid = format!("{mid}:0");
+    if defer_new && !conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM session_events WHERE source=?1 AND session_id=?2 AND event_uid=?3)",
+        [ID, sid, uid.as_str()], |r| r.get::<_, bool>(0),
+    )? { return Ok(None); }
+    if row["status"] != "DONE" && row["status"] != "ERROR" {
+        return Ok(None);
+    }
     // Compact truncation is explicitly lossy. Preserve its raw step, but
     // never overwrite a previously complete message with shortened text.
     if row["is_truncated"] == true
@@ -148,7 +156,6 @@ fn step<'a>(
     let Some(text) = format::text(row).filter(|s| !s.is_empty()) else {
         return Ok(None);
     };
-    let uid = format!("{mid}:0");
     insert_session_event(
         conn,
         &EventRow {
@@ -166,4 +173,61 @@ fn step<'a>(
     )?;
     keys.events.insert(uid);
     Ok(Some((role, text)))
+}
+
+fn omitted_message(row: &Value) -> bool {
+    let message = matches!(
+        (row["source"].as_str(), row["type"].as_str()),
+        (Some("USER_EXPLICIT"), Some("USER_INPUT")) | (Some("MODEL"), Some("PLANNER_RESPONSE"))
+    );
+    message
+        && (row["is_truncated"] == true
+            || row["truncated_fields"]
+                .as_array()
+                .is_some_and(|fields| !fields.is_empty())
+            || (row["status"] != "DONE" && row["status"] != "ERROR"))
+}
+
+struct OrderedSteps<'a> {
+    rows: Vec<(u64, &'a Value)>,
+    gaps: std::collections::BTreeMap<i64, u64>,
+}
+
+fn ordered_steps(rows: &[Value]) -> Result<OrderedSteps<'_>> {
+    let mut ordered = rows
+        .iter()
+        .map(|row| Ok((format::index(row)?, row)))
+        .collect::<Result<Vec<_>>>()?;
+    ordered.sort_by_key(|(index, _)| *index);
+    let mut gaps = std::collections::BTreeMap::<i64, u64>::new();
+    for (index, row) in &ordered {
+        if omitted_message(row) {
+            gaps.entry(format::time(row)?)
+                .and_modify(|first| *first = (*first).min(*index))
+                .or_insert(*index);
+        }
+    }
+    Ok(OrderedSteps {
+        rows: ordered,
+        gaps,
+    })
+}
+
+fn write_preview(
+    conn: &Connection,
+    sid: &str,
+    preview: Option<&str>,
+    complete: bool,
+) -> Result<()> {
+    if complete {
+        conn.execute("UPDATE sessions SET first_prompt=?3 WHERE source=?1 AND session_id=?2 AND first_prompt IS NOT ?3",rusqlite::params![ID,sid,preview])?;
+    } else if let Some(preview) = preview {
+        // A complete user step remains useful when another step is partial.
+        // Such a capture cannot replace a preview from complete evidence.
+        conn.execute(
+            "UPDATE sessions SET first_prompt=?3 WHERE source=?1 AND session_id=?2 AND first_prompt IS NULL",
+            rusqlite::params![ID, sid, preview],
+        )?;
+    }
+    Ok(())
 }
