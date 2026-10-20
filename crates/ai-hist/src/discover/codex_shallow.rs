@@ -29,7 +29,10 @@ impl CodexProvider {
             };
             state.names = Some(names);
         }
-        Ok(state.names.as_ref().and_then(|names| names.get(session_id).cloned()))
+        Ok(state
+            .names
+            .as_ref()
+            .and_then(|names| names.get(session_id).cloned()))
     }
 }
 
@@ -54,7 +57,28 @@ impl ShallowSessionProvider for CodexProvider {
         vec![
             WatchRoot::tree(roots.codex.join("sessions")),
             WatchRoot::tree(roots.codex.join("archived_sessions")),
+            WatchRoot::directory_of(roots.codex, WatchEntries::CodexStores),
         ]
+    }
+
+    fn fingerprint_inputs(&self, env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
+        let mut inputs = Vec::new();
+        for root in [
+            env.codex_home.join("sessions"),
+            env.codex_home.join("archived_sessions"),
+        ] {
+            inputs.extend(file_candidates(
+                "codex",
+                crate::collect_matching_files(&root, "rollout-", "jsonl")?,
+                crate::file_stamp_and_modified,
+            )?);
+        }
+        match crate::providers::codex::sqlite::fingerprint(&env.codex_home) {
+            Ok(sqlite) => inputs.extend(sqlite),
+            Err(error) if error.is::<crate::ingest::CaptureCancelled>() => return Err(error),
+            Err(error) => eprintln!("ai-hist: [codex] skipping SQLite history: {error:#}"),
+        }
+        Ok(inputs)
     }
 
     fn enumerate(
@@ -63,7 +87,9 @@ impl ShallowSessionProvider for CodexProvider {
         _requested_limit: Option<usize>,
     ) -> Result<Vec<Candidate>> {
         *self.thread_names.lock().expect("codex thread names lock") = CodexThreadNames {
-            index: Some(crate::ingest::codex_thread_names::session_index_path(&env.codex_home)),
+            index: Some(crate::ingest::codex_thread_names::session_index_path(
+                &env.codex_home,
+            )),
             names: None,
         };
         let mut files = Vec::new();
@@ -72,22 +98,21 @@ impl ShallowSessionProvider for CodexProvider {
             env.codex_home.join("sessions"),
             env.codex_home.join("archived_sessions"),
         ] {
-            match crate::ingest::path_scope::PathScope::walk_of(scope, &root) {
-                crate::ingest::path_scope::RootWalk::Skip => {}
-                crate::ingest::path_scope::RootWalk::Full => {
-                    files.extend(crate::collect_matching_files(&root, "rollout-", "jsonl")?);
-                }
-                crate::ingest::path_scope::RootWalk::Partial(scope) => {
-                    files.extend(crate::collect_matching_files_scoped(
-                        &root,
-                        "rollout-",
-                        "jsonl",
-                        Some(scope),
-                    )?);
-                }
-            }
+            files.extend(crate::ingest::codex_rollout_locators(&root, scope)?);
         }
-        file_candidates("codex", files, crate::file_stamp_and_modified)
+        let (sqlite, incomplete_rollouts) =
+            match crate::providers::codex::sqlite::enumerate(&env.codex_home, &env.provider_roots) {
+                Ok(found) => found,
+                Err(error) if error.is::<crate::ingest::CaptureCancelled>() => return Err(error),
+                Err(error) => {
+                    eprintln!("ai-hist: [codex] skipping SQLite history: {error:#}");
+                    (Vec::new(), Default::default())
+                }
+            };
+        files.retain(|path| !incomplete_rollouts.contains(path));
+        let mut candidates = file_candidates("codex", files, crate::file_stamp_and_modified)?;
+        candidates.extend(sqlite);
+        Ok(candidates)
     }
 
     fn read_shallow(
@@ -96,6 +121,9 @@ impl ShallowSessionProvider for CodexProvider {
         _catalog: Option<&Connection>,
         candidate: &Candidate,
     ) -> Result<Option<ShallowSession>> {
+        if crate::providers::codex::sqlite::parse_locator(&candidate.locator).is_some() {
+            return crate::providers::codex::sqlite::shallow(scan, candidate);
+        }
         let path = PathBuf::from(&candidate.locator);
         let bounded = read_bounded_jsonl(scan, &path)?;
         let Some(meta) = bounded.head_records().next().and_then(|line| {
@@ -141,6 +169,7 @@ impl ShallowSessionProvider for CodexProvider {
         let mut replay_gate = crate::codex::ForkReplayGate::new(
             crate::codex::fork_parent_id(payload, session_id),
             crate::codex::fork_origin_ms(payload, session_id, claude_timestamp(&meta)),
+            crate::codex::pages_history(payload),
         );
         replay_gate.probe_copied_history(
             bounded.head_records().skip(1).filter_map(parse_record),
@@ -182,7 +211,10 @@ impl ShallowSessionProvider for CodexProvider {
                 break;
             }
         }
-        let mtime = crate::file_modified_ms(&path);
+        // The locator of a compressed rollout names no file; its copy does.
+        let mtime = crate::ingest::transcript_file::stored_path(&path)
+            .ok()
+            .and_then(|stored| crate::file_modified_ms(&stored));
         Ok(Some(ShallowSession {
             source: "codex".into(),
             session_id: session_id.to_string(),

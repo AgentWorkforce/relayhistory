@@ -335,6 +335,22 @@ pub(crate) fn fork_parent_id(payload: Option<&Value>, session_id: &str) -> Optio
         })
 }
 
+/// Whether a rollout's opening `session_meta` declares paginated history
+/// (`history_mode: "paginated"`): the builds that write it (Codex 0.133
+/// through 0.148) are the only ones that copy a fork's history straight after
+/// the child's `session_meta`, without the parent's.
+///
+/// Every other fork either copies nothing (a `thread_spawn` subagent spawned
+/// without fork mode) or replays the parent's own `session_meta` first: codex-rs
+/// keeps `SessionMeta` items when it builds a fork's initial history
+/// (`keep_forked_rollout_item`, `codex-rs/core/src/agent/control/spawn.rs`).
+pub(crate) fn pages_history(payload: Option<&Value>) -> bool {
+    payload
+        .and_then(|p| p.get("history_mode"))
+        .and_then(Value::as_str)
+        == Some("paginated")
+}
+
 /// When a thread began, for ordering its turns against its fork: the UUIDv7
 /// thread id's timestamp, else `payload.timestamp`, else the `session_meta`
 /// record's own timestamp.
@@ -382,11 +398,17 @@ pub(crate) enum ReplayStep {
 ///   `payload.id` is the parent the opening record named ([`fork_parent_id`]).
 /// - **Directly after the child's `session_meta`** (Codex 0.133 through
 ///   0.148, which write `history_mode: "paginated"` and no copy of the
-///   parent's `session_meta`): the span opens at the record after the first
-///   one when [`CopiedHistoryProbe`] finds, before the child's first own turn,
-///   something only a copy can hold -- a turn ordered before the fork, a
-///   `token_count`, or a `compacted` record. The child makes no request and
-///   compacts nothing before its first turn.
+///   parent's `session_meta`): in a rollout whose opening `session_meta`
+///   declares paginated history ([`pages_history`]), the span opens at the
+///   record after the first one when [`CopiedHistoryProbe`] finds, before the
+///   child's first own turn, something only a copy can hold -- a turn ordered
+///   before the fork, a `token_count`, or a `compacted` record. The child
+///   makes no request and compacts nothing before its first turn. No other
+///   rollout is probed: a subagent spawned without fork mode copies nothing,
+///   and its turns can carry nothing that orders them (Codex 0.90--0.99
+///   write `turn_context` without a `turn_id` and persist no
+///   `task_started`), so a probe there would read the child's own
+///   `token_count` as the copy's.
 ///
 /// A span closes at the first `task_started` or `turn_context` that
 /// [`forked_turn_owner`] does not call a replay. A rollout without an explicit
@@ -417,6 +439,9 @@ pub(crate) enum ReplayStep {
 pub(crate) struct ForkReplayGate {
     parent: Option<String>,
     origin_ms: Option<i64>,
+    /// The opening `session_meta` declares paginated history
+    /// ([`pages_history`]): the only rollouts [`CopiedHistoryProbe`] runs on.
+    pages_history: bool,
     replaying: bool,
     /// The turn the last `task_started` inside the span opened, when that
     /// `task_started` was judged a replay (`Some(None)` for one without a
@@ -458,20 +483,22 @@ impl ReplayOpening {
 }
 
 impl ForkReplayGate {
-    pub(crate) fn new(parent: Option<String>, origin_ms: Option<i64>) -> Self {
+    pub(crate) fn new(parent: Option<String>, origin_ms: Option<i64>, pages_history: bool) -> Self {
         Self {
             // Without a fork origin no turn can be ordered, so the gate is
             // never armed rather than armed and immediately undecided.
             parent: parent.filter(|_| origin_ms.is_some()),
             origin_ms,
+            pages_history,
             ..Self::default()
         }
     }
 
     /// A probe for a copy that follows the child's `session_meta` directly,
-    /// or `None` when this rollout names no fork parent to gate.
+    /// or `None` when this rollout names no fork parent to gate or does not
+    /// declare paginated history.
     pub(crate) fn copied_history_probe(&self) -> Option<CopiedHistoryProbe> {
-        self.parent.as_ref()?;
+        self.parent.as_ref().filter(|_| self.pages_history)?;
         let mut gate = self.clone();
         gate.copied_history = true;
         Some(CopiedHistoryProbe {
@@ -707,6 +734,7 @@ mod tests {
         let mut gate = ForkReplayGate::new(
             fork_parent_id(Some(&json!({"forkedFromId": "parent"})), child),
             uuid_v7_ms(child),
+            false,
         );
         let rec = |kind: &str, payload: Value| json!({"type": kind, "payload": payload});
         assert_eq!(
@@ -748,7 +776,7 @@ mod tests {
         let child = "01a0c210-ec76-71c2-8585-47285eab37cc";
         let origin = uuid_v7_ms(child).unwrap();
         let second = origin / 1000;
-        let mut gate = ForkReplayGate::new(Some("parent".to_string()), Some(origin));
+        let mut gate = ForkReplayGate::new(Some("parent".to_string()), Some(origin), false);
         let rec = |kind: &str, payload: Value| json!({"type": kind, "payload": payload});
         assert_eq!(
             gate.step(false, &rec("session_meta", json!({"id": "parent"}))),
@@ -792,7 +820,7 @@ mod tests {
     /// Feed `records` (after the file's first) to a fresh probe and return
     /// the gate it arms.
     fn probed(parent: &str, child: &str, records: &[Value]) -> ForkReplayGate {
-        let mut gate = ForkReplayGate::new(Some(parent.to_string()), uuid_v7_ms(child));
+        let mut gate = ForkReplayGate::new(Some(parent.to_string()), uuid_v7_ms(child), true);
         let mut probe = gate.copied_history_probe().expect("a fork arms a probe");
         for record in records {
             if probe.observe(record) {
@@ -918,6 +946,53 @@ mod tests {
         assert_eq!(gate.opening(), ReplayOpening::ParentSessionMeta);
     }
 
+    /// A Codex 0.95 subagent spawned without fork mode copies nothing, and
+    /// its first own turn carries nothing that orders it: a `turn_context`
+    /// without a `turn_id`, and no `task_started`. Its rollout declares no
+    /// paginated history, so it is not probed and its own `token_count` is
+    /// not read as a copy's.
+    #[test]
+    fn a_fork_without_paginated_history_is_never_probed() {
+        let child = "01a0c210-ec76-71c2-8585-47285eab37cc";
+        let meta = json!({
+            "id": child,
+            "source": {"subagent": {"thread_spawn": {"parent_thread_id": "parent", "depth": 1}}},
+        });
+        let rec = |kind: &str, payload: Value| json!({"type": kind, "payload": payload});
+        let records = [
+            rec(
+                "turn_context",
+                json!({"cwd": "/tmp/project", "model": "gpt-5.2-codex"}),
+            ),
+            rec(
+                "event_msg",
+                json!({"type": "user_message", "message": "find why test_x fails"}),
+            ),
+            rec("event_msg", json!({"type": "token_count", "info": null})),
+        ];
+        assert!(!pages_history(Some(&meta)));
+        let mut gate = ForkReplayGate::new(
+            fork_parent_id(Some(&meta), child),
+            uuid_v7_ms(child),
+            pages_history(Some(&meta)),
+        );
+        assert!(gate.copied_history_probe().is_none());
+        gate.probe_copied_history(records.clone(), || true);
+        for record in &records {
+            assert_eq!(gate.step(false, record), ReplayStep::Outside, "{record}");
+        }
+        // The same records under paginated history are a copy.
+        let paginated = json!({"history_mode": "paginated"});
+        assert!(pages_history(Some(&paginated)));
+        let mut gate = ForkReplayGate::new(
+            Some("parent".to_string()),
+            uuid_v7_ms(child),
+            pages_history(Some(&paginated)),
+        );
+        gate.probe_copied_history(records.clone(), || true);
+        assert_eq!(gate.step(false, &records[0]), ReplayStep::Replay);
+    }
+
     #[test]
     fn a_probe_cut_short_proves_a_copy_only_by_a_uuid_v7_replayed_turn() {
         let child = "01a0c210-ec76-71c2-8585-47285eab37cc";
@@ -936,7 +1011,7 @@ mod tests {
             rec("event_msg", json!({"type": "token_count", "info": null})),
         ];
         assert!(!probed("parent", child, &legacy).copied_history);
-        assert!(ForkReplayGate::new(None, uuid_v7_ms(child))
+        assert!(ForkReplayGate::new(None, uuid_v7_ms(child), true)
             .copied_history_probe()
             .is_none());
     }
@@ -959,15 +1034,15 @@ mod tests {
                 json!({"type": "task_complete", "turn_id": "rollout-4"}),
             ),
         ];
-        let mut gate = ForkReplayGate::new(Some("parent".to_string()), uuid_v7_ms(child));
+        let mut gate = ForkReplayGate::new(Some("parent".to_string()), uuid_v7_ms(child), true);
         gate.probe_copied_history(copy.clone(), || true);
         assert_eq!(gate.step(false, &copy[0]), ReplayStep::Replay);
         // Cut short by the read window instead, it proves nothing.
-        let mut gate = ForkReplayGate::new(Some("parent".to_string()), uuid_v7_ms(child));
+        let mut gate = ForkReplayGate::new(Some("parent".to_string()), uuid_v7_ms(child), true);
         gate.probe_copied_history(copy.clone(), || false);
         assert_eq!(gate.step(false, &copy[0]), ReplayStep::Outside);
         // A file that ends on the child's spawn prompt holds no copy.
-        let mut gate = ForkReplayGate::new(Some("parent".to_string()), uuid_v7_ms(child));
+        let mut gate = ForkReplayGate::new(Some("parent".to_string()), uuid_v7_ms(child), true);
         let prompt = rec(
             "event_msg",
             json!({"type": "user_message", "message": "spawn"}),

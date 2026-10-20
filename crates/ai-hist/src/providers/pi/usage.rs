@@ -10,7 +10,7 @@ fn counter(v: &Value, key: &'static str) -> std::result::Result<Option<u64>, Usa
         })
         .transpose()
 }
-pub(super) fn normalize(v: &Value) -> std::result::Result<Option<NormalizedUsage>, UsageError> {
+pub(crate) fn normalize(v: &Value) -> std::result::Result<Option<NormalizedUsage>, UsageError> {
     if !v.is_object() {
         return Err(UsageError::NotAnObject);
     }

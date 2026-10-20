@@ -5,9 +5,11 @@ pub(crate) mod copilot;
 pub(crate) mod cursor;
 pub(crate) mod devin;
 pub(crate) mod grok;
+pub(crate) mod grok_bot;
 pub(crate) mod hermes;
 pub(crate) mod muse;
 pub(crate) mod omp;
+pub(crate) mod openclaw;
 pub(crate) mod opencode;
 pub(crate) mod pi;
 #[cfg(test)]

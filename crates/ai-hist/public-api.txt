@@ -183,9 +183,11 @@ pub ai_hist::Source::Copilot
 pub ai_hist::Source::Cursor
 pub ai_hist::Source::Devin
 pub ai_hist::Source::Grok
+pub ai_hist::Source::GrokBot
 pub ai_hist::Source::Hermes
 pub ai_hist::Source::Muse
 pub ai_hist::Source::Omp
+pub ai_hist::Source::OpenClaw
 pub ai_hist::Source::OpenCode
 pub ai_hist::Source::Pi
 impl ai_hist::Source
@@ -916,12 +918,14 @@ pub fn ai_hist::StoredRow::serialize<S: serde_core::ser::Serializer>(&self, S) -
 impl<'de> serde_core::de::Deserialize<'de> for ai_hist::StoredRow
 pub fn ai_hist::StoredRow::deserialize<D: serde_core::de::Deserializer<'de>>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
 #[non_exhaustive] pub struct ai_hist::SyncOptions
+pub ai_hist::SyncOptions::codex_sqlite_max_age_days: core::option::Option<u64>
 pub ai_hist::SyncOptions::force: bool
 pub ai_hist::SyncOptions::lock_timeout_ms: u64
 pub ai_hist::SyncOptions::progress: core::option::Option<ai_hist::ProgressObserver>
 pub ai_hist::SyncOptions::sources: core::option::Option<alloc::vec::Vec<ai_hist::Source>>
 pub ai_hist::SyncOptions::stop: core::option::Option<ai_hist::StopToken>
 impl ai_hist::SyncOptions
+pub fn ai_hist::SyncOptions::codex_sqlite_max_age_days(self, u64) -> Self
 pub fn ai_hist::SyncOptions::force(self, bool) -> Self
 pub fn ai_hist::SyncOptions::lock_timeout_ms(self, u64) -> Self
 pub fn ai_hist::SyncOptions::progress(self, ai_hist::ProgressObserver) -> Self

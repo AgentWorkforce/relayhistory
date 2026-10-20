@@ -9,10 +9,12 @@ use serde::{Deserialize, Serialize};
 use std::fs::OpenOptions;
 use std::time::Instant;
 
+mod codex_selected;
 mod probe;
 mod snapshot;
 mod unified_diff;
 
+pub(crate) use codex_selected::ingest_selected_codex;
 pub(crate) use probe::HydrationProbe;
 use snapshot::source_snapshot;
 use unified_diff::split_unified_diff;
@@ -153,7 +155,11 @@ pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 3;
 /// images, including checkpoints written by generation 17's fork replay fix.
 /// Version 19: capture native Codex CommandExecution command/output pairs so
 /// PR evidence in existing sessions reaches History after a re-upload.
-pub(crate) const HYDRATION_PARSER_VERSION: i64 = 19;
+/// Version 20: a checkpoint at 19 re-parses once, so an embedder that only
+/// hydrates restores the Codex forks and subagents without paginated history
+/// that generation 17's probe read whole as copied parent history, which
+/// sync's `codex_fork_replay_gate` generation 3 restores.
+pub(crate) const HYDRATION_PARSER_VERSION: i64 = 20;
 
 #[derive(Debug, Clone)]
 pub struct HydrateSessionOptions {
@@ -421,7 +427,7 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
         connector_id: options.source.clone(),
         connector_instance: "default".into(),
     };
-    let local_observation = observe_local_target(&conn, options, &mut target, &local_key)?;
+    let local_observation = observe_local_target(&conn, options, roots, &mut target, &local_key)?;
     // Before the stamp short-circuit: see `read_grok_unified_log_for_hydration`.
     let log_diagnostics = read_grok_unified_log_for_hydration(&conn, options, &roots.grok)?;
     let mut snapshot = source_snapshot(&conn, options, &target, roots, claude_snapshot)?;
@@ -522,6 +528,36 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
         source_diagnostics,
         snapshot.codex_relationship_complete,
     )
+}
+
+fn prefer_restored_codex_rollout(
+    options: &HydrateSessionOptions,
+    roots: &crate::ProviderRoots,
+    target: &mut CatalogTarget,
+    observation: &mut Option<SessionObservation>,
+) -> Result<()> {
+    if options.source != "codex" {
+        return Ok(());
+    }
+    codex_selected::refresh_catalog_codex_locator(options, roots, target, observation)?;
+    let Some((state, id)) = target
+        .locator
+        .as_deref()
+        .and_then(crate::providers::codex::sqlite::parse_locator)
+    else {
+        return Ok(());
+    };
+    anyhow::ensure!(
+        id == options.session_id,
+        "SESSION_SOURCE_MISMATCH: Codex SQLite thread identity changed"
+    );
+    if let Some(rollout) = crate::providers::codex::sqlite::restored_rollout(roots, &state, id)? {
+        target.locator = Some(rollout.to_string_lossy().into_owned());
+        if let Some(observation) = observation.as_mut() {
+            observation.raw_locator = target.locator.clone();
+        }
+    }
+    Ok(())
 }
 
 /// Refuse a cancelled or invalid request, and a remote one whose connector is
@@ -708,13 +744,17 @@ fn commit_local_pass(
 
 /// The builtin local adapter's observation of the session, which locates the
 /// target; without one, no other configured local adapter may have seen it.
+/// One read answers both, so a concurrent first hydration's builtin
+/// observation is never missed and then counted as another adapter's.
 fn observe_local_target(
     conn: &Connection,
     options: &HydrateSessionOptions,
+    roots: &crate::ProviderRoots,
     target: &mut CatalogTarget,
     local_key: &ObservationKey,
 ) -> Result<Option<SessionObservation>> {
-    let local_observation = observations::get(conn, local_key)?;
+    let observed = observations::list(conn, &options.source, &options.session_id)?;
+    let mut local_observation = observed.iter().find(|seen| &seen.key == local_key).cloned();
     if let Some(observation) = &local_observation {
         // OpenCode and Devin enumerate by session id, while their local
         // parsers need the separately recorded provider database path from
@@ -725,15 +765,14 @@ fn observe_local_target(
         target.discovery_state = Some(observation.discovery_state.clone());
     } else {
         anyhow::ensure!(
-            !observations::list(conn, &options.source, &options.session_id)?
-                .iter()
-                .any(
-                    |observation| observation.key.location == SessionLocation::Local
-                        && observation.key.connector_id != "legacy-unknown"
-                ),
+            !observed.iter().any(
+                |observation| observation.key.location == SessionLocation::Local
+                    && observation.key.connector_id != "legacy-unknown"
+            ),
             "CONNECTOR_NOT_CONFIGURED: the builtin local adapter has not observed this session"
         );
     }
+    prefer_restored_codex_rollout(options, roots, target, &mut local_observation)?;
     Ok(local_observation)
 }
 
@@ -1787,6 +1826,12 @@ fn unchanged_cursor_check(
     options: &HydrateSessionOptions,
     snapshot: &SourceSnapshot,
 ) -> Result<UnchangedCursorCheck> {
+    if snapshot.provider_session.is_some() {
+        return Ok(UnchangedCursorCheck {
+            valid: true,
+            bytes_read: 0,
+        });
+    }
     if !matches!(options.source.as_str(), "claude" | "codex") {
         return Ok(UnchangedCursorCheck {
             valid: true,
@@ -2317,12 +2362,6 @@ pub(crate) fn ingest_selected_claude(ctx: SelectedIngest<'_>) -> Result<Selected
         ctx.parser_upgrade,
     )
     .map(|outcome| (outcome, Vec::new(), None))
-}
-
-pub(crate) fn ingest_selected_codex(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
-    let path = ctx.file();
-    ingest_codex(ctx.conn, ctx.options, path, ctx.cursor, ctx.parser_upgrade)
-        .map(|outcome| (outcome, Vec::new(), None))
 }
 
 pub(crate) fn ingest_selected_cursor(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
@@ -3084,60 +3123,6 @@ fn claude_subagent_meta(transcript: &Path) -> Option<Value> {
     serde_json::from_str(&fs::read_to_string(path).ok()?).ok()
 }
 
-fn ingest_codex(
-    conn: &Connection,
-    options: &HydrateSessionOptions,
-    path: &Path,
-    cursor: &mut TranscriptCursorState,
-    parser_upgrade: bool,
-) -> Result<IngestOutcome> {
-    let (meta, meta_bytes) = read_codex_session_meta_counted(path)?;
-    let meta = meta.ok_or_else(|| {
-        hydration_error(
-            "SESSION_SOURCE_MISMATCH",
-            "Codex rollout has no session metadata",
-        )
-    })?;
-    if meta.session_id != options.session_id || meta.is_subagent {
-        return Err(hydration_error(
-            "SESSION_SOURCE_MISMATCH",
-            "Codex rollout identity does not match the selected root session",
-        ));
-    }
-    let mut indexed = IngestOutcome {
-        bytes_read: meta_bytes as i64,
-        ..Default::default()
-    };
-    let (outcome, pass) = ingest_codex_rollout_incremental(conn, path, &meta, cursor)?;
-    indexed.absorb(pass);
-    if let Some(first) = outcome.first_ts {
-        upsert_session(
-            conn,
-            &SessionCatalogRow {
-                session_id: &meta.session_id,
-                source: "codex",
-                cwd: Some(&meta.cwd),
-                git_branch: meta.git_branch.as_deref(),
-                first_ts: first,
-                last_ts: outcome.last_ts.unwrap_or(first),
-                last_assistant_text: outcome.last_assistant_text.as_deref(),
-                raw_path: Some(&path.to_string_lossy()),
-            },
-        )?;
-    }
-    if options.include_related {
-        // Codex records continuity only when a producer writes explicit
-        // fields on `session_meta`; a plain `codex resume` leaves no signal.
-        indexed.bytes_read += crate::continuity::capture_codex_rollout(conn, path)? as i64;
-        // Each child's own continuity is captured with it (a spawned
-        // subagent's `thread_spawn` parent is a fork edge that lives only in
-        // the child's `session_meta`), so reconcile once they are all banked.
-        indexed.absorb_outcome(ingest_codex_children(conn, options, path, parser_upgrade)?);
-        crate::continuity::reconcile(conn, "codex")?;
-    }
-    Ok(indexed)
-}
-
 /// Rollout files that could hold a child of a session started in `directory`.
 ///
 /// Codex partitions rollouts by the date a session started, so a child spawned
@@ -3152,16 +3137,12 @@ fn ingest_codex(
 /// from claiming complete relationship coverage.
 fn codex_child_candidates(directory: &Path) -> Result<Vec<PathBuf>> {
     let Some((from, through)) = codex_child_scan_dates(directory) else {
-        return collect_matching_files(directory, "rollout-", "jsonl");
+        return codex_rollout_locators(directory, None);
     };
     let mut candidates = Vec::new();
     for root in codex_rollout_roots(directory) {
         for date in [&from, &through] {
-            candidates.extend(collect_matching_files(
-                &root.join(date),
-                "rollout-",
-                "jsonl",
-            )?);
+            candidates.extend(codex_rollout_locators(&root.join(date), None)?);
         }
     }
     candidates.sort();
@@ -3391,7 +3372,7 @@ fn recorded_codex_child_rollouts(
     Ok(locators
         .into_iter()
         .map(PathBuf::from)
-        .filter(|path| path.is_file())
+        .filter(|path| crate::ingest::transcript_file::exists(path))
         .collect())
 }
 
@@ -3956,7 +3937,7 @@ fn build_local_result(
     if options.source == "codex" && options.include_related && !codex_relationship_complete {
         diagnostics.push(HydrationDiagnostic {
             code: "HYDRATION_BOUNDED_RELATIONSHIPS".to_string(),
-            message: "Codex child search examined the session's date and the next date; newer rollout dates exist, so relationship coverage is incomplete".to_string(),
+            message: "Codex related thread search or acquisition was incomplete".to_string(),
             duration_ms: None,
             source_bytes: None,
             records_parsed: None,
@@ -4812,6 +4793,232 @@ mod tests {
             ],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn selected_sqlite_hydration_loads_children_and_follows_a_restored_rollout() {
+        let home = tempfile::tempdir().unwrap();
+        let codex = home.path().join(".codex");
+        fs::create_dir_all(&codex).unwrap();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex/sqlite");
+        for (script, database) in [
+            ("subagent-edge-state.sql", "state_5.sqlite"),
+            ("subagent-edge-history.sql", "thread_history_1.sqlite"),
+        ] {
+            let sql = fs::read_to_string(fixtures.join(script))
+                .unwrap()
+                .replace("{{CODEX_HOME}}", &codex.to_string_lossy());
+            Connection::open(codex.join(database))
+                .unwrap()
+                .execute_batch(&sql)
+                .unwrap();
+        }
+        let guardian_rollout = codex.join("sessions/2026/04/20/rollout-guardian.jsonl");
+        fs::create_dir_all(guardian_rollout.parent().unwrap()).unwrap();
+        let guardian_lines = [
+            json!({"timestamp":"2026-04-20T00:00:00Z","type":"session_meta","payload":{"id":"guardian","cwd":"/work/app","thread_source":"guardian_review"}}),
+            json!({"timestamp":"2026-04-20T00:00:01Z","type":"event_msg","payload":{"type":"agent_message","message":"Guardian review"}}),
+        ];
+        fs::write(
+            &guardian_rollout,
+            guardian_lines
+                .iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n")
+                + "\n",
+        )
+        .unwrap();
+        let state = Connection::open(codex.join("state_5.sqlite")).unwrap();
+        state.execute(
+            "INSERT INTO threads (id,rollout_path,created_at_ms,updated_at_ms,source,archived,history_mode) VALUES ('guardian',?1,1776643200000,1776643300000,'cli',0,'legacy')",
+            [guardian_rollout.to_string_lossy().as_ref()],
+        ).unwrap();
+        state
+            .execute(
+                "INSERT INTO thread_spawn_edges VALUES ('sqlite-parent','guardian','completed')",
+                [],
+            )
+            .unwrap();
+        let db = home.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        let locator = crate::providers::codex::sqlite::locator(
+            &codex.join("state_5.sqlite"),
+            "sqlite-parent",
+        );
+        catalog_row(&conn, "codex", "sqlite-parent", Some(Path::new(&locator)));
+        let guardian_before: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM sessions WHERE source='codex' AND session_id='guardian'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(guardian_before, 0, "guardian has not been discovered yet");
+        drop(conn);
+
+        let mut request = options("codex", "sqlite-parent");
+        request.include_related = false;
+        hydrate_session_at_with_home(&db, &request, home.path()).unwrap();
+        let child_events = || -> i64 {
+            open_db(&db).unwrap().query_row(
+                "SELECT count(*) FROM session_events WHERE source='codex' AND session_id='sqlite-child'",
+                [], |row| row.get(0),
+            ).unwrap()
+        };
+        assert_eq!(child_events(), 0);
+        let related: i64 = open_db(&db).unwrap().query_row(
+            "SELECT count(*) FROM session_relationships WHERE source='codex' AND parent_session_id='sqlite-parent'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(related, 0);
+
+        request.include_related = true;
+        let full = hydrate_session_at_with_home(&db, &request, home.path()).unwrap();
+        assert!(full
+            .related_session_ids
+            .contains(&"sqlite-child".to_string()));
+        assert!(full.related_session_ids.contains(&"guardian".to_string()));
+        assert!(child_events() > 0);
+        // The spawn edge and the child's thread_source share one linked-child
+        // row; the later observation may supply its evidence_kind.
+        let sqlite_child_link_has_events: bool = open_db(&db)
+            .unwrap()
+            .query_row(
+                "SELECT child_has_events FROM session_relationships WHERE source='codex' AND parent_session_id='sqlite-parent' AND child_session_id='sqlite-child' AND relationship_uid='child:sqlite-child'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(sqlite_child_link_has_events);
+        let guardian_events: i64 = open_db(&db).unwrap().query_row(
+            "SELECT count(*) FROM session_events WHERE source='codex' AND session_id='guardian'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(
+            guardian_events > 0,
+            "the linked guardian rollout is acquired"
+        );
+        let guardian_catalog: i64 = open_db(&db)
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM sessions WHERE source='codex' AND session_id='guardian'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(guardian_catalog, 1, "guardian remains a catalog root");
+        let guardian_link_has_events: bool = open_db(&db)
+            .unwrap()
+            .query_row(
+                "SELECT child_has_events FROM session_relationships WHERE source='codex' AND parent_session_id='sqlite-parent' AND child_session_id='guardian' AND evidence_kind='codex_thread_spawn_edge'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            guardian_link_has_events,
+            "the guardian edge has child evidence"
+        );
+        let root_event_id: i64 = open_db(&db).unwrap().query_row(
+            "SELECT id FROM session_events WHERE source='codex' AND session_id='sqlite-parent' ORDER BY id LIMIT 1",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(
+            hydrate_session_at_with_home(&db, &request, home.path())
+                .unwrap()
+                .status,
+            "unchanged"
+        );
+
+        let history = Connection::open(codex.join("thread_history_1.sqlite")).unwrap();
+        history.execute(
+            "INSERT INTO thread_items VALUES ('sqlite-child','turn-2','child-new',21,1776643221000,'agentMessage',?1)",
+            [json!({"type":"agentMessage","id":"child-new","text":"New child answer"}).to_string()],
+        ).unwrap();
+        let updated = hydrate_session_at_with_home(&db, &request, home.path()).unwrap();
+        assert_eq!(updated.status, "updated");
+        assert!(child_events() > 1);
+        let retained_event_id: i64 = open_db(&db).unwrap().query_row(
+            "SELECT id FROM session_events WHERE source='codex' AND session_id='sqlite-parent' ORDER BY id LIMIT 1",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(retained_event_id, root_event_id);
+
+        request.include_related = false;
+        Connection::open(codex.join("state_5.sqlite"))
+            .unwrap()
+            .execute(
+                "UPDATE threads SET model='gpt-synthetic-updated' WHERE id='sqlite-parent'",
+                [],
+            )
+            .unwrap();
+        hydrate_session_at_with_home(&db, &request, home.path()).unwrap();
+        let retained_links: i64 = open_db(&db)
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM session_relationships WHERE source='codex' AND parent_session_id='sqlite-parent'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            retained_links > 0,
+            "parent-only hydration retains existing child links"
+        );
+        request.include_related = true;
+        let related_again = hydrate_session_at_with_home(&db, &request, home.path()).unwrap();
+        assert!(related_again
+            .related_session_ids
+            .contains(&"sqlite-child".to_string()));
+
+        let rollout = codex.join("sessions/2026/04/20/rollout-sqlite-parent.jsonl");
+        fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+        let lines = [
+            json!({"timestamp":"2026-04-20T00:00:00Z","type":"session_meta","payload":{"id":"sqlite-parent","cwd":"/work/app"}}),
+            json!({"timestamp":"2026-04-20T00:00:01Z","type":"event_msg","payload":{"type":"user_message","message":"Restored prompt"}}),
+        ];
+        let text = lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        fs::write(&rollout, &text).unwrap();
+        Connection::open(codex.join("state_5.sqlite"))
+            .unwrap()
+            .execute(
+                "UPDATE threads SET rollout_path=?1 WHERE id='sqlite-parent'",
+                [rollout.to_string_lossy().as_ref()],
+            )
+            .unwrap();
+        history.execute(
+            "UPDATE thread_history_projection_state SET next_rollout_byte_offset=?1 WHERE thread_id='sqlite-parent'",
+            [text.len() as i64],
+        ).unwrap();
+        let restored = hydrate_session_at_with_home(&db, &request, home.path()).unwrap();
+        assert_eq!(restored.status, "updated");
+        let observation: String = open_db(&db).unwrap().query_row(
+            "SELECT raw_locator FROM session_presences WHERE source='codex' AND session_id='sqlite-parent' AND location='local'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(observation, rollout.to_string_lossy());
+        fs::remove_file(&rollout).unwrap();
+        let recovered = hydrate_session_at_with_home(&db, &request, home.path()).unwrap();
+        assert_eq!(recovered.status, "updated");
+        let observation: String = open_db(&db).unwrap().query_row(
+            "SELECT raw_locator FROM session_presences WHERE source='codex' AND session_id='sqlite-parent' AND location='local'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(observation, locator);
+        let recovered_events: i64 = open_db(&db).unwrap().query_row(
+            "SELECT count(*) FROM session_events WHERE source='codex' AND session_id='sqlite-parent' AND message_id='sqlite-sqlite-parent-1'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(
+            recovered_events > 0,
+            "pruned rollout recovers SQLite evidence"
+        );
     }
 
     /// `<claude root>/transcripts/` is not a Claude root (#208, see the claude
@@ -12945,6 +13152,91 @@ mod tests {
             )
             .unwrap();
         assert_eq!(counts, (1, 1));
+    }
+
+    /// A concurrent first hydration commits the builtin local observation
+    /// while this one is still deciding whether the session is observed. Every
+    /// interleaving must read either no local observation or the builtin one:
+    /// taking the builtin row for another local adapter's refuses a session
+    /// the builtin adapter did observe.
+    #[test]
+    fn builtin_observation_committed_mid_lookup_is_never_a_foreign_adapter() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(
+            &conn,
+            "claude",
+            "racing",
+            Some(Path::new("/work/racing.jsonl")),
+        );
+        let options = options("claude", "racing");
+        let roots = crate::ProviderRoots::from_home(
+            dir.path().to_path_buf(),
+            dir.path().join("opencode.db"),
+        );
+        let key = ObservationKey {
+            source: "claude".into(),
+            session_id: "racing".into(),
+            location: SessionLocation::Local,
+            connector_id: "claude".into(),
+            connector_instance: "default".into(),
+        };
+        let observation = fresh_local_observation(
+            &conn,
+            key.clone(),
+            &catalog_target(&conn, &options).unwrap(),
+            &options,
+        );
+
+        // What the lookup costs against a session nothing has observed.
+        let ticks = std::sync::Arc::new(AtomicU64::new(0));
+        let tick = std::sync::Arc::clone(&ticks);
+        let mut target = catalog_target(&conn, &options).unwrap();
+        conn.progress_handler(
+            1,
+            Some(move || {
+                tick.fetch_add(1, Ordering::SeqCst);
+                false
+            }),
+        );
+        let unobserved = observe_local_target(&conn, &options, &roots, &mut target, &key).unwrap();
+        conn.progress_handler(0, None::<fn() -> bool>);
+        assert!(unobserved.is_none());
+        let total = ticks.load(Ordering::SeqCst);
+        assert!(total > 0, "the lookup must cost some ticks");
+
+        // Commit the builtin observation from a second connection at every
+        // tick of the lookup in turn.
+        for at in 0..total {
+            conn.execute(
+                "DELETE FROM session_observations WHERE source='claude' AND session_id='racing'",
+                [],
+            )
+            .unwrap();
+            let mut target = catalog_target(&conn, &options).unwrap();
+            let writer_path = db.clone();
+            let observation = observation.clone();
+            let tick = AtomicU64::new(0);
+            conn.progress_handler(
+                1,
+                Some(move || {
+                    if tick.fetch_add(1, Ordering::SeqCst) == at {
+                        let writer = open_db(&writer_path).unwrap();
+                        observations::upsert(&writer, &observation).unwrap();
+                    }
+                    false
+                }),
+            );
+            let observed = observe_local_target(&conn, &options, &roots, &mut target, &key);
+            conn.progress_handler(0, None::<fn() -> bool>);
+            let observed = observed.unwrap_or_else(|error| panic!("tick {at}/{total}: {error:#}"));
+            assert!(
+                observed.is_none_or(|observed| observed.key == key),
+                "tick {at}/{total}"
+            );
+        }
     }
 
     fn remote_catalog_row(conn: &Connection, source: &str, session_id: &str) {

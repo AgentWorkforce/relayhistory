@@ -11,6 +11,8 @@ pub(crate) const LOCAL_SOURCES: &[LocalSource] = &[
     crate::providers::hermes::LOCAL_SOURCE,
     crate::providers::omp::LOCAL_SOURCE,
     crate::providers::copilot::LOCAL_SOURCE,
+    crate::providers::grok_bot::LOCAL_SOURCE,
+    crate::providers::openclaw::LOCAL_SOURCE,
     #[cfg(test)]
     crate::providers::test_fixture::LOCAL_SOURCE,
 ];

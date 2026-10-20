@@ -30,6 +30,7 @@ pub(crate) mod cold_read;
 pub(crate) mod control;
 pub(crate) mod cursor;
 pub(crate) mod devin;
+mod event_insert;
 mod evidence_probe;
 pub(crate) mod evidence_reconcile;
 mod evidence_upserts;
@@ -38,6 +39,7 @@ mod grok_unified;
 pub(crate) mod hook;
 pub(crate) mod hydrate;
 mod images;
+pub(crate) use images::image_markdown;
 pub(crate) mod incremental;
 pub(crate) mod jsonl;
 pub(crate) mod muse;
@@ -49,7 +51,9 @@ mod sweep_write;
 pub(crate) mod titles;
 pub(crate) mod tool_result_facts;
 pub(crate) mod transcript_cursor;
+pub(crate) mod transcript_file;
 
+use event_insert::insert_session_event;
 pub(crate) use evidence_probe::note_deleted;
 use evidence_probe::{
     claude_sidecar_evidence_exists, claude_transcript_events_exist, codex_session_evidence_exists,
@@ -150,8 +154,8 @@ pub(crate) mod scoped_files;
 #[cfg(test)]
 pub(crate) use scoped_files::take_dirs_read;
 pub(crate) use scoped_files::{
-    collect_matching_files, collect_matching_files_scoped, collect_muse_transcripts,
-    collect_muse_transcripts_scoped, grok_transcripts_for,
+    codex_rollout_locators, collect_matching_files, collect_matching_files_scoped,
+    collect_muse_transcripts, collect_muse_transcripts_scoped, grok_transcripts_for,
 };
 use sweep_phases::SweepPhases;
 pub(crate) use sweep_phases::SweepScope;
@@ -318,7 +322,7 @@ pub(crate) fn with_capture_observer<T>(
     run()
 }
 
-fn capture_progress(source: &str, processed_files: usize, total_files: Option<usize>) {
+pub(crate) fn capture_progress(source: &str, processed_files: usize, total_files: Option<usize>) {
     CAPTURE_OBSERVER.with(|slot| {
         let observer = slot.borrow().clone();
         if let Some(observer) = observer {
@@ -883,7 +887,7 @@ const OPENCODE_NORMALIZER_GENERATION: &str = "opencode_normalizer_v2";
 /// The one-time backfill generations are part of it for the same reason as
 /// the keys above: each is recorded in sync state and re-reads unchanged
 /// sources when it moves, which it can only do if the sweep runs.
-use crate::providers::sweep_generation;
+use crate::providers::{qualify_source_fingerprint, sweep_generation};
 
 /// Version tag of the destination marker's encoding, so a marker written by a
 /// build with a different shape is rejected rather than misread.
@@ -2094,7 +2098,7 @@ fn sweep_fingerprint(
         .collect::<Vec<_>>();
     let inputs = sweep_only_fingerprint_inputs(roots);
     match discover::source_fingerprint_with(&env, &providers, &inputs) {
-        Ok(sources) => Some(format!("{}/{sources}", sweep_generation())),
+        Ok(sources) => qualify_source_fingerprint(sources),
         Err(error) => {
             sync_note!("  [sync] source fingerprint unavailable: {error:#}");
             None
@@ -3237,7 +3241,10 @@ const CODEX_RAW_MESSAGE_FACTS_KEY: &str = "codex_raw_message_facts";
 ///
 /// Generation 2 gates the copy Codex 0.133--0.148 write straight after the
 /// child's `session_meta`, without the parent's (`codex::CopiedHistoryProbe`).
-const CODEX_FORK_REPLAY_GENERATION: i64 = 2;
+/// Generation 3 runs that probe only on rollouts that declare paginated
+/// history (`codex::pages_history`), restoring the forks and subagents of
+/// other builds whose own turns generation 2 retired as a copy.
+const CODEX_FORK_REPLAY_GENERATION: i64 = 3;
 const CODEX_FORK_REPLAY_KEY: &str = "codex_fork_replay_gate";
 
 /// One-time re-read of the Claude transcripts whose delegation evidence an
@@ -3381,7 +3388,7 @@ const FORGOTTEN_PATHS_KEY: &str = "forgotten_paths";
 /// holds the pass open for one more sync, then it is no longer a path the
 /// state knows about and the generation is recorded normally, instead of the
 /// pass staying pending for the life of the install.
-fn forget_unobserved_paths(
+pub(crate) fn forget_unobserved_paths(
     state: &mut Map<String, Value>,
     stamps: &mut Map<String, Value>,
     stamp_map_key: &str,
@@ -4111,7 +4118,7 @@ fn metadata_identity(_metadata: &fs::Metadata) -> (Option<u64>, Option<u64>) {
 
 struct CompleteJsonlReader {
     path: PathBuf,
-    reader: BufReader<fs::File>,
+    reader: BufReader<transcript_file::TranscriptFile>,
     cursor: FileCursor,
     position: u64,
     prefix_hasher: Sha256,
@@ -4610,7 +4617,7 @@ fn cleanup_subagent_registration(conn: &Connection, source: &str, session_id: &s
          WHERE source = ?1 AND child_session_id = ?2 AND parent_session_id <> ?2",
         params![source, session_id],
     )?;
-    conn.execute(
+    let sessions = conn.execute(
         "DELETE FROM sessions \
          WHERE source = ? AND session_id = ? \
            AND NOT EXISTS (\
@@ -4623,8 +4630,10 @@ fn cleanup_subagent_registration(conn: &Connection, source: &str, session_id: &s
         "INSERT OR IGNORE INTO session_relationships SELECT * FROM retained_relationships; \
          DELETE FROM retained_relationships;",
     )?;
-    // The session delete drops the relationships and markers the probes join.
-    evidence_probe::note_evidence_changed(conn);
+    // Only the session delete drops evidence the probes join; a presence is
+    // not. Releasing on every changed delegated-thread rollout re-read every
+    // evidence key once per thread.
+    evidence_probe::note_deleted(conn, "sessions", sessions);
     Ok(())
 }
 
@@ -5304,10 +5313,10 @@ fn codex_session_events_exist(conn: &Connection, session_id: &str) -> Result<boo
 }
 
 pub(crate) struct CodexSessionMeta {
-    session_id: String,
+    pub(crate) session_id: String,
     cwd: String,
     git_branch: Option<String>,
-    is_subagent: bool,
+    pub(crate) is_subagent: bool,
     /// The parent this thread was delegated by, from whichever field the
     /// provider recorded it in.
     parent_session_id: Option<String>,
@@ -5329,6 +5338,8 @@ pub(crate) struct CodexSessionMeta {
     /// UUIDv7 thread id's timestamp, else `payload.timestamp`, else the
     /// record's own timestamp.
     fork_origin_ms: Option<i64>,
+    /// `history_mode: "paginated"` (`codex::pages_history`).
+    fork_pages_history: bool,
 }
 
 /// Resolve the parent identity from every Codex session-meta shape observed in
@@ -5854,13 +5865,16 @@ fn repair_codex_rollout_user_messages(
             [meta.session_id.as_str()],
         )?;
     }
-    let outcome = ingest_codex_rollout(conn, path, meta)?;
+    // A read from byte zero like any other: the cursor it ends on is stored,
+    // so the rollout's next change resumes rather than re-reading it.
+    let outcome = ingest_codex_rollout_at_locator(conn, path, meta, false)?;
     if let Some(tx) = tx {
         tx.commit()?;
     }
     Ok(outcome)
 }
 
+#[cfg(test)]
 pub(crate) fn ingest_codex_rollout(
     conn: &Connection,
     path: &Path,
@@ -5899,24 +5913,11 @@ fn ingest_codex_rollout_at_locator(
     } else {
         transcript_cursor::TranscriptCursorState::default()
     };
-    // The reader's own validation hashes a bounded window at each end of the
-    // committed prefix (see `transcript_cursor`), so an in-place edit strictly
-    // between those windows that keeps the file's length would pass it. A
-    // changed stamp alone does not prove an append, so resume only when the
-    // file also grew past the size it had when the cursor was written: an
-    // append-only writer always grows it, an in-place edit that keeps the
-    // length never does. Anything else re-reads from byte zero.
-    //
-    // What is still assumed: an in-place edit inside that gap *and* an append
-    // in the same interval between two passes. Codex appends to its rollouts
-    // and never rewrites them, which is the same trade the Claude walk's
-    // cursor already makes.
+    // A changed stamp alone does not prove an append; see
+    // `TranscriptFileCursor::only_appended_to`. Anything else re-reads from
+    // byte zero.
     if let Some(file) = cursor.file.as_ref() {
-        let grew = path
-            .metadata()
-            .map(|now| now.len() > file.size)
-            .unwrap_or(false);
-        if !grew {
+        if !transcript_file::metadata(path).is_ok_and(|now| file.only_appended_to(&now)) {
             cursor = transcript_cursor::TranscriptCursorState::default();
         }
     }
@@ -5952,20 +5953,12 @@ fn ingest_codex_rollout_incremental(
     let cwd = Some(meta.cwd.as_str());
     let branch = meta.git_branch.as_deref();
     let mut outcome = CodexIngestOutcome::default();
-    // A position an older parser committed sits past records whose state
-    // markers it never wrote: read the rollout again from byte zero.
-    if cursor
-        .codex
-        .as_ref()
-        .is_some_and(|codex| codex.state_markers < CODEX_STATE_MARKER_GENERATION)
-    {
-        *cursor = transcript_cursor::TranscriptCursorState::default();
-    }
+    cursor.restart_unresumable_codex(meta.fork_parent_id.is_some());
     // Codex keeps its existing rule for a trailing line with no newline: it
     // is the half-written tail of a live rollout and the next pass re-reads
     // it. Unlike Claude, no Codex writer leaves its last line unterminated.
     let (mut reader, mut replay_gate, probe_bytes) =
-        rollout_head::open_codex_walk(path, cursor.file.as_ref(), meta)?;
+        rollout_head::open_codex_walk(conn, path, cursor, meta)?;
     let mut pass = transcript_cursor::IncrementalPass {
         rotated: reader.rotated,
         ..Default::default()
@@ -6084,6 +6077,7 @@ fn ingest_codex_rollout_incremental(
     // `task_complete` the cursor could commit at, because its lines are
     // skipped before the arms that would.
     let mut fork_replay: Option<ForkReplaySpan> = None;
+    let mut replay_markers: Vec<String> = Vec::new();
     // The replay marker whose inherited baseline no child snapshot has
     // confirmed yet (see `inherited_baseline_verdict`). Carried across passes
     // on the cursor, so a pass may commit before the child's first snapshot
@@ -6153,6 +6147,7 @@ fn ingest_codex_rollout_incremental(
             codex::ReplayStep::Closed { turn_id, basis } => {
                 if let Some(span) = fork_replay.take() {
                     outcome.saw_fork_replay = true;
+                    replay_markers.push(span.marker_uid());
                     let seeded = prev_totals.is_none() && span.inherited.is_some();
                     record_codex_fork_replay(
                         conn,
@@ -6664,6 +6659,7 @@ fn ingest_codex_rollout_incremental(
                                 previous_human_message: human_messages.remembered(),
                                 inherited_baseline_marker: inherited_baseline_marker.clone(),
                                 state_markers: CODEX_STATE_MARKER_GENERATION,
+                                fork_replay: CODEX_FORK_REPLAY_GENERATION,
                             },
                         );
                     }
@@ -6946,13 +6942,7 @@ fn ingest_codex_rollout_incremental(
         &mut unwritten_line,
         conn.total_changes() == changes_before_line,
     )?;
-    // The readable file ended inside a replay: the fork's first own turn is
-    // not written yet. The span is still accounted for, and the next pass,
-    // which re-reads it, closes it.
-    if let Some(span) = fork_replay.take() {
-        outcome.saw_fork_replay = true;
-        record_codex_fork_replay(conn, meta, &span, None, None)?;
-    }
+    fork_replay::finish_codex_replay(conn, meta, fork_replay.take(), replay_markers, &mut outcome)?;
     // Collapse each measured run onto its first span, so the rows a single
     // delta accounted for read as the one request it measured rather than as
     // one measured request and a trail of unmeasured ones.
@@ -11189,10 +11179,6 @@ struct EventRow<'a> {
 
 /// Write one normalized event, including the columns only some providers can
 /// fill.
-fn insert_session_event(conn: &Connection, row: &EventRow<'_>) -> Result<()> {
-    sweep_session::write_event(conn, row)
-}
-
 /// One tool call as a provider record names it, with the record context its
 /// rows are written under.
 ///
@@ -11837,14 +11823,16 @@ pub(crate) fn validate_opened_file_identity(path: &Path, opened: &fs::File) -> R
     Ok(())
 }
 
+/// The stored file's stat: a transcript compressed under its locator stamps
+/// as its compressed copy, so a change of encoding is a change of stamp.
 fn file_stamp(path: &Path) -> Result<String> {
-    Ok(stamp_of(&path.metadata()?))
+    Ok(stamp_of(&transcript_file::stored(path)?.1))
 }
 
 /// The change stamp and recency hint discovery needs per enumerated file,
 /// from one stat. Errors for anything that is not a regular file.
 pub(crate) fn file_stamp_and_modified(path: &Path) -> Result<(String, Option<i64>)> {
-    let metadata = path.metadata()?;
+    let (_, metadata) = transcript_file::stored(path)?;
     anyhow::ensure!(
         metadata.is_file(),
         "{} is not a regular file",
@@ -27253,6 +27241,328 @@ mod tests {
         assert_eq!(rewritten, 1, "the walk resumed past an in-place edit");
     }
 
+    /// A two-turn rollout for the compression tests, and the row of its first
+    /// turn that only a read from byte zero writes back.
+    fn compressible_rollout(day: &Path, session: &str) -> (PathBuf, String) {
+        let rollout = day.join(format!("rollout-2026-04-20T05-00-00-{session}.jsonl"));
+        let event = |at: &str, payload: Value| {
+            format!(
+                "{}\n",
+                json!({"timestamp": at, "type": "event_msg", "payload": payload})
+            )
+        };
+        let mut text = format!(
+            "{}\n",
+            json!({"timestamp": "2026-04-20T05:00:00.000Z", "type": "session_meta",
+                   "payload": {"id": session, "cwd": "/tmp/project"}})
+        );
+        for n in 1..=2u32 {
+            text.push_str(&event(
+                &format!("2026-04-20T05:0{n}:01.000Z"),
+                json!({"type": "user_message", "message": format!("run {n}")}),
+            ));
+            text.push_str(&event(
+                &format!("2026-04-20T05:0{n}:02.000Z"),
+                json!({"type": "agent_message", "message": format!("done {n}")}),
+            ));
+            text.push_str(&event(
+                &format!("2026-04-20T05:0{n}:03.000Z"),
+                json!({"type": "task_complete", "turn_id": format!("t{n}")}),
+            ));
+        }
+        (rollout, text)
+    }
+
+    /// Replace `rollout` by its zstd-compressed copy the way Codex does: same
+    /// records, same mtime, a new file under `.jsonl.zst`.
+    fn compress_rollout(rollout: &Path) -> PathBuf {
+        let modified = fs::metadata(rollout).unwrap().modified().unwrap();
+        let compressed = transcript_file::compressed_path(rollout);
+        let bytes = zstd::bulk::compress(&fs::read(rollout).unwrap(), 3).unwrap();
+        fs::write(&compressed, bytes).unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&compressed)
+            .unwrap()
+            .set_modified(modified)
+            .unwrap();
+        fs::remove_file(rollout).unwrap();
+        compressed
+    }
+
+    fn codex_rows(conn: &Connection, sql: &str) -> i64 {
+        conn.query_row(sql, [], |row| row.get(0)).unwrap()
+    }
+
+    /// A rollout Codex compresses after it was indexed is the same rollout:
+    /// its stamp-map key, cursor and catalog locator stay the plain name, and
+    /// the walk resumes from the committed position instead of indexing the
+    /// records again. The compressed copy is immutable, so the next pass
+    /// skips it on its stamp.
+    #[test]
+    fn a_rollout_compressed_after_ingest_keeps_its_identity_and_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("codex");
+        let day = root.join("sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        let (rollout, text) = compressible_rollout(&day, "sess_zst");
+        fs::write(&rollout, &text).unwrap();
+        let locator = rollout.to_string_lossy().to_string();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        state.insert("codex_rollouts_v7".into(), json!({}));
+        sync_codex(&conn, &mut state, &root).unwrap();
+        let events = codex_rows(
+            &conn,
+            "SELECT COUNT(*) FROM session_events WHERE source = 'codex'",
+        );
+        assert!(events > 0);
+        // A row behind the cursor: a resumed pass never writes it back.
+        conn.execute(
+            "DELETE FROM session_events WHERE source = 'codex' AND text = 'done 1'",
+            [],
+        )
+        .unwrap();
+
+        compress_rollout(&rollout);
+        sync_codex(&conn, &mut state, &root).unwrap();
+        let behind =
+            "SELECT COUNT(*) FROM session_events WHERE source = 'codex' AND text = 'done 1'";
+        assert_eq!(
+            codex_rows(&conn, behind),
+            0,
+            "compressing the rollout re-read it from zero"
+        );
+        let seen = state["codex_rollouts_v7"].as_object().unwrap();
+        assert_eq!(seen.keys().collect::<Vec<_>>(), vec![&locator]);
+        assert_eq!(seen[&locator]["session"], "sess_zst");
+        let (cursor_locator, document, committed): (String, String, i64) = conn
+            .query_row(
+                "SELECT locator, parser_state_json, committed_offset FROM transcript_cursors \
+                 WHERE source = 'codex'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(cursor_locator, locator);
+        assert_eq!(committed as usize, text.len());
+        let cursor = transcript_cursor::TranscriptCursorState::decode(Some(&document));
+        assert!(cursor.file.unwrap().compressed);
+        let raw_path: String = conn
+            .query_row(
+                "SELECT raw_path FROM sessions WHERE source = 'codex' AND session_id = 'sess_zst'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(raw_path, locator);
+
+        // Unchanged and immutable: skipped on its stamp, nothing re-read.
+        conn.execute("DELETE FROM transcript_cursors", []).unwrap();
+        sync_codex(&conn, &mut state, &root).unwrap();
+        assert_eq!(
+            codex_rows(&conn, "SELECT COUNT(*) FROM transcript_cursors"),
+            0,
+            "an unchanged compressed rollout was opened again"
+        );
+
+        // A store that only ever saw the compressed copy holds every row.
+        let fresh = Connection::open_in_memory().unwrap();
+        init_db(&fresh).unwrap();
+        let mut fresh_state = Map::new();
+        fresh_state.insert("codex_rollouts_v7".into(), json!({}));
+        sync_codex(&fresh, &mut fresh_state, &root).unwrap();
+        assert_eq!(
+            codex_rows(
+                &fresh,
+                "SELECT COUNT(*) FROM session_events WHERE source = 'codex'"
+            ),
+            events
+        );
+        assert_eq!(codex_rows(&fresh, behind), 1);
+    }
+
+    /// A cursor over a compressed rollout is proven by the window over its
+    /// stored bytes: bounded, however large the records, and an in-place
+    /// change to those bytes still fails it.
+    #[cfg(unix)]
+    #[test]
+    fn a_compressed_cursor_is_validated_without_decompressing_its_records() {
+        use sha2::{Digest, Sha256};
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("codex");
+        let day = root.join("sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        let (rollout, mut text) = compressible_rollout(&day, "sess_big");
+        // Incompressible turns, so the stored file is far larger than the
+        // two windows that prove it.
+        let mut noise = Sha256::digest(b"seed").to_vec();
+        for n in 3..60u32 {
+            let mut blob = String::new();
+            for _ in 0..200 {
+                noise = Sha256::digest(&noise).to_vec();
+                blob.push_str(&format!("{noise:02x?}"));
+            }
+            for (second, payload) in [
+                (
+                    1,
+                    json!({"type": "user_message", "message": format!("run {n} {blob}")}),
+                ),
+                (
+                    2,
+                    json!({"type": "agent_message", "message": format!("done {n}")}),
+                ),
+                (
+                    3,
+                    json!({"type": "task_complete", "turn_id": format!("t{n}")}),
+                ),
+            ] {
+                text.push_str(&format!(
+                    "{}\n",
+                    json!({"timestamp": format!("2026-04-20T06:{:02}:{second:02}.000Z", n % 60),
+                           "type": "event_msg", "payload": payload})
+                ));
+            }
+        }
+        fs::write(&rollout, &text).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        state.insert("codex_rollouts_v7".into(), json!({}));
+        sync_codex(&conn, &mut state, &root).unwrap();
+        let compressed = compress_rollout(&rollout);
+        sync_codex(&conn, &mut state, &root).unwrap();
+
+        let locator = rollout.to_string_lossy().to_string();
+        let cursor = transcript_cursor::load_cursor(
+            &conn,
+            &transcript_cursor::CursorKey::Locator {
+                source: "codex",
+                locator: &locator,
+            },
+        )
+        .unwrap();
+        let file = cursor.file.expect("the walk stored a cursor");
+        assert!(file.compressed && file.stored_hash.is_some(), "{file:?}");
+        let stored_len = fs::metadata(&compressed).unwrap().len();
+        assert!(stored_len > 4 * transcript_cursor::PREFIX_WINDOW_BYTES);
+        let check = transcript_cursor::committed_prefix_matches(&file, &rollout);
+        assert!(check.valid);
+        assert_eq!(
+            check.bytes_read,
+            2 * transcript_cursor::PREFIX_WINDOW_BYTES,
+            "validating the compressed copy read more than its two windows"
+        );
+
+        // The same file, its last bytes rewritten and its mtime put back.
+        let modified = fs::metadata(&compressed).unwrap().modified().unwrap();
+        let handle = fs::File::options().write(true).open(&compressed).unwrap();
+        std::os::unix::fs::FileExt::write_at(&handle, b"tampered", stored_len - 8).unwrap();
+        handle.set_modified(modified).unwrap();
+        assert!(!transcript_cursor::committed_prefix_matches(&file, &rollout).valid);
+    }
+
+    /// Resuming a compressed session writes the rollout back out as plain
+    /// JSONL and appends to it. The walk continues from the cursor it took
+    /// over the compressed copy and indexes only the new turn.
+    #[test]
+    fn a_compressed_rollout_written_back_out_and_appended_resumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("codex");
+        let day = root.join("sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        let (rollout, text) = compressible_rollout(&day, "sess_unzst");
+        fs::write(&rollout, &text).unwrap();
+        let compressed = compress_rollout(&rollout);
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        state.insert("codex_rollouts_v7".into(), json!({}));
+        sync_codex(&conn, &mut state, &root).unwrap();
+        let behind =
+            "SELECT COUNT(*) FROM session_events WHERE source = 'codex' AND text = 'done 1'";
+        assert_eq!(codex_rows(&conn, behind), 1);
+        conn.execute(
+            "DELETE FROM session_events WHERE source = 'codex' AND text = 'done 1'",
+            [],
+        )
+        .unwrap();
+
+        let appended = [
+            json!({"timestamp": "2026-04-20T05:03:01.000Z", "type": "event_msg",
+                   "payload": {"type": "user_message", "message": "run 3"}}),
+            json!({"timestamp": "2026-04-20T05:03:02.000Z", "type": "event_msg",
+                   "payload": {"type": "agent_message", "message": "done 3"}}),
+            json!({"timestamp": "2026-04-20T05:03:03.000Z", "type": "event_msg",
+                   "payload": {"type": "task_complete", "turn_id": "t3"}}),
+        ]
+        .iter()
+        .map(|record| format!("{record}\n"))
+        .collect::<String>();
+        fs::write(&rollout, format!("{text}{appended}")).unwrap();
+        fs::remove_file(&compressed).unwrap();
+        sync_codex(&conn, &mut state, &root).unwrap();
+        assert_eq!(
+            codex_rows(&conn, behind),
+            0,
+            "writing the rollout back out re-read it from zero"
+        );
+        assert_eq!(
+            codex_rows(
+                &conn,
+                "SELECT COUNT(*) FROM session_events WHERE source = 'codex' AND text = 'done 3'"
+            ),
+            1
+        );
+        let committed = codex_rows(
+            &conn,
+            "SELECT committed_offset FROM transcript_cursors WHERE source = 'codex'",
+        );
+        assert_eq!(committed as usize, text.len() + appended.len());
+    }
+
+    /// Between writing the compressed copy and removing the original, both
+    /// encodings are on disk. They are one rollout: one stamp-map key, one
+    /// cursor, and the rows one read of either writes.
+    #[test]
+    fn a_rollout_in_both_encodings_is_one_rollout() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("codex");
+        let day = root.join("sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        let (rollout, text) = compressible_rollout(&day, "sess_both");
+        fs::write(&rollout, &text).unwrap();
+        fs::write(
+            transcript_file::compressed_path(&rollout),
+            zstd::bulk::compress(text.as_bytes(), 3).unwrap(),
+        )
+        .unwrap();
+
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        state.insert("codex_rollouts_v7".into(), json!({}));
+        sync_codex(&conn, &mut state, &root).unwrap();
+        assert_eq!(state["codex_rollouts_v7"].as_object().unwrap().len(), 1);
+        assert_eq!(
+            codex_rows(
+                &conn,
+                "SELECT COUNT(*) FROM transcript_cursors WHERE source = 'codex'"
+            ),
+            1
+        );
+        assert_eq!(
+            codex_rows(
+                &conn,
+                "SELECT COUNT(*) FROM session_events WHERE source = 'codex' AND text = 'done 2'"
+            ),
+            1
+        );
+    }
+
     /// An install already at the recorded generation must still re-read its
     /// unchanged Codex rollouts once when a new fact is added.
     ///
@@ -37180,7 +37490,10 @@ mod codex_fork_replay_tests {
         let conn = open_db(&dir.path().join("history.db")).unwrap();
         let mut state = Map::new();
         sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
-        assert_eq!(state.get(CODEX_FORK_REPLAY_KEY), Some(&json!(2)));
+        assert_eq!(
+            state.get(CODEX_FORK_REPLAY_KEY),
+            Some(&json!(CODEX_FORK_REPLAY_GENERATION))
+        );
         let at = parse_iso_ms("2026-04-20T00:01:00.000Z").unwrap();
         let plant_stale = || {
             conn.execute(
@@ -37200,7 +37513,10 @@ mod codex_fork_replay_tests {
             vec![format!("child prompt {CHILD_TURN}")]
         );
         assert_eq!(token_totals(&conn, CHILD), vec![300]);
-        assert_eq!(state.get(CODEX_FORK_REPLAY_KEY), Some(&json!(2)));
+        assert_eq!(
+            state.get(CODEX_FORK_REPLAY_KEY),
+            Some(&json!(CODEX_FORK_REPLAY_GENERATION))
+        );
 
         // Spent: an unchanged fork is not re-read again.
         plant_stale();
@@ -37212,6 +37528,179 @@ mod codex_fork_replay_tests {
                 "parent prompt".to_string()
             ]
         );
+    }
+
+    /// A Codex 0.95 subagent spawned without fork mode: its rollout copies
+    /// nothing and declares no paginated history, and its own turn carries
+    /// nothing that orders it -- a `turn_context` without a `turn_id`, and no
+    /// `task_started` (0.95 does not persist one).
+    fn unpaginated_subagent() -> String {
+        let at = "2026-04-20T00:01:00.000Z";
+        [
+            line(
+                at,
+                "session_meta",
+                json!({"id": CHILD, "cwd": "/tmp/project", "timestamp": at,
+                       "cli_version": "0.95.0",
+                       "source": {"subagent": {"thread_spawn": {"parent_thread_id": PARENT, "depth": 1}}}}),
+            ),
+            line(
+                "2026-04-20T00:01:00.100Z",
+                "turn_context",
+                json!({"cwd": "/tmp/project", "model": "gpt-5.2-codex"}),
+            ),
+            line(
+                "2026-04-20T00:01:00.200Z",
+                "event_msg",
+                json!({"type": "user_message", "message": "find why test_x fails"}),
+            ),
+            line(
+                "2026-04-20T00:01:03.000Z",
+                "event_msg",
+                json!({"type": "agent_message", "message": "test_x reads a stale fixture"}),
+            ),
+            line("2026-04-20T00:01:03.001Z", "event_msg", usage(920)),
+        ]
+        .concat()
+    }
+
+    /// The subagent's own turn is indexed under it, whole: nothing is gated.
+    #[test]
+    fn a_subagent_without_paginated_history_keeps_its_own_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(day.join("rollout-child.jsonl"), unpaginated_subagent()).unwrap();
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+        assert_eq!(
+            texts(&conn, CHILD),
+            vec!["find why test_x fails", "test_x reads a stale fixture"]
+        );
+        assert_eq!(token_totals(&conn, CHILD), vec![920]);
+        assert!(replay_marker(&conn, CHILD).is_none());
+    }
+
+    /// A store a generation-2 build wrote retired such a subagent's own turn
+    /// as copied history; the generation-3 re-read restores it and retires
+    /// that marker.
+    #[test]
+    fn a_generation_two_store_restores_a_subagent_it_read_as_a_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join(".codex/sessions/2026/04/20");
+        fs::create_dir_all(&day).unwrap();
+        fs::write(day.join("rollout-child.jsonl"), unpaginated_subagent()).unwrap();
+        let conn = open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+
+        // What generation 2 left: no events, one `copied_history` marker.
+        conn.execute(
+            "DELETE FROM session_events WHERE source = 'codex' AND session_id = ?",
+            [CHILD],
+        )
+        .unwrap();
+        insert_session_marker(
+            &conn,
+            "codex",
+            CHILD,
+            &NewSessionMarker {
+                marker_uid: "1:fork_replay",
+                ts_ms: None,
+                message_id: None,
+                parent_id: Some(PARENT),
+                turn_id: None,
+                kind: "fork_replay_boundary",
+                subkind: Some("copied_history"),
+                text: None,
+                payload_json: Some("{}"),
+            },
+        )
+        .unwrap();
+        state.insert(CODEX_FORK_REPLAY_KEY.to_string(), json!(2));
+        sync_codex(&conn, &mut state, &dir.path().join(".codex")).unwrap();
+
+        assert_eq!(
+            texts(&conn, CHILD),
+            vec!["find why test_x fails", "test_x reads a stale fixture"]
+        );
+        assert_eq!(token_totals(&conn, CHILD), vec![920]);
+        assert!(replay_marker(&conn, CHILD).is_none());
+        assert_eq!(
+            state.get(CODEX_FORK_REPLAY_KEY),
+            Some(&json!(CODEX_FORK_REPLAY_GENERATION))
+        );
+    }
+
+    /// A fork's position an older replay gate committed is not resumed from:
+    /// that gate may have retired the child's own first turn and committed
+    /// past it, so the pass reads from byte zero, restores the turn and
+    /// retires the stale marker. A position the current gate committed is
+    /// resumed from.
+    #[test]
+    fn a_fork_cursor_an_older_gate_committed_is_read_again_from_byte_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout-child.jsonl");
+        fs::write(
+            &rollout,
+            unpaginated_subagent() + &child_turn(CHILD_TURN, 1600),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let meta = read_codex_session_meta(&rollout).unwrap().unwrap();
+        let mut cursor = transcript_cursor::TranscriptCursorState::default();
+        ingest_codex_rollout_incremental(&conn, &rollout, &meta, &mut cursor).unwrap();
+        let own = vec![
+            "find why test_x fails",
+            "test_x reads a stale fixture",
+            "child prompt",
+            "child answer",
+        ];
+        assert_eq!(texts(&conn, CHILD), own);
+        assert!(cursor.file.as_ref().is_some_and(|file| file.offset > 0));
+
+        // What an older gate left: the first turn retired under a
+        // `copied_history` marker, and a position past it.
+        conn.execute(
+            "DELETE FROM session_events WHERE source = 'codex' AND session_id = ? \
+             AND text IN ('find why test_x fails', 'test_x reads a stale fixture')",
+            [CHILD],
+        )
+        .unwrap();
+        insert_session_marker(
+            &conn,
+            "codex",
+            CHILD,
+            &NewSessionMarker {
+                marker_uid: "1:fork_replay",
+                ts_ms: None,
+                message_id: None,
+                parent_id: Some(PARENT),
+                turn_id: Some(CHILD_TURN),
+                kind: "fork_replay_boundary",
+                subkind: Some("copied_history"),
+                text: None,
+                payload_json: Some("{}"),
+            },
+        )
+        .unwrap();
+        let resumed = |generation: i64| {
+            let mut stale = cursor.clone();
+            stale.codex.as_mut().unwrap().fork_replay = generation;
+            ingest_codex_rollout_incremental(&conn, &rollout, &meta, &mut stale).unwrap();
+        };
+        // The current gate's position resumes at the end and reads nothing.
+        resumed(CODEX_FORK_REPLAY_GENERATION);
+        assert_eq!(texts(&conn, CHILD), vec!["child prompt", "child answer"]);
+        resumed(CODEX_FORK_REPLAY_GENERATION - 1);
+        let mut restored = texts(&conn, CHILD);
+        restored.sort();
+        let mut expected = own.clone();
+        expected.sort();
+        assert_eq!(restored, expected);
+        assert!(replay_marker(&conn, CHILD).is_none());
     }
 
     /// A signature marker's request identity is stored whole or not at all.

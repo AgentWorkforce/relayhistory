@@ -32,6 +32,9 @@ use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::{Duration, SystemTime};
 
+#[path = "provider_support/grok_bot_fixture.rs"]
+mod grok_bot_fixture;
+
 // ---------------------------------------------------------------------------
 // manifest
 // ---------------------------------------------------------------------------
@@ -47,6 +50,8 @@ enum Layout {
     /// A directory whose contents are copied verbatim into `HOME`. Used for
     /// every fixture whose provider layout is itself part of the fixture.
     HomeTree,
+    /// Short synthetic Grok Bot JSON files staged under native base32 keys.
+    GrokBotReplicas,
     /// SQL fixture applied at a provider-owned relative home path.
     #[allow(dead_code)] // Used by admitted SQLite providers.
     Sqlite(&'static str),
@@ -203,13 +208,45 @@ fn stage(fixture: &Fixture, home: &Path) {
                 copy_tree(&root.join(file), home);
             }
         }
+        Layout::GrokBotReplicas => {
+            grok_bot_fixture::stage(home);
+        }
         Layout::Sqlite(relative) => {
             let path = home.join(relative);
             fs::create_dir_all(path.parent().expect("SQLite parent")).unwrap();
             let db = Connection::open(path).unwrap();
             for file in fixture.files {
-                db.execute_batch(&fs::read_to_string(root.join(file)).unwrap())
-                    .unwrap();
+                let from = root.join(file);
+                if relative == ".codex/state_5.sqlite" {
+                    if from.extension().and_then(|s| s.to_str()) == Some("jsonl") {
+                        let rollout = home
+                            .join(".codex/sessions/2026/04/20")
+                            .join(from.file_name().unwrap());
+                        fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+                        fs::copy(from, rollout).unwrap();
+                        continue;
+                    }
+                    let target = if from
+                        .file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .contains("history")
+                    {
+                        home.join(".codex/thread_history_1.sqlite")
+                    } else {
+                        home.join(".codex/state_5.sqlite")
+                    };
+                    let sql = fs::read_to_string(from)
+                        .unwrap()
+                        .replace("{{CODEX_HOME}}", &home.join(".codex").to_string_lossy());
+                    Connection::open(target)
+                        .unwrap()
+                        .execute_batch(&sql)
+                        .unwrap();
+                } else {
+                    db.execute_batch(&fs::read_to_string(from).unwrap())
+                        .unwrap();
+                }
             }
         }
         Layout::OpencodeSqlite => {
@@ -317,12 +354,17 @@ fn capture(fixture: &Fixture, home: &Path) -> Value {
     let opencode_db = home.join(".local/share/opencode/opencode.db");
     std::env::set_var("HOME", home);
     std::env::set_var("USERPROFILE", home);
+    std::env::set_var("APPDATA", home.join("AppData/Roaming"));
+    std::env::set_var("XDG_CONFIG_HOME", home.join(".config"));
     std::env::set_var("OPENCODE_DB", &opencode_db);
     // Devin's root follows `XDG_DATA_HOME`; pin it to the staged home so a
     // host that sets the variable does not leak its real store into a
     // fixture run.
     std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
     std::env::remove_var("AI_HIST_DB");
+    // Historical fixtures deliberately predate the production 30-day Codex
+    // SQLite recovery window; the corpus tests parser fidelity, not recency.
+    std::env::set_var("AI_HIST_CODEX_SQLITE_MAX_AGE_DAYS", "0");
     // Muse Code's root follows `XDG_DATA_HOME`; the fixture's own `HOME`
     // layout has to win over whatever the machine running the tests sets.
     std::env::remove_var("XDG_DATA_HOME");
@@ -581,6 +623,15 @@ fn redact_value(value: Value, homes: &[String], stamp: bool) -> Value {
 /// `args_json`, whose escapes are backslashes. Nothing this normalizes reaches
 /// the store — the ledger keeps the platform's own separators.
 fn redact_string(text: String, homes: &[String], stamp: bool) -> String {
+    // SQLite acquisition hashes include the staged rollout path. Its temp
+    // HOME changes on every run, so retain the hash kind rather than its
+    // fixture-specific digest in committed snapshots.
+    if stamp && text.starts_with("sha256:") {
+        return "sha256:<content>".into();
+    }
+    if stamp && text.starts_with("codex-sqlite-v2:sha256:") {
+        return "codex-sqlite-v2:sha256:<content>".into();
+    }
     let mut text = text;
     let mut replaced = false;
     for home in homes {
@@ -592,6 +643,15 @@ fn redact_string(text: String, homes: &[String], stamp: bool) -> String {
     }
     if replaced {
         text = text.replace('\\', "/");
+        // Grok Bot follows Electron's platform-specific userData convention.
+        // Normalize the one staged fixture across each runner's path.
+        for user_data in [
+            "Library/Application Support/Grok Bot",
+            ".config/Grok Bot",
+            "AppData/Roaming/Grok Bot",
+        ] {
+            text = text.replace(user_data, "<grok-bot-user-data>");
+        }
     }
     if stamp {
         text = mask_long_digit_runs(&text);
@@ -638,6 +698,14 @@ fn flush_digits(digits: &mut String, out: &mut String) {
 /// harness locally must see "no parser changed", not 46 stale snapshots.
 #[test]
 fn redaction_normalizes_windows_locators_to_the_committed_form() {
+    assert_eq!(
+        redact_string(
+            "codex-sqlite-v2:sha256:staged-path-digest".into(),
+            &[],
+            true
+        ),
+        "codex-sqlite-v2:sha256:<content>"
+    );
     let windows = vec![r"C:\Users\dev\AppData\Local\Temp\.tmpAbCd\claude__simple-turn".to_string()];
     assert_eq!(
         redact_string(
@@ -1280,6 +1348,32 @@ fn codex_archived_rollouts_are_discovered() {
     assert_eq!(text(&sessions[0], "session_id"), "sess_archived_1");
 }
 
+/// A rollout Codex compressed to `.jsonl.zst` holds the evidence the plain
+/// rollout does, row for row. Only the change stamp, which measures the
+/// stored file, tells them apart.
+#[test]
+fn codex_compressed_rollout_matches_the_plain_one() {
+    let evidence = |key: &str| {
+        let mut evidence = snapshot(key).clone();
+        let evidence = evidence.as_object_mut().expect("snapshot object");
+        for describes_the_fixture in ["corpus_files", "fixture", "layout", "origin", "quirk"] {
+            evidence.remove(describes_the_fixture);
+        }
+        for session in evidence["sessions"].as_array_mut().expect("sessions") {
+            session
+                .as_object_mut()
+                .expect("session row")
+                .remove("source_stamp");
+        }
+        Value::Object(evidence.clone())
+    };
+    assert_eq!(
+        evidence("codex/compressed-rollout"),
+        evidence("codex/multi-turn")
+    );
+    assert!(!rows("codex/compressed-rollout", "session_events").is_empty());
+}
+
 /// `parent_thread_id` in a subagent rollout's `session_meta` is a delegation
 /// edge, and the delegated thread is evidence rather than a catalog row.
 #[test]
@@ -1518,6 +1612,41 @@ fn codex_subagent_fork_records_lineage_and_gates_the_replay() {
         marker["closed_by_turn_id"],
         "019da867-37b0-7000-8000-0000000000b1"
     );
+}
+
+/// A Codex 0.95 subagent spawned without fork mode copies no parent history
+/// and declares no paginated history, so nothing in it is gated: its own
+/// turn, which nothing orders against the spawn, is indexed under it whole.
+#[test]
+fn codex_subagent_without_paginated_history_keeps_its_own_turn() {
+    let key = "codex/subagent-unpaginated";
+    let root = "019da89d-b100-7000-8000-0000000000e0";
+    let child = "019da89d-c488-7000-8000-0000000000f0";
+    let fork = rows(key, "session_relationships")
+        .iter()
+        .find(|edge| text(edge, "relationship") == "fork")
+        .expect("fork edge");
+    assert_eq!(text(fork, "parent_session_id"), root);
+    assert_eq!(text(fork, "child_session_id"), child);
+    assert_eq!(
+        session_texts(key, child),
+        vec![
+            ("user".to_string(), "find why test_x fails".to_string()),
+            (
+                "assistant".to_string(),
+                "test_x reads a stale fixture".to_string()
+            ),
+        ]
+    );
+    let child_usage = rows(key, "session_events")
+        .iter()
+        .filter(|event| text(event, "session_id") == child)
+        .filter_map(|event| field(event, "token_json").as_str())
+        .map(|raw| serde_json::from_str::<Value>(raw).expect("token json"))
+        .map(|usage| usage["total_tokens"].as_i64().expect("total"))
+        .collect::<Vec<_>>();
+    assert_eq!(child_usage, vec![920]);
+    assert!(fork_replay_marker(key, child).is_none());
 }
 
 /// #210: a Codex 0.150+ `guardian_review` thread that names its parent is a

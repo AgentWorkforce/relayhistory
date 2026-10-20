@@ -84,15 +84,19 @@ pub(crate) fn retire(conn: &Connection, source: &str, sid: &str, keys: &Keys) ->
 // Reconcile after local shares retire: surviving remote events in this session
 // and other sessions still support prompt rows. Compare complete ordered user
 // text projections, and prefer the existing owner when its evidence survives.
+// A control row (harness-written user text) never supports a prompt.
 fn reconcile_prompts(conn: &Connection, source: &str, sid: &str, keep: &str) -> Result<()> {
+    // `+e.source` keeps the planner on the timestamp index: without
+    // statistics it would otherwise walk every event of the source to
+    // satisfy the GROUP BY, once per prompt row.
     let reference = "SELECT e.session_id FROM session_events e \
-        WHERE e.source = ?1 AND e.role = 'user' \
-          AND e.kind = 'text' AND e.ts_ms = history.timestamp_ms \
+        WHERE +e.source = ?1 AND e.role = 'user' \
+          AND e.kind = 'text' AND e.control_kind IS NULL AND e.ts_ms = history.timestamp_ms \
         GROUP BY e.session_id, e.message_id \
         HAVING (SELECT group_concat(text, char(10)) FROM \
           (SELECT text FROM session_events b WHERE b.source = ?1 \
            AND b.session_id = e.session_id AND b.message_id = e.message_id \
-           AND b.role = 'user' AND b.kind = 'text' \
+           AND b.role = 'user' AND b.kind = 'text' AND b.control_kind IS NULL \
            ORDER BY CAST(substr(b.event_uid, length(b.message_id) + 2) AS INTEGER))) = history.prompt \
         ORDER BY (e.session_id = ?2) DESC, e.session_id LIMIT 1";
     let project = reference.replacen("SELECT e.session_id", "SELECT e.project", 1);
@@ -134,24 +138,30 @@ pub(crate) fn retire_locator_sessions(
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     for sid in sessions {
-        crate::ingest::retire_local_session_evidence(conn, source, &sid)?;
-        reconcile_prompts(conn, source, &sid, "[]")?;
-        for table in [
-            "session_observations",
-            "session_hydration_checkpoints",
-            "session_presences",
-        ] {
-            conn.execute(
-                &format!(
-                    "DELETE FROM {table} WHERE source = ?1 AND session_id = ?2 AND location = 'local'"
-                ),
-                [source, &sid],
-            )?;
-        }
-        conn.execute("DELETE FROM sessions WHERE source=?1 AND session_id=?2 AND NOT EXISTS(SELECT 1 FROM session_observations WHERE source=?1 AND session_id=?2 AND location='remote') AND NOT EXISTS(SELECT 1 FROM session_presences WHERE source=?1 AND session_id=?2 AND location='remote') AND NOT EXISTS(SELECT 1 FROM session_events WHERE source=?1 AND session_id=?2) AND NOT EXISTS(SELECT 1 FROM tool_calls WHERE source=?1 AND session_id=?2) AND NOT EXISTS(SELECT 1 FROM session_markers WHERE source=?1 AND session_id=?2) AND NOT EXISTS(SELECT 1 FROM file_edits WHERE source=?1 AND session_id=?2)", [source, &sid])?;
-        refresh_remote_catalog(conn, source, &sid)?;
+        retire_local_session(conn, source, &sid)?;
     }
     Ok(())
+}
+
+/// Retire the local share of one session: its local-only evidence, prompt
+/// ownership, local presence, and the catalog row once nothing backs it.
+pub(crate) fn retire_local_session(conn: &Connection, source: &str, sid: &str) -> Result<()> {
+    crate::ingest::retire_local_session_evidence(conn, source, sid)?;
+    reconcile_prompts(conn, source, sid, "[]")?;
+    for table in [
+        "session_observations",
+        "session_hydration_checkpoints",
+        "session_presences",
+    ] {
+        conn.execute(
+            &format!(
+                "DELETE FROM {table} WHERE source = ?1 AND session_id = ?2 AND location = 'local'"
+            ),
+            [source, sid],
+        )?;
+    }
+    conn.execute("DELETE FROM sessions WHERE source=?1 AND session_id=?2 AND NOT EXISTS(SELECT 1 FROM session_observations WHERE source=?1 AND session_id=?2 AND location='remote') AND NOT EXISTS(SELECT 1 FROM session_presences WHERE source=?1 AND session_id=?2 AND location='remote') AND NOT EXISTS(SELECT 1 FROM session_events WHERE source=?1 AND session_id=?2) AND NOT EXISTS(SELECT 1 FROM tool_calls WHERE source=?1 AND session_id=?2) AND NOT EXISTS(SELECT 1 FROM session_markers WHERE source=?1 AND session_id=?2) AND NOT EXISTS(SELECT 1 FROM file_edits WHERE source=?1 AND session_id=?2)", [source, sid])?;
+    refresh_remote_catalog(conn, source, sid)
 }
 
 fn refresh_remote_catalog(conn: &Connection, source: &str, sid: &str) -> Result<()> {

@@ -1,9 +1,9 @@
 use anyhow::Result;
-use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use super::super::transcript_file::{self, TranscriptFile, TranscriptMetadata};
 use super::{file_identity, now_ms, prefix_window_digest_counted, TranscriptFileCursor};
 
 mod open;
@@ -162,8 +162,8 @@ enum Source {
     /// A streaming read. `file` is the generation the pass opened, which
     /// replay and the commit re-read consult even after the path is replaced.
     File {
-        file: fs::File,
-        reader: BufReader<fs::File>,
+        file: TranscriptFile,
+        reader: BufReader<TranscriptFile>,
     },
     /// The bytes of one open, walked again without touching the disk.
     Memory {
@@ -195,6 +195,8 @@ pub(crate) struct TranscriptReader {
     quiesced: bool,
     device: Option<u64>,
     inode: Option<u64>,
+    /// The bytes are stored zstd-compressed; see [`TranscriptFileCursor::compressed`].
+    compressed: bool,
     /// The size and mtime observed when the file was opened, which is the
     /// instant [`Self::unchanged_since_ms`] is stamped from. `commit` stats
     /// the file again, and a stat that moved in between means the clock is
@@ -401,7 +403,7 @@ impl TranscriptReader {
                 open::replay_reader(&mut span, &mut each)
             }
             Source::File { file, reader } => {
-                let resume = reader.get_ref().stream_position()?;
+                let resume = reader.get_mut().stream_position()?;
                 let replayed = open::replay_file(file, from, to, &mut each);
                 reader.get_mut().seek(SeekFrom::Start(resume))?;
                 replayed
@@ -452,9 +454,10 @@ impl TranscriptReader {
             self.opened_ctime_ns,
         ) || !super::filesystem_keeps_change_time(&self.path, &metadata);
         let (device, inode) = file_identity(&metadata);
-        let identity_changed = self.device.is_some()
-            && device.is_some()
-            && (self.device, self.inode) != (device, inode);
+        let identity_changed = metadata.compressed() != self.compressed
+            || self.device.is_some()
+                && device.is_some()
+                && (self.device, self.inode) != (device, inode);
         if identity_changed || size < offset || size < self.opened_size {
             return Ok(CommitOutcome::Superseded);
         }
@@ -470,6 +473,7 @@ impl TranscriptReader {
             self.unchanged_since_ms
         };
         let prefix_hash = self.commit_prefix(offset, &window, rehash)?;
+        let stored_hash = self.commit_stored_window(&metadata)?;
         Ok(CommitOutcome::Published(TranscriptFileCursor {
             offset,
             device: self.device,
@@ -478,15 +482,38 @@ impl TranscriptReader {
             size,
             unchanged_since_ms,
             prefix_hash,
+            compressed: self.compressed,
+            stored_hash,
         }))
+    }
+
+    /// The window over a compressed transcript's stored bytes, read through
+    /// the handle this pass opened. See [`TranscriptFileCursor::stored_hash`].
+    fn commit_stored_window(&mut self, metadata: &TranscriptMetadata) -> Result<Option<String>> {
+        if !self.compressed {
+            return Ok(None);
+        }
+        let stored_len = metadata.stored_len();
+        let (digest, read) = match &self.source {
+            Source::File { file, .. } => match file.compressed_file() {
+                Some(stored) => super::stored_window(stored, stored_len)?,
+                None => return Ok(None),
+            },
+            Source::Memory { .. } => {
+                let stored = std::fs::File::open(transcript_file::stored_path(&self.path)?)?;
+                super::stored_window(&stored, stored_len)?
+            }
+        };
+        self.validation_bytes += read;
+        Ok(Some(digest))
     }
 
     /// The generation this pass opened. A streaming read stats its own handle,
     /// which still names the inode from `open` after the path is replaced.
-    fn commit_metadata(&self) -> Result<fs::Metadata> {
+    fn commit_metadata(&self) -> Result<TranscriptMetadata> {
         match &self.source {
             Source::File { file, .. } => Ok(file.metadata()?),
-            Source::Memory { .. } => Ok(fs::metadata(&self.path)?),
+            Source::Memory { .. } => Ok(transcript_file::metadata(&self.path)?),
         }
     }
 
@@ -557,7 +584,7 @@ impl TranscriptReader {
 
     /// A clone of the handle `next_line` reads, so a test can watch its offset.
     #[cfg(test)]
-    pub(crate) fn probe_file(&self) -> fs::File {
+    pub(crate) fn probe_file(&self) -> TranscriptFile {
         match &self.source {
             Source::File { reader, .. } => {
                 reader.get_ref().try_clone().expect("streaming file clones")

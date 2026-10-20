@@ -41,6 +41,14 @@ fn sync_codex_rollouts_and_history(
     let (cwds, branches, mut inserted) = sync_codex_rollouts_with_repairs_and_coverage(
         conn, state, root, repairs, coverage, touched, paths,
     )?;
+    match sync_codex_sqlite_scoped(conn, state, root, repairs, coverage, touched, paths) {
+        Ok(sqlite_inserted) => inserted += sqlite_inserted,
+        Err(error) if error.is::<CaptureCancelled>() => return Err(error),
+        Err(error) => {
+            coverage.note_unread();
+            sync_note!("  [codex] SQLite history unavailable: {error:#}");
+        }
+    }
     let path = root.join("history.jsonl");
     // One incremental file. A tick whose paths are rollouts has nothing new
     // in it, and opening it on every append is a read the backstop still does.
@@ -97,6 +105,53 @@ fn sync_codex_rollouts_and_history(
     Ok(inserted)
 }
 
+fn sync_codex_sqlite_scoped(
+    conn: &Connection,
+    state: &mut Map<String, Value>,
+    root: &Path,
+    repairs: &SweepRepairs,
+    coverage: &mut SweepCoverage,
+    touched: &mut HashSet<String>,
+    paths: Option<&super::path_scope::PathScope>,
+) -> Result<usize> {
+    let selection = crate::providers::codex::sqlite::database_selection(root)?;
+    if let Some(diagnostic) = selection.diagnostic {
+        sync_note!("  [codex] skipping SQLite history: {diagnostic}");
+    }
+    let Some((state_db, history_db)) = selection.pair else {
+        crate::providers::codex::sqlite::reset_backlog(state);
+        return Ok(0);
+    };
+    let changed = paths.is_none()
+        || !repairs.is_empty()
+        || crate::providers::codex::sqlite::backlog_pending(state)
+        || paths.is_some_and(|scope| {
+            scope.mentions(&root.join("sessions"))
+                || scope.mentions(&root.join("archived_sessions"))
+        })
+        || [state_db, history_db].iter().any(|file| {
+            ["", "-wal", "-shm", "-journal"].iter().any(|suffix| {
+                super::path_scope::file_in_scope(
+                    paths,
+                    &PathBuf::from(format!("{}{suffix}", file.display())),
+                )
+            })
+        });
+    if changed {
+        let outcome = crate::providers::codex::sqlite::sync(conn, state, root, repairs)?;
+        for id in outcome.read {
+            coverage.note_read("codex", &id, true);
+            touched.insert(id);
+        }
+        if outcome.incomplete {
+            coverage.note_unread();
+        }
+        Ok(outcome.inserted)
+    } else {
+        Ok(0)
+    }
+}
+
 /// What one pass over the new lines of Codex's `history.jsonl` did.
 struct CodexHistoryRead {
     /// The position after the last line read.
@@ -132,11 +187,250 @@ fn ingest_codex_history_lines(
                     }
                     touched.insert(session_id.to_string());
                 }
-                read.inserted += insert_history(conn, &entry)?;
+                let inserted = insert_history(conn, &entry)?;
+                if inserted == 0 {
+                    crate::providers::codex::sqlite::claim_history_log_prompt(conn, &entry)?;
+                }
+                read.inserted += inserted;
             }
             Ok(None) => {}
             Err(_) => read.errors += 1,
         }
     }
     Ok(read)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::discover::{CodexProvider, DiscoveryEnv, ShallowSessionProvider};
+
+    #[test]
+    fn scoped_history_tick_continues_a_pending_sqlite_backlog() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".codex");
+        std::fs::create_dir_all(&root).unwrap();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex/sqlite");
+        for (script, database) in [
+            ("pruned-all-items-state.sql", "state_5.sqlite"),
+            ("pruned-all-items-history.sql", "thread_history_1.sqlite"),
+        ] {
+            let sql = std::fs::read_to_string(fixtures.join(script))
+                .unwrap()
+                .replace("{{CODEX_HOME}}", &root.to_string_lossy());
+            Connection::open(root.join(database))
+                .unwrap()
+                .execute_batch(&sql)
+                .unwrap();
+        }
+        let conn = crate::open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        state.insert(
+            "codex_sqlite_sweep_cursor_v1".into(),
+            Value::String(
+                serde_json::json!({
+                    "updated_at_ms": i64::MAX,
+                    "thread_id": "cursor",
+                    "restart": true
+                })
+                .to_string(),
+            ),
+        );
+        let scope = crate::ingest::path_scope::PathScope::from_paths([root.join("history.jsonl")]);
+        let mut touched = HashSet::new();
+
+        sync_codex_sources(
+            &conn,
+            &mut state,
+            &root,
+            &SweepRepairs::default(),
+            &mut SweepCoverage::default(),
+            &mut touched,
+            scope.as_ref(),
+        )
+        .unwrap();
+        assert!(touched.contains("sqlite-pruned-all-items"));
+    }
+
+    #[test]
+    fn newer_sqlite_schema_skips_fallback_without_losing_rollouts() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".codex");
+        std::fs::create_dir_all(&root).unwrap();
+        for name in [
+            "state_5.sqlite",
+            "thread_history_1.sqlite",
+            "state_6.sqlite",
+        ] {
+            std::fs::write(root.join(name), b"new schema").unwrap();
+        }
+        let rollout = root.join("sessions/2026/04/20/rollout-primary.jsonl");
+        std::fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/codex/sqlite/rollout-rollout-primary.jsonl");
+        std::fs::copy(fixture, &rollout).unwrap();
+
+        let selection = crate::providers::codex::sqlite::database_selection(&root).unwrap();
+        assert!(selection.pair.is_none());
+        assert!(selection.diagnostic.unwrap().contains("state_6.sqlite"));
+
+        let conn = crate::open_db(&dir.path().join("history.db")).unwrap();
+        let mut roots = crate::ProviderRoots::from_home(
+            dir.path().to_path_buf(),
+            dir.path().join("opencode.db"),
+        );
+        roots.codex = root.clone();
+        let env = DiscoveryEnv::with_provider_roots(&conn, roots);
+        let candidates = CodexProvider::default().enumerate(&env, None).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].locator, rollout.to_string_lossy());
+
+        let mut state = Map::new();
+        state.insert(
+            "codex_sqlite_sweep_cursor_v1".into(),
+            Value::String(
+                serde_json::json!({
+                    "updated_at_ms": 1,
+                    "thread_id": "stale"
+                })
+                .to_string(),
+            ),
+        );
+        sync_codex_sources(
+            &conn,
+            &mut state,
+            &root,
+            &SweepRepairs::default(),
+            &mut SweepCoverage::default(),
+            &mut HashSet::new(),
+            None,
+        )
+        .unwrap();
+        assert!(state["codex_sqlite_sweep_cursor_v1"].is_null());
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sessions WHERE source='codex' AND session_id='sqlite-rollout-primary'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn unreadable_sqlite_tables_do_not_hide_rollouts_or_history_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".codex");
+        std::fs::create_dir_all(&root).unwrap();
+        Connection::open(root.join("state_5.sqlite")).unwrap();
+        Connection::open(root.join("thread_history_1.sqlite")).unwrap();
+        let rollout = root.join("sessions/2026/04/20/rollout-primary.jsonl");
+        std::fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests/fixtures/codex/sqlite/rollout-rollout-primary.jsonl");
+        std::fs::copy(fixture, &rollout).unwrap();
+        std::fs::write(
+            root.join("history.jsonl"),
+            "{\"text\":\"history-only\",\"ts\":1776643300,\"sessionId\":\"sqlite-rollout-primary\"}\n",
+        ).unwrap();
+
+        let conn = crate::open_db(&dir.path().join("history.db")).unwrap();
+        let mut roots = crate::ProviderRoots::from_home(
+            dir.path().to_path_buf(),
+            dir.path().join("opencode.db"),
+        );
+        roots.codex = root.clone();
+        let env = DiscoveryEnv::with_provider_roots(&conn, roots);
+        let candidates = CodexProvider::default().enumerate(&env, None).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].locator, rollout.to_string_lossy());
+
+        let mut state = Map::new();
+        let mut coverage = SweepCoverage::default();
+        sync_codex_sources(
+            &conn,
+            &mut state,
+            &root,
+            &SweepRepairs::default(),
+            &mut coverage,
+            &mut HashSet::new(),
+            None,
+        )
+        .unwrap();
+        let count: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM history WHERE source='codex' AND prompt='history-only'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn a_history_log_duplicate_survives_sqlite_projection_pruning() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join(".codex");
+        std::fs::create_dir_all(&root).unwrap();
+        let fixtures = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/codex/sqlite");
+        for (script, database) in [
+            ("pruned-all-items-state.sql", "state_5.sqlite"),
+            ("pruned-all-items-history.sql", "thread_history_1.sqlite"),
+        ] {
+            let sql = std::fs::read_to_string(fixtures.join(script))
+                .unwrap()
+                .replace("{{CODEX_HOME}}", &root.to_string_lossy());
+            Connection::open(root.join(database))
+                .unwrap()
+                .execute_batch(&sql)
+                .unwrap();
+        }
+        std::fs::write(
+            root.join("history.jsonl"),
+            serde_json::json!({"session_id":"sqlite-pruned-all-items","ts":1776643200,"text":"Please inspect the project"}).to_string() + "\n",
+        ).unwrap();
+        let conn = crate::open_db(&dir.path().join("history.db")).unwrap();
+        let mut state = Map::new();
+        let mut coverage = SweepCoverage::default();
+        let mut touched = HashSet::new();
+        let repairs = SweepRepairs::default();
+        sync_codex_sources(
+            &conn,
+            &mut state,
+            &root,
+            &repairs,
+            &mut coverage,
+            &mut touched,
+            None,
+        )
+        .unwrap();
+        Connection::open(root.join("thread_history_1.sqlite"))
+            .unwrap()
+            .execute(
+                "DELETE FROM thread_items WHERE item_id='sqlite-sqlite-pruned-all-items-0'",
+                [],
+            )
+            .unwrap();
+        Connection::open(root.join("state_5.sqlite")).unwrap().execute(
+            "UPDATE threads SET updated_at_ms=updated_at_ms+1 WHERE id='sqlite-pruned-all-items'", [],
+        ).unwrap();
+        sync_codex_sources(
+            &conn,
+            &mut state,
+            &root,
+            &repairs,
+            &mut coverage,
+            &mut touched,
+            None,
+        )
+        .unwrap();
+        let count: i64 = conn.query_row(
+            "SELECT count(*) FROM history WHERE source='codex' AND prompt='Please inspect the project'",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert_eq!(
+            count, 1,
+            "the consumed history.jsonl prompt remains searchable"
+        );
+    }
 }

@@ -128,6 +128,12 @@ Legend:
 sources themselves; relayhistory no longer ingests either, and a writable open
 deletes what an earlier release stored for them.
 
+**Update (2026-10-15):** every **codex** cell covers rollouts in both encodings
+Codex stores: plain `rollout-*.jsonl` and the zstd-compressed
+`rollout-*.jsonl.zst` it writes for a finished session. A rollout is captured
+under its `.jsonl` locator either way and keeps that identity when Codex
+compresses it ([session catalog](../session-catalog.md)).
+
 | Record type                                                        | claude | codex | cursor | grok | muse | opencode | devin | Owner / closes                                                                                                                                                                                                                                                                |
 | ------------------------------------------------------------------ | ------ | ----- | ------ | ---- | ---- | -------- | ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Prompt / `history` row                                             | ✓      | ✓     | ✓      | ◐    | ✓    | ✓        | ✓     | grok timestamps: [#167](https://github.com/AgentWorkforce/relayhistory/issues/167)                                                                                                                                                                                            |
@@ -141,13 +147,13 @@ deletes what an earlier release stored for them.
 | Token usage — each streamed record verbatim                        | ✓      | —     | —      | —    | —    | —        | —     | `session_events.record_token_json`; other sources store usage once per record                                                                                                                                                                                                 | 
 | `request_id`                                                       | ✗      | —     | —      | —    | ✓    | —        | ✓     | [#164](https://github.com/AgentWorkforce/relayhistory/issues/164)                                                                                                                                                                                                             |
 | `stop_reason`                                                      | ✗      | —     | —      | —    | ✓    | ✓        | ✓     | [#164](https://github.com/AgentWorkforce/relayhistory/issues/164) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                                                                                         |
-| Codex `turn_id`                                                    | —      | ✗     | —      | —    | —    | —        | —     | [#164](https://github.com/AgentWorkforce/relayhistory/issues/164)                                                                                                                                                                                                             |
+| Codex `turn_id`                                                    | —      | ◐     | —      | —    | —    | —        | —     | [#164](https://github.com/AgentWorkforce/relayhistory/issues/164)                                                                                                                                                                                                             |
 | Sidechain / meta flags                                             | ✓      | ✗     | —      | —    | —    | —        | —     | [#164](https://github.com/AgentWorkforce/relayhistory/issues/164)                                                                                                                                                                                                             |
 | Tool calls (`tool_calls`)                                          | ✓      | ✓     | ✓      | ✓    | ✓    | ✓        | ✓     | [#166](https://github.com/AgentWorkforce/relayhistory/issues/166) / [#167](https://github.com/AgentWorkforce/relayhistory/issues/167) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                     |
 | Native Codex `CommandExecution` command, output, and exit status | — | ✓ | — | — | — | — | — | `item_completed` supplies a completed shell result even when the model called a JavaScript orchestration tool. These records feed session PR evidence. |
 | Tool-result fidelity (identity, bytes, truncation, hash, ordering) | ✓      | ✓     | —      | ✓    | ✓    | ✗        | ✓     | [#171](https://github.com/AgentWorkforce/relayhistory/issues/171)                                                                                                                                                                                                             |
 | File edits (`file_edits`)                                          | ✓      | ✓     | ✓      | ✓    | ✓    | ✓        | ✓     | [#166](https://github.com/AgentWorkforce/relayhistory/issues/166) / [#167](https://github.com/AgentWorkforce/relayhistory/issues/167) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                     |
-| Compaction / summary markers                                       | ✗      | ✗     | ✗      | ✓    | ✗    | ✓        | ✓     | [#165](https://github.com/AgentWorkforce/relayhistory/issues/165) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                                                                                         |
+| Compaction / summary markers                                       | ✗      | ◐     | ✗      | ✓    | ✗    | ✓        | ✓     | [#165](https://github.com/AgentWorkforce/relayhistory/issues/165) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                                                                                         |
 | Control / lifecycle rows                                           | ✓      | ✓     | ✗      | ◐    | ✓    | ✓        | ◐     | [#165](https://github.com/AgentWorkforce/relayhistory/issues/165), [#180](https://github.com/AgentWorkforce/relayhistory/issues/180)                                                                                                                                          |
 | Relationship — delegated                                           | ◐      | ✓     | —      | ◐    | ✓    | ✓        | —     | [#170](https://github.com/AgentWorkforce/relayhistory/issues/170) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                                                                                         |
 | Relationship — fork / resume / continuation                        | ✗      | ✓     | ✗      | ✗    | ✗    | ✗        | —     | [#170](https://github.com/AgentWorkforce/relayhistory/issues/170)                                                                                                                                                                                                             |
@@ -163,6 +169,9 @@ opposite representations are stored once; standalone and repeated replies remain
 readable. Parser upgrades re-read unchanged captures once and preserve existing
 event-message identities. Assistant `message_id` values remain line-derived;
 payload IDs are retained separately as `provider_message_id`.
+The SQLite layout fills gaps when a rollout is missing or truncated: it records
+native item IDs, turn IDs, compaction and turn-error markers, and one cumulative
+`threads.tokens_used` snapshot. Per-message usage remains unavailable there.
 
 ### Why each non-`✓` cell reads the way it does
 
@@ -328,7 +337,7 @@ otherwise `relationship_capture` records it as `identity_status = 'unlinked'`
 with a null child id. A linked child's edge names the session whose tool call
 started it (a nested subagent's parent is the subagent that spawned it), and
 its evidence is read by id through `SessionStore::session`. `relationship_capabilities().stable_child_identity` is
-`always` for codex, opencode and muse, `sometimes` for claude and grok, and
+`always` for codex, grok-bot, opencode and muse, `sometimes` for claude and grok, and
 `never` for cursor/devin. Codex fork is `✓`:
 the `fork` edge is recorded from the fields Codex actually writes on
 `session_meta` — `forked_from_id` for a human fork, and
@@ -340,8 +349,8 @@ one `fork_replay_boundary` marker instead of re-indexing the parent's prompts,
 events and token baseline under the child
 ([#210](https://github.com/AgentWorkforce/relayhistory/issues/210)). Codex
 0.133–0.148 (`history_mode: "paginated"`) copy that history straight after the
-child's own `session_meta`, without the parent's; there the span opens at line
-1 when a record before the child's first own turn is one only a copy can hold
+child's own `session_meta`, without the parent's; in a rollout that declares
+that `history_mode` the span opens at line 1 when a record before the child's first own turn is one only a copy can hold
 (a turn ordered before the fork, a `token_count`, a `compacted` record), closes
 at the first UUIDv7 turn at or after the fork, and its marker's `subkind` is
 `copied_history`. The `✓` is for spans the evidence can bound: in a span opened
@@ -503,6 +512,11 @@ Generated from provider-owned acquisition records; these cells describe fixture-
 | copilot | Messages and identity | Journal version 1 session.start header identity, native event UUIDs, user/assistant text, reasoningText, per-message model, provider messageId and requestId, turnId, cwd and branch from the header context, copilotVersion, every model the journal names; an event's parent is its nearest parentId ancestor stored as an event (markers between them are skipped); agent- and skill-delivered user messages are synthetic, not prompts or user turns; other journal versions rejected with diagnostic; duplicate native IDs at distinct live paths rejected and a journal declaring a new identity retires the old one. |
 | copilot | Tools and usage | Assistant toolRequests and tool.execution_complete join by native toolCallId, scoped as <parentToolCallId>/<toolCallId> under a delegating call because subagents number calls independently; success/error outcomes; assistant.message outputTokens kept verbatim as per-message usage (output only); session.shutdown modelMetrics and session.usage_checkpoint kept raw in markers as session-wide cumulative totals, excluded from request usage; no inferred file edits. |
 | copilot | Control and lineage | Turn boundaries, model changes, resume, permissions, system messages, subagent lifecycle and unknown event types retained as markers with their raw parentId; subagent messages flagged sidechain by parentToolCallId and never the session preview; no child session, relationship, resume command or live execution. |
+| grok-bot | Messages and identity | Base32 transcript keys, native agent and entry IDs, roster titles, complete and truncated tails across account slots; bounded local window accumulates across captures. |
+| grok-bot | Control and lineage | Widget responses, voice turns, approvals, attachments and app events retained; Cursor cloud-agent IDs recorded as observed delegation without a local child transcript. |
+| grok-bot | Usage and acquisition | No local model, token or cost usage; passive local blobs only, with no host backfill, network calls or credential reads. |
+| openclaw | Messages and tools | Agent schema 19-31 transcript rows (JSON, or zstd from schema 23) and verified cold archives (file or SQLite, from schema 21), plus the pre-2026.8 JSONL store (`sessions/*.jsonl` with its `sessions.json` index), full entry tree with native entry IDs, user/assistant/thinking/tool content, toolCallId joins and isError outcomes; session key, agent ID and channel retained as metadata. A session the agent database holds is read from it, never also from JSONL. |
+| openclaw | Usage and relationships | Assistant per-message usage with reported cost, one request per provider responseId; delivery mirrors, transcript-only rows and CLI-harness rows carry no request usage. Session windows, previous session and parent/spawn keys retained as metadata; no relationship, resume or live execution advertised. Reset/delete archives, compaction checkpoints and the doctor's import archive are not read; a deleted session retires. |
 <!-- END GENERATED PROVIDER CAPTURE -->
 
 ### Embedded Codex image evidence

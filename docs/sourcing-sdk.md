@@ -208,7 +208,8 @@ checkpoint.
 thread with a content-free `CaptureProgress { source, processed_files,
 total_files }` as each provider's files are read — no paths, no session text.
 Unchanged files count as processed. OpenCode counts its SQLite database as
-one file, or one session file per session in the legacy JSON tree.
+one file, or one session file per session in the legacy JSON tree. Codex's
+SQLite fallback reports its bounded thread batch as `source: "codex-sqlite"`.
 
 ### `sync`
 
@@ -229,6 +230,15 @@ source, so the next unforced full sweep still compares against the last full
 one and sees whatever moved in the sources a scoped sweep left out. Each
 source's own cursors and stamps are written as usual. `Some(vec![])` reads
 nothing and reports `swept: false`.
+
+Codex SQLite recovery is a bounded backstop for threads whose rollout was
+pruned or truncated: a sweep reads at most 50 threads, newest first, and saves
+a cursor so later sweeps continue the backlog before the all-source
+fingerprint can skip it. By default only threads updated in the last 30 days
+are eligible. `SyncOptions::codex_sqlite_max_age_days` overrides that window;
+`Some(0)` disables it. When the option is `None`,
+`AI_HIST_CODEX_SQLITE_MAX_AGE_DAYS` is read, then the 30-day default is used.
+Threads with a complete rollout are never projected from SQLite.
 
 `SyncReport { swept, changed, head_revision }`: `swept` is false when the fingerprint matched
 and nothing was opened. `changed` lists the `SessionRef`s whose catalog row was
@@ -997,9 +1007,11 @@ handle.
 | cursor | ✓ | ✓ | ✓ | ✓ | — | none |
 | devin | ✓ | ✓ | ✓ | ✓ | — | none |
 | grok | ✓ | ✓ | ✓ | ✓ | ✓ | per-request |
+| grok-bot | ✓ | ✓ | — | — | ✓ | none |
 | hermes | ✓ | ✓ | ✓ | — | — | none |
 | muse | ✓ | ✓ | ✓ | ✓ | ✓ | per-request |
 | omp | ✓ | ✓ | ✓ | — | — | per-message |
+| openclaw | ✓ | ✓ | ✓ | — | — | per-message |
 | opencode | ✓ | ✓ | ✓ | ✓ | ✓ | none |
 | pi | ✓ | ✓ | ✓ | — | — | per-message |
 <!-- sourcing-sdk-population-table:end -->

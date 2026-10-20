@@ -1,0 +1,2 @@
+{"timestamp": "2026-04-20T00:00:00Z", "type": "session_meta", "payload": {"id": "sqlite-truncated-rollout", "cwd": "/work/app"}}
+{"timestamp": "2026-04-20T00:00:00Z", "type": "response_item", "payload": {"type": "message", "role": "user", "id": "sqlite-sqlite-truncated-rollout-0", "content": [{"type": "input_text", "text": "Please inspect the project"}]}}

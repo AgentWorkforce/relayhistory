@@ -1,0 +1,158 @@
+{
+  "corpus_files": [
+    "codex/sqlite/archived-thread-state.sql",
+    "codex/sqlite/archived-thread-history.sql"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "codex/sqlite-archived-thread",
+  "history": [
+    {
+      "project": "/work/app",
+      "prompt": "Please inspect the project",
+      "session_id": "sqlite-archived-thread",
+      "source": "codex",
+      "timestamp_ms": 1776643200000
+    }
+  ],
+  "hydration": [
+    {
+      "related_session_ids": [],
+      "session_id": "sqlite-archived-thread",
+      "source": "codex",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "Sqlite(\".codex/state_5.sqlite\")",
+  "notes": [],
+  "origin": "relayhistory",
+  "quirk": "An archived paginated thread with no rollout still appears in the catalog and ledger.",
+  "session_events": [
+    {
+      "agent_id": null,
+      "call_index": null,
+      "control_kind": null,
+      "cwd": "/work/app",
+      "error_signal": null,
+      "event_index": null,
+      "event_source": null,
+      "event_uid": "sqlite-sqlite-archived-thread-0",
+      "git_branch": "feature/sqlite",
+      "kind": "text",
+      "message_id": "sqlite-sqlite-archived-thread-0",
+      "model": "gpt-synthetic",
+      "parent_id": null,
+      "payload_bytes": null,
+      "payload_hash": null,
+      "payload_truncated": null,
+      "project": "/work/app",
+      "request_id": null,
+      "result_status": null,
+      "role": "user",
+      "session_id": "sqlite-archived-thread",
+      "source": "codex",
+      "stop_reason": null,
+      "subagent_session_id": null,
+      "text": "Please inspect the project",
+      "token_json": null,
+      "tool_use_id": null,
+      "ts_ms": 1776643200000
+    },
+    {
+      "agent_id": null,
+      "call_index": null,
+      "control_kind": null,
+      "cwd": "/work/app",
+      "error_signal": null,
+      "event_index": null,
+      "event_source": null,
+      "event_uid": "sqlite-sqlite-archived-thread-1",
+      "git_branch": "feature/sqlite",
+      "kind": "text",
+      "message_id": "sqlite-sqlite-archived-thread-1",
+      "model": "gpt-synthetic",
+      "parent_id": null,
+      "payload_bytes": null,
+      "payload_hash": null,
+      "payload_truncated": null,
+      "project": "/work/app",
+      "request_id": null,
+      "result_status": null,
+      "role": "assistant",
+      "session_id": "sqlite-archived-thread",
+      "source": "codex",
+      "stop_reason": null,
+      "subagent_session_id": null,
+      "text": "I inspected the project and fixed it.",
+      "token_json": null,
+      "tool_use_id": null,
+      "ts_ms": 1776643201000
+    }
+  ],
+  "session_markers": [
+    {
+      "kind": "session_metadata",
+      "marker_uid": "sqlite:thread",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "{\"agent_nickname\":null,\"agent_role\":null,\"archived\":true,\"content_hash\":\"1a3335370363261d84c0c2f644240a45b4170e2a00f9eaf20c757e0f943e2d43\",\"history_ids\":[1],\"name\":\"SQLite thread\",\"next_rollout_byte_offset\":0,\"source\":\"cli\"}",
+      "session_id": "sqlite-archived-thread",
+      "source": "codex",
+      "subkind": "sqlite",
+      "text": null,
+      "ts_ms": 1776643200000,
+      "turn_id": null
+    },
+    {
+      "kind": "message_phase",
+      "marker_uid": "sqlite-sqlite-archived-thread-1:phase",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "{\"phase\":\"final_answer\"}",
+      "session_id": "sqlite-archived-thread",
+      "source": "codex",
+      "subkind": "sqlite",
+      "text": null,
+      "ts_ms": 1776643201000,
+      "turn_id": "turn-1"
+    },
+    {
+      "kind": "usage_snapshot",
+      "marker_uid": "sqlite:tokens_used",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "{\"accounting\":\"cumulative\",\"tokens_used\":12345}",
+      "session_id": "sqlite-archived-thread",
+      "source": "codex",
+      "subkind": "sqlite",
+      "text": null,
+      "ts_ms": 1776643300000,
+      "turn_id": null
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": "0.151.0",
+      "cwd": "/work/app",
+      "discovery_state": "full",
+      "first_activity_ms": 1776643200000,
+      "first_prompt": "Please inspect the project",
+      "git_branch": "feature/sqlite",
+      "initial_commit": null,
+      "last_activity_ms": 1776643300000,
+      "last_assistant_text": "I inspected the project and fixed it.",
+      "models_json": "[\"gpt-synthetic\"]",
+      "originator": "codex_cli_rs",
+      "raw_path": "sqlite:<home>/.codex/state_5.sqlite#sqlite-archived-thread",
+      "repo_url": "https://example.test/team/app",
+      "session_id": "sqlite-archived-thread",
+      "source": "codex",
+      "source_stamp": "codex-sqlite-v2:sha256:<content>",
+      "title": "SQLite thread",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "codex",
+  "tool_calls": []
+}

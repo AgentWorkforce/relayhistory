@@ -1,0 +1,119 @@
+{
+  "corpus_files": [
+    "codex/sqlite/rollout-primary-state.sql",
+    "codex/sqlite/rollout-primary-history.sql",
+    "codex/sqlite/rollout-rollout-primary.jsonl"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "codex/sqlite-rollout-primary",
+  "history": [
+    {
+      "project": "/work/app",
+      "prompt": "Rollout primary prompt",
+      "session_id": "sqlite-rollout-primary",
+      "source": "codex",
+      "timestamp_ms": 1776643201000
+    }
+  ],
+  "hydration": [
+    {
+      "related_session_ids": [],
+      "session_id": "sqlite-rollout-primary",
+      "source": "codex",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "Sqlite(\".codex/state_5.sqlite\")",
+  "notes": [],
+  "origin": "relayhistory",
+  "quirk": "A complete rollout is primary even when SQLite contains conflicting text for the same thread.",
+  "session_events": [
+    {
+      "agent_id": null,
+      "call_index": null,
+      "control_kind": null,
+      "cwd": "/work/app",
+      "error_signal": null,
+      "event_index": null,
+      "event_source": null,
+      "event_uid": "1:user_message",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "1:user_message",
+      "model": null,
+      "parent_id": null,
+      "payload_bytes": null,
+      "payload_hash": null,
+      "payload_truncated": null,
+      "project": "/work/app",
+      "request_id": null,
+      "result_status": null,
+      "role": "user",
+      "session_id": "sqlite-rollout-primary",
+      "source": "codex",
+      "stop_reason": null,
+      "subagent_session_id": null,
+      "text": "Rollout primary prompt",
+      "token_json": null,
+      "tool_use_id": null,
+      "ts_ms": 1776643201000
+    },
+    {
+      "agent_id": null,
+      "call_index": null,
+      "control_kind": null,
+      "cwd": "/work/app",
+      "error_signal": null,
+      "event_index": null,
+      "event_source": null,
+      "event_uid": "2:agent_message",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "2:agent_message",
+      "model": null,
+      "parent_id": null,
+      "payload_bytes": null,
+      "payload_hash": null,
+      "payload_truncated": null,
+      "project": "/work/app",
+      "request_id": null,
+      "result_status": null,
+      "role": "assistant",
+      "session_id": "sqlite-rollout-primary",
+      "source": "codex",
+      "stop_reason": null,
+      "subagent_session_id": null,
+      "text": "ROLLOUT WINS",
+      "token_json": null,
+      "tool_use_id": null,
+      "ts_ms": 1776643202000
+    }
+  ],
+  "session_markers": [],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": null,
+      "cwd": "/work/app",
+      "discovery_state": "full",
+      "first_activity_ms": 1776643200000,
+      "first_prompt": "Rollout primary prompt",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1776643202000,
+      "last_assistant_text": "ROLLOUT WINS",
+      "models_json": null,
+      "originator": null,
+      "raw_path": "<home>/.codex/sessions/2026/04/20/rollout-rollout-primary.jsonl",
+      "repo_url": null,
+      "session_id": "sqlite-rollout-primary",
+      "source": "codex",
+      "source_stamp": "<n>:384",
+      "title": null,
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "codex",
+  "tool_calls": []
+}
