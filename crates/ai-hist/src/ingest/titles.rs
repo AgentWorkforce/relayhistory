@@ -68,14 +68,42 @@ pub(crate) fn opencode_title(raw: Option<&str>) -> Option<String> {
     (!placeholder).then_some(title)
 }
 
-/// Grok's name for the session, from `summary.json`'s top-level `title`.
+/// Grok Build writes its displayed name to `generated_title`, with
+/// `session_summary` on older recordings. Keep accepting `title` from exports.
 pub(crate) fn grok_title(summary: Option<&Value>) -> Option<String> {
-    non_blank_title(summary?.get("title").and_then(Value::as_str))
+    let summary = summary?;
+    ["generated_title", "session_summary", "title"]
+        .iter()
+        .find_map(|key| non_blank_title(summary.get(key).and_then(Value::as_str)))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::opencode_title;
+    use super::{grok_title, opencode_title};
+    use serde_json::json;
+
+    #[test]
+    fn grok_titles_read_the_live_cli_fields_before_legacy_exports() {
+        for (summary, expected) in [
+            (
+                json!({"generated_title": " Drop Python SDK and open the PR ", "session_summary": "Old summary", "title": "Export"}),
+                Some("Drop Python SDK and open the PR"),
+            ),
+            (
+                json!({"generated_title": " \n ", "session_summary": "Older CLI name", "title": "Export"}),
+                Some("Older CLI name"),
+            ),
+            (
+                json!({"generated_title": null, "session_summary": 42, "title": "Export"}),
+                Some("Export"),
+            ),
+            (json!({"session_summary": "\t", "title": ""}), None),
+            (json!({}), None),
+        ] {
+            assert_eq!(grok_title(Some(&summary)).as_deref(), expected);
+        }
+        assert_eq!(grok_title(None), None);
+    }
 
     #[test]
     fn an_opencode_placeholder_title_is_no_title() {

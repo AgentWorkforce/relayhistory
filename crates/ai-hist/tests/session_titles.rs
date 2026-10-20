@@ -149,3 +149,91 @@ fn discovery_alone_catalogs_a_codex_thread_name() {
         Some("Fix tests")
     );
 }
+
+#[test]
+fn grok_cli_titles_reach_discovery_hydration_and_sync() {
+    for operation in ["discover", "hydrate", "sync"] {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join(".grok/sessions/%2Fwork%2Fapp/grok-title");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(
+            dir.join("chat_history.jsonl"),
+            "{\"type\":\"user\",\"content\":\"A prompt, not the title\"}\n",
+        )
+        .unwrap();
+        let summary = dir.join("summary.json");
+        let write_title = |name: &str| {
+            fs::write(
+                &summary,
+                serde_json::json!({
+                    "info": {"id": "grok-title", "cwd": "/work/app"},
+                    "generated_title": name,
+                    "session_summary": "Previous name",
+                    "created_at": "2026-10-19T15:39:08.995237Z"
+                })
+                .to_string(),
+            )
+            .unwrap();
+        };
+        write_title("Drop Python SDK and open the PR");
+        let store = store(home.path());
+        let session = SessionRef::id(Source::Grok, "grok-title");
+        let capture = || match operation {
+            "discover" => {
+                store.discover(DiscoveryOptions::default()).unwrap();
+            }
+            "hydrate" => {
+                store.hydrate(&session, Default::default()).unwrap();
+            }
+            _ => {
+                store.sync(Default::default()).unwrap();
+            }
+        };
+        // Hydration targets a discovered identity; it does not enumerate.
+        if operation == "hydrate" {
+            store.discover(DiscoveryOptions::default()).unwrap();
+        }
+        capture();
+        assert_eq!(
+            title(&store, Source::Grok, "grok-title", true).as_deref(),
+            Some("Drop Python SDK and open the PR"),
+            "{operation}"
+        );
+        assert_eq!(title(&store, Source::Grok, "grok-title", false), None);
+
+        // Only summary.json changes; transcript bytes remain untouched.
+        write_title("Remove Python SDK");
+        capture();
+        assert_eq!(
+            title(&store, Source::Grok, "grok-title", true).as_deref(),
+            Some("Remove Python SDK"),
+            "{operation} must notice summary-only renames"
+        );
+
+        if operation != "sync" {
+            // The previous reader saved these same source bytes without the
+            // Grok title-reader generation, and left title null. Both shallow
+            // discovery and hydration must repair that cache without a file edit.
+            let db = rusqlite::Connection::open(home.path().join("ai-history.db")).unwrap();
+            db.execute("UPDATE sessions SET title=NULL WHERE source='grok'", [])
+                .unwrap();
+            for table in [
+                "sessions",
+                "session_presences",
+                "session_observations",
+                "session_hydration_checkpoints",
+                "observation_hydration_checkpoints",
+            ] {
+                db.execute(&format!(
+                    "UPDATE {table} SET source_stamp=replace(source_stamp,'|titles:v1','') WHERE source='grok'"
+                ), []).unwrap();
+            }
+            capture();
+            assert_eq!(
+                title(&store, Source::Grok, "grok-title", true).as_deref(),
+                Some("Remove Python SDK"),
+                "{operation} must repair an older cache"
+            );
+        }
+    }
+}
