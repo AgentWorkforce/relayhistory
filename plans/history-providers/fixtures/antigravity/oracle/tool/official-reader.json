@@ -1,0 +1,79 @@
+[
+  {
+    "id": "00000000000000000000000000000002:0",
+    "step_index": 0,
+    "trajectory_id": "00000000000000000000000000000002",
+    "parent_trajectory_id": "",
+    "depth": 0,
+    "type": "TEXT_RESPONSE",
+    "source": "USER",
+    "target": "UNKNOWN",
+    "status": "DONE",
+    "content": "Call the fixture_echo tool with blue.",
+    "content_delta": "Call the fixture_echo tool with blue.",
+    "thinking": "",
+    "thinking_delta": "",
+    "tool_calls": [],
+    "error": "",
+    "is_complete_response": false,
+    "structured_output": null,
+    "workflow_progress": null,
+    "usage_metadata": null,
+    "http_code": 0
+  },
+  {
+    "id": "00000000000000000000000000000002:1",
+    "step_index": 1,
+    "trajectory_id": "00000000000000000000000000000002",
+    "parent_trajectory_id": "",
+    "depth": 0,
+    "type": "TOOL_CALL",
+    "source": "MODEL",
+    "target": "TARGET_ENVIRONMENT",
+    "status": "DONE",
+    "content": "Calling custom tool \"fixture_echo\"",
+    "content_delta": "Calling custom tool \"fixture_echo\"",
+    "thinking": "",
+    "thinking_delta": "",
+    "tool_calls": [
+      {
+        "name": "fixture_echo",
+        "args": {
+          "value": "blue"
+        },
+        "id": "fixture-call-001",
+        "step_id": "00000000000000000000000000000002:1",
+        "canonical_path": null,
+        "server_name": null
+      }
+    ],
+    "error": "",
+    "is_complete_response": false,
+    "structured_output": null,
+    "workflow_progress": null,
+    "usage_metadata": null,
+    "http_code": 0
+  },
+  {
+    "id": "00000000000000000000000000000002:2",
+    "step_index": 2,
+    "trajectory_id": "00000000000000000000000000000002",
+    "parent_trajectory_id": "",
+    "depth": 0,
+    "type": "TEXT_RESPONSE",
+    "source": "MODEL",
+    "target": "TARGET_USER",
+    "status": "DONE",
+    "content": "The fixture tool returned blue.",
+    "content_delta": "The fixture tool returned blue.",
+    "thinking": "",
+    "thinking_delta": "",
+    "tool_calls": [],
+    "error": "",
+    "is_complete_response": true,
+    "structured_output": null,
+    "workflow_progress": null,
+    "usage_metadata": null,
+    "http_code": 0
+  }
+]
