@@ -57,6 +57,29 @@ impl Conversation {
             .collect();
         format!("{}/{hex}", self.windows.len())
     }
+    /// `<namespace>:<sessionId>` of every window: the identity each window
+    /// had as its own session (generation v2, and the JSONL store's).
+    pub(super) fn window_ids(&self) -> Vec<String> {
+        let Some(first) = self.windows.first() else {
+            return vec![];
+        };
+        let name = native_name(&self.key, &first.agent_id);
+        let Some(namespace) = self.id.strip_suffix(&format!(":{name}")) else {
+            return vec![];
+        };
+        self.windows
+            .iter()
+            .map(|w| format!("{namespace}:{}", w.native_id))
+            .collect()
+    }
+    /// The tool-call ID scope of one window: native IDs in the oldest
+    /// window, `<id>#<sessionId>` in later ones, so two runs that reuse a
+    /// call ID stay two calls. Fixed by window order, which a partial read
+    /// knows without reading other windows' events.
+    pub(super) fn tool_scope(&self, index: usize) -> Option<&str> {
+        let window = &self.windows[index];
+        (index > 0 && !window.legacy).then_some(window.native_id.as_str())
+    }
     pub(super) fn records(&self) -> usize {
         self.windows.iter().map(|w| w.events.len()).sum()
     }

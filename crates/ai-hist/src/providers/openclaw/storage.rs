@@ -105,7 +105,9 @@ pub(super) fn read<T>(
 /// a selected capture aggregates only the windows of one conversation key
 /// (its own and its cron runs'; the caller keeps the exact canonical match).
 pub(super) fn session_query(selected: bool, schema: &Schema) -> String {
-    const KEY: &str = "(session_key=?1 OR substr(session_key,1,length(?1)+5)=?1||':run:')";
+    // Case-insensitive, as `canonical_key` folds `cron:<job>:RUN:<id>`.
+    const KEY: &str =
+        "(session_key=?1 OR lower(substr(session_key,1,length(?1)+5))=lower(?1)||':run:')";
     let predicate = if selected {
         format!("WHERE session_id IN (SELECT session_id FROM session_windows WHERE {KEY})")
     } else {
@@ -129,7 +131,7 @@ pub(super) fn session_query(selected: bool, schema: &Schema) -> String {
          LEFT JOIN session_nodes n ON n.session_key=w.session_key \
          LEFT JOIN transcript_rewrite_watermarks r ON r.session_id=w.session_id \
          LEFT JOIN {cold} c ON c.session_id=w.session_id \
-         WHERE (?1 IS NULL OR w.session_key=?1 OR substr(w.session_key,1,length(?1)+5)=?1||':run:') \
+         WHERE (?1 IS NULL OR w.session_key=?1 OR lower(substr(w.session_key,1,length(?1)+5))=lower(?1)||':run:') \
          AND (e.events IS NOT NULL OR c.session_id IS NOT NULL) \
          ORDER BY 21 DESC, w.session_id LIMIT ?2"
     )

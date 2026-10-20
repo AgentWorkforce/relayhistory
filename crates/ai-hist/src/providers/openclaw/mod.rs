@@ -249,7 +249,10 @@ fn sweep_database(
     let mut stamps = Map::new();
     let mut inserted = 0;
     let mut unread = 0;
-    let ids = storage::read(&context, path, |conn, schema| {
+    // A failed conversation keeps its windows' rows under any earlier
+    // identity too (a per-window ID before generation v3).
+    let mut kept = vec![];
+    let mut ids = storage::read(&context, path, |conn, schema| {
         let windows = storage::sessions(conn, ctx.roots, path, schema, MAX_SWEEP + 1, None)?;
         // A truncated listing is not a complete snapshot: retiring against it
         // would delete conversations past the bound.
@@ -289,6 +292,7 @@ fn sweep_database(
                         conv.key
                     );
                     unread += 1;
+                    kept.extend(conv.window_ids());
                     if let Some(cursor) = cursor {
                         stamps.insert(conv.id.clone(), cursor.clone());
                     }
@@ -299,6 +303,7 @@ fn sweep_database(
         }
         Ok(conversations.into_iter().map(|c| c.id).collect::<Vec<_>>())
     })?;
+    ids.extend(kept);
     let tx = ctx.conn.unchecked_transaction()?;
     retire::retire_absent(&tx, path, &ids)?;
     tx.commit()?;

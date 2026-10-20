@@ -54,6 +54,13 @@ pub(super) fn is_heartbeat_ack(text: &str) -> bool {
         .or_else(|| trimmed.strip_suffix("HEARTBEAT_OK"));
     rest.is_some_and(|rest| rest.trim().chars().count() <= 300)
 }
+/// A tool-call ID inside its window's scope (see `Conversation::tool_scope`).
+pub(super) fn scoped(id: &str, scope: Option<&str>) -> String {
+    match scope {
+        Some(window) => format!("{id}#{window}"),
+        None => id.into(),
+    }
+}
 /// Text blocks concatenated as upstream's heartbeat filter reads them.
 fn joined_text(content: &Value) -> String {
     match content {
@@ -202,4 +209,34 @@ pub(super) fn validate(entry: &Value, first: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Message fields OpenClaw adds to Pi messages. Retained verbatim in a marker.
+const OPENCLAW_FIELDS: &[&str] = &[
+    "__openclaw",
+    "idempotencyKey",
+    "openclawDelivery",
+    "openclawDeliveryMirror",
+    "openclawDisplayContent",
+    "openclawStreamFallback",
+    "provenance",
+    "excludeFromContext",
+    "diagnostics",
+    "errorMessage",
+    "responseModel",
+    "supersedesEntryId",
+];
+
+/// OpenClaw-owned message fields, or None when the message is plain Pi.
+pub(super) fn openclaw_metadata(msg: &Value, active: bool) -> Option<Value> {
+    let mut fields = serde_json::Map::new();
+    for key in OPENCLAW_FIELDS {
+        if let Some(value) = msg.get(*key) {
+            fields.insert((*key).into(), value.clone());
+        }
+    }
+    if !active {
+        fields.insert("active_branch".into(), Value::Bool(false));
+    }
+    (!fields.is_empty()).then_some(Value::Object(fields))
 }

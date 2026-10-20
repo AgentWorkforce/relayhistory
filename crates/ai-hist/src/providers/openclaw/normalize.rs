@@ -15,22 +15,6 @@ use crate::providers::file_history::{self, Keys};
 use crate::{insert_history, insert_session_marker, HistoryEntry, NewSessionMarker};
 use anyhow::Context;
 
-/// Message fields OpenClaw adds to Pi messages. Retained verbatim in a marker.
-const OPENCLAW_FIELDS: &[&str] = &[
-    "__openclaw",
-    "idempotencyKey",
-    "openclawDelivery",
-    "openclawDeliveryMirror",
-    "openclawDisplayContent",
-    "openclawStreamFallback",
-    "provenance",
-    "excludeFromContext",
-    "diagnostics",
-    "errorMessage",
-    "responseModel",
-    "supersedesEntryId",
-];
-
 /// What one pass over a conversation's windows wrote.
 struct Written {
     keys: Keys,
@@ -63,11 +47,15 @@ fn cwd(header: &Event) -> Option<&str> {
         .filter(|c| !c.trim().is_empty())
 }
 /// Write one window's header marker and every captured event after it.
-fn write(conn: &Connection, s: &Session, out: &mut Written) -> Result<()> {
+fn write(conn: &Connection, s: &Session, scope: Option<&str>, out: &mut Written) -> Result<()> {
     crate::ingest::check_capture_cancelled()?;
     let header = header(s)?;
     let cwd = cwd(header);
     session_marker(conn, s, header, &mut out.keys)?;
+    // Whether the latest user turn came from a person: a quiet
+    // acknowledgement is hidden only after a wake poll or in a run nobody
+    // prompted, never when a person asked for that text.
+    let mut prompted = false;
     for event in &s.events[1..] {
         crate::ingest::check_capture_cancelled()?;
         let entry = &event.entry;
@@ -76,12 +64,15 @@ fn write(conn: &Connection, s: &Session, out: &mut Written) -> Result<()> {
         out.first = out.first.min(ts);
         out.last = out.last.max(ts);
         if entry["type"] == "message" {
-            out.inserted += message(conn, s, cwd, event, &mut out.keys)?;
+            out.inserted += message(conn, s, cwd, event, &mut out.keys, scope)?;
             let msg = &entry["message"];
+            if msg["role"] == "user" {
+                prompted = control_kind(msg).is_none();
+            }
             if msg["role"] == "assistant" && !is_delivery_mirror(msg) {
                 let text = text(&msg["content"]);
-                // A quiet heartbeat acknowledgement is not the session's reply.
-                if !text.trim().is_empty() && !is_heartbeat_ack(&text) {
+                let quiet = !prompted && is_heartbeat_ack(&text);
+                if !text.trim().is_empty() && !quiet {
                     out.assistant = Some(text);
                 }
             }
@@ -104,8 +95,8 @@ fn write(conn: &Connection, s: &Session, out: &mut Written) -> Result<()> {
 /// catalog field, so evidence its windows no longer hold is retired.
 pub(super) fn session(conn: &Connection, conv: &Conversation, path: &Path) -> Result<usize> {
     let mut written = Written::new(conv);
-    for window in &conv.windows {
-        write(conn, window, &mut written)?;
+    for (index, window) in conv.windows.iter().enumerate() {
+        write(conn, window, conv.tool_scope(index), &mut written)?;
     }
     super::legacy::claim(conn, conv, path)?;
     file_history::retire(conn, ID, &conv.id, &written.keys)?;
@@ -140,9 +131,21 @@ pub(super) fn session(conn: &Connection, conv: &Conversation, path: &Path) -> Re
 /// Nothing is retired and catalog fields only widen.
 pub(super) fn append(conn: &Connection, conv: &Conversation, path: &Path) -> Result<usize> {
     let mut written = Written::new(conv);
-    for window in conv.windows.iter().filter(|w| !w.events.is_empty()) {
-        write(conn, window, &mut written)?;
+    let newest = conv.windows.len() - 1;
+    let mut reply = None;
+    for (index, window) in conv.windows.iter().enumerate() {
+        if window.events.is_empty() {
+            continue;
+        }
+        written.assistant = None;
+        write(conn, window, conv.tool_scope(index), &mut written)?;
+        // Only the newest window's reply can replace the conversation's; an
+        // older window growing leaves the stored one.
+        if index == newest {
+            reply = written.assistant.take();
+        }
     }
+    written.assistant = reply;
     super::legacy::claim(conn, conv, path)?;
     crate::ingest::upsert_session(
         conn,
@@ -251,13 +254,14 @@ fn message(
     cwd: Option<&str>,
     event: &Event,
     keys: &mut Keys,
+    scope: Option<&str>,
 ) -> Result<usize> {
     let entry = &event.entry;
     let msg = &entry["message"];
     let role = string(msg, "role")?;
     let mid = string(entry, "id")?;
     let control = control_kind(msg);
-    let mut metadata = openclaw_metadata(msg, event.active);
+    let mut metadata = format::openclaw_metadata(msg, event.active);
     if role == "assistant" && !counts_usage(msg) {
         if let Some(usage) = msg.get("usage") {
             // Retained as reported, outside request accounting.
@@ -327,9 +331,9 @@ fn message(
         ..Default::default()
     };
     if role == "toolResult" {
-        result(conn, &base, msg, keys)?;
+        result(conn, &base, msg, keys, scope)?;
     } else {
-        content(conn, s, &base, &msg["content"], keys)?;
+        content(conn, s, &base, &msg["content"], keys, scope)?;
     }
     if role != "user" || control.is_some() {
         return Ok(0);
@@ -354,26 +358,13 @@ fn message(
     )
 }
 
-/// OpenClaw-owned message fields, or None when the message is plain Pi.
-fn openclaw_metadata(msg: &Value, active: bool) -> Option<Value> {
-    let mut fields = serde_json::Map::new();
-    for key in OPENCLAW_FIELDS {
-        if let Some(value) = msg.get(*key) {
-            fields.insert((*key).into(), value.clone());
-        }
-    }
-    if !active {
-        fields.insert("active_branch".into(), Value::Bool(false));
-    }
-    (!fields.is_empty()).then_some(Value::Object(fields))
-}
-
 fn content(
     conn: &Connection,
     s: &Session,
     base: &EventRow<'_>,
     value: &Value,
     keys: &mut Keys,
+    scope: Option<&str>,
 ) -> Result<()> {
     let blocks = value
         .as_array()
@@ -385,7 +376,7 @@ fn content(
             "text" => ("text", block["text"].as_str().map(str::to_owned)),
             "thinking" => ("thinking", block["thinking"].as_str().map(str::to_owned)),
             "toolCall" => {
-                call(conn, base, block, keys)?;
+                call(conn, base, block, keys, scope)?;
                 ("tool_use", Some(serde_json::to_string(block)?))
             }
             _ => {
@@ -394,7 +385,8 @@ fn content(
             }
         };
         let facts = ToolResultFacts {
-            tool_use_id: (kind == "tool_use").then(|| block["id"].as_str().unwrap().to_owned()),
+            tool_use_id: (kind == "tool_use")
+                .then(|| format::scoped(block["id"].as_str().unwrap(), scope)),
             ..Default::default()
         };
         // A control kind only ever marks a user text row.
@@ -459,8 +451,14 @@ fn opaque_block(
     Ok(())
 }
 
-fn call(conn: &Connection, base: &EventRow<'_>, block: &Value, keys: &mut Keys) -> Result<()> {
-    let id = string(block, "id")?;
+fn call(
+    conn: &Connection,
+    base: &EventRow<'_>,
+    block: &Value,
+    keys: &mut Keys,
+    scope: Option<&str>,
+) -> Result<()> {
+    let id = &format::scoped(string(block, "id")?, scope);
     let name = string(block, "name")?;
     let args = serde_json::to_string(&block["arguments"])?;
     // Paths in arguments are recorded as text; they are never opened.
@@ -484,8 +482,14 @@ fn call(conn: &Connection, base: &EventRow<'_>, block: &Value, keys: &mut Keys) 
     Ok(())
 }
 
-fn result(conn: &Connection, base: &EventRow<'_>, msg: &Value, keys: &mut Keys) -> Result<()> {
-    let id = string(msg, "toolCallId")?;
+fn result(
+    conn: &Connection,
+    base: &EventRow<'_>,
+    msg: &Value,
+    keys: &mut Keys,
+    scope: Option<&str>,
+) -> Result<()> {
+    let id = &format::scoped(string(msg, "toolCallId")?, scope);
     let error = match msg.get("isError") {
         None | Some(Value::Null) => None,
         Some(value) => Some(

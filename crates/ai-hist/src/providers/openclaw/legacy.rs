@@ -537,9 +537,9 @@ pub(super) fn claim(
     conv: &conversation::Conversation,
     database: &Path,
 ) -> Result<()> {
-    let Some(first) = conv.windows.first().filter(|w| !w.legacy) else {
+    if conv.windows.first().is_none_or(|w| w.legacy) {
         return Ok(());
-    };
+    }
     let Some(dir) = database
         .parent()
         .and_then(Path::parent)
@@ -547,12 +547,7 @@ pub(super) fn claim(
     else {
         return Ok(());
     };
-    let name = conversation::native_name(&conv.key, &first.agent_id);
-    let Some(namespace) = conv.id.strip_suffix(&format!(":{name}")) else {
-        return Ok(());
-    };
-    for window in &conv.windows {
-        let legacy_id = format!("{namespace}:{}", window.native_id);
+    for (window, legacy_id) in conv.windows.iter().zip(conv.window_ids()) {
         if legacy_id == conv.id {
             continue;
         }

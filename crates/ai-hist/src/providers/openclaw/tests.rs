@@ -1414,3 +1414,194 @@ fn keys_too_long_for_a_ledger_identity_are_hashed_and_still_hydrate() {
         .unwrap();
     assert!(!evidence.messages.is_empty());
 }
+
+#[test]
+fn upgrading_identities_keeps_a_failed_conversations_earlier_rows() {
+    let (home, roots, path, db) = fixture();
+    let mut ledger = Ledger::new(home.path());
+    // A ledger from the per-window generation: the Telegram transcript was
+    // its own session.
+    let old = "main:fixture-telegram-0001";
+    ledger
+        .conn
+        .execute(
+            "INSERT INTO sessions (source, session_id, raw_path, first_activity_ms, last_activity_ms) VALUES ('openclaw', ?1, ?2, 1, 1)",
+            params![old, path.to_string_lossy()],
+        )
+        .unwrap();
+    crate::mark_session_presence(&ledger.conn, ID, old, crate::SessionLocation::Local).unwrap();
+    // Its conversation cannot be normalized this sweep.
+    db.execute(
+        "UPDATE transcript_events SET event_json='{not json' WHERE session_id='fixture-telegram-0001' AND seq=1",
+        [],
+    )
+    .unwrap();
+    assert_eq!(ledger.sweep(&roots, None).unwrap().unread, 1);
+    let rows = |conn: &Connection, id: &str| -> i64 {
+        conn.query_row(
+            "SELECT count(*) FROM sessions WHERE source='openclaw' AND session_id=?1",
+            [id],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    assert_eq!(
+        rows(&ledger.conn, old),
+        1,
+        "a failed conversation retires nothing"
+    );
+    // Once it normalizes, the conversation replaces the per-window row.
+    let original = MAIN
+        .lines()
+        .find(|l| l.starts_with("INSERT INTO transcript_events VALUES('fixture-telegram-0001',1,"))
+        .unwrap();
+    db.execute_batch(&format!(
+        "PRAGMA foreign_keys=OFF; DELETE FROM transcript_events WHERE session_id='fixture-telegram-0001' AND seq=1; {original} UPDATE session_windows SET transcript_updated_at=transcript_updated_at+1 WHERE session_id='fixture-telegram-0001';"
+    ))
+    .unwrap();
+    assert_eq!(ledger.sweep(&roots, None).unwrap().unread, 0);
+    assert_eq!(rows(&ledger.conn, old), 0);
+    assert_eq!(rows(&ledger.conn, TELEGRAM), 1);
+}
+
+/// Insert one assistant entry into a cron run window, as a grown tail.
+fn add_reply(db: &Connection, window: &str, seq: i64, id: &str, content: &str) {
+    let json = format!(
+        r#"{{"type":"message","id":"{id}","parentId":null,"timestamp":"2026-09-21T15:00:{seq:02}.000Z","message":{{"role":"assistant","content":{content},"api":"openai-responses","provider":"openai","model":"fixture-model","usage":{{"input":5,"output":1,"cacheRead":0,"cacheWrite":0,"totalTokens":6}},"stopReason":"stop","timestamp":17900009{seq:02}000}}}}"#
+    );
+    db.execute(
+        "INSERT INTO transcript_events (session_id, seq, event_json, created_at) VALUES (?1, ?2, ?3, 1790000900000)",
+        params![window, seq, json],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO transcript_event_identities (session_id, event_id, seq, event_type, created_at) VALUES (?1, ?2, ?3, 'message', 1790000900000)",
+        params![window, id, seq],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE session_windows SET transcript_updated_at=transcript_updated_at+1 WHERE session_id=?1",
+        [window],
+    )
+    .unwrap();
+}
+
+#[test]
+fn review_runs_reusing_a_tool_id_keep_both_calls_and_their_results() {
+    let home = tempfile::tempdir().unwrap();
+    let roots = ProviderRoots::from_home(home.path().into(), home.path().join("opencode.db"));
+    let (_ops, db) = database(home.path(), "ops", OPS);
+    let call = |path: &str| {
+        format!(
+            r#"[{{"type":"toolCall","id":"call_1","name":"read","arguments":{{"path":"{path}"}}}}]"#
+        )
+    };
+    add_reply(&db, "fixture-cron-run-1", 2, "run-1-call", &call("a.txt"));
+    add_reply(&db, "fixture-cron-run-2", 2, "run-2-call", &call("b.txt"));
+    let mut ledger = Ledger::new(home.path());
+    ledger.sweep(&roots, None).unwrap();
+    let mut stmt = ledger
+        .conn
+        .prepare("SELECT tool_use_id, args_json FROM tool_calls WHERE source='openclaw' AND session_id=?1 ORDER BY tool_use_id")
+        .unwrap();
+    let calls: Vec<(String, String)> = stmt
+        .query_map([CRON], |r| Ok((r.get(0)?, r.get(1)?)))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(
+        calls,
+        [
+            ("call_1".into(), r#"{"path":"a.txt"}"#.into()),
+            (
+                "call_1#fixture-cron-run-2".into(),
+                r#"{"path":"b.txt"}"#.into()
+            ),
+        ]
+    );
+}
+
+#[test]
+fn review_mixed_case_run_keys_hydrate_with_their_job() {
+    let home = tempfile::tempdir().unwrap();
+    let roots = ProviderRoots::from_home(home.path().into(), home.path().join("opencode.db"));
+    let (ops, db) = database(home.path(), "ops", OPS);
+    db.execute_batch("PRAGMA foreign_keys=OFF").unwrap();
+    db.execute(
+        "UPDATE session_windows SET session_key='agent:ops:cron:fixture-job:RUN:r2' WHERE session_id='fixture-cron-run-2'",
+        [],
+    )
+    .unwrap();
+    let ids: Vec<_> = storage::enumerate(&roots, None)
+        .unwrap()
+        .into_iter()
+        .filter_map(|c| c.session_id)
+        .collect();
+    assert_eq!(ids.iter().filter(|id| id.starts_with(CRON)).count(), 1);
+    let conv = conversation(&roots, &ops, CRON);
+    assert_eq!(
+        conv.windows.len(),
+        2,
+        "the mixed-case run is a window of its job"
+    );
+}
+
+#[test]
+fn review_an_older_window_growing_keeps_the_newest_reply_and_asked_acks_count() {
+    let home = tempfile::tempdir().unwrap();
+    let roots = ProviderRoots::from_home(home.path().into(), home.path().join("opencode.db"));
+    let (_ops, db) = database(home.path(), "ops", OPS);
+    let mut ledger = Ledger::new(home.path());
+    // The newest run answers; the older run then grows.
+    add_reply(
+        &db,
+        "fixture-cron-run-2",
+        2,
+        "run-2-answer",
+        r#"[{"type":"text","text":"Run two answer."}]"#,
+    );
+    ledger.sweep(&roots, None).unwrap();
+    add_reply(
+        &db,
+        "fixture-cron-run-1",
+        2,
+        "run-1-late",
+        r#"[{"type":"text","text":"Run one late answer."}]"#,
+    );
+    ledger.sweep(&roots, None).unwrap();
+    let last: String = ledger
+        .conn
+        .query_row(
+            "SELECT last_assistant_text FROM sessions WHERE source='openclaw' AND session_id=?1",
+            [CRON],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(last, "Run two answer.");
+    // A person who asks for the token gets it as the reply.
+    let (_main, main_db) = database(home.path(), "main", MAIN);
+    let ask = r#"{"type":"message","id":"ask-token","parentId":null,"timestamp":"2026-09-21T15:00:10.000Z","message":{"role":"user","content":"Reply with exactly HEARTBEAT_OK","timestamp":1790000910000}}"#;
+    main_db
+        .execute(
+            "INSERT INTO transcript_events (session_id, seq, event_json, created_at) VALUES ('fixture-telegram-0001', 5, ?1, 1790000910000)",
+            [ask],
+        )
+        .unwrap();
+    let answer = r#"{"type":"message","id":"token-reply","parentId":"ask-token","timestamp":"2026-09-21T15:00:11.000Z","message":{"role":"assistant","content":[{"type":"text","text":"HEARTBEAT_OK"}],"api":"openai-responses","provider":"openai","model":"fixture-model","stopReason":"stop","timestamp":1790000911000}}"#;
+    main_db
+        .execute(
+            "INSERT INTO transcript_events (session_id, seq, event_json, created_at) VALUES ('fixture-telegram-0001', 6, ?1, 1790000911000)",
+            [answer],
+        )
+        .unwrap();
+    ledger.sweep(&roots, None).unwrap();
+    let last: String = ledger
+        .conn
+        .query_row(
+            "SELECT last_assistant_text FROM sessions WHERE source='openclaw' AND session_id=?1",
+            [TELEGRAM],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(last, "HEARTBEAT_OK");
+}
