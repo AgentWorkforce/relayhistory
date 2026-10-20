@@ -669,6 +669,7 @@ fn codebuddy_review_complete_unknown_outcome_clears_prior_native_result() {
         let evidence = read(&store, case);
         assert_eq!(evidence.tool_calls[0].is_error, None);
         assert_eq!(evidence.tool_results[0].result_status, None);
+        assert_eq!(evidence.tool_results[0].error_signal, None);
         assert_eq!(evidence.tool_results[0].text, original.tool_results[0].text);
         assert_eq!(
             evidence.tool_results[0].event_uid,
@@ -849,5 +850,210 @@ fn codebuddy_incomplete_replacement_discovery_preserves_unknown_catalog_fields()
             Some("Synthetic replacement title.")
         );
         assert!(texts(&updated).contains(&"Synthetic replacement prompt."));
+    }
+}
+
+#[cfg(all(feature = "unstable-internal", feature = "export"))]
+#[test]
+fn codebuddy_actual_tool_export_remote_intake_and_local_rehydrate() {
+    use ai_hist::export::{ExportLimits, ExportSelection, ExportSnapshot};
+    use ai_hist::{
+        EvidenceKind, EvidenceRecord, NormalizedSourceEvidence, ObservationKey, SessionLocation,
+        ShallowSession, SourceEvidenceSubmission, SourceObservation, SourceObservationBatch,
+    };
+    for (case, error_only) in [
+        ("tool", false),
+        ("error", false),
+        ("error", true),
+        ("spill", false),
+    ] {
+        let origin = tempfile::tempdir().unwrap();
+        let path = stage(origin.path(), case);
+        if error_only {
+            let mut rows: Vec<Value> = std::fs::read_to_string(&path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            for row in &mut rows {
+                if row["type"] == "function_call_result" {
+                    row["providerData"]["toolResult"]["rawResponse"]["is_error"] = Value::Null;
+                }
+            }
+            write(&path, &rows);
+        }
+        let captured = std::fs::read(&path).unwrap();
+        let source = open(origin.path());
+        sync(&source);
+        if case == "tool" {
+            let native = read(&source, case);
+            assert_eq!(native.tool_calls.len(), 1);
+            assert!(native.messages.iter().flat_map(|m| &m.blocks).any(
+                |b| b.text.as_deref() == Some("   1→Synthetic fixture file color blue.\n   2→")
+            ));
+        }
+        let expected = read(&source, case);
+        assert_eq!(
+            expected.tool_results[0].error_signal.as_deref(),
+            if case == "error" {
+                Some(if error_only {
+                    "tool_status"
+                } else {
+                    "tool_result.is_error"
+                })
+            } else {
+                None
+            }
+        );
+        assert_eq!(expected.tool_calls.len(), 1);
+        assert_eq!(expected.tool_calls[0].tool_use_id, "fixture-call-001");
+        assert_eq!(
+            expected.tool_results[0].tool_use_id.as_deref(),
+            Some("fixture-call-001")
+        );
+        assert!(expected
+            .messages
+            .iter()
+            .flat_map(|m| &m.blocks)
+            .any(|b| b.kind == BlockKind::ToolResult
+                && b.tool_use_id.as_deref() == Some("fixture-call-001")));
+        assert!(expected
+            .messages
+            .iter()
+            .flat_map(|m| &m.blocks)
+            .any(|b| b.kind == BlockKind::ToolUse
+                && b.tool_use_id.as_deref() == Some("fixture-call-001")));
+        let kinds = vec![
+            EvidenceKind::SessionEvent,
+            EvidenceKind::SessionMarker,
+            EvidenceKind::ToolCall,
+        ];
+        let mut snapshot = ExportSnapshot::open(
+            rusqlite::Connection::open(origin.path().join("conformance.db")).unwrap(),
+            &ExportSelection {
+                sources: vec!["codebuddy".into()],
+                kinds: kinds.iter().map(|k| k.as_str().into()).collect(),
+                ..Default::default()
+            },
+            &ExportLimits {
+                max_batch_records: 1,
+                ..Default::default()
+            },
+            60_000,
+            1_000,
+        )
+        .unwrap();
+        let mut cursor = Some(snapshot.handle().cursor);
+        let mut records = vec![];
+        while let Some(value) = cursor {
+            let page = snapshot.page(&value, 1_000).unwrap();
+            cursor = page.next_cursor;
+            for record in page.records {
+                let mut payload = record.payload.as_object().unwrap().clone();
+                assert!(!payload.contains_key("raw_facts_version"));
+                payload.remove("id");
+                payload.remove("location");
+                records.push(EvidenceRecord {
+                    kind: serde_json::from_value(serde_json::json!(record.kind)).unwrap(),
+                    payload,
+                    record_id: Some(record.record_id),
+                    revision_id: Some(record.revision_id),
+                });
+            }
+        }
+        for derived_cache in [false, true] {
+            let home = tempfile::tempdir().unwrap();
+            let store = open(home.path());
+            let key = ObservationKey {
+                source: "codebuddy".into(),
+                session_id: sid(case),
+                location: SessionLocation::Remote,
+                connector_id: "fixture-remote".into(),
+                connector_instance: "default".into(),
+            };
+            store
+                .apply_source_observations(SourceObservationBatch::new(
+                    "fixture-remote",
+                    "default",
+                    SessionLocation::Remote,
+                    vec![SourceObservation {
+                        session: ShallowSession {
+                            source: "codebuddy".into(),
+                            session_id: sid(case),
+                            source_stamp: Some("remote-fixture".into()),
+                            ..Default::default()
+                        },
+                        raw_locator: None,
+                    }],
+                ))
+                .unwrap();
+            let revision = store.source_observation(&key).unwrap().revision.unwrap();
+            store
+                .apply_source_evidence(
+                    SourceEvidenceSubmission::new(
+                        key,
+                        revision,
+                        NormalizedSourceEvidence {
+                            source_stamp: "remote-fixture".into(),
+                            source_bytes: 1,
+                            covered_kinds: kinds.clone(),
+                            records: records.clone(),
+                        },
+                    )
+                    .include_related(false),
+                )
+                .unwrap();
+            let conn = ai_hist::open_db(&home.path().join("conformance.db")).unwrap();
+            let unstamped: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM session_events WHERE raw_facts_version IS NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                unstamped > 0,
+                "receiver has only real remote intake before hydration"
+            );
+            if derived_cache {
+                conn.execute("UPDATE session_events SET project_key='receiver-derived-cache',project_key_method='path'", []).unwrap();
+            }
+            let path = stage(home.path(), case);
+            std::fs::write(path, &captured).unwrap();
+            store
+                .discover(DiscoveryOptions::default().sources([Source::Codebuddy]))
+                .unwrap();
+            store
+                .hydrate(
+                    &SessionRef::id(Source::Codebuddy, sid(case)),
+                    HydrateOptions::default(),
+                )
+                .unwrap();
+            let stamped: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM session_events WHERE raw_facts_version IS NOT NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(stamped, unstamped);
+            let before = read(&store, case);
+            store
+                .hydrate(&reference(case), HydrateOptions::default())
+                .unwrap();
+            assert_eq!(read(&store, case).messages, before.messages);
+            let revision = store.head_revision().unwrap();
+            store
+                .hydrate(&reference(case), HydrateOptions::default())
+                .unwrap();
+            assert_eq!(store.head_revision().unwrap(), revision);
+            assert_eq!(read(&store, case).messages, read(&source, case).messages);
+            assert_eq!(
+                read(&store, case).tool_calls,
+                read(&source, case).tool_calls
+            );
+            assert_eq!(read(&store, case).tool_results, expected.tool_results);
+            assert_eq!(read(&store, case).markers, expected.markers);
+        }
     }
 }

@@ -29,6 +29,11 @@ control facts remain markers. Tool calls/results join on native callId. Full
 inline spill content is read without opening embedded pointer paths. Usage is
 counted once per native upstream response ID, never per tool-block copy.
 Unknown fields remain unknown; unknown control fact types fail closed.
+Native call IDs remain available on both tool-use and tool-result blocks.
+Exported evidence crosses the public remote-intake boundary and can then be
+hydrated from the same local transcript without changing messages, tool joins,
+result payloads or raw markers. Explicit native error flags use the existing
+error-signal vocabulary; unknown outcomes remain unknown.
 
 No executable resume, model call, authentication, provider config mutation,
 subagent discovery, delegation inference or private operator history is part of

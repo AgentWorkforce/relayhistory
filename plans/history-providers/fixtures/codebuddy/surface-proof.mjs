@@ -16,8 +16,10 @@ if (!process.env.RH_CODEBUDDY_SURFACE_CHILD) {
     TMPDIR: temporary, AI_HIST_DB: path.join(home, 'history.db'),
     RELAYHISTORY_HOME: path.join(home, 'commercial'), RH_CODEBUDDY_SURFACE_CHILD: '1',
   };
-  fs.cpSync(path.join(root, 'crates/ai-hist/tests/fixtures/codebuddy/ordinary/.codebuddy'),
-    path.join(home, '.codebuddy'), { recursive: true });
+  for (const fixture of ['ordinary', 'tool']) {
+    fs.cpSync(path.join(root, `crates/ai-hist/tests/fixtures/codebuddy/${fixture}/.codebuddy`),
+      path.join(home, '.codebuddy'), { recursive: true });
+  }
   try {
     const result = spawnSync(process.execPath, [import.meta.filename, root], { env, encoding: 'utf8' });
     process.stdout.write(result.stdout);
@@ -28,10 +30,10 @@ if (!process.env.RH_CODEBUDDY_SURFACE_CHILD) {
   const sdk = await import(pathToFileURL(path.join(root, 'sdk-ts/dist/index.js')));
   const dbPath = process.env.AI_HIST_DB;
   const discovered = await sdk.discoverSessions({ dbPath, sources: ['codebuddy'], scope: 'local' });
-  assert.equal(discovered.discovered, 1);
+  assert.equal(discovered.discovered, 2);
   const catalog = await sdk.listSessionCatalogPage({ dbPath, sources: ['codebuddy'] });
-  assert.equal(catalog.sessions.length, 1);
-  const sid = catalog.sessions[0].sessionId;
+  assert.equal(catalog.sessions.length, 2);
+  const sid = catalog.sessions.find(row => row.sessionId.endsWith(':fixture-ordinary')).sessionId;
   assert.match(sid, /^project:[a-f0-9]+:fixture-ordinary$/);
   await sdk.hydrateSession({ dbPath, source: 'codebuddy', sessionId: sid });
   const hits = await sdk.search('synthetic CodeBuddy needle', { dbPath, source: 'codebuddy' });
@@ -42,6 +44,15 @@ if (!process.env.RH_CODEBUDDY_SURFACE_CHILD) {
   assert.equal(usage.usage.inputTokens, 23);
   assert.equal(usage.usage.outputTokens, 7);
   assert.deepEqual(usage.accounting, ['per-message']);
+  const toolSid = catalog.sessions.find(row => row.sessionId.endsWith(':fixture-tool')).sessionId;
+  await sdk.hydrateSession({ dbPath, source: 'codebuddy', sessionId: toolSid });
+  const calls = await sdk.getSessionToolCalls('codebuddy', toolSid, { dbPath });
+  assert.equal(calls[0].toolUseId, 'fixture-call-001');
+  const events = await sdk.getSessionEvents(toolSid, { dbPath, source: 'codebuddy' });
+  assert.equal(events.find(event => event.kind === 'tool_use').toolUseId, calls[0].toolUseId);
+  const result = events.find(event => event.kind === 'tool_result');
+  assert.equal(result.toolUseId, calls[0].toolUseId);
+  assert.match(result.text, /Synthetic fixture file color blue/);
   const caps = await sdk.getSourceCapabilities('codebuddy');
   assert.equal(caps.source, 'codebuddy');
   assert.ok(caps.evidenceKinds.includes('tool_call'));

@@ -193,8 +193,8 @@ fn result(conn: &Connection, base: &EventRow<'_>, row: &Value, keys: &mut Keys) 
         inline.is_some() || !text.starts_with("<persisted-output>"),
         "CODEBUDDY_UNSUPPORTED_RESULT: sidecar-only output"
     );
-    let error = row["providerData"]["toolResult"]["rawResponse"]["is_error"] == true
-        || format::truthy(&row["providerData"]["toolResult"]["error"]);
+    let native_error = row["providerData"]["toolResult"]["rawResponse"]["is_error"] == true;
+    let error = native_error || format::truthy(&row["providerData"]["toolResult"]["error"]);
     let mut facts = ToolResultFacts::from_payload(&Value::String(text.into()));
     facts.tool_use_id = Some(id.into());
     facts.result_status = if error {
@@ -202,7 +202,11 @@ fn result(conn: &Connection, base: &EventRow<'_>, row: &Value, keys: &mut Keys) 
     } else {
         (row["status"] == "completed").then(|| "completed".into())
     };
-    facts.error_signal = error.then(|| "native_tool_error".into());
+    facts.error_signal = if native_error {
+        Some(crate::ingest::ERROR_SIGNAL_TOOL_RESULT.into())
+    } else {
+        error.then(|| crate::ingest::ERROR_SIGNAL_TOOL_STATUS.into())
+    };
     insert_session_event(
         conn,
         &EventRow {

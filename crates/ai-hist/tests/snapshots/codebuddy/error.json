@@ -92,7 +92,7 @@
       "call_index": null,
       "control_kind": null,
       "cwd": "/fixture/workspace",
-      "error_signal": "native_tool_error",
+      "error_signal": "tool_result.is_error",
       "event_index": null,
       "event_source": null,
       "event_uid": "fixture-error-006:0",
