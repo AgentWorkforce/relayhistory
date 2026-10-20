@@ -1,0 +1,42 @@
+{
+  "ordinary": [
+    "fixture-ordinary-001"
+  ],
+  "resumed": [
+    "fixture-ordinary-001",
+    "fixture-ordinary-006"
+  ],
+  "tool": [
+    "fixture-tool-001"
+  ],
+  "spill": [
+    "fixture-spill-001"
+  ],
+  "error": [
+    "fixture-error-001"
+  ],
+  "fork": [
+    "u1"
+  ],
+  "pending-rewind": [
+    "u1"
+  ],
+  "compact": [
+    "u1",
+    "u4"
+  ],
+  "reasoning": [
+    "u1"
+  ],
+  "fragments": [
+    "u1"
+  ],
+  "metadata": [
+    "u1"
+  ],
+  "string-content": [
+    "u1",
+    "u3",
+    "u6"
+  ]
+}

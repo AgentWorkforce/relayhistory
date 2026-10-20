@@ -1,0 +1,158 @@
+{
+  "session": {
+    "id": "fixture-metadata",
+    "history": [
+      {
+        "type": "message",
+        "id": "u1",
+        "timestamp": 1791720000001,
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Synthetic original prompt."
+          }
+        ],
+        "sessionId": "fixture-metadata",
+        "cwd": "/fixture/workspace"
+      },
+      {
+        "type": "message",
+        "id": "a2",
+        "timestamp": 1791720000002,
+        "role": "assistant",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "Synthetic old branch answer."
+          }
+        ],
+        "sessionId": "fixture-metadata",
+        "cwd": "/fixture/workspace",
+        "parentId": "u1"
+      },
+      {
+        "type": "custom-title",
+        "id": "title1",
+        "timestamp": 1791720000010,
+        "customTitle": "Synthetic chosen title."
+      },
+      {
+        "type": "ai-title",
+        "id": "title2",
+        "timestamp": 1791720000020,
+        "aiTitle": "Synthetic later AI title."
+      }
+    ],
+    "createdAt": 1792527413304.0881,
+    "updatedAt": 1792527413304.4326,
+    "meta": {
+      "codebuddy.ai/sessionTitle": [
+        {
+          "type": "ai-title",
+          "id": "title2",
+          "timestamp": 1791720000020,
+          "aiTitle": "Synthetic later AI title."
+        },
+        {
+          "type": "custom-title",
+          "id": "title1",
+          "timestamp": 1791720000010,
+          "customTitle": "Synthetic chosen title."
+        }
+      ],
+      "cwd": "/fixture/workspace"
+    },
+    "hasCompactedHistory": false
+  },
+  "replay": [
+    {
+      "type": "message",
+      "id": "u1",
+      "timestamp": 1791720000001,
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Synthetic original prompt."
+        }
+      ],
+      "sessionId": "fixture-metadata",
+      "cwd": "/fixture/workspace"
+    },
+    {
+      "type": "message",
+      "id": "a2",
+      "timestamp": 1791720000002,
+      "role": "assistant",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "Synthetic old branch answer."
+        }
+      ],
+      "sessionId": "fixture-metadata",
+      "cwd": "/fixture/workspace",
+      "parentId": "u1"
+    }
+  ],
+  "lane": [
+    {
+      "type": "message",
+      "uuid": "u1",
+      "timestamp": "2026-10-11T12:00:00.001Z",
+      "payload": {
+        "type": "message",
+        "id": "u1",
+        "timestamp": 1791720000001,
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Synthetic original prompt."
+          }
+        ],
+        "sessionId": "fixture-metadata",
+        "cwd": "/fixture/workspace"
+      }
+    },
+    {
+      "type": "message",
+      "uuid": "a2",
+      "timestamp": "2026-10-11T12:00:00.002Z",
+      "payload": {
+        "type": "message",
+        "id": "a2",
+        "timestamp": 1791720000002,
+        "role": "assistant",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "Synthetic old branch answer."
+          }
+        ],
+        "sessionId": "fixture-metadata",
+        "cwd": "/fixture/workspace",
+        "parentId": "u1"
+      }
+    }
+  ],
+  "titleFacts": [
+    {
+      "type": "ai-title",
+      "id": "title2",
+      "timestamp": 1791720000020,
+      "aiTitle": "Synthetic later AI title."
+    },
+    {
+      "type": "custom-title",
+      "id": "title1",
+      "timestamp": 1791720000010,
+      "customTitle": "Synthetic chosen title."
+    }
+  ],
+  "nativeTitle": "Synthetic chosen title.",
+  "realUserMessageIds": [
+    "u1"
+  ]
+}

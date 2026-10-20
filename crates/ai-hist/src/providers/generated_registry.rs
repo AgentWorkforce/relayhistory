@@ -71,6 +71,11 @@ const REGISTRATIONS: &[Registration] = &[
         adapter: kimi::ADAPTER,
     },
     Registration {
+        id: "codebuddy",
+        metadata: codebuddy::METADATA,
+        adapter: codebuddy::ADAPTER,
+    },
+    Registration {
         id: "grok-bot",
         metadata: grok_bot::METADATA,
         adapter: grok_bot::ADAPTER,

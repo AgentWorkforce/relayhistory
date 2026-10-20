@@ -1,0 +1,3 @@
+{"type":"message","id":"u1","timestamp":1791720000001,"role":"user","content":[{"type":"input_text","text":"Synthetic original prompt."}],"sessionId":"fixture-pending-rewind","cwd":"/fixture/workspace"}
+{"type":"message","id":"a2","timestamp":1791720000002,"role":"assistant","content":[{"type":"output_text","text":"Synthetic old branch answer."}],"sessionId":"fixture-pending-rewind","cwd":"/fixture/workspace","parentId":"u1"}
+{"type":"resend-fork-notice","id":"notice-3","parentId":"u1","timestamp":1791720000003,"providerData":{"skipRun":true,"resendForkNotice":true},"sessionId":"fixture-pending-rewind","cwd":"/fixture/workspace"}

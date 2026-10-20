@@ -1,0 +1,273 @@
+{
+  "session": {
+    "id": "fixture-string-content",
+    "history": [
+      {
+        "type": "message",
+        "id": "u1",
+        "timestamp": 1791720000001,
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Synthetic original prompt."
+          }
+        ],
+        "sessionId": "fixture-string-content",
+        "cwd": "/fixture/workspace"
+      },
+      {
+        "type": "message",
+        "id": "a2",
+        "timestamp": 1791720000002,
+        "role": "assistant",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "Synthetic old branch answer."
+          }
+        ],
+        "sessionId": "fixture-string-content",
+        "cwd": "/fixture/workspace",
+        "parentId": "u1"
+      },
+      {
+        "type": "message",
+        "id": "u3",
+        "timestamp": 1791720000003,
+        "role": "user",
+        "content": "Discuss <cb_summary_extra> and <teammate-messageboard> literally.",
+        "sessionId": "fixture-string-content",
+        "cwd": "/fixture/workspace",
+        "parentId": "a2"
+      },
+      {
+        "type": "message",
+        "id": "a4",
+        "timestamp": 1791720000004,
+        "role": "assistant",
+        "content": "Synthetic string-content answer.",
+        "sessionId": "fixture-string-content",
+        "cwd": "/fixture/workspace",
+        "parentId": "u3"
+      },
+      {
+        "type": "message",
+        "id": "u5",
+        "timestamp": 1791720000005,
+        "role": "user",
+        "content": "<cb_summary>Actual synthetic control summary.</cb_summary>",
+        "sessionId": "fixture-string-content",
+        "cwd": "/fixture/workspace",
+        "parentId": "a4"
+      },
+      {
+        "type": "message",
+        "id": "u6",
+        "timestamp": 1791720000006,
+        "role": "user",
+        "content": "Explicit native real user <cb_summary> literal.",
+        "sessionId": "fixture-string-content",
+        "cwd": "/fixture/workspace",
+        "providerData": {
+          "startsNewUserRequest": true,
+          "isMeta": true
+        },
+        "parentId": "u5"
+      }
+    ],
+    "createdAt": 1792527413305.3472,
+    "updatedAt": 1792527413305.6233,
+    "meta": {
+      "cwd": "/fixture/workspace"
+    },
+    "hasCompactedHistory": false
+  },
+  "replay": [
+    {
+      "type": "message",
+      "id": "u1",
+      "timestamp": 1791720000001,
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Synthetic original prompt."
+        }
+      ],
+      "sessionId": "fixture-string-content",
+      "cwd": "/fixture/workspace"
+    },
+    {
+      "type": "message",
+      "id": "a2",
+      "timestamp": 1791720000002,
+      "role": "assistant",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "Synthetic old branch answer."
+        }
+      ],
+      "sessionId": "fixture-string-content",
+      "cwd": "/fixture/workspace",
+      "parentId": "u1"
+    },
+    {
+      "type": "message",
+      "id": "u3",
+      "timestamp": 1791720000003,
+      "role": "user",
+      "content": "Discuss <cb_summary_extra> and <teammate-messageboard> literally.",
+      "sessionId": "fixture-string-content",
+      "cwd": "/fixture/workspace",
+      "parentId": "a2"
+    },
+    {
+      "type": "message",
+      "id": "a4",
+      "timestamp": 1791720000004,
+      "role": "assistant",
+      "content": "Synthetic string-content answer.",
+      "sessionId": "fixture-string-content",
+      "cwd": "/fixture/workspace",
+      "parentId": "u3"
+    },
+    {
+      "type": "message",
+      "id": "u5",
+      "timestamp": 1791720000005,
+      "role": "user",
+      "content": "<cb_summary>Actual synthetic control summary.</cb_summary>",
+      "sessionId": "fixture-string-content",
+      "cwd": "/fixture/workspace",
+      "parentId": "a4"
+    },
+    {
+      "type": "message",
+      "id": "u6",
+      "timestamp": 1791720000006,
+      "role": "user",
+      "content": "Explicit native real user <cb_summary> literal.",
+      "sessionId": "fixture-string-content",
+      "cwd": "/fixture/workspace",
+      "providerData": {
+        "startsNewUserRequest": true,
+        "isMeta": true
+      },
+      "parentId": "u5"
+    }
+  ],
+  "lane": [
+    {
+      "type": "message",
+      "uuid": "u1",
+      "timestamp": "2026-10-11T12:00:00.001Z",
+      "payload": {
+        "type": "message",
+        "id": "u1",
+        "timestamp": 1791720000001,
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Synthetic original prompt."
+          }
+        ],
+        "sessionId": "fixture-string-content",
+        "cwd": "/fixture/workspace"
+      }
+    },
+    {
+      "type": "message",
+      "uuid": "a2",
+      "timestamp": "2026-10-11T12:00:00.002Z",
+      "payload": {
+        "type": "message",
+        "id": "a2",
+        "timestamp": 1791720000002,
+        "role": "assistant",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "Synthetic old branch answer."
+          }
+        ],
+        "sessionId": "fixture-string-content",
+        "cwd": "/fixture/workspace",
+        "parentId": "u1"
+      }
+    },
+    {
+      "type": "message",
+      "uuid": "u3",
+      "timestamp": "2026-10-11T12:00:00.003Z",
+      "payload": {
+        "type": "message",
+        "id": "u3",
+        "timestamp": 1791720000003,
+        "role": "user",
+        "content": "Discuss <cb_summary_extra> and <teammate-messageboard> literally.",
+        "sessionId": "fixture-string-content",
+        "cwd": "/fixture/workspace",
+        "parentId": "a2"
+      }
+    },
+    {
+      "type": "message",
+      "uuid": "a4",
+      "timestamp": "2026-10-11T12:00:00.004Z",
+      "payload": {
+        "type": "message",
+        "id": "a4",
+        "timestamp": 1791720000004,
+        "role": "assistant",
+        "content": "Synthetic string-content answer.",
+        "sessionId": "fixture-string-content",
+        "cwd": "/fixture/workspace",
+        "parentId": "u3"
+      }
+    },
+    {
+      "type": "message",
+      "uuid": "u5",
+      "timestamp": "2026-10-11T12:00:00.005Z",
+      "payload": {
+        "type": "message",
+        "id": "u5",
+        "timestamp": 1791720000005,
+        "role": "user",
+        "content": "<cb_summary>Actual synthetic control summary.</cb_summary>",
+        "sessionId": "fixture-string-content",
+        "cwd": "/fixture/workspace",
+        "parentId": "a4"
+      }
+    },
+    {
+      "type": "message",
+      "uuid": "u6",
+      "timestamp": "2026-10-11T12:00:00.006Z",
+      "payload": {
+        "type": "message",
+        "id": "u6",
+        "timestamp": 1791720000006,
+        "role": "user",
+        "content": "Explicit native real user <cb_summary> literal.",
+        "sessionId": "fixture-string-content",
+        "cwd": "/fixture/workspace",
+        "providerData": {
+          "startsNewUserRequest": true,
+          "isMeta": true
+        },
+        "parentId": "u5"
+      }
+    }
+  ],
+  "titleFacts": [],
+  "nativeTitle": "Synthetic original prompt.",
+  "realUserMessageIds": [
+    "u1",
+    "u3",
+    "u6"
+  ]
+}

@@ -250,6 +250,19 @@ source without deciding which one fails the test.
 | kimi/subagent | Kimi Code 2.2.0 native protocol 1.5 writer, localhost model fixture, independently restored by pinned official foldWireRecords; subagent case. |
 | kimi/rewound | Native 2.2 binary journal plus pinned official buildUndoSwitchRecords writer constructor; official flattenChain+fold confirms prior messages are retired. |
 | kimi/official-reader | Pinned official source restart replay oracle, independent of RelayHistory. |
+| codebuddy/ordinary | Official @tencent-ai/codebuddy-code 2.171.0 CLI writer with isolated localhost model and independent native historical deserializer: ordinary. |
+| codebuddy/resumed | Official @tencent-ai/codebuddy-code 2.171.0 CLI writer with isolated localhost model and independent native historical deserializer: resumed. |
+| codebuddy/tool | Official @tencent-ai/codebuddy-code 2.171.0 CLI writer with isolated localhost model and independent native historical deserializer: tool. |
+| codebuddy/spill | Official @tencent-ai/codebuddy-code 2.171.0 CLI writer with isolated localhost model and independent native historical deserializer: spill. |
+| codebuddy/error | Official Tencent CLI 2.171.0 against isolated localhost model, actual native Read file-size error and independent native historical reader. |
+| codebuddy/fork | Published native LocalJsonlSessionStore 2.171.0 offline recorder and fresh high-level historical replay reader; fork control. Not a CLI model-loop capture. |
+| codebuddy/pending-rewind | Published native LocalJsonlSessionStore 2.171.0 offline recorder and fresh high-level historical replay reader; pending-rewind control. Not a CLI model-loop capture. |
+| codebuddy/compact | Published native LocalJsonlSessionStore 2.171.0 offline recorder and fresh high-level historical replay reader; compact control. Not a CLI model-loop capture. |
+| codebuddy/reasoning | Published native LocalJsonlSessionStore 2.171.0 offline recorder and fresh high-level historical reader replay; reasoning. Not a CLI model-loop capture. |
+| codebuddy/fragments | Published native LocalJsonlSessionStore 2.171.0 offline recorder and fresh high-level historical reader replay; fragments. Not a CLI model-loop capture. |
+| codebuddy/metadata | Published native LocalJsonlSessionStore 2.171.0 offline recorder and fresh high-level historical reader replay; metadata. Not a CLI model-loop capture. |
+| codebuddy/string-content | Published native LocalJsonlSessionStore 2.171.0 offline recorder and fresh high-level historical reader replay; string-content. Not a CLI model-loop capture. |
+| codebuddy/official-reader | Fresh-process native SessionStoreImpl historical reader oracle for all four CLI captures. |
 | grok-bot/replicas | Synthetic complete and truncated transcript tails in two account slots, roster titles, widget response, cloud-agent round trip, and voice turns. |
 | openclaw/agent24 | OpenClaw 2026.10.4 writer, agent schema 24, deterministic clock/UUIDs: Pi v4 entries in transcript_events incl. one writer-compressed zstd row, session keys as conversation identity, main and Telegram keys, thinking/tool calls/results with isError, per-message usage, zero-usage delivery mirror, shared-mode heartbeat polls (marker and legacy prompt) with quiet acknowledgements. |
 | openclaw/agent24-ops | Second agent database from the same writer run: relay DM key under a non-main agent ID, and an isolated cron job whose two runs are two windows of one session key. |

@@ -33,6 +33,8 @@ pub enum Source {
     QwenCode,
     #[serde(rename = "kimi")]
     Kimi,
+    #[serde(rename = "codebuddy")]
+    Codebuddy,
     #[serde(rename = "grok-bot")]
     GrokBot,
     #[serde(rename = "openclaw")]
@@ -59,6 +61,7 @@ impl Source {
         Self::Copilot,
         Self::QwenCode,
         Self::Kimi,
+        Self::Codebuddy,
         Self::GrokBot,
         Self::OpenClaw,
         #[cfg(test)]
@@ -82,6 +85,7 @@ impl Source {
             Self::Copilot => "copilot",
             Self::QwenCode => "qwen-code",
             Self::Kimi => "kimi",
+            Self::Codebuddy => "codebuddy",
             Self::GrokBot => "grok-bot",
             Self::OpenClaw => "openclaw",
             #[cfg(test)]
@@ -106,6 +110,7 @@ impl Source {
             "copilot" => Some(Self::Copilot),
             "qwen-code" => Some(Self::QwenCode),
             "kimi" => Some(Self::Kimi),
+            "codebuddy" => Some(Self::Codebuddy),
             "grok-bot" => Some(Self::GrokBot),
             "openclaw" => Some(Self::OpenClaw),
             #[cfg(test)]

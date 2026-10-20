@@ -1,0 +1,183 @@
+{
+  "corpus_files": [
+    "codebuddy/metadata"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "codebuddy/metadata",
+  "history": [
+    {
+      "project": "/fixture/workspace",
+      "prompt": "Synthetic original prompt.",
+      "session_id": "project:85bb7a9ae979f4260522cdcef7d1a0314b4ae28737b9f5d1c693a48338d814c2:fixture-metadata",
+      "source": "codebuddy",
+      "timestamp_ms": 1791720000001
+    }
+  ],
+  "hydration": [
+    {
+      "related_session_ids": [],
+      "session_id": "project:85bb7a9ae979f4260522cdcef7d1a0314b4ae28737b9f5d1c693a48338d814c2:fixture-metadata",
+      "source": "codebuddy",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "HomeTree",
+  "notes": [],
+  "origin": "relayhistory",
+  "quirk": "Published native LocalJsonlSessionStore 2.171.0 offline recorder and fresh high-level historical reader replay; metadata. Not a CLI model-loop capture.",
+  "session_events": [
+    {
+      "agent_id": null,
+      "call_index": null,
+      "control_kind": null,
+      "cwd": "/fixture/workspace",
+      "error_signal": null,
+      "event_index": null,
+      "event_source": null,
+      "event_uid": "u1:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "u1",
+      "model": null,
+      "parent_id": null,
+      "payload_bytes": null,
+      "payload_hash": null,
+      "payload_truncated": null,
+      "project": "/fixture/workspace",
+      "request_id": null,
+      "result_status": null,
+      "role": "user",
+      "session_id": "project:85bb7a9ae979f4260522cdcef7d1a0314b4ae28737b9f5d1c693a48338d814c2:fixture-metadata",
+      "source": "codebuddy",
+      "stop_reason": null,
+      "subagent_session_id": null,
+      "text": "Synthetic original prompt.",
+      "token_json": null,
+      "tool_use_id": null,
+      "ts_ms": 1791720000001
+    },
+    {
+      "agent_id": null,
+      "call_index": null,
+      "control_kind": null,
+      "cwd": "/fixture/workspace",
+      "error_signal": null,
+      "event_index": null,
+      "event_source": null,
+      "event_uid": "a2:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "a2",
+      "model": null,
+      "parent_id": "u1",
+      "payload_bytes": null,
+      "payload_hash": null,
+      "payload_truncated": null,
+      "project": "/fixture/workspace",
+      "request_id": null,
+      "result_status": null,
+      "role": "assistant",
+      "session_id": "project:85bb7a9ae979f4260522cdcef7d1a0314b4ae28737b9f5d1c693a48338d814c2:fixture-metadata",
+      "source": "codebuddy",
+      "stop_reason": null,
+      "subagent_session_id": null,
+      "text": "Synthetic old branch answer.",
+      "token_json": null,
+      "tool_use_id": null,
+      "ts_ms": 1791720000002
+    }
+  ],
+  "session_markers": [
+    {
+      "kind": "message",
+      "marker_uid": "record:0",
+      "message_id": "u1",
+      "parent_id": null,
+      "payload_json": "{\"content\":[{\"text\":\"Synthetic original prompt.\",\"type\":\"input_text\"}],\"cwd\":\"/fixture/workspace\",\"id\":\"u1\",\"role\":\"user\",\"sessionId\":\"fixture-metadata\",\"timestamp\":1791720000001,\"type\":\"message\"}",
+      "session_id": "project:85bb7a9ae979f4260522cdcef7d1a0314b4ae28737b9f5d1c693a48338d814c2:fixture-metadata",
+      "source": "codebuddy",
+      "subkind": null,
+      "text": null,
+      "ts_ms": 1791720000001,
+      "turn_id": null
+    },
+    {
+      "kind": "message",
+      "marker_uid": "record:1",
+      "message_id": "a2",
+      "parent_id": "u1",
+      "payload_json": "{\"content\":[{\"text\":\"Synthetic old branch answer.\",\"type\":\"output_text\"}],\"cwd\":\"/fixture/workspace\",\"id\":\"a2\",\"parentId\":\"u1\",\"role\":\"assistant\",\"sessionId\":\"fixture-metadata\",\"timestamp\":1791720000002,\"type\":\"message\"}",
+      "session_id": "project:85bb7a9ae979f4260522cdcef7d1a0314b4ae28737b9f5d1c693a48338d814c2:fixture-metadata",
+      "source": "codebuddy",
+      "subkind": null,
+      "text": null,
+      "ts_ms": 1791720000002,
+      "turn_id": null
+    },
+    {
+      "kind": "custom-title",
+      "marker_uid": "record:2",
+      "message_id": "title1",
+      "parent_id": null,
+      "payload_json": "{\"customTitle\":\"Synthetic chosen title.\",\"id\":\"title1\",\"timestamp\":1791720000010,\"type\":\"custom-title\"}",
+      "session_id": "project:85bb7a9ae979f4260522cdcef7d1a0314b4ae28737b9f5d1c693a48338d814c2:fixture-metadata",
+      "source": "codebuddy",
+      "subkind": null,
+      "text": null,
+      "ts_ms": 1791720000010,
+      "turn_id": null
+    },
+    {
+      "kind": "ai-title",
+      "marker_uid": "record:3",
+      "message_id": "title2",
+      "parent_id": null,
+      "payload_json": "{\"aiTitle\":\"Synthetic later AI title.\",\"id\":\"title2\",\"timestamp\":1791720000020,\"type\":\"ai-title\"}",
+      "session_id": "project:85bb7a9ae979f4260522cdcef7d1a0314b4ae28737b9f5d1c693a48338d814c2:fixture-metadata",
+      "source": "codebuddy",
+      "subkind": null,
+      "text": null,
+      "ts_ms": 1791720000020,
+      "turn_id": null
+    },
+    {
+      "kind": "session-meta",
+      "marker_uid": "record:4",
+      "message_id": "meta1",
+      "parent_id": null,
+      "payload_json": "{\"id\":\"meta1\",\"meta\":{\"codebuddy.ai/sessionTitle\":[{\"id\":\"topic1\",\"timestamp\":1791720000005,\"topic\":\"Synthetic metadata topic.\",\"type\":\"topic\"}]},\"sessionId\":\"fixture-metadata\",\"timestamp\":1791720000030,\"type\":\"session-meta\"}",
+      "session_id": "project:85bb7a9ae979f4260522cdcef7d1a0314b4ae28737b9f5d1c693a48338d814c2:fixture-metadata",
+      "source": "codebuddy",
+      "subkind": null,
+      "text": null,
+      "ts_ms": 1791720000030,
+      "turn_id": null
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": null,
+      "cwd": "/fixture/workspace",
+      "discovery_state": "full",
+      "first_activity_ms": 1791720000001,
+      "first_prompt": "Synthetic original prompt.",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1791720000030,
+      "last_assistant_text": "Synthetic old branch answer.",
+      "models_json": null,
+      "originator": null,
+      "raw_path": "<home>/.codebuddy/projects/fixture-workspace/fixture-metadata.jsonl",
+      "repo_url": null,
+      "session_id": "project:85bb7a9ae979f4260522cdcef7d1a0314b4ae28737b9f5d1c693a48338d814c2:fixture-metadata",
+      "source": "codebuddy",
+      "source_stamp": "codebuddy_jsonl_v1:sha256:2eb39a880166c478655f8277ed7ac8da9df6e0d8ff1b1fbbda9df77b0348c20a",
+      "title": "Synthetic chosen title.",
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "codebuddy",
+  "tool_calls": []
+}
