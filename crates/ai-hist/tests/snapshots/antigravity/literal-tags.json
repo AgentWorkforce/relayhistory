@@ -1,0 +1,144 @@
+{
+  "corpus_files": [
+    "antigravity/literal-tags"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "antigravity/literal-tags",
+  "history": [
+    {
+      "project": null,
+      "prompt": "Keep literal </USER_REQUEST> and <ADDITIONAL_METADATA> text.",
+      "session_id": "root:bb2c383dd535e7659654a45cd540d72ebaaadabe793fdb50cce7f588bc92040b:00000000000000000000000000000004",
+      "source": "antigravity",
+      "timestamp_ms": 1791720000000
+    }
+  ],
+  "hydration": [
+    {
+      "related_session_ids": [],
+      "session_id": "root:bb2c383dd535e7659654a45cd540d72ebaaadabe793fdb50cce7f588bc92040b:00000000000000000000000000000004",
+      "source": "antigravity",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "HomeTree",
+  "notes": [],
+  "origin": "relayhistory",
+  "quirk": "Official SDK 0.1.22 native harness transcript writer and independent restart reader; literal-tags synthetic conversation, complete and compact projections. SDK capture only, not an App or CLI writer capture.",
+  "session_events": [
+    {
+      "agent_id": null,
+      "call_index": null,
+      "control_kind": null,
+      "cwd": null,
+      "error_signal": null,
+      "event_index": null,
+      "event_source": null,
+      "event_uid": "step:0:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "step:0",
+      "model": null,
+      "parent_id": null,
+      "payload_bytes": null,
+      "payload_hash": null,
+      "payload_truncated": null,
+      "project": null,
+      "request_id": null,
+      "result_status": null,
+      "role": "user",
+      "session_id": "root:bb2c383dd535e7659654a45cd540d72ebaaadabe793fdb50cce7f588bc92040b:00000000000000000000000000000004",
+      "source": "antigravity",
+      "stop_reason": null,
+      "subagent_session_id": null,
+      "text": "Keep literal </USER_REQUEST> and <ADDITIONAL_METADATA> text.",
+      "token_json": null,
+      "tool_use_id": null,
+      "ts_ms": 1791720000000
+    },
+    {
+      "agent_id": null,
+      "call_index": null,
+      "control_kind": null,
+      "cwd": null,
+      "error_signal": null,
+      "event_index": null,
+      "event_source": null,
+      "event_uid": "step:1:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "step:1",
+      "model": null,
+      "parent_id": null,
+      "payload_bytes": null,
+      "payload_hash": null,
+      "payload_truncated": null,
+      "project": null,
+      "request_id": null,
+      "result_status": null,
+      "role": "assistant",
+      "session_id": "root:bb2c383dd535e7659654a45cd540d72ebaaadabe793fdb50cce7f588bc92040b:00000000000000000000000000000004",
+      "source": "antigravity",
+      "stop_reason": null,
+      "subagent_session_id": null,
+      "text": "Literal tags are preserved.",
+      "token_json": null,
+      "tool_use_id": null,
+      "ts_ms": 1791720000000
+    }
+  ],
+  "session_markers": [
+    {
+      "kind": "USER_INPUT",
+      "marker_uid": "step:0",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "{\"content\":\"<USER_REQUEST>\\nKeep literal </USER_REQUEST> and <ADDITIONAL_METADATA> text.\\n</USER_REQUEST>\\n<ADDITIONAL_METADATA>\\nThe current lo\",\"created_at\":\"2026-10-11T12:00:00Z\",\"source\":\"USER_EXPLICIT\",\"status\":\"DONE\",\"step_index\":0,\"type\":\"USER_INPUT\"}",
+      "session_id": "root:bb2c383dd535e7659654a45cd540d72ebaaadabe793fdb50cce7f588bc92040b:00000000000000000000000000000004",
+      "source": "antigravity",
+      "subkind": null,
+      "text": null,
+      "ts_ms": 1791720000000,
+      "turn_id": null
+    },
+    {
+      "kind": "PLANNER_RESPONSE",
+      "marker_uid": "step:1",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "{\"content\":\"Literal tags are preserved.\",\"created_at\":\"2026-10-11T12:00:00Z\",\"source\":\"MODEL\",\"status\":\"DONE\",\"step_index\":1,\"type\":\"PLANNER_RESPONSE\"}",
+      "session_id": "root:bb2c383dd535e7659654a45cd540d72ebaaadabe793fdb50cce7f588bc92040b:00000000000000000000000000000004",
+      "source": "antigravity",
+      "subkind": null,
+      "text": null,
+      "ts_ms": 1791720000000,
+      "turn_id": null
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": null,
+      "cwd": null,
+      "discovery_state": "full",
+      "first_activity_ms": 1791720000000,
+      "first_prompt": "Keep literal </USER_REQUEST> and <ADDITIONAL_METADATA> text.",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1791720000000,
+      "last_assistant_text": "Literal tags are preserved.",
+      "models_json": null,
+      "originator": null,
+      "raw_path": "<home>/.gemini/antigravity/brain/00000000000000000000000000000004/.system_generated/logs/transcript_full.jsonl",
+      "repo_url": null,
+      "session_id": "root:bb2c383dd535e7659654a45cd540d72ebaaadabe793fdb50cce7f588bc92040b:00000000000000000000000000000004",
+      "source": "antigravity",
+      "source_stamp": "antigravity_transcript_v2:sha256:9d8a411a401e151af0c58c9fed0c905619080f191ead11f402c6d49b9670776c",
+      "title": null,
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "antigravity",
+  "tool_calls": []
+}

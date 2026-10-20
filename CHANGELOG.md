@@ -8,10 +8,12 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Antigravity native transcript history is discoverable and searchable across App, CLI and IDE brain directories, with recorded user/assistant text and step markers; full transcripts take precedence over truncated compact files.
 - Oh My Pi history is discoverable and searchable from its native title-slot session files, with recorded messages, tool calls and results, observed usage and control markers; shared Pi roots do not double-import these sessions.
 
 ### Rust API
 
+- Added `Source::Antigravity` for filtering and reading persisted Antigravity transcripts.
 - Added `Source::Omp` for filtering and reading persisted Oh My Pi session history.
 
 ## [0.47.0] - 2026-10-18

@@ -1,0 +1,87 @@
+[
+  {
+    "name": "ordinary",
+    "conversation_id": "00000000000000000000000000000001",
+    "root": ".gemini/antigravity/brain/00000000000000000000000000000001/.system_generated/logs",
+    "writer": "google-antigravity 0.1.22 native localharness",
+    "records": {
+      "transcript_full.jsonl": {
+        "raw_sha256": "45ef298821661928460562aed2d504389960d9467182553de023a45dbd4c2a26",
+        "sanitized_sha256": "b44f8ced1f4cfae560616b7efc6a711df2f893c5e34e3a8f0cd1aa36ebac3691"
+      },
+      "transcript.jsonl": {
+        "raw_sha256": "45ef298821661928460562aed2d504389960d9467182553de023a45dbd4c2a26",
+        "sanitized_sha256": "b44f8ced1f4cfae560616b7efc6a711df2f893c5e34e3a8f0cd1aa36ebac3691"
+      }
+    },
+    "reader_steps": 2
+  },
+  {
+    "name": "tool",
+    "conversation_id": "00000000000000000000000000000002",
+    "root": ".gemini/antigravity/brain/00000000000000000000000000000002/.system_generated/logs",
+    "writer": "google-antigravity 0.1.22 native localharness",
+    "records": {
+      "transcript_full.jsonl": {
+        "raw_sha256": "05986afca291d208a894b7f55cc990f3af676376d1f93ec7fcbd6d20a8af063e",
+        "sanitized_sha256": "864fbdf7692f7eb04db917ff25ec0cf3fc1d8cbd965428e6eb3bf8025c727298"
+      },
+      "transcript.jsonl": {
+        "raw_sha256": "ac6832b0c371e21c3a7118dd798939344812e93c414fb04d8d31097d50272594",
+        "sanitized_sha256": "5306ae892d7c4a3d4a1a77ea6fda7876f543591de4bc2d071155912193b79bcf"
+      }
+    },
+    "reader_steps": 3
+  },
+  {
+    "name": "resumed",
+    "conversation_id": "00000000000000000000000000000003",
+    "root": ".gemini/antigravity/brain/00000000000000000000000000000003/.system_generated/logs",
+    "writer": "google-antigravity 0.1.22 native localharness",
+    "records": {
+      "transcript_full.jsonl": {
+        "raw_sha256": "7d6863765494c033ff25f127174e9a0e1a5c3f4b1588ce1052ea2799d396da02",
+        "sanitized_sha256": "9535eadee134acf6c4e5ab8f6df01b480432d495753c6be7ee06b592f9672ca7"
+      },
+      "transcript.jsonl": {
+        "raw_sha256": "7d6863765494c033ff25f127174e9a0e1a5c3f4b1588ce1052ea2799d396da02",
+        "sanitized_sha256": "9535eadee134acf6c4e5ab8f6df01b480432d495753c6be7ee06b592f9672ca7"
+      }
+    },
+    "reader_steps": 4
+  },
+  {
+    "name": "literal-tags",
+    "conversation_id": "00000000000000000000000000000004",
+    "root": ".gemini/antigravity/brain/00000000000000000000000000000004/.system_generated/logs",
+    "writer": "google-antigravity 0.1.22 native localharness",
+    "records": {
+      "transcript_full.jsonl": {
+        "raw_sha256": "a203822ef5656478d6f2271ebf4bbdb68c151ed4b0b5abaa908138b5e32484d9",
+        "sanitized_sha256": "5ea060942114123e74648c453ba9df5c2f1dcd3661aca1374e7e5ce2c8f516e7"
+      },
+      "transcript.jsonl": {
+        "raw_sha256": "a203822ef5656478d6f2271ebf4bbdb68c151ed4b0b5abaa908138b5e32484d9",
+        "sanitized_sha256": "5ea060942114123e74648c453ba9df5c2f1dcd3661aca1374e7e5ce2c8f516e7"
+      }
+    },
+    "reader_steps": 2
+  },
+  {
+    "name": "long",
+    "conversation_id": "00000000000000000000000000000005",
+    "root": ".gemini/antigravity/brain/00000000000000000000000000000005/.system_generated/logs",
+    "writer": "google-antigravity 0.1.22 native localharness",
+    "records": {
+      "transcript_full.jsonl": {
+        "raw_sha256": "e426e232cf83de9612f650b3a5a8a3d94125f50d635ba4937261238de772d7e5",
+        "sanitized_sha256": "01edcd9c03cb41c504ffc06255f3adb35713ea1a8375d6b9f2b694f9e98809fc"
+      },
+      "transcript.jsonl": {
+        "raw_sha256": "73fb349af9ccc0bf950e40dce3c4450e8e8fe2a6e3577cda998645eb4c681044",
+        "sanitized_sha256": "885be5771321ed2633060a21a43477bc4a8479c33f9b77888095b7ad7bb7cacf"
+      }
+    },
+    "reader_steps": 2
+  }
+]

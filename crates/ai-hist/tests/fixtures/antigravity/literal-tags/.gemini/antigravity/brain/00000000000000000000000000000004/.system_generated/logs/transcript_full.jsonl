@@ -1,0 +1,2 @@
+{"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-10-11T12:00:00Z","content":"<USER_REQUEST>\nKeep literal </USER_REQUEST> and <ADDITIONAL_METADATA> text.\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-10-11T05:00:00-07:00.\n</ADDITIONAL_METADATA>"}
+{"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-10-11T12:00:00Z","content":"Literal tags are preserved."}
