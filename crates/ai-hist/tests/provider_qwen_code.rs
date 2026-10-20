@@ -674,6 +674,13 @@ fn qwen_actual_tool_export_remote_intake_and_local_rehydrate() {
         let expected = read(&source, n);
         assert_eq!(expected.tool_calls.len(), 1);
         assert_eq!(expected.tool_calls[0].tool_use_id, "fixture-call-001");
+        let call = expected
+            .messages
+            .iter()
+            .flat_map(|m| &m.blocks)
+            .find(|b| b.kind == ai_hist::BlockKind::ToolUse)
+            .unwrap();
+        assert_eq!(call.tool_use_id.as_deref(), Some("fixture-call-001"));
         let result = expected
             .messages
             .iter()

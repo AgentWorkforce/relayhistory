@@ -42,6 +42,7 @@ if (!process.env.RH_QWEN_SURFACE_CHILD) {
   assert.equal(calls.length, 1);
   assert.equal(calls[0].toolUseId, 'fixture-call-001');
   const events = await sdk.getSessionEvents(sid, { dbPath, source: 'qwen-code' });
+  assert.equal(events.filter(e => e.kind === 'tool_use' && e.toolUseId === calls[0].toolUseId).length, 1);
   assert.equal(events.filter(e => e.kind === 'tool_result' && e.toolUseId === 'fixture-call-001').length, 1);
   const caps = await sdk.getSourceCapabilities('qwen-code');
   assert.equal(caps.source, 'qwen-code');

@@ -165,6 +165,10 @@ fn content(
                 None,
             )?;
             keys.tools.insert(id.into());
+            let facts = ToolResultFacts {
+                tool_use_id: Some(id.into()),
+                ..Default::default()
+            };
             let raw = serde_json::to_string(call)?;
             insert_session_event(
                 conn,
@@ -172,6 +176,7 @@ fn content(
                     kind: "tool_use",
                     text: Some(&raw),
                     event_uid: &uid,
+                    tool_result_facts: Some(&facts),
                     ..*base
                 },
             )?;
