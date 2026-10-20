@@ -351,7 +351,7 @@
       "repo_url": null,
       "session_id": "grok-uni-0001",
       "source": "grok",
-      "source_stamp": "<n>:286|<n>:224|<n>:2064|x:4b12893eab9c151d",
+      "source_stamp": "<n>:286|<n>:224|<n>:2064|x:4b12893eab9c151d|titles:v1",
       "title": null,
       "workspace_roots_json": null
     },
@@ -371,7 +371,7 @@
       "repo_url": null,
       "session_id": "grok-uni-0002",
       "source": "grok",
-      "source_stamp": "<n>:160|<n>:847|x:1599a177d233c402",
+      "source_stamp": "<n>:160|<n>:847|x:1599a177d233c402|titles:v1",
       "title": null,
       "workspace_roots_json": null
     }

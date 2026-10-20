@@ -309,7 +309,7 @@
       "repo_url": null,
       "session_id": "grok-00000001",
       "source": "grok",
-      "source_stamp": "<n>:984|<n>:293|<n>:273|x:bc9d04b26f598621",
+      "source_stamp": "<n>:984|<n>:293|<n>:273|x:bc9d04b26f598621|titles:v1",
       "title": "add a retry to the client",
       "workspace_roots_json": null
     }

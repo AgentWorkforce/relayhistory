@@ -11,6 +11,9 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Antigravity native transcript history is discoverable and searchable across App, CLI and IDE brain directories, with recorded user/assistant text and step markers; full transcripts take precedence over truncated compact files.
 - Oh My Pi history is discoverable and searchable from its native title-slot session files, with recorded messages, tool calls and results, observed usage and control markers; shared Pi roots do not double-import these sessions.
 
+### Fixed
+
+- Grok Build sessions show the name recorded in `generated_title` or `session_summary`; previously cached sessions refresh their missing titles on the next discovery, sync or hydration.
 ### Removed
 
 - Removed the zero-caller `discoverAndList` helper from the TypeScript SDK; callers run `discoverSessions` then `listSessionCatalogPage` directly.

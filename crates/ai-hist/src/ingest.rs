@@ -15531,8 +15531,11 @@ pub(crate) fn grok_source_inventory(chat: &Path) -> Result<GrokSourceInventory> 
     // extra files colliding is not a failure mode worth designing against,
     // short enough that the stamp stays readable in a diagnostic.
     stamp.push_str(&format!("|x:{:.16}", format!("{:x}", digest.finalize())));
+    // Earlier readers only understood summary.title, leaving real Grok Build
+    // names null. All three acquisition paths use this stamp: invalidate Grok
+    // alone once, including finished sessions whose source files never change.
     Ok(GrokSourceInventory {
-        stamp,
+        stamp: format!("{stamp}|titles:v1"),
         modified_ms: modified,
         bytes,
     })
@@ -17953,6 +17956,40 @@ mod tests {
         )
         .unwrap();
         (dir.join("chat_history.jsonl"), dir)
+    }
+
+    #[test]
+    fn grok_sync_repairs_cached_titles_without_source_changes() {
+        let home = tempfile::tempdir().unwrap();
+        let (chat, dir) = grok_stream_fixture(home.path(), "grok-title");
+        let summary_path = dir.join("summary.json");
+        let mut summary: Value = serde_json::from_slice(&fs::read(&summary_path).unwrap()).unwrap();
+        summary["generated_title"] = json!("Drop Python SDK and open the PR");
+        fs::write(summary_path, summary.to_string()).unwrap();
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let root = home.path().join(".grok/sessions");
+        let mut state = Map::new();
+        assert_eq!(super::sync_grok(&conn, &mut state, &root).unwrap(), 1);
+        conn.execute("UPDATE sessions SET title=NULL WHERE source='grok'", [])
+            .unwrap();
+        let key = chat.to_string_lossy().to_string();
+        let old_stamp = grok_saved_stamp(&state, &key)
+            .unwrap()
+            .strip_suffix("|titles:v1")
+            .unwrap()
+            .to_string();
+        state[super::GROK_SYNC_STATE_KEY][&key]["stamp"] = json!(old_stamp);
+        // The reread repairs metadata without inserting duplicate history rows.
+        assert_eq!(super::sync_grok(&conn, &mut state, &root).unwrap(), 0);
+        let title: String = conn
+            .query_row(
+                "SELECT title FROM sessions WHERE source='grok' AND session_id='grok-title'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(title, "Drop Python SDK and open the PR");
+        assert_eq!(super::sync_grok(&conn, &mut state, &root).unwrap(), 0);
     }
 
     #[test]

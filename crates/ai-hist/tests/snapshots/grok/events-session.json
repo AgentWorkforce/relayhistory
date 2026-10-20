@@ -605,7 +605,7 @@
       "repo_url": null,
       "session_id": "grok-evt-0001",
       "source": "grok",
-      "source_stamp": "<n>:2041|<n>:322|<n>:4634|x:05d2c5e49fdfbdce",
+      "source_stamp": "<n>:2041|<n>:322|<n>:4634|x:05d2c5e49fdfbdce|titles:v1",
       "title": "add a retry to the http client",
       "workspace_roots_json": null
     }
