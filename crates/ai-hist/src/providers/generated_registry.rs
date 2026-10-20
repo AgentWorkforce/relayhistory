@@ -51,6 +51,11 @@ const REGISTRATIONS: &[Registration] = &[
         adapter: omp::ADAPTER,
     },
     Registration {
+        id: "antigravity",
+        metadata: antigravity::METADATA,
+        adapter: antigravity::ADAPTER,
+    },
+    Registration {
         id: "copilot",
         metadata: copilot::METADATA,
         adapter: copilot::ADAPTER,

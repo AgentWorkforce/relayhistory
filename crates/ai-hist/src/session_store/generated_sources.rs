@@ -25,6 +25,8 @@ pub enum Source {
     Hermes,
     #[serde(rename = "omp")]
     Omp,
+    #[serde(rename = "antigravity")]
+    Antigravity,
     #[serde(rename = "copilot")]
     Copilot,
     #[serde(rename = "grok-bot")]
@@ -49,6 +51,7 @@ impl Source {
         Self::Pi,
         Self::Hermes,
         Self::Omp,
+        Self::Antigravity,
         Self::Copilot,
         Self::GrokBot,
         Self::OpenClaw,
@@ -69,6 +72,7 @@ impl Source {
             Self::Pi => "pi",
             Self::Hermes => "hermes",
             Self::Omp => "omp",
+            Self::Antigravity => "antigravity",
             Self::Copilot => "copilot",
             Self::GrokBot => "grok-bot",
             Self::OpenClaw => "openclaw",
@@ -90,6 +94,7 @@ impl Source {
             "pi" => Some(Self::Pi),
             "hermes" => Some(Self::Hermes),
             "omp" => Some(Self::Omp),
+            "antigravity" => Some(Self::Antigravity),
             "copilot" => Some(Self::Copilot),
             "grok-bot" => Some(Self::GrokBot),
             "openclaw" => Some(Self::OpenClaw),
