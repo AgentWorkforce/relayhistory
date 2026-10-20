@@ -26,7 +26,6 @@ export const SOURCES = Object.freeze([
   'hermes',
   'omp',
   'copilot',
-  'gemini',
   'grok-bot',
   'openclaw',
 ] as const);

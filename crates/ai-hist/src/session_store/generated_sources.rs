@@ -27,8 +27,6 @@ pub enum Source {
     Omp,
     #[serde(rename = "copilot")]
     Copilot,
-    #[serde(rename = "gemini")]
-    Gemini,
     #[serde(rename = "grok-bot")]
     GrokBot,
     #[serde(rename = "openclaw")]
@@ -52,7 +50,6 @@ impl Source {
         Self::Hermes,
         Self::Omp,
         Self::Copilot,
-        Self::Gemini,
         Self::GrokBot,
         Self::OpenClaw,
         #[cfg(test)]
@@ -73,7 +70,6 @@ impl Source {
             Self::Hermes => "hermes",
             Self::Omp => "omp",
             Self::Copilot => "copilot",
-            Self::Gemini => "gemini",
             Self::GrokBot => "grok-bot",
             Self::OpenClaw => "openclaw",
             #[cfg(test)]
@@ -95,7 +91,6 @@ impl Source {
             "hermes" => Some(Self::Hermes),
             "omp" => Some(Self::Omp),
             "copilot" => Some(Self::Copilot),
-            "gemini" | "gemini-cli" => Some(Self::Gemini),
             "grok-bot" => Some(Self::GrokBot),
             "openclaw" => Some(Self::OpenClaw),
             #[cfg(test)]

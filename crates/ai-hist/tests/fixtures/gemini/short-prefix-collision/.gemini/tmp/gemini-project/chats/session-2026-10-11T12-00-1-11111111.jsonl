@@ -1,3 +1,0 @@
-{"sessionId":"11111111-2222-4222-8222-222222222222","projectHash":"52e30737efc78fb781017102c6074d53ab432a8cc4edc0a26b2b9756700cd3a0","startTime":"2026-10-11T12:00:16.000Z","lastUpdated":"2026-10-11T12:00:17.000Z","kind":"main"}
-{"id":"collision-user","timestamp":"2026-10-11T12:00:18.000Z","type":"user","content":"Different full UUID with the same short prefix."}
-{"$set":{"lastUpdated":"2026-10-11T12:00:19.000Z"}}

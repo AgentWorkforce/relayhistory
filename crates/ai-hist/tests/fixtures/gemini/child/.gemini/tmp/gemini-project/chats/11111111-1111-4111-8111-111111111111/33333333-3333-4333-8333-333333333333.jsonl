@@ -1,5 +1,0 @@
-{"sessionId":"33333333-3333-4333-8333-333333333333","projectHash":"52e30737efc78fb781017102c6074d53ab432a8cc4edc0a26b2b9756700cd3a0","startTime":"2026-10-11T12:00:32.000Z","lastUpdated":"2026-10-11T12:00:33.000Z","kind":"subagent","directories":["/synthetic/gemini-project"]}
-{"id":"child-user","timestamp":"2026-10-11T12:00:34.000Z","type":"user","content":"Investigate the synthetic child task."}
-{"$set":{"lastUpdated":"2026-10-11T12:00:35.000Z"}}
-{"id":"child-assistant","timestamp":"2026-10-11T12:00:36.000Z","type":"gemini","content":"Synthetic child task finished.","thoughts":[],"tokens":null,"model":"gemini-fixture-model"}
-{"$set":{"lastUpdated":"2026-10-11T12:00:37.000Z"}}
