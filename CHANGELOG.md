@@ -14,11 +14,15 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - Grok Build sessions show the name recorded in `generated_title` or `session_summary`; previously cached sessions refresh their missing titles on the next discovery, sync or hydration.
+### Removed
+
+- Removed the zero-caller `discoverAndList` helper from the TypeScript SDK; callers run `discoverSessions` then `listSessionCatalogPage` directly.
 
 ### Rust API
 
 - Added `Source::Antigravity` for filtering and reading persisted Antigravity transcripts.
 - Added `Source::Omp` for filtering and reading persisted Oh My Pi session history.
+- Removed `project_identity::origin_remote_url`; `project_identity(cwd).repo_url` carries the same value.
 
 ## [0.47.0] - 2026-10-18
 

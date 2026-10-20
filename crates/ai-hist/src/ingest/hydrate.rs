@@ -321,10 +321,6 @@ fn hydration_error(code: &str, message: impl std::fmt::Display) -> anyhow::Error
     anyhow::anyhow!("{code}: {message}")
 }
 
-pub fn hydrate_session(options: &HydrateSessionOptions) -> Result<HydrateSessionResult> {
-    hydrate_session_at(&default_db_path(), options)
-}
-
 pub fn hydrate_session_at(
     db_path: &Path,
     options: &HydrateSessionOptions,

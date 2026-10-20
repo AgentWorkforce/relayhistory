@@ -2633,16 +2633,10 @@ fn install_managed_service(spec: &ServiceSpec, interval: u64, args: &[String]) -
     }
 }
 
-/// Single-quote a path for a crontab line so spaces / shell metacharacters in
-/// the binary path don't break the scheduled command.
-fn shell_single_quote(s: &str) -> String {
-    format!("'{}'", s.replace('\'', "'\\''"))
-}
-
 /// Quote one shell word and then protect `%` from cron's command-to-stdin
 /// splitting. The added backslash is consumed by cron before the shell sees it.
 fn cron_shell_word(s: &str) -> String {
-    shell_single_quote(s).replace('%', "\\%")
+    sh_single_quote(s).replace('%', "\\%")
 }
 
 /// Smallest divisor of `base` that is `>= n`. Using a divisor keeps a `*/step`
@@ -3787,8 +3781,8 @@ mod tests {
 
     #[test]
     fn shell_single_quote_survives_spaces_and_quotes() {
-        assert_eq!(shell_single_quote("/opt/ai hist/bin"), "'/opt/ai hist/bin'");
-        assert_eq!(shell_single_quote("a'b"), "'a'\\''b'");
+        assert_eq!(sh_single_quote("/opt/ai hist/bin"), "'/opt/ai hist/bin'");
+        assert_eq!(sh_single_quote("a'b"), "'a'\\''b'");
     }
 
     #[test]

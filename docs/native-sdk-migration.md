@@ -71,7 +71,7 @@ and export. Cloud auth, sharing, replay and uploads are not part of `ai-hist`;
 team uploads come from the [Agent Relay desktop app](https://agentrelay.com).
 Local Git linkage remains in `ai-hist`.
 
-Native contract 16 rejects older addons whose credential-driven source selection
+Native contract 28 rejects older addons whose credential-driven source selection
 or cloud exports would violate the new boundary. Optional source plugins use the
 fixed JSON observation/evidence intake; installing another source does not
 require rebuilding that addon. JavaScript and MCP hosts continue to use public
