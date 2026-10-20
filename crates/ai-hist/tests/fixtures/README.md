@@ -70,6 +70,7 @@ they are a real fact about the fixture.
 | --- | --- |
 | `ClaudeTranscript` | flat `.jsonl` into `~/.claude/projects/corpus/` |
 | `CodexRollout` | flat `.jsonl` into `~/.codex/sessions/2026/04/20/`, renamed to the `rollout-` prefix the codex adapter enumerates |
+| `Sqlite` (Codex) | paired SQL scripts executed into `~/.codex/state_5.sqlite` and `~/.codex/thread_history_1.sqlite`; optional rollout staged beside them |
 | `HomeTree` | directory copied verbatim into `HOME` — for fixtures whose provider layout is itself the point |
 | `OpencodeSqlite` | `.sql` executed into `~/.local/share/opencode/opencode.db` |
 | `OpencodeLegacyJson` | burn's older OpenCode JSON layout, copied under `~/.local/share/opencode/` |
@@ -146,6 +147,7 @@ source without deciding which one fails the test.
 | `codex/oversized-shell-output` | burn | `codex/oversized-shell-output.jsonl` | an 80 KB shell function-call output |
 | `codex/parent-thread-id` | relayhistory | `codex/parent-thread-id` | a subagent rollout naming its root through `parent_thread_id` plus `thread_source: subagent` |
 | `codex/archived-session` | relayhistory | `codex/archived-session` | a rollout under `~/.codex/archived_sessions/`, the second codex discovery root |
+| `codex/compressed-rollout` | relayhistory | `codex/compressed-rollout` | the `multi-turn` rollout as Codex stores a finished one, zstd-compressed to `rollout-….jsonl.zst` |
 | `codex/counter-regressed` | relayhistory | `codex/counter-regressed.jsonl` | a cached-input counter grows faster than total input, making the cumulative delta unnormalizable |
 | `codex/counter-negative` | relayhistory | `codex/counter-negative.jsonl` | a cumulative snapshot contains a negative input counter that must be preserved and refused |
 | `codex/counter-fractional` | relayhistory | `codex/counter-fractional.jsonl` | a cumulative snapshot contains a fractional output counter that must be preserved and refused |
@@ -164,7 +166,14 @@ source without deciding which one fails the test.
 | `codex/fork-human` | relayhistory | `codex/fork-human/parent.jsonl`, `codex/fork-human/child.jsonl` | a human fork (`forked_from_id`, `thread_source: user`) whose rollout replays the parent's `session_meta`, both turns and their cumulative `token_count` before its own turn |
 | `codex/fork-paginated` | relayhistory | `codex/fork-paginated/parent.jsonl`, `codex/fork-paginated/child.jsonl` | a Codex 0.144 human fork (`history_mode: paginated`) whose rollout copies both parent turns and their cumulative `token_count` straight after its own `session_meta`, without the parent's |
 | `codex/fork-subagent` | relayhistory | `codex/fork-subagent/root.jsonl`, `codex/fork-subagent/subagent.jsonl` | a spawned subagent naming its parent in `source.subagent.thread_spawn.parent_thread_id`, replaying the parent's open turn (with a tool call) and starting its own turn in the thread id's own millisecond |
+| `codex/subagent-unpaginated` | relayhistory | `codex/subagent-unpaginated/root.jsonl`, `codex/subagent-unpaginated/subagent.jsonl` | a Codex 0.95 subagent spawned without fork mode (`source.subagent.thread_spawn.parent_thread_id`, no `history_mode`): it copies no parent history, persists no `task_started`, and its `turn_context` carries no `turn_id`, so nothing orders its own turn against the spawn |
 | `codex/guardian-review` | relayhistory | `codex/guardian-review/parent.jsonl`, `codex/guardian-review/guardian.jsonl` | a Codex 0.150+ `thread_source: guardian_review` rollout with `parent_thread_id` that opens on a `compaction` item rather than a replay |
+| `codex/sqlite-pruned-all-items` | relayhistory | `codex/sqlite/pruned-all-items-{state,history}.sql` | A pruned paginated rollout leaves every native item type, a failed command and a turn error in paired SQLite stores. |
+| `codex/sqlite-rollout-primary` | relayhistory | `codex/sqlite/rollout-primary-{state,history}.sql`, `codex/sqlite/rollout-rollout-primary.jsonl` | A complete rollout is primary even when SQLite contains conflicting text for the same thread. |
+| `codex/sqlite-truncated-rollout` | relayhistory | `codex/sqlite/truncated-rollout-{state,history}.sql`, `codex/sqlite/rollout-truncated-rollout.jsonl` | A truncated rollout overlaps one native user item with SQLite, which supplies the missing assistant item once. |
+| `codex/sqlite-legacy-no-items` | relayhistory | `codex/sqlite/legacy-no-items-{state,history}.sql` | A legacy thread has no paginated items and is excluded from SQLite fallback. |
+| `codex/sqlite-subagent-edge` | relayhistory | `codex/sqlite/subagent-edge-{state,history}.sql` | A child thread names its parent in source JSON and thread_spawn_edges while remaining outside the root catalog. |
+| `codex/sqlite-archived-thread` | relayhistory | `codex/sqlite/archived-thread-{state,history}.sql` | An archived paginated thread with no rollout still appears in the catalog and ledger. |
 
 ### `cursor`
 
@@ -228,4 +237,11 @@ source without deciding which one fails the test.
 | gemini/rewound | Pinned Gemini CLI recorder/official-reader synthetic rewound journal projection; legacy JSON is authored input accepted by the current reader, not an old-writer capture. |
 | gemini/short-prefix-collision | Pinned Gemini CLI recorder/official-reader synthetic short-prefix-collision journal projection; legacy JSON is authored input accepted by the current reader, not an old-writer capture. |
 | gemini/tool-result-patched | Pinned Gemini CLI recorder/official-reader synthetic tool-result-patched journal projection; legacy JSON is authored input accepted by the current reader, not an old-writer capture. |
+| grok-bot/replicas | Synthetic complete and truncated transcript tails in two account slots, roster titles, widget response, cloud-agent round trip, and voice turns. |
+| openclaw/agent24 | OpenClaw 2026.10.4 writer, agent schema 24, deterministic clock/UUIDs: Pi v4 entries in transcript_events incl. one writer-compressed zstd row, non-UUID session ID, main and Telegram session keys, thinking/tool calls/results with isError, per-message usage, zero-usage delivery mirror. |
+| openclaw/agent24-ops | Second agent database from the same writer run: relay DM session key under a non-main agent ID, namespaced by agent. |
+| openclaw/agent19 | OpenClaw 2026.8.1 writer, agent schema 19 (2026.8.1-2026.9.4): the first database layout, plain-JSON transcript_events without zstd columns and no cold-archive table; same synthetic sessions as agent24. |
+| openclaw/agent21 | OpenClaw 2026.9.5 writer, agent schema 21: cold-archive table added, transcript rows still plain JSON. |
+| openclaw/agent23 | OpenClaw 2026.9.6 writer, agent schema 23: writer-compressed zstd rows, the transcript layout schema 24 keeps. |
+| openclaw/legacy-jsonl | OpenClaw 2026.7.35 writer, the pre-database store: per-agent `sessions/sessions.json` index (label, chat type, channel, model, absolute `sessionFile`) beside Pi v3 JSONL transcripts, for main and ops agents; same synthetic turns as agent24. |
 <!-- END GENERATED PROVIDER FIXTURES -->

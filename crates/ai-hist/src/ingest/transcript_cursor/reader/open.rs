@@ -1,11 +1,11 @@
 //! Opening a transcript from bytes already read, and replaying that generation.
 
 use anyhow::Result;
-use std::fs;
 use std::io::{BufRead, BufReader, Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::Arc;
 
+use super::super::super::transcript_file::{self, TranscriptFile, TranscriptMetadata};
 use super::super::super::{check_capture_cancelled, cold_read, metadata_mtime_ns};
 use super::super::{
     change_time_ns, file_identity, now_ms, prefix_window_digest_counted, prefix_window_digest_of,
@@ -27,6 +27,7 @@ pub(super) fn open_streaming(
     let mtime_ns = metadata_mtime_ns(&metadata);
     let opened_ctime_ns = change_time_ns(&metadata);
     let (device, inode) = file_identity(&metadata);
+    let compressed = metadata.compressed();
     // A cursor at offset 0 is still a cursor. It records the file's
     // identity, size and mtime, and those are what say whether anything
     // has been appended since the last pass. Reading it as "no cursor"
@@ -52,17 +53,7 @@ pub(super) fn open_streaming(
         }
         _ => None,
     };
-    let resume = saved.map(|saved| {
-        saved_resume(
-            size,
-            mtime_ns,
-            device,
-            inode,
-            saved,
-            rewind_to,
-            saved_window,
-        )
-    });
+    let resume = saved.map(|saved| saved_resume(&metadata, saved, rewind_to, saved_window));
     let offset = resume.as_ref().map(|resume| resume.offset).unwrap_or(0);
     // The saved cursor covered the whole file, so that digest is the
     // opened window. Reusing it keeps the resume to one bounded read.
@@ -102,6 +93,7 @@ pub(super) fn open_streaming(
         quiesced: resume.as_ref().is_some_and(|resume| resume.quiesced),
         device,
         inode,
+        compressed,
         rotated: resume.as_ref().is_some_and(|resume| resume.rotated),
     })
 }
@@ -117,18 +109,16 @@ struct SavedResume {
 }
 
 fn saved_resume(
-    size: u64,
-    mtime_ns: u64,
-    device: Option<u64>,
-    inode: Option<u64>,
+    metadata: &TranscriptMetadata,
     saved: &TranscriptFileCursor,
     rewind_to: Option<u64>,
     saved_window: Option<String>,
 ) -> SavedResume {
-    let identity_changed = saved.device.is_some()
-        && device.is_some()
-        && (saved.device, saved.inode) != (device, inode);
-    let valid = !identity_changed
+    let size = metadata.len();
+    let mtime_ns = metadata_mtime_ns(metadata);
+    // A transcript compressed since the cursor was taken is a new file
+    // holding the same records: the windows below are what can tell.
+    let valid = !saved.identity_moved(metadata)
         && size >= saved.offset
         && mtime_ns >= saved.mtime_ns
         && saved_window.as_deref() == Some(saved.prefix_hash.as_str());
@@ -223,7 +213,9 @@ pub(super) fn open_captured(
         return Ok(None);
     }
     let bytes = cold_read::read_all(path)?;
-    if cold_read::fresh(path).is_none() && change_time_ns(&fs::metadata(path)?).is_some() {
+    if cold_read::fresh(path).is_none()
+        && change_time_ns(&*transcript_file::metadata(path)?).is_some()
+    {
         // The file moved while it was read, and its change time can prove
         // that. A platform with no change time still walks these bytes;
         // commit reads the path again because that time is absent.
@@ -238,7 +230,7 @@ fn reader_from_bytes(
     saved: Option<&TranscriptFileCursor>,
     rewind_to: Option<u64>,
 ) -> Result<Option<TranscriptReader>> {
-    let metadata = fs::metadata(path)?;
+    let metadata = transcript_file::metadata(path)?;
     let size = metadata.len();
     if size != bytes.len() as u64 {
         return Ok(None);
@@ -246,21 +238,12 @@ fn reader_from_bytes(
     let mtime_ns = metadata_mtime_ns(&metadata);
     let opened_ctime_ns = change_time_ns(&metadata);
     let (device, inode) = file_identity(&metadata);
+    let compressed = metadata.compressed();
     let saved_window = match saved {
         Some(saved) if size >= saved.offset => prefix_window_digest_of(&bytes, saved.offset).ok(),
         _ => None,
     };
-    let resume = saved.map(|saved| {
-        saved_resume(
-            size,
-            mtime_ns,
-            device,
-            inode,
-            saved,
-            rewind_to,
-            saved_window,
-        )
-    });
+    let resume = saved.map(|saved| saved_resume(&metadata, saved, rewind_to, saved_window));
     let offset = resume.as_ref().map(|resume| resume.offset).unwrap_or(0);
     let opened_window = match resume
         .as_ref()
@@ -291,12 +274,13 @@ fn reader_from_bytes(
         quiesced: resume.as_ref().is_some_and(|resume| resume.quiesced),
         device,
         inode,
+        compressed,
         rotated: resume.as_ref().is_some_and(|resume| resume.rotated),
     }))
 }
 
 pub(super) fn replay_file(
-    file: &mut fs::File,
+    file: &mut TranscriptFile,
     from: u64,
     to: u64,
     each: &mut impl FnMut(&str) -> Result<()>,

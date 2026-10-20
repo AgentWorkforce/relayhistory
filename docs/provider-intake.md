@@ -139,8 +139,10 @@ Generated-file allowlist:
 
 Every shard's `fixtures` entries have `source`, `name`, `layout`, `origin`,
 `files`, and `quirk`. `HomeTree` copies a provider-owned fixture tree into the
-isolated home; `Sqlite` also requires `target`, a relative home path at which to
-execute its SQL files. Use SQL fixtures instead of checked-in live databases.
+isolated home; `GrokBotReplicas` stages short JSON files under the base32 keys
+listed in its manifest; `Sqlite` also requires `target`, a relative home path at
+which to execute its SQL files. Use SQL fixtures instead of checked-in live
+databases.
 The existing legacy layouts remain available. `capture` is an array of
 `{ "evidence": "...", "coverage": "..." }` cells describing what these
 fixtures actually prove and what is unavailable. New providers must supply it.

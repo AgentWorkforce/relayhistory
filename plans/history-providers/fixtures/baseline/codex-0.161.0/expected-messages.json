@@ -1,0 +1,22 @@
+[
+  {
+    "role": "user",
+    "text": "Inspect the native Codex fixture."
+  },
+  {
+    "role": "assistant",
+    "text": "Reading the native Codex fixture."
+  },
+  {
+    "role": "assistant",
+    "text": "The native fixture remains readable."
+  },
+  {
+    "role": "user",
+    "text": "Resume the native Codex fixture."
+  },
+  {
+    "role": "assistant",
+    "text": "The restarted native fixture is readable."
+  }
+]

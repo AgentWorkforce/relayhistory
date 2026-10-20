@@ -23,3 +23,17 @@ pub(crate) fn sweep_generation() -> String {
         )
     )
 }
+
+pub(crate) fn source_fingerprint_generation() -> String {
+    format!(
+        "{}/{}",
+        sweep_generation(),
+        crate::providers::codex::sqlite::fingerprint_component()
+    )
+}
+
+pub(crate) fn qualify_source_fingerprint(sources: String) -> Option<String> {
+    let fingerprint = format!("{}/{sources}", source_fingerprint_generation());
+    crate::providers::codex::sqlite::remember_source_fingerprint(fingerprint.clone());
+    Some(fingerprint)
+}

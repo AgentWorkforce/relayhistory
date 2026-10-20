@@ -10,7 +10,7 @@ mod format;
 mod normalize;
 #[cfg(test)]
 mod tests;
-mod usage;
+pub(super) mod usage;
 const ID: &str = "pi";
 const HEAD_LIMIT: u64 = 64 * 1024;
 pub(crate) const LOCAL_SOURCE: LocalSource = LocalSource {

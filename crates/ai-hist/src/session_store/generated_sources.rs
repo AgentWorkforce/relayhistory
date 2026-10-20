@@ -27,6 +27,10 @@ pub enum Source {
     Copilot,
     #[serde(rename = "gemini")]
     Gemini,
+    #[serde(rename = "grok-bot")]
+    GrokBot,
+    #[serde(rename = "openclaw")]
+    OpenClaw,
     #[cfg(test)]
     #[serde(rename = "test-fixture")]
     TestFixture,
@@ -46,6 +50,8 @@ impl Source {
         Self::Hermes,
         Self::Copilot,
         Self::Gemini,
+        Self::GrokBot,
+        Self::OpenClaw,
         #[cfg(test)]
         Self::TestFixture,
     ];
@@ -64,6 +70,8 @@ impl Source {
             Self::Hermes => "hermes",
             Self::Copilot => "copilot",
             Self::Gemini => "gemini",
+            Self::GrokBot => "grok-bot",
+            Self::OpenClaw => "openclaw",
             #[cfg(test)]
             Self::TestFixture => "test-fixture",
         }
@@ -83,6 +91,8 @@ impl Source {
             "hermes" => Some(Self::Hermes),
             "copilot" => Some(Self::Copilot),
             "gemini" | "gemini-cli" => Some(Self::Gemini),
+            "grok-bot" => Some(Self::GrokBot),
+            "openclaw" => Some(Self::OpenClaw),
             #[cfg(test)]
             "test-fixture" | "test-fixture-alias" => Some(Self::TestFixture),
             _ => None,

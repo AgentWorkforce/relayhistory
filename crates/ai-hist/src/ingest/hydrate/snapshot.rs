@@ -13,6 +13,41 @@ pub(super) fn source_snapshot(
     if let Some(refusal) = crate::sources::catalog::hydration_refusal(&options.source) {
         return Err(hydration_error("HYDRATION_UNSUPPORTED", refusal));
     }
+    if options.source == "codex" {
+        if let Some((path, id)) = target
+            .locator
+            .as_deref()
+            .and_then(crate::providers::codex::sqlite::parse_locator)
+        {
+            anyhow::ensure!(
+                id == options.session_id,
+                "SESSION_SOURCE_MISMATCH: Codex SQLite thread identity changed"
+            );
+            let acquired = if options.include_related {
+                crate::providers::codex::sqlite::capture_related(roots, &path, id)?
+            } else {
+                crate::providers::codex::sqlite::capture(roots, &path, id)?
+            };
+            let relationship_complete = !acquired.payload["related_incomplete"]
+                .as_bool()
+                .unwrap_or(false);
+            return Ok(SourceSnapshot {
+                stamp: format!("codex-sqlite-v2:{}", acquired.stamp),
+                bytes: 0,
+                records: SnapshotRecords::Counted(acquired.records),
+                path: Some(path),
+                claude_transcript: None,
+                devin_session: None,
+                scanned_bytes: 0,
+                provider_session: Some(acquired),
+                claude_subagents: Vec::new(),
+                scanned_superseded: false,
+                stamped_cursors: Vec::new(),
+                opencode_layout: None,
+                codex_relationship_complete: relationship_complete,
+            });
+        }
+    }
     if let Some(adapter) = crate::providers::adapter(&options.source) {
         let locator = target.locator.as_deref().ok_or_else(|| {
             hydration_error(
@@ -312,7 +347,8 @@ fn captured_claude_snapshot(
         // live path again here: rotation may remove it after the bytes were
         // safely captured, and those bytes are the evidence being hydrated.
     } else {
-        if !path.is_file() {
+        // A Codex rollout compressed since discovery is the same source.
+        if !crate::ingest::transcript_file::exists(path) {
             return Err(hydration_error(
                 "SESSION_SOURCE_UNAVAILABLE",
                 format!(
@@ -372,7 +408,7 @@ fn file_source_inventory(
         // Counted by the pass that parses, not by a walk over the whole file
         // before it: that walk is exactly the cost cursors remove.
         (
-            path.metadata()?.len() as i64,
+            crate::ingest::transcript_file::metadata(path)?.len() as i64,
             SnapshotRecords::Counted(0),
             file_stamp(path)?,
         )
@@ -453,7 +489,7 @@ impl RelatedStamp {
             crate::ingest::check_capture_cancelled()?;
             self.stamp.push('|');
             self.stamp.push_str(&file_stamp(&child)?);
-            self.bytes += child.metadata()?.len() as i64;
+            self.bytes += crate::ingest::transcript_file::metadata(&child)?.len() as i64;
             self.stamped_cursors.push(("codex".to_string(), child));
         }
         Ok(complete)

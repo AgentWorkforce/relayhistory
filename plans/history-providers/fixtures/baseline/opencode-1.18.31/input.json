@@ -1,0 +1,102 @@
+{
+  "info": {
+    "id": "ses_baseline11831",
+    "slug": "synthetic-retry",
+    "projectID": "global",
+    "directory": "/fixture/opencode",
+    "title": "Synthetic retry baseline",
+    "version": "1.18.31",
+    "time": {
+      "created": 1792018800000,
+      "updated": 1792018801000
+    }
+  },
+  "messages": [
+    {
+      "info": {
+        "id": "msg_baseline11831u",
+        "sessionID": "ses_baseline11831",
+        "role": "user",
+        "time": {
+          "created": 1792018800000
+        },
+        "agent": "build",
+        "model": {
+          "providerID": "fixture",
+          "modelID": "fixture-model"
+        }
+      },
+      "parts": [
+        {
+          "id": "prt_msg_baseline11831u",
+          "sessionID": "ses_baseline11831",
+          "messageID": "msg_baseline11831u",
+          "type": "text",
+          "text": "Inspect the synthetic retry fixture."
+        }
+      ]
+    },
+    {
+      "info": {
+        "id": "msg_baseline11831a",
+        "sessionID": "ses_baseline11831",
+        "role": "assistant",
+        "time": {
+          "created": 1792018801000
+        },
+        "parentID": "msg_baseline11831u",
+        "providerID": "fixture",
+        "modelID": "fixture-model",
+        "mode": "build",
+        "agent": "build",
+        "path": {
+          "cwd": "/fixture/opencode",
+          "root": "/fixture/opencode"
+        },
+        "cost": 0,
+        "tokens": {
+          "input": 5,
+          "output": 7,
+          "reasoning": 0,
+          "cache": {
+            "read": 0,
+            "write": 0
+          }
+        },
+        "finish": "stop"
+      },
+      "parts": [
+        {
+          "id": "prt_msg_baseline11831a",
+          "sessionID": "ses_baseline11831",
+          "messageID": "msg_baseline11831a",
+          "type": "text",
+          "text": "The synthetic retry is bounded."
+        },
+        {
+          "id": "prt_baseline11831tool",
+          "sessionID": "ses_baseline11831",
+          "messageID": "msg_baseline11831a",
+          "type": "tool",
+          "callID": "call_baseline11831",
+          "tool": "bash",
+          "state": {
+            "status": "completed",
+            "input": {
+              "command": "printf synthetic"
+            },
+            "output": "synthetic",
+            "title": "Synthetic command",
+            "metadata": {
+              "exit": 0
+            },
+            "time": {
+              "start": 1792018800100,
+              "end": 1792018800200
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

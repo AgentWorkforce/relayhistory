@@ -8,14 +8,70 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- GitHub Copilot CLI session history is discoverable and searchable from `$COPILOT_HOME/session-state/<id>/events.jsonl` (default `~/.copilot`), with per-message models, reasoning, tool calls and results, verbatim per-message `outputTokens`, and every other journal event — including the cumulative `session.shutdown` usage totals — as session markers.
 - Gemini CLI history is discoverable and searchable from its local JSONL journals and supported legacy JSON files, with recorded messages, tool calls and patched results, measured usage, and journal revisions preserved as markers.
-- `remote::send_remote_message_with` and `RemoteCredential` let a host send a remote-session message with its own resolved Devin credential instead of the connector's file/env lookup. The error-code contract is unchanged: an unusable credential fails `INVALID_ARGUMENT`, never `CONNECTOR_NOT_CONFIGURED`.
 
 ### Rust API
 
-- Added `Source::Copilot` for filtering and reading persisted GitHub Copilot CLI session history.
 - Added `Source::Gemini` for filtering and reading persisted Gemini CLI session history.
+
+## [0.47.0] - 2026-10-18
+
+### Added
+
+- OpenClaw history from older installs is read too: agent databases written by OpenClaw 2026.8.1 through 2026.9.6 (schemas 19–23), and the pre-2026.8 JSONL session store (`agents/<id>/sessions/*.jsonl` with `sessions.json`); a session already imported into the agent database is read only from there.
+
+## [0.46.0] - 2026-10-18
+
+### Added
+
+- OpenClaw session history is discoverable and searchable from every agent database under `$OPENCLAW_STATE_DIR` (default `~/.openclaw`, honoring `OPENCLAW_HOME` and `OPENCLAW_PROFILE`): messages, thinking, tool calls and results, per-message usage, cold-archived transcripts, and each session's key, agent and channel as metadata.
+
+### Fixed
+
+- Re-reading a long Pi or Copilot session no longer slows quadratically with its prompt count, and a prompt later marked as harness-written no longer keeps its history row.
+- Devin remote capture skips provider-classified `code_review` and `code_review_and_analysis` sessions only when their origin is `automation`; person-started reviews and other work remain discoverable.
+
+### Rust API
+
+- Added `Source::OpenClaw` for filtering and reading persisted OpenClaw session history.
+
+## [0.45.2] - 2026-10-17
+
+### Fixed
+
+- Grok Bot sessions no longer fail to open on one unmapped entry: entries without a usable id or time are skipped, unknown roles and message types become markers, messages to non-cloud-agent peers keep their text without a delegation edge, and an unreadable or newer roster leaves the transcript readable.
+
+## [0.45.1] - 2026-10-16
+
+### Fixed
+
+- Codex SQLite recovery processes at most 50 recent threads per sweep, resumes the backlog newest-first, reports thread progress and lets uncatalogued sources run first instead of blocking later providers behind an unbounded pass.
+
+### Rust API
+
+- `SyncOptions::codex_sqlite_max_age_days` and its builder override the 30-day Codex SQLite recovery window; zero disables the cutoff and `AI_HIST_CODEX_SQLITE_MAX_AGE_DAYS` supplies the process default.
+
+## [0.45.0] - 2026-10-16
+
+### Added
+
+- Grok Bot desktop transcript replicas are discoverable from the local Electron persistence store, including messages, widgets, voice turns, markers and cloud-agent delegation; repeated captures retain entries after the app's local window moves on.
+- Codex threads whose rollout was pruned or truncated are recovered from local SQLite thread history, including assistant messages, tools, edits, relationships and a cumulative token snapshot.
+- GitHub Copilot CLI session history is discoverable and searchable from `$COPILOT_HOME/session-state/<id>/events.jsonl` (default `~/.copilot`), with per-message models, reasoning, tool calls and results, verbatim per-message `outputTokens`, and every other journal event — including the cumulative `session.shutdown` usage totals — as session markers.
+- `remote::send_remote_message_with` and `RemoteCredential` let a host send a remote-session message with its own resolved Devin credential instead of the connector's file/env lookup. The error-code contract is unchanged: an unusable credential fails `INVALID_ARGUMENT`, never `CONNECTOR_NOT_CONFIGURED`.
+
+### Fixed
+
+- Two simultaneous first hydrations of one local session both succeed; the slower one no longer fails `CONNECTOR_NOT_CONFIGURED` when the other records the session's local observation mid-lookup.
+- Codex rollouts that Codex has compressed to `rollout-*.jsonl.zst` are discovered, synced, hydrated and fed to the change feed as evidence under their `.jsonl` locator; a rollout compressed after it was indexed keeps its session, locator and cursor and is not ingested again.
+- The first sync of a new store records each Codex rollout's cursor, so the rollout's next append resumes instead of re-reading it from the start.
+- A sync over many changed delegated Codex threads no longer re-reads every stored Codex evidence key once per thread; on a 3,858-rollout archive, a sweep after Codex compressed 3,238 of them drops from 430 s to 33 s of CPU.
+- Codex forks and subagents keep their own turns: only a rollout whose `session_meta` declares `history_mode: "paginated"` is checked for parent history copied straight after the child's `session_meta`, so a subagent whose first turn carries no ordering evidence (Codex 0.90–0.99 write `turn_context` without a `turn_id`) is indexed under its own id rather than retired whole as copied history. The first `sync` (or `hydrate`) re-reads existing forks once and retires the stale `fork_replay_boundary` marker.
+
+### Rust API
+
+- Added `Source::GrokBot` for filtering and reading persisted Grok Bot desktop history.
+- Added `Source::Copilot` for filtering and reading persisted GitHub Copilot CLI session history.
 
 ## [0.44.0] - 2026-10-14
 
@@ -1001,7 +1057,12 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - The SDK reads provider JSONL natively and works without the Python CLI.
 
-[Unreleased]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.44.0...HEAD
+[Unreleased]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.47.0...HEAD
+[0.47.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.46.0...sdk-ts-v0.47.0
+[0.46.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.45.2...sdk-ts-v0.46.0
+[0.45.2]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.45.1...sdk-ts-v0.45.2
+[0.45.1]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.45.0...sdk-ts-v0.45.1
+[0.45.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.44.0...sdk-ts-v0.45.0
 [0.44.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.43.0...sdk-ts-v0.44.0
 [0.43.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.42.1...sdk-ts-v0.43.0
 [0.42.1]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.42.0...sdk-ts-v0.42.1

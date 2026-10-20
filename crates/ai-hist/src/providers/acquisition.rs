@@ -98,7 +98,10 @@ pub(crate) fn validate_provider_path(
     provider_roots: &crate::ProviderRoots,
 ) -> Result<()> {
     let roots = crate::sources::catalog::transcript_roots(source, provider_roots);
-    let canonical = std::fs::canonicalize(path)?;
+    // A locator whose transcript is stored compressed is checked by where its
+    // bytes are.
+    let stored = crate::ingest::transcript_file::stored_path(path);
+    let canonical = std::fs::canonicalize(stored.as_deref().unwrap_or(path))?;
     let valid = roots
         .iter()
         .filter_map(|root| std::fs::canonicalize(root).ok())

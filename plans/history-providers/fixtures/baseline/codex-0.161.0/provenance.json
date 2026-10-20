@@ -1,0 +1,45 @@
+{
+  "package": "@openai/codex@0.161.0",
+  "platform": "darwin-arm64",
+  "native_binary": "@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex",
+  "native_binary_sha256": "12ac11d2c7eee27cfae34393986d7b7c9ed0dea537cb749831cdd7033893e6de",
+  "synthetic": true,
+  "acquisition": "app-server JSON-RPC thread/start \u2192 thread/inject_items \u2192 shutdown \u2192 restart \u2192 thread/resume \u2192 thread/inject_items; never turn/start",
+  "model_provider": "synthetic offline localhost:9, no authentication",
+  "native_session_id_sanitized": "019b76da-a800-7000-8000-000000000161",
+  "reader_limit": "thread/read includeTurns and thread/turns/list full and thread/items/list all return empty public projections despite persisted response_item rows; not independent transcript certification",
+  "expected_messages_origin": "authored synthetic thread/inject_items requests, distinct from empty official reader responses",
+  "files": {
+    "session.jsonl": "a247eb51ae06072977674470e1feceeb7988aa45bd01066a2a35e1c05de74239",
+    "expected-messages.json": "999e98a5a2d2b6d33abe471df7263739d06401a4b0ee1d62a5a78fb73a4ab827",
+    "reader.json": "854338fefa6dc74c34da5abe3b3b2fdb38f66b4fe8e4d8e47faa66e389e54887",
+    "items.json": "5ee42a36bcbb191e686d444a498d18bafc76f87940e4b00e545abde18c09413e",
+    "turns.json": "5ee42a36bcbb191e686d444a498d18bafc76f87940e4b00e545abde18c09413e",
+    "reopened-items.json": "5ee42a36bcbb191e686d444a498d18bafc76f87940e4b00e545abde18c09413e",
+    "resumed-items.json": "5ee42a36bcbb191e686d444a498d18bafc76f87940e4b00e545abde18c09413e",
+    "rpc-transcript.json": "424e951dbd92e62d41e8bf960c72f2468bc4ae331fb02146343f8da28d409675"
+  },
+  "schema_sha256": {
+    "ThreadStartParams.json": "e9c6d3cc18d049bfbc0249add3808fb8e5a27e1a0b5a423767aafbc3859a9428",
+    "ThreadInjectItemsParams.json": "8d7e754402a2bb71bd817882076d2f8ac4cd75d4573306db082a83b841aa3532",
+    "ThreadReadParams.json": "dfe040c6ac71d30795b8be3f3ff232e66f362a37f883b491e5d1ea367f470db4",
+    "ThreadTurnsListParams.json": "2a8b93d7d4437cc25e16a1dde16d8db3c338d39e16c5eece2a56e943a21577d7",
+    "ThreadItemsListParams.json": "d5cf9784413f1d1abba756e04e48b273a9d12ab2c5675442e91b6a4ee55e19f0",
+    "ThreadResumeParams.json": "c818e26d830ac4430791eab7d4a872d2384fa6006b14c505d8caf46e7e093527"
+  },
+  "environment_allowlist": {
+    "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+    "HOME": "isolated synthetic home",
+    "USERPROFILE": "isolated synthetic home",
+    "CODEX_HOME": "isolated synthetic home/codex",
+    "TMPDIR": "isolated synthetic home/tmp",
+    "CODEX_DISABLE_TELEMETRY": "1",
+    "RUST_LOG": "off"
+  },
+  "reproduction_files": {
+    "capture.py": "277909044dc3aabe0d4b1369d5c253eb8a429982d147691ce2f107e6f105050a",
+    "sanitize.py": "68388464cbf343a351d3afd4d047767507065e316cbfcc47c52d61bc130ce350",
+    "rpc_reader.py": "80372e4f2c465b8926d8d9cc89516794ed2b28f5f80a7e33995b233d935cf241",
+    "test_capture_helpers.py": "08f3c14d2243952fcd9a880148e2f661e5c12d3631a9a1cce9b7ab2c77e60cdc"
+  }
+}

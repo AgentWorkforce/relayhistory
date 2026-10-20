@@ -1020,6 +1020,57 @@ fn devin_mapping_stamp_tracks_the_mapped_listing_fields() {
 }
 
 #[test]
+fn devin_mapping_skips_review_sessions_and_keeps_uncategorized_work() {
+    // Devin Review and push-review automations are `automation`-origin
+    // sessions the classifier files under the review categories; they carry
+    // no conversational history worth keeping.
+    for category in ["code_review", "code_review_and_analysis"] {
+        let mut entry = devin_session(DEVIN_SESSION_ID, "Review this push");
+        entry["category"] = serde_json::json!(category);
+        assert!(
+            map_devin_session(&entry).is_none(),
+            "{category} must not map"
+        );
+    }
+    // Uncategorized and non-review sessions still map: `category` is only
+    // populated once Cognition's classifier has run.
+    for category in [
+        serde_json::Value::Null,
+        serde_json::json!("bug_fixing"),
+        serde_json::json!("other"),
+    ] {
+        let mut entry = devin_session(DEVIN_SESSION_ID, "t");
+        entry["category"] = category.clone();
+        assert!(
+            map_devin_session(&entry).is_some(),
+            "{category} must still map"
+        );
+    }
+    // The review filter is scoped to automation-spawned sessions: a
+    // person-directed session whose work the classifier files as review
+    // still belongs in the catalog.
+    for category in ["code_review", "code_review_and_analysis"] {
+        for origin in [
+            None,
+            Some("webapp"),
+            Some("slack"),
+            Some("teams"),
+            Some("api"),
+            Some("desktop"),
+            Some("cli"),
+        ] {
+            let mut entry = devin_session(DEVIN_SESSION_ID, "Review my PR");
+            entry["origin"] = serde_json::json!(origin);
+            entry["category"] = serde_json::json!(category);
+            assert!(
+                map_devin_session(&entry).is_some(),
+                "{origin:?} {category} work must still map"
+            );
+        }
+    }
+}
+
+#[test]
 fn devin_mapping_skips_malformed_ids_and_normalizes_the_prefixed_form() {
     for bad_id in [
         "",
@@ -1072,6 +1123,44 @@ fn devin_credentials_parse_the_flat_toml() {
     assert_eq!(devin_org_id(&config).as_deref(), Some("org-x"));
     std::fs::write(&config, "not json").unwrap();
     assert!(devin_org_id(&config).is_none());
+}
+
+#[test]
+fn devin_enumeration_keeps_walking_past_review_only_pages() {
+    // An org whose recent history is dense with Devin Review automations
+    // must not exhaust the page bound on filtered sessions: pages that yield
+    // nothing do not count toward it, while an absolute fetch bound still
+    // terminates the walk.
+    let _cleared = without_credentials_override();
+    let home = tempfile::tempdir().unwrap();
+    let mut review = devin_session(DEVIN_SESSION_ID, "Review this push");
+    review["category"] = serde_json::json!("code_review");
+    let mut script: Vec<(u16, String)> = (0..MAX_LIST_PAGES + 20)
+        .map(|page| {
+            (
+                200,
+                devin_page(&[review.clone()], Some(&format!("cursor+{page}")), true),
+            )
+        })
+        .collect();
+    script.push((
+        200,
+        devin_page(
+            &[devin_session("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", "real")],
+            None,
+            false,
+        ),
+    ));
+    let transport = Arc::new(ScriptedDevinTransport::new(script));
+    let provider = devin_provider(home.path(), &transport, None);
+    let conn = catalog();
+    let env = env_at(&conn, home.path());
+    let candidates = provider.enumerate(&env, None).unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(
+        candidates[0].session_id.as_deref(),
+        Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+    );
 }
 
 #[test]
