@@ -5,8 +5,8 @@ use crate::providers::file_history;
 
 /// Retire local evidence of sessions recorded at `path` that a complete
 /// snapshot no longer contains.
-pub(super) fn retire_absent(conn: &Connection, path: &Path, sessions: &[Session]) -> Result<()> {
-    let keep: std::collections::BTreeSet<&str> = sessions.iter().map(|s| s.id.as_str()).collect();
+pub(super) fn retire_absent(conn: &Connection, path: &Path, ids: &[String]) -> Result<()> {
+    let keep: std::collections::BTreeSet<&str> = ids.iter().map(String::as_str).collect();
     let mut stmt =
         conn.prepare("SELECT session_id FROM sessions WHERE source=?1 AND raw_path=?2")?;
     let recorded = stmt

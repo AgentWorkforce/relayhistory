@@ -8,7 +8,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- OpenClaw session history is discoverable and searchable from every agent database under `$OPENCLAW_STATE_DIR` (default `~/.openclaw`, honoring `OPENCLAW_HOME` and `OPENCLAW_PROFILE`): messages, thinking, tool calls and results, per-message usage, cold-archived transcripts, and each session's key, agent and channel as metadata.
+- OpenClaw session history is discoverable and searchable from every agent database under `$OPENCLAW_STATE_DIR` (default `~/.openclaw`, honoring `OPENCLAW_HOME` and `OPENCLAW_PROFILE`), one session per conversation key with every cron and heartbeat run folded in: messages, thinking, tool calls and results, per-message usage, cold-archived transcripts, and each session's key, agent and channel as metadata. Heartbeat polls are not counted as prompts.
 
 ### Fixed
 

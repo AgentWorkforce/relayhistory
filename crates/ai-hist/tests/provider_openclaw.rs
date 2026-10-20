@@ -28,7 +28,7 @@ fn openclaw_public_history_conformance() {
         home.path(),
         HistoryCase {
             source: Source::OpenClaw,
-            session_id: "main:fixture/main:α",
+            session_id: "main:main",
             messages: &[
                 (Role::User, "Find the OpenClaw fixture needle"),
                 (Role::Assistant, "I will read the notes."),
@@ -48,14 +48,15 @@ fn openclaw_public_history_conformance() {
         .collect();
     assert_eq!(blocks.len(), 2);
     assert!(blocks.iter().all(|b| b.tool_use_id.as_ref() == Some(id)));
-    // Two measured requests; the delivery mirror repeats the reply unmetered.
+    // Two answers and two heartbeat acknowledgements are measured requests;
+    // the delivery mirror repeats a reply unmetered.
     let measured: Vec<_> = evidence
         .requests
         .iter()
         .filter_map(|r| r.usage.as_ref())
         .collect();
-    assert_eq!(measured.len(), 2);
-    assert_eq!(measured.iter().map(|u| u.input_tokens).sum::<u64>(), 230);
+    assert_eq!(measured.len(), 4);
+    assert_eq!(measured.iter().map(|u| u.input_tokens).sum::<u64>(), 270);
 
     let other = tempfile::tempdir().unwrap();
     stage(
@@ -67,7 +68,7 @@ fn openclaw_public_history_conformance() {
         other.path(),
         HistoryCase {
             source: Source::OpenClaw,
-            session_id: "ops:fixture-relay-0001",
+            session_id: "ops:relay:dm:fixture-sender",
             messages: &[
                 (Role::User, "Relay question for the ops agent"),
                 (Role::Assistant, "Relay answer from the ops agent."),

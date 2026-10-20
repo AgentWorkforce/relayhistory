@@ -119,7 +119,7 @@ harness writes into the user role that is not a human prompt keeps
 | `meta`                     | claude | `isMeta: true` and nothing above applies                                                   |
 | `resume_marker`            | claude | a bare `/resume <id>` or `/continue <id>`                                                  |
 | `synthetic`                | opencode | a user `text` part flagged `synthetic: true` (harness-written context, e.g. an `@file` read) |
-| `synthetic`                | openclaw | a user message OpenClaw wrote itself: `provenance.kind` `inter_session` or `internal_system`, `excludeFromContext`, or `__openclaw.contextFreeCommand` |
+| `synthetic`                | openclaw | a user message OpenClaw wrote itself: a heartbeat or wake prompt (`[OpenClaw heartbeat poll]`, the default heartbeat prompts), `provenance.kind` `inter_session` or `internal_system`, `excludeFromContext`, or `__openclaw.contextFreeCommand` |
 
 A `control_kind` is only ever set on a `role = "user"`, `kind = "text"` row,
 and only to one of the spellings above; the source-evidence validation a

@@ -58,6 +58,8 @@ const SESSIONS = [
   ['main', 'agent:main:main', 'fixture/main:α'],
   ['main', 'agent:main:telegram:direct:fixture-peer', 'fixture-telegram-0001'],
   ['ops', 'agent:ops:relay:dm:fixture-sender', 'fixture-relay-0001'],
+  ['ops', 'agent:ops:cron:fixture-job', 'fixture-cron-run-1'],
+  ['ops', 'agent:ops:cron:fixture-job', 'fixture-cron-run-2'],
 ];
 if (phase === 'oracle') {
   const oracle = {
@@ -110,6 +112,25 @@ const mirror = await transcript.appendAssistantMirrorMessageByIdentity({
 });
 if (!mirror.ok) throw new Error(`mirror append rejected: ${mirror.reason}`);
 
+// A shared-mode heartbeat appends into the main session: the current
+// transcript marker, then the legacy default prompt (upstream matches
+// `prompt` or `prompt\n...`), each with a quiet acknowledgement.
+const HEARTBEAT_LEGACY = 'Read HEARTBEAT.md if it exists (workspace context). Follow it strictly. Do not infer or repeat old tasks from prior chats. If nothing needs attention, reply HEARTBEAT_OK.';
+for (const [prompt, ack, extra] of [
+  ['[OpenClaw heartbeat poll]', 'NO_REPLY', { provenance: { kind: 'internal_system', sourceTool: 'heartbeat' } }],
+  [`${HEARTBEAT_LEGACY}\nCurrent time: fixture`, 'HEARTBEAT_OK', {}],
+]) {
+  for (const message of [
+    { role: 'user', content: prompt, timestamp: 1790000006000, ...extra },
+    assistant([{ type: 'text', text: ack }], { usage: usage(20, 1, 0, 0.0001), timestamp: 1790000006500 }),
+  ]) {
+    const result = await transcript.appendSessionTranscriptMessageByIdentity({
+      agentId: 'main', sessionKey: 'agent:main:main', sessionId: 'fixture/main:α', cwd: '/fixture/project', message,
+    });
+    if (!result?.appended) throw new Error('heartbeat append rejected');
+  }
+}
+
 await session('main', 'agent:main:telegram:direct:fixture-peer', 'fixture-telegram-0001', 1789999991000, [
   { role: 'user', content: 'Run the failing fixture command', timestamp: 1790000101000 },
   assistant([{ type: 'toolCall', id: 'call_fixture_exec', name: 'exec', arguments: { command: 'false' } }],
@@ -122,6 +143,15 @@ await session('main', 'agent:main:telegram:direct:fixture-peer', 'fixture-telegr
 await session('ops', 'agent:ops:relay:dm:fixture-sender', 'fixture-relay-0001', 1789999992000, [
   { role: 'user', content: [{ type: 'text', text: 'Relay question for the ops agent' }], timestamp: 1790000201000 },
   assistant([{ type: 'text', text: 'Relay answer from the ops agent.' }], { usage: usage(30, 6, 0, 0.0003), timestamp: 1790000202000 }),
+]);
+
+// An isolated cron job keeps one session key and opens a new window (session
+// ID) for every run; its prompt is not a user turn.
+await session('ops', 'agent:ops:cron:fixture-job', 'fixture-cron-run-1', 1789999993000, [
+  assistant([{ type: 'text', text: 'Cron run one checked the fixture queue.' }], { usage: usage(50, 7, 0, 0.0004), timestamp: 1790000301000 }),
+]);
+await session('ops', 'agent:ops:cron:fixture-job', 'fixture-cron-run-2', 1789999994000, [
+  assistant([{ type: 'text', text: 'NO_REPLY' }], { usage: usage(45, 1, 0, 0.0003), timestamp: 1790000401000 }),
 ]);
 
 process.exit(0);

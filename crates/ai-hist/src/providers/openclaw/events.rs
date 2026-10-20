@@ -153,3 +153,31 @@ pub(super) fn decompress(blob: Option<Vec<u8>>, bytes: Option<i64>) -> Result<St
     );
     String::from_utf8(decoded).context("OPENCLAW_INVALID_RECORD: event is not UTF-8")
 }
+
+/// The first 64 entries, for a bounded first prompt and cwd: hot rows, or
+/// the verified cold archive once upstream has moved them there.
+pub(super) fn head(
+    context: &AcquisitionContext<'_>,
+    conn: &Connection,
+    path: &Path,
+    s: &Session,
+) -> Result<Vec<Value>> {
+    if let Some(archive) = &s.cold {
+        let events = cold::events(context, conn, path, &s.native_id, archive)?;
+        return Ok(events.into_iter().take(64).map(|e| e.entry).collect());
+    }
+    let mut stmt = conn.prepare(
+        "SELECT event_json, event_zstd, event_utf8_bytes FROM transcript_events \
+         WHERE session_id=?1 ORDER BY seq LIMIT 64",
+    )?;
+    let mut rows = stmt.query([&s.native_id])?;
+    let mut head = vec![];
+    while let Some(r) = rows.next()? {
+        let text = match r.get::<_, Option<String>>(0)? {
+            Some(json) => json,
+            None => decompress(r.get(1)?, r.get(2)?)?,
+        };
+        head.push(serde_json::from_str::<Value>(&text)?);
+    }
+    Ok(head)
+}
