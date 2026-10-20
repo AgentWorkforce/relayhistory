@@ -9,6 +9,7 @@ use sha2::{Digest, Sha256};
 mod format;
 mod normalize;
 mod roots;
+mod shared_evidence;
 mod storage;
 #[cfg(test)]
 mod tests;

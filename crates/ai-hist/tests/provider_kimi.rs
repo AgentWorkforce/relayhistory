@@ -948,3 +948,173 @@ fn shared_same_clock_ordering_conflict_rolls_back_entire_replacement() {
     let retained: String=conn.query_row("SELECT source_stamp FROM session_hydration_checkpoints WHERE source='kimi' AND session_id=?1",[sid(2,"main")],|r|r.get(0)).unwrap();
     assert_eq!(retained, checkpoint);
 }
+
+#[cfg(feature = "unstable-internal")]
+#[test]
+fn remote_backed_stable_position_rewrites_roll_back_every_evidence_kind() {
+    for ownership in ["remote", "both"] {
+        for change in [
+            "text",
+            "timestamp",
+            "native-id",
+            "nullable",
+            "marker",
+            "tool-only",
+        ] {
+            let home = tempfile::tempdir().unwrap();
+            let wire = stage(home.path(), "tool");
+            let store = open(home.path());
+            let reference = SessionRef::id(Source::Kimi, sid(2, "main"));
+            store
+                .discover(DiscoveryOptions::default().sources([Source::Kimi]))
+                .unwrap();
+            store
+                .hydrate(&reference, HydrateOptions::default())
+                .unwrap();
+            let conn = ai_hist::open_db(&home.path().join("db")).unwrap();
+            let (table, key) = match change {
+                "marker" => ("session_markers", "marker_uid='wire:0'"),
+                "tool-only" => ("tool_calls", "tool_use_id='fixture-tool-001'"),
+                _ => ("session_events", "event_uid='message:0:text'"),
+            };
+            conn.execute(&format!("UPDATE {table} SET location=?1 WHERE source='kimi' AND session_id=?2 AND {key}"),rusqlite::params![ownership,sid(2,"main")]).unwrap();
+            if change == "nullable" {
+                conn.execute("UPDATE session_events SET model='Remote recorded model' WHERE source='kimi' AND session_id=?1 AND event_uid='message:0:text'",[sid(2,"main")]).unwrap();
+            }
+            let before = evidence(&store, 2, "main");
+            let revision = store.head_revision().unwrap();
+            let checkpoint:String=conn.query_row("SELECT source_stamp FROM session_hydration_checkpoints WHERE source='kimi' AND session_id=?1",[sid(2,"main")],|r|r.get(0)).unwrap();
+            let mut records = rows(&wire);
+            let user = records
+                .iter_mut()
+                .find(|r| {
+                    r["type"] == "agent.message.appended"
+                        && r["message"]["message"]["role"] == "user"
+                })
+                .unwrap();
+            match change {
+                "text" => {
+                    user["message"]["message"]["content"][0]["text"] =
+                        "Reassigned complete user text.".into()
+                }
+                "timestamp" => user["time"] = (user["time"].as_i64().unwrap() + 1).into(),
+                "native-id" => {
+                    user["message"]["meta"]["userMessageId"] = "different-native-user-id".into()
+                }
+                "nullable" => {}
+                "marker" => {
+                    records[0]["fixtureChangedMetadata"] = "different marker payload".into()
+                }
+                "tool-only" => {
+                    let call = records
+                        .iter_mut()
+                        .find(|r| {
+                            r["type"] == "agent.message.appended"
+                                && r["message"]["message"]["toolCalls"]
+                                    .as_array()
+                                    .is_some_and(|v| !v.is_empty())
+                        })
+                        .unwrap();
+                    call["message"]["message"]["toolCalls"][0]["arguments"] =
+                        "{\"path\":\"different-fixture.txt\"}".into();
+                }
+                _ => unreachable!(),
+            }
+            replace_rows(&wire, &records);
+            // A raw-byte-only change also exercises nullable-field preservation.
+            use std::io::Write;
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&wire)
+                .unwrap()
+                .write_all(b"\n")
+                .unwrap();
+            let error = store
+                .hydrate(&reference, HydrateOptions::default())
+                .unwrap_err();
+            assert!(
+                error.to_string().contains("KIMI_SHARED_EVIDENCE_CONFLICT"),
+                "{ownership} {change}: {error}"
+            );
+            let after = evidence(&store, 2, "main");
+            assert_eq!(
+                after.session, before.session,
+                "{ownership} {change} catalog"
+            );
+            assert_eq!(after.usage, before.usage, "{ownership} {change} usage");
+            assert_eq!(
+                store.head_revision().unwrap(),
+                revision,
+                "{ownership} {change} revision"
+            );
+            assert_eq!(
+                after.messages, before.messages,
+                "{ownership} {change} events"
+            );
+            assert_eq!(
+                after.markers, before.markers,
+                "{ownership} {change} markers"
+            );
+            assert_eq!(
+                after.tool_calls, before.tool_calls,
+                "{ownership} {change} tools"
+            );
+            assert_eq!(
+                after.tool_results, before.tool_results,
+                "{ownership} {change} results"
+            );
+            assert_eq!(
+                after.prompts, before.prompts,
+                "{ownership} {change} prompts"
+            );
+            let retained:String=conn.query_row("SELECT source_stamp FROM session_hydration_checkpoints WHERE source='kimi' AND session_id=?1",[sid(2,"main")],|r|r.get(0)).unwrap();
+            assert_eq!(retained, checkpoint);
+            let retained:String=conn.query_row(&format!("SELECT location FROM {table} WHERE source='kimi' AND session_id=?1 AND {key}"),[sid(2,"main")],|r|r.get(0)).unwrap();
+            assert_eq!(retained, ownership);
+        }
+    }
+}
+
+#[cfg(feature = "unstable-internal")]
+#[test]
+fn identical_remote_backed_imports_can_add_local_shares() {
+    for ownership in ["remote", "both"] {
+        let home = tempfile::tempdir().unwrap();
+        let wire = stage(home.path(), "tool");
+        let store = open(home.path());
+        let reference = SessionRef::id(Source::Kimi, sid(2, "main"));
+        store
+            .discover(DiscoveryOptions::default().sources([Source::Kimi]))
+            .unwrap();
+        store
+            .hydrate(&reference, HydrateOptions::default())
+            .unwrap();
+        let conn = ai_hist::open_db(&home.path().join("db")).unwrap();
+        for table in ["session_events", "session_markers", "tool_calls"] {
+            conn.execute(
+                &format!("UPDATE {table} SET location=?1 WHERE source='kimi' AND session_id=?2"),
+                rusqlite::params![ownership, sid(2, "main")],
+            )
+            .unwrap();
+        }
+        let before = evidence(&store, 2, "main");
+        use std::io::Write;
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&wire)
+            .unwrap()
+            .write_all(b"\n")
+            .unwrap();
+        store
+            .hydrate(&reference, HydrateOptions::default())
+            .unwrap();
+        let after = evidence(&store, 2, "main");
+        assert_eq!(after.messages, before.messages);
+        assert_eq!(after.markers, before.markers);
+        assert_eq!(after.tool_calls, before.tool_calls);
+        for table in ["session_events", "session_markers", "tool_calls"] {
+            let count:i64=conn.query_row(&format!("SELECT count(*) FROM {table} WHERE source='kimi' AND session_id=?1 AND location!='both'"),[sid(2,"main")],|r|r.get(0)).unwrap();
+            assert_eq!(count, 0, "{ownership} {table}");
+        }
+    }
+}

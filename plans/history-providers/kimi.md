@@ -40,3 +40,10 @@ Complete rewrites reconcile native event order within each recorded millisecond.
 Only affected local event buckets are replayed; unchanged buckets keep their IDs.
 If a reordered bucket also carries remote evidence, hydration reports a retryable
 ownership conflict and rolls back the replacement, retaining the prior snapshot.
+
+Kimi also snapshots remote-backed event, marker and tool payloads inside the
+capture transaction. The actual normalized writes must preserve every such
+payload; only adding a local ownership share is allowed. A differing positional
+identity, timestamp, text, nullable field, marker or tool payload raises
+`KIMI_SHARED_EVIDENCE_CONFLICT` and rolls back all evidence and checkpoint writes.
+This protects the stored remote snapshot even when event order does not change.

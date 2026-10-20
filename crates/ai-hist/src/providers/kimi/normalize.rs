@@ -19,6 +19,7 @@ pub(super) fn write(conn: &Connection, payload: &Value) -> Result<usize> {
     if !complete {
         return Ok(0);
     }
+    let shared = super::shared_evidence::Snapshot::capture(conn, sid)?;
     let mut keys = Keys::default();
     let mut outcome = MessageOutcome::default();
     let mut first = i64::MAX;
@@ -62,6 +63,18 @@ pub(super) fn write(conn: &Connection, payload: &Value) -> Result<usize> {
         let reordered = file_history::reconcile_event_order(conn, ID, sid, &outcome.events)?;
         replay_buckets(conn, sid, cwd, rows, &live, &reordered, &mut keys)?;
     }
+    finish(conn, sid, payload, first, last, outcome, shared)
+}
+
+fn finish(
+    conn: &Connection,
+    sid: &str,
+    payload: &Value,
+    first: i64,
+    last: i64,
+    outcome: MessageOutcome,
+    shared: super::shared_evidence::Snapshot,
+) -> Result<usize> {
     catalog(
         conn,
         payload,
@@ -70,6 +83,7 @@ pub(super) fn write(conn: &Connection, payload: &Value) -> Result<usize> {
         outcome.assistant.as_deref(),
         outcome.preview,
     )?;
+    shared.ensure_unchanged(conn, sid)?;
     Ok(outcome.inserted)
 }
 
