@@ -48,7 +48,9 @@ pub(super) fn write(conn: &Connection, payload: &Value) -> Result<usize> {
             continue;
         };
         if role == "user" {
-            preview.get_or_insert(text);
+            if row["status"] == "DONE" {
+                preview.get_or_insert(text);
+            }
             let hash = crate::prompt_hash(text);
             keys.prompts.insert(format!("{ts}:{hash}"));
             inserted += insert_history(
@@ -97,6 +99,13 @@ pub(super) fn write(conn: &Connection, payload: &Value) -> Result<usize> {
     )?;
     if complete {
         conn.execute("UPDATE sessions SET first_prompt=?3 WHERE source=?1 AND session_id=?2 AND first_prompt IS NOT ?3",rusqlite::params![ID,sid,preview])?;
+    } else if let Some(preview) = preview {
+        // A complete user step remains useful when another step is partial.
+        // Such a capture cannot replace a preview from complete evidence.
+        conn.execute(
+            "UPDATE sessions SET first_prompt=?3 WHERE source=?1 AND session_id=?2 AND first_prompt IS NULL",
+            rusqlite::params![ID, sid, preview],
+        )?;
     }
     Ok(inserted)
 }
