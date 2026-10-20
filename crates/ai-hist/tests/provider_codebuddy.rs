@@ -522,6 +522,67 @@ fn codebuddy_same_time_public_pages_keep_native_sequence() {
     assert!(turns.next_cursor.is_none());
 }
 #[test]
+fn codebuddy_complete_same_time_rewrite_keeps_native_order() {
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path(), "ordinary");
+    let mut rows: Vec<Value> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    for row in &mut rows {
+        row["timestamp"] = Value::from(1791720000000i64);
+    }
+    let store = open(home.path());
+    write(&path, &rows[1..]);
+    sync(&store);
+    write(&path, &rows);
+    sync(&store);
+    assert_eq!(
+        read(&store, "ordinary")
+            .messages
+            .iter()
+            .map(|m| m.role)
+            .collect::<Vec<_>>(),
+        vec![Role::User, Role::Assistant]
+    );
+    let before = read(&store, "ordinary");
+    sync(&store);
+    assert_eq!(read(&store, "ordinary"), before);
+    let revision = store.head_revision().unwrap();
+    sync(&store);
+    assert_eq!(store.head_revision().unwrap(), revision);
+    #[cfg(feature = "unstable-internal")]
+    {
+        let conn = ai_hist::open_db(store.db_path()).unwrap();
+        let first =
+            ai_hist::session_events_page(&conn, &sid("ordinary"), Some("codebuddy"), 1, None)
+                .unwrap();
+        assert_eq!(first.events[0].role, "user");
+        let second = ai_hist::session_events_page(
+            &conn,
+            &sid("ordinary"),
+            Some("codebuddy"),
+            1,
+            first.next_cursor.as_ref(),
+        )
+        .unwrap();
+        assert_eq!(second.events[0].role, "assistant");
+        assert!(second.next_cursor.is_none());
+    }
+    rows.reverse();
+    write(&path, &rows);
+    sync(&store);
+    assert_eq!(
+        read(&store, "ordinary")
+            .messages
+            .iter()
+            .map(|m| m.role)
+            .collect::<Vec<_>>(),
+        vec![Role::Assistant, Role::User]
+    );
+}
+#[test]
 fn codebuddy_authoritative_inline_result_preserves_literal_persisted_output_tag() {
     let home = tempfile::tempdir().unwrap();
     let path = stage(home.path(), "tool");
@@ -573,4 +634,115 @@ fn codebuddy_native_explicit_user_override_wins_over_meta_and_literal_summary_ta
         .iter()
         .any(|p| p.prompt.as_deref() == Some("Explicit native real user <cb_summary> literal.")));
     assert!(!texts(&e).contains(&"<cb_summary>Actual synthetic control summary.</cb_summary>"));
+}
+#[test]
+fn codebuddy_incomplete_replacement_keeps_events_tools_prompts_and_markers_atomic() {
+    for case in ["tool", "fragments"] {
+        let home = tempfile::tempdir().unwrap();
+        let path = stage(home.path(), case);
+        let store = open(home.path());
+        sync(&store);
+        let old = read(&store, case);
+        let mut rows: Vec<Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|x| serde_json::from_str(x).unwrap())
+            .collect();
+        rows[0]["content"] = Value::String("Synthetic replacement prompt.".into());
+        if case == "tool" {
+            rows.iter_mut()
+                .find(|r| r["type"] == "function_call")
+                .unwrap()["arguments"] =
+                Value::String("{\"file_path\":\"/fixture/replacement.txt\"}".into());
+            rows.iter_mut()
+                .find(|r| r["type"] == "function_call_result")
+                .unwrap()["providerData"]["toolResult"]["content"] =
+                Value::String("Synthetic replacement tool result.".into());
+        } else {
+            let fragment = rows.iter_mut().find(|r| r["id"] == "a3").unwrap();
+            fragment["content"] = Value::String("Synthetic replacement first fragment.".into());
+        }
+        let last = rows.pop().unwrap();
+        let mut partial = rows.iter().map(|r| format!("{r}\n")).collect::<String>();
+        partial.push_str("{\"type\":\"message\"");
+        std::fs::write(&path, partial).unwrap();
+        store
+            .hydrate(&reference(case), HydrateOptions::default())
+            .unwrap();
+        let deferred = read(&store, case);
+        assert_eq!(deferred.messages, old.messages, "{case} events");
+        assert_eq!(deferred.prompts, old.prompts, "{case} prompts");
+        assert_eq!(deferred.markers, old.markers, "{case} markers");
+        assert_eq!(deferred.tool_calls, old.tool_calls, "{case} tools");
+        assert_eq!(deferred.tool_results, old.tool_results, "{case} results");
+        rows.push(last);
+        write(&path, &rows);
+        store
+            .hydrate(&reference(case), HydrateOptions::default())
+            .unwrap();
+        let complete = read(&store, case);
+        assert!(texts(&complete).contains(&"Synthetic replacement prompt."));
+        assert_ne!(complete.messages, old.messages);
+        if case == "tool" {
+            assert!(complete
+                .messages
+                .iter()
+                .flat_map(|m| &m.blocks)
+                .any(|b| b.text.as_deref() == Some("Synthetic replacement tool result.")));
+        }
+    }
+}
+#[test]
+fn codebuddy_incomplete_replacement_discovery_preserves_unknown_catalog_fields() {
+    for oversized_tail in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let path = stage(home.path(), "ordinary");
+        let store = open(home.path());
+        sync(&store);
+        let old = read(&store, "ordinary");
+        assert!(old.session.title.is_none());
+        let mut rows: Vec<Value> = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|x| serde_json::from_str(x).unwrap())
+            .collect();
+        rows.insert(0,serde_json::json!({"type":"custom-title","id":"replacement-title","timestamp":1791720099999i64,"customTitle":"Synthetic replacement title."}));
+        rows[1]["content"] = Value::String("Synthetic replacement prompt.".into());
+        let complete = rows.iter().map(|r| format!("{r}\n")).collect::<String>();
+        let mut partial = rows[..rows.len() - 1]
+            .iter()
+            .map(|r| format!("{r}\n"))
+            .collect::<String>();
+        if oversized_tail {
+            partial.push_str("{\"type\":\"message\",\"content\":\"");
+            partial.push_str(&"Synthetic oversized pending tail. ".repeat(5000));
+        } else {
+            partial.push('{');
+        }
+        std::fs::write(&path, partial).unwrap();
+        store
+            .discover(DiscoveryOptions::default().sources([Source::Codebuddy]))
+            .unwrap();
+        let shallow = read(&store, "ordinary");
+        assert_eq!(shallow.session.title, old.session.title);
+        assert_eq!(shallow.session.first_prompt, old.session.first_prompt);
+        assert_eq!(
+            shallow.session.last_activity_ms,
+            old.session.last_activity_ms
+        );
+        assert_eq!(shallow.markers, old.markers);
+        std::fs::write(&path, complete).unwrap();
+        store
+            .discover(DiscoveryOptions::default().sources([Source::Codebuddy]))
+            .unwrap();
+        store
+            .hydrate(&reference("ordinary"), HydrateOptions::default())
+            .unwrap();
+        let updated = read(&store, "ordinary");
+        assert_eq!(
+            updated.session.title.as_deref(),
+            Some("Synthetic replacement title.")
+        );
+        assert!(texts(&updated).contains(&"Synthetic replacement prompt."));
+    }
 }

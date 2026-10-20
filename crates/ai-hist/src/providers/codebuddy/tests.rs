@@ -22,8 +22,10 @@ fn incomplete_tail_is_not_a_complete_rewrite() {
 
 #[test]
 fn root_override_freezes_relative_paths_without_expanding_tilde() {
-    let home = Path::new("/isolated/home");
-    let cwd = Path::new("/isolated/work");
+    let isolated = tempfile::tempdir().unwrap();
+    let home = isolated.path();
+    let work = home.join("work");
+    let cwd = work.as_path();
     assert_eq!(
         roots::from_value(home, Some(std::ffi::OsStr::new("relative")), cwd),
         cwd.join("relative")

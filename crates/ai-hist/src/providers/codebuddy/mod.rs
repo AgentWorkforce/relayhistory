@@ -74,10 +74,13 @@ impl ShallowSessionProvider for Provider {
     ) -> Result<Option<ShallowSession>> {
         let context = AcquisitionContext::new(ID, scan.provider_roots);
         let path = storage::selected(&context, Path::new(&candidate.locator))?;
-        let (rows, latest) = storage::shallow_rows(scan, &path)?;
+        let (rows, latest, partial) = storage::shallow_rows(scan, &path)?;
         let sid = roots::identity(scan.provider_roots, &path)?;
         if let Some(conn) = conn {
             normalize::check_identity(conn, &sid, &path)?;
+            if partial && normalize::has_evidence(conn, &sid)? {
+                return crate::discover::catalog_row(conn, ID, &sid, true);
+            }
         }
         Ok(Some(ShallowSession {
             source: ID.into(),

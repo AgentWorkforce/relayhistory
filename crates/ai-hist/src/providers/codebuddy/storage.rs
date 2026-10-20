@@ -1,5 +1,8 @@
 use super::*;
-pub(super) fn shallow_rows(scan: &ScanEnv<'_>, path: &Path) -> Result<(Vec<Value>, Option<i64>)> {
+pub(super) fn shallow_rows(
+    scan: &ScanEnv<'_>,
+    path: &Path,
+) -> Result<(Vec<Value>, Option<i64>, bool)> {
     use std::io::{Read, Seek, SeekFrom};
     let mut file = std::fs::File::open(path)?;
     let length = file.metadata()?.len();
@@ -7,7 +10,7 @@ pub(super) fn shallow_rows(scan: &ScanEnv<'_>, path: &Path) -> Result<(Vec<Value
     (&mut file).take(HEAD_LIMIT).read_to_end(&mut prefix)?;
     scan.note_open();
     scan.note_bytes(prefix.len() as u64);
-    let (rows, _) = format::parse(&prefix, length > HEAD_LIMIT)?;
+    let (rows, mut partial) = format::parse(&prefix, length > HEAD_LIMIT)?;
     scan.note_records(rows.len() as u64);
     let mut latest = rows
         .iter()
@@ -28,7 +31,10 @@ pub(super) fn shallow_rows(scan: &ScanEnv<'_>, path: &Path) -> Result<(Vec<Value
                 .position(|b| *b == b'\n')
                 .map_or(tail.len(), |n| n + 1)
         };
-        let (last, _) = format::parse(&tail[start..], false)?;
+        let (last, tail_partial) = format::parse(&tail[start..], false)?;
+        // A record spanning both windows cannot be validated by discovery.
+        // Treat an unparsed unterminated tail conservatively until hydration.
+        partial |= tail_partial || (!tail.ends_with(b"\n") && last.is_empty());
         scan.note_records(last.len() as u64);
         for row in &last {
             if let Some(time) = row["timestamp"].as_i64() {
@@ -45,7 +51,7 @@ pub(super) fn shallow_rows(scan: &ScanEnv<'_>, path: &Path) -> Result<(Vec<Value
     // A single step can span both bounded windows. Keep its path-derived
     // conversation identity discoverable without inventing activity or text;
     // explicit hydration validates and reads the complete record.
-    Ok((rows, latest))
+    Ok((rows, latest, partial))
 }
 pub(super) fn selected(context: &AcquisitionContext<'_>, path: &Path) -> Result<PathBuf> {
     context.validate(path)?;

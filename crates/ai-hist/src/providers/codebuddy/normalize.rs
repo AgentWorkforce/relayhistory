@@ -19,6 +19,12 @@ pub(super) fn write(conn: &Connection, payload: &Value) -> Result<usize> {
         .as_array()
         .context("Codebuddy active lane missing")?;
     let complete = payload["partial"] == false;
+    // A rewritten prefix plus an incomplete tail must not replace selected
+    // old rows while leaving the old suffix live. Publish the replacement
+    // atomically only when complete; a first capture may expose its prefix.
+    if !complete && has_evidence(conn, sid)? {
+        return Ok(0);
+    }
     let mut keys = Keys::default();
     let mut inserted = 0;
     let mut seen_usage = std::collections::BTreeSet::new();
@@ -27,10 +33,19 @@ pub(super) fn write(conn: &Connection, payload: &Value) -> Result<usize> {
     }
     let mut occurrences = std::collections::BTreeMap::new();
     for row in active {
-        inserted += event(conn, sid, row, &mut occurrences, &mut seen_usage, &mut keys)?;
+        inserted += event(
+            conn,
+            sid,
+            row,
+            &mut occurrences,
+            &mut seen_usage,
+            &mut keys,
+            None,
+        )?;
     }
     if complete {
         file_history::retire(conn, ID, sid, &keys)?;
+        reconcile_order(conn, sid, active, &mut keys)?;
         file_history::retire_locator_sessions(conn, ID, path, Some(sid))?;
     }
     catalog(conn, sid, path, active, rows, complete)?;
@@ -38,6 +53,25 @@ pub(super) fn write(conn: &Connection, payload: &Value) -> Result<usize> {
         title::write(conn, sid, rows)?;
     }
     Ok(inserted)
+}
+fn reconcile_order(conn: &Connection, sid: &str, active: &[Value], keys: &mut Keys) -> Result<()> {
+    let replay = file_history::reconcile_event_order(conn, ID, sid, &ordered_events(active)?)?;
+    if !replay.is_empty() {
+        let mut occurrences = std::collections::BTreeMap::new();
+        let mut seen_usage = std::collections::BTreeSet::new();
+        for row in active {
+            event(
+                conn,
+                sid,
+                row,
+                &mut occurrences,
+                &mut seen_usage,
+                keys,
+                Some(&replay),
+            )?;
+        }
+    }
+    Ok(())
 }
 fn catalog(
     conn: &Connection,
@@ -193,6 +227,7 @@ fn event(
     occurrences: &mut std::collections::BTreeMap<String, usize>,
     seen_usage: &mut std::collections::BTreeSet<String>,
     keys: &mut Keys,
+    only: Option<&std::collections::BTreeSet<i64>>,
 ) -> Result<usize> {
     let mut inserted = 0;
 
@@ -216,6 +251,9 @@ fn event(
     let token = (!usage.is_null() && seen_usage.insert(request.to_owned()))
         .then(|| serde_json::to_string(usage))
         .transpose()?;
+    if only.is_some_and(|times| !times.contains(&ts)) {
+        return Ok(0);
+    }
     let base = EventRow {
         source: ID,
         session_id: sid,
@@ -268,4 +306,27 @@ fn event(
         _ => unreachable!(),
     }
     Ok(inserted)
+}
+
+pub(super) fn has_evidence(conn: &Connection, sid: &str) -> Result<bool> {
+    Ok(conn.query_row("SELECT EXISTS(SELECT 1 FROM session_events WHERE source=?1 AND session_id=?2) OR EXISTS(SELECT 1 FROM session_markers WHERE source=?1 AND session_id=?2)",[ID,sid],|r|r.get(0))?)
+}
+
+fn ordered_events(rows: &[Value]) -> Result<Vec<(i64, String)>> {
+    let mut occurrences = std::collections::BTreeMap::new();
+    let mut desired = Vec::new();
+    for row in rows {
+        let kind = format::string(row, "type")?;
+        if !matches!(kind, "message" | "function_call" | "function_call_result") {
+            continue;
+        }
+        let mid = format::string(row, "id")?;
+        let occurrence = occurrences.entry(mid).or_insert(0usize);
+        let uid = format!("{mid}:{occurrence}");
+        *occurrence += 1;
+        if kind != "message" || format::human_message(row) {
+            desired.push((format::time(row)?, uid));
+        }
+    }
+    Ok(desired)
 }

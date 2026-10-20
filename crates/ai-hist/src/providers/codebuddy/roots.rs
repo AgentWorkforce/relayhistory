@@ -58,7 +58,7 @@ pub(super) fn identity(roots: &ProviderRoots, path: &Path) -> Result<String> {
         .context("CODEBUDDY_INVALID_PATH: invalid session ID")?;
     let namespace = root.strip_prefix(&roots.home).unwrap_or(root);
     let key = serde_json::to_vec(&(
-        namespace.to_string_lossy(),
+        namespace.to_string_lossy().replace('\\', "/"),
         parts[0].as_os_str().to_string_lossy(),
     ))?;
     Ok(format!("project:{:x}:{native}", Sha256::digest(key)))
