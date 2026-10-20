@@ -94,14 +94,25 @@ pub(super) fn capture(path: &Path, context: &AcquisitionContext<'_>) -> Result<A
         || rows
             .iter()
             .any(|r| r["status"] != "DONE" && r["status"] != "ERROR");
-    let payload = serde_json::json!({"sid":sid,"path":path,"rows":rows,"partial":incomplete,"bytesSha256":format!("{:x}", Sha256::digest(&bytes))});
-    let records = payload["rows"].as_array().unwrap().len() as i64;
-    Ok(AcquiredSession::new(
+    let bytes_hash = format!("{:x}", Sha256::digest(&bytes));
+    // The absolute locator is needed by normalization, but a temporary HOME
+    // relocation is not an evidence revision. Identity, projection selection
+    // and exact source bytes still distinguish every meaningful capture.
+    let revision = serde_json::to_vec(&(
+        &sid,
+        path.file_name().unwrap().to_str().unwrap(),
+        &bytes_hash,
+    ))?;
+    let stamp = format!("sha256:{:x}", Sha256::digest(revision));
+    let records = rows.len() as i64;
+    let payload = serde_json::json!({"sid":sid,"path":path,"rows":rows,"partial":incomplete,"bytesSha256":bytes_hash});
+    Ok(AcquiredSession {
+        stamp,
         payload,
-        bytes.len() as i64,
+        bytes: bytes.len() as i64,
         records,
-        vec![path],
-    ))
+        read_paths: vec![path],
+    })
 }
 
 pub(super) fn shallow_rows(scan: &ScanEnv<'_>, path: &Path) -> Result<(Vec<Value>, i64)> {

@@ -146,3 +146,42 @@ fn exact_source_stamp_changes_for_whitespace_and_nonterminal_steps_defer_retirem
         true
     );
 }
+
+#[test]
+fn source_stamp_is_home_independent_but_tracks_projection_and_identity() {
+    let original=include_bytes!("../../../tests/fixtures/antigravity/ordinary/.gemini/antigravity/brain/00000000000000000000000000000001/.system_generated/logs/transcript_full.jsonl");
+    let capture = |home: &Path, variant: &str, name: &str| {
+        let roots = ProviderRoots::from_home(home.into(), home.join("opencode.db"));
+        let path = home
+            .join(".gemini")
+            .join(variant)
+            .join("brain/native/.system_generated/logs")
+            .join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, original).unwrap();
+        storage::capture(&path, &AcquisitionContext::new(ID, &roots)).unwrap()
+    };
+    let first_home = tempfile::tempdir().unwrap();
+    let second_home = tempfile::tempdir().unwrap();
+    let first = capture(first_home.path(), "antigravity", "transcript_full.jsonl");
+    let relocated = capture(second_home.path(), "antigravity", "transcript_full.jsonl");
+    assert_ne!(first.payload["path"], relocated.payload["path"]);
+    assert_eq!(first.payload["sid"], relocated.payload["sid"]);
+    assert_eq!(
+        first.stamp, relocated.stamp,
+        "temporary HOME relocation is not an evidence revision"
+    );
+    std::fs::remove_file(first.payload["path"].as_str().unwrap()).unwrap();
+    let compact = capture(first_home.path(), "antigravity", "transcript.jsonl");
+    assert_eq!(first.payload["bytesSha256"], compact.payload["bytesSha256"]);
+    assert_ne!(
+        first.stamp, compact.stamp,
+        "projection handoff must trigger hydration even for equal bytes"
+    );
+    let other = capture(
+        second_home.path(),
+        "antigravity-cli",
+        "transcript_full.jsonl",
+    );
+    assert_ne!(first.stamp, other.stamp, "root namespaces remain separate");
+}
