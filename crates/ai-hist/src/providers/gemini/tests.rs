@@ -247,6 +247,11 @@ fn denied_root_is_error_without_mutating_permissions() {
     let (home, roots, path) = fixture();
     let root = path.parent().unwrap();
     std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // Privileged processes can bypass mode bits, invalidating this premise.
+    if std::fs::read_dir(root).is_ok() {
+        std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        return;
+    }
     let conn = crate::open_db(&home.path().join("test.db")).unwrap();
     let result = storage::enumerate(&DiscoveryEnv::with_provider_roots(&conn, roots));
     let mode = std::fs::metadata(root).unwrap().permissions().mode() & 0o777;
@@ -466,4 +471,98 @@ fn inline_result_without_response_record_has_absent_message_identity() {
         )
         .unwrap();
     assert_eq!(identity, None);
+}
+
+#[test]
+fn scoped_migration_then_journal_deletion_reclaims_legacy_cache() {
+    let (home, roots, journal) = fixture();
+    std::fs::remove_file(&journal).unwrap();
+    let legacy = journal.with_extension("json");
+    std::fs::write(&legacy, include_str!("../../../tests/fixtures/gemini/legacy/.gemini/tmp/gemini-project/chats/session-legacy-22222222.json")).unwrap();
+    let db = home.path().join("test.db");
+    let store = crate::SessionStore::open(
+        crate::StoreOptions::default()
+            .db_path(&db)
+            .roots(roots.clone()),
+    )
+    .unwrap();
+    let conn = crate::open_db(&db).unwrap();
+    let mut state = Map::new();
+    let repairs = crate::ingest::SweepRepairs::default();
+    let run = |state: &mut Map<String, Value>,
+               paths: Option<&crate::ingest::path_scope::PathScope>| {
+        sweep(SweepContext {
+            conn: &conn,
+            state,
+            roots: &roots,
+            paths,
+            repairs: &repairs,
+        })
+        .unwrap()
+    };
+    run(&mut state, None);
+    let legacy_cache = state["gemini_file_stamps"][legacy.to_string_lossy().as_ref()].clone();
+    std::fs::write(&journal, include_str!("../../../tests/fixtures/gemini/legacy-migrated/.gemini/tmp/gemini-project/chats/session-legacy-22222222.jsonl")).unwrap();
+    let scope = crate::ingest::path_scope::PathScope::from_paths([journal.clone()]).unwrap();
+    run(&mut state, Some(&scope));
+    assert_eq!(
+        state["gemini_file_stamps"][legacy.to_string_lossy().as_ref()],
+        legacy_cache
+    );
+    let owner = || {
+        conn.query_row("SELECT raw_path FROM sessions WHERE source='gemini' AND session_id='22222222-2222-4222-8222-222222222222'", [], |r| r.get::<_, String>(0)).unwrap()
+    };
+    assert_eq!(owner(), journal.to_string_lossy());
+    std::fs::remove_file(&journal).unwrap();
+    let mut previous = None;
+    for _ in 0..2 {
+        assert_eq!(run(&mut state, None).unread, 0);
+        assert_eq!(
+            owner(),
+            legacy.to_string_lossy(),
+            "surviving legacy must reclaim catalog ownership"
+        );
+        let sid = "22222222-2222-4222-8222-222222222222";
+        let evidence = store
+            .session(
+                &crate::SessionRef::id(crate::Source::Gemini, sid),
+                crate::SessionQuery::default(),
+            )
+            .unwrap()
+            .expect("surviving legacy remains publicly readable");
+        assert_eq!(evidence.session.raw_path.as_ref(), Some(&legacy));
+        assert!(!evidence.messages.is_empty());
+        assert!(crate::session_locations(&conn, ID, sid)
+            .unwrap()
+            .contains(&"local".into()));
+        let hits = crate::search(
+            &conn,
+            &["needle".into()],
+            false,
+            &crate::QueryFilter {
+                source: Some(ID.into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(
+            hits.iter().any(|h| h.session_id.as_deref() == Some(sid)),
+            "surviving legacy remains searchable"
+        );
+        let revision: i64 = conn
+            .query_row(
+                "SELECT max(revision) FROM session_events WHERE source='gemini' AND session_id=?1",
+                [sid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        if let Some((messages, previous_revision)) = previous.as_ref() {
+            assert_eq!(&evidence.messages, messages);
+            assert_eq!(
+                revision, *previous_revision,
+                "unchanged fallback cannot churn evidence"
+            );
+        }
+        previous = Some((evidence.messages, revision));
+    }
 }

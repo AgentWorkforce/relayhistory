@@ -1,0 +1,52 @@
+{
+  "id": "omp",
+  "rust_id": "omp",
+  "variant": "Omp",
+  "order": 430,
+  "aliases": [],
+  "fixtures": [
+    {
+      "source": "omp",
+      "name": "title-v3",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "omp/title-v3"
+      ],
+      "quirk": "Authored synthetic OMP18.9.2 title-slot JSONL verified against pinned official parseSessionContent; partial assistant usage, image blob reference retained as marker, actual tool IDs."
+    },
+    {
+      "source": "omp",
+      "name": "writer-v3",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "omp/writer-v3"
+      ],
+      "quirk": "OMP18.9.2 checksum-pinned real SessionManager writer capture: user/assistant/tool, title change, reopen/resume; independently read with getEntries and loadSessionMessagesReadOnly. Random IDs and wall clock sanitized consistently."
+    }
+  ],
+  "capture": [
+    {
+      "evidence": "Messages and identity",
+      "coverage": "Title-slot v3 native session/entry IDs and complete persisted history; ambiguous legacy direct headers rejected to prevent double admission with Pi."
+    },
+    {
+      "evidence": "Tools and usage",
+      "coverage": "Actual toolCallId joins, isError results and observed partial assistant usage; image references retained as opaque markers without reading blobs; no inferred edits or usage."
+    },
+    {
+      "evidence": "Control and lifecycle",
+      "coverage": "Title overlay and raw header/control metadata; complete rewrite retirement and partial tail preservation. No active-context projection, resume or inferred delegation."
+    }
+  ],
+  "population": {
+    "evidence": [
+      "history",
+      "session_event",
+      "tool_call",
+      "session_marker"
+    ],
+    "usage_accounting": "per-message"
+  }
+}

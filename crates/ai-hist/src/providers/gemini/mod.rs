@@ -333,9 +333,12 @@ fn cached(
     if repairs.contains(ID, sid) {
         return Ok(false);
     }
+    // Scoped migration can retain a legacy stamp after ownership moves to JSONL.
+    // A cache hit must still own this locator, or a missing journal can retire
+    // the session while its unchanged legacy source survives.
     Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM sessions WHERE source='gemini' AND session_id=?1)",
-        [sid],
+        "SELECT EXISTS(SELECT 1 FROM sessions WHERE source='gemini' AND session_id=?1 AND raw_path=?2)",
+        [sid, candidate.locator.as_str()],
         |r| r.get(0),
     )?)
 }

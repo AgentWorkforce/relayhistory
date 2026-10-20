@@ -1,0 +1,21 @@
+// Synthetic fixture authoring only; run oracle.mjs afterward to verify pinned sources.
+import fs from 'node:fs';
+import crypto from 'node:crypto';
+import assert from 'node:assert/strict';
+const root=process.argv[2];const dir=import.meta.dirname;
+if(!root) throw new Error('Pass pinned upstream checkout; no operator history');
+const provenance=JSON.parse(fs.readFileSync(dir+'/provenance.json'));
+for(const [relative,digest] of Object.entries(provenance.upstream_files)) assert.equal(crypto.createHash('sha256').update(fs.readFileSync(root+'/'+relative)).digest('hex'),digest);
+let src=fs.readFileSync(root+'/packages/coding-agent/src/session/session-title-slot.ts','utf8').replace(/^import[\s\S]*?from "\.\/session-entries";\s*/,'');
+const constants=fs.readFileSync(root+'/packages/coding-agent/src/session/session-entries.ts','utf8');
+src=constants.match(/export const SESSION_TITLE_SLOT_BYTES = .*;/)[0]+'\n'+constants.match(/export const SESSION_TITLE_SLOT_ENTRY_TYPE = .*;/)[0]+'\n'+src;
+const helpers=Function(new Bun.Transpiler({loader:'ts'}).transformSync(src).replace(/export /g,'')+'\nreturn {serializeTitleSlot,overlayTitleSlotContent};')();
+const timestamp='2026-01-01T00:00:00.000Z';const hash=JSON.parse(fs.readFileSync(dir+'/provenance.json')).blob_sha256;
+const header={type:'session',version:3,id:'019b76da-a800-7000-8000-000000000001',timestamp,cwd:'/synthetic/workspace',title:'stale header title'};
+const entries=[{type:'message',id:'00000001',parentId:null,timestamp,message:{role:'user',content:[{type:'text',text:'Inspect this synthetic image'},{type:'image',data:'blob:sha256:'+hash,mimeType:'image/png'}],timestamp:1767225600000}},{type:'message',id:'00000002',parentId:'00000001',timestamp,message:{role:'assistant',content:[{type:'text',text:'Reading a fixture'},{type:'toolCall',id:'call-synthetic-1',name:'read',arguments:{path:'fixture.txt'}}],api:'synthetic',provider:'synthetic',model:'fixture-model',usage:{input:12},stopReason:'toolUse',timestamp:1767225600000}},{type:'message',id:'00000003',parentId:'00000002',timestamp,message:{role:'toolResult',toolCallId:'call-synthetic-1',toolName:'read',content:[{type:'text',text:'fixture bytes'}],isError:false,timestamp:1767225600000}}];
+const slot=helpers.serializeTitleSlot({title:'Synthetic initial title',source:'user',updatedAt:timestamp});
+const ordinary=slot+[header,...entries].map(x=>JSON.stringify(x)+'\n').join('');
+fs.writeFileSync(dir+'/ordinary.jsonl',ordinary);fs.writeFileSync(dir+'/title-rewrite.jsonl',helpers.overlayTitleSlotContent(ordinary,{title:'Synthetic changed title',source:'user',updatedAt:timestamp}));
+fs.writeFileSync(dir+'/fork.jsonl',slot+[{...header,id:'019b76da-a800-7000-8000-000000000002',parentSession:header.id},...entries].map(x=>JSON.stringify(x)+'\n').join(''));
+fs.writeFileSync(dir+'/rewrite.jsonl',slot+[header,entries[0]].map(x=>JSON.stringify(x)+'\n').join(''));
+fs.writeFileSync(dir+'/partial-tail.jsonl',ordinary+'{"type":"message","id":');

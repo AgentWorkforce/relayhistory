@@ -9,10 +9,12 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - Gemini CLI history is discoverable and searchable from its local JSONL journals and supported legacy JSON files, with recorded messages, tool calls and patched results, measured usage, and journal revisions preserved as markers.
+- Oh My Pi history is discoverable and searchable from its native title-slot session files, with recorded messages, tool calls and results, observed usage and control markers; shared Pi roots do not double-import these sessions.
 
 ### Rust API
 
 - Added `Source::Gemini` for filtering and reading persisted Gemini CLI session history.
+- Added `Source::Omp` for filtering and reading persisted Oh My Pi session history.
 
 ## [0.47.0] - 2026-10-18
 

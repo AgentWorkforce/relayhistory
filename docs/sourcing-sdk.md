@@ -1011,6 +1011,7 @@ handle.
 | grok-bot | ✓ | ✓ | — | — | ✓ | none |
 | hermes | ✓ | ✓ | ✓ | — | — | none |
 | muse | ✓ | ✓ | ✓ | ✓ | ✓ | per-request |
+| omp | ✓ | ✓ | ✓ | — | — | per-message |
 | openclaw | ✓ | ✓ | ✓ | — | — | per-message |
 | opencode | ✓ | ✓ | ✓ | ✓ | ✓ | none |
 | pi | ✓ | ✓ | ✓ | — | — | per-message |

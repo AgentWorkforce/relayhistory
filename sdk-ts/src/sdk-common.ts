@@ -24,6 +24,7 @@ export const SOURCES = Object.freeze([
   'devin',
   'pi',
   'hermes',
+  'omp',
   'copilot',
   'gemini',
   'grok-bot',
