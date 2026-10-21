@@ -257,6 +257,7 @@ fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
     let env = DiscoveryEnv::with_provider_roots(ctx.conn, ctx.roots.clone())
         .with_path_scope(ctx.paths.cloned());
     let mut result = SweepResult::default();
+    let mut failed_capture = false;
     for candidate in Provider.enumerate(&env, None)? {
         crate::ingest::check_capture_cancelled()?;
         let path = Path::new(&candidate.locator);
@@ -276,10 +277,13 @@ fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
                 crate::ingest::check_capture_cancelled()?;
                 eprintln!("VT Code {}: {error:#}", path.display());
                 result.unread += 1;
+                failed_capture = true;
             }
         }
     }
-    if ctx.paths.is_none() && result.unread == 0 {
+    // A successfully captured partial tail is still a live session. Only an
+    // actual capture failure makes retirement of other locators uncertain.
+    if ctx.paths.is_none() && !failed_capture {
         crate::providers::file_history::retire_missing(ctx.conn, ID, ctx.roots)?;
     }
     Ok(result)

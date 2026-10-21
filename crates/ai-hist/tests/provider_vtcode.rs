@@ -21,8 +21,11 @@ fn stage(home: &Path) -> PathBuf {
     path
 }
 fn sid(home: &Path) -> String {
+    sid_named(home, NATIVE)
+}
+fn sid_named(home: &Path, native: &str) -> String {
     format!(
-        "root:{:x}:{NATIVE}",
+        "root:{:x}:{native}",
         Sha256::digest(home.join(".vtcode/sessions").to_string_lossy().as_bytes())
     )
 }
@@ -309,6 +312,39 @@ fn missing_canonical_journal_is_diagnostic() {
         &evidence(&store, &id),
         "I found one safe fixture file."
     ));
+}
+
+#[test]
+fn partial_live_journal_does_not_block_retirement_of_deleted_sibling() {
+    let home = tempfile::tempdir().unwrap();
+    let deleted = stage(home.path());
+    let native = "partial-sibling";
+    let sibling = home
+        .path()
+        .join(".vtcode/sessions")
+        .join(native)
+        .join("events.jsonl");
+    std::fs::create_dir_all(sibling.parent().unwrap()).unwrap();
+    let sibling_fixture = FIXTURE.replace(NATIVE, native);
+    std::fs::write(&sibling, &sibling_fixture).unwrap();
+    let store = open(home.path());
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    let deleted_id = sid(home.path());
+    let sibling_id = sid_named(home.path(), native);
+    let original = evidence(&store, &sibling_id).messages;
+    assert!(!original.is_empty());
+
+    std::fs::remove_dir_all(deleted.parent().unwrap()).unwrap();
+    std::fs::write(&sibling, format!("{sibling_fixture}{{\"schema_version\":")).unwrap();
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    assert!(store
+        .session(
+            &SessionRef::id(Source::Vtcode, deleted_id),
+            SessionQuery::default(),
+        )
+        .unwrap()
+        .is_none());
+    assert_eq!(evidence(&store, &sibling_id).messages, original);
 }
 
 #[test]
