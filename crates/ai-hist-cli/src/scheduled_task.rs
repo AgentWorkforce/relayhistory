@@ -178,27 +178,78 @@ fn task_environment(spec: &ServiceSpec) -> Result<Vec<(String, String)>> {
 /// the Hermes resolver expands.
 pub(crate) fn referenced_variables(value: &str) -> Vec<String> {
     let mut names = Vec::new();
+    expand_references(value, |name| {
+        if !names.iter().any(|seen| seen == name) {
+            names.push(name.to_string());
+        }
+        None
+    });
+    names
+}
+
+/// `value` with each `$NAME`/`${NAME}` replaced by `lookup(NAME)`, left as
+/// written when that is `None`, an unclosed `${` or a bare `$`: Hermes's
+/// expansion rules.
+pub(crate) fn expand_references(
+    value: &str,
+    mut lookup: impl FnMut(&str) -> Option<String>,
+) -> String {
+    let mut output = String::new();
     let mut rest = value;
     while let Some(at) = rest.find('$') {
+        output.push_str(&rest[..at]);
         rest = &rest[at + 1..];
-        let (name, after) = match rest.strip_prefix('{') {
+        let (name, after, written) = match rest.strip_prefix('{') {
             Some(braced) => match braced.find('}') {
-                Some(end) => (&braced[..end], &braced[end + 1..]),
-                None => break,
+                Some(end) => (&braced[..end], &braced[end + 1..], &rest[..end + 2]),
+                None => ("", rest, ""),
             },
             None => {
                 let end = rest
                     .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
                     .unwrap_or(rest.len());
-                (&rest[..end], &rest[end..])
+                (&rest[..end], &rest[end..], &rest[..end])
             }
         };
-        if !name.is_empty() && !names.iter().any(|seen| seen == name) {
-            names.push(name.to_string());
+        match (!name.is_empty()).then(|| lookup(name)).flatten() {
+            Some(expanded) => output.push_str(&expanded),
+            None => {
+                output.push('$');
+                output.push_str(written);
+            }
         }
         rest = after;
     }
-    names
+    output.push_str(rest);
+    output
+}
+
+/// The captured provider root that blocks an install from a UNC directory:
+/// one that may depend on the current directory, which cmd.exe cannot enter
+/// there. Variables captured only because HERMES_HOME references them are not
+/// roots, and HERMES_HOME is judged after Hermes's own expansion.
+pub(crate) fn unc_blocker(environment: &[(String, String)]) -> Option<&str> {
+    let roots = super::PROVIDER_ENV_VARS
+        .iter()
+        .chain(WINDOWS_EXTRA_ENV_VARS.iter());
+    let roots: Vec<&str> = roots.copied().collect();
+    let captured = |name: &str| {
+        environment
+            .iter()
+            .find(|(captured, _)| captured == name)
+            .map(|(_, value)| value.clone())
+    };
+    environment.iter().find_map(|(name, value)| {
+        if !roots.contains(&name.as_str()) {
+            return None;
+        }
+        let value = if name == "HERMES_HOME" {
+            expand_references(value, captured)
+        } else {
+            value.clone()
+        };
+        relative_path_value(name, &value).then_some(name.as_str())
+    })
 }
 
 /// Captured variables that hold a name or suffix rather than a path.
@@ -217,7 +268,8 @@ const NON_PATH_ENV_VARS: [&str; 4] = [
 /// - `PI_CONFIG_DIR`, which OMP always joins to home;
 /// - OpenClaw's values, trimmed: `null`/`undefined` (unset) and `~`, `~/`,
 ///   `~\` (home);
-/// - `~` and `~/` in the Pi/OMP agent and session directories (home).
+/// - `~` and `~/` in the Pi/OMP agent and session directories and in an
+///   expanded HERMES_HOME (home).
 pub(crate) fn relative_path_value(name: &str, value: &str) -> bool {
     let home_tilde = |v: &str| v == "~" || v.starts_with("~/");
     let exempt = NON_PATH_ENV_VARS.contains(&name)
@@ -226,7 +278,7 @@ pub(crate) fn relative_path_value(name: &str, value: &str) -> bool {
             let v = value.trim();
             matches!(v, "null" | "undefined") || home_tilde(v) || v.starts_with("~\\")
         })
-        || (name.starts_with("PI_CODING_AGENT_") && home_tilde(value));
+        || ((name.starts_with("PI_CODING_AGENT_") || name == "HERMES_HOME") && home_tilde(value));
     !exempt && !Path::new(value).is_absolute()
 }
 
@@ -423,10 +475,7 @@ pub(crate) fn install(spec: &ServiceSpec, bin: &str, interval: u64, args: &[Stri
     // resolve relative provider roots from.
     let unc = cwd.starts_with(r"\\");
     if unc {
-        if let Some((name, _)) = environment
-            .iter()
-            .find(|(name, value)| relative_path_value(name, value))
-        {
+        if let Some(name) = unc_blocker(&environment) {
             anyhow::bail!(
                 "cannot install sync service from the network path {cwd}: {name} is relative, and a scheduled task cannot resolve it there. Install from a local directory or make {name} absolute."
             );
@@ -651,6 +700,37 @@ mod tests {
         // An unclosed `${` and a bare `$` name nothing, as Hermes leaves them.
         assert!(referenced_variables("C:/hermes/${OPEN").is_empty());
         assert!(referenced_variables("cost$/x").is_empty());
+    }
+
+    #[test]
+    fn hermes_references_expand_as_hermes_does() {
+        let env = |name: &str| (name == "ROOT").then(|| "R".to_string());
+        assert_eq!(expand_references("$ROOT/${ROOT}/x", env), "R/R/x");
+        assert_eq!(expand_references("$UNSET/${UNSET}", env), "$UNSET/${UNSET}");
+        assert_eq!(expand_references("a$/${OPEN", env), "a$/${OPEN");
+    }
+
+    #[test]
+    fn unc_installs_judge_only_provider_roots_after_expansion() {
+        let absolute = std::env::current_dir().unwrap().display().to_string();
+        let pair = |name: &str, value: &str| (name.to_string(), value.to_string());
+        // A referenced variable is not a root, and HERMES_HOME expands to an
+        // absolute path.
+        let env = [
+            pair("HERMES_HOME", &format!("{absolute}/${{PROFILE}}")),
+            pair("PROFILE", "work"),
+        ];
+        assert_eq!(unc_blocker(&env), None);
+        let env = [pair("HERMES_HOME", "$ROOT/hermes"), pair("ROOT", &absolute)];
+        assert_eq!(unc_blocker(&env), None);
+        assert_eq!(unc_blocker(&[pair("HERMES_HOME", "~/hermes")]), None);
+        // A relative provider root still blocks.
+        let env = [pair("HERMES_HOME", "$ROOT/hermes"), pair("ROOT", "rel")];
+        assert_eq!(unc_blocker(&env), Some("HERMES_HOME"));
+        assert_eq!(
+            unc_blocker(&[pair("CODEX_HOME", "codex")]),
+            Some("CODEX_HOME")
+        );
     }
 
     #[test]
