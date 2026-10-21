@@ -1,12 +1,14 @@
 //! Validated canonical evidence records accepted from installed source adapters.
 //! Foreign database row ids are retained in observations but never assigned locally.
 mod ownership;
+mod session_event;
 use crate::observations::ObservationKey;
 use crate::SessionLocation;
 use anyhow::{ensure, Context, Result};
 use rusqlite::{params_from_iter, Connection};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
+use session_event::validate_session_event;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -306,70 +308,6 @@ fn validate_ownership(key: &ObservationKey, record: &EvidenceRecord, spec: &Spec
                 .and_then(Value::as_str)
                 .is_some_and(|value| !value.is_empty()),
             "INVALID_ARGUMENT: empty evidence identity {field}"
-        );
-    }
-    Ok(())
-}
-
-fn validate_session_event(payload: &Map<String, Value>) -> Result<()> {
-    ensure!(
-        ["user", "assistant", "tool_result"]
-            .contains(&payload["role"].as_str().unwrap_or_default())
-            && ["text", "thinking", "tool_use", "tool_result"]
-                .contains(&payload["kind"].as_str().unwrap_or_default()),
-        "INVALID_ARGUMENT: invalid event role or kind"
-    );
-    // `control_kind` is a closed vocabulary, and every reader -- the
-    // user-turn page, prompt attribution, the plugin's turn export --
-    // treats any non-null value as authoritative without rechecking
-    // it. A spelling nobody classifies, or a kind on a row the
-    // contract says can never carry one, would silently hide real
-    // evidence, so it is refused here rather than stored.
-    if let Some(value) = payload.get("control_kind").filter(|v| !v.is_null()) {
-        ensure!(
-            value
-                .as_str()
-                .is_some_and(|value| crate::ingest::control::ControlKind::parse(value).is_some()),
-            "INVALID_ARGUMENT: unsupported control_kind value"
-        );
-        ensure!(
-            payload["role"].as_str() == Some("user") && payload["kind"].as_str() == Some("text"),
-            "INVALID_ARGUMENT: control_kind is only valid on a user text event"
-        );
-    }
-    let tool_result = payload["kind"].as_str() == Some("tool_result");
-    for field in TOOL_RESULT_FIELDS {
-        let Some(value) = payload.get(*field).filter(|v| !v.is_null()) else {
-            continue;
-        };
-        // A native call ID joins both tool-use and tool-result blocks;
-        // every other fidelity field describes a result only.
-        ensure!(
-            tool_result || (*field == "tool_use_id" && payload["kind"] == "tool_use"),
-            "INVALID_ARGUMENT: {field} is only valid on a tool_result event (tool_use_id also accepts tool_use)"
-        );
-        validate_tool_result_field(field, value)?;
-    }
-    Ok(())
-}
-
-fn validate_tool_result_field(field: &str, value: &Value) -> Result<()> {
-    if NON_NEGATIVE_FIELDS.contains(&field) {
-        ensure!(
-            value.as_i64().is_some_and(|n| n >= 0),
-            "INVALID_ARGUMENT: {field} must not be negative"
-        );
-    }
-    let vocabulary = match field {
-        "result_status" => Some(RESULT_STATUSES),
-        "event_source" => Some(EVENT_SOURCES),
-        "error_signal" => Some(ERROR_SIGNALS),
-        _ => None,
-    };
-    if let Some(allowed) = vocabulary {
-        ensure!(
-            value.as_str().is_some_and(|v| allowed.contains(&v)),
-            "INVALID_ARGUMENT: unsupported {field} value"
         );
     }
     Ok(())
@@ -683,15 +621,27 @@ mod tests {
         record.write(&conn, SessionLocation::Local).unwrap();
         assert_eq!(location(&conn).as_deref(), Some("local"));
         record.write(&conn, SessionLocation::Local).unwrap();
-        assert_eq!(location(&conn).as_deref(), Some("local"), "same side stays itself");
+        assert_eq!(
+            location(&conn).as_deref(),
+            Some("local"),
+            "same side stays itself"
+        );
         record.write(&conn, SessionLocation::Remote).unwrap();
         assert_eq!(location(&conn).as_deref(), Some("both"));
         record.remove(&conn, SessionLocation::Local).unwrap();
-        assert_eq!(location(&conn).as_deref(), Some("remote"), "the remote share stays");
+        assert_eq!(
+            location(&conn).as_deref(),
+            Some("remote"),
+            "the remote share stays"
+        );
         record.write(&conn, SessionLocation::Local).unwrap();
         assert_eq!(location(&conn).as_deref(), Some("both"));
         record.remove(&conn, SessionLocation::Remote).unwrap();
-        assert_eq!(location(&conn).as_deref(), Some("local"), "the local share stays");
+        assert_eq!(
+            location(&conn).as_deref(),
+            Some("local"),
+            "the local share stays"
+        );
         record.remove(&conn, SessionLocation::Local).unwrap();
         assert_eq!(location(&conn), None, "nothing backs it any more");
     }
@@ -756,13 +706,17 @@ mod tests {
             .iter()
             .filter(|field| **field != "tool_use_id")
         {
-            let value = tool_result_event().payload.get(*field).cloned().unwrap_or_else(|| {
-                if *field == "error_signal" {
-                    json!("tool_result.is_error")
-                } else {
-                    json!("fixture-identity")
-                }
-            });
+            let value = tool_result_event()
+                .payload
+                .get(*field)
+                .cloned()
+                .unwrap_or_else(|| {
+                    if *field == "error_signal" {
+                        json!("tool_result.is_error")
+                    } else {
+                        json!("fixture-identity")
+                    }
+                });
             record.payload.insert((*field).into(), value);
             let error = validate(record.clone()).expect_err("other fidelity stays result-only");
             assert!(
@@ -786,8 +740,8 @@ mod tests {
         // sort first under `--rank-by bytes`, which is the one place the value
         // is load-bearing.
         for field in ["payload_bytes", "call_index", "event_index"] {
-            let error = validate(with(field, json!(-1)))
-                .expect_err("a negative {field} must be rejected");
+            let error =
+                validate(with(field, json!(-1))).expect_err("a negative {field} must be rejected");
             assert!(
                 error.to_string().contains("must not be negative"),
                 "{field}: {error}"
@@ -868,21 +822,27 @@ mod tests {
         assistant.payload.insert("role".into(), json!("assistant"));
         let error = validate(assistant).expect_err("assistant rows never carry a control kind");
         assert!(
-            error.to_string().contains("only valid on a user text event"),
+            error
+                .to_string()
+                .contains("only valid on a user text event"),
             "{error}"
         );
 
         let error = validate(with("control_kind", json!("codex_context_wrapper")))
             .expect_err("tool results never carry a control kind");
         assert!(
-            error.to_string().contains("only valid on a user text event"),
+            error
+                .to_string()
+                .contains("only valid on a user text event"),
             "{error}"
         );
 
         // A user row that is not text either: the classification is about
         // what the human's turn is, not about a tool result on it.
         let mut user_tool_result = user_text_event(json!("meta"));
-        user_tool_result.payload.insert("kind".into(), json!("tool_result"));
+        user_tool_result
+            .payload
+            .insert("kind".into(), json!("tool_result"));
         assert!(validate(user_tool_result).is_err());
     }
 
@@ -893,7 +853,9 @@ mod tests {
         record.payload.insert("kind".into(), json!("text"));
         let error = validate(record).expect_err("fidelity on a text row must be rejected");
         assert!(
-            error.to_string().contains("only valid on a tool_result event"),
+            error
+                .to_string()
+                .contains("only valid on a tool_result event"),
             "{error}"
         );
     }

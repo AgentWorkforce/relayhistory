@@ -21,6 +21,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - A desktop socket pointer file with more than one line (LF or CRLF) names the socket by its first line instead of never connecting.
 - The relay roster, status, join and leave tools move on to the next desktop socket candidate when a Windows named pipe is busy, and report `socket_busy` (not "desktop isn't running") when none answers.
+- Hermes hydration preserves remote-backed evidence when a local transcript changes, rejecting conflicting rewrites without replacing shared history.
+- Source evidence intake rejects blank tool call identifiers while preserving recorded Hermes call and result identities.
 
 ### Rust API
 
