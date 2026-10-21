@@ -475,6 +475,14 @@ fn optional_index_partial_tail_keeps_native_journal_readable_and_oversize_is_dia
         .iter()
         .any(|d| d.code == "JUNIE_INDEX_TOO_LARGE"));
     assert_eq!(evidence(&store).tool_calls[0].tool_use_id, "step-tool-1");
+    assert_eq!(
+        project_facts(&home.path().join("junie.db")),
+        (
+            Some("/synthetic/project".into()),
+            Some("/synthetic/project".into()),
+            Some("/synthetic/project".into())
+        )
+    );
     let mut query = CatalogQuery::default();
     query.sources = Some(vec![Source::Junie]);
     assert_eq!(
@@ -569,6 +577,88 @@ fn missing_optional_index_preserves_verified_local_project_facts() {
         .unwrap();
     assert_eq!(project_facts(&db), before);
     assert_eq!(evidence(&store).tool_calls[0].tool_use_id, "step-tool-1");
+}
+
+#[test]
+fn present_native_summary_removing_project_clears_local_catalog_and_evidence() {
+    let home = tempfile::tempdir().unwrap();
+    stage(home.path());
+    let store = open(home.path());
+    let reference = SessionRef::id(Source::Junie, SID);
+    store
+        .discover(DiscoveryOptions::default().sources([Source::Junie]))
+        .unwrap();
+    store
+        .hydrate(&reference, HydrateOptions::default())
+        .unwrap();
+    let db = home.path().join("junie.db");
+    assert_eq!(project_facts(&db).0.as_deref(), Some("/synthetic/project"));
+    assert!(project_keys(&db).0.is_some());
+    let index = home.path().join(".junie/sessions/index.jsonl");
+    let mut summary: serde_json::Value =
+        serde_json::from_str(std::fs::read_to_string(&index).unwrap().trim()).unwrap();
+    summary.as_object_mut().unwrap().remove("projectDir");
+    std::fs::write(&index, format!("{}\n", summary)).unwrap();
+    store
+        .discover(DiscoveryOptions::default().sources([Source::Junie]))
+        .unwrap();
+    store
+        .hydrate(&reference, HydrateOptions::default())
+        .unwrap();
+    assert_eq!(project_facts(&db), (None, None, None));
+    assert_eq!(project_keys(&db), (None, None));
+}
+
+#[cfg(feature = "unstable-internal")]
+#[test]
+fn present_native_project_removal_keeps_independent_remote_catalog_project() {
+    use ai_hist::{SessionLocation, ShallowSession, SourceObservation, SourceObservationBatch};
+    let home = tempfile::tempdir().unwrap();
+    stage(home.path());
+    let store = open(home.path());
+    let reference = SessionRef::id(Source::Junie, SID);
+    store
+        .discover(DiscoveryOptions::default().sources([Source::Junie]))
+        .unwrap();
+    store
+        .hydrate(&reference, HydrateOptions::default())
+        .unwrap();
+    store
+        .apply_source_observations(SourceObservationBatch::new(
+            "remote-project-control",
+            "default",
+            SessionLocation::Remote,
+            vec![SourceObservation {
+                session: ShallowSession {
+                    source: "junie".into(),
+                    session_id: SID.into(),
+                    cwd: Some("/remote/project".into()),
+                    source_stamp: Some("remote-project-full".into()),
+                    discovery_state: "full".into(),
+                    ..Default::default()
+                },
+                raw_locator: None,
+            }],
+        ))
+        .unwrap();
+    let db = home.path().join("junie.db");
+    assert_eq!(project_facts(&db).0.as_deref(), Some("/remote/project"));
+    let remote_key = project_keys(&db).0;
+    let index = home.path().join(".junie/sessions/index.jsonl");
+    let mut summary: serde_json::Value =
+        serde_json::from_str(std::fs::read_to_string(&index).unwrap().trim()).unwrap();
+    summary.as_object_mut().unwrap().remove("projectDir");
+    std::fs::write(&index, format!("{}\n", summary)).unwrap();
+    store
+        .discover(DiscoveryOptions::default().sources([Source::Junie]))
+        .unwrap();
+    store
+        .hydrate(&reference, HydrateOptions::default())
+        .unwrap();
+    assert_eq!(project_facts(&db).0.as_deref(), Some("/remote/project"));
+    assert_eq!(project_keys(&db).0, remote_key);
+    assert_eq!(project_facts(&db).1, None);
+    assert_eq!(project_facts(&db).2, None);
 }
 
 #[test]

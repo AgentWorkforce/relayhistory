@@ -8,6 +8,7 @@ use anyhow::Context;
 
 mod format;
 mod normalize;
+mod project;
 mod roots;
 mod storage;
 #[cfg(test)]
@@ -81,7 +82,7 @@ impl ShallowSessionProvider for Provider {
             // The generic presence upsert preserves `full` across a shallow
             // discovery. A moved journal has not yet been captured at its new
             // locator, so its old events cannot establish missing index facts.
-            normalize::invalidate_relocated_local_capture(conn, sid, &path)?;
+            project::invalidate_relocated_local_capture(conn, sid, &path)?;
             if capture.payload["partial"] == true || capture.payload["bounded"] == true {
                 crate::discover::catalog_row(conn, ID, sid, true)?
             } else {

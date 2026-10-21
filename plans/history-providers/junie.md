@@ -65,7 +65,9 @@ unavailable index titles do not clear it. When index metadata is unavailable,
 a full local capture at the same journal locator also preserves its verified
 project directory for event, history and catalog reconciliation. A remote-only
 or discovery-only catalog row does not supply that fact; an explicit native
-summary without `projectDir` does not use the fallback. If discovery finds the
+summary without `projectDir` clears the prior local project and its derived
+catalog/event keys while retaining an independently remote-owned catalog
+project. If discovery finds the
 same session ID at a new journal locator, it invalidates the old full-local
 capture and demotes the catalog's full state before replacing the locator,
 unless an independent remote full capture still supports that state. The new
