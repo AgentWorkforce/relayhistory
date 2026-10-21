@@ -285,12 +285,128 @@ fn metadata_only_journal_change_updates_marker_without_rewriting_messages() {
 #[test]
 fn missing_canonical_journal_is_diagnostic() {
     let home = tempfile::tempdir().unwrap();
+    let valid = stage(home.path());
     std::fs::create_dir_all(home.path().join(".vtcode/sessions/missing")).unwrap();
     let store = open(home.path());
-    let error = store
+    let report = store
         .discover(DiscoveryOptions::default().sources([Source::Vtcode]))
-        .unwrap_err();
-    assert_eq!(error.code(), "DISCOVERY_FAILED");
+        .unwrap();
+    assert_eq!(report.discovered, 1);
+    assert!(report
+        .diagnostics
+        .iter()
+        .any(|d| d.message.contains("VTCODE_MISSING_JOURNAL")));
+    let id = sid(home.path());
+    store
+        .hydrate(
+            &SessionRef::id(Source::Vtcode, &id),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    std::fs::remove_file(valid).unwrap();
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    assert!(contains(
+        &evidence(&store, &id),
+        "I found one safe fixture file."
+    ));
+}
+
+#[test]
+fn shallow_tail_never_replaces_the_opening_prompt() {
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path());
+    let opening = "A".repeat(70_000);
+    let mut rows = FIXTURE.lines().map(str::to_owned).collect::<Vec<_>>();
+    let mut first: serde_json::Value = serde_json::from_str(&rows[1]).unwrap();
+    first["event"]["context"]["goal"] = opening.clone().into();
+    rows[1] = first.to_string();
+    std::fs::write(&path, format!("{}\n", rows.join("\n"))).unwrap();
+    let store = open(home.path());
+    let report = store
+        .discover(DiscoveryOptions::default().sources([Source::Vtcode]))
+        .unwrap();
+    assert_eq!(report.discovered, 1);
+    let conn = rusqlite::Connection::open(home.path().join("conformance.db")).unwrap();
+    let first: Option<String> = conn
+        .query_row(
+            "SELECT first_prompt FROM sessions WHERE source='vtcode'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(first, None, "tail turn is not an opening prompt");
+    store
+        .hydrate(
+            &SessionRef::id(Source::Vtcode, &sid(home.path())),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    // Change the stamp so the next discovery must reconsider shallow input.
+    std::fs::write(
+        &path,
+        format!("{}\n{}\n", rows.join("\n"), FIXTURE.lines().last().unwrap()),
+    )
+    .unwrap();
+    store
+        .discover(DiscoveryOptions::default().sources([Source::Vtcode]))
+        .unwrap();
+    let first: Option<String> = conn
+        .query_row(
+            "SELECT first_prompt FROM sessions WHERE source='vtcode'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(first.as_deref(), Some(opening.as_str()));
+}
+
+#[test]
+fn complete_rewrite_without_user_turn_clears_first_prompt() {
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path());
+    let store = open(home.path());
+    let id = sid(home.path());
+    store
+        .discover(DiscoveryOptions::default().sources([Source::Vtcode]))
+        .unwrap();
+    store
+        .hydrate(
+            &SessionRef::id(Source::Vtcode, &id),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    let conn = rusqlite::Connection::open(home.path().join("conformance.db")).unwrap();
+    let first: Option<String> = conn
+        .query_row(
+            "SELECT first_prompt FROM sessions WHERE source='vtcode'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(first.as_deref(), Some("Inspect the synthetic fixture"));
+    let rows = FIXTURE
+        .lines()
+        .filter(|line| !line.contains("\"type\":\"turn.started\""))
+        .collect::<Vec<_>>();
+    std::fs::write(path, format!("{}\n", rows.join("\n"))).unwrap();
+    store
+        .hydrate(
+            &SessionRef::id(Source::Vtcode, &id),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    let first: Option<String> = conn
+        .query_row(
+            "SELECT first_prompt FROM sessions WHERE source='vtcode'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(first, None);
+    assert!(evidence(&store, &id)
+        .messages
+        .iter()
+        .all(|m| m.role != Role::User));
 }
 
 #[cfg(unix)]

@@ -262,9 +262,10 @@ fn write_catalog(
             raw_path: Some(&path.to_string_lossy()),
         },
     )?;
-    if let Some((text, _, _)) = format::first_prompt(rows, native) {
+    let first_prompt = format::first_prompt(rows, native).map(|(text, _, _)| text);
+    if complete || first_prompt.is_some() {
         conn.execute("UPDATE sessions SET first_prompt=?2 WHERE source='vtcode' AND session_id=?1 AND first_prompt IS NOT ?2",
-            rusqlite::params![sid, text])?;
+            rusqlite::params![sid, first_prompt])?;
     }
     Ok(())
 }

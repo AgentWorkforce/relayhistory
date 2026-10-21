@@ -81,11 +81,18 @@ impl ShallowSessionProvider for Provider {
                 if env.path_scope().is_some_and(|scope| !scope.mentions(&path)) {
                     continue;
                 }
-                anyhow::ensure!(
-                    path.is_file(),
-                    "VTCODE_MISSING_JOURNAL: session directory {} has no events.jsonl",
-                    entry.path().display()
-                );
+                if !path.is_file() {
+                    // A partial native session must be diagnosed per candidate;
+                    // it cannot hide valid siblings or permit missing retirement.
+                    found.push(Candidate {
+                        source: ID,
+                        locator: path.to_string_lossy().into_owned(),
+                        session_id: None,
+                        recency_hint_ms: None,
+                        stamp: "missing-journal".into(),
+                    });
+                    continue;
+                }
                 AcquisitionContext::new(ID, &env.provider_roots).validate(&path)?;
                 let (stamp, recency_hint_ms) = crate::file_stamp_and_modified(&path)?;
                 found.push(Candidate {
@@ -111,16 +118,17 @@ impl ShallowSessionProvider for Provider {
         c: &Candidate,
     ) -> Result<Option<ShallowSession>> {
         let path = Path::new(&c.locator);
+        ensure_journal(path)?;
         let (sid, native) = roots::identity(scan.provider_roots, path)?;
         let context = AcquisitionContext::new(ID, scan.provider_roots);
         context.validate(path)?;
-        let rows = shallow_rows(scan, path)?;
+        let (rows, prefix_rows) = shallow_rows(scan, path)?;
         scan.note_records(rows.len() as u64);
         normalize::validate_native(&rows, &native)?;
         if let Some(conn) = conn {
             normalize::check_identity(conn, &sid, path)?;
         }
-        let first = format::first_prompt(&rows, &native);
+        let first = format::first_prompt(&rows[..prefix_rows], &native);
         let times = rows
             .iter()
             .map(format::event_time)
@@ -145,7 +153,7 @@ impl ShallowSessionProvider for Provider {
     }
 }
 
-fn shallow_rows(scan: &ScanEnv<'_>, path: &Path) -> Result<Vec<Value>> {
+fn shallow_rows(scan: &ScanEnv<'_>, path: &Path) -> Result<(Vec<Value>, usize)> {
     let mut file = std::fs::File::open(path)?;
     let size = file.metadata()?.len();
     let mut head = Vec::new();
@@ -158,6 +166,7 @@ fn shallow_rows(scan: &ScanEnv<'_>, path: &Path) -> Result<Vec<Value>> {
         "VTCODE_SHALLOW_BOUND: no complete event in first 64 KiB"
     );
     let (mut rows, _) = format::parse(&head[..head_end])?;
+    let prefix_rows = rows.len();
     if size > head.len() as u64 {
         let start = size.saturating_sub(SHALLOW_BYTES).max(head.len() as u64);
         file.seek(SeekFrom::Start(start))?;
@@ -175,10 +184,20 @@ fn shallow_rows(scan: &ScanEnv<'_>, path: &Path) -> Result<Vec<Value>> {
             rows.extend(format::parse(&tail[offset..])?.0);
         }
     }
-    Ok(rows)
+    Ok((rows, prefix_rows))
+}
+
+fn ensure_journal(path: &Path) -> Result<()> {
+    anyhow::ensure!(
+        path.is_file(),
+        "VTCODE_MISSING_JOURNAL: session directory {} has no events.jsonl",
+        path.parent().unwrap_or(path).display()
+    );
+    Ok(())
 }
 
 fn snapshot(path: &Path, context: &AcquisitionContext<'_>) -> Result<AcquiredSession> {
+    ensure_journal(path)?;
     let bytes = context.read(path)?;
     let (rows, partial) = format::parse(&bytes)?;
     let (sid, native) = roots::identity(context.roots, path)?;
