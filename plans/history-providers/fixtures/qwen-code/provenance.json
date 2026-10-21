@@ -1,0 +1,68 @@
+{
+  "upstream": "https://github.com/QwenLM/qwen-code",
+  "revision": "82bd240ad0d31fd1d3a83dd803625118019ba35d",
+  "version": "0.25.3",
+  "sources": {
+    "packages/core/src/utils/toolResultDisplayCompaction.ts": "41c9a80ca5230bd046f2939a2dccc45b856832ebd321c86341ba6c4b77d07196",
+    "packages/core/src/services/chatRecordingService.ts": "160d2a254e5d187c0b3e3885f359beb3bbc0b8b444d2f82d8236eca856fcc5d9",
+    "packages/core/src/services/session-artifact-persistence.ts": "09c8b9880752e4436e8af9f9484259bde144adf7acbc90dd36178db56ddb5b08",
+    "packages/core/src/telemetry/gen-ai-usage.ts": "8ce5c30db38dc2623be9bd0c3c02e78d5638585cee3a8fd95616a3da313e209b",
+    "packages/core/src/utils/paths.ts": "d8b45cca20f6c0bfa493b891b50ab6ceeb89ca74777d550230a0d5379ce52655",
+    "packages/core/src/config/approval-mode.ts": "2381186f3bef00970939ea431a693990566c8759822ebf518f50b77b5951eb12",
+    "packages/core/src/utils/runtimeModelPrefix.ts": "81a6e3501649bc47db4fd97d001421cd6c73dd452b07118af4f9c265bc4ccba7",
+    "packages/core/src/utils/file-identity.ts": "cac437bbd23eb56c94b004f913c448ef8ad024ef3b391d12d7a774810c94550d",
+    "packages/core/src/utils/sessionStorageUtils.ts": "cf1cb98e10d98c03afaf407f0931d2251e6b7cd5cb4312ce8a548b9e240547de",
+    "packages/core/src/services/session-sources.ts": "59af035defc95dc5e780f190fbe5e5fc84bf8a5a018f7724f9b44894dd84ed68",
+    "packages/core/src/services/sessionService.ts": "d6a21abd1d7757617e042514909233f7d7ac8352b329fd4f3377d07a573b895f",
+    "packages/core/src/core/genai-compat.ts": "501a2432aa360d1120f778bf52c13167f2bb100cb25e1801b1db68bf3f7c64f6",
+    "packages/core/src/services/session-turn-state.ts": "885efc57639e81b552acb963bef79033fc8a874fcc14d4f81e946e92c04fb4c4",
+    "packages/core/src/services/chatRecordingService.test.ts": "4bdf8787e6f9559b6a758bf66572e0a23bfc6ce651bdf65ca67c4eeb96db6532",
+    "packages/core/src/services/session-execution-engine.ts": "435cba5932ddd7bddab7ed005db13e906c7af28dac1e8589a220f143ddd0136a",
+    "packages/core/src/utils/transcript-records.ts": "a71ecbe6657187bd0507b7eb47a9709a574c3ff3d1696b94e7abcf857eeccfc6",
+    "packages/core/src/utils/shell-result.ts": "111941efebe4d401daa87236de2f1f24ac8525c51796edde7d88d30e8a22cc0f",
+    "packages/core/src/utils/background-turn-context.ts": "abe49cf714b4366bd5fd970969d4f55609c91394486ad628d6b2862448e585cb",
+    "packages/core/src/utils/process-liveness.ts": "1cd87e549254b98e19f58295e207ed1e4e4840ea6f091f72a64c85b00af2f336",
+    "packages/core/src/agents/runtime/agent-context.ts": "af021769e6183c7967059508fa7032485e9435681d0a6163cf193376f16d7e57",
+    "package.json": "cd9a5c48bb1407cf17e00c43b23de5a1d95129b44f7ee6c90160bd48095e9f0f",
+    "packages/core/src/services/session-api-history.ts": "9bcedff17612c6b2844b450f81eae954381c00f396d7fc4c850d66688f676648",
+    "packages/core/src/config/storage.ts": "21bcd472463f36f7a7083df19c446e0d9a59c66c6e41c48422c05ebfaf7e8ad8",
+    "packages/core/src/utils/debugLogger.ts": "233c641672d62d01b10a0e1bcb10db2da1df3fbc66571d1990d522c34bd4d7f8",
+    "packages/core/src/core/anthropicContentGenerator/usage.ts": "2c359803b7b7c31af393b3bd768a9a0ec35d7e48e10314519ebe4c41bb58dab2",
+    "packages/core/src/services/branch-points.ts": "6cbc44a96891b7d11ec104ade39019c9d11710074f4cb3e54cc7d6e486c98063",
+    "packages/core/src/utils/errors.ts": "ec86ce1b15a12703fb86c7a3110f3118bddb4a9ebb87c3450f42f8239b106393",
+    "packages/core/src/utils/no-follow-open.ts": "e3d3f8cda35a3b77969bae9b58f4ec27eddadca485b66049f84f067506452c27",
+    "packages/core/src/managed-runtime/managed-session-record-sink.ts": "7be89de5a2824efc994943a948dbd461455bf79559a82e48351cee5387ebabc4",
+    "packages/core/src/utils/jsonl-utils.ts": "926b342951437f953e3753fe40ae19870641d1ead8242c0d75f397726902a0a1",
+    "packages/core/src/core/openaiContentGenerator/converter.ts": "3edcb8458302c2d4ece13051f9569378614941cfcc83a039322a0dbb2d3a4b9e",
+    "packages/core/src/managed-runtime/managed-session-records.ts": "ac90d49fba2a0f6dc52fdbaf6f50db03803346a2e28e8907461690d728b42eee",
+    "packages/core/src/utils/message-group-deletion.ts": "806e5d1a1e2c2f0f2bdad344c965667cde2a16f3221bcf86edd6ef794a740908",
+    "packages/core/src/managed-runtime/local-jsonl-managed-session-journal-store.ts": "1863a2f17a201784b65b57f07e428bd88fd2474d103160cc846cee9e6a98e8c8",
+    "packages/core/src/services/session-writer-lease.ts": "2916c8b0c2142c320ecaac8838c7eaef4ba81aea933a7adb0b465fdafe88851e"
+  },
+  "cases": {
+    "ordinary": {
+      ".qwen/projects/-synthetic-qwen-project/chats/11111111-1111-4111-8111-000000000001.jsonl": "61dacfc4b30a2f0037740bb26137c8c8ff791d7f509a02b28eb698f18947eaa6"
+    },
+    "tool": {
+      ".qwen/projects/-synthetic-qwen-project/chats/11111111-1111-4111-8111-000000000002.jsonl": "ab26612dcac8b5fcdddc8d4b0ec5b8908de18770a71777a8bd40ea124c73fd25"
+    },
+    "resumed": {
+      ".qwen/projects/-synthetic-qwen-project/chats/11111111-1111-4111-8111-000000000003.jsonl": "37e2c3e845788b501373d6a18fbf829575bc0b463d4549ebb21d79b920918309"
+    },
+    "rewind": {
+      ".qwen/projects/-synthetic-qwen-project/chats/11111111-1111-4111-8111-000000000004.jsonl": "9f71bde56843e101f733d3e62e7f11a363e99e4167d7c0a19ae22930a020c620"
+    },
+    "metadata": {
+      ".qwen/projects/-synthetic-qwen-project/chats/11111111-1111-4111-8111-000000000005.jsonl": "c2dc7b66c55c0f6c0705c860e58689412abb8c397ff55981fd1d32fe1f2d7c48"
+    },
+    "same-time": {
+      ".qwen/projects/-synthetic-qwen-project/chats/11111111-1111-4111-8111-000000000006.jsonl": "4ea51b189d9d75c1e131be9ab29e43f59866d94f4c7ca4e32a38a1337a72a558"
+    }
+  },
+  "captureSha256": "63a98c062b70b5078e1ac9319131fc29a9ee24a848c7a26179dac347bc9bd928",
+  "derivedOracleSha256": "ac39dc1d806f9b614614fba332f650ae0b2370125c3eec99b41b409c13b3e8fa",
+  "captureRuntime": {
+    "node": "v22.22.2",
+    "typescript": "5.9.3"
+  }
+}

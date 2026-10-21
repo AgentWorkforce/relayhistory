@@ -2858,11 +2858,12 @@ pub struct SessionEvent {
     /// written before the column existed, and for sources that do not yet set
     /// it.
     pub raw_kind: Option<String>,
-    /// Per-tool-result fidelity. Every field below is `None` on a row that is
-    /// not a tool result, and on a tool-result row whose provider does not
-    /// record that fact — never a stand-in value, because a fabricated zero
-    /// byte count or a guessed status reads exactly like a measured one.
+    /// Native call ID joining a `tool_use` or `tool_result` to its tool call.
+    /// `None` when the provider did not record the ID, and on other event kinds.
     pub tool_use_id: Option<String>,
+    /// Per-tool-result fidelity. Every field below is `None` on a row that is
+    /// not a tool result, and when its provider does not record that fact —
+    /// never a stand-in value or a guessed status.
     /// Raw UTF-8 byte length of the provider's result payload, measured
     /// before `text` is materialized.
     pub payload_bytes: Option<i64>,
