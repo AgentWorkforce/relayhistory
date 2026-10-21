@@ -9,14 +9,19 @@ pub(super) fn string<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
 }
 
 pub(super) fn time(value: &Value) -> Result<Option<i64>> {
-    let Some(timestamp) = value["timestamp"].as_str() else {
-        return Ok(None);
-    };
-    Ok(Some(
-        chrono::DateTime::parse_from_rfc3339(timestamp)
-            .context("QODER_INVALID_RECORD: timestamp")?
-            .timestamp_millis(),
-    ))
+    match &value["timestamp"] {
+        Value::Null => Ok(None),
+        Value::Number(timestamp) => timestamp
+            .as_i64()
+            .map(Some)
+            .context("QODER_INVALID_RECORD: timestamp must be integer milliseconds"),
+        Value::String(timestamp) => Ok(Some(
+            chrono::DateTime::parse_from_rfc3339(timestamp)
+                .context("QODER_INVALID_RECORD: timestamp")?
+                .timestamp_millis(),
+        )),
+        _ => anyhow::bail!("QODER_INVALID_RECORD: timestamp type"),
+    }
 }
 
 pub(super) fn parse(bytes: &[u8], shallow: bool) -> Result<Vec<Value>> {

@@ -106,6 +106,16 @@ fn qoder_native_writer_tool_history_reaches_public_facade() {
         "the independent reader recovered the tool identity"
     );
     assert!(evidence.markers.iter().any(|m| m.kind == "active-leaf"));
+    assert_eq!(
+        evidence
+            .markers
+            .iter()
+            .find(|m| m.marker_uid == "1:active-leaf")
+            .unwrap()
+            .ts_ms,
+        Some(1_792_606_312_007),
+        "native integer-millisecond control timestamp reaches public markers"
+    );
 }
 
 #[test]
