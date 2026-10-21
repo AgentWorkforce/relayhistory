@@ -644,6 +644,67 @@ fn codebuddy_review_upstream_response_identity_groups_native_records() {
     );
 }
 #[test]
+fn codebuddy_filtered_metadata_does_not_consume_later_tool_usage() {
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path(), "tool");
+    let mut rows: Vec<Value> = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    let call_index = rows
+        .iter()
+        .position(|row| row["type"] == "function_call")
+        .unwrap();
+    let call = rows[call_index].clone();
+    let mut metadata = rows
+        .iter()
+        .find(|row| row["role"] == "assistant")
+        .unwrap()
+        .clone();
+    metadata["id"] = Value::from("fixture-filtered-meta");
+    metadata["timestamp"] = Value::from(call["timestamp"].as_i64().unwrap() - 1);
+    metadata["providerData"]["messageId"] = call["providerData"]["messageId"].clone();
+    metadata["providerData"]["rawUsage"] = call["providerData"]["rawUsage"].clone();
+    metadata["providerData"]["isMeta"] = Value::Bool(true);
+    metadata["content"] = Value::from("Private native metadata, not an assistant answer.");
+    rows.insert(call_index, metadata);
+    write(&path, &rows);
+
+    let store = open(home.path());
+    sync(&store);
+    let evidence = read(&store, "tool");
+    let request_key = format!(
+        "provider-message-id:{}",
+        call["providerData"]["messageId"].as_str().unwrap()
+    );
+    let request = evidence
+        .requests
+        .iter()
+        .find(|request| request.request_key == request_key)
+        .unwrap();
+    assert_eq!(request.usage.as_ref().unwrap().input_tokens, 23);
+    assert_eq!(request.usage.as_ref().unwrap().output_tokens, 7);
+    assert_eq!(evidence.markers.len(), rows.len());
+    assert!(evidence
+        .markers
+        .iter()
+        .filter_map(|m| m.raw_payload())
+        .any(|raw| {
+            raw.contains("fixture-filtered-meta") && raw.contains("Private native metadata")
+        }));
+    assert!(!evidence
+        .messages
+        .iter()
+        .any(|message| { message.message_id.as_deref() == Some("fixture-filtered-meta") }));
+    assert_eq!(evidence.tool_calls[0].tool_use_id, "fixture-call-001");
+    sync(&store);
+    let revision = store.head_revision().unwrap();
+    sync(&store);
+    assert_eq!(store.head_revision().unwrap(), revision);
+    assert_eq!(read(&store, "tool"), evidence);
+}
+#[test]
 fn codebuddy_review_complete_unknown_outcome_clears_prior_native_result() {
     for case in ["tool", "error"] {
         let home = tempfile::tempdir().unwrap();

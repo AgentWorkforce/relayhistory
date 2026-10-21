@@ -134,7 +134,7 @@
         "codebuddy/official-reader.json",
         "codebuddy/official-human.json"
       ],
-      "quirk": "Fresh-process native SessionStoreImpl historical reader oracle for all four CLI captures."
+      "quirk": "Fresh-process native SessionStoreImpl historical reader oracle for all five CLI captures, plus high-level historical replay for the seven recorder controls."
     }
   ],
   "capture": [

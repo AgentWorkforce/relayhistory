@@ -250,6 +250,9 @@ fn event(
         "function_call_result" => "tool_result",
         _ => format::string(row, "role")?,
     };
+    if kind == "message" && !format::human_message(row) {
+        return Ok(0);
+    }
     let usage = &row["providerData"]["rawUsage"];
     let provider_message_id = row["providerData"]["messageId"]
         .as_str()
@@ -283,9 +286,6 @@ fn event(
     match kind {
         "message" => {
             let text = format::text(row);
-            if !format::human_message(row) {
-                return Ok(0);
-            }
             insert_session_event(
                 conn,
                 &EventRow {

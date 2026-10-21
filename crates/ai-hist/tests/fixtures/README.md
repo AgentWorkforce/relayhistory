@@ -262,7 +262,7 @@ source without deciding which one fails the test.
 | codebuddy/fragments | Published native LocalJsonlSessionStore 2.171.0 offline recorder and fresh high-level historical reader replay; fragments. Not a CLI model-loop capture. |
 | codebuddy/metadata | Published native LocalJsonlSessionStore 2.171.0 offline recorder and fresh high-level historical reader replay; metadata. Not a CLI model-loop capture. |
 | codebuddy/string-content | Published native LocalJsonlSessionStore 2.171.0 offline recorder and fresh high-level historical reader replay; string-content. Not a CLI model-loop capture. |
-| codebuddy/official-reader | Fresh-process native SessionStoreImpl historical reader oracle for all four CLI captures. |
+| codebuddy/official-reader | Fresh-process native SessionStoreImpl historical reader oracle for all five CLI captures, plus high-level historical replay for the seven recorder controls. |
 | grok-bot/replicas | Synthetic complete and truncated transcript tails in two account slots, roster titles, widget response, cloud-agent round trip, and voice turns. |
 | openclaw/agent24 | OpenClaw 2026.10.4 writer, agent schema 24, deterministic clock/UUIDs: Pi v4 entries in transcript_events incl. one writer-compressed zstd row, session keys as conversation identity, main and Telegram keys, thinking/tool calls/results with isError, per-message usage, zero-usage delivery mirror, shared-mode heartbeat polls (marker and legacy prompt) with quiet acknowledgements. |
 | openclaw/agent24-ops | Second agent database from the same writer run: relay DM key under a non-main agent ID, and an isolated cron job whose two runs are two windows of one session key. |
