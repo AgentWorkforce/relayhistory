@@ -376,6 +376,15 @@ pub(crate) fn install(spec: &ServiceSpec, bin: &str, interval: u64, args: &[Stri
     let cwd = (!unc).then_some(cwd.as_str());
     let log = std::env::temp_dir().join(format!("{}.log", spec.log_stem));
     let wrapper = wrapper_path(spec);
+    // The action names the wrapper on a command line that cmd.exe expands, so
+    // a `%NAME%` in its path would open some other file. (Paths inside the
+    // wrapper are safe: batch_quote doubles `%`.)
+    if wrapper.display().to_string().contains('%') {
+        anyhow::bail!(
+            "cannot install sync service: the wrapper path {} contains %, which Task Scheduler would expand. Set XDG_DATA_HOME to a directory without % in its path.",
+            wrapper.display()
+        );
+    }
     let script = wrapper_script(
         spec,
         bin,
