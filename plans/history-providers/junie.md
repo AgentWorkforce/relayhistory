@@ -46,7 +46,11 @@ Root precedence: `JUNIE_HOME` overrides the default `~/.junie` in a live
 process; `ProviderRoots::from_home` isolates a supplied home and ignores the
 process environment. Explicit roots are frozen with their namespace before
 scanning. Discovery is passive and reads only bounded metadata and event
-prefixes. Unsupported event shapes fail visibly, while unknown evidence is
+prefixes. One bounded `index.jsonl` read is shared by the sessions of a root
+within a discovery or sweep pass; a new pass reads fresh index metadata. For
+a journal beyond the 64 KiB shallow window, fresh index activity and title
+are still applied while a saved prompt preview fills any missing excerpt.
+Unsupported event shapes fail visibly, while unknown evidence is
 preserved as bounded markers. A complete journal rewrite retires stale local
 evidence; an incomplete final JSONL line defers replacement. No native resume
 control, usage accounting, file edits or live execution is claimed.

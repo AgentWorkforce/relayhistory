@@ -76,7 +76,7 @@ impl ShallowSessionProvider for Provider {
         let path = storage::selected(&context, Path::new(&candidate.locator))?;
         let capture = storage::shallow(scan, &context, &path, &self.indexes)?;
         let sid = format::string(&capture.payload, "sid")?;
-        let previous = if let Some(conn) = conn {
+        let previous: Option<ShallowSession> = if let Some(conn) = conn {
             normalize::check_identity(conn, sid, &path)?;
             if capture.payload["partial"] == true || capture.payload["bounded"] == true {
                 crate::discover::catalog_row(conn, ID, sid, true)?
@@ -169,11 +169,8 @@ fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
     for candidate in storage::enumerate(&env, None)? {
         crate::ingest::check_capture_cancelled()?;
         let run = || -> Result<(usize, bool)> {
-            let capture = storage::capture_with_index(
-                Path::new(&candidate.locator),
-                &context,
-                &indexes,
-            )?;
+            let capture =
+                storage::capture_with_index(Path::new(&candidate.locator), &context, &indexes)?;
             let tx = ctx.conn.unchecked_transaction()?;
             let n = normalize::write(&tx, &capture.payload)?;
             tx.commit()?;

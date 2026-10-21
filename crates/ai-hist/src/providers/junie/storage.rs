@@ -73,13 +73,13 @@ impl IndexData {
                         .with_context(|| format!("JUNIE_INVALID_INDEX: line {}", index + 1))
                 }
             };
-            let sid = format::string(&row, "sessionId")?;
+            let sid = format::string(&row, "sessionId")?.to_owned();
             anyhow::ensure!(
                 row["createdAt"].as_i64().is_some() && row["updatedAt"].as_i64().is_some(),
                 "JUNIE_INVALID_INDEX: timestamps"
             );
-            if summaries.insert(sid.to_owned(), row).is_some() {
-                duplicates.insert(sid.to_owned());
+            if summaries.insert(sid.clone(), row).is_some() {
+                duplicates.insert(sid);
             }
         }
         Ok(Self {

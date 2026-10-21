@@ -293,6 +293,11 @@ fn bounded_discovery_refreshes_index_activity_and_reads_shared_index_once() {
     second_index["sessionId"] = second_id.into();
     std::fs::write(&index_path, format!("{first_index}\n{second_index}\n")).unwrap();
 
+    let env = ai_hist::DiscoveryEnv::with_roots(
+        &conn,
+        home.path().to_owned(),
+        home.path().join("missing-opencode.db"),
+    );
     let mut rows = Vec::new();
     let report =
         ai_hist::discover_sessions_with_env(&env, &options, |row| rows.push(row.clone())).unwrap();
