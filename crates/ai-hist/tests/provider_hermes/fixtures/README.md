@@ -3,7 +3,7 @@
 These are captured RelayHistory artifacts, not a hand-written approximation of
 its old index. They were produced by RelayHistory commit
 `d6211bf47f8fc8f72047b8b720c1840525cbe686`, before the tool-use ID intake
-correction, using only the checked-in synthetic Hermes `../schema31.sql`.
+correction, using only the checked-in synthetic Hermes `../../fixtures/hermes/schema31.sql`.
 That native fixture was written by NousResearch/hermes-agent
 `97a9ae8ee55d31bebce49f1fb6b5ef775323976a` with its schema-31 SessionDB API;
 see `plans/history-providers/hermes.md` and the adjacent official export oracle.

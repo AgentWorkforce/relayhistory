@@ -309,7 +309,7 @@ its own exported native tool-use IDs with the result-only validation error.
 The current intake accepts that unmodified evidence. The restored old index
 reads and exports without staging native history, syncing or reindexing; its
 `hermes_schema31_v4` checkpoint remains intact. Fixture provenance and exact
-reproduction commands are in `tests/fixtures/hermes/transport/README.md` under
+reproduction commands are in `tests/provider_hermes/fixtures/README.md` under
 the crate. The checked-in dump is reproducible from the captured SQLite file.
 
 The malformed-identity regression fails without rejecting empty/whitespace

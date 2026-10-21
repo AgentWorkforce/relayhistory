@@ -254,10 +254,8 @@ fn hermes_native_export_preserves_tool_identity_in_both_acquisition_orders() {
 fn hermes_pre_intake_index_and_archive_work_without_reindexing() {
     let home = tempfile::tempdir().unwrap();
     let conn = rusqlite::Connection::open(home.path().join("ledger.db")).unwrap();
-    conn.execute_batch(include_str!(
-        "../fixtures/hermes/transport/pre-intake-index.sql"
-    ))
-    .unwrap();
+    conn.execute_batch(include_str!("fixtures/pre-intake-index.sql"))
+        .unwrap();
     drop(conn);
     // No native home is staged: opening and exporting cannot silently reacquire it.
     let store = open(home.path());
@@ -268,10 +266,8 @@ fn hermes_pre_intake_index_and_archive_work_without_reindexing() {
     let stamp:String=conn.query_row("SELECT source_stamp FROM session_hydration_checkpoints WHERE source='hermes' AND session_id=?1 AND location='local'",[SID],|r|r.get(0)).unwrap();
     assert!(stamp.starts_with("hermes_schema31_v4:"));
     let current = export(home.path());
-    let old: Vec<HistoryExportRecord> = serde_json::from_str(include_str!(
-        "../fixtures/hermes/transport/pre-intake-export.json"
-    ))
-    .unwrap();
+    let old: Vec<HistoryExportRecord> =
+        serde_json::from_str(include_str!("fixtures/pre-intake-export.json")).unwrap();
     assert_eq!(
         records(&current)
             .iter()
@@ -290,10 +286,8 @@ fn hermes_pre_intake_index_and_archive_work_without_reindexing() {
 }
 #[test]
 fn hermes_export_rejects_malformed_call_ids_and_result_fields_on_non_results() {
-    let archive: Vec<HistoryExportRecord> = serde_json::from_str(include_str!(
-        "../fixtures/hermes/transport/pre-intake-export.json"
-    ))
-    .unwrap();
+    let archive: Vec<HistoryExportRecord> =
+        serde_json::from_str(include_str!("fixtures/pre-intake-export.json")).unwrap();
     let native = records(&archive);
     let call = native
         .iter()
@@ -389,10 +383,8 @@ fn assert_no_evidence_changes(store: &SessionStore, before: ai_hist::Watermark) 
 }
 #[test]
 fn hermes_conflicting_native_rewrite_rolls_back_remote_backed_evidence() {
-    let archive: Vec<HistoryExportRecord> = serde_json::from_str(include_str!(
-        "../fixtures/hermes/transport/pre-intake-export.json"
-    ))
-    .unwrap();
+    let archive: Vec<HistoryExportRecord> =
+        serde_json::from_str(include_str!("fixtures/pre-intake-export.json")).unwrap();
     let home = tempfile::tempdir().unwrap();
     let store = open(home.path());
     observe(&store);
