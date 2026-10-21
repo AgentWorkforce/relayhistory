@@ -15,6 +15,7 @@ pub(crate) mod omp;
 pub(crate) mod openclaw;
 pub(crate) mod opencode;
 pub(crate) mod pi;
+pub(crate) mod qoder;
 pub(crate) mod qwen_code;
 #[cfg(test)]
 pub(crate) mod test_fixture;

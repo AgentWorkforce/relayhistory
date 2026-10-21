@@ -192,6 +192,7 @@ pub ai_hist::Source::Omp
 pub ai_hist::Source::OpenClaw
 pub ai_hist::Source::OpenCode
 pub ai_hist::Source::Pi
+pub ai_hist::Source::Qoder
 pub ai_hist::Source::QwenCode
 impl ai_hist::Source
 pub const ai_hist::Source::ALL: &'static [ai_hist::Source]

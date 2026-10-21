@@ -15,6 +15,7 @@ pub(crate) const LOCAL_SOURCES: &[LocalSource] = &[
     crate::providers::qwen_code::LOCAL_SOURCE,
     crate::providers::kimi::LOCAL_SOURCE,
     crate::providers::codebuddy::LOCAL_SOURCE,
+    crate::providers::qoder::LOCAL_SOURCE,
     crate::providers::grok_bot::LOCAL_SOURCE,
     crate::providers::openclaw::LOCAL_SOURCE,
     #[cfg(test)]
