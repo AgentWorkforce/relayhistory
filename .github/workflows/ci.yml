@@ -352,3 +352,47 @@ jobs:
         run: node --test scripts/history-helper-packaging.composed.mjs
       - name: Verify installed local SDK on Windows
         run: node scripts/smoke-history-packages.mjs
+
+  # The same executable checks on native Windows arm64 (aarch64-pc-windows-msvc),
+  # the gate for publishing the win32-arm64-msvc packages.
+  windows-arm64-helper-cancellation:
+    runs-on: windows-11-arm
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Confirm a native arm64 toolchain and runtime
+        run: |
+          set -euo pipefail
+          test "$(node -p process.arch)" = arm64
+          rustc -vV | grep -Fx 'host: aarch64-pc-windows-msvc'
+      - name: Build local native addon and optional SDK runtimes
+        run: |
+          set -euo pipefail
+          npm --prefix crates/ai-hist-napi ci
+          npm --prefix crates/ai-hist-napi run build:debug
+          npm --prefix sdk-ts ci
+          npm --prefix plugins/provider-sources/sdk ci --ignore-scripts
+          npm --prefix plugins/provider-sources/sdk run build
+      - name: Verify the native binding contract
+        working-directory: crates/ai-hist-napi
+        run: node ../../scripts/verify-native-contract.mjs ./index.js
+      - name: Verify actual Windows descendant cleanup and missing executable errors
+        run: node --test plugins/provider-sources/sdk/dist/helper-runtime.test.js
+      - name: Verify shell-free packaging contracts
+        run: node --test scripts/history-helper-packaging.composed.mjs
+      - name: Verify installed local SDK on Windows arm64
+        run: node scripts/smoke-history-packages.mjs
+      # The release builds this helper natively on windows-11-arm; build and
+      # run it here too, so its C dependencies (ring, bundled SQLite) are
+      # proven on aarch64-pc-windows-msvc before a release depends on them.
+      - name: Build and verify the provider-sources helper executable
+        run: |
+          set -euo pipefail
+          cargo build --manifest-path plugins/provider-sources/rust/Cargo.toml --locked --bin history-provider-sources
+          node scripts/verify-history-helper.mjs plugins/provider-sources/rust/target/debug/history-provider-sources.exe

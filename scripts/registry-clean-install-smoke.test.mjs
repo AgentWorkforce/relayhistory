@@ -27,7 +27,7 @@ test('release package list covers the public npm family', () => {
   assert.ok(REGISTRY_RELEASE_PACKAGES.includes('ai-hist'));
   assert.ok(REGISTRY_RELEASE_PACKAGES.includes('ai-hist-mcp'));
   assert.ok(REGISTRY_RELEASE_PACKAGES.includes('ai-hist-native-linux-x64-gnu'));
-  assert.equal(REGISTRY_RELEASE_PACKAGES.length, 10);
+  assert.equal(REGISTRY_RELEASE_PACKAGES.length, 11);
 });
 
 test('waitForRegistryPackages retries until every package resolves', async () => {

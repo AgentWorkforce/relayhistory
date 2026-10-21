@@ -4,7 +4,11 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Minor]
+
+### Added
+
+- Windows arm64 (`aarch64-pc-windows-msvc`) is supported: `npm install` pulls the prebuilt `ai-hist-native-win32-arm64-msvc` addon, and `@relayhistory/provider-sources` ships a native `win32-arm64-msvc` helper.
 
 ## [0.49.0] - 2026-10-21
 

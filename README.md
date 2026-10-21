@@ -34,7 +34,7 @@ The bare `ai-hist` command bootstraps a searchable database on first use: it dis
 
 RelayHistory follows each harness's configured state directory. Set `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, or `GROK_HOME` to relocate Claude Code, Codex, or Grok data; unset or empty values fall back to `~/.claude`, `~/.codex`, and `~/.grok`. Muse Code sessions are read from `$XDG_DATA_HOME/muse/sessions` (`~/.local/share/muse/sessions` when `XDG_DATA_HOME` is unset). OpenCode uses `OPENCODE_DB`, defaulting to `~/.local/share/opencode/opencode.db`. Devin CLI sessions are read from `$XDG_DATA_HOME/devin/cli/sessions.db`, defaulting to `~/.local/share/devin/cli/sessions.db`.
 
-Node.js 20 or 22 is required. `npm install` pulls a prebuilt native addon for macOS (arm64, x64), Linux glibc ≥ 2.28 and musl (arm64, x64), and Windows x64 — no Rust toolchain, compiler, or separate binary download. The glibc floor covers Debian 12, Ubuntu 22.04, Amazon Linux 2023, and RHEL/Alma 9; releases are smoke-tested on `node:22-bookworm-slim` and `ubuntu:22.04`.
+Node.js 20 or 22 is required. `npm install` pulls a prebuilt native addon for macOS (arm64, x64), Linux glibc ≥ 2.28 and musl (arm64, x64), and Windows (x64, arm64) — no Rust toolchain, compiler, or separate binary download. The glibc floor covers Debian 12, Ubuntu 22.04, Amazon Linux 2023, and RHEL/Alma 9; releases are smoke-tested on `node:22-bookworm-slim` and `ubuntu:22.04`.
 
 ## Embedding from Rust
 
