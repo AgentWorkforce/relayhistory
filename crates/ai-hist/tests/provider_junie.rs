@@ -28,9 +28,13 @@ fn stage(home: &Path) -> PathBuf {
 }
 
 fn open(home: &Path) -> SessionStore {
+    open_with_db(home, home.join("junie.db"))
+}
+
+fn open_with_db(home: &Path, db: PathBuf) -> SessionStore {
     SessionStore::open(
         StoreOptions::default()
-            .db_path(home.join("junie.db"))
+            .db_path(db)
             .roots(ProviderRoots::from_home(
                 home.into(),
                 home.join("opencode.db"),
@@ -64,6 +68,26 @@ fn project_facts(db: &Path) -> (Option<String>, Option<String>, Option<String>) 
         .unwrap();
     let event_project = conn.query_row("SELECT project FROM session_events WHERE source='junie' AND session_id=?1 AND role='user' LIMIT 1", [SID], |row| row.get(0)).unwrap();
     (cwd, history_project, event_project)
+}
+
+fn project_keys(db: &Path) -> (Option<String>, Option<String>) {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    let catalog = conn
+        .query_row(
+            "SELECT project_key FROM sessions WHERE source='junie' AND session_id=?1",
+            [SID],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let event = conn
+        .query_row(
+            "SELECT project_key FROM session_events WHERE source='junie' \
+             AND session_id=?1 AND role='user' LIMIT 1",
+            [SID],
+            |row| row.get(0),
+        )
+        .unwrap();
+    (catalog, event)
 }
 
 #[test]
@@ -545,6 +569,55 @@ fn missing_optional_index_preserves_verified_local_project_facts() {
         .unwrap();
     assert_eq!(project_facts(&db), before);
     assert_eq!(evidence(&store).tool_calls[0].tool_use_id, "step-tool-1");
+}
+
+#[test]
+fn relocated_journal_without_index_does_not_inherit_old_project() {
+    let old_home = tempfile::tempdir().unwrap();
+    let new_home = tempfile::tempdir().unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let db = catalog.path().join("junie.db");
+    let old_path = stage(old_home.path());
+    let reference = SessionRef::id(Source::Junie, SID);
+    let old = open_with_db(old_home.path(), db.clone());
+    old.discover(DiscoveryOptions::default().sources([Source::Junie]))
+        .unwrap();
+    old.hydrate(&reference, HydrateOptions::default()).unwrap();
+    assert_eq!(project_facts(&db).1.as_deref(), Some("/synthetic/project"));
+    assert!(project_keys(&db).0.is_some());
+    assert!(project_keys(&db).1.is_some());
+    drop(old);
+
+    let new_path = stage(new_home.path());
+    std::fs::remove_file(new_home.path().join(".junie/sessions/index.jsonl")).unwrap();
+    std::fs::remove_file(old_path).unwrap();
+    let moved = open_with_db(new_home.path(), db.clone());
+    // Before rediscovery, an ID hydration can only target the old locator or
+    // its cached checkpoint; it cannot select the new journal on its own.
+    let before_discovery = project_facts(&db);
+    let _ = moved.hydrate(&reference, HydrateOptions::default());
+    assert_eq!(project_facts(&db), before_discovery);
+    for _ in 0..2 {
+        moved
+            .discover(DiscoveryOptions::default().sources([Source::Junie]))
+            .unwrap();
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let (locator, state): (String, String) = conn
+            .query_row(
+                "SELECT raw_locator, discovery_state FROM session_presences \
+                 WHERE source='junie' AND session_id=?1 AND location='local'",
+                [SID],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(locator, new_path.to_string_lossy());
+        assert_eq!(state, "shallow");
+    }
+    moved
+        .hydrate(&reference, HydrateOptions::default())
+        .unwrap();
+    assert_eq!(project_facts(&db), (None, None, None));
+    assert_eq!(project_keys(&db), (None, None));
 }
 
 #[test]

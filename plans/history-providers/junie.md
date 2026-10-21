@@ -65,7 +65,10 @@ unavailable index titles do not clear it. When index metadata is unavailable,
 a full local capture at the same journal locator also preserves its verified
 project directory for event, history and catalog reconciliation. A remote-only
 or discovery-only catalog row does not supply that fact; an explicit native
-summary without `projectDir` does not use the fallback.
+summary without `projectDir` does not use the fallback. If discovery finds the
+same session ID at a new journal locator, it invalidates the old full-local
+capture before replacing the locator, so the new journal cannot inherit the
+old journal's project while its index is unavailable.
 Unsupported event shapes fail visibly, while unknown evidence is
 preserved as bounded markers. A complete journal rewrite retires stale local
 evidence; an incomplete final JSONL line defers replacement. No native resume

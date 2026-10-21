@@ -78,6 +78,10 @@ impl ShallowSessionProvider for Provider {
         let sid = format::string(&capture.payload, "sid")?;
         let previous: Option<ShallowSession> = if let Some(conn) = conn {
             normalize::check_identity(conn, sid, &path)?;
+            // The generic presence upsert preserves `full` across a shallow
+            // discovery. A moved journal has not yet been captured at its new
+            // locator, so its old events cannot establish missing index facts.
+            normalize::invalidate_relocated_local_capture(conn, sid, &path)?;
             if capture.payload["partial"] == true || capture.payload["bounded"] == true {
                 crate::discover::catalog_row(conn, ID, sid, true)?
             } else {

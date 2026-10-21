@@ -13,6 +13,40 @@ pub(super) fn check_identity(conn: &Connection, sid: &str, path: &Path) -> Resul
     file_history::check_identity(conn, ID, "JUNIE", sid, path)
 }
 
+pub(super) fn invalidate_relocated_local_capture(
+    conn: &Connection,
+    sid: &str,
+    path: &Path,
+) -> Result<()> {
+    let moved = conn.execute(
+        "UPDATE session_presences SET discovery_state='shallow' \
+         WHERE source=?1 AND session_id=?2 AND location='local' \
+         AND discovery_state='full' AND raw_locator IS NOT NULL AND raw_locator<>?3",
+        rusqlite::params![ID, sid, path.to_string_lossy()],
+    )?;
+    if moved > 0 {
+        // The observation projection otherwise promotes the just-demoted
+        // presence back to `full` from the old observation during this same
+        // discovery transaction. Neither row proves capture at the new path.
+        conn.execute(
+            "UPDATE session_observations SET discovery_state='shallow' \
+             WHERE source=?1 AND session_id=?2 AND location='local' \
+             AND discovery_state='full' AND raw_locator IS NOT ?3",
+            rusqlite::params![ID, sid, path.to_string_lossy()],
+        )?;
+        // A remote presence may own the merged catalog cwd. Only retract the
+        // old local projection when there is no independent remote presence.
+        conn.execute(
+            "UPDATE sessions SET cwd=NULL, project_key=NULL, project_key_method=NULL \
+             WHERE source=?1 AND session_id=?2 \
+             AND NOT EXISTS (SELECT 1 FROM session_presences p WHERE p.source=?1 \
+               AND p.session_id=?2 AND p.location='remote')",
+            rusqlite::params![ID, sid],
+        )?;
+    }
+    Ok(())
+}
+
 fn project_dir(
     conn: &Connection,
     sid: &str,
@@ -58,6 +92,32 @@ fn captured_identity(payload: &Value) -> Result<(&str, &Path)> {
     Ok((sid, path))
 }
 
+fn clear_unknown_local_project_keys(conn: &Connection, sid: &str, cwd: Option<&str>) -> Result<()> {
+    if cwd.is_none() {
+        // Generic event upserts retain a stored project key when the incoming
+        // one is absent. A complete Junie capture with no project cannot keep
+        // that key on local-only evidence from an earlier journal.
+        conn.execute(
+            "UPDATE session_events SET project_key=NULL, project_key_method=NULL \
+             WHERE source=?1 AND session_id=?2 AND location='local' \
+             AND project_key IS NOT NULL",
+            rusqlite::params![ID, sid],
+        )?;
+    }
+    Ok(())
+}
+
+fn project_for_capture(
+    conn: &Connection,
+    sid: &str,
+    path: &Path,
+    summary: &Value,
+) -> Result<Option<String>> {
+    let cwd = project_dir(conn, sid, path, summary)?;
+    clear_unknown_local_project_keys(conn, sid, cwd.as_deref())?;
+    Ok(cwd)
+}
+
 pub(super) fn write(conn: &Connection, payload: &Value) -> Result<usize> {
     let (sid, path) = captured_identity(payload)?;
     check_identity(conn, sid, path)?;
@@ -66,9 +126,9 @@ pub(super) fn write(conn: &Connection, payload: &Value) -> Result<usize> {
     }
     let rows = journal_rows(payload)?;
     let summary = &payload["summary"];
-    let cwd_value = project_dir(conn, sid, path, summary)?;
-    let cwd = cwd_value.as_deref();
     let shared = crate::providers::shared_evidence::Snapshot::capture(conn, ID, sid)?;
+    let cwd_value = project_for_capture(conn, sid, path, summary)?;
+    let cwd = cwd_value.as_deref();
     let live = last_block_updates(rows);
     let mut keys = Keys::default();
     let mut desired = Vec::new();
