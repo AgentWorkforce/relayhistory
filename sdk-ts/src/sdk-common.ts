@@ -32,3 +32,87 @@ export const SOURCES = Object.freeze([
   'codebuddy',
   'qoder',
   'vtcode',
+  'grok-bot',
+  'openclaw',
+] as const);
+// END GENERATED PROVIDER SOURCES
+
+export type Source = (typeof SOURCES)[number];
+
+/**
+ * The evidence kinds a provider adapter can produce, in the canonical order
+ * the native layer reports them. Kept as a value so runtime validation and
+ * the compile-time type cannot drift apart.
+ */
+export const EVIDENCE_KINDS = Object.freeze([
+  'history',
+  'session_event',
+  'tool_call',
+  'file_edit',
+  'relationship',
+  'commit_link',
+  'session_marker',
+] as const);
+
+export type EvidenceKind = (typeof EVIDENCE_KINDS)[number];
+
+/** The kinds a session must cover for hydration to report `full`. */
+export const FULL_SESSION_KINDS: readonly EvidenceKind[] = Object.freeze([
+  'history',
+  'session_event',
+  'tool_call',
+  'file_edit',
+  'relationship',
+] as const);
+/** A source that can identify a session catalog entry: every source. */
+export type CatalogSource = Source;
+export const CATALOG_SOURCES: readonly CatalogSource[] = SOURCES;
+
+const SOURCE_SET: ReadonlySet<string> = new Set(SOURCES);
+const CATALOG_SOURCE_SET: ReadonlySet<string> = new Set(CATALOG_SOURCES);
+
+/** Return whether an unknown value is a source recognized by this SDK build. */
+export function isSource(value: unknown): value is Source {
+  return typeof value === 'string' && SOURCE_SET.has(value);
+}
+
+/** Return whether an unknown value can identify a session catalog entry. */
+export function isCatalogSource(value: unknown): value is CatalogSource {
+  return typeof value === 'string' && CATALOG_SOURCE_SET.has(value);
+}
+
+export type SessionScope = 'local' | 'remote' | 'all';
+export type SessionLocation = Exclude<SessionScope, 'all'>;
+
+export class RelayHistoryError extends Error {
+  constructor(message: string, readonly code: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = new.target.name;
+  }
+}
+
+export class UnsupportedPlatformError extends RelayHistoryError {}
+export class NativePackageMissingError extends RelayHistoryError {}
+export class NativeLoadError extends RelayHistoryError {}
+export class NativeContractMismatchError extends RelayHistoryError {}
+export class DatabaseOpenError extends RelayHistoryError {}
+export class InvalidArgumentError extends RelayHistoryError {}
+export class UnsupportedOperationError extends RelayHistoryError {}
+export class SessionNotFoundError extends RelayHistoryError {}
+export class SessionSourceUnavailableError extends RelayHistoryError {}
+export class SessionSourceMismatchError extends RelayHistoryError {}
+export class HydrationUnsupportedError extends RelayHistoryError {}
+export class HydrationFailedError extends RelayHistoryError {}
+export class ConnectorNotConfiguredError extends RelayHistoryError {}
+export class AuthenticationExpiredError extends RelayHistoryError {}
+export class PermissionDeniedError extends RelayHistoryError {}
+export class EvidencePartialError extends RelayHistoryError {}
+export class ConnectorFailureError extends RelayHistoryError {}
+
+export function defaultDbPath(): string {
+  if (process.env.AI_HIST_DB !== undefined) return process.env.AI_HIST_DB;
+  if (process.env.XDG_DATA_HOME !== undefined) {
+    return join(process.env.XDG_DATA_HOME, 'ai-hist', 'ai-history.db');
+  }
+  return join(homedir(), '.local', 'share', 'ai-hist', 'ai-history.db');
+}

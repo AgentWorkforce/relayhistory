@@ -265,3 +265,11 @@ source without deciding which one fails the test.
 | codebuddy/official-reader | Fresh-process native SessionStoreImpl historical reader oracle for all five CLI captures, plus high-level historical replay for the seven recorder controls. |
 | qoder/global-cli | Official global Qoder CLI npm 1.1.75 TranscriptStore native writer; ordinary, tool, resumed, and same-millisecond synthetic sessions with released Repository historical restart-reader oracle. |
 | vtcode/basic | Synthetic VT Code 0.180.2 native-writer canonical schema-0.18.0 journal, independently reopened through visit_snapshot: two user turns, assistant items, actual tool IDs, per-turn usage, compaction control and thread aggregate. |
+| grok-bot/replicas | Synthetic complete and truncated transcript tails in two account slots, roster titles, widget response, cloud-agent round trip, and voice turns. |
+| openclaw/agent24 | OpenClaw 2026.10.4 writer, agent schema 24, deterministic clock/UUIDs: Pi v4 entries in transcript_events incl. one writer-compressed zstd row, session keys as conversation identity, main and Telegram keys, thinking/tool calls/results with isError, per-message usage, zero-usage delivery mirror, shared-mode heartbeat polls (marker and legacy prompt) with quiet acknowledgements. |
+| openclaw/agent24-ops | Second agent database from the same writer run: relay DM key under a non-main agent ID, and an isolated cron job whose two runs are two windows of one session key. |
+| openclaw/agent19 | OpenClaw 2026.8.1 writer, agent schema 19 (2026.8.1-2026.9.4): the first database layout, plain-JSON transcript_events without zstd columns and no cold-archive table; same synthetic sessions as agent24. |
+| openclaw/agent21 | OpenClaw 2026.9.5 writer, agent schema 21: cold-archive table added, transcript rows still plain JSON. |
+| openclaw/agent23 | OpenClaw 2026.9.6 writer, agent schema 23: writer-compressed zstd rows, the transcript layout schema 24 keeps. |
+| openclaw/legacy-jsonl | OpenClaw 2026.7.35 writer, the pre-database store: per-agent `sessions/sessions.json` index (label, chat type, channel, model, absolute `sessionFile`) beside Pi v3 JSONL transcripts, for main and ops agents; same synthetic turns as agent24. |
+<!-- END GENERATED PROVIDER FIXTURES -->
