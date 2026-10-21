@@ -385,6 +385,11 @@ fn result(
     )?;
     if let Some(error) = error {
         set_tool_call_error(conn, ID, base.session_id, id, error)?;
+    } else {
+        conn.execute(
+            "UPDATE tool_calls SET is_error=NULL WHERE source='qoder' AND session_id=?1 AND tool_use_id=?2 AND location='local' AND is_error IS NOT NULL",
+            rusqlite::params![base.session_id, id],
+        )?;
     }
     keys.results.insert(id.into());
     keys.events.insert(uid.into());

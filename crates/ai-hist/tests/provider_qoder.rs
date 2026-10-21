@@ -225,6 +225,42 @@ fn qoder_metadata_only_rewrite_keeps_messages_and_updates_marker() {
 }
 
 #[test]
+fn qoder_rewrite_without_result_error_clears_old_local_failure() {
+    use ai_hist::SyncOptions;
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path(), "synthetic-tool", TOOL);
+    let store = open(home.path());
+    let mut lines = TOOL.lines().map(str::to_owned).collect::<Vec<_>>();
+    let mut result: serde_json::Value = serde_json::from_str(&lines[6]).unwrap();
+    result["message"]["content"][0]["is_error"] = true.into();
+    lines[6] = result.to_string();
+    std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    let reference = SessionRef::id(Source::Qoder, "synthetic-tool");
+    assert_eq!(
+        store
+            .session(&reference, SessionQuery::default())
+            .unwrap()
+            .unwrap()
+            .tool_calls[0]
+            .is_error,
+        Some(true)
+    );
+    std::fs::write(&path, TOOL).unwrap();
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    assert_eq!(
+        store
+            .session(&reference, SessionQuery::default())
+            .unwrap()
+            .unwrap()
+            .tool_calls[0]
+            .is_error,
+        None,
+        "the complete local rewrite no longer reports an obsolete failure"
+    );
+}
+
+#[test]
 fn qoder_replaced_transcript_at_same_path_retires_old_local_session() {
     use ai_hist::SyncOptions;
     let home = tempfile::tempdir().unwrap();
