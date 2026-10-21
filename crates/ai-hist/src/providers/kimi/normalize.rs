@@ -1,10 +1,10 @@
 use super::*;
-use crate::providers::shared_evidence::Snapshot;
 use crate::ingest::{
     insert_session_event, insert_tool_call, upsert_session_rebuilt, EventRow, SessionCatalogRow,
     ToolCallRef, ToolResultFacts,
 };
 use crate::providers::file_history::{self, Keys};
+use crate::providers::shared_evidence::Snapshot;
 use crate::{insert_history, insert_session_marker, HistoryEntry, NewSessionMarker};
 pub(super) fn check_identity(conn: &Connection, sid: &str, path: &Path) -> Result<()> {
     file_history::check_identity(conn, ID, "KIMI", sid, path)

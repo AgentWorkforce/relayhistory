@@ -291,3 +291,36 @@ review signed off. Final query checks: `cargo test -p ai-hist providers::hermes
 all-feature Clippy with warnings denied, formatting, and rust-oleum all pass.
 The previous composed head `4fe3a8aa` passed all nine hosted CI jobs; the final
 head requires a fresh run.
+
+
+## Transport compatibility acceptance (#521)
+
+The schema-31 native SQLite fixture now runs through discovery, hydration,
+actual paged `ExportSnapshot`, public remote observation/evidence intake, and
+local hydration in both acquisition orders. Recorded call IDs, result text,
+message blocks and markers survive; unknown usage stays unknown. Remote-first
+rows become `both` after matching local hydration. Local-first rows keep their
+local canonical ownership while retaining the remote observation. Repeats do
+not change canonical evidence; observation bookkeeping can still advance.
+
+A separate checkout at `d6211bf47f8fc8f72047b8b720c1840525cbe686` produced the
+checked-in old index SQL dump and actual export archive. That revision rejects
+its own exported native tool-use IDs with the result-only validation error.
+The current intake accepts that unmodified evidence. The restored old index
+reads and exports without staging native history, syncing or reindexing; its
+`hermes_schema31_v4` checkpoint remains intact. Fixture provenance and exact
+reproduction commands are in `tests/fixtures/hermes/transport/README.md` under
+the crate. The checked-in dump is reproducible from the captured SQLite file.
+
+The malformed-identity regression fails without rejecting empty/whitespace
+call IDs; result-only fields remain forbidden on tool-use/text/thinking events.
+The conflicting-native-rewrite regression fails when the remote-backed payload
+guard is absent: hydration succeeds instead of rejecting the rewrite. Kimi's
+existing guard is now shared and Hermes runs it inside the same transaction
+as normalization, preserving imported evidence on conflict. No normalization
+generation bump or forced reindex is needed.
+
+Focused acceptance: 5 Hermes, 29 Kimi and 22 source-intake tests pass with
+`cargo +1.99.0 test -p ai-hist --all-features --test provider_hermes
+--test provider_kimi --test source_intake`. Broader and independent review gates
+are recorded in the pull request once completed.
