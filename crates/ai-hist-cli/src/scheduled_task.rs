@@ -162,15 +162,25 @@ const NON_PATH_ENV_VARS: [&str; 4] = [
     "PI_PROFILE",
 ];
 
-/// Whether `value` of `name` might depend on the current directory. Only an
-/// absolute path is known not to: providers differ on `~` and `$VAR` (Codex
-/// and Claude take them literally), so those count too. Names that are not
-/// paths, and the `null`/`undefined` markers OpenClaw trims and ignores, do
-/// not.
+/// Whether `value` of `name` might depend on the current directory. An
+/// absolute path never does; otherwise only the forms a provider is known to
+/// resolve elsewhere are exempt, since others (Codex, Claude) take `~` and
+/// `$VAR` literally:
+/// - names that are not paths ([`NON_PATH_ENV_VARS`]);
+/// - `PI_CONFIG_DIR`, which OMP always joins to home;
+/// - OpenClaw's values, trimmed: `null`/`undefined` (unset) and `~`, `~/`,
+///   `~\` (home);
+/// - `~` and `~/` in the Pi/OMP agent and session directories (home).
 pub(crate) fn relative_path_value(name: &str, value: &str) -> bool {
-    let openclaw_unset =
-        name.starts_with("OPENCLAW_") && matches!(value.trim(), "null" | "undefined");
-    !NON_PATH_ENV_VARS.contains(&name) && !openclaw_unset && !Path::new(value).is_absolute()
+    let home_tilde = |v: &str| v == "~" || v.starts_with("~/");
+    let exempt = NON_PATH_ENV_VARS.contains(&name)
+        || name == "PI_CONFIG_DIR"
+        || (name.starts_with("OPENCLAW_") && {
+            let v = value.trim();
+            matches!(v, "null" | "undefined") || home_tilde(v) || v.starts_with("~\\")
+        })
+        || (name.starts_with("PI_CODING_AGENT_") && home_tilde(value));
+    !exempt && !Path::new(value).is_absolute()
 }
 
 /// The `.cmd` wrapper the task runs: set the environment, change to `cwd` (the
@@ -611,6 +621,13 @@ mod tests {
         assert!(!relative_path_value("OPENCLAW_STATE_DIR", " null "));
         assert!(!relative_path_value("OPENCLAW_HOME", "undefined"));
         assert!(relative_path_value("CODEX_HOME", "null"));
+        // Forms a provider resolves against home rather than the current one.
+        assert!(!relative_path_value("OPENCLAW_HOME", "~/claw"));
+        assert!(!relative_path_value("OPENCLAW_STATE_DIR", r"~\state"));
+        assert!(!relative_path_value("PI_CONFIG_DIR", ".omp"));
+        assert!(!relative_path_value("PI_CODING_AGENT_DIR", "~/pi"));
+        // Pi does not expand `~\`, so that one stays relative.
+        assert!(relative_path_value("PI_CODING_AGENT_DIR", r"~\pi"));
         // Absolute paths and names that are not paths never depend on it.
         let absolute = std::env::current_dir().unwrap().display().to_string();
         assert!(!relative_path_value("QWEN_HOME", &absolute));
