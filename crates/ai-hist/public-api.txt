@@ -194,6 +194,7 @@ pub ai_hist::Source::OpenCode
 pub ai_hist::Source::Pi
 pub ai_hist::Source::Qoder
 pub ai_hist::Source::QwenCode
+pub ai_hist::Source::Vtcode
 impl ai_hist::Source
 pub const ai_hist::Source::ALL: &'static [ai_hist::Source]
 pub fn ai_hist::Source::as_str(self) -> &'static str

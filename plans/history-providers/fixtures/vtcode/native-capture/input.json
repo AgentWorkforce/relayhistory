@@ -1,0 +1,14 @@
+[
+  {"type":"thread.started","thread_id":"vt-synthetic-session"},
+  {"type":"turn.started","context":{"task_id":"task-a","turn_id":"turn-a","actor_id":"vt-synthetic-session","origin":"user","timestamp":"2026-10-20T12:00:00Z","goal":"Inspect the synthetic fixture"}},
+  {"type":"item.completed","item":{"id":"assistant-a","context":{"task_id":"task-a","turn_id":"turn-a","actor_id":"vt-synthetic-session","timestamp":"2026-10-20T12:00:01Z"},"type":"agent_message","text":"I found one safe fixture file."}},
+  {"type":"turn.completed","completed_at":"2026-10-20T12:00:02Z","usage":{"input_tokens":12,"cached_input_tokens":2,"cache_creation_tokens":1,"output_tokens":8}},
+  {"type":"turn.started","context":{"task_id":"task-b","turn_id":"turn-b","actor_id":"vt-synthetic-session","origin":"user","timestamp":"2026-10-20T12:01:00Z","goal":"Run the synthetic verification"}},
+  {"type":"item.started","item":{"id":"invocation-b","context":{"task_id":"task-b","turn_id":"turn-b","actor_id":"vt-synthetic-session","timestamp":"2026-10-20T12:01:01Z"},"type":"tool_invocation","tool_name":"Bash","arguments":{"command":"printf fixture"},"tool_call_id":"call-b","status":"in_progress"}},
+  {"type":"item.completed","item":{"id":"invocation-b","context":{"task_id":"task-b","turn_id":"turn-b","actor_id":"vt-synthetic-session","timestamp":"2026-10-20T12:01:02Z"},"type":"tool_invocation","tool_name":"Bash","arguments":{"command":"printf fixture"},"tool_call_id":"call-b","status":"completed","outcome":"success"}},
+  {"type":"item.completed","item":{"id":"output-b","context":{"task_id":"task-b","turn_id":"turn-b","actor_id":"vt-synthetic-session","timestamp":"2026-10-20T12:01:03Z"},"type":"tool_output","call_id":"invocation-b","tool_call_id":"call-b","output":"fixture","exit_code":0,"status":"completed"}},
+  {"type":"item.completed","item":{"id":"assistant-b","context":{"task_id":"task-b","turn_id":"turn-b","actor_id":"vt-synthetic-session","timestamp":"2026-10-20T12:01:04Z"},"type":"agent_message","text":"Verification returned fixture."}},
+  {"type":"turn.completed","completed_at":"2026-10-20T12:01:05Z","usage":{"input_tokens":20,"cached_input_tokens":4,"cache_creation_tokens":0,"output_tokens":10}},
+  {"type":"thread.compact_boundary","thread_id":"vt-synthetic-session","trigger":"manual","mode":"local","original_message_count":4,"compacted_message_count":2},
+  {"type":"thread.completed","thread_id":"vt-synthetic-session","session_id":"vt-synthetic-session","subtype":"success","outcome_code":"completed","usage":{"input_tokens":32,"cached_input_tokens":6,"cache_creation_tokens":1,"output_tokens":18},"num_turns":2,"completed_at":"2026-10-20T12:01:06Z"}
+]

@@ -1,0 +1,197 @@
+{
+  "event_count": 12,
+  "events": [
+    {
+      "event": {
+        "thread_id": "vt-synthetic-session",
+        "type": "thread.started"
+      },
+      "offset": 0
+    },
+    {
+      "event": {
+        "context": {
+          "actor_id": "vt-synthetic-session",
+          "goal": "Inspect the synthetic fixture",
+          "origin": "user",
+          "task_id": "task-a",
+          "timestamp": "2026-10-20T12:00:00Z",
+          "turn_id": "turn-a"
+        },
+        "type": "turn.started"
+      },
+      "offset": 97
+    },
+    {
+      "event": {
+        "item": {
+          "context": {
+            "actor_id": "vt-synthetic-session",
+            "task_id": "task-a",
+            "timestamp": "2026-10-20T12:00:01Z",
+            "turn_id": "turn-a"
+          },
+          "id": "assistant-a",
+          "text": "I found one safe fixture file.",
+          "type": "agent_message"
+        },
+        "type": "item.completed"
+      },
+      "offset": 331
+    },
+    {
+      "event": {
+        "completed_at": "2026-10-20T12:00:02Z",
+        "type": "turn.completed",
+        "usage": {
+          "cache_creation_tokens": 1,
+          "cached_input_tokens": 2,
+          "input_tokens": 12,
+          "output_tokens": 8
+        }
+      },
+      "offset": 603
+    },
+    {
+      "event": {
+        "context": {
+          "actor_id": "vt-synthetic-session",
+          "goal": "Run the synthetic verification",
+          "origin": "user",
+          "task_id": "task-b",
+          "timestamp": "2026-10-20T12:01:00Z",
+          "turn_id": "turn-b"
+        },
+        "type": "turn.started"
+      },
+      "offset": 799
+    },
+    {
+      "event": {
+        "item": {
+          "arguments": {
+            "command": "printf fixture"
+          },
+          "context": {
+            "actor_id": "vt-synthetic-session",
+            "task_id": "task-b",
+            "timestamp": "2026-10-20T12:01:01Z",
+            "turn_id": "turn-b"
+          },
+          "id": "invocation-b",
+          "status": "in_progress",
+          "tool_call_id": "call-b",
+          "tool_name": "Bash",
+          "type": "tool_invocation"
+        },
+        "type": "item.started"
+      },
+      "offset": 1034
+    },
+    {
+      "event": {
+        "item": {
+          "arguments": {
+            "command": "printf fixture"
+          },
+          "context": {
+            "actor_id": "vt-synthetic-session",
+            "task_id": "task-b",
+            "timestamp": "2026-10-20T12:01:02Z",
+            "turn_id": "turn-b"
+          },
+          "id": "invocation-b",
+          "outcome": "success",
+          "status": "completed",
+          "tool_call_id": "call-b",
+          "tool_name": "Bash",
+          "type": "tool_invocation"
+        },
+        "type": "item.completed"
+      },
+      "offset": 1374
+    },
+    {
+      "event": {
+        "item": {
+          "call_id": "invocation-b",
+          "context": {
+            "actor_id": "vt-synthetic-session",
+            "task_id": "task-b",
+            "timestamp": "2026-10-20T12:01:03Z",
+            "turn_id": "turn-b"
+          },
+          "exit_code": 0,
+          "id": "output-b",
+          "output": "fixture",
+          "status": "completed",
+          "tool_call_id": "call-b",
+          "type": "tool_output"
+        },
+        "type": "item.completed"
+      },
+      "offset": 1734
+    },
+    {
+      "event": {
+        "item": {
+          "context": {
+            "actor_id": "vt-synthetic-session",
+            "task_id": "task-b",
+            "timestamp": "2026-10-20T12:01:04Z",
+            "turn_id": "turn-b"
+          },
+          "id": "assistant-b",
+          "text": "Verification returned fixture.",
+          "type": "agent_message"
+        },
+        "type": "item.completed"
+      },
+      "offset": 2064
+    },
+    {
+      "event": {
+        "completed_at": "2026-10-20T12:01:05Z",
+        "type": "turn.completed",
+        "usage": {
+          "cache_creation_tokens": 0,
+          "cached_input_tokens": 4,
+          "input_tokens": 20,
+          "output_tokens": 10
+        }
+      },
+      "offset": 2336
+    },
+    {
+      "event": {
+        "compacted_message_count": 2,
+        "mode": "local",
+        "original_message_count": 4,
+        "thread_id": "vt-synthetic-session",
+        "trigger": "manual",
+        "type": "thread.compact_boundary"
+      },
+      "offset": 2533
+    },
+    {
+      "event": {
+        "completed_at": "2026-10-20T12:01:06Z",
+        "num_turns": 2,
+        "outcome_code": "completed",
+        "session_id": "vt-synthetic-session",
+        "subtype": "success",
+        "thread_id": "vt-synthetic-session",
+        "type": "thread.completed",
+        "usage": {
+          "cache_creation_tokens": 1,
+          "cached_input_tokens": 6,
+          "input_tokens": 32,
+          "output_tokens": 18
+        }
+      },
+      "offset": 2728
+    }
+  ],
+  "session_id": "vt-synthetic-session",
+  "turn_count": 2
+}

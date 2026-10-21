@@ -81,6 +81,11 @@ const REGISTRATIONS: &[Registration] = &[
         adapter: qoder::ADAPTER,
     },
     Registration {
+        id: "vtcode",
+        metadata: vtcode::METADATA,
+        adapter: vtcode::ADAPTER,
+    },
+    Registration {
         id: "grok-bot",
         metadata: grok_bot::METADATA,
         adapter: grok_bot::ADAPTER,

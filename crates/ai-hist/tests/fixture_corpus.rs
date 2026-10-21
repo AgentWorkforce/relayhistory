@@ -21,11 +21,12 @@
 //! the attribute.
 
 use ai_hist::{
-    discover_sessions_with_env, hydrate_session_at, open_db, sync_scoped_at, DiscoverOptions,
-    DiscoveryEnv, HydrateSessionOptions, SessionScope,
+    discover_sessions_with_env, hydrate_session_at_with_home, open_db, sync_scoped_at,
+    DiscoverOptions, DiscoveryEnv, HydrateSessionOptions, SessionScope,
 };
 use rusqlite::Connection;
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -404,7 +405,9 @@ fn capture(fixture: &Fixture, home: &Path) -> Value {
 
     let mut hydrations = Vec::new();
     for (source, session_id) in &discovered {
-        let result = hydrate_session_at(
+        // Hydrate against the same explicit fixture roots used for discovery.
+        // A workspace-scoped provider need not declare those roots in process env.
+        let result = hydrate_session_at_with_home(
             &db,
             &HydrateSessionOptions {
                 source: source.clone(),
@@ -412,6 +415,7 @@ fn capture(fixture: &Fixture, home: &Path) -> Value {
                 scope: SessionScope::Local,
                 include_related: true,
             },
+            home,
         );
         // Only what hydration *decided* is snapshotted. `capability`,
         // `discovery_state` and the `evidence` counters are derived bookkeeping
@@ -632,9 +636,18 @@ fn redact_string(text: String, homes: &[String], stamp: bool) -> String {
     if stamp && text.starts_with("codex-sqlite-v2:sha256:") {
         return "codex-sqlite-v2:sha256:<content>".into();
     }
+    if stamp && text.starts_with("vtcode_0_18_v1:sha256:") {
+        return "vtcode_0_18_v1:sha256:<content>".into();
+    }
     let mut text = text;
     let mut replaced = false;
     for home in homes {
+        // VT Code namespaces native ids by the declared workspace root. Its
+        // fixture HOME is temporary, so keep the namespace shape and native
+        // id while dropping only the path-derived digest.
+        let workspace_root = Path::new(home).join(".vtcode/sessions");
+        let digest = Sha256::digest(workspace_root.to_string_lossy().as_bytes());
+        text = text.replace(&format!("root:{digest:x}:"), "root:<workspace>:");
         if home.is_empty() || !text.contains(home.as_str()) {
             continue;
         }
@@ -821,6 +834,21 @@ fn corpus_snapshots_match_committed_evidence() {
          `UPDATE_SNAPSHOTS=1 cargo test -p ai-hist --all-features --test fixture_corpus`:\n{}",
         mismatched.join("\n")
     );
+}
+
+#[test]
+fn vtcode_corpus_hydrates_native_evidence() {
+    let key = "vtcode/basic";
+    assert_eq!(text(&rows(key, "hydration")[0], "status"), "hydrated");
+    let events = rows(key, "session_events");
+    assert!(events.iter().any(|row| text(row, "message_id") == "turn-a"));
+    assert!(events
+        .iter()
+        .any(|row| text(row, "message_id") == "assistant-b"));
+    assert!(events
+        .iter()
+        .any(|row| text(row, "tool_use_id") == "call-b"));
+    assert_eq!(rows(key, "tool_calls").len(), 1);
 }
 
 /// The first line that moved, so a failure names the behaviour that changed

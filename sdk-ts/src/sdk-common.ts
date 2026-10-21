@@ -31,6 +31,7 @@ export const SOURCES = Object.freeze([
   'kimi',
   'codebuddy',
   'qoder',
+  'vtcode',
   'grok-bot',
   'openclaw',
 ] as const);

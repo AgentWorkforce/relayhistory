@@ -19,3 +19,4 @@ pub(crate) mod qoder;
 pub(crate) mod qwen_code;
 #[cfg(test)]
 pub(crate) mod test_fixture;
+pub(crate) mod vtcode;

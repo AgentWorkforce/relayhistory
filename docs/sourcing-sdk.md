@@ -1019,6 +1019,7 @@ handle.
 | pi | ✓ | ✓ | ✓ | — | — | per-message |
 | qoder | ✓ | ✓ | ✓ | — | — | none |
 | qwen-code | ✓ | ✓ | ✓ | — | — | per-message |
+| vtcode | ✓ | ✓ | ✓ | — | — | per-request |
 <!-- sourcing-sdk-population-table:end -->
 
 The ADR's [capture matrix](decisions/2026-09-19-relayhistory-owns-session-sourcing.md#capture-matrix)
