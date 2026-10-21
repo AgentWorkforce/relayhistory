@@ -21,8 +21,8 @@
 //! the attribute.
 
 use ai_hist::{
-    discover_sessions_with_env, hydrate_session_at, open_db, sync_scoped_at, DiscoverOptions,
-    DiscoveryEnv, HydrateSessionOptions, SessionScope,
+    discover_sessions_with_env, hydrate_session_at_with_home, open_db, sync_scoped_at,
+    DiscoverOptions, DiscoveryEnv, HydrateSessionOptions, SessionScope,
 };
 use rusqlite::Connection;
 use serde_json::{json, Map, Value};
@@ -404,7 +404,9 @@ fn capture(fixture: &Fixture, home: &Path) -> Value {
 
     let mut hydrations = Vec::new();
     for (source, session_id) in &discovered {
-        let result = hydrate_session_at(
+        // Hydrate against the same explicit fixture roots used for discovery.
+        // A workspace-scoped provider need not declare those roots in process env.
+        let result = hydrate_session_at_with_home(
             &db,
             &HydrateSessionOptions {
                 source: source.clone(),
@@ -412,6 +414,7 @@ fn capture(fixture: &Fixture, home: &Path) -> Value {
                 scope: SessionScope::Local,
                 include_related: true,
             },
+            home,
         );
         // Only what hydration *decided* is snapshotted. `capability`,
         // `discovery_state` and the `evidence` counters are derived bookkeeping
@@ -821,6 +824,21 @@ fn corpus_snapshots_match_committed_evidence() {
          `UPDATE_SNAPSHOTS=1 cargo test -p ai-hist --all-features --test fixture_corpus`:\n{}",
         mismatched.join("\n")
     );
+}
+
+#[test]
+fn vtcode_corpus_hydrates_native_evidence() {
+    let key = "vtcode/basic";
+    assert_eq!(text(&rows(key, "hydration")[0], "status"), "hydrated");
+    let events = rows(key, "session_events");
+    assert!(events.iter().any(|row| text(row, "message_id") == "turn-a"));
+    assert!(events
+        .iter()
+        .any(|row| text(row, "message_id") == "assistant-b"));
+    assert!(events
+        .iter()
+        .any(|row| text(row, "tool_use_id") == "call-b"));
+    assert_eq!(rows(key, "tool_calls").len(), 1);
 }
 
 /// The first line that moved, so a failure names the behaviour that changed

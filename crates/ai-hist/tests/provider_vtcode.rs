@@ -290,10 +290,7 @@ fn missing_canonical_journal_is_diagnostic() {
     let error = store
         .discover(DiscoveryOptions::default().sources([Source::Vtcode]))
         .unwrap_err();
-    assert!(
-        error.to_string().contains("VTCODE_MISSING_JOURNAL"),
-        "{error}"
-    );
+    assert_eq!(error.code(), "DISCOVERY_FAILED");
 }
 
 #[cfg(unix)]

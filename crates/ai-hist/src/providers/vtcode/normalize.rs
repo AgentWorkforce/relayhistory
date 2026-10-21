@@ -49,26 +49,25 @@ pub(super) fn write(conn: &Connection, payload: &Value, path: &Path) -> Result<u
         .and_then(Path::parent)
         .and_then(Path::parent)
         .map(|p| p.to_string_lossy().into_owned());
-    let (keys, inserted, first, last, last_assistant) =
-        write_rows(conn, sid, native, cwd.as_deref(), rows)?;
+    let written = write_rows(conn, sid, native, cwd.as_deref(), rows)?;
     anyhow::ensure!(
-        first.is_some(),
+        written.first.is_some(),
         "VTCODE_INVALID_RECORD: no timestamped history"
     );
     if complete {
-        file_history::retire(conn, ID, sid, &keys)?;
+        file_history::retire(conn, ID, sid, &written.keys)?;
         file_history::retire_locator_sessions(conn, ID, path, Some(sid))?;
         repair_order(conn, sid, native, cwd.as_deref(), rows)?;
     }
     let summary = WriteSummary {
         cwd: cwd.as_deref(),
-        first: first.unwrap(),
-        last: last.unwrap(),
-        last_assistant,
+        first: written.first.unwrap(),
+        last: written.last.unwrap(),
+        last_assistant: written.last_assistant,
     };
     write_catalog(conn, sid, native, path, rows, complete, &summary)?;
     shared.ensure_unchanged(conn, sid)?;
-    Ok(inserted)
+    Ok(written.inserted)
 }
 
 fn repair_order(
@@ -83,7 +82,7 @@ fn repair_order(
     if reordered.is_empty() {
         return Ok(());
     }
-    let usage = turn_usage(rows, native)?;
+    let usage = usage::turn_usage(rows, native)?;
     let mut replay_keys = Keys::default();
     for row in rows {
         replay_row(
@@ -168,17 +167,25 @@ fn desired_events(rows: &[Value], native: &str) -> Result<Vec<(i64, String)>> {
     Ok(desired)
 }
 
+struct WrittenRows<'a> {
+    keys: Keys,
+    inserted: usize,
+    first: Option<i64>,
+    last: Option<i64>,
+    last_assistant: Option<&'a str>,
+}
+
 fn write_rows<'a>(
     conn: &Connection,
     sid: &str,
     native: &str,
     cwd: Option<&str>,
     rows: &'a [Value],
-) -> Result<(Keys, usize, Option<i64>, Option<i64>, Option<&'a str>)> {
+) -> Result<WrittenRows<'a>> {
     let mut keys = Keys::default();
     let mut inserted = 0;
     let mut last_assistant = None;
-    let usage = turn_usage(rows, native)?;
+    let usage = usage::turn_usage(rows, native)?;
     let mut first = None;
     let mut last = None;
     for (index, row) in rows.iter().enumerate() {
@@ -214,7 +221,13 @@ fn write_rows<'a>(
             marker(conn, sid, row, index, &mut keys)?;
         }
     }
-    Ok((keys, inserted, first, last, last_assistant))
+    Ok(WrittenRows {
+        keys,
+        inserted,
+        first,
+        last,
+        last_assistant,
+    })
 }
 
 struct WriteSummary<'a> {
@@ -263,41 +276,6 @@ fn has_evidence(conn: &Connection, sid: &str) -> Result<bool> {
         [sid],
         |row| row.get::<_, bool>(0),
     )?)
-}
-
-fn turn_usage(rows: &[Value], native: &str) -> Result<BTreeMap<String, String>> {
-    let mut current_turn = None;
-    let mut last_assistant = None;
-    let mut output = BTreeMap::new();
-    for row in rows {
-        match row["type"].as_str() {
-            Some("turn.started") => {
-                current_turn = (row["context"]["actor_id"] == native)
-                    .then(|| row["context"]["turn_id"].as_str())
-                    .flatten();
-                last_assistant = None;
-            }
-            Some("item.completed") if row["item"]["type"] == "agent_message" => {
-                if current_turn.is_some()
-                    && row["item"]["context"]["actor_id"] == native
-                    && row["item"]["context"]["turn_id"].as_str() == current_turn
-                {
-                    last_assistant = row["item"]["id"].as_str();
-                }
-            }
-            Some("turn.completed" | "turn.failed") => {
-                if let Some(id) = last_assistant {
-                    if row["usage"].is_object() {
-                        output.insert(id.to_owned(), serde_json::to_string(&row["usage"])?);
-                    }
-                }
-                current_turn = None;
-                last_assistant = None;
-            }
-            _ => {}
-        }
-    }
-    Ok(output)
 }
 
 fn prompt(

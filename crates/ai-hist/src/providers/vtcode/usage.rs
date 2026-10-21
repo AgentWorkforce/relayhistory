@@ -1,5 +1,41 @@
 use super::*;
 use crate::UsageCoverage;
+use std::collections::BTreeMap;
+
+pub(super) fn turn_usage(rows: &[Value], native: &str) -> Result<BTreeMap<String, String>> {
+    let mut current_turn = None;
+    let mut last_assistant = None;
+    let mut output = BTreeMap::new();
+    for row in rows {
+        match row["type"].as_str() {
+            Some("turn.started") => {
+                current_turn = (row["context"]["actor_id"] == native)
+                    .then(|| row["context"]["turn_id"].as_str())
+                    .flatten();
+                last_assistant = None;
+            }
+            Some("item.completed") if row["item"]["type"] == "agent_message" => {
+                if current_turn.is_some()
+                    && row["item"]["context"]["actor_id"] == native
+                    && row["item"]["context"]["turn_id"].as_str() == current_turn
+                {
+                    last_assistant = row["item"]["id"].as_str();
+                }
+            }
+            Some("turn.completed" | "turn.failed") => {
+                if let Some(id) = last_assistant {
+                    if row["usage"].is_object() {
+                        output.insert(id.to_owned(), serde_json::to_string(&row["usage"])?);
+                    }
+                }
+                current_turn = None;
+                last_assistant = None;
+            }
+            _ => {}
+        }
+    }
+    Ok(output)
+}
 
 fn counter(value: &Value, field: &'static str) -> std::result::Result<Option<u64>, UsageError> {
     value
