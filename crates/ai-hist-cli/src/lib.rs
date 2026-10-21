@@ -29,6 +29,7 @@ use ai_hist::paths::{default_opencode_db_path, home_dir};
 use ai_hist::{discover, remote, *};
 mod export;
 mod import;
+mod scheduled_task;
 use import::import_history;
 
 use export::export_history;
@@ -274,15 +275,15 @@ enum Command {
     Sync {
         #[command(flatten)]
         scope: SessionScopeArgs,
-        /// Install a background service (launchd on macOS, cron on Linux) that
-        /// runs `sync` on an interval so the database stays fresh automatically.
+        /// Install a background service (launchd on macOS, cron on Linux, Task
+        /// Scheduler on Windows) that runs `sync` on an interval.
         #[arg(long)]
         install_service: bool,
         /// Remove the background sync service installed by --install-service.
         #[arg(long, conflicts_with = "install_service")]
         uninstall_service: bool,
-        /// Seconds between syncs for the installed service (macOS only; cron
-        /// runs at 1-minute granularity).
+        /// Seconds between syncs for the installed service (exact on macOS;
+        /// cron and Task Scheduler run at 1-minute granularity).
         #[arg(long, default_value_t = 60)]
         interval: u64,
     },
@@ -2617,17 +2618,17 @@ fn launchd_environment_xml(environment: &[(&str, String)]) -> String {
 }
 
 fn install_managed_service(spec: &ServiceSpec, interval: u64, args: &[String]) -> Result<()> {
-    let bin = service_binary()?;
-    let bin = bin.to_string_lossy();
+    let bin = service_binary()?.to_string_lossy().into_owned();
     if cfg!(target_os = "macos") {
         install_launchd_service(spec, &bin, interval, args)
     } else if cfg!(target_os = "linux") {
         install_cron_service(spec, &bin, interval, args)
+    } else if cfg!(windows) {
+        scheduled_task::install(spec, &bin, interval, args)
     } else {
         anyhow::bail!(
-            "Automatic {} service install is only supported on macOS and Linux. \
-             Schedule `ai-hist {}` yourself (e.g. via your platform's task scheduler) instead.",
-            spec.human,
+            "Automatic service install is only supported on macOS, Linux and Windows. \
+             Schedule `ai-hist {}` yourself instead.",
             spec.subcommand
         )
     }
@@ -2856,6 +2857,8 @@ fn uninstall_managed_service(spec: &ServiceSpec) -> Result<()> {
         write_crontab(&format!("{}\n", kept.join("\n")))?;
         println!("Removed cron {} job.", spec.human);
         Ok(())
+    } else if cfg!(windows) {
+        scheduled_task::uninstall(spec)
     } else {
         anyhow::bail!("No managed {} service exists on this platform.", spec.human)
     }

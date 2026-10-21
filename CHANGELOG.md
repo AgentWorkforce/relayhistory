@@ -4,7 +4,11 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Minor]
+
+### Added
+
+- `ai-hist sync --install-service` works on Windows: it registers a hidden Task Scheduler task (`\RelayHistory\ai-hist-sync`) that runs `sync` every `--interval` (rounded up to whole minutes) while you are logged on, with no console window, logging to `%TEMP%\ai-hist-sync.log`; `--uninstall-service` removes it.
 
 ## [0.49.0] - 2026-10-21
 
