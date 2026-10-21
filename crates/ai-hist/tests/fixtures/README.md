@@ -263,6 +263,8 @@ source without deciding which one fails the test.
 | codebuddy/metadata | Published native LocalJsonlSessionStore 2.171.0 offline recorder and fresh high-level historical reader replay; metadata. Not a CLI model-loop capture. |
 | codebuddy/string-content | Published native LocalJsonlSessionStore 2.171.0 offline recorder and fresh high-level historical reader replay; string-content. Not a CLI model-loop capture. |
 | codebuddy/official-reader | Fresh-process native SessionStoreImpl historical reader oracle for all five CLI captures, plus high-level historical replay for the seven recorder controls. |
+| junie/native | Pinned Junie CLI 3110.7 SessionStore native writer capture across separate JVM processes; third-process official reader oracle, two prompts, A2UX assistant blocks, repeated tool step and parent-side subagent notice. |
+| junie/official-reader | Third-process SessionStore.readStoredEventsFromFile oracle from the pinned released jar, independent of RelayHistory. |
 | qoder/global-cli | Official global Qoder CLI npm 1.1.75 TranscriptStore native writer; ordinary, tool, resumed, and same-millisecond synthetic sessions with released Repository historical restart-reader oracle. |
 | vtcode/basic | Synthetic VT Code 0.180.2 native-writer canonical schema-0.18.0 journal, independently reopened through visit_snapshot: two user turns, assistant items, actual tool IDs, per-turn usage, compaction control and thread aggregate. |
 | grok-bot/replicas | Synthetic complete and truncated transcript tails in two account slots, roster titles, widget response, cloud-agent round trip, and voice turns. |

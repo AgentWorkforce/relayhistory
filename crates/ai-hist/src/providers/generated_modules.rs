@@ -9,6 +9,7 @@ pub(crate) mod devin;
 pub(crate) mod grok;
 pub(crate) mod grok_bot;
 pub(crate) mod hermes;
+pub(crate) mod junie;
 pub(crate) mod kimi;
 pub(crate) mod muse;
 pub(crate) mod omp;

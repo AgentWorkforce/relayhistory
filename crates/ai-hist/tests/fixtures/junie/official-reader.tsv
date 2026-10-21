@@ -1,0 +1,8 @@
+user	req-1	1792606063900	Hello from synthetic Junie
+assistant-markdown	step-md-1	1792606063933	I will inspect a synthetic file.
+tool-IN_PROGRESS	step-tool-1	1792606063935	Read synthetic.txt|null
+tool-COMPLETED	step-tool-1	1792606063936	Read synthetic.txt|blue
+assistant-result	step-result-1	1792606063937	The synthetic file is blue.
+user	req-2	1792606064362	Continue after restart
+subagent	step-child-1	1792606064388	Researcher|task-native-1
+assistant-result	step-result-2	1792606064390	The child confirmed blue.
