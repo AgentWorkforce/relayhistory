@@ -315,25 +315,17 @@ pub(crate) fn install(spec: &ServiceSpec, bin: &str, interval: u64, args: &[Stri
     if let Some(dir) = wrapper.parent() {
         fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
+    // A failed reinstall must leave the running task's wrapper as it was.
+    let previous = fs::read(&wrapper).ok();
     fs::write(&wrapper, script).with_context(|| format!("writing {}", wrapper.display()))?;
-
-    let system_root = std::env::var_os("SystemRoot")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
-    let action = task_action(&system_root, &wrapper);
-    let start = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-    let xml = task_xml(spec, &start, minutes, &action);
-    let definition = tempfile::Builder::new()
-        .prefix("ai-hist-task-")
-        .suffix(".xml")
-        .tempfile()
-        .context("creating the task definition file")?;
-    fs::write(definition.path(), utf16le_with_bom(&xml))
-        .with_context(|| format!("writing {}", definition.path().display()))?;
-
+    if let Err(error) = register(spec, minutes, &wrapper) {
+        let _ = match previous {
+            Some(bytes) => fs::write(&wrapper, bytes),
+            None => fs::remove_file(&wrapper),
+        };
+        return Err(error);
+    }
     let name = task_name(spec);
-    let xml_path = definition.path().display().to_string();
-    schtasks_checked(&["/Create", "/TN", &name, "/XML", &xml_path, "/F"])?;
     // Start the first run now, as launchd's RunAtLoad does.
     if schtasks_checked(&["/Run", "/TN", &name]).is_err() {
         eprintln!("Note: the first run starts at the next scheduled time.");
@@ -349,11 +341,39 @@ pub(crate) fn install(spec: &ServiceSpec, bin: &str, interval: u64, args: &[Stri
     Ok(())
 }
 
+/// Register (or replace) the task that runs `wrapper` every `minutes`.
+fn register(spec: &ServiceSpec, minutes: u64, wrapper: &Path) -> Result<()> {
+    let system_root = std::env::var_os("SystemRoot")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+    let action = task_action(&system_root, wrapper);
+    let start = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
+    let xml = task_xml(spec, &start, minutes, &action);
+    let definition = tempfile::Builder::new()
+        .prefix("ai-hist-task-")
+        .suffix(".xml")
+        .tempfile()
+        .context("creating the task definition file")?;
+    fs::write(definition.path(), utf16le_with_bom(&xml))
+        .with_context(|| format!("writing {}", definition.path().display()))?;
+
+    let name = task_name(spec);
+    let xml_path = definition.path().display().to_string();
+    schtasks_checked(&["/Create", "/TN", &name, "/XML", &xml_path, "/F"])
+}
+
 /// Remove the task and its wrapper. A task that is not registered is not an
 /// error, so uninstalling twice succeeds.
 pub(crate) fn uninstall(spec: &ServiceSpec) -> Result<()> {
     let name = task_name(spec);
     let registered = schtasks(&["/Query", "/TN", &name])?.status.success();
+    // `/Query` fails the same way for a missing task and an unreachable
+    // scheduler (its message is localized), so a failed lookup counts as
+    // "not installed" only while Task Scheduler itself still answers.
+    if !registered {
+        schtasks_checked(&["/Query", "/FO", "CSV", "/NH"])
+            .context("cannot tell whether the sync task is registered; leaving it in place")?;
+    }
     if registered {
         schtasks_checked(&["/Delete", "/TN", &name, "/F"])?;
     }
