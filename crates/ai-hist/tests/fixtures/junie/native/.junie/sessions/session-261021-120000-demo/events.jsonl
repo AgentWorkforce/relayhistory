@@ -1,0 +1,8 @@
+{"kind":"UserPromptEvent","requestId":"req-1","prompt":"Hello from synthetic Junie","timestampMs":1792606063900}
+{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"MarkdownBlockUpdatedEvent","stepId":"step-md-1","text":"I will inspect a synthetic file."}},"taskId":"task-native-1","timestampMs":1792606063933}
+{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"ToolBlockUpdatedEvent","stepId":"step-tool-1","text":"Read synthetic.txt","status":"IN_PROGRESS"}},"taskId":"task-native-1","timestampMs":1792606063935}
+{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"ToolBlockUpdatedEvent","stepId":"step-tool-1","text":"Read synthetic.txt","status":"COMPLETED","details":"path: synthetic.txt","output":"blue"}},"taskId":"task-native-1","timestampMs":1792606063936}
+{"kind":"SessionA2uxEvent","event":{"state":"COMPLETED","agentEvent":{"kind":"ResultBlockUpdatedEvent","stepId":"step-result-1","cancelled":false,"result":"The synthetic file is blue.","changes":[]}},"taskId":"task-native-1","timestampMs":1792606063937}
+{"kind":"UserPromptEvent","requestId":"req-2","prompt":"Continue after restart","timestampMs":1792606064362}
+{"kind":"SessionA2uxEvent","event":{"state":"IN_PROGRESS","agentEvent":{"kind":"SubagentSpawnedEvent","stepId":"step-child-1","name":"Researcher","role":"research","task":"Check a synthetic color","parentId":"task-native-1"}},"taskId":"task-native-1","timestampMs":1792606064388}
+{"kind":"SessionA2uxEvent","event":{"state":"COMPLETED","agentEvent":{"kind":"ResultBlockUpdatedEvent","stepId":"step-result-2","cancelled":false,"result":"The child confirmed blue.","changes":[]}},"taskId":"task-native-1","timestampMs":1792606064390}

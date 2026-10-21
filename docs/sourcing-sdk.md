@@ -1011,6 +1011,7 @@ handle.
 | grok | ✓ | ✓ | ✓ | ✓ | ✓ | per-request |
 | grok-bot | ✓ | ✓ | — | — | ✓ | none |
 | hermes | ✓ | ✓ | ✓ | — | — | none |
+| junie | ✓ | ✓ | ✓ | — | — | none |
 | kimi | ✓ | ✓ | ✓ | — | — | none |
 | muse | ✓ | ✓ | ✓ | ✓ | ✓ | per-request |
 | omp | ✓ | ✓ | ✓ | — | — | per-message |

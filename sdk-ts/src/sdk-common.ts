@@ -30,6 +30,7 @@ export const SOURCES = Object.freeze([
   'qwen-code',
   'kimi',
   'codebuddy',
+  'junie',
   'qoder',
   'vtcode',
   'grok-bot',

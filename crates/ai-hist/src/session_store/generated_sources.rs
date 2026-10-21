@@ -35,6 +35,8 @@ pub enum Source {
     Kimi,
     #[serde(rename = "codebuddy")]
     Codebuddy,
+    #[serde(rename = "junie")]
+    Junie,
     #[serde(rename = "qoder")]
     Qoder,
     #[serde(rename = "vtcode")]
@@ -66,6 +68,7 @@ impl Source {
         Self::QwenCode,
         Self::Kimi,
         Self::Codebuddy,
+        Self::Junie,
         Self::Qoder,
         Self::Vtcode,
         Self::GrokBot,
@@ -92,6 +95,7 @@ impl Source {
             Self::QwenCode => "qwen-code",
             Self::Kimi => "kimi",
             Self::Codebuddy => "codebuddy",
+            Self::Junie => "junie",
             Self::Qoder => "qoder",
             Self::Vtcode => "vtcode",
             Self::GrokBot => "grok-bot",
@@ -119,6 +123,7 @@ impl Source {
             "qwen-code" => Some(Self::QwenCode),
             "kimi" => Some(Self::Kimi),
             "codebuddy" => Some(Self::Codebuddy),
+            "junie" => Some(Self::Junie),
             "qoder" => Some(Self::Qoder),
             "vtcode" | "vt-code" => Some(Self::Vtcode),
             "grok-bot" => Some(Self::GrokBot),
@@ -147,6 +152,7 @@ impl Source {
             Self::QwenCode => &crate::providers::qwen_code::METADATA,
             Self::Kimi => &crate::providers::kimi::METADATA,
             Self::Codebuddy => &crate::providers::codebuddy::METADATA,
+            Self::Junie => &crate::providers::junie::METADATA,
             Self::Qoder => &crate::providers::qoder::METADATA,
             Self::Vtcode => &crate::providers::vtcode::METADATA,
             Self::GrokBot => &crate::providers::grok_bot::METADATA,

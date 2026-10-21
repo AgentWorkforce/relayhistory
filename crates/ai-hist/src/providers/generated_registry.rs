@@ -76,6 +76,11 @@ const REGISTRATIONS: &[Registration] = &[
         adapter: codebuddy::ADAPTER,
     },
     Registration {
+        id: "junie",
+        metadata: junie::METADATA,
+        adapter: junie::ADAPTER,
+    },
+    Registration {
         id: "qoder",
         metadata: qoder::METADATA,
         adapter: qoder::ADAPTER,
