@@ -162,14 +162,15 @@ const NON_PATH_ENV_VARS: [&str; 4] = [
     "PI_PROFILE",
 ];
 
-/// Whether `value` of `name` is a path its provider would resolve against the
-/// current directory. `~`, `$VAR`/`%VAR%` forms and OpenClaw's `null` and
-/// `undefined` markers are resolved by the providers themselves.
+/// Whether `value` of `name` might depend on the current directory. Only an
+/// absolute path is known not to: providers differ on `~` and `$VAR` (Codex
+/// and Claude take them literally), so those count too. Names that are not
+/// paths, and the `null`/`undefined` markers OpenClaw trims and ignores, do
+/// not.
 pub(crate) fn relative_path_value(name: &str, value: &str) -> bool {
-    !NON_PATH_ENV_VARS.contains(&name)
-        && !Path::new(value).is_absolute()
-        && !value.starts_with(['~', '$', '%', '\\', '/'])
-        && !matches!(value, "null" | "undefined")
+    let openclaw_unset =
+        name.starts_with("OPENCLAW_") && matches!(value.trim(), "null" | "undefined");
+    !NON_PATH_ENV_VARS.contains(&name) && !openclaw_unset && !Path::new(value).is_absolute()
 }
 
 /// The `.cmd` wrapper the task runs: set the environment, change to `cwd` (the
@@ -603,10 +604,16 @@ mod tests {
     fn only_plain_relative_paths_need_an_install_directory() {
         assert!(relative_path_value("OPENCLAW_STATE_DIR", "state"));
         assert!(relative_path_value("CODEX_HOME", r".\codex"));
-        // Providers resolve these themselves, or they are not paths at all.
-        assert!(!relative_path_value("OPENCLAW_HOME", "~/claw"));
-        assert!(!relative_path_value("HERMES_HOME", "$HOME/hermes"));
-        assert!(!relative_path_value("OPENCLAW_STATE_DIR", "null"));
+        // Some providers take `~` and `$VAR` literally, so they may be relative.
+        assert!(relative_path_value("CODEX_HOME", "~/codex"));
+        assert!(relative_path_value("HERMES_HOME", "$HOME/hermes"));
+        // `null` is OpenClaw's unset marker only; elsewhere it is a path.
+        assert!(!relative_path_value("OPENCLAW_STATE_DIR", " null "));
+        assert!(!relative_path_value("OPENCLAW_HOME", "undefined"));
+        assert!(relative_path_value("CODEX_HOME", "null"));
+        // Absolute paths and names that are not paths never depend on it.
+        let absolute = std::env::current_dir().unwrap().display().to_string();
+        assert!(!relative_path_value("QWEN_HOME", &absolute));
         assert!(!relative_path_value("OMP_PROFILE", "work"));
         assert!(!relative_path_value("HERMES_DATA_DIR_SUFFIX", "dev"));
     }
