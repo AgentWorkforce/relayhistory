@@ -39,6 +39,12 @@ pub(super) fn string<'a>(v: &'a Value, field: &str) -> Result<&'a str> {
         .with_context(|| format!("VTCODE_INVALID_RECORD: {field} missing"))
 }
 
+pub(super) fn text<'a>(v: &'a Value, field: &str) -> Result<&'a str> {
+    v[field]
+        .as_str()
+        .with_context(|| format!("VTCODE_INVALID_RECORD: {field} missing"))
+}
+
 pub(super) fn time(text: &str) -> Result<i64> {
     Ok(chrono::DateTime::parse_from_rfc3339(text)
         .context("VTCODE_INVALID_RECORD: invalid timestamp")?
@@ -61,7 +67,11 @@ pub(super) fn first_prompt(rows: &[Value], native: &str) -> Option<(String, i64,
         {
             return None;
         }
-        let goal = row["context"]["goal"].as_str()?.to_owned();
+        let goal = row["context"]["goal"]
+            .as_str()?
+            .chars()
+            .take(4096)
+            .collect();
         let id = row["context"]["turn_id"].as_str()?.to_owned();
         let ts = time(row["context"]["timestamp"].as_str()?).ok()?;
         Some((goal, ts, id))

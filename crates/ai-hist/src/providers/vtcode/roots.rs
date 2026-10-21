@@ -45,7 +45,10 @@ fn resolve_workspaces(workspaces: Vec<PathBuf>) -> ResolvedProviderRoots {
                 _ => normalized.push(part.as_os_str()),
             }
         }
-        roots.push(normalized.join(".vtcode/sessions"));
+        // Existing workspace aliases must share one namespace and one scan.
+        // Keep a missing declared workspace lexical so it can appear later.
+        let workspace = std::fs::canonicalize(&normalized).unwrap_or(normalized);
+        roots.push(workspace.join(".vtcode/sessions"));
     }
     roots.sort();
     roots.dedup();
@@ -98,5 +101,17 @@ mod tests {
             .unwrap()
             .0;
         assert_ne!(one, two);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_symlink_and_target_share_one_root() {
+        let home = tempfile::tempdir().unwrap();
+        let workspace = home.path().join("workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        let alias = home.path().join("alias");
+        std::os::unix::fs::symlink(&workspace, &alias).unwrap();
+        let resolved = resolve_workspaces(vec![alias, workspace.clone()]);
+        assert_eq!(resolved.paths, vec![workspace.join(".vtcode/sessions")]);
     }
 }

@@ -393,7 +393,123 @@ fn shallow_tail_never_replaces_the_opening_prompt() {
             |r| r.get(0),
         )
         .unwrap();
-    assert_eq!(first.as_deref(), Some(opening.as_str()));
+    assert_eq!(first.as_deref(), Some(&opening[..4096]));
+    assert!(contains(&evidence(&store, &sid(home.path())), &opening));
+}
+
+#[test]
+fn empty_native_text_is_evidence_not_a_session_error() {
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path());
+    let mut rows = FIXTURE.lines().map(str::to_owned).collect::<Vec<_>>();
+    let mut prompt: serde_json::Value = serde_json::from_str(&rows[1]).unwrap();
+    prompt["event"]["context"]["goal"] = "".into();
+    rows[1] = prompt.to_string();
+    let mut reply: serde_json::Value = serde_json::from_str(&rows[2]).unwrap();
+    reply["event"]["item"]["text"] = "".into();
+    rows[2] = reply.to_string();
+    std::fs::write(path, format!("{}\n", rows.join("\n"))).unwrap();
+    let store = open(home.path());
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    let evidence = evidence(&store, &sid(home.path()));
+    assert!(evidence
+        .messages
+        .iter()
+        .any(|m| m.role == Role::User && m.blocks.iter().any(|b| b.text.as_deref() == Some(""))));
+    assert!(evidence.messages.iter().any(
+        |m| m.role == Role::Assistant && m.blocks.iter().any(|b| b.text.as_deref() == Some(""))
+    ));
+    assert!(contains(&evidence, "Run the synthetic verification"));
+}
+
+#[test]
+fn tool_output_call_id_resolves_native_invocation_tool_id() {
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path());
+    let mut rows = FIXTURE.lines().map(str::to_owned).collect::<Vec<_>>();
+    let mut output: serde_json::Value = serde_json::from_str(&rows[7]).unwrap();
+    output["event"]["item"]
+        .as_object_mut()
+        .unwrap()
+        .remove("tool_call_id");
+    output["event"]["item"]["status"] = "failed".into();
+    rows[7] = output.to_string();
+    std::fs::write(path, format!("{}\n", rows.join("\n"))).unwrap();
+    let store = open(home.path());
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    let evidence = evidence(&store, &sid(home.path()));
+    assert_eq!(evidence.tool_calls[0].tool_use_id, "call-b");
+    assert_eq!(evidence.tool_calls[0].is_error, Some(true));
+    assert!(evidence
+        .tool_results
+        .iter()
+        .any(|r| r.tool_use_id.as_deref() == Some("call-b")));
+}
+
+#[test]
+fn thread_started_only_keeps_unknown_activity_time() {
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path());
+    std::fs::write(path, format!("{}\n", FIXTURE.lines().next().unwrap())).unwrap();
+    let store = open(home.path());
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    let mut query = CatalogQuery::default();
+    query.sources = Some(vec![Source::Vtcode]);
+    let row = store.sessions(query).next().unwrap().unwrap();
+    assert_eq!(row.first_activity_ms, None);
+    assert_eq!(row.last_activity_ms, None);
+    let evidence = evidence(&store, &sid(home.path()));
+    assert!(evidence.messages.is_empty());
+    assert!(evidence.markers.iter().any(|m| m.kind == "thread.started"));
+}
+
+#[cfg(feature = "unstable-internal")]
+#[test]
+fn untimed_local_start_keeps_remote_catalog_metadata() {
+    use ai_hist::{SessionLocation, ShallowSession, SourceObservation, SourceObservationBatch};
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path());
+    std::fs::write(path, format!("{}\n", FIXTURE.lines().next().unwrap())).unwrap();
+    let store = open(home.path());
+    let id = sid(home.path());
+    store
+        .apply_source_observations(SourceObservationBatch::new(
+            "synthetic-remote",
+            "default",
+            SessionLocation::Remote,
+            vec![SourceObservation {
+                session: ShallowSession {
+                    source: "vtcode".into(),
+                    session_id: id.clone(),
+                    first_activity_ms: Some(1_700_000_000_000),
+                    last_activity_ms: Some(1_700_000_000_001),
+                    first_prompt: Some("Remote observed prompt".into()),
+                    ..Default::default()
+                },
+                raw_locator: None,
+            }],
+        ))
+        .unwrap();
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    let mut query = CatalogQuery::default();
+    query.sources = Some(vec![Source::Vtcode]);
+    let row = store.sessions(query).next().unwrap().unwrap();
+    assert_eq!(row.first_activity_ms, Some(1_700_000_000_000));
+    assert_eq!(row.last_activity_ms, Some(1_700_000_000_001));
+    assert_eq!(row.first_prompt.as_deref(), Some("Remote observed prompt"));
+    let conn = rusqlite::Connection::open(home.path().join("conformance.db")).unwrap();
+    let state: String = conn
+        .query_row(
+            "SELECT discovery_state FROM sessions WHERE source='vtcode' AND session_id=?1",
+            [&id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(state, "full");
+    assert!(evidence(&store, &id)
+        .markers
+        .iter()
+        .any(|marker| marker.kind == "thread.started"));
 }
 
 #[test]

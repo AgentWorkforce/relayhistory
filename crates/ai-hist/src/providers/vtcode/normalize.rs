@@ -8,6 +8,8 @@ use crate::providers::shared_evidence::Snapshot;
 use crate::{insert_history, insert_session_marker, HistoryEntry, NewSessionMarker};
 use std::collections::BTreeMap;
 
+mod tool_output;
+
 pub(super) fn validate_native(rows: &[Value], native: &str) -> Result<()> {
     for row in rows {
         if row["type"] == "thread.started"
@@ -50,24 +52,55 @@ pub(super) fn write(conn: &Connection, payload: &Value, path: &Path) -> Result<u
         .and_then(Path::parent)
         .map(|p| p.to_string_lossy().into_owned());
     let written = write_rows(conn, sid, native, cwd.as_deref(), rows)?;
-    anyhow::ensure!(
-        written.first.is_some(),
-        "VTCODE_INVALID_RECORD: no timestamped history"
-    );
     if complete {
         file_history::retire(conn, ID, sid, &written.keys)?;
         file_history::retire_locator_sessions(conn, ID, path, Some(sid))?;
         repair_order(conn, sid, native, cwd.as_deref(), rows)?;
     }
-    let summary = WriteSummary {
-        cwd: cwd.as_deref(),
-        first: written.first.unwrap(),
-        last: written.last.unwrap(),
-        last_assistant: written.last_assistant,
-    };
-    write_catalog(conn, sid, native, path, rows, complete, &summary)?;
+    if let Some(first) = written.first {
+        let summary = WriteSummary {
+            cwd: cwd.as_deref(),
+            first,
+            last: written.last.unwrap_or(first),
+            last_assistant: written.last_assistant,
+        };
+        write_catalog(conn, sid, native, path, rows, complete, &summary)?;
+    } else {
+        write_untimed_catalog(conn, sid, cwd.as_deref(), path, complete)?;
+    }
     shared.ensure_unchanged(conn, sid)?;
     Ok(written.inserted)
+}
+
+fn write_untimed_catalog(
+    conn: &Connection,
+    sid: &str,
+    cwd: Option<&str>,
+    path: &Path,
+    complete: bool,
+) -> Result<()> {
+    crate::discover::upsert_shallow_session(
+        conn,
+        &ShallowSession {
+            source: ID.into(),
+            session_id: sid.into(),
+            cwd: cwd.map(str::to_owned),
+            raw_path: Some(path.to_string_lossy().into_owned()),
+            discovery_state: if complete { "full" } else { "shallow" }.into(),
+            ..Default::default()
+        },
+    )?;
+    if complete {
+        conn.execute(
+            "UPDATE sessions SET discovery_state='full' WHERE source='vtcode' AND session_id=?1",
+            [sid],
+        )?;
+        conn.execute(
+            "UPDATE sessions SET first_activity_ms=NULL,last_activity_ms=NULL,first_prompt=NULL,last_assistant_text=NULL WHERE source='vtcode' AND session_id=?1 AND NOT EXISTS (SELECT 1 FROM session_presences WHERE source='vtcode' AND session_id=?1 AND location='remote')",
+            [sid],
+        )?;
+    }
+    Ok(())
 }
 
 fn repair_order(
@@ -132,7 +165,7 @@ fn replay_row(
                 keys,
             )?,
             Some("tool_invocation") => call(conn, sid, cwd, item, keys)?,
-            Some("tool_output") => result(conn, sid, cwd, item, keys)?,
+            Some("tool_output") => tool_output::result(conn, sid, cwd, item, keys)?,
             _ => {}
         }
     }
@@ -202,7 +235,7 @@ fn write_rows<'a>(
             let item = &row["item"];
             match item["type"].as_str() {
                 Some("agent_message") => {
-                    last_assistant = Some(format::string(item, "text")?);
+                    last_assistant = Some(format::text(item, "text")?);
                     assistant(
                         conn,
                         sid,
@@ -213,7 +246,7 @@ fn write_rows<'a>(
                     )?;
                 }
                 Some("tool_invocation") => call(conn, sid, cwd, item, &mut keys)?,
-                Some("tool_output") => result(conn, sid, cwd, item, &mut keys)?,
+                Some("tool_output") => tool_output::result(conn, sid, cwd, item, &mut keys)?,
                 _ => marker(conn, sid, row, index, &mut keys)?,
             }
         } else {
@@ -287,7 +320,7 @@ fn prompt(
 ) -> Result<usize> {
     let context = &row["context"];
     let id = format::string(context, "turn_id")?;
-    let text = format::string(context, "goal")?;
+    let text = format::text(context, "goal")?;
     let ts = format::time(format::string(context, "timestamp")?)?;
     let uid = format!("{id}:0");
     insert_session_event(
@@ -344,7 +377,7 @@ fn assistant(
             event_uid: &uid,
             role: "assistant",
             kind: "text",
-            text: Some(format::string(item, "text")?),
+            text: Some(format::text(item, "text")?),
             ts_ms: ts,
             cwd,
             project: cwd,
@@ -412,50 +445,6 @@ fn call(
             ..Default::default()
         },
     )?;
-    keys.events.insert(uid);
-    Ok(())
-}
-
-fn result(
-    conn: &Connection,
-    sid: &str,
-    cwd: Option<&str>,
-    item: &Value,
-    keys: &mut Keys,
-) -> Result<()> {
-    let id = format::string(item, "id")?;
-    let tool_id = item["tool_call_id"]
-        .as_str()
-        .or_else(|| item["call_id"].as_str())
-        .context("VTCODE_INVALID_RECORD: tool output call identity missing")?;
-    let ts = format::time(format::string(&item["context"], "timestamp")?)?;
-    let text = item["output"].as_str().unwrap_or("");
-    let error = item["status"] == "failed";
-    let mut facts = ToolResultFacts::from_payload(&Value::String(text.into()));
-    facts.tool_use_id = Some(tool_id.into());
-    facts.result_status = Some(if error { "errored" } else { "completed" }.into());
-    facts.error_signal = error.then(|| "status_failed".into());
-    let uid = format!("{id}:0");
-    insert_session_event(
-        conn,
-        &EventRow {
-            source: ID,
-            session_id: sid,
-            message_id: id,
-            event_uid: &uid,
-            role: "tool_result",
-            kind: "tool_result",
-            text: Some(text),
-            ts_ms: ts,
-            cwd,
-            project: cwd,
-            tool_result_facts: Some(&facts),
-            raw_kind: Some("tool_output"),
-            ..Default::default()
-        },
-    )?;
-    set_tool_call_error(conn, ID, sid, tool_id, error)?;
-    keys.results.insert(tool_id.into());
     keys.events.insert(uid);
     Ok(())
 }
