@@ -51,6 +51,21 @@ fn marker(conn: &Connection, s: &Session, m: HermesMarker<'_>, keys: &mut Keys) 
     Ok(())
 }
 pub(super) fn session(conn: &Connection, s: &Session, path: &Path) -> Result<usize> {
+    // Callers normally own a database snapshot transaction; direct internal
+    // callers receive the same rollback guarantee without nesting transactions.
+    let transaction = conn
+        .is_autocommit()
+        .then(|| conn.unchecked_transaction())
+        .transpose()?;
+    let shared = crate::providers::shared_evidence::Snapshot::capture(conn, ID, &s.id)?;
+    let inserted = write_session(conn, s, path)?;
+    shared.ensure_unchanged(conn, &s.id)?;
+    if let Some(transaction) = transaction {
+        transaction.commit()?;
+    }
+    Ok(inserted)
+}
+fn write_session(conn: &Connection, s: &Session, path: &Path) -> Result<usize> {
     crate::ingest::check_capture_cancelled()?;
     let mut keys = Keys::default();
     let mut inserted = 0;
