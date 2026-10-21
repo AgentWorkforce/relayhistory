@@ -27,6 +27,9 @@ pub(super) fn write(conn: &Connection, payload: &Value, path: &Path) -> Result<u
     }
     write_catalog(conn, sid, cwd, path, entries, &written, complete)?;
     shared.ensure_unchanged(conn, sid)?;
+    if complete {
+        file_history::retire_locator_sessions(conn, ID, path, Some(sid))?;
+    }
     Ok(written.inserted)
 }
 

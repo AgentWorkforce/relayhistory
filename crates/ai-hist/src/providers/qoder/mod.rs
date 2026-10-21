@@ -181,6 +181,12 @@ impl ShallowSessionProvider for Provider {
             for project in std::fs::read_dir(root)? {
                 crate::ingest::check_capture_cancelled()?;
                 let project = project?;
+                if env
+                    .path_scope()
+                    .is_some_and(|scope| !scope.mentions(&project.path()))
+                {
+                    continue;
+                }
                 if !project.file_type()?.is_dir() {
                     continue;
                 }

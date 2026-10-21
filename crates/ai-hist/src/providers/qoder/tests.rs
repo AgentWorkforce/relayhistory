@@ -46,3 +46,28 @@ fn selected_transcript_symlink_cannot_escape_declared_root() {
     let roots = ProviderRoots::from_home(home.path().into(), home.path().join("opencode.db"));
     assert!(AcquisitionContext::new(ID, &roots).validate(&path).is_err());
 }
+
+#[cfg(unix)]
+#[test]
+fn scoped_enumeration_does_not_open_unrelated_project() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join(".qoder/projects");
+    let selected = root.join("selected/session.jsonl");
+    std::fs::create_dir_all(selected.parent().unwrap()).unwrap();
+    std::fs::write(&selected, b"{}\n").unwrap();
+    let unrelated = root.join("unrelated");
+    std::fs::create_dir_all(&unrelated).unwrap();
+    std::fs::set_permissions(&unrelated, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::read_dir(&unrelated).is_ok() {
+        // Privileged test runners can bypass directory permissions.
+        return;
+    }
+    let conn = Connection::open_in_memory().unwrap();
+    let roots = ProviderRoots::from_home(home.path().into(), home.path().join("opencode.db"));
+    let scope = crate::ingest::path_scope::PathScope::from_paths([selected.clone()]);
+    let env = DiscoveryEnv::with_provider_roots(&conn, roots).with_path_scope(scope);
+    let candidates = Provider.enumerate(&env, None).unwrap();
+    assert_eq!(candidates.len(), 1);
+    assert_eq!(candidates[0].locator, selected.to_string_lossy());
+}

@@ -225,6 +225,31 @@ fn qoder_metadata_only_rewrite_keeps_messages_and_updates_marker() {
 }
 
 #[test]
+fn qoder_replaced_transcript_at_same_path_retires_old_local_session() {
+    use ai_hist::SyncOptions;
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path(), "synthetic-tool", TOOL);
+    let store = open(home.path());
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    let old = SessionRef::id(Source::Qoder, "synthetic-tool");
+    assert!(store
+        .session(&old, SessionQuery::default())
+        .unwrap()
+        .is_some());
+    std::fs::write(&path, TOOL.replace("synthetic-tool", "replacement-tool")).unwrap();
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    assert!(store
+        .session(&old, SessionQuery::default())
+        .unwrap()
+        .is_none());
+    let new = SessionRef::id(Source::Qoder, "replacement-tool");
+    assert!(store
+        .session(&new, SessionQuery::default())
+        .unwrap()
+        .is_some());
+}
+
+#[test]
 fn qoder_empty_root_collision_and_explicit_root_are_truthful() {
     let home = tempfile::tempdir().unwrap();
     let store = open(home.path());
@@ -551,6 +576,52 @@ fn qoder_actual_export_public_intake_then_local_hydrate_preserves_remote_share()
         before_conflict,
         "conflicting local payload rewrite leaves remote snapshot intact"
     );
+}
+
+#[cfg(all(feature = "unstable-internal", feature = "export"))]
+#[test]
+fn qoder_replaced_locator_keeps_imported_old_session_remote_only() {
+    use ai_hist::SyncOptions;
+    let (destination, store, remote) = remote_case(TOOL, "synthetic-tool");
+    let path = stage(destination.path(), "synthetic-tool", TOOL);
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    let old = SessionRef::id(Source::Qoder, "synthetic-tool");
+    assert_eq!(
+        store
+            .session(&old, SessionQuery::default())
+            .unwrap()
+            .unwrap()
+            .messages,
+        remote.messages
+    );
+    std::fs::write(&path, TOOL.replace("synthetic-tool", "replacement-tool")).unwrap();
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    assert_eq!(
+        store
+            .session(&old, SessionQuery::default())
+            .unwrap()
+            .unwrap()
+            .messages,
+        remote.messages,
+        "the imported old session remains searchable"
+    );
+    let conn = rusqlite::Connection::open(destination.path().join("qoder.db")).unwrap();
+    let local_presence: i64 = conn.query_row(
+        "SELECT count(*) FROM session_presences WHERE source='qoder' AND session_id='synthetic-tool' AND location='local'",
+        [],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(
+        local_presence, 0,
+        "the replaced locator no longer backs the old session"
+    );
+    assert!(store
+        .session(
+            &SessionRef::id(Source::Qoder, "replacement-tool"),
+            SessionQuery::default()
+        )
+        .unwrap()
+        .is_some());
 }
 
 #[cfg(all(feature = "unstable-internal", feature = "export"))]
