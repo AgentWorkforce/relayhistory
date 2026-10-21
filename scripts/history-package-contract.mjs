@@ -93,6 +93,7 @@ export const platforms = {
   "linux-x64-musl": ["linux", "x64", "musl"],
   "linux-arm64-musl": ["linux", "arm64", "musl"],
   "win32-x64-msvc": ["win32", "x64"],
+  "win32-arm64-msvc": ["win32", "arm64"],
 };
 export function validatePluginManifest(plugin, manifest) {
   const info = plugins[plugin];

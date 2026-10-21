@@ -8,6 +8,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Windows arm64 (`aarch64-pc-windows-msvc`) is supported: `npm install` pulls the prebuilt `ai-hist-native-win32-arm64-msvc` addon, and `@relayhistory/provider-sources` ships a native `win32-arm64-msvc` helper.
 - Qwen Code interactive session history is discoverable and searchable from native transcript files, preserving the active conversation branch, recorded messages and tool evidence.
 - Kimi Code history is discoverable and searchable from current native session journals, including recorded messages, tools and separate subagent transcripts.
 - Codebuddy Code history is discoverable and searchable from native project session files, including recorded messages and tool evidence.
