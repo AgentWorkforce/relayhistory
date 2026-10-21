@@ -199,6 +199,126 @@ fn terminal_native_tool_status_without_output_keeps_observed_success() {
 }
 
 #[test]
+fn terminal_tool_error_rewrite_to_unknown_matches_fresh_capture() {
+    for (status, output) in [(Some("IN_PROGRESS"), Some("blue")), (None, None)] {
+        let rewritten = tempfile::tempdir().unwrap();
+        let path = stage(rewritten.path());
+        let original = std::fs::read_to_string(&path).unwrap();
+        let failed = original.replace("\"status\":\"COMPLETED\"", "\"status\":\"FAILED\"");
+        std::fs::write(&path, failed).unwrap();
+        let store = open(rewritten.path());
+        let reference = SessionRef::id(Source::Junie, SID);
+        store
+            .discover(DiscoveryOptions::default().sources([Source::Junie]))
+            .unwrap();
+        store
+            .hydrate(&reference, HydrateOptions::default())
+            .unwrap();
+        assert_eq!(evidence(&store).tool_calls[0].is_error, Some(true));
+
+        let mut lines = original.lines().map(str::to_owned).collect::<Vec<_>>();
+        let mut row: serde_json::Value = serde_json::from_str(&lines[3]).unwrap();
+        let agent = row["event"]["agentEvent"].as_object_mut().unwrap();
+        match status {
+            Some(value) => agent.insert("status".into(), value.into()),
+            None => agent.remove("status"),
+        };
+        match output {
+            Some(value) => agent.insert("output".into(), value.into()),
+            None => agent.remove("output"),
+        };
+        lines[3] = row.to_string();
+        let target = format!("{}\n", lines.join("\n"));
+        std::fs::write(&path, &target).unwrap();
+        store
+            .hydrate(&reference, HydrateOptions::default())
+            .unwrap();
+        let after = evidence(&store);
+
+        let fresh = tempfile::tempdir().unwrap();
+        let fresh_path = stage(fresh.path());
+        std::fs::write(fresh_path, target).unwrap();
+        let fresh_store = open(fresh.path());
+        fresh_store
+            .discover(DiscoveryOptions::default().sources([Source::Junie]))
+            .unwrap();
+        fresh_store
+            .hydrate(&reference, HydrateOptions::default())
+            .unwrap();
+        let expected = evidence(&fresh_store);
+        assert_eq!(after.tool_calls[0].is_error, None);
+        assert_eq!(after.tool_calls, expected.tool_calls);
+        assert_eq!(after.tool_results, expected.tool_results);
+    }
+}
+
+#[cfg(feature = "unstable-internal")]
+#[test]
+fn bounded_discovery_refreshes_index_activity_and_reads_shared_index_once() {
+    let home = tempfile::tempdir().unwrap();
+    let first_path = stage(home.path());
+    let conn = ai_hist::open_db(&home.path().join("discovery.db")).unwrap();
+    let env = ai_hist::DiscoveryEnv::with_roots(
+        &conn,
+        home.path().to_owned(),
+        home.path().join("missing-opencode.db"),
+    );
+    let options =
+        ai_hist::DiscoverOptions::new(ai_hist::SessionScope::Local, vec!["junie".into()], None);
+    ai_hist::discover_sessions_with_env(&env, &options, |_| {}).unwrap();
+
+    let journal = std::fs::read_to_string(&first_path).unwrap();
+    let padded = format!(
+        "{journal}{}",
+        "{\"kind\":\"FutureEvent\",\"timestampMs\":1792609205000}\n".repeat(1400)
+    );
+    assert!(padded.len() > 64 * 1024);
+    std::fs::write(&first_path, &padded).unwrap();
+    let second_id = "session-261021-120001-demo";
+    let second_path = first_path
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join(second_id)
+        .join("events.jsonl");
+    std::fs::create_dir_all(second_path.parent().unwrap()).unwrap();
+    std::fs::write(&second_path, &padded).unwrap();
+    let index_path = home.path().join(".junie/sessions/index.jsonl");
+    let mut first_index: serde_json::Value =
+        serde_json::from_str(std::fs::read_to_string(&index_path).unwrap().trim()).unwrap();
+    first_index["updatedAt"] = 1792609300000_i64.into();
+    first_index["taskName"] = "Recently active Junie session".into();
+    let mut second_index = first_index.clone();
+    second_index["sessionId"] = second_id.into();
+    std::fs::write(&index_path, format!("{first_index}\n{second_index}\n")).unwrap();
+
+    let mut rows = Vec::new();
+    let report =
+        ai_hist::discover_sessions_with_env(&env, &options, |row| rows.push(row.clone())).unwrap();
+    assert!(report.diagnostics.is_empty(), "{:?}", report.diagnostics);
+    assert_eq!(rows.len(), 2);
+    let first = rows.iter().find(|row| row.session_id == SID).unwrap();
+    assert_eq!(first.last_activity_ms, Some(1792609300000));
+    assert_eq!(
+        first.title.as_deref(),
+        Some("Recently active Junie session")
+    );
+    assert_eq!(
+        first.first_prompt.as_deref(),
+        Some("Hello from synthetic Junie")
+    );
+    assert_eq!(
+        report.counters.files_opened, 3,
+        "one index and two journals"
+    );
+    assert_eq!(
+        report.counters.bytes_read,
+        std::fs::metadata(&index_path).unwrap().len() + 2 * (64 * 1024 + 1)
+    );
+}
+
+#[test]
 fn optional_index_partial_tail_keeps_native_journal_readable_and_oversize_is_diagnostic() {
     let home = tempfile::tempdir().unwrap();
     stage(home.path());

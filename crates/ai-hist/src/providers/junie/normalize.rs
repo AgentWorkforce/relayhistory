@@ -429,7 +429,6 @@ fn emit_tool(
         )?;
         writes.keys.events.insert(uid.clone());
         writes.desired.push((ts, uid));
-        writes.keys.results.insert(native_id.into());
     }
     Ok(())
 }

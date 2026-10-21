@@ -16,7 +16,7 @@ mod tests;
 const ID: &str = "junie";
 pub(crate) const LOCAL_SOURCE: LocalSource = LocalSource {
     id: ID,
-    discovery: Discovery::Provider(|| Box::new(Provider)),
+    discovery: Discovery::Provider(|| Box::new(Provider::default())),
     hydration: Hydration::Parser(ingest),
     transcript_roots: |roots| roots.for_provider(ID).to_vec(),
     relationships: Relationships::NONE,
@@ -43,7 +43,10 @@ pub(crate) const ADAPTER: Option<ProviderAdapter> = Some(ProviderAdapter {
     },
 });
 
-struct Provider;
+#[derive(Default)]
+struct Provider {
+    indexes: storage::IndexCache,
+}
 impl ShallowSessionProvider for Provider {
     fn source(&self) -> &'static str {
         ID
@@ -57,6 +60,7 @@ impl ShallowSessionProvider for Provider {
         ]
     }
     fn enumerate(&self, env: &DiscoveryEnv<'_>, limit: Option<usize>) -> Result<Vec<Candidate>> {
+        self.indexes.clear();
         storage::enumerate(env, limit)
     }
     fn read_access(&self) -> crate::discover::ShallowReadAccess {
@@ -70,16 +74,18 @@ impl ShallowSessionProvider for Provider {
     ) -> Result<Option<ShallowSession>> {
         let context = AcquisitionContext::new(ID, scan.provider_roots);
         let path = storage::selected(&context, Path::new(&candidate.locator))?;
-        let capture = storage::shallow(scan, &context, &path)?;
+        let capture = storage::shallow(scan, &context, &path, &self.indexes)?;
         let sid = format::string(&capture.payload, "sid")?;
-        if let Some(conn) = conn {
+        let previous = if let Some(conn) = conn {
             normalize::check_identity(conn, sid, &path)?;
             if capture.payload["partial"] == true || capture.payload["bounded"] == true {
-                if let Some(previous) = crate::discover::catalog_row(conn, ID, sid, true)? {
-                    return Ok(Some(previous));
-                }
+                crate::discover::catalog_row(conn, ID, sid, true)?
+            } else {
+                None
             }
-        }
+        } else {
+            None
+        };
         let rows = capture.payload["rows"].as_array().context("Junie rows")?;
         let summary = &capture.payload["summary"];
         let first = rows.iter().map(format::time).collect::<Result<Vec<_>>>()?;
@@ -88,16 +94,25 @@ impl ShallowSessionProvider for Provider {
             session_id: sid.into(),
             first_activity_ms: summary["createdAt"]
                 .as_i64()
-                .or_else(|| first.iter().min().copied()),
+                .or_else(|| first.iter().min().copied())
+                .or_else(|| previous.as_ref().and_then(|row| row.first_activity_ms)),
             last_activity_ms: summary["updatedAt"]
                 .as_i64()
-                .or_else(|| first.iter().max().copied()),
+                .or_else(|| first.iter().max().copied())
+                .or_else(|| previous.as_ref().and_then(|row| row.last_activity_ms)),
             first_prompt: rows
                 .iter()
                 .find_map(format::human_text)
-                .map(|s| s.chars().take(4096).collect()),
-            cwd: summary["projectDir"].as_str().map(str::to_owned),
-            title: summary["taskName"].as_str().map(str::to_owned),
+                .map(|s| s.chars().take(4096).collect())
+                .or_else(|| previous.as_ref().and_then(|row| row.first_prompt.clone())),
+            cwd: summary["projectDir"]
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| previous.as_ref().and_then(|row| row.cwd.clone())),
+            title: summary["taskName"]
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| previous.as_ref().and_then(|row| row.title.clone())),
             raw_path: Some(path.to_string_lossy().into_owned()),
             source_stamp: Some(candidate.stamp.clone()),
             discovery_state: "shallow".into(),
@@ -150,10 +165,15 @@ fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
     let context = AcquisitionContext::new(ID, ctx.roots);
     let mut result = SweepResult::default();
     let mut failed_capture = false;
+    let indexes = storage::IndexCache::default();
     for candidate in storage::enumerate(&env, None)? {
         crate::ingest::check_capture_cancelled()?;
         let run = || -> Result<(usize, bool)> {
-            let capture = storage::capture(Path::new(&candidate.locator), &context)?;
+            let capture = storage::capture_with_index(
+                Path::new(&candidate.locator),
+                &context,
+                &indexes,
+            )?;
             let tx = ctx.conn.unchecked_transaction()?;
             let n = normalize::write(&tx, &capture.payload)?;
             tx.commit()?;
