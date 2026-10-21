@@ -36,12 +36,16 @@ const EXECUTION_TIME_LIMIT: &str = "PT6H";
 /// Task Scheduler starts from the user's registry environment, which lacks
 /// shell-only variables: `HOME` (`home_dir()` prefers it over `USERPROFILE`)
 /// and the provider roots the shared launchd/cron list does not carry yet.
-const WINDOWS_EXTRA_ENV_VARS: [&str; 10] = [
+const WINDOWS_EXTRA_ENV_VARS: [&str; 14] = [
     "HOME",
     "COPILOT_HOME",
+    "GROK_BOT_USER_DATA",
     "HERMES_HOME",
     "HERMES_DATA_DIR_SUFFIX",
     "OMP_PROFILE",
+    "OPENCLAW_HOME",
+    "OPENCLAW_PROFILE",
+    "OPENCLAW_STATE_DIR",
     "OPENCODE_STORAGE_DIR",
     "PI_CODING_AGENT_DIR",
     "PI_CODING_AGENT_SESSION_DIR",
@@ -316,13 +320,27 @@ pub(crate) fn install(spec: &ServiceSpec, bin: &str, interval: u64, args: &[Stri
         fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
     // A failed reinstall must leave the running task's wrapper as it was.
-    let previous = fs::read(&wrapper).ok();
+    // A wrapper that exists but cannot be read stops the install before
+    // anything changes, so rollback never deletes a live task's wrapper.
+    let previous = match fs::read(&wrapper) {
+        Ok(bytes) => Some(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => {
+            return Err(error).with_context(|| format!("reading {}", wrapper.display()));
+        }
+    };
     fs::write(&wrapper, script).with_context(|| format!("writing {}", wrapper.display()))?;
     if let Err(error) = register(spec, minutes, &wrapper) {
-        let _ = match previous {
+        let restored = match previous {
             Some(bytes) => fs::write(&wrapper, bytes),
             None => fs::remove_file(&wrapper),
         };
+        if let Err(rollback) = restored {
+            return Err(error.context(format!(
+                "registering the task failed, and restoring {} failed too ({rollback})",
+                wrapper.display()
+            )));
+        }
         return Err(error);
     }
     let name = task_name(spec);
