@@ -14,7 +14,12 @@ pub(super) fn turn_usage(rows: &[Value], native: &str) -> Result<BTreeMap<String
                     .flatten();
                 last_assistant = None;
             }
-            Some("item.completed") if row["item"]["type"] == "agent_message" => {
+            Some("item.completed")
+                if matches!(
+                    row["item"]["type"].as_str(),
+                    Some("agent_message" | "tool_invocation")
+                ) =>
+            {
                 if current_turn.is_some()
                     && row["item"]["context"]["actor_id"] == native
                     && row["item"]["context"]["turn_id"].as_str() == current_turn

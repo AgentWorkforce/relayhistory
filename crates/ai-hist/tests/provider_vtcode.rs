@@ -446,6 +446,82 @@ fn tool_output_call_id_resolves_native_invocation_tool_id() {
         .any(|r| r.tool_use_id.as_deref() == Some("call-b")));
 }
 
+fn stage_tool_only(home: &Path, status: &str) {
+    let path = stage(home);
+    let mut rows = FIXTURE.lines().map(str::to_owned).collect::<Vec<_>>();
+    let mut invocation: serde_json::Value = serde_json::from_str(&rows[6]).unwrap();
+    invocation["event"]["item"]["status"] = status.into();
+    rows[6] = invocation.to_string();
+    let retained = [0, 4, 5, 6, 9]
+        .into_iter()
+        .map(|index| rows[index].as_str())
+        .collect::<Vec<_>>();
+    std::fs::write(path, format!("{}\n", retained.join("\n"))).unwrap();
+}
+
+#[test]
+fn invocation_failure_without_output_survives_retirement() {
+    let home = tempfile::tempdir().unwrap();
+    stage_tool_only(home.path(), "failed");
+    let store = open(home.path());
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    let e = evidence(&store, &sid(home.path()));
+    assert_eq!(e.tool_calls.len(), 1);
+    assert_eq!(e.tool_calls[0].is_error, Some(true));
+    assert!(e.tool_results.is_empty());
+}
+
+#[test]
+fn tool_only_turn_usage_attaches_to_recorded_invocation() {
+    let home = tempfile::tempdir().unwrap();
+    stage_tool_only(home.path(), "completed");
+    let store = open(home.path());
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    let e = evidence(&store, &sid(home.path()));
+    let assistant = e
+        .messages
+        .iter()
+        .find(|message| message.role == Role::Assistant)
+        .unwrap();
+    let usage = assistant
+        .usage
+        .as_ref()
+        .expect("native turn usage on tool use");
+    assert_eq!(usage.input_tokens, 16);
+    assert_eq!(usage.cache_read_tokens, 4);
+    assert_eq!(usage.output_tokens, 10);
+    assert_eq!(e.messages.iter().filter(|m| m.usage.is_some()).count(), 1);
+}
+
+#[test]
+fn rewritten_invocation_id_joins_its_current_output() {
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path());
+    let store = open(home.path());
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    let mut rows = FIXTURE.lines().map(str::to_owned).collect::<Vec<_>>();
+    for index in [5, 6] {
+        let mut invocation: serde_json::Value = serde_json::from_str(&rows[index]).unwrap();
+        invocation["event"]["item"]["tool_call_id"] = "call-new".into();
+        rows[index] = invocation.to_string();
+    }
+    let mut output: serde_json::Value = serde_json::from_str(&rows[7]).unwrap();
+    output["event"]["item"]
+        .as_object_mut()
+        .unwrap()
+        .remove("tool_call_id");
+    output["event"]["item"]["status"] = "failed".into();
+    rows[7] = output.to_string();
+    std::fs::write(path, format!("{}\n", rows.join("\n"))).unwrap();
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    let e = evidence(&store, &sid(home.path()));
+    assert_eq!(e.tool_calls.len(), 1);
+    assert_eq!(e.tool_calls[0].tool_use_id, "call-new");
+    assert_eq!(e.tool_calls[0].is_error, Some(true));
+    assert_eq!(e.tool_results.len(), 1);
+    assert_eq!(e.tool_results[0].tool_use_id.as_deref(), Some("call-new"));
+}
+
 #[test]
 fn thread_started_only_keeps_unknown_activity_time() {
     let home = tempfile::tempdir().unwrap();
@@ -735,6 +811,33 @@ fn native_export_remote_intake_then_local_hydrate_preserves_identities() {
     assert_eq!(after.messages, native.messages);
     assert_eq!(after.tool_calls, native.tool_calls);
     assert_eq!(after.markers, native.markers);
+    let control_only = [
+        FIXTURE.lines().next().unwrap(),
+        FIXTURE.lines().last().unwrap(),
+    ];
+    std::fs::write(&path, format!("{}\n", control_only.join("\n"))).unwrap();
+    receiver
+        .hydrate(
+            &SessionRef::id(Source::Vtcode, &id),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    let after_control = evidence(&receiver, &id);
+    assert_eq!(after_control.messages, native.messages);
+    assert_eq!(after_control.tool_calls, native.tool_calls);
+    let mut catalog_query = CatalogQuery::default();
+    catalog_query.sources = Some(vec![Source::Vtcode]);
+    let catalog = receiver.sessions(catalog_query).next().unwrap().unwrap();
+    assert_eq!(
+        catalog.first_prompt.as_deref(),
+        Some("Inspect the synthetic fixture")
+    );
+    assert_eq!(
+        catalog.last_assistant_text.as_deref(),
+        Some("Verification returned fixture.")
+    );
+    assert_eq!(catalog.first_activity_ms, Some(1_792_497_600_000));
+    assert_eq!(catalog.last_activity_ms, Some(1_792_497_666_000));
     let revision = receiver.head_revision().unwrap();
     std::fs::write(
         &path,
@@ -759,6 +862,6 @@ fn native_export_remote_intake_then_local_hydrate_preserves_identities() {
     let retained = evidence(&receiver, &id);
     assert_eq!(retained.messages, native.messages);
     assert_eq!(retained.tool_calls, native.tool_calls);
-    assert_eq!(retained.markers, native.markers);
+    assert_eq!(retained.markers, after_control.markers);
     assert_eq!(receiver.head_revision().unwrap(), revision);
 }

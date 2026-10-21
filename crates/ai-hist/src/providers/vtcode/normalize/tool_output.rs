@@ -1,25 +1,18 @@
 use super::*;
-use rusqlite::OptionalExtension;
 
 pub(super) fn result(
     conn: &Connection,
     sid: &str,
     cwd: Option<&str>,
     item: &Value,
+    calls: &BTreeMap<String, String>,
     keys: &mut Keys,
 ) -> Result<()> {
     let id = format::string(item, "id")?;
     let call_id = format::string(item, "call_id")?;
-    let invocation_tool_id: Option<String> = conn
-        .query_row(
-            "SELECT tool_use_id FROM tool_calls WHERE source=?1 AND session_id=?2 AND message_id=?3",
-            rusqlite::params![ID, sid, call_id],
-            |row| row.get(0),
-        )
-        .optional()?;
     let tool_id = item["tool_call_id"]
         .as_str()
-        .or(invocation_tool_id.as_deref())
+        .or_else(|| calls.get(call_id).map(String::as_str))
         .unwrap_or(call_id);
     let ts = format::time(format::string(&item["context"], "timestamp")?)?;
     let text = item["output"].as_str().unwrap_or("");

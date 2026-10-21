@@ -8,7 +8,27 @@ use crate::providers::shared_evidence::Snapshot;
 use crate::{insert_history, insert_session_marker, HistoryEntry, NewSessionMarker};
 use std::collections::BTreeMap;
 
+mod catalog;
 mod tool_output;
+
+fn current_calls(rows: &[Value], native: &str) -> Result<BTreeMap<String, String>> {
+    let mut calls = BTreeMap::new();
+    for row in rows {
+        if row["type"] == "item.completed"
+            && row["item"]["type"] == "tool_invocation"
+            && row["item"]["context"]["actor_id"] == native
+        {
+            let item = &row["item"];
+            let id = format::string(item, "id")?;
+            let tool_id = item["tool_call_id"].as_str().unwrap_or(id);
+            anyhow::ensure!(
+                calls.insert(id.to_owned(), tool_id.to_owned()).is_none(),
+                "VTCODE_INVALID_RECORD: duplicate tool invocation item id"
+            );
+        }
+    }
+    Ok(calls)
+}
 
 pub(super) fn validate_native(rows: &[Value], native: &str) -> Result<()> {
     for row in rows {
@@ -58,49 +78,18 @@ pub(super) fn write(conn: &Connection, payload: &Value, path: &Path) -> Result<u
         repair_order(conn, sid, native, cwd.as_deref(), rows)?;
     }
     if let Some(first) = written.first {
-        let summary = WriteSummary {
+        let summary = catalog::Summary {
             cwd: cwd.as_deref(),
             first,
             last: written.last.unwrap_or(first),
             last_assistant: written.last_assistant,
         };
-        write_catalog(conn, sid, native, path, rows, complete, &summary)?;
+        catalog::timed(conn, sid, native, path, rows, complete, &summary)?;
     } else {
-        write_untimed_catalog(conn, sid, cwd.as_deref(), path, complete)?;
+        catalog::untimed(conn, sid, cwd.as_deref(), path, complete)?;
     }
     shared.ensure_unchanged(conn, sid)?;
     Ok(written.inserted)
-}
-
-fn write_untimed_catalog(
-    conn: &Connection,
-    sid: &str,
-    cwd: Option<&str>,
-    path: &Path,
-    complete: bool,
-) -> Result<()> {
-    crate::discover::upsert_shallow_session(
-        conn,
-        &ShallowSession {
-            source: ID.into(),
-            session_id: sid.into(),
-            cwd: cwd.map(str::to_owned),
-            raw_path: Some(path.to_string_lossy().into_owned()),
-            discovery_state: if complete { "full" } else { "shallow" }.into(),
-            ..Default::default()
-        },
-    )?;
-    if complete {
-        conn.execute(
-            "UPDATE sessions SET discovery_state='full' WHERE source='vtcode' AND session_id=?1",
-            [sid],
-        )?;
-        conn.execute(
-            "UPDATE sessions SET first_activity_ms=NULL,last_activity_ms=NULL,first_prompt=NULL,last_assistant_text=NULL WHERE source='vtcode' AND session_id=?1 AND NOT EXISTS (SELECT 1 FROM session_presences WHERE source='vtcode' AND session_id=?1 AND location='remote')",
-            [sid],
-        )?;
-    }
-    Ok(())
 }
 
 fn repair_order(
@@ -116,9 +105,11 @@ fn repair_order(
         return Ok(());
     }
     let usage = usage::turn_usage(rows, native)?;
+    let calls = current_calls(rows, native)?;
     let replay = ReplayFacts {
         reordered: &reordered,
         usage: &usage,
+        calls: &calls,
     };
     let mut replay_keys = Keys::default();
     for row in rows {
@@ -130,6 +121,7 @@ fn repair_order(
 struct ReplayFacts<'a> {
     reordered: &'a std::collections::BTreeSet<i64>,
     usage: &'a BTreeMap<String, String>,
+    calls: &'a BTreeMap<String, String>,
 }
 
 fn replay_row(
@@ -164,8 +156,15 @@ fn replay_row(
                 replay.usage.get(format::string(item, "id")?),
                 keys,
             )?,
-            Some("tool_invocation") => call(conn, sid, cwd, item, keys)?,
-            Some("tool_output") => tool_output::result(conn, sid, cwd, item, keys)?,
+            Some("tool_invocation") => call(
+                conn,
+                sid,
+                cwd,
+                item,
+                replay.usage.get(format::string(item, "id")?),
+                keys,
+            )?,
+            Some("tool_output") => tool_output::result(conn, sid, cwd, item, replay.calls, keys)?,
             _ => {}
         }
     }
@@ -207,6 +206,56 @@ struct WrittenRows<'a> {
     last_assistant: Option<&'a str>,
 }
 
+struct CaptureFacts<'a> {
+    usage: &'a BTreeMap<String, String>,
+    calls: &'a BTreeMap<String, String>,
+}
+
+fn write_item<'a>(
+    conn: &Connection,
+    sid: &str,
+    cwd: Option<&str>,
+    row: &'a Value,
+    index: usize,
+    facts: &CaptureFacts<'_>,
+    keys: &mut Keys,
+) -> Result<Option<&'a str>> {
+    let item = &row["item"];
+    match item["type"].as_str() {
+        Some("agent_message") => {
+            let text = format::text(item, "text")?;
+            assistant(
+                conn,
+                sid,
+                cwd,
+                item,
+                facts.usage.get(format::string(item, "id")?),
+                keys,
+            )?;
+            Ok(Some(text))
+        }
+        Some("tool_invocation") => {
+            call(
+                conn,
+                sid,
+                cwd,
+                item,
+                facts.usage.get(format::string(item, "id")?),
+                keys,
+            )?;
+            Ok(None)
+        }
+        Some("tool_output") => {
+            tool_output::result(conn, sid, cwd, item, facts.calls, keys)?;
+            Ok(None)
+        }
+        _ => {
+            marker(conn, sid, row, index, keys)?;
+            Ok(None)
+        }
+    }
+}
+
 fn write_rows<'a>(
     conn: &Connection,
     sid: &str,
@@ -218,6 +267,11 @@ fn write_rows<'a>(
     let mut inserted = 0;
     let mut last_assistant = None;
     let usage = usage::turn_usage(rows, native)?;
+    let calls = current_calls(rows, native)?;
+    let facts = CaptureFacts {
+        usage: &usage,
+        calls: &calls,
+    };
     let mut first = None;
     let mut last = None;
     for (index, row) in rows.iter().enumerate() {
@@ -232,22 +286,8 @@ fn write_rows<'a>(
         {
             inserted += prompt(conn, sid, cwd, row, &mut keys)?;
         } else if row["type"] == "item.completed" && row["item"]["context"]["actor_id"] == native {
-            let item = &row["item"];
-            match item["type"].as_str() {
-                Some("agent_message") => {
-                    last_assistant = Some(format::text(item, "text")?);
-                    assistant(
-                        conn,
-                        sid,
-                        cwd,
-                        item,
-                        usage.get(format::string(item, "id")?),
-                        &mut keys,
-                    )?;
-                }
-                Some("tool_invocation") => call(conn, sid, cwd, item, &mut keys)?,
-                Some("tool_output") => tool_output::result(conn, sid, cwd, item, &mut keys)?,
-                _ => marker(conn, sid, row, index, &mut keys)?,
+            if let Some(text) = write_item(conn, sid, cwd, row, index, &facts, &mut keys)? {
+                last_assistant = Some(text);
             }
         } else {
             marker(conn, sid, row, index, &mut keys)?;
@@ -260,47 +300,6 @@ fn write_rows<'a>(
         last,
         last_assistant,
     })
-}
-
-struct WriteSummary<'a> {
-    cwd: Option<&'a str>,
-    first: i64,
-    last: i64,
-    last_assistant: Option<&'a str>,
-}
-fn write_catalog(
-    conn: &Connection,
-    sid: &str,
-    native: &str,
-    path: &Path,
-    rows: &[Value],
-    complete: bool,
-    summary: &WriteSummary<'_>,
-) -> Result<()> {
-    let writer = if complete {
-        upsert_session_rebuilt
-    } else {
-        crate::ingest::upsert_session
-    };
-    writer(
-        conn,
-        &SessionCatalogRow {
-            source: ID,
-            session_id: sid,
-            cwd: summary.cwd,
-            git_branch: None,
-            first_ts: summary.first,
-            last_ts: summary.last,
-            last_assistant_text: summary.last_assistant,
-            raw_path: Some(&path.to_string_lossy()),
-        },
-    )?;
-    let first_prompt = format::first_prompt(rows, native).map(|(text, _, _)| text);
-    if complete || first_prompt.is_some() {
-        conn.execute("UPDATE sessions SET first_prompt=?2 WHERE source='vtcode' AND session_id=?1 AND first_prompt IS NOT ?2",
-            rusqlite::params![sid, first_prompt])?;
-    }
-    Ok(())
 }
 
 fn has_evidence(conn: &Connection, sid: &str) -> Result<bool> {
@@ -395,12 +394,18 @@ fn call(
     sid: &str,
     cwd: Option<&str>,
     item: &Value,
+    usage: Option<&String>,
     keys: &mut Keys,
 ) -> Result<()> {
     let id = format::string(item, "id")?;
     let tool_id = item["tool_call_id"].as_str().unwrap_or(id);
     let ts = format::time(format::string(&item["context"], "timestamp")?)?;
     let args = serde_json::to_string(&item["arguments"])?;
+    let status = match item["status"].as_str() {
+        Some("failed") => Some(true),
+        Some("completed") => Some(false),
+        _ => None,
+    };
     insert_tool_call(
         conn,
         &ToolCallRef {
@@ -415,13 +420,12 @@ fn call(
         format::string(item, "tool_name")?,
         None,
         &args,
-        match item["status"].as_str() {
-            Some("failed") => Some(true),
-            Some("completed") => Some(false),
-            _ => None,
-        },
+        status,
     )?;
     keys.tools.insert(tool_id.into());
+    if status.is_some() {
+        keys.results.insert(tool_id.into());
+    }
     let uid = format!("{id}:0");
     let facts = ToolResultFacts {
         tool_use_id: Some(tool_id.into()),
@@ -437,6 +441,7 @@ fn call(
             role: "assistant",
             kind: "tool_use",
             text: Some(&args),
+            token_json: usage.map(String::as_str),
             ts_ms: ts,
             cwd,
             project: cwd,
