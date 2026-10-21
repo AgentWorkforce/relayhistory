@@ -296,6 +296,9 @@ fn wrapper_path(spec: &ServiceSpec) -> PathBuf {
         .filter(|dir| !dir.is_empty())
         .map(PathBuf::from)
         .unwrap_or_else(|| ai_hist::paths::home_dir().join(".local").join("share"));
+    // The task's action names this path, so a relative XDG_DATA_HOME is
+    // anchored here rather than wherever a scheduled run would resolve it.
+    let data = std::path::absolute(&data).unwrap_or(data);
     data.join("ai-hist")
         .join("services")
         .join(format!("{}.cmd", spec.log_stem))
