@@ -249,8 +249,11 @@ public `name` and `description`; and `leave_relay` removes it. They make short
 local Unix-socket requests to Agent Relay desktop. Roster listing accepts
 optional `query`, `where` (`this_computer`, `cloud`, or `other_desktop`), and
 `include_idle` inputs. Socket discovery checks
-`AGENT_RELAY_SOCKET`, then `~/.agentworkforce/desktop/relay-socket`, then the
-macOS/Linux defaults. No Relaycast client or cloud credential is part of
+`AGENT_RELAY_SOCKET`, then the first line of `~/.agentworkforce/desktop/relay-socket`, then the
+macOS/Linux defaults. Windows has no default: Agent Relay desktop does not yet
+listen on Windows, and when it does it must publish its named pipe through one
+of those two, since a fixed pipe name could be claimed first by another local
+process. No Relaycast client or cloud credential is part of
 ai-hist; when the desktop is absent the tool returns a clear non-fatal result.
 A connected desktop has a 15-second response deadline. If it does not answer in
 that time, the tool reports `timeout` distinctly from an absent app.

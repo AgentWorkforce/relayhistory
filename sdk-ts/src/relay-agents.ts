@@ -1,7 +1,7 @@
 import { readFile } from 'node:fs/promises';
 import { request } from 'node:http';
 import { homedir, tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, posix } from 'node:path';
 
 const NOT_RUNNING = "Agent Relay desktop isn't running on this machine; open it, or use the Agent Relay MCP";
 const DESKTOP_TIMEOUT = "Agent Relay desktop didn't answer in time";
@@ -77,6 +77,8 @@ export class RelayAgentsError extends Error {
 
 class SocketUnavailable extends Error {}
 class SocketPermissionDenied extends Error {}
+/** A Windows pipe with every instance in use: present, but not this attempt. */
+class SocketBusy extends Error {}
 
 /** List live Relay participants through the local desktop app, never the cloud. */
 export async function listRelayAgents(
@@ -134,11 +136,16 @@ async function relayRequest(
   const paths = await relaySocketCandidates(runtime);
   let permissionError: SocketPermissionDenied | undefined;
   let timeoutError: RelayAgentsError | undefined;
+  let busyError: SocketBusy | undefined;
   for (const path of paths) {
     try {
       return await requestSocket(path, method, target, body, runtime.timeoutMs ?? DEFAULT_TIMEOUT_MS);
     } catch (error) {
       if (error instanceof SocketUnavailable) continue;
+      if (error instanceof SocketBusy) {
+        busyError = error;
+        continue;
+      }
       if (error instanceof SocketPermissionDenied) {
         permissionError = error;
         continue;
@@ -154,6 +161,7 @@ async function relayRequest(
   if (permissionError) {
     throw new RelayAgentsError('socket_access_denied', permissionError.message);
   }
+  if (busyError) throw new RelayAgentsError('socket_busy', busyError.message);
   return { available: false, message: NOT_RUNNING };
 }
 
@@ -172,25 +180,32 @@ export async function relaySocketCandidates(runtime: RelaySocketRuntime = {}): P
 
   add(env.AGENT_RELAY_SOCKET);
   try {
-    add(await readFile(join(home, '.agentworkforce', 'desktop', 'relay-socket'), 'utf8'));
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'ENOENT') {
-      // An unreadable/stale pointer must not prevent trying the platform path.
-    }
+    // The pointer is the socket path plus a newline (LF or CRLF); only its
+    // first line names the socket.
+    const pointer = await readFile(join(home, '.agentworkforce', 'desktop', 'relay-socket'), 'utf8');
+    add(pointer.split(/\r?\n/u, 1)[0]);
+  } catch {
+    // A missing, unreadable or stale pointer must not prevent trying the platform path.
   }
 
   if (platform === 'darwin') {
-    add(join(home, 'Library', 'Application Support', 'com.agentrelay.desktop', 'run', 'relay.sock'));
-    add(join(home, 'Library', 'Application Support', 'com.agentrelay.desktop.dev', 'run', 'relay.sock'));
-    add(join(temporary, `agent-relay-${uid}`, 'relay.sock'));
-    add(join(temporary, `agent-relay-dev-${uid}`, 'relay.sock'));
-    add(join('/tmp', `agent-relay-${uid}`, 'relay.sock'));
-    add(join('/tmp', `agent-relay-dev-${uid}`, 'relay.sock'));
+    add(posix.join(home, 'Library', 'Application Support', 'com.agentrelay.desktop', 'run', 'relay.sock'));
+    add(posix.join(home, 'Library', 'Application Support', 'com.agentrelay.desktop.dev', 'run', 'relay.sock'));
+    add(posix.join(temporary, `agent-relay-${uid}`, 'relay.sock'));
+    add(posix.join(temporary, `agent-relay-dev-${uid}`, 'relay.sock'));
+    add(posix.join('/tmp', `agent-relay-${uid}`, 'relay.sock'));
+    add(posix.join('/tmp', `agent-relay-dev-${uid}`, 'relay.sock'));
   } else if (platform === 'linux') {
     const runtimeDirectory = env.XDG_RUNTIME_DIR?.trim();
-    if (runtimeDirectory) add(join(runtimeDirectory, 'agent-relay', 'relay.sock'));
-    add(join(env.XDG_DATA_HOME?.trim() || join(home, '.local', 'share'), 'com.agentrelay.desktop', 'run', 'relay.sock'));
+    if (runtimeDirectory) add(posix.join(runtimeDirectory, 'agent-relay', 'relay.sock'));
+    add(posix.join(
+      env.XDG_DATA_HOME?.trim() || posix.join(home, '.local', 'share'), 'com.agentrelay.desktop', 'run', 'relay.sock',
+    ));
   }
+  // Windows has no default: Node reaches a local socket there only as a named
+  // pipe, and pipe names are machine-wide, so any local process could claim a
+  // fixed name first and pose as the desktop. The desktop must publish its
+  // pipe through AGENT_RELAY_SOCKET or the pointer file in the user's profile.
   return result;
 }
 
@@ -286,6 +301,8 @@ function requestSocket(
       const message = `Cannot access Agent Relay desktop socket at ${path}: ${error.message}`;
       if (error.code === 'EACCES' || error.code === 'EPERM') {
         finish(() => reject(new SocketPermissionDenied(message)));
+      } else if (!requestSent && error.code === 'EBUSY') {
+        finish(() => reject(new SocketBusy(message)));
       } else if (error.code === 'ENOENT' || error.code === 'ENOTDIR'
         || error.code === 'ECONNREFUSED' || error.code === 'EINVAL'
         || (!requestSent && (error.code === 'EAGAIN' || error.code === 'ETIMEDOUT'))) {
