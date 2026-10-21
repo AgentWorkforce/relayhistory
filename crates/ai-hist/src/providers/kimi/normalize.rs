@@ -166,7 +166,7 @@ fn message(
         ..Default::default()
     };
     let text = format::text(&msg["content"]);
-    if !text.is_empty() {
+    if role == "tool" || !text.is_empty() {
         let eid = format!("{generated}:text");
         let mut facts = ToolResultFacts::from_payload(&msg["content"]);
         facts.tool_use_id = msg["toolCallId"].as_str().map(str::to_owned);

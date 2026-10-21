@@ -109,6 +109,51 @@ fn native_tools_join_without_streaming_context_duplicates() {
     assert!(e.markers.len() > e.messages.len());
 }
 #[test]
+fn empty_native_tool_results_keep_their_call_identity() {
+    for content in [
+        serde_json::json!([]),
+        serde_json::json!([{"type":"text","text":""}]),
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let wire = stage(home.path(), "tool");
+        let rewritten = std::fs::read_to_string(&wire)
+            .unwrap()
+            .lines()
+            .map(|line| {
+                let mut row: serde_json::Value = serde_json::from_str(line).unwrap();
+                if row["type"] == "agent.message.appended"
+                    && row["message"]["message"]["role"] == "tool"
+                {
+                    row["message"]["message"]["content"] = content.clone();
+                }
+                row.to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(wire, format!("{rewritten}\n")).unwrap();
+        let store = open(home.path());
+        store.sync(SyncOptions::default().force(true)).unwrap();
+        let native = evidence(&store, 2, "main");
+        assert_eq!(native.tool_calls.len(), 1);
+        let call_id = &native.tool_calls[0].tool_use_id;
+        let results = native
+            .messages
+            .iter()
+            .flat_map(|m| &m.blocks)
+            .filter(|block| {
+                block.kind == ai_hist::BlockKind::ToolResult
+                    && block.tool_use_id.as_deref() == Some(call_id.as_str())
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            results.len(),
+            1,
+            "empty native result must join its tool call"
+        );
+        assert_eq!(results[0].text.as_deref(), Some(""));
+    }
+}
+#[test]
 fn known_id_resume_and_subagent_wires_remain_separate() {
     let home = tempfile::tempdir().unwrap();
     stage(home.path(), "resumed");
