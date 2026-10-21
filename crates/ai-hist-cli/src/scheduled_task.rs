@@ -135,9 +135,30 @@ fn batch_quote_arg(value: &str) -> String {
     batch_quote(&format!("{value}{}", "\\".repeat(trailing)))
 }
 
+/// Captured variables that hold a name or suffix rather than a path.
+const NON_PATH_ENV_VARS: [&str; 4] = [
+    "HERMES_DATA_DIR_SUFFIX",
+    "OMP_PROFILE",
+    "OPENCLAW_PROFILE",
+    "PI_PROFILE",
+];
+
+/// `value` of `name` as the task should see it: a relative path is resolved
+/// against `cwd` (the install directory), because a scheduled run starts
+/// elsewhere. Names, absolute paths and `~` paths (which providers expand
+/// themselves) are kept as they are.
+pub(crate) fn task_environment_value(name: &str, value: String, cwd: &Path) -> String {
+    let relative = !Path::new(&value).is_absolute() && !value.starts_with('~');
+    if relative && !NON_PATH_ENV_VARS.contains(&name) {
+        cwd.join(&value).display().to_string()
+    } else {
+        value
+    }
+}
+
 /// The environment the task needs, read from this process: the provider roots
 /// the launchd and cron services capture, plus [`WINDOWS_EXTRA_ENV_VARS`].
-fn task_environment(spec: &ServiceSpec) -> Result<Vec<(&'static str, String)>> {
+fn task_environment(spec: &ServiceSpec, cwd: &Path) -> Result<Vec<(&'static str, String)>> {
     let mut environment = service_provider_environment(spec)?;
     for name in WINDOWS_EXTRA_ENV_VARS {
         let Some(value) = std::env::var_os(name) else {
@@ -147,23 +168,23 @@ fn task_environment(spec: &ServiceSpec) -> Result<Vec<(&'static str, String)>> {
             environment.push((name, value));
         }
     }
-    Ok(environment)
+    Ok(environment
+        .into_iter()
+        .map(|(name, value)| (name, task_environment_value(name, value, cwd)))
+        .collect())
 }
 
-/// The `.cmd` wrapper the task runs: set the environment, `pushd` to `cwd` (the
-/// install directory, so relative provider roots resolve as they did there),
-/// run ai-hist, append its output to `log`. CRLF line endings, UTF-8 (switched
-/// to with `chcp` before any non-ASCII line is read).
+/// The `.cmd` wrapper the task runs: set the environment, run ai-hist, append
+/// its output to `log`. CRLF line endings, UTF-8 (switched to with `chcp`
+/// before any non-ASCII line is read).
 pub(crate) fn wrapper_script(
     spec: &ServiceSpec,
     bin: &str,
     args: &[String],
     environment: &[(&str, String)],
-    cwd: &str,
     log: &str,
 ) -> Result<String> {
     reject_quote("the ai-hist binary path", bin)?;
-    reject_quote("the install directory", cwd)?;
     reject_quote("the service log path", log)?;
     let mut lines = vec![
         "@echo off".to_string(),
@@ -178,11 +199,6 @@ pub(crate) fn wrapper_script(
         reject_quote(name, value)?;
         lines.push(format!("set {}", batch_quote(&format!("{name}={value}"))));
     }
-    lines.push(format!(
-        "pushd {} >> {} 2>&1 || exit /b 1",
-        batch_quote(cwd),
-        batch_quote(log)
-    ));
     let mut command = vec![batch_quote(bin)];
     for arg in service_command_args(spec, args) {
         reject_quote("a service argument", &arg)?;
@@ -193,9 +209,6 @@ pub(crate) fn wrapper_script(
         command.join(" "),
         batch_quote(log)
     ));
-    // `pushd` into a UNC directory maps a drive letter that outlives the
-    // script unless `popd` releases it.
-    lines.push("popd".to_string());
     Ok(format!("{}\r\n", lines.join("\r\n")))
 }
 
@@ -326,18 +339,11 @@ pub(crate) fn install(spec: &ServiceSpec, bin: &str, interval: u64, args: &[Stri
             "Note: Task Scheduler runs at 1-minute granularity; --interval={interval}s scheduled as {cadence}."
         );
     }
-    let environment = task_environment(spec)?;
+    let cwd = std::env::current_dir().context("reading the current directory")?;
+    let environment = task_environment(spec, &cwd)?;
     let log = std::env::temp_dir().join(format!("{}.log", spec.log_stem));
     let wrapper = wrapper_path(spec);
-    let cwd = std::env::current_dir().context("reading the current directory")?;
-    let script = wrapper_script(
-        spec,
-        bin,
-        args,
-        &environment,
-        &cwd.display().to_string(),
-        &log.display().to_string(),
-    )?;
+    let script = wrapper_script(spec, bin, args, &environment, &log.display().to_string())?;
     if let Some(dir) = wrapper.parent() {
         fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
@@ -501,7 +507,6 @@ mod tests {
             r"C:\Program Files\ai-hist\ai-hist.exe",
             &["--source-connector".to_string(), "devin".to_string()],
             &environment,
-            r"C:\work & play",
             r"C:\Users\Ann Lee\AppData\Local\Temp\ai-hist-sync.log",
         )
         .unwrap();
@@ -512,23 +517,32 @@ mod tests {
         assert_eq!(lines[3], "setlocal DisableDelayedExpansion");
         assert_eq!(lines[4], r#"set "CLAUDE_CONFIG_DIR=D:\Claude & tools""#);
         assert_eq!(lines[5], r#"set "CODEX_HOME=D:\codex's 100%% archive""#);
-        // Relative provider roots resolve against the install directory.
-        // `pushd` also enters a UNC directory; a sync that cannot get there
-        // stops rather than reading relative roots from the wrong place.
         assert_eq!(
             lines[6],
-            r#"pushd "C:\work & play" >> "C:\Users\Ann Lee\AppData\Local\Temp\ai-hist-sync.log" 2>&1 || exit /b 1"#
-        );
-        assert_eq!(
-            lines[7],
             r#""C:\Program Files\ai-hist\ai-hist.exe" "sync" "--source-connector" "devin" >> "C:\Users\Ann Lee\AppData\Local\Temp\ai-hist-sync.log" 2>&1"#
         );
-        assert_eq!(lines[8], "popd");
-        assert_eq!(lines[9], "");
+        assert_eq!(lines[7], "");
         assert!(
             !script.replace("\r\n", "").contains('\n'),
             "every line ends in CRLF"
         );
+    }
+
+    #[test]
+    fn relative_roots_resolve_against_the_install_directory() {
+        let cwd = std::env::current_dir().unwrap();
+        let resolve = |name, value: &str| task_environment_value(name, value.to_string(), &cwd);
+        // A scheduled run starts elsewhere, so a relative root is made absolute.
+        assert_eq!(
+            resolve("OPENCLAW_STATE_DIR", "state"),
+            cwd.join("state").display().to_string()
+        );
+        // Absolute and `~` paths, and names that are not paths, stay as given.
+        let absolute = cwd.join("qwen").display().to_string();
+        assert_eq!(resolve("QWEN_HOME", &absolute), absolute);
+        assert_eq!(resolve("OPENCLAW_HOME", "~/claw"), "~/claw");
+        assert_eq!(resolve("OMP_PROFILE", "work"), "work");
+        assert_eq!(resolve("HERMES_DATA_DIR_SUFFIX", "dev"), "dev");
     }
 
     #[test]
@@ -538,7 +552,6 @@ mod tests {
             r"C:\ai-hist.exe",
             &[],
             &[("CODEX_HOME", r#"D:\a"b"#.to_string())],
-            r"C:\work",
             r"C:\log",
         )
         .unwrap_err();
