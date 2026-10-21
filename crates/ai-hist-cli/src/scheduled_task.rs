@@ -36,7 +36,7 @@ const EXECUTION_TIME_LIMIT: &str = "PT6H";
 /// Task Scheduler starts from the user's registry environment, which lacks
 /// shell-only variables: `HOME` (`home_dir()` prefers it over `USERPROFILE`)
 /// and the provider roots the shared launchd/cron list does not carry yet.
-const WINDOWS_EXTRA_ENV_VARS: [&str; 14] = [
+const WINDOWS_EXTRA_ENV_VARS: [&str; 16] = [
     "HOME",
     "COPILOT_HOME",
     "GROK_BOT_USER_DATA",
@@ -51,6 +51,8 @@ const WINDOWS_EXTRA_ENV_VARS: [&str; 14] = [
     "PI_CODING_AGENT_SESSION_DIR",
     "PI_CONFIG_DIR",
     "PI_PROFILE",
+    "QWEN_HOME",
+    "QWEN_RUNTIME_DIR",
 ];
 
 /// The task's full path, e.g. `\RelayHistory\ai-hist-sync-ann`. Task paths are
@@ -148,7 +150,7 @@ fn task_environment(spec: &ServiceSpec) -> Result<Vec<(&'static str, String)>> {
     Ok(environment)
 }
 
-/// The `.cmd` wrapper the task runs: set the environment, change to `cwd` (the
+/// The `.cmd` wrapper the task runs: set the environment, `pushd` to `cwd` (the
 /// install directory, so relative provider roots resolve as they did there),
 /// run ai-hist, append its output to `log`. CRLF line endings, UTF-8 (switched
 /// to with `chcp` before any non-ASCII line is read).
@@ -176,7 +178,11 @@ pub(crate) fn wrapper_script(
         reject_quote(name, value)?;
         lines.push(format!("set {}", batch_quote(&format!("{name}={value}"))));
     }
-    lines.push(format!("cd /d {}", batch_quote(cwd)));
+    lines.push(format!(
+        "pushd {} >> {} 2>&1 || exit /b 1",
+        batch_quote(cwd),
+        batch_quote(log)
+    ));
     let mut command = vec![batch_quote(bin)];
     for arg in service_command_args(spec, args) {
         reject_quote("a service argument", &arg)?;
@@ -504,7 +510,12 @@ mod tests {
         assert_eq!(lines[4], r#"set "CLAUDE_CONFIG_DIR=D:\Claude & tools""#);
         assert_eq!(lines[5], r#"set "CODEX_HOME=D:\codex's 100%% archive""#);
         // Relative provider roots resolve against the install directory.
-        assert_eq!(lines[6], r#"cd /d "C:\work & play""#);
+        // `pushd` also enters a UNC directory; a sync that cannot get there
+        // stops rather than reading relative roots from the wrong place.
+        assert_eq!(
+            lines[6],
+            r#"pushd "C:\work & play" >> "C:\Users\Ann Lee\AppData\Local\Temp\ai-hist-sync.log" 2>&1 || exit /b 1"#
+        );
         assert_eq!(
             lines[7],
             r#""C:\Program Files\ai-hist\ai-hist.exe" "sync" "--source-connector" "devin" >> "C:\Users\Ann Lee\AppData\Local\Temp\ai-hist-sync.log" 2>&1"#
