@@ -124,12 +124,13 @@ fn sweep_dir(
             if held.contains(&native) || !seen.insert(native.clone()) {
                 return Ok((0, false, native));
             }
+            let id = s.id.clone();
             let tx = ctx.conn.unchecked_transaction()?;
-            let n = legacy::complete_or_append(&tx, &s, path)?;
+            let n = legacy::complete_or_append(&tx, s, path)?;
             // A rewritten file that now holds another session drops the old,
             // once the rewrite is complete.
             if !partial {
-                file_history::retire_locator_sessions(&tx, ID, path, Some(&s.id))?;
+                file_history::retire_locator_sessions(&tx, ID, path, Some(&id))?;
             }
             tx.commit()?;
             Ok((n, partial, native))

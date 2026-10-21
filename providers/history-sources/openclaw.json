@@ -14,7 +14,7 @@
       "files": [
         "openclaw/main-schema24.sql"
       ],
-      "quirk": "OpenClaw 2026.10.4 writer, agent schema 24, deterministic clock/UUIDs: Pi v4 entries in transcript_events incl. one writer-compressed zstd row, non-UUID session ID, main and Telegram session keys, thinking/tool calls/results with isError, per-message usage, zero-usage delivery mirror."
+      "quirk": "OpenClaw 2026.10.4 writer, agent schema 24, deterministic clock/UUIDs: Pi v4 entries in transcript_events incl. one writer-compressed zstd row, session keys as conversation identity, main and Telegram keys, thinking/tool calls/results with isError, per-message usage, zero-usage delivery mirror, shared-mode heartbeat polls (marker and legacy prompt) with quiet acknowledgements."
     },
     {
       "source": "openclaw",
@@ -25,7 +25,7 @@
       "files": [
         "openclaw/ops-schema24.sql"
       ],
-      "quirk": "Second agent database from the same writer run: relay DM session key under a non-main agent ID, namespaced by agent."
+      "quirk": "Second agent database from the same writer run: relay DM key under a non-main agent ID, and an isolated cron job whose two runs are two windows of one session key."
     },
     {
       "source": "openclaw",
@@ -74,7 +74,7 @@
   "capture": [
     {
       "evidence": "Messages and tools",
-      "coverage": "Agent schema 19-31 transcript rows (JSON, or zstd from schema 23) and verified cold archives (file or SQLite, from schema 21), plus the pre-2026.8 JSONL store (`sessions/*.jsonl` with its `sessions.json` index), full entry tree with native entry IDs, user/assistant/thinking/tool content, toolCallId joins and isError outcomes; session key, agent ID and channel retained as metadata. A session the agent database holds is read from it, never also from JSONL."
+      "coverage": "One session per OpenClaw session key for agent databases (every window: resets, isolated cron and heartbeat runs; cron run keys fold into their job); one per transcript for the pre-2026.8 JSONL store. Agent schema 19-31 transcript rows (JSON, or zstd from schema 23) and verified cold archives (file or SQLite, from schema 21), plus the JSONL store (`sessions/*.jsonl` with its `sessions.json` index), full entry tree with native entry IDs, user/assistant/thinking/tool content, toolCallId joins and isError outcomes; session key, agent ID and channel retained as metadata; heartbeat and wake prompts are controls. A session the agent database holds is read from it, never also from JSONL."
     },
     {
       "evidence": "Usage and relationships",

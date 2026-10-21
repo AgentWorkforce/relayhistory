@@ -3,6 +3,77 @@
 use super::*;
 use anyhow::{ensure, Context};
 
+// `src/auto-reply/heartbeat.ts` and `heartbeat-filter.ts` at the reviewed
+// upstream revision: the transcript markers internal wakes persist instead
+// of their prompt, the current and legacy default prompts, and the periodic
+// task prompt.
+const WAKE_MARKERS: &[&str] = &[
+    "[OpenClaw heartbeat poll]",
+    "[OpenClaw cron wake]",
+    "[OpenClaw session event]",
+    "[OpenClaw exec completion]",
+];
+const HEARTBEAT_PROMPTS: &[&str] = &[
+    "Follow the heartbeat monitor scratch context when provided. Recurring tasks are automations; create or change their schedules with the automations tool, not heartbeat scratch. Do not infer or repeat old tasks from prior chats. If nothing needs attention, reply NO_REPLY.",
+    "Read HEARTBEAT.md if it exists (workspace context). Follow it strictly. Do not infer or repeat old tasks from prior chats. If nothing needs attention, reply HEARTBEAT_OK.",
+];
+const TASK_PROMPT: &str =
+    "Run the following periodic tasks (only those due based on their intervals):";
+const TASK_COMPLETIONS: &[&str] = &[
+    "After completing all due tasks, reply HEARTBEAT_OK.",
+    "After completing all due tasks, reply NO_REPLY.",
+    "Use heartbeat_respond to report the wake outcome.",
+];
+/// Upstream's `isHeartbeatUserMessage` for an unconfigured prompt: an internal
+/// wake marker, a default heartbeat prompt (alone or followed by a newline),
+/// or the periodic-task prompt.
+pub(super) fn is_heartbeat_prompt(text: &str) -> bool {
+    let text = text.trim();
+    WAKE_MARKERS.contains(&text)
+        || text.starts_with("[OpenClaw exec completion]\n")
+        || HEARTBEAT_PROMPTS.iter().any(|p| {
+            text == *p
+                || text
+                    .strip_prefix(p)
+                    .is_some_and(|rest| rest.starts_with('\n'))
+        })
+        || (text.starts_with(TASK_PROMPT) && TASK_COMPLETIONS.iter().any(|c| text.contains(c)))
+}
+/// A quiet heartbeat reply (`stripHeartbeatToken` in heartbeat mode): the
+/// silent token alone, or the heartbeat token at either edge of at most 300
+/// further characters.
+pub(super) fn is_heartbeat_ack(text: &str) -> bool {
+    let trimmed = text
+        .trim()
+        .trim_matches(|c| matches!(c, '*' | '`' | '~' | '_'));
+    if trimmed == "NO_REPLY" {
+        return true;
+    }
+    let rest = trimmed
+        .strip_prefix("HEARTBEAT_OK")
+        .or_else(|| trimmed.strip_suffix("HEARTBEAT_OK"));
+    rest.is_some_and(|rest| rest.trim().chars().count() <= 300)
+}
+/// A tool-call ID inside its window's scope (see `Conversation::tool_scope`).
+pub(super) fn scoped(id: &str, scope: Option<&str>) -> String {
+    match scope {
+        Some(window) => format!("{id}#{window}"),
+        None => id.into(),
+    }
+}
+/// Text blocks concatenated as upstream's heartbeat filter reads them.
+fn joined_text(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) => blocks
+            .iter()
+            .filter(|b| b["type"] == "text")
+            .filter_map(|b| b["text"].as_str())
+            .collect(),
+        _ => String::new(),
+    }
+}
+
 /// A user-role record OpenClaw wrote itself rather than a human prompt.
 pub(super) fn control_kind(msg: &Value) -> Option<&'static str> {
     // `external_user` provenance is a person on another channel, and Codex
@@ -10,7 +81,8 @@ pub(super) fn control_kind(msg: &Value) -> Option<&'static str> {
     // prompts. Inter-session and system input, context-excluded notes and
     // context-free commands are OpenClaw's own records.
     let synthetic = msg["role"] == "user"
-        && (msg["excludeFromContext"] == true
+        && (is_heartbeat_prompt(&joined_text(&msg["content"]))
+            || msg["excludeFromContext"] == true
             || msg["__openclaw"]["contextFreeCommand"] == true
             || matches!(
                 msg["provenance"]["kind"].as_str(),
@@ -137,4 +209,34 @@ pub(super) fn validate(entry: &Value, first: bool) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Message fields OpenClaw adds to Pi messages. Retained verbatim in a marker.
+const OPENCLAW_FIELDS: &[&str] = &[
+    "__openclaw",
+    "idempotencyKey",
+    "openclawDelivery",
+    "openclawDeliveryMirror",
+    "openclawDisplayContent",
+    "openclawStreamFallback",
+    "provenance",
+    "excludeFromContext",
+    "diagnostics",
+    "errorMessage",
+    "responseModel",
+    "supersedesEntryId",
+];
+
+/// OpenClaw-owned message fields, or None when the message is plain Pi.
+pub(super) fn openclaw_metadata(msg: &Value, active: bool) -> Option<Value> {
+    let mut fields = serde_json::Map::new();
+    for key in OPENCLAW_FIELDS {
+        if let Some(value) = msg.get(*key) {
+            fields.insert((*key).into(), value.clone());
+        }
+    }
+    if !active {
+        fields.insert("active_branch".into(), Value::Bool(false));
+    }
+    (!fields.is_empty()).then_some(Value::Object(fields))
 }

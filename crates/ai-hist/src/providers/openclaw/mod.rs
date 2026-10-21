@@ -6,6 +6,7 @@ use crate::sources::catalog::{Discovery, Fixtures, Hydration, LocalSource, Relat
 use crate::EvidenceKind;
 use serde::{Deserialize, Serialize};
 mod cold;
+mod conversation;
 mod events;
 mod format;
 mod legacy;
@@ -49,7 +50,7 @@ pub(crate) const ADAPTER: Option<ProviderAdapter> = Some(ProviderAdapter {
     resolve_roots: roots::resolve,
     watch_roots: stores::watch_roots,
 });
-const GENERATION: &str = "openclaw_agent24_v2";
+const GENERATION: &str = "openclaw_agent24_v3";
 #[derive(Debug, Serialize, Deserialize)]
 struct Session {
     id: String,
@@ -91,6 +92,10 @@ struct Session {
     partial: bool,
     /// Change stamp of this session's rows; drives incremental sweeps.
     stamp: String,
+    /// For a tail re-read: whether the newest user turn before the tail came
+    /// from a person.
+    #[serde(default, skip)]
+    prompted: bool,
     events: Vec<Event>,
 }
 #[derive(Debug, Serialize, Deserialize)]
@@ -152,11 +157,17 @@ fn ingest(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
     let snapshot = ctx
         .provider_session
         .ok_or_else(|| anyhow::anyhow!("missing OpenClaw snapshot"))?;
-    let session: Session = serde_json::from_value(snapshot.payload.clone())?;
     let path = ctx
         .path
         .ok_or_else(|| anyhow::anyhow!("missing OpenClaw path"))?;
-    legacy::complete_or_append(ctx.conn, &session, path)?;
+    // A database capture is a conversation; a JSONL capture is one transcript.
+    if snapshot.payload.get("windows").is_some() {
+        let conv: conversation::Conversation = serde_json::from_value(snapshot.payload.clone())?;
+        normalize::session(ctx.conn, &conv, path)?;
+    } else {
+        let session: Session = serde_json::from_value(snapshot.payload.clone())?;
+        legacy::complete_or_append(ctx.conn, session, path)?;
+    }
     Ok((
         IngestOutcome {
             records: snapshot.records,
@@ -229,9 +240,10 @@ fn sweep(mut ctx: SweepContext<'_>) -> Result<SweepResult> {
     Ok(result)
 }
 
-/// Normalize every session of one database whose stamp changed, then retire
-/// sessions the complete snapshot no longer holds. One read snapshot covers
-/// the listing and every re-read session; each session commits atomically.
+/// Normalize every conversation of one database whose stamp changed, then
+/// retire conversations the complete snapshot no longer holds. One read
+/// snapshot covers the listing and every re-read window; each conversation
+/// commits atomically.
 fn sweep_database(
     ctx: &SweepContext<'_>,
     path: &Path,
@@ -241,89 +253,144 @@ fn sweep_database(
     let mut stamps = Map::new();
     let mut inserted = 0;
     let mut unread = 0;
-    let sessions = storage::read(&context, path, |conn, schema| {
-        let mut sessions = storage::sessions(conn, ctx.roots, path, schema, MAX_SWEEP + 1, None)?;
+    // A failed conversation keeps its windows' rows under any earlier
+    // identity too (a per-window ID before generation v3).
+    let mut kept = vec![];
+    let mut ids = storage::read(&context, path, |conn, schema| {
+        let windows = storage::sessions(conn, ctx.roots, path, schema, MAX_SWEEP + 1, None)?;
         // A truncated listing is not a complete snapshot: retiring against it
-        // would delete sessions past the bound.
+        // would delete conversations past the bound.
         anyhow::ensure!(
-            sessions.len() <= MAX_SWEEP,
+            windows.len() <= MAX_SWEEP,
             "OpenClaw database exceeds {MAX_SWEEP} sessions"
         );
-        for s in &mut sessions {
+        let mut conversations = conversation::group(windows);
+        for conv in &mut conversations {
             crate::ingest::check_capture_cancelled()?;
-            let stamp = format!("{GENERATION}/{}", s.stamp);
-            let cursor = previous.get(&s.id);
-            let repair = ctx.repairs.contains(ID, &s.id) || !present(ctx.conn, &s.id)?;
+            let stamp = format!("{GENERATION}/{}", conv.stamp());
+            let cursor = previous.get(&conv.id);
+            let repair = ctx.repairs.contains(ID, &conv.id) || !present(ctx.conn, &conv.id)?;
             if !repair && cursor.and_then(|c| c["stamp"].as_str()) == Some(&stamp) {
-                stamps.insert(s.id.clone(), cursor.unwrap().clone());
+                stamps.insert(conv.id.clone(), cursor.unwrap().clone());
                 continue;
             }
-            let from = cursor
+            let plan = cursor
                 .filter(|_| !repair)
-                .map(|c| appended_from(conn, s, c))
+                .map(|c| plan_append(conn, conv, c))
                 .transpose()?
                 .flatten();
-            let normalized = normalize_one(ctx, &context, (conn, schema), path, s, from);
-            // Each session's events are released before the next is read.
-            s.events = vec![];
+            let normalized = normalize_one(ctx, &context, (conn, schema), path, conv, plan);
+            // Each conversation's events are released before the next is read.
+            for window in &mut conv.windows {
+                window.events = vec![];
+            }
             match normalized {
                 Ok(n) => inserted += n,
                 Err(error) => {
                     crate::ingest::check_capture_cancelled()?;
-                    // One malformed session keeps its prior evidence and its
-                    // previous cursor; the rest of the database still syncs.
+                    // One malformed conversation keeps its prior evidence and
+                    // its previous cursor; the rest of the database still syncs.
                     eprintln!(
                         "OpenClaw {} session {:?}: {error:#}",
                         path.display(),
-                        s.native_id
+                        conv.key
                     );
                     unread += 1;
+                    kept.extend(conv.window_ids());
                     if let Some(cursor) = cursor {
-                        stamps.insert(s.id.clone(), cursor.clone());
+                        stamps.insert(conv.id.clone(), cursor.clone());
                     }
                     continue;
                 }
             }
-            stamps.insert(s.id.clone(), cursor_for(conn, s, stamp)?);
+            stamps.insert(conv.id.clone(), cursor_for(conn, conv, stamp)?);
         }
-        Ok(sessions)
+        Ok(conversations.into_iter().map(|c| c.id).collect::<Vec<_>>())
     })?;
+    ids.extend(kept);
     let tx = ctx.conn.unchecked_transaction()?;
-    retire::retire_absent(&tx, path, &sessions)?;
+    retire::retire_absent(&tx, path, &ids)?;
     tx.commit()?;
     Ok((inserted, unread, stamps))
 }
-/// Events re-read before the previous last sequence: in-place annotations
-/// (delivery and mirror fields) land on the newest rows.
+/// Events re-read before a window's previous last sequence: in-place
+/// annotations (delivery and mirror fields) land on the newest rows.
 const TAIL: usize = 32;
+/// How one window of a grown conversation is re-read.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Read {
+    Unchanged,
+    From(i64),
+    Whole,
+}
 
-/// Read and normalize one changed session: only its grown tail when `from`
-/// proves an append, else the whole transcript. One ledger transaction.
+/// Read and normalize one changed conversation: only grown tails and new
+/// windows when `plan` proves an append, else every window. One ledger
+/// transaction.
 fn normalize_one(
     ctx: &SweepContext<'_>,
     context: &AcquisitionContext<'_>,
     (conn, schema): (&Connection, &schema::Schema),
     path: &Path,
-    s: &mut Session,
-    from: Option<i64>,
+    conv: &mut conversation::Conversation,
+    plan: Option<Vec<Read>>,
 ) -> Result<usize> {
-    s.events = match from {
-        Some(seq) => events::tail(conn, schema, &s.native_id, seq)?,
-        None => events::events(context, conn, path, schema, s)?,
-    };
+    for (i, window) in conv.windows.iter_mut().enumerate() {
+        window.events = match plan.as_ref().map_or(Read::Whole, |p| p[i]) {
+            Read::Unchanged => vec![],
+            Read::From(seq) => {
+                window.prompted = events::prompted_before(conn, schema, &window.native_id, seq)?;
+                events::tail(conn, schema, &window.native_id, seq)?
+            }
+            Read::Whole => events::events(context, conn, path, schema, window)?,
+        };
+    }
     let tx = ctx.conn.unchecked_transaction()?;
-    let n = match from {
-        Some(_) => normalize::append(&tx, s, path)?,
-        None => normalize::session(&tx, s, path)?,
+    let n = match plan {
+        Some(_) => normalize::append(&tx, conv, path)?,
+        None => normalize::session(&tx, conv, path)?,
     };
     tx.commit()?;
     Ok(n)
 }
 
-/// The first sequence to re-read when the session only grew since `cursor`:
-/// same rewrite watermark, still hot, every new row past the old end, and the
-/// old tail's entry IDs unchanged. Anything else needs a complete read, which
-/// also retires evidence the transcript dropped.
+/// How to re-read a conversation that only grew since `cursor`: every
+/// previous window still present, each unchanged, appended (same rewrite
+/// watermark, still hot, new rows past the old end, the old tail's entry IDs
+/// intact) or new. Anything else needs a complete read, which also retires
+/// evidence the conversation dropped.
+fn plan_append(
+    conn: &Connection,
+    conv: &conversation::Conversation,
+    cursor: &Value,
+) -> Result<Option<Vec<Read>>> {
+    let Some(previous) = cursor["windows"].as_object() else {
+        return Ok(None);
+    };
+    let current: std::collections::BTreeSet<&str> =
+        conv.windows.iter().map(|w| w.native_id.as_str()).collect();
+    if !cursor["stamp"]
+        .as_str()
+        .is_some_and(|c| c.starts_with(GENERATION))
+        || previous.keys().any(|id| !current.contains(id.as_str()))
+    {
+        return Ok(None);
+    }
+    let mut plan = vec![];
+    for window in &conv.windows {
+        let step = match previous.get(&window.native_id) {
+            None => Read::Whole,
+            Some(old) if old["stamp"].as_str() == Some(&window.stamp) => Read::Unchanged,
+            Some(old) => match appended_from(conn, window, old)? {
+                Some(seq) => Read::From(seq),
+                None => return Ok(None),
+            },
+        };
+        plan.push(step);
+    }
+    Ok(Some(plan))
+}
+/// The first sequence to re-read when one window only grew since `cursor`.
 fn appended_from(conn: &Connection, s: &Session, cursor: &Value) -> Result<Option<i64>> {
     let (Some(count), Some(last)) = (s.event_count, s.last_seq) else {
         return Ok(None);
@@ -339,9 +406,6 @@ fn appended_from(conn: &Connection, s: &Session, cursor: &Value) -> Result<Optio
     };
     let grew = s.cold.is_none()
         && cursor["rewrite"].as_str() == s.rewrite.as_deref()
-        && cursor["stamp"]
-            .as_str()
-            .is_some_and(|c| c.starts_with(GENERATION))
         && count - old_count == last - old_last
         && last >= old_last;
     if !grew || events::ids_at(conn, &s.native_id, first, old_last)? != tail {
@@ -349,18 +413,29 @@ fn appended_from(conn: &Connection, s: &Session, cursor: &Value) -> Result<Optio
     }
     Ok(Some(first))
 }
-fn cursor_for(conn: &Connection, s: &Session, stamp: String) -> Result<Value> {
-    let tail = match s.cold {
-        Some(_) => vec![],
-        None => events::tail_ids(conn, &s.native_id, TAIL)?,
-    };
-    Ok(serde_json::json!({
-        "stamp": stamp,
-        "count": s.event_count,
-        "last_seq": s.last_seq,
-        "rewrite": s.rewrite,
-        "tail": tail,
-    }))
+fn cursor_for(
+    conn: &Connection,
+    conv: &conversation::Conversation,
+    stamp: String,
+) -> Result<Value> {
+    let mut windows = Map::new();
+    for s in &conv.windows {
+        let tail = match s.cold {
+            Some(_) => vec![],
+            None => events::tail_ids(conn, &s.native_id, TAIL)?,
+        };
+        windows.insert(
+            s.native_id.clone(),
+            serde_json::json!({
+                "stamp": s.stamp,
+                "count": s.event_count,
+                "last_seq": s.last_seq,
+                "rewrite": s.rewrite,
+                "tail": tail,
+            }),
+        );
+    }
+    Ok(serde_json::json!({"stamp": stamp, "windows": windows}))
 }
 fn present(conn: &Connection, id: &str) -> Result<bool> {
     Ok(conn.query_row(

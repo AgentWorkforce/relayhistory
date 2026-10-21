@@ -4,7 +4,11 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Minor]
+
+### Changed
+
+- OpenClaw history is one session per conversation key, as OpenClaw's own session list shows it: every reset, rollover and isolated cron or heartbeat run of a key is part of that session (`main:main`, `main:cron:<job>`) instead of one session per run, and heartbeat polls are not counted as prompts. Existing OpenClaw session IDs from agent databases change on the next sync.
 
 ## [0.48.0] - 2026-10-20
 

@@ -42,6 +42,30 @@
           "id": "00000000-0000-4000-8000-000000000017",
           "role": "assistant",
           "toolCallId": null
+        },
+        {
+          "type": "message",
+          "id": "00000000-0000-4000-8000-000000000019",
+          "role": "user",
+          "toolCallId": null
+        },
+        {
+          "type": "message",
+          "id": "00000000-0000-4000-8000-000000000021",
+          "role": "assistant",
+          "toolCallId": null
+        },
+        {
+          "type": "message",
+          "id": "00000000-0000-4000-8000-000000000023",
+          "role": "user",
+          "toolCallId": null
+        },
+        {
+          "type": "message",
+          "id": "00000000-0000-4000-8000-000000000025",
+          "role": "assistant",
+          "toolCallId": null
         }
       ]
     },
@@ -58,25 +82,25 @@
         },
         {
           "type": "message",
-          "id": "00000000-0000-4000-8000-000000000019",
+          "id": "00000000-0000-4000-8000-000000000027",
           "role": "user",
           "toolCallId": null
         },
         {
           "type": "message",
-          "id": "00000000-0000-4000-8000-000000000022",
+          "id": "00000000-0000-4000-8000-000000000030",
           "role": "assistant",
           "toolCallId": null
         },
         {
           "type": "message",
-          "id": "00000000-0000-4000-8000-000000000024",
+          "id": "00000000-0000-4000-8000-000000000032",
           "role": "toolResult",
           "toolCallId": "call_fixture_exec"
         },
         {
           "type": "message",
-          "id": "00000000-0000-4000-8000-000000000026",
+          "id": "00000000-0000-4000-8000-000000000034",
           "role": "assistant",
           "toolCallId": null
         }
@@ -95,13 +119,51 @@
         },
         {
           "type": "message",
-          "id": "00000000-0000-4000-8000-000000000037",
+          "id": "00000000-0000-4000-8000-000000000045",
           "role": "user",
           "toolCallId": null
         },
         {
           "type": "message",
-          "id": "00000000-0000-4000-8000-000000000040",
+          "id": "00000000-0000-4000-8000-000000000048",
+          "role": "assistant",
+          "toolCallId": null
+        }
+      ]
+    },
+    {
+      "agentId": "ops",
+      "sessionKey": "agent:ops:cron:fixture-job",
+      "sessionId": "fixture-cron-run-1",
+      "events": [
+        {
+          "type": "session",
+          "id": "fixture-cron-run-1",
+          "role": null,
+          "toolCallId": null
+        },
+        {
+          "type": "message",
+          "id": "00000000-0000-4000-8000-000000000050",
+          "role": "assistant",
+          "toolCallId": null
+        }
+      ]
+    },
+    {
+      "agentId": "ops",
+      "sessionKey": "agent:ops:cron:fixture-job",
+      "sessionId": "fixture-cron-run-2",
+      "events": [
+        {
+          "type": "session",
+          "id": "fixture-cron-run-2",
+          "role": null,
+          "toolCallId": null
+        },
+        {
+          "type": "message",
+          "id": "00000000-0000-4000-8000-000000000053",
           "role": "assistant",
           "toolCallId": null
         }

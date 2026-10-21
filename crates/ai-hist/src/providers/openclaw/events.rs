@@ -95,6 +95,35 @@ pub(super) fn tail(
     }
     Ok(result)
 }
+/// Whether the newest user turn before `from_seq` came from a person, for a
+/// tail re-read that starts after it: a quiet acknowledgement it asked for is
+/// the session's reply. Bounded; no user turn found is a run nobody prompted.
+pub(super) fn prompted_before(
+    conn: &Connection,
+    schema: &Schema,
+    native: &str,
+    from_seq: i64,
+) -> Result<bool> {
+    let mut stmt = conn.prepare(&format!(
+        "SELECT e.event_json, {} FROM transcript_events e \
+         WHERE e.session_id=?1 AND e.seq<?2 ORDER BY e.seq DESC LIMIT 4096",
+        schema.payload_columns()
+    ))?;
+    let mut rows = stmt.query(rusqlite::params![native, from_seq])?;
+    while let Some(r) = rows.next()? {
+        check_capture_cancelled()?;
+        let text = match r.get::<_, Option<String>>(0)? {
+            Some(json) => json,
+            None => decompress(r.get(1)?, r.get(2)?)?,
+        };
+        let entry: Value = serde_json::from_str(&text)?;
+        let msg = &entry["message"];
+        if entry["type"] == "message" && msg["role"] == "user" {
+            return Ok(format::control_kind(msg).is_none());
+        }
+    }
+    Ok(false)
+}
 /// `(seq, entry id)` of the last `count` events, from the identity index
 /// alone: proof that an earlier tail was not replaced.
 pub(super) fn tail_ids(

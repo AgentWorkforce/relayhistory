@@ -1,8 +1,10 @@
 //! OpenClaw transcript entries are Pi session entries (header, message,
 //! model_change, compaction, custom, ...) stored as SQLite rows. Messages carry
 //! OpenClaw's own delivery and run metadata beside the Pi fields.
+use super::conversation::Conversation;
 use super::format::{
-    control_kind, counts_usage, entry_time, first_prompt, is_delivery_mirror, string, text,
+    control_kind, counts_usage, entry_time, first_prompt, is_delivery_mirror, is_heartbeat_ack,
+    string, text,
 };
 use super::*;
 use crate::ingest::{
@@ -13,29 +15,24 @@ use crate::providers::file_history::{self, Keys};
 use crate::{insert_history, insert_session_marker, HistoryEntry, NewSessionMarker};
 use anyhow::Context;
 
-/// Message fields OpenClaw adds to Pi messages. Retained verbatim in a marker.
-const OPENCLAW_FIELDS: &[&str] = &[
-    "__openclaw",
-    "idempotencyKey",
-    "openclawDelivery",
-    "openclawDeliveryMirror",
-    "openclawDisplayContent",
-    "openclawStreamFallback",
-    "provenance",
-    "excludeFromContext",
-    "diagnostics",
-    "errorMessage",
-    "responseModel",
-    "supersedesEntryId",
-];
-
-/// What one pass over a run of events wrote.
+/// What one pass over a conversation's windows wrote.
 struct Written {
     keys: Keys,
     inserted: usize,
     first: i64,
     last: i64,
     assistant: Option<String>,
+}
+impl Written {
+    fn new(conv: &Conversation) -> Self {
+        Self {
+            keys: Keys::default(),
+            inserted: 0,
+            first: conv.started(),
+            last: conv.last_activity().max(conv.started()),
+            assistant: None,
+        }
+    }
 }
 
 fn header(s: &Session) -> Result<&Event> {
@@ -49,20 +46,16 @@ fn cwd(header: &Event) -> Option<&str> {
         .as_str()
         .filter(|c| !c.trim().is_empty())
 }
-
-/// Write the header marker and every captured event after it.
-fn write(conn: &Connection, s: &Session) -> Result<Written> {
+/// Write one window's header marker and every captured event after it.
+fn write(conn: &Connection, s: &Session, scope: Option<&str>, out: &mut Written) -> Result<()> {
     crate::ingest::check_capture_cancelled()?;
     let header = header(s)?;
     let cwd = cwd(header);
-    let mut out = Written {
-        keys: Keys::default(),
-        inserted: 0,
-        first: s.started,
-        last: s.latest.max(s.started),
-        assistant: None,
-    };
     session_marker(conn, s, header, &mut out.keys)?;
+    // Whether the latest user turn came from a person: a quiet
+    // acknowledgement is hidden only after a wake poll or in a run nobody
+    // prompted, never when a person asked for that text.
+    let mut prompted = s.prompted;
     for event in &s.events[1..] {
         crate::ingest::check_capture_cancelled()?;
         let entry = &event.entry;
@@ -71,11 +64,15 @@ fn write(conn: &Connection, s: &Session) -> Result<Written> {
         out.first = out.first.min(ts);
         out.last = out.last.max(ts);
         if entry["type"] == "message" {
-            out.inserted += message(conn, s, cwd, event, &mut out.keys)?;
+            out.inserted += message(conn, s, cwd, event, &mut out.keys, scope)?;
             let msg = &entry["message"];
+            if msg["role"] == "user" {
+                prompted = control_kind(msg).is_none();
+            }
             if msg["role"] == "assistant" && !is_delivery_mirror(msg) {
                 let text = text(&msg["content"]);
-                if !text.trim().is_empty() {
+                let quiet = !prompted && is_heartbeat_ack(&text);
+                if !text.trim().is_empty() && !quiet {
                     out.assistant = Some(text);
                 }
             }
@@ -91,31 +88,24 @@ fn write(conn: &Connection, s: &Session) -> Result<Written> {
             )?;
         }
     }
-    Ok(out)
+    Ok(())
 }
 
-fn title(s: &Session) -> Option<&str> {
-    s.title.as_deref().or_else(|| {
-        s.events
-            .iter()
-            .rev()
-            .find(|e| e.entry["type"] == "session_info")
-            .and_then(|e| e.entry["name"].as_str())
-    })
-}
-
-/// Normalize a complete transcript: authoritative for every row and catalog
-/// field, so evidence the transcript no longer holds is retired.
-pub(super) fn session(conn: &Connection, s: &Session, path: &Path) -> Result<usize> {
-    let written = write(conn, s)?;
-    super::legacy::claim(conn, s, path)?;
-    file_history::retire(conn, ID, &s.id, &written.keys)?;
-    let cwd = cwd(header(s)?);
+/// Normalize a complete conversation: authoritative for every row and
+/// catalog field, so evidence its windows no longer hold is retired.
+pub(super) fn session(conn: &Connection, conv: &Conversation, path: &Path) -> Result<usize> {
+    let mut written = Written::new(conv);
+    for (index, window) in conv.windows.iter().enumerate() {
+        write(conn, window, conv.tool_scope(index), &mut written)?;
+    }
+    super::legacy::claim(conn, conv, path)?;
+    file_history::retire(conn, ID, &conv.id, &written.keys)?;
+    let cwd = conv.cwd();
     upsert_session_rebuilt(
         conn,
         &SessionCatalogRow {
             source: ID,
-            session_id: &s.id,
+            session_id: &conv.id,
             cwd,
             git_branch: None,
             first_ts: written.first,
@@ -124,30 +114,45 @@ pub(super) fn session(conn: &Connection, s: &Session, path: &Path) -> Result<usi
             raw_path: Some(&path.to_string_lossy()),
         },
     )?;
-    crate::ingest::set_session_title(conn, ID, &s.id, title(s))?;
-    let models = serde_json::to_string(&models(s))?;
-    let first_prompt = first_prompt(s.events.iter().map(|e| &e.entry));
+    crate::ingest::set_session_title(conn, ID, &conv.id, conv.title())?;
+    let models = serde_json::to_string(&conv.models())?;
+    let first_prompt = first_prompt(conv.entries());
     // A complete snapshot is authoritative even when metadata was cleared.
     conn.execute(
         "UPDATE sessions SET models_json=?3, first_prompt=?4, cwd=?5 WHERE source=?1 AND session_id=?2 AND (models_json IS NOT ?3 OR first_prompt IS NOT ?4 OR cwd IS NOT ?5)",
-        rusqlite::params![ID, s.id, models, first_prompt, cwd],
+        rusqlite::params![ID, conv.id, models, first_prompt, cwd],
     )?;
     Ok(written.inserted)
 }
 
-/// Normalize the header plus the tail of a transcript that only grew since
-/// its last complete read. Nothing is retired and catalog fields only widen:
-/// the earlier rows were not re-read.
-pub(super) fn append(conn: &Connection, s: &Session, path: &Path) -> Result<usize> {
-    let written = write(conn, s)?;
-    super::legacy::claim(conn, s, path)?;
-    let cwd = cwd(header(s)?);
+/// Normalize the windows of a conversation that only grew since its last
+/// complete read: each captured window's header plus its re-read tail, or a
+/// new window whole. Windows with no captured events were not re-read.
+/// Nothing is retired and catalog fields only widen.
+pub(super) fn append(conn: &Connection, conv: &Conversation, path: &Path) -> Result<usize> {
+    let mut written = Written::new(conv);
+    let newest = conv.windows.len() - 1;
+    let mut reply = None;
+    for (index, window) in conv.windows.iter().enumerate() {
+        if window.events.is_empty() {
+            continue;
+        }
+        written.assistant = None;
+        write(conn, window, conv.tool_scope(index), &mut written)?;
+        // Only the newest window's reply can replace the conversation's; an
+        // older window growing leaves the stored one.
+        if index == newest {
+            reply = written.assistant.take();
+        }
+    }
+    written.assistant = reply;
+    super::legacy::claim(conn, conv, path)?;
     crate::ingest::upsert_session(
         conn,
         &SessionCatalogRow {
             source: ID,
-            session_id: &s.id,
-            cwd,
+            session_id: &conv.id,
+            cwd: conv.cwd(),
             git_branch: None,
             first_ts: written.first,
             last_ts: written.last,
@@ -155,34 +160,19 @@ pub(super) fn append(conn: &Connection, s: &Session, path: &Path) -> Result<usiz
             raw_path: Some(&path.to_string_lossy()),
         },
     )?;
-    if let Some(title) = title(s) {
-        crate::ingest::set_session_title(conn, ID, &s.id, Some(title))?;
+    if let Some(title) = conv.title() {
+        crate::ingest::set_session_title(conn, ID, &conv.id, Some(title))?;
     }
-    let models = serde_json::to_string(&models(s))?;
+    let models = serde_json::to_string(&conv.models())?;
     conn.execute(
         "UPDATE sessions SET models_json=(SELECT json_group_array(value) FROM (SELECT value FROM json_each(coalesce(sessions.models_json,'[]')) UNION SELECT value FROM json_each(?3) ORDER BY value)), \
          first_prompt=coalesce(first_prompt, ?4) WHERE source=?1 AND session_id=?2",
-        rusqlite::params![ID, s.id, models, first_prompt(s.events.iter().map(|e| &e.entry))],
+        rusqlite::params![ID, conv.id, models, first_prompt(conv.entries())],
     )?;
     Ok(written.inserted)
 }
 
-fn models(s: &Session) -> Vec<String> {
-    let mut models: Vec<String> = s
-        .events
-        .iter()
-        .filter(|e| {
-            e.entry["message"]["role"] == "assistant" && !is_delivery_mirror(&e.entry["message"])
-        })
-        .filter_map(|e| e.entry["message"]["model"].as_str().map(str::to_owned))
-        .chain(s.model.clone())
-        .collect();
-    models.sort();
-    models.dedup();
-    models
-}
-
-/// The session header plus the OpenClaw catalog row it belongs to.
+/// One window's session header plus the OpenClaw catalog row it belongs to.
 fn session_marker(conn: &Connection, s: &Session, header: &Event, keys: &mut Keys) -> Result<()> {
     let mut payload = serde_json::json!({
         "header": header.entry,
@@ -209,12 +199,14 @@ fn session_marker(conn: &Connection, s: &Session, header: &Event, keys: &mut Key
     });
     super::legacy::mark(&mut payload, s);
     let payload = serde_json::to_string(&crate::ingest::bound_marker_value(payload))?;
+    // One header marker per window; the session ID is the window's own.
+    let uid = format!("session:{}", s.native_id);
     insert_session_marker(
         conn,
         ID,
         &s.id,
         &NewSessionMarker {
-            marker_uid: "session",
+            marker_uid: &uid,
             kind: "session_metadata",
             subkind: Some("openclaw"),
             ts_ms: Some(entry_time(&header.entry)?),
@@ -222,7 +214,7 @@ fn session_marker(conn: &Connection, s: &Session, header: &Event, keys: &mut Key
             ..Default::default()
         },
     )?;
-    keys.markers.insert("session".into());
+    keys.markers.insert(uid);
     Ok(())
 }
 
@@ -262,13 +254,14 @@ fn message(
     cwd: Option<&str>,
     event: &Event,
     keys: &mut Keys,
+    scope: Option<&str>,
 ) -> Result<usize> {
     let entry = &event.entry;
     let msg = &entry["message"];
     let role = string(msg, "role")?;
     let mid = string(entry, "id")?;
     let control = control_kind(msg);
-    let mut metadata = openclaw_metadata(msg, event.active);
+    let mut metadata = format::openclaw_metadata(msg, event.active);
     if role == "assistant" && !counts_usage(msg) {
         if let Some(usage) = msg.get("usage") {
             // Retained as reported, outside request accounting.
@@ -338,9 +331,9 @@ fn message(
         ..Default::default()
     };
     if role == "toolResult" {
-        result(conn, &base, msg, keys)?;
+        result(conn, &base, msg, keys, scope)?;
     } else {
-        content(conn, s, &base, &msg["content"], keys)?;
+        content(conn, s, &base, &msg["content"], keys, scope)?;
     }
     if role != "user" || control.is_some() {
         return Ok(0);
@@ -365,26 +358,13 @@ fn message(
     )
 }
 
-/// OpenClaw-owned message fields, or None when the message is plain Pi.
-fn openclaw_metadata(msg: &Value, active: bool) -> Option<Value> {
-    let mut fields = serde_json::Map::new();
-    for key in OPENCLAW_FIELDS {
-        if let Some(value) = msg.get(*key) {
-            fields.insert((*key).into(), value.clone());
-        }
-    }
-    if !active {
-        fields.insert("active_branch".into(), Value::Bool(false));
-    }
-    (!fields.is_empty()).then_some(Value::Object(fields))
-}
-
 fn content(
     conn: &Connection,
     s: &Session,
     base: &EventRow<'_>,
     value: &Value,
     keys: &mut Keys,
+    scope: Option<&str>,
 ) -> Result<()> {
     let blocks = value
         .as_array()
@@ -396,7 +376,7 @@ fn content(
             "text" => ("text", block["text"].as_str().map(str::to_owned)),
             "thinking" => ("thinking", block["thinking"].as_str().map(str::to_owned)),
             "toolCall" => {
-                call(conn, base, block, keys)?;
+                call(conn, base, block, keys, scope)?;
                 ("tool_use", Some(serde_json::to_string(block)?))
             }
             _ => {
@@ -405,7 +385,8 @@ fn content(
             }
         };
         let facts = ToolResultFacts {
-            tool_use_id: (kind == "tool_use").then(|| block["id"].as_str().unwrap().to_owned()),
+            tool_use_id: (kind == "tool_use")
+                .then(|| format::scoped(block["id"].as_str().unwrap(), scope)),
             ..Default::default()
         };
         // A control kind only ever marks a user text row.
@@ -470,8 +451,14 @@ fn opaque_block(
     Ok(())
 }
 
-fn call(conn: &Connection, base: &EventRow<'_>, block: &Value, keys: &mut Keys) -> Result<()> {
-    let id = string(block, "id")?;
+fn call(
+    conn: &Connection,
+    base: &EventRow<'_>,
+    block: &Value,
+    keys: &mut Keys,
+    scope: Option<&str>,
+) -> Result<()> {
+    let id = &format::scoped(string(block, "id")?, scope);
     let name = string(block, "name")?;
     let args = serde_json::to_string(&block["arguments"])?;
     // Paths in arguments are recorded as text; they are never opened.
@@ -495,8 +482,14 @@ fn call(conn: &Connection, base: &EventRow<'_>, block: &Value, keys: &mut Keys) 
     Ok(())
 }
 
-fn result(conn: &Connection, base: &EventRow<'_>, msg: &Value, keys: &mut Keys) -> Result<()> {
-    let id = string(msg, "toolCallId")?;
+fn result(
+    conn: &Connection,
+    base: &EventRow<'_>,
+    msg: &Value,
+    keys: &mut Keys,
+    scope: Option<&str>,
+) -> Result<()> {
+    let id = &format::scoped(string(msg, "toolCallId")?, scope);
     let error = match msg.get("isError") {
         None | Some(Value::Null) => None,
         Some(value) => Some(

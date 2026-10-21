@@ -9,6 +9,9 @@ pub(super) const SCHEMA24: &str =
     include_str!("../../../tests/fixtures/openclaw/main-schema24.sql");
 pub(super) const MAIN: &str = "main:fixture-main-0001";
 pub(super) const TELEGRAM: &str = "main:fixture-telegram-0001";
+/// The same Telegram session once the agent database holds it: a
+/// conversation, named by its key.
+pub(super) const TELEGRAM_CONVERSATION: &str = "main:telegram:direct:fixture-peer";
 
 pub(super) fn home() -> (tempfile::TempDir, ProviderRoots) {
     let home = tempfile::tempdir().unwrap();
@@ -39,8 +42,27 @@ pub(super) fn legacy(home: &Path) -> PathBuf {
 pub(super) fn context(roots: &ProviderRoots) -> AcquisitionContext<'_> {
     AcquisitionContext::new(ID, roots)
 }
+/// A captured session: a JSONL transcript, or the newest window of a database
+/// conversation.
 fn capture(roots: &ProviderRoots, path: &Path, id: &str) -> Session {
-    serde_json::from_value(storage::capture(&context(roots), path, id).unwrap().payload).unwrap()
+    let payload = storage::capture(&context(roots), path, id).unwrap().payload;
+    if payload.get("windows").is_some() {
+        let conv: conversation::Conversation = serde_json::from_value(payload).unwrap();
+        return conv.windows.into_iter().last().unwrap();
+    }
+    serde_json::from_value(payload).unwrap()
+}
+/// One window of a database conversation, by its native session ID.
+fn window(roots: &ProviderRoots, path: &Path, key: &str, native: &str) -> Session {
+    let id = format!("main:{}", conversation::native_name(key, "main"));
+    let payload = storage::capture(&context(roots), path, &id)
+        .unwrap()
+        .payload;
+    let conv: conversation::Conversation = serde_json::from_value(payload).unwrap();
+    conv.windows
+        .into_iter()
+        .find(|w| w.native_id == native)
+        .unwrap()
 }
 pub(super) fn count(conn: &Connection, sql: &str) -> i64 {
     conn.query_row(sql, [], |r| r.get(0)).unwrap()
@@ -144,14 +166,14 @@ fn released_schemas_19_21_23_match_their_writers_oracles() {
         let oracle: Value = serde_json::from_str(oracle).unwrap();
         let main = oracle["sessions"].as_array().unwrap().iter();
         for expected in main.filter(|s| s["agentId"] == "main") {
-            let id = format!("main:{}", expected["sessionId"].as_str().unwrap());
-            let s = capture(&roots, &path, &id);
+            let key = expected["sessionKey"].as_str().unwrap();
+            let s = window(&roots, &path, key, expected["sessionId"].as_str().unwrap());
             assert_eq!(s.schema_version, Some(version));
             assert_eq!(s.session_key, expected["sessionKey"]);
             assert_eq!(
                 &Value::Array(summary(&s)),
                 &expected["events"],
-                "{version} {id}"
+                "{version} {key}"
             );
             assert!(s.events.iter().skip(1).all(|e| e.active));
         }
@@ -165,9 +187,12 @@ fn released_schemas_19_21_23_match_their_writers_oracles() {
             ledger.count("SELECT count(*) FROM tool_calls WHERE is_error=1"),
             1
         );
+        // The current writer's fixture adds two heartbeat acknowledgements,
+        // which were real model calls.
+        let heartbeats = if version == 24 { 2 } else { 0 };
         assert_eq!(
             ledger.count("SELECT count(DISTINCT message_id) FROM session_events WHERE token_json IS NOT NULL"),
-            4
+            4 + heartbeats
         );
         // A grown transcript re-reads only its tail on every schema.
         db.execute_batch(
@@ -284,7 +309,7 @@ fn legacy_transcripts_match_the_2026_7_35_reader_and_carry_index_metadata() {
     let marker: String = ledger
         .conn
         .query_row(
-            "SELECT payload_json FROM session_markers WHERE session_id=?1 AND marker_uid='session'",
+            "SELECT payload_json FROM session_markers WHERE session_id=?1 AND marker_uid='session:fixture-main-0001'",
             [MAIN],
             |r| r.get(0),
         )
@@ -351,7 +376,7 @@ fn the_database_owns_imported_sessions_and_keeps_them_across_the_archive_move() 
     let (home, roots) = home();
     let dir = legacy(home.path());
     let jsonl = dir.join("fixture-telegram-0001.jsonl");
-    // Before the upgrade: every session comes from JSONL.
+    // Before the upgrade: every session comes from JSONL, one per transcript.
     let mut ledger = Ledger::new(home.path());
     ledger.sweep(&roots, None);
     assert_eq!(
@@ -359,39 +384,53 @@ fn the_database_owns_imported_sessions_and_keeps_them_across_the_archive_move() 
         Some(jsonl.to_string_lossy().into())
     );
     // The doctor imports the transcript under the same session ID while the
-    // file is still in place: one candidate, read from the database.
+    // file is still in place: one candidate, the database's conversation.
     let (db, _db) = database(home.path(), SCHEMA24);
     let candidates = storage::enumerate(&roots, None).unwrap();
+    assert!(!candidates
+        .iter()
+        .any(|c| c.session_id.as_deref() == Some(TELEGRAM)));
     let telegram: Vec<_> = candidates
         .iter()
-        .filter(|c| c.session_id.as_deref() == Some(TELEGRAM))
+        .filter(|c| c.session_id.as_deref() == Some(TELEGRAM_CONVERSATION))
         .collect();
     assert_eq!(telegram.len(), 1);
     assert_eq!(telegram[0].locator, db.to_string_lossy());
     assert_eq!(
         candidates.len(),
         4,
-        "main-0001 JSONL plus the database's α and Telegram, plus ops"
+        "main-0001 JSONL plus the database's main and Telegram conversations, plus ops"
     );
     let before = ledger.count(&format!(
         "SELECT count(*) FROM session_events WHERE session_id='{TELEGRAM}'"
     ));
     assert_eq!(ledger.sweep(&roots, None).unread, 0);
-    assert_eq!(ledger.raw_path(TELEGRAM), Some(db.to_string_lossy().into()));
+    // The conversation now owns the imported window: the JSONL row retired
+    // into it, so its evidence is not counted twice.
+    assert_eq!(
+        ledger.raw_path(TELEGRAM_CONVERSATION),
+        Some(db.to_string_lossy().into())
+    );
+    assert_eq!(ledger.raw_path(TELEGRAM), None);
     assert_eq!(
         ledger.raw_path(MAIN),
         Some(dir.join("fixture-main-0001.jsonl").to_string_lossy().into())
     );
-    // Not emitted twice: the database's copy replaced the JSONL rows.
     assert_eq!(
         ledger.count(&format!(
-            "SELECT count(*) FROM session_events WHERE session_id='{TELEGRAM}'"
+            "SELECT count(*) FROM session_events WHERE session_id='{TELEGRAM_CONVERSATION}'"
         )),
         before
     );
     assert_eq!(
+        ledger.count(
+            "SELECT count(*) FROM session_events WHERE session_id='main:fixture-telegram-0001'"
+        ),
+        0
+    );
+    assert_eq!(
         ledger.count(&format!(
-            "SELECT count(*) FROM history WHERE session_id='{TELEGRAM}'"
+            "SELECT count(*) FROM history WHERE session_id='{TELEGRAM_CONVERSATION}'"
         )),
         1
     );
@@ -406,12 +445,14 @@ fn the_database_owns_imported_sessions_and_keeps_them_across_the_archive_move() 
     )
     .unwrap();
     assert_eq!(ledger.sweep(&roots, None).unread, 0);
-    assert!(crate::session_locations(&ledger.conn, ID, TELEGRAM)
-        .unwrap()
-        .contains(&"local".into()));
+    assert!(
+        crate::session_locations(&ledger.conn, ID, TELEGRAM_CONVERSATION)
+            .unwrap()
+            .contains(&"local".into())
+    );
     assert_eq!(
         ledger.count(&format!(
-            "SELECT count(*) FROM history WHERE session_id='{TELEGRAM}'"
+            "SELECT count(*) FROM history WHERE session_id='{TELEGRAM_CONVERSATION}'"
         )),
         1
     );

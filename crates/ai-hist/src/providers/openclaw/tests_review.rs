@@ -59,12 +59,19 @@ fn review_a_scoped_sweep_of_the_sessions_directory_never_retires_an_imported_ses
     archive(home.path(), &dir, "fixture-telegram-0001.jsonl");
     let scope = PathScope::from_paths([dir.clone()]).unwrap();
     ledger.sweep(&roots, Some(&scope));
+    // The database was not read: its conversation does not hold the window
+    // yet, so the JSONL row keeps its evidence.
     assert_eq!(history(&ledger, TELEGRAM), 1);
     assert_eq!(events(&ledger, TELEGRAM), before);
-    // The row follows the database, which then re-reads it.
-    assert_eq!(ledger.raw_path(TELEGRAM), Some(db.to_string_lossy().into()));
+    // A full sweep reads the database, whose conversation then owns it.
     ledger.sweep(&roots, None);
-    assert_eq!(history(&ledger, TELEGRAM), 1);
+    assert_eq!(history(&ledger, TELEGRAM), 0);
+    assert_eq!(history(&ledger, TELEGRAM_CONVERSATION), 1);
+    assert_eq!(events(&ledger, TELEGRAM_CONVERSATION), before);
+    assert_eq!(
+        ledger.raw_path(TELEGRAM_CONVERSATION),
+        Some(db.to_string_lossy().into())
+    );
 }
 
 #[test]
@@ -89,7 +96,7 @@ fn review_a_partial_rewrite_never_retires_indexed_evidence() {
     let s: Session = serde_json::from_value(acquired.payload).unwrap();
     assert!(s.partial);
     let tx = ledger.conn.unchecked_transaction().unwrap();
-    legacy::complete_or_append(&tx, &s, &path).unwrap();
+    legacy::complete_or_append(&tx, s, &path).unwrap();
     tx.commit().unwrap();
     assert_eq!(events(&ledger, TELEGRAM), before);
     // Once complete again, the transcript is authoritative.
