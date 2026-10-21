@@ -36,12 +36,14 @@ const EXECUTION_TIME_LIMIT: &str = "PT6H";
 /// Task Scheduler starts from the user's registry environment, which lacks
 /// shell-only variables: `HOME` (`home_dir()` prefers it over `USERPROFILE`)
 /// and the provider roots the shared launchd/cron list does not carry yet.
-const WINDOWS_EXTRA_ENV_VARS: [&str; 16] = [
+const WINDOWS_EXTRA_ENV_VARS: [&str; 18] = [
     "HOME",
+    "CODEBUDDY_CONFIG_DIR",
     "COPILOT_HOME",
     "GROK_BOT_USER_DATA",
     "HERMES_HOME",
     "HERMES_DATA_DIR_SUFFIX",
+    "KIMI_CODE_HOME",
     "OMP_PROFILE",
     "OPENCLAW_HOME",
     "OPENCLAW_PROFILE",
@@ -141,17 +143,62 @@ fn batch_quote_arg(value: &str) -> String {
 /// relative, `~`, `$VAR` and unset-marker forms, and the wrapper changes to
 /// the install directory (see [`wrapper_script`]) so they resolve as they did
 /// there.
-fn task_environment(spec: &ServiceSpec) -> Result<Vec<(&'static str, String)>> {
-    let mut environment = service_provider_environment(spec)?;
-    for name in WINDOWS_EXTRA_ENV_VARS {
-        let Some(value) = std::env::var_os(name) else {
-            continue;
-        };
-        if let Some(value) = scheduler_environment_value(name, value)? {
-            environment.push((name, value));
+fn task_environment(spec: &ServiceSpec) -> Result<Vec<(String, String)>> {
+    let mut environment: Vec<(String, String)> = service_provider_environment(spec)?
+        .into_iter()
+        .map(|(name, value)| (name.to_string(), value))
+        .collect();
+    let capture = |environment: &mut Vec<(String, String)>, name: &str| -> Result<()> {
+        if environment.iter().any(|(captured, _)| captured == name) {
+            return Ok(());
         }
+        if let Some(value) = std::env::var_os(name) {
+            if let Some(value) = scheduler_environment_value(name, value)? {
+                environment.push((name.to_string(), value));
+            }
+        }
+        Ok(())
+    };
+    for name in WINDOWS_EXTRA_ENV_VARS {
+        capture(&mut environment, name)?;
+    }
+    // Hermes expands `$NAME`/`${NAME}` in HERMES_HOME when it runs, so the
+    // variables it names must reach the task too.
+    let hermes = environment
+        .iter()
+        .find(|(name, _)| name == "HERMES_HOME")
+        .map(|(_, value)| referenced_variables(value));
+    for name in hermes.unwrap_or_default() {
+        capture(&mut environment, &name)?;
     }
     Ok(environment)
+}
+
+/// The variable names `value` references as `$NAME` or `${NAME}`, the forms
+/// the Hermes resolver expands.
+pub(crate) fn referenced_variables(value: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut rest = value;
+    while let Some(at) = rest.find('$') {
+        rest = &rest[at + 1..];
+        let (name, after) = match rest.strip_prefix('{') {
+            Some(braced) => match braced.find('}') {
+                Some(end) => (&braced[..end], &braced[end + 1..]),
+                None => break,
+            },
+            None => {
+                let end = rest
+                    .find(|c: char| !c.is_ascii_alphanumeric() && c != '_')
+                    .unwrap_or(rest.len());
+                (&rest[..end], &rest[end..])
+            }
+        };
+        if !name.is_empty() && !names.iter().any(|seen| seen == name) {
+            names.push(name.to_string());
+        }
+        rest = after;
+    }
+    names
 }
 
 /// Captured variables that hold a name or suffix rather than a path.
@@ -192,7 +239,7 @@ pub(crate) fn wrapper_script(
     spec: &ServiceSpec,
     bin: &str,
     args: &[String],
-    environment: &[(&str, String)],
+    environment: &[(impl AsRef<str>, String)],
     cwd: Option<&str>,
     log: &str,
 ) -> Result<String> {
@@ -208,6 +255,7 @@ pub(crate) fn wrapper_script(
         "setlocal DisableDelayedExpansion".to_string(),
     ];
     for (name, value) in environment {
+        let name = name.as_ref();
         reject_quote(name, value)?;
         lines.push(format!("set {}", batch_quote(&format!("{name}={value}"))));
     }
@@ -592,6 +640,17 @@ mod tests {
             !script.replace("\r\n", "").contains('\n'),
             "every line ends in CRLF"
         );
+    }
+
+    #[test]
+    fn hermes_references_are_found_in_both_forms() {
+        assert_eq!(
+            referenced_variables("$ROOT/hermes/${PROFILE}/$ROOT"),
+            ["ROOT", "PROFILE"]
+        );
+        // An unclosed `${` and a bare `$` name nothing, as Hermes leaves them.
+        assert!(referenced_variables("C:/hermes/${OPEN").is_empty());
+        assert!(referenced_variables("cost$/x").is_empty());
     }
 
     #[test]
