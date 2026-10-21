@@ -6,11 +6,18 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Qoder global CLI session history is discoverable and searchable from its native project transcripts, preserving recorded messages, tools, results, and resume appends.
+
+### Rust API
+
+- Added `Source::Qoder` for filtering and reading persisted Qoder global CLI history.
+
 ## [0.50.1] - 2026-10-21
 
 ### Added
 
-- Qoder global CLI session history is discoverable and searchable from its native project transcripts, preserving recorded messages, tools, results, and resume appends.
 - Windows arm64 (`aarch64-pc-windows-msvc`) is supported: `npm install` pulls the prebuilt `ai-hist-native-win32-arm64-msvc` addon, and `@relayhistory/provider-sources` ships a native `win32-arm64-msvc` helper.
 - Qwen Code interactive session history is discoverable and searchable from native transcript files, preserving the active conversation branch, recorded messages and tool evidence.
 - Kimi Code history is discoverable and searchable from current native session journals, including recorded messages, tools and separate subagent transcripts.
@@ -29,7 +36,6 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Rust API
 
-- Added `Source::Qoder` for filtering and reading persisted Qoder global CLI history.
 - Added `Source::QwenCode` for filtering and reading persisted Qwen Code history.
 - Added `Source::Kimi` for filtering and reading persisted Kimi Code history.
 - Added `Source::Codebuddy` for filtering and reading persisted Codebuddy Code history.
