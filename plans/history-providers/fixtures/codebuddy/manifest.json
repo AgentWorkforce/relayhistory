@@ -1,0 +1,138 @@
+[
+  {
+    "name": "ordinary",
+    "native_session_id": "fixture-ordinary",
+    "files": [
+      {
+        "path": ".codebuddy/projects/fixture-workspace/fixture-ordinary.jsonl",
+        "sha256": "bf12391d034a208636d5c6a7545a1f85a492ec3e8459f5d3d3f859730a9b48cd"
+      }
+    ],
+    "raw_sha256": "487ffc02d777afc1d5ff734461a77c218c7b762749cbcaffb1a463369bf4db6a"
+  },
+  {
+    "name": "resumed",
+    "native_session_id": "fixture-resumed",
+    "files": [
+      {
+        "path": ".codebuddy/projects/fixture-workspace/fixture-resumed.jsonl",
+        "sha256": "fc475c07e6e5ccc2ca7490f61b6977a05749f324875bbcde4b05de2aae87f4e8"
+      }
+    ],
+    "raw_sha256": "b6689c756b90b6a10f5db59da5b3d71b27175f26509ce92dc9a9b67048b4235b"
+  },
+  {
+    "name": "tool",
+    "native_session_id": "fixture-tool",
+    "files": [
+      {
+        "path": ".codebuddy/projects/fixture-workspace/fixture-tool.jsonl",
+        "sha256": "5a69008773d347603d64fba6fe5b2c11aef91069a21d4eeb59bdeeb9b6f110a2"
+      }
+    ],
+    "raw_sha256": "18ec8cc00bc3741837adaaa4235cd04df27f5b540de57313269629c4759c55bd"
+  },
+  {
+    "name": "spill",
+    "native_session_id": "fixture-spill",
+    "files": [
+      {
+        "path": ".codebuddy/projects/fixture-workspace/fixture-spill.jsonl",
+        "sha256": "d7bc6f8e859b68e3ddebbf28dc4f86171b05cd29525baa51e1c4b6b3cb944ff4"
+      },
+      {
+        "path": ".codebuddy/projects/fixture-workspace/fixture-spill/tool-results/fixture-call-001.txt",
+        "sha256": "04dc1437ad1e1d9d650cb4270086d96bbb6b94e1832cf6fab6db4b1d038d0d43"
+      }
+    ],
+    "raw_sha256": "020335bca0c03e9d8249984b691e1cb8df9cfc66782de0a58bc90d36b1440789"
+  },
+  {
+    "name": "error",
+    "native_session_id": "fixture-error",
+    "files": [
+      {
+        "path": ".codebuddy/projects/fixture-workspace/fixture-error.jsonl",
+        "sha256": "f4fa756b8cda2bdf6a7c71fd4c48e065e5b500b74d07b1f7553f8502a9b26406"
+      }
+    ],
+    "raw_sha256": "2f786055c1791f81e81ff16e349817133fc27b5f9d44a2ed13f05a1e9cfb9942"
+  },
+  {
+    "name": "fork",
+    "native_session_id": "fixture-fork",
+    "writer": "Native LocalJsonlSessionStore recorder, not CLI model loop",
+    "files": [
+      {
+        "path": ".codebuddy/projects/fixture-workspace/fixture-fork.jsonl",
+        "sha256": "6a57bd2f07a38a27dce06e6ff3492e87ff16828f1e74846ff1c027e1b364f54e"
+      }
+    ]
+  },
+  {
+    "name": "pending-rewind",
+    "native_session_id": "fixture-pending-rewind",
+    "writer": "Native LocalJsonlSessionStore recorder, not CLI model loop",
+    "files": [
+      {
+        "path": ".codebuddy/projects/fixture-workspace/fixture-pending-rewind.jsonl",
+        "sha256": "b44c56318e7a16a971291ddf83f0fdf2b50010bb5d7e5f32cb0757eea19142bf"
+      }
+    ]
+  },
+  {
+    "name": "compact",
+    "native_session_id": "fixture-compact",
+    "writer": "Native LocalJsonlSessionStore recorder, not CLI model loop",
+    "files": [
+      {
+        "path": ".codebuddy/projects/fixture-workspace/fixture-compact.jsonl",
+        "sha256": "7df0c2b1e2fad1acbc9bba1b341149ace09b3514f5d610aaa97005028db5d467"
+      }
+    ]
+  },
+  {
+    "name": "reasoning",
+    "native_session_id": "fixture-reasoning",
+    "writer": "Native LocalJsonlSessionStore recorder, not CLI model loop",
+    "files": [
+      {
+        "path": ".codebuddy/projects/fixture-workspace/fixture-reasoning.jsonl",
+        "sha256": "4ce3e2d41c6d3353ba7a3d79f7ee1b9f78bd28c4d548537c8af49d9353ecb636"
+      }
+    ]
+  },
+  {
+    "name": "fragments",
+    "native_session_id": "fixture-fragments",
+    "writer": "Native LocalJsonlSessionStore recorder, not CLI model loop",
+    "files": [
+      {
+        "path": ".codebuddy/projects/fixture-workspace/fixture-fragments.jsonl",
+        "sha256": "c2e38bb956d407a06bef7dbbc3cc03bf586dc922ed39c08a9d2b276e6a1971a9"
+      }
+    ]
+  },
+  {
+    "name": "metadata",
+    "native_session_id": "fixture-metadata",
+    "writer": "Native LocalJsonlSessionStore recorder, not CLI model loop",
+    "files": [
+      {
+        "path": ".codebuddy/projects/fixture-workspace/fixture-metadata.jsonl",
+        "sha256": "1bb3d79837757a5da5f24dafbccf671aec7edd937cebb02d371b36592ba782f9"
+      }
+    ]
+  },
+  {
+    "name": "string-content",
+    "native_session_id": "fixture-string-content",
+    "writer": "Native LocalJsonlSessionStore recorder, not CLI model loop",
+    "files": [
+      {
+        "path": ".codebuddy/projects/fixture-workspace/fixture-string-content.jsonl",
+        "sha256": "2122bf4de94090e642203fa92b8c6cbb4449acb4ae3380e706adcb70469acfab"
+      }
+    ]
+  }
+]

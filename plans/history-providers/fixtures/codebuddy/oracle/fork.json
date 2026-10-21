@@ -1,0 +1,146 @@
+{
+  "session": {
+    "id": "fixture-fork",
+    "history": [
+      {
+        "type": "message",
+        "id": "u1",
+        "timestamp": 1791720000001,
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Synthetic original prompt."
+          }
+        ],
+        "sessionId": "fixture-fork",
+        "cwd": "/fixture/workspace"
+      },
+      {
+        "type": "message",
+        "id": "a2",
+        "timestamp": 1791720000002,
+        "role": "assistant",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "Synthetic old branch answer."
+          }
+        ],
+        "sessionId": "fixture-fork",
+        "cwd": "/fixture/workspace",
+        "parentId": "u1"
+      },
+      {
+        "type": "resend-fork-notice",
+        "id": "notice-3",
+        "parentId": "u1",
+        "timestamp": 1791720000003,
+        "providerData": {
+          "skipRun": true,
+          "resendForkNotice": true
+        },
+        "sessionId": "fixture-fork",
+        "cwd": "/fixture/workspace"
+      },
+      {
+        "type": "message",
+        "id": "a4",
+        "timestamp": 1791720000004,
+        "role": "assistant",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "Synthetic replacement branch answer."
+          }
+        ],
+        "sessionId": "fixture-fork",
+        "cwd": "/fixture/workspace",
+        "parentId": "u1"
+      }
+    ],
+    "createdAt": 1792527413293.6902,
+    "updatedAt": 1792527413295.5515,
+    "meta": {
+      "cwd": "/fixture/workspace"
+    },
+    "hasCompactedHistory": false
+  },
+  "replay": [
+    {
+      "type": "message",
+      "id": "u1",
+      "timestamp": 1791720000001,
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Synthetic original prompt."
+        }
+      ],
+      "sessionId": "fixture-fork",
+      "cwd": "/fixture/workspace"
+    },
+    {
+      "type": "message",
+      "id": "a4",
+      "timestamp": 1791720000004,
+      "role": "assistant",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "Synthetic replacement branch answer."
+        }
+      ],
+      "sessionId": "fixture-fork",
+      "cwd": "/fixture/workspace",
+      "parentId": "u1"
+    }
+  ],
+  "lane": [
+    {
+      "type": "message",
+      "uuid": "u1",
+      "timestamp": "2026-10-11T12:00:00.001Z",
+      "payload": {
+        "type": "message",
+        "id": "u1",
+        "timestamp": 1791720000001,
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Synthetic original prompt."
+          }
+        ],
+        "sessionId": "fixture-fork",
+        "cwd": "/fixture/workspace"
+      }
+    },
+    {
+      "type": "message",
+      "uuid": "a4",
+      "timestamp": "2026-10-11T12:00:00.004Z",
+      "payload": {
+        "type": "message",
+        "id": "a4",
+        "timestamp": 1791720000004,
+        "role": "assistant",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "Synthetic replacement branch answer."
+          }
+        ],
+        "sessionId": "fixture-fork",
+        "cwd": "/fixture/workspace",
+        "parentId": "u1"
+      }
+    }
+  ],
+  "titleFacts": [],
+  "nativeTitle": "Synthetic original prompt.",
+  "realUserMessageIds": [
+    "u1"
+  ]
+}

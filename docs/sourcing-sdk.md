@@ -1003,6 +1003,7 @@ handle.
 | --- | --- | --- | --- | --- | --- | --- |
 | antigravity | ✓ | ✓ | — | — | — | none |
 | claude | ✓ | ✓ | ✓ | ✓ | ✓ | per-message |
+| codebuddy | ✓ | ✓ | ✓ | — | — | per-message |
 | codex | ✓ | ✓ | ✓ | ✓ | ✓ | cumulative-delta |
 | copilot | ✓ | ✓ | ✓ | — | — | per-message |
 | cursor | ✓ | ✓ | ✓ | ✓ | — | none |

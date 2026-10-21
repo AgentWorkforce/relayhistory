@@ -10,11 +10,13 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Qwen Code interactive session history is discoverable and searchable from native transcript files, preserving the active conversation branch, recorded messages and tool evidence.
 - Kimi Code history is discoverable and searchable from current native session journals, including recorded messages, tools and separate subagent transcripts.
+- Codebuddy Code history is discoverable and searchable from native project session files, including recorded messages and tool evidence.
 
 ### Rust API
 
 - Added `Source::QwenCode` for filtering and reading persisted Qwen Code history.
 - Added `Source::Kimi` for filtering and reading persisted Kimi Code history.
+- Added `Source::Codebuddy` for filtering and reading persisted Codebuddy Code history.
 
 ## [0.49.0] - 2026-10-21
 

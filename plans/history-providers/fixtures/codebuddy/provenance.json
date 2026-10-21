@@ -1,0 +1,33 @@
+{
+  "captured_on": "2026-10-20",
+  "package": "@tencent-ai/codebuddy-code",
+  "version": "2.171.0",
+  "tarball": "https://registry.npmjs.org/@tencent-ai/codebuddy-code/-/codebuddy-code-2.171.0.tgz",
+  "npm_integrity": "sha512-AjTOUX3+chTqwn0uxWifqE/IgJt3UMt135X4JlPxSlQsS5PFxd1vOZctLM54iQGbQGmsvYJ+Y9LeG2iveIReYQ==",
+  "npm_sha1": "54cc516d98bcd22fe8907f31a472d6e24a4538e2",
+  "bundle_sha256": "f04e3bf3ac210ed68931a947a63ef26296695766a432a90498383ec150da47b0",
+  "writer": "Five actual official CLI model-loop captures against a synthetic loopback SSE server; seven published LocalJsonlSessionStore recorder control captures without model calls",
+  "historical_reader": "Fresh process SessionStoreImpl.deserializeSessionFromPath for all captures; original HistoryUtils.resolveReplayHistory for controls, native isExternalUserPromptItem and getEffectiveSessionTitle. Separate LocalJsonlSessionStore.loadLane context oracle retained, never substituted for full historical replay.",
+  "instrumentation": "Only replace the pinned webpack terminal CLI entry with return __webpack_require__(81102); unmodified reader/writer functions, no decoder clone",
+  "platform": "macOS arm64, Node 22.22.2",
+  "isolation": "Fresh output HOME and env allowlist, dummy key only on 127.0.0.1, all model variants local, no user config/auth/history; tools empty or Read only; 50-second subprocess bounds",
+  "sanitation": [
+    "Deterministic native IDs, preserving links and resumed identity",
+    "Clock offset to fixed integer millisecond epoch, preserving relative times",
+    "Synthetic isolated cwd/HOME/project paths",
+    "Remove transient _meta baggage only"
+  ],
+  "documentation": [
+    "https://www.codebuddy.cn/docs/cli/codebuddy-dir",
+    "https://www.codebuddy.cn/docs/cli/models",
+    "https://www.codebuddy.cn/docs/cli/env-vars",
+    "https://www.codebuddy.ai/docs/cli/cli-reference"
+  ],
+  "limitations": [
+    "Other versions/customized product distributions not certified",
+    "Subagent transcripts and delegation not certified",
+    "Runtime-only lane moves without durable facts cannot be recovered after restart",
+    "Sidecar-only tool output variants unsupported; embedded paths never read",
+    "Unknown control facts fail closed"
+  ]
+}
