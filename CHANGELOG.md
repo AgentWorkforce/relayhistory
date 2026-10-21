@@ -13,14 +13,14 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Kimi Code history is discoverable and searchable from current native session journals, including recorded messages, tools and separate subagent transcripts.
 - Codebuddy Code history is discoverable and searchable from native project session files, including recorded messages and tool evidence.
 
+### Removed
+
+- The source-built Rust CLI no longer installs a background sync service: `ai-hist sync --install-service`, `--uninstall-service` and `--interval` (launchd on macOS, cron on Linux) are gone. Run `ai-hist watch`, or schedule `ai-hist sync` yourself. A service installed earlier keeps running until you remove it: `launchctl unload ~/Library/LaunchAgents/com.ai-hist.sync.plist` and delete that file on macOS, or delete the `# ai-hist sync (managed)` line from `crontab -e` on Linux.
+
 ### Fixed
 
 - A desktop socket pointer file with more than one line (LF or CRLF) names the socket by its first line instead of never connecting.
 - The relay roster, status, join and leave tools move on to the next desktop socket candidate when a Windows named pipe is busy, and report `socket_busy` (not "desktop isn't running") when none answers.
-
-### Removed
-
-- The source-built Rust CLI no longer installs a background sync service: `ai-hist sync --install-service`, `--uninstall-service` and `--interval` (launchd on macOS, cron on Linux) are gone. Run `ai-hist watch`, or schedule `ai-hist sync` yourself. A service installed earlier keeps running until you remove it: `launchctl unload ~/Library/LaunchAgents/com.ai-hist.sync.plist` and delete that file on macOS, or delete the `# ai-hist sync (managed)` line from `crontab -e` on Linux.
 
 ### Rust API
 
