@@ -6,6 +6,14 @@ pub(super) struct Summary<'a> {
     pub(super) first: i64,
     pub(super) last: i64,
     pub(super) last_assistant: Option<&'a str>,
+    pub(super) prior: Option<&'a PriorActivity>,
+}
+
+pub(super) struct PriorActivity {
+    catalog_first: Option<i64>,
+    catalog_last: Option<i64>,
+    local_first: Option<i64>,
+    local_last: Option<i64>,
 }
 
 fn has_remote(conn: &Connection, sid: &str) -> Result<bool> {
@@ -16,12 +24,35 @@ fn has_remote(conn: &Connection, sid: &str) -> Result<bool> {
     )?)
 }
 
+pub(super) fn prior_activity(conn: &Connection, sid: &str) -> Result<Option<PriorActivity>> {
+    if !has_remote(conn, sid)? {
+        return Ok(None);
+    }
+    let (catalog_first, catalog_last): (Option<i64>, Option<i64>) = conn.query_row(
+        "SELECT first_activity_ms,last_activity_ms FROM sessions WHERE source='vtcode' AND session_id=?1",
+        [sid],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let (local_first, local_last): (Option<i64>, Option<i64>) = conn.query_row(
+        "SELECT MIN(ts),MAX(ts) FROM (SELECT ts_ms AS ts FROM session_events WHERE source='vtcode' AND session_id=?1 AND location='local' UNION ALL SELECT ts_ms FROM session_markers WHERE source='vtcode' AND session_id=?1 AND location='local' UNION ALL SELECT ts_ms FROM tool_calls WHERE source='vtcode' AND session_id=?1 AND location='local')",
+        [sid],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    Ok(Some(PriorActivity {
+        catalog_first,
+        catalog_last,
+        local_first,
+        local_last,
+    }))
+}
+
 pub(super) fn untimed(
     conn: &Connection,
     sid: &str,
     cwd: Option<&str>,
     path: &Path,
     complete: bool,
+    prior: Option<&PriorActivity>,
 ) -> Result<()> {
     crate::discover::upsert_shallow_session(
         conn,
@@ -39,8 +70,8 @@ pub(super) fn untimed(
             "UPDATE sessions SET discovery_state='full' WHERE source='vtcode' AND session_id=?1",
             [sid],
         )?;
-        if has_remote(conn, sid)? {
-            refresh_shared(conn, sid)?;
+        if let Some(prior) = prior {
+            refresh_shared(conn, sid, prior)?;
         } else {
             conn.execute(
                 "UPDATE sessions SET first_activity_ms=NULL,last_activity_ms=NULL,first_prompt=NULL,last_assistant_text=NULL WHERE source='vtcode' AND session_id=?1",
@@ -60,8 +91,8 @@ pub(super) fn timed(
     complete: bool,
     summary: &Summary<'_>,
 ) -> Result<()> {
-    let remote = complete && has_remote(conn, sid)?;
-    let writer = if complete && !remote {
+    let remote = complete && summary.prior.is_some();
+    let writer = if complete {
         upsert_session_rebuilt
     } else {
         crate::ingest::upsert_session
@@ -79,8 +110,8 @@ pub(super) fn timed(
             raw_path: Some(&path.to_string_lossy()),
         },
     )?;
-    if remote {
-        refresh_shared(conn, sid)?;
+    if let Some(prior) = summary.prior.filter(|_| remote) {
+        refresh_shared(conn, sid, prior)?;
     } else {
         let first_prompt = format::first_prompt(rows, native).map(|(text, _, _)| text);
         if complete || first_prompt.is_some() {
@@ -95,7 +126,7 @@ pub(super) fn timed(
 // previews from surviving shared events, then remote observation metadata if
 // that connector has not supplied full events yet. Never reuse a retired local
 // preview merely because a remote presence keeps the session row alive.
-fn refresh_shared(conn: &Connection, sid: &str) -> Result<()> {
+fn refresh_shared(conn: &Connection, sid: &str, prior: &PriorActivity) -> Result<()> {
     let first_prompt: Option<String> = conn
         .query_row(
             "SELECT text FROM session_events WHERE source='vtcode' AND session_id=?1 AND role='user' AND kind='text' AND text IS NOT NULL ORDER BY ts_ms,id LIMIT 1",
@@ -125,21 +156,26 @@ fn refresh_shared(conn: &Connection, sid: &str) -> Result<()> {
         "UPDATE sessions SET first_prompt=?2,last_assistant_text=?3 WHERE source='vtcode' AND session_id=?1 AND (first_prompt IS NOT ?2 OR last_assistant_text IS NOT ?3)",
         rusqlite::params![sid, first_prompt, last_assistant],
     )?;
-    let remote_events: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM session_events WHERE source='vtcode' AND session_id=?1 AND location IN ('remote','both'))",
+    let (observed_first, observed_last): (Option<i64>, Option<i64>) = conn.query_row(
+        "SELECT MIN(ts),MAX(ts) FROM (SELECT ts_ms AS ts FROM session_events WHERE source='vtcode' AND session_id=?1 UNION ALL SELECT ts_ms FROM session_markers WHERE source='vtcode' AND session_id=?1 UNION ALL SELECT ts_ms FROM tool_calls WHERE source='vtcode' AND session_id=?1 UNION ALL SELECT timestamp_ms FROM history WHERE source='vtcode' AND session_id=?1)",
         [sid],
-        |row| row.get(0),
+        |row| Ok((row.get(0)?, row.get(1)?)),
     )?;
-    if remote_events {
-        let (first, last): (Option<i64>, Option<i64>) = conn.query_row(
-            "SELECT MIN(ts),MAX(ts) FROM (SELECT ts_ms AS ts FROM session_events WHERE source='vtcode' AND session_id=?1 UNION ALL SELECT ts_ms FROM session_markers WHERE source='vtcode' AND session_id=?1 UNION ALL SELECT ts_ms FROM tool_calls WHERE source='vtcode' AND session_id=?1 UNION ALL SELECT timestamp_ms FROM history WHERE source='vtcode' AND session_id=?1)",
-            [sid],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        conn.execute(
-            "UPDATE sessions SET first_activity_ms=?2,last_activity_ms=?3 WHERE source='vtcode' AND session_id=?1 AND (first_activity_ms IS NOT ?2 OR last_activity_ms IS NOT ?3)",
-            rusqlite::params![sid, first, last],
-        )?;
-    }
+    // The shared catalog has no per-observation time columns. An endpoint
+    // outside the old local evidence range is known to come from the remote
+    // observation; an endpoint equal to retired local evidence is ambiguous
+    // and must not be carried forward as if it were still observed.
+    let remote_first = prior
+        .catalog_first
+        .filter(|first| prior.local_first.is_none_or(|local| *first < local));
+    let remote_last = prior
+        .catalog_last
+        .filter(|last| prior.local_last.is_none_or(|local| *last > local));
+    let first = observed_first.into_iter().chain(remote_first).min();
+    let last = observed_last.into_iter().chain(remote_last).max();
+    conn.execute(
+        "UPDATE sessions SET first_activity_ms=?2,last_activity_ms=?3 WHERE source='vtcode' AND session_id=?1 AND (first_activity_ms IS NOT ?2 OR last_activity_ms IS NOT ?3)",
+        rusqlite::params![sid, first, last],
+    )?;
     Ok(())
 }

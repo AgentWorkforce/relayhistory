@@ -9,17 +9,11 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - Qoder global CLI session history is discoverable and searchable from its native project transcripts, preserving recorded messages, tools, results, and resume appends.
-
-### Rust API
-
-- Added `Source::Qoder` for filtering and reading persisted Qoder global CLI history.
-
-### Added
-
 - VT Code history is discoverable and searchable from canonical workspace journals under explicitly configured workspace roots, preserving recorded turns, tool identities, usage and control events.
 
 ### Rust API
 
+- Added `Source::Qoder` for filtering and reading persisted Qoder global CLI history.
 - Added `Source::Vtcode` for filtering and reading persisted VT Code session history.
 
 ## [0.50.1] - 2026-10-21

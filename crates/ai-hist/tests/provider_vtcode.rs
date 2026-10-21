@@ -588,6 +588,70 @@ fn untimed_local_start_keeps_remote_catalog_metadata() {
         .any(|marker| marker.kind == "thread.started"));
 }
 
+#[cfg(feature = "unstable-internal")]
+#[test]
+fn remote_observation_without_events_does_not_keep_retired_local_activity() {
+    use ai_hist::{SessionLocation, ShallowSession, SourceObservation, SourceObservationBatch};
+    for (remote_bounds, expected) in [
+        (None, (1_792_497_660_000, 1_792_497_666_000)),
+        (
+            Some((1_792_497_540_000, 1_792_497_720_000)),
+            (1_792_497_540_000, 1_792_497_720_000),
+        ),
+    ] {
+        let home = tempfile::tempdir().unwrap();
+        let path = stage(home.path());
+        let store = open(home.path());
+        let id = sid(home.path());
+        store.sync(SyncOptions::default().force(true)).unwrap();
+        store
+            .apply_source_observations(SourceObservationBatch::new(
+                "synthetic-remote",
+                "default",
+                SessionLocation::Remote,
+                vec![SourceObservation {
+                    session: ShallowSession {
+                        source: "vtcode".into(),
+                        session_id: id.clone(),
+                        first_activity_ms: remote_bounds.map(|bounds| bounds.0),
+                        last_activity_ms: remote_bounds.map(|bounds| bounds.1),
+                        first_prompt: Some("Remote observed preview".into()),
+                        ..Default::default()
+                    },
+                    raw_locator: None,
+                }],
+            ))
+            .unwrap();
+        let rows = FIXTURE
+            .lines()
+            .enumerate()
+            .filter(|(index, _)| ![1, 2, 3].contains(index))
+            .map(|(_, row)| row)
+            .collect::<Vec<_>>();
+        std::fs::write(path, format!("{}\n", rows.join("\n"))).unwrap();
+        store.sync(SyncOptions::default().force(true)).unwrap();
+        let mut query = CatalogQuery::default();
+        query.sources = Some(vec![Source::Vtcode]);
+        let row = store.sessions(query).next().unwrap().unwrap();
+        assert_eq!(row.first_activity_ms, Some(expected.0));
+        assert_eq!(row.last_activity_ms, Some(expected.1));
+        assert_eq!(
+            row.first_prompt.as_deref(),
+            Some("Run the synthetic verification")
+        );
+        assert!(!contains(
+            &evidence(&store, &id),
+            "Inspect the synthetic fixture"
+        ));
+        store.sync(SyncOptions::default().force(true)).unwrap();
+        let mut repeated = CatalogQuery::default();
+        repeated.sources = Some(vec![Source::Vtcode]);
+        let stable = store.sessions(repeated).next().unwrap().unwrap();
+        assert_eq!(stable.first_activity_ms, Some(expected.0));
+        assert_eq!(stable.last_activity_ms, Some(expected.1));
+    }
+}
+
 #[test]
 fn complete_rewrite_without_user_turn_clears_first_prompt() {
     let home = tempfile::tempdir().unwrap();

@@ -65,6 +65,11 @@ pub(super) fn write(conn: &Connection, payload: &Value, path: &Path) -> Result<u
         return Ok(0);
     }
     let shared = Snapshot::capture(conn, ID, sid)?;
+    let prior_activity = if complete {
+        catalog::prior_activity(conn, sid)?
+    } else {
+        None
+    };
     let cwd = path
         .parent()
         .and_then(Path::parent)
@@ -83,10 +88,26 @@ pub(super) fn write(conn: &Connection, payload: &Value, path: &Path) -> Result<u
             first,
             last: written.last.unwrap_or(first),
             last_assistant: written.last_assistant,
+            prior: prior_activity.as_ref(),
         };
-        catalog::timed(conn, sid, native, path, rows, complete, &summary)?;
+        catalog::timed(
+            conn,
+            sid,
+            native,
+            path,
+            rows,
+            complete,
+            &summary,
+        )?;
     } else {
-        catalog::untimed(conn, sid, cwd.as_deref(), path, complete)?;
+        catalog::untimed(
+            conn,
+            sid,
+            cwd.as_deref(),
+            path,
+            complete,
+            prior_activity.as_ref(),
+        )?;
     }
     shared.ensure_unchanged(conn, sid)?;
     Ok(written.inserted)
