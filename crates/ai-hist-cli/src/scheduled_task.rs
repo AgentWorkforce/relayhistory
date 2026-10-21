@@ -138,8 +138,9 @@ fn batch_quote_arg(value: &str) -> String {
 /// The environment the task needs, read from this process: the provider roots
 /// the launchd and cron services capture, plus [`WINDOWS_EXTRA_ENV_VARS`].
 /// Values are passed through verbatim: each provider resolves its own
-/// relative, `~`, `$VAR` and unset-marker forms, and the task runs in the
-/// install directory (see [`task_xml`]) so they resolve as they did there.
+/// relative, `~`, `$VAR` and unset-marker forms, and the wrapper changes to
+/// the install directory (see [`wrapper_script`]) so they resolve as they did
+/// there.
 fn task_environment(spec: &ServiceSpec) -> Result<Vec<(&'static str, String)>> {
     let mut environment = service_provider_environment(spec)?;
     for name in WINDOWS_EXTRA_ENV_VARS {
@@ -153,14 +154,35 @@ fn task_environment(spec: &ServiceSpec) -> Result<Vec<(&'static str, String)>> {
     Ok(environment)
 }
 
-/// The `.cmd` wrapper the task runs: set the environment, run ai-hist, append
-/// its output to `log`. CRLF line endings, UTF-8 (switched to with `chcp`
-/// before any non-ASCII line is read).
+/// Captured variables that hold a name or suffix rather than a path.
+const NON_PATH_ENV_VARS: [&str; 4] = [
+    "HERMES_DATA_DIR_SUFFIX",
+    "OMP_PROFILE",
+    "OPENCLAW_PROFILE",
+    "PI_PROFILE",
+];
+
+/// Whether `value` of `name` is a path its provider would resolve against the
+/// current directory. `~`, `$VAR`/`%VAR%` forms and OpenClaw's `null` and
+/// `undefined` markers are resolved by the providers themselves.
+pub(crate) fn relative_path_value(name: &str, value: &str) -> bool {
+    !NON_PATH_ENV_VARS.contains(&name)
+        && !Path::new(value).is_absolute()
+        && !value.starts_with(['~', '$', '%', '\\', '/'])
+        && !matches!(value, "null" | "undefined")
+}
+
+/// The `.cmd` wrapper the task runs: set the environment, change to `cwd` (the
+/// install directory; `None` for a UNC one, which cmd.exe cannot enter), run
+/// ai-hist, append its output to `log`. The `cd` is best effort: a since-removed
+/// install directory is logged and the sync still runs. CRLF line endings,
+/// UTF-8 (switched to with `chcp` before any non-ASCII line is read).
 pub(crate) fn wrapper_script(
     spec: &ServiceSpec,
     bin: &str,
     args: &[String],
     environment: &[(&str, String)],
+    cwd: Option<&str>,
     log: &str,
 ) -> Result<String> {
     reject_quote("the ai-hist binary path", bin)?;
@@ -177,6 +199,14 @@ pub(crate) fn wrapper_script(
     for (name, value) in environment {
         reject_quote(name, value)?;
         lines.push(format!("set {}", batch_quote(&format!("{name}={value}"))));
+    }
+    if let Some(cwd) = cwd {
+        reject_quote("the install directory", cwd)?;
+        lines.push(format!(
+            "cd /d {} >> {} 2>&1",
+            batch_quote(cwd),
+            batch_quote(log)
+        ));
     }
     let mut command = vec![batch_quote(bin)];
     for arg in service_command_args(spec, args) {
@@ -209,15 +239,14 @@ pub(crate) fn task_action(system_root: &Path, wrapper: &Path) -> (String, String
 
 /// Task definition: repeat every `minutes` from `start_boundary` (local time),
 /// run only while the user is logged on (no stored password), hidden, on
-/// battery too, catch up a missed run, never overlap a still-running one. The
-/// action starts in `working_dir`, the install directory, so relative provider
-/// roots resolve exactly as they did for the install command.
+/// battery too, catch up a missed run, never overlap a still-running one. No
+/// `WorkingDirectory`: Task Scheduler refuses to start an action whose working
+/// directory has been removed, so the wrapper changes directory itself.
 pub(crate) fn task_xml(
     spec: &ServiceSpec,
     start_boundary: &str,
     minutes: u64,
     action: &(String, String),
-    working_dir: &str,
 ) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
@@ -264,7 +293,6 @@ pub(crate) fn task_xml(
     <Exec>
       <Command>{command}</Command>
       <Arguments>{arguments}</Arguments>
-      <WorkingDirectory>{working_dir}</WorkingDirectory>
     </Exec>
   </Actions>
 </Task>
@@ -274,7 +302,6 @@ pub(crate) fn task_xml(
         time_limit = EXECUTION_TIME_LIMIT,
         command = xml_escape(&action.0),
         arguments = xml_escape(&action.1),
-        working_dir = xml_escape(working_dir),
     )
 }
 
@@ -332,16 +359,31 @@ pub(crate) fn install(spec: &ServiceSpec, bin: &str, interval: u64, args: &[Stri
     }
     let cwd = std::env::current_dir().context("reading the current directory")?;
     let cwd = cwd.display().to_string();
-    if cwd.starts_with(r"\\") {
-        // cmd.exe cannot run in a UNC directory and falls back to %SystemRoot%.
-        eprintln!(
-            "Note: installing from a network path; relative provider roots will resolve against %SystemRoot% in the scheduled task."
-        );
-    }
     let environment = task_environment(spec)?;
+    // cmd.exe cannot enter a UNC directory, so the wrapper has nowhere to
+    // resolve relative provider roots from.
+    let unc = cwd.starts_with(r"\\");
+    if unc {
+        if let Some((name, _)) = environment
+            .iter()
+            .find(|(name, value)| relative_path_value(name, value))
+        {
+            anyhow::bail!(
+                "cannot install sync service from the network path {cwd}: {name} is relative, and a scheduled task cannot resolve it there. Install from a local directory or make {name} absolute."
+            );
+        }
+    }
+    let cwd = (!unc).then_some(cwd.as_str());
     let log = std::env::temp_dir().join(format!("{}.log", spec.log_stem));
     let wrapper = wrapper_path(spec);
-    let script = wrapper_script(spec, bin, args, &environment, &log.display().to_string())?;
+    let script = wrapper_script(
+        spec,
+        bin,
+        args,
+        &environment,
+        cwd,
+        &log.display().to_string(),
+    )?;
     if let Some(dir) = wrapper.parent() {
         fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
@@ -356,7 +398,7 @@ pub(crate) fn install(spec: &ServiceSpec, bin: &str, interval: u64, args: &[Stri
         }
     };
     fs::write(&wrapper, script).with_context(|| format!("writing {}", wrapper.display()))?;
-    if let Err(error) = register(spec, minutes, &wrapper, &cwd) {
+    if let Err(error) = register(spec, minutes, &wrapper) {
         let restored = match previous {
             Some(bytes) => fs::write(&wrapper, bytes),
             None => fs::remove_file(&wrapper),
@@ -385,15 +427,14 @@ pub(crate) fn install(spec: &ServiceSpec, bin: &str, interval: u64, args: &[Stri
     Ok(())
 }
 
-/// Register (or replace) the task that runs `wrapper` every `minutes` in
-/// `working_dir`.
-fn register(spec: &ServiceSpec, minutes: u64, wrapper: &Path, working_dir: &str) -> Result<()> {
+/// Register (or replace) the task that runs `wrapper` every `minutes`.
+fn register(spec: &ServiceSpec, minutes: u64, wrapper: &Path) -> Result<()> {
     let system_root = std::env::var_os("SystemRoot")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
     let action = task_action(&system_root, wrapper);
     let start = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-    let xml = task_xml(spec, &start, minutes, &action, working_dir);
+    let xml = task_xml(spec, &start, minutes, &action);
     let definition = tempfile::Builder::new()
         .prefix("ai-hist-task-")
         .suffix(".xml")
@@ -506,6 +547,7 @@ mod tests {
             r"C:\Program Files\ai-hist\ai-hist.exe",
             &["--source-connector".to_string(), "devin".to_string()],
             &environment,
+            Some(r"C:\work & play"),
             r"C:\Users\Ann Lee\AppData\Local\Temp\ai-hist-sync.log",
         )
         .unwrap();
@@ -516,11 +558,16 @@ mod tests {
         assert_eq!(lines[3], "setlocal DisableDelayedExpansion");
         assert_eq!(lines[4], r#"set "CLAUDE_CONFIG_DIR=D:\Claude & tools""#);
         assert_eq!(lines[5], r#"set "CODEX_HOME=D:\codex's 100%% archive""#);
+        // Best effort: a removed install directory is logged, the sync still runs.
         assert_eq!(
             lines[6],
+            r#"cd /d "C:\work & play" >> "C:\Users\Ann Lee\AppData\Local\Temp\ai-hist-sync.log" 2>&1"#
+        );
+        assert_eq!(
+            lines[7],
             r#""C:\Program Files\ai-hist\ai-hist.exe" "sync" "--source-connector" "devin" >> "C:\Users\Ann Lee\AppData\Local\Temp\ai-hist-sync.log" 2>&1"#
         );
-        assert_eq!(lines[7], "");
+        assert_eq!(lines[8], "");
         assert!(
             !script.replace("\r\n", "").contains('\n'),
             "every line ends in CRLF"
@@ -534,12 +581,25 @@ mod tests {
             r"C:\ai-hist.exe",
             &[],
             &[("CODEX_HOME", r#"D:\a"b"#.to_string())],
+            None,
             r"C:\log",
         )
         .unwrap_err();
         assert!(error
             .to_string()
             .contains("CODEX_HOME contains a double quote"));
+    }
+
+    #[test]
+    fn only_plain_relative_paths_need_an_install_directory() {
+        assert!(relative_path_value("OPENCLAW_STATE_DIR", "state"));
+        assert!(relative_path_value("CODEX_HOME", r".\codex"));
+        // Providers resolve these themselves, or they are not paths at all.
+        assert!(!relative_path_value("OPENCLAW_HOME", "~/claw"));
+        assert!(!relative_path_value("HERMES_HOME", "$HOME/hermes"));
+        assert!(!relative_path_value("OPENCLAW_STATE_DIR", "null"));
+        assert!(!relative_path_value("OMP_PROFILE", "work"));
+        assert!(!relative_path_value("HERMES_DATA_DIR_SUFFIX", "dev"));
     }
 
     #[test]
@@ -561,13 +621,7 @@ mod tests {
             r"C:\Windows\System32\conhost.exe".to_string(),
             r#"--headless "C:\a&b\cmd.exe" /c ""x<y>.cmd"""#.to_string(),
         );
-        let xml = task_xml(
-            &SYNC_SERVICE,
-            "2026-10-20T09:30:00",
-            5,
-            &action,
-            r"C:\work & play",
-        );
+        let xml = task_xml(&SYNC_SERVICE, "2026-10-20T09:30:00", 5, &action);
         for expected in [
             "<Interval>PT5M</Interval>",
             "<StartBoundary>2026-10-20T09:30:00</StartBoundary>",
@@ -581,11 +635,11 @@ mod tests {
             "<ExecutionTimeLimit>PT6H</ExecutionTimeLimit>",
             r"<Command>C:\Windows\System32\conhost.exe</Command>",
             r#"<Arguments>--headless "C:\a&amp;b\cmd.exe" /c ""x&lt;y&gt;.cmd""</Arguments>"#,
-            // Relative provider roots resolve against the install directory.
-            r"<WorkingDirectory>C:\work &amp; play</WorkingDirectory>",
         ] {
             assert!(xml.contains(expected), "missing {expected} in\n{xml}");
         }
+        // A removed working directory would stop the task from starting.
+        assert!(!xml.contains("<WorkingDirectory>"));
         // No repetition duration: the trigger repeats indefinitely.
         assert!(!xml.contains("<Duration>"));
     }
