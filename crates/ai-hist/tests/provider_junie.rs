@@ -237,8 +237,12 @@ fn discovery_limit_selects_newest_journal_after_enumerating_all_directories() {
         .unwrap()
         .join("session-zz-newer");
     std::fs::create_dir_all(&second).unwrap();
-    std::thread::sleep(std::time::Duration::from_millis(20));
-    std::fs::copy(&original, second.join("events.jsonl")).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(1100));
+    std::fs::write(
+        second.join("events.jsonl"),
+        std::fs::read(&original).unwrap(),
+    )
+    .unwrap();
     let store = open(home.path());
     store
         .discover(
@@ -331,6 +335,7 @@ fn explicit_roots_isolate_equal_native_ids_and_empty_default_is_safe() {
     }
 }
 
+#[cfg(feature = "unstable-internal")]
 #[test]
 fn remote_evidence_accepts_matching_local_share_but_rejects_conflicting_rewrite() {
     let home = tempfile::tempdir().unwrap();
@@ -379,6 +384,7 @@ fn remote_evidence_accepts_matching_local_share_but_rejects_conflicting_rewrite(
     assert_eq!(evidence(&store).messages, before.messages);
 }
 
+#[cfg(all(feature = "unstable-internal", feature = "export"))]
 #[test]
 fn exported_junie_evidence_roundtrips_through_public_intake_then_local_hydrate() {
     use ai_hist::export::{ExportLimits, ExportSelection, ExportSnapshot};
