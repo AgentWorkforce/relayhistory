@@ -612,12 +612,29 @@ fn relocated_journal_without_index_does_not_inherit_old_project() {
             .unwrap();
         assert_eq!(locator, new_path.to_string_lossy());
         assert_eq!(state, "shallow");
+        let catalog_state: String = conn
+            .query_row(
+                "SELECT discovery_state FROM sessions WHERE source='junie' AND session_id=?1",
+                [SID],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(catalog_state, "shallow");
     }
     moved
         .hydrate(&reference, HydrateOptions::default())
         .unwrap();
     assert_eq!(project_facts(&db), (None, None, None));
     assert_eq!(project_keys(&db), (None, None));
+    let conn = rusqlite::Connection::open(&db).unwrap();
+    let catalog_state: String = conn
+        .query_row(
+            "SELECT discovery_state FROM sessions WHERE source='junie' AND session_id=?1",
+            [SID],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(catalog_state, "full");
 }
 
 #[test]

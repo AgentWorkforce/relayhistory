@@ -67,8 +67,9 @@ project directory for event, history and catalog reconciliation. A remote-only
 or discovery-only catalog row does not supply that fact; an explicit native
 summary without `projectDir` does not use the fallback. If discovery finds the
 same session ID at a new journal locator, it invalidates the old full-local
-capture before replacing the locator, so the new journal cannot inherit the
-old journal's project while its index is unavailable.
+capture and demotes the catalog's full state before replacing the locator,
+unless an independent remote full capture still supports that state. The new
+journal cannot inherit the old journal's project while its index is unavailable.
 Unsupported event shapes fail visibly, while unknown evidence is
 preserved as bounded markers. A complete journal rewrite retires stale local
 evidence; an incomplete final JSONL line defers replacement. No native resume

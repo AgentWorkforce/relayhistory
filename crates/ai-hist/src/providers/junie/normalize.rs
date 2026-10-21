@@ -34,6 +34,17 @@ pub(super) fn invalidate_relocated_local_capture(
              AND discovery_state='full' AND raw_locator IS NOT ?3",
             rusqlite::params![ID, sid, path.to_string_lossy()],
         )?;
+        conn.execute(
+            "UPDATE sessions SET discovery_state=CASE WHEN EXISTS ( \
+               SELECT 1 FROM session_presences p WHERE p.source=?1 \
+               AND p.session_id=?2 AND p.location='remote' AND p.discovery_state='full' \
+             ) OR EXISTS ( \
+               SELECT 1 FROM session_observations o WHERE o.source=?1 \
+               AND o.session_id=?2 AND o.location='remote' AND o.discovery_state='full' \
+             ) THEN 'full' ELSE 'shallow' END \
+             WHERE source=?1 AND session_id=?2",
+            rusqlite::params![ID, sid],
+        )?;
         // A remote presence may own the merged catalog cwd. Only retract the
         // old local projection when there is no independent remote presence.
         conn.execute(
