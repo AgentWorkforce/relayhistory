@@ -8,7 +8,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- `ai-hist sync --install-service` works on Windows: it registers a hidden Task Scheduler task (`\RelayHistory\ai-hist-sync`) that runs `sync` every `--interval` (rounded up to whole minutes) while you are logged on, with no console window, logging to `%TEMP%\ai-hist-sync.log`; `--uninstall-service` removes it.
+- `ai-hist sync --install-service` works on Windows: it registers a hidden Task Scheduler task per account (`\RelayHistory\ai-hist-sync-<user>`) that runs `sync` every `--interval` (rounded up to whole minutes) while you are logged on, with no console window, logging to `%TEMP%\ai-hist-sync.log`; `--uninstall-service` removes it.
 
 ## [0.49.0] - 2026-10-21
 

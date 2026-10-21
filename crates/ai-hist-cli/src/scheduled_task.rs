@@ -32,14 +32,49 @@ const TASK_FOLDER: &str = r"\RelayHistory";
 /// hold `IgnoreNew` off every later run forever.
 const EXECUTION_TIME_LIMIT: &str = "PT6H";
 
-/// Variables passed through to the task besides the provider roots. Task
-/// Scheduler starts from the user's registry environment, which lacks a
-/// shell-only `HOME`, and `home_dir()` prefers `HOME` over `USERPROFILE`.
-const WINDOWS_EXTRA_ENV_VARS: [&str; 1] = ["HOME"];
+/// Variables passed through to the task besides the shared provider roots.
+/// Task Scheduler starts from the user's registry environment, which lacks
+/// shell-only variables: `HOME` (`home_dir()` prefers it over `USERPROFILE`)
+/// and the provider roots the shared launchd/cron list does not carry yet.
+const WINDOWS_EXTRA_ENV_VARS: [&str; 10] = [
+    "HOME",
+    "COPILOT_HOME",
+    "HERMES_HOME",
+    "HERMES_DATA_DIR_SUFFIX",
+    "OMP_PROFILE",
+    "OPENCODE_STORAGE_DIR",
+    "PI_CODING_AGENT_DIR",
+    "PI_CODING_AGENT_SESSION_DIR",
+    "PI_CONFIG_DIR",
+    "PI_PROFILE",
+];
 
-/// The task's full path, e.g. `\RelayHistory\ai-hist-sync`.
+/// The task's full path, e.g. `\RelayHistory\ai-hist-sync-ann`. Task paths are
+/// machine-wide, so each account registers its own task.
 pub(crate) fn task_name(spec: &ServiceSpec) -> String {
-    format!(r"{TASK_FOLDER}\{}", spec.log_stem)
+    let account = std::env::var("USERNAME")
+        .ok()
+        .filter(|name| !name.trim().is_empty())
+        .or_else(|| {
+            let home = ai_hist::paths::home_dir();
+            home.file_name().map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "user".to_string());
+    task_name_for(spec, &account)
+}
+
+/// [`task_name`] for `account`, with characters a task name cannot hold
+/// replaced by `_`.
+pub(crate) fn task_name_for(spec: &ServiceSpec, account: &str) -> String {
+    let account: String = account
+        .chars()
+        .map(|c| match c {
+            '\\' | '/' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+    format!(r"{TASK_FOLDER}\{}-{account}", spec.log_stem)
 }
 
 /// Returns `(repetition minutes, human cadence, effective period in seconds)`.
@@ -138,7 +173,11 @@ pub(crate) fn wrapper_script(
         reject_quote("a service argument", &arg)?;
         command.push(batch_quote_arg(&arg));
     }
-    lines.push(format!("{} >> {} 2>&1", command.join(" "), batch_quote(log)));
+    lines.push(format!(
+        "{} >> {} 2>&1",
+        command.join(" "),
+        batch_quote(log)
+    ));
     Ok(format!("{}\r\n", lines.join("\r\n")))
 }
 
@@ -300,7 +339,10 @@ pub(crate) fn install(spec: &ServiceSpec, bin: &str, interval: u64, args: &[Stri
         eprintln!("Note: the first run starts at the next scheduled time.");
     }
 
-    println!("Installed Task Scheduler {} task ({name}); running {cadence}.", spec.human);
+    println!(
+        "Installed Task Scheduler {} task ({name}); running {cadence}.",
+        spec.human
+    );
     println!("  view:   schtasks /Query /TN \"{name}\" /V /FO LIST");
     println!("  log:    {}", log.display());
     println!("  remove: ai-hist {} --uninstall-service", spec.subcommand);
@@ -333,8 +375,16 @@ mod tests {
     use crate::SYNC_SERVICE;
 
     #[test]
-    fn task_name_lives_in_the_relayhistory_folder() {
-        assert_eq!(task_name(&SYNC_SERVICE), r"\RelayHistory\ai-hist-sync");
+    fn task_name_is_per_account_in_the_relayhistory_folder() {
+        assert_eq!(
+            task_name_for(&SYNC_SERVICE, "Ann Lee"),
+            r"\RelayHistory\ai-hist-sync-Ann Lee"
+        );
+        assert_eq!(
+            task_name_for(&SYNC_SERVICE, r"a\b:c*d|e"),
+            r"\RelayHistory\ai-hist-sync-a_b_c_d_e"
+        );
+        assert!(task_name(&SYNC_SERVICE).starts_with(r"\RelayHistory\ai-hist-sync-"));
     }
 
     #[test]
@@ -347,9 +397,15 @@ mod tests {
         // No divisor rounding: Task Scheduler repeats uniformly at any minute step.
         assert_eq!(task_schedule(420), (7, "every 7 minutes".to_string(), 420));
         assert_eq!(task_schedule(5400).1, "every 90 minutes");
-        assert_eq!(task_schedule(7200), (120, "every 2 hour(s)".to_string(), 7200));
+        assert_eq!(
+            task_schedule(7200),
+            (120, "every 2 hour(s)".to_string(), 7200)
+        );
         // A day or longer runs once a day, as cron does.
-        assert_eq!(task_schedule(86_400), (1440, "once a day".to_string(), 86_400));
+        assert_eq!(
+            task_schedule(86_400),
+            (1440, "once a day".to_string(), 86_400)
+        );
         assert_eq!(task_schedule(90_000).0, 1440);
         assert_eq!(task_schedule(u64::MAX).0, 1440);
     }
@@ -397,7 +453,10 @@ mod tests {
             r#""C:\Program Files\ai-hist\ai-hist.exe" "sync" "--source-connector" "devin" >> "C:\Users\Ann Lee\AppData\Local\Temp\ai-hist-sync.log" 2>&1"#
         );
         assert_eq!(lines[7], "");
-        assert!(!script.replace("\r\n", "").contains('\n'), "every line ends in CRLF");
+        assert!(
+            !script.replace("\r\n", "").contains('\n'),
+            "every line ends in CRLF"
+        );
     }
 
     #[test]
@@ -410,7 +469,9 @@ mod tests {
             r"C:\log",
         )
         .unwrap_err();
-        assert!(error.to_string().contains("CODEX_HOME contains a double quote"));
+        assert!(error
+            .to_string()
+            .contains("CODEX_HOME contains a double quote"));
     }
 
     #[test]
