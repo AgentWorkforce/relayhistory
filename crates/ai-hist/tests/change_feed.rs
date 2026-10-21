@@ -180,8 +180,8 @@ fn an_in_progress_message_reaches_the_feed_only_once_complete() {
         "the prompt is indexed, the streaming message is held: {events:?}"
     );
     assert!(matches!(
-        &events[0].op,
-        ChangeOp::Upsert(EvidenceRow::SessionEvent(event)) if event.role == "user"
+        upsert(&events[0].op),
+        Some(EvidenceRow::SessionEvent(event)) if event.role == "user"
     ));
     assert!(
         tick.iter().any(|change| change.kind == ChangeKind::Session),
@@ -220,8 +220,8 @@ fn an_in_progress_message_reaches_the_feed_only_once_complete() {
     let tick = drain(&store, head);
     let mut uids: Vec<String> = tick
         .iter()
-        .filter_map(|change| match &change.op {
-            ChangeOp::Upsert(EvidenceRow::SessionEvent(event)) => Some(event.event_uid.clone()),
+        .filter_map(|change| match upsert(&change.op) {
+            Some(EvidenceRow::SessionEvent(event)) => Some(event.event_uid.clone()),
             _ => None,
         })
         .collect();
@@ -528,8 +528,8 @@ fn replaying_the_feed_reconstructs_the_tables_after_every_sync() {
     let grown = drain(&store, before);
     assert!(
         grown.iter().any(|change| matches!(
-            &change.op,
-            ChangeOp::Upsert(EvidenceRow::SessionEvent(event)) if event.event_uid == "u-late-1:0"
+            upsert(&change.op),
+            Some(EvidenceRow::SessionEvent(event)) if event.event_uid == "u-late-1:0"
         )),
         "the appended turn is in the delta: {grown:?}"
     );
@@ -626,8 +626,8 @@ fn a_history_prompt_reaches_the_feed_with_its_stored_row() {
             Value::from("ship the feed"),
         ]
     );
-    match &change.op {
-        ChangeOp::Upsert(EvidenceRow::History(entry)) => {
+    match upsert(&change.op) {
+        Some(EvidenceRow::History(entry)) => {
             assert_eq!(entry.prompt, "ship the feed");
             assert_eq!(entry.timestamp_ms, 1_756_634_400_000);
         }
@@ -1223,8 +1223,8 @@ fn a_forced_sweep_over_unchanged_files_reports_nothing() {
         "the new record and the grown session's own rows: {delta:?}"
     );
     assert!(delta.iter().any(|change| matches!(
-        &change.op,
-        ChangeOp::Upsert(EvidenceRow::SessionEvent(event)) if event.event_uid.starts_with("u-tick-1")
+        upsert(&change.op),
+        Some(EvidenceRow::SessionEvent(event)) if event.event_uid.starts_with("u-tick-1")
     )));
 
     // A hydration over the sweep's rows rewrites every record it re-reads
@@ -1560,8 +1560,16 @@ fn session_events_since(store: &SessionStore, from: Watermark) -> Vec<Change> {
 }
 
 fn event_token(change: &Change) -> Option<&str> {
-    match &change.op {
-        ChangeOp::Upsert(EvidenceRow::SessionEvent(event)) => event.token_json.as_deref(),
+    match upsert(&change.op) {
+        Some(EvidenceRow::SessionEvent(event)) => event.token_json.as_deref(),
+        _ => None,
+    }
+}
+
+/// The typed row of an upsert, or `None` for a delete.
+fn upsert(op: &ChangeOp) -> Option<&EvidenceRow> {
+    match op {
+        ChangeOp::Upsert(row) => Some(row),
         _ => None,
     }
 }

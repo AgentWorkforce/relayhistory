@@ -118,4 +118,29 @@ impl Source {
             _ => None,
         }
     }
+
+    /// The provider metadata this source registers; total, so no lookup can miss.
+    pub(crate) fn metadata(self) -> &'static crate::providers::ProviderMetadata {
+        match self {
+            Self::Claude => &crate::providers::claude::METADATA,
+            Self::Codex => &crate::providers::codex::METADATA,
+            Self::Cursor => &crate::providers::cursor::METADATA,
+            Self::Grok => &crate::providers::grok::METADATA,
+            Self::OpenCode => &crate::providers::opencode::METADATA,
+            Self::Muse => &crate::providers::muse::METADATA,
+            Self::Devin => &crate::providers::devin::METADATA,
+            Self::Pi => &crate::providers::pi::METADATA,
+            Self::Hermes => &crate::providers::hermes::METADATA,
+            Self::Omp => &crate::providers::omp::METADATA,
+            Self::Antigravity => &crate::providers::antigravity::METADATA,
+            Self::Copilot => &crate::providers::copilot::METADATA,
+            Self::QwenCode => &crate::providers::qwen_code::METADATA,
+            Self::Kimi => &crate::providers::kimi::METADATA,
+            Self::Codebuddy => &crate::providers::codebuddy::METADATA,
+            Self::GrokBot => &crate::providers::grok_bot::METADATA,
+            Self::OpenClaw => &crate::providers::openclaw::METADATA,
+            #[cfg(test)]
+            Self::TestFixture => &crate::providers::test_fixture::METADATA,
+        }
+    }
 }

@@ -51,7 +51,7 @@ pub fn ai_hist::ChangeKind::as_str(self) -> &'static str
 pub fn ai_hist::ChangeKind::evidence_kind(self) -> core::option::Option<ai_hist::EvidenceKind>
 #[non_exhaustive] pub enum ai_hist::ChangeOp
 pub ai_hist::ChangeOp::Delete
-pub ai_hist::ChangeOp::Upsert(ai_hist::EvidenceRow)
+pub ai_hist::ChangeOp::Upsert(alloc::boxed::Box<ai_hist::EvidenceRow>)
 #[non_exhaustive] pub enum ai_hist::ControlKind
 pub ai_hist::ControlKind::BashPassthroughInput
 pub ai_hist::ControlKind::BashPassthroughOutput
@@ -118,7 +118,7 @@ pub ai_hist::EvidenceRow::FileEdit(ai_hist::SessionFileEdit)
 pub ai_hist::EvidenceRow::History(ai_hist::HistoryEntry)
 pub ai_hist::EvidenceRow::Relationship(ai_hist::SessionRelationship)
 pub ai_hist::EvidenceRow::Session(ai_hist::ShallowSession)
-pub ai_hist::EvidenceRow::SessionEvent(ai_hist::SessionEvent)
+pub ai_hist::EvidenceRow::SessionEvent(alloc::boxed::Box<ai_hist::SessionEvent>)
 pub ai_hist::EvidenceRow::SessionMarker(ai_hist::SessionMarker)
 pub ai_hist::EvidenceRow::ToolCall(ai_hist::SessionToolCall)
 pub ai_hist::EvidenceRow::Untyped

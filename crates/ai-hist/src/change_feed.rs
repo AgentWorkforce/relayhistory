@@ -816,17 +816,13 @@ pub(crate) fn visit_rows_by_rowid(
 
 /// The typed row an upsert carries, per kind, so no second read is needed.
 ///
-/// The variants differ in size because the rows do; an event row is several
-/// times a tool call. Boxing the large ones would put an allocation between
-/// the consumer and every row it reads, to save space in a value that exists
-/// one page at a time.
+/// The event row is boxed to keep the enum small; serde output is unchanged.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "kind", content = "row", rename_all = "snake_case")]
 #[non_exhaustive]
-#[allow(clippy::large_enum_variant)]
 pub enum EvidenceRow {
     Session(ShallowSession),
-    SessionEvent(SessionEvent),
+    SessionEvent(Box<SessionEvent>),
     ToolCall(SessionToolCall),
     FileEdit(SessionFileEdit),
     SessionMarker(SessionMarker),
@@ -841,11 +837,10 @@ pub enum EvidenceRow {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case")]
 #[non_exhaustive]
-#[allow(clippy::large_enum_variant)]
 pub enum ChangeOp {
     /// The record was written; this is its current row. A record seen before
     /// under the same key has been replaced, not duplicated.
-    Upsert(EvidenceRow),
+    Upsert(Box<EvidenceRow>),
     /// The record was deleted.
     Delete,
 }
@@ -1577,7 +1572,7 @@ fn upsert_sql(kind: ChangeKind, stored: &[String], filtered: bool) -> String {
 fn typed_evidence(kind: ChangeKind, row: &rusqlite::Row<'_>) -> rusqlite::Result<EvidenceRow> {
     Ok(match kind {
         ChangeKind::Session => EvidenceRow::Session(row_to_session(row)?),
-        ChangeKind::SessionEvent => EvidenceRow::SessionEvent(row_to_session_event(row)?),
+        ChangeKind::SessionEvent => EvidenceRow::SessionEvent(Box::new(row_to_session_event(row)?)),
         ChangeKind::ToolCall => EvidenceRow::ToolCall(row_to_tool_call(row)?),
         ChangeKind::FileEdit => EvidenceRow::FileEdit(row_to_file_edit(row)?),
         ChangeKind::SessionMarker => EvidenceRow::SessionMarker(row_to_session_marker(row)?),
@@ -1641,7 +1636,7 @@ fn read_upserts(
             record_key,
             key: table.key_from_row(kind, &columns),
             revision: revision.max(0) as u64,
-            op: ChangeOp::Upsert(evidence),
+            op: ChangeOp::Upsert(Box::new(evidence)),
             columns: Some(columns),
         });
     }
@@ -1737,6 +1732,14 @@ mod tests {
         changes.map(|change| change.unwrap()).collect()
     }
 
+    /// The typed row of an upsert, or `None` for a delete.
+    fn upsert(op: &ChangeOp) -> Option<&EvidenceRow> {
+        match op {
+            ChangeOp::Upsert(row) => Some(row),
+            ChangeOp::Delete => None,
+        }
+    }
+
     fn all(store: &SessionStore) -> Vec<Change> {
         drain(
             store
@@ -1815,14 +1818,14 @@ mod tests {
         assert!(changes
             .iter()
             .all(|change| change.source == Some(Source::Claude) && change.session_id == "s1"));
-        match &changes[1].op {
-            ChangeOp::Upsert(EvidenceRow::SessionEvent(event)) => {
+        match upsert(&changes[1].op) {
+            Some(EvidenceRow::SessionEvent(event)) => {
                 assert_eq!(event.text.as_deref(), Some("one"));
             }
             other => panic!("typed row expected: {other:?}"),
         }
-        match &changes[0].op {
-            ChangeOp::Upsert(EvidenceRow::Session(session)) => {
+        match upsert(&changes[0].op) {
+            Some(EvidenceRow::Session(session)) => {
                 assert_eq!(session.cwd.as_deref(), Some("/p"));
             }
             other => panic!("typed row expected: {other:?}"),
@@ -2073,7 +2076,7 @@ INSERT INTO observation_evidence (source, session_id, location, connector_id,
         let delta = drain(store.changes_since(head, ChangeQuery::default()).unwrap());
         assert!(
             delta.iter().any(|change| change.kind == ChangeKind::Session
-                && matches!(&change.op, ChangeOp::Upsert(EvidenceRow::Session(session))
+                && matches!(upsert(&change.op), Some(EvidenceRow::Session(session))
                     if session.locations == vec!["remote".to_string()])),
             "{delta:?}"
         );
@@ -2377,8 +2380,8 @@ INSERT INTO observation_evidence (source, session_id, location, connector_id,
         for change in seen.by_ref() {
             last = Some(change.unwrap());
         }
-        match last.map(|change| change.op) {
-            Some(ChangeOp::Upsert(EvidenceRow::Session(session))) => {
+        match last.as_ref().and_then(|change| upsert(&change.op)) {
+            Some(EvidenceRow::Session(session)) => {
                 assert_eq!(session.locations, vec!["local", "remote"]);
             }
             other => panic!("the last change is the row with both presences: {other:?}"),
@@ -2397,8 +2400,8 @@ INSERT INTO observation_evidence (source, session_id, location, connector_id,
         assert_eq!(delta.len(), 1, "{delta:?}");
         assert_eq!(delta[0].kind, ChangeKind::Session);
         assert_eq!(delta[0].record_key, "s1");
-        match &delta[0].op {
-            ChangeOp::Upsert(EvidenceRow::Session(session)) => {
+        match upsert(&delta[0].op) {
+            Some(EvidenceRow::Session(session)) => {
                 assert_eq!(session.locations, vec!["remote"]);
             }
             other => panic!("a replacement row, not a tombstone: {other:?}"),
@@ -2418,8 +2421,8 @@ INSERT INTO observation_evidence (source, session_id, location, connector_id,
                 .unwrap(),
         );
         assert_eq!(delta.len(), 1, "{delta:?}");
-        match &delta[0].op {
-            ChangeOp::Upsert(EvidenceRow::Session(session)) => {
+        match upsert(&delta[0].op) {
+            Some(EvidenceRow::Session(session)) => {
                 assert_eq!(session.locations, vec!["local", "remote"]);
             }
             other => panic!("{other:?}"),

@@ -527,7 +527,7 @@ position.
 
 `changes_since(from, ChangeQuery { kinds, consumer, batch })` yields
 `Change { kind, source, session_id, record_key, revision, op }` in
-`(revision, kind, record_key)` order, where `op` is `Upsert(EvidenceRow)` —
+`(revision, kind, record_key)` order, where `op` is `Upsert(Box<EvidenceRow>)` —
 the typed row, `ShallowSession`, `SessionEvent`, `SessionToolCall`,
 `SessionFileEdit`, `SessionMarker` or `SessionRelationship` — or `Delete`.
 `record_key` is the record's provider-native identity within its session and

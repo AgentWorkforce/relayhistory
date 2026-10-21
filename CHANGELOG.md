@@ -18,6 +18,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Added `Source::QwenCode` for filtering and reading persisted Qwen Code history.
 - Added `Source::Kimi` for filtering and reading persisted Kimi Code history.
 - Added `Source::Codebuddy` for filtering and reading persisted Codebuddy Code history.
+- `ChangeOp::Upsert` now holds a `Box<EvidenceRow>` and `EvidenceRow::SessionEvent` a `Box<SessionEvent>`, shrinking every `Change`; match through the box (e.g. `ChangeOp::Upsert(row) => match row.as_ref() { .. }`) and wrap constructed values with `Box::new`. The serialized change feed is unchanged.
 
 ## [0.49.0] - 2026-10-21
 

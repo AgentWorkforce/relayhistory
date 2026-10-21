@@ -22,7 +22,7 @@ use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 
 use crate::session_store::Error;
 use crate::store::open_db_readonly;
@@ -164,7 +164,7 @@ impl ReadPool {
         if let Some(entry) = idle.pop() {
             if identity_now().as_ref() == Some(&entry.identity) {
                 return Ok(PooledConnection {
-                    conn: Some(entry.conn),
+                    conn: entry.conn,
                     identity: Some(entry.identity),
                     gates: entry.gates,
                     pool: Some(Arc::clone(self)),
@@ -184,7 +184,7 @@ impl ReadPool {
             }
             let pool = identity.as_ref().map(|_| Arc::clone(self));
             return Ok(PooledConnection {
-                conn: Some(conn),
+                conn,
                 identity,
                 gates: Gates::default(),
                 pool,
@@ -206,7 +206,7 @@ impl ReadPool {
 /// is back in autocommit; one still inside a transaction is closed instead,
 /// so no snapshot ever outlives the call that took it.
 pub(crate) struct PooledConnection {
-    conn: Option<Connection>,
+    conn: Connection,
     identity: Option<FileIdentity>,
     gates: Gates,
     pool: Option<Arc<ReadPool>>,
@@ -217,7 +217,7 @@ impl PooledConnection {
     #[cfg(test)]
     pub(crate) fn detached(conn: Connection) -> Self {
         Self {
-            conn: Some(conn),
+            conn,
             identity: None,
             gates: Gates::default(),
             pool: None,
@@ -255,30 +255,35 @@ impl Deref for PooledConnection {
     type Target = Connection;
 
     fn deref(&self) -> &Connection {
-        self.conn
-            .as_ref()
-            .expect("a pooled connection is present until drop")
+        &self.conn
     }
 }
 
 impl DerefMut for PooledConnection {
     fn deref_mut(&mut self) -> &mut Connection {
-        self.conn
-            .as_mut()
-            .expect("a pooled connection is present until drop")
+        &mut self.conn
     }
 }
 
 impl Drop for PooledConnection {
     fn drop(&mut self) {
-        let (Some(conn), Some(identity), Some(pool)) =
-            (self.conn.take(), self.identity.take(), self.pool.take())
-        else {
+        let (Some(identity), Some(pool)) = (self.identity.take(), self.pool.take()) else {
             return;
         };
-        if !conn.is_autocommit() {
+        if !self.conn.is_autocommit() {
             return;
         }
+        // Moving the connection out of `&mut self` needs something left in
+        // its place: an empty in-memory connection, with no file and no
+        // schema, closed as this guard finishes dropping. Should even that
+        // fail to open, the connection is closed rather than pooled, which
+        // is always safe.
+        let Ok(stand_in) = Connection::open_in_memory_with_flags(
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) else {
+            return;
+        };
+        let conn = std::mem::replace(&mut self.conn, stand_in);
         let mut idle = pool
             .idle
             .lock()

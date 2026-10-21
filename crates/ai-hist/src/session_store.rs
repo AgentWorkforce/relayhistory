@@ -354,7 +354,7 @@ impl Source {
         // by an adapter (a remote connector cannot supply them, so the
         // connector-facing declaration leaves them out); the parsers that
         // write them are the ones an embedder needs listed.
-        let metadata = crate::providers::metadata(name).expect("registered source metadata");
+        let metadata = self.metadata();
         if metadata.markers && !evidence_kinds.contains(&EvidenceKind::SessionMarker) {
             evidence_kinds.push(EvidenceKind::SessionMarker);
         }

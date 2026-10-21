@@ -579,14 +579,14 @@ tombstone at its own revision, which a later insert of the same key clears.
 `Change { kind, source, source_name, session_id, record_key, key, revision, op, columns }`
 in `(revision, kind, record_key)` order, bounded to the head at open, in
 `batch`-sized indexed reads of at most `MAX_CHANGE_BATCH`; `op` is
-`Upsert(EvidenceRow)` — the typed row, so no second read is needed, or
+`Upsert(Box<EvidenceRow>)` — the typed row, so no second read is needed, or
 `EvidenceRow::Untyped` for a kind with none — or `Delete`. A re-seen key is a
 replace, never a duplicate.
 
 | `ChangeKind`          | Table                   | `key` after the kind                                                  | Typed row             |
 | --------------------- | ----------------------- | --------------------------------------------------------------------- | --------------------- |
 | `Session`             | `sessions`              | `source, session_id`                                                  | `ShallowSession`      |
-| `SessionEvent`        | `session_events`        | `source, session_id, event_uid`                                       | `SessionEvent`        |
+| `SessionEvent`        | `session_events`        | `source, session_id, event_uid`                                       | `Box<SessionEvent>`   |
 | `ToolCall`            | `tool_calls`            | `source, session_id, tool_use_id`                                     | `SessionToolCall`     |
 | `FileEdit`            | `file_edits`            | `source, session_id, tool_use_id`                                     | `SessionFileEdit`     |
 | `SessionMarker`       | `session_markers`       | `source, session_id, marker_uid`                                      | `SessionMarker`       |
