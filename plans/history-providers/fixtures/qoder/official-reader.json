@@ -1,0 +1,192 @@
+{
+  "synthetic-ordinary": [
+    {
+      "uuid": "ordinary-u1",
+      "type": "user",
+      "message": {
+        "role": "user",
+        "content": "Explain the synthetic project."
+      }
+    },
+    {
+      "uuid": "ordinary-a1",
+      "type": "assistant",
+      "message": {
+        "role": "assistant",
+        "model": "synthetic-model",
+        "content": [
+          {
+            "type": "text",
+            "text": "It contains sample files."
+          }
+        ]
+      }
+    }
+  ],
+  "synthetic-tool": [
+    {
+      "uuid": "tool-u1",
+      "type": "user",
+      "message": {
+        "role": "user",
+        "content": "Read note.txt."
+      }
+    },
+    {
+      "uuid": "tool-a1",
+      "type": "assistant",
+      "message": {
+        "role": "assistant",
+        "model": "synthetic-model",
+        "content": [
+          {
+            "type": "text",
+            "text": "Reading it."
+          },
+          {
+            "type": "tool_use",
+            "id": "call-1",
+            "name": "Read",
+            "input": {
+              "file_path": "note.txt"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "uuid": "tool-r1",
+      "type": "user",
+      "message": {
+        "role": "user",
+        "content": [
+          {
+            "type": "tool_result",
+            "tool_use_id": "call-1",
+            "content": "Synthetic note contents."
+          }
+        ]
+      }
+    },
+    {
+      "uuid": "tool-a2",
+      "type": "assistant",
+      "message": {
+        "role": "assistant",
+        "model": "synthetic-model",
+        "content": [
+          {
+            "type": "text",
+            "text": "The note is synthetic."
+          }
+        ]
+      }
+    }
+  ],
+  "synthetic-same-ms": [
+    {
+      "uuid": "same-u1",
+      "type": "user",
+      "message": {
+        "role": "user",
+        "content": "Read one.txt."
+      }
+    },
+    {
+      "uuid": "same-a1",
+      "type": "assistant",
+      "message": {
+        "role": "assistant",
+        "model": "synthetic-model",
+        "content": [
+          {
+            "type": "text",
+            "text": "Reading it."
+          },
+          {
+            "type": "tool_use",
+            "id": "same-call",
+            "name": "Read",
+            "input": {
+              "file_path": "one.txt"
+            }
+          }
+        ]
+      }
+    },
+    {
+      "uuid": "same-r1",
+      "type": "user",
+      "message": {
+        "role": "user",
+        "content": [
+          {
+            "type": "tool_result",
+            "tool_use_id": "same-call",
+            "content": "One synthetic line."
+          }
+        ]
+      }
+    },
+    {
+      "uuid": "same-a2",
+      "type": "assistant",
+      "message": {
+        "role": "assistant",
+        "model": "synthetic-model",
+        "content": [
+          {
+            "type": "text",
+            "text": "Found one line."
+          }
+        ]
+      }
+    }
+  ],
+  "synthetic-resume": [
+    {
+      "uuid": "resume-u1",
+      "type": "user",
+      "message": {
+        "role": "user",
+        "content": "Start the sample."
+      }
+    },
+    {
+      "uuid": "resume-a1",
+      "type": "assistant",
+      "message": {
+        "role": "assistant",
+        "model": "synthetic-model",
+        "content": [
+          {
+            "type": "text",
+            "text": "Started."
+          }
+        ]
+      }
+    },
+    {
+      "uuid": "resume-u2",
+      "type": "user",
+      "message": {
+        "role": "user",
+        "content": "Continue the sample."
+      }
+    },
+    {
+      "uuid": "resume-a2",
+      "type": "assistant",
+      "message": {
+        "role": "assistant",
+        "model": "synthetic-model",
+        "content": [
+          {
+            "type": "text",
+            "text": "Continued."
+          }
+        ]
+      }
+    }
+  ]
+}

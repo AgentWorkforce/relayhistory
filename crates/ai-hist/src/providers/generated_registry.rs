@@ -76,6 +76,11 @@ const REGISTRATIONS: &[Registration] = &[
         adapter: codebuddy::ADAPTER,
     },
     Registration {
+        id: "qoder",
+        metadata: qoder::METADATA,
+        adapter: qoder::ADAPTER,
+    },
+    Registration {
         id: "grok-bot",
         metadata: grok_bot::METADATA,
         adapter: grok_bot::ADAPTER,

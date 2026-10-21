@@ -1017,6 +1017,7 @@ handle.
 | openclaw | ✓ | ✓ | ✓ | — | — | per-message |
 | opencode | ✓ | ✓ | ✓ | ✓ | ✓ | none |
 | pi | ✓ | ✓ | ✓ | — | — | per-message |
+| qoder | ✓ | ✓ | ✓ | — | — | none |
 | qwen-code | ✓ | ✓ | ✓ | — | — | per-message |
 <!-- sourcing-sdk-population-table:end -->
 

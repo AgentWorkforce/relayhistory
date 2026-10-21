@@ -35,6 +35,8 @@ pub enum Source {
     Kimi,
     #[serde(rename = "codebuddy")]
     Codebuddy,
+    #[serde(rename = "qoder")]
+    Qoder,
     #[serde(rename = "grok-bot")]
     GrokBot,
     #[serde(rename = "openclaw")]
@@ -62,6 +64,7 @@ impl Source {
         Self::QwenCode,
         Self::Kimi,
         Self::Codebuddy,
+        Self::Qoder,
         Self::GrokBot,
         Self::OpenClaw,
         #[cfg(test)]
@@ -86,6 +89,7 @@ impl Source {
             Self::QwenCode => "qwen-code",
             Self::Kimi => "kimi",
             Self::Codebuddy => "codebuddy",
+            Self::Qoder => "qoder",
             Self::GrokBot => "grok-bot",
             Self::OpenClaw => "openclaw",
             #[cfg(test)]
@@ -111,6 +115,7 @@ impl Source {
             "qwen-code" => Some(Self::QwenCode),
             "kimi" => Some(Self::Kimi),
             "codebuddy" => Some(Self::Codebuddy),
+            "qoder" => Some(Self::Qoder),
             "grok-bot" => Some(Self::GrokBot),
             "openclaw" => Some(Self::OpenClaw),
             #[cfg(test)]
@@ -137,6 +142,7 @@ impl Source {
             Self::QwenCode => &crate::providers::qwen_code::METADATA,
             Self::Kimi => &crate::providers::kimi::METADATA,
             Self::Codebuddy => &crate::providers::codebuddy::METADATA,
+            Self::Qoder => &crate::providers::qoder::METADATA,
             Self::GrokBot => &crate::providers::grok_bot::METADATA,
             Self::OpenClaw => &crate::providers::openclaw::METADATA,
             #[cfg(test)]

@@ -1,0 +1,31 @@
+{
+  "id": "qoder",
+  "rust_id": "qoder",
+  "variant": "Qoder",
+  "order": 457,
+  "aliases": [],
+  "fixtures": [
+    {
+      "source": "qoder",
+      "name": "global-cli",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": ["qoder/global-cli"],
+      "quirk": "Official global Qoder CLI npm 1.1.75 TranscriptStore native writer; ordinary, tool, resumed, and same-millisecond synthetic sessions with released Repository historical restart-reader oracle."
+    }
+  ],
+  "capture": [
+    {
+      "evidence": "Messages and identity",
+      "coverage": "Global CLI 1.1.x projects JSONL, observed sessionId and UUID/parentUuid, timestamps, cwd, model and user/assistant text; same native ID at distinct paths is rejected with a collision diagnostic."
+    },
+    {
+      "evidence": "Tools and control",
+      "coverage": "Persisted tool_use and tool_result IDs joined; active-leaf and last-prompt retained as markers. Same-millisecond remote ordering conflict reports retryable failure under #463. Usage objects supplied to writer are discarded, so per-request usage stays unknown. No file edits or relationships inferred. Qoder CN and IDE schemas are excluded."
+    }
+  ],
+  "population": {
+    "evidence": ["history", "session_event", "tool_call", "session_marker"],
+    "usage_accounting": "none"
+  }
+}
