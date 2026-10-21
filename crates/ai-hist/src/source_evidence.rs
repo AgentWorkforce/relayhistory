@@ -341,12 +341,11 @@ fn validate_session_event(payload: &Map<String, Value>) -> Result<()> {
         let Some(value) = payload.get(*field).filter(|v| !v.is_null()) else {
             continue;
         };
-        // The contract says these are null on anything that is not a
-        // tool result. An adapter that fills them anyway is describing
-        // a row it does not understand.
+        // A native call ID joins both tool-use and tool-result blocks;
+        // every other fidelity field describes a result only.
         ensure!(
-            tool_result,
-            "INVALID_ARGUMENT: {field} is only valid on a tool_result event"
+            tool_result || (*field == "tool_use_id" && payload["kind"] == "tool_use"),
+            "INVALID_ARGUMENT: {field} is only valid on a tool_result event (tool_use_id also accepts tool_use)"
         );
         validate_tool_result_field(field, value)?;
     }
@@ -739,6 +738,46 @@ mod tests {
     #[test]
     fn a_well_formed_tool_result_event_is_accepted() {
         validate(tool_result_event()).expect("the documented shape must pass");
+    }
+
+    #[test]
+    fn native_tool_use_id_is_accepted_without_result_fidelity() {
+        let mut record = tool_result_event();
+        record.payload.insert("role".into(), json!("assistant"));
+        record.payload.insert("kind".into(), json!("tool_use"));
+        for field in TOOL_RESULT_FIELDS
+            .iter()
+            .filter(|field| **field != "tool_use_id")
+        {
+            record.payload.remove(*field);
+        }
+        validate(record.clone()).expect("native call identity belongs to tool-use blocks too");
+        for field in TOOL_RESULT_FIELDS
+            .iter()
+            .filter(|field| **field != "tool_use_id")
+        {
+            let value = tool_result_event().payload.get(*field).cloned().unwrap_or_else(|| {
+                if *field == "error_signal" {
+                    json!("tool_result.is_error")
+                } else {
+                    json!("fixture-identity")
+                }
+            });
+            record.payload.insert((*field).into(), value);
+            let error = validate(record.clone()).expect_err("other fidelity stays result-only");
+            assert!(
+                error
+                    .to_string()
+                    .contains("only valid on a tool_result event"),
+                "{field}: {error}"
+            );
+            record.payload.remove(*field);
+        }
+        record.payload.insert("kind".into(), json!("text"));
+        assert!(
+            validate(record).is_err(),
+            "call identity is not legal on plain text"
+        );
     }
 
     #[test]

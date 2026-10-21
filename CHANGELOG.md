@@ -9,6 +9,11 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - Windows arm64 (`aarch64-pc-windows-msvc`) is supported: `npm install` pulls the prebuilt `ai-hist-native-win32-arm64-msvc` addon, and `@relayhistory/provider-sources` ships a native `win32-arm64-msvc` helper.
+- Qwen Code interactive session history is discoverable and searchable from native transcript files, preserving the active conversation branch, recorded messages and tool evidence.
+
+### Rust API
+
+- Added `Source::QwenCode` for filtering and reading persisted Qwen Code history.
 
 ## [0.49.0] - 2026-10-21
 

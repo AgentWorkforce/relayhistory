@@ -1,0 +1,108 @@
+{
+  "id": "qwen-code",
+  "rust_id": "qwen_code",
+  "variant": "QwenCode",
+  "order": 434,
+  "aliases": [],
+  "fixtures": [
+    {
+      "source": "qwen-code",
+      "name": "ordinary",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "qwen-code/ordinary"
+      ],
+      "quirk": "Pinned Qwen Code 0.25.3 ChatRecordingService with real writer lease, synthetic data; independent native UUID-chain reader oracle."
+    },
+    {
+      "source": "qwen-code",
+      "name": "tool",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "qwen-code/tool"
+      ],
+      "quirk": "Pinned Qwen Code 0.25.3 ChatRecordingService with real writer lease, synthetic data; independent native UUID-chain reader oracle."
+    },
+    {
+      "source": "qwen-code",
+      "name": "resumed",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "qwen-code/resumed"
+      ],
+      "quirk": "Pinned Qwen Code 0.25.3 ChatRecordingService with real writer lease, synthetic data; independent native UUID-chain reader oracle."
+    },
+    {
+      "source": "qwen-code",
+      "name": "rewind",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "qwen-code/rewind"
+      ],
+      "quirk": "Pinned Qwen Code 0.25.3 ChatRecordingService with real writer lease, synthetic data; independent native UUID-chain reader oracle."
+    },
+    {
+      "source": "qwen-code",
+      "name": "metadata",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "qwen-code/metadata"
+      ],
+      "quirk": "Pinned Qwen Code 0.25.3 ChatRecordingService with real writer lease, synthetic data; independent native UUID-chain reader oracle."
+    },
+    {
+      "source": "qwen-code",
+      "name": "same-time",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "qwen-code/same-time"
+      ],
+      "quirk": "Pinned Qwen Code 0.25.3 ChatRecordingService with real writer lease, synthetic data; independent native UUID-chain reader oracle."
+    },
+    {
+      "source": "qwen-code",
+      "name": "official-reader",
+      "layout": "Reference",
+      "origin": "RelayHistory",
+      "files": [
+        "qwen-code/official-reader.json"
+      ],
+      "quirk": "Pinned independent prepareTranscriptRecords replay for all six native recorder captures."
+    },
+    {
+      "source": "qwen-code",
+      "name": "derived-reader",
+      "layout": "Reference",
+      "origin": "RelayHistory",
+      "files": [
+        "qwen-code/derived-reader.json"
+      ],
+      "quirk": "Explicitly derived UUID fragment and trailing artifact mutation of native captures replayed through the independent pinned upstream reader, not an actual writer case."
+    }
+  ],
+  "capture": [
+    {
+      "evidence": "Messages and identity",
+      "coverage": "Ordinary native JSONL UUID parent-chain replay, native fragment aggregation, recorded timestamps/cwd/model, runtime-root and project namespaces; native tool-call/result IDs and typed arguments/results; raw branch/control/reasoning parts retained as markers."
+    },
+    {
+      "evidence": "Usage and limits",
+      "coverage": "Stored assistant usage metadata per message with inclusive cache subtraction; upstream reasoning/cache-write reporting provenance is unavailable. QWEN_RUNTIME_DIR overrides QWEN_HOME; explicit roots represent runtime configuration. No live resume or managed-session transactional replay; reasoning remains raw marker evidence and managed envelopes fail explicitly."
+    }
+  ],
+  "population": {
+    "evidence": [
+      "history",
+      "session_event",
+      "tool_call",
+      "session_marker"
+    ],
+    "usage_accounting": "per-message"
+  }
+}
