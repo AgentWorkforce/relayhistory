@@ -71,3 +71,30 @@ fn scoped_enumeration_does_not_open_unrelated_project() {
     assert_eq!(candidates.len(), 1);
     assert_eq!(candidates[0].locator, selected.to_string_lossy());
 }
+
+#[test]
+fn rejected_oversized_opening_is_counted_as_discovery_work() {
+    let home = tempfile::tempdir().unwrap();
+    let root = home.path().join(".qoder/projects/project");
+    std::fs::create_dir_all(&root).unwrap();
+    let fixture = include_str!("../../../tests/fixtures/qoder/global-cli/.qoder/projects/-synthetic-qoder-project/synthetic-tool.jsonl");
+    std::fs::write(root.join("good.jsonl"), fixture).unwrap();
+    let oversized = format!("{{\"type\":\"user\",\"padding\":\"{}\"}}\n", "X".repeat(8 * 1024 * 1024));
+    std::fs::write(root.join("oversized.jsonl"), oversized).unwrap();
+    let conn = crate::open_db(&home.path().join("catalog.db")).unwrap();
+    let roots = ProviderRoots::from_home(home.path().into(), home.path().join("opencode.db"));
+    let env = DiscoveryEnv::with_provider_roots(&conn, roots);
+    let summary = crate::discover::discover_sessions_with_env(
+        &env,
+        &crate::discover::DiscoverOptions::new(
+            crate::SessionScope::Local,
+            vec![ID.into()],
+            None,
+        ),
+        |_| {},
+    ).unwrap();
+    assert_eq!(summary.discovered, 1);
+    assert!(summary.diagnostics.iter().any(|d| d.error.contains("QODER_OVERSIZED_OPENING_RECORD")));
+    assert_eq!(summary.counters.files_opened, 2);
+    assert!(summary.counters.bytes_read >= 8 * 1024 * 1024);
+}

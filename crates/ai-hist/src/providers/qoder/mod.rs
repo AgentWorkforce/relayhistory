@@ -75,11 +75,18 @@ fn resolve_roots(home: &Path, use_env: bool) -> ResolvedProviderRoots {
     vec![config.join("projects")].into()
 }
 
-fn prefix(context: &AcquisitionContext<'_>, path: &Path) -> Result<(Vec<u8>, std::fs::File)> {
+fn prefix(
+    context: &AcquisitionContext<'_>,
+    path: &Path,
+    scan: &ScanEnv<'_>,
+) -> Result<(Vec<u8>, std::fs::File)> {
     context.validate(path)?;
     let mut bytes = Vec::new();
     let mut file = std::fs::File::open(path)?;
-    (&mut file).take(HEAD_LIMIT).read_to_end(&mut bytes)?;
+    scan.note_open();
+    let read = (&mut file).take(HEAD_LIMIT).read_to_end(&mut bytes);
+    scan.note_bytes(bytes.len() as u64);
+    read?;
     // A single native user message can exceed the normal shallow prefix.
     // Read only through its first terminated record, with an explicit cap.
     while !bytes.contains(&b'\n') && bytes.len() < OPENING_RECORD_LIMIT {
@@ -90,6 +97,7 @@ fn prefix(context: &AcquisitionContext<'_>, path: &Path) -> Result<(Vec<u8>, std
             break;
         }
         bytes.extend_from_slice(&chunk[..count]);
+        scan.note_bytes(count as u64);
     }
     anyhow::ensure!(
         bytes.contains(&b'\n') || bytes.len() < OPENING_RECORD_LIMIT,
@@ -238,9 +246,8 @@ impl ShallowSessionProvider for Provider {
         let (bytes, mut file) = prefix(
             &AcquisitionContext::new(ID, scan.provider_roots),
             Path::new(&c.locator),
+            scan,
         )?;
-        scan.note_open();
-        scan.note_bytes(bytes.len() as u64);
         let entries = format::parse(&bytes, true)?;
         let header = &entries[0];
         let sid = format::string(header, "sessionId")?;
