@@ -1,0 +1,5 @@
+{"type":"message","id":"u1","timestamp":1791720000001,"role":"user","content":[{"type":"input_text","text":"Synthetic original prompt."}],"sessionId":"fixture-metadata","cwd":"/fixture/workspace"}
+{"type":"message","id":"a2","timestamp":1791720000002,"role":"assistant","content":[{"type":"output_text","text":"Synthetic old branch answer."}],"sessionId":"fixture-metadata","cwd":"/fixture/workspace","parentId":"u1"}
+{"type":"custom-title","id":"title1","timestamp":1791720000010,"customTitle":"Synthetic chosen title."}
+{"type":"ai-title","id":"title2","timestamp":1791720000020,"aiTitle":"Synthetic later AI title."}
+{"type":"session-meta","id":"meta1","sessionId":"fixture-metadata","timestamp":1791720000030,"meta":{"codebuddy.ai/sessionTitle":[{"type":"topic","id":"topic1","timestamp":1791720000005,"topic":"Synthetic metadata topic."}]}}

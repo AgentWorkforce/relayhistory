@@ -1,0 +1,88 @@
+{
+  "id": "kimi",
+  "rust_id": "kimi",
+  "variant": "Kimi",
+  "order": 435,
+  "aliases": [],
+  "fixtures": [
+    {
+      "source": "kimi",
+      "name": "ordinary",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "kimi/ordinary"
+      ],
+      "quirk": "Kimi Code 2.2.0 native protocol 1.5 writer, localhost model fixture, independently restored by pinned official foldWireRecords; ordinary case."
+    },
+    {
+      "source": "kimi",
+      "name": "tool",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "kimi/tool"
+      ],
+      "quirk": "Kimi Code 2.2.0 native protocol 1.5 writer, localhost model fixture, independently restored by pinned official foldWireRecords; tool case."
+    },
+    {
+      "source": "kimi",
+      "name": "resumed",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "kimi/resumed"
+      ],
+      "quirk": "Kimi Code 2.2.0 native protocol 1.5 writer, localhost model fixture, independently restored by pinned official foldWireRecords; resumed case."
+    },
+    {
+      "source": "kimi",
+      "name": "subagent",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "kimi/subagent"
+      ],
+      "quirk": "Kimi Code 2.2.0 native protocol 1.5 writer, localhost model fixture, independently restored by pinned official foldWireRecords; subagent case."
+    },
+    {
+      "source": "kimi",
+      "name": "rewound",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "kimi/rewound"
+      ],
+      "quirk": "Native 2.2 binary journal plus pinned official buildUndoSwitchRecords writer constructor; official flattenChain+fold confirms prior messages are retired."
+    },
+    {
+      "source": "kimi",
+      "name": "official-reader",
+      "layout": "Reference",
+      "origin": "RelayHistory",
+      "files": [
+        "kimi/official-reader.json"
+      ],
+      "quirk": "Pinned official source restart replay oracle, independent of RelayHistory."
+    }
+  ],
+  "capture": [
+    {
+      "evidence": "Messages and tools",
+      "coverage": "Current Kimi Code 2.2 native wire 1.5 canonical message events, native tool IDs/results and separate subagent wires. Streaming/context duplicates are markers rather than duplicate human turns. Millisecond timestamps, state v2 title/cwd and root/session/agent identity preserved."
+    },
+    {
+      "evidence": "Control and limits",
+      "coverage": "Bounded raw wire markers retain controls, observed usage, reasoning and media references. No derived costs, inferred token totals, pricing, file edits, parent relationships or native resume. Legacy Python context/wire/checkpoints are unsupported; KIMI_SHARE_DIR is a legacy migration setting, current root override is KIMI_CODE_HOME."
+    }
+  ],
+  "population": {
+    "evidence": [
+      "history",
+      "session_event",
+      "session_marker",
+      "tool_call"
+    ],
+    "usage_accounting": "none"
+  }
+}

@@ -18,6 +18,7 @@ export const REGISTRY_RELEASE_PACKAGES = Object.freeze([
   'ai-hist-native-linux-arm64-musl',
   'ai-hist-native-linux-x64-gnu',
   'ai-hist-native-linux-x64-musl',
+  'ai-hist-native-win32-arm64-msvc',
   'ai-hist-native-win32-x64-msvc',
 ]);
 

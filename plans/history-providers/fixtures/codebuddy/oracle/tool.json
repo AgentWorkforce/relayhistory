@@ -1,0 +1,190 @@
+{
+  "id": "fixture-tool",
+  "storeId": "tool-reader",
+  "history": [
+    {
+      "id": "fixture-tool-001",
+      "timestamp": 1791720000000,
+      "type": "message",
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Read the synthetic fixture file."
+        }
+      ],
+      "providerData": {
+        "agent": "cli",
+        "conversationRequestId": "fixture-tool-002"
+      },
+      "__codebuddyLocal": {
+        "sensitiveUserInputReviewed": true
+      },
+      "sessionId": "fixture-tool",
+      "cwd": "/fixture/workspace"
+    },
+    {
+      "timestamp": 1791720000004,
+      "type": "file-history-snapshot",
+      "messageId": "fixture-tool-001",
+      "isSnapshotUpdate": false,
+      "snapshot": {
+        "messageId": "fixture-tool-001",
+        "trackedFileBackups": {}
+      },
+      "cwd": "/fixture/workspace"
+    },
+    {
+      "id": "fixture-tool-003",
+      "parentId": "fixture-tool-001",
+      "timestamp": 1791720000120,
+      "type": "function_call",
+      "providerData": {
+        "conversationRequestId": "fixture-tool-002",
+        "messageId": "fixture-tool-004",
+        "stepSeq": 1,
+        "model": "fixture-local",
+        "requestModelId": "custom-local:fixture-local",
+        "requestModelName": "Fixture local",
+        "traceId": "fixture-tool-005",
+        "rawUsage": {
+          "prompt_tokens": 23,
+          "completion_tokens": 7,
+          "total_tokens": 30
+        },
+        "agent": "cli",
+        "argumentsDisplayText": "fixture.txt",
+        "usage": {
+          "requests": 1,
+          "inputTokens": 23,
+          "outputTokens": 7,
+          "totalTokens": 30,
+          "inputTokensDetails": [
+            {
+              "cached_tokens": 0
+            }
+          ],
+          "outputTokensDetails": [
+            {
+              "reasoning_tokens": 0
+            }
+          ]
+        }
+      },
+      "callId": "fixture-call-001",
+      "name": "Read",
+      "arguments": "{\"file_path\": \"/fixture/workspace/fixture.txt\"}",
+      "sessionId": "fixture-tool",
+      "message": {
+        "usage": {
+          "input_tokens": 23,
+          "output_tokens": 7,
+          "total_tokens": 30
+        }
+      },
+      "cwd": "/fixture/workspace"
+    },
+    {
+      "id": "fixture-tool-006",
+      "parentId": "fixture-tool-003",
+      "timestamp": 1791720000156,
+      "type": "function_call_result",
+      "name": "Read",
+      "callId": "fixture-call-001",
+      "status": "completed",
+      "output": {
+        "type": "text",
+        "text": "   1\u2192Synthetic fixture file color blue.\n   2\u2192"
+      },
+      "providerData": {
+        "conversationRequestId": "fixture-tool-002",
+        "messageId": "fixture-tool-004",
+        "stepSeq": 1,
+        "agent": "cli",
+        "toolResult": {
+          "title": "Read 2 lines",
+          "content": "   1\u2192Synthetic fixture file color blue.\n   2\u2192",
+          "renderer": {
+            "type": "code",
+            "context": {
+              "language": "text"
+            }
+          }
+        },
+        "model": "fixture-local",
+        "requestModelId": "custom-local:fixture-local",
+        "requestModelName": "Fixture local",
+        "traceId": "fixture-tool-005"
+      },
+      "sessionId": "fixture-tool",
+      "cwd": "/fixture/workspace"
+    },
+    {
+      "id": "fixture-tool-007",
+      "parentId": "fixture-tool-006",
+      "timestamp": 1791720000185,
+      "type": "message",
+      "role": "assistant",
+      "providerData": {
+        "conversationRequestId": "fixture-tool-002",
+        "messageId": "fixture-tool-008",
+        "stepSeq": 2,
+        "model": "fixture-local",
+        "requestModelId": "custom-local:fixture-local",
+        "requestModelName": "Fixture local",
+        "traceId": "fixture-tool-005",
+        "rawUsage": {
+          "prompt_tokens": 23,
+          "completion_tokens": 7,
+          "total_tokens": 30
+        },
+        "agent": "cli",
+        "usage": {
+          "requests": 1,
+          "inputTokens": 23,
+          "outputTokens": 7,
+          "totalTokens": 30,
+          "inputTokensDetails": [
+            {
+              "cached_tokens": 0
+            }
+          ],
+          "outputTokensDetails": [
+            {
+              "reasoning_tokens": 0
+            }
+          ]
+        }
+      },
+      "status": "completed",
+      "content": [
+        {
+          "providerData": {
+            "annotations": []
+          },
+          "type": "output_text",
+          "text": "The synthetic fixture tool returned blue."
+        }
+      ],
+      "sessionId": "fixture-tool",
+      "message": {
+        "usage": {
+          "input_tokens": 23,
+          "output_tokens": 7,
+          "total_tokens": 30
+        }
+      },
+      "cwd": "/fixture/workspace"
+    }
+  ],
+  "createdAt": 1792526675846.6846,
+  "updatedAt": 1792527511032.8293,
+  "meta": {
+    "cwd": "/fixture/workspace"
+  },
+  "hasCompactedHistory": false,
+  "realUserMessageIds": [
+    "fixture-tool-001"
+  ],
+  "nativeTitle": "Read the synthetic fixture file."
+}

@@ -201,7 +201,7 @@ async function setCoreCrateVersion(root, version) {
 }
 
 /**
- * Set `version` on the core crate, then the seven optional helper pins, the
+ * Set `version` on the core crate, then the eight optional helper pins, the
  * public `ai-hist` peer range and the matching lockfile coordinates for both
  * optional plugins, plus the version of each plugin's Rust crate. Idempotent.
  *

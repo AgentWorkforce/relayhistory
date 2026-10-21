@@ -1,0 +1,19 @@
+{
+  "product": "Kimi Code CLI",
+  "version": "2.2.0",
+  "source_commit": "472192c34c1efad89a369870eff0da0b708ce9bb",
+  "tag": "@moonshot-ai/kimi-code@2.2.0",
+  "platform": "darwin-arm64",
+  "artifacts": {
+    "kimi-code-2.2.0-source.tar.gz": "7a8cc813519a6e8b81ee7149b0da93e73282564afbc24edb5952a75dfc68e42b",
+    "kimi-code-2.2.0-bin.tar.gz": "034b37fee68e242b8d1800470c502d5870602fb54e1597d99d20d9e9f3fa8f59",
+    "kimi": "dab42ead275f8a49e9ce30a6263f614fce5926455bed103d0d16940655619bf5"
+  },
+  "protocol": "1.5",
+  "state_version": 2,
+  "oracle": "official pinned source flattenChain then foldWireRecords, after native process exit",
+  "reader_dependencies": {
+    "immer": "11.1.0",
+    "zod": "4.3.6"
+  }
+}

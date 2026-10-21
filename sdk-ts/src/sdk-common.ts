@@ -28,6 +28,8 @@ export const SOURCES = Object.freeze([
   'antigravity',
   'copilot',
   'qwen-code',
+  'kimi',
+  'codebuddy',
   'grok-bot',
   'openclaw',
 ] as const);

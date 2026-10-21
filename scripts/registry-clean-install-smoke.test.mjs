@@ -27,7 +27,7 @@ test('release package list covers the public npm family', () => {
   assert.ok(REGISTRY_RELEASE_PACKAGES.includes('ai-hist'));
   assert.ok(REGISTRY_RELEASE_PACKAGES.includes('ai-hist-mcp'));
   assert.ok(REGISTRY_RELEASE_PACKAGES.includes('ai-hist-native-linux-x64-gnu'));
-  assert.equal(REGISTRY_RELEASE_PACKAGES.length, 10);
+  assert.equal(REGISTRY_RELEASE_PACKAGES.length, 11);
 });
 
 test('waitForRegistryPackages retries until every package resolves', async () => {
@@ -115,5 +115,7 @@ test('waitForRegistryPackages stops on elapsed time before the job timeout', asy
       && error.message.includes('after 3 attempts'),
   );
   assert.equal(lookups, REGISTRY_RELEASE_PACKAGES.length * 3);
-  assert.deepEqual(waits, [20, 10]);
+  // Each lookup costs 1ms, so the second wait is clipped to what is left of
+  // the 50ms budget after two attempts and one full wait.
+  assert.deepEqual(waits, [20, 50 - (20 + 2 * REGISTRY_RELEASE_PACKAGES.length)]);
 });

@@ -1,0 +1,199 @@
+{
+  "session": {
+    "id": "fixture-fragments",
+    "history": [
+      {
+        "type": "message",
+        "id": "u1",
+        "timestamp": 1791720000001,
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Synthetic original prompt."
+          }
+        ],
+        "sessionId": "fixture-fragments",
+        "cwd": "/fixture/workspace"
+      },
+      {
+        "type": "message",
+        "id": "a2",
+        "timestamp": 1791720000002,
+        "role": "assistant",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "Synthetic old branch answer."
+          }
+        ],
+        "sessionId": "fixture-fragments",
+        "cwd": "/fixture/workspace",
+        "parentId": "u1"
+      },
+      {
+        "type": "message",
+        "id": "a3",
+        "timestamp": 1791720000003,
+        "role": "assistant",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "Synthetic first fragment."
+          }
+        ],
+        "sessionId": "fixture-fragments",
+        "cwd": "/fixture/workspace",
+        "parentId": "a2"
+      },
+      {
+        "type": "message",
+        "id": "a3",
+        "timestamp": 1791720000003,
+        "role": "assistant",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "Synthetic second fragment."
+          }
+        ],
+        "sessionId": "fixture-fragments",
+        "cwd": "/fixture/workspace",
+        "parentId": "a2"
+      }
+    ],
+    "createdAt": 1792527413303.0874,
+    "updatedAt": 1792527413303.2893,
+    "meta": {
+      "cwd": "/fixture/workspace"
+    },
+    "hasCompactedHistory": false
+  },
+  "replay": [
+    {
+      "type": "message",
+      "id": "u1",
+      "timestamp": 1791720000001,
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Synthetic original prompt."
+        }
+      ],
+      "sessionId": "fixture-fragments",
+      "cwd": "/fixture/workspace"
+    },
+    {
+      "type": "message",
+      "id": "a2",
+      "timestamp": 1791720000002,
+      "role": "assistant",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "Synthetic old branch answer."
+        }
+      ],
+      "sessionId": "fixture-fragments",
+      "cwd": "/fixture/workspace",
+      "parentId": "u1"
+    },
+    {
+      "type": "message",
+      "id": "a3",
+      "timestamp": 1791720000003,
+      "role": "assistant",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "Synthetic first fragment."
+        }
+      ],
+      "sessionId": "fixture-fragments",
+      "cwd": "/fixture/workspace",
+      "parentId": "a2"
+    },
+    {
+      "type": "message",
+      "id": "a3",
+      "timestamp": 1791720000003,
+      "role": "assistant",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "Synthetic second fragment."
+        }
+      ],
+      "sessionId": "fixture-fragments",
+      "cwd": "/fixture/workspace",
+      "parentId": "a2"
+    }
+  ],
+  "lane": [
+    {
+      "type": "message",
+      "uuid": "u1",
+      "timestamp": "2026-10-11T12:00:00.001Z",
+      "payload": {
+        "type": "message",
+        "id": "u1",
+        "timestamp": 1791720000001,
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Synthetic original prompt."
+          }
+        ],
+        "sessionId": "fixture-fragments",
+        "cwd": "/fixture/workspace"
+      }
+    },
+    {
+      "type": "message",
+      "uuid": "a2",
+      "timestamp": "2026-10-11T12:00:00.002Z",
+      "payload": {
+        "type": "message",
+        "id": "a2",
+        "timestamp": 1791720000002,
+        "role": "assistant",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "Synthetic old branch answer."
+          }
+        ],
+        "sessionId": "fixture-fragments",
+        "cwd": "/fixture/workspace",
+        "parentId": "u1"
+      }
+    },
+    {
+      "type": "message",
+      "uuid": "a3",
+      "timestamp": "2026-10-11T12:00:00.003Z",
+      "payload": {
+        "type": "message",
+        "id": "a3",
+        "timestamp": 1791720000003,
+        "role": "assistant",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "Synthetic second fragment."
+          }
+        ],
+        "sessionId": "fixture-fragments",
+        "cwd": "/fixture/workspace",
+        "parentId": "a2"
+      }
+    }
+  ],
+  "titleFacts": [],
+  "nativeTitle": "Synthetic original prompt.",
+  "realUserMessageIds": [
+    "u1"
+  ]
+}

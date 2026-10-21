@@ -9,11 +9,16 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - `ai-hist sync --install-service` works on Windows: it registers a hidden Task Scheduler task per account (`\RelayHistory\ai-hist-sync-<user>`) that runs `sync` every `--interval` (rounded up to whole minutes) while you are logged on, with no console window, logging to `%TEMP%\ai-hist-sync.log`; `--uninstall-service` removes it.
+- Windows arm64 (`aarch64-pc-windows-msvc`) is supported: `npm install` pulls the prebuilt `ai-hist-native-win32-arm64-msvc` addon, and `@relayhistory/provider-sources` ships a native `win32-arm64-msvc` helper.
 - Qwen Code interactive session history is discoverable and searchable from native transcript files, preserving the active conversation branch, recorded messages and tool evidence.
+- Kimi Code history is discoverable and searchable from current native session journals, including recorded messages, tools and separate subagent transcripts.
+- Codebuddy Code history is discoverable and searchable from native project session files, including recorded messages and tool evidence.
 
 ### Rust API
 
 - Added `Source::QwenCode` for filtering and reading persisted Qwen Code history.
+- Added `Source::Kimi` for filtering and reading persisted Kimi Code history.
+- Added `Source::Codebuddy` for filtering and reading persisted Codebuddy Code history.
 
 ## [0.49.0] - 2026-10-21
 

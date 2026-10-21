@@ -14,7 +14,7 @@
  * Each name has to exist once, published by a human account; CI owns it from
  * then on. This publishes a placeholder for every name that is still missing.
  *
- * A placeholder rather than the real package because the seven platform
+ * A placeholder rather than the real package because the eight platform
  * packages each carry a cross-compiled binary for their target: no single
  * machine can build all of them. The real artifacts come from the release.
  *

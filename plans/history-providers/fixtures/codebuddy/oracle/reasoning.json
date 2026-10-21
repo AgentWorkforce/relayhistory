@@ -1,0 +1,278 @@
+{
+  "session": {
+    "id": "fixture-reasoning",
+    "history": [
+      {
+        "type": "message",
+        "id": "u1",
+        "timestamp": 1791720000001,
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Synthetic original prompt."
+          }
+        ],
+        "sessionId": "fixture-reasoning",
+        "cwd": "/fixture/workspace"
+      },
+      {
+        "type": "message",
+        "id": "a2",
+        "timestamp": 1791720000002,
+        "role": "assistant",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "Synthetic old branch answer."
+          }
+        ],
+        "sessionId": "fixture-reasoning",
+        "cwd": "/fixture/workspace",
+        "parentId": "u1"
+      },
+      {
+        "type": "reasoning",
+        "id": "r3",
+        "timestamp": 1791720000003,
+        "summary": [
+          {
+            "type": "summary_text",
+            "text": "Synthetic reasoning kept opaque."
+          }
+        ],
+        "sessionId": "fixture-reasoning",
+        "cwd": "/fixture/workspace",
+        "parentId": "a2"
+      },
+      {
+        "type": "message",
+        "id": "u4",
+        "timestamp": 1791720000004,
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Synthetic internal notice."
+          }
+        ],
+        "sessionId": "fixture-reasoning",
+        "cwd": "/fixture/workspace",
+        "providerData": {
+          "skipRun": true,
+          "isMeta": true
+        },
+        "parentId": "r3"
+      },
+      {
+        "type": "message",
+        "id": "a5",
+        "timestamp": 1791720000005,
+        "role": "assistant",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "Synthetic answer after reasoning."
+          }
+        ],
+        "sessionId": "fixture-reasoning",
+        "cwd": "/fixture/workspace",
+        "parentId": "u4"
+      }
+    ],
+    "createdAt": 1792527413301.6238,
+    "updatedAt": 1792527413302.0376,
+    "meta": {
+      "cwd": "/fixture/workspace"
+    },
+    "hasCompactedHistory": false
+  },
+  "replay": [
+    {
+      "type": "message",
+      "id": "u1",
+      "timestamp": 1791720000001,
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Synthetic original prompt."
+        }
+      ],
+      "sessionId": "fixture-reasoning",
+      "cwd": "/fixture/workspace"
+    },
+    {
+      "type": "message",
+      "id": "a2",
+      "timestamp": 1791720000002,
+      "role": "assistant",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "Synthetic old branch answer."
+        }
+      ],
+      "sessionId": "fixture-reasoning",
+      "cwd": "/fixture/workspace",
+      "parentId": "u1"
+    },
+    {
+      "type": "reasoning",
+      "id": "r3",
+      "timestamp": 1791720000003,
+      "summary": [
+        {
+          "type": "summary_text",
+          "text": "Synthetic reasoning kept opaque."
+        }
+      ],
+      "sessionId": "fixture-reasoning",
+      "cwd": "/fixture/workspace",
+      "parentId": "a2"
+    },
+    {
+      "type": "message",
+      "id": "u4",
+      "timestamp": 1791720000004,
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Synthetic internal notice."
+        }
+      ],
+      "sessionId": "fixture-reasoning",
+      "cwd": "/fixture/workspace",
+      "providerData": {
+        "skipRun": true,
+        "isMeta": true
+      },
+      "parentId": "r3"
+    },
+    {
+      "type": "message",
+      "id": "a5",
+      "timestamp": 1791720000005,
+      "role": "assistant",
+      "content": [
+        {
+          "type": "output_text",
+          "text": "Synthetic answer after reasoning."
+        }
+      ],
+      "sessionId": "fixture-reasoning",
+      "cwd": "/fixture/workspace",
+      "parentId": "u4"
+    }
+  ],
+  "lane": [
+    {
+      "type": "message",
+      "uuid": "u1",
+      "timestamp": "2026-10-11T12:00:00.001Z",
+      "payload": {
+        "type": "message",
+        "id": "u1",
+        "timestamp": 1791720000001,
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Synthetic original prompt."
+          }
+        ],
+        "sessionId": "fixture-reasoning",
+        "cwd": "/fixture/workspace"
+      }
+    },
+    {
+      "type": "message",
+      "uuid": "a2",
+      "timestamp": "2026-10-11T12:00:00.002Z",
+      "payload": {
+        "type": "message",
+        "id": "a2",
+        "timestamp": 1791720000002,
+        "role": "assistant",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "Synthetic old branch answer."
+          }
+        ],
+        "sessionId": "fixture-reasoning",
+        "cwd": "/fixture/workspace",
+        "parentId": "u1"
+      }
+    },
+    {
+      "type": "reasoning",
+      "uuid": "r3",
+      "timestamp": "2026-10-11T12:00:00.003Z",
+      "payload": {
+        "type": "reasoning",
+        "id": "r3",
+        "timestamp": 1791720000003,
+        "summary": [
+          {
+            "type": "summary_text",
+            "text": "Synthetic reasoning kept opaque."
+          }
+        ],
+        "sessionId": "fixture-reasoning",
+        "cwd": "/fixture/workspace",
+        "parentId": "a2"
+      }
+    },
+    {
+      "type": "message",
+      "uuid": "u4",
+      "timestamp": "2026-10-11T12:00:00.004Z",
+      "payload": {
+        "type": "message",
+        "id": "u4",
+        "timestamp": 1791720000004,
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Synthetic internal notice."
+          }
+        ],
+        "sessionId": "fixture-reasoning",
+        "cwd": "/fixture/workspace",
+        "providerData": {
+          "skipRun": true,
+          "isMeta": true
+        },
+        "parentId": "r3"
+      }
+    },
+    {
+      "type": "message",
+      "uuid": "a5",
+      "timestamp": "2026-10-11T12:00:00.005Z",
+      "payload": {
+        "type": "message",
+        "id": "a5",
+        "timestamp": 1791720000005,
+        "role": "assistant",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "Synthetic answer after reasoning."
+          }
+        ],
+        "sessionId": "fixture-reasoning",
+        "cwd": "/fixture/workspace",
+        "parentId": "u4"
+      }
+    }
+  ],
+  "titleFacts": [],
+  "nativeTitle": "Synthetic original prompt.",
+  "realUserMessageIds": [
+    "u1"
+  ]
+}

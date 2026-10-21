@@ -1,0 +1,99 @@
+{
+  "session": {
+    "id": "fixture-pending-rewind",
+    "history": [
+      {
+        "type": "message",
+        "id": "u1",
+        "timestamp": 1791720000001,
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Synthetic original prompt."
+          }
+        ],
+        "sessionId": "fixture-pending-rewind",
+        "cwd": "/fixture/workspace"
+      },
+      {
+        "type": "message",
+        "id": "a2",
+        "timestamp": 1791720000002,
+        "role": "assistant",
+        "content": [
+          {
+            "type": "output_text",
+            "text": "Synthetic old branch answer."
+          }
+        ],
+        "sessionId": "fixture-pending-rewind",
+        "cwd": "/fixture/workspace",
+        "parentId": "u1"
+      },
+      {
+        "type": "resend-fork-notice",
+        "id": "notice-3",
+        "parentId": "u1",
+        "timestamp": 1791720000003,
+        "providerData": {
+          "skipRun": true,
+          "resendForkNotice": true
+        },
+        "sessionId": "fixture-pending-rewind",
+        "cwd": "/fixture/workspace"
+      }
+    ],
+    "createdAt": 1792527413298.313,
+    "updatedAt": 1792527413298.9526,
+    "meta": {
+      "cwd": "/fixture/workspace"
+    },
+    "hasCompactedHistory": false,
+    "conversationReverted": true,
+    "lastMessageId": "u1",
+    "lastUserMessageId": "u1"
+  },
+  "replay": [
+    {
+      "type": "message",
+      "id": "u1",
+      "timestamp": 1791720000001,
+      "role": "user",
+      "content": [
+        {
+          "type": "input_text",
+          "text": "Synthetic original prompt."
+        }
+      ],
+      "sessionId": "fixture-pending-rewind",
+      "cwd": "/fixture/workspace"
+    }
+  ],
+  "lane": [
+    {
+      "type": "message",
+      "uuid": "u1",
+      "timestamp": "2026-10-11T12:00:00.001Z",
+      "payload": {
+        "type": "message",
+        "id": "u1",
+        "timestamp": 1791720000001,
+        "role": "user",
+        "content": [
+          {
+            "type": "input_text",
+            "text": "Synthetic original prompt."
+          }
+        ],
+        "sessionId": "fixture-pending-rewind",
+        "cwd": "/fixture/workspace"
+      }
+    }
+  ],
+  "titleFacts": [],
+  "nativeTitle": "Synthetic original prompt.",
+  "realUserMessageIds": [
+    "u1"
+  ]
+}

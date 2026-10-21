@@ -1003,6 +1003,7 @@ handle.
 | --- | --- | --- | --- | --- | --- | --- |
 | antigravity | ✓ | ✓ | — | — | — | none |
 | claude | ✓ | ✓ | ✓ | ✓ | ✓ | per-message |
+| codebuddy | ✓ | ✓ | ✓ | — | — | per-message |
 | codex | ✓ | ✓ | ✓ | ✓ | ✓ | cumulative-delta |
 | copilot | ✓ | ✓ | ✓ | — | — | per-message |
 | cursor | ✓ | ✓ | ✓ | ✓ | — | none |
@@ -1010,6 +1011,7 @@ handle.
 | grok | ✓ | ✓ | ✓ | ✓ | ✓ | per-request |
 | grok-bot | ✓ | ✓ | — | — | ✓ | none |
 | hermes | ✓ | ✓ | ✓ | — | — | none |
+| kimi | ✓ | ✓ | ✓ | — | — | none |
 | muse | ✓ | ✓ | ✓ | ✓ | ✓ | per-request |
 | omp | ✓ | ✓ | ✓ | — | — | per-message |
 | openclaw | ✓ | ✓ | ✓ | — | — | per-message |

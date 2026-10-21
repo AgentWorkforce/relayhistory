@@ -1,0 +1,157 @@
+{
+  "corpus_files": [
+    "codebuddy/ordinary"
+  ],
+  "discovery_diagnostics": [],
+  "file_edits": [],
+  "fixture": "codebuddy/ordinary",
+  "history": [
+    {
+      "project": "/fixture/workspace",
+      "prompt": "Find the synthetic CodeBuddy needle.",
+      "session_id": "project:85bb7a9ae979f4260522cdcef7d1a0314b4ae28737b9f5d1c693a48338d814c2:fixture-ordinary",
+      "source": "codebuddy",
+      "timestamp_ms": 1791720000000
+    }
+  ],
+  "hydration": [
+    {
+      "related_session_ids": [],
+      "session_id": "project:85bb7a9ae979f4260522cdcef7d1a0314b4ae28737b9f5d1c693a48338d814c2:fixture-ordinary",
+      "source": "codebuddy",
+      "status": "hydrated"
+    }
+  ],
+  "layout": "HomeTree",
+  "notes": [],
+  "origin": "relayhistory",
+  "quirk": "Official @tencent-ai/codebuddy-code 2.171.0 CLI writer with isolated localhost model and independent native historical deserializer: ordinary.",
+  "session_events": [
+    {
+      "agent_id": null,
+      "call_index": null,
+      "control_kind": null,
+      "cwd": "/fixture/workspace",
+      "error_signal": null,
+      "event_index": null,
+      "event_source": null,
+      "event_uid": "fixture-ordinary-001:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "fixture-ordinary-001",
+      "model": null,
+      "parent_id": null,
+      "payload_bytes": null,
+      "payload_hash": null,
+      "payload_truncated": null,
+      "project": "/fixture/workspace",
+      "request_id": null,
+      "result_status": null,
+      "role": "user",
+      "session_id": "project:85bb7a9ae979f4260522cdcef7d1a0314b4ae28737b9f5d1c693a48338d814c2:fixture-ordinary",
+      "source": "codebuddy",
+      "stop_reason": null,
+      "subagent_session_id": null,
+      "text": "Find the synthetic CodeBuddy needle.",
+      "token_json": null,
+      "tool_use_id": null,
+      "ts_ms": 1791720000000
+    },
+    {
+      "agent_id": null,
+      "call_index": null,
+      "control_kind": null,
+      "cwd": "/fixture/workspace",
+      "error_signal": null,
+      "event_index": null,
+      "event_source": null,
+      "event_uid": "fixture-ordinary-003:0",
+      "git_branch": null,
+      "kind": "text",
+      "message_id": "fixture-ordinary-003",
+      "model": "fixture-local",
+      "parent_id": "fixture-ordinary-001",
+      "payload_bytes": null,
+      "payload_hash": null,
+      "payload_truncated": null,
+      "project": "/fixture/workspace",
+      "request_id": null,
+      "result_status": null,
+      "role": "assistant",
+      "session_id": "project:85bb7a9ae979f4260522cdcef7d1a0314b4ae28737b9f5d1c693a48338d814c2:fixture-ordinary",
+      "source": "codebuddy",
+      "stop_reason": null,
+      "subagent_session_id": null,
+      "text": "Found the synthetic CodeBuddy needle.",
+      "token_json": "{\"completion_tokens\":7,\"prompt_tokens\":23,\"total_tokens\":30}",
+      "tool_use_id": null,
+      "ts_ms": 1791720000426
+    }
+  ],
+  "session_markers": [
+    {
+      "kind": "message",
+      "marker_uid": "record:0",
+      "message_id": "fixture-ordinary-001",
+      "parent_id": null,
+      "payload_json": "{\"__codebuddyLocal\":{\"sensitiveUserInputReviewed\":true},\"content\":[{\"text\":\"Find the synthetic CodeBuddy needle.\",\"type\":\"input_text\"}],\"cwd\":\"/fixture/workspace\",\"id\":\"fixture-ordinary-001\",\"providerData\":{\"agent\":\"cli\",\"conversationRequestId\":\"fixture-ordinary-002\"},\"role\":\"user\",\"sessionId\":\"fixture-ordinary\",\"timestamp\":1791720000000,\"type\":\"message\"}",
+      "session_id": "project:85bb7a9ae979f4260522cdcef7d1a0314b4ae28737b9f5d1c693a48338d814c2:fixture-ordinary",
+      "source": "codebuddy",
+      "subkind": null,
+      "text": null,
+      "ts_ms": 1791720000000,
+      "turn_id": null
+    },
+    {
+      "kind": "file-history-snapshot",
+      "marker_uid": "record:1",
+      "message_id": null,
+      "parent_id": null,
+      "payload_json": "{\"cwd\":\"/fixture/workspace\",\"isSnapshotUpdate\":false,\"messageId\":\"fixture-ordinary-001\",\"snapshot\":{\"messageId\":\"fixture-ordinary-001\",\"trackedFileBackups\":{}},\"timestamp\":1791720000012,\"type\":\"file-history-snapshot\"}",
+      "session_id": "project:85bb7a9ae979f4260522cdcef7d1a0314b4ae28737b9f5d1c693a48338d814c2:fixture-ordinary",
+      "source": "codebuddy",
+      "subkind": null,
+      "text": null,
+      "ts_ms": 1791720000012,
+      "turn_id": null
+    },
+    {
+      "kind": "message",
+      "marker_uid": "record:2",
+      "message_id": "fixture-ordinary-003",
+      "parent_id": "fixture-ordinary-001",
+      "payload_json": "{\"content\":[{\"providerData\":{\"annotations\":[]},\"text\":\"Found the synthetic CodeBuddy needle.\",\"type\":\"output_text\"}],\"cwd\":\"/fixture/workspace\",\"id\":\"fixture-ordinary-003\",\"message\":{\"usage\":{\"input_tokens\":23,\"output_tokens\":7,\"total_tokens\":30}},\"parentId\":\"fixture-ordinary-001\",\"providerData\":{\"agent\":\"cli\",\"conversationRequestId\":\"fixture-ordinary-002\",\"messageId\":\"fixture-ordinary-004\",\"model\":\"fixture-local\",\"rawUsage\":{\"completion_tokens\":7,\"prompt_tokens\":23,\"total_tokens\":30},\"requestModelId\":\"custom-local:fixture-local\",\"requestModelName\":\"Fixture local\",\"stepSeq\":1,\"traceId\":\"fixture-ordinary-005\",\"usage\":{\"inputTokens\":23,\"inputTokensDetails\":[{\"cached_tokens\":0}],\"outputTokens\":7,\"outputTokensDetails\":[{\"reasoning_tokens\":0}],\"requests\":1,\"totalTokens\":30}},\"role\":\"assistant\",\"sessionId\":\"fixture-ordinary\",\"status\":\"completed\",\"timestamp\":1791720000426,\"type\":\"message\"}",
+      "session_id": "project:85bb7a9ae979f4260522cdcef7d1a0314b4ae28737b9f5d1c693a48338d814c2:fixture-ordinary",
+      "source": "codebuddy",
+      "subkind": null,
+      "text": null,
+      "ts_ms": 1791720000426,
+      "turn_id": null
+    }
+  ],
+  "session_relationships": [],
+  "sessions": [
+    {
+      "agent_version": null,
+      "cwd": "/fixture/workspace",
+      "discovery_state": "full",
+      "first_activity_ms": 1791720000000,
+      "first_prompt": "Find the synthetic CodeBuddy needle.",
+      "git_branch": null,
+      "initial_commit": null,
+      "last_activity_ms": 1791720000426,
+      "last_assistant_text": "Found the synthetic CodeBuddy needle.",
+      "models_json": null,
+      "originator": null,
+      "raw_path": "<home>/.codebuddy/projects/fixture-workspace/fixture-ordinary.jsonl",
+      "repo_url": null,
+      "session_id": "project:85bb7a9ae979f4260522cdcef7d1a0314b4ae28737b9f5d1c693a48338d814c2:fixture-ordinary",
+      "source": "codebuddy",
+      "source_stamp": "codebuddy_jsonl_v1:sha256:afa015a5c2a0d86237dc8cbe115aac3806a2d40b1c2b625410cb9e613b155abd",
+      "title": null,
+      "workspace_roots_json": null
+    }
+  ],
+  "source": "codebuddy",
+  "tool_calls": []
+}

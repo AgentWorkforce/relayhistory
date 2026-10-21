@@ -1,0 +1,163 @@
+{
+  "id": "codebuddy",
+  "rust_id": "codebuddy",
+  "variant": "Codebuddy",
+  "order": 439,
+  "aliases": [],
+  "fixtures": [
+    {
+      "source": "codebuddy",
+      "name": "ordinary",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "codebuddy/ordinary"
+      ],
+      "quirk": "Official @tencent-ai/codebuddy-code 2.171.0 CLI writer with isolated localhost model and independent native historical deserializer: ordinary."
+    },
+    {
+      "source": "codebuddy",
+      "name": "resumed",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "codebuddy/resumed"
+      ],
+      "quirk": "Official @tencent-ai/codebuddy-code 2.171.0 CLI writer with isolated localhost model and independent native historical deserializer: resumed."
+    },
+    {
+      "source": "codebuddy",
+      "name": "tool",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "codebuddy/tool"
+      ],
+      "quirk": "Official @tencent-ai/codebuddy-code 2.171.0 CLI writer with isolated localhost model and independent native historical deserializer: tool."
+    },
+    {
+      "source": "codebuddy",
+      "name": "spill",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "codebuddy/spill"
+      ],
+      "quirk": "Official @tencent-ai/codebuddy-code 2.171.0 CLI writer with isolated localhost model and independent native historical deserializer: spill."
+    },
+    {
+      "source": "codebuddy",
+      "name": "error",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "codebuddy/error"
+      ],
+      "quirk": "Official Tencent CLI 2.171.0 against isolated localhost model, actual native Read file-size error and independent native historical reader."
+    },
+    {
+      "source": "codebuddy",
+      "name": "fork",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "codebuddy/fork"
+      ],
+      "quirk": "Published native LocalJsonlSessionStore 2.171.0 offline recorder and fresh high-level historical replay reader; fork control. Not a CLI model-loop capture."
+    },
+    {
+      "source": "codebuddy",
+      "name": "pending-rewind",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "codebuddy/pending-rewind"
+      ],
+      "quirk": "Published native LocalJsonlSessionStore 2.171.0 offline recorder and fresh high-level historical replay reader; pending-rewind control. Not a CLI model-loop capture."
+    },
+    {
+      "source": "codebuddy",
+      "name": "compact",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "codebuddy/compact"
+      ],
+      "quirk": "Published native LocalJsonlSessionStore 2.171.0 offline recorder and fresh high-level historical replay reader; compact control. Not a CLI model-loop capture."
+    },
+    {
+      "source": "codebuddy",
+      "name": "reasoning",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "codebuddy/reasoning"
+      ],
+      "quirk": "Published native LocalJsonlSessionStore 2.171.0 offline recorder and fresh high-level historical reader replay; reasoning. Not a CLI model-loop capture."
+    },
+    {
+      "source": "codebuddy",
+      "name": "fragments",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "codebuddy/fragments"
+      ],
+      "quirk": "Published native LocalJsonlSessionStore 2.171.0 offline recorder and fresh high-level historical reader replay; fragments. Not a CLI model-loop capture."
+    },
+    {
+      "source": "codebuddy",
+      "name": "metadata",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "codebuddy/metadata"
+      ],
+      "quirk": "Published native LocalJsonlSessionStore 2.171.0 offline recorder and fresh high-level historical reader replay; metadata. Not a CLI model-loop capture."
+    },
+    {
+      "source": "codebuddy",
+      "name": "string-content",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "codebuddy/string-content"
+      ],
+      "quirk": "Published native LocalJsonlSessionStore 2.171.0 offline recorder and fresh high-level historical reader replay; string-content. Not a CLI model-loop capture."
+    },
+    {
+      "source": "codebuddy",
+      "name": "official-reader",
+      "layout": "Reference",
+      "origin": "RelayHistory",
+      "files": [
+        "codebuddy/official-reader.json",
+        "codebuddy/official-human.json"
+      ],
+      "quirk": "Fresh-process native SessionStoreImpl historical reader oracle for all five CLI captures, plus high-level historical replay for the seven recorder controls."
+    }
+  ],
+  "capture": [
+    {
+      "evidence": "Messages and identity",
+      "coverage": "Native linear project JSONL user/assistant text, native item IDs and integer millisecond clocks, project/root-namespaced session identities, recorded cwd. CODEBUDDY_CONFIG_DIR overrides the config root; global input history and active-session metadata are excluded."
+    },
+    {
+      "evidence": "Tools and usage",
+      "coverage": "Native function call/result callId joins, full inline toolResult.content including spills, raw markers and per-upstream-message rawUsage counters counted once. Embedded output paths are never read. Sidecar-only outputs, unrecognized control facts fail closed; no delegation or resume execution inferred."
+    },
+    {
+      "evidence": "Native replay",
+      "coverage": "Published native recorder and fresh high-level historical restore/replay oracle prove branch tombstone, pending rewind and compaction ancestry; retained pre-compaction messages stay searchable, controls and summaries remain markers. Native reasoning nodes stay opaque; adjacent native message fragments are preserved. Native title facts use custom/AI/topic precedence. Runtime-only lane moves without durable facts cannot be inferred."
+    }
+  ],
+  "population": {
+    "evidence": [
+      "history",
+      "session_event",
+      "session_marker",
+      "tool_call"
+    ],
+    "usage_accounting": "per-message"
+  }
+}
