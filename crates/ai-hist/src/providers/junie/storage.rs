@@ -193,9 +193,27 @@ fn enumerate_root(
     let mut candidates = Vec::new();
     for entry in std::fs::read_dir(root)? {
         crate::ingest::check_capture_cancelled()?;
-        let directory = entry?.path();
-        context.validate(&directory)?;
-        if !directory.is_dir() {
+        let entry = entry?;
+        let directory = entry.path();
+        let kind = match entry.file_type() {
+            Ok(kind) => kind,
+            Err(error) => {
+                eprintln!("Junie {}: {error:#}", directory.display());
+                continue;
+            }
+        };
+        if kind.is_symlink() {
+            eprintln!(
+                "Junie {}: JUNIE_INVALID_PATH: symlinked session directory",
+                directory.display()
+            );
+            continue;
+        }
+        if !kind.is_dir() {
+            continue;
+        }
+        if let Err(error) = context.validate(&directory) {
+            eprintln!("Junie {}: {error:#}", directory.display());
             continue;
         }
         let path = directory.join("events.jsonl");
@@ -208,7 +226,10 @@ fn enumerate_root(
         if !path.try_exists()? {
             continue;
         }
-        selected(context, &path)?;
+        if let Err(error) = selected(context, &path) {
+            eprintln!("Junie {}: {error:#}", path.display());
+            continue;
+        }
         let (stamp, recency_hint_ms) = crate::file_stamp_and_modified(&path)?;
         candidates.push(Candidate {
             source: ID,

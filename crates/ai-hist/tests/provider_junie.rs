@@ -2,7 +2,7 @@
 mod provider_support;
 use ai_hist::{
     CatalogQuery, DiscoveryOptions, HydrateOptions, ProviderRoots, Role, SessionQuery, SessionRef,
-    SessionStore, Source, StoreOptions,
+    SessionStore, Source, StoreOptions, SyncOptions,
 };
 use provider_support::{assert_history_conformance, HistoryCase};
 use std::path::{Path, PathBuf};
@@ -728,6 +728,83 @@ fn relocated_journal_without_index_does_not_inherit_old_project() {
 }
 
 #[test]
+fn partial_relocated_journal_cannot_prove_old_project_at_new_locator() {
+    let old_home = tempfile::tempdir().unwrap();
+    let new_home = tempfile::tempdir().unwrap();
+    let catalog = tempfile::tempdir().unwrap();
+    let db = catalog.path().join("junie.db");
+    let old_path = stage(old_home.path());
+    let reference = SessionRef::id(Source::Junie, SID);
+    let old = open_with_db(old_home.path(), db.clone());
+    old.discover(DiscoveryOptions::default().sources([Source::Junie]))
+        .unwrap();
+    old.hydrate(&reference, HydrateOptions::default()).unwrap();
+    drop(old);
+
+    let new_path = stage(new_home.path());
+    std::fs::remove_file(new_home.path().join(".junie/sessions/index.jsonl")).unwrap();
+    std::fs::remove_file(old_path).unwrap();
+    let moved = open_with_db(new_home.path(), db.clone());
+    moved
+        .discover(DiscoveryOptions::default().sources([Source::Junie]))
+        .unwrap();
+    let complete = std::fs::read(&new_path).unwrap();
+    let mut partial = complete.clone();
+    partial.extend_from_slice(b"{\"eventType\":");
+    std::fs::write(&new_path, partial).unwrap();
+    moved
+        .hydrate(&reference, HydrateOptions::default())
+        .unwrap();
+    // The incomplete append defers replacement, so old evidence remains.
+    assert_eq!(project_facts(&db).1.as_deref(), Some("/synthetic/project"));
+
+    drop(moved);
+    std::fs::write(&new_path, complete).unwrap();
+    let moved = open_with_db(new_home.path(), db.clone());
+    moved
+        .hydrate(&reference, HydrateOptions::default())
+        .unwrap();
+    assert_eq!(project_facts(&db), (None, None, None));
+    assert_eq!(project_keys(&db), (None, None));
+}
+
+#[test]
+fn same_locator_sync_then_partial_hydrate_preserves_complete_project_provenance() {
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path());
+    let db = home.path().join("junie.db");
+    let reference = SessionRef::id(Source::Junie, SID);
+    let store = open(home.path());
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    assert_eq!(project_facts(&db).0.as_deref(), Some("/synthetic/project"));
+
+    std::fs::remove_file(home.path().join(".junie/sessions/index.jsonl")).unwrap();
+    let complete = std::fs::read(&path).unwrap();
+    let mut partial = complete.clone();
+    partial.extend_from_slice(b"{\"eventType\":");
+    std::fs::write(&path, partial).unwrap();
+    store
+        .hydrate(&reference, HydrateOptions::default())
+        .unwrap();
+    assert_eq!(project_facts(&db).1.as_deref(), Some("/synthetic/project"));
+
+    drop(store);
+    std::fs::write(&path, complete).unwrap();
+    let store = open(home.path());
+    store
+        .hydrate(&reference, HydrateOptions::default())
+        .unwrap();
+    assert_eq!(
+        project_facts(&db),
+        (
+            Some("/synthetic/project".into()),
+            Some("/synthetic/project".into()),
+            Some("/synthetic/project".into())
+        )
+    );
+}
+
+#[test]
 fn native_index_rename_refreshes_full_catalog_on_discovery() {
     let home = tempfile::tempdir().unwrap();
     stage(home.path());
@@ -793,6 +870,100 @@ fn discovery_limit_selects_newest_journal_after_enumerating_all_directories() {
         .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].session_id, "session-zz-newer");
+}
+
+#[cfg(unix)]
+#[test]
+fn invalid_session_siblings_do_not_hide_verified_journal() {
+    use std::os::unix::fs::symlink;
+
+    let home = tempfile::tempdir().unwrap();
+    let valid = stage(home.path());
+    let sessions = valid.parent().unwrap().parent().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("events.jsonl"), b"outside").unwrap();
+    symlink(outside.path(), sessions.join("escaped-session")).unwrap();
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStringExt;
+        let non_utf8 = sessions.join(std::ffi::OsString::from_vec(b"bad-\xff".to_vec()));
+        std::fs::create_dir(&non_utf8).unwrap();
+        std::fs::write(non_utf8.join("events.jsonl"), b"not-a-journal").unwrap();
+    }
+
+    let store = open(home.path());
+    assert_eq!(
+        store
+            .discover(DiscoveryOptions::default().sources([Source::Junie]))
+            .unwrap()
+            .discovered,
+        1
+    );
+    store
+        .hydrate(
+            &SessionRef::id(Source::Junie, SID),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    assert_eq!(evidence(&store).tool_calls[0].tool_use_id, "step-tool-1");
+}
+
+#[cfg(unix)]
+#[test]
+fn escaped_replacement_keeps_last_good_local_evidence() {
+    use std::os::unix::fs::symlink;
+
+    let home = tempfile::tempdir().unwrap();
+    let valid = stage(home.path());
+    let original = std::fs::read(&valid).unwrap();
+    let store = open(home.path());
+    store
+        .discover(DiscoveryOptions::default().sources([Source::Junie]))
+        .unwrap();
+    store
+        .hydrate(
+            &SessionRef::id(Source::Junie, SID),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+
+    let outside = tempfile::tempdir().unwrap();
+    std::fs::write(outside.path().join("events.jsonl"), b"outside secret").unwrap();
+    std::fs::remove_dir_all(valid.parent().unwrap()).unwrap();
+    symlink(outside.path(), valid.parent().unwrap()).unwrap();
+    let healthy = valid
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("healthy-sibling/events.jsonl");
+    std::fs::create_dir_all(healthy.parent().unwrap()).unwrap();
+    std::fs::write(&healthy, original).unwrap();
+
+    assert_eq!(
+        store
+            .discover(DiscoveryOptions::default().sources([Source::Junie]))
+            .unwrap()
+            .discovered,
+        1
+    );
+    let report = store.sync(SyncOptions::default().force(true)).unwrap();
+    assert!(report.swept);
+    let sibling = store
+        .session(
+            &SessionRef::id(Source::Junie, "healthy-sibling"),
+            SessionQuery::default(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(sibling.tool_calls[0].tool_use_id, "step-tool-1");
+    let retained = evidence(&store);
+    assert_eq!(retained.tool_calls[0].tool_use_id, "step-tool-1");
+    assert!(!retained
+        .messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .any(|block| block.text.as_deref() == Some("outside secret")));
 }
 
 #[test]

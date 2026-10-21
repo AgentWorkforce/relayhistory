@@ -1,6 +1,37 @@
 use super::*;
+use crate::ingest::transcript_cursor::{load_cursor, CursorKey, TranscriptCursorState};
 use rusqlite::OptionalExtension;
 use serde_json::Value;
+
+const COMPLETE_LOCATOR_KEY: &str = "junieCompleteLocatorV1";
+
+pub(super) fn set_complete_locator(cursor: &mut TranscriptCursorState, path: &Path) {
+    cursor.extra.insert(
+        COMPLETE_LOCATOR_KEY.into(),
+        Value::String(path.to_string_lossy().into_owned()),
+    );
+}
+
+pub(super) fn preserve_complete_locator(
+    conn: &Connection,
+    sid: &str,
+    cursor: &mut TranscriptCursorState,
+) -> Result<()> {
+    let stored = load_cursor(
+        conn,
+        &CursorKey::Session {
+            source: ID,
+            session_id: sid,
+            location: "local",
+        },
+    )?;
+    if let Some(locator) = stored.extra.get(COMPLETE_LOCATOR_KEY) {
+        cursor
+            .extra
+            .insert(COMPLETE_LOCATOR_KEY.into(), locator.clone());
+    }
+    Ok(())
+}
 
 pub(super) fn invalidate_relocated_local_capture(
     conn: &Connection,
@@ -60,10 +91,29 @@ fn project_dir(
         // A present native summary without a project is authoritative absence.
         return Ok(None);
     }
+    let complete_locator: Option<String> = conn
+        .query_row(
+            "SELECT parser_state_json FROM session_hydration_checkpoints \
+             WHERE source=?1 AND session_id=?2 AND location='local'",
+            rusqlite::params![ID, sid],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    let cursor = TranscriptCursorState::decode(complete_locator.as_deref());
+    let complete_locator = cursor
+        .extra
+        .get(COMPLETE_LOCATOR_KEY)
+        .and_then(Value::as_str);
+    if complete_locator != Some(path.to_string_lossy().as_ref()) {
+        return Ok(None);
+    }
     // Missing/unreadable optional metadata cannot retract the project from a
-    // prior full local capture at this same native locator. The shared catalog
-    // cwd may have since been replaced by a remote observation, so take the
-    // prior event fact only from a local or shared-local evidence row.
+    // prior complete normalization at this same native locator. The generic
+    // hydration wrapper marks presence full even when an incomplete journal
+    // deferred replacement, so presence state alone cannot prove provenance.
+    // The shared catalog cwd may also have been replaced by a remote
+    // observation: take only a unique local or shared-local event fact.
     Ok(conn
         .query_row(
             "SELECT MIN(e.cwd) FROM session_events e \
@@ -76,6 +126,32 @@ fn project_dir(
             |row| row.get(0),
         )
         .optional()?)
+}
+
+pub(super) fn record_complete_capture(conn: &Connection, sid: &str, path: &Path) -> Result<()> {
+    let mut cursor = load_cursor(
+        conn,
+        &CursorKey::Session {
+            source: ID,
+            session_id: sid,
+            location: "local",
+        },
+    )?;
+    set_complete_locator(&mut cursor, path);
+    conn.execute(
+        "INSERT INTO session_hydration_checkpoints \
+         (source,session_id,location,parser_version,updated_ms,parser_state_json) \
+         VALUES (?1,?2,'local',?3,CAST(strftime('%s','now') AS INTEGER)*1000,?4) \
+         ON CONFLICT(source,session_id,location) DO UPDATE SET \
+           parser_state_json=excluded.parser_state_json",
+        rusqlite::params![
+            ID,
+            sid,
+            crate::ingest::hydrate::HYDRATION_PARSER_VERSION,
+            cursor.encode()?
+        ],
+    )?;
+    Ok(())
 }
 
 fn clear_unknown_local_project_keys(conn: &Connection, sid: &str, cwd: Option<&str>) -> Result<()> {

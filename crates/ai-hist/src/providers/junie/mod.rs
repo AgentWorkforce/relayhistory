@@ -146,6 +146,24 @@ fn acquire(
 fn ingest(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
     let capture = ctx.provider_session.context("missing Junie acquisition")?;
     normalize::write(ctx.conn, &capture.payload)?;
+    if capture.payload["partial"] != true {
+        // Generic hydration stores its cursor after the provider parser runs.
+        // Carry the same completed-capture fact into that write; a deferred
+        // append leaves the previously proven locator untouched.
+        let sid = format::string(&capture.payload, "sid")?;
+        let path = Path::new(format::string(&capture.payload, "path")?);
+        project::record_complete_capture(ctx.conn, sid, path)?;
+        project::set_complete_locator(ctx.cursor, path);
+    } else {
+        // The generic pass may reset its cursor on a first targeted hydrate
+        // or parser upgrade. A partial journal cannot replace the last good
+        // capture, including a complete one previously written by sync.
+        project::preserve_complete_locator(
+            ctx.conn,
+            format::string(&capture.payload, "sid")?,
+            ctx.cursor,
+        )?;
+    }
     let mut diagnostics = Vec::new();
     if let Some(code) = capture.payload["index_issue"].as_str() {
         diagnostics.push(crate::hydrate::HydrationDiagnostic {
@@ -190,6 +208,13 @@ fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
                 storage::capture_with_index(Path::new(&candidate.locator), &context, &indexes)?;
             let tx = ctx.conn.unchecked_transaction()?;
             let n = normalize::write(&tx, &capture.payload)?;
+            if capture.payload["partial"] != true {
+                project::record_complete_capture(
+                    &tx,
+                    format::string(&capture.payload, "sid")?,
+                    Path::new(&candidate.locator),
+                )?;
+            }
             tx.commit()?;
             Ok((n, capture.payload["partial"] == true))
         };

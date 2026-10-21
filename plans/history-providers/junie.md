@@ -62,8 +62,13 @@ escaping the declared root remains a hard containment error. A complete native
 index title rename refreshes the catalog
 during discovery, including a previously fully hydrated row; blank or
 unavailable index titles do not clear it. When index metadata is unavailable,
-a full local capture at the same journal locator also preserves its verified
-project directory for event, history and catalog reconciliation. A remote-only
+the last successfully normalized complete journal locator is recorded in
+Junie's versioned local hydration cursor state. Only an exact locator match
+and a unique persisted local event project preserve that verified directory
+for event, history and catalog reconciliation. A partial append leaves the
+previous complete locator intact even though generic hydration may mark its
+presence full; moving to a new locator cannot transfer the old project.
+A remote-only
 or discovery-only catalog row does not supply that fact; an explicit native
 summary without `projectDir` clears the prior local project and its derived
 catalog/event keys while retaining an independently remote-owned catalog
@@ -72,7 +77,10 @@ same session ID at a new journal locator, it invalidates the old full-local
 capture and demotes the catalog's full state before replacing the locator,
 unless an independent remote full capture still supports that state. The new
 journal cannot inherit the old journal's project while its index is unavailable.
-Unsupported event shapes fail visibly, while unknown evidence is
+Invalid session siblings (including symlink escapes and non-UTF-8 IDs) are
+skipped without hiding a valid journal in the same root; root and optional
+index containment checks remain strict. Unsupported event shapes fail visibly,
+while unknown evidence is
 preserved as bounded markers. A complete journal rewrite retires stale local
 evidence; an incomplete final JSONL line defers replacement. No native resume
 control, usage accounting, file edits or live execution is claimed.
