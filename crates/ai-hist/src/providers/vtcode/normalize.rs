@@ -90,15 +90,7 @@ pub(super) fn write(conn: &Connection, payload: &Value, path: &Path) -> Result<u
             last_assistant: written.last_assistant,
             prior: prior_activity.as_ref(),
         };
-        catalog::timed(
-            conn,
-            sid,
-            native,
-            path,
-            rows,
-            complete,
-            &summary,
-        )?;
+        catalog::timed(conn, sid, native, path, rows, complete, &summary)?;
     } else {
         catalog::untimed(
             conn,
