@@ -135,30 +135,12 @@ fn batch_quote_arg(value: &str) -> String {
     batch_quote(&format!("{value}{}", "\\".repeat(trailing)))
 }
 
-/// Captured variables that hold a name or suffix rather than a path.
-const NON_PATH_ENV_VARS: [&str; 4] = [
-    "HERMES_DATA_DIR_SUFFIX",
-    "OMP_PROFILE",
-    "OPENCLAW_PROFILE",
-    "PI_PROFILE",
-];
-
-/// `value` of `name` as the task should see it: a relative path is resolved
-/// against `cwd` (the install directory), because a scheduled run starts
-/// elsewhere. Names, absolute paths and `~` paths (which providers expand
-/// themselves) are kept as they are.
-pub(crate) fn task_environment_value(name: &str, value: String, cwd: &Path) -> String {
-    let relative = !Path::new(&value).is_absolute() && !value.starts_with('~');
-    if relative && !NON_PATH_ENV_VARS.contains(&name) {
-        cwd.join(&value).display().to_string()
-    } else {
-        value
-    }
-}
-
 /// The environment the task needs, read from this process: the provider roots
 /// the launchd and cron services capture, plus [`WINDOWS_EXTRA_ENV_VARS`].
-fn task_environment(spec: &ServiceSpec, cwd: &Path) -> Result<Vec<(&'static str, String)>> {
+/// Values are passed through verbatim: each provider resolves its own
+/// relative, `~`, `$VAR` and unset-marker forms, and the task runs in the
+/// install directory (see [`task_xml`]) so they resolve as they did there.
+fn task_environment(spec: &ServiceSpec) -> Result<Vec<(&'static str, String)>> {
     let mut environment = service_provider_environment(spec)?;
     for name in WINDOWS_EXTRA_ENV_VARS {
         let Some(value) = std::env::var_os(name) else {
@@ -168,10 +150,7 @@ fn task_environment(spec: &ServiceSpec, cwd: &Path) -> Result<Vec<(&'static str,
             environment.push((name, value));
         }
     }
-    Ok(environment
-        .into_iter()
-        .map(|(name, value)| (name, task_environment_value(name, value, cwd)))
-        .collect())
+    Ok(environment)
 }
 
 /// The `.cmd` wrapper the task runs: set the environment, run ai-hist, append
@@ -230,12 +209,15 @@ pub(crate) fn task_action(system_root: &Path, wrapper: &Path) -> (String, String
 
 /// Task definition: repeat every `minutes` from `start_boundary` (local time),
 /// run only while the user is logged on (no stored password), hidden, on
-/// battery too, catch up a missed run, never overlap a still-running one.
+/// battery too, catch up a missed run, never overlap a still-running one. The
+/// action starts in `working_dir`, the install directory, so relative provider
+/// roots resolve exactly as they did for the install command.
 pub(crate) fn task_xml(
     spec: &ServiceSpec,
     start_boundary: &str,
     minutes: u64,
     action: &(String, String),
+    working_dir: &str,
 ) -> String {
     format!(
         r#"<?xml version="1.0" encoding="UTF-16"?>
@@ -282,6 +264,7 @@ pub(crate) fn task_xml(
     <Exec>
       <Command>{command}</Command>
       <Arguments>{arguments}</Arguments>
+      <WorkingDirectory>{working_dir}</WorkingDirectory>
     </Exec>
   </Actions>
 </Task>
@@ -291,6 +274,7 @@ pub(crate) fn task_xml(
         time_limit = EXECUTION_TIME_LIMIT,
         command = xml_escape(&action.0),
         arguments = xml_escape(&action.1),
+        working_dir = xml_escape(working_dir),
     )
 }
 
@@ -344,7 +328,14 @@ pub(crate) fn install(spec: &ServiceSpec, bin: &str, interval: u64, args: &[Stri
         );
     }
     let cwd = std::env::current_dir().context("reading the current directory")?;
-    let environment = task_environment(spec, &cwd)?;
+    let cwd = cwd.display().to_string();
+    if cwd.starts_with(r"\\") {
+        // cmd.exe cannot run in a UNC directory and falls back to %SystemRoot%.
+        eprintln!(
+            "Note: installing from a network path; relative provider roots will resolve against %SystemRoot% in the scheduled task."
+        );
+    }
+    let environment = task_environment(spec)?;
     let log = std::env::temp_dir().join(format!("{}.log", spec.log_stem));
     let wrapper = wrapper_path(spec);
     let script = wrapper_script(spec, bin, args, &environment, &log.display().to_string())?;
@@ -362,7 +353,7 @@ pub(crate) fn install(spec: &ServiceSpec, bin: &str, interval: u64, args: &[Stri
         }
     };
     fs::write(&wrapper, script).with_context(|| format!("writing {}", wrapper.display()))?;
-    if let Err(error) = register(spec, minutes, &wrapper) {
+    if let Err(error) = register(spec, minutes, &wrapper, &cwd) {
         let restored = match previous {
             Some(bytes) => fs::write(&wrapper, bytes),
             None => fs::remove_file(&wrapper),
@@ -391,14 +382,15 @@ pub(crate) fn install(spec: &ServiceSpec, bin: &str, interval: u64, args: &[Stri
     Ok(())
 }
 
-/// Register (or replace) the task that runs `wrapper` every `minutes`.
-fn register(spec: &ServiceSpec, minutes: u64, wrapper: &Path) -> Result<()> {
+/// Register (or replace) the task that runs `wrapper` every `minutes` in
+/// `working_dir`.
+fn register(spec: &ServiceSpec, minutes: u64, wrapper: &Path, working_dir: &str) -> Result<()> {
     let system_root = std::env::var_os("SystemRoot")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
     let action = task_action(&system_root, wrapper);
     let start = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S").to_string();
-    let xml = task_xml(spec, &start, minutes, &action);
+    let xml = task_xml(spec, &start, minutes, &action, working_dir);
     let definition = tempfile::Builder::new()
         .prefix("ai-hist-task-")
         .suffix(".xml")
@@ -533,23 +525,6 @@ mod tests {
     }
 
     #[test]
-    fn relative_roots_resolve_against_the_install_directory() {
-        let cwd = std::env::current_dir().unwrap();
-        let resolve = |name, value: &str| task_environment_value(name, value.to_string(), &cwd);
-        // A scheduled run starts elsewhere, so a relative root is made absolute.
-        assert_eq!(
-            resolve("OPENCLAW_STATE_DIR", "state"),
-            cwd.join("state").display().to_string()
-        );
-        // Absolute and `~` paths, and names that are not paths, stay as given.
-        let absolute = cwd.join("qwen").display().to_string();
-        assert_eq!(resolve("QWEN_HOME", &absolute), absolute);
-        assert_eq!(resolve("OPENCLAW_HOME", "~/claw"), "~/claw");
-        assert_eq!(resolve("OMP_PROFILE", "work"), "work");
-        assert_eq!(resolve("HERMES_DATA_DIR_SUFFIX", "dev"), "dev");
-    }
-
-    #[test]
     fn wrapper_rejects_double_quotes() {
         let error = wrapper_script(
             &SYNC_SERVICE,
@@ -583,7 +558,13 @@ mod tests {
             r"C:\Windows\System32\conhost.exe".to_string(),
             r#"--headless "C:\a&b\cmd.exe" /c ""x<y>.cmd"""#.to_string(),
         );
-        let xml = task_xml(&SYNC_SERVICE, "2026-10-20T09:30:00", 5, &action);
+        let xml = task_xml(
+            &SYNC_SERVICE,
+            "2026-10-20T09:30:00",
+            5,
+            &action,
+            r"C:\work & play",
+        );
         for expected in [
             "<Interval>PT5M</Interval>",
             "<StartBoundary>2026-10-20T09:30:00</StartBoundary>",
@@ -597,6 +578,8 @@ mod tests {
             "<ExecutionTimeLimit>PT6H</ExecutionTimeLimit>",
             r"<Command>C:\Windows\System32\conhost.exe</Command>",
             r#"<Arguments>--headless "C:\a&amp;b\cmd.exe" /c ""x&lt;y&gt;.cmd""</Arguments>"#,
+            // Relative provider roots resolve against the install directory.
+            r"<WorkingDirectory>C:\work &amp; play</WorkingDirectory>",
         ] {
             assert!(xml.contains(expected), "missing {expected} in\n{xml}");
         }
