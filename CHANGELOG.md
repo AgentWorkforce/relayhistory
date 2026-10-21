@@ -17,6 +17,11 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - The source-built Rust CLI no longer installs a background sync service: `ai-hist sync --install-service`, `--uninstall-service` and `--interval` (launchd on macOS, cron on Linux) are gone. Run `ai-hist watch`, or schedule `ai-hist sync` yourself. A service installed earlier keeps running until you remove it: `launchctl unload ~/Library/LaunchAgents/com.ai-hist.sync.plist` and delete that file on macOS, or delete the `# ai-hist sync (managed)` line from `crontab -e` on Linux.
 
+### Fixed
+
+- Hermes hydration preserves remote-backed evidence when a local transcript changes, rejecting conflicting rewrites without replacing shared history.
+- Source evidence intake rejects blank tool call identifiers while preserving recorded Hermes call and result identities.
+
 ### Rust API
 
 - Added `Source::QwenCode` for filtering and reading persisted Qwen Code history.
