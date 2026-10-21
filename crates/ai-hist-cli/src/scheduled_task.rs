@@ -193,6 +193,9 @@ pub(crate) fn wrapper_script(
         command.join(" "),
         batch_quote(log)
     ));
+    // `pushd` into a UNC directory maps a drive letter that outlives the
+    // script unless `popd` releases it.
+    lines.push("popd".to_string());
     Ok(format!("{}\r\n", lines.join("\r\n")))
 }
 
@@ -520,7 +523,8 @@ mod tests {
             lines[7],
             r#""C:\Program Files\ai-hist\ai-hist.exe" "sync" "--source-connector" "devin" >> "C:\Users\Ann Lee\AppData\Local\Temp\ai-hist-sync.log" 2>&1"#
         );
-        assert_eq!(lines[8], "");
+        assert_eq!(lines[8], "popd");
+        assert_eq!(lines[9], "");
         assert!(
             !script.replace("\r\n", "").contains('\n'),
             "every line ends in CRLF"
