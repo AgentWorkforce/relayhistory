@@ -61,7 +61,8 @@ pub(crate) fn task_name(spec: &ServiceSpec) -> String {
         .filter(|name| !name.trim().is_empty())
         .or_else(|| {
             let home = ai_hist::paths::home_dir();
-            home.file_name().map(|name| name.to_string_lossy().into_owned())
+            home.file_name()
+                .map(|name| name.to_string_lossy().into_owned())
         })
         .unwrap_or_else(|| "user".to_string());
     task_name_for(spec, &account)
@@ -147,17 +148,20 @@ fn task_environment(spec: &ServiceSpec) -> Result<Vec<(&'static str, String)>> {
     Ok(environment)
 }
 
-/// The `.cmd` wrapper the task runs: set the environment, run ai-hist, append
-/// its output to `log`. CRLF line endings, UTF-8 (switched to with `chcp`
-/// before any non-ASCII line is read).
+/// The `.cmd` wrapper the task runs: set the environment, change to `cwd` (the
+/// install directory, so relative provider roots resolve as they did there),
+/// run ai-hist, append its output to `log`. CRLF line endings, UTF-8 (switched
+/// to with `chcp` before any non-ASCII line is read).
 pub(crate) fn wrapper_script(
     spec: &ServiceSpec,
     bin: &str,
     args: &[String],
     environment: &[(&str, String)],
+    cwd: &str,
     log: &str,
 ) -> Result<String> {
     reject_quote("the ai-hist binary path", bin)?;
+    reject_quote("the install directory", cwd)?;
     reject_quote("the service log path", log)?;
     let mut lines = vec![
         "@echo off".to_string(),
@@ -172,6 +176,7 @@ pub(crate) fn wrapper_script(
         reject_quote(name, value)?;
         lines.push(format!("set {}", batch_quote(&format!("{name}={value}"))));
     }
+    lines.push(format!("cd /d {}", batch_quote(cwd)));
     let mut command = vec![batch_quote(bin)];
     for arg in service_command_args(spec, args) {
         reject_quote("a service argument", &arg)?;
@@ -315,7 +320,15 @@ pub(crate) fn install(spec: &ServiceSpec, bin: &str, interval: u64, args: &[Stri
     let environment = task_environment(spec)?;
     let log = std::env::temp_dir().join(format!("{}.log", spec.log_stem));
     let wrapper = wrapper_path(spec);
-    let script = wrapper_script(spec, bin, args, &environment, &log.display().to_string())?;
+    let cwd = std::env::current_dir().context("reading the current directory")?;
+    let script = wrapper_script(
+        spec,
+        bin,
+        args,
+        &environment,
+        &cwd.display().to_string(),
+        &log.display().to_string(),
+    )?;
     if let Some(dir) = wrapper.parent() {
         fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
     }
@@ -476,6 +489,7 @@ mod tests {
             r"C:\Program Files\ai-hist\ai-hist.exe",
             &["--source-connector".to_string(), "devin".to_string()],
             &environment,
+            r"C:\work & play",
             r"C:\Users\Ann Lee\AppData\Local\Temp\ai-hist-sync.log",
         )
         .unwrap();
@@ -486,11 +500,13 @@ mod tests {
         assert_eq!(lines[3], "setlocal DisableDelayedExpansion");
         assert_eq!(lines[4], r#"set "CLAUDE_CONFIG_DIR=D:\Claude & tools""#);
         assert_eq!(lines[5], r#"set "CODEX_HOME=D:\codex's 100%% archive""#);
+        // Relative provider roots resolve against the install directory.
+        assert_eq!(lines[6], r#"cd /d "C:\work & play""#);
         assert_eq!(
-            lines[6],
+            lines[7],
             r#""C:\Program Files\ai-hist\ai-hist.exe" "sync" "--source-connector" "devin" >> "C:\Users\Ann Lee\AppData\Local\Temp\ai-hist-sync.log" 2>&1"#
         );
-        assert_eq!(lines[7], "");
+        assert_eq!(lines[8], "");
         assert!(
             !script.replace("\r\n", "").contains('\n'),
             "every line ends in CRLF"
@@ -504,6 +520,7 @@ mod tests {
             r"C:\ai-hist.exe",
             &[],
             &[("CODEX_HOME", r#"D:\a"b"#.to_string())],
+            r"C:\work",
             r"C:\log",
         )
         .unwrap_err();
