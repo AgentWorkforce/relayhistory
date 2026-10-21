@@ -202,7 +202,8 @@ pub(crate) fn expand_references(
         let (name, after, written) = match rest.strip_prefix('{') {
             Some(braced) => match braced.find('}') {
                 Some(end) => (&braced[..end], &braced[end + 1..], &rest[..end + 2]),
-                None => ("", rest, ""),
+                // Hermes takes everything after an unclosed `${` literally.
+                None => ("", "", rest),
             },
             None => {
                 let end = rest
@@ -699,6 +700,8 @@ mod tests {
         );
         // An unclosed `${` and a bare `$` name nothing, as Hermes leaves them.
         assert!(referenced_variables("C:/hermes/${OPEN").is_empty());
+        // Nothing after an unclosed `${` is a reference, as in Hermes.
+        assert!(referenced_variables("C:/${OPEN/$LATER").is_empty());
         assert!(referenced_variables("cost$/x").is_empty());
     }
 
@@ -708,6 +711,7 @@ mod tests {
         assert_eq!(expand_references("$ROOT/${ROOT}/x", env), "R/R/x");
         assert_eq!(expand_references("$UNSET/${UNSET}", env), "$UNSET/${UNSET}");
         assert_eq!(expand_references("a$/${OPEN", env), "a$/${OPEN");
+        assert_eq!(expand_references("${OPEN/$ROOT", env), "${OPEN/$ROOT");
     }
 
     #[test]
