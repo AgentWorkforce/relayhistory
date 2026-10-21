@@ -115,5 +115,7 @@ test('waitForRegistryPackages stops on elapsed time before the job timeout', asy
       && error.message.includes('after 3 attempts'),
   );
   assert.equal(lookups, REGISTRY_RELEASE_PACKAGES.length * 3);
-  assert.deepEqual(waits, [20, 10]);
+  // Each lookup costs 1ms, so the second wait is clipped to what is left of
+  // the 50ms budget after two attempts and one full wait.
+  assert.deepEqual(waits, [20, 50 - (20 + 2 * REGISTRY_RELEASE_PACKAGES.length)]);
 });
