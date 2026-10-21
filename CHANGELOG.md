@@ -9,6 +9,11 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - `ai-hist sync --install-service` works on Windows: it registers a hidden Task Scheduler task per account (`\RelayHistory\ai-hist-sync-<user>`) that runs `sync` every `--interval` (rounded up to whole minutes) while you are logged on, with no console window, logging to `%TEMP%\ai-hist-sync.log`; `--uninstall-service` removes it.
+- Qwen Code interactive session history is discoverable and searchable from native transcript files, preserving the active conversation branch, recorded messages and tool evidence.
+
+### Rust API
+
+- Added `Source::QwenCode` for filtering and reading persisted Qwen Code history.
 
 ## [0.49.0] - 2026-10-21
 
