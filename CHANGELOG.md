@@ -1110,7 +1110,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - The SDK reads provider JSONL natively and works without the Python CLI.
 
-[Unreleased]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.50.1...HEAD
+[Unreleased - Minor]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.50.1...HEAD
 [0.50.1]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.49.0...sdk-ts-v0.50.1
 [0.49.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.48.0...sdk-ts-v0.49.0
 [0.48.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.47.0...sdk-ts-v0.48.0
