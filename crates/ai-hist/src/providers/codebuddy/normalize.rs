@@ -224,6 +224,15 @@ fn result(conn: &Connection, base: &EventRow<'_>, row: &Value, keys: &mut Keys) 
     Ok(())
 }
 
+fn visible_role<'a>(row: &'a Value, kind: &str) -> Result<Option<&'a str>> {
+    let role = match kind {
+        "function_call" => "assistant",
+        "function_call_result" => "tool_result",
+        _ => format::string(row, "role")?,
+    };
+    Ok((kind != "message" || format::human_message(row)).then_some(role))
+}
+
 fn event(
     conn: &Connection,
     sid: &str,
@@ -245,14 +254,9 @@ fn event(
     let occurrence = occurrences.entry(mid.to_owned()).or_default();
     let uid = format!("{mid}:{}", *occurrence);
     *occurrence += 1;
-    let role = match kind {
-        "function_call" => "assistant",
-        "function_call_result" => "tool_result",
-        _ => format::string(row, "role")?,
-    };
-    if kind == "message" && !format::human_message(row) {
+    let Some(role) = visible_role(row, kind)? else {
         return Ok(0);
-    }
+    };
     let usage = &row["providerData"]["rawUsage"];
     let provider_message_id = row["providerData"]["messageId"]
         .as_str()
