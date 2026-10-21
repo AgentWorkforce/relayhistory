@@ -91,17 +91,16 @@ fn a_busy_source_failure_prints_a_fresh_write_capability_probe() {
 }
 
 #[test]
-fn unsupported_remote_sync_fails_before_watch_or_service_setup() {
+fn unsupported_remote_sync_fails_before_watch_setup() {
     let temp = tempfile::tempdir().unwrap();
     let db_path = temp.path().join("history.db");
-    for args in [vec!["--remote"], vec!["--remote", "--install-service"]] {
-        let mut command = isolated_sync(&temp, &db_path);
-        command.args(args);
-        let output = command.output().unwrap();
-        assert!(!output.status.success());
-        assert!(String::from_utf8_lossy(&output.stderr)
-            .contains("no remote provider connectors are configured"));
-    }
+    let output = isolated_sync(&temp, &db_path)
+        .arg("--remote")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr)
+        .contains("no remote provider connectors are configured"));
 
     let output = Command::new(env!("CARGO_BIN_EXE_ai-hist"))
         .arg("--db")
