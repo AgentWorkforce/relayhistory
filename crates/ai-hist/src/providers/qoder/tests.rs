@@ -31,3 +31,18 @@ fn relative_config_root_is_frozen_against_the_opening_cwd() {
     assert_eq!(expand(&home, &opening_cwd, "~/.qoder"), home.join(".qoder"));
     assert_eq!(expand(&home, &opening_cwd, home.to_str().unwrap()), home);
 }
+
+#[cfg(unix)]
+#[test]
+fn selected_transcript_symlink_cannot_escape_declared_root() {
+    let home = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    let root = home.path().join(".qoder/projects");
+    let path = root.join("project/synthetic-tool.jsonl");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let secret = outside.path().join("synthetic-tool.jsonl");
+    std::fs::write(&secret, b"synthetic external bytes").unwrap();
+    std::os::unix::fs::symlink(&secret, &path).unwrap();
+    let roots = ProviderRoots::from_home(home.path().into(), home.path().join("opencode.db"));
+    assert!(AcquisitionContext::new(ID, &roots).validate(&path).is_err());
+}

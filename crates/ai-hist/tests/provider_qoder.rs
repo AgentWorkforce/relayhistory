@@ -58,6 +58,10 @@ fn qoder_native_writer_tool_history_reaches_public_facade() {
         Some("call-1")
     );
     assert_eq!(
+        evidence.tool_results[0].text.as_deref(),
+        Some("Synthetic note contents.")
+    );
+    assert_eq!(
         evidence
             .messages
             .iter()
@@ -162,6 +166,52 @@ fn qoder_unsupported_schema_is_diagnostic() {
         .diagnostics
         .iter()
         .any(|d| d.message.contains("QODER_UNSUPPORTED_SCHEMA")));
+    std::fs::write(&path, format!("{TOOL}{{malformed}}\n")).unwrap();
+    let malformed = open(home.path())
+        .discover(DiscoveryOptions::default().sources([Source::Qoder]))
+        .unwrap();
+    assert_eq!(malformed.discovered, 0);
+    assert!(malformed
+        .diagnostics
+        .iter()
+        .any(|d| d.message.contains("QODER_INVALID_RECORD")));
+}
+
+#[test]
+fn qoder_metadata_only_rewrite_keeps_messages_and_updates_marker() {
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path(), "synthetic-tool", TOOL);
+    let store = open(home.path());
+    store
+        .discover(DiscoveryOptions::default().sources([Source::Qoder]))
+        .unwrap();
+    let reference = SessionRef::id(Source::Qoder, "synthetic-tool");
+    store
+        .hydrate(&reference, HydrateOptions::default())
+        .unwrap();
+    let before = store
+        .session(&reference, SessionQuery::default())
+        .unwrap()
+        .unwrap();
+    std::fs::write(
+        &path,
+        TOOL.replacen(
+            "\"lastPrompt\":\"Read note.txt.\"",
+            "\"lastPrompt\":\"Renamed prompt label.\"",
+            1,
+        ),
+    )
+    .unwrap();
+    store
+        .hydrate(&reference, HydrateOptions::default())
+        .unwrap();
+    let after = store
+        .session(&reference, SessionQuery::default())
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.messages, before.messages);
+    assert_eq!(after.tool_calls, before.tool_calls);
+    assert_ne!(after.markers, before.markers);
 }
 
 #[test]

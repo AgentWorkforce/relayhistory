@@ -19,24 +19,21 @@ pub(super) fn write(conn: &Connection, payload: &Value, path: &Path) -> Result<u
     let shared = Snapshot::capture(conn, ID, sid)?;
     let cwd = header["cwd"].as_str();
     let mut keys = Keys::default();
-    let (inserted, last, assistant) = write_rows(conn, sid, cwd, entries, &mut keys)?;
+    let written = write_rows(conn, sid, cwd, entries, &mut keys)?;
     let complete = payload["tail"].as_array().is_some_and(Vec::is_empty);
     if complete {
         file_history::retire(conn, ID, sid, &keys)?;
         reconcile_complete(conn, sid, cwd, entries, &mut keys)?;
     }
-    write_catalog(
-        conn,
-        sid,
-        cwd,
-        path,
-        entries,
-        last,
-        assistant.as_deref(),
-        complete,
-    )?;
+    write_catalog(conn, sid, cwd, path, entries, &written, complete)?;
     shared.ensure_unchanged(conn, sid)?;
-    Ok(inserted)
+    Ok(written.inserted)
+}
+
+struct WrittenRows {
+    inserted: usize,
+    last: i64,
+    assistant: Option<String>,
 }
 
 fn write_rows(
@@ -45,7 +42,7 @@ fn write_rows(
     cwd: Option<&str>,
     entries: &[Value],
     keys: &mut Keys,
-) -> Result<(usize, i64, Option<String>)> {
+) -> Result<WrittenRows> {
     let first = format::time(&entries[0])?.context("QODER_INVALID_RECORD: first timestamp")?;
     let mut last = first;
     let mut assistant = None;
@@ -73,7 +70,11 @@ fn write_rows(
             )?;
         }
     }
-    Ok((inserted, last, assistant))
+    Ok(WrittenRows {
+        inserted,
+        last,
+        assistant,
+    })
 }
 
 fn reconcile_complete(
@@ -100,8 +101,7 @@ fn write_catalog(
     cwd: Option<&str>,
     path: &Path,
     entries: &[Value],
-    last: i64,
-    assistant: Option<&str>,
+    written: &WrittenRows,
     complete: bool,
 ) -> Result<()> {
     let first = format::time(&entries[0])?.context("QODER_INVALID_RECORD: first timestamp")?;
@@ -118,8 +118,8 @@ fn write_catalog(
             cwd,
             git_branch: None,
             first_ts: first,
-            last_ts: last,
-            last_assistant_text: complete.then_some(assistant).flatten(),
+            last_ts: written.last,
+            last_assistant_text: complete.then_some(written.assistant.as_deref()).flatten(),
             raw_path: Some(&path.to_string_lossy()),
         },
     )?;
