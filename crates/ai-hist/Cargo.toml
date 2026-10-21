@@ -45,9 +45,15 @@ url = { version = "2", optional = true }
 # libzstd binding Codex writes them with.
 zstd = { version = "0.13", default-features = false }
 
+[target.'cfg(unix)'.dependencies]
+# Safe wrappers for the statfs/statvfs, flock and kill(pid, 0) calls the crate
+# makes, so it needs no `unsafe` of its own.
+rustix = { version = "1", features = ["fs", "process"] }
+
 [target.'cfg(windows)'.dependencies]
 fs2 = "0.4"
-windows-sys = { version = "0.61", features = ["Win32_Storage_FileSystem"] }
+# Quota-aware free space (`GetDiskFreeSpaceExW`) behind a safe API.
+fs4 = { version = "1", default-features = false }
 
 [dev-dependencies]
 tempfile = "3"

@@ -73,6 +73,10 @@ pub(super) fn enumerate(env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
 pub(super) fn capture(path: &Path, context: &AcquisitionContext<'_>) -> Result<AcquiredSession> {
     let path = selected(context, path)?;
     let bytes = context.read(&path)?;
+    let name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| anyhow::anyhow!("ANTIGRAVITY_INVALID_PATH: not a transcript"))?;
     let (rows, partial) = format::parse(&bytes, false)?;
     anyhow::ensure!(
         !rows.is_empty(),
@@ -85,7 +89,7 @@ pub(super) fn capture(path: &Path, context: &AcquisitionContext<'_>) -> Result<A
                 .is_some_and(|a| !a.is_empty())
     });
     anyhow::ensure!(
-        path.file_name().unwrap() != "transcript_full.jsonl" || !truncated,
+        name != "transcript_full.jsonl" || !truncated,
         "ANTIGRAVITY_INVALID_RECORD: full transcript declares truncation"
     );
     let sid = roots::identity(context.roots, &path)?;
@@ -98,11 +102,7 @@ pub(super) fn capture(path: &Path, context: &AcquisitionContext<'_>) -> Result<A
     // The absolute locator is needed by normalization, but a temporary HOME
     // relocation is not an evidence revision. Identity, projection selection
     // and exact source bytes still distinguish every meaningful capture.
-    let revision = serde_json::to_vec(&(
-        &sid,
-        path.file_name().unwrap().to_str().unwrap(),
-        &bytes_hash,
-    ))?;
+    let revision = serde_json::to_vec(&(&sid, name, &bytes_hash))?;
     let stamp = format!("sha256:{:x}", Sha256::digest(revision));
     let records = rows.len() as i64;
     let payload = serde_json::json!({"sid":sid,"path":path,"rows":rows,"partial":incomplete,"bytesSha256":bytes_hash});

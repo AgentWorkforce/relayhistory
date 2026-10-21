@@ -354,7 +354,7 @@ type FetchedRows = Mutex<BTreeMap<String, ShallowSession>>;
 
 fn take_fetched(rows: &FetchedRows, locator: &str) -> Option<ShallowSession> {
     rows.lock()
-        .expect("remote connector row cache")
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .get(locator)
         .cloned()
 }
@@ -558,7 +558,10 @@ impl ShallowSessionProvider for CodexCloudProvider {
                 break;
             }
         }
-        *self.fetched.lock().expect("remote connector row cache") = rows;
+        *self
+            .fetched
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = rows;
         Ok(candidates)
     }
 

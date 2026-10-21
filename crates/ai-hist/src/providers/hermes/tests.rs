@@ -709,8 +709,11 @@ fn native_suffix_and_windows_roots_keep_portable_ids_but_same_path_overrides_do_
             .insert(ID.into(), native.default_root.unwrap());
         let frozen: ProviderRoots =
             serde_json::from_value(serde_json::to_value(&roots).unwrap()).unwrap();
-        assert_eq!(storage::profile(&frozen, &path), "default");
-        assert_eq!(storage::profile(&frozen, &named), "profile:636f646572");
+        assert_eq!(storage::profile(&frozen, &path).unwrap(), "default");
+        assert_eq!(
+            storage::profile(&frozen, &named).unwrap(),
+            "profile:636f646572"
+        );
         assert!(storage::enumerate(&frozen, None)
             .unwrap()
             .iter()
@@ -721,8 +724,12 @@ fn native_suffix_and_windows_roots_keep_portable_ids_but_same_path_overrides_do_
         roots.provider_default_roots.clear();
         let custom: ProviderRoots =
             serde_json::from_value(serde_json::to_value(&roots).unwrap()).unwrap();
-        assert!(storage::profile(&custom, &path).starts_with("root:"));
-        assert!(storage::profile(&custom, &named).starts_with("root:"));
+        assert!(storage::profile(&custom, &path)
+            .unwrap()
+            .starts_with("root:"));
+        assert!(storage::profile(&custom, &named)
+            .unwrap()
+            .starts_with("root:"));
         // A changed identity contract retires the old local catalog rather than
         // leaving path-hashed duplicates beside the new portable IDs.
         let conn = crate::open_db(&home.path().join(format!("ledger-{windows}.db"))).unwrap();
@@ -767,13 +774,14 @@ fn legacy_roots_infer_only_the_canonical_default_without_reading_environment() {
         .remove("provider_default_roots");
     let legacy: ProviderRoots = serde_json::from_value(wire.clone()).unwrap();
     assert_eq!(
-        storage::profile(&legacy, &home.path().join(".hermes/state.db")),
+        storage::profile(&legacy, &home.path().join(".hermes/state.db")).unwrap(),
         "default"
     );
     wire["provider_roots"][ID] = serde_json::json!([home.path().join(".hermes-suffix")]);
     let legacy: ProviderRoots = serde_json::from_value(wire).unwrap();
     assert!(
         storage::profile(&legacy, &home.path().join(".hermes-suffix/state.db"))
+            .unwrap()
             .starts_with("root:")
     );
 }

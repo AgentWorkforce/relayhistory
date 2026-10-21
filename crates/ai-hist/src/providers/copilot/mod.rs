@@ -36,8 +36,9 @@ pub(crate) const METADATA: ProviderMetadata = ProviderMetadata {
         splits_requests: false,
     }),
 };
+const GENERATION: &str = "copilot_v1_1";
 pub(crate) const ADAPTER: Option<ProviderAdapter> = Some(ProviderAdapter {
-    generation: "copilot_v1_1",
+    generation: GENERATION,
     acquire,
     sweep,
     resolve_roots: |home, use_env| vec![resolve_roots(home, use_env)].into(),
@@ -274,7 +275,7 @@ fn unchanged(ctx: &SweepContext<'_>, previous: Option<&Value>, stamp: &str) -> R
     let Some(previous) = previous else {
         return Ok(false);
     };
-    let generation = ADAPTER.unwrap().generation;
+    let generation = GENERATION;
     let Some(sid) = previous["sid"].as_str() else {
         return Ok(false);
     };
@@ -320,7 +321,7 @@ fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
             candidates.iter().map(|c| c.locator.as_str()).collect();
         cache.retain(|path, _| visited.contains(path.as_str()));
     }
-    let generation = ADAPTER.unwrap().generation;
+    let generation = GENERATION;
     for candidate in candidates {
         crate::ingest::check_capture_cancelled()?;
         if unchanged(&ctx, cache.get(&candidate.locator), &candidate.stamp)? {

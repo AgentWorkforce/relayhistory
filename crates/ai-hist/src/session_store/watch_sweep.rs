@@ -55,7 +55,7 @@ impl WatchSources {
     /// with exactly the roots the loop is about to adopt.
     pub(super) fn watch_roots(&self) -> Vec<WatchRoot> {
         let by_source = sync_watch_roots_by_source(&self.roots);
-        let mut by_root = self.by_root.lock().expect("watch sources");
+        let mut by_root = self.by_root.lock().unwrap_or_else(PoisonError::into_inner);
         by_root.clear();
         for (name, roots) in &by_source {
             let Some(source) = Source::parse(name) else {
@@ -78,7 +78,10 @@ impl WatchSources {
                 roots: fired,
                 paths,
             } if request.force => {
-                let sources = sources_of(&self.by_root.lock().expect("watch sources"), fired);
+                let sources = sources_of(
+                    &self.by_root.lock().unwrap_or_else(PoisonError::into_inner),
+                    fired,
+                );
                 let paths = sources
                     .as_ref()
                     .and_then(|_| PathScope::from_paths(paths.iter().cloned()));
@@ -110,7 +113,7 @@ impl WatchSources {
         let ChangeScope::Roots { roots: fired, .. } = &request.scope else {
             return None;
         };
-        let by_root = self.by_root.lock().expect("watch sources");
+        let by_root = self.by_root.lock().unwrap_or_else(PoisonError::into_inner);
         sources_of(&by_root, fired)
     }
 }
@@ -161,7 +164,7 @@ impl WatchSweep {
         }
         let plan = self.sources.plan(request);
         {
-            let mut notes = self.notes.lock().expect("watch notes");
+            let mut notes = self.notes.lock().unwrap_or_else(PoisonError::into_inner);
             notes.kind = WatchTick::Sync;
             notes.sources = plan.sources.clone();
         }
@@ -170,7 +173,7 @@ impl WatchSweep {
         // is one — nothing this loop reported has moved since, and a
         // change another process made in between is a change since the
         // last report either way — and a fresh read otherwise.
-        let mut base = self.baseline.lock().expect("watch baseline");
+        let mut base = self.baseline.lock().unwrap_or_else(PoisonError::into_inner);
         // The baseline this sweep compares against, kept outside it so a
         // cancelled sweep can still say what it committed (below).
         let mut swept_from: Option<CatalogFingerprint> = None;
@@ -181,7 +184,10 @@ impl WatchSweep {
         });
         match result {
             Ok((outcome, changed)) => {
-                self.notes.lock().expect("watch notes").changed = changed;
+                self.notes
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .changed = changed;
                 Ok(outcome)
             }
             Err(error) => {
@@ -206,7 +212,7 @@ impl WatchSweep {
     fn discover_tick(&self, request: &TickRequest) -> anyhow::Result<TickOutcome> {
         let sources = self.sources.discover_sources(request);
         {
-            let mut notes = self.notes.lock().expect("watch notes");
+            let mut notes = self.notes.lock().unwrap_or_else(PoisonError::into_inner);
             notes.kind = WatchTick::Discover;
             notes.sources = sources.clone();
             notes.changed.clear();
@@ -274,7 +280,10 @@ impl WatchSweep {
         match diff {
             Ok((after, changed)) => {
                 *base = Some(after);
-                self.notes.lock().expect("watch notes").changed = changed;
+                self.notes
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .changed = changed;
             }
             // Surfaced rather than swallowed, and without giving up the
             // cancellation: the failure goes onto the stream as its own

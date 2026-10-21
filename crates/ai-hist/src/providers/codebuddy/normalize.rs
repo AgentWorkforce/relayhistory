@@ -233,6 +233,25 @@ fn visible_role<'a>(row: &'a Value, kind: &str) -> Result<Option<&'a str>> {
     Ok((kind != "message" || format::human_message(row)).then_some(role))
 }
 
+/// The native row types that carry conversation events.
+#[derive(Clone, Copy)]
+enum RowKind {
+    Message,
+    Call,
+    CallResult,
+}
+
+impl RowKind {
+    fn of(kind: &str) -> Option<Self> {
+        match kind {
+            "message" => Some(Self::Message),
+            "function_call" => Some(Self::Call),
+            "function_call_result" => Some(Self::CallResult),
+            _ => None,
+        }
+    }
+}
+
 fn event(
     conn: &Connection,
     sid: &str,
@@ -246,9 +265,9 @@ fn event(
 
     crate::ingest::check_capture_cancelled()?;
     let kind = format::string(row, "type")?;
-    if !matches!(kind, "message" | "function_call" | "function_call_result") {
+    let Some(row_kind) = RowKind::of(kind) else {
         return Ok(0);
-    }
+    };
     let mid = format::string(row, "id")?;
     let ts = format::time(row)?;
     let occurrence = occurrences.entry(mid.to_owned()).or_default();
@@ -287,8 +306,8 @@ fn event(
         raw_kind: Some(kind),
         ..Default::default()
     };
-    match kind {
-        "message" => {
+    match row_kind {
+        RowKind::Message => {
             let text = format::text(row);
             insert_session_event(
                 conn,
@@ -316,9 +335,8 @@ fn event(
                 )?;
             }
         }
-        "function_call" => call(conn, &base, row, keys)?,
-        "function_call_result" => result(conn, &base, row, keys)?,
-        _ => unreachable!(),
+        RowKind::Call => call(conn, &base, row, keys)?,
+        RowKind::CallResult => result(conn, &base, row, keys)?,
     }
     Ok(inserted)
 }

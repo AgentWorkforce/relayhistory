@@ -10,9 +10,6 @@ pub(super) fn source_snapshot(
     roots: &crate::ProviderRoots,
     claude_snapshot: Option<ClaudeTranscriptSnapshot>,
 ) -> Result<SourceSnapshot> {
-    if let Some(refusal) = crate::sources::catalog::hydration_refusal(&options.source) {
-        return Err(hydration_error("HYDRATION_UNSUPPORTED", refusal));
-    }
     if options.source == "codex" {
         if let Some((path, id)) = target
             .locator

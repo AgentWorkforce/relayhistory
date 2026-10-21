@@ -501,7 +501,10 @@ impl ShallowSessionProvider for ClaudeWebProvider {
                 break;
             }
         }
-        *self.fetched.lock().expect("remote connector row cache") = rows;
+        *self
+            .fetched
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = rows;
         Ok(candidates)
     }
 

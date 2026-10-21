@@ -89,7 +89,10 @@ pub(super) fn active_messages(rows: &[Value]) -> Result<std::collections::BTreeS
             !branches.contains_key(&name) && branches.contains_key(&base) && line <= index,
             "KIMI_INVALID_BRANCH: duplicate/future branch"
         );
-        branches.get_mut(&current).unwrap().1 = index;
+        branches
+            .get_mut(&current)
+            .context("KIMI_INVALID_BRANCH: unknown active branch")?
+            .1 = index;
         branches.insert(name.clone(), (index + 1, rows.len(), Some((base, line))));
         current = name;
         if let Some(line) = row["legacyUndoLine"].as_u64() {

@@ -13,68 +13,67 @@ pub(super) const TELEGRAM: &str = "main:fixture-telegram-0001";
 /// conversation, named by its key.
 pub(super) const TELEGRAM_CONVERSATION: &str = "main:telegram:direct:fixture-peer";
 
-pub(super) fn home() -> (tempfile::TempDir, ProviderRoots) {
-    let home = tempfile::tempdir().unwrap();
+pub(super) fn home() -> anyhow::Result<(tempfile::TempDir, ProviderRoots)> {
+    let home = tempfile::tempdir()?;
     let roots = ProviderRoots::from_home(home.path().into(), home.path().join("opencode.db"));
-    (home, roots)
+    Ok((home, roots))
 }
-pub(super) fn database(home: &Path, sql: &str) -> (PathBuf, Connection) {
+pub(super) fn database(home: &Path, sql: &str) -> anyhow::Result<(PathBuf, Connection)> {
+    std::fs::create_dir_all(home.join(".openclaw/agents/main/agent"))?;
     let path = home.join(".openclaw/agents/main/agent/openclaw-agent.sqlite");
-    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-    let db = Connection::open(&path).unwrap();
-    db.execute_batch(sql).unwrap();
-    (path, db)
+    let db = Connection::open(&path)?;
+    db.execute_batch(sql)?;
+    Ok((path, db))
 }
 /// The 2026.7.35 writer's sessions directories, copied into `home`.
-pub(super) fn legacy(home: &Path) -> PathBuf {
+pub(super) fn legacy(home: &Path) -> anyhow::Result<PathBuf> {
     let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("tests/fixtures/openclaw/legacy-jsonl/.openclaw/agents");
     for agent in ["main", "ops"] {
         let to = home.join(".openclaw/agents").join(agent).join("sessions");
-        std::fs::create_dir_all(&to).unwrap();
-        for entry in std::fs::read_dir(fixture.join(agent).join("sessions")).unwrap() {
-            let entry = entry.unwrap();
-            std::fs::copy(entry.path(), to.join(entry.file_name())).unwrap();
+        std::fs::create_dir_all(&to)?;
+        for entry in std::fs::read_dir(fixture.join(agent).join("sessions"))? {
+            let entry = entry?;
+            std::fs::copy(entry.path(), to.join(entry.file_name()))?;
         }
     }
-    home.join(".openclaw/agents/main/sessions")
+    Ok(home.join(".openclaw/agents/main/sessions"))
 }
 pub(super) fn context(roots: &ProviderRoots) -> AcquisitionContext<'_> {
     AcquisitionContext::new(ID, roots)
 }
 /// A captured session: a JSONL transcript, or the newest window of a database
 /// conversation.
-fn capture(roots: &ProviderRoots, path: &Path, id: &str) -> Session {
-    let payload = storage::capture(&context(roots), path, id).unwrap().payload;
+fn capture(roots: &ProviderRoots, path: &Path, id: &str) -> anyhow::Result<Session> {
+    let payload = storage::capture(&context(roots), path, id)?.payload;
     if payload.get("windows").is_some() {
-        let conv: conversation::Conversation = serde_json::from_value(payload).unwrap();
-        return conv.windows.into_iter().last().unwrap();
+        let conv: conversation::Conversation = serde_json::from_value(payload)?;
+        let last = conv.windows.into_iter().last();
+        return last.ok_or_else(|| anyhow::anyhow!("no window"));
     }
-    serde_json::from_value(payload).unwrap()
+    Ok(serde_json::from_value(payload)?)
 }
 /// One window of a database conversation, by its native session ID.
-fn window(roots: &ProviderRoots, path: &Path, key: &str, native: &str) -> Session {
+fn window(roots: &ProviderRoots, path: &Path, key: &str, native: &str) -> anyhow::Result<Session> {
     let id = format!("main:{}", conversation::native_name(key, "main"));
-    let payload = storage::capture(&context(roots), path, &id)
-        .unwrap()
-        .payload;
-    let conv: conversation::Conversation = serde_json::from_value(payload).unwrap();
+    let payload = storage::capture(&context(roots), path, &id)?.payload;
+    let conv: conversation::Conversation = serde_json::from_value(payload)?;
     conv.windows
         .into_iter()
         .find(|w| w.native_id == native)
-        .unwrap()
+        .ok_or_else(|| anyhow::anyhow!("no window {native}"))
 }
+#[cfg(test)]
 pub(super) fn count(conn: &Connection, sql: &str) -> i64 {
     conn.query_row(sql, [], |r| r.get(0)).unwrap()
 }
-fn ids(roots: &ProviderRoots) -> Vec<String> {
-    let mut ids: Vec<_> = storage::enumerate(roots, None)
-        .unwrap()
+fn ids(roots: &ProviderRoots) -> anyhow::Result<Vec<String>> {
+    let mut ids: Vec<_> = storage::enumerate(roots, None)?
         .into_iter()
         .filter_map(|c| c.session_id)
         .collect();
     ids.sort();
-    ids
+    Ok(ids)
 }
 fn summary(s: &Session) -> Vec<Value> {
     s.events
@@ -94,6 +93,7 @@ pub(super) struct Ledger {
     pub(super) state: Map<String, Value>,
     repairs: crate::ingest::SweepRepairs,
 }
+#[cfg(test)]
 impl Ledger {
     pub(super) fn new(home: &Path) -> Self {
         Self {
@@ -156,8 +156,8 @@ fn released_schemas_19_21_23_match_their_writers_oracles() {
         ),
         (SCHEMA24, include_str!("oracle.json"), 24, true, true),
     ] {
-        let (home, roots) = home();
-        let (path, db) = database(home.path(), sql);
+        let (home, roots) = home().unwrap();
+        let (path, db) = database(home.path(), sql).unwrap();
         let schema = schema::detect(&db, "main").unwrap();
         assert_eq!(
             (schema.version, schema.transcripts, schema.zstd, schema.cold),
@@ -167,7 +167,7 @@ fn released_schemas_19_21_23_match_their_writers_oracles() {
         let main = oracle["sessions"].as_array().unwrap().iter();
         for expected in main.filter(|s| s["agentId"] == "main") {
             let key = expected["sessionKey"].as_str().unwrap();
-            let s = window(&roots, &path, key, expected["sessionId"].as_str().unwrap());
+            let s = window(&roots, &path, key, expected["sessionId"].as_str().unwrap()).unwrap();
             assert_eq!(s.schema_version, Some(version));
             assert_eq!(s.session_key, expected["sessionKey"]);
             assert_eq!(
@@ -177,7 +177,7 @@ fn released_schemas_19_21_23_match_their_writers_oracles() {
             );
             assert!(s.events.iter().skip(1).all(|e| e.active));
         }
-        assert_eq!(ids(&roots).len(), 2, "schema {version}");
+        assert_eq!(ids(&roots).unwrap().len(), 2, "schema {version}");
         // Every released schema normalizes to the same evidence.
         let mut ledger = Ledger::new(home.path());
         let swept = ledger.sweep(&roots, None);
@@ -212,15 +212,15 @@ fn released_schemas_19_21_23_match_their_writers_oracles() {
 
 #[test]
 fn unreleased_and_pre_transcript_schemas_are_told_apart() {
-    let (home, roots) = home();
-    let (_path, db) = database(home.path(), SCHEMA19);
+    let (home, roots) = home().unwrap();
+    let (_path, db) = database(home.path(), SCHEMA19).unwrap();
     // 20 and 22 sit between released layouts and are read by their columns.
     for v in [20, 22] {
         db.execute_batch(&format!(
             "UPDATE schema_meta SET schema_version={v}; PRAGMA user_version={v}"
         ))
         .unwrap();
-        assert_eq!(ids(&roots).len(), 2, "schema {v}");
+        assert_eq!(ids(&roots).unwrap().len(), 2, "schema {v}");
     }
     // An older schema that already holds transcript tables is not guessed at.
     db.execute_batch("UPDATE schema_meta SET schema_version=18; PRAGMA user_version=18")
@@ -231,17 +231,21 @@ fn unreleased_and_pre_transcript_schemas_are_told_apart() {
     );
     drop(db);
     // The 2026.7.x agent database: schema 1, auth profiles only.
-    let (_home, roots) = self::home();
+    let (_home, roots) = self::home().unwrap();
     let (path, _db) = database(
         _home.path(),
         "CREATE TABLE schema_meta (meta_key TEXT NOT NULL PRIMARY KEY, role TEXT NOT NULL, schema_version INTEGER NOT NULL, \
          agent_id TEXT, app_version TEXT, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL) STRICT; \
          CREATE TABLE auth_profile_store (id TEXT PRIMARY KEY); \
          INSERT INTO schema_meta VALUES ('primary','agent',1,'main',NULL,1,1); PRAGMA user_version=1;",
+    )
+    .unwrap();
+    assert!(ids(&roots).unwrap().is_empty());
+    legacy(_home.path()).unwrap();
+    assert_eq!(
+        ids(&roots).unwrap(),
+        [MAIN, TELEGRAM, "ops:fixture-relay-0001"]
     );
-    assert!(ids(&roots).is_empty());
-    legacy(_home.path());
-    assert_eq!(ids(&roots), [MAIN, TELEGRAM, "ops:fixture-relay-0001"]);
     let mut ledger = Ledger::new(_home.path());
     assert_eq!(ledger.sweep(&roots, None).unread, 0);
     assert_eq!(ledger.count("SELECT count(*) FROM sessions"), 3);
@@ -250,8 +254,8 @@ fn unreleased_and_pre_transcript_schemas_are_told_apart() {
 
 #[test]
 fn legacy_transcripts_match_the_2026_7_35_reader_and_carry_index_metadata() {
-    let (home, roots) = home();
-    let dir = legacy(home.path());
+    let (home, roots) = home().unwrap();
+    let dir = legacy(home.path()).unwrap();
     let oracle: Value = serde_json::from_str(include_str!("oracle-legacy.json")).unwrap();
     assert_eq!(oracle["package"], "openclaw@2026.7.35");
     for expected in oracle["sessions"].as_array().unwrap() {
@@ -260,19 +264,19 @@ fn legacy_transcripts_match_the_2026_7_35_reader_and_carry_index_metadata() {
         let path = home
             .path()
             .join(format!(".openclaw/agents/{agent}/sessions/{native}.jsonl"));
-        let s = capture(&roots, &path, &format!("{agent}:{native}"));
+        let s = capture(&roots, &path, &format!("{agent}:{native}")).unwrap();
         assert!(s.legacy);
         assert_eq!(s.schema_version, None);
         assert_eq!(s.session_key, expected["sessionKey"]);
         assert_eq!(&Value::Array(summary(&s)), &expected["events"], "{native}");
         assert!(s.events.iter().skip(1).all(|e| e.active));
     }
-    let main = capture(&roots, &dir.join("fixture-main-0001.jsonl"), MAIN);
+    let main = capture(&roots, &dir.join("fixture-main-0001.jsonl"), MAIN).unwrap();
     assert_eq!(main.title.as_deref(), Some("Fixture main session"));
     assert_eq!(main.channel.as_deref(), Some("main"));
     assert_eq!(main.chat_type.as_deref(), Some("direct"));
     assert_eq!(main.model.as_deref(), Some("fixture-model"));
-    let telegram = capture(&roots, &dir.join("fixture-telegram-0001.jsonl"), TELEGRAM);
+    let telegram = capture(&roots, &dir.join("fixture-telegram-0001.jsonl"), TELEGRAM).unwrap();
     assert_eq!(telegram.window_channel.as_deref(), Some("telegram"));
     assert_eq!(telegram.channel.as_deref(), Some("telegram"));
     // A transcript never resolves to another session's identity.
@@ -336,8 +340,8 @@ fn legacy_transcripts_match_the_2026_7_35_reader_and_carry_index_metadata() {
 
 #[test]
 fn archives_temp_files_and_checkpoints_are_not_sessions_and_deletes_retire() {
-    let (home, roots) = home();
-    let dir = legacy(home.path());
+    let (home, roots) = home().unwrap();
+    let dir = legacy(home.path()).unwrap();
     let mut ledger = Ledger::new(home.path());
     ledger.sweep(&roots, None);
     for name in [
@@ -350,7 +354,7 @@ fn archives_temp_files_and_checkpoints_are_not_sessions_and_deletes_retire() {
     ] {
         std::fs::copy(dir.join("fixture-main-0001.jsonl"), dir.join(name)).unwrap();
     }
-    assert_eq!(ids(&roots).len(), 3);
+    assert_eq!(ids(&roots).unwrap().len(), 3);
     // Upstream deletes a session by renaming its transcript to an archive:
     // the session retires like any deleted session.
     std::fs::rename(
@@ -373,8 +377,8 @@ fn archives_temp_files_and_checkpoints_are_not_sessions_and_deletes_retire() {
 
 #[test]
 fn the_database_owns_imported_sessions_and_keeps_them_across_the_archive_move() {
-    let (home, roots) = home();
-    let dir = legacy(home.path());
+    let (home, roots) = home().unwrap();
+    let dir = legacy(home.path()).unwrap();
     let jsonl = dir.join("fixture-telegram-0001.jsonl");
     // Before the upgrade: every session comes from JSONL, one per transcript.
     let mut ledger = Ledger::new(home.path());
@@ -385,7 +389,7 @@ fn the_database_owns_imported_sessions_and_keeps_them_across_the_archive_move() 
     );
     // The doctor imports the transcript under the same session ID while the
     // file is still in place: one candidate, the database's conversation.
-    let (db, _db) = database(home.path(), SCHEMA24);
+    let (db, _db) = database(home.path(), SCHEMA24).unwrap();
     let candidates = storage::enumerate(&roots, None).unwrap();
     assert!(!candidates
         .iter()
@@ -456,16 +460,16 @@ fn the_database_owns_imported_sessions_and_keeps_them_across_the_archive_move() 
         )),
         1
     );
-    assert_eq!(ids(&roots).len(), 4);
+    assert_eq!(ids(&roots).unwrap().len(), 4);
 }
 
 #[test]
 fn an_unreadable_database_withholds_its_agents_jsonl_and_retirement() {
-    let (home, roots) = home();
-    let dir = legacy(home.path());
+    let (home, roots) = home().unwrap();
+    let dir = legacy(home.path()).unwrap();
     let mut ledger = Ledger::new(home.path());
     ledger.sweep(&roots, None);
-    let (db, conn) = database(home.path(), SCHEMA24);
+    let (db, conn) = database(home.path(), SCHEMA24).unwrap();
     conn.execute_batch("UPDATE schema_meta SET schema_version=32; PRAGMA user_version=32")
         .unwrap();
     std::fs::remove_file(dir.join("fixture-main-0001.jsonl")).unwrap();
@@ -478,8 +482,8 @@ fn an_unreadable_database_withholds_its_agents_jsonl_and_retirement() {
 
 #[test]
 fn index_edits_partial_tails_watches_and_fingerprints_cover_the_legacy_store() {
-    let (home, roots) = home();
-    let dir = legacy(home.path());
+    let (home, roots) = home().unwrap();
+    let dir = legacy(home.path()).unwrap();
     let mut ledger = Ledger::new(home.path());
     ledger.sweep(&roots, None);
     let watches: Vec<_> = stores::watch_roots(&roots)

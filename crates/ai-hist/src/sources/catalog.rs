@@ -50,26 +50,14 @@ pub(crate) enum Discovery {
     /// Its shallow adapter. Built fresh per call, because an adapter may carry
     /// per-pass state.
     Provider(fn() -> Box<dyn ShallowSessionProvider>),
-    /// No adapter, deliberately, and why. No built-in source is exempt today;
-    /// the variant keeps the `exempt_sources` contract a decision per source.
-    #[allow(dead_code)]
-    Exempt(&'static str),
 }
 
-/// Whether one catalogued session of a source can be hydrated.
+/// How one catalogued session of a source is hydrated. Every built-in source
+/// has a local parser; a source without one would add a variant here.
 #[derive(Clone, Copy)]
 pub(crate) enum Hydration {
     /// Its local parser for one selected session.
     Parser(IngestSelectedFn),
-    /// A valid catalog source that no local parser backs. Hydration accepts
-    /// the request and then refuses it with `HYDRATION_UNSUPPORTED` and this
-    /// message. No built-in source takes this today.
-    #[allow(dead_code)]
-    NoConnector(&'static str),
-    /// Not a hydratable catalog source at all: rejected as an invalid
-    /// argument. No built-in source takes this today.
-    #[allow(dead_code)]
-    Unsupported,
 }
 
 /// What a source's records establish about delegation; see
@@ -122,7 +110,6 @@ impl LocalSource {
     pub fn discovery_exemption(&self) -> Option<&'static str> {
         match self.discovery {
             Discovery::Provider(_) => None,
-            Discovery::Exempt(reason) => Some(reason),
         }
     }
     /// Where this source's fixture-corpus entries live.
@@ -133,7 +120,7 @@ impl LocalSource {
     /// Whether hydration accepts this source (it may still refuse the
     /// session when no parser backs it).
     pub fn is_hydration_source(&self) -> bool {
-        !matches!(self.hydration, Hydration::Unsupported)
+        matches!(self.hydration, Hydration::Parser(_))
     }
 }
 
@@ -166,40 +153,8 @@ const SOURCE_IDS: [&str; SOURCE_COUNT] = {
 /// Backs `SOURCE_CHOICES`.
 pub(crate) const SOURCE_CHOICES: &[&str] = &SOURCE_IDS;
 
-const EXEMPTION_COUNT: usize = {
-    let mut count = 0;
-    let mut i = 0;
-    while i < SOURCE_COUNT {
-        if let Discovery::Exempt(_) = LOCAL_SOURCES[i].discovery {
-            count += 1;
-        }
-        i += 1;
-    }
-    count
-};
-
-const EXEMPTIONS: [SourceExemption; EXEMPTION_COUNT] = {
-    let mut out = [SourceExemption {
-        source: "",
-        reason: "",
-    }; EXEMPTION_COUNT];
-    let mut i = 0;
-    let mut next = 0;
-    while i < SOURCE_COUNT {
-        if let Discovery::Exempt(reason) = LOCAL_SOURCES[i].discovery {
-            out[next] = SourceExemption {
-                source: LOCAL_SOURCES[i].id,
-                reason,
-            };
-            next += 1;
-        }
-        i += 1;
-    }
-    out
-};
-
-/// Backs `DISCOVERY_EXEMPTIONS`.
-pub(crate) const DISCOVERY_EXEMPTIONS: &[SourceExemption] = &EXEMPTIONS;
+/// Backs `DISCOVERY_EXEMPTIONS`: every built-in source has a shallow adapter.
+pub(crate) const DISCOVERY_EXEMPTIONS: &[SourceExemption] = &[];
 
 /// A fresh shallow adapter for every discoverable source, in source-id order.
 ///
@@ -207,33 +162,20 @@ pub(crate) const DISCOVERY_EXEMPTIONS: &[SourceExemption] = &EXEMPTIONS;
 /// order connector summaries and diagnostics are reported in. Sorting here
 /// keeps that order stable, independent of where a descriptor is declared.
 pub(crate) fn shallow_providers() -> Vec<Box<dyn ShallowSessionProvider>> {
-    let mut providers: Vec<&LocalSource> = LOCAL_SOURCES
-        .iter()
-        .filter(|source| matches!(source.discovery, Discovery::Provider(_)))
-        .collect();
+    let mut providers: Vec<&LocalSource> = LOCAL_SOURCES.iter().collect();
     providers.sort_by_key(|source| source.id);
     providers
         .into_iter()
-        .filter_map(|source| match source.discovery {
-            Discovery::Provider(build) => Some(build()),
-            Discovery::Exempt(_) => None,
+        .map(|source| match source.discovery {
+            Discovery::Provider(build) => build(),
         })
         .collect()
 }
 
-/// The targeted-hydration parser for a source, if one backs it.
+/// The targeted-hydration parser for a source, if it is a built-in source.
 pub(crate) fn selected_ingest(source: &str) -> Option<IngestSelectedFn> {
     match local_source(source)?.hydration {
         Hydration::Parser(parser) => Some(parser),
-        Hydration::NoConnector(_) | Hydration::Unsupported => None,
-    }
-}
-
-/// Why hydration refuses a known source that no parser backs.
-pub(crate) fn hydration_refusal(source: &str) -> Option<&'static str> {
-    match local_source(source)?.hydration {
-        Hydration::NoConnector(message) => Some(message),
-        Hydration::Parser(_) | Hydration::Unsupported => None,
     }
 }
 
@@ -277,11 +219,10 @@ mod tests {
     #[test]
     fn each_discovery_adapter_reports_its_own_descriptor_id() {
         for descriptor in LOCAL_SOURCES {
-            if let Discovery::Provider(build) = descriptor.discovery {
-                let provider = build();
-                assert_eq!(provider.source(), descriptor.id);
-                assert_eq!(provider.location(), crate::SessionLocation::Local);
-            }
+            let Discovery::Provider(build) = descriptor.discovery;
+            let provider = build();
+            assert_eq!(provider.source(), descriptor.id);
+            assert_eq!(provider.location(), crate::SessionLocation::Local);
         }
     }
 
@@ -315,7 +256,6 @@ mod tests {
     fn an_unknown_source_declares_nothing() {
         assert!(local_source("zzz").is_none());
         assert!(selected_ingest("zzz").is_none());
-        assert!(hydration_refusal("zzz").is_none());
         assert!(resume_command("zzz", "s1", Some("/p")).is_none());
         assert_eq!(relationships("zzz").stable_child_identity, "never");
         let roots = ProviderRoots::from_env(PathBuf::from("/home/u"));

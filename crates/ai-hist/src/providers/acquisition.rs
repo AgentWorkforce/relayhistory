@@ -35,8 +35,9 @@ pub(crate) struct AcquiredSession {
 }
 impl AcquiredSession {
     pub fn new(payload: Value, bytes: i64, records: i64, read_paths: Vec<PathBuf>) -> Self {
-        let encoded = serde_json::to_vec(&payload).expect("JSON payload serializes");
-        let stamp = format!("sha256:{:x}", Sha256::digest(&encoded));
+        // `Value`'s `Display` is the same compact encoding as `to_vec`, and
+        // cannot fail: every map key is already a string.
+        let stamp = format!("sha256:{:x}", Sha256::digest(payload.to_string()));
         Self {
             stamp,
             payload,
@@ -72,6 +73,8 @@ pub(crate) fn sqlite_snapshot<T>(
 /// Capture a provider-owned explicit file set in stable order. The provider
 /// enumerates only evidence files; this helper never recursively scans a home.
 /// Byte strings are preserved, so a parser can defer an incomplete final line.
+/// Only the test-fixture provider (itself test-only) uses it so far.
+#[cfg(test)]
 pub(crate) fn file_snapshot(
     context: &AcquisitionContext<'_>,
     mut paths: Vec<PathBuf>,

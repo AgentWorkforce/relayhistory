@@ -17,7 +17,7 @@ mod unified_diff;
 pub(crate) use codex_selected::ingest_selected_codex;
 pub(crate) use probe::HydrationProbe;
 use snapshot::source_snapshot;
-use unified_diff::split_unified_diff;
+use unified_diff::codex_diff_records;
 
 /// Bumped to 3 on two counts that landed together: capability became derived
 /// from declared evidence coverage, and `bytesRead` began reporting what a
@@ -1354,7 +1354,10 @@ fn hydrate_remote_codex_diff_observed(
             })
             .unwrap_or_else(|| "remote-diff:".into());
         tx.execute("DELETE FROM file_edits WHERE source='codex' AND session_id=? AND tool_name='codex cloud diff' AND substr(tool_use_id,1,?)=?",params![options.session_id,prefix.len(),prefix])?;
-        for (index, patch) in split_unified_diff(diff).into_iter().enumerate() {
+        for (index, patch) in unified_diff::split_unified_diff(diff)
+            .into_iter()
+            .enumerate()
+        {
             // Old releases materialized the only remote diff under this bare
             // provider key. Its overwritten presence cannot identify an owner.
             // Retain that canonical projection instead of duplicating it under
@@ -2290,7 +2293,7 @@ pub(crate) struct SelectedIngest<'a> {
     pub(crate) claude_subagents: &'a [ClaudeSubagentEvidence],
     pub(crate) claude_snapshot: Option<&'a ClaudeTranscriptSnapshot>,
     pub(crate) devin_session: Option<&'a crate::ingest::devin::DevinSession>,
-    #[allow(dead_code)] // Used by provider-owned selected parsers.
+    /// Read by provider-owned selected parsers.
     pub(crate) provider_session: Option<&'a crate::providers::AcquiredSession>,
     pub(crate) cursor: &'a mut TranscriptCursorState,
     /// A checkpoint exists and another parser generation wrote it, so the
@@ -2312,8 +2315,9 @@ pub(crate) type IngestSelectedFn = fn(SelectedIngest<'_>) -> Result<SelectedInge
 impl<'a> SelectedIngest<'a> {
     /// The locator every file-backed parser requires; `source_snapshot`
     /// always resolves one before a parser runs.
-    fn file(&self) -> &'a Path {
-        self.path.unwrap()
+    fn file(&self) -> Result<&'a Path> {
+        self.path
+            .context("a file-backed parser ran without a resolved transcript path")
     }
 
     /// A provider whose reader still re-reads the file on every change reports
@@ -2347,7 +2351,7 @@ fn ingest_selected(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
 }
 
 pub(crate) fn ingest_selected_claude(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
-    let path = ctx.file();
+    let path = ctx.file()?;
     ingest_claude(
         ctx.conn,
         ctx.options,
@@ -2361,17 +2365,17 @@ pub(crate) fn ingest_selected_claude(ctx: SelectedIngest<'_>) -> Result<Selected
 }
 
 pub(crate) fn ingest_selected_cursor(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
-    let (diagnostics, consumed) = ingest_cursor(ctx.conn, ctx.options, ctx.target, ctx.file())?;
+    let (diagnostics, consumed) = ingest_cursor(ctx.conn, ctx.options, ctx.target, ctx.file()?)?;
     Ok((ctx.whole_file(), diagnostics, Some(consumed)))
 }
 
 pub(crate) fn ingest_selected_grok(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
-    ingest_grok(ctx.conn, ctx.options, ctx.file())
+    ingest_grok(ctx.conn, ctx.options, ctx.file()?)
         .map(|diagnostics| (ctx.whole_file(), diagnostics, None))
 }
 
 pub(crate) fn ingest_selected_muse(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
-    let path = ctx.file();
+    let path = ctx.file()?;
     let diagnostics = ingest_muse(ctx.conn, ctx.options, path)?;
     let mut outcome = ctx.whole_file();
     // With related evidence the read covers every subagent log too.
@@ -2386,7 +2390,7 @@ pub(crate) fn ingest_selected_muse(ctx: SelectedIngest<'_>) -> Result<SelectedIn
 }
 
 pub(crate) fn ingest_selected_opencode(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
-    let path = ctx.file();
+    let path = ctx.file()?;
     // Whichever layout `source_snapshot` validated this locator
     // against. Not the file extension: `OPENCODE_DB` is an arbitrary
     // path, so a perfectly good SQLite store may be called
@@ -2428,7 +2432,7 @@ pub(crate) fn ingest_selected_devin(ctx: SelectedIngest<'_>) -> Result<SelectedI
     // `path` is the `sessions.db` whose provenance `source_snapshot`
     // verified; its parent is the Devin CLI data directory that also holds
     // `transcripts/`.
-    let path = ctx.file();
+    let path = ctx.file()?;
     let loaded = ctx.devin_session.ok_or_else(|| {
         hydration_error(
             "SESSION_SOURCE_UNAVAILABLE",
@@ -4378,7 +4382,7 @@ pub(crate) fn save_observation_progress(
             committed_offset: cursor.map_or(0, |cursor| cursor.committed_offset()),
             prefix_hash: cursor.and_then(|cursor| cursor.prefix_hash()),
             dev_ino: cursor.and_then(|cursor| cursor.dev_ino()),
-            parser_state_json: cursor.map(|cursor| cursor.encode()),
+            parser_state_json: cursor.map(|cursor| cursor.encode()).transpose()?,
         },
     )
 }
@@ -4465,11 +4469,7 @@ pub fn normalize_source_evidence(
                 source == "codex",
                 "CONNECTOR_FAILURE: Codex evidence returned for another source"
             );
-            let records=split_unified_diff(&diff).into_iter().enumerate().map(|(index,patch)| {
-                let (added,removed)=count_unified_diff_lines(&patch.text);
-                let payload=json!({"source":source,"session_id":session_id,"tool_use_id":format!("remote-diff:{index}"),"file_path":patch.path,"tool_name":"codex cloud diff","lines_added":added,"lines_removed":removed,"structured_patch_json":json!({"unified_diff":patch.text}).to_string()}).as_object().unwrap().clone();
-                EvidenceRecord{kind:EvidenceKind::FileEdit,payload,record_id:None,revision_id:None}
-            }).collect();
+            let records = codex_diff_records(source, session_id, &diff);
             (
                 source_stamp,
                 source_bytes,
@@ -8234,6 +8234,7 @@ mod tests {
     /// The `bytes_read` half of the scope runs on every CI pass, at a size
     /// that costs nothing, in
     /// `an_append_to_a_large_transcript_reads_only_the_append`.
+    #[cfg(unix)]
     #[test]
     #[ignore = "measures process-wide peak RSS; run alone with --test-threads=1"]
     fn reading_a_200mb_transcript_stays_under_a_memory_ceiling() {
@@ -9143,6 +9144,7 @@ mod tests {
     /// happened. Both readers used it, so a transcript with one 500 MiB
     /// record made the reader allocate 500 MiB whatever the caps said. The
     /// ceiling is now on the reader.
+    #[cfg(unix)]
     #[test]
     fn a_record_over_the_ceiling_is_skipped_rather_than_held() {
         let dir = tempfile::tempdir().unwrap();
@@ -10809,7 +10811,7 @@ mod tests {
         let decoded = TranscriptCursorState::decode(Some(&raw));
         assert_eq!(decoded.committed_offset(), 12);
         assert_eq!(decoded.claude.as_ref().unwrap().next_line_index, 3);
-        let round_tripped: Value = serde_json::from_str(&decoded.encode()).unwrap();
+        let round_tripped: Value = serde_json::from_str(&decoded.encode().unwrap()).unwrap();
         assert_eq!(
             round_tripped["tool_results"],
             serde_json::json!({"call_index": 9, "event_index": 41}),

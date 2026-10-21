@@ -99,3 +99,42 @@ fn push_git_escape(raw: &[u8], mut index: usize, bytes: &mut Vec<u8>) -> usize {
     }
     index
 }
+
+/// The `file_edits` evidence a Codex cloud task's unified diff carries: one
+/// record per destination file.
+pub(super) fn codex_diff_records(
+    source: &str,
+    session_id: &str,
+    diff: &str,
+) -> Vec<crate::EvidenceRecord> {
+    use serde_json::{json, Map, Value};
+    split_unified_diff(diff)
+        .into_iter()
+        .enumerate()
+        .map(|(index, patch)| {
+            let (added, removed) = crate::ingest::count_unified_diff_lines(&patch.text);
+            let payload = [
+                ("source", json!(source)),
+                ("session_id", json!(session_id)),
+                ("tool_use_id", json!(format!("remote-diff:{index}"))),
+                ("file_path", json!(patch.path)),
+                ("tool_name", json!("codex cloud diff")),
+                ("lines_added", json!(added)),
+                ("lines_removed", json!(removed)),
+                (
+                    "structured_patch_json",
+                    json!(json!({"unified_diff":patch.text}).to_string()),
+                ),
+            ]
+            .into_iter()
+            .map(|(key, value)| (key.to_string(), value))
+            .collect::<Map<String, Value>>();
+            crate::EvidenceRecord {
+                kind: crate::EvidenceKind::FileEdit,
+                payload,
+                record_id: None,
+                revision_id: None,
+            }
+        })
+        .collect()
+}

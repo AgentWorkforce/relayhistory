@@ -19,7 +19,7 @@ struct CodexThreadNames {
 
 impl CodexProvider {
     fn thread_name(&self, session_id: &str) -> Result<Option<String>> {
-        let mut state = self.thread_names.lock().expect("codex thread names lock");
+        let mut state = self.thread_names.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if state.names.is_none() {
             let names = match state.index.as_deref() {
                 Some(index) if index.exists() => {
@@ -86,7 +86,7 @@ impl ShallowSessionProvider for CodexProvider {
         env: &DiscoveryEnv<'_>,
         _requested_limit: Option<usize>,
     ) -> Result<Vec<Candidate>> {
-        *self.thread_names.lock().expect("codex thread names lock") = CodexThreadNames {
+        *self.thread_names.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = CodexThreadNames {
             index: Some(crate::ingest::codex_thread_names::session_index_path(
                 &env.codex_home,
             )),

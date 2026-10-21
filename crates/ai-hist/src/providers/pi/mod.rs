@@ -31,8 +31,9 @@ pub(crate) const METADATA: ProviderMetadata = ProviderMetadata {
         splits_requests: false,
     }),
 };
+const GENERATION: &str = "pi_v3_4";
 pub(crate) const ADAPTER: Option<ProviderAdapter> = Some(ProviderAdapter {
-    generation: "pi_v3_4",
+    generation: GENERATION,
     acquire,
     sweep,
     resolve_roots: |home, use_env| resolve_roots(home, use_env).into(),
@@ -253,15 +254,16 @@ fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
     for candidate in candidates {
         crate::ingest::check_capture_cancelled()?;
         let path = Path::new(&candidate.locator);
-        let generation = ADAPTER.unwrap().generation;
-        if let Some(previous) = cache.get(&candidate.locator) {
-            if previous["stamp"].as_str() == Some(&candidate.stamp)
-                && previous["generation"].as_str() == Some(generation)
-                && previous["sid"]
-                    .as_str()
-                    .is_some_and(|sid| !ctx.repairs.contains(ID, sid))
-            {
-                let sid = previous["sid"].as_str().unwrap();
+        let generation = GENERATION;
+        let cached_sid = cache
+            .get(&candidate.locator)
+            .filter(|previous| {
+                previous["stamp"].as_str() == Some(&candidate.stamp)
+                    && previous["generation"].as_str() == Some(generation)
+            })
+            .and_then(|previous| previous["sid"].as_str());
+        if let Some(sid) = cached_sid {
+            if !ctx.repairs.contains(ID, sid) {
                 let present: bool = ctx.conn.query_row(
                     "SELECT EXISTS(SELECT 1 FROM sessions WHERE source='pi' AND session_id=?1)",
                     [sid],

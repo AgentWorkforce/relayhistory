@@ -577,14 +577,12 @@ pub(crate) fn load_all_from_sqlite(src: &Connection) -> Result<OpencodeStoreLoad
         }
     }
 
-    let ids: Vec<String> = infos.keys().cloned().collect();
-    load.sessions.reserve(ids.len());
-    for id in ids {
+    load.sessions.reserve(infos.len());
+    for (id, info) in infos {
         super::check_capture_cancelled()?;
         if failed.contains_key(&id) {
             continue;
         }
-        let info = infos.remove(&id).expect("id came from this map");
         load.sessions.push(finish(
             info,
             messages_by_session.remove(&id).unwrap_or_default(),

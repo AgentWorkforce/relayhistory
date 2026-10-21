@@ -529,7 +529,10 @@ impl ShallowSessionProvider for DevinCloudProvider {
             cursor.is_none() || self.limit.is_some_and(|limit| candidates.len() >= limit),
             "EVIDENCE_PARTIAL: Devin session list exceeded the page bound"
         );
-        *self.fetched.lock().expect("remote connector row cache") = rows;
+        *self
+            .fetched
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = rows;
         Ok(candidates)
     }
 
@@ -572,18 +575,17 @@ pub(super) fn send_devin_session_message_at(
 /// a host holding its own Devin credential — a workspace credential store,
 /// say — sends as `auth` without the connector's file/env lookup.
 /// The send's argument checks, shared so the file/env path and the
-/// host-credential path refuse malformed input identically.
-fn validate_send_args(session_id: &str, message: &str) -> Result<()> {
-    anyhow::ensure!(
-        devin_session_hex(session_id).is_some(),
-        "INVALID_ARGUMENT: remote Devin session id is malformed"
-    );
+/// host-credential path refuse malformed input identically. Returns the
+/// session's hex ID.
+fn validate_send_args<'a>(session_id: &'a str, message: &str) -> Result<&'a str> {
+    let hex = devin_session_hex(session_id)
+        .context("INVALID_ARGUMENT: remote Devin session id is malformed")?;
     anyhow::ensure!(
         !message.trim().is_empty() && message.len() <= super::MAX_REMOTE_MESSAGE_BYTES,
         "INVALID_ARGUMENT: message must be non-empty and within {} bytes",
         super::MAX_REMOTE_MESSAGE_BYTES,
     );
-    Ok(())
+    Ok(hex)
 }
 
 pub(super) fn send_devin_session_message(
@@ -592,8 +594,7 @@ pub(super) fn send_devin_session_message(
     message: &str,
     transport: &dyn DevinTransport,
 ) -> Result<()> {
-    validate_send_args(session_id, message)?;
-    let hex = devin_session_hex(session_id).unwrap();
+    let hex = validate_send_args(session_id, message)?;
     let url = format!(
         "{}/v3/organizations/{}/sessions/devin-{hex}/messages",
         auth.base_url, auth.org_id,

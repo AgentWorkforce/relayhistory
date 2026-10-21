@@ -79,30 +79,35 @@ fn sync_codex_rollouts_and_history(
     }
     // This also upgrades legacy numeric cursors at EOF. The actual committed
     // position may include complete lines appended after the initial stat.
-    let opened_cursor = source.cursor.to_value();
+    let opened_cursor = source.cursor.to_value()?;
     if consumed != offset || state.get("codex") != Some(&opened_cursor) {
         state.insert(
             "codex".to_string(),
-            source.committed_cursor(consumed, true)?.to_value(),
+            source.committed_cursor(consumed, true)?.to_value()?,
         );
     }
     let backfilled = backfill_codex_metadata_scoped(conn, state, &cwds, &branches, touched)?;
-    if consumed == offset && backfilled == 0 {
-        sync_note!("  [codex] up to date");
-    } else {
-        let mut parts = Vec::new();
-        if inserted > 0 || consumed > offset {
-            parts.push(format!("+{inserted} rows"));
-        }
-        if backfilled > 0 {
-            parts.push(format!("backfilled {backfilled} project/branch values"));
-        }
-        if errors > 0 {
-            parts.push(format!("{errors} errors"));
-        }
-        sync_note!("  [codex] {}", parts.join(", "));
-    }
+    note_codex_history_sync(consumed > offset, inserted, backfilled, errors);
     Ok(inserted)
+}
+
+/// Report what one `history.jsonl` pass changed.
+fn note_codex_history_sync(advanced: bool, inserted: usize, backfilled: usize, errors: usize) {
+    if !advanced && backfilled == 0 {
+        sync_note!("  [codex] up to date");
+        return;
+    }
+    let mut parts = Vec::new();
+    if inserted > 0 || advanced {
+        parts.push(format!("+{inserted} rows"));
+    }
+    if backfilled > 0 {
+        parts.push(format!("backfilled {backfilled} project/branch values"));
+    }
+    if errors > 0 {
+        parts.push(format!("{errors} errors"));
+    }
+    sync_note!("  [codex] {}", parts.join(", "));
 }
 
 fn sync_codex_sqlite_scoped(

@@ -1,5 +1,4 @@
 //! Internal admission seam for provider-owned acquisition. No runtime loading.
-#![allow(dead_code)] // Optional adapter hooks are exercised by the test provider until pilots land.
 use crate::discover::WatchRoot;
 use crate::hydrate::HydrateSessionOptions;
 use crate::{MessageIdOrigin, NormalizedUsage, ProviderRoots, UsageAccounting, UsageError};

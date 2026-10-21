@@ -1,4 +1,4 @@
-use std::sync::{Condvar, Mutex, MutexGuard};
+use std::sync::{Condvar, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use super::scope::{widen, ChangeScope, ScopedTickFn, TickRequest};
@@ -100,8 +100,10 @@ pub(super) struct RunState {
 
 pub(super) struct WatchInner {
     pub(super) tick: ScopedTickFn,
-    pub(super) on_report: Option<ReportSink>,
-    pub(super) on_error: Option<ErrorSink>,
+    /// Set by the builder. Behind a lock so setting one does not depend on
+    /// the `Arc` being unshared; ticks clone the sink out before calling it.
+    pub(super) on_report: Mutex<Option<ReportSink>>,
+    pub(super) on_error: Mutex<Option<ErrorSink>>,
     pub(super) wake: Mutex<WakeState>,
     pub(super) wake_cv: Condvar,
     pub(super) run: Mutex<RunState>,
@@ -118,7 +120,7 @@ pub(super) struct InFlight<'a> {
 impl Drop for InFlight<'_> {
     fn drop(&mut self) {
         let (deferred, since, scope) = {
-            let mut run = self.inner.run.lock().expect("watch run state");
+            let mut run = self.inner.run.lock().unwrap_or_else(PoisonError::into_inner);
             run.in_flight = false;
             run.completed = run.completed.wrapping_add(1);
             (
@@ -142,7 +144,7 @@ impl Drop for InFlight<'_> {
 
 impl WatchInner {
     pub(super) fn stopped(&self) -> bool {
-        self.wake.lock().expect("watch wake state").stopped
+        self.wake.lock().unwrap_or_else(PoisonError::into_inner).stopped
     }
 
     /// Post a change signal. Called by the filesystem watcher's callback, and
@@ -156,7 +158,7 @@ impl WatchInner {
     /// arrival when one is already pending and widening its scope.
     pub(super) fn signal_change_since(&self, at: Instant, scope: ChangeScope) {
         {
-            let mut wake = self.wake.lock().expect("watch wake state");
+            let mut wake = self.wake.lock().unwrap_or_else(PoisonError::into_inner);
             if wake.stopped {
                 return;
             }
@@ -170,7 +172,7 @@ impl WatchInner {
     /// when the backend reports a watched path removed.
     pub(super) fn signal_registration_lost(&self) {
         {
-            let mut wake = self.wake.lock().expect("watch wake state");
+            let mut wake = self.wake.lock().unwrap_or_else(PoisonError::into_inner);
             if wake.stopped {
                 return;
             }
@@ -181,14 +183,15 @@ impl WatchInner {
 
     pub(super) fn request_stop(&self) {
         {
-            let mut wake = self.wake.lock().expect("watch wake state");
+            let mut wake = self.wake.lock().unwrap_or_else(PoisonError::into_inner);
             wake.stopped = true;
         }
         self.wake_cv.notify_all();
     }
 
     pub(super) fn report_error(&self, error: &anyhow::Error) {
-        if let Some(sink) = &self.on_error {
+        let sink = self.on_error.lock().unwrap_or_else(PoisonError::into_inner).clone();
+        if let Some(sink) = sink {
             sink(error);
         } else {
             eprintln!("ai-hist: watch failed: {error:#}");
@@ -204,7 +207,7 @@ impl WatchInner {
         debounce: Duration,
         leading_edge: bool,
     ) -> Option<Wake> {
-        let mut wake = self.wake.lock().expect("watch wake state");
+        let mut wake = self.wake.lock().unwrap_or_else(PoisonError::into_inner);
         loop {
             if wake.stopped {
                 return None;
@@ -222,7 +225,7 @@ impl WatchInner {
             let (next, result) = self
                 .wake_cv
                 .wait_timeout(wake, timeout)
-                .expect("watch wake state");
+                .unwrap_or_else(PoisonError::into_inner);
             wake = next;
             if result.timed_out() {
                 if wake.stopped {
@@ -268,7 +271,7 @@ impl WatchInner {
         // short session occupies. The bit itself is left set; the
         // caller takes it and reconciles before it sweeps.
         self.sleep_through_debounce(window);
-        let mut wake = self.wake.lock().expect("watch wake state");
+        let mut wake = self.wake.lock().unwrap_or_else(PoisonError::into_inner);
         if wake.stopped {
             return None;
         }
@@ -306,7 +309,7 @@ impl WatchInner {
     /// sweep, has to be acted on by the iteration that comes out of it and
     /// not by the one after the next sweep.
     pub(super) fn take_registration_lost(&self) -> bool {
-        let mut wake = self.wake.lock().expect("watch wake state");
+        let mut wake = self.wake.lock().unwrap_or_else(PoisonError::into_inner);
         std::mem::take(&mut wake.registration_lost)
     }
 
@@ -318,13 +321,13 @@ impl WatchInner {
         // from the command line and the addition panics on a sum it cannot
         // represent.
         let duration = duration.min(Duration::from_millis(MAX_INTERVAL_MS));
-        let mut wake = self.wake.lock().expect("watch wake state");
+        let mut wake = self.wake.lock().unwrap_or_else(PoisonError::into_inner);
         let Some(deadline) = Instant::now().checked_add(duration) else {
             // Unreachable given the bound above. A platform whose clock cannot
             // represent even that should wait for the stop signal rather than
             // spin through zero-length sleeps.
             while !done(&wake) {
-                wake = self.wake_cv.wait(wake).expect("watch wake state");
+                wake = self.wake_cv.wait(wake).unwrap_or_else(PoisonError::into_inner);
             }
             return;
         };
@@ -336,7 +339,7 @@ impl WatchInner {
             let (next, _) = self
                 .wake_cv
                 .wait_timeout(wake, deadline - now)
-                .expect("watch wake state");
+                .unwrap_or_else(PoisonError::into_inner);
             wake = next;
         }
     }
@@ -368,7 +371,7 @@ impl WatchInner {
     /// Claim the in-flight slot, or remember a forced trigger that could not
     /// have it.
     pub(super) fn claim_or_defer(&self, wake: &Wake) -> Option<InFlight<'_>> {
-        let mut run = self.run.lock().expect("watch run state");
+        let mut run = self.run.lock().unwrap_or_else(PoisonError::into_inner);
         if run.in_flight {
             if wake.trigger.forces_scan() {
                 run.deferred_force = true;
@@ -389,7 +392,7 @@ impl WatchInner {
     /// `tick()` is a real completion barrier rather than a silent no-op.
     pub(super) fn run_or_join(&self, trigger: TickTrigger) {
         let join_target = {
-            let mut run = self.run.lock().expect("watch run state");
+            let mut run = self.run.lock().unwrap_or_else(PoisonError::into_inner);
             if run.in_flight {
                 Some(run.completed.wrapping_add(1))
             } else {
@@ -402,9 +405,9 @@ impl WatchInner {
                 self.run_claimed(Wake::from(trigger), InFlight { inner: self });
             }
             Some(target) => {
-                let mut run = self.run.lock().expect("watch run state");
+                let mut run = self.run.lock().unwrap_or_else(PoisonError::into_inner);
                 while run.completed < target {
-                    run = self.run_cv.wait(run).expect("watch run state");
+                    run = self.run_cv.wait(run).unwrap_or_else(PoisonError::into_inner);
                 }
             }
         }
@@ -428,8 +431,9 @@ impl WatchInner {
             },
         });
         let elapsed = started.elapsed();
+        let on_report = self.on_report.lock().unwrap_or_else(PoisonError::into_inner).clone();
         let report = |outcome: TickOutcome, cancelled: bool| {
-            if let Some(sink) = &self.on_report {
+            if let Some(sink) = &on_report {
                 sink(&TickReport {
                     trigger,
                     forced,
@@ -472,9 +476,9 @@ impl WatchInner {
     }
 
     pub(super) fn wait_for_idle(&self) {
-        let mut run = self.run.lock().expect("watch run state");
+        let mut run = self.run.lock().unwrap_or_else(PoisonError::into_inner);
         while run.in_flight {
-            run = self.run_cv.wait(run).expect("watch run state");
+            run = self.run_cv.wait(run).unwrap_or_else(PoisonError::into_inner);
         }
     }
 }

@@ -372,12 +372,20 @@ fn content(
         .unwrap_or_else(|| vec![serde_json::json!({"type":"text", "text":value})]);
     for (index, block) in blocks.iter().enumerate() {
         let uid = format!("{}:{index}", base.message_id);
-        let (kind, text) = match block["type"].as_str().unwrap_or("unknown") {
-            "text" => ("text", block["text"].as_str().map(str::to_owned)),
-            "thinking" => ("thinking", block["thinking"].as_str().map(str::to_owned)),
+        let (kind, text, tool_use_id) = match block["type"].as_str().unwrap_or("unknown") {
+            "text" => ("text", block["text"].as_str().map(str::to_owned), None),
+            "thinking" => (
+                "thinking",
+                block["thinking"].as_str().map(str::to_owned),
+                None,
+            ),
             "toolCall" => {
                 call(conn, base, block, keys, scope)?;
-                ("tool_use", Some(serde_json::to_string(block)?))
+                (
+                    "tool_use",
+                    Some(serde_json::to_string(block)?),
+                    Some(format::scoped(string(block, "id")?, scope)),
+                )
             }
             _ => {
                 opaque_block(conn, s, base, block, &uid, keys)?;
@@ -385,8 +393,7 @@ fn content(
             }
         };
         let facts = ToolResultFacts {
-            tool_use_id: (kind == "tool_use")
-                .then(|| format::scoped(block["id"].as_str().unwrap(), scope)),
+            tool_use_id,
             ..Default::default()
         };
         // A control kind only ever marks a user text row.

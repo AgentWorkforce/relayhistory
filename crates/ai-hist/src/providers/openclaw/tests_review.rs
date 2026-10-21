@@ -18,27 +18,27 @@ fn events(ledger: &Ledger, id: &str) -> i64 {
     ))
 }
 /// The doctor's archive move of one imported transcript.
-fn archive(home: &Path, dir: &Path, name: &str) {
+fn archive(home: &Path, dir: &Path, name: &str) -> std::io::Result<()> {
     let archive = home.join(".openclaw/agents/main/session-sqlite-import-archive");
-    std::fs::create_dir_all(&archive).unwrap();
-    std::fs::rename(dir.join(name), archive.join(format!("{name}.imported-1"))).unwrap();
+    std::fs::create_dir_all(&archive)?;
+    std::fs::rename(dir.join(name), archive.join(format!("{name}.imported-1")))
 }
 
 #[test]
 fn review_a_failed_database_import_keeps_its_jsonl_history_after_the_archive_move() {
-    let (home, roots) = home();
-    let dir = legacy(home.path());
+    let (home, roots) = home().unwrap();
+    let dir = legacy(home.path()).unwrap();
     let mut ledger = Ledger::new(home.path());
     ledger.sweep(&roots, None);
     let before = events(&ledger, TELEGRAM);
     // The database holds the session, but one of its rows cannot be decoded.
-    let (_db, conn) = database(home.path(), SCHEMA24);
+    let (_db, conn) = database(home.path(), SCHEMA24).unwrap();
     conn.execute_batch(
         "UPDATE transcript_events SET event_json='{not json' WHERE session_id='fixture-telegram-0001' AND seq=1",
     )
     .unwrap();
     assert!(ledger.sweep(&roots, None).unread >= 1);
-    archive(home.path(), &dir, "fixture-telegram-0001.jsonl");
+    archive(home.path(), &dir, "fixture-telegram-0001.jsonl").unwrap();
     ledger.sweep(&roots, None);
     assert_eq!(history(&ledger, TELEGRAM), 1);
     assert_eq!(events(&ledger, TELEGRAM), before);
@@ -49,14 +49,14 @@ fn review_a_failed_database_import_keeps_its_jsonl_history_after_the_archive_mov
 
 #[test]
 fn review_a_scoped_sweep_of_the_sessions_directory_never_retires_an_imported_session() {
-    let (home, roots) = home();
-    let dir = legacy(home.path());
+    let (home, roots) = home().unwrap();
+    let dir = legacy(home.path()).unwrap();
     let mut ledger = Ledger::new(home.path());
     ledger.sweep(&roots, None);
     let before = events(&ledger, TELEGRAM);
     // Imported and archived between sweeps; only the sessions watch fires.
-    let (db, _conn) = database(home.path(), SCHEMA24);
-    archive(home.path(), &dir, "fixture-telegram-0001.jsonl");
+    let (db, _conn) = database(home.path(), SCHEMA24).unwrap();
+    archive(home.path(), &dir, "fixture-telegram-0001.jsonl").unwrap();
     let scope = PathScope::from_paths([dir.clone()]).unwrap();
     ledger.sweep(&roots, Some(&scope));
     // The database was not read: its conversation does not hold the window
@@ -76,8 +76,8 @@ fn review_a_scoped_sweep_of_the_sessions_directory_never_retires_an_imported_ses
 
 #[test]
 fn review_a_partial_rewrite_never_retires_indexed_evidence() {
-    let (home, roots) = home();
-    let dir = legacy(home.path());
+    let (home, roots) = home().unwrap();
+    let dir = legacy(home.path()).unwrap();
     let mut ledger = Ledger::new(home.path());
     ledger.sweep(&roots, None);
     let before = events(&ledger, TELEGRAM);
@@ -107,11 +107,11 @@ fn review_a_partial_rewrite_never_retires_indexed_evidence() {
 
 #[test]
 fn review_an_unreadable_database_protects_jsonl_rows_after_its_sessions_directory_is_gone() {
-    let (home, roots) = home();
-    let dir = legacy(home.path());
+    let (home, roots) = home().unwrap();
+    let dir = legacy(home.path()).unwrap();
     let mut ledger = Ledger::new(home.path());
     ledger.sweep(&roots, None);
-    let (_db, conn) = database(home.path(), SCHEMA24);
+    let (_db, conn) = database(home.path(), SCHEMA24).unwrap();
     conn.execute_batch("UPDATE schema_meta SET schema_version=32; PRAGMA user_version=32")
         .unwrap();
     std::fs::remove_dir_all(&dir).unwrap();
@@ -124,9 +124,9 @@ fn review_an_unreadable_database_protects_jsonl_rows_after_its_sessions_director
 
 #[test]
 fn review_bounded_discovery_never_offers_a_database_held_session_from_jsonl() {
-    let (home, roots) = home();
-    let dir = legacy(home.path());
-    let (_db, conn) = database(home.path(), SCHEMA24);
+    let (home, roots) = home().unwrap();
+    let dir = legacy(home.path()).unwrap();
+    let (_db, conn) = database(home.path(), SCHEMA24).unwrap();
     // Two newer database sessions fill a limit of one plus its look-ahead.
     for id in ["zz-new-1", "zz-new-2"] {
         conn.execute_batch(&format!(
@@ -161,8 +161,8 @@ fn review_bounded_discovery_never_offers_a_database_held_session_from_jsonl() {
 
 #[test]
 fn review_shallow_discovery_parses_each_index_once() {
-    let (home, roots) = home();
-    legacy(home.path());
+    let (home, roots) = home().unwrap();
+    legacy(home.path()).unwrap();
     let catalog = Connection::open_in_memory().unwrap();
     let env = DiscoveryEnv::with_provider_roots(&catalog, roots.clone());
     let candidates = storage::enumerate(&roots, None).unwrap();
@@ -205,8 +205,8 @@ fn review_shallow_discovery_parses_each_index_once() {
 
 #[test]
 fn review_an_oversized_transcript_is_unread_and_keeps_its_history() {
-    let (home, roots) = home();
-    let dir = legacy(home.path());
+    let (home, roots) = home().unwrap();
+    let dir = legacy(home.path()).unwrap();
     let mut ledger = Ledger::new(home.path());
     ledger.sweep(&roots, None);
     let before = events(&ledger, MAIN);
@@ -234,8 +234,8 @@ fn review_an_oversized_transcript_is_unread_and_keeps_its_history() {
 #[cfg(unix)]
 #[test]
 fn review_one_unlistable_sessions_directory_does_not_fail_the_sweep() {
-    let (home, roots) = home();
-    legacy(home.path());
+    let (home, roots) = home().unwrap();
+    legacy(home.path()).unwrap();
     let mut ledger = Ledger::new(home.path());
     ledger.sweep(&roots, None);
     // The ops agent's sessions directory now escapes the root.

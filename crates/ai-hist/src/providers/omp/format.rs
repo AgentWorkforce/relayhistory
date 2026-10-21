@@ -57,11 +57,14 @@ pub(super) fn parse(bytes: &[u8], shallow: bool) -> Result<Vec<Value>> {
         let mut entry: Value = serde_json::from_slice(line)
             .context("OMP_INVALID_RECORD: malformed complete JSONL record")?;
         if entries.is_empty() {
-            anyhow::ensure!(
-                entry["type"] == "session" && entry["version"] == 3,
-                "OMP_UNSUPPORTED_SCHEMA: expected OMP session version 3"
-            );
-            overlay_title(&mut entry, &slot);
+            let header = entry
+                .as_object_mut()
+                .filter(|h| {
+                    h.get("type").is_some_and(|t| *t == "session")
+                        && h.get("version").is_some_and(|v| *v == 3)
+                })
+                .context("OMP_UNSUPPORTED_SCHEMA: expected OMP session version 3")?;
+            overlay_title(header, &slot);
             string(&entry, "id")?;
             string(&entry, "cwd")?;
             time(&entry)?;
@@ -126,8 +129,7 @@ pub(super) fn first_prompt(entries: &[Value]) -> Option<String> {
         .map(|value| value.chars().take(4096).collect())
 }
 
-fn overlay_title(header: &mut Value, slot: &Value) {
-    let header = header.as_object_mut().expect("validated session header");
+fn overlay_title(header: &mut serde_json::Map<String, Value>, slot: &Value) {
     if slot["title"].as_str().is_some_and(|s| !s.is_empty()) {
         header.insert("title".into(), slot["title"].clone());
     } else {

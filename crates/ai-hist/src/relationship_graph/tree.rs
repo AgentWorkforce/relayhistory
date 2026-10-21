@@ -49,19 +49,23 @@ fn mark_cycle(nodes: &mut [SessionTreeNode], pending: &Pending) -> RelationshipD
     }
 }
 
-/// The traversable children; unlinked evidence is reported and set aside.
+/// The traversable children, each with its child id; unlinked evidence is
+/// reported and set aside.
 fn split_unlinked(
     children: Vec<SessionRelationship>,
     unlinked: &mut Vec<SessionRelationship>,
     diagnostics: &mut Vec<RelationshipDiagnostic>,
-) -> Vec<SessionRelationship> {
+) -> Vec<(String, SessionRelationship)> {
     let mut linked = Vec::new();
     for relationship in children {
-        if relationship.is_unlinked() {
-            diagnostics.push(unlinked_diagnostic(&relationship));
-            unlinked.push(relationship);
-        } else {
-            linked.push(relationship);
+        match relationship.child_session_id.clone() {
+            Some(child_session_id) if !relationship.is_unlinked() => {
+                linked.push((child_session_id, relationship));
+            }
+            _ => {
+                diagnostics.push(unlinked_diagnostic(&relationship));
+                unlinked.push(relationship);
+            }
         }
     }
     linked
@@ -70,15 +74,11 @@ fn split_unlinked(
 /// Pushed in reverse so the stack pops them in the total order of `linked`.
 fn push_children(
     stack: &mut Vec<Pending>,
-    linked: Vec<SessionRelationship>,
+    linked: Vec<(String, SessionRelationship)>,
     parent: &Pending,
     parent_index: usize,
 ) {
-    for relationship in linked.into_iter().rev() {
-        let child_session_id = relationship
-            .child_session_id
-            .clone()
-            .expect("linked relationships carry a child id");
+    for (child_session_id, relationship) in linked.into_iter().rev() {
         stack.push(Pending {
             session_id: child_session_id,
             depth: parent.depth + 1,
