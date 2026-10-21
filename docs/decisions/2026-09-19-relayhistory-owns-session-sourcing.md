@@ -523,25 +523,6 @@ Generated from provider-owned acquisition records; these cells describe fixture-
 | codebuddy | Native replay | Published native recorder and fresh high-level historical restore/replay oracle prove branch tombstone, pending rewind and compaction ancestry; retained pre-compaction messages stay searchable, controls and summaries remain markers. Native reasoning nodes stay opaque; adjacent native message fragments are preserved. Native title facts use custom/AI/topic precedence. Runtime-only lane moves without durable facts cannot be inferred. |
 | qoder | Messages and identity | Global CLI 1.1.x projects JSONL, observed sessionId and UUID/parentUuid, timestamps, cwd, model and user/assistant text; same native ID at distinct paths is rejected with a collision diagnostic. |
 | qoder | Tools and control | Persisted tool_use and tool_result IDs joined; active-leaf and last-prompt retained as markers. Same-millisecond remote ordering conflict reports retryable failure under #463. Usage objects supplied to writer are discarded, so per-request usage stays unknown. No file edits or relationships inferred. Qoder CN and IDE schemas are excluded. |
-| grok-bot | Messages and identity | Base32 transcript keys, native agent and entry IDs, roster titles, complete and truncated tails across account slots; bounded local window accumulates across captures. |
-| grok-bot | Control and lineage | Widget responses, voice turns, approvals, attachments and app events retained; Cursor cloud-agent IDs recorded as observed delegation without a local child transcript. |
-| grok-bot | Usage and acquisition | No local model, token or cost usage; passive local blobs only, with no host backfill, network calls or credential reads. |
-| openclaw | Messages and tools | One session per OpenClaw session key for agent databases (every window: resets, isolated cron and heartbeat runs; cron run keys fold into their job); one per transcript for the pre-2026.8 JSONL store. Agent schema 19-31 transcript rows (JSON, or zstd from schema 23) and verified cold archives (file or SQLite, from schema 21), plus the JSONL store (`sessions/*.jsonl` with its `sessions.json` index), full entry tree with native entry IDs, user/assistant/thinking/tool content, toolCallId joins and isError outcomes; session key, agent ID and channel retained as metadata; heartbeat and wake prompts are controls. A session the agent database holds is read from it, never also from JSONL. |
-| openclaw | Usage and relationships | Assistant per-message usage with reported cost, one request per provider responseId; delivery mirrors, transcript-only rows and CLI-harness rows carry no request usage. Session windows, previous session and parent/spawn keys retained as metadata; no relationship, resume or live execution advertised. Reset/delete archives, compaction checkpoints and the doctor's import archive are not read; a deleted session retires. |
-<!-- END GENERATED PROVIDER CAPTURE -->
-
-### Embedded Codex image evidence
-
-An image attached to a prompt is session evidence even when the prompt has no
-text. Capture only raster bytes embedded by the harness, capped at 1 MiB per
-image, as self-contained Markdown blocks sharing the native message identity.
-Images remain outside prompt-history text and usage-attribution keys.
-
-Following local file paths or downloading remote URLs was rejected: later sync
-cannot establish that those bytes are the bytes the model originally received,
-and a transcript must not authorize filesystem or network reads. Dropping all
-images was rejected because it loses the evidence needed to understand an
-image-only turn. Unsupported or oversized references become explicit unavailable
-blocks. Copies increase database and upload size; replay therefore needs bounded
-pages that preserve whole supported images. This policy validates raster headers
-and size, not image semantics or visual redaction.
+| vtcode | Messages and identity | Workspace-scoped canonical events preserve native turn/item IDs and exact user-origin prompts; multi-workspace identities are namespaced to prevent same-ID collapse. |
+| vtcode | Tools and usage | Native tool_call_id and call_id join; turn.completed usage recorded once on the final assistant item, thread aggregate remains a marker; no model or file-edit inference. |
+| vtcode | Control and lifecycle | Compaction, completion and unrecognized records remain markers; no native resume or delegation claim. Partial tails defer replacement and complete rewrites retire removed records. |

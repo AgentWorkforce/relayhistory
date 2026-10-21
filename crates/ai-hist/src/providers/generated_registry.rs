@@ -79,21 +79,6 @@ const REGISTRATIONS: &[Registration] = &[
         id: "qoder",
         metadata: qoder::METADATA,
         adapter: qoder::ADAPTER,
-    },
-    Registration {
-        id: "grok-bot",
-        metadata: grok_bot::METADATA,
-        adapter: grok_bot::ADAPTER,
-    },
-    Registration {
-        id: "openclaw",
-        metadata: openclaw::METADATA,
-        adapter: openclaw::ADAPTER,
-    },
-    #[cfg(test)]
-    Registration {
-        id: "test-fixture",
-        metadata: test_fixture::METADATA,
-        adapter: test_fixture::ADAPTER,
-    },
-];
+        id: "vtcode",
+        metadata: vtcode::METADATA,
+        adapter: vtcode::ADAPTER,

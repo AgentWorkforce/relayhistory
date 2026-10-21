@@ -22,6 +22,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Qwen Code interactive session history is discoverable and searchable from native transcript files, preserving the active conversation branch, recorded messages and tool evidence.
 - Kimi Code history is discoverable and searchable from current native session journals, including recorded messages, tools and separate subagent transcripts.
 - Codebuddy Code history is discoverable and searchable from native project session files, including recorded messages and tool evidence.
+- VT Code history is discoverable and searchable from canonical workspace journals under explicitly configured workspace roots, preserving recorded turns, tool identities, usage and control events.
 
 ### Removed
 
@@ -39,6 +40,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Added `Source::QwenCode` for filtering and reading persisted Qwen Code history.
 - Added `Source::Kimi` for filtering and reading persisted Kimi Code history.
 - Added `Source::Codebuddy` for filtering and reading persisted Codebuddy Code history.
+- Added `Source::Vtcode` for filtering and reading persisted VT Code session history.
 - `ChangeOp::Upsert` now holds a `Box<EvidenceRow>` and `EvidenceRow::SessionEvent` a `Box<SessionEvent>`, shrinking every `Change`; match through the box (e.g. `ChangeOp::Upsert(row) => match row.as_ref() { .. }`) and wrap constructed values with `Box::new`. The serialized change feed is unchanged.
 
 ## [0.49.0] - 2026-10-21
