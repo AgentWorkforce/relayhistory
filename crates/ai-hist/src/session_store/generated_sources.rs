@@ -142,6 +142,7 @@ impl Source {
             Self::QwenCode => &crate::providers::qwen_code::METADATA,
             Self::Kimi => &crate::providers::kimi::METADATA,
             Self::Codebuddy => &crate::providers::codebuddy::METADATA,
+            Self::Qoder => &crate::providers::qoder::METADATA,
             Self::GrokBot => &crate::providers::grok_bot::METADATA,
             Self::OpenClaw => &crate::providers::openclaw::METADATA,
             #[cfg(test)]

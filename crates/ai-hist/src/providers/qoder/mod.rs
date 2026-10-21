@@ -11,6 +11,7 @@ mod normalize;
 #[cfg(test)]
 mod tests;
 const ID: &str = "qoder";
+const GENERATION: &str = "qoder_cli_1_1_v1";
 const HEAD_LIMIT: u64 = 64 * 1024;
 const OPENING_RECORD_LIMIT: usize = 8 * 1024 * 1024;
 pub(crate) const LOCAL_SOURCE: LocalSource = LocalSource {
@@ -28,7 +29,7 @@ pub(crate) const METADATA: ProviderMetadata = ProviderMetadata {
     usage: None,
 };
 pub(crate) const ADAPTER: Option<ProviderAdapter> = Some(ProviderAdapter {
-    generation: "qoder_cli_1_1_v1",
+    generation: GENERATION,
     acquire,
     sweep,
     resolve_roots,
@@ -335,6 +336,27 @@ fn ingest(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
         None,
     ))
 }
+fn cache_hit(
+    conn: &Connection,
+    candidate: &Candidate,
+    previous: &Value,
+    repairs: &crate::ingest::SweepRepairs,
+) -> Result<bool> {
+    let Some(sid) = previous["sid"].as_str() else {
+        return Ok(false);
+    };
+    if previous["stamp"].as_str() != Some(&candidate.stamp)
+        || previous["generation"].as_str() != Some(GENERATION)
+        || repairs.contains(ID, sid)
+    {
+        return Ok(false);
+    }
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sessions WHERE source='qoder' AND session_id=?1)",
+        [sid],
+        |row| row.get(0),
+    )?)
+}
 fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
     let env = DiscoveryEnv::with_provider_roots(ctx.conn, ctx.roots.clone())
         .with_path_scope(ctx.paths.cloned());
@@ -355,23 +377,10 @@ fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
     for candidate in candidates {
         crate::ingest::check_capture_cancelled()?;
         let path = Path::new(&candidate.locator);
-        let generation = ADAPTER.unwrap().generation;
+        let generation = GENERATION;
         if let Some(previous) = cache.get(&candidate.locator) {
-            if previous["stamp"].as_str() == Some(&candidate.stamp)
-                && previous["generation"].as_str() == Some(generation)
-                && previous["sid"]
-                    .as_str()
-                    .is_some_and(|sid| !ctx.repairs.contains(ID, sid))
-            {
-                let sid = previous["sid"].as_str().unwrap();
-                let present: bool = ctx.conn.query_row(
-                    "SELECT EXISTS(SELECT 1 FROM sessions WHERE source='qoder' AND session_id=?1)",
-                    [sid],
-                    |r| r.get(0),
-                )?;
-                if present {
-                    continue;
-                }
+            if cache_hit(ctx.conn, &candidate, previous, ctx.repairs)? {
+                continue;
             }
         }
         let ingest = || -> Result<(usize, bool, String)> {

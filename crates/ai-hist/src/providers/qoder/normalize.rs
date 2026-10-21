@@ -275,7 +275,11 @@ fn content(conn: &Connection, base: &EventRow<'_>, value: &Value, keys: &mut Key
             }
         };
         let facts = ToolResultFacts {
-            tool_use_id: (kind == "tool_use").then(|| block["id"].as_str().unwrap().to_owned()),
+            tool_use_id: if kind == "tool_use" {
+                Some(format::string(block, "id")?.to_owned())
+            } else {
+                None
+            },
             ..Default::default()
         };
         insert_session_event(
