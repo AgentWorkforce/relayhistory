@@ -17,20 +17,14 @@ pub fn unlock(file: &File) -> io::Result<()> {
 #[cfg(unix)]
 mod imp {
     use super::*;
-    use std::os::unix::io::AsRawFd;
+    use rustix::fs::FlockOperation;
 
-    fn flock(file: &File, flags: i32) -> io::Result<()> {
-        // SAFETY: `file` owns the descriptor for the lifetime of the call.
-        let rc = unsafe { libc::flock(file.as_raw_fd(), flags) };
-        if rc == 0 {
-            Ok(())
-        } else {
-            Err(io::Error::last_os_error())
-        }
+    fn flock(file: &File, operation: FlockOperation) -> io::Result<()> {
+        rustix::fs::flock(file, operation).map_err(io::Error::from)
     }
 
     pub fn try_lock_exclusive(file: &File) -> io::Result<()> {
-        match flock(file, libc::LOCK_EX | libc::LOCK_NB) {
+        match flock(file, FlockOperation::NonBlockingLockExclusive) {
             Err(err) if err.raw_os_error() == Some(libc::EAGAIN) => {
                 Err(io::Error::new(io::ErrorKind::WouldBlock, err))
             }
@@ -39,11 +33,11 @@ mod imp {
     }
 
     pub fn lock_exclusive(file: &File) -> io::Result<()> {
-        flock(file, libc::LOCK_EX)
+        flock(file, FlockOperation::LockExclusive)
     }
 
     pub fn unlock(file: &File) -> io::Result<()> {
-        flock(file, libc::LOCK_UN)
+        flock(file, FlockOperation::Unlock)
     }
 }
 

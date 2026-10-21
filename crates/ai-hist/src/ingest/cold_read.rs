@@ -324,7 +324,7 @@ pub(crate) fn read_all(path: &Path) -> io::Result<Arc<[u8]>> {
     }
     let mut shared = open_shared(path)?;
     let mut buf = Vec::with_capacity(before.len() as usize);
-    shared.file().read_to_end(&mut buf)?;
+    shared.file()?.read_to_end(&mut buf)?;
     drop(shared.into_file());
     let after = transcript_file::metadata(path)?;
     let bytes: Arc<[u8]> = buf.into();
@@ -386,7 +386,7 @@ fn first_record(bytes: &[u8]) -> Option<(Vec<u8>, u64)> {
 fn read_one_record(path: &Path) -> io::Result<Option<(Vec<u8>, u64)>> {
     use std::io::BufRead;
     let mut shared = open_shared(path)?;
-    let mut reader = std::io::BufReader::new(shared.file());
+    let mut reader = std::io::BufReader::new(shared.file()?);
     let mut raw = Vec::new();
     let ceiling = crate::ingest::transcript_cursor::MAX_RECORD_BYTES;
     let read = reader.by_ref().take(ceiling).read_until(b'\n', &mut raw)? as u64;
@@ -490,7 +490,10 @@ pub(crate) fn probe(path: &Path) -> bool {
         Ok(shared) => shared,
         Err(_) => return false,
     };
-    let ok = shared.file().read(&mut [0u8; 1]).is_ok();
+    let ok = shared
+        .file()
+        .and_then(|file| file.read(&mut [0u8; 1]))
+        .is_ok();
     if !ok {
         let _ = shared.into_file();
     }
@@ -507,13 +510,17 @@ pub(crate) struct SharedFile {
 }
 
 impl SharedFile {
-    pub(crate) fn file(&mut self) -> &mut TranscriptFile {
-        self.file.as_mut().expect("shared file is live")
+    pub(crate) fn file(&mut self) -> io::Result<&mut TranscriptFile> {
+        self.file
+            .as_mut()
+            .ok_or_else(|| io::Error::other("shared file is no longer live"))
     }
 
-    pub(crate) fn into_file(mut self) -> TranscriptFile {
+    pub(crate) fn into_file(mut self) -> io::Result<TranscriptFile> {
         self.repark = false;
-        self.file.take().expect("shared file is live")
+        self.file
+            .take()
+            .ok_or_else(|| io::Error::other("shared file is no longer live"))
     }
 }
 
@@ -529,7 +536,7 @@ impl Drop for SharedFile {
 }
 
 pub(crate) fn open_file(path: &Path) -> io::Result<TranscriptFile> {
-    open_shared(path).map(SharedFile::into_file)
+    open_shared(path).and_then(SharedFile::into_file)
 }
 
 pub(crate) fn open_shared(path: &Path) -> io::Result<SharedFile> {

@@ -258,15 +258,18 @@ impl std::fmt::Debug for ZstdFile {
 
 impl ZstdFile {
     fn decoder(&mut self) -> io::Result<&mut Decoder> {
-        if self.decoder.is_none() {
-            debug_assert_eq!(self.position, 0);
-            let source = At {
-                file: Arc::clone(&self.file),
-                offset: 0,
-            };
-            self.decoder = Some(Box::new(Decoder::with_buffer(BufReader::new(source))?));
-        }
-        Ok(self.decoder.as_mut().expect("decoder was just started"))
+        let decoder = match self.decoder.take() {
+            Some(decoder) => decoder,
+            None => {
+                debug_assert_eq!(self.position, 0);
+                let source = At {
+                    file: Arc::clone(&self.file),
+                    offset: 0,
+                };
+                Box::new(Decoder::with_buffer(BufReader::new(source))?)
+            }
+        };
+        Ok(self.decoder.insert(decoder))
     }
 
     /// Decompress and discard up to `target`, or to the end of the records.

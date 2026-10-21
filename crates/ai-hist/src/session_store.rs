@@ -68,7 +68,7 @@ use std::collections::{BTreeMap, VecDeque};
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 mod catalog_digest;
@@ -869,7 +869,8 @@ impl SessionStore {
             .with_immediate(opts.immediate)
             .with_leading_edge(opts.leading_edge)
             .on_report(Arc::new(move |report| {
-                let notes = std::mem::take(&mut *notes.lock().expect("watch notes"));
+                let notes =
+                    std::mem::take(&mut *notes.lock().unwrap_or_else(PoisonError::into_inner));
                 let tick = TickReport::from_loop(report, notes);
                 send_report(&report_sink, || Ok(tick));
             }))
@@ -1151,7 +1152,7 @@ type ReportSlot = Arc<Mutex<Option<ReportSender>>>;
 /// Put one item on the watch stream, if it is still open. `item` is built
 /// only when there is a receiver to hand it to.
 fn send_report(slot: &ReportSlot, item: impl FnOnce() -> Result<TickReport, Error>) {
-    if let Some(sender) = &*slot.lock().expect("watch reports") {
+    if let Some(sender) = &*slot.lock().unwrap_or_else(PoisonError::into_inner) {
         let _ = sender.send(item());
     }
 }

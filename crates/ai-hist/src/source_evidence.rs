@@ -444,21 +444,22 @@ fn fill_derived_columns(record: &mut EvidenceRecord, spec: &Spec) {
         });
     }
 }
-fn sql_value(value: &Value) -> rusqlite::types::Value {
-    match value {
-        Value::Null => rusqlite::types::Value::Null,
-        Value::Bool(value) => rusqlite::types::Value::Integer(i64::from(*value)),
-        Value::Number(value) => value
-            .as_i64()
-            .map(rusqlite::types::Value::Integer)
-            .unwrap_or_else(|| rusqlite::types::Value::Real(value.as_f64().unwrap())),
-        Value::String(value) => rusqlite::types::Value::Text(value.clone()),
-        _ => unreachable!("validated evidence contains only SQLite scalars"),
-    }
+fn sql_value(value: &Value) -> Result<rusqlite::types::Value> {
+    use rusqlite::types::Value as Sql;
+    Ok(match value {
+        Value::Null => Sql::Null,
+        Value::Bool(value) => Sql::Integer(i64::from(*value)),
+        Value::Number(value) => (value.as_i64().map(Sql::Integer))
+            .or_else(|| value.as_f64().map(Sql::Real))
+            .context("evidence number is not representable as a SQLite REAL")?,
+        Value::String(value) => Sql::Text(value.clone()),
+        _ => anyhow::bail!("validated evidence contains only SQLite scalars"),
+    })
 }
 impl EvidenceRecord {
     pub fn identity(&self) -> String {
-        serde_json::to_string(&json!([
+        // `Value`'s `Display` is its compact JSON serialization, which cannot fail.
+        json!([
             self.kind,
             self.kind
                 .spec()
@@ -466,12 +467,12 @@ impl EvidenceRecord {
                 .split(',')
                 .map(|field| self.payload.get(field).cloned().unwrap_or(Value::Null))
                 .collect::<Vec<_>>()
-        ]))
-        .expect("JSON evidence identity")
+        ])
+        .to_string()
     }
-    fn key_sql(&self) -> (String, Vec<rusqlite::types::Value>) {
+    fn key_sql(&self) -> Result<(String, Vec<rusqlite::types::Value>)> {
         let columns = self.kind.spec().key.split(',').collect::<Vec<_>>();
-        (
+        Ok((
             columns
                 .iter()
                 .map(|column| format!("{column}=?"))
@@ -480,8 +481,8 @@ impl EvidenceRecord {
             columns
                 .iter()
                 .map(|column| sql_value(&self.payload[*column]))
-                .collect(),
-        )
+                .collect::<Result<_>>()?,
+        ))
     }
     /// Whether the canonical row still equals this adapter-owned projection.
     /// Local ingestion can write directly; a changed value revokes remote ownership.
@@ -506,7 +507,7 @@ impl EvidenceRecord {
         let mut values = vec![];
         for column in self.kind.owned_columns() {
             clauses.push(format!("{column} IS ?"));
-            values.push(sql_value(self.payload.get(column).unwrap_or(&Value::Null)));
+            values.push(sql_value(self.payload.get(column).unwrap_or(&Value::Null))?);
         }
         Ok(conn.query_row(
             &format!(
@@ -519,7 +520,7 @@ impl EvidenceRecord {
         )?)
     }
     pub(crate) fn exists(&self, conn: &Connection) -> Result<bool> {
-        let (condition, values) = self.key_sql();
+        let (condition, values) = self.key_sql()?;
         Ok(conn.query_row(
             &format!(
                 "SELECT EXISTS(SELECT 1 FROM {} WHERE {condition})",
@@ -534,7 +535,7 @@ impl EvidenceRecord {
     /// retired: a record the other side also backs stays, as the other side's.
     pub(crate) fn remove(&self, conn: &Connection, location: SessionLocation) -> Result<()> {
         let table = self.kind.spec().table;
-        let (condition, values) = self.key_sql();
+        let (condition, values) = self.key_sql()?;
         if crate::store::EVIDENCE_LOCATION_TABLES.contains(&table) {
             let params = values
                 .iter()
@@ -559,7 +560,7 @@ impl EvidenceRecord {
         let mut values = columns
             .iter()
             .map(|column| sql_value(self.payload.get(*column).unwrap_or(&Value::Null)))
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>>>()?;
         let mut updates = columns
             .iter()
             .filter(|column| !spec.key.split(',').any(|key| key == **column))

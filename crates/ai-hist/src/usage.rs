@@ -453,8 +453,13 @@ pub(crate) fn normalize_legacy_usage(
                 return Ok(None);
             }
         }
-        // `source_accounting` already rejected anything else.
-        _ => unreachable!("source_accounting accepted an unhandled source"),
+        // `source_accounting` already rejected anything else; a source it
+        // accepts without a reader here is still unknown to this normalizer.
+        _ => {
+            return Err(UsageError::UnknownSource {
+                source: source.to_string(),
+            })
+        }
     }
 
     let cost = read_cost(object)?;

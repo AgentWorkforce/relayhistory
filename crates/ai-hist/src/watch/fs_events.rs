@@ -98,14 +98,14 @@ pub(super) fn handle_backend_error(
 ) {
     let registration_keys = roots
         .lock()
-        .expect("watch roots")
+        .unwrap_or_else(PoisonError::into_inner)
         .iter()
         .map(|root| root.registration_key().to_path_buf())
         .collect::<Vec<_>>();
     if !registration_keys.is_empty() {
         stale
             .lock()
-            .expect("stale roots")
+            .unwrap_or_else(PoisonError::into_inner)
             .extend(registration_keys);
         on_registration_lost();
     }
@@ -175,7 +175,7 @@ impl FsWatch {
     /// Keep the callback's copy of a root in step with the registered
     /// one, so it matches against the same spellings.
     fn remember(&self, root: &WatchRoot) {
-        let mut known = self.depth.lock().expect("watch roots");
+        let mut known = self.depth.lock().unwrap_or_else(PoisonError::into_inner);
         match known.iter_mut().find(|seen| seen.path == root.path) {
             Some(seen) => *seen = root.clone(),
             None => known.push(root.clone()),
@@ -186,7 +186,7 @@ impl FsWatch {
     /// derivation first names an hour into the run. Returns how
     /// many are new, so the caller knows whether to retry attaching.
     pub(super) fn adopt(&mut self, roots: Vec<WatchRoot>) -> usize {
-        let mut known = self.depth.lock().expect("watch roots");
+        let mut known = self.depth.lock().unwrap_or_else(PoisonError::into_inner);
         let mut added = 0usize;
         for root in roots {
             if known.iter().any(|seen| seen.path == root.path) {
@@ -226,7 +226,7 @@ impl FsWatch {
         let mut lost = Vec::new();
         let mut resolved = Vec::new();
         let watcher = &mut self.watcher;
-        let mut stale = self.stale.lock().expect("stale roots");
+        let mut stale = self.stale.lock().unwrap_or_else(PoisonError::into_inner);
         self.watched.retain_mut(|entry| {
             let reported_gone = stale.remove(entry.root.registration_key());
             let current = root_identity(entry.root.registered_path());
@@ -348,7 +348,7 @@ pub(super) fn attach(
             return;
         }
         let (matched, removed) = {
-            let roots = depth_for_events.lock().expect("watch roots");
+            let roots = depth_for_events.lock().unwrap_or_else(PoisonError::into_inner);
             let matched = event_scope(&event, &roots);
             // A registered path that was removed takes its watch with it,
             // whatever the name does afterwards. Recorded here because the
@@ -360,7 +360,7 @@ pub(super) fn attach(
         };
         if !removed.is_empty() {
             {
-                let mut stale = stale_for_events.lock().expect("stale roots");
+                let mut stale = stale_for_events.lock().unwrap_or_else(PoisonError::into_inner);
                 stale.extend(removed);
             }
             // Recorded *and* announced. Recording alone leaves the
@@ -391,7 +391,7 @@ pub(super) fn attach(
     }
     // The callback matches against these, so it has to see the resolved
     // spellings rather than the ones the caller handed in.
-    *depth.lock().expect("watch roots") = known;
+    *depth.lock().unwrap_or_else(PoisonError::into_inner) = known;
     Ok(FsWatch {
         watcher,
         watched,

@@ -31,8 +31,10 @@ impl Conversation {
     pub(super) fn partial(&self) -> bool {
         self.windows.iter().any(|w| w.partial)
     }
-    pub(super) fn latest(&self) -> &Session {
-        self.windows.last().expect("a conversation has a window")
+    pub(super) fn latest(&self) -> anyhow::Result<&Session> {
+        self.windows
+            .last()
+            .ok_or_else(|| anyhow::anyhow!("OPENCLAW_INVALID_RECORD: conversation has no window"))
     }
     pub(super) fn started(&self) -> i64 {
         self.windows.iter().map(|w| w.started).min().unwrap_or(0)

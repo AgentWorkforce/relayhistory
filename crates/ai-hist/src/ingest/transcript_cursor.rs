@@ -484,8 +484,8 @@ impl TranscriptCursorState {
             .unwrap_or_default()
     }
 
-    pub(crate) fn encode(&self) -> String {
-        serde_json::to_string(self).expect("transcript cursor serialization cannot fail")
+    pub(crate) fn encode(&self) -> Result<String> {
+        Ok(serde_json::to_string(self)?)
     }
 
     pub(crate) fn committed_offset(&self) -> i64 {
@@ -769,7 +769,7 @@ fn store_settled_cursor(
     conn.execute(
         "UPDATE transcript_cursors SET parser_state_json = ?1 \
          WHERE source = ?2 AND locator = ?3 AND parser_state_json = ?4",
-        params![settled.encode(), source, locator, loaded],
+        params![settled.encode()?, source, locator, loaded],
     )?;
     Ok(())
 }

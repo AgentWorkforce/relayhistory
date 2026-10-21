@@ -605,7 +605,8 @@ fn sqlite_lock_error(error: &rusqlite::Error) -> bool {
 }
 
 fn enable_wal_for_migration(conn: &Connection) -> Result<()> {
-    for attempt in 0..=JOURNAL_MODE_RETRY_ATTEMPTS {
+    let mut attempt = 0;
+    loop {
         match conn.pragma_update(None, "journal_mode", "WAL") {
             Ok(()) => return Ok(()),
             Err(error) if attempt < JOURNAL_MODE_RETRY_ATTEMPTS && sqlite_lock_error(&error) => {
@@ -614,11 +615,11 @@ fn enable_wal_for_migration(conn: &Connection) -> Result<()> {
                 // simultaneous first opens; the migration write lock below has
                 // the normal bounded contention policy.
                 std::thread::sleep(Duration::from_millis(JOURNAL_MODE_RETRY_MS));
+                attempt += 1;
             }
             Err(error) => return Err(error.into()),
         }
     }
-    unreachable!("the bounded journal-mode retry loop always returns")
 }
 
 /// Prepared statements a writable connection keeps compiled.
@@ -3212,14 +3213,13 @@ pub fn session_events_page(
     if has_more {
         events.truncate(limit as usize);
     }
-    let next_cursor = has_more && !events.is_empty();
-    let next_cursor = next_cursor.then(|| {
-        let last = events.last().expect("non-empty page");
-        SessionEventCursor {
+    let next_cursor = events
+        .last()
+        .filter(|_| has_more)
+        .map(|last| SessionEventCursor {
             ts_ms: last.ts_ms,
             id: last.id,
-        }
-    });
+        });
     Ok(SessionEventPage {
         events,
         next_cursor,
@@ -3321,13 +3321,13 @@ pub fn session_markers_page(
     if has_more {
         markers.truncate(limit as usize);
     }
-    let next_cursor = has_more.then(|| {
-        let last = markers.last().expect("non-empty page");
-        SessionEvidenceCursor {
+    let next_cursor = markers
+        .last()
+        .filter(|_| has_more)
+        .map(|last| SessionEvidenceCursor {
             ts_ms: last.ts_ms,
             id: last.id,
-        }
-    });
+        });
     Ok(SessionMarkerPage {
         markers,
         next_cursor,
@@ -3512,13 +3512,13 @@ pub fn session_tool_calls_page(
     if has_more {
         tool_calls.truncate(limit as usize);
     }
-    let next_cursor = has_more.then(|| {
-        let last = tool_calls.last().expect("non-empty page");
-        SessionEvidenceCursor {
+    let next_cursor = tool_calls
+        .last()
+        .filter(|_| has_more)
+        .map(|last| SessionEvidenceCursor {
             ts_ms: last.ts_ms,
             id: last.id,
-        }
-    });
+        });
     Ok(SessionToolCallPage {
         tool_calls,
         next_cursor,
@@ -3553,13 +3553,13 @@ pub fn session_file_edits_page(
     if has_more {
         file_edits.truncate(limit as usize);
     }
-    let next_cursor = has_more.then(|| {
-        let last = file_edits.last().expect("non-empty page");
-        SessionEvidenceCursor {
+    let next_cursor = file_edits
+        .last()
+        .filter(|_| has_more)
+        .map(|last| SessionEvidenceCursor {
             ts_ms: last.ts_ms,
             id: last.id,
-        }
-    });
+        });
     Ok(SessionFileEditPage {
         file_edits,
         next_cursor,
@@ -3799,13 +3799,13 @@ fn read_user_turns(
 
     let user_turns = fill_user_turns(conn, source, session_id, &headers)?;
 
-    let next_cursor = has_more.then(|| {
-        let last = user_turns.last().expect("non-empty page");
-        SessionEventCursor {
+    let next_cursor = user_turns
+        .last()
+        .filter(|_| has_more)
+        .map(|last| SessionEventCursor {
             ts_ms: last.ts_ms,
             id: last.id,
-        }
-    });
+        });
     // Read-only: nothing to commit, and an explicit rollback releases the
     // snapshot rather than leaving it to drop order.
     if let Some(snapshot) = snapshot {
@@ -3875,8 +3875,7 @@ fn fill_user_turns(
     let last_block_ts = headers
         .iter()
         .map(|header| header.last_ts_ms)
-        .max()
-        .expect("non-empty page");
+        .fold(first.last_ts_ms, std::cmp::Ord::max);
     let by_key: std::collections::HashMap<&str, usize> = headers
         .iter()
         .enumerate()

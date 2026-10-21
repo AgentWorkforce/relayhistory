@@ -55,44 +55,35 @@ fn filesystem_keeps_change_time_cached(_path: &Path, _metadata: &fs::Metadata) -
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 fn statfs_keeps_change_time(path: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
-    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+    let Ok(stat) = rustix::fs::statfs(path) else {
         return false;
     };
-    let mut stat = std::mem::MaybeUninit::<libc::statfs>::zeroed();
-    // SAFETY: `statfs` writes a complete `statfs` on success and reads only
-    // the NUL-terminated path; both pointers are to live locals.
-    if unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
-        return false;
-    }
-    // SAFETY: `statfs` returned 0, so the struct is initialized.
-    let stat = unsafe { stat.assume_init() };
-    // SAFETY: the kernel NUL-terminates `f_fstypename` within its bounds.
-    let name = unsafe { std::ffi::CStr::from_ptr(stat.f_fstypename.as_ptr()) };
-    matches!(name.to_bytes(), b"apfs" | b"hfs")
+    // `f_fstypename` is a NUL-terminated name within a fixed-size array.
+    let name: Vec<u8> = stat
+        .f_fstypename
+        .iter()
+        .take_while(|&&byte| byte != 0)
+        .map(|&byte| byte.to_ne_bytes()[0])
+        .collect();
+    matches!(name.as_slice(), b"apfs" | b"hfs")
 }
 
 #[cfg(any(target_os = "linux", target_os = "android"))]
 fn statfs_keeps_change_time(path: &Path) -> bool {
-    use std::os::unix::ffi::OsStrExt;
     const EXT2_3_4: u64 = 0xEF53;
     const XFS: u64 = 0x5846_5342;
     const BTRFS: u64 = 0x9123_683E;
     const ZFS: u64 = 0x2FC1_2FC1;
     const TMPFS: u64 = 0x0102_1994;
     const F2FS: u64 = 0xF2F5_2010;
-    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+    let Ok(stat) = rustix::fs::statfs(path) else {
         return false;
     };
-    let mut stat = std::mem::MaybeUninit::<libc::statfs>::zeroed();
-    // SAFETY: as above.
-    if unsafe { libc::statfs(path.as_ptr(), stat.as_mut_ptr()) } != 0 {
+    // `f_type`'s width and signedness differ by target; the magic is its low
+    // 32 bits either way.
+    let Ok(kind) = u64::try_from(i128::from(stat.f_type) & 0xFFFF_FFFF) else {
         return false;
-    }
-    // SAFETY: `statfs` returned 0, so the struct is initialized.
-    let stat = unsafe { stat.assume_init() };
-    #[allow(clippy::unnecessary_cast)]
-    let kind = (stat.f_type as u64) & 0xFFFF_FFFF;
+    };
     matches!(kind, EXT2_3_4 | XFS | BTRFS | ZFS | TMPFS | F2FS)
 }
 

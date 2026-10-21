@@ -834,7 +834,7 @@ pub fn run() -> Result<()> {
         Command::Show { id, json } => show_entry(&conn, id, json),
         Command::Context { id, window } => show_context(&conn, id, window),
         Command::Doctor { json } => doctor(&db_path, json),
-        Command::Compact { .. } => unreachable!("compact is dispatched before a connection opens"),
+        Command::Compact { .. } => anyhow::bail!("compact is dispatched before a connection opens"),
         Command::Pack {
             scope,
             query,
@@ -989,7 +989,7 @@ pub fn run() -> Result<()> {
         | Command::Sync { .. }
         | Command::Watch { .. }
         | Command::Ingest { .. } => {
-            unreachable!("sync commands are handled before opening the shared database")
+            anyhow::bail!("sync commands are handled before opening the shared database")
         }
         Command::Export {
             output,
@@ -3533,8 +3533,7 @@ fn load_sqlite_entries(path: &Path) -> Result<Vec<HistoryEntry>> {
 fn parse_date_ms(date: &str) -> Result<i64> {
     let parsed = chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")?;
     Ok(parsed
-        .and_hms_opt(0, 0, 0)
-        .unwrap()
+        .and_time(chrono::NaiveTime::MIN)
         .and_utc()
         .timestamp_millis())
 }

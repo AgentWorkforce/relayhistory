@@ -111,7 +111,10 @@ pub(super) fn capture(path: &Path, context: &AcquisitionContext<'_>) -> Result<A
         rows.iter().any(|r| r["type"] == "message"),
         "CODEBUDDY_INVALID_RECORD: no complete messages"
     );
-    let native = path.file_stem().and_then(|s| s.to_str()).unwrap();
+    let native = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .context("CODEBUDDY_INVALID_PATH: invalid session ID")?;
     for row in &rows {
         anyhow::ensure!(
             row.get("sessionId").is_none_or(|s| s == native),
@@ -138,14 +141,30 @@ pub(super) fn capture(path: &Path, context: &AcquisitionContext<'_>) -> Result<A
         payload: serde_json::json!({"sid":sid,"path":path,"rows":rows,"active":active,"partial":partial,"bytesSha256":hash}),
     })
 }
+/// Whether `row` is a native control fact rather than a conversation row.
+fn fact(row: &Value) -> Result<bool> {
+    Ok(format::fact_type(format::string(row, "type")?))
+}
+/// The conversation rows of `rows`, in order, with control facts dropped.
+fn conversation<'a>(rows: impl Iterator<Item = &'a Value>) -> Result<Vec<Value>> {
+    let mut out = Vec::new();
+    for row in rows {
+        if !fact(row)? {
+            out.push(row.clone());
+        }
+    }
+    Ok(out)
+}
 pub(super) fn active_rows(rows: &[Value]) -> Result<Vec<Value>> {
-    let pending = rows
-        .iter()
-        .rev()
-        .find(|r| {
-            !format::fact_type(r["type"].as_str().unwrap()) || r["type"] == "resend-fork-notice"
-        })
-        .filter(|r| r["type"] == "resend-fork-notice");
+    let mut pending = None;
+    for row in rows.iter().rev() {
+        if row["type"] == "resend-fork-notice" {
+            pending = Some(row);
+        }
+        if pending.is_some() || !fact(row)? {
+            break;
+        }
+    }
     if let Some(pending) = pending {
         return walk_history(rows, pending["parentId"].as_str());
     }
@@ -155,17 +174,15 @@ pub(super) fn active_rows(rows: &[Value]) -> Result<Vec<Value>> {
             || format::truthy(&r["providerData"]["contentFilterNotice"])
     });
     if !parents || !fork {
-        return Ok(rows
-            .iter()
-            .filter(|r| !format::fact_type(r["type"].as_str().unwrap()))
-            .cloned()
-            .collect());
+        return conversation(rows.iter());
     }
-    let tip = rows
-        .iter()
-        .rev()
-        .find(|r| !format::fact_type(r["type"].as_str().unwrap()))
-        .and_then(|r| r["id"].as_str());
+    let mut tip = None;
+    for row in rows.iter().rev() {
+        if !fact(row)? {
+            tip = row["id"].as_str();
+            break;
+        }
+    }
     walk_history(rows, tip)
 }
 fn walk_history<'a>(rows: &'a [Value], mut tip: Option<&'a str>) -> Result<Vec<Value>> {
@@ -197,9 +214,5 @@ fn walk_history<'a>(rows: &'a [Value], mut tip: Option<&'a str>) -> Result<Vec<V
         });
         end = index;
     }
-    Ok(selected
-        .into_iter()
-        .filter(|i| !format::fact_type(rows[*i]["type"].as_str().unwrap()))
-        .map(|i| rows[i].clone())
-        .collect())
+    conversation(selected.into_iter().map(|i| &rows[i]))
 }

@@ -175,12 +175,20 @@ fn content(conn: &Connection, base: &EventRow<'_>, value: &Value, keys: &mut Key
     for (index, block) in blocks.iter().enumerate() {
         let uid = format!("{}:{index}", base.message_id);
         let kind = block["type"].as_str().unwrap_or("unknown");
-        let (kind, text) = match kind {
-            "text" => ("text", block["text"].as_str().map(str::to_owned)),
-            "thinking" => ("thinking", block["thinking"].as_str().map(str::to_owned)),
+        let (kind, text, tool_use_id) = match kind {
+            "text" => ("text", block["text"].as_str().map(str::to_owned), None),
+            "thinking" => (
+                "thinking",
+                block["thinking"].as_str().map(str::to_owned),
+                None,
+            ),
             "toolCall" => {
                 call(conn, base, block, keys)?;
-                ("tool_use", Some(serde_json::to_string(block)?))
+                (
+                    "tool_use",
+                    Some(serde_json::to_string(block)?),
+                    Some(format::string(block, "id")?.to_owned()),
+                )
             }
             _ => {
                 opaque_block(conn, base, block, &uid, keys)?;
@@ -188,7 +196,7 @@ fn content(conn: &Connection, base: &EventRow<'_>, value: &Value, keys: &mut Key
             }
         };
         let facts = ToolResultFacts {
-            tool_use_id: (kind == "tool_use").then(|| block["id"].as_str().unwrap().to_owned()),
+            tool_use_id,
             ..Default::default()
         };
         insert_session_event(

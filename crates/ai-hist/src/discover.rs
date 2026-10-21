@@ -408,7 +408,7 @@ pub struct DiscoveryEnv<'a> {
     /// every candidate. Never set on the fingerprint environment: a partial
     /// listing must not become the cached picture of a source.
     path_scope: Option<crate::ingest::path_scope::PathScope>,
-    #[allow(dead_code)] // Used by provider-owned adapters.
+    /// Read by provider-owned adapters.
     pub(crate) provider_roots: crate::ProviderRoots,
 }
 
@@ -568,7 +568,6 @@ pub struct ScanEnv<'a> {
     /// Root of OpenCode's legacy `storage/` JSON tree.
     pub opencode_storage_dir: &'a Path,
     counters: &'a CounterCell,
-    #[allow(dead_code)]
     pub(crate) provider_roots: &'a crate::ProviderRoots,
 }
 
@@ -2207,7 +2206,7 @@ impl OpencodeProvider {
     /// layout — either it has the legacy JSON tree, or it has no OpenCode
     /// store at all.
     fn snapshot(&self, scan: &ScanEnv<'_>) -> Result<MutexGuard<'_, Option<OpencodeLive>>> {
-        let mut guard = self.live.lock().expect("opencode live snapshot lock");
+        let mut guard = self.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if guard.is_none() {
             let listing =
                 crate::paths::list_opencode_db_files(scan.opencode_db, scan.opencode_db_pinned);
@@ -2366,18 +2365,18 @@ struct OpencodePassGuard<'a> {
 
 impl Drop for OpencodePassGuard<'_> {
     fn drop(&mut self) {
-        *self.live.lock().expect("opencode live snapshot lock") = None;
+        *self.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 }
 
 impl ShallowSessionProvider for OpencodeProvider {
     fn begin_discovery_pass(&self) -> Result<Option<Box<dyn DiscoveryPassGuard + '_>>> {
-        let pass = self.pass.lock().expect("opencode discovery pass lock");
+        let pass = self.pass.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // A SourceRegistry retains this adapter across calls. Drop the last
         // call's SQLite transaction before detecting this call's layout, while
         // the pass lock prevents a concurrent call from replacing the state
         // between enumeration and reads.
-        *self.live.lock().expect("opencode live snapshot lock") = None;
+        *self.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         Ok(Some(Box::new(OpencodePassGuard {
             _pass: pass,
             live: &self.live,
@@ -2528,7 +2527,7 @@ impl ShallowSessionProvider for OpencodeProvider {
         // directory). Do not re-detect the host here: OpenCode can create its
         // SQLite store after JSON enumeration, and those locators must still
         // be read by the layout that produced them.
-        let guard = self.live.lock().expect("opencode live snapshot lock");
+        let guard = self.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if candidate.session_id.is_none() {
             // A store this run could not open: the engine reports the
             // failure against its path.
@@ -2749,7 +2748,7 @@ struct DevinReadSnapshot {
 
 impl DevinProvider {
     fn snapshot(&self, scan: &ScanEnv<'_>) -> Result<MutexGuard<'_, Option<DevinReadSnapshot>>> {
-        let mut guard = self.live.lock().expect("devin live snapshot lock");
+        let mut guard = self.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if guard.is_none() && crate::ingest::devin::sessions_db_path(scan.devin_dir).is_file() {
             *guard = Some(open_devin_snapshot(scan)?);
         }
@@ -2808,14 +2807,14 @@ struct DevinPassGuard<'a> {
 
 impl Drop for DevinPassGuard<'_> {
     fn drop(&mut self) {
-        *self.live.lock().expect("devin live snapshot lock") = None;
+        *self.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 }
 
 impl ShallowSessionProvider for DevinProvider {
     fn begin_discovery_pass(&self) -> Result<Option<Box<dyn DiscoveryPassGuard + '_>>> {
-        let pass = self.pass.lock().expect("devin discovery pass lock");
-        *self.live.lock().expect("devin live snapshot lock") = None;
+        let pass = self.pass.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *self.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         Ok(Some(Box::new(DevinPassGuard {
             _pass: pass,
             live: &self.live,
@@ -3031,7 +3030,7 @@ impl ShallowSessionProvider for DevinProvider {
         _catalog: Option<&Connection>,
         candidate: &Candidate,
     ) -> Result<Option<ShallowSession>> {
-        let guard = self.live.lock().expect("devin live snapshot lock");
+        let guard = self.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(snapshot) = guard.as_ref() else {
             return Ok(None);
         };
@@ -4695,12 +4694,15 @@ fn discover_sessions_with_worker_limit(
                         let outcome = provider.read_shallow(&scan, None, candidate);
                         results
                             .lock()
-                            .expect("window read results")
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
                             .push((entry_index, outcome));
                     });
                 }
             });
-            for (entry_index, outcome) in results.into_inner().expect("window read results") {
+            let results = results
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (entry_index, outcome) in results {
                 if let WindowEntry::Read { result, .. } = &mut entries[entry_index] {
                     *result = Some(outcome);
                 }

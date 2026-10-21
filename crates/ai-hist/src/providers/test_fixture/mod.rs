@@ -36,6 +36,17 @@ pub(crate) const ADAPTER: Option<ProviderAdapter> = Some(ProviderAdapter {
     },
     watch_roots: |roots| vec![WatchRoot::tree(directory(roots))],
 });
+fn invalid(field: &str) -> anyhow::Error {
+    anyhow::anyhow!("TEST_FIXTURE_INVALID_RECORD: missing {field}")
+}
+fn string<'a>(value: &'a Value, field: &str) -> Result<&'a str> {
+    value[field].as_str().ok_or_else(|| invalid(field))
+}
+fn messages(value: &Value) -> Result<&Vec<Value>> {
+    value["messages"]
+        .as_array()
+        .ok_or_else(|| invalid("messages"))
+}
 fn directory(roots: &ProviderRoots) -> PathBuf {
     roots.for_provider(ID)[0].clone()
 }
@@ -83,7 +94,7 @@ impl ShallowSessionProvider for Provider {
         let v: Value = serde_json::from_slice(&bytes)?;
         Ok(Some(ShallowSession {
             source: ID.into(),
-            session_id: v["id"].as_str().unwrap().into(),
+            session_id: string(&v, "id")?.into(),
             first_prompt: v["messages"][0]["text"].as_str().map(str::to_owned),
             raw_path: Some(c.locator.clone()),
             source_stamp: Some(c.stamp.clone()),
@@ -108,7 +119,7 @@ fn acquire(
     if let Some(sidecar) = value["sidecar"].as_str() {
         file_snapshot(context, vec![PathBuf::from(sidecar)])?;
     }
-    let records = value["messages"].as_array().unwrap().len() as i64;
+    let records = messages(&value)?.len() as i64;
     Ok(AcquiredSession::new(
         value,
         bytes.len() as i64,
@@ -117,13 +128,13 @@ fn acquire(
     ))
 }
 fn normalize(conn: &Connection, payload: &Value, path: &Path) -> Result<usize> {
-    let id = payload["id"].as_str().unwrap();
+    let id = string(payload, "id")?;
     let mut inserted = 0;
-    for message in payload["messages"].as_array().unwrap() {
-        let text = message["text"].as_str().unwrap();
-        let mid = message["id"].as_str().unwrap();
-        let role = message["role"].as_str().unwrap();
-        let ts = message["ts"].as_i64().unwrap();
+    for message in messages(payload)? {
+        let text = string(message, "text")?;
+        let mid = string(message, "id")?;
+        let role = string(message, "role")?;
+        let ts = message["ts"].as_i64().ok_or_else(|| invalid("ts"))?;
         if role == "user" {
             inserted += crate::insert_history(
                 conn,
@@ -189,8 +200,11 @@ fn ingest(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
         .insert("upgraded".into(), Value::Bool(ctx.parser_upgrade));
     let snapshot = ctx
         .provider_session
-        .expect("provider payload carried into destination transaction");
-    normalize(ctx.conn, &snapshot.payload, ctx.path.unwrap())?;
+        .ok_or_else(|| anyhow::anyhow!("missing test fixture snapshot"))?;
+    let path = ctx
+        .path
+        .ok_or_else(|| anyhow::anyhow!("missing test fixture session path"))?;
+    normalize(ctx.conn, &snapshot.payload, path)?;
     Ok((
         IngestOutcome {
             records: snapshot.records,

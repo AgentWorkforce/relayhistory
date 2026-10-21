@@ -15,7 +15,7 @@ use rusqlite::{Connection, OptionalExtension};
 /// reports it, and must re-stamp that row even though `sessions` itself was
 /// not written — a subagent cleanup that drops the local presence and keeps
 /// the remote one changes nothing else.
-pub(super) const PRESENCE_TRIGGERS: &[&str] = &[
+pub(super) const PRESENCE_TRIGGERS: &[&str; 3] = &[
     "change_feed_session_locations_insert",
     "change_feed_session_locations_update",
     "change_feed_session_locations_delete",
@@ -501,9 +501,7 @@ fn create_presence_triggers(conn: &Connection) -> Result<()> {
     };
     let stamp_new = stamp_session("NEW");
     let stamp_old = stamp_session("OLD");
-    let [insert, update, delete] = PRESENCE_TRIGGERS else {
-        unreachable!("three presence triggers")
-    };
+    let &[insert, update, delete] = PRESENCE_TRIGGERS;
     if !update_trigger_is_current(conn, update, PRESENCE_MOVED_GUARD)? {
         conn.execute_batch(&format!("DROP TRIGGER IF EXISTS {update};"))?;
     }

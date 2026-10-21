@@ -191,7 +191,7 @@ pub fn scan_codex_rollout_counted(path: &Path) -> Result<(Option<ContinuityEvide
     if first.trim().is_empty() {
         return Ok((None, bytes_read));
     }
-    let Ok(value) = serde_json::from_str::<Value>(first) else {
+    let Ok(value) = serde_json::from_str::<serde_json::Map<String, Value>>(first) else {
         return Ok((None, bytes_read));
     };
     if value.get("type").and_then(Value::as_str) != Some("session_meta") {
@@ -218,11 +218,7 @@ pub fn scan_codex_rollout_counted(path: &Path) -> Result<(Option<ContinuityEvide
         ),
         ..ContinuityEvidence::default()
     };
-    evidence.first_ts_ms = record_ts_ms(
-        value
-            .as_object()
-            .expect("session_meta line is an object here"),
-    );
+    evidence.first_ts_ms = record_ts_ms(&value);
     if let Some(target) = string_field(
         payload,
         &["continuedFromSessionId", "continued_from_session_id"],

@@ -304,7 +304,7 @@ impl<'de> Deserialize<'de> for ProviderRoots {
 }
 
 impl ProviderRoots {
-    #[allow(dead_code)] // Provider-owned adapters use this frozen map.
+    /// Provider-owned adapters read their roots from this frozen map.
     pub(crate) fn for_provider(&self, id: &str) -> &[PathBuf] {
         self.provider_roots
             .get(id)

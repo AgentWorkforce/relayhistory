@@ -64,7 +64,7 @@ fn read_head_records(
         return collect_head_records(io::Cursor::new(&bytes[..]), limit, skip_unparseable);
     }
     let mut shared = cold_read::open_shared(path)?;
-    let reader = BufReader::new(shared.file());
+    let reader = BufReader::new(shared.file()?);
     collect_head_records(reader, limit, skip_unparseable)
 }
 

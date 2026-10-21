@@ -64,7 +64,7 @@ pub(crate) fn store_cursor(
     key: &CursorKey<'_>,
     state: &TranscriptCursorState,
 ) -> Result<()> {
-    let encoded = state.encode();
+    let encoded = state.encode()?;
     let offset = state.committed_offset();
     let prefix_hash = state.prefix_hash();
     let dev_ino = state.dev_ino();

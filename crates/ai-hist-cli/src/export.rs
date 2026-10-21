@@ -26,23 +26,22 @@ pub(crate) fn export_history(
         matches!(format, "sqlite" | "jsonl"),
         "unsupported export format '{format}'"
     );
+    // A sqlite export always has a destination, so the format travels with it.
     let dest = match (format, output) {
-        ("sqlite", None) => Some(Path::new(DEFAULT_SQLITE_EXPORT)),
-        (_, output) => output,
+        ("sqlite", output) => Some((true, output.unwrap_or(Path::new(DEFAULT_SQLITE_EXPORT)))),
+        (_, output) => output.map(|output| (false, output)),
     };
     // An existing symlink destination is written through, to its target, as
     // a direct write would; the rename below would otherwise replace the link.
-    let target = dest.map(follow_destination_symlink);
-    if let (Some(dest), Some(target)) = (dest, target.as_deref()) {
+    let dest = dest.map(|(sqlite, dest)| (sqlite, dest, follow_destination_symlink(dest)));
+    if let Some((_, dest, target)) = &dest {
         ensure_export_spares_active_database(conn, active_db, dest, target)?;
     }
     let rows = export_rows(conn, source, project, since)?;
     if rows.is_empty() {
         anyhow::bail!("No entries matched the export filters.");
     }
-    if format == "sqlite" {
-        let dest = dest.expect("a sqlite export always has a destination");
-        let target = target.as_deref().expect("resolved alongside dest");
+    if let Some((true, dest, target)) = &dest {
         let inserted = write_sqlite_export(&rows, target)?;
         println!("Exported {inserted} entries to {}", dest.display());
         return Ok(());
@@ -59,8 +58,8 @@ pub(crate) fn export_history(
         });
         writeln!(&mut body, "{}", serde_json::to_string(&row)?)?;
     }
-    if let (Some(path), Some(target)) = (dest, target.as_deref()) {
-        let mut staged = staged_export_file(target)?;
+    if let Some((_, path, target)) = dest {
+        let mut staged = staged_export_file(&target)?;
         if path.extension().and_then(|s| s.to_str()) == Some("gz") {
             let mut enc = GzEncoder::new(staged.as_file_mut(), Compression::default());
             enc.write_all(&body)?;
@@ -69,7 +68,7 @@ pub(crate) fn export_history(
             staged.write_all(&body)?;
         }
         staged.as_file().sync_all()?;
-        persist_export(staged, target)?;
+        persist_export(staged, &target)?;
         eprintln!("Exported {} entries to {}", rows.len(), path.display());
     } else {
         io::stdout().write_all(&body)?;

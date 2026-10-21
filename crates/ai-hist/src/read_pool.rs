@@ -233,11 +233,7 @@ impl PooledConnection {
         name: &'static str,
         check: impl FnOnce(&Connection) -> anyhow::Result<bool>,
     ) -> anyhow::Result<bool> {
-        let conn = self
-            .conn
-            .as_ref()
-            .expect("a pooled connection is present until drop");
-        let version: i64 = conn.query_row("PRAGMA schema_version", [], |row| row.get(0))?;
+        let version: i64 = self.query_row("PRAGMA schema_version", [], |row| row.get(0))?;
         if version != self.gates.schema_version {
             self.gates = Gates {
                 schema_version: version,
@@ -247,7 +243,7 @@ impl PooledConnection {
         if self.gates.passed.contains(&name) {
             return Ok(true);
         }
-        let passed = check(conn)?;
+        let passed = check(self)?;
         if passed {
             self.gates.passed.push(name);
         }
