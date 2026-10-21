@@ -18,4 +18,4 @@ with sqlite3.connect(capture / "legacy-index.db") as connection:
     ]
 text = "PRAGMA foreign_keys=OFF;\n" + "\n".join(statements) + "\n"
 text = text.replace(str(capture / "home"), "/synthetic/hermes-pre-intake-home")
-output.write_text(text)
+output.write_text(text, encoding="utf-8", newline="\n")

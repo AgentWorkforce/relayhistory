@@ -324,3 +324,14 @@ Focused acceptance: 5 Hermes, 29 Kimi and 22 source-intake tests pass with
 `cargo +1.99.0 test -p ai-hist --all-features --test provider_hermes
 --test provider_kimi --test source_intake`. Broader and independent review gates
 are recorded in the pull request once completed.
+
+Review added a History-only transport case: a managed remote prompt must remain
+protected even when the imported snapshot contains no session events. The guard
+matches the remote observation's recorded History identity to the canonical row;
+a local-first row merely observed remotely remains locally writable. The new
+regression first failed because conflicting hydration succeeded. It now exercises
+both immediate conflict and a matching hydration followed by a conflict, alongside
+a local-first/unmanaged control. The query drives from session-scoped observation
+evidence and uses the unique history key; EXPLAIN on the restored fixture confirms
+indexed lookups for both tables. The dump reproducer explicitly writes UTF-8/LF,
+including the native non-ASCII session identifier.

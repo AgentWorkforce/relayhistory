@@ -108,6 +108,32 @@ fn export(home: &Path) -> Vec<HistoryExportRecord> {
     assert_eq!(records.len(), 18);
     records
 }
+fn history_archive(home: &Path) -> Vec<HistoryExportRecord> {
+    let mut snapshot = ExportSnapshot::open(
+        rusqlite::Connection::open(home.join("ledger.db")).unwrap(),
+        &ExportSelection {
+            sessions: vec![SessionIdentity {
+                source: "hermes".into(),
+                session_id: SID.into(),
+            }],
+            kinds: vec!["history".into()],
+            ..Default::default()
+        },
+        &ExportLimits::default(),
+        60_000,
+        1_000,
+    )
+    .unwrap();
+    let mut cursor = Some(snapshot.handle().cursor);
+    let mut archive = Vec::new();
+    while let Some(value) = cursor {
+        let page = snapshot.page(&value, 1_000).unwrap();
+        cursor = page.next_cursor;
+        archive.extend(page.records);
+    }
+    assert!(!archive.is_empty(), "native export contains history rows");
+    archive
+}
 fn records(archive: &[HistoryExportRecord]) -> Vec<EvidenceRecord> {
     archive
         .iter()
@@ -415,4 +441,115 @@ fn hermes_conflicting_native_rewrite_rolls_back_remote_backed_evidence() {
     assert_same(&read(&store), &expected);
     assert_location(home.path(), "remote");
     assert_no_evidence_changes(&store, before);
+}
+
+#[test]
+fn hermes_history_only_remote_intake_survives_conflicting_native_rewrite() {
+    let origin = tempfile::tempdir().unwrap();
+    stage(origin.path());
+    let original = open(origin.path());
+    hydrate(&original);
+    let archive = history_archive(origin.path());
+    for matching_first in [false, true] {
+        let home = tempfile::tempdir().unwrap();
+        let store = open(home.path());
+        observe(&store);
+        let revision = store.source_observation(&key()).unwrap().revision.unwrap();
+        store
+            .apply_source_evidence(
+                SourceEvidenceSubmission::new(
+                    key(),
+                    revision,
+                    NormalizedSourceEvidence {
+                        source_stamp: "native-history-only".into(),
+                        source_bytes: 0,
+                        covered_kinds: vec![EvidenceKind::History],
+                        records: records(&archive),
+                    },
+                )
+                .include_related(false),
+            )
+            .unwrap();
+        let remote = read(&store);
+        assert!(!remote.prompts.is_empty());
+        stage(home.path());
+        if matching_first {
+            hydrate(&store);
+            assert_eq!(
+                read(&store).prompts,
+                remote.prompts,
+                "matching native history is accepted"
+            );
+        }
+        let prior = read(&store);
+        let native = rusqlite::Connection::open(home.path().join(".hermes/state.db")).unwrap();
+        native
+            .execute(
+                "UPDATE messages SET content='Conflicting native history rewrite' WHERE id=1",
+                [],
+            )
+            .unwrap();
+        drop(native);
+        store
+            .discover(DiscoveryOptions::default().sources([Source::Hermes]))
+            .unwrap();
+        let before = store.head_revision().unwrap();
+        let error = store
+            .hydrate(&reference(), HydrateOptions::default())
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("HERMES_SHARED_EVIDENCE_CONFLICT"));
+        assert_eq!(read(&store).prompts, prior.prompts);
+        assert_eq!(store.head_revision().unwrap(), before);
+    }
+}
+
+#[test]
+fn hermes_local_only_history_rewrite_remains_allowed() {
+    let home = tempfile::tempdir().unwrap();
+    stage(home.path());
+    let store = open(home.path());
+    hydrate(&store);
+    let archive = history_archive(home.path());
+    observe(&store);
+    let revision = store.source_observation(&key()).unwrap().revision.unwrap();
+    store
+        .apply_source_evidence(
+            SourceEvidenceSubmission::new(
+                key(),
+                revision,
+                NormalizedSourceEvidence {
+                    source_stamp: "local-first-history".into(),
+                    source_bytes: 0,
+                    covered_kinds: vec![EvidenceKind::History],
+                    records: records(&archive),
+                },
+            )
+            .include_related(false),
+        )
+        .unwrap();
+    // Local-first canonical ownership remains local even when an equivalent
+    // remote observation exists; only remotely managed history is protected.
+    let conn = rusqlite::Connection::open(home.path().join("ledger.db")).unwrap();
+    let managed: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM observation_evidence WHERE source='hermes' AND session_id=?1 AND location='remote' AND json_extract(payload_json,'$.item.record.kind')='history' AND json_extract(payload_json,'$.item.managed')=1",
+            [SID],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(managed, 0);
+    drop(conn);
+    let original = read(&store);
+    let native = rusqlite::Connection::open(home.path().join(".hermes/state.db")).unwrap();
+    native
+        .execute(
+            "UPDATE messages SET content='Allowed local history rewrite' WHERE id=1",
+            [],
+        )
+        .unwrap();
+    drop(native);
+    hydrate(&store);
+    assert_ne!(read(&store).prompts, original.prompts);
 }

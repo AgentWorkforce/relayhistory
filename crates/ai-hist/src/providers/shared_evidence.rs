@@ -38,6 +38,34 @@ impl Snapshot {
                 rows.insert((table, row.get(key_index)?), fingerprint(row, &columns)?);
             }
         }
+        // History has no location column. Match its canonical key to records
+        // that remote intake actually owns; merely having remote observation
+        // data for the session must not freeze local-only prompts.
+        let columns = EvidenceKind::History
+            .owned_columns()
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        let selected_columns = columns
+            .iter()
+            .map(|name| format!("h.{name} AS {name}"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let mut statement = conn.prepare(&format!(
+            "SELECT {selected_columns} FROM observation_evidence oe CROSS JOIN history h \
+             WHERE oe.source=?1 AND oe.session_id=?2 AND oe.location='remote' \
+             AND h.source=oe.source AND h.session_id=oe.session_id \
+             AND h.timestamp_ms=json_extract(oe.payload_json,'$.item.record.payload.timestamp_ms') \
+             AND h.prompt=json_extract(oe.payload_json,'$.item.record.payload.prompt') \
+             AND json_extract(oe.payload_json,'$.item.managed')=1 \
+             AND json_extract(oe.payload_json,'$.item.record.kind')='history'"
+        ))?;
+        let mut selected = statement.query([source, sid])?;
+        while let Some(row) = selected.next()? {
+            let timestamp_ms: i64 = row.get("timestamp_ms")?;
+            let prompt: String = row.get("prompt")?;
+            let key = serde_json::to_string(&(timestamp_ms, prompt))?;
+            rows.insert(("history", key), fingerprint(row, &columns)?);
+        }
         Ok(Self { source, rows })
     }
     pub(crate) fn ensure_unchanged(&self, conn: &Connection, sid: &str) -> Result<()> {
