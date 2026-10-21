@@ -91,10 +91,10 @@ fn summary(
         .and_then(Path::parent)
         .context("JUNIE_INVALID_PATH: events parent")?;
     let index_path = parent.join("index.jsonl");
-    context.validate(&index_path)?;
     if !index_path.try_exists()? {
         return Ok((Value::Null, Vec::new(), None));
     }
+    context.validate(&index_path)?;
     anyhow::ensure!(
         std::fs::metadata(&index_path)?.len() <= INDEX_MAX as u64,
         "JUNIE_INDEX_TOO_LARGE: bounded index read exceeds 8 MiB"

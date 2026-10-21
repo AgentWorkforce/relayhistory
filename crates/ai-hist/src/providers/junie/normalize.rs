@@ -186,6 +186,11 @@ struct Emitted {
     assistant: Option<String>,
 }
 
+struct EmitWrites<'a> {
+    keys: &'a mut Keys,
+    desired: &'a mut Vec<(i64, String)>,
+}
+
 fn emit(
     conn: &Connection,
     sid: &str,
@@ -198,7 +203,15 @@ fn emit(
     let mut result = Emitted::default();
     let ts = format::time(row)?;
     if let Some(prompt) = format::human_text(row) {
-        return emit_user(conn, sid, cwd, row, index, ts, prompt, keys, desired);
+        return emit_user(
+            conn,
+            sid,
+            cwd,
+            row,
+            index,
+            prompt,
+            EmitWrites { keys, desired },
+        );
     }
     if row["kind"] != "SessionA2uxEvent" {
         return Ok(result);
@@ -242,7 +255,15 @@ fn emit(
             }
         }
         "ToolBlockUpdatedEvent" => {
-            emit_tool(conn, sid, cwd, agent, index, ts, mid, keys, desired)?;
+            emit_tool(
+                conn,
+                sid,
+                cwd,
+                agent,
+                index,
+                ts,
+                EmitWrites { keys, desired },
+            )?;
         }
         _ => {}
     }
@@ -255,11 +276,10 @@ fn emit_user(
     cwd: Option<&str>,
     row: &Value,
     index: usize,
-    ts: i64,
     prompt: &str,
-    keys: &mut Keys,
-    desired: &mut Vec<(i64, String)>,
+    writes: EmitWrites<'_>,
 ) -> Result<Emitted> {
+    let ts = format::time(row)?;
     let fallback = format!("journal:{index:020}");
     let mid = row["requestId"]
         .as_str()
@@ -283,10 +303,10 @@ fn emit_user(
             ..Default::default()
         },
     )?;
-    keys.events.insert(uid.clone());
-    desired.push((ts, uid));
+    writes.keys.events.insert(uid.clone());
+    writes.desired.push((ts, uid));
     let hash = crate::prompt_hash(prompt);
-    keys.prompts.insert(format!("{ts}:{hash}"));
+    writes.keys.prompts.insert(format!("{ts}:{hash}"));
     let prompts = insert_history(
         conn,
         &HistoryEntry {
@@ -313,9 +333,7 @@ fn emit_tool(
     agent: &Value,
     index: usize,
     ts: i64,
-    mid: &str,
-    keys: &mut Keys,
-    desired: &mut Vec<(i64, String)>,
+    writes: EmitWrites<'_>,
 ) -> Result<()> {
     let Some(native_id) = agent["stepId"].as_str().filter(|id| !id.is_empty()) else {
         return Ok(());
@@ -333,7 +351,7 @@ fn emit_tool(
         &ToolCallRef {
             source: ID,
             session_id: sid,
-            message_id: mid,
+            message_id: native_id,
             tool_use_id: native_id,
             ts_ms: ts,
             cwd,
@@ -344,7 +362,10 @@ fn emit_tool(
         "{}",
         is_error,
     )?;
-    keys.tools.insert(native_id.into());
+    writes.keys.tools.insert(native_id.into());
+    if is_error.is_some() {
+        writes.keys.results.insert(native_id.into());
+    }
     let facts = ToolResultFacts {
         tool_use_id: Some(native_id.into()),
         ..Default::default()
@@ -355,7 +376,7 @@ fn emit_tool(
         &EventRow {
             source: ID,
             session_id: sid,
-            message_id: mid,
+            message_id: native_id,
             ts_ms: ts,
             role: "assistant",
             kind: "tool_use",
@@ -368,8 +389,8 @@ fn emit_tool(
             ..Default::default()
         },
     )?;
-    keys.events.insert(uid.clone());
-    desired.push((ts, uid));
+    writes.keys.events.insert(uid.clone());
+    writes.desired.push((ts, uid));
     if let Some(output) = agent["output"].as_str() {
         let mut facts = ToolResultFacts::from_payload(&agent["output"]);
         facts.tool_use_id = Some(native_id.into());
@@ -393,7 +414,7 @@ fn emit_tool(
             &EventRow {
                 source: ID,
                 session_id: sid,
-                message_id: mid,
+                message_id: native_id,
                 ts_ms: ts,
                 role: "tool_result",
                 kind: "tool_result",
@@ -406,9 +427,9 @@ fn emit_tool(
                 ..Default::default()
             },
         )?;
-        keys.events.insert(uid.clone());
-        desired.push((ts, uid));
-        keys.results.insert(native_id.into());
+        writes.keys.events.insert(uid.clone());
+        writes.desired.push((ts, uid));
+        writes.keys.results.insert(native_id.into());
     }
     Ok(())
 }

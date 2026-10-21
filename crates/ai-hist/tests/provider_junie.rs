@@ -176,6 +176,29 @@ fn invalid_native_row_preserves_prior_evidence() {
 }
 
 #[test]
+fn terminal_native_tool_status_without_output_keeps_observed_success() {
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path());
+    let rows = std::fs::read_to_string(&path)
+        .unwrap()
+        .replace(",\"output\":\"blue\"", "");
+    std::fs::write(&path, rows).unwrap();
+    let store = open(home.path());
+    store
+        .discover(DiscoveryOptions::default().sources([Source::Junie]))
+        .unwrap();
+    store
+        .hydrate(
+            &SessionRef::id(Source::Junie, SID),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    let result = evidence(&store);
+    assert_eq!(result.tool_calls[0].is_error, Some(false));
+    assert!(result.tool_results.is_empty());
+}
+
+#[test]
 fn optional_index_partial_tail_keeps_native_journal_readable_and_oversize_is_diagnostic() {
     let home = tempfile::tempdir().unwrap();
     stage(home.path());
@@ -252,6 +275,10 @@ fn explicit_roots_isolate_equal_native_ids_and_empty_default_is_safe() {
         let target = root.join(SID).join("events.jsonl");
         std::fs::create_dir_all(target.parent().unwrap()).unwrap();
         std::fs::copy(&native, target).unwrap();
+        assert!(
+            !root.join("index.jsonl").exists(),
+            "optional metadata is absent"
+        );
     }
     let mut roots = serde_json::to_value(ProviderRoots::from_home(
         home.path().into(),
