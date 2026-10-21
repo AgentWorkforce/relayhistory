@@ -46,6 +46,26 @@ fn evidence(store: &SessionStore) -> ai_hist::SessionEvidence {
         .unwrap()
 }
 
+fn project_facts(db: &Path) -> (Option<String>, Option<String>, Option<String>) {
+    let conn = rusqlite::Connection::open(db).unwrap();
+    let cwd = conn
+        .query_row(
+            "SELECT cwd FROM sessions WHERE source='junie' AND session_id=?1",
+            [SID],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let history_project = conn
+        .query_row(
+            "SELECT project FROM history WHERE source='junie' AND session_id=?1 LIMIT 1",
+            [SID],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let event_project = conn.query_row("SELECT project FROM session_events WHERE source='junie' AND session_id=?1 AND role='user' LIMIT 1", [SID], |row| row.get(0)).unwrap();
+    (cwd, history_project, event_project)
+}
+
 #[test]
 fn junie_public_history_conformance() {
     let home = tempfile::tempdir().unwrap();
@@ -495,6 +515,39 @@ fn malformed_optional_index_keeps_verified_journal_and_prior_title() {
 }
 
 #[test]
+fn missing_optional_index_preserves_verified_local_project_facts() {
+    let home = tempfile::tempdir().unwrap();
+    stage(home.path());
+    let store = open(home.path());
+    let reference = SessionRef::id(Source::Junie, SID);
+    store
+        .discover(DiscoveryOptions::default().sources([Source::Junie]))
+        .unwrap();
+    store
+        .hydrate(&reference, HydrateOptions::default())
+        .unwrap();
+    let db = home.path().join("junie.db");
+    let before = project_facts(&db);
+    assert_eq!(
+        before,
+        (
+            Some("/synthetic/project".into()),
+            Some("/synthetic/project".into()),
+            Some("/synthetic/project".into())
+        )
+    );
+    std::fs::remove_file(home.path().join(".junie/sessions/index.jsonl")).unwrap();
+    store
+        .discover(DiscoveryOptions::default().sources([Source::Junie]))
+        .unwrap();
+    store
+        .hydrate(&reference, HydrateOptions::default())
+        .unwrap();
+    assert_eq!(project_facts(&db), before);
+    assert_eq!(evidence(&store).tool_calls[0].tool_use_id, "step-tool-1");
+}
+
+#[test]
 fn native_index_rename_refreshes_full_catalog_on_discovery() {
     let home = tempfile::tempdir().unwrap();
     stage(home.path());
@@ -639,6 +692,7 @@ fn explicit_roots_isolate_equal_native_ids_and_empty_default_is_safe() {
 #[cfg(feature = "unstable-internal")]
 #[test]
 fn remote_evidence_accepts_matching_local_share_but_rejects_conflicting_rewrite() {
+    use ai_hist::{SessionLocation, ShallowSession, SourceObservation, SourceObservationBatch};
     let home = tempfile::tempdir().unwrap();
     let path = stage(home.path());
     let store = open(home.path());
@@ -673,6 +727,40 @@ fn remote_evidence_accepts_matching_local_share_but_rejects_conflicting_rewrite(
         let count: i64 = conn.query_row(&format!("SELECT count(*) FROM {table} WHERE source='junie' AND session_id=?1 AND location!='both'"), [SID], |r| r.get(0)).unwrap();
         assert_eq!(count, 0, "{table} did not gain a local share");
     }
+    let before_projects = project_facts(&home.path().join("junie.db"));
+    store
+        .apply_source_observations(SourceObservationBatch::new(
+            "different-project-fixture",
+            "default",
+            SessionLocation::Remote,
+            vec![SourceObservation {
+                session: ShallowSession {
+                    source: "junie".into(),
+                    session_id: SID.into(),
+                    cwd: Some("/remote/different-project".into()),
+                    source_stamp: Some("remote-project-only".into()),
+                    ..Default::default()
+                },
+                raw_locator: None,
+            }],
+        ))
+        .unwrap();
+    assert_eq!(
+        project_facts(&home.path().join("junie.db")).0.as_deref(),
+        Some("/remote/different-project")
+    );
+    std::fs::remove_file(home.path().join(".junie/sessions/index.jsonl")).unwrap();
+    store
+        .discover(DiscoveryOptions::default().sources([Source::Junie]))
+        .unwrap();
+    store
+        .hydrate(&reference, HydrateOptions::default())
+        .unwrap();
+    assert_eq!(
+        project_facts(&home.path().join("junie.db")),
+        before_projects
+    );
+    assert_eq!(evidence(&store).messages, before.messages);
     let original = std::fs::read_to_string(&path).unwrap();
     std::fs::write(
         &path,

@@ -61,7 +61,11 @@ a diagnostic while verified journal evidence remains readable. An index path
 escaping the declared root remains a hard containment error. A complete native
 index title rename refreshes the catalog
 during discovery, including a previously fully hydrated row; blank or
-unavailable index titles do not clear it.
+unavailable index titles do not clear it. When index metadata is unavailable,
+a full local capture at the same journal locator also preserves its verified
+project directory for event, history and catalog reconciliation. A remote-only
+or discovery-only catalog row does not supply that fact; an explicit native
+summary without `projectDir` does not use the fallback.
 Unsupported event shapes fail visibly, while unknown evidence is
 preserved as bounded markers. A complete journal rewrite retires stale local
 evidence; an incomplete final JSONL line defers replacement. No native resume

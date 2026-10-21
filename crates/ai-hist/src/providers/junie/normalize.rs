@@ -5,6 +5,7 @@ use crate::ingest::{
 };
 use crate::providers::file_history::{self, Keys};
 use crate::{insert_history, insert_session_marker, HistoryEntry, NewSessionMarker};
+use rusqlite::OptionalExtension;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -12,19 +13,61 @@ pub(super) fn check_identity(conn: &Connection, sid: &str, path: &Path) -> Resul
     file_history::check_identity(conn, ID, "JUNIE", sid, path)
 }
 
-pub(super) fn write(conn: &Connection, payload: &Value) -> Result<usize> {
-    let sid = format::string(payload, "sid")?;
-    let path = Path::new(format::string(payload, "path")?);
-    check_identity(conn, sid, path)?;
-    if payload["partial"] == true {
-        return Ok(0);
+fn project_dir(
+    conn: &Connection,
+    sid: &str,
+    path: &Path,
+    summary: &Value,
+) -> Result<Option<String>> {
+    if let Some(cwd) = summary["projectDir"].as_str() {
+        return Ok(Some(cwd.to_owned()));
     }
+    if !summary.is_null() {
+        // A present native summary without a project is authoritative absence.
+        return Ok(None);
+    }
+    // Missing/unreadable optional metadata cannot retract the project from a
+    // prior full local capture at this same native locator. The shared catalog
+    // cwd may have since been replaced by a remote observation, so take the
+    // prior event fact only from a local or shared-local evidence row.
+    Ok(conn
+        .query_row(
+            "SELECT MIN(e.cwd) FROM session_events e \
+             JOIN session_presences p USING (source,session_id) \
+             WHERE e.source=?1 AND e.session_id=?2 AND p.location='local' \
+             AND p.discovery_state='full' AND p.raw_locator=?3 \
+             AND e.location IN ('local','both') AND e.cwd IS NOT NULL \
+             GROUP BY e.source,e.session_id HAVING COUNT(DISTINCT e.cwd)=1",
+            rusqlite::params![ID, sid, path.to_string_lossy()],
+            |row| row.get(0),
+        )
+        .optional()?)
+}
+
+fn journal_rows(payload: &Value) -> Result<&[Value]> {
     let rows = payload["rows"]
         .as_array()
         .context("JUNIE_INVALID_JOURNAL: rows")?;
     anyhow::ensure!(!rows.is_empty(), "JUNIE_EMPTY_JOURNAL: no event rows");
+    Ok(rows)
+}
+
+fn captured_identity(payload: &Value) -> Result<(&str, &Path)> {
+    let sid = format::string(payload, "sid")?;
+    let path = Path::new(format::string(payload, "path")?);
+    Ok((sid, path))
+}
+
+pub(super) fn write(conn: &Connection, payload: &Value) -> Result<usize> {
+    let (sid, path) = captured_identity(payload)?;
+    check_identity(conn, sid, path)?;
+    if payload["partial"] == true {
+        return Ok(0);
+    }
+    let rows = journal_rows(payload)?;
     let summary = &payload["summary"];
-    let cwd = summary["projectDir"].as_str();
+    let cwd_value = project_dir(conn, sid, path, summary)?;
+    let cwd = cwd_value.as_deref();
     let shared = crate::providers::shared_evidence::Snapshot::capture(conn, ID, sid)?;
     let live = last_block_updates(rows);
     let mut keys = Keys::default();
