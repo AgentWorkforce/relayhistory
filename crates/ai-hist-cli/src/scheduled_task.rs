@@ -387,9 +387,12 @@ fn register(spec: &ServiceSpec, minutes: u64, wrapper: &Path) -> Result<()> {
         .context("creating the task definition file")?;
     fs::write(definition.path(), utf16le_with_bom(&xml))
         .with_context(|| format!("writing {}", definition.path().display()))?;
+    // schtasks cannot open a file another handle holds for writing (sharing
+    // violation), so close ours and keep only the self-deleting path.
+    let definition = definition.into_temp_path();
 
     let name = task_name(spec);
-    let xml_path = definition.path().display().to_string();
+    let xml_path = definition.display().to_string();
     schtasks_checked(&["/Create", "/TN", &name, "/XML", &xml_path, "/F"])
 }
 
