@@ -8,7 +8,6 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- The relay roster, status, join and leave tools look for Agent Relay desktop on Windows: after `AGENT_RELAY_SOCKET` and the `~/.agentworkforce/desktop/relay-socket` pointer (a named pipe such as `\\.\pipe\…`), they try the per-user pipes `\\.\pipe\agent-relay-<user>` and `\\.\pipe\agent-relay-dev-<user>`.
 - Windows arm64 (`aarch64-pc-windows-msvc`) is supported: `npm install` pulls the prebuilt `ai-hist-native-win32-arm64-msvc` addon, and `@relayhistory/provider-sources` ships a native `win32-arm64-msvc` helper.
 - Qwen Code interactive session history is discoverable and searchable from native transcript files, preserving the active conversation branch, recorded messages and tool evidence.
 - Kimi Code history is discoverable and searchable from current native session journals, including recorded messages, tools and separate subagent transcripts.
@@ -17,6 +16,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - A desktop socket pointer file with more than one line (LF or CRLF) names the socket by its first line instead of never connecting.
+- The relay roster, status, join and leave tools move on to the next desktop socket candidate when a Windows named pipe is busy, and report `socket_busy` (not "desktop isn't running") when none answers.
 
 ### Rust API
 

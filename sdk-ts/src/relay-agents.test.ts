@@ -412,23 +412,22 @@ test('Linux discovery tries both runtime and data-directory defaults', async () 
   ]);
 });
 
-test('Windows discovery tries per-user named pipes for both builds', async () => {
-  const paths = await relaySocketCandidates({
-    env: { AGENT_RELAY_SOCKET: '\\\\.\\pipe\\chosen', USERNAME: 'Alice Smith' },
-    home: 'C:\\Users\\alice', platform: 'win32', temporaryDirectory: 'C:\\Temp', uid: 0,
-  });
-  assert.deepEqual(paths, [
-    '\\\\.\\pipe\\chosen',
-    '\\\\.\\pipe\\agent-relay-alice_smith',
-    '\\\\.\\pipe\\agent-relay-dev-alice_smith',
-  ]);
-});
-
-test('Windows discovery names the pipes from the home directory without USERNAME', async () => {
-  const paths = await relaySocketCandidates({
-    env: {}, home: 'C:\\Users\\Bob\\', platform: 'win32', temporaryDirectory: 'C:\\Temp', uid: 0,
-  });
-  assert.deepEqual(paths, ['\\\\.\\pipe\\agent-relay-bob', '\\\\.\\pipe\\agent-relay-dev-bob']);
+test('Windows discovery has no fixed default pipe another process could claim first', async () => {
+  // Pipe names are machine-wide, so only a pipe the desktop publishes is tried.
+  const root = await mkdtemp(join(tmpdir(), 'relay-agents-win32-'));
+  try {
+    const published = await relaySocketCandidates({
+      env: { AGENT_RELAY_SOCKET: '\\\\.\\pipe\\chosen', USERNAME: 'alice' },
+      home: root, platform: 'win32', temporaryDirectory: root, uid: 0,
+    });
+    assert.deepEqual(published, ['\\\\.\\pipe\\chosen']);
+    const unpublished = await relaySocketCandidates({
+      env: { USERNAME: 'alice' }, home: root, platform: 'win32', temporaryDirectory: root, uid: 0,
+    });
+    assert.deepEqual(unpublished, []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
 });
 
 test('a CRLF pointer file names only its first line', async (t) => {
@@ -442,11 +441,7 @@ test('a CRLF pointer file names only its first line', async (t) => {
     env: { USERNAME: 'alice' }, home: root, platform: 'win32', temporaryDirectory: root, uid: 0,
   });
 
-  assert.deepEqual(paths, [
-    '\\\\.\\pipe\\agent-relay-desktop',
-    '\\\\.\\pipe\\agent-relay-alice',
-    '\\\\.\\pipe\\agent-relay-dev-alice',
-  ]);
+  assert.deepEqual(paths, ['\\\\.\\pipe\\agent-relay-desktop']);
 });
 
 test('missing desktop is a clear non-fatal result', async () => {

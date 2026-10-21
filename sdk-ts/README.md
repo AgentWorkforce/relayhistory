@@ -246,12 +246,14 @@ The MCP-only `list_relay_agents` tool lists live relay participants, not
 history. `relay_status` reports whether the local session hosting the MCP server is reachable; `join_relay`
 makes that session reachable by teammates and agents, with optional
 public `name` and `description`; and `leave_relay` removes it. They make short
-local Unix-socket (on Windows, named-pipe) requests to Agent Relay desktop. Roster listing accepts
+local Unix-socket requests to Agent Relay desktop. Roster listing accepts
 optional `query`, `where` (`this_computer`, `cloud`, or `other_desktop`), and
 `include_idle` inputs. Socket discovery checks
 `AGENT_RELAY_SOCKET`, then the first line of `~/.agentworkforce/desktop/relay-socket`, then the
-macOS/Linux defaults or, on Windows, the per-user pipes
-`\\.\pipe\agent-relay-<user>` and `\\.\pipe\agent-relay-dev-<user>`. No Relaycast client or cloud credential is part of
+macOS/Linux defaults. Windows has no default: Agent Relay desktop does not yet
+listen on Windows, and when it does it must publish its named pipe through one
+of those two, since a fixed pipe name could be claimed first by another local
+process. No Relaycast client or cloud credential is part of
 ai-hist; when the desktop is absent the tool returns a clear non-fatal result.
 A connected desktop has a 15-second response deadline. If it does not answer in
 that time, the tool reports `timeout` distinctly from an absent app.
