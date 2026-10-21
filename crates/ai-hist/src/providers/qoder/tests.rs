@@ -23,13 +23,40 @@ fn relative_config_root_is_frozen_against_the_opening_cwd() {
     let root = tempfile::tempdir().unwrap();
     let home = root.path().join("home");
     let opening_cwd = root.path().join("first-workspace");
-    let config = expand(&home, &opening_cwd, "relative-qoder-config");
+    let config = expand(&home, "relative-qoder-config", || Ok(opening_cwd.clone())).unwrap();
     assert_eq!(
         config.join("projects"),
         opening_cwd.join("relative-qoder-config/projects")
     );
-    assert_eq!(expand(&home, &opening_cwd, "~/.qoder"), home.join(".qoder"));
-    assert_eq!(expand(&home, &opening_cwd, home.to_str().unwrap()), home);
+    assert_eq!(
+        expand(&home, "~/.qoder", || Ok(opening_cwd.clone())).unwrap(),
+        home.join(".qoder")
+    );
+    assert_eq!(
+        expand(&home, home.to_str().unwrap(), || Ok(opening_cwd)).unwrap(),
+        home
+    );
+}
+
+#[test]
+fn absolute_config_and_default_do_not_require_a_live_cwd() {
+    let home = tempfile::tempdir().unwrap();
+    let no_cwd = || Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+    let absolute = home.path().join("absolute-qoder");
+    assert_eq!(
+        expand(home.path(), "~/.qoder", no_cwd).unwrap(),
+        home.path().join(".qoder")
+    );
+    assert_eq!(
+        expand(home.path(), absolute.to_str().unwrap(), no_cwd).unwrap(),
+        absolute
+    );
+    assert_eq!(
+        expand(home.path(), "relative-qoder", no_cwd)
+            .unwrap_err()
+            .kind(),
+        std::io::ErrorKind::NotFound
+    );
 }
 
 #[cfg(unix)]
@@ -58,6 +85,16 @@ fn scoped_enumeration_does_not_open_unrelated_project() {
     std::fs::write(&selected, b"{}\n").unwrap();
     let unrelated = root.join("unrelated");
     std::fs::create_dir_all(&unrelated).unwrap();
+    struct RestorePermissions(PathBuf, std::fs::Permissions);
+    impl Drop for RestorePermissions {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, self.1.clone());
+        }
+    }
+    let _restore = RestorePermissions(
+        unrelated.clone(),
+        std::fs::metadata(&unrelated).unwrap().permissions(),
+    );
     std::fs::set_permissions(&unrelated, std::fs::Permissions::from_mode(0o000)).unwrap();
     if std::fs::read_dir(&unrelated).is_ok() {
         // Privileged test runners can bypass directory permissions.

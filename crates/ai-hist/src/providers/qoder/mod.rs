@@ -41,7 +41,11 @@ pub(crate) const ADAPTER: Option<ProviderAdapter> = Some(ProviderAdapter {
             .collect()
     },
 });
-fn expand(home: &Path, cwd: &Path, value: &str) -> PathBuf {
+fn expand(
+    home: &Path,
+    value: &str,
+    cwd: impl FnOnce() -> std::io::Result<PathBuf>,
+) -> std::io::Result<PathBuf> {
     let path = if value == "~" {
         home.to_path_buf()
     } else if let Some(rest) = value.strip_prefix("~/") {
@@ -50,14 +54,19 @@ fn expand(home: &Path, cwd: &Path, value: &str) -> PathBuf {
         PathBuf::from(value)
     };
     if path.is_absolute() {
-        path
+        Ok(path)
     } else {
-        cwd.join(path)
+        Ok(cwd()?.join(path))
     }
 }
 fn resolve_roots(home: &Path, use_env: bool) -> ResolvedProviderRoots {
-    let cwd = match std::env::current_dir() {
-        Ok(cwd) => cwd,
+    let value = use_env
+        .then(|| std::env::var("QODER_CONFIG_DIR").ok())
+        .flatten()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| "~/.qoder".into());
+    let config = match expand(home, &value, std::env::current_dir) {
+        Ok(config) => config,
         Err(error) => {
             return ResolvedProviderRoots {
                 error: Some(format!(
@@ -67,12 +76,6 @@ fn resolve_roots(home: &Path, use_env: bool) -> ResolvedProviderRoots {
             }
         }
     };
-    let config = use_env
-        .then(|| std::env::var("QODER_CONFIG_DIR").ok())
-        .flatten()
-        .filter(|value| !value.is_empty())
-        .map(|value| expand(home, &cwd, &value))
-        .unwrap_or_else(|| expand(home, &cwd, "~/.qoder"));
     vec![config.join("projects")].into()
 }
 
