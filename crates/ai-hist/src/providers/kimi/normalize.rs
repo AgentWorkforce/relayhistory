@@ -1,4 +1,5 @@
 use super::*;
+use crate::providers::shared_evidence::Snapshot;
 use crate::ingest::{
     insert_session_event, insert_tool_call, upsert_session_rebuilt, EventRow, SessionCatalogRow,
     ToolCallRef, ToolResultFacts,
@@ -19,7 +20,7 @@ pub(super) fn write(conn: &Connection, payload: &Value) -> Result<usize> {
     if !complete {
         return Ok(0);
     }
-    let shared = super::shared_evidence::Snapshot::capture(conn, sid)?;
+    let shared = Snapshot::capture(conn, ID, sid)?;
     let mut keys = Keys::default();
     let mut outcome = MessageOutcome::default();
     let mut first = i64::MAX;
@@ -73,7 +74,7 @@ fn finish(
     first: i64,
     last: i64,
     outcome: MessageOutcome,
-    shared: super::shared_evidence::Snapshot,
+    shared: Snapshot,
 ) -> Result<usize> {
     catalog(
         conn,
