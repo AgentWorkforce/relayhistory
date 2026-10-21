@@ -60,7 +60,7 @@ impl ShallowSessionProvider for Provider {
         ]
     }
     fn enumerate(&self, env: &DiscoveryEnv<'_>, limit: Option<usize>) -> Result<Vec<Candidate>> {
-        self.indexes.clear();
+        self.indexes.clear()?;
         storage::enumerate(env, limit)
     }
     fn read_access(&self) -> crate::discover::ShallowReadAccess {

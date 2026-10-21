@@ -14,12 +14,19 @@ pub(super) struct IndexCache {
 }
 
 impl IndexCache {
-    pub(super) fn clear(&self) {
-        self.roots.lock().unwrap().clear();
+    pub(super) fn clear(&self) -> Result<()> {
+        self.roots
+            .lock()
+            .map_err(|_| anyhow::anyhow!("JUNIE_INDEX_CACHE_POISONED"))?
+            .clear();
+        Ok(())
     }
 
     fn get(&self, context: &AcquisitionContext<'_>, root: &Path) -> Result<(Arc<IndexData>, bool)> {
-        let mut roots = self.roots.lock().unwrap();
+        let mut roots = self
+            .roots
+            .lock()
+            .map_err(|_| anyhow::anyhow!("JUNIE_INDEX_CACHE_POISONED"))?;
         if let Some(data) = roots.get(root) {
             return Ok((Arc::clone(data), false));
         }
