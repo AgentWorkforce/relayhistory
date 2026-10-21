@@ -4,7 +4,7 @@
 //! and `ai-hist.exe` is a console program, so the task runs a small generated
 //! `.cmd` wrapper through a headless console host:
 //!
-//! `conhost.exe --headless "<LOCALAPPDATA>\ai-hist\services\<log_stem>.cmd"`
+//! `conhost.exe --headless "<data dir>\ai-hist\services\<log_stem>.cmd"`
 //!
 //! The wrapper sets the captured provider environment (as the launchd plist's
 //! `EnvironmentVariables` and the cron line's `NAME=value` prefix do), runs
@@ -303,12 +303,16 @@ pub(crate) fn utf16le_with_bom(text: &str) -> Vec<u8> {
     bytes
 }
 
+/// The wrapper lives in ai-hist's data directory, beside the default database,
+/// not under `%LOCALAPPDATA%`: a packaged (MSIX) app redirects its children's
+/// AppData writes into a private package folder Task Scheduler cannot see, so
+/// a wrapper written there by `--install-service` from such an app never runs.
 fn wrapper_path(spec: &ServiceSpec) -> PathBuf {
-    let local_app_data = std::env::var_os("LOCALAPPDATA")
+    let data = std::env::var_os("XDG_DATA_HOME")
+        .filter(|dir| !dir.is_empty())
         .map(PathBuf::from)
-        .unwrap_or_else(|| ai_hist::paths::home_dir().join(r"AppData\Local"));
-    local_app_data
-        .join("ai-hist")
+        .unwrap_or_else(|| ai_hist::paths::home_dir().join(".local").join("share"));
+    data.join("ai-hist")
         .join("services")
         .join(format!("{}.cmd", spec.log_stem))
 }
