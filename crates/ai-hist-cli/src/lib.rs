@@ -60,15 +60,6 @@ impl SessionScopeArgs {
             SessionScope::Local
         }
     }
-
-    fn service_args(self) -> Vec<String> {
-        match self.resolve() {
-            SessionScope::Local if self.local => vec!["--local".to_string()],
-            SessionScope::Local => Vec::new(),
-            SessionScope::Remote => vec!["--remote".to_string()],
-            SessionScope::All => vec!["--all".to_string()],
-        }
-    }
 }
 
 #[derive(Parser)]
@@ -274,17 +265,6 @@ enum Command {
     Sync {
         #[command(flatten)]
         scope: SessionScopeArgs,
-        /// Install a background service (launchd on macOS, cron on Linux) that
-        /// runs `sync` on an interval so the database stays fresh automatically.
-        #[arg(long)]
-        install_service: bool,
-        /// Remove the background sync service installed by --install-service.
-        #[arg(long, conflicts_with = "install_service")]
-        uninstall_service: bool,
-        /// Seconds between syncs for the installed service (macOS only; cron
-        /// runs at 1-minute granularity).
-        #[arg(long, default_value_t = 60)]
-        interval: u64,
     },
     /// Repeatedly sync agent history using the requested configured connectors.
     ///
@@ -619,32 +599,7 @@ pub fn run() -> Result<()> {
     // Pre-dispatch them so the common connection setup below cannot initialize the schema or
     // wait on SQLite before contention is detected.
     match &cli.command {
-        Command::Sync {
-            scope,
-            install_service,
-            uninstall_service,
-            interval,
-        } => {
-            if *install_service {
-                if scope.resolve() == SessionScope::Remote {
-                    remote::ensure_selected_remote_connectors_configured_for(
-                        "sync",
-                        &[],
-                        &connectors,
-                    )?;
-                }
-                let mut service_args = scope.service_args();
-                if cli.no_source_connectors {
-                    service_args.push("--no-source-connectors".into());
-                }
-                for id in &cli.source_connectors {
-                    service_args.extend(["--source-connector".to_string(), id.clone()]);
-                }
-                return install_managed_service(&SYNC_SERVICE, *interval, &service_args);
-            }
-            if *uninstall_service {
-                return uninstall_managed_service(&SYNC_SERVICE);
-            }
+        Command::Sync { scope } => {
             return sync_scoped_at_with_output(
                 &db_path,
                 scope.resolve(),
@@ -2507,358 +2462,10 @@ fn run_hook_ingest(db_path: &Path, hook: &str, quiet: bool, json: bool) -> Resul
     Ok(())
 }
 
-/// A background service managed by ai-hist. Both the local `sync` job and the
-/// cloud `push` job share the same launchd/cron plumbing; only these fields
-/// differ.
-struct ServiceSpec {
-    /// launchd label and plist basename stem, e.g. "com.ai-hist.sync".
-    label: &'static str,
-    /// ai-hist subcommand the service runs, e.g. "sync" or "push".
-    subcommand: &'static str,
-    /// `/tmp/<log_stem>.log` and `.err` capture the service's output.
-    log_stem: &'static str,
-    /// Human-facing noun for messages, e.g. "sync" or "cloud push".
-    human: &'static str,
-}
-
-const SYNC_SERVICE: ServiceSpec = ServiceSpec {
-    label: "com.ai-hist.sync",
-    subcommand: "sync",
-    log_stem: "ai-hist-sync",
-    human: "sync",
-};
-
-/// The comment marker that identifies this service's managed crontab line.
-fn cron_marker(spec: &ServiceSpec) -> String {
-    format!("# ai-hist {} (managed)", spec.subcommand)
-}
-
-fn launchd_plist_path(spec: &ServiceSpec) -> PathBuf {
-    home_dir().join(format!("Library/LaunchAgents/{}.plist", spec.label))
-}
-
-/// Resolve the absolute path of the running ai-hist binary so the service
+/// Resolve the absolute path of the running ai-hist binary so the git hook
 /// invokes it directly rather than through a development launcher.
-fn service_binary() -> Result<PathBuf> {
-    std::env::current_exe().context("could not resolve the ai-hist binary path for the service")
-}
-
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-}
-
-fn service_command_args(spec: &ServiceSpec, args: &[String]) -> Vec<String> {
-    let mut command = Vec::with_capacity(args.len() + 1);
-    command.push(spec.subcommand.to_string());
-    command.extend(args.iter().cloned());
-    command
-}
-
-const PROVIDER_ENV_VARS: [&str; 5] = [
-    "CLAUDE_CONFIG_DIR",
-    "CODEX_HOME",
-    "GROK_HOME",
-    "OPENCODE_DB",
-    // Muse Code keeps its sessions under `$XDG_DATA_HOME/muse/sessions`.
-    "XDG_DATA_HOME",
-];
-
-fn scheduler_environment_value(name: &str, value: std::ffi::OsString) -> Result<Option<String>> {
-    let value = value.into_string().map_err(|_| {
-        anyhow::anyhow!(
-            "cannot install sync service: {name} contains non-UTF-8 bytes; use a UTF-8 provider path"
-        )
-    })?;
-    if value.trim().is_empty() {
-        return Ok(None);
-    }
-    if value.contains(['\n', '\r']) {
-        anyhow::bail!(
-            "cannot install sync service: {name} contains a newline, which scheduler files cannot represent safely"
-        );
-    }
-    Ok(Some(value))
-}
-
-fn service_provider_environment(spec: &ServiceSpec) -> Result<Vec<(&'static str, String)>> {
-    if spec.subcommand != "sync" {
-        return Ok(Vec::new());
-    }
-    let mut environment = Vec::new();
-    for name in PROVIDER_ENV_VARS {
-        let Some(value) = std::env::var_os(name) else {
-            continue;
-        };
-        if let Some(value) = scheduler_environment_value(name, value)? {
-            environment.push((name, value));
-        }
-    }
-    Ok(environment)
-}
-
-fn launchd_environment_xml(environment: &[(&str, String)]) -> String {
-    if environment.is_empty() {
-        return String::new();
-    }
-    let entries = environment
-        .iter()
-        .map(|(name, value)| {
-            format!(
-                "        <key>{}</key>\n        <string>{}</string>",
-                xml_escape(name),
-                xml_escape(value)
-            )
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    format!("    <key>EnvironmentVariables</key>\n    <dict>\n{entries}\n    </dict>\n")
-}
-
-fn install_managed_service(spec: &ServiceSpec, interval: u64, args: &[String]) -> Result<()> {
-    let bin = service_binary()?;
-    let bin = bin.to_string_lossy();
-    if cfg!(target_os = "macos") {
-        install_launchd_service(spec, &bin, interval, args)
-    } else if cfg!(target_os = "linux") {
-        install_cron_service(spec, &bin, interval, args)
-    } else {
-        anyhow::bail!(
-            "Automatic {} service install is only supported on macOS and Linux. \
-             Schedule `ai-hist {}` yourself (e.g. via your platform's task scheduler) instead.",
-            spec.human,
-            spec.subcommand
-        )
-    }
-}
-
-/// Quote one shell word and then protect `%` from cron's command-to-stdin
-/// splitting. The added backslash is consumed by cron before the shell sees it.
-fn cron_shell_word(s: &str) -> String {
-    sh_single_quote(s).replace('%', "\\%")
-}
-
-/// Smallest divisor of `base` that is `>= n`. Using a divisor keeps a `*/step`
-/// cron field uniform — a non-divisor step (e.g. `*/45`) fires a short interval
-/// at the field's rollover (`:00, :45, :00` → a 15-minute gap).
-fn round_up_to_divisor(n: u64, base: u64) -> u64 {
-    (n..=base).find(|d| base.is_multiple_of(*d)).unwrap_or(base)
-}
-
-/// Returns `(cron expression, human cadence, effective period in seconds)`. The
-/// effective period lets callers detect when the interval was rounded. cron
-/// can't match every interval exactly; we always round toward a *coarser*,
-/// uniform cadence so a scheduled push never fires more often than requested.
-fn cron_schedule(interval: u64) -> (String, String, u64) {
-    // Sub-two-minute intervals can only be "every minute".
-    if interval < 120 {
-        return ("* * * * *".to_string(), "every minute".to_string(), 60);
-    }
-    let minutes = interval / 60; // floor; >= 2 here
-    if minutes < 60 {
-        // Uniform minute steps require a divisor of 60; round up to the next one.
-        let step = round_up_to_divisor(minutes, 60);
-        if step < 60 {
-            return (
-                format!("*/{step} * * * *"),
-                format!("every {step} minutes"),
-                step * 60,
-            );
-        }
-        return ("0 * * * *".to_string(), "every hour".to_string(), 3600);
-    }
-    // Round up to whole hours (e.g. 90 min -> 2h), then to a uniform hour step.
-    let hours = minutes.div_ceil(60);
-    if hours < 24 {
-        let step = round_up_to_divisor(hours, 24);
-        if step < 24 {
-            return (
-                format!("0 */{step} * * *"),
-                format!("every {step} hour(s)"),
-                step * 3600,
-            );
-        }
-        return ("0 0 * * *".to_string(), "once a day".to_string(), 86_400);
-    }
-    // A day or longer: run once daily at midnight.
-    ("0 0 * * *".to_string(), "once a day".to_string(), 86_400)
-}
-
-fn install_launchd_service(
-    spec: &ServiceSpec,
-    bin: &str,
-    interval: u64,
-    args: &[String],
-) -> Result<()> {
-    let plist_path = launchd_plist_path(spec);
-    if let Some(dir) = plist_path.parent() {
-        fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-    }
-    let command_args = service_command_args(spec, args)
-        .iter()
-        .map(|arg| format!("        <string>{}</string>", xml_escape(arg)))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let environment = service_provider_environment(spec)?;
-    let environment_xml = launchd_environment_xml(&environment);
-    let plist = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>{label}</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>{bin}</string>
-{command_args}
-    </array>
-{environment_xml}    <key>StartInterval</key>
-    <integer>{interval}</integer>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>/tmp/{log_stem}.log</string>
-    <key>StandardErrorPath</key>
-    <string>/tmp/{log_stem}.err</string>
-</dict>
-</plist>
-"#,
-        label = spec.label,
-        bin = xml_escape(bin),
-        command_args = command_args,
-        environment_xml = environment_xml,
-        interval = interval,
-        log_stem = spec.log_stem,
-    );
-    fs::write(&plist_path, plist).with_context(|| format!("writing {}", plist_path.display()))?;
-
-    // Reload idempotently: unload any previous version (ignoring errors), then load.
-    let _ = std::process::Command::new("launchctl")
-        .arg("unload")
-        .arg(&plist_path)
-        .status();
-    let status = std::process::Command::new("launchctl")
-        .arg("load")
-        .arg(&plist_path)
-        .status()
-        .context("running launchctl load")?;
-    if !status.success() {
-        anyhow::bail!("launchctl load failed for {}", plist_path.display());
-    }
-
-    println!(
-        "Installed launchd {} service ({}); running every {interval}s.",
-        spec.human, spec.label
-    );
-    println!("  plist: {}", plist_path.display());
-    println!("  check: launchctl list | grep ai-hist   (middle column 0 = healthy)");
-    println!("  remove: ai-hist {} --uninstall-service", spec.subcommand);
-    Ok(())
-}
-
-fn read_crontab() -> String {
-    match std::process::Command::new("crontab").arg("-l").output() {
-        Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
-        // No crontab yet (or `crontab -l` errors on an empty table) — start fresh.
-        _ => String::new(),
-    }
-}
-
-fn write_crontab(contents: &str) -> Result<()> {
-    let mut child = std::process::Command::new("crontab")
-        .arg("-")
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-        .context("running `crontab -` (is cron installed?)")?;
-    child
-        .stdin
-        .take()
-        .context("failed to open crontab stdin")?
-        .write_all(contents.as_bytes())?;
-    let status = child.wait()?;
-    if !status.success() {
-        anyhow::bail!("crontab update failed");
-    }
-    Ok(())
-}
-
-fn install_cron_service(
-    spec: &ServiceSpec,
-    bin: &str,
-    interval: u64,
-    args: &[String],
-) -> Result<()> {
-    let (schedule, cadence, effective) = cron_schedule(interval);
-    // cron can't match every interval exactly; the confirmation below states the
-    // cadence actually scheduled. Only note a mismatch when it isn't exact, so a
-    // plain `--interval=300` install doesn't imply the user picked an odd value.
-    if effective != interval {
-        eprintln!(
-            "Note: cron runs at 1-minute granularity; --interval={interval}s scheduled as {cadence}."
-        );
-    }
-    let marker = cron_marker(spec);
-    let environment = service_provider_environment(spec)?;
-    let command = environment
-        .iter()
-        .map(|(name, value)| format!("{name}={}", cron_shell_word(value)))
-        .chain(std::iter::once(cron_shell_word(bin)))
-        .chain(
-            service_command_args(spec, args)
-                .iter()
-                .map(|arg| cron_shell_word(arg)),
-        )
-        .collect::<Vec<_>>()
-        .join(" ");
-    let line = format!(
-        "{schedule} {command} >> /tmp/{}.log 2>&1 {marker}",
-        spec.log_stem
-    );
-    // Drop any previously managed line, then append the current one.
-    let mut lines: Vec<String> = read_crontab()
-        .lines()
-        .filter(|l| !l.contains(&marker))
-        .map(str::to_string)
-        .collect();
-    lines.push(line);
-    write_crontab(&format!("{}\n", lines.join("\n")))?;
-
-    println!("Installed cron {} job; running {cadence}.", spec.human);
-    println!("  view:   crontab -l");
-    println!("  remove: ai-hist {} --uninstall-service", spec.subcommand);
-    Ok(())
-}
-
-fn uninstall_managed_service(spec: &ServiceSpec) -> Result<()> {
-    if cfg!(target_os = "macos") {
-        let plist_path = launchd_plist_path(spec);
-        let _ = std::process::Command::new("launchctl")
-            .arg("unload")
-            .arg(&plist_path)
-            .status();
-        if plist_path.exists() {
-            fs::remove_file(&plist_path)
-                .with_context(|| format!("removing {}", plist_path.display()))?;
-            println!("Removed launchd {} service.", spec.human);
-        } else {
-            println!("No launchd {} service installed.", spec.human);
-        }
-        Ok(())
-    } else if cfg!(target_os = "linux") {
-        let marker = cron_marker(spec);
-        let kept: Vec<String> = read_crontab()
-            .lines()
-            .filter(|l| !l.contains(&marker))
-            .map(str::to_string)
-            .collect();
-        write_crontab(&format!("{}\n", kept.join("\n")))?;
-        println!("Removed cron {} job.", spec.human);
-        Ok(())
-    } else {
-        anyhow::bail!("No managed {} service exists on this platform.", spec.human)
-    }
+fn hook_binary() -> Result<PathBuf> {
+    std::env::current_exe().context("could not resolve the ai-hist binary path for the git hook")
 }
 
 const GIT_HOOK_MARKER_BEGIN: &str = "# ai-hist session commit link (managed begin)";
@@ -2891,7 +2498,7 @@ fn setup_git_hook(db_path: &Path, repo: &Path, uninstall: bool) -> Result<()> {
         "{} already exists and is not managed by ai-hist; install manually or remove it first",
         hook_path.display()
     );
-    let bin = service_binary()?;
+    let bin = hook_binary()?;
     let block = format!(
         r#"#!/bin/sh
 {begin}
@@ -3651,29 +3258,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn cron_schedule_maps_intervals_to_step_expressions() {
-        assert_eq!(cron_schedule(60).0, "* * * * *");
-        assert_eq!(cron_schedule(300).0, "*/5 * * * *"); // push default
-        assert_eq!(cron_schedule(120).0, "*/2 * * * *");
-        assert_eq!(cron_schedule(3600).0, "0 */1 * * *");
-        // Sub-two-minute intervals collapse to every minute.
-        assert_eq!(cron_schedule(30).0, "* * * * *");
-        assert_eq!(cron_schedule(90).0, "* * * * *");
-        // Never run MORE often than requested: round toward a coarser cadence.
-        assert_eq!(cron_schedule(5400).0, "0 */2 * * *"); // 90 min -> every 2h, not hourly
-        assert_eq!(cron_schedule(86_400).0, "0 0 * * *"); // 1 day -> daily, not hourly
-        assert_eq!(cron_schedule(90_000).0, "0 0 * * *"); // 25h -> daily
-                                                          // Non-divisor steps round up to a uniform divisor (no short boundary gap).
-        assert_eq!(cron_schedule(420).0, "*/10 * * * *"); // 7 min -> */10 (not */7)
-        assert_eq!(cron_schedule(2700).0, "0 * * * *"); // 45 min -> hourly (60 is next divisor)
-        assert_eq!(cron_schedule(25_200).0, "0 */8 * * *"); // 7h -> */8 (uniform), not */7
-                                                            // The effective period flags whether the interval was matched exactly.
-        assert_eq!(cron_schedule(300).2, 300);
-        assert_eq!(cron_schedule(5400).2, 7200);
-        assert_eq!(cron_schedule(420).2, 600);
-    }
-
     /// `sessions markers` and `sessions usage` are cache-only reads over the
     /// evidence tables, so they must not take the write lock any more than
     /// `sessions list` does; `sessions discover` upserts and must.
@@ -3723,9 +3307,6 @@ mod tests {
         // fails at runtime with "attempt to write a readonly database".
         assert!(!super::is_read_only(&super::Command::Sync {
             scope: super::SessionScopeArgs::default(),
-            install_service: false,
-            uninstall_service: false,
-            interval: 60,
         }));
         assert!(!super::is_read_only(&super::Command::Tag {
             session_id: "s".into(),
@@ -3783,59 +3364,6 @@ mod tests {
     fn shell_single_quote_survives_spaces_and_quotes() {
         assert_eq!(sh_single_quote("/opt/ai hist/bin"), "'/opt/ai hist/bin'");
         assert_eq!(sh_single_quote("a'b"), "'a'\\''b'");
-    }
-
-    #[test]
-    fn xml_escape_protects_plist_path() {
-        // A binary path with shell/XML metacharacters must not break the plist.
-        assert_eq!(
-            xml_escape("/home/a&b/<bin>/ai-hist"),
-            "/home/a&amp;b/&lt;bin&gt;/ai-hist"
-        );
-        assert_eq!(
-            xml_escape("/usr/local/bin/ai-hist"),
-            "/usr/local/bin/ai-hist"
-        );
-    }
-
-    #[test]
-    fn service_environment_rendering_preserves_relocated_provider_roots() {
-        let environment = vec![
-            ("CLAUDE_CONFIG_DIR", "/srv/Claude & tools".to_string()),
-            ("CODEX_HOME", "/srv/codex's 100% \\archive".to_string()),
-        ];
-        let xml = launchd_environment_xml(&environment);
-        assert!(xml.contains("<key>EnvironmentVariables</key>"));
-        assert!(xml.contains("<key>CLAUDE_CONFIG_DIR</key>"));
-        assert!(xml.contains("<string>/srv/Claude &amp; tools</string>"));
-        assert!(xml.contains("<key>CODEX_HOME</key>"));
-
-        let cron = environment
-            .iter()
-            .map(|(name, value)| format!("{name}={}", cron_shell_word(value)))
-            .collect::<Vec<_>>()
-            .join(" ");
-        assert_eq!(
-            cron,
-            r"CLAUDE_CONFIG_DIR='/srv/Claude & tools' CODEX_HOME='/srv/codex'\''s 100\% \archive'"
-        );
-    }
-
-    #[test]
-    fn scheduler_environment_rejects_line_breaks() {
-        let error =
-            scheduler_environment_value("CODEX_HOME", "/srv/codex\narchive".into()).unwrap_err();
-        assert!(error.to_string().contains("contains a newline"));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn scheduler_environment_rejects_non_utf8_paths_without_changing_them() {
-        use std::os::unix::ffi::OsStringExt;
-
-        let value = std::ffi::OsString::from_vec(b"/srv/codex-\xff".to_vec());
-        let error = scheduler_environment_value("CODEX_HOME", value).unwrap_err();
-        assert!(error.to_string().contains("contains non-UTF-8 bytes"));
     }
 
     #[test]
