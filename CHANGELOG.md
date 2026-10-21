@@ -9,8 +9,10 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - The relay roster, status, join and leave tools look for Agent Relay desktop on Windows: after `AGENT_RELAY_SOCKET` and the `~/.agentworkforce/desktop/relay-socket` pointer (a named pipe such as `\\.\pipe\…`), they try the per-user pipes `\\.\pipe\agent-relay-<user>` and `\\.\pipe\agent-relay-dev-<user>`.
+- Windows arm64 (`aarch64-pc-windows-msvc`) is supported: `npm install` pulls the prebuilt `ai-hist-native-win32-arm64-msvc` addon, and `@relayhistory/provider-sources` ships a native `win32-arm64-msvc` helper.
 - Qwen Code interactive session history is discoverable and searchable from native transcript files, preserving the active conversation branch, recorded messages and tool evidence.
 - Kimi Code history is discoverable and searchable from current native session journals, including recorded messages, tools and separate subagent transcripts.
+- Codebuddy Code history is discoverable and searchable from native project session files, including recorded messages and tool evidence.
 
 ### Fixed
 
@@ -20,6 +22,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Added `Source::QwenCode` for filtering and reading persisted Qwen Code history.
 - Added `Source::Kimi` for filtering and reading persisted Kimi Code history.
+- Added `Source::Codebuddy` for filtering and reading persisted Codebuddy Code history.
 
 ## [0.49.0] - 2026-10-21
 

@@ -46,7 +46,8 @@
     "@relayhistory/provider-sources-linux-arm64-gnu": "0.49.0",
     "@relayhistory/provider-sources-linux-x64-musl": "0.49.0",
     "@relayhistory/provider-sources-linux-arm64-musl": "0.49.0",
-    "@relayhistory/provider-sources-win32-x64-msvc": "0.49.0"
+    "@relayhistory/provider-sources-win32-x64-msvc": "0.49.0",
+    "@relayhistory/provider-sources-win32-arm64-msvc": "0.49.0"
   },
   "publishConfig": {
     "access": "public"

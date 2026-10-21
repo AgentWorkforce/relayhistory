@@ -1,0 +1,40 @@
+# Codebuddy Code (#439)
+
+Passive acquisition of the pinned official Tencent CLI 2.171.0 project JSONL
+format. Native writer and independent historical reader evidence, isolation,
+regeneration and remaining limits are recorded in
+[the fixture evidence](fixtures/codebuddy/README.md).
+
+Selected files are only `projects/<project-key>/<native-session-id>.jsonl`.
+Discovery uses bounded head/tail reads and path-derived identity; hydration
+captures exact immutable bytes. Full sweep and selected hydration share one
+normalizer. Partial final records retain previous complete evidence. Once normalized
+evidence exists, an incomplete replacement defers its entire projection and
+keeps the cached catalog, including unknown metadata; a first partial capture
+may expose its complete prefix. Complete
+rewrites retire missing events, and successful partial reads do not prevent
+retiring unrelated deleted files. Failed captures prevent uncertain whole-root
+retirement. Change stamps use namespace plus exact bytes, not temporary HOME.
+Discovery follows the shared catalog contract: it fills missing titles and
+preserves a fully indexed title. Sync or selected hydration applies native
+renames and explicit removal from a complete transcript, even for small files.
+
+Native message IDs and millisecond clocks are preserved. A complete replacement
+repairs changed insertion order within a timestamp bucket by replaying its
+local events; unchanged captures keep their evidence identities and revisions.
+Conflicting remote ownership rejects the replacement until reconciled.
+Historical replay matches native high-level restore/replay: retained pre-compaction messages stay
+searchable, while inactive fork messages, summaries and
+control facts remain markers. Tool calls/results join on native callId. Full
+inline spill content is read without opening embedded pointer paths. Usage is
+counted once per native upstream response ID, never per tool-block copy.
+Unknown fields remain unknown; unknown control fact types fail closed.
+Native call IDs remain available on both tool-use and tool-result blocks.
+Exported evidence crosses the public remote-intake boundary and can then be
+hydrated from the same local transcript without changing messages, tool joins,
+result payloads or raw markers. Explicit native error flags use the existing
+error-signal vocabulary; unknown outcomes remain unknown.
+
+No executable resume, model call, authentication, provider config mutation,
+subagent discovery, delegation inference or private operator history is part of
+acquisition. Future version/product certification remains independent work.

@@ -5,7 +5,7 @@ One workflow releases everything: `Publish RelayHistory release`
 trusted publishing and must not change -- see "Renaming this workflow" below). All public packages share one version:
 the `ai-hist` npm package, `ai-hist-native`, each native platform package, `ai-hist-mcp`,
 `@relayhistory/provider-sources` and its
-seven platform helper packages, and the `ai-hist` crates.io crate. The SDK checks the current native contract
+eight platform helper packages, and the `ai-hist` crates.io crate. The SDK checks the current native contract
 version at initialization; both halves declare it in source (`sdk-ts/src/native.ts`
 and `crates/ai-hist-napi/src/lib.rs`).
 
@@ -25,8 +25,8 @@ and `crates/ai-hist-napi/src/lib.rs`).
    bump type applied to the highest published core version on npm, or
    `custom_version`. Every other job takes the version from here, because the
    helper matrix has to stamp it into the Rust crates it compiles.
-2. `build` builds and tests the native addon on all seven targets, and
-   `helpers` builds the provider-sources helper for seven platforms, verifying
+2. `build` builds and tests the native addon on all eight targets, and
+   `helpers` builds the provider-sources helper for eight platforms, verifying
    each executable and its glibc floor. `helpers` applies
    `scripts/set-release-version.mjs` first, so the executables report the
    release version. Both jobs run in parallel and upload binaries as artifacts.
@@ -78,9 +78,9 @@ and `crates/ai-hist-napi/src/lib.rs`).
    (or musl) is selected.
 6. `plugins` checks out the tagged published tree, packages each helper binary at
    the release version, verifies staged tarballs, verifies the *published* core
-   at each plugin's peer minimum, then publishes the seven helpers of each
+   at each plugin's peer minimum, then publishes the eight helpers of each
    plugin before its JavaScript package. Post-publish verification waits for
-   all 8 exact-version manifests to become visible on npm, then installs the
+   all 9 exact-version manifests to become visible on npm, then installs the
    JavaScript packages as ordinary dependencies with npm's `--libc` set to this
    runner's family (`glibc` or `musl`) so the matching platform helper is
    selected, and loads the plugins. Missing versions (`E404`/`ETARGET`) are
@@ -89,7 +89,7 @@ and `crates/ai-hist-napi/src/lib.rs`).
    output.
 
 `scripts/set-release-version.mjs <version>` is the only place that knows what a
-plugin release version touches (version, the seven helper pins, the `ai-hist`
+plugin release version touches (version, the eight helper pins, the `ai-hist`
 peer range `^<version>`, the lockfile coordinates, and the `[package]` version
 of each plugin's Rust crate plus that crate's own `Cargo.lock` entry — the
 helper executable reports `CARGO_PKG_VERSION`). It is idempotent, and
@@ -215,6 +215,11 @@ version, so nothing asks for `0.0.0`.
 The script reads names from `scripts/history-package-contract.mjs`, skips
 anything already on the registry, and is safe to re-run.
 
+It covers the plugin names only. A new native platform package, such as
+`ai-hist-native-win32-arm64-msvc`, is claimed the same way by hand: publish a
+`0.0.0` placeholder from a human account and set this workflow as its trusted
+publisher before the release that first ships it.
+
 ## Renaming this workflow
 
 Don't, unless you are prepared to repoint every package. npm OIDC trusted
@@ -254,8 +259,9 @@ workflow publishes is listed at the top of this document.
 - Node-API: level 4.
 - macOS: 12+, arm64 and x64.
 - Linux: glibc and musl, arm64 and x64.
-- Windows: Windows 10/11 and Server 2022, x64 MSVC.
-- Windows arm64: unsupported until an executable CI test is reliable.
+- Windows: Windows 10/11 and Server 2022, x64 MSVC; Windows 11 arm64 MSVC.
+  Each architecture is built and executed natively on its own hosted runner
+  (`windows-latest`, `windows-11-arm`), in CI and in the release matrix.
 
 To validate a local artifact:
 
