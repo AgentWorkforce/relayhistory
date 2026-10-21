@@ -324,6 +324,76 @@ fn bounded_discovery_refreshes_index_activity_and_reads_shared_index_once() {
 }
 
 #[test]
+fn oversized_opening_prompt_remains_selectable_until_full_hydration() {
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path());
+    let original = std::fs::read_to_string(&path).unwrap();
+    let mut lines = original.lines().map(str::to_owned).collect::<Vec<_>>();
+    let mut opening: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+    let prompt = "P".repeat(70_000);
+    opening["prompt"] = prompt.clone().into();
+    lines[0] = opening.to_string();
+    std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+
+    let store = open(home.path());
+    assert_eq!(
+        store
+            .discover(DiscoveryOptions::default().sources([Source::Junie]))
+            .unwrap()
+            .discovered,
+        1
+    );
+    let mut query = CatalogQuery::default();
+    query.sources = Some(vec![Source::Junie]);
+    let catalog = store.sessions(query).next().unwrap().unwrap();
+    assert_eq!(catalog.session_id, SID);
+    assert_eq!(catalog.title.as_deref(), Some("Synthetic Junie capture"));
+    assert_eq!(
+        catalog.first_prompt, None,
+        "the bounded read saw no full row"
+    );
+    store
+        .hydrate(
+            &SessionRef::id(Source::Junie, SID),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    assert!(evidence(&store)
+        .messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .any(|block| block.text.as_deref() == Some(prompt.as_str())));
+
+    let updated = "Q".repeat(70_000);
+    opening["prompt"] = updated.clone().into();
+    lines[0] = opening.to_string();
+    std::fs::write(&path, format!("{}\n", lines.join("\n"))).unwrap();
+    store
+        .discover(DiscoveryOptions::default().sources([Source::Junie]))
+        .unwrap();
+    let mut query = CatalogQuery::default();
+    query.sources = Some(vec![Source::Junie]);
+    assert_eq!(
+        store.sessions(query).next().unwrap().unwrap().first_prompt,
+        Some("P".repeat(4096)),
+        "bounded discovery keeps the prior preview until full hydration"
+    );
+    store
+        .hydrate(
+            &SessionRef::id(Source::Junie, SID),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    let mut query = CatalogQuery::default();
+    query.sources = Some(vec![Source::Junie]);
+    assert_eq!(
+        store.sessions(query).next().unwrap().unwrap().first_prompt,
+        Some("Q".repeat(4096)),
+        "selected hydration replaces the cached preview with native text"
+    );
+}
+
+#[test]
 fn optional_index_partial_tail_keeps_native_journal_readable_and_oversize_is_diagnostic() {
     let home = tempfile::tempdir().unwrap();
     stage(home.path());

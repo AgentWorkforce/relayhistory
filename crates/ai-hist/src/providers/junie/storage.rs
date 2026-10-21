@@ -261,6 +261,7 @@ pub(super) fn shallow(
     file.take(SHALLOW_MAX + 1).read_to_end(&mut head)?;
     scan.note_bytes(head.len() as u64);
     let bounded = length > SHALLOW_MAX;
+    let mut oversized_first = false;
     if bounded {
         if let Some(end) = head
             .iter()
@@ -269,19 +270,26 @@ pub(super) fn shallow(
         {
             head.truncate(end + 1);
         } else {
-            anyhow::bail!("JUNIE_OVERSIZED_RECORD: first event exceeds bounded discovery window");
+            // The index and directory still identify a selectable session.
+            // A selected hydrate can read the complete native prompt later.
+            head.clear();
+            oversized_first = true;
         }
     }
-    let (rows, partial) = format::parse(&head)?;
+    let (rows, partial) = if oversized_first {
+        (Vec::new(), false)
+    } else {
+        format::parse(&head)?
+    };
     let records = rows.len() as i64;
     anyhow::ensure!(
-        !rows.is_empty() || partial,
+        !rows.is_empty() || partial || oversized_first,
         "JUNIE_EMPTY_JOURNAL: no readable persisted events"
     );
     scan.note_records(records as u64);
     Ok(AcquiredSession {
         stamp: String::new(),
-        payload: serde_json::json!({"sid":sid,"path":path,"rows":rows,"summary":summary,"partial":partial,"bounded":bounded}),
+        payload: serde_json::json!({"sid":sid,"path":path,"rows":rows,"summary":summary,"partial":partial,"bounded":bounded,"oversized_first":oversized_first}),
         bytes: 0,
         records,
         read_paths: vec![path],
