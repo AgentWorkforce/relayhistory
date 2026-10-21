@@ -412,6 +412,43 @@ test('Linux discovery tries both runtime and data-directory defaults', async () 
   ]);
 });
 
+test('Windows discovery tries per-user named pipes for both builds', async () => {
+  const paths = await relaySocketCandidates({
+    env: { AGENT_RELAY_SOCKET: '\\\\.\\pipe\\chosen', USERNAME: 'Alice Smith' },
+    home: 'C:\\Users\\alice', platform: 'win32', temporaryDirectory: 'C:\\Temp', uid: 0,
+  });
+  assert.deepEqual(paths, [
+    '\\\\.\\pipe\\chosen',
+    '\\\\.\\pipe\\agent-relay-alice_smith',
+    '\\\\.\\pipe\\agent-relay-dev-alice_smith',
+  ]);
+});
+
+test('Windows discovery names the pipes from the home directory without USERNAME', async () => {
+  const paths = await relaySocketCandidates({
+    env: {}, home: 'C:\\Users\\Bob\\', platform: 'win32', temporaryDirectory: 'C:\\Temp', uid: 0,
+  });
+  assert.deepEqual(paths, ['\\\\.\\pipe\\agent-relay-bob', '\\\\.\\pipe\\agent-relay-dev-bob']);
+});
+
+test('a CRLF pointer file names only its first line', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'relay-agents-crlf-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const pointer = join(root, '.agentworkforce', 'desktop', 'relay-socket');
+  await mkdir(dirname(pointer), { recursive: true });
+  await writeFile(pointer, '\\\\.\\pipe\\agent-relay-desktop\r\nstale second line\r\n', { mode: 0o600 });
+
+  const paths = await relaySocketCandidates({
+    env: { USERNAME: 'alice' }, home: root, platform: 'win32', temporaryDirectory: root, uid: 0,
+  });
+
+  assert.deepEqual(paths, [
+    '\\\\.\\pipe\\agent-relay-desktop',
+    '\\\\.\\pipe\\agent-relay-alice',
+    '\\\\.\\pipe\\agent-relay-dev-alice',
+  ]);
+});
+
 test('missing desktop is a clear non-fatal result', async () => {
   const root = await mkdtemp(join(tmpdir(), 'relay-agents-missing-'));
   try {

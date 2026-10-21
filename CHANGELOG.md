@@ -4,7 +4,15 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Minor]
+
+### Added
+
+- The relay roster, status, join and leave tools look for Agent Relay desktop on Windows: after `AGENT_RELAY_SOCKET` and the `~/.agentworkforce/desktop/relay-socket` pointer (a named pipe such as `\\.\pipe\…`), they try the per-user pipes `\\.\pipe\agent-relay-<user>` and `\\.\pipe\agent-relay-dev-<user>`.
+
+### Fixed
+
+- A desktop socket pointer file with more than one line (LF or CRLF) names the socket by its first line instead of never connecting.
 
 ## [0.49.0] - 2026-10-21
 
