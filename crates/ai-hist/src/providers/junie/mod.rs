@@ -88,7 +88,14 @@ impl ShallowSessionProvider for Provider {
         };
         let rows = capture.payload["rows"].as_array().context("Junie rows")?;
         let summary = &capture.payload["summary"];
+        let native_title = crate::ingest::titles::non_blank_title(summary["taskName"].as_str());
         let first = rows.iter().map(format::time).collect::<Result<Vec<_>>>()?;
+        if let Some(conn) = conn {
+            // The index is Junie's current title authority. The generic shallow
+            // merge protects fully hydrated titles because other providers may
+            // read stale prefixes; this value came from the current index.
+            crate::ingest::titles::set_session_title(conn, ID, sid, native_title.as_deref())?;
+        }
         Ok(Some(ShallowSession {
             source: ID.into(),
             session_id: sid.into(),
@@ -109,10 +116,7 @@ impl ShallowSessionProvider for Provider {
                 .as_str()
                 .map(str::to_owned)
                 .or_else(|| previous.as_ref().and_then(|row| row.cwd.clone())),
-            title: summary["taskName"]
-                .as_str()
-                .map(str::to_owned)
-                .or_else(|| previous.as_ref().and_then(|row| row.title.clone())),
+            title: native_title.or_else(|| previous.as_ref().and_then(|row| row.title.clone())),
             raw_path: Some(path.to_string_lossy().into_owned()),
             source_stamp: Some(candidate.stamp.clone()),
             discovery_state: "shallow".into(),
@@ -137,18 +141,26 @@ fn acquire(
 fn ingest(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
     let capture = ctx.provider_session.context("missing Junie acquisition")?;
     normalize::write(ctx.conn, &capture.payload)?;
-    let diagnostics = if capture.payload["partial"] == true {
-        vec![crate::hydrate::HydrationDiagnostic {
+    let mut diagnostics = Vec::new();
+    if let Some(code) = capture.payload["index_issue"].as_str() {
+        diagnostics.push(crate::hydrate::HydrationDiagnostic {
+            code: code.into(),
+            message: "Optional Junie index metadata was unavailable; verified journal evidence was retained".into(),
+            duration_ms: None,
+            source_bytes: Some(capture.bytes),
+            records_parsed: Some(capture.records),
+        });
+    }
+    if capture.payload["partial"] == true {
+        diagnostics.push(crate::hydrate::HydrationDiagnostic {
             code: "JUNIE_INCOMPLETE_JOURNAL".into(),
             message: "Incomplete final event; replacement deferred until the journal is complete"
                 .into(),
             duration_ms: None,
             source_bytes: Some(capture.bytes),
             records_parsed: Some(capture.records),
-        }]
-    } else {
-        vec![]
-    };
+        });
+    }
     Ok((
         IngestOutcome {
             records: capture.records,

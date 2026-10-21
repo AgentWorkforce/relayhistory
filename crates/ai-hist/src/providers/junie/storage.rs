@@ -35,6 +35,8 @@ struct IndexData {
     duplicates: HashSet<String>,
     bytes: Vec<u8>,
     path: Option<PathBuf>,
+    oversized_len: Option<u64>,
+    issue: Option<&'static str>,
 }
 
 impl IndexData {
@@ -44,15 +46,50 @@ impl IndexData {
             return Ok(Self::default());
         }
         context.validate(&index_path)?;
-        anyhow::ensure!(
-            std::fs::metadata(&index_path)?.len() <= INDEX_MAX as u64,
-            "JUNIE_INDEX_TOO_LARGE: bounded index read exceeds 8 MiB"
-        );
-        let bytes = context.read(&index_path)?;
-        anyhow::ensure!(
-            bytes.len() <= INDEX_MAX,
-            "JUNIE_INDEX_TOO_LARGE: bounded index read exceeds 8 MiB"
-        );
+        let file = match std::fs::File::open(&index_path) {
+            Ok(file) => file,
+            Err(_) => {
+                return Ok(Self {
+                    issue: Some("JUNIE_INDEX_UNREADABLE"),
+                    ..Self::default()
+                })
+            }
+        };
+        let len = match file.metadata() {
+            Ok(metadata) => metadata.len(),
+            Err(_) => {
+                return Ok(Self {
+                    issue: Some("JUNIE_INDEX_UNREADABLE"),
+                    ..Self::default()
+                })
+            }
+        };
+        if len > INDEX_MAX as u64 {
+            return Ok(Self {
+                oversized_len: Some(len),
+                issue: Some("JUNIE_INDEX_TOO_LARGE"),
+                ..Self::default()
+            });
+        }
+        // The writer may append after metadata: cap the actual read too.
+        let mut bytes = Vec::new();
+        if file
+            .take(INDEX_MAX as u64 + 1)
+            .read_to_end(&mut bytes)
+            .is_err()
+        {
+            return Ok(Self {
+                issue: Some("JUNIE_INDEX_UNREADABLE"),
+                ..Self::default()
+            });
+        }
+        if bytes.len() > INDEX_MAX {
+            return Ok(Self {
+                oversized_len: Some(bytes.len() as u64),
+                issue: Some("JUNIE_INDEX_TOO_LARGE"),
+                ..Self::default()
+            });
+        }
         let mut summaries = HashMap::new();
         let mut duplicates = HashSet::new();
         for (index, line) in bytes.split(|b| *b == b'\n').enumerate() {
@@ -68,16 +105,15 @@ impl IndexData {
                 {
                     break
                 }
-                Err(error) => {
-                    return Err(error)
-                        .with_context(|| format!("JUNIE_INVALID_INDEX: line {}", index + 1))
-                }
+                Err(_) => return Ok(Self::invalid(bytes.clone(), index_path)),
             };
-            let sid = format::string(&row, "sessionId")?.to_owned();
-            anyhow::ensure!(
-                row["createdAt"].as_i64().is_some() && row["updatedAt"].as_i64().is_some(),
-                "JUNIE_INVALID_INDEX: timestamps"
-            );
+            let Ok(sid) = format::string(&row, "sessionId") else {
+                return Ok(Self::invalid(bytes.clone(), index_path));
+            };
+            let sid = sid.to_owned();
+            if row["createdAt"].as_i64().is_none() || row["updatedAt"].as_i64().is_none() {
+                return Ok(Self::invalid(bytes.clone(), index_path));
+            }
             if summaries.insert(sid.clone(), row).is_some() {
                 duplicates.insert(sid);
             }
@@ -87,7 +123,18 @@ impl IndexData {
             duplicates,
             bytes,
             path: Some(index_path),
+            oversized_len: None,
+            issue: None,
         })
+    }
+
+    fn invalid(bytes: Vec<u8>, path: PathBuf) -> Self {
+        Self {
+            bytes,
+            path: Some(path),
+            issue: Some("JUNIE_INVALID_INDEX"),
+            ..Self::default()
+        }
     }
 }
 
@@ -230,10 +277,17 @@ fn capture_inner(
     let mut hash = Sha256::new();
     hash.update(&events);
     hash.update(&index.bytes);
+    if let Some(issue) = index.issue {
+        hash.update(issue.as_bytes());
+    }
+    if let Some(len) = index.oversized_len {
+        hash.update(b"JUNIE_INDEX_TOO_LARGE");
+        hash.update(len.to_le_bytes());
+    }
     let stamp = format!("sha256:{:x}", hash.finalize());
     Ok(AcquiredSession {
         stamp,
-        payload: serde_json::json!({"sid":sid,"native_id":path.parent().and_then(Path::file_name).and_then(|s|s.to_str()),"path":path,"rows":rows,"summary":summary,"partial":partial}),
+        payload: serde_json::json!({"sid":sid,"native_id":path.parent().and_then(Path::file_name).and_then(|s|s.to_str()),"path":path,"rows":rows,"summary":summary,"partial":partial,"index_issue":index.issue}),
         bytes: (events.len() + index.bytes.len()) as i64,
         records,
         read_paths,

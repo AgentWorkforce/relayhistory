@@ -53,7 +53,15 @@ are still applied while a saved prompt preview fills any missing excerpt.
 If the first row itself exceeds that window, a new catalog entry records the
 native directory identity and index summary with no prompt preview; selecting
 it for full hydration reads the complete prompt. Existing catalog previews
-remain cached until hydration refreshes them.
+remain cached until hydration refreshes them. An optional index above 8 MiB
+is skipped after a bounded read; the native journal remains discoverable and
+hydratable, and selected hydration reports `JUNIE_INDEX_TOO_LARGE` with index
+metadata unknown. Malformed or unreadable optional index data likewise yields
+a diagnostic while verified journal evidence remains readable. An index path
+escaping the declared root remains a hard containment error. A complete native
+index title rename refreshes the catalog
+during discovery, including a previously fully hydrated row; blank or
+unavailable index titles do not clear it.
 Unsupported event shapes fail visibly, while unknown evidence is
 preserved as bounded markers. A complete journal rewrite retires stale local
 evidence; an incomplete final JSONL line defers replacement. No native resume

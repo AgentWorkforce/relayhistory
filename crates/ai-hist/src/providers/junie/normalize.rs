@@ -68,8 +68,12 @@ pub(super) fn write(conn: &Connection, payload: &Value) -> Result<usize> {
             raw_path: Some(&path.to_string_lossy()),
         },
     )?;
-    conn.execute("UPDATE sessions SET first_prompt=?3,title=?4 WHERE source=?1 AND session_id=?2 AND (first_prompt IS NOT ?3 OR title IS NOT ?4)",
-        rusqlite::params![ID,sid,preview,summary["taskName"].as_str()])?;
+    conn.execute("UPDATE sessions SET first_prompt=?3 WHERE source=?1 AND session_id=?2 AND first_prompt IS NOT ?3",
+        rusqlite::params![ID,sid,preview])?;
+    // The optional index may be absent or too large to read. Only a native
+    // nonblank taskName is authority to replace a cached title.
+    let title = crate::ingest::titles::non_blank_title(summary["taskName"].as_str());
+    crate::ingest::titles::set_session_title(conn, ID, sid, title.as_deref())?;
     shared.ensure_unchanged(conn, sid)?;
     Ok(prompts)
 }

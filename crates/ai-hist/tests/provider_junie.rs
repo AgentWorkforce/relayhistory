@@ -412,12 +412,118 @@ fn optional_index_partial_tail_keeps_native_journal_readable_and_oversize_is_dia
         .unwrap();
     assert_eq!(evidence(&store).tool_calls[0].tool_use_id, "step-tool-1");
     std::fs::write(&index, vec![b' '; 8 * 1024 * 1024 + 1]).unwrap();
-    assert!(store
+    let discovery = store
+        .discover(DiscoveryOptions::default().sources([Source::Junie]))
+        .unwrap();
+    assert!(
+        discovery.diagnostics.is_empty(),
+        "{:?}",
+        discovery.diagnostics
+    );
+    let report = store
         .hydrate(
             &SessionRef::id(Source::Junie, SID),
-            HydrateOptions::default()
+            HydrateOptions::default(),
         )
-        .is_err());
+        .unwrap();
+    assert!(report
+        .diagnostics
+        .iter()
+        .any(|d| d.code == "JUNIE_INDEX_TOO_LARGE"));
+    assert_eq!(evidence(&store).tool_calls[0].tool_use_id, "step-tool-1");
+    let mut query = CatalogQuery::default();
+    query.sources = Some(vec![Source::Junie]);
+    assert_eq!(
+        store
+            .sessions(query)
+            .next()
+            .unwrap()
+            .unwrap()
+            .title
+            .as_deref(),
+        Some("Synthetic Junie capture")
+    );
+}
+
+#[test]
+fn malformed_optional_index_keeps_verified_journal_and_prior_title() {
+    let home = tempfile::tempdir().unwrap();
+    stage(home.path());
+    let store = open(home.path());
+    store
+        .discover(DiscoveryOptions::default().sources([Source::Junie]))
+        .unwrap();
+    store
+        .hydrate(
+            &SessionRef::id(Source::Junie, SID),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    let index = home.path().join(".junie/sessions/index.jsonl");
+    std::fs::write(index, b"{bad complete row}\n").unwrap();
+    let discovered = store
+        .discover(DiscoveryOptions::default().sources([Source::Junie]))
+        .unwrap();
+    assert!(
+        discovered.diagnostics.is_empty(),
+        "{:?}",
+        discovered.diagnostics
+    );
+    let report = store
+        .hydrate(
+            &SessionRef::id(Source::Junie, SID),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    assert!(report
+        .diagnostics
+        .iter()
+        .any(|d| d.code == "JUNIE_INVALID_INDEX"));
+    let mut query = CatalogQuery::default();
+    query.sources = Some(vec![Source::Junie]);
+    assert_eq!(
+        store
+            .sessions(query)
+            .next()
+            .unwrap()
+            .unwrap()
+            .title
+            .as_deref(),
+        Some("Synthetic Junie capture")
+    );
+    assert_eq!(evidence(&store).tool_calls[0].tool_use_id, "step-tool-1");
+}
+
+#[test]
+fn native_index_rename_refreshes_full_catalog_on_discovery() {
+    let home = tempfile::tempdir().unwrap();
+    stage(home.path());
+    let store = open(home.path());
+    store
+        .discover(DiscoveryOptions::default().sources([Source::Junie]))
+        .unwrap();
+    store
+        .hydrate(
+            &SessionRef::id(Source::Junie, SID),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    let index = home.path().join(".junie/sessions/index.jsonl");
+    let renamed = std::fs::read_to_string(&index).unwrap().replace(
+        "Synthetic Junie capture",
+        "Renamed native title before hydration",
+    );
+    std::fs::write(index, renamed).unwrap();
+    store
+        .discover(DiscoveryOptions::default().sources([Source::Junie]))
+        .unwrap();
+    let mut query = CatalogQuery::default();
+    query.sources = Some(vec![Source::Junie]);
+    let row = store.sessions(query).next().unwrap().unwrap();
+    assert_eq!(
+        row.title.as_deref(),
+        Some("Renamed native title before hydration")
+    );
     assert_eq!(evidence(&store).tool_calls[0].tool_use_id, "step-tool-1");
 }
 
