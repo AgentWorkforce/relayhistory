@@ -1,0 +1,743 @@
+{
+  "ordinary": {
+    "sessionId": "11111111-1111-4111-8111-000000000001",
+    "records": [
+      {
+        "uuid": "00000000-0000-4000-8000-000000000002",
+        "parentUuid": null,
+        "sessionId": "11111111-1111-4111-8111-000000000001",
+        "timestamp": "2026-10-11T12:00:00.000Z",
+        "type": "user",
+        "provenance": "real_user",
+        "cwd": "/synthetic/qwen-project",
+        "version": "0.25.3",
+        "gitBranch": "fixture-branch",
+        "executionContext": {
+          "modelId": "fixture-model",
+          "authType": "fixture-auth",
+          "approvalMode": "default"
+        },
+        "message": {
+          "role": "user",
+          "parts": [
+            {
+              "text": "Find the synthetic Qwen needle."
+            }
+          ]
+        },
+        "promptId": "prompt-one"
+      },
+      {
+        "uuid": "00000000-0000-4000-8000-000000000003",
+        "parentUuid": "00000000-0000-4000-8000-000000000002",
+        "sessionId": "11111111-1111-4111-8111-000000000001",
+        "timestamp": "2026-10-11T12:00:00.000Z",
+        "type": "assistant",
+        "provenance": "assistant_output",
+        "cwd": "/synthetic/qwen-project",
+        "version": "0.25.3",
+        "gitBranch": "fixture-branch",
+        "model": "fixture-model",
+        "message": {
+          "role": "model",
+          "parts": [
+            {
+              "text": "Found the synthetic Qwen needle."
+            }
+          ]
+        },
+        "usageMetadata": {
+          "promptTokenCount": 100,
+          "candidatesTokenCount": 20,
+          "totalTokenCount": 120,
+          "cachedContentTokenCount": 10
+        }
+      }
+    ],
+    "gaps": [],
+    "diagnostics": []
+  },
+  "tool": {
+    "sessionId": "11111111-1111-4111-8111-000000000002",
+    "records": [
+      {
+        "uuid": "00000000-0000-4000-8000-000000000005",
+        "parentUuid": null,
+        "sessionId": "11111111-1111-4111-8111-000000000002",
+        "timestamp": "2026-10-11T12:00:00.000Z",
+        "type": "user",
+        "provenance": "real_user",
+        "cwd": "/synthetic/qwen-project",
+        "version": "0.25.3",
+        "gitBranch": "fixture-branch",
+        "executionContext": {
+          "modelId": "fixture-model",
+          "authType": "fixture-auth",
+          "approvalMode": "default"
+        },
+        "message": {
+          "role": "user",
+          "parts": [
+            {
+              "text": "Find the synthetic Qwen needle."
+            }
+          ]
+        },
+        "promptId": "prompt-one"
+      },
+      {
+        "uuid": "00000000-0000-4000-8000-000000000006",
+        "parentUuid": "00000000-0000-4000-8000-000000000005",
+        "sessionId": "11111111-1111-4111-8111-000000000002",
+        "timestamp": "2026-10-11T12:00:00.000Z",
+        "type": "assistant",
+        "provenance": "assistant_output",
+        "cwd": "/synthetic/qwen-project",
+        "version": "0.25.3",
+        "gitBranch": "fixture-branch",
+        "model": "fixture-model",
+        "message": {
+          "role": "model",
+          "parts": [
+            {
+              "thought": true,
+              "text": "Synthetic private reasoning."
+            },
+            {
+              "functionCall": {
+                "id": "fixture-call-001",
+                "name": "fixture_lookup",
+                "args": {
+                  "value": "blue"
+                }
+              }
+            }
+          ]
+        }
+      },
+      {
+        "uuid": "00000000-0000-4000-8000-000000000007",
+        "parentUuid": "00000000-0000-4000-8000-000000000006",
+        "sessionId": "11111111-1111-4111-8111-000000000002",
+        "timestamp": "2026-10-11T12:00:00.000Z",
+        "type": "tool_result",
+        "provenance": "tool_result",
+        "cwd": "/synthetic/qwen-project",
+        "version": "0.25.3",
+        "gitBranch": "fixture-branch",
+        "message": {
+          "role": "user",
+          "parts": [
+            {
+              "functionResponse": {
+                "id": "fixture-call-001",
+                "name": "fixture_lookup",
+                "response": {
+                  "result": "blue"
+                }
+              }
+            }
+          ]
+        },
+        "toolCallResult": {
+          "callId": "fixture-call-001",
+          "name": "fixture_lookup",
+          "status": "success",
+          "resultDisplay": "blue"
+        }
+      },
+      {
+        "uuid": "00000000-0000-4000-8000-000000000008",
+        "parentUuid": "00000000-0000-4000-8000-000000000007",
+        "sessionId": "11111111-1111-4111-8111-000000000002",
+        "timestamp": "2026-10-11T12:00:00.000Z",
+        "type": "assistant",
+        "provenance": "assistant_output",
+        "cwd": "/synthetic/qwen-project",
+        "version": "0.25.3",
+        "gitBranch": "fixture-branch",
+        "model": "fixture-model",
+        "message": {
+          "role": "model",
+          "parts": [
+            {
+              "text": "Found the synthetic Qwen needle."
+            }
+          ]
+        },
+        "usageMetadata": {
+          "promptTokenCount": 100,
+          "candidatesTokenCount": 20,
+          "totalTokenCount": 120,
+          "cachedContentTokenCount": 10
+        }
+      }
+    ],
+    "gaps": [],
+    "diagnostics": []
+  },
+  "resumed": {
+    "sessionId": "11111111-1111-4111-8111-000000000003",
+    "records": [
+      {
+        "uuid": "00000000-0000-4000-8000-000000000010",
+        "parentUuid": null,
+        "sessionId": "11111111-1111-4111-8111-000000000003",
+        "timestamp": "2026-10-11T12:00:00.000Z",
+        "type": "user",
+        "provenance": "real_user",
+        "cwd": "/synthetic/qwen-project",
+        "version": "0.25.3",
+        "gitBranch": "fixture-branch",
+        "executionContext": {
+          "modelId": "fixture-model",
+          "authType": "fixture-auth",
+          "approvalMode": "default"
+        },
+        "message": {
+          "role": "user",
+          "parts": [
+            {
+              "text": "Find the synthetic Qwen needle."
+            }
+          ]
+        },
+        "promptId": "prompt-one"
+      },
+      {
+        "uuid": "00000000-0000-4000-8000-000000000011",
+        "parentUuid": "00000000-0000-4000-8000-000000000010",
+        "sessionId": "11111111-1111-4111-8111-000000000003",
+        "timestamp": "2026-10-11T12:00:00.000Z",
+        "type": "assistant",
+        "provenance": "assistant_output",
+        "cwd": "/synthetic/qwen-project",
+        "version": "0.25.3",
+        "gitBranch": "fixture-branch",
+        "model": "fixture-model",
+        "message": {
+          "role": "model",
+          "parts": [
+            {
+              "text": "Found the synthetic Qwen needle."
+            }
+          ]
+        },
+        "usageMetadata": {
+          "promptTokenCount": 100,
+          "candidatesTokenCount": 20,
+          "totalTokenCount": 120,
+          "cachedContentTokenCount": 10
+        }
+      },
+      {
+        "uuid": "00000000-0000-4000-8000-000000000013",
+        "parentUuid": "00000000-0000-4000-8000-000000000011",
+        "sessionId": "11111111-1111-4111-8111-000000000003",
+        "timestamp": "2026-10-11T12:00:00.000Z",
+        "type": "user",
+        "provenance": "real_user",
+        "cwd": "/synthetic/qwen-project",
+        "version": "0.25.3",
+        "gitBranch": "fixture-branch",
+        "executionContext": {
+          "modelId": "fixture-model",
+          "authType": "fixture-auth",
+          "approvalMode": "default"
+        },
+        "message": {
+          "role": "user",
+          "parts": [
+            {
+              "text": "Continue the synthetic investigation."
+            }
+          ]
+        }
+      },
+      {
+        "uuid": "00000000-0000-4000-8000-000000000014",
+        "parentUuid": "00000000-0000-4000-8000-000000000013",
+        "sessionId": "11111111-1111-4111-8111-000000000003",
+        "timestamp": "2026-10-11T12:00:00.000Z",
+        "type": "assistant",
+        "provenance": "assistant_output",
+        "cwd": "/synthetic/qwen-project",
+        "version": "0.25.3",
+        "gitBranch": "fixture-branch",
+        "model": "fixture-model",
+        "message": {
+          "role": "model",
+          "parts": [
+            {
+              "text": "The resumed investigation is complete."
+            }
+          ]
+        }
+      }
+    ],
+    "gaps": [],
+    "diagnostics": []
+  },
+  "rewind": {
+    "sessionId": "11111111-1111-4111-8111-000000000004",
+    "records": [
+      {
+        "uuid": "00000000-0000-4000-8000-000000000018",
+        "parentUuid": null,
+        "sessionId": "11111111-1111-4111-8111-000000000004",
+        "timestamp": "2026-10-11T12:00:00.000Z",
+        "type": "system",
+        "provenance": "system",
+        "cwd": "/synthetic/qwen-project",
+        "version": "0.25.3",
+        "gitBranch": "fixture-branch",
+        "subtype": "rewind",
+        "systemPayload": {
+          "truncatedCount": 2
+        }
+      },
+      {
+        "uuid": "00000000-0000-4000-8000-000000000019",
+        "parentUuid": "00000000-0000-4000-8000-000000000018",
+        "sessionId": "11111111-1111-4111-8111-000000000004",
+        "timestamp": "2026-10-11T12:00:00.000Z",
+        "type": "user",
+        "provenance": "real_user",
+        "cwd": "/synthetic/qwen-project",
+        "version": "0.25.3",
+        "gitBranch": "fixture-branch",
+        "executionContext": {
+          "modelId": "fixture-model",
+          "authType": "fixture-auth",
+          "approvalMode": "default"
+        },
+        "message": {
+          "role": "user",
+          "parts": [
+            {
+              "text": "Replacement synthetic Qwen request."
+            }
+          ]
+        }
+      },
+      {
+        "uuid": "00000000-0000-4000-8000-000000000020",
+        "parentUuid": "00000000-0000-4000-8000-000000000019",
+        "sessionId": "11111111-1111-4111-8111-000000000004",
+        "timestamp": "2026-10-11T12:00:00.000Z",
+        "type": "assistant",
+        "provenance": "assistant_output",
+        "cwd": "/synthetic/qwen-project",
+        "version": "0.25.3",
+        "gitBranch": "fixture-branch",
+        "model": "fixture-model",
+        "message": {
+          "role": "model",
+          "parts": [
+            {
+              "text": "Replacement synthetic answer."
+            }
+          ]
+        }
+      }
+    ],
+    "gaps": [],
+    "diagnostics": []
+  },
+  "metadata": {
+    "sessionId": "11111111-1111-4111-8111-000000000005",
+    "records": [
+      {
+        "uuid": "00000000-0000-4000-8000-000000000022",
+        "parentUuid": null,
+        "sessionId": "11111111-1111-4111-8111-000000000005",
+        "timestamp": "2026-10-11T12:00:00.000Z",
+        "type": "user",
+        "provenance": "real_user",
+        "cwd": "/synthetic/qwen-project",
+        "version": "0.25.3",
+        "gitBranch": "fixture-branch",
+        "executionContext": {
+          "modelId": "fixture-model",
+          "authType": "fixture-auth",
+          "approvalMode": "default"
+        },
+        "message": {
+          "role": "user",
+          "parts": [
+            {
+              "text": "Find the synthetic Qwen needle."
+            }
+          ]
+        },
+        "promptId": "prompt-one"
+      },
+      {
+        "uuid": "00000000-0000-4000-8000-000000000023",
+        "parentUuid": "00000000-0000-4000-8000-000000000022",
+        "sessionId": "11111111-1111-4111-8111-000000000005",
+        "timestamp": "2026-10-11T12:00:00.000Z",
+        "type": "assistant",
+        "provenance": "assistant_output",
+        "cwd": "/synthetic/qwen-project",
+        "version": "0.25.3",
+        "gitBranch": "fixture-branch",
+        "model": "fixture-model",
+        "message": {
+          "role": "model",
+          "parts": [
+            {
+              "text": "Found the synthetic Qwen needle."
+            }
+          ]
+        },
+        "usageMetadata": {
+          "promptTokenCount": 100,
+          "candidatesTokenCount": 20,
+          "totalTokenCount": 120,
+          "cachedContentTokenCount": 10
+        }
+      },
+      {
+        "uuid": "00000000-0000-4000-8000-000000000024",
+        "parentUuid": "00000000-0000-4000-8000-000000000023",
+        "sessionId": "11111111-1111-4111-8111-000000000005",
+        "timestamp": "2026-10-11T12:00:00.000Z",
+        "type": "system",
+        "provenance": "system",
+        "cwd": "/synthetic/qwen-project",
+        "version": "0.25.3",
+        "gitBranch": "fixture-branch",
+        "subtype": "custom_title",
+        "systemPayload": {
+          "customTitle": "Synthetic Qwen title.",
+          "titleSource": "manual"
+        }
+      }
+    ],
+    "gaps": [],
+    "diagnostics": []
+  },
+  "same-time": {
+    "sessionId": "11111111-1111-4111-8111-000000000006",
+    "records": [
+      {
+        "uuid": "00000000-0000-4000-8000-000000000028",
+        "parentUuid": null,
+        "sessionId": "11111111-1111-4111-8111-000000000006",
+        "timestamp": "2026-10-11T12:00:00.000Z",
+        "type": "user",
+        "provenance": "real_user",
+        "cwd": "/synthetic/qwen-project",
+        "version": "0.25.3",
+        "gitBranch": "fixture-branch",
+        "executionContext": {
+          "modelId": "fixture-model",
+          "authType": "fixture-auth",
+          "approvalMode": "default"
+        },
+        "message": {
+          "role": "user",
+          "parts": [
+            {
+              "text": "Find the synthetic Qwen needle."
+            }
+          ]
+        },
+        "promptId": "prompt-one"
+      },
+      {
+        "uuid": "00000000-0000-4000-8000-000000000029",
+        "parentUuid": "00000000-0000-4000-8000-000000000028",
+        "sessionId": "11111111-1111-4111-8111-000000000006",
+        "timestamp": "2026-10-11T12:00:00.000Z",
+        "type": "assistant",
+        "provenance": "assistant_output",
+        "cwd": "/synthetic/qwen-project",
+        "version": "0.25.3",
+        "gitBranch": "fixture-branch",
+        "model": "fixture-model",
+        "message": {
+          "role": "model",
+          "parts": [
+            {
+              "text": "Found the synthetic Qwen needle."
+            }
+          ]
+        },
+        "usageMetadata": {
+          "promptTokenCount": 100,
+          "candidatesTokenCount": 20,
+          "totalTokenCount": 120,
+          "cachedContentTokenCount": 10
+        }
+      },
+      {
+        "uuid": "00000000-0000-4000-8000-000000000030",
+        "parentUuid": "00000000-0000-4000-8000-000000000029",
+        "sessionId": "11111111-1111-4111-8111-000000000006",
+        "timestamp": "2026-10-11T12:00:00.000Z",
+        "type": "user",
+        "provenance": "real_user",
+        "cwd": "/synthetic/qwen-project",
+        "version": "0.25.3",
+        "gitBranch": "fixture-branch",
+        "executionContext": {
+          "modelId": "fixture-model",
+          "authType": "fixture-auth",
+          "approvalMode": "default"
+        },
+        "message": {
+          "role": "user",
+          "parts": [
+            {
+              "text": "Synthetic request 1."
+            }
+          ]
+        }
+      },
+      {
+        "uuid": "00000000-0000-4000-8000-000000000031",
+        "parentUuid": "00000000-0000-4000-8000-000000000030",
+        "sessionId": "11111111-1111-4111-8111-000000000006",
+        "timestamp": "2026-10-11T12:00:00.000Z",
+        "type": "assistant",
+        "provenance": "assistant_output",
+        "cwd": "/synthetic/qwen-project",
+        "version": "0.25.3",
+        "gitBranch": "fixture-branch",
+        "model": "fixture-model",
+        "message": {
+          "role": "model",
+          "parts": [
+            {
+              "text": "Synthetic answer 1."
+            }
+          ]
+        }
+      },
+      {
+        "uuid": "00000000-0000-4000-8000-000000000032",
+        "parentUuid": "00000000-0000-4000-8000-000000000031",
+        "sessionId": "11111111-1111-4111-8111-000000000006",
+        "timestamp": "2026-10-11T12:00:00.000Z",
+        "type": "user",
+        "provenance": "real_user",
+        "cwd": "/synthetic/qwen-project",
+        "version": "0.25.3",
+        "gitBranch": "fixture-branch",
+        "executionContext": {
+          "modelId": "fixture-model",
+          "authType": "fixture-auth",
+          "approvalMode": "default"
+        },
+        "message": {
+          "role": "user",
+          "parts": [
+            {
+              "text": "Synthetic request 2."
+            }
+          ]
+        }
+      },
+      {
+        "uuid": "00000000-0000-4000-8000-000000000033",
+        "parentUuid": "00000000-0000-4000-8000-000000000032",
+        "sessionId": "11111111-1111-4111-8111-000000000006",
+        "timestamp": "2026-10-11T12:00:00.000Z",
+        "type": "assistant",
+        "provenance": "assistant_output",
+        "cwd": "/synthetic/qwen-project",
+        "version": "0.25.3",
+        "gitBranch": "fixture-branch",
+        "model": "fixture-model",
+        "message": {
+          "role": "model",
+          "parts": [
+            {
+              "text": "Synthetic answer 2."
+            }
+          ]
+        }
+      },
+      {
+        "uuid": "00000000-0000-4000-8000-000000000034",
+        "parentUuid": "00000000-0000-4000-8000-000000000033",
+        "sessionId": "11111111-1111-4111-8111-000000000006",
+        "timestamp": "2026-10-11T12:00:00.000Z",
+        "type": "user",
+        "provenance": "real_user",
+        "cwd": "/synthetic/qwen-project",
+        "version": "0.25.3",
+        "gitBranch": "fixture-branch",
+        "executionContext": {
+          "modelId": "fixture-model",
+          "authType": "fixture-auth",
+          "approvalMode": "default"
+        },
+        "message": {
+          "role": "user",
+          "parts": [
+            {
+              "text": "Synthetic request 3."
+            }
+          ]
+        }
+      },
+      {
+        "uuid": "00000000-0000-4000-8000-000000000035",
+        "parentUuid": "00000000-0000-4000-8000-000000000034",
+        "sessionId": "11111111-1111-4111-8111-000000000006",
+        "timestamp": "2026-10-11T12:00:00.000Z",
+        "type": "assistant",
+        "provenance": "assistant_output",
+        "cwd": "/synthetic/qwen-project",
+        "version": "0.25.3",
+        "gitBranch": "fixture-branch",
+        "model": "fixture-model",
+        "message": {
+          "role": "model",
+          "parts": [
+            {
+              "text": "Synthetic answer 3."
+            }
+          ]
+        }
+      },
+      {
+        "uuid": "00000000-0000-4000-8000-000000000036",
+        "parentUuid": "00000000-0000-4000-8000-000000000035",
+        "sessionId": "11111111-1111-4111-8111-000000000006",
+        "timestamp": "2026-10-11T12:00:00.000Z",
+        "type": "user",
+        "provenance": "real_user",
+        "cwd": "/synthetic/qwen-project",
+        "version": "0.25.3",
+        "gitBranch": "fixture-branch",
+        "executionContext": {
+          "modelId": "fixture-model",
+          "authType": "fixture-auth",
+          "approvalMode": "default"
+        },
+        "message": {
+          "role": "user",
+          "parts": [
+            {
+              "text": "Synthetic request 4."
+            }
+          ]
+        }
+      },
+      {
+        "uuid": "00000000-0000-4000-8000-000000000037",
+        "parentUuid": "00000000-0000-4000-8000-000000000036",
+        "sessionId": "11111111-1111-4111-8111-000000000006",
+        "timestamp": "2026-10-11T12:00:00.000Z",
+        "type": "assistant",
+        "provenance": "assistant_output",
+        "cwd": "/synthetic/qwen-project",
+        "version": "0.25.3",
+        "gitBranch": "fixture-branch",
+        "model": "fixture-model",
+        "message": {
+          "role": "model",
+          "parts": [
+            {
+              "text": "Synthetic answer 4."
+            }
+          ]
+        }
+      },
+      {
+        "uuid": "00000000-0000-4000-8000-000000000038",
+        "parentUuid": "00000000-0000-4000-8000-000000000037",
+        "sessionId": "11111111-1111-4111-8111-000000000006",
+        "timestamp": "2026-10-11T12:00:00.000Z",
+        "type": "user",
+        "provenance": "real_user",
+        "cwd": "/synthetic/qwen-project",
+        "version": "0.25.3",
+        "gitBranch": "fixture-branch",
+        "executionContext": {
+          "modelId": "fixture-model",
+          "authType": "fixture-auth",
+          "approvalMode": "default"
+        },
+        "message": {
+          "role": "user",
+          "parts": [
+            {
+              "text": "Synthetic request 5."
+            }
+          ]
+        }
+      },
+      {
+        "uuid": "00000000-0000-4000-8000-000000000039",
+        "parentUuid": "00000000-0000-4000-8000-000000000038",
+        "sessionId": "11111111-1111-4111-8111-000000000006",
+        "timestamp": "2026-10-11T12:00:00.000Z",
+        "type": "assistant",
+        "provenance": "assistant_output",
+        "cwd": "/synthetic/qwen-project",
+        "version": "0.25.3",
+        "gitBranch": "fixture-branch",
+        "model": "fixture-model",
+        "message": {
+          "role": "model",
+          "parts": [
+            {
+              "text": "Synthetic answer 5."
+            }
+          ]
+        }
+      },
+      {
+        "uuid": "00000000-0000-4000-8000-000000000040",
+        "parentUuid": "00000000-0000-4000-8000-000000000039",
+        "sessionId": "11111111-1111-4111-8111-000000000006",
+        "timestamp": "2026-10-11T12:00:00.000Z",
+        "type": "user",
+        "provenance": "real_user",
+        "cwd": "/synthetic/qwen-project",
+        "version": "0.25.3",
+        "gitBranch": "fixture-branch",
+        "executionContext": {
+          "modelId": "fixture-model",
+          "authType": "fixture-auth",
+          "approvalMode": "default"
+        },
+        "message": {
+          "role": "user",
+          "parts": [
+            {
+              "text": "Synthetic request 6."
+            }
+          ]
+        }
+      },
+      {
+        "uuid": "00000000-0000-4000-8000-000000000041",
+        "parentUuid": "00000000-0000-4000-8000-000000000040",
+        "sessionId": "11111111-1111-4111-8111-000000000006",
+        "timestamp": "2026-10-11T12:00:00.000Z",
+        "type": "assistant",
+        "provenance": "assistant_output",
+        "cwd": "/synthetic/qwen-project",
+        "version": "0.25.3",
+        "gitBranch": "fixture-branch",
+        "model": "fixture-model",
+        "message": {
+          "role": "model",
+          "parts": [
+            {
+              "text": "Synthetic answer 6."
+            }
+          ]
+        }
+      }
+    ],
+    "gaps": [],
+    "diagnostics": []
+  }
+}

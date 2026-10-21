@@ -2,6 +2,9 @@
 //! each: native identity ownership, retirement of evidence a complete rewrite
 //! dropped, and retirement of a locator a full sweep confirmed missing.
 //! Every function is keyed on the provider's canonical source id.
+mod order;
+pub(crate) use order::reconcile_event_order;
+
 use super::AcquisitionContext;
 use crate::ProviderRoots;
 use anyhow::Result;

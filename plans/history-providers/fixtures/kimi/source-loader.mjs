@@ -1,0 +1,3 @@
+import{existsSync}from'node:fs';import{pathToFileURL,fileURLToPath}from'node:url';
+const base=process.env.KIMI_SOURCE+'/packages/agent-core-v2/src/';
+export async function resolve(s,c,next){if(['immer','zod'].includes(s))return next(s,{...c,parentURL:process.env.KIMI_READER_DEPS+'/package.json'});let p;if(s.startsWith('#/'))p=base+s.slice(2)+'.ts';else if(s.startsWith('#human/'))p=base+'human/'+s.slice(7)+'.ts';else if(s.startsWith('.')&&c.parentURL){let u=new URL(s,c.parentURL);if(existsSync(fileURLToPath(u)+'.ts'))p=fileURLToPath(u)+'.ts';}return p?{url:pathToFileURL(p).href,shortCircuit:true}:next(s,c);}

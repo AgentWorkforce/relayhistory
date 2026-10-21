@@ -29,6 +29,10 @@ pub enum Source {
     Antigravity,
     #[serde(rename = "copilot")]
     Copilot,
+    #[serde(rename = "qwen-code")]
+    QwenCode,
+    #[serde(rename = "kimi")]
+    Kimi,
     #[serde(rename = "grok-bot")]
     GrokBot,
     #[serde(rename = "openclaw")]
@@ -53,6 +57,8 @@ impl Source {
         Self::Omp,
         Self::Antigravity,
         Self::Copilot,
+        Self::QwenCode,
+        Self::Kimi,
         Self::GrokBot,
         Self::OpenClaw,
         #[cfg(test)]
@@ -74,6 +80,8 @@ impl Source {
             Self::Omp => "omp",
             Self::Antigravity => "antigravity",
             Self::Copilot => "copilot",
+            Self::QwenCode => "qwen-code",
+            Self::Kimi => "kimi",
             Self::GrokBot => "grok-bot",
             Self::OpenClaw => "openclaw",
             #[cfg(test)]
@@ -96,6 +104,8 @@ impl Source {
             "omp" => Some(Self::Omp),
             "antigravity" => Some(Self::Antigravity),
             "copilot" => Some(Self::Copilot),
+            "qwen-code" => Some(Self::QwenCode),
+            "kimi" => Some(Self::Kimi),
             "grok-bot" => Some(Self::GrokBot),
             "openclaw" => Some(Self::OpenClaw),
             #[cfg(test)]

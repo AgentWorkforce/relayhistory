@@ -61,6 +61,16 @@ const REGISTRATIONS: &[Registration] = &[
         adapter: copilot::ADAPTER,
     },
     Registration {
+        id: "qwen-code",
+        metadata: qwen_code::METADATA,
+        adapter: qwen_code::ADAPTER,
+    },
+    Registration {
+        id: "kimi",
+        metadata: kimi::METADATA,
+        adapter: kimi::ADAPTER,
+    },
+    Registration {
         id: "grok-bot",
         metadata: grok_bot::METADATA,
         adapter: grok_bot::ADAPTER,

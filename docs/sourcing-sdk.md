@@ -1010,11 +1010,13 @@ handle.
 | grok | ✓ | ✓ | ✓ | ✓ | ✓ | per-request |
 | grok-bot | ✓ | ✓ | — | — | ✓ | none |
 | hermes | ✓ | ✓ | ✓ | — | — | none |
+| kimi | ✓ | ✓ | ✓ | — | — | none |
 | muse | ✓ | ✓ | ✓ | ✓ | ✓ | per-request |
 | omp | ✓ | ✓ | ✓ | — | — | per-message |
 | openclaw | ✓ | ✓ | ✓ | — | — | per-message |
 | opencode | ✓ | ✓ | ✓ | ✓ | ✓ | none |
 | pi | ✓ | ✓ | ✓ | — | — | per-message |
+| qwen-code | ✓ | ✓ | ✓ | — | — | per-message |
 <!-- sourcing-sdk-population-table:end -->
 
 The ADR's [capture matrix](decisions/2026-09-19-relayhistory-owns-session-sourcing.md#capture-matrix)
