@@ -1,5 +1,6 @@
 //! Validated canonical evidence records accepted from installed source adapters.
 //! Foreign database row ids are retained in observations but never assigned locally.
+mod ownership;
 use crate::observations::ObservationKey;
 use crate::SessionLocation;
 use anyhow::{ensure, Context, Result};
@@ -501,10 +502,9 @@ impl EvidenceRecord {
     /// not evidence about who owns the row.
     pub(crate) fn matches_canonical(&self, conn: &Connection) -> Result<bool> {
         let spec = self.kind.spec();
-        let derived: Vec<&str> = spec.derived.split(',').filter(|c| !c.is_empty()).collect();
         let mut clauses = vec![];
         let mut values = vec![];
-        for column in spec.columns.split(',').filter(|c| !derived.contains(c)) {
+        for column in self.kind.owned_columns() {
             clauses.push(format!("{column} IS ?"));
             values.push(sql_value(self.payload.get(column).unwrap_or(&Value::Null)));
         }

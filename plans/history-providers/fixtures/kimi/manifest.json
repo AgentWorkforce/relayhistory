@@ -1,0 +1,102 @@
+[
+  {
+    "name": "ordinary",
+    "native_session_id": "session_00000000-0000-4000-8000-000000000001",
+    "root": ".kimi-code/sessions/wd_fixture_000000000001/session_00000000-0000-4000-8000-000000000001",
+    "writer": "Kimi Code CLI2.2.0 official darwin-arm64 binary",
+    "files": {
+      "state.json": {
+        "raw_sha256": "5f145bdc4487762ae2b50d1a33f7b6c7c2c25737ac8b59f3410c636e7666c7a2",
+        "sanitized_sha256": "646a3ec3f557cd618c61a1d01cc796f9bb78714cfd8528daec7a07856868865e"
+      },
+      "agents/main/wire.jsonl": {
+        "raw_sha256": "8a52ca9cfb363afabfccf407b2937ae748ba6cb99448be2e42cb7369b14e7d33",
+        "sanitized_sha256": "785c33d27c0d96a1208d58762de1537b4b8cb58aa4d0bb5b9a368c826b817089"
+      }
+    },
+    "agents": [
+      "main"
+    ]
+  },
+  {
+    "name": "tool",
+    "native_session_id": "session_00000000-0000-4000-8000-000000000002",
+    "root": ".kimi-code/sessions/wd_fixture_000000000002/session_00000000-0000-4000-8000-000000000002",
+    "writer": "Kimi Code CLI2.2.0 official darwin-arm64 binary",
+    "files": {
+      "state.json": {
+        "raw_sha256": "44ca1432c6c62e21ca31e4988bb2ceda244987fd8af59064bf71ce3b86209a63",
+        "sanitized_sha256": "81a95e8474e6f27cf086f7afb0d14ce2b2d6bbd873e190594f72ae3669f2f705"
+      },
+      "agents/main/wire.jsonl": {
+        "raw_sha256": "030b6d3ec9873b2f322b612dfeba1980a1ff5e7815aefbdf8a12834796d60105",
+        "sanitized_sha256": "4c87b7af672e6d7cca31c6cfde1d6eaeaaf96004b322225563269e585fbd9d56"
+      }
+    },
+    "agents": [
+      "main"
+    ]
+  },
+  {
+    "name": "resumed",
+    "native_session_id": "session_00000000-0000-4000-8000-000000000003",
+    "root": ".kimi-code/sessions/wd_fixture_000000000003/session_00000000-0000-4000-8000-000000000003",
+    "writer": "Kimi Code CLI2.2.0 official darwin-arm64 binary",
+    "files": {
+      "state.json": {
+        "raw_sha256": "d83bda5e107166a2f00973c36d47daba2e2bcaa6979332a11cd747df71d857cc",
+        "sanitized_sha256": "fd9781eebff1434e2486d9752a4e510cafc3e9bb67aa9a73ff9acdbf1d80239f"
+      },
+      "agents/main/wire.jsonl": {
+        "raw_sha256": "906e1010288f63921e4aff81d1e092f15c062a7ecc671cfc6a03335aa8b6bdaf",
+        "sanitized_sha256": "83b565b2401dba1c663a7ea9e9c8ddc10a64c775fd9b738d0a14debebc102369"
+      }
+    },
+    "agents": [
+      "main"
+    ]
+  },
+  {
+    "name": "subagent",
+    "native_session_id": "session_00000000-0000-4000-8000-000000000004",
+    "root": ".kimi-code/sessions/wd_fixture_000000000004/session_00000000-0000-4000-8000-000000000004",
+    "writer": "Kimi Code CLI2.2.0 official darwin-arm64 binary",
+    "files": {
+      "state.json": {
+        "raw_sha256": "0fb979850428b9fded9e975613f52679e24050f1fb0b544b4c25662472732217",
+        "sanitized_sha256": "b1d5f140ae9eca73ea3fa7c4d46f4df580ca5e5e7e7a901ea72111842e12d207"
+      },
+      "agents/agent-0/wire.jsonl": {
+        "raw_sha256": "5be7c9c0077282332ef8cf6f37394e5cdb9a97c1bae5555afe94aed9be6c756c",
+        "sanitized_sha256": "2a25213391d89788e239b2d2447059b702950504dbdcdefcccffbff9767a562b"
+      },
+      "agents/main/wire.jsonl": {
+        "raw_sha256": "a92c3d09d87aaa17e6d8a1f7cea1729936d2b1be9161d8041f5ec28abc3f34b6",
+        "sanitized_sha256": "727bbf63faf033bd90fb741f59163d5791268922716d6f185606ee9ceeed996a"
+      }
+    },
+    "agents": [
+      "agent-0",
+      "main"
+    ]
+  },
+  {
+    "name": "rewound",
+    "native_session_id": "session_00000000-0000-4000-8000-000000000005",
+    "root": ".kimi-code/sessions/wd_fixture_000000000005/session_00000000-0000-4000-8000-000000000005",
+    "writer": "Kimi Code CLI2.2.0 official darwin-arm64 binary",
+    "files": {
+      "state.json": {
+        "raw_sha256": "5f145bdc4487762ae2b50d1a33f7b6c7c2c25737ac8b59f3410c636e7666c7a2",
+        "sanitized_sha256": "470de2b0422b8c93d678274589e05410720226514878bdda387ff357411f4759"
+      },
+      "agents/main/wire.jsonl": {
+        "raw_sha256": "dfda7fa84337a3e979d997b89de006a16e315cbd6c442e24ed7edff71c88e5ea",
+        "sanitized_sha256": "f828386675e589a11bc6b3f98c45c131be4ccaa4a00a1fb5e4bc3c70aabd5b38"
+      }
+    },
+    "agents": [
+      "main"
+    ]
+  }
+]

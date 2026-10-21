@@ -244,6 +244,12 @@ source without deciding which one fails the test.
 | qwen-code/same-time | Pinned Qwen Code 0.25.3 ChatRecordingService with real writer lease, synthetic data; independent native UUID-chain reader oracle. |
 | qwen-code/official-reader | Pinned independent prepareTranscriptRecords replay for all six native recorder captures. |
 | qwen-code/derived-reader | Explicitly derived UUID fragment and trailing artifact mutation of native captures replayed through the independent pinned upstream reader, not an actual writer case. |
+| kimi/ordinary | Kimi Code 2.2.0 native protocol 1.5 writer, localhost model fixture, independently restored by pinned official foldWireRecords; ordinary case. |
+| kimi/tool | Kimi Code 2.2.0 native protocol 1.5 writer, localhost model fixture, independently restored by pinned official foldWireRecords; tool case. |
+| kimi/resumed | Kimi Code 2.2.0 native protocol 1.5 writer, localhost model fixture, independently restored by pinned official foldWireRecords; resumed case. |
+| kimi/subagent | Kimi Code 2.2.0 native protocol 1.5 writer, localhost model fixture, independently restored by pinned official foldWireRecords; subagent case. |
+| kimi/rewound | Native 2.2 binary journal plus pinned official buildUndoSwitchRecords writer constructor; official flattenChain+fold confirms prior messages are retired. |
+| kimi/official-reader | Pinned official source restart replay oracle, independent of RelayHistory. |
 | grok-bot/replicas | Synthetic complete and truncated transcript tails in two account slots, roster titles, widget response, cloud-agent round trip, and voice turns. |
 | openclaw/agent24 | OpenClaw 2026.10.4 writer, agent schema 24, deterministic clock/UUIDs: Pi v4 entries in transcript_events incl. one writer-compressed zstd row, session keys as conversation identity, main and Telegram keys, thinking/tool calls/results with isError, per-message usage, zero-usage delivery mirror, shared-mode heartbeat polls (marker and legacy prompt) with quiet acknowledgements. |
 | openclaw/agent24-ops | Second agent database from the same writer run: relay DM key under a non-main agent ID, and an isolated cron job whose two runs are two windows of one session key. |
