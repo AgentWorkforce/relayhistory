@@ -219,11 +219,10 @@ mod tests {
     #[test]
     fn each_discovery_adapter_reports_its_own_descriptor_id() {
         for descriptor in LOCAL_SOURCES {
-            if let Discovery::Provider(build) = descriptor.discovery {
-                let provider = build();
-                assert_eq!(provider.source(), descriptor.id);
-                assert_eq!(provider.location(), crate::SessionLocation::Local);
-            }
+            let Discovery::Provider(build) = descriptor.discovery;
+            let provider = build();
+            assert_eq!(provider.source(), descriptor.id);
+            assert_eq!(provider.location(), crate::SessionLocation::Local);
         }
     }
 
