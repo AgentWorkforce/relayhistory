@@ -337,7 +337,7 @@ fn shallow_tail_never_replaces_the_opening_prompt() {
     assert_eq!(first, None, "tail turn is not an opening prompt");
     store
         .hydrate(
-            &SessionRef::id(Source::Vtcode, &sid(home.path())),
+            &SessionRef::id(Source::Vtcode, sid(home.path())),
             HydrateOptions::default(),
         )
         .unwrap();
