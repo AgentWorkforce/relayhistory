@@ -83,20 +83,20 @@ fn repair_order(
         return Ok(());
     }
     let usage = usage::turn_usage(rows, native)?;
+    let replay = ReplayFacts {
+        reordered: &reordered,
+        usage: &usage,
+    };
     let mut replay_keys = Keys::default();
     for row in rows {
-        replay_row(
-            conn,
-            sid,
-            native,
-            cwd,
-            row,
-            &reordered,
-            &usage,
-            &mut replay_keys,
-        )?;
+        replay_row(conn, sid, native, cwd, row, &replay, &mut replay_keys)?;
     }
     Ok(())
+}
+
+struct ReplayFacts<'a> {
+    reordered: &'a std::collections::BTreeSet<i64>,
+    usage: &'a BTreeMap<String, String>,
 }
 
 fn replay_row(
@@ -105,8 +105,7 @@ fn replay_row(
     native: &str,
     cwd: Option<&str>,
     row: &Value,
-    reordered: &std::collections::BTreeSet<i64>,
-    usage: &BTreeMap<String, String>,
+    replay: &ReplayFacts<'_>,
     keys: &mut Keys,
 ) -> Result<()> {
     if row["type"] == "turn.started"
@@ -114,13 +113,13 @@ fn replay_row(
         && row["context"]["actor_id"] == native
     {
         let ts = format::time(format::string(&row["context"], "timestamp")?)?;
-        if reordered.contains(&ts) {
+        if replay.reordered.contains(&ts) {
             prompt(conn, sid, cwd, row, keys)?;
         }
     } else if row["type"] == "item.completed" && row["item"]["context"]["actor_id"] == native {
         let item = &row["item"];
         let ts = format::time(format::string(&item["context"], "timestamp")?)?;
-        if !reordered.contains(&ts) {
+        if !replay.reordered.contains(&ts) {
             return Ok(());
         }
         match item["type"].as_str() {
@@ -129,7 +128,7 @@ fn replay_row(
                 sid,
                 cwd,
                 item,
-                usage.get(format::string(item, "id")?),
+                replay.usage.get(format::string(item, "id")?),
                 keys,
             )?,
             Some("tool_invocation") => call(conn, sid, cwd, item, keys)?,

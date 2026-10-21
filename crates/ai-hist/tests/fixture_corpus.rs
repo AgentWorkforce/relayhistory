@@ -26,6 +26,7 @@ use ai_hist::{
 };
 use rusqlite::Connection;
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -635,9 +636,18 @@ fn redact_string(text: String, homes: &[String], stamp: bool) -> String {
     if stamp && text.starts_with("codex-sqlite-v2:sha256:") {
         return "codex-sqlite-v2:sha256:<content>".into();
     }
+    if stamp && text.starts_with("vtcode_0_18_v1:sha256:") {
+        return "vtcode_0_18_v1:sha256:<content>".into();
+    }
     let mut text = text;
     let mut replaced = false;
     for home in homes {
+        // VT Code namespaces native ids by the declared workspace root. Its
+        // fixture HOME is temporary, so keep the namespace shape and native
+        // id while dropping only the path-derived digest.
+        let workspace_root = Path::new(home).join(".vtcode/sessions");
+        let digest = Sha256::digest(workspace_root.to_string_lossy().as_bytes());
+        text = text.replace(&format!("root:{digest:x}:"), "root:<workspace>:");
         if home.is_empty() || !text.contains(home.as_str()) {
             continue;
         }
