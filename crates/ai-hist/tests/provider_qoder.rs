@@ -298,6 +298,98 @@ fn qoder_empty_root_collision_and_explicit_root_are_truthful() {
         .is_empty());
 }
 
+#[test]
+fn qoder_oversized_opening_prompt_remains_discoverable() {
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path(), "synthetic-tool", TOOL);
+    let mut lines = TOOL.lines().map(str::to_owned).collect::<Vec<_>>();
+    let mut opening: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+    opening["message"]["content"] = "X".repeat(70_000).into();
+    lines[0] = opening.to_string();
+    std::fs::write(path, format!("{}\n", lines.join("\n"))).unwrap();
+    let store = open(home.path());
+    let report = store
+        .discover(DiscoveryOptions::default().sources([Source::Qoder]))
+        .unwrap();
+    assert_eq!(report.discovered, 1);
+    let conn = rusqlite::Connection::open(home.path().join("qoder.db")).unwrap();
+    let prompt: String = conn
+        .query_row(
+            "SELECT first_prompt FROM sessions WHERE source='qoder' AND session_id='synthetic-tool'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(prompt, "X".repeat(4096));
+}
+
+#[test]
+fn qoder_over_cap_opening_is_diagnostic_without_hiding_a_valid_sibling() {
+    let home = tempfile::tempdir().unwrap();
+    stage(home.path(), "synthetic-tool", TOOL);
+    let mut opening: serde_json::Value =
+        serde_json::from_str(TOOL.lines().next().unwrap()).unwrap();
+    opening["sessionId"] = "oversized".into();
+    opening["message"]["content"] = "X".repeat(8 * 1024 * 1024).into();
+    stage(home.path(), "oversized", &format!("{opening}\n"));
+    let store = open(home.path());
+    let report = store
+        .discover(DiscoveryOptions::default().sources([Source::Qoder]))
+        .unwrap();
+    assert_eq!(report.discovered, 1);
+    assert!(report.diagnostics.iter().any(|diagnostic| diagnostic
+        .message
+        .contains("QODER_OVERSIZED_OPENING_RECORD")));
+}
+
+#[test]
+fn qoder_shallow_tail_advances_activity_after_many_appends() {
+    for count in [300, 1_000] {
+        let home = tempfile::tempdir().unwrap();
+        let path = stage(home.path(), "synthetic-tool", TOOL);
+        let mut bytes = TOOL.to_owned();
+        for index in 0..count {
+            bytes.push_str(&format!(
+                "{}\n",
+                serde_json::json!({"type":"active-leaf","sessionId":"synthetic-tool","leafUuid":"tool-a2","timestamp":1_900_000_000_000_i64 + index})
+            ));
+        }
+        std::fs::write(path, bytes).unwrap();
+        let store = open(home.path());
+        let report = store
+            .discover(DiscoveryOptions::default().sources([Source::Qoder]))
+            .unwrap();
+        assert_eq!(report.discovered, 1);
+        let conn = rusqlite::Connection::open(home.path().join("qoder.db")).unwrap();
+        let last: i64 = conn
+            .query_row(
+                "SELECT last_activity_ms FROM sessions WHERE source='qoder' AND session_id='synthetic-tool'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(last, 1_900_000_000_000_i64 + count - 1);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn qoder_enumeration_skips_nested_trees_and_directory_symlinks() {
+    let home = tempfile::tempdir().unwrap();
+    stage(home.path(), "synthetic-tool", TOOL);
+    let root = home.path().join(".qoder/projects");
+    let nested = root.join("unrelated/deep/tree");
+    std::fs::create_dir_all(&nested).unwrap();
+    std::fs::write(nested.join("invalid.jsonl"), b"not a transcript\n").unwrap();
+    std::os::unix::fs::symlink(&root, root.join("loop")).unwrap();
+    let store = open(home.path());
+    let report = store
+        .discover(DiscoveryOptions::default().sources([Source::Qoder]))
+        .unwrap();
+    assert_eq!(report.discovered, 1);
+    assert!(report.diagnostics.is_empty());
+}
+
 #[cfg(all(feature = "unstable-internal", feature = "export"))]
 fn remote_case(
     fixture: &str,
