@@ -1,5 +1,13 @@
 use super::*;
 
+pub(super) fn tool_id<'a>(item: &'a Value, calls: &'a BTreeMap<String, String>) -> Result<&'a str> {
+    let call_id = format::string(item, "call_id")?;
+    Ok(item["tool_call_id"]
+        .as_str()
+        .or_else(|| calls.get(call_id).map(String::as_str))
+        .unwrap_or(call_id))
+}
+
 pub(super) fn result(
     conn: &Connection,
     sid: &str,
@@ -8,12 +16,22 @@ pub(super) fn result(
     calls: &BTreeMap<String, String>,
     keys: &mut Keys,
 ) -> Result<()> {
+    let tool_id = result_event(conn, sid, cwd, item, calls, keys)?;
+    set_tool_call_error(conn, ID, sid, &tool_id, item["status"] == "failed")?;
+    keys.results.insert(tool_id);
+    Ok(())
+}
+
+pub(super) fn result_event(
+    conn: &Connection,
+    sid: &str,
+    cwd: Option<&str>,
+    item: &Value,
+    calls: &BTreeMap<String, String>,
+    keys: &mut Keys,
+) -> Result<String> {
     let id = format::string(item, "id")?;
-    let call_id = format::string(item, "call_id")?;
-    let tool_id = item["tool_call_id"]
-        .as_str()
-        .or_else(|| calls.get(call_id).map(String::as_str))
-        .unwrap_or(call_id);
+    let tool_id = tool_id(item, calls)?;
     let ts = format::time(format::string(&item["context"], "timestamp")?)?;
     let text = item["output"].as_str().unwrap_or("");
     let error = item["status"] == "failed";
@@ -40,8 +58,6 @@ pub(super) fn result(
             ..Default::default()
         },
     )?;
-    set_tool_call_error(conn, ID, sid, tool_id, error)?;
-    keys.results.insert(tool_id.into());
     keys.events.insert(uid);
-    Ok(())
+    Ok(tool_id.into())
 }

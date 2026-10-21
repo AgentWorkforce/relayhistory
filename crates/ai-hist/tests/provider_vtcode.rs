@@ -523,6 +523,78 @@ fn rewritten_invocation_id_joins_its_current_output() {
 }
 
 #[test]
+fn same_millisecond_order_repair_keeps_failed_tool_result() {
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path());
+    let mut rows = FIXTURE.lines().map(str::to_owned).collect::<Vec<_>>();
+    let mut output: serde_json::Value = serde_json::from_str(&rows[7]).unwrap();
+    output["event"]["item"]["status"] = "failed".into();
+    rows[7] = output.to_string();
+    std::fs::write(&path, format!("{}\n", rows.join("\n"))).unwrap();
+    let store = open(home.path());
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    let before = evidence(&store, &sid(home.path()));
+    assert_eq!(before.tool_calls[0].is_error, Some(true));
+
+    let mut assistant: serde_json::Value = serde_json::from_str(&rows[8]).unwrap();
+    assistant["event"]["item"]["id"] = "assistant-before-call".into();
+    assistant["event"]["item"]["text"] = "Synthetic same-time reply".into();
+    assistant["event"]["item"]["context"]["timestamp"] = "2026-10-20T12:01:02Z".into();
+    rows.insert(6, assistant.to_string());
+    std::fs::write(path, format!("{}\n", rows.join("\n"))).unwrap();
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    let after = evidence(&store, &sid(home.path()));
+    assert!(contains(&after, "Synthetic same-time reply"));
+    assert_eq!(after.tool_calls[0].is_error, Some(true));
+    assert_eq!(after.tool_results.len(), 1);
+    assert_eq!(
+        after.tool_results[0].result_status.as_deref(),
+        Some("errored")
+    );
+}
+
+#[test]
+fn reordered_earlier_output_keeps_later_final_tool_status() {
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path());
+    let mut rows = FIXTURE.lines().map(str::to_owned).collect::<Vec<_>>();
+    let mut first_output: serde_json::Value = serde_json::from_str(&rows[7]).unwrap();
+    first_output["event"]["item"]["status"] = "failed".into();
+    rows[7] = first_output.to_string();
+    let mut final_output = first_output;
+    final_output["event"]["item"]["id"] = "output-final".into();
+    final_output["event"]["item"]["status"] = "completed".into();
+    final_output["event"]["item"]["context"]["timestamp"] = "2026-10-20T12:01:05Z".into();
+    rows.insert(9, final_output.to_string());
+    std::fs::write(&path, format!("{}\n", rows.join("\n"))).unwrap();
+    let store = open(home.path());
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    assert_eq!(
+        evidence(&store, &sid(home.path())).tool_calls[0].is_error,
+        Some(false)
+    );
+
+    let mut assistant: serde_json::Value = serde_json::from_str(&rows[8]).unwrap();
+    assistant["event"]["item"]["id"] = "assistant-before-output".into();
+    assistant["event"]["item"]["text"] = "Synthetic same-time result preface".into();
+    assistant["event"]["item"]["context"]["timestamp"] = "2026-10-20T12:01:03Z".into();
+    rows.insert(7, assistant.to_string());
+    std::fs::write(path, format!("{}\n", rows.join("\n"))).unwrap();
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    let after = evidence(&store, &sid(home.path()));
+    assert_eq!(after.tool_calls[0].is_error, Some(false));
+    assert_eq!(after.tool_results.len(), 2);
+    assert!(after
+        .tool_results
+        .iter()
+        .any(|r| r.result_status.as_deref() == Some("errored")));
+    assert!(after
+        .tool_results
+        .iter()
+        .any(|r| r.result_status.as_deref() == Some("completed")));
+}
+
+#[test]
 fn thread_started_only_keeps_unknown_activity_time() {
     let home = tempfile::tempdir().unwrap();
     let path = stage(home.path());

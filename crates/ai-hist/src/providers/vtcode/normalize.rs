@@ -169,7 +169,7 @@ fn replay_row(
                 replay.usage.get(format::string(item, "id")?),
                 keys,
             )?,
-            Some("tool_invocation") => call(
+            Some("tool_invocation") => call_event(
                 conn,
                 sid,
                 cwd,
@@ -177,7 +177,9 @@ fn replay_row(
                 replay.usage.get(format::string(item, "id")?),
                 keys,
             )?,
-            Some("tool_output") => tool_output::result(conn, sid, cwd, item, replay.calls, keys)?,
+            Some("tool_output") => {
+                tool_output::result_event(conn, sid, cwd, item, replay.calls, keys)?;
+            }
             _ => {}
         }
     }
@@ -439,6 +441,23 @@ fn call(
     if status.is_some() {
         keys.results.insert(tool_id.into());
     }
+    call_event(conn, sid, cwd, item, usage, keys)
+}
+
+// Order repair only replaces session events. The full pass has already
+// established the final tool-call status from every native output.
+fn call_event(
+    conn: &Connection,
+    sid: &str,
+    cwd: Option<&str>,
+    item: &Value,
+    usage: Option<&String>,
+    keys: &mut Keys,
+) -> Result<()> {
+    let id = format::string(item, "id")?;
+    let tool_id = item["tool_call_id"].as_str().unwrap_or(id);
+    let ts = format::time(format::string(&item["context"], "timestamp")?)?;
+    let args = serde_json::to_string(&item["arguments"])?;
     let uid = format!("{id}:0");
     let facts = ToolResultFacts {
         tool_use_id: Some(tool_id.into()),
