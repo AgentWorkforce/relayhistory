@@ -152,6 +152,33 @@ fn metadata_rows(
     }
     Ok((last, title, records))
 }
+fn project_candidates(
+    project: &Path,
+    scope: Option<&crate::ingest::path_scope::PathScope>,
+    out: &mut Vec<Candidate>,
+) -> Result<()> {
+    for file in std::fs::read_dir(project)? {
+        crate::ingest::check_capture_cancelled()?;
+        let file = file?;
+        if !file.file_type()?.is_file() || file.path().extension().is_none_or(|ext| ext != "jsonl")
+        {
+            continue;
+        }
+        let path = file.path();
+        if scope.is_some_and(|scope| !scope.mentions(&path)) {
+            continue;
+        }
+        let (stamp, recency_hint_ms) = crate::file_stamp_and_modified(&path)?;
+        out.push(Candidate {
+            source: ID,
+            locator: path.to_string_lossy().into_owned(),
+            session_id: None,
+            recency_hint_ms,
+            stamp,
+        });
+    }
+    Ok(())
+}
 struct Provider;
 impl ShallowSessionProvider for Provider {
     fn source(&self) -> &'static str {
@@ -190,27 +217,7 @@ impl ShallowSessionProvider for Provider {
                 if !project.file_type()?.is_dir() {
                     continue;
                 }
-                for file in std::fs::read_dir(project.path())? {
-                    crate::ingest::check_capture_cancelled()?;
-                    let file = file?;
-                    if !file.file_type()?.is_file()
-                        || file.path().extension().is_none_or(|ext| ext != "jsonl")
-                    {
-                        continue;
-                    }
-                    let path = file.path();
-                    if env.path_scope().is_some_and(|scope| !scope.mentions(&path)) {
-                        continue;
-                    }
-                    let (stamp, recency_hint_ms) = crate::file_stamp_and_modified(&path)?;
-                    out.push(Candidate {
-                        source: ID,
-                        locator: path.to_string_lossy().into_owned(),
-                        session_id: None,
-                        recency_hint_ms,
-                        stamp,
-                    });
-                }
+                project_candidates(&project.path(), env.path_scope(), &mut out)?;
             }
         }
         out.sort_by(|a, b| a.locator.cmp(&b.locator));
