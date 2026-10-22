@@ -22,6 +22,7 @@ from mistralai_vibe_local_harness.vibe._storage import (
     AppendEntryOp,
     PluginLockV1,
     ProjectionStateV1,
+    ReplaceEntryOp,
     UnifiedSessionStore,
     empty_runtime_state,
 )
@@ -142,6 +143,54 @@ def append(root: Path) -> None:
     )
 
 
+def write_replace_base(root: Path) -> None:
+    running = effect()
+    running["updatedAt"] = START + 1000
+    running["generationStatus"] = "running"
+    running["state"] = {"status": "running"}
+    history = [
+        entry("user-1", "user", "Explain the synthetic repository", 0),
+        running,
+        entry("assistant-1", "assistant", "Pending synthetic answer", 1000),
+    ]
+    state = PublicSessionState(
+        session=PublicSession(
+            id=SID, status=IdleSessionStatus(), created_at=START,
+            updated_at=START + 1000, title="Synthetic Vibe replacement session",
+        ),
+        history=LatestPublicHistoryPage(entries=history),
+        turn_queue=TurnQueue(items=[], paused=False, max_items=TURN_QUEUE_MAX_ITEMS),
+    )
+    projection = ProjectionStateV1(
+        session_id=SID, snapshot_sequence=0, watermark=2, snapshot=state
+    )
+    runtime = empty_runtime_state(
+        SID, snapshot_sequence=0, plugin_lock=PluginLockV1(plugins=[]),
+        cwd="/synthetic/repository", pins={},
+    )
+    checkpoint = {"checkpoint_version": 1, "context": {"messages": []}}
+    UnifiedSessionStore(root, SID).write_generation(
+        checkpoint=checkpoint, runtime_state=runtime, projection_state=projection
+    )
+
+
+def replace(root: Path) -> None:
+    revised = entry("assistant-1", "assistant", "Final synthetic answer", 1000)
+    revised["updatedAt"] = START + 1500
+    settled = effect()
+    settled["updatedAt"] = START + 1500
+    settled["detail"]["input"] = {"path": "/synthetic/repository/UPDATED.md"}
+    settled["state"]["outputText"] = "A revised synthetic README"
+    settled["state"]["output"] = {"text": "A revised synthetic README"}
+    UnifiedSessionStore(root, SID).advance_projection_delta(
+        4,
+        (
+            ReplaceEntryOp(id="assistant-1", entry=revised),
+            ReplaceEntryOp(id="effect-action-1", entry=settled),
+        ),
+    )
+
+
 def rewrite(root: Path) -> None:
     # Native generation replacement: one old assistant entry and the tool
     # effect disappear, rather than a JSON fixture being edited by hand.
@@ -218,6 +267,10 @@ if __name__ == "__main__":
         read(root)
     elif command == "append":
         append(root)
+    elif command == "write-replace-base":
+        write_replace_base(root)
+    elif command == "replace":
+        replace(root)
     elif command == "rewrite":
         rewrite(root)
     elif command == "reorder":

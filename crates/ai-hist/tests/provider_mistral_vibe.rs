@@ -463,6 +463,71 @@ fn native_journal_only_append_is_seen_by_unforced_sync() {
 }
 
 #[test]
+fn native_journal_replace_updates_existing_message_and_tool() {
+    let home = tempfile::tempdir().unwrap();
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/provider-fixtures/mistral-vibe/pre-replace-home");
+    copy_tree(&source, home.path());
+    let store = open(home.path());
+    store
+        .discover(DiscoveryOptions::default().sources([Source::MistralVibe]))
+        .unwrap();
+    store
+        .hydrate(
+            &SessionRef::id(Source::MistralVibe, SID),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    let before = evidence(&store);
+    assert_eq!(before.messages.len(), 3);
+    assert_eq!(before.tool_calls.len(), 1);
+    assert_eq!(before.tool_calls[0].is_error, None);
+    assert_eq!(before.tool_results.len(), 0);
+    assert!(before.messages.iter().any(|message| message
+        .blocks
+        .iter()
+        .any(|block| { block.text.as_deref() == Some("Pending synthetic answer") })));
+    assert_eq!(
+        before.tool_calls[0].args.as_ref().unwrap()["path"],
+        "/synthetic/repository/README.md"
+    );
+
+    let journal = home
+        .path()
+        .join(".vibe/logs/session/unified")
+        .join(SID)
+        .join("journal/0000000000000001.jsonl");
+    let replacement = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/provider-fixtures/mistral-vibe/replace-home/.vibe/logs/session/unified")
+        .join(SID)
+        .join("journal/0000000000000001.jsonl");
+    std::fs::copy(replacement, journal).unwrap();
+    store.sync(SyncOptions::default()).unwrap();
+    let after = evidence(&store);
+    assert_eq!(after.messages.len(), 3);
+    assert_eq!(after.tool_calls.len(), 1);
+    assert_eq!(after.tool_results.len(), 1);
+    assert_eq!(after.tool_calls[0].tool_use_id, "effect-action-1");
+    assert_eq!(after.tool_calls[0].is_error, Some(false));
+    assert_eq!(
+        after.tool_calls[0].args.as_ref().unwrap()["path"],
+        "/synthetic/repository/UPDATED.md"
+    );
+    assert!(after.messages.iter().any(|message| message
+        .blocks
+        .iter()
+        .any(|block| { block.text.as_deref() == Some("Final synthetic answer") })));
+    assert!(!after.messages.iter().any(|message| message
+        .blocks
+        .iter()
+        .any(|block| { block.text.as_deref() == Some("Pending synthetic answer") })));
+    assert_eq!(
+        after.tool_results[0].text.as_deref(),
+        Some("A revised synthetic README")
+    );
+}
+
+#[test]
 fn native_deletion_preserves_remote_catalog_after_locator_changes() {
     let home = tempfile::tempdir().unwrap();
     let current = stage(home.path());
