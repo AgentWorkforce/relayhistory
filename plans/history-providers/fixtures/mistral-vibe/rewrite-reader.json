@@ -1,0 +1,50 @@
+{
+  "session_id": "vibe-synthetic-001",
+  "format_minor": 9,
+  "cwd": "/synthetic/repository",
+  "title": "Revised Vibe session",
+  "entries": [
+    {
+      "content": [
+        {
+          "text": "Explain the synthetic repository",
+          "type": "text"
+        }
+      ],
+      "createdAt": 1792609200000,
+      "generationStatus": "completed",
+      "id": "user-1",
+      "inputEntryId": null,
+      "relatedEntryId": null,
+      "role": "user",
+      "sessionId": "vibe-synthetic-001",
+      "source": "turn_start",
+      "turnId": "turn-1",
+      "type": "message",
+      "updatedAt": 1792609200000
+    },
+    {
+      "content": [
+        {
+          "text": "It contains a revised fixture.",
+          "type": "text"
+        }
+      ],
+      "createdAt": 1792609204000,
+      "generationStatus": "completed",
+      "id": "assistant-revised",
+      "inputEntryId": "user-1",
+      "relatedEntryId": null,
+      "role": "assistant",
+      "sessionId": "vibe-synthetic-001",
+      "source": "harness",
+      "turnId": "turn-1",
+      "type": "message",
+      "updatedAt": 1792609204000
+    }
+  ],
+  "interop_roles": [
+    "user",
+    "assistant"
+  ]
+}
