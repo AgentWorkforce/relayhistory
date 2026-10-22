@@ -5,9 +5,50 @@ fn roots(home: &Path) -> ProviderRoots {
 }
 
 #[test]
+fn discovery_latest_message_uses_session_index_without_global_grouping() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(include_str!("../../../tests/fixtures/goose/schema17.sql"))
+        .unwrap();
+    let query = storage::session_query(false);
+    let mut plan = conn
+        .prepare(&format!("EXPLAIN QUERY PLAN {query}"))
+        .unwrap();
+    let details = plan
+        .query_map(rusqlite::params![Option::<String>::None, 1], |row| {
+            row.get::<_, String>(3)
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert!(details
+        .iter()
+        .any(|detail| detail.contains("CORRELATED SCALAR SUBQUERY")));
+    assert!(details
+        .iter()
+        .any(|detail| detail.contains("idx_messages_session_created")
+            && detail.contains("session_id=?")));
+    assert!(!details
+        .iter()
+        .any(|detail| detail.contains("MATERIALIZE") || detail.contains("SCAN messages")));
+    conn.execute(
+        "UPDATE messages SET created_timestamp=1792642924 WHERE message_id='assistant-native-3'",
+        [],
+    )
+    .unwrap();
+    let latest: i64 = conn
+        .query_row(
+            &query,
+            rusqlite::params![Option::<String>::None, 1],
+            |row| row.get(7),
+        )
+        .unwrap();
+    assert_eq!(latest, 1792642924);
+}
+
+#[test]
 fn native_snapshot_reads_schema17_and_official_order() {
     let home = tempfile::tempdir().unwrap();
-    let dir = home.path().join(".local/share/goose/sessions");
+    let dir = roots(home.path()).for_provider(ID)[0].join("sessions");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("sessions.db");
     rusqlite::Connection::open(&path)
@@ -41,7 +82,7 @@ fn native_snapshot_reads_schema17_and_official_order() {
 #[test]
 fn unsupported_schema_fails_before_presenting_empty_coverage() {
     let home = tempfile::tempdir().unwrap();
-    let dir = home.path().join(".local/share/goose/sessions");
+    let dir = roots(home.path()).for_provider(ID)[0].join("sessions");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("sessions.db");
     let conn = rusqlite::Connection::open(&path).unwrap();
@@ -60,7 +101,7 @@ fn unsupported_schema_fails_before_presenting_empty_coverage() {
 #[test]
 fn wal_only_append_is_in_snapshot_and_fingerprint() {
     let home = tempfile::tempdir().unwrap();
-    let dir = home.path().join(".local/share/goose/sessions");
+    let dir = roots(home.path()).for_provider(ID)[0].join("sessions");
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("sessions.db");
     let writer = rusqlite::Connection::open(&path).unwrap();
@@ -90,7 +131,7 @@ fn wal_only_append_is_in_snapshot_and_fingerprint() {
 fn escaped_database_symlink_is_rejected_before_open() {
     let home = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
-    let dir = home.path().join(".local/share/goose/sessions");
+    let dir = roots(home.path()).for_provider(ID)[0].join("sessions");
     std::fs::create_dir_all(&dir).unwrap();
     let other = outside.path().join("sessions.db");
     rusqlite::Connection::open(&other).unwrap();

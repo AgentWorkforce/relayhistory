@@ -113,8 +113,12 @@ fn timestamp(value: i64) -> Result<i64> {
     value.checked_mul(1000).context("invalid Goose timestamp")
 }
 pub(super) fn session_query(selected: bool) -> String {
-    let predicate = if selected { "WHERE session_id=?1" } else { "" };
-    format!("SELECT s.id,s.name,s.provider_name,s.model_config_json,s.working_dir,s.parent_session_id,cast(strftime('%s',s.created_at) as integer),max(cast(strftime('%s',s.updated_at) as integer),coalesce(m.latest,0)) AS latest FROM sessions s LEFT JOIN (SELECT session_id,max(created_timestamp) AS latest FROM messages {predicate} GROUP BY session_id) m ON m.session_id=s.id WHERE (?1 IS NULL OR s.id=?1) ORDER BY latest DESC,s.id LIMIT ?2")
+    let predicate = if selected {
+        "s.id=?1"
+    } else {
+        "(?1 IS NULL OR s.id=?1)"
+    };
+    format!("SELECT s.id,s.name,s.provider_name,s.model_config_json,s.working_dir,s.parent_session_id,cast(strftime('%s',s.created_at) as integer),max(cast(strftime('%s',s.updated_at) as integer),coalesce((SELECT m.created_timestamp FROM messages m WHERE m.session_id=s.id ORDER BY m.created_timestamp DESC,m.id DESC LIMIT 1),0)) AS latest FROM sessions s WHERE {predicate} ORDER BY latest DESC,s.id LIMIT ?2")
 }
 fn sessions(
     conn: &Connection,

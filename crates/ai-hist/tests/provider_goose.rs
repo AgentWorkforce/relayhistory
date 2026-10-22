@@ -27,10 +27,17 @@ fn open(home: &std::path::Path) -> SessionStore {
     .unwrap()
 }
 
+fn native_path(home: &std::path::Path) -> std::path::PathBuf {
+    if cfg!(windows) {
+        home.join("AppData/Roaming/Block/goose/data/sessions/sessions.db")
+    } else {
+        home.join(".local/share/goose/sessions/sessions.db")
+    }
+}
+
 fn stage(home: &std::path::Path, sql: &str) {
-    let dir = home.join(".local/share/goose/sessions");
-    std::fs::create_dir_all(&dir).unwrap();
-    let path = dir.join("sessions.db");
+    let path = native_path(home);
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     if path.exists() {
         std::fs::remove_file(&path).unwrap();
     }
@@ -63,7 +70,7 @@ fn hydrate(store: &SessionStore) -> ai_hist::SessionEvidence {
 #[test]
 fn goose_native_schema17_public_history_conformance() {
     let home = tempfile::tempdir().unwrap();
-    let parent = home.path().join(".local/share/goose/sessions");
+    let parent = native_path(home.path()).parent().unwrap().to_path_buf();
     std::fs::create_dir_all(&parent).unwrap();
     let native = rusqlite::Connection::open(parent.join("sessions.db")).unwrap();
     native
@@ -123,9 +130,7 @@ fn goose_interleaved_native_blocks_keep_order_and_stable_ids_after_reopen() {
         {"type":"text","text":"After the tool."}
     ]);
     let interleaved = blocks.to_string();
-    let native =
-        rusqlite::Connection::open(home.path().join(".local/share/goose/sessions/sessions.db"))
-            .unwrap();
+    let native = rusqlite::Connection::open(native_path(home.path())).unwrap();
     native
         .execute(
             "UPDATE messages SET content_json=?1 WHERE message_id='assistant-native-1'",
@@ -198,9 +203,7 @@ fn goose_interleaved_native_blocks_keep_order_and_stable_ids_after_reopen() {
     // The captured upstream replace_conversation changes SQLite row IDs while
     // keeping this message ID. Reapply only the derived interleaved content.
     stage(home.path(), include_str!("fixtures/goose/rewritten.sql"));
-    let native =
-        rusqlite::Connection::open(home.path().join(".local/share/goose/sessions/sessions.db"))
-            .unwrap();
+    let native = rusqlite::Connection::open(native_path(home.path())).unwrap();
     native
         .execute(
             "UPDATE messages SET content_json=?1 WHERE message_id='assistant-native-1'",
@@ -237,9 +240,7 @@ fn goose_interleaved_native_blocks_keep_order_and_stable_ids_after_reopen() {
         {"type":"toolRequest","id":"call-native-1","toolCall":{"status":"success","value":{"name":"read_file"}}},
         {"type":"text","text":"After the tool."}
     ]);
-    let native =
-        rusqlite::Connection::open(home.path().join(".local/share/goose/sessions/sessions.db"))
-            .unwrap();
+    let native = rusqlite::Connection::open(native_path(home.path())).unwrap();
     native
         .execute(
             "UPDATE messages SET content_json=?1 WHERE message_id='assistant-native-1'",
@@ -274,7 +275,7 @@ fn goose_interleaved_native_blocks_keep_order_and_stable_ids_after_reopen() {
 fn goose_multiblock_user_prompt_survives_reopen_and_retires_on_rewrite() {
     let home = tempfile::tempdir().unwrap();
     stage(home.path(), include_str!("fixtures/goose/schema17.sql"));
-    let native_path = home.path().join(".local/share/goose/sessions/sessions.db");
+    let native_path = native_path(home.path());
     let first = serde_json::json!([
         {"type":"text","text":"First part of prompt"},
         {"type":"image","mimeType":"image/png"},
@@ -377,9 +378,7 @@ fn goose_multiblock_user_prompt_survives_reopen_and_retires_on_rewrite() {
 fn goose_remote_opaque_event_uid_does_not_abort_local_prompt_reconciliation() {
     let home = tempfile::tempdir().unwrap();
     stage(home.path(), include_str!("fixtures/goose/schema17.sql"));
-    let native =
-        rusqlite::Connection::open(home.path().join(".local/share/goose/sessions/sessions.db"))
-            .unwrap();
+    let native = rusqlite::Connection::open(native_path(home.path())).unwrap();
     let ts: i64 = native
         .query_row(
             "SELECT created_timestamp * 1000 FROM messages WHERE message_id='user-native-1'",
@@ -479,9 +478,7 @@ fn goose_native_replace_reorders_stable_ids_and_retires_removed_result() {
     // SQLite rows. Align its recorded seconds with the original writer to
     // exercise same-millisecond order repair independently of clock drift.
     stage(home.path(), include_str!("fixtures/goose/rewritten.sql"));
-    let native =
-        rusqlite::Connection::open(home.path().join(".local/share/goose/sessions/sessions.db"))
-            .unwrap();
+    let native = rusqlite::Connection::open(native_path(home.path())).unwrap();
     native.execute("UPDATE messages SET created_timestamp=1792642821 WHERE message_id IN ('user-native-1','assistant-native-1','assistant-native-2')", []).unwrap();
     native.execute("UPDATE messages SET created_timestamp=1792642824 WHERE message_id IN ('user-native-2','assistant-native-3')", []).unwrap();
     drop(native);
@@ -587,7 +584,7 @@ fn goose_native_deletion_retires_local_observation_and_keeps_remote_catalog() {
             }],
         ))
         .unwrap();
-    std::fs::remove_file(home.path().join(".local/share/goose/sessions/sessions.db")).unwrap();
+    std::fs::remove_file(native_path(home.path())).unwrap();
     store.sync(SyncOptions::default().force(true)).unwrap();
     let conn = rusqlite::Connection::open(home.path().join("ledger.db")).unwrap();
     let local: i64 = conn
@@ -619,9 +616,7 @@ fn goose_native_deletion_retires_local_observation_and_keeps_remote_catalog() {
 fn goose_success_envelope_with_error_result_is_errored() {
     let home = tempfile::tempdir().unwrap();
     stage(home.path(), include_str!("fixtures/goose/schema17.sql"));
-    let native =
-        rusqlite::Connection::open(home.path().join(".local/share/goose/sessions/sessions.db"))
-            .unwrap();
+    let native = rusqlite::Connection::open(native_path(home.path())).unwrap();
     native.execute("UPDATE messages SET content_json=json_set(content_json,'$[0].toolResult.value.isError',json('true')) WHERE message_id='tool-native-1'", []).unwrap();
     drop(native);
     let store = open(home.path());
@@ -634,14 +629,148 @@ fn goose_success_envelope_with_error_result_is_errored() {
 }
 
 #[test]
+fn goose_mixed_tool_result_keeps_native_nontext_content_and_retires_it_on_rewrite() {
+    let home = tempfile::tempdir().unwrap();
+    stage(home.path(), include_str!("fixtures/goose/schema17.sql"));
+    let original = serde_json::json!([{
+        "type":"toolResponse", "id":"call-native-1",
+        "toolResult":{"status":"success","value":{"resultType":"complete","isError":false,
+            "content":[
+                {"type":"text","text":"Visible result"},
+                {"type":"resource","uri":"synthetic://goose/report"}
+            ]}}
+    }]);
+    let write_result = |content: &serde_json::Value| {
+        let conn = rusqlite::Connection::open(native_path(home.path())).unwrap();
+        conn.execute(
+            "UPDATE messages SET content_json=?1 WHERE message_id='tool-native-1'",
+            [content.to_string()],
+        )
+        .unwrap();
+    };
+    write_result(&original);
+    let store = open(home.path());
+    let before = hydrate(&store);
+    assert_eq!(
+        before.tool_results[0].text.as_deref(),
+        Some("Visible result")
+    );
+    let native_marker = before
+        .markers
+        .iter()
+        .find(|marker| marker.kind == "tool_result_block")
+        .unwrap();
+    assert_eq!(native_marker.payload.as_ref().unwrap(), &original[0]);
+    #[cfg(feature = "export")]
+    {
+        let mut snapshot = ExportSnapshot::open(
+            rusqlite::Connection::open(home.path().join("ledger.db")).unwrap(),
+            &ExportSelection {
+                sessions: vec![SessionIdentity {
+                    source: "goose".into(),
+                    session_id: SID.into(),
+                }],
+                kinds: vec!["session_marker".into()],
+                ..Default::default()
+            },
+            &ExportLimits::default(),
+            60_000,
+            1_000,
+        )
+        .unwrap();
+        let page = snapshot.page(&snapshot.handle().cursor, 1_000).unwrap();
+        let exported = page
+            .records
+            .into_iter()
+            .find(|record| {
+                record.kind == "session_marker"
+                    && record.payload["payload_json"]
+                        .as_str()
+                        .is_some_and(|raw| raw.contains("synthetic://goose/report"))
+            })
+            .unwrap();
+        let receiver_home = tempfile::tempdir().unwrap();
+        let receiver = open(receiver_home.path());
+        receiver
+            .apply_source_observations(SourceObservationBatch::new(
+                "mixed-result",
+                "fixture",
+                SessionLocation::Remote,
+                vec![SourceObservation {
+                    session: ShallowSession {
+                        source: "goose".into(),
+                        session_id: SID.into(),
+                        source_stamp: Some("mixed-result".into()),
+                        ..Default::default()
+                    },
+                    raw_locator: None,
+                }],
+            ))
+            .unwrap();
+        let key = ObservationKey {
+            source: "goose".into(),
+            session_id: SID.into(),
+            location: SessionLocation::Remote,
+            connector_id: "mixed-result".into(),
+            connector_instance: "fixture".into(),
+        };
+        let revision = receiver.source_observation(&key).unwrap().revision.unwrap();
+        let mut payload = exported.payload.as_object().unwrap().clone();
+        payload.remove("id");
+        payload.remove("location");
+        receiver
+            .apply_source_evidence(
+                SourceEvidenceSubmission::new(
+                    key,
+                    revision,
+                    NormalizedSourceEvidence {
+                        source_stamp: "mixed-result".into(),
+                        source_bytes: 0,
+                        covered_kinds: vec![EvidenceKind::SessionMarker],
+                        records: vec![EvidenceRecord {
+                            kind: EvidenceKind::SessionMarker,
+                            payload,
+                            record_id: Some(exported.record_id),
+                            revision_id: Some(exported.revision_id),
+                        }],
+                    },
+                )
+                .include_related(false),
+            )
+            .unwrap();
+        let imported = receiver
+            .session(&SessionRef::id(Source::Goose, SID), SessionQuery::default())
+            .unwrap()
+            .unwrap();
+        assert!(imported.markers.iter().any(|marker| marker
+            .payload
+            .as_ref()
+            .is_some_and(|payload| payload == &original[0])));
+    }
+    let revised = serde_json::json!([{
+        "type":"toolResponse", "id":"call-native-1",
+        "toolResult":{"status":"success","value":{"resultType":"complete","isError":false,
+            "content":[{"type":"text","text":"Rewritten text only"}]}}
+    }]);
+    write_result(&revised);
+    let after = hydrate(&store);
+    assert_eq!(
+        after.tool_results[0].text.as_deref(),
+        Some("Rewritten text only")
+    );
+    assert!(!after
+        .markers
+        .iter()
+        .any(|marker| marker.kind == "tool_result_block"));
+}
+
+#[test]
 fn goose_malformed_native_rewrite_keeps_prior_public_evidence() {
     let home = tempfile::tempdir().unwrap();
     stage(home.path(), include_str!("fixtures/goose/schema17.sql"));
     let store = open(home.path());
     let prior = hydrate(&store);
-    let native =
-        rusqlite::Connection::open(home.path().join(".local/share/goose/sessions/sessions.db"))
-            .unwrap();
+    let native = rusqlite::Connection::open(native_path(home.path())).unwrap();
     native
         .execute(
             "UPDATE messages SET content_json='{' WHERE message_id='assistant-native-2'",

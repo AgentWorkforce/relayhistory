@@ -278,12 +278,21 @@ impl Sink<'_> {
         );
         let text = result_text(block, status)?;
         let errored = status == "error" || block["toolResult"]["value"]["isError"] == true;
+        let native_content = &block["toolResult"]["value"]["content"];
+        let mixed_content = native_content
+            .as_array()
+            .is_some_and(|content| content.iter().any(|item| item["type"] != "text"));
         let (call_index, event_index) = self.indexer.next(id);
         if !self.enabled() {
             return Ok(());
         }
-        let mut facts = ToolResultFacts::from_payload(&Value::String(text.clone()))
-            .with_ordering(call_index, event_index);
+        let measured = if mixed_content {
+            native_content.clone()
+        } else {
+            Value::String(text.clone())
+        };
+        let mut facts =
+            ToolResultFacts::from_payload(&measured).with_ordering(call_index, event_index);
         facts.tool_use_id = Some(id.into());
         facts.event_source = Some("tool_result".into());
         facts.result_status = Some(if errored { "errored" } else { "completed" }.into());
@@ -293,6 +302,22 @@ impl Sink<'_> {
         if self.replay.is_none() {
             set_tool_call_error(self.conn, ID, &self.session.id, id, errored)?;
             self.keys.results.insert(id.into());
+            if mixed_content {
+                // Search text is only a projection of mixed native content.
+                // Keep the complete block for public reads and exports.
+                marker(
+                    self.conn,
+                    self.session,
+                    GooseMarker {
+                        uid,
+                        message: Some(self.mid),
+                        ts: self.message.timestamp,
+                        kind: "tool_result_block",
+                        payload: block,
+                    },
+                    self.keys,
+                )?;
+            }
         }
         insert_session_event(
             self.conn,
