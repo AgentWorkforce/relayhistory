@@ -250,6 +250,7 @@ source without deciding which one fails the test.
 | kimi/subagent | Kimi Code 2.2.0 native protocol 1.5 writer, localhost model fixture, independently restored by pinned official foldWireRecords; subagent case. |
 | kimi/rewound | Native 2.2 binary journal plus pinned official buildUndoSwitchRecords writer constructor; official flattenChain+fold confirms prior messages are retired. |
 | kimi/official-reader | Pinned official source restart replay oracle, independent of RelayHistory. |
+| cline/native | Pinned Cline core version-1 messages artifact; native golden ordinary, reasoning, tool, and final text. Synthetic rewrite/resume snapshots exercise stable message IDs. |
 | codebuddy/ordinary | Official @tencent-ai/codebuddy-code 2.171.0 CLI writer with isolated localhost model and independent native historical deserializer: ordinary. |
 | codebuddy/resumed | Official @tencent-ai/codebuddy-code 2.171.0 CLI writer with isolated localhost model and independent native historical deserializer: resumed. |
 | codebuddy/tool | Official @tencent-ai/codebuddy-code 2.171.0 CLI writer with isolated localhost model and independent native historical deserializer: tool. |

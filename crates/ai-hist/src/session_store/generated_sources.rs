@@ -33,6 +33,8 @@ pub enum Source {
     QwenCode,
     #[serde(rename = "kimi")]
     Kimi,
+    #[serde(rename = "cline")]
+    Cline,
     #[serde(rename = "codebuddy")]
     Codebuddy,
     #[serde(rename = "cortex")]
@@ -77,6 +79,7 @@ impl Source {
         Self::Copilot,
         Self::QwenCode,
         Self::Kimi,
+        Self::Cline,
         Self::Codebuddy,
         Self::Cortex,
         Self::DeepAgents,
@@ -110,6 +113,7 @@ impl Source {
             "copilot",
             "qwen-code",
             "kimi",
+            "cline",
             "codebuddy",
             "cortex",
             "deepagents",
@@ -144,6 +148,7 @@ impl Source {
             ("copilot", Source::Copilot),
             ("qwen-code", Source::QwenCode),
             ("kimi", Source::Kimi),
+            ("cline", Source::Cline),
             ("codebuddy", Source::Codebuddy),
             ("cortex", Source::Cortex),
             ("deepagents", Source::DeepAgents),
@@ -184,6 +189,7 @@ impl Source {
             &crate::providers::copilot::METADATA,
             &crate::providers::qwen_code::METADATA,
             &crate::providers::kimi::METADATA,
+            &crate::providers::cline::METADATA,
             &crate::providers::codebuddy::METADATA,
             &crate::providers::cortex::METADATA,
             &crate::providers::deepagents::METADATA,

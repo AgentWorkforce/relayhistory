@@ -1,0 +1,79 @@
+{
+  "version": 1,
+  "updated_at": "2026-10-22T10:01:10.000Z",
+  "agent": "lead",
+  "sessionId": "synthetic-resume",
+  "origin": {
+    "source": "cli",
+    "mode": "user",
+    "sessionId": "synthetic-resume"
+  },
+  "messages": [
+    {
+      "id": "resume-u1",
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Inspect the README and summarize it."
+        }
+      ]
+    },
+    {
+      "id": "resume-a1",
+      "role": "assistant",
+      "ts": 1745343731456,
+      "modelInfo": {
+        "id": "claude-sonnet-4-6",
+        "provider": "anthropic",
+        "family": "claude-sonnet-4"
+      },
+      "metrics": {
+        "inputTokens": 21,
+        "outputTokens": 8,
+        "cacheReadTokens": 3,
+        "cacheWriteTokens": 1,
+        "cost": 0.13
+      },
+      "content": [
+        {
+          "type": "text",
+          "text": "The README describes a small test fixture project."
+        }
+      ]
+    },
+    {
+      "id": "resume-u2",
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Continue the synthetic task."
+        }
+      ]
+    },
+    {
+      "id": "resume-a2",
+      "role": "assistant",
+      "ts": 1792663260000,
+      "modelInfo": {
+        "id": "claude-sonnet-4-6",
+        "provider": "anthropic",
+        "family": "claude-sonnet-4"
+      },
+      "metrics": {
+        "inputTokens": 21,
+        "outputTokens": 8,
+        "cacheReadTokens": 3,
+        "cacheWriteTokens": 1,
+        "cost": 0.13
+      },
+      "content": [
+        {
+          "type": "text",
+          "text": "The continuation is complete."
+        }
+      ]
+    }
+  ]
+}

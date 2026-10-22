@@ -1,0 +1,46 @@
+{
+  "version": 1,
+  "updated_at": "2026-10-22T10:00:00.000Z",
+  "agent": "lead",
+  "sessionId": "synthetic-ordinary",
+  "origin": {
+    "source": "cli",
+    "mode": "user",
+    "sessionId": "synthetic-ordinary"
+  },
+  "messages": [
+    {
+      "id": "ordinary-u1",
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Inspect the README and summarize it."
+        }
+      ]
+    },
+    {
+      "id": "ordinary-a1",
+      "role": "assistant",
+      "ts": 1745343731456,
+      "modelInfo": {
+        "id": "claude-sonnet-4-6",
+        "provider": "anthropic",
+        "family": "claude-sonnet-4"
+      },
+      "metrics": {
+        "inputTokens": 21,
+        "outputTokens": 8,
+        "cacheReadTokens": 3,
+        "cacheWriteTokens": 1,
+        "cost": 0.13
+      },
+      "content": [
+        {
+          "type": "text",
+          "text": "The README describes a small test fixture project."
+        }
+      ]
+    }
+  ]
+}

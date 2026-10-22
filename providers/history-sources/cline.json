@@ -1,0 +1,31 @@
+{
+  "id": "cline",
+  "rust_id": "cline",
+  "variant": "Cline",
+  "order": 438,
+  "aliases": [],
+  "fixtures": [
+    {
+      "source": "cline",
+      "name": "native",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": ["cline/native"],
+      "quirk": "Pinned Cline core version-1 messages artifact; native golden ordinary, reasoning, tool, and final text. Synthetic rewrite/resume snapshots exercise stable message IDs."
+    }
+  ],
+  "capture": [
+    {
+      "evidence": "Messages and identity",
+      "coverage": "Cline core v1 sessionId and per-message stable id, user/assistant text and thinking, assistant modelInfo and ts; user timestamps are derived from the nearest following assistant or snapshot updated_at. CLI/SDK data/sessions only; legacy VS Code tasks excluded."
+    },
+    {
+      "evidence": "Tools and usage",
+      "coverage": "tool_use.id joins tool_result.tool_use_id; is_error retained. Terminal assistant metrics are retained as bounded raw markers; request-normalized usage is unavailable because the writer can stamp aggregate run fallback. Unknown blocks remain bounded markers. No native relationship, edit or resume capability inferred."
+    }
+  ],
+  "population": {
+    "evidence": ["history", "session_event", "tool_call", "session_marker"],
+    "usage_accounting": "none"
+  }
+}
