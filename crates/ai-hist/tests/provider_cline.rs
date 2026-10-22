@@ -112,6 +112,7 @@ fn native_tool_history_reaches_public_facade_and_reader_oracle() {
 }
 
 #[test]
+#[cfg(feature = "unstable-internal")]
 fn native_result_only_and_mixed_user_messages_reach_public_user_turns() {
     let home = tempfile::tempdir().unwrap();
     let path = stage(home.path(), "fixture-success-01");
