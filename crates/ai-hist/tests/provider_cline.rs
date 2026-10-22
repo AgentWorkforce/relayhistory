@@ -741,6 +741,84 @@ fn large_escaped_user_and_assistant_text_export_and_import_with_projection() {
 }
 
 #[test]
+fn shared_large_multipart_prompt_moves_to_surviving_local_session() {
+    let home = tempfile::tempdir().unwrap();
+    let mut snapshots = Vec::new();
+    for sid in ["aa-cline", "bb-cline"] {
+        let source = Path::new(FIXTURE)
+            .join("synthetic-ordinary")
+            .join("synthetic-ordinary.messages.json");
+        let mut snapshot: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(source).unwrap()).unwrap();
+        snapshot["sessionId"] = sid.into();
+        snapshot["messages"][0]["content"] = serde_json::json!([
+            {"type":"text","text":"Shared large prompt"},
+            {"type":"text","text":"\"".repeat(300_000)}
+        ]);
+        let path = home
+            .path()
+            .join(format!(".cline/data/sessions/{sid}/{sid}.messages.json"));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+        snapshots.push((sid, path));
+    }
+    let store = open(home.path());
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    let support_markers: Vec<(String, String, i64)> = {
+        let mut stmt = conn.prepare("SELECT session_id,payload_json,ts_ms FROM session_markers WHERE source='cline' AND kind='prompt_support' ORDER BY session_id").unwrap();
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    };
+    assert_eq!(support_markers.len(), 2);
+    assert!(support_markers.iter().all(|(_, payload, _)| {
+        payload.len() <= 128
+            && serde_json::from_str::<serde_json::Value>(payload)
+                .ok()
+                .and_then(|value| value["text_sha256"].as_str().map(str::len))
+                == Some(64)
+    }));
+    assert_eq!(support_markers[0].2, support_markers[1].2);
+    let (owner, prompt): (String, String) = conn
+        .query_row(
+            "SELECT session_id,prompt FROM history WHERE source='cline' AND prompt LIKE 'Shared large prompt%'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert!(prompt.contains("\"truncated\":true"));
+    let survivor = snapshots.iter().find(|(sid, _)| *sid != owner).unwrap().0;
+    let owner_path = &snapshots.iter().find(|(sid, _)| *sid == owner).unwrap().1;
+    std::fs::remove_file(owner_path).unwrap();
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    let (new_owner, retained): (String, String) = conn
+        .query_row(
+            "SELECT session_id,prompt FROM history WHERE source='cline' AND prompt LIKE 'Shared large prompt%'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(new_owner, survivor);
+    assert_eq!(retained, prompt);
+    std::fs::remove_file(
+        &snapshots
+            .iter()
+            .find(|(sid, _)| *sid == survivor)
+            .unwrap()
+            .1,
+    )
+    .unwrap();
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    let remaining: i64 = conn.query_row("SELECT count(*) FROM history WHERE source='cline' AND prompt LIKE 'Shared large prompt%'", [], |row| row.get(0)).unwrap();
+    assert_eq!(
+        remaining, 0,
+        "no unsupported prompt may survive local deletion"
+    );
+}
+
+#[test]
 #[cfg(all(feature = "export", feature = "unstable-internal"))]
 fn oversized_tool_use_exports_and_imports_complete_bounded_evidence() {
     let home = tempfile::tempdir().unwrap();
@@ -785,6 +863,15 @@ fn oversized_tool_use_exports_and_imports_complete_bounded_evidence() {
     assert!(records
         .iter()
         .all(|record| record.payload.to_string().len() <= 512 * 1024));
+    let support = records
+        .iter()
+        .find(|record| {
+            record.kind == "session_marker" && record.payload["kind"] == "prompt_support"
+        })
+        .unwrap();
+    let support_payload: serde_json::Value =
+        serde_json::from_str(support.payload["payload_json"].as_str().unwrap()).unwrap();
+    assert_eq!(support_payload["text_sha256"].as_str().unwrap().len(), 64);
     let call = records
         .iter()
         .find(|record| record.kind == "tool_call")
@@ -877,6 +964,11 @@ fn oversized_tool_use_exports_and_imports_complete_bounded_evidence() {
     let remote = read(&receiver, "fixture-success-01");
     assert_eq!(remote.tool_calls[0].tool_use_id, "tool-call-1");
     assert_eq!(remote.tool_calls[0].name, "read_files");
+    let imported: String = rusqlite::Connection::open(receiver.db_path()).unwrap().query_row("SELECT payload_json FROM session_markers WHERE source='cline' AND session_id='fixture-success-01' AND kind='prompt_support'", [], |row| row.get(0)).unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&imported).unwrap(),
+        support_payload
+    );
 }
 
 #[test]

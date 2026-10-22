@@ -144,6 +144,7 @@ fn write_message(
     let text = format::bounded_visible_text(&text);
     let hash = crate::prompt_hash(&text);
     keys.prompts.insert(format!("{ts}:{hash}"));
+    prompts::support(conn, sid, mid, ts, &text, keys)?;
     insert_history(
         conn,
         &HistoryEntry {

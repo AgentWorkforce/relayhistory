@@ -82,13 +82,28 @@ pub(super) fn result_text(value: &Value, facts: &crate::ingest::ToolResultFacts)
         "native_payload_bytes":facts.payload_bytes,
         "native_payload_hash":facts.payload_hash,
     });
+    bounded_prefix_with_facts(&full, &format!("{BOUNDARY}{projection}"), MAX_ENCODED)
+}
+
+fn bounded_prefix_with_facts(full: &str, suffix: &str, max_encoded: usize) -> String {
     let prefix = full.chars().take(32 * 1024).collect::<String>();
-    let bounded = format!("{prefix}{BOUNDARY}{projection}");
-    if Value::String(bounded.clone()).to_string().len() <= MAX_ENCODED {
-        bounded
-    } else {
-        format!("{BOUNDARY}{projection}")
+    let offsets: Vec<usize> = prefix
+        .char_indices()
+        .map(|(offset, _)| offset)
+        .chain(std::iter::once(prefix.len()))
+        .collect();
+    let mut low = 0;
+    let mut high = offsets.len() - 1;
+    while low < high {
+        let middle = (low + high).div_ceil(2);
+        let candidate = format!("{}{suffix}", &prefix[..offsets[middle]]);
+        if Value::String(candidate).to_string().len() <= max_encoded {
+            low = middle;
+        } else {
+            high = middle - 1;
+        }
     }
+    format!("{}{suffix}", &prefix[..offsets[low]])
 }
 
 pub(super) fn parse(bytes: &[u8], path_id: &str) -> Result<Value> {
@@ -198,13 +213,7 @@ pub(super) fn bounded_visible_text(full: &str) -> String {
         "native_text_bytes":facts.payload_bytes, "native_text_hash":facts.payload_hash,
     });
     let boundary = "\n\n[Native Cline text projection]\n";
-    let prefix = full.chars().take(32 * 1024).collect::<String>();
-    let bounded = format!("{prefix}{boundary}{projection}");
-    if Value::String(bounded.clone()).to_string().len() <= MAX_ENCODED {
-        bounded
-    } else {
-        format!("{boundary}{projection}")
-    }
+    bounded_prefix_with_facts(full, &format!("{boundary}{projection}"), MAX_ENCODED)
 }
 
 pub(super) fn first_prompt(messages: &[Value]) -> Option<String> {
