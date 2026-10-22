@@ -11,14 +11,14 @@
       "prompt": "Continue after restart.",
       "session_id": "default:32303236313032325f31",
       "source": "goose",
-      "timestamp_ms": 1792643569000
+      "timestamp_ms": 1792643676000
     },
     {
       "project": "/synthetic/goose/workspace",
       "prompt": "Find the Goose fixture needle",
       "session_id": "default:32303236313032325f31",
       "source": "goose",
-      "timestamp_ms": 1792643569000
+      "timestamp_ms": 1792643676000
     }
   ],
   "hydration": [
@@ -62,7 +62,7 @@
       "text": "{\"id\":\"call-native-1\",\"toolCall\":{\"status\":\"success\",\"value\":{\"name\":\"read_file\"}},\"type\":\"toolRequest\"}",
       "token_json": null,
       "tool_use_id": "call-native-1",
-      "ts_ms": 1792643569000
+      "ts_ms": 1792643676000
     },
     {
       "agent_id": null,
@@ -92,7 +92,7 @@
       "text": "I will inspect the fixture.",
       "token_json": null,
       "tool_use_id": null,
-      "ts_ms": 1792643569000
+      "ts_ms": 1792643676000
     },
     {
       "agent_id": null,
@@ -122,7 +122,7 @@
       "text": "The tool result was removed during rewrite.",
       "token_json": null,
       "tool_use_id": null,
-      "ts_ms": 1792643569000
+      "ts_ms": 1792643676000
     },
     {
       "agent_id": null,
@@ -152,7 +152,7 @@
       "text": "The revised historical answer is available.",
       "token_json": null,
       "tool_use_id": null,
-      "ts_ms": 1792643569000
+      "ts_ms": 1792643676000
     },
     {
       "agent_id": null,
@@ -182,7 +182,7 @@
       "text": "Find the Goose fixture needle",
       "token_json": null,
       "tool_use_id": null,
-      "ts_ms": 1792643569000
+      "ts_ms": 1792643676000
     },
     {
       "agent_id": null,
@@ -212,7 +212,7 @@
       "text": "Continue after restart.",
       "token_json": null,
       "tool_use_id": null,
-      "ts_ms": 1792643569000
+      "ts_ms": 1792643676000
     }
   ],
   "session_markers": [
@@ -239,7 +239,7 @@
       "source": "goose",
       "subkind": "goose",
       "text": null,
-      "ts_ms": 1792643569000,
+      "ts_ms": 1792643676000,
       "turn_id": null
     },
     {
@@ -252,7 +252,7 @@
       "source": "goose",
       "subkind": "goose",
       "text": null,
-      "ts_ms": 1792643569000,
+      "ts_ms": 1792643676000,
       "turn_id": null
     },
     {
@@ -265,7 +265,7 @@
       "source": "goose",
       "subkind": "goose",
       "text": null,
-      "ts_ms": 1792643569000,
+      "ts_ms": 1792643676000,
       "turn_id": null
     },
     {
@@ -278,7 +278,7 @@
       "source": "goose",
       "subkind": "goose",
       "text": null,
-      "ts_ms": 1792643569000,
+      "ts_ms": 1792643676000,
       "turn_id": null
     },
     {
@@ -291,7 +291,7 @@
       "source": "goose",
       "subkind": "goose",
       "text": null,
-      "ts_ms": 1792643569000,
+      "ts_ms": 1792643676000,
       "turn_id": null
     }
   ],
@@ -305,7 +305,7 @@
       "first_prompt": "Find the Goose fixture needle",
       "git_branch": null,
       "initial_commit": null,
-      "last_activity_ms": 1792643569000,
+      "last_activity_ms": 1792643676000,
       "last_assistant_text": "The revised historical answer is available.",
       "models_json": "[]",
       "originator": null,
@@ -313,7 +313,7 @@
       "repo_url": null,
       "session_id": "default:32303236313032325f31",
       "source": "goose",
-      "source_stamp": "goose_schema17_v1:sha256:50d92cbafa06d306b28aef20ad3ed485a1690e716da12deffecae9d841fb2cdf",
+      "source_stamp": "goose_schema17_v1:sha256:b4735235e80cf364149bb845cc8fb8d34995ef617d75db6b1518350d91c70639",
       "title": "Synthetic Goose history",
       "workspace_roots_json": null
     }
@@ -329,7 +329,7 @@
       "source": "goose",
       "target": null,
       "tool_use_id": "call-native-1",
-      "ts_ms": 1792643569000
+      "ts_ms": 1792643676000
     }
   ]
 }

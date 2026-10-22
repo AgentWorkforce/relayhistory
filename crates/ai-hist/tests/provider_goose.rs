@@ -1,8 +1,15 @@
 mod provider_support;
+#[cfg(feature = "export")]
+use ai_hist::export::{ExportLimits, ExportSelection, ExportSnapshot, SessionIdentity};
 use ai_hist::{
     DiscoveryOptions, HydrateOptions, ProviderRoots, Role, SessionLocation, SessionQuery,
     SessionRef, SessionStore, ShallowSession, Source, SourceObservation, SourceObservationBatch,
     StoreOptions, SyncOptions,
+};
+#[cfg(feature = "export")]
+use ai_hist::{
+    EvidenceKind, EvidenceRecord, NormalizedSourceEvidence, ObservationKey,
+    SourceEvidenceSubmission,
 };
 use provider_support::{assert_history_conformance, HistoryCase};
 
@@ -121,6 +128,7 @@ fn goose_native_replace_reorders_stable_ids_and_retires_removed_result() {
     drop(native);
     let after = hydrate(&store);
     assert_eq!(after.tool_calls.len(), 1);
+    assert_eq!(after.tool_calls[0].is_error, None);
     assert!(after.tool_results.is_empty());
     let ids: Vec<_> = after
         .messages
@@ -137,9 +145,10 @@ fn goose_native_replace_reorders_stable_ids_and_retires_removed_result() {
             "assistant-native-3"
         ]
     );
-    let oracle: serde_json::Value =
-        serde_json::from_str(include_str!("fixtures/goose/rewritten-official-export.json"))
-            .unwrap();
+    let oracle: serde_json::Value = serde_json::from_str(include_str!(
+        "fixtures/goose/rewritten-official-export.json"
+    ))
+    .unwrap();
     let official_ids: Vec<_> = oracle["conversation"]
         .as_array()
         .unwrap()
@@ -245,4 +254,220 @@ fn goose_native_deletion_retires_local_observation_and_keeps_remote_catalog() {
     assert!(remaining.messages.is_empty());
     assert!(remaining.tool_calls.is_empty());
     assert!(remaining.tool_results.is_empty());
+}
+
+#[test]
+fn goose_success_envelope_with_error_result_is_errored() {
+    let home = tempfile::tempdir().unwrap();
+    stage(home.path(), include_str!("fixtures/goose/schema17.sql"));
+    let native =
+        rusqlite::Connection::open(home.path().join(".local/share/goose/sessions/sessions.db"))
+            .unwrap();
+    native.execute("UPDATE messages SET content_json=json_set(content_json,'$[0].toolResult.value.isError',json('true')) WHERE message_id='tool-native-1'", []).unwrap();
+    drop(native);
+    let store = open(home.path());
+    let evidence = hydrate(&store);
+    assert_eq!(evidence.tool_calls[0].is_error, Some(true));
+    assert_eq!(
+        evidence.tool_results[0].result_status.as_deref(),
+        Some("errored")
+    );
+}
+
+#[test]
+fn goose_malformed_native_rewrite_keeps_prior_public_evidence() {
+    let home = tempfile::tempdir().unwrap();
+    stage(home.path(), include_str!("fixtures/goose/schema17.sql"));
+    let store = open(home.path());
+    let prior = hydrate(&store);
+    let native =
+        rusqlite::Connection::open(home.path().join(".local/share/goose/sessions/sessions.db"))
+            .unwrap();
+    native
+        .execute(
+            "UPDATE messages SET content_json='{' WHERE message_id='assistant-native-2'",
+            [],
+        )
+        .unwrap();
+    drop(native);
+    store
+        .discover(DiscoveryOptions::default().sources([Source::Goose]))
+        .unwrap();
+    let reference = SessionRef::id(Source::Goose, SID);
+    assert!(store
+        .hydrate(&reference, HydrateOptions::default())
+        .is_err());
+    let after = store
+        .session(&reference, SessionQuery::default())
+        .unwrap()
+        .unwrap();
+    assert_eq!(after.messages, prior.messages);
+    assert_eq!(after.tool_calls, prior.tool_calls);
+    assert_eq!(after.tool_results, prior.tool_results);
+}
+
+#[cfg(feature = "export")]
+#[test]
+fn goose_native_export_remote_intake_retains_evidence_on_order_conflict() {
+    let origin = tempfile::tempdir().unwrap();
+    stage(origin.path(), include_str!("fixtures/goose/schema17.sql"));
+    let original_store = open(origin.path());
+    let original = hydrate(&original_store);
+    let kinds = vec![
+        EvidenceKind::History,
+        EvidenceKind::SessionEvent,
+        EvidenceKind::ToolCall,
+        EvidenceKind::SessionMarker,
+    ];
+    let mut snapshot = ExportSnapshot::open(
+        rusqlite::Connection::open(origin.path().join("ledger.db")).unwrap(),
+        &ExportSelection {
+            sessions: vec![SessionIdentity {
+                source: "goose".into(),
+                session_id: SID.into(),
+            }],
+            kinds: kinds.iter().map(|kind| kind.as_str().into()).collect(),
+            ..Default::default()
+        },
+        &ExportLimits {
+            max_batch_records: 1,
+            ..Default::default()
+        },
+        60_000,
+        1_000,
+    )
+    .unwrap();
+    let mut cursor = Some(snapshot.handle().cursor);
+    let mut records = Vec::new();
+    while let Some(value) = cursor {
+        let page = snapshot.page(&value, 1_000).unwrap();
+        cursor = page.next_cursor;
+        records.extend(page.records);
+    }
+    assert!(!records.is_empty());
+    let records: Vec<EvidenceRecord> = records
+        .into_iter()
+        .map(|record| {
+            let mut payload = record.payload.as_object().unwrap().clone();
+            payload.remove("id");
+            payload.remove("location");
+            EvidenceRecord {
+                kind: serde_json::from_value(serde_json::json!(record.kind)).unwrap(),
+                payload,
+                record_id: Some(record.record_id),
+                revision_id: Some(record.revision_id),
+            }
+        })
+        .collect();
+    let receiver_home = tempfile::tempdir().unwrap();
+    let receiver = open(receiver_home.path());
+    receiver
+        .apply_source_observations(SourceObservationBatch::new(
+            "goose-transport",
+            "fixture",
+            SessionLocation::Remote,
+            vec![SourceObservation {
+                session: ShallowSession {
+                    source: "goose".into(),
+                    session_id: SID.into(),
+                    source_stamp: Some("goose-native-archive".into()),
+                    ..Default::default()
+                },
+                raw_locator: None,
+            }],
+        ))
+        .unwrap();
+    let key = ObservationKey {
+        source: "goose".into(),
+        session_id: SID.into(),
+        location: SessionLocation::Remote,
+        connector_id: "goose-transport".into(),
+        connector_instance: "fixture".into(),
+    };
+    let revision = receiver.source_observation(&key).unwrap().revision.unwrap();
+    let evidence = NormalizedSourceEvidence {
+        source_stamp: "goose-native-archive".into(),
+        source_bytes: 0,
+        covered_kinds: kinds,
+        records,
+    };
+    receiver
+        .apply_source_evidence(
+            SourceEvidenceSubmission::new(key.clone(), revision, evidence.clone())
+                .include_related(false),
+        )
+        .unwrap();
+    let reference = SessionRef::id(Source::Goose, SID);
+    let remote = receiver
+        .session(&reference, SessionQuery::default())
+        .unwrap()
+        .unwrap();
+    // Shared source intake currently stores an identity set rather than a
+    // durable native ordinal: https://github.com/AgentWorkforce/relayhistory/issues/532.
+    // Verify every imported message while leaving native order to local reads.
+    let mut imported_blocks: Vec<_> = remote
+        .messages
+        .iter()
+        .flat_map(|message| {
+            message.blocks.iter().map(|block| {
+                (
+                    message.message_id.clone(),
+                    serde_json::to_string(block).unwrap(),
+                )
+            })
+        })
+        .collect();
+    let mut native_blocks: Vec<_> = original
+        .messages
+        .iter()
+        .flat_map(|message| {
+            message.blocks.iter().map(|block| {
+                (
+                    message.message_id.clone(),
+                    serde_json::to_string(block).unwrap(),
+                )
+            })
+        })
+        .collect();
+    imported_blocks.sort();
+    native_blocks.sort();
+    assert_eq!(imported_blocks, native_blocks);
+    assert_eq!(remote.messages.len(), original.messages.len());
+    assert_eq!(remote.tool_calls, original.tool_calls);
+    assert_eq!(remote.tool_results, original.tool_results);
+    let revision = receiver.source_observation(&key).unwrap().revision.unwrap();
+    let repeated = receiver
+        .apply_source_evidence(
+            SourceEvidenceSubmission::new(key, revision, evidence).include_related(false),
+        )
+        .unwrap();
+    assert_eq!(repeated.status, "unchanged");
+    assert_eq!(
+        receiver
+            .session(&reference, SessionQuery::default())
+            .unwrap()
+            .unwrap()
+            .messages,
+        remote.messages
+    );
+    drop(receiver);
+    let receiver = open(receiver_home.path());
+    stage(
+        receiver_home.path(),
+        include_str!("fixtures/goose/schema17.sql"),
+    );
+    receiver
+        .discover(DiscoveryOptions::default().sources([Source::Goose]))
+        .unwrap();
+    let failure = receiver
+        .hydrate(&reference, HydrateOptions::default())
+        .unwrap_err();
+    assert!(format!("{failure:#}").contains("FILE_HISTORY_SHARED_ORDER_CONFLICT"));
+    let retained = receiver
+        .session(&reference, SessionQuery::default())
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained.messages, remote.messages);
+    assert_eq!(retained.tool_calls, remote.tool_calls);
+    assert_eq!(retained.tool_results, remote.tool_results);
 }

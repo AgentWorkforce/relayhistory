@@ -137,7 +137,7 @@ fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
 fn retire_missing_databases(ctx: &SweepContext<'_>) -> Result<()> {
     // A missing configured root is unavailable, not proof of deletion.
     let mut stmt = ctx.conn.prepare(
-        "SELECT DISTINCT raw_path FROM sessions WHERE source=?1 AND raw_path IS NOT NULL",
+        "SELECT DISTINCT locator FROM (SELECT raw_path AS locator FROM sessions WHERE source=?1 AND raw_path IS NOT NULL UNION SELECT raw_locator AS locator FROM session_observations WHERE source=?1 AND location='local' AND raw_locator IS NOT NULL UNION SELECT raw_locator AS locator FROM session_presences WHERE source=?1 AND location='local' AND raw_locator IS NOT NULL)",
     )?;
     let paths = stmt
         .query_map([ID], |r| r.get::<_, String>(0))?
