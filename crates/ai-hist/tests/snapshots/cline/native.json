@@ -180,7 +180,7 @@
       "cwd": null,
       "error_signal": null,
       "event_index": null,
-      "event_source": null,
+      "event_source": "tool_result",
       "event_uid": "msg_user_2:0",
       "git_branch": null,
       "kind": "tool_result",

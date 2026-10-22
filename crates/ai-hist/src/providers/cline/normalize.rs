@@ -292,6 +292,9 @@ fn result(
     let mut facts = ToolResultFacts::from_payload(&block["content"]);
     let text = format::result_text(&block["content"], &facts);
     facts.tool_use_id = Some(id.into());
+    // Native tool_result blocks arrive inside Cline user messages. The public
+    // user-turn reader requires this explicit provenance to include them.
+    facts.event_source = Some("tool_result".into());
     let error = block["is_error"].as_bool();
     facts.result_status = error.map(|e| if e { "errored" } else { "completed" }.into());
     facts.error_signal = error.filter(|e| *e).map(|_| "is_error".into());

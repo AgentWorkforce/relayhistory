@@ -110,6 +110,62 @@ fn native_tool_history_reaches_public_facade_and_reader_oracle() {
         "independent restart reader preserved writer IDs"
     );
 }
+
+#[test]
+fn native_result_only_and_mixed_user_messages_reach_public_user_turns() {
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path(), "fixture-success-01");
+    let mut snapshot: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    snapshot["messages"][0]["content"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "type": "tool_result",
+            "tool_use_id": "tool-call-1",
+            "content": "Mixed block result",
+            "is_error": false
+        }));
+    std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+
+    let store = open(home.path());
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    let turns = ai_hist::session_user_turns_page(&conn, "cline", "fixture-success-01", 10, None)
+        .unwrap()
+        .user_turns;
+    assert_eq!(turns.len(), 2, "result-only message is a user turn");
+    assert_eq!(turns[0].message_id.as_deref(), Some("msg_user_1"));
+    assert_eq!(
+        turns[0]
+            .blocks
+            .iter()
+            .map(|b| b.kind.as_str())
+            .collect::<Vec<_>>(),
+        ["text", "tool_result"],
+        "mixed message retains its result block"
+    );
+    assert_eq!(
+        turns[0].blocks[1].tool_use_id.as_deref(),
+        Some("tool-call-1")
+    );
+    assert_eq!(turns[0].blocks[1].is_error, Some(0));
+    assert_eq!(
+        turns[0].blocks[1].byte_len,
+        "Mixed block result".len() as i64
+    );
+    assert_eq!(turns[1].message_id.as_deref(), Some("msg_user_2"));
+    assert_eq!(turns[1].blocks.len(), 1);
+    assert_eq!(turns[1].blocks[0].kind, "tool_result");
+    assert_eq!(
+        turns[1].blocks[0].tool_use_id.as_deref(),
+        Some("tool-call-1")
+    );
+    assert_eq!(
+        turns[1].blocks[0].byte_len,
+        "# Project\n\nA small test fixture.".len() as i64
+    );
+}
 #[test]
 fn native_resume_snapshot_rewrite_and_partial_last_good() {
     let home = tempfile::tempdir().unwrap();
