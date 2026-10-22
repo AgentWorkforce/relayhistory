@@ -29,7 +29,7 @@
       "status": "hydrated"
     }
   ],
-  "layout": "Sqlite(\".local/share/goose/sessions/sessions.db\")",
+  "layout": "SqliteProviderDefault(\"sessions/sessions.db\")",
   "notes": [],
   "origin": "relayhistory",
   "quirk": "Native replace_conversation deletes and reinserts rows with the same message IDs, removes the tool result, and changes the final text.",
@@ -309,7 +309,7 @@
       "last_assistant_text": "The revised historical answer is available.",
       "models_json": "[]",
       "originator": null,
-      "raw_path": "<home>/.local/share/goose/sessions/sessions.db",
+      "raw_path": "<provider-root:goose>/sessions/sessions.db",
       "repo_url": null,
       "session_id": "default:32303236313032325f31",
       "source": "goose",

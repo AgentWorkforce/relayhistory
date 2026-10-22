@@ -8,8 +8,8 @@
     {
       "source": "goose",
       "name": "schema17",
-      "layout": "Sqlite",
-      "target": ".local/share/goose/sessions/sessions.db",
+      "layout": "SqliteProviderDefault",
+      "target": "sessions/sessions.db",
       "origin": "RelayHistory",
       "files": ["goose/schema17.sql"],
       "quirk": "Goose 1.56.0 native schema-17 writer: ordinary and tool turns, then appended turns after process restart."
@@ -17,8 +17,8 @@
     {
       "source": "goose",
       "name": "before-resume",
-      "layout": "Sqlite",
-      "target": ".local/share/goose/sessions/sessions.db",
+      "layout": "SqliteProviderDefault",
+      "target": "sessions/sessions.db",
       "origin": "RelayHistory",
       "files": ["goose/before-resume.sql"],
       "quirk": "Same native writer before process restart; four messages including matching tool request and response IDs."
@@ -42,8 +42,8 @@
     {
       "source": "goose",
       "name": "rewritten",
-      "layout": "Sqlite",
-      "target": ".local/share/goose/sessions/sessions.db",
+      "layout": "SqliteProviderDefault",
+      "target": "sessions/sessions.db",
       "origin": "RelayHistory",
       "files": ["goose/rewritten.sql"],
       "quirk": "Native replace_conversation deletes and reinserts rows with the same message IDs, removes the tool result, and changes the final text."

@@ -29,7 +29,7 @@
       "status": "hydrated"
     }
   ],
-  "layout": "Sqlite(\".local/share/goose/sessions/sessions.db\")",
+  "layout": "SqliteProviderDefault(\"sessions/sessions.db\")",
   "notes": [],
   "origin": "relayhistory",
   "quirk": "Goose 1.56.0 native schema-17 writer: ordinary and tool turns, then appended turns after process restart.",
@@ -352,7 +352,7 @@
       "last_assistant_text": "The historical answer is still available.",
       "models_json": "[]",
       "originator": null,
-      "raw_path": "<home>/.local/share/goose/sessions/sessions.db",
+      "raw_path": "<provider-root:goose>/sessions/sessions.db",
       "repo_url": null,
       "session_id": "default:32303236313032325f31",
       "source": "goose",

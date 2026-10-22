@@ -22,7 +22,7 @@
       "status": "hydrated"
     }
   ],
-  "layout": "Sqlite(\".local/share/goose/sessions/sessions.db\")",
+  "layout": "SqliteProviderDefault(\"sessions/sessions.db\")",
   "notes": [],
   "origin": "relayhistory",
   "quirk": "Same native writer before process restart; four messages including matching tool request and response IDs.",
@@ -259,7 +259,7 @@
       "last_assistant_text": "Found the Goose fixture needle.",
       "models_json": "[]",
       "originator": null,
-      "raw_path": "<home>/.local/share/goose/sessions/sessions.db",
+      "raw_path": "<provider-root:goose>/sessions/sessions.db",
       "repo_url": null,
       "session_id": "default:32303236313032325f31",
       "source": "goose",
