@@ -79,86 +79,94 @@ impl Source {
 
     /// Canonical lowercase identifier stored in the ledger.
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Claude => "claude",
-            Self::Codex => "codex",
-            Self::Cursor => "cursor",
-            Self::Grok => "grok",
-            Self::OpenCode => "opencode",
-            Self::Muse => "muse",
-            Self::Devin => "devin",
-            Self::Pi => "pi",
-            Self::Hermes => "hermes",
-            Self::Omp => "omp",
-            Self::Antigravity => "antigravity",
-            Self::Copilot => "copilot",
-            Self::QwenCode => "qwen-code",
-            Self::Kimi => "kimi",
-            Self::Codebuddy => "codebuddy",
-            Self::Junie => "junie",
-            Self::Qoder => "qoder",
-            Self::Vtcode => "vtcode",
-            Self::GrokBot => "grok-bot",
-            Self::OpenClaw => "openclaw",
+        // Enum ordinals and this table are emitted together, with identical cfg gates.
+        const NAMES: [&str; Source::ALL.len()] = [
+            "claude",
+            "codex",
+            "cursor",
+            "grok",
+            "opencode",
+            "muse",
+            "devin",
+            "pi",
+            "hermes",
+            "omp",
+            "antigravity",
+            "copilot",
+            "qwen-code",
+            "kimi",
+            "codebuddy",
+            "junie",
+            "qoder",
+            "vtcode",
+            "grok-bot",
+            "openclaw",
             #[cfg(test)]
-            Self::TestFixture => "test-fixture",
-        }
+            "test-fixture",
+        ];
+        NAMES[self as usize]
     }
 
     /// Parse an admitted identifier or explicit alias.
     pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "claude" => Some(Self::Claude),
-            "codex" => Some(Self::Codex),
-            "cursor" => Some(Self::Cursor),
-            "grok" => Some(Self::Grok),
-            "opencode" => Some(Self::OpenCode),
-            "muse" => Some(Self::Muse),
-            "devin" => Some(Self::Devin),
-            "pi" => Some(Self::Pi),
-            "hermes" => Some(Self::Hermes),
-            "omp" => Some(Self::Omp),
-            "antigravity" => Some(Self::Antigravity),
-            "copilot" => Some(Self::Copilot),
-            "qwen-code" => Some(Self::QwenCode),
-            "kimi" => Some(Self::Kimi),
-            "codebuddy" => Some(Self::Codebuddy),
-            "junie" => Some(Self::Junie),
-            "qoder" => Some(Self::Qoder),
-            "vtcode" | "vt-code" => Some(Self::Vtcode),
-            "grok-bot" => Some(Self::GrokBot),
-            "openclaw" => Some(Self::OpenClaw),
+        const NAMES: &[(&str, Source)] = &[
+            ("claude", Source::Claude),
+            ("codex", Source::Codex),
+            ("cursor", Source::Cursor),
+            ("grok", Source::Grok),
+            ("opencode", Source::OpenCode),
+            ("muse", Source::Muse),
+            ("devin", Source::Devin),
+            ("pi", Source::Pi),
+            ("hermes", Source::Hermes),
+            ("omp", Source::Omp),
+            ("antigravity", Source::Antigravity),
+            ("copilot", Source::Copilot),
+            ("qwen-code", Source::QwenCode),
+            ("kimi", Source::Kimi),
+            ("codebuddy", Source::Codebuddy),
+            ("junie", Source::Junie),
+            ("qoder", Source::Qoder),
+            ("vtcode", Source::Vtcode),
+            ("vt-code", Source::Vtcode),
+            ("grok-bot", Source::GrokBot),
+            ("openclaw", Source::OpenClaw),
             #[cfg(test)]
-            "test-fixture" | "test-fixture-alias" => Some(Self::TestFixture),
-            _ => None,
-        }
+            ("test-fixture", Source::TestFixture),
+            #[cfg(test)]
+            ("test-fixture-alias", Source::TestFixture),
+        ];
+        NAMES
+            .iter()
+            .find_map(|(name, source)| (*name == value).then_some(*source))
     }
 
     /// The provider metadata this source registers; total, so no lookup can miss.
     pub(crate) fn metadata(self) -> &'static crate::providers::ProviderMetadata {
-        match self {
-            Self::Claude => &crate::providers::claude::METADATA,
-            Self::Codex => &crate::providers::codex::METADATA,
-            Self::Cursor => &crate::providers::cursor::METADATA,
-            Self::Grok => &crate::providers::grok::METADATA,
-            Self::OpenCode => &crate::providers::opencode::METADATA,
-            Self::Muse => &crate::providers::muse::METADATA,
-            Self::Devin => &crate::providers::devin::METADATA,
-            Self::Pi => &crate::providers::pi::METADATA,
-            Self::Hermes => &crate::providers::hermes::METADATA,
-            Self::Omp => &crate::providers::omp::METADATA,
-            Self::Antigravity => &crate::providers::antigravity::METADATA,
-            Self::Copilot => &crate::providers::copilot::METADATA,
-            Self::QwenCode => &crate::providers::qwen_code::METADATA,
-            Self::Kimi => &crate::providers::kimi::METADATA,
-            Self::Codebuddy => &crate::providers::codebuddy::METADATA,
-            Self::Junie => &crate::providers::junie::METADATA,
-            Self::Qoder => &crate::providers::qoder::METADATA,
-            Self::Vtcode => &crate::providers::vtcode::METADATA,
-            Self::GrokBot => &crate::providers::grok_bot::METADATA,
-            Self::OpenClaw => &crate::providers::openclaw::METADATA,
+        const METADATA: [&crate::providers::ProviderMetadata; Source::ALL.len()] = [
+            &crate::providers::claude::METADATA,
+            &crate::providers::codex::METADATA,
+            &crate::providers::cursor::METADATA,
+            &crate::providers::grok::METADATA,
+            &crate::providers::opencode::METADATA,
+            &crate::providers::muse::METADATA,
+            &crate::providers::devin::METADATA,
+            &crate::providers::pi::METADATA,
+            &crate::providers::hermes::METADATA,
+            &crate::providers::omp::METADATA,
+            &crate::providers::antigravity::METADATA,
+            &crate::providers::copilot::METADATA,
+            &crate::providers::qwen_code::METADATA,
+            &crate::providers::kimi::METADATA,
+            &crate::providers::codebuddy::METADATA,
+            &crate::providers::junie::METADATA,
+            &crate::providers::qoder::METADATA,
+            &crate::providers::vtcode::METADATA,
+            &crate::providers::grok_bot::METADATA,
+            &crate::providers::openclaw::METADATA,
             #[cfg(test)]
-            Self::TestFixture => &crate::providers::test_fixture::METADATA,
-        }
+            &crate::providers::test_fixture::METADATA,
+        ];
+        METADATA[self as usize]
     }
 }
