@@ -257,6 +257,9 @@ fn call(conn: &Connection, base: &EventRow<'_>, block: &Value, keys: &mut Keys) 
     let id = format::string(block, "id")?;
     let name = format::string(block, "name")?;
     let args = format::tool_input_args(block)?;
+    let target = block["input"]["file_path"]
+        .as_str()
+        .filter(|path| path.len() <= 4096);
     insert_tool_call(
         conn,
         &ToolCallRef {
@@ -268,7 +271,7 @@ fn call(conn: &Connection, base: &EventRow<'_>, block: &Value, keys: &mut Keys) 
             ..Default::default()
         },
         name,
-        block["input"]["file_path"].as_str().filter(|path| path.len() <= 4096),
+        target,
         &args,
         None,
     )?;
@@ -301,8 +304,17 @@ fn result(
             ..*base
         },
     )?;
-    if let Some(error) = error.filter(|_| !replay) {
-        set_tool_call_error(conn, ID, base.session_id, id, error)?;
+    if !replay {
+        if let Some(error) = error {
+            set_tool_call_error(conn, ID, base.session_id, id, error)?;
+        } else {
+            // Native is_error is optional. Clear only a local call's prior
+            // outcome; remote-backed rows remain under Snapshot's guard.
+            conn.execute(
+                "UPDATE tool_calls SET is_error=NULL WHERE source=?1 AND session_id=?2 AND tool_use_id=?3 AND location='local' AND is_error IS NOT NULL",
+                rusqlite::params![ID, base.session_id, id],
+            )?;
+        }
     }
     keys.results.insert(id.into());
     keys.events.insert(uid.into());

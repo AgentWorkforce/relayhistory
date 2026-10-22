@@ -283,6 +283,54 @@ fn same_timestamp_reorder_replays_events_without_regressing_tool_status() {
 }
 
 #[test]
+fn rewrite_without_optional_result_status_clears_stale_local_call_status() {
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path(), "fixture-success-01");
+    let mut snapshot: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    snapshot["messages"][2]["content"][0]["is_error"] = true.into();
+    std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    let store = open(home.path());
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    assert_eq!(
+        read(&store, "fixture-success-01").tool_calls[0].is_error,
+        Some(true)
+    );
+    snapshot["messages"][2]["content"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("is_error");
+    std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    let rewritten = read(&store, "fixture-success-01");
+    assert_eq!(rewritten.tool_results[0].result_status, None);
+    assert_eq!(rewritten.tool_calls[0].is_error, None);
+}
+
+#[test]
+fn malformed_sibling_does_not_block_confirmed_deleted_session_retirement() {
+    let home = tempfile::tempdir().unwrap();
+    let removed = stage(home.path(), "synthetic-ordinary");
+    let store = open(home.path());
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    assert!(read(&store, "synthetic-ordinary").prompts.len() == 1);
+    std::fs::remove_file(removed).unwrap();
+    let bad = home
+        .path()
+        .join(".cline/data/sessions/bad/bad.messages.json");
+    std::fs::create_dir_all(bad.parent().unwrap()).unwrap();
+    std::fs::write(&bad, b"{broken").unwrap();
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    assert!(store
+        .session(
+            &SessionRef::id(Source::Cline, "synthetic-ordinary"),
+            SessionQuery::default()
+        )
+        .unwrap()
+        .is_none());
+}
+
+#[test]
 fn small_mixed_tool_result_preserves_native_nontext_blocks() {
     let home = tempfile::tempdir().unwrap();
     let path = stage(home.path(), "fixture-success-01");
@@ -488,6 +536,51 @@ fn escaped_large_result_searches_locally_and_after_remote_intake_with_bounded_ex
         .as_deref()
         .unwrap()
         .contains("alphaunique\nneedleunique"));
+}
+
+#[test]
+#[cfg(feature = "export")]
+fn near_limit_result_reserves_export_record_envelope_space() {
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path(), "fixture-success-01");
+    let mut snapshot: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    snapshot["messages"][2]["content"][0]["content"] = serde_json::json!([
+        {"type":"text","text":"x".repeat(512 * 1024 - 128)}
+    ]);
+    std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    let store = open(home.path());
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    let mut export = ExportSnapshot::open(
+        rusqlite::Connection::open(store.db_path()).unwrap(),
+        &ExportSelection {
+            sessions: vec![SessionIdentity {
+                source: "cline".into(),
+                session_id: "fixture-success-01".into(),
+            }],
+            kinds: vec!["session_event".into()],
+            ..Default::default()
+        },
+        &ExportLimits::default(),
+        60_000,
+        1_000,
+    )
+    .unwrap();
+    let mut cursor = Some(export.handle().cursor);
+    let mut found = false;
+    while let Some(value) = cursor {
+        let page = export.page(&value, 1_000).unwrap();
+        cursor = page.next_cursor;
+        for record in page.records {
+            if record.payload["kind"] == "tool_result" {
+                assert!(record.payload.to_string().len() <= 512 * 1024);
+                let text = record.payload["text"].as_str().unwrap();
+                assert!(text.contains("\"truncated\":true"));
+                found = true;
+            }
+        }
+    }
+    assert!(found);
 }
 
 #[test]

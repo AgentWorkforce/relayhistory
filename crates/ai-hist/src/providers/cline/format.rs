@@ -60,7 +60,8 @@ pub(super) fn result_text(value: &Value, facts: &crate::ingest::ToolResultFacts)
         "[non-text result content]".into()
     };
     const BOUNDARY: &str = "\n\n[Native Cline result projection]\n";
-    const MAX_ENCODED: usize = 512 * 1024;
+    // Leave space for the exported event envelope, native IDs and timestamps.
+    const MAX_ENCODED: usize = 128 * 1024;
     let has_nontext = value
         .as_array()
         .is_some_and(|blocks| blocks.iter().any(|block| block["type"] != "text"));
@@ -205,10 +206,11 @@ pub(super) fn tool_input_args(block: &Value) -> Result<String> {
         return Ok(exact);
     }
     let facts = crate::ingest::ToolResultFacts::from_payload(&block["input"]);
-    Ok(serde_json::json!({
+    let projection = serde_json::json!({
         "projection":"cline-tool-input-v1", "truncated":true,
         "native_input_bytes":facts.payload_bytes, "native_input_hash":facts.payload_hash,
-    }).to_string())
+    });
+    Ok(projection.to_string())
 }
 
 pub(super) fn tool_use_text(block: &Value) -> Result<String> {
@@ -217,9 +219,10 @@ pub(super) fn tool_use_text(block: &Value) -> Result<String> {
         return Ok(exact);
     }
     let facts = crate::ingest::ToolResultFacts::from_payload(&block["input"]);
-    Ok(serde_json::json!({
+    let projection = serde_json::json!({
         "projection":"cline-tool-use-v1", "truncated":true,
         "id":string(block, "id")?, "name":string(block, "name")?,
         "native_input_bytes":facts.payload_bytes, "native_input_hash":facts.payload_hash,
-    }).to_string())
+    });
+    Ok(projection.to_string())
 }

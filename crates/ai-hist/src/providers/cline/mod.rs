@@ -322,7 +322,7 @@ fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
             }
         }
     }
-    if ctx.paths.is_none() && result.unread == 0 {
+    if ctx.paths.is_none() {
         retire_missing(ctx.conn, ctx.roots)?;
     }
     ctx.state.insert(cache_key.into(), Value::Object(cache));
@@ -364,11 +364,22 @@ fn retire_missing(conn: &Connection, roots: &ProviderRoots) -> Result<()> {
         for path in paths {
             let native =
                 path.file_name().and_then(|s| s.to_str()) == Some(&format!("{sid}.messages.json"));
-            if !native
-                || !crate::providers::file_history::confirmed_missing_with_extension(
+            let absent = if native {
+                match crate::providers::file_history::confirmed_missing_with_extension(
                     ID, roots, &path, "json",
-                )?
-            {
+                ) {
+                    Ok(absent) => absent,
+                    Err(error) => {
+                        crate::ingest::check_capture_cancelled()?;
+                        let display_path = path.display();
+                        eprintln!("Cline {display_path}: deletion proof unavailable: {error:#}");
+                        false
+                    }
+                }
+            } else {
+                false
+            };
+            if !absent {
                 all_missing = false;
                 break;
             }
