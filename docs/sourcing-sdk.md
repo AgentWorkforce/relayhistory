@@ -1014,6 +1014,7 @@ handle.
 | hermes | ✓ | ✓ | ✓ | — | — | none |
 | junie | ✓ | ✓ | ✓ | — | — | none |
 | kimi | ✓ | ✓ | ✓ | — | — | none |
+| mistral-vibe | ✓ | ✓ | ✓ | — | — | none |
 | muse | ✓ | ✓ | ✓ | ✓ | ✓ | per-request |
 | omp | ✓ | ✓ | ✓ | — | — | per-message |
 | openclaw | ✓ | ✓ | ✓ | — | — | per-message |

@@ -1,0 +1,11 @@
+# Reproducing the Mistral Vibe 3.0.1 synthetic capture
+
+Use the released binary wheel `mistral-vibe==3.0.1` in an isolated Python environment. The source pin is `mistralai/mistral-vibe@dd2c04ce717c417731ab89c333cd0a72541e33ba`. `capture.py` imports the official `UnifiedSessionStore`; it does not start Vibe or call a model, auth service, network, or a private session.
+
+From the repository root, set `PYTHONPATH` to the isolated wheel directory. For the baseline fixture, run `capture.py write <temporary-save-dir>`, then `capture.py append <temporary-save-dir>` in a second process, then `capture.py read <temporary-save-dir>` in a third process. The last command prints the official loader's state and interoperability export roles. Copy `<temporary-save-dir>/unified` into `crates/ai-hist/tests/fixtures/mistral-vibe/fixture-home/.vibe/logs/session/` and record reader output as `official-reader.json`.
+
+To prove generation replacement, copy that baseline `unified` tree to another temporary save directory, then run `capture.py rewrite <second-save-dir>` and `capture.py read <second-save-dir>` in separate processes. Copy the resulting tree under `crates/ai-hist/tests/provider-fixtures/mistral-vibe/rewrite-home/.vibe/logs/session/`; record output as `rewrite-reader.json`. The rewrite uses native snapshot sequence 2 after the two baseline journal records, so the official reader must not replay those old records onto the new projection.
+
+For the same-millisecond native-order regression, copy the baseline tree to a third save directory, run `capture.py reorder <third-save-dir>`, then `capture.py read <third-save-dir>` in another process. Copy the tree under `crates/ai-hist/tests/provider-fixtures/mistral-vibe/reorder-home/.vibe/logs/session/` and record `reorder-reader.json`. The new generation preserves each native entry ID and recorded timestamp but moves the assistant message before the effect at their shared millisecond.
+
+`crates/ai-hist/tests/provider-fixtures/mistral-vibe/pre-append-home` is the native `write_generation` output before `advance_projection_delta`; `pre-append-reader.json` is a separate-process official read of it. The regression stages this tree, appends only the writer-emitted journal file from `fixture-home`, and checks that an ordinary unforced RelayHistory sync discovers the new turn without a CURRENT rewrite.
