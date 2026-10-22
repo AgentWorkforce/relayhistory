@@ -4,7 +4,7 @@ use anyhow::{ensure, Context};
 use std::collections::HashMap;
 const MAX_SESSIONS: usize = 100_000;
 const MAX_MESSAGES: usize = 1_000_000;
-pub(super) const MAX_PARTS: usize = 2_000_000;
+const MAX_PARTS: usize = 2_000_000;
 const MAX_METADATA_BYTES: i64 = 16 * 1024;
 pub(super) const MAX_ROW_BYTES: i64 = 1024 * 1024;
 const MAX_SESSION_BYTES: i64 = 64 * 1024 * 1024;
@@ -272,6 +272,8 @@ fn read_parts(
     for row in rows {
         check_capture_cancelled()?;
         let (id, message_id, timestamp, raw, bytes) = row?;
+        count += 1;
+        ensure!(count <= MAX_PARTS, "Kilo part capture exceeds safety limit");
         let Some(&position) = positions.get(message_id.as_str()) else {
             continue;
         };
@@ -291,8 +293,6 @@ fn read_parts(
             timestamp,
             data,
         });
-        count += 1;
-        ensure!(count <= MAX_PARTS, "Kilo part capture exceeds safety limit");
     }
     Ok(())
 }
@@ -300,33 +300,43 @@ pub(super) fn enumerate(roots: &ProviderRoots, limit: Option<usize>) -> Result<V
     let context = AcquisitionContext::new(ID, roots);
     let mut candidates = vec![];
     for path in databases(roots)?.0 {
-        let mut stamps = vec![];
-        for suffix in ["", "-wal", "-journal"] {
-            let candidate = if suffix.is_empty() {
-                Some(path.clone())
-            } else {
-                sidecar_safe(&path, suffix)?
-            };
-            if let Some(candidate) = candidate {
-                stamps.push(crate::file_stamp_and_modified(&candidate)?.0);
+        let per_path = (|| -> Result<Vec<Candidate>> {
+            let mut stamps = vec![];
+            for suffix in ["", "-wal", "-journal"] {
+                let candidate = if suffix.is_empty() {
+                    Some(path.clone())
+                } else {
+                    sidecar_safe(&path, suffix)?
+                };
+                if let Some(candidate) = candidate {
+                    stamps.push(crate::file_stamp_and_modified(&candidate)?.0);
+                }
             }
-        }
-        let stamp = stamps.join("|");
-        let rows = read(&context, &path, |conn| {
-            sessions(conn, roots, &path, None, MAX_SESSIONS + 1)
-        })?;
-        ensure!(
-            rows.len() <= MAX_SESSIONS,
-            "Kilo discovery exceeds safety limit"
-        );
-        for session in rows {
-            candidates.push(Candidate {
-                source: ID,
-                locator: path.to_string_lossy().into_owned(),
-                session_id: Some(session.id),
-                recency_hint_ms: Some(session.latest),
-                stamp: stamp.clone(),
-            });
+            let stamp = stamps.join("|");
+            let rows = read(&context, &path, |conn| {
+                sessions(conn, roots, &path, None, MAX_SESSIONS + 1)
+            })?;
+            ensure!(
+                rows.len() <= MAX_SESSIONS,
+                "Kilo discovery exceeds safety limit"
+            );
+            Ok(rows
+                .into_iter()
+                .map(|session| Candidate {
+                    source: ID,
+                    locator: path.to_string_lossy().into_owned(),
+                    session_id: Some(session.id),
+                    recency_hint_ms: Some(session.latest),
+                    stamp: stamp.clone(),
+                })
+                .collect())
+        })();
+        match per_path {
+            Ok(found) => candidates.extend(found),
+            Err(error) => {
+                check_capture_cancelled()?;
+                eprintln!("Kilo {} discovery: {error:#}", path.display());
+            }
         }
     }
     candidates.sort_by(|a, b| {
@@ -431,21 +441,32 @@ pub(super) fn capture(
 pub(super) fn fingerprint_inputs(roots: &ProviderRoots) -> Result<Vec<Candidate>> {
     let mut result = vec![];
     for path in databases(roots)?.0 {
-        for suffix in ["", "-wal", "-journal"] {
-            let candidate = if suffix.is_empty() {
-                Some(path.clone())
-            } else {
-                sidecar_safe(&path, suffix)?
-            };
-            if let Some(candidate) = candidate {
-                let (stamp, modified) = crate::file_stamp_and_modified(&candidate)?;
-                result.push(Candidate {
-                    source: ID,
-                    locator: candidate.to_string_lossy().into_owned(),
-                    session_id: None,
-                    recency_hint_ms: modified,
-                    stamp: format!("{}/{stamp}", namespace(roots, &path)),
-                });
+        let per_path = (|| -> Result<Vec<Candidate>> {
+            let mut found = vec![];
+            for suffix in ["", "-wal", "-journal"] {
+                let candidate = if suffix.is_empty() {
+                    Some(path.clone())
+                } else {
+                    sidecar_safe(&path, suffix)?
+                };
+                if let Some(candidate) = candidate {
+                    let (stamp, modified) = crate::file_stamp_and_modified(&candidate)?;
+                    found.push(Candidate {
+                        source: ID,
+                        locator: candidate.to_string_lossy().into_owned(),
+                        session_id: None,
+                        recency_hint_ms: modified,
+                        stamp: format!("{}/{stamp}", namespace(roots, &path)),
+                    });
+                }
+            }
+            Ok(found)
+        })();
+        match per_path {
+            Ok(found) => result.extend(found),
+            Err(error) => {
+                check_capture_cancelled()?;
+                eprintln!("Kilo {} fingerprint: {error:#}", path.display());
             }
         }
     }

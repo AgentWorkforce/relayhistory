@@ -381,9 +381,11 @@ fn kilo_bad_configured_root_does_not_block_healthy_root() {
     stage(home.path(), include_str!("fixtures/kilo/schema-7-8-15.sql"));
     let bad = home.path().join("bad-kilo.db");
     std::fs::create_dir(&bad).unwrap();
+    let corrupt = home.path().join("corrupt-kilo.db");
+    std::fs::write(&corrupt, b"not a SQLite database").unwrap();
     let roots = ProviderRoots::from_home(home.path().into(), home.path().join("opencode.db"));
     let mut wire = serde_json::to_value(roots).unwrap();
-    wire["provider_roots"]["kilo"] = serde_json::json!([bad, path(home.path())]);
+    wire["provider_roots"]["kilo"] = serde_json::json!([bad, corrupt, path(home.path())]);
     let roots: ProviderRoots = serde_json::from_value(wire).unwrap();
     let store = SessionStore::open(
         StoreOptions::default()

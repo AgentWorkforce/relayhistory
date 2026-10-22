@@ -2,6 +2,8 @@ use super::*;
 use anyhow::ensure;
 
 pub(super) fn first_prompt(conn: &Connection, native: &str) -> Result<Option<String>> {
+    const MAX_SHALLOW_ROWS: usize = 256;
+    const MAX_SHALLOW_BYTES: i64 = 16 * 1024 * 1024;
     let max_message_bytes: Option<i64> = conn.query_row(
         "SELECT MAX(length(CAST(data AS BLOB))) FROM message WHERE session_id=?1",
         [native],
@@ -15,17 +17,25 @@ pub(super) fn first_prompt(conn: &Connection, native: &str) -> Result<Option<Str
     let mut rows = stmt.query(rusqlite::params![
         native,
         storage::MAX_ROW_BYTES,
-        (storage::MAX_PARTS + 1) as i64
+        (MAX_SHALLOW_ROWS + 1) as i64
     ])?;
     let mut message_id = String::new();
     let mut prompt = String::new();
     let mut chars = 0;
+    let mut row_count = 0;
+    let mut byte_count = 0;
     while let Some(row) = rows.next()? {
         crate::ingest::check_capture_cancelled()?;
         let id: String = row.get(0)?;
         let summary: Option<i64> = row.get(1)?;
         let raw: String = row.get(2)?;
         let bytes: i64 = row.get(3)?;
+        row_count += 1;
+        byte_count += bytes;
+        ensure!(
+            row_count <= MAX_SHALLOW_ROWS && byte_count <= MAX_SHALLOW_BYTES,
+            "Kilo shallow prompt exceeds bounded scan budget"
+        );
         ensure!(
             !id.is_empty() && bytes <= storage::MAX_ROW_BYTES,
             "oversized Kilo shallow prompt row"

@@ -32,3 +32,14 @@ fn ancestor_scope_covers_database_and_sidecar() {
         crate::ingest::path_scope::PathScope::from_paths([root.join("kilo.db-wal")]).unwrap();
     assert!(storage::in_scope(&database, Some(&sidecar)));
 }
+
+#[test]
+fn shallow_prompt_refuses_an_unbounded_run_of_ignored_parts() {
+    let db = Connection::open_in_memory().unwrap();
+    db.execute_batch("CREATE TABLE message(id TEXT,session_id TEXT,time_created INTEGER,data TEXT); CREATE TABLE part(id TEXT,message_id TEXT,data TEXT); INSERT INTO message VALUES('m','s',1,'{\"role\":\"user\"}');").unwrap();
+    for index in 0..257 {
+        db.execute("INSERT INTO part VALUES(?1,'m','{\"type\":\"text\",\"text\":\"ignored\",\"ignored\":true}')",[format!("p{index:03}")]).unwrap();
+    }
+    let error = shallow::first_prompt(&db, "s").unwrap_err();
+    assert!(error.to_string().contains("bounded scan budget"));
+}
