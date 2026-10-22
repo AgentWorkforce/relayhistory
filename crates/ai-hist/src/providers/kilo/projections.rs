@@ -17,14 +17,23 @@ pub(super) fn bounded_arguments(input: &Value) -> String {
 }
 
 pub(super) fn bounded_text(text: &str) -> String {
+    project_text(text, "native_part")
+}
+
+pub(super) fn bounded_joined_text(text: &str) -> String {
+    project_text(text, "normalized_parts")
+}
+
+fn project_text(text: &str, input_basis: &str) -> String {
     if Value::String(text.to_owned()).to_string().len() <= 256 * 1024 {
         return text.to_owned();
     }
     let projection = serde_json::json!({
         "projection": "kilo-text-v1",
         "truncated": true,
-        "native_payload_bytes": text.len(),
-        "native_payload_hash": format!("{:x}", Sha256::digest(text.as_bytes())),
+        "input_basis": input_basis,
+        "input_bytes": text.len(),
+        "input_sha256": format!("{:x}", Sha256::digest(text.as_bytes())),
     });
     format!(
         "{}\n\n[Native Kilo text projection]\n{projection}",

@@ -1,6 +1,7 @@
 //! Kilo CLI 7.8.15 database selection, frozen at ProviderRoots construction.
 use super::*;
 use crate::discover::WatchEntries;
+use crate::ingest::check_capture_cancelled;
 use sha2::{Digest, Sha256};
 use std::ffi::OsString;
 
@@ -67,6 +68,28 @@ pub(super) fn watch_roots(roots: &ProviderRoots) -> Vec<WatchRoot> {
             ))
         })
         .collect()
+}
+
+pub(super) fn databases(roots: &ProviderRoots) -> Result<(Vec<PathBuf>, u64)> {
+    roots.ensure_provider_roots(ID)?;
+    let context = AcquisitionContext::new(ID, roots);
+    let mut paths = vec![];
+    let mut unread = 0;
+    for path in roots.for_provider(ID) {
+        check_capture_cancelled()?;
+        match std::fs::metadata(path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Ok(meta) if meta.is_file() && context.validate(path).is_ok() => {}
+            _ => {
+                unread += 1;
+                continue;
+            }
+        }
+        paths.push(path.clone());
+    }
+    paths.sort();
+    paths.dedup();
+    Ok((paths, unread))
 }
 
 pub(super) fn identity(namespace: &str, native: &str) -> String {

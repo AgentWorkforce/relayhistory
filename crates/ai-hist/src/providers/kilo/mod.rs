@@ -9,6 +9,7 @@ mod normalize;
 mod projections;
 mod prompts;
 mod roots;
+mod shallow;
 mod storage;
 #[cfg(test)]
 mod tests;
@@ -118,7 +119,9 @@ fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
     let context = AcquisitionContext::new(ID, ctx.roots);
     let mut inserted = 0;
     let mut unread = 0;
-    for path in storage::databases(ctx.roots)? {
+    let (databases, broken_paths) = storage::databases(ctx.roots)?;
+    unread += broken_paths;
+    for path in databases {
         if !storage::in_scope(&path, ctx.paths) {
             continue;
         }

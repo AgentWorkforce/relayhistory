@@ -157,7 +157,7 @@ fn joined_text(message: &Message) -> Option<String> {
         .filter_map(|p| p.data["text"].as_str())
         .map(projections::bounded_text)
         .collect();
-    (!parts.is_empty()).then(|| projections::bounded_text(&parts.join("\n")))
+    (!parts.is_empty()).then(|| projections::bounded_joined_text(&parts.join("\n")))
 }
 fn prompt(message: &Message) -> Option<String> {
     if message.data["summary"] == true {
@@ -241,6 +241,7 @@ fn write_message(
                             role: &message.role,
                             kind: event_kind,
                             text: Some(&text),
+                            project: Some(&session.cwd),
                             cwd: Some(&session.cwd),
                             raw_kind: Some("part.data"),
                             raw_facts: RawMessageFacts {
@@ -373,6 +374,7 @@ fn tool(ctx: ToolContext<'_>, part: &Part, uid: &str) -> Result<()> {
                 role: &message.role,
                 kind: "tool_use",
                 text: Some(&args),
+                project: Some(&session.cwd),
                 cwd: Some(&session.cwd),
                 raw_kind: Some("part.data"),
                 tool_result_facts: Some(&facts),
@@ -419,6 +421,7 @@ fn tool(ctx: ToolContext<'_>, part: &Part, uid: &str) -> Result<()> {
                 role: "tool_result",
                 kind: "tool_result",
                 text: Some(&text),
+                project: Some(&session.cwd),
                 cwd: Some(&session.cwd),
                 raw_kind: Some("part.data"),
                 tool_result_facts: Some(&facts),

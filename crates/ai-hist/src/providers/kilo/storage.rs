@@ -1,14 +1,16 @@
 use super::*;
 use crate::ingest::check_capture_cancelled;
 use anyhow::{ensure, Context};
+use std::collections::HashMap;
 const MAX_SESSIONS: usize = 100_000;
 const MAX_MESSAGES: usize = 1_000_000;
-const MAX_PARTS: usize = 2_000_000;
+pub(super) const MAX_PARTS: usize = 2_000_000;
 const MAX_METADATA_BYTES: i64 = 16 * 1024;
-const MAX_ROW_BYTES: i64 = 1024 * 1024;
+pub(super) const MAX_ROW_BYTES: i64 = 1024 * 1024;
 const MAX_SESSION_BYTES: i64 = 64 * 1024 * 1024;
 
 use super::roots::{identity, namespace};
+use super::shallow::first_prompt;
 fn native_id(id: &str) -> Result<String> {
     let encoded = id.rsplit(':').next().unwrap_or("");
     ensure!(
@@ -40,26 +42,7 @@ fn sidecar_safe(path: &Path, suffix: &str) -> Result<Option<PathBuf>> {
     );
     Ok(Some(candidate))
 }
-pub(super) fn databases(roots: &ProviderRoots) -> Result<Vec<PathBuf>> {
-    roots.ensure_provider_roots(ID)?;
-    let context = AcquisitionContext::new(ID, roots);
-    let mut paths = vec![];
-    for path in roots.for_provider(ID) {
-        check_capture_cancelled()?;
-        match std::fs::metadata(path) {
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error.into()),
-            Ok(meta) => {
-                ensure!(meta.is_file(), "Kilo database path is not a file");
-                context.validate(path)?;
-            }
-        }
-        paths.push(path.clone());
-    }
-    paths.sort();
-    paths.dedup();
-    Ok(paths)
-}
+pub(super) use super::roots::databases;
 pub(super) fn confirmed_missing(roots: &ProviderRoots, path: &Path) -> Result<bool> {
     if !roots.for_provider(ID).iter().any(|p| p == path) {
         return Ok(false);
@@ -267,49 +250,56 @@ fn read_parts(
     result: &mut [Message],
     total_bytes: &mut i64,
 ) -> Result<()> {
+    let positions: HashMap<_, _> = result
+        .iter()
+        .enumerate()
+        .map(|(index, message)| (message.id.clone(), index))
+        .collect();
+    let mut stmt = conn.prepare("SELECT CASE WHEN length(CAST(id AS BLOB))<=512 THEN id ELSE '' END,CASE WHEN length(CAST(message_id AS BLOB))<=512 THEN message_id ELSE '' END,time_created,CASE WHEN length(CAST(data AS BLOB))<=?3 THEN data ELSE '' END,length(CAST(data AS BLOB)) FROM part WHERE session_id=?1 ORDER BY message_id,id LIMIT ?2")?;
+    let rows = stmt.query_map(
+        rusqlite::params![native, (MAX_PARTS + 1) as i64, MAX_ROW_BYTES],
+        |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, i64>(4)?,
+            ))
+        },
+    )?;
     let mut count = 0;
-    for message in result {
-        let mut stmt = conn.prepare("SELECT CASE WHEN length(CAST(id AS BLOB))<=512 THEN id ELSE '' END,time_created,CASE WHEN length(CAST(data AS BLOB))<=?4 THEN data ELSE '' END,length(CAST(data AS BLOB)) FROM part WHERE session_id=?1 AND message_id=?2 ORDER BY id LIMIT ?3")?;
-        let rows = stmt.query_map(
-            rusqlite::params![native, message.id, (MAX_PARTS + 1) as i64, MAX_ROW_BYTES],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, i64>(3)?,
-                ))
-            },
-        )?;
-        for row in rows {
-            check_capture_cancelled()?;
-            let (id, timestamp, raw, bytes) = row?;
-            ensure!(bytes <= MAX_ROW_BYTES, "oversized Kilo part data");
-            *total_bytes += bytes;
-            ensure!(
-                *total_bytes <= MAX_SESSION_BYTES,
-                "Kilo session exceeds source size limit"
-            );
-            ensure!(
-                !id.is_empty() && id.len() <= 512 && timestamp >= 0,
-                "invalid Kilo part identity/timestamp"
-            );
-            let data = serde_json::from_str(&raw).context("malformed Kilo part data")?;
-            message.parts.push(Part {
-                id,
-                timestamp,
-                data,
-            });
-            count += 1;
-            ensure!(count <= MAX_PARTS, "Kilo part capture exceeds safety limit");
-        }
+    for row in rows {
+        check_capture_cancelled()?;
+        let (id, message_id, timestamp, raw, bytes) = row?;
+        let Some(&position) = positions.get(message_id.as_str()) else {
+            continue;
+        };
+        ensure!(bytes <= MAX_ROW_BYTES, "oversized Kilo part data");
+        *total_bytes += bytes;
+        ensure!(
+            *total_bytes <= MAX_SESSION_BYTES,
+            "Kilo session exceeds source size limit"
+        );
+        ensure!(
+            !id.is_empty() && id.len() <= 512 && timestamp >= 0,
+            "invalid Kilo part identity/timestamp"
+        );
+        let data = serde_json::from_str(&raw).context("malformed Kilo part data")?;
+        result[position].parts.push(Part {
+            id,
+            timestamp,
+            data,
+        });
+        count += 1;
+        ensure!(count <= MAX_PARTS, "Kilo part capture exceeds safety limit");
     }
     Ok(())
 }
 pub(super) fn enumerate(roots: &ProviderRoots, limit: Option<usize>) -> Result<Vec<Candidate>> {
     let context = AcquisitionContext::new(ID, roots);
     let mut candidates = vec![];
-    for path in databases(roots)? {
+    for path in databases(roots)?.0 {
         let mut stamps = vec![];
         for suffix in ["", "-wal", "-journal"] {
             let candidate = if suffix.is_empty() {
@@ -379,31 +369,6 @@ pub(super) fn shallow(scan: &ScanEnv<'_>, candidate: &Candidate) -> Result<Optio
         }))
     })
 }
-fn first_prompt(conn: &Connection, native: &str) -> Result<Option<String>> {
-    let max_message_bytes: Option<i64> = conn.query_row(
-        "SELECT MAX(length(CAST(data AS BLOB))) FROM message WHERE session_id=?1",
-        [native],
-        |row| row.get(0),
-    )?;
-    ensure!(
-        max_message_bytes.unwrap_or(0) <= MAX_ROW_BYTES,
-        "oversized Kilo prompt message data"
-    );
-    let mut stmt = conn.prepare("SELECT CASE WHEN length(CAST(p.data AS BLOB))<=?2 THEN p.data ELSE '' END,length(CAST(p.data AS BLOB)) FROM part p JOIN message m ON m.id=p.message_id WHERE m.session_id=?1 AND CASE WHEN length(CAST(m.data AS BLOB))<=?2 THEN json_extract(m.data,'$.role') ELSE NULL END='user' ORDER BY m.time_created,m.id,p.id LIMIT 32")?;
-    for row in stmt.query_map(rusqlite::params![native, MAX_ROW_BYTES], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-    })? {
-        let (raw, bytes) = row?;
-        ensure!(bytes <= MAX_ROW_BYTES, "oversized Kilo prompt data");
-        let data: Value = serde_json::from_str(&raw)?;
-        if data["type"] == "text" && data["synthetic"] != true && data["ignored"] != true {
-            if let Some(text) = data["text"].as_str() {
-                return Ok(Some(text.chars().take(512).collect()));
-            }
-        }
-    }
-    Ok(None)
-}
 pub(super) fn scan(
     context: &AcquisitionContext<'_>,
     path: &Path,
@@ -465,7 +430,7 @@ pub(super) fn capture(
 }
 pub(super) fn fingerprint_inputs(roots: &ProviderRoots) -> Result<Vec<Candidate>> {
     let mut result = vec![];
-    for path in databases(roots)? {
+    for path in databases(roots)?.0 {
         for suffix in ["", "-wal", "-journal"] {
             let candidate = if suffix.is_empty() {
                 Some(path.clone())

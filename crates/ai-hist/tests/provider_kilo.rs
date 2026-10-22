@@ -376,6 +376,70 @@ fn kilo_configured_database_namespace_separates_same_native_id() {
 }
 
 #[test]
+fn kilo_bad_configured_root_does_not_block_healthy_root() {
+    let home = tempfile::tempdir().unwrap();
+    stage(home.path(), include_str!("fixtures/kilo/schema-7-8-15.sql"));
+    let bad = home.path().join("bad-kilo.db");
+    std::fs::create_dir(&bad).unwrap();
+    let roots = ProviderRoots::from_home(home.path().into(), home.path().join("opencode.db"));
+    let mut wire = serde_json::to_value(roots).unwrap();
+    wire["provider_roots"]["kilo"] = serde_json::json!([bad, path(home.path())]);
+    let roots: ProviderRoots = serde_json::from_value(wire).unwrap();
+    let store = SessionStore::open(
+        StoreOptions::default()
+            .db_path(home.path().join("ledger.db"))
+            .roots(roots),
+    )
+    .unwrap();
+    store
+        .discover(DiscoveryOptions::default().sources([Source::Kilo]))
+        .unwrap();
+    store
+        .sync(SyncOptions::default().sources([Source::Kilo]))
+        .unwrap();
+    assert!(store
+        .session(&SessionRef::id(Source::Kilo, SID), SessionQuery::default())
+        .unwrap()
+        .is_some());
+}
+
+#[test]
+fn kilo_shallow_first_prompt_joins_native_text_parts_and_preserves_project() {
+    let home = tempfile::tempdir().unwrap();
+    stage(home.path(), include_str!("fixtures/kilo/schema-7-8-15.sql"));
+    let native = rusqlite::Connection::open(path(home.path())).unwrap();
+    native.execute("INSERT INTO part(id,message_id,session_id,time_created,time_updated,data) VALUES('prt_kiloToolUserText003','msg_kiloToolUser002','ses_kiloTool002',1792653182039,1792653182039,?1)",[serde_json::json!({"type":"text","text":"Second shallow line"}).to_string()]).unwrap();
+    drop(native);
+    let store = open(home.path());
+    store
+        .discover(DiscoveryOptions::default().sources([Source::Kilo]))
+        .unwrap();
+    let conn = rusqlite::Connection::open(home.path().join("ledger.db")).unwrap();
+    let shallow: String = conn
+        .query_row(
+            "SELECT first_prompt FROM sessions WHERE source='kilo' AND session_id=?1",
+            [SID],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        shallow,
+        "Find the synthetic Kilo needle\nSecond shallow line"
+    );
+    store
+        .hydrate(
+            &SessionRef::id(Source::Kilo, SID),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    let (prompt,project): (String,Option<String>) = conn.query_row("SELECT prompt,project FROM history WHERE source='kilo' AND session_id=?1 ORDER BY timestamp_ms LIMIT 1",[SID],|row|Ok((row.get(0)?,row.get(1)?))).unwrap();
+    assert_eq!(prompt, shallow);
+    assert_eq!(project.as_deref(), Some("/private/tmp/rh-kilo-capture"));
+    let missing_project: i64 = conn.query_row("SELECT count(*) FROM session_events WHERE source='kilo' AND session_id=?1 AND kind IN ('text','tool_use','tool_result') AND project IS NULL",[SID],|row|row.get(0)).unwrap();
+    assert_eq!(missing_project, 0);
+}
+
+#[test]
 fn kilo_missing_database_retires_only_after_parent_is_confirmed() {
     let home = tempfile::tempdir().unwrap();
     stage(home.path(), include_str!("fixtures/kilo/schema-7-8-15.sql"));
@@ -567,16 +631,25 @@ fn kilo_local_retirement_preserves_prompt_supported_by_remote_share() {
     };
     let home = tempfile::tempdir().unwrap();
     stage(home.path(), include_str!("fixtures/kilo/schema-7-8-15.sql"));
+    let add_large_parts = |conn: &rusqlite::Connection| {
+        let data = serde_json::json!({"type":"text","text":format!("Remote supported second line {}", "\\".repeat(300_000))}).to_string();
+        for index in 3..12 {
+            let id = format!("prt_kiloToolUserText{index:03}");
+            conn.execute("INSERT INTO part(id,message_id,session_id,time_created,time_updated,data) VALUES(?1,'msg_kiloToolUser002','ses_kiloTool002',1792653182039,1792653182039,?2)", rusqlite::params![id,data]).unwrap();
+        }
+    };
     let native = rusqlite::Connection::open(path(home.path())).unwrap();
-    native.execute("INSERT INTO part(id,message_id,session_id,time_created,time_updated,data) VALUES('prt_kiloToolUserText003','msg_kiloToolUser002','ses_kiloTool002',1792653182039,1792653182039,?1)",[serde_json::json!({"type":"text","text":"Remote supported second line"}).to_string()]).unwrap();
+    add_large_parts(&native);
     drop(native);
     let store = open(home.path());
     store
         .sync(SyncOptions::default().sources([Source::Kilo]))
         .unwrap();
     let reference = SessionRef::id(Source::Kilo, SID);
-    let expected_prompt = "Find the synthetic Kilo needle\nRemote supported second line";
     let ledger = home.path().join("ledger.db");
+    let expected_prompt: String = rusqlite::Connection::open(&ledger).unwrap().query_row("SELECT prompt FROM history WHERE source='kilo' AND session_id=?1 ORDER BY timestamp_ms LIMIT 1", [SID], |row| row.get(0)).unwrap();
+    assert!(expected_prompt.contains("[Native Kilo text projection]"));
+    assert!(expected_prompt.contains("\"input_basis\":\"normalized_parts\""));
     let mut export = ExportSnapshot::open(
         rusqlite::Connection::open(&ledger).unwrap(),
         &ExportSelection {
@@ -631,7 +704,7 @@ fn kilo_local_retirement_preserves_prompt_supported_by_remote_share() {
         include_str!("fixtures/kilo/schema-7-8-15.sql"),
     );
     let native = rusqlite::Connection::open(path(receiver_home.path())).unwrap();
-    native.execute("INSERT INTO part(id,message_id,session_id,time_created,time_updated,data) VALUES('prt_kiloToolUserText003','msg_kiloToolUser002','ses_kiloTool002',1792653182039,1792653182039,?1)",[serde_json::json!({"type":"text","text":"Remote supported second line"}).to_string()]).unwrap();
+    add_large_parts(&native);
     drop(native);
     let store = open(receiver_home.path());
     let home = receiver_home;
