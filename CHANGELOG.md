@@ -9,6 +9,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - Kilo CLI history is discoverable and searchable from its native session database, preserving recorded messages, tool results and session rewrites.
+- DeepAgents Code history is discoverable and searchable from native root checkpoints and message writes, including recorded tools, message revisions and compaction.
 - Cortex Code history is discoverable and searchable from native snapshots and journals, preserving messages, tool results, rewrites and recorded event markers.
 - Mistral Vibe 3 history is discoverable and searchable from its native session store, including journal appends, generation rewrites, messages and tool effects.
 - goose history is discoverable and searchable from its native session database, preserving messages, tool results and native conversation rewrites.
@@ -19,6 +20,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Rust API
 
 - Added `Source::Kilo` for filtering and reading persisted Kilo CLI history.
+- Added `Source::DeepAgents` for filtering and reading persisted DeepAgents Code history.
 - Added `Source::Cortex` for filtering and reading persisted Cortex Code history.
 - Added `Source::MistralVibe` for filtering and reading persisted Mistral Vibe history.
 - Added `Source::Goose` for filtering and reading persisted goose history.

@@ -1,0 +1,55 @@
+{
+  "id": "deepagents",
+  "rust_id": "deepagents",
+  "variant": "DeepAgents",
+  "order": 443,
+  "aliases": [],
+  "fixtures": [
+    {
+      "source": "deepagents",
+      "name": "dcode-checkpoints",
+      "layout": "Sqlite",
+      "target": ".deepagents/.state/sessions.db",
+      "origin": "RelayHistory",
+      "files": [
+        "deepagents/sessions.sql"
+      ],
+      "quirk": "Pinned dcode 0.1.88 writer and current SDK DeltaChannel: 171 checkpoints crossing snapshot frequency 50, pending writes, native tool IDs, same-ID revision/removal, and Overwrite compaction."
+    },
+    {
+      "source": "deepagents",
+      "name": "native-oracles",
+      "layout": "Reference",
+      "origin": "RelayHistory",
+      "files": [
+        "deepagents/official-443.json",
+        "deepagents/official-444.json",
+        "deepagents/official-445.json",
+        "deepagents/official-446.json",
+        "deepagents/capture.py",
+        "deepagents/README.md",
+        "deepagents/native-446-state.json"
+      ],
+      "quirk": "Fresh-process bundled inspector transcript exports and the fully synthetic native capture recipe."
+    }
+  ],
+  "capture": [
+    {
+      "evidence": "Messages and tools",
+      "coverage": "Pinned DeepAgents Code SQLite MsgPack root checkpoints v2 and v4 plus ordered messages writes; text-only message projection with native IDs and tool call/result IDs."
+    },
+    {
+      "evidence": "Usage and relationships",
+      "coverage": "No measured usage, file edits, child namespace relationships, offloaded history, or native resume claimed."
+    }
+  ],
+  "population": {
+    "evidence": [
+      "history",
+      "session_event",
+      "tool_call",
+      "session_marker"
+    ],
+    "usage_accounting": "none"
+  }
+}

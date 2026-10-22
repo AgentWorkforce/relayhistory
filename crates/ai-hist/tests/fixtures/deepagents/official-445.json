@@ -1,0 +1,48 @@
+{
+  "database": "<fixture>/sessions.db",
+  "thread": {
+    "thread_id": "019a0000-0000-7000-8000-000000000445",
+    "thread_name": null,
+    "agent_name": null,
+    "created_at": "2026-10-22T14:00:00+00:00",
+    "updated_at": "2026-10-22T14:01:00+00:00",
+    "latest_checkpoint_id": "00000000-0000-7000-8000-000000000007",
+    "checkpoint_count": 2,
+    "writes_count": 2,
+    "git_branch": null,
+    "git_commit_sha": null,
+    "cwd": null,
+    "repository_name": null,
+    "repository_url": null,
+    "message_count": 2
+  },
+  "turn_count": 1,
+  "preamble": [],
+  "turns": [
+    {
+      "number": 1,
+      "start_message_index": 0,
+      "end_message_index": 1,
+      "messages": [
+        {
+          "index": 0,
+          "role": "user",
+          "name": null,
+          "id": "keep",
+          "content": "Retained prompt",
+          "content_chars": 15,
+          "content_truncated": false
+        },
+        {
+          "index": 1,
+          "role": "assistant",
+          "name": null,
+          "id": "revise",
+          "content": "Revised answer",
+          "content_chars": 14,
+          "content_truncated": false
+        }
+      ]
+    }
+  ]
+}

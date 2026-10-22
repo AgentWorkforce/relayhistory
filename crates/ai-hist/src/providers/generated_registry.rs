@@ -81,6 +81,11 @@ const REGISTRATIONS: &[Registration] = &[
         adapter: cortex::ADAPTER,
     },
     Registration {
+        id: "deepagents",
+        metadata: deepagents::METADATA,
+        adapter: deepagents::ADAPTER,
+    },
+    Registration {
         id: "goose",
         metadata: goose::METADATA,
         adapter: goose::ADAPTER,
