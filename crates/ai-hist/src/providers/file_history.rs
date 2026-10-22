@@ -3,6 +3,8 @@
 //! dropped, and retirement of a locator a full sweep confirmed missing.
 //! Every function is keyed on the provider's canonical source id.
 mod order;
+#[cfg(test)]
+mod tests;
 pub(crate) use order::reconcile_event_order;
 
 use super::AcquisitionContext;
@@ -192,7 +194,7 @@ pub(crate) fn retire_missing(conn: &Connection, source: &str, roots: &ProviderRo
     for path in paths {
         crate::ingest::check_capture_cancelled()?;
         let path = PathBuf::from(path);
-        if confirmed_missing(source, roots, &path)? {
+        if confirmed_missing_with_extension(source, roots, &path, "jsonl")? {
             let tx = conn.unchecked_transaction()?;
             retire_missing_locator(&tx, source, &path)?;
             tx.commit()?;
@@ -201,8 +203,16 @@ pub(crate) fn retire_missing(conn: &Connection, source: &str, roots: &ProviderRo
     Ok(())
 }
 
-fn confirmed_missing(source: &str, roots: &ProviderRoots, path: &Path) -> Result<bool> {
-    if path.extension().is_none_or(|e| e != "jsonl") {
+/// Prove a file is absent beneath an accessible, contained provider root.
+/// Providers with multiple authoritative files must check every companion
+/// before retiring a session; one absent metadata file is not sufficient.
+pub(crate) fn confirmed_missing_with_extension(
+    source: &str,
+    roots: &ProviderRoots,
+    path: &Path,
+    extension: &str,
+) -> Result<bool> {
+    if path.extension().is_none_or(|e| e != extension) {
         return Ok(false);
     }
     let context = AcquisitionContext::new(source, roots);
