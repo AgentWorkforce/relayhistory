@@ -57,7 +57,12 @@ fn retire_missing_native(conn: &Connection, roots: &ProviderRoots) -> Result<()>
         let mut all_missing = true;
         for raw in paths {
             let path = PathBuf::from(raw);
-            let side = sidecar(&path)?;
+            let Ok(side) = sidecar(&path) else {
+                // An explicit local locator without a native filename is
+                // unknown evidence, never proof that the session was deleted.
+                all_missing = false;
+                break;
+            };
             if !crate::providers::file_history::confirmed_missing_with_extension(
                 ID, roots, &path, "json",
             )? || !crate::providers::file_history::confirmed_missing_with_extension(

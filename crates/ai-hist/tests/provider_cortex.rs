@@ -379,6 +379,28 @@ fn moved_native_pair_keeps_local_evidence_until_all_paths_are_gone() {
         .is_none());
 }
 #[test]
+fn malformed_local_locator_cannot_prove_native_deletion() {
+    let home = tempfile::tempdir().unwrap();
+    let (meta, side) = stage(home.path());
+    let store = open(home.path());
+    let reference = SessionRef::id(Source::Cortex, ID);
+    store
+        .sync(SyncOptions::default().sources([Source::Cortex]).force(true))
+        .unwrap();
+    let conn = rusqlite::Connection::open(home.path().join("cortex.db")).unwrap();
+    conn.execute("UPDATE session_observations SET raw_locator='/' WHERE source='cortex' AND session_id=?1 AND location='local'", [ID]).unwrap();
+    conn.execute("UPDATE session_presences SET raw_locator='/' WHERE source='cortex' AND session_id=?1 AND location='local'", [ID]).unwrap();
+    std::fs::remove_file(meta).unwrap();
+    std::fs::remove_file(side).unwrap();
+    store
+        .sync(SyncOptions::default().sources([Source::Cortex]).force(true))
+        .unwrap();
+    assert!(store
+        .session(&reference, SessionQuery::default())
+        .unwrap()
+        .is_some());
+}
+#[test]
 fn missing_root_preserves_prior_local_evidence() {
     let home = tempfile::tempdir().unwrap();
     stage(home.path());
@@ -642,7 +664,7 @@ fn public_export_intake_then_local_wipe_preserves_remote_share() {
                     source_stamp: Some("export-2".into()),
                     ..Default::default()
                 },
-                raw_locator: Some("remote-cortex-locator".into()),
+                raw_locator: Some("/".into()),
             }],
         ))
         .unwrap();
@@ -669,5 +691,5 @@ fn public_export_intake_then_local_wipe_preserves_remote_share() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(raw.as_deref(), Some("remote-cortex-locator"));
+    assert_eq!(raw.as_deref(), Some("/"));
 }
