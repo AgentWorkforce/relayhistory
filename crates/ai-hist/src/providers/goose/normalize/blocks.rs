@@ -348,11 +348,17 @@ impl Sink<'_> {
 }
 
 fn mixed_result_event_text(block: &Value, visible: &str, facts: &ToolResultFacts) -> String {
+    const RAW_BOUNDARY: &str = "\n\n[Native Goose result JSON]\n";
+    const PROJECTION_BOUNDARY: &str = "\n\n[Native Goose result projection]\n";
     let full = block.to_string();
+    // Decoded visible text comes first so FTS indexes actual words and
+    // phrases across newlines. The compact JSON suffix has no literal
+    // newlines, so the last boundary unambiguously identifies its start.
+    let complete = format!("{visible}{RAW_BOUNDARY}{full}");
     // Export wraps text in another JSON string. Measure that encoded form,
     // since escaping can make a smaller native block exceed a page.
-    if Value::String(full.clone()).to_string().len() <= 512 * 1024 {
-        return full;
+    if Value::String(complete.clone()).to_string().len() <= 512 * 1024 {
+        return complete;
     }
     // A single export record must fit the default 1 MiB page. Preserve raw
     // measurements in ToolResultFacts and make the display loss explicit.
@@ -378,16 +384,19 @@ fn mixed_result_event_text(block: &Value, visible: &str, facts: &ToolResultFacts
         "native_payload_hash": facts.payload_hash,
     })
     .to_string();
-    if Value::String(projection.clone()).to_string().len() <= 512 * 1024 {
-        projection
+    let visible_prefix = visible.chars().take(32 * 1024).collect::<String>();
+    let projected = format!("{visible_prefix}{PROJECTION_BOUNDARY}{projection}");
+    if Value::String(projected.clone()).to_string().len() <= 512 * 1024 {
+        projected
     } else {
-        serde_json::json!({
+        let minimal = serde_json::json!({
             "projection": "goose-mixed-result-v1",
             "truncated": true,
             "native_payload_bytes": facts.payload_bytes,
             "native_payload_hash": facts.payload_hash,
         })
-        .to_string()
+        .to_string();
+        format!("{PROJECTION_BOUNDARY}{minimal}")
     }
 }
 

@@ -67,6 +67,12 @@ fn hydrate(store: &SessionStore) -> ai_hist::SessionEvidence {
         .unwrap()
 }
 
+fn mixed_native_suffix(text: &str) -> &str {
+    text.rsplit_once("\n\n[Native Goose result JSON]\n")
+        .unwrap()
+        .1
+}
+
 #[test]
 fn goose_native_schema17_public_history_conformance() {
     let home = tempfile::tempdir().unwrap();
@@ -636,7 +642,7 @@ fn goose_mixed_tool_result_keeps_native_nontext_content_and_retires_it_on_rewrit
         "type":"toolResponse", "id":"call-native-1",
         "toolResult":{"status":"success","value":{"resultType":"complete","isError":false,
             "content":[
-                {"type":"text","text":"Visible ".to_owned() + &"x".repeat(200)},
+                {"type":"text","text":"alphaunique\nneedleunique ".to_owned() + &"x".repeat(200)},
                 {"type":"resource","uri":"synthetic://goose/report"}
             ]}}
     }]);
@@ -652,10 +658,50 @@ fn goose_mixed_tool_result_keeps_native_nontext_content_and_retires_it_on_rewrit
     let store = open(home.path());
     let before = hydrate(&store);
     assert_eq!(
-        serde_json::from_str::<serde_json::Value>(before.tool_results[0].text.as_deref().unwrap())
-            .unwrap(),
+        serde_json::from_str::<serde_json::Value>(mixed_native_suffix(
+            before.tool_results[0].text.as_deref().unwrap()
+        ))
+        .unwrap(),
         original[0]
     );
+    let search_count = |path: &std::path::Path, query: &str| -> i64 {
+        let conn = rusqlite::Connection::open(path).unwrap();
+        let indexed: i64 = conn.query_row(
+            "SELECT count(*) FROM session_events_fts f JOIN session_events e ON e.id=f.rowid WHERE session_events_fts MATCH ?1 AND e.source='goose' AND e.session_id=?2 AND e.kind='tool_result'",
+            rusqlite::params![query, SID], |r| r.get(0),
+        ).unwrap();
+        #[cfg(feature = "unstable-internal")]
+        {
+            let found = ai_hist::history_search::search_all(
+                &conn,
+                &[query.to_owned()],
+                true,
+                &ai_hist::QueryFilter {
+                    source: Some("goose".into()),
+                    scope: ai_hist::SessionScope::All,
+                    ..Default::default()
+                },
+                ai_hist::history_search::SearchRole::All,
+            )
+            .unwrap();
+            let public = found
+                .iter()
+                .filter(|hit| {
+                    hit.match_source == ai_hist::history_search::MATCH_SOURCE_SESSION_EVENT
+                        && hit.session_id.as_deref() == Some(SID)
+                        && hit.kind == "tool_result"
+                })
+                .count() as i64;
+            assert_eq!(
+                public, indexed,
+                "public search must return indexed Goose tool results"
+            );
+        }
+        indexed
+    };
+    let ledger = home.path().join("ledger.db");
+    assert_eq!(search_count(&ledger, "needleunique"), 1);
+    assert_eq!(search_count(&ledger, "\"alphaunique needleunique\""), 1);
     #[cfg(feature = "export")]
     {
         let mut snapshot = ExportSnapshot::open(
@@ -739,11 +785,17 @@ fn goose_mixed_tool_result_keeps_native_nontext_content_and_retires_it_on_rewrit
             .unwrap()
             .unwrap();
         assert_eq!(
-            serde_json::from_str::<serde_json::Value>(
+            serde_json::from_str::<serde_json::Value>(mixed_native_suffix(
                 imported.tool_results[0].text.as_deref().unwrap()
-            )
+            ))
             .unwrap(),
             original[0]
+        );
+        let remote_ledger = receiver_home.path().join("ledger.db");
+        assert_eq!(search_count(&remote_ledger, "needleunique"), 1);
+        assert_eq!(
+            search_count(&remote_ledger, "\"alphaunique needleunique\""),
+            1
         );
     }
     let revised = serde_json::json!([{
@@ -762,6 +814,7 @@ fn goose_mixed_tool_result_keeps_native_nontext_content_and_retires_it_on_rewrit
         .as_deref()
         .unwrap()
         .contains("synthetic://goose/report"));
+    assert_eq!(search_count(&ledger, "needleunique"), 0);
 }
 
 #[test]
@@ -789,8 +842,14 @@ fn goose_escaped_mixed_result_exports_honest_projection() {
     drop(conn);
     let store = open(home.path());
     let before = hydrate(&store);
-    let projected: serde_json::Value =
-        serde_json::from_str(before.tool_results[0].text.as_deref().unwrap()).unwrap();
+    let projected_text = before.tool_results[0].text.as_deref().unwrap();
+    let projected: serde_json::Value = serde_json::from_str(
+        projected_text
+            .rsplit_once("\n\n[Native Goose result projection]\n")
+            .unwrap()
+            .1,
+    )
+    .unwrap();
     assert_eq!(projected["truncated"], true);
     assert_eq!(projected["projection"], "goose-mixed-result-v1");
     assert_eq!(
@@ -876,9 +935,14 @@ fn goose_escaped_mixed_result_exports_honest_projection() {
         .session(&SessionRef::id(Source::Goose, SID), SessionQuery::default())
         .unwrap()
         .unwrap();
+    let imported_text = imported.tool_results[0].text.as_deref().unwrap();
+    assert_eq!(imported_text, projected_text);
     assert_eq!(
         serde_json::from_str::<serde_json::Value>(
-            imported.tool_results[0].text.as_deref().unwrap()
+            imported_text
+                .rsplit_once("\n\n[Native Goose result projection]\n")
+                .unwrap()
+                .1
         )
         .unwrap(),
         projected,
