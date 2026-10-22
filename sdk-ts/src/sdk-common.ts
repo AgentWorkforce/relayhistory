@@ -31,6 +31,7 @@ export const SOURCES = Object.freeze([
   'kimi',
   'codebuddy',
   'cortex',
+  'goose',
   'junie',
   'mistral-vibe',
   'qoder',

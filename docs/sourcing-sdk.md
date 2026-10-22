@@ -1009,6 +1009,7 @@ handle.
 | cortex | ✓ | ✓ | ✓ | — | — | none |
 | cursor | ✓ | ✓ | ✓ | ✓ | — | none |
 | devin | ✓ | ✓ | ✓ | ✓ | — | none |
+| goose | ✓ | ✓ | ✓ | — | — | none |
 | grok | ✓ | ✓ | ✓ | ✓ | ✓ | per-request |
 | grok-bot | ✓ | ✓ | — | — | ✓ | none |
 | hermes | ✓ | ✓ | ✓ | — | — | none |

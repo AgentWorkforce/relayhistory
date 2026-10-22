@@ -10,6 +10,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Cortex Code history is discoverable and searchable from native snapshots and journals, preserving messages, tool results, rewrites and recorded event markers.
 - Mistral Vibe 3 history is discoverable and searchable from its native session store, including journal appends, generation rewrites, messages and tool effects.
+- goose history is discoverable and searchable from its native session database, preserving messages, tool results and native conversation rewrites.
 - Qoder global CLI session history is discoverable and searchable from its native project transcripts, preserving recorded messages, tools, results, and resume appends.
 - VT Code history is discoverable and searchable from canonical workspace journals under explicitly configured workspace roots, preserving recorded turns, tool identities, usage and control events.
 - Junie CLI history is discoverable and searchable from native session journals, including recorded prompts, assistant text, tool output and event markers.
@@ -18,6 +19,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Added `Source::Cortex` for filtering and reading persisted Cortex Code history.
 - Added `Source::MistralVibe` for filtering and reading persisted Mistral Vibe history.
+- Added `Source::Goose` for filtering and reading persisted goose history.
 - Added `Source::Qoder` for filtering and reading persisted Qoder global CLI history.
 - Added `Source::Vtcode` for filtering and reading persisted VT Code session history.
 - Added `Source::Junie` for filtering and reading persisted Junie CLI history.
