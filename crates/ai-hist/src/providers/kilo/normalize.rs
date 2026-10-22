@@ -155,8 +155,9 @@ fn joined_text(message: &Message) -> Option<String> {
             p.data["type"] == "text" && p.data["synthetic"] != true && p.data["ignored"] != true
         })
         .filter_map(|p| p.data["text"].as_str())
+        .map(projections::bounded_text)
         .collect();
-    (!parts.is_empty()).then(|| parts.join("\n"))
+    (!parts.is_empty()).then(|| projections::bounded_text(&parts.join("\n")))
 }
 fn prompt(message: &Message) -> Option<String> {
     if message.data["summary"] == true {
@@ -219,6 +220,7 @@ fn write_message(
                 let text = part.data["text"]
                     .as_str()
                     .context("Kilo text part missing text")?;
+                let text = projections::bounded_text(text);
                 let control = part.data["synthetic"] == true
                     || part.data["ignored"] == true
                     || message.data["summary"] == true;
@@ -238,7 +240,7 @@ fn write_message(
                             ts_ms: message.timestamp,
                             role: &message.role,
                             kind: event_kind,
-                            text: Some(text),
+                            text: Some(&text),
                             cwd: Some(&session.cwd),
                             raw_kind: Some("part.data"),
                             raw_facts: RawMessageFacts {

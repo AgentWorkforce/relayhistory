@@ -1,3 +1,4 @@
+use super::projections;
 use super::*;
 use crate::providers::file_history;
 use std::collections::{BTreeMap, BTreeSet};
@@ -39,11 +40,13 @@ fn supported_prompts(conn: &Connection, times: &BTreeSet<i64>) -> Result<Vec<Pro
             session_id,
             timestamp,
             project: parts.first().and_then(|(_, p)| p.clone()),
-            prompt: parts
-                .into_iter()
-                .map(|(text, _)| text)
-                .collect::<Vec<_>>()
-                .join("\n"),
+            prompt: projections::bounded_text(
+                &parts
+                    .into_iter()
+                    .map(|(text, _)| text)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            ),
         })
         .collect())
 }

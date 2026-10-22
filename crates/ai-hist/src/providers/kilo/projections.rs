@@ -15,3 +15,19 @@ pub(super) fn bounded_arguments(input: &Value) -> String {
     })
     .to_string()
 }
+
+pub(super) fn bounded_text(text: &str) -> String {
+    if Value::String(text.to_owned()).to_string().len() <= 256 * 1024 {
+        return text.to_owned();
+    }
+    let projection = serde_json::json!({
+        "projection": "kilo-text-v1",
+        "truncated": true,
+        "native_payload_bytes": text.len(),
+        "native_payload_hash": format!("{:x}", Sha256::digest(text.as_bytes())),
+    });
+    format!(
+        "{}\n\n[Native Kilo text projection]\n{projection}",
+        text.chars().take(32 * 1024).collect::<String>()
+    )
+}

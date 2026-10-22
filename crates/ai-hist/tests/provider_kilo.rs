@@ -913,6 +913,76 @@ fn kilo_large_tool_arguments_fit_default_export_page() {
         .any(|record| record.kind == "session_event" && record.payload["kind"] == "tool_use"));
 }
 
+#[cfg(feature = "export")]
+#[test]
+fn kilo_large_text_prompt_and_event_fit_default_export_page() {
+    let home = tempfile::tempdir().unwrap();
+    stage(home.path(), include_str!("fixtures/kilo/schema-7-8-15.sql"));
+    let native = rusqlite::Connection::open(path(home.path())).unwrap();
+    let text = format!("largeunique\nneedleunique {}", "\\".repeat(300_000));
+    let payload = serde_json::json!({"type":"text","text":text});
+    native
+        .execute(
+            "UPDATE part SET data=?1 WHERE id='prt_kiloToolUserText002'",
+            [payload.to_string()],
+        )
+        .unwrap();
+    drop(native);
+    let origin = open(home.path());
+    origin
+        .sync(SyncOptions::default().sources([Source::Kilo]))
+        .unwrap();
+    let local = origin
+        .session(&SessionRef::id(Source::Kilo, SID), SessionQuery::default())
+        .unwrap()
+        .unwrap();
+    let projected = local
+        .messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter_map(|block| block.text.as_deref())
+        .find(|text| text.starts_with("largeunique\nneedleunique"))
+        .unwrap();
+    assert!(projected.contains("[Native Kilo text projection]"));
+    assert!(
+        serde_json::Value::String(projected.into())
+            .to_string()
+            .len()
+            < 512 * 1024
+    );
+    let ledger = home.path().join("ledger.db");
+    let conn = rusqlite::Connection::open(&ledger).unwrap();
+    let prompt: String = conn.query_row("SELECT prompt FROM history WHERE source='kilo' AND session_id=?1 ORDER BY timestamp_ms LIMIT 1", [SID], |row| row.get(0)).unwrap();
+    assert_eq!(prompt, projected);
+    let mut export = ExportSnapshot::open(
+        conn,
+        &ExportSelection {
+            sessions: vec![SessionIdentity {
+                source: "kilo".into(),
+                session_id: SID.into(),
+            }],
+            kinds: vec!["history".into(), "session_event".into()],
+            ..Default::default()
+        },
+        &ExportLimits::default(),
+        60_000,
+        1_000,
+    )
+    .unwrap();
+    let mut cursor = Some(export.handle().cursor);
+    let mut kinds = std::collections::BTreeSet::new();
+    while let Some(current) = cursor {
+        let page = export.page(&current, 1_000).unwrap();
+        for record in &page.records {
+            assert!(serde_json::to_vec(record).unwrap().len() < 1_048_576);
+            kinds.insert(record.kind.as_str().to_owned());
+        }
+        cursor = page.next_cursor;
+    }
+    assert!(kinds.contains("history"));
+    assert!(kinds.contains("session_event"));
+}
+
 #[test]
 fn kilo_pending_tool_rewrite_clears_prior_error_status() {
     let home = tempfile::tempdir().unwrap();
