@@ -295,6 +295,7 @@ pub(super) fn shallow(scan: &ScanEnv<'_>, c: &Candidate) -> Result<Option<Shallo
         }))
     })
 }
+#[cfg(test)]
 pub(super) fn all(context: &AcquisitionContext<'_>, path: &Path) -> Result<Vec<Session>> {
     read(context, path, |conn| {
         let mut rows = sessions(conn, context.roots, path, MAX_SESSIONS + 1, None)?;
@@ -309,6 +310,8 @@ pub(super) fn all(context: &AcquisitionContext<'_>, path: &Path) -> Result<Vec<S
         Ok(rows)
     })
 }
+mod scan;
+pub(super) use scan::scan;
 pub(super) fn capture(
     context: &AcquisitionContext<'_>,
     path: &Path,

@@ -915,6 +915,132 @@ fn goose_malformed_native_rewrite_keeps_prior_public_evidence() {
     assert_eq!(after.tool_results, prior.tool_results);
 }
 
+#[test]
+fn goose_sweep_isolates_bad_siblings_and_keeps_deletion_accounting() {
+    let home = tempfile::tempdir().unwrap();
+    let later = tempfile::tempdir().unwrap();
+    stage(home.path(), include_str!("fixtures/goose/schema17.sql"));
+    stage(later.path(), include_str!("fixtures/goose/schema17.sql"));
+    let mut roots = serde_json::to_value(ProviderRoots::from_home(
+        home.path().into(),
+        home.path().join("opencode.db"),
+    ))
+    .unwrap();
+    roots["provider_roots"]["goose"] = serde_json::json!([
+        native_path(home.path()).parent().unwrap().parent().unwrap(),
+        native_path(later.path())
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap(),
+    ]);
+    let roots: ProviderRoots = serde_json::from_value(roots).unwrap();
+    let store = SessionStore::open(
+        StoreOptions::default()
+            .db_path(home.path().join("ledger.db"))
+            .roots(roots),
+    )
+    .unwrap();
+    let original = hydrate(&store);
+    let native = rusqlite::Connection::open(native_path(home.path())).unwrap();
+    native.execute_batch(
+        "INSERT INTO sessions(id,name,working_dir,created_at,updated_at) VALUES
+         ('20261022_2','Unsupported sibling','/synthetic/goose/workspace','2026-10-22 04:20:21','2026-10-22 04:20:24'),
+         ('20261022_3','Healthy sibling','/synthetic/goose/workspace','2026-10-22 04:20:21','2026-10-22 04:20:24');
+         INSERT INTO messages(message_id,session_id,role,content_json,created_timestamp) VALUES
+         ('unsupported','20261022_2','user','[{\"type\":\"text\",\"text\":\"Do not commit me\"},{\"type\":\"unsupported\"}]',1792642821),
+         ('healthy','20261022_3','user','[{\"type\":\"text\",\"text\":\"Healthy sibling prompt\"}]',1792642821);
+         UPDATE messages SET content_json='{' WHERE message_id='assistant-native-2';"
+    ).unwrap();
+    drop(native);
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    let encode = |native: &str| {
+        format!(
+            "default:{}",
+            native
+                .bytes()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        )
+    };
+    let healthy_id = encode("20261022_3");
+    let healthy = store
+        .session(
+            &SessionRef::id(Source::Goose, &healthy_id),
+            SessionQuery::default(),
+        )
+        .unwrap()
+        .unwrap();
+    assert!(healthy
+        .messages
+        .iter()
+        .flat_map(|m| &m.blocks)
+        .any(|block| block.text.as_deref() == Some("Healthy sibling prompt")));
+    let after_bad = store
+        .session(&SessionRef::id(Source::Goose, SID), SessionQuery::default())
+        .unwrap()
+        .unwrap();
+    assert_eq!(after_bad.messages, original.messages);
+    let unsupported_id = encode("20261022_2");
+    let unsupported = store
+        .session(
+            &SessionRef::id(Source::Goose, &unsupported_id),
+            SessionQuery::default(),
+        )
+        .unwrap();
+    assert!(unsupported.is_none_or(|session| session.messages.is_empty()));
+    let conn = rusqlite::Connection::open(home.path().join("ledger.db")).unwrap();
+    let partial_events: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM session_events WHERE source='goose' AND session_id=?1",
+            [&unsupported_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    let partial_markers: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM session_markers WHERE source='goose' AND session_id=?1",
+            [&unsupported_id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        (partial_events, partial_markers),
+        (0, 0),
+        "failed normalization must roll back partial writes"
+    );
+    let later_count: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sessions WHERE source='goose' AND raw_path=?1",
+            [native_path(later.path()).to_string_lossy().as_ref()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(later_count, 1, "a later database must still be swept");
+    drop(conn);
+    let native = rusqlite::Connection::open(native_path(home.path())).unwrap();
+    native
+        .execute("DELETE FROM messages WHERE session_id='20261022_3'", [])
+        .unwrap();
+    native
+        .execute("DELETE FROM sessions WHERE id='20261022_3'", [])
+        .unwrap();
+    drop(native);
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    let retired = store
+        .session(
+            &SessionRef::id(Source::Goose, &healthy_id),
+            SessionQuery::default(),
+        )
+        .unwrap();
+    assert!(retired.is_none_or(|session| session.messages.is_empty()));
+    let still_bad = store
+        .session(&SessionRef::id(Source::Goose, SID), SessionQuery::default())
+        .unwrap()
+        .unwrap();
+    assert_eq!(still_bad.messages, original.messages);
+}
+
 #[cfg(feature = "export")]
 #[test]
 fn goose_native_export_remote_intake_retains_evidence_on_order_conflict() {

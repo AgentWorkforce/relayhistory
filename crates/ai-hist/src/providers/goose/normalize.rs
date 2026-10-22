@@ -295,8 +295,8 @@ fn reconcile_history(conn: &Connection, session: &str) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn retire_deleted(conn: &Connection, path: &Path, sessions: &[Session]) -> Result<()> {
-    let keep = serde_json::to_string(&sessions.iter().map(|s| &s.id).collect::<Vec<_>>())?;
+pub(super) fn retire_deleted(conn: &Connection, path: &Path, session_ids: &[String]) -> Result<()> {
+    let keep = serde_json::to_string(session_ids)?;
     let mut stmt = conn.prepare("SELECT session_id FROM (SELECT session_id FROM sessions WHERE source=?1 AND raw_path=?2 UNION SELECT session_id FROM session_observations WHERE source=?1 AND location='local' AND raw_locator=?2 UNION SELECT session_id FROM session_presences WHERE source=?1 AND location='local' AND raw_locator=?2) WHERE session_id NOT IN (SELECT value FROM json_each(?3))")?;
     let absent = stmt
         .query_map(rusqlite::params![ID, path.to_string_lossy(), keep], |r| {

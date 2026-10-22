@@ -111,6 +111,7 @@ fn ingest(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
 fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
     let context = AcquisitionContext::new(ID, ctx.roots);
     let mut inserted = 0;
+    let mut unread = 0;
     // SQLite changes, including WAL writes, require a complete coherent snapshot.
     // Always re-read: this also repairs lost rows without trusting a source cursor.
     for path in storage::databases(ctx.roots)? {
@@ -118,23 +119,61 @@ fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
             continue;
         }
         crate::ingest::check_capture_cancelled()?;
-        let sessions = storage::all(&context, &path)?;
-        let tx = ctx.conn.unchecked_transaction()?;
-        for session in &sessions {
+        let ids = match storage::scan(&context, &path, |id, result| {
+            let session = match result {
+                Ok(session) => session,
+                Err(error) => {
+                    crate::ingest::check_capture_cancelled()?;
+                    eprintln!("Goose {id}: {error:#}");
+                    unread += 1;
+                    return Ok(());
+                }
+            };
+            // Each destination write either commits in full or rolls back,
+            // without discarding healthy siblings from this source snapshot.
+            let write = || -> Result<usize> {
+                let tx = ctx.conn.unchecked_transaction()?;
+                let count = normalize::session(&tx, &session, &path)?;
+                tx.commit()?;
+                Ok(count)
+            };
+            match write() {
+                Ok(count) => inserted += count,
+                Err(error) => {
+                    crate::ingest::check_capture_cancelled()?;
+                    eprintln!("Goose {id}: {error:#}");
+                    unread += 1;
+                }
+            }
+            Ok(())
+        }) {
+            Ok(ids) => ids,
+            Err(error) => {
+                crate::ingest::check_capture_cancelled()?;
+                eprintln!("Goose {}: {error:#}", path.display());
+                unread += 1;
+                continue;
+            }
+        };
+        let retire = || -> Result<()> {
+            let tx = ctx.conn.unchecked_transaction()?;
+            normalize::retire_deleted(&tx, &path, &ids)?;
+            tx.commit()?;
+            Ok(())
+        };
+        if let Err(error) = retire() {
             crate::ingest::check_capture_cancelled()?;
-            inserted += normalize::session(&tx, session, &path)?;
+            eprintln!("Goose {} retirement: {error:#}", path.display());
+            unread += 1;
         }
-        normalize::retire_deleted(&tx, &path, &sessions)?;
-        tx.commit()?;
     }
-    retire_missing_databases(&ctx)?;
-    Ok(SweepResult {
-        inserted,
-        unread: 0,
-    })
+    if unread == 0 {
+        unread += retire_missing_databases(&ctx)?;
+    }
+    Ok(SweepResult { inserted, unread })
 }
 
-fn retire_missing_databases(ctx: &SweepContext<'_>) -> Result<()> {
+fn retire_missing_databases(ctx: &SweepContext<'_>) -> Result<u64> {
     // A missing configured root is unavailable, not proof of deletion.
     let mut stmt = ctx.conn.prepare(
         "SELECT DISTINCT locator FROM (SELECT raw_path AS locator FROM sessions WHERE source=?1 AND raw_path IS NOT NULL UNION SELECT raw_locator AS locator FROM session_observations WHERE source=?1 AND location='local' AND raw_locator IS NOT NULL UNION SELECT raw_locator AS locator FROM session_presences WHERE source=?1 AND location='local' AND raw_locator IS NOT NULL)",
@@ -142,14 +181,26 @@ fn retire_missing_databases(ctx: &SweepContext<'_>) -> Result<()> {
     let paths = stmt
         .query_map([ID], |r| r.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut unread = 0;
     for path in paths {
         let path = PathBuf::from(path);
-        if storage::in_scope(&path, ctx.paths) && storage::confirmed_missing(ctx.roots, &path)? {
+        if !storage::in_scope(&path, ctx.paths) {
+            continue;
+        }
+        let retire = || -> Result<()> {
+            if storage::confirmed_missing(ctx.roots, &path)? {
+                crate::ingest::check_capture_cancelled()?;
+                let tx = ctx.conn.unchecked_transaction()?;
+                normalize::retire_deleted(&tx, &path, &[])?;
+                tx.commit()?;
+            }
+            Ok(())
+        };
+        if let Err(error) = retire() {
             crate::ingest::check_capture_cancelled()?;
-            let tx = ctx.conn.unchecked_transaction()?;
-            normalize::retire_deleted(&tx, &path, &[])?;
-            tx.commit()?;
+            eprintln!("Goose {} retirement: {error:#}", path.display());
+            unread += 1;
         }
     }
-    Ok(())
+    Ok(unread)
 }
