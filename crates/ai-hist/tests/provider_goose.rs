@@ -636,7 +636,7 @@ fn goose_mixed_tool_result_keeps_native_nontext_content_and_retires_it_on_rewrit
         "type":"toolResponse", "id":"call-native-1",
         "toolResult":{"status":"success","value":{"resultType":"complete","isError":false,
             "content":[
-                {"type":"text","text":"Visible result"},
+                {"type":"text","text":"Visible ".to_owned() + &"x".repeat(200)},
                 {"type":"resource","uri":"synthetic://goose/report"}
             ]}}
     }]);
@@ -652,15 +652,10 @@ fn goose_mixed_tool_result_keeps_native_nontext_content_and_retires_it_on_rewrit
     let store = open(home.path());
     let before = hydrate(&store);
     assert_eq!(
-        before.tool_results[0].text.as_deref(),
-        Some("Visible result")
+        serde_json::from_str::<serde_json::Value>(before.tool_results[0].text.as_deref().unwrap())
+            .unwrap(),
+        original[0]
     );
-    let native_marker = before
-        .markers
-        .iter()
-        .find(|marker| marker.kind == "tool_result_block")
-        .unwrap();
-    assert_eq!(native_marker.payload.as_ref().unwrap(), &original[0]);
     #[cfg(feature = "export")]
     {
         let mut snapshot = ExportSnapshot::open(
@@ -670,7 +665,7 @@ fn goose_mixed_tool_result_keeps_native_nontext_content_and_retires_it_on_rewrit
                     source: "goose".into(),
                     session_id: SID.into(),
                 }],
-                kinds: vec!["session_marker".into()],
+                kinds: vec!["session_event".into()],
                 ..Default::default()
             },
             &ExportLimits::default(),
@@ -683,8 +678,9 @@ fn goose_mixed_tool_result_keeps_native_nontext_content_and_retires_it_on_rewrit
             .records
             .into_iter()
             .find(|record| {
-                record.kind == "session_marker"
-                    && record.payload["payload_json"]
+                record.kind == "session_event"
+                    && record.payload["kind"] == "tool_result"
+                    && record.payload["text"]
                         .as_str()
                         .is_some_and(|raw| raw.contains("synthetic://goose/report"))
             })
@@ -726,9 +722,9 @@ fn goose_mixed_tool_result_keeps_native_nontext_content_and_retires_it_on_rewrit
                     NormalizedSourceEvidence {
                         source_stamp: "mixed-result".into(),
                         source_bytes: 0,
-                        covered_kinds: vec![EvidenceKind::SessionMarker],
+                        covered_kinds: vec![EvidenceKind::SessionEvent],
                         records: vec![EvidenceRecord {
-                            kind: EvidenceKind::SessionMarker,
+                            kind: EvidenceKind::SessionEvent,
                             payload,
                             record_id: Some(exported.record_id),
                             revision_id: Some(exported.revision_id),
@@ -742,10 +738,13 @@ fn goose_mixed_tool_result_keeps_native_nontext_content_and_retires_it_on_rewrit
             .session(&SessionRef::id(Source::Goose, SID), SessionQuery::default())
             .unwrap()
             .unwrap();
-        assert!(imported.markers.iter().any(|marker| marker
-            .payload
-            .as_ref()
-            .is_some_and(|payload| payload == &original[0])));
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(
+                imported.tool_results[0].text.as_deref().unwrap()
+            )
+            .unwrap(),
+            original[0]
+        );
     }
     let revised = serde_json::json!([{
         "type":"toolResponse", "id":"call-native-1",
@@ -758,10 +757,132 @@ fn goose_mixed_tool_result_keeps_native_nontext_content_and_retires_it_on_rewrit
         after.tool_results[0].text.as_deref(),
         Some("Rewritten text only")
     );
-    assert!(!after
-        .markers
-        .iter()
-        .any(|marker| marker.kind == "tool_result_block"));
+    assert!(!after.tool_results[0]
+        .text
+        .as_deref()
+        .unwrap()
+        .contains("synthetic://goose/report"));
+}
+
+#[test]
+#[cfg(feature = "export")]
+fn goose_escaped_mixed_result_exports_honest_projection() {
+    let home = tempfile::tempdir().unwrap();
+    stage(home.path(), include_str!("fixtures/goose/schema17.sql"));
+    let native = serde_json::json!([{
+        "type":"toolResponse", "id":"call-native-1",
+        "toolResult":{"status":"success","value":{"resultType":"complete","isError":false,
+            "content":[
+                {"type":"text","text":"\"".repeat(190_000)},
+                {"type":"resource","uri":"synthetic://goose/huge-report"}
+            ]}}
+    }]);
+    let native_text = native[0].to_string();
+    assert!(native_text.len() < 512 * 1024);
+    assert!(serde_json::Value::String(native_text).to_string().len() > 512 * 1024);
+    let conn = rusqlite::Connection::open(native_path(home.path())).unwrap();
+    conn.execute(
+        "UPDATE messages SET content_json=?1 WHERE message_id='tool-native-1'",
+        [native.to_string()],
+    )
+    .unwrap();
+    drop(conn);
+    let store = open(home.path());
+    let before = hydrate(&store);
+    let projected: serde_json::Value =
+        serde_json::from_str(before.tool_results[0].text.as_deref().unwrap()).unwrap();
+    assert_eq!(projected["truncated"], true);
+    assert_eq!(projected["projection"], "goose-mixed-result-v1");
+    assert_eq!(
+        projected["content"][1]["uri"],
+        "synthetic://goose/huge-report"
+    );
+    assert!(projected["native_payload_bytes"].as_i64().unwrap() > 190_000);
+    assert_eq!(
+        projected["native_payload_hash"].as_str(),
+        before.tool_results[0].payload_hash.as_deref()
+    );
+    let mut snapshot = ExportSnapshot::open(
+        rusqlite::Connection::open(home.path().join("ledger.db")).unwrap(),
+        &ExportSelection {
+            sessions: vec![SessionIdentity {
+                source: "goose".into(),
+                session_id: SID.into(),
+            }],
+            kinds: vec!["session_event".into()],
+            ..Default::default()
+        },
+        &ExportLimits::default(),
+        60_000,
+        1_000,
+    )
+    .unwrap();
+    let page = snapshot.page(&snapshot.handle().cursor, 1_000).unwrap();
+    let record = page
+        .records
+        .into_iter()
+        .find(|r| r.kind == "session_event" && r.payload["kind"] == "tool_result")
+        .unwrap();
+    let receiver_home = tempfile::tempdir().unwrap();
+    let receiver = open(receiver_home.path());
+    receiver
+        .apply_source_observations(SourceObservationBatch::new(
+            "huge-result",
+            "fixture",
+            SessionLocation::Remote,
+            vec![SourceObservation {
+                session: ShallowSession {
+                    source: "goose".into(),
+                    session_id: SID.into(),
+                    source_stamp: Some("huge-result".into()),
+                    ..Default::default()
+                },
+                raw_locator: None,
+            }],
+        ))
+        .unwrap();
+    let key = ObservationKey {
+        source: "goose".into(),
+        session_id: SID.into(),
+        location: SessionLocation::Remote,
+        connector_id: "huge-result".into(),
+        connector_instance: "fixture".into(),
+    };
+    let revision = receiver.source_observation(&key).unwrap().revision.unwrap();
+    let mut payload = record.payload.as_object().unwrap().clone();
+    payload.remove("id");
+    payload.remove("location");
+    receiver
+        .apply_source_evidence(
+            SourceEvidenceSubmission::new(
+                key,
+                revision,
+                NormalizedSourceEvidence {
+                    source_stamp: "huge-result".into(),
+                    source_bytes: 0,
+                    covered_kinds: vec![EvidenceKind::SessionEvent],
+                    records: vec![EvidenceRecord {
+                        kind: EvidenceKind::SessionEvent,
+                        payload,
+                        record_id: Some(record.record_id),
+                        revision_id: Some(record.revision_id),
+                    }],
+                },
+            )
+            .include_related(false),
+        )
+        .unwrap();
+    let imported = receiver
+        .session(&SessionRef::id(Source::Goose, SID), SessionQuery::default())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(
+            imported.tool_results[0].text.as_deref().unwrap()
+        )
+        .unwrap(),
+        projected,
+    );
 }
 
 #[test]

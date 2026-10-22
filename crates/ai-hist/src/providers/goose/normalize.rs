@@ -33,6 +33,9 @@ fn marker(conn: &Connection, s: &Session, m: GooseMarker<'_>, keys: &mut Keys) -
         kind,
         payload,
     } = m;
+    // Markers are bounded projections by contract. Full tool result bodies
+    // belong in the event text column, not in marker payload_json.
+    let bounded_payload = crate::ingest::bound_marker_json(&payload.to_string());
     crate::insert_session_marker(
         conn,
         ID,
@@ -46,7 +49,7 @@ fn marker(conn: &Connection, s: &Session, m: GooseMarker<'_>, keys: &mut Keys) -
             kind,
             subkind: Some("goose"),
             text: None,
-            payload_json: Some(&payload.to_string()),
+            payload_json: bounded_payload.as_deref(),
         },
     )?;
     keys.markers.insert(uid.into());

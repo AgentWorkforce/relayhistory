@@ -293,6 +293,11 @@ impl Sink<'_> {
         };
         let mut facts =
             ToolResultFacts::from_payload(&measured).with_ordering(call_index, event_index);
+        let event_text = if mixed_content {
+            mixed_result_event_text(block, &text, &facts)
+        } else {
+            text.clone()
+        };
         facts.tool_use_id = Some(id.into());
         facts.event_source = Some("tool_result".into());
         facts.result_status = Some(if errored { "errored" } else { "completed" }.into());
@@ -302,22 +307,6 @@ impl Sink<'_> {
         if self.replay.is_none() {
             set_tool_call_error(self.conn, ID, &self.session.id, id, errored)?;
             self.keys.results.insert(id.into());
-            if mixed_content {
-                // Search text is only a projection of mixed native content.
-                // Keep the complete block for public reads and exports.
-                marker(
-                    self.conn,
-                    self.session,
-                    GooseMarker {
-                        uid,
-                        message: Some(self.mid),
-                        ts: self.message.timestamp,
-                        kind: "tool_result_block",
-                        payload: block,
-                    },
-                    self.keys,
-                )?;
-            }
         }
         insert_session_event(
             self.conn,
@@ -329,7 +318,7 @@ impl Sink<'_> {
                 ts_ms: self.message.timestamp,
                 role: "tool_result",
                 kind: "tool_result",
-                text: Some(&text),
+                text: Some(&event_text),
                 raw_kind: Some("messages.content_json"),
                 tool_result_facts: Some(&facts),
                 ..Default::default()
@@ -355,6 +344,50 @@ impl Sink<'_> {
             },
             self.keys,
         )
+    }
+}
+
+fn mixed_result_event_text(block: &Value, visible: &str, facts: &ToolResultFacts) -> String {
+    let full = block.to_string();
+    // Export wraps text in another JSON string. Measure that encoded form,
+    // since escaping can make a smaller native block exceed a page.
+    if Value::String(full.clone()).to_string().len() <= 512 * 1024 {
+        return full;
+    }
+    // A single export record must fit the default 1 MiB page. Preserve raw
+    // measurements in ToolResultFacts and make the display loss explicit.
+    let content = block["toolResult"]["value"]["content"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .take(32)
+        .map(|item| {
+            serde_json::json!({
+                "type": item["type"].as_str().map(|s| s.chars().take(128).collect::<String>()),
+                "uri": item["uri"].as_str().map(|s| s.chars().take(256).collect::<String>()),
+                "mime_type": item["mimeType"].as_str().map(|s| s.chars().take(128).collect::<String>()),
+            })
+        })
+        .collect::<Vec<_>>();
+    let projection = serde_json::json!({
+        "projection": "goose-mixed-result-v1",
+        "truncated": true,
+        "visible_text_prefix": visible.chars().take(32 * 1024).collect::<String>(),
+        "content": content,
+        "native_payload_bytes": facts.payload_bytes,
+        "native_payload_hash": facts.payload_hash,
+    })
+    .to_string();
+    if Value::String(projection.clone()).to_string().len() <= 512 * 1024 {
+        projection
+    } else {
+        serde_json::json!({
+            "projection": "goose-mixed-result-v1",
+            "truncated": true,
+            "native_payload_bytes": facts.payload_bytes,
+            "native_payload_hash": facts.payload_hash,
+        })
+        .to_string()
     }
 }
 
