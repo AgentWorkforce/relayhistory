@@ -371,6 +371,9 @@ fn capture(fixture: &Fixture, home: &Path) -> Value {
     // fixture run.
     std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
     std::env::remove_var("AI_HIST_DB");
+    // The corpus stages Goose's default root. A host override must not make
+    // the environment-backed sync read a different database from discovery.
+    std::env::remove_var("GOOSE_PATH_ROOT");
     // Historical fixtures deliberately predate the production 30-day Codex
     // SQLite recovery window; the corpus tests parser fidelity, not recency.
     std::env::set_var("AI_HIST_CODEX_SQLITE_MAX_AGE_DAYS", "0");
