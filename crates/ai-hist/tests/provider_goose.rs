@@ -357,6 +357,19 @@ fn goose_multiblock_user_prompt_survives_reopen_and_retires_on_rewrite() {
     let current = prompts();
     assert!(current.contains(&"First part of prompt".into()));
     assert!(!current.contains(&"First part of prompt\nSecond part of prompt".into()));
+    let many = serde_json::Value::Array(
+        (0..12)
+            .map(|index| serde_json::json!({"type":"text","text":format!("part-{index}")}))
+            .collect(),
+    );
+    write_user(&many);
+    hydrate(&rewritten);
+    assert!(prompts().contains(
+        &(0..12)
+            .map(|index| format!("part-{index}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    ));
 }
 
 #[cfg(feature = "export")]
@@ -405,6 +418,10 @@ fn goose_remote_opaque_event_uid_does_not_abort_local_prompt_reconciliation() {
         "source":"goose", "session_id":remote_sid, "event_uid":"connector:opaque",
         "role":"user", "kind":"text", "ts_ms":ts, "text":"Unrelated remote prompt"
     });
+    let null_text = serde_json::json!({
+        "source":"goose", "session_id":remote_sid, "event_uid":"connector:null-text",
+        "role":"user", "kind":"text", "ts_ms":ts
+    });
     store
         .apply_source_evidence(
             SourceEvidenceSubmission::new(
@@ -414,12 +431,20 @@ fn goose_remote_opaque_event_uid_does_not_abort_local_prompt_reconciliation() {
                     source_stamp: "opaque-stamp".into(),
                     source_bytes: 0,
                     covered_kinds: vec![EvidenceKind::SessionEvent],
-                    records: vec![EvidenceRecord {
-                        kind: EvidenceKind::SessionEvent,
-                        payload: payload.as_object().unwrap().clone(),
-                        record_id: Some("remote:opaque".into()),
-                        revision_id: Some("remote:1".into()),
-                    }],
+                    records: vec![
+                        EvidenceRecord {
+                            kind: EvidenceKind::SessionEvent,
+                            payload: payload.as_object().unwrap().clone(),
+                            record_id: Some("remote:opaque".into()),
+                            revision_id: Some("remote:1".into()),
+                        },
+                        EvidenceRecord {
+                            kind: EvidenceKind::SessionEvent,
+                            payload: null_text.as_object().unwrap().clone(),
+                            record_id: Some("remote:null-text".into()),
+                            revision_id: Some("remote:1".into()),
+                        },
+                    ],
                 },
             )
             .include_related(false),

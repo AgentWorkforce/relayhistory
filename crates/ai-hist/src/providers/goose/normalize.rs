@@ -199,7 +199,10 @@ fn text_message_key(uid: &str) -> Option<(&str, usize)> {
     if !(key.starts_with("native:") || key.starts_with("row:")) {
         return None;
     }
-    position.parse::<usize>().ok().map(|position| (key, position))
+    position
+        .parse::<usize>()
+        .ok()
+        .map(|position| (key, position))
 }
 
 struct PromptSupport {
@@ -209,12 +212,24 @@ struct PromptSupport {
     project: Option<String>,
 }
 
+struct PromptPart {
+    position: usize,
+    text: String,
+    project: Option<String>,
+}
+
 fn supported_prompts(conn: &Connection, times: &BTreeSet<i64>) -> Result<Vec<PromptSupport>> {
-    let mut groups: BTreeMap<(String, i64, String), Vec<(usize, String, Option<String>)>> = BTreeMap::new();
+    let mut groups: BTreeMap<(String, i64, String), Vec<PromptPart>> = BTreeMap::new();
     let timestamps = serde_json::to_string(times)?;
-    let mut stmt = conn.prepare("SELECT session_id,ts_ms,event_uid,text,cwd FROM session_events WHERE source=?1 AND role='user' AND kind='text' AND control_kind IS NULL AND ts_ms IN (SELECT value FROM json_each(?2)) ORDER BY ts_ms,id")?;
+    let mut stmt = conn.prepare("SELECT session_id,ts_ms,event_uid,text,cwd FROM session_events WHERE source=?1 AND role='user' AND kind='text' AND text IS NOT NULL AND control_kind IS NULL AND ts_ms IN (SELECT value FROM json_each(?2)) ORDER BY ts_ms,id")?;
     let rows = stmt.query_map(rusqlite::params![ID, timestamps], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, Option<String>>(4)?))
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+            row.get::<_, Option<String>>(4)?,
+        ))
     })?;
     for row in rows {
         let (sid, ts, uid, text, project) = row?;
@@ -224,32 +239,54 @@ fn supported_prompts(conn: &Connection, times: &BTreeSet<i64>) -> Result<Vec<Pro
         let (key, position) = text_message_key(&uid)
             .map(|(key, position)| (key.to_owned(), position))
             .unwrap_or_else(|| (format!("opaque:{uid}"), 0));
-        groups.entry((sid, ts, key)).or_default().push((position, text, project));
+        groups.entry((sid, ts, key)).or_default().push(PromptPart {
+            position,
+            text,
+            project,
+        });
     }
-    Ok(groups.into_iter().map(|((session_id,timestamp_ms,_),mut parts)| {
-        parts.sort_by_key(|(position,_,_)| *position);
-        let project = parts.first().and_then(|(_,_,project)| project.clone());
-        PromptSupport { session_id, timestamp_ms,
-            prompt:parts.into_iter().map(|(_,text,_)| text).collect::<Vec<_>>().join("\n"),
-            project }
-    }).collect())
+    Ok(groups
+        .into_iter()
+        .map(|((session_id, timestamp_ms, _), mut parts)| {
+            parts.sort_by_key(|part| part.position);
+            let project = parts.first().and_then(|part| part.project.clone());
+            PromptSupport {
+                session_id,
+                timestamp_ms,
+                prompt: parts
+                    .into_iter()
+                    .map(|part| part.text)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                project,
+            }
+        })
+        .collect())
 }
 
 fn reconcile_history(conn: &Connection, session: &str) -> Result<()> {
-    let mut stmt = conn.prepare("SELECT id,timestamp_ms,prompt FROM history WHERE source=?1 AND session_id=?2")?;
-    let rows = stmt.query_map([ID, session], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
-    })?.collect::<rusqlite::Result<Vec<_>>>()?;
-    let times = rows.iter().map(|(_,ts,_)| *ts).collect();
+    let mut stmt = conn
+        .prepare("SELECT id,timestamp_ms,prompt FROM history WHERE source=?1 AND session_id=?2")?;
+    let rows = stmt
+        .query_map([ID, session], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let times = rows.iter().map(|(_, ts, _)| *ts).collect();
     let supported = supported_prompts(conn, &times)?;
     for (id, ts, prompt) in rows {
-        let owner = supported.iter()
+        let owner = supported
+            .iter()
             .filter(|p| p.timestamp_ms == ts && p.prompt == prompt)
             .min_by_key(|p| (p.session_id != session, &p.session_id));
         if let Some(owner) = owner {
             conn.execute("UPDATE history SET session_id=?2,project=?3 WHERE id=?1 AND (session_id IS NOT ?2 OR project IS NOT ?3)",rusqlite::params![id,owner.session_id,owner.project])?;
         } else {
-            conn.execute("DELETE FROM history WHERE id=?1",[id])?;
+            conn.execute("DELETE FROM history WHERE id=?1", [id])?;
         }
     }
     Ok(())
