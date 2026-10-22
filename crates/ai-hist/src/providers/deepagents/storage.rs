@@ -7,6 +7,8 @@ use sha2::{Digest, Sha256};
 const MAX_THREADS: usize = 100_000;
 const MAX_WRITES: usize = 100_000;
 const MAX_THREAD_BYTES: usize = 64 * 1024 * 1024;
+mod discovery;
+pub(super) use discovery::{enumerate, fingerprint_inputs};
 
 fn acknowledge(context: &AcquisitionContext<'_>, path: &Path) -> Result<bool> {
     if !path.try_exists()? {
@@ -14,26 +16,6 @@ fn acknowledge(context: &AcquisitionContext<'_>, path: &Path) -> Result<bool> {
     }
     context.validate(path)?;
     Ok(true)
-}
-pub(super) fn databases(roots: &ProviderRoots) -> Result<Vec<PathBuf>> {
-    roots.ensure_provider_roots(ID)?;
-    let context = AcquisitionContext::new(ID, roots);
-    let mut paths = vec![];
-    for path in roots.for_provider(ID) {
-        check_capture_cancelled()?;
-        match std::fs::metadata(path) {
-            Ok(meta) => {
-                ensure!(meta.is_file(), "DeepAgents sessions database is not a file");
-                context.validate(path)?;
-                paths.push(path.clone());
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
-        }
-    }
-    paths.sort();
-    paths.dedup();
-    Ok(paths)
 }
 fn read<T>(
     context: &AcquisitionContext<'_>,
@@ -332,69 +314,6 @@ fn read_messages(
         }
     }
     Ok(messages.finish())
-}
-pub(super) fn enumerate(roots: &ProviderRoots, limit: Option<usize>) -> Result<Vec<Candidate>> {
-    let context = AcquisitionContext::new(ID, roots);
-    let mut out = vec![];
-    for path in databases(roots)? {
-        let stamp = file_stamp(&context, &path)?;
-        read(&context, &path, |conn| {
-            for thread in thread_ids(conn)? {
-                check_capture_cancelled()?;
-                let recency = latest_metadata(conn, &thread)
-                    .and_then(|(_, meta)| {
-                        timestamp(&meta, "updated_at")
-                            .or_else(|_| latest_checkpoint_time(conn, &thread))
-                    })
-                    .ok();
-                out.push(Candidate {
-                    source: ID,
-                    locator: path.to_string_lossy().into_owned(),
-                    session_id: Some(identity(roots, &path, &thread)),
-                    recency_hint_ms: recency,
-                    stamp: stamp.clone(),
-                });
-            }
-            Ok(())
-        })?;
-    }
-    out.sort_by(|a, b| {
-        b.recency_hint_ms
-            .cmp(&a.recency_hint_ms)
-            .then_with(|| a.session_id.cmp(&b.session_id))
-    });
-    out.truncate(limit.unwrap_or(MAX_THREADS));
-    Ok(out)
-}
-fn file_stamp(context: &AcquisitionContext<'_>, path: &Path) -> Result<String> {
-    let mut stamps = vec![];
-    for suffix in ["", "-wal", "-journal"] {
-        let file = sidecar(path, suffix);
-        if acknowledge(context, &file)? {
-            stamps.push(crate::file_stamp_and_modified(&file)?.0);
-        }
-    }
-    Ok(stamps.join("|"))
-}
-pub(super) fn fingerprint_inputs(roots: &ProviderRoots) -> Result<Vec<Candidate>> {
-    let context = AcquisitionContext::new(ID, roots);
-    let mut out = vec![];
-    for path in databases(roots)? {
-        for suffix in ["", "-wal", "-journal"] {
-            let file = sidecar(&path, suffix);
-            if acknowledge(&context, &file)? {
-                let (stamp, recency_hint_ms) = crate::file_stamp_and_modified(&file)?;
-                out.push(Candidate {
-                    source: ID,
-                    locator: file.to_string_lossy().into_owned(),
-                    session_id: None,
-                    recency_hint_ms,
-                    stamp,
-                });
-            }
-        }
-    }
-    Ok(out)
 }
 pub(super) fn shallow(scan: &ScanEnv<'_>, candidate: &Candidate) -> Result<Option<ShallowSession>> {
     let context = AcquisitionContext::new(ID, scan.provider_roots);

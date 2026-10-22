@@ -153,6 +153,36 @@ fn current_delta_checkpoint_time_drives_discovery_and_shallow_recency() {
     assert_eq!(shallow, graph.latest);
 }
 #[test]
+fn discovery_isolates_corrupt_file_and_directory_roots() {
+    let (home, roots, good, _db) = fixture();
+    let corrupt = home.path().join("corrupt.db");
+    std::fs::write(&corrupt, b"not a SQLite database").unwrap();
+    let directory = home.path().join("directory.db");
+    std::fs::create_dir(&directory).unwrap();
+    let mut config = serde_json::to_value(roots).unwrap();
+    config["provider_roots"]["deepagents"] = serde_json::json!([corrupt, directory, good]);
+    let mixed: ProviderRoots = serde_json::from_value(config).unwrap();
+    let found = storage::enumerate(&mixed, None).unwrap();
+    assert_eq!(
+        found.len(),
+        4,
+        "healthy conversations survive two bad siblings"
+    );
+    let fingerprints = storage::fingerprint_inputs(&mixed).unwrap();
+    assert!(fingerprints
+        .iter()
+        .any(|candidate| candidate.locator == good.to_string_lossy()));
+    assert!(fingerprints
+        .iter()
+        .all(|candidate| !candidate.locator.contains("corrupt.db")
+            && !candidate.locator.contains("directory.db")));
+    let mut only_bad = serde_json::to_value(mixed).unwrap();
+    only_bad["provider_roots"]["deepagents"] = serde_json::json!([corrupt, directory]);
+    let only_bad: ProviderRoots = serde_json::from_value(only_bad).unwrap();
+    assert!(storage::enumerate(&only_bad, None).is_err());
+    assert!(storage::fingerprint_inputs(&only_bad).is_err());
+}
+#[test]
 fn wal_only_write_and_revision_change_selected_capture_without_source_write() {
     let (_home, roots, path, db) = fixture();
     db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0")
