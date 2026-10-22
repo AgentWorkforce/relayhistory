@@ -134,7 +134,6 @@ fn journal(
 ) -> Result<(usize, bool)> {
     let complete = bytes.last().is_none_or(|byte| *byte == b'\n');
     let final_index = bytes.iter().filter(|byte| **byte == b'\n').count();
-    let mut expected = first;
     let mut previous: Option<String> = None;
     let mut count = 0;
     for (index, raw) in bytes.split(|b| *b == b'\n').enumerate() {
@@ -151,6 +150,9 @@ fn journal(
         if !complete && at_end {
             break;
         }
+        let expected = first
+            .checked_add(u64::try_from(index)?)
+            .context("VIBE_INVALID_SEQUENCE")?;
         let record: Value = serde_json::from_slice(raw)?;
         let marker = b",\"record_sha256\":\"";
         let start = raw
@@ -220,7 +222,6 @@ fn journal(
             }
         }
         previous = Some(actual);
-        expected += 1;
         count += 1;
     }
     Ok((count, !complete))
@@ -288,7 +289,7 @@ fn load_generation(
     // normalized into RelayHistory evidence.
     let (checkpoint, _) = descriptor(
         context,
-        &base,
+        base,
         &manifest["checkpoint"],
         "checkpoint.json",
         paths,
@@ -302,14 +303,14 @@ fn load_generation(
     }
     let (projection, _) = descriptor(
         context,
-        &base,
+        base,
         &manifest["projection_state"],
         "projection-state.json",
         paths,
     )?;
     let (runtime, _) = descriptor(
         context,
-        &base,
+        base,
         &manifest["runtime_state"],
         "runtime-state.json",
         paths,
@@ -442,7 +443,7 @@ fn capture_once(path: &Path, context: &AcquisitionContext<'_>) -> Result<Acquire
     let bytes = paths.iter().map(|(_, size)| *size).sum::<i64>();
     let paths = paths.into_iter().map(|(path, _)| path).collect();
     Ok(AcquiredSession::new(
-        serde_json::json!({"sid":sid,"native":native,"path":path,"state":state,"runtime":runtime,"partial":partial,"journal_count":journal_count}),
+        serde_json::json!({"sid":sid,"native":native,"state":state,"runtime":runtime,"partial":partial,"journal_count":journal_count}),
         bytes,
         entries.len() as i64 + journal_count as i64,
         paths,

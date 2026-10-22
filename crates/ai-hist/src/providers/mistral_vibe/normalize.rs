@@ -360,15 +360,10 @@ fn replay_order(
     Ok(())
 }
 
-pub(super) fn write(conn: &Connection, payload: &Value) -> Result<usize> {
+pub(super) fn write(conn: &Connection, payload: &Value, path: &Path) -> Result<usize> {
     let sid = payload["sid"]
         .as_str()
         .context("VIBE_INVALID_CAPTURE: sid")?;
-    let path = Path::new(
-        payload["path"]
-            .as_str()
-            .context("VIBE_INVALID_CAPTURE: path")?,
-    );
     check_identity(conn, sid, path)?;
     if payload["partial"] == true {
         return Ok(0);
@@ -390,12 +385,16 @@ pub(super) fn write(conn: &Connection, payload: &Value) -> Result<usize> {
             session_id: sid,
             cwd,
             git_branch: None,
-            first_ts: (projection.first != i64::MAX)
-                .then_some(projection.first)
-                .unwrap_or(0),
-            last_ts: (projection.last != i64::MIN)
-                .then_some(projection.last)
-                .unwrap_or(0),
+            first_ts: if projection.first == i64::MAX {
+                0
+            } else {
+                projection.first
+            },
+            last_ts: if projection.last == i64::MIN {
+                0
+            } else {
+                projection.last
+            },
             last_assistant_text: projection.last_assistant.as_deref(),
             raw_path: Some(&path.to_string_lossy()),
         },

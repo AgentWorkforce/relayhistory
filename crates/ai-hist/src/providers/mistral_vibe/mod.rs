@@ -188,7 +188,11 @@ fn ingest(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
         captured.payload["partial"] != true,
         "VIBE_PARTIAL_JOURNAL: incomplete final record; prior evidence retained"
     );
-    normalize::write(ctx.conn, &captured.payload)?;
+    normalize::write(
+        ctx.conn,
+        &captured.payload,
+        ctx.path.context("missing Vibe native path")?,
+    )?;
     Ok((
         IngestOutcome {
             records: captured.records,
@@ -211,7 +215,7 @@ fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
             let captured = storage::capture(path, &context)?;
             anyhow::ensure!(captured.payload["partial"] != true, "VIBE_PARTIAL_JOURNAL");
             let tx = ctx.conn.unchecked_transaction()?;
-            let written = normalize::write(&tx, &captured.payload)?;
+            let written = normalize::write(&tx, &captured.payload, path)?;
             tx.commit()?;
             Ok(written)
         };
