@@ -130,7 +130,8 @@ fn marker_owners(
         let times = serde_json::to_string(&times)?;
         let mut markers = conn.prepare(
             "SELECT session_id,ts_ms,CASE WHEN json_valid(payload_json) THEN \
-             json_extract(payload_json,'$.text_sha256') END FROM session_markers \
+             CASE WHEN json_type(payload_json,'$.text_sha256')='text' THEN \
+             json_extract(payload_json,'$.text_sha256') END END FROM session_markers \
              WHERE source=?1 AND kind='prompt_support' AND message_id IS NOT NULL \
              AND length(CAST(payload_json AS BLOB))<=128 \
              AND ts_ms IN (SELECT value FROM json_each(?2)) ORDER BY session_id",

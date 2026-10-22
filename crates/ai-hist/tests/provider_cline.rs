@@ -790,6 +790,22 @@ fn shared_large_multipart_prompt_moves_to_surviving_local_session() {
         .unwrap();
     assert!(prompt.contains("\"truncated\":true"));
     let survivor = snapshots.iter().find(|(sid, _)| *sid != owner).unwrap().0;
+    for (index, payload) in [
+        r#"{"text_sha256":123}"#,
+        r#"{"text_sha256":true}"#,
+        r#"{"text_sha256":{"unexpected":"object"}}"#,
+        r#"{"text_sha256":null}"#,
+        "not-json",
+    ]
+    .iter()
+    .enumerate()
+    {
+        conn.execute(
+            "INSERT INTO session_markers(source,session_id,marker_uid,ts_ms,message_id,kind,payload_json) VALUES('cline',?1,?2,?3,'invalid-native-id','prompt_support',?4)",
+            rusqlite::params![survivor,format!("invalid-support-{index}"),support_markers[0].2,payload],
+        )
+        .unwrap();
+    }
     let owner_path = &snapshots.iter().find(|(sid, _)| *sid == owner).unwrap().1;
     std::fs::remove_file(owner_path).unwrap();
     store.sync(SyncOptions::default().force(true)).unwrap();
