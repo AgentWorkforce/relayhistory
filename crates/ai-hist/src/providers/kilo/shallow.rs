@@ -27,6 +27,9 @@ pub(super) fn first_prompt(conn: &Connection, native: &str) -> Result<Option<Str
     while let Some(row) = rows.next()? {
         crate::ingest::check_capture_cancelled()?;
         let id: String = row.get(0)?;
+        if id != message_id && !prompt.is_empty() {
+            return Ok(Some(prompt));
+        }
         let summary: Option<i64> = row.get(1)?;
         let raw: String = row.get(2)?;
         let bytes: i64 = row.get(3)?;
@@ -41,9 +44,6 @@ pub(super) fn first_prompt(conn: &Connection, native: &str) -> Result<Option<Str
             "oversized Kilo shallow prompt row"
         );
         if id != message_id {
-            if !prompt.is_empty() {
-                return Ok(Some(prompt));
-            }
             message_id = id;
         }
         if summary == Some(1) {

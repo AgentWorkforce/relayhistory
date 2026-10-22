@@ -43,3 +43,18 @@ fn shallow_prompt_refuses_an_unbounded_run_of_ignored_parts() {
     let error = shallow::first_prompt(&db, "s").unwrap_err();
     assert!(error.to_string().contains("bounded scan budget"));
 }
+
+#[test]
+fn a_sole_broken_configured_root_is_diagnostic() {
+    let home = tempfile::tempdir().unwrap();
+    let broken = home.path().join("kilo.db");
+    std::fs::create_dir(&broken).unwrap();
+    let roots = ProviderRoots::from_home(home.path().into(), home.path().join("opencode.db"));
+    let mut wire = serde_json::to_value(roots).unwrap();
+    wire["provider_roots"]["kilo"] = serde_json::json!([broken]);
+    let roots: ProviderRoots = serde_json::from_value(wire).unwrap();
+    let error = storage::enumerate(&roots, None).unwrap_err();
+    assert!(error
+        .to_string()
+        .contains("configured database roots are unreadable"));
+}

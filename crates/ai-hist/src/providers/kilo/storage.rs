@@ -299,7 +299,12 @@ fn read_parts(
 pub(super) fn enumerate(roots: &ProviderRoots, limit: Option<usize>) -> Result<Vec<Candidate>> {
     let context = AcquisitionContext::new(ID, roots);
     let mut candidates = vec![];
-    for path in databases(roots)?.0 {
+    let (paths, unread) = databases(roots)?;
+    ensure!(
+        !paths.is_empty() || unread == 0,
+        "Kilo configured database roots are unreadable"
+    );
+    for path in paths {
         let per_path = (|| -> Result<Vec<Candidate>> {
             let mut stamps = vec![];
             for suffix in ["", "-wal", "-journal"] {
@@ -440,7 +445,12 @@ pub(super) fn capture(
 }
 pub(super) fn fingerprint_inputs(roots: &ProviderRoots) -> Result<Vec<Candidate>> {
     let mut result = vec![];
-    for path in databases(roots)?.0 {
+    let (paths, unread) = databases(roots)?;
+    ensure!(
+        !paths.is_empty() || unread == 0,
+        "Kilo configured database roots are unreadable"
+    );
+    for path in paths {
         let per_path = (|| -> Result<Vec<Candidate>> {
             let mut found = vec![];
             for suffix in ["", "-wal", "-journal"] {

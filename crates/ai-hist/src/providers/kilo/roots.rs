@@ -81,6 +81,10 @@ pub(super) fn databases(roots: &ProviderRoots) -> Result<(Vec<PathBuf>, u64)> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Ok(meta) if meta.is_file() && context.validate(path).is_ok() => {}
             _ => {
+                eprintln!(
+                    "Kilo configured database root unreadable: {}",
+                    path.display()
+                );
                 unread += 1;
                 continue;
             }

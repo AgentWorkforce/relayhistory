@@ -442,6 +442,34 @@ fn kilo_shallow_first_prompt_joins_native_text_parts_and_preserves_project() {
 }
 
 #[test]
+fn kilo_shallow_prompt_survives_later_oversized_user_part() {
+    let home = tempfile::tempdir().unwrap();
+    stage(home.path(), include_str!("fixtures/kilo/schema-7-8-15.sql"));
+    let native = rusqlite::Connection::open(path(home.path())).unwrap();
+    let oversized = serde_json::json!({"type":"text","text":"x".repeat(1_048_577)}).to_string();
+    native
+        .execute(
+            "UPDATE part SET data=?1 WHERE id='prt_kiloResumeUserText003'",
+            [oversized],
+        )
+        .unwrap();
+    drop(native);
+    let store = open(home.path());
+    store
+        .discover(DiscoveryOptions::default().sources([Source::Kilo]))
+        .unwrap();
+    let conn = rusqlite::Connection::open(home.path().join("ledger.db")).unwrap();
+    let prompt: String = conn
+        .query_row(
+            "SELECT first_prompt FROM sessions WHERE source='kilo' AND session_id=?1",
+            [SID],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(prompt, "Find the synthetic Kilo needle");
+}
+
+#[test]
 fn kilo_missing_database_retires_only_after_parent_is_confirmed() {
     let home = tempfile::tempdir().unwrap();
     stage(home.path(), include_str!("fixtures/kilo/schema-7-8-15.sql"));
