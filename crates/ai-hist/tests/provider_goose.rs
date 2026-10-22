@@ -2,9 +2,9 @@ mod provider_support;
 #[cfg(feature = "export")]
 use ai_hist::export::{ExportLimits, ExportSelection, ExportSnapshot, SessionIdentity};
 use ai_hist::{
-    DiscoveryOptions, HydrateOptions, ProviderRoots, Role, SessionLocation, SessionQuery,
-    SessionRef, SessionStore, ShallowSession, Source, SourceObservation, SourceObservationBatch,
-    StoreOptions, SyncOptions,
+    BlockKind, DiscoveryOptions, HydrateOptions, ProviderRoots, Role, SessionLocation,
+    SessionQuery, SessionRef, SessionStore, ShallowSession, Source, SourceObservation,
+    SourceObservationBatch, StoreOptions, SyncOptions,
 };
 #[cfg(feature = "export")]
 use ai_hist::{
@@ -107,6 +107,167 @@ fn goose_native_schema17_public_history_conformance() {
         serde_json::from_str(include_str!("fixtures/goose/schema17-official-export.json")).unwrap();
     assert_eq!(oracle["conversation"].as_array().unwrap().len(), 6);
     assert_eq!(oracle["id"], "20261022_1");
+}
+
+#[test]
+fn goose_interleaved_native_blocks_keep_order_and_stable_ids_after_reopen() {
+    let home = tempfile::tempdir().unwrap();
+    stage(home.path(), include_str!("fixtures/goose/schema17.sql"));
+    // Derived format variant: Goose persists an ordered content_json array.
+    // Put a tool between two text runs and thinking before both, while keeping
+    // the native writer's message ID and tool-request identity.
+    let blocks = serde_json::json!([
+        {"type":"thinking","thinking":"Inspect first."},
+        {"type":"text","text":"Before the tool."},
+        {"type":"toolRequest","id":"call-native-1","toolCall":{"status":"success","value":{"name":"read_file"}}},
+        {"type":"text","text":"After the tool."}
+    ]);
+    let interleaved = blocks.to_string();
+    let native =
+        rusqlite::Connection::open(home.path().join(".local/share/goose/sessions/sessions.db"))
+            .unwrap();
+    native
+        .execute(
+            "UPDATE messages SET content_json=?1 WHERE message_id='assistant-native-1'",
+            [&interleaved],
+        )
+        .unwrap();
+    drop(native);
+    let reference = SessionRef::id(Source::Goose, SID);
+    let store = open(home.path());
+    let first = hydrate(&store);
+    let target = first
+        .messages
+        .iter()
+        .find(|message| message.message_id.as_deref() == Some("assistant-native-1"))
+        .unwrap();
+    let kinds = target
+        .blocks
+        .iter()
+        .map(|block| block.kind)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        [
+            BlockKind::Thinking,
+            BlockKind::Text,
+            BlockKind::ToolUse,
+            BlockKind::Text
+        ]
+    );
+    let ids = target
+        .blocks
+        .iter()
+        .map(|block| block.event_uid.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(ids.len(), 4);
+    drop(store);
+    let reopened = open(home.path());
+    reopened
+        .discover(DiscoveryOptions::default().sources([Source::Goose]))
+        .unwrap();
+    reopened
+        .hydrate(&reference, HydrateOptions::default())
+        .unwrap();
+    let second = reopened
+        .session(&reference, SessionQuery::default())
+        .unwrap()
+        .unwrap();
+    let target = second
+        .messages
+        .iter()
+        .find(|message| message.message_id.as_deref() == Some("assistant-native-1"))
+        .unwrap();
+    assert_eq!(
+        target
+            .blocks
+            .iter()
+            .map(|block| block.kind)
+            .collect::<Vec<_>>(),
+        kinds
+    );
+    assert_eq!(
+        target
+            .blocks
+            .iter()
+            .map(|block| block.event_uid.clone())
+            .collect::<Vec<_>>(),
+        ids
+    );
+    drop(reopened);
+    // The captured upstream replace_conversation changes SQLite row IDs while
+    // keeping this message ID. Reapply only the derived interleaved content.
+    stage(home.path(), include_str!("fixtures/goose/rewritten.sql"));
+    let native =
+        rusqlite::Connection::open(home.path().join(".local/share/goose/sessions/sessions.db"))
+            .unwrap();
+    native
+        .execute(
+            "UPDATE messages SET content_json=?1 WHERE message_id='assistant-native-1'",
+            [&interleaved],
+        )
+        .unwrap();
+    drop(native);
+    let rewritten = open(home.path());
+    let after = hydrate(&rewritten);
+    let target = after
+        .messages
+        .iter()
+        .find(|message| message.message_id.as_deref() == Some("assistant-native-1"))
+        .unwrap();
+    assert_eq!(
+        target
+            .blocks
+            .iter()
+            .map(|block| block.kind)
+            .collect::<Vec<_>>(),
+        kinds
+    );
+    assert_eq!(
+        target
+            .blocks
+            .iter()
+            .map(|block| block.event_uid.clone())
+            .collect::<Vec<_>>(),
+        ids
+    );
+    let retained_tools = after.tool_calls.clone();
+    let reordered = serde_json::json!([
+        {"type":"thinking","thinking":"Inspect first."},
+        {"type":"toolRequest","id":"call-native-1","toolCall":{"status":"success","value":{"name":"read_file"}}},
+        {"type":"text","text":"After the tool."}
+    ]);
+    let native =
+        rusqlite::Connection::open(home.path().join(".local/share/goose/sessions/sessions.db"))
+            .unwrap();
+    native
+        .execute(
+            "UPDATE messages SET content_json=?1 WHERE message_id='assistant-native-1'",
+            [reordered.to_string()],
+        )
+        .unwrap();
+    drop(native);
+    let changed = hydrate(&rewritten);
+    let target = changed
+        .messages
+        .iter()
+        .find(|message| message.message_id.as_deref() == Some("assistant-native-1"))
+        .unwrap();
+    assert_eq!(
+        target
+            .blocks
+            .iter()
+            .map(|block| block.kind)
+            .collect::<Vec<_>>(),
+        [BlockKind::Thinking, BlockKind::ToolUse, BlockKind::Text]
+    );
+    assert_eq!(target.blocks[0].text.as_deref(), Some("Inspect first."));
+    assert_eq!(
+        target.blocks[1].tool_use_id.as_deref(),
+        Some("call-native-1")
+    );
+    assert_eq!(target.blocks[2].text.as_deref(), Some("After the tool."));
+    assert_eq!(changed.tool_calls, retained_tools);
 }
 
 #[test]

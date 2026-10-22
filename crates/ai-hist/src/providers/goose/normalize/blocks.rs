@@ -38,10 +38,12 @@ pub(super) fn message(
         indexer,
         replay,
     };
-    if replay.is_none() {
+    let inserted = if replay.is_none() {
         sink.metadata()?;
-    }
-    let inserted = sink.text(blocks)?;
+        sink.history(blocks)?
+    } else {
+        0
+    };
     for (position, block) in blocks.iter().enumerate() {
         crate::ingest::check_capture_cancelled()?;
         sink.block(position, block)?;
@@ -77,7 +79,7 @@ impl Sink<'_> {
         )
     }
 
-    fn text(&mut self, blocks: &[Value]) -> Result<usize> {
+    fn history(&mut self, blocks: &[Value]) -> Result<usize> {
         let parts = blocks
             .iter()
             .filter(|b| b["type"] == "text")
@@ -87,11 +89,9 @@ impl Sink<'_> {
             return Ok(0);
         }
         let text = parts.join("\n");
-        let uid = format!("{}:text", self.message.key);
-        let mut inserted = 0;
         let control = is_control(self.message);
-        if self.replay.is_none() && self.message.role == "user" && !control {
-            inserted += crate::insert_history(
+        if self.message.role == "user" && !control {
+            return crate::insert_history(
                 self.conn,
                 &HistoryEntry {
                     id: 0,
@@ -102,22 +102,30 @@ impl Sink<'_> {
                     prompt_hash: None,
                     timestamp_ms: self.message.timestamp,
                 },
-            )?;
+            );
         }
+        Ok(0)
+    }
+
+    fn text(&mut self, uid: &str, block: &Value) -> Result<()> {
+        let text = block["text"]
+            .as_str()
+            .context("Goose text block missing text")?;
         if !self.enabled() {
-            return Ok(inserted);
+            return Ok(());
         }
+        let control = is_control(self.message);
         insert_session_event(
             self.conn,
             &EventRow {
                 source: ID,
                 session_id: &self.session.id,
                 message_id: self.mid,
-                event_uid: &uid,
+                event_uid: uid,
                 ts_ms: self.message.timestamp,
                 role: &self.message.role,
                 kind: "text",
-                text: Some(&text),
+                text: Some(text),
                 cwd: self.session.cwd.as_deref(),
                 raw_kind: Some("messages.content_json"),
                 raw_facts: RawMessageFacts {
@@ -131,8 +139,8 @@ impl Sink<'_> {
                 ..Default::default()
             },
         )?;
-        self.note_event(&uid);
-        Ok(inserted)
+        self.note_event(uid);
+        Ok(())
     }
 
     fn block(&mut self, position: usize, block: &Value) -> Result<()> {
@@ -141,7 +149,7 @@ impl Sink<'_> {
             .context("Goose content block missing type")?;
         let uid = format!("{}:{position}:{tag}", self.message.key);
         match tag {
-            "text" => Ok(()),
+            "text" => self.text(&uid, block),
             "thinking" => self.thinking(&uid, block),
             "toolRequest" => self.call(&uid, block),
             "toolResponse" => self.result(&uid, block),
