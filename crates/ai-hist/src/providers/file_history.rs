@@ -151,8 +151,22 @@ pub(crate) fn retire_locator_sessions(
 /// Retire the local share of one session: its local-only evidence, prompt
 /// ownership, local presence, and the catalog row once nothing backs it.
 pub(crate) fn retire_local_session(conn: &Connection, source: &str, sid: &str) -> Result<()> {
+    retire_local_session_with_prompts(conn, source, sid, |conn, source, sid| {
+        reconcile_prompts(conn, source, sid, "[]")
+    })
+}
+
+/// Retire a local session with the provider's native prompt-order projection.
+/// Providers whose event IDs do not encode a numeric block offset supply their
+/// own reconciliation while sharing evidence and catalog retirement.
+pub(crate) fn retire_local_session_with_prompts(
+    conn: &Connection,
+    source: &str,
+    sid: &str,
+    reconcile: fn(&Connection, &str, &str) -> Result<()>,
+) -> Result<()> {
     crate::ingest::retire_local_session_evidence(conn, source, sid)?;
-    reconcile_prompts(conn, source, sid, "[]")?;
+    reconcile(conn, source, sid)?;
     for table in [
         "session_observations",
         "session_hydration_checkpoints",
