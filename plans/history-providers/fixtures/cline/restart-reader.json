@@ -1,0 +1,114 @@
+{
+  "synthetic-ordinary.messages.json": [
+    {
+      "id": "ordinary-u1",
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Inspect the README and summarize it."
+        }
+      ],
+      "modelInfo": null,
+      "metrics": null,
+      "ts": null
+    },
+    {
+      "id": "ordinary-a1",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "text",
+          "text": "The README describes a small test fixture project."
+        }
+      ],
+      "modelInfo": {
+        "id": "claude-sonnet-4-6",
+        "provider": "anthropic",
+        "family": "claude-sonnet-4"
+      },
+      "metrics": {
+        "inputTokens": 21,
+        "outputTokens": 8,
+        "cacheReadTokens": 3,
+        "cacheWriteTokens": 1,
+        "cost": 0.13
+      },
+      "ts": 1745343731456
+    }
+  ],
+  "synthetic-resume.messages.json": [
+    {
+      "id": "resume-u1",
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Inspect the README and summarize it."
+        }
+      ],
+      "modelInfo": null,
+      "metrics": null,
+      "ts": null
+    },
+    {
+      "id": "resume-a1",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "text",
+          "text": "The README describes a small test fixture project."
+        }
+      ],
+      "modelInfo": {
+        "id": "claude-sonnet-4-6",
+        "provider": "anthropic",
+        "family": "claude-sonnet-4"
+      },
+      "metrics": {
+        "inputTokens": 21,
+        "outputTokens": 8,
+        "cacheReadTokens": 3,
+        "cacheWriteTokens": 1,
+        "cost": 0.13
+      },
+      "ts": 1745343731456
+    },
+    {
+      "id": "resume-u2",
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "Continue the synthetic task."
+        }
+      ],
+      "modelInfo": null,
+      "metrics": null,
+      "ts": null
+    },
+    {
+      "id": "resume-a2",
+      "role": "assistant",
+      "content": [
+        {
+          "type": "text",
+          "text": "The continuation is complete."
+        }
+      ],
+      "modelInfo": {
+        "id": "claude-sonnet-4-6",
+        "provider": "anthropic",
+        "family": "claude-sonnet-4"
+      },
+      "metrics": {
+        "inputTokens": 21,
+        "outputTokens": 8,
+        "cacheReadTokens": 3,
+        "cacheWriteTokens": 1,
+        "cost": 0.13
+      },
+      "ts": 1792663260000
+    }
+  ]
+}

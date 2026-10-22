@@ -29,6 +29,7 @@ export const SOURCES = Object.freeze([
   'copilot',
   'qwen-code',
   'kimi',
+  'cline',
   'codebuddy',
   'cortex',
   'deepagents',

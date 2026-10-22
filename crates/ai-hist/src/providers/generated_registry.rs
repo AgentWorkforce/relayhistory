@@ -71,6 +71,11 @@ const REGISTRATIONS: &[Registration] = &[
         adapter: kimi::ADAPTER,
     },
     Registration {
+        id: "cline",
+        metadata: cline::METADATA,
+        adapter: cline::ADAPTER,
+    },
+    Registration {
         id: "codebuddy",
         metadata: codebuddy::METADATA,
         adapter: codebuddy::ADAPTER,
