@@ -82,7 +82,11 @@ impl ShallowSessionProvider for Provider {
                     continue;
                 };
                 let (stamp, recency) = if path.exists() {
-                    crate::file_stamp_and_modified(&path)?
+                    // Keep a malformed pointer as a candidate so acquisition
+                    // diagnoses it without aborting healthy siblings or
+                    // permitting a deletion sweep on this uncertain root.
+                    crate::file_stamp_and_modified(&path)
+                        .unwrap_or_else(|_| ("invalid-CURRENT".into(), None))
                 } else {
                     ("missing-CURRENT".into(), None)
                 };

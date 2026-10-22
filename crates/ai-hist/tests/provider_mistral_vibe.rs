@@ -329,6 +329,26 @@ fn escaped_sibling_cannot_hide_native_store() {
 }
 
 #[test]
+fn directory_pointer_cannot_hide_healthy_sibling() {
+    let home = tempfile::tempdir().unwrap();
+    let current = stage(home.path());
+    let broken = home
+        .path()
+        .join(".vibe/logs/session/unified/broken/CURRENT");
+    std::fs::create_dir_all(&broken).unwrap();
+    let store = open(home.path());
+    store
+        .discover(DiscoveryOptions::default().sources([Source::MistralVibe]))
+        .unwrap();
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    assert_eq!(evidence(&store).messages.len(), 5);
+    std::fs::remove_file(&current).unwrap();
+    std::fs::create_dir(&current).unwrap();
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    assert_eq!(evidence(&store).messages.len(), 5);
+}
+
+#[test]
 fn only_native_session_directory_deletion_retires_evidence() {
     let home = tempfile::tempdir().unwrap();
     let current = stage(home.path());
