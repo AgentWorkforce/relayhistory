@@ -44,21 +44,24 @@ mod tests {
     use super::*;
     #[test]
     fn absolute_override_joins_data_and_relative_override_is_ignored() {
-        let home = Path::new("/isolated/home");
+        let isolated = tempfile::tempdir().unwrap();
+        let home = isolated.path();
+        let absolute_root = home.join("goose");
         let absolute = resolve_with(home, true, |key| {
-            (key == "GOOSE_PATH_ROOT").then(|| OsString::from("/isolated/goose"))
+            (key == "GOOSE_PATH_ROOT").then(|| absolute_root.as_os_str().to_os_string())
         });
-        assert_eq!(absolute.paths, vec![PathBuf::from("/isolated/goose/data")]);
+        assert_eq!(absolute.paths, vec![absolute_root.join("data")]);
         assert!(absolute.default_root.is_none());
         let relative = resolve_with(home, true, |key| {
             (key == "GOOSE_PATH_ROOT").then(|| OsString::from("relative"))
         });
         assert_eq!(relative.paths, resolve_with(home, false, |_| None).paths);
+        let xdg_root = home.join("xdg");
         let xdg = resolve_with(home, true, |key| {
-            (key == "XDG_DATA_HOME").then(|| OsString::from("/isolated/xdg"))
+            (key == "XDG_DATA_HOME").then(|| xdg_root.as_os_str().to_os_string())
         });
         if !cfg!(windows) {
-            assert_eq!(xdg.paths, vec![PathBuf::from("/isolated/xdg/goose")]);
+            assert_eq!(xdg.paths, vec![xdg_root.join("goose")]);
             let relative_xdg = resolve_with(home, true, |key| {
                 (key == "XDG_DATA_HOME").then(|| OsString::from("relative"))
             });
