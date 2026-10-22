@@ -386,6 +386,19 @@
   ],
   "session_markers": [
     {
+      "kind": "prompt_support",
+      "marker_uid": "msg_user_1:prompt_support",
+      "message_id": "msg_user_1",
+      "parent_id": null,
+      "payload_json": "{\"text_sha256\":\"ec3270f0a3022593e94a046fa80fd5ce5a8124da20a8030d6bf59b38f530bafc\"}",
+      "session_id": "fixture-success-01",
+      "source": "cline",
+      "subkind": "projected_text_sha256",
+      "text": null,
+      "ts_ms": 1745343730123,
+      "turn_id": null
+    },
+    {
       "kind": "timestamp_provenance",
       "marker_uid": "msg_user_1:timestamp",
       "message_id": "msg_user_1",
@@ -438,6 +451,19 @@
       "turn_id": null
     },
     {
+      "kind": "prompt_support",
+      "marker_uid": "ordinary-u1:prompt_support",
+      "message_id": "ordinary-u1",
+      "parent_id": null,
+      "payload_json": "{\"text_sha256\":\"ec3270f0a3022593e94a046fa80fd5ce5a8124da20a8030d6bf59b38f530bafc\"}",
+      "session_id": "synthetic-ordinary",
+      "source": "cline",
+      "subkind": "projected_text_sha256",
+      "text": null,
+      "ts_ms": 1745343731456,
+      "turn_id": null
+    },
+    {
       "kind": "timestamp_provenance",
       "marker_uid": "ordinary-u1:timestamp",
       "message_id": "ordinary-u1",
@@ -464,6 +490,19 @@
       "turn_id": null
     },
     {
+      "kind": "prompt_support",
+      "marker_uid": "resume-u1:prompt_support",
+      "message_id": "resume-u1",
+      "parent_id": null,
+      "payload_json": "{\"text_sha256\":\"ec3270f0a3022593e94a046fa80fd5ce5a8124da20a8030d6bf59b38f530bafc\"}",
+      "session_id": "synthetic-resume",
+      "source": "cline",
+      "subkind": "projected_text_sha256",
+      "text": null,
+      "ts_ms": 1745343731456,
+      "turn_id": null
+    },
+    {
       "kind": "timestamp_provenance",
       "marker_uid": "resume-u1:timestamp",
       "message_id": "resume-u1",
@@ -485,6 +524,19 @@
       "session_id": "synthetic-resume",
       "source": "cline",
       "subkind": "terminal_metrics",
+      "text": null,
+      "ts_ms": 1792663260000,
+      "turn_id": null
+    },
+    {
+      "kind": "prompt_support",
+      "marker_uid": "resume-u2:prompt_support",
+      "message_id": "resume-u2",
+      "parent_id": null,
+      "payload_json": "{\"text_sha256\":\"1b2a8619474a4d136cdf6777c851c298a63019930cf3f66e29223f4205630ca3\"}",
+      "session_id": "synthetic-resume",
+      "source": "cline",
+      "subkind": "projected_text_sha256",
       "text": null,
       "ts_ms": 1792663260000,
       "turn_id": null

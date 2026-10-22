@@ -1,9 +1,8 @@
 use super::*;
 use crate::providers::file_history::{self, Keys};
 use crate::{insert_session_marker, NewSessionMarker};
-use rusqlite::OptionalExtension;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 
 fn full_hash(text: &str) -> String {
     format!("{:x}", Sha256::digest(text.as_bytes()))
@@ -92,20 +91,20 @@ fn reattribute_local_support(
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut owner = conn.prepare(
-        "SELECT session_id FROM session_markers WHERE source=?1 AND kind='prompt_support' \
-         AND ts_ms=?2 AND json_extract(payload_json,'$.text_sha256')=?3 \
-         ORDER BY session_id=?4 DESC,session_id LIMIT 1",
-    )?;
+    let needed: BTreeSet<(i64, String)> = rows
+        .iter()
+        .filter_map(|(_, ts, prompt, hash)| {
+            let key = format!("{ts}:{}", hash.as_deref().unwrap_or_default());
+            (!supported.contains(&key)).then(|| (*ts, full_hash(prompt)))
+        })
+        .collect();
+    let owners = marker_owners(conn, source, sid, &needed)?;
     for (id, ts, prompt, hash) in &rows {
         let key = format!("{ts}:{}", hash.as_deref().unwrap_or_default());
         if supported.contains(&key) {
             continue;
         }
-        let projected_hash = full_hash(prompt);
-        let query = rusqlite::params![source, ts, projected_hash, sid];
-        let candidate: Option<String> = owner.query_row(query, |row| row.get(0)).optional()?;
-        if let Some(candidate) = candidate {
+        if let Some(candidate) = owners.get(&(*ts, full_hash(prompt))) {
             if candidate == sid {
                 supported.insert(key);
             } else {
@@ -117,6 +116,51 @@ fn reattribute_local_support(
         }
     }
     Ok(())
+}
+
+fn marker_owners(
+    conn: &Connection,
+    source: &str,
+    sid: &str,
+    needed: &BTreeSet<(i64, String)>,
+) -> Result<BTreeMap<(i64, String), String>> {
+    let mut owners = BTreeMap::new();
+    if !needed.is_empty() {
+        let times: BTreeSet<i64> = needed.iter().map(|(ts, _)| *ts).collect();
+        let times = serde_json::to_string(&times)?;
+        let mut markers = conn.prepare(
+            "SELECT session_id,ts_ms,CASE WHEN json_valid(payload_json) THEN \
+             json_extract(payload_json,'$.text_sha256') END FROM session_markers \
+             WHERE source=?1 AND kind='prompt_support' AND message_id IS NOT NULL \
+             AND length(CAST(payload_json AS BLOB))<=128 \
+             AND ts_ms IN (SELECT value FROM json_each(?2)) ORDER BY session_id",
+        )?;
+        let found = markers.query_map(rusqlite::params![source, times], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, Option<String>>(2)?,
+            ))
+        })?;
+        for found in found {
+            crate::ingest::check_capture_cancelled()?;
+            let (candidate, ts, Some(hash)) = found? else {
+                continue;
+            };
+            if hash.len() != 64
+                || !hash.bytes().all(|byte| byte.is_ascii_hexdigit())
+                || !needed.contains(&(ts, hash.clone()))
+            {
+                continue;
+            }
+            let key = (ts, hash);
+            let owner = owners.entry(key).or_insert_with(|| candidate.clone());
+            if candidate == sid {
+                *owner = candidate;
+            }
+        }
+    }
+    Ok(owners)
 }
 
 pub(super) fn reconcile_retired(conn: &Connection, source: &str, sid: &str) -> Result<()> {
