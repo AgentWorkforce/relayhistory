@@ -134,7 +134,7 @@ fn write_message(
         ..Default::default()
     };
     write_blocks(conn, &base, message, blocks, keys, replay)?;
-    if replay || role != "user" || blocks.iter().any(|b| b["type"] == "tool_result") {
+    if replay || role != "user" {
         return Ok(0);
     }
     let text = format::text(&message["content"]);
@@ -198,7 +198,7 @@ fn write_blocks(
                         if !replay {
                             call(conn, base, block, keys)?;
                         }
-                        Some(serde_json::to_string(block)?)
+                        Some(format::tool_use_text(block)?)
                     }
                 };
                 let facts = ToolResultFacts {
@@ -256,7 +256,7 @@ fn marker(
 fn call(conn: &Connection, base: &EventRow<'_>, block: &Value, keys: &mut Keys) -> Result<()> {
     let id = format::string(block, "id")?;
     let name = format::string(block, "name")?;
-    let args = serde_json::to_string(&block["input"])?;
+    let args = format::tool_input_args(block)?;
     insert_tool_call(
         conn,
         &ToolCallRef {
@@ -268,7 +268,7 @@ fn call(conn: &Connection, base: &EventRow<'_>, block: &Value, keys: &mut Keys) 
             ..Default::default()
         },
         name,
-        block["input"]["file_path"].as_str(),
+        block["input"]["file_path"].as_str().filter(|path| path.len() <= 4096),
         &args,
         None,
     )?;

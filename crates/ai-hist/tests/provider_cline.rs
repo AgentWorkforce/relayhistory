@@ -490,6 +490,183 @@ fn escaped_large_result_searches_locally_and_after_remote_intake_with_bounded_ex
         .contains("alphaunique\nneedleunique"));
 }
 
+#[test]
+#[cfg(all(feature = "export", feature = "unstable-internal"))]
+fn oversized_tool_use_exports_and_imports_complete_bounded_evidence() {
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path(), "fixture-success-01");
+    let mut snapshot: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let input = serde_json::json!({"file_path":"README.md","content":"\"".repeat(2_000_000)});
+    snapshot["messages"][1]["content"][1]["input"] = input.clone();
+    std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    let store = open(home.path());
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    let original = read(&store, "fixture-success-01");
+    assert_eq!(original.tool_calls[0].tool_use_id, "tool-call-1");
+    let mut export = ExportSnapshot::open(
+        rusqlite::Connection::open(store.db_path()).unwrap(),
+        &ExportSelection {
+            sessions: vec![SessionIdentity {
+                source: "cline".into(),
+                session_id: "fixture-success-01".into(),
+            }],
+            kinds: vec![
+                "history".into(),
+                "session_event".into(),
+                "tool_call".into(),
+                "session_marker".into(),
+            ],
+            ..Default::default()
+        },
+        &ExportLimits::default(),
+        60_000,
+        1_000,
+    )
+    .unwrap();
+    let mut records = Vec::new();
+    let mut cursor = Some(export.handle().cursor);
+    while let Some(value) = cursor {
+        let page = export.page(&value, 1_000).unwrap();
+        cursor = page.next_cursor;
+        records.extend(page.records);
+    }
+    assert!(records.len() >= 4);
+    assert!(records
+        .iter()
+        .all(|record| record.payload.to_string().len() <= 512 * 1024));
+    let call = records
+        .iter()
+        .find(|record| record.kind == "tool_call")
+        .unwrap();
+    assert_eq!(call.payload["tool_use_id"], "tool-call-1");
+    assert_eq!(call.payload["name"], "read_files");
+    let args: serde_json::Value =
+        serde_json::from_str(call.payload["args_json"].as_str().unwrap()).unwrap();
+    assert_eq!(args["projection"], "cline-tool-input-v1");
+    assert_eq!(args["truncated"], true);
+    let event = records
+        .iter()
+        .find(|record| record.kind == "session_event" && record.payload["kind"] == "tool_use")
+        .unwrap();
+    let projected: serde_json::Value =
+        serde_json::from_str(event.payload["text"].as_str().unwrap()).unwrap();
+    assert_eq!(projected["id"], "tool-call-1");
+    assert_eq!(projected["name"], "read_files");
+    assert_eq!(projected["native_input_hash"], args["native_input_hash"]);
+    assert_eq!(projected["native_input_bytes"], args["native_input_bytes"]);
+
+    let receiver_home = tempfile::tempdir().unwrap();
+    let receiver = open(receiver_home.path());
+    let key = ObservationKey {
+        source: "cline".into(),
+        session_id: "fixture-success-01".into(),
+        location: SessionLocation::Remote,
+        connector_id: "cline-transport".into(),
+        connector_instance: "tool-use".into(),
+    };
+    receiver
+        .apply_source_observations(SourceObservationBatch::new(
+            "cline-transport",
+            "tool-use",
+            SessionLocation::Remote,
+            vec![SourceObservation {
+                session: ShallowSession {
+                    source: "cline".into(),
+                    session_id: "fixture-success-01".into(),
+                    source_stamp: Some("remote-1".into()),
+                    ..Default::default()
+                },
+                raw_locator: None,
+            }],
+        ))
+        .unwrap();
+    let revision = receiver.source_observation(&key).unwrap().revision.unwrap();
+    let covered = [
+        EvidenceKind::History,
+        EvidenceKind::SessionEvent,
+        EvidenceKind::ToolCall,
+        EvidenceKind::SessionMarker,
+    ];
+    let evidence_records = records
+        .into_iter()
+        .map(|record| {
+            let kind = match record.kind.as_str() {
+                "history" => EvidenceKind::History,
+                "session_event" => EvidenceKind::SessionEvent,
+                "tool_call" => EvidenceKind::ToolCall,
+                "session_marker" => EvidenceKind::SessionMarker,
+                other => panic!("unexpected export kind: {other}"),
+            };
+            let mut payload = record.payload.as_object().unwrap().clone();
+            payload.remove("id");
+            payload.remove("location");
+            EvidenceRecord {
+                kind,
+                payload,
+                record_id: Some(record.record_id),
+                revision_id: Some(record.revision_id),
+            }
+        })
+        .collect();
+    receiver
+        .apply_source_evidence(
+            SourceEvidenceSubmission::new(
+                key,
+                revision,
+                NormalizedSourceEvidence {
+                    source_stamp: "remote-1".into(),
+                    source_bytes: 0,
+                    covered_kinds: covered.to_vec(),
+                    records: evidence_records,
+                },
+            )
+            .include_related(false),
+        )
+        .unwrap();
+    let remote = read(&receiver, "fixture-success-01");
+    assert_eq!(remote.tool_calls[0].tool_use_id, "tool-call-1");
+    assert_eq!(remote.tool_calls[0].name, "read_files");
+}
+
+#[test]
+fn mixed_user_text_and_tool_result_preserves_only_prompt_text() {
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path(), "synthetic-ordinary");
+    let mut snapshot: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    snapshot["messages"][0]["content"] = serde_json::json!([
+        {"type":"tool_result","tool_use_id":"synthetic-call","content":"SECRETRESULT"},
+        {"type":"text","text":"Please summarize"},
+        {"type":"text","text":"the README"}
+    ]);
+    std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    let store = open(home.path());
+    store
+        .discover(DiscoveryOptions::default().sources([Source::Cline]))
+        .unwrap();
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    let first: String = conn.query_row("SELECT first_prompt FROM sessions WHERE source='cline' AND session_id='synthetic-ordinary'", [], |row| row.get(0)).unwrap();
+    assert_eq!(first, "Please summarize\nthe README");
+    store
+        .hydrate(
+            &SessionRef::id(Source::Cline, "synthetic-ordinary"),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    let evidence = read(&store, "synthetic-ordinary");
+    assert_eq!(evidence.prompts.len(), 1);
+    assert_eq!(
+        evidence.prompts[0].prompt.as_deref(),
+        Some("Please summarize\nthe README")
+    );
+    assert!(!evidence.prompts[0]
+        .prompt
+        .as_deref()
+        .unwrap()
+        .contains("SECRETRESULT"));
+}
+
 #[cfg(feature = "unstable-internal")]
 fn search_result_count(path: &Path, query: &str) -> i64 {
     let conn = rusqlite::Connection::open(path).unwrap();

@@ -139,8 +139,10 @@ pub(super) fn parse(bytes: &[u8], path_id: &str) -> Result<Value> {
                     );
                 }
                 "tool_use" => {
-                    string(block, "id")?;
-                    string(block, "name")?;
+                    anyhow::ensure!(
+                        string(block, "id")?.len() <= 1024 && string(block, "name")?.len() <= 256,
+                        "CLINE_INVALID_RECORD: tool identity exceeds export bounds"
+                    );
                     anyhow::ensure!(
                         block.get("input").is_some(),
                         "CLINE_INVALID_RECORD: tool input"
@@ -188,12 +190,36 @@ pub(super) fn first_prompt(messages: &[Value]) -> Option<String> {
     messages
         .iter()
         .filter(|m| m["role"] == "user")
-        .filter(|m| {
-            !m["content"]
-                .as_array()
-                .is_some_and(|a| a.iter().any(|b| b["type"] == "tool_result"))
-        })
         .map(|m| text(&m["content"]))
         .find(|s| !s.trim().is_empty())
         .map(|s| s.chars().take(4096).collect())
+}
+
+// Keep each encoded field well below the export page's single-record budget.
+// Both projections describe the exact native input using the same measurement.
+const MAX_TOOL_FIELD_ENCODED: usize = 128 * 1024;
+
+pub(super) fn tool_input_args(block: &Value) -> Result<String> {
+    let exact = serde_json::to_string(&block["input"])?;
+    if Value::String(exact.clone()).to_string().len() <= MAX_TOOL_FIELD_ENCODED {
+        return Ok(exact);
+    }
+    let facts = crate::ingest::ToolResultFacts::from_payload(&block["input"]);
+    Ok(serde_json::json!({
+        "projection":"cline-tool-input-v1", "truncated":true,
+        "native_input_bytes":facts.payload_bytes, "native_input_hash":facts.payload_hash,
+    }).to_string())
+}
+
+pub(super) fn tool_use_text(block: &Value) -> Result<String> {
+    let exact = serde_json::to_string(block)?;
+    if Value::String(exact.clone()).to_string().len() <= MAX_TOOL_FIELD_ENCODED {
+        return Ok(exact);
+    }
+    let facts = crate::ingest::ToolResultFacts::from_payload(&block["input"]);
+    Ok(serde_json::json!({
+        "projection":"cline-tool-use-v1", "truncated":true,
+        "id":string(block, "id")?, "name":string(block, "name")?,
+        "native_input_bytes":facts.payload_bytes, "native_input_hash":facts.payload_hash,
+    }).to_string())
 }
