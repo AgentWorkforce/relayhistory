@@ -1008,6 +1008,7 @@ handle.
 | copilot | ✓ | ✓ | ✓ | — | — | per-message |
 | cortex | ✓ | ✓ | ✓ | — | — | none |
 | cursor | ✓ | ✓ | ✓ | ✓ | — | none |
+| deepagents | ✓ | ✓ | ✓ | — | — | none |
 | devin | ✓ | ✓ | ✓ | ✓ | — | none |
 | goose | ✓ | ✓ | ✓ | — | — | none |
 | grok | ✓ | ✓ | ✓ | ✓ | ✓ | per-request |

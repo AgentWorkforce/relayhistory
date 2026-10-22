@@ -6,6 +6,7 @@ pub(crate) mod codex;
 pub(crate) mod copilot;
 pub(crate) mod cortex;
 pub(crate) mod cursor;
+pub(crate) mod deepagents;
 pub(crate) mod devin;
 pub(crate) mod goose;
 pub(crate) mod grok;

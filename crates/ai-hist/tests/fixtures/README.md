@@ -264,6 +264,8 @@ source without deciding which one fails the test.
 | codebuddy/string-content | Published native LocalJsonlSessionStore 2.171.0 offline recorder and fresh high-level historical reader replay; string-content. Not a CLI model-loop capture. |
 | codebuddy/official-reader | Fresh-process native SessionStoreImpl historical reader oracle for all five CLI captures, plus high-level historical replay for the seven recorder controls. |
 | cortex/native | Official Cortex Code CLI 1.2.18 native writer merged, flat, rewritten, zero-byte empty sidecar and untimed sessions; raw native restart-reader oracles for IDs, order and content. |
+| deepagents/dcode-checkpoints | Pinned dcode 0.1.88 writer and current SDK DeltaChannel: 171 checkpoints crossing snapshot frequency 50, pending writes, native tool IDs, same-ID revision/removal, and Overwrite compaction. |
+| deepagents/native-oracles | Fresh-process bundled inspector transcript exports and the fully synthetic native capture recipe. |
 | goose/schema17 | Goose 1.56.0 native schema-17 writer: ordinary and tool turns, then appended turns after process restart. |
 | goose/before-resume | Same native writer before process restart; four messages including matching tool request and response IDs. |
 | goose/schema17-official-export | Independent SessionManager::get_session/export_session read in a fresh process after resume. |
