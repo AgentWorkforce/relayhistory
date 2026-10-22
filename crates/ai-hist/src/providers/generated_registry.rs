@@ -91,6 +91,11 @@ const REGISTRATIONS: &[Registration] = &[
         adapter: junie::ADAPTER,
     },
     Registration {
+        id: "kilo",
+        metadata: kilo::METADATA,
+        adapter: kilo::ADAPTER,
+    },
+    Registration {
         id: "mistral-vibe",
         metadata: mistral_vibe::METADATA,
         adapter: mistral_vibe::ADAPTER,

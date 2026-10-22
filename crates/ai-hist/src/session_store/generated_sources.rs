@@ -41,6 +41,8 @@ pub enum Source {
     Goose,
     #[serde(rename = "junie")]
     Junie,
+    #[serde(rename = "kilo")]
+    Kilo,
     #[serde(rename = "mistral-vibe")]
     MistralVibe,
     #[serde(rename = "qoder")]
@@ -77,6 +79,7 @@ impl Source {
         Self::Cortex,
         Self::Goose,
         Self::Junie,
+        Self::Kilo,
         Self::MistralVibe,
         Self::Qoder,
         Self::Vtcode,
@@ -108,6 +111,7 @@ impl Source {
             "cortex",
             "goose",
             "junie",
+            "kilo",
             "mistral-vibe",
             "qoder",
             "vtcode",
@@ -140,6 +144,7 @@ impl Source {
             ("cortex", Source::Cortex),
             ("goose", Source::Goose),
             ("junie", Source::Junie),
+            ("kilo", Source::Kilo),
             ("mistral-vibe", Source::MistralVibe),
             ("vibe", Source::MistralVibe),
             ("qoder", Source::Qoder),
@@ -178,6 +183,7 @@ impl Source {
             &crate::providers::cortex::METADATA,
             &crate::providers::goose::METADATA,
             &crate::providers::junie::METADATA,
+            &crate::providers::kilo::METADATA,
             &crate::providers::mistral_vibe::METADATA,
             &crate::providers::qoder::METADATA,
             &crate::providers::vtcode::METADATA,
