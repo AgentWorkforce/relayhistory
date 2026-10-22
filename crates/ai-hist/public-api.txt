@@ -184,6 +184,7 @@ pub ai_hist::Source::Copilot
 pub ai_hist::Source::Cortex
 pub ai_hist::Source::Cursor
 pub ai_hist::Source::Devin
+pub ai_hist::Source::Goose
 pub ai_hist::Source::Grok
 pub ai_hist::Source::GrokBot
 pub ai_hist::Source::Hermes

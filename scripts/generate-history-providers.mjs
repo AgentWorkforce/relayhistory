@@ -19,12 +19,12 @@ function readDescriptors(root, directory, testOnly) {
     if (!fs.existsSync(path.join(root, `crates/ai-hist/src/providers/${item.rust_id}/mod.rs`))) throw new Error(`Missing provider module: ${name}`);
     for (const fixture of item.fixtures) {
       if (fixture.source !== item.id || !/^[a-z0-9-]+$/.test(fixture.name) || !fixture.quirk || !fixture.files?.length) throw new Error(`Invalid fixture for ${item.id}`);
-      const layouts = ['ClaudeTranscript', 'CodexRollout', 'HomeTree', 'GrokBotReplicas', 'OpencodeSqlite', 'DevinSqlite', 'OpencodeLegacyJson', 'Reference', 'Sqlite'];
+      const layouts = ['ClaudeTranscript', 'CodexRollout', 'HomeTree', 'GrokBotReplicas', 'OpencodeSqlite', 'DevinSqlite', 'OpencodeLegacyJson', 'Reference', 'Sqlite', 'SqliteProviderDefault'];
       if (!layouts.includes(fixture.layout) || !['Burn', 'RelayHistory', 'SessionMigrate'].includes(fixture.origin)) throw new Error(`Invalid fixture layout/origin: ${item.id}/${fixture.name}`);
       for (const file of fixture.files) {
         if (!file.startsWith(`${item.id}/`) || file.split('/').includes('..') || !fs.existsSync(path.join(root, 'crates/ai-hist/tests', testOnly ? 'provider-fixtures' : 'fixtures', file))) throw new Error(`Missing or unowned fixture: ${file}`);
       }
-      if (fixture.layout === 'Sqlite' && (!fixture.target || path.isAbsolute(fixture.target) || path.win32.isAbsolute(fixture.target) || fixture.target.split(/[\\/]/).includes('..'))) throw new Error(`Invalid SQLite fixture target: ${item.id}`);
+      if (['Sqlite', 'SqliteProviderDefault'].includes(fixture.layout) && (!fixture.target || path.isAbsolute(fixture.target) || path.win32.isAbsolute(fixture.target) || fixture.target.split(/[\\/]/).includes('..'))) throw new Error(`Invalid SQLite fixture target: ${item.id}`);
       if (fixture.layout !== 'Reference' && !testOnly && !fs.existsSync(path.join(root, 'crates/ai-hist/tests/snapshots', item.id, `${fixture.name}.json`))) throw new Error(`Missing snapshot: ${item.id}/${fixture.name}`);
     }
     if (!testOnly) {
@@ -79,7 +79,7 @@ export function outputs(root = ROOT) {
   const common = fs.readFileSync(path.join(root,'sdk-ts/src/sdk-common.ts'),'utf8');
   out.set('sdk-ts/src/sdk-common.ts', markedSection(common, '// BEGIN GENERATED PROVIDER SOURCES', '// END GENERATED PROVIDER SOURCES', 'export const SOURCES = Object.freeze([\n'+live.map(i => `  '${i.id}',`).join('\n')+'\n] as const);'));
   const fixtures = live.flatMap(i => i.fixtures);
-  out.set('crates/ai-hist/tests/generated/provider_corpus.rs', banner+'const CORPUS: &[Fixture] = &[\n'+fixtures.map(f => `    Fixture { source: ${quote(f.source)}, name: ${quote(f.name)}, layout: Layout::${f.layout}${f.layout==='Sqlite'?`(${quote(f.target)})`:''}, origin: Origin::${f.origin}, files: &[${f.files.map(quote).join(', ')}], quirk: ${quote(f.quirk)} },`).join('\n')+'\n];\n');
+  out.set('crates/ai-hist/tests/generated/provider_corpus.rs', banner+'const CORPUS: &[Fixture] = &[\n'+fixtures.map(f => `    Fixture { source: ${quote(f.source)}, name: ${quote(f.name)}, layout: Layout::${f.layout}${['Sqlite','SqliteProviderDefault'].includes(f.layout)?`(${quote(f.target)})`:''}, origin: Origin::${f.origin}, files: &[${f.files.map(quote).join(', ')}], quirk: ${quote(f.quirk)} },`).join('\n')+'\n];\n');
   const added = live.filter(i=>!i.legacy);
   for (const item of added) if (!item.capture?.length) throw new Error(`Missing capture matrix for ${item.id}`);
   const readmePath='crates/ai-hist/tests/fixtures/README.md';

@@ -7,6 +7,7 @@ pub(crate) mod copilot;
 pub(crate) mod cortex;
 pub(crate) mod cursor;
 pub(crate) mod devin;
+pub(crate) mod goose;
 pub(crate) mod grok;
 pub(crate) mod grok_bot;
 pub(crate) mod hermes;

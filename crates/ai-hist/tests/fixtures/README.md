@@ -264,6 +264,13 @@ source without deciding which one fails the test.
 | codebuddy/string-content | Published native LocalJsonlSessionStore 2.171.0 offline recorder and fresh high-level historical reader replay; string-content. Not a CLI model-loop capture. |
 | codebuddy/official-reader | Fresh-process native SessionStoreImpl historical reader oracle for all five CLI captures, plus high-level historical replay for the seven recorder controls. |
 | cortex/native | Official Cortex Code CLI 1.2.18 native writer merged, flat, rewritten, zero-byte empty sidecar and untimed sessions; raw native restart-reader oracles for IDs, order and content. |
+| goose/schema17 | Goose 1.56.0 native schema-17 writer: ordinary and tool turns, then appended turns after process restart. |
+| goose/before-resume | Same native writer before process restart; four messages including matching tool request and response IDs. |
+| goose/schema17-official-export | Independent SessionManager::get_session/export_session read in a fresh process after resume. |
+| goose/before-resume-official-export | Independent SessionManager::get_session/export_session read in a fresh process before resume. |
+| goose/rewritten | Native replace_conversation deletes and reinserts rows with the same message IDs, removes the tool result, and changes the final text. |
+| goose/rewritten-official-export | Independent get_session/export_session read in a fresh process after native conversation replacement. |
+| goose/native-capture-source | The exact synthetic harness and capture instructions run against the pinned Goose API. |
 | junie/native | Pinned Junie CLI 3110.7 SessionStore native writer capture across separate JVM processes; third-process official reader oracle, two prompts, A2UX assistant blocks, repeated tool step and parent-side subagent notice. |
 | junie/official-reader | Third-process SessionStore.readStoredEventsFromFile oracle from the pinned released jar, independent of RelayHistory. |
 | mistral-vibe/unified-3-0-1 | Pinned v1 minor 9 chunked projection with native CURRENT/manifest digests, tool effect, and chained journal delta; synthetic entries survive a separate-process reader. |

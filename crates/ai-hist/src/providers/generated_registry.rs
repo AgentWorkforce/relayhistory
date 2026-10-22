@@ -81,6 +81,11 @@ const REGISTRATIONS: &[Registration] = &[
         adapter: cortex::ADAPTER,
     },
     Registration {
+        id: "goose",
+        metadata: goose::METADATA,
+        adapter: goose::ADAPTER,
+    },
+    Registration {
         id: "junie",
         metadata: junie::METADATA,
         adapter: junie::ADAPTER,

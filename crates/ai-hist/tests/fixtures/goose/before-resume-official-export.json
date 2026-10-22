@@ -1,0 +1,125 @@
+{
+  "id": "20261022_1",
+  "working_dir": "/synthetic/goose/workspace",
+  "name": "Synthetic Goose history",
+  "user_set_name": false,
+  "session_type": "user",
+  "created_at": "2026-10-22T04:20:52Z",
+  "updated_at": "2026-10-22T04:20:52Z",
+  "extension_data": {},
+  "usage": {
+    "input_tokens": null,
+    "output_tokens": null,
+    "total_tokens": null,
+    "cache_read_input_tokens": null,
+    "cache_write_input_tokens": null
+  },
+  "accumulated_usage": {
+    "input_tokens": null,
+    "output_tokens": null,
+    "total_tokens": null,
+    "cache_read_input_tokens": null,
+    "cache_write_input_tokens": null
+  },
+  "accumulated_cost": null,
+  "schedule_id": null,
+  "recipe": null,
+  "user_recipe_values": null,
+  "conversation": [
+    {
+      "id": "user-native-1",
+      "role": "user",
+      "created": 1792642852,
+      "content": [
+        {
+          "type": "text",
+          "text": "Find the Goose fixture needle"
+        }
+      ],
+      "metadata": {
+        "userVisible": true,
+        "agentVisible": true
+      }
+    },
+    {
+      "id": "assistant-native-1",
+      "role": "assistant",
+      "created": 1792642852,
+      "content": [
+        {
+          "type": "text",
+          "text": "I will inspect the fixture."
+        },
+        {
+          "type": "toolRequest",
+          "id": "call-native-1",
+          "toolCall": {
+            "status": "success",
+            "value": {
+              "name": "read_file"
+            }
+          }
+        }
+      ],
+      "metadata": {
+        "userVisible": true,
+        "agentVisible": true
+      }
+    },
+    {
+      "id": "tool-native-1",
+      "role": "user",
+      "created": 1792642852,
+      "content": [
+        {
+          "type": "toolResponse",
+          "id": "call-native-1",
+          "toolResult": {
+            "status": "success",
+            "value": {
+              "resultType": "complete",
+              "content": [
+                {
+                  "type": "text",
+                  "text": "The Goose fixture needle is here."
+                }
+              ],
+              "isError": false
+            }
+          }
+        }
+      ],
+      "metadata": {
+        "userVisible": true,
+        "agentVisible": true
+      }
+    },
+    {
+      "id": "assistant-native-2",
+      "role": "assistant",
+      "created": 1792642852,
+      "content": [
+        {
+          "type": "text",
+          "text": "Found the Goose fixture needle."
+        }
+      ],
+      "metadata": {
+        "userVisible": true,
+        "agentVisible": true
+      }
+    }
+  ],
+  "message_count": 4,
+  "last_message_at": "2026-10-22T04:20:52Z",
+  "provider_name": null,
+  "model_config": null,
+  "goose_mode": "auto",
+  "archived_at": null,
+  "project_id": null,
+  "parent_session_id": null,
+  "last_message_snippet": null,
+  "system_prompt_override": null,
+  "system_prompt_extras": {},
+  "container": null
+}

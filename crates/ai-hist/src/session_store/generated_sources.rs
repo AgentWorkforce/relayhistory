@@ -37,6 +37,8 @@ pub enum Source {
     Codebuddy,
     #[serde(rename = "cortex")]
     Cortex,
+    #[serde(rename = "goose")]
+    Goose,
     #[serde(rename = "junie")]
     Junie,
     #[serde(rename = "mistral-vibe")]
@@ -73,6 +75,7 @@ impl Source {
         Self::Kimi,
         Self::Codebuddy,
         Self::Cortex,
+        Self::Goose,
         Self::Junie,
         Self::MistralVibe,
         Self::Qoder,
@@ -103,6 +106,7 @@ impl Source {
             "kimi",
             "codebuddy",
             "cortex",
+            "goose",
             "junie",
             "mistral-vibe",
             "qoder",
@@ -134,6 +138,7 @@ impl Source {
             ("kimi", Source::Kimi),
             ("codebuddy", Source::Codebuddy),
             ("cortex", Source::Cortex),
+            ("goose", Source::Goose),
             ("junie", Source::Junie),
             ("mistral-vibe", Source::MistralVibe),
             ("vibe", Source::MistralVibe),
@@ -171,6 +176,7 @@ impl Source {
             &crate::providers::kimi::METADATA,
             &crate::providers::codebuddy::METADATA,
             &crate::providers::cortex::METADATA,
+            &crate::providers::goose::METADATA,
             &crate::providers::junie::METADATA,
             &crate::providers::mistral_vibe::METADATA,
             &crate::providers::qoder::METADATA,

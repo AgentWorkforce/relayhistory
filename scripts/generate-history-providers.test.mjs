@@ -91,6 +91,19 @@ test('sandbox ignores non-JSON descriptor-directory documentation',t=>{
   assert.ok(descriptors(root).length);
 });
 
+test('provider-default SQLite fixtures retain validated relative targets', t => {
+  const root = sandbox(t);
+  change(root, 'claude', d => Object.assign(d.fixtures[0], {
+    layout: 'SqliteProviderDefault', target: 'sessions/sessions.db',
+  }));
+  assert.match(outputs(root).get('crates/ai-hist/tests/generated/provider_corpus.rs'),
+    /Layout::SqliteProviderDefault\("sessions\/sessions\.db"\)/);
+  for (const target of ['', '../escape.db', '/absolute.db', 'C:\\absolute.db', '..\\escape.db']) {
+    change(root, 'claude', d => { d.fixtures[0].target = target; });
+    assert.throws(() => outputs(root), /Invalid SQLite fixture target/);
+  }
+});
+
 // Compile the generated ordinal tables against distinct metadata sentinels.
 // Both cfg modes matter: a test-only variant must not shift production entries.
 test('source names, aliases and metadata agree with enum ordinals in both cfg modes', t => {

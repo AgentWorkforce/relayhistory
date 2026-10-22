@@ -1,0 +1,76 @@
+{
+  "id": "goose",
+  "rust_id": "goose",
+  "variant": "Goose",
+  "order": 450,
+  "aliases": [],
+  "fixtures": [
+    {
+      "source": "goose",
+      "name": "schema17",
+      "layout": "SqliteProviderDefault",
+      "target": "sessions/sessions.db",
+      "origin": "RelayHistory",
+      "files": ["goose/schema17.sql"],
+      "quirk": "Goose 1.56.0 native schema-17 writer: ordinary and tool turns, then appended turns after process restart."
+    },
+    {
+      "source": "goose",
+      "name": "before-resume",
+      "layout": "SqliteProviderDefault",
+      "target": "sessions/sessions.db",
+      "origin": "RelayHistory",
+      "files": ["goose/before-resume.sql"],
+      "quirk": "Same native writer before process restart; four messages including matching tool request and response IDs."
+    },
+    {
+      "source": "goose",
+      "name": "schema17-official-export",
+      "layout": "Reference",
+      "origin": "RelayHistory",
+      "files": ["goose/schema17-official-export.json"],
+      "quirk": "Independent SessionManager::get_session/export_session read in a fresh process after resume."
+    },
+    {
+      "source": "goose",
+      "name": "before-resume-official-export",
+      "layout": "Reference",
+      "origin": "RelayHistory",
+      "files": ["goose/before-resume-official-export.json"],
+      "quirk": "Independent SessionManager::get_session/export_session read in a fresh process before resume."
+    },
+    {
+      "source": "goose",
+      "name": "rewritten",
+      "layout": "SqliteProviderDefault",
+      "target": "sessions/sessions.db",
+      "origin": "RelayHistory",
+      "files": ["goose/rewritten.sql"],
+      "quirk": "Native replace_conversation deletes and reinserts rows with the same message IDs, removes the tool result, and changes the final text."
+    },
+    {
+      "source": "goose",
+      "name": "rewritten-official-export",
+      "layout": "Reference",
+      "origin": "RelayHistory",
+      "files": ["goose/rewritten-official-export.json"],
+      "quirk": "Independent get_session/export_session read in a fresh process after native conversation replacement."
+    },
+    {
+      "source": "goose",
+      "name": "native-capture-source",
+      "layout": "Reference",
+      "origin": "RelayHistory",
+      "files": ["goose/capture.rs", "goose/README.md"],
+      "quirk": "The exact synthetic harness and capture instructions run against the pinned Goose API."
+    }
+  ],
+  "capture": [
+    {"evidence": "Messages and tools", "coverage": "Schema-17 SQLite text blocks and native tool request/response IDs; WAL-visible coherent snapshot."},
+    {"evidence": "Usage and relationships", "coverage": "Session totals are not per-request usage; parent ID remains metadata; no file edits, delegation, or native resume advertised."}
+  ],
+  "population": {
+    "evidence": ["history", "session_event", "tool_call", "session_marker"],
+    "usage_accounting": "none"
+  }
+}
