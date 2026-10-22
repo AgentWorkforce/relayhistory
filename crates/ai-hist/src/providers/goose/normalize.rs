@@ -7,7 +7,7 @@ use crate::ingest::{
 use crate::store::NewSessionMarker;
 use crate::HistoryEntry;
 use anyhow::{ensure, Context};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 #[derive(Default)]
 struct Keys {
     events: BTreeSet<String>,
@@ -190,13 +190,68 @@ fn is_control(m: &Message) -> bool {
         .is_some_and(|v| v["turnContext"] == true || v["userVisible"] == false)
 }
 
-// History has a source/timestamp/text identity shared by sessions, not an event
-// identity or location column. Reconcile against the finalized evidence rows.
+// History is keyed by source/time/joined prompt, while public events retain
+// individual native text blocks. The positional event key distinguishes even
+// repeated native message IDs within one timestamp bucket.
+fn text_message_key(uid: &str) -> Option<(&str, usize)> {
+    let without_tag = uid.strip_suffix(":text")?;
+    let (key, position) = without_tag.rsplit_once(':')?;
+    if !(key.starts_with("native:") || key.starts_with("row:")) {
+        return None;
+    }
+    position.parse::<usize>().ok().map(|position| (key, position))
+}
+
+struct PromptSupport {
+    session_id: String,
+    timestamp_ms: i64,
+    prompt: String,
+    project: Option<String>,
+}
+
+fn supported_prompts(conn: &Connection, times: &BTreeSet<i64>) -> Result<Vec<PromptSupport>> {
+    let mut groups: BTreeMap<(String, i64, String), Vec<(usize, String, Option<String>)>> = BTreeMap::new();
+    let timestamps = serde_json::to_string(times)?;
+    let mut stmt = conn.prepare("SELECT session_id,ts_ms,event_uid,text,cwd FROM session_events WHERE source=?1 AND role='user' AND kind='text' AND control_kind IS NULL AND ts_ms IN (SELECT value FROM json_each(?2)) ORDER BY ts_ms,id")?;
+    let rows = stmt.query_map(rusqlite::params![ID, timestamps], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, Option<String>>(4)?))
+    })?;
+    for row in rows {
+        let (sid, ts, uid, text, project) = row?;
+        // Remote intake accepts opaque event IDs. Let an unknown format
+        // support its own single-event prompt without grouping it with native
+        // blocks or aborting an unrelated local session.
+        let (key, position) = text_message_key(&uid)
+            .map(|(key, position)| (key.to_owned(), position))
+            .unwrap_or_else(|| (format!("opaque:{uid}"), 0));
+        groups.entry((sid, ts, key)).or_default().push((position, text, project));
+    }
+    Ok(groups.into_iter().map(|((session_id,timestamp_ms,_),mut parts)| {
+        parts.sort_by_key(|(position,_,_)| *position);
+        let project = parts.first().and_then(|(_,_,project)| project.clone());
+        PromptSupport { session_id, timestamp_ms,
+            prompt:parts.into_iter().map(|(_,text,_)| text).collect::<Vec<_>>().join("\n"),
+            project }
+    }).collect())
+}
+
 fn reconcile_history(conn: &Connection, session: &str) -> Result<()> {
-    const MATCH: &str = "e.source=history.source AND e.role='user' AND e.kind='text' AND e.control_kind IS NULL AND e.ts_ms=history.timestamp_ms AND e.text=history.prompt";
-    conn.execute(&format!("UPDATE history SET session_id=(SELECT e.session_id FROM session_events e WHERE {MATCH} ORDER BY e.session_id LIMIT 1), project=(SELECT e.cwd FROM session_events e WHERE {MATCH} ORDER BY e.session_id LIMIT 1) WHERE source=?1 AND session_id=?2 AND NOT EXISTS(SELECT 1 FROM session_events e WHERE {MATCH} AND e.session_id=?2) AND EXISTS(SELECT 1 FROM session_events e WHERE {MATCH})"),rusqlite::params![ID,session])?;
-    conn.execute(&format!("DELETE FROM history WHERE source=?1 AND session_id=?2 AND NOT EXISTS(SELECT 1 FROM session_events e WHERE {MATCH})"),rusqlite::params![ID,session])?;
-    conn.execute("UPDATE history SET project=(SELECT e.cwd FROM session_events e WHERE e.source=history.source AND e.session_id=history.session_id AND e.role='user' AND e.kind='text' AND e.control_kind IS NULL AND e.ts_ms=history.timestamp_ms AND e.text=history.prompt LIMIT 1) WHERE source=?1 AND session_id=?2 AND project IS NOT (SELECT e.cwd FROM session_events e WHERE e.source=history.source AND e.session_id=history.session_id AND e.role='user' AND e.kind='text' AND e.control_kind IS NULL AND e.ts_ms=history.timestamp_ms AND e.text=history.prompt LIMIT 1)", rusqlite::params![ID,session])?;
+    let mut stmt = conn.prepare("SELECT id,timestamp_ms,prompt FROM history WHERE source=?1 AND session_id=?2")?;
+    let rows = stmt.query_map([ID, session], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?, row.get::<_, String>(2)?))
+    })?.collect::<rusqlite::Result<Vec<_>>>()?;
+    let times = rows.iter().map(|(_,ts,_)| *ts).collect();
+    let supported = supported_prompts(conn, &times)?;
+    for (id, ts, prompt) in rows {
+        let owner = supported.iter()
+            .filter(|p| p.timestamp_ms == ts && p.prompt == prompt)
+            .min_by_key(|p| (p.session_id != session, &p.session_id));
+        if let Some(owner) = owner {
+            conn.execute("UPDATE history SET session_id=?2,project=?3 WHERE id=?1 AND (session_id IS NOT ?2 OR project IS NOT ?3)",rusqlite::params![id,owner.session_id,owner.project])?;
+        } else {
+            conn.execute("DELETE FROM history WHERE id=?1",[id])?;
+        }
+    }
     Ok(())
 }
 

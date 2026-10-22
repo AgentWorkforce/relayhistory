@@ -271,6 +271,179 @@ fn goose_interleaved_native_blocks_keep_order_and_stable_ids_after_reopen() {
 }
 
 #[test]
+fn goose_multiblock_user_prompt_survives_reopen_and_retires_on_rewrite() {
+    let home = tempfile::tempdir().unwrap();
+    stage(home.path(), include_str!("fixtures/goose/schema17.sql"));
+    let native_path = home.path().join(".local/share/goose/sessions/sessions.db");
+    let first = serde_json::json!([
+        {"type":"text","text":"First part of prompt"},
+        {"type":"image","mimeType":"image/png"},
+        {"type":"text","text":"Second part of prompt"}
+    ]);
+    let write_user = |content: &serde_json::Value| {
+        let native = rusqlite::Connection::open(&native_path).unwrap();
+        native
+            .execute(
+                "UPDATE messages SET content_json=?1 WHERE message_id='user-native-1'",
+                [content.to_string()],
+            )
+            .unwrap();
+    };
+    let prompts =
+        || {
+            let conn = rusqlite::Connection::open(home.path().join("ledger.db")).unwrap();
+            let mut stmt = conn.prepare(
+            "SELECT prompt FROM history WHERE source='goose' AND session_id=?1 ORDER BY prompt",
+        ).unwrap();
+            stmt.query_map([SID], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+    write_user(&first);
+    let store = open(home.path());
+    let evidence = hydrate(&store);
+    assert_eq!(
+        evidence
+            .messages
+            .iter()
+            .find(|message| message.message_id.as_deref() == Some("user-native-1"))
+            .unwrap()
+            .blocks
+            .iter()
+            .map(|block| block.text.as_deref())
+            .collect::<Vec<_>>(),
+        [Some("First part of prompt"), Some("Second part of prompt")]
+    );
+    assert!(prompts().contains(&"First part of prompt\nSecond part of prompt".into()));
+    #[cfg(feature = "unstable-internal")]
+    {
+        let conn = rusqlite::Connection::open(home.path().join("ledger.db")).unwrap();
+        let hits = ai_hist::search(
+            &conn,
+            &["Second".into()],
+            false,
+            &ai_hist::QueryFilter {
+                source: Some("goose".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(hits
+            .iter()
+            .any(|hit| hit.prompt == "First part of prompt\nSecond part of prompt"));
+    }
+    drop(store);
+    let reopened = open(home.path());
+    reopened
+        .discover(DiscoveryOptions::default().sources([Source::Goose]))
+        .unwrap();
+    reopened
+        .hydrate(
+            &SessionRef::id(Source::Goose, SID),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    assert!(prompts().contains(&"First part of prompt\nSecond part of prompt".into()));
+    drop(reopened);
+    stage(home.path(), include_str!("fixtures/goose/rewritten.sql"));
+    write_user(&first);
+    let rewritten = open(home.path());
+    hydrate(&rewritten);
+    assert!(prompts().contains(&"First part of prompt\nSecond part of prompt".into()));
+    let removed = serde_json::json!([{"type":"text","text":"First part of prompt"}]);
+    write_user(&removed);
+    hydrate(&rewritten);
+    let current = prompts();
+    assert!(current.contains(&"First part of prompt".into()));
+    assert!(!current.contains(&"First part of prompt\nSecond part of prompt".into()));
+}
+
+#[cfg(feature = "export")]
+#[test]
+fn goose_remote_opaque_event_uid_does_not_abort_local_prompt_reconciliation() {
+    let home = tempfile::tempdir().unwrap();
+    stage(home.path(), include_str!("fixtures/goose/schema17.sql"));
+    let native =
+        rusqlite::Connection::open(home.path().join(".local/share/goose/sessions/sessions.db"))
+            .unwrap();
+    let ts: i64 = native
+        .query_row(
+            "SELECT created_timestamp * 1000 FROM messages WHERE message_id='user-native-1'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    drop(native);
+    let store = open(home.path());
+    let remote_sid = "unrelated-remote-goose";
+    store
+        .apply_source_observations(SourceObservationBatch::new(
+            "opaque-connector",
+            "fixture",
+            SessionLocation::Remote,
+            vec![SourceObservation {
+                session: ShallowSession {
+                    source: "goose".into(),
+                    session_id: remote_sid.into(),
+                    source_stamp: Some("opaque-stamp".into()),
+                    ..Default::default()
+                },
+                raw_locator: None,
+            }],
+        ))
+        .unwrap();
+    let key = ObservationKey {
+        source: "goose".into(),
+        session_id: remote_sid.into(),
+        location: SessionLocation::Remote,
+        connector_id: "opaque-connector".into(),
+        connector_instance: "fixture".into(),
+    };
+    let revision = store.source_observation(&key).unwrap().revision.unwrap();
+    let payload = serde_json::json!({
+        "source":"goose", "session_id":remote_sid, "event_uid":"connector:opaque",
+        "role":"user", "kind":"text", "ts_ms":ts, "text":"Unrelated remote prompt"
+    });
+    store
+        .apply_source_evidence(
+            SourceEvidenceSubmission::new(
+                key,
+                revision,
+                NormalizedSourceEvidence {
+                    source_stamp: "opaque-stamp".into(),
+                    source_bytes: 0,
+                    covered_kinds: vec![EvidenceKind::SessionEvent],
+                    records: vec![EvidenceRecord {
+                        kind: EvidenceKind::SessionEvent,
+                        payload: payload.as_object().unwrap().clone(),
+                        record_id: Some("remote:opaque".into()),
+                        revision_id: Some("remote:1".into()),
+                    }],
+                },
+            )
+            .include_related(false),
+        )
+        .unwrap();
+    let native = hydrate(&store);
+    assert!(native.messages.iter().any(|message| message
+        .blocks
+        .iter()
+        .any(|block| block.text.as_deref() == Some("Find the Goose fixture needle"))));
+    let remote = store
+        .session(
+            &SessionRef::id(Source::Goose, remote_sid),
+            SessionQuery::default(),
+        )
+        .unwrap()
+        .unwrap();
+    assert!(remote.messages.iter().any(|message| message
+        .blocks
+        .iter()
+        .any(|block| block.text.as_deref() == Some("Unrelated remote prompt"))));
+}
+
+#[test]
 fn goose_native_replace_reorders_stable_ids_and_retires_removed_result() {
     let home = tempfile::tempdir().unwrap();
     stage(home.path(), include_str!("fixtures/goose/schema17.sql"));
