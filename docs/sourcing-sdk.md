@@ -1006,6 +1006,7 @@ handle.
 | codebuddy | ✓ | ✓ | ✓ | — | — | per-message |
 | codex | ✓ | ✓ | ✓ | ✓ | ✓ | cumulative-delta |
 | copilot | ✓ | ✓ | ✓ | — | — | per-message |
+| cortex | ✓ | ✓ | ✓ | — | — | none |
 | cursor | ✓ | ✓ | ✓ | ✓ | — | none |
 | devin | ✓ | ✓ | ✓ | ✓ | — | none |
 | grok | ✓ | ✓ | ✓ | ✓ | ✓ | per-request |

@@ -35,6 +35,8 @@ pub enum Source {
     Kimi,
     #[serde(rename = "codebuddy")]
     Codebuddy,
+    #[serde(rename = "cortex")]
+    Cortex,
     #[serde(rename = "junie")]
     Junie,
     #[serde(rename = "qoder")]
@@ -68,6 +70,7 @@ impl Source {
         Self::QwenCode,
         Self::Kimi,
         Self::Codebuddy,
+        Self::Cortex,
         Self::Junie,
         Self::Qoder,
         Self::Vtcode,
@@ -96,6 +99,7 @@ impl Source {
             "qwen-code",
             "kimi",
             "codebuddy",
+            "cortex",
             "junie",
             "qoder",
             "vtcode",
@@ -125,6 +129,7 @@ impl Source {
             ("qwen-code", Source::QwenCode),
             ("kimi", Source::Kimi),
             ("codebuddy", Source::Codebuddy),
+            ("cortex", Source::Cortex),
             ("junie", Source::Junie),
             ("qoder", Source::Qoder),
             ("vtcode", Source::Vtcode),
@@ -159,6 +164,7 @@ impl Source {
             &crate::providers::qwen_code::METADATA,
             &crate::providers::kimi::METADATA,
             &crate::providers::codebuddy::METADATA,
+            &crate::providers::cortex::METADATA,
             &crate::providers::junie::METADATA,
             &crate::providers::qoder::METADATA,
             &crate::providers::vtcode::METADATA,

@@ -8,12 +8,14 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Cortex Code history is discoverable and searchable from native snapshots and journals, preserving messages, tool results, rewrites and recorded event markers.
 - Qoder global CLI session history is discoverable and searchable from its native project transcripts, preserving recorded messages, tools, results, and resume appends.
 - VT Code history is discoverable and searchable from canonical workspace journals under explicitly configured workspace roots, preserving recorded turns, tool identities, usage and control events.
 - Junie CLI history is discoverable and searchable from native session journals, including recorded prompts, assistant text, tool output and event markers.
 
 ### Rust API
 
+- Added `Source::Cortex` for filtering and reading persisted Cortex Code history.
 - Added `Source::Qoder` for filtering and reading persisted Qoder global CLI history.
 - Added `Source::Vtcode` for filtering and reading persisted VT Code session history.
 - Added `Source::Junie` for filtering and reading persisted Junie CLI history.

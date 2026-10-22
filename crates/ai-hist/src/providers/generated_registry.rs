@@ -76,6 +76,11 @@ const REGISTRATIONS: &[Registration] = &[
         adapter: codebuddy::ADAPTER,
     },
     Registration {
+        id: "cortex",
+        metadata: cortex::METADATA,
+        adapter: cortex::ADAPTER,
+    },
+    Registration {
         id: "junie",
         metadata: junie::METADATA,
         adapter: junie::ADAPTER,
