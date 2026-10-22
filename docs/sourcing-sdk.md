@@ -1014,6 +1014,7 @@ handle.
 | grok-bot | ✓ | ✓ | — | — | ✓ | none |
 | hermes | ✓ | ✓ | ✓ | — | — | none |
 | junie | ✓ | ✓ | ✓ | — | — | none |
+| kilo | ✓ | ✓ | ✓ | — | — | none |
 | kimi | ✓ | ✓ | ✓ | — | — | none |
 | mistral-vibe | ✓ | ✓ | ✓ | — | — | none |
 | muse | ✓ | ✓ | ✓ | ✓ | ✓ | per-request |

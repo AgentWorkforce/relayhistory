@@ -189,6 +189,7 @@ pub ai_hist::Source::Grok
 pub ai_hist::Source::GrokBot
 pub ai_hist::Source::Hermes
 pub ai_hist::Source::Junie
+pub ai_hist::Source::Kilo
 pub ai_hist::Source::Kimi
 pub ai_hist::Source::MistralVibe
 pub ai_hist::Source::Muse

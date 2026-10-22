@@ -18,6 +18,7 @@ pub(crate) const LOCAL_SOURCES: &[LocalSource] = &[
     crate::providers::cortex::LOCAL_SOURCE,
     crate::providers::goose::LOCAL_SOURCE,
     crate::providers::junie::LOCAL_SOURCE,
+    crate::providers::kilo::LOCAL_SOURCE,
     crate::providers::mistral_vibe::LOCAL_SOURCE,
     crate::providers::qoder::LOCAL_SOURCE,
     crate::providers::vtcode::LOCAL_SOURCE,

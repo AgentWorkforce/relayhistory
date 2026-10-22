@@ -273,6 +273,11 @@ source without deciding which one fails the test.
 | goose/native-capture-source | The exact synthetic harness and capture instructions run against the pinned Goose API. |
 | junie/native | Pinned Junie CLI 3110.7 SessionStore native writer capture across separate JVM processes; third-process official reader oracle, two prompts, A2UX assistant blocks, repeated tool step and parent-side subagent notice. |
 | junie/official-reader | Third-process SessionStore.readStoredEventsFromFile oracle from the pinned released jar, independent of RelayHistory. |
+| kilo/sqlite-7-8-15 | Kilo CLI 7.8.15 native import writer: user, assistant, completed tool, and resumed turns after process restart. |
+| kilo/before-resume | Same native writer before resumed turns are imported in a separate process. |
+| kilo/before-resume-official-export | Independent Kilo export after first native writer process exited. |
+| kilo/after-resume-official-export | Independent Kilo export after append in another native writer process. |
+| kilo/native-capture-inputs | Synthetic native import inputs and capture procedure, no account, paid model, or private history. |
 | mistral-vibe/unified-3-0-1 | Pinned v1 minor 9 chunked projection with native CURRENT/manifest digests, tool effect, and chained journal delta; synthetic entries survive a separate-process reader. |
 | qoder/global-cli | Official global Qoder CLI npm 1.1.75 TranscriptStore native writer; ordinary, tool, resumed, and same-millisecond synthetic sessions with released Repository historical restart-reader oracle. |
 | vtcode/basic | Synthetic VT Code 0.180.2 native-writer canonical schema-0.18.0 journal, independently reopened through visit_snapshot: two user turns, assistant items, actual tool IDs, per-turn usage, compaction control and thread aggregate. |

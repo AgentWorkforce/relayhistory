@@ -12,6 +12,7 @@ pub(crate) mod grok;
 pub(crate) mod grok_bot;
 pub(crate) mod hermes;
 pub(crate) mod junie;
+pub(crate) mod kilo;
 pub(crate) mod kimi;
 pub(crate) mod mistral_vibe;
 pub(crate) mod muse;
