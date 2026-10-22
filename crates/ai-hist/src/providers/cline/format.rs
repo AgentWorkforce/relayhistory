@@ -187,6 +187,26 @@ pub(super) fn text(value: &Value) -> String {
         .unwrap_or_default()
 }
 
+pub(super) fn bounded_visible_text(full: &str) -> String {
+    const MAX_ENCODED: usize = 128 * 1024;
+    if Value::String(full.to_owned()).to_string().len() <= MAX_ENCODED {
+        return full.to_owned();
+    }
+    let facts = crate::ingest::ToolResultFacts::from_payload(&Value::String(full.to_owned()));
+    let projection = serde_json::json!({
+        "projection":"cline-visible-text-v1", "truncated":true,
+        "native_text_bytes":facts.payload_bytes, "native_text_hash":facts.payload_hash,
+    });
+    let boundary = "\n\n[Native Cline text projection]\n";
+    let prefix = full.chars().take(32 * 1024).collect::<String>();
+    let bounded = format!("{prefix}{boundary}{projection}");
+    if Value::String(bounded.clone()).to_string().len() <= MAX_ENCODED {
+        bounded
+    } else {
+        format!("{boundary}{projection}")
+    }
+}
+
 pub(super) fn first_prompt(messages: &[Value]) -> Option<String> {
     messages
         .iter()

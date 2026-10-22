@@ -585,6 +585,163 @@ fn near_limit_result_reserves_export_record_envelope_space() {
 
 #[test]
 #[cfg(all(feature = "export", feature = "unstable-internal"))]
+fn large_escaped_user_and_assistant_text_export_and_import_with_projection() {
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path(), "fixture-success-01");
+    let mut snapshot: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    let large = format!("alphaunique\nneedleunique {}", "\"".repeat(900_000));
+    snapshot["messages"][0]["content"] = serde_json::json!([
+        {"type":"text","text":"alphaunique"},
+        {"type":"text","text":large}
+    ]);
+    snapshot["messages"][3]["content"] = serde_json::json!([
+        {"type":"text","text":format!("assistantunique\nanswerunique {}", "\"".repeat(900_000))}
+    ]);
+    std::fs::write(&path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    let store = open(home.path());
+    store.sync(SyncOptions::default().force(true)).unwrap();
+    let mut export = ExportSnapshot::open(
+        rusqlite::Connection::open(store.db_path()).unwrap(),
+        &ExportSelection {
+            sessions: vec![SessionIdentity {
+                source: "cline".into(),
+                session_id: "fixture-success-01".into(),
+            }],
+            kinds: vec!["history".into(), "session_event".into()],
+            ..Default::default()
+        },
+        &ExportLimits::default(),
+        60_000,
+        1_000,
+    )
+    .unwrap();
+    let mut records = Vec::new();
+    let mut cursor = Some(export.handle().cursor);
+    while let Some(value) = cursor {
+        let page = export.page(&value, 1_000).unwrap();
+        cursor = page.next_cursor;
+        records.extend(page.records);
+    }
+    assert!(records
+        .iter()
+        .all(|record| record.payload.to_string().len() <= 512 * 1024));
+    let prompt = records
+        .iter()
+        .find(|r| {
+            r.kind == "history"
+                && r.payload["prompt"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("alphaunique"))
+        })
+        .unwrap();
+    assert!(prompt.payload["prompt"]
+        .as_str()
+        .unwrap()
+        .contains("\"truncated\":true"));
+    let assistant = records
+        .iter()
+        .find(|r| {
+            r.kind == "session_event"
+                && r.payload["text"]
+                    .as_str()
+                    .is_some_and(|s| s.contains("assistantunique"))
+        })
+        .unwrap();
+    assert!(assistant.payload["text"]
+        .as_str()
+        .unwrap()
+        .contains("\"truncated\":true"));
+    let receiver_home = tempfile::tempdir().unwrap();
+    let receiver = open(receiver_home.path());
+    let key = ObservationKey {
+        source: "cline".into(),
+        session_id: "fixture-success-01".into(),
+        location: SessionLocation::Remote,
+        connector_id: "cline-transport".into(),
+        connector_instance: "large-text".into(),
+    };
+    receiver
+        .apply_source_observations(SourceObservationBatch::new(
+            "cline-transport",
+            "large-text",
+            SessionLocation::Remote,
+            vec![SourceObservation {
+                session: ShallowSession {
+                    source: "cline".into(),
+                    session_id: "fixture-success-01".into(),
+                    source_stamp: Some("remote-large".into()),
+                    ..Default::default()
+                },
+                raw_locator: None,
+            }],
+        ))
+        .unwrap();
+    let revision = receiver.source_observation(&key).unwrap().revision.unwrap();
+    let evidence_records = records
+        .into_iter()
+        .map(|record| {
+            let kind = match record.kind.as_str() {
+                "history" => EvidenceKind::History,
+                "session_event" => EvidenceKind::SessionEvent,
+                other => panic!("unexpected export kind: {other}"),
+            };
+            let mut payload = record.payload.as_object().unwrap().clone();
+            payload.remove("id");
+            payload.remove("location");
+            EvidenceRecord {
+                kind,
+                payload,
+                record_id: Some(record.record_id),
+                revision_id: Some(record.revision_id),
+            }
+        })
+        .collect();
+    receiver
+        .apply_source_evidence(
+            SourceEvidenceSubmission::new(
+                key,
+                revision,
+                NormalizedSourceEvidence {
+                    source_stamp: "remote-large".into(),
+                    source_bytes: 0,
+                    covered_kinds: vec![EvidenceKind::History, EvidenceKind::SessionEvent],
+                    records: evidence_records,
+                },
+            )
+            .include_related(false),
+        )
+        .unwrap();
+    let remote = read(&receiver, "fixture-success-01");
+    assert!(remote.prompts.iter().any(|p| p
+        .prompt
+        .as_deref()
+        .is_some_and(|s| s.contains("alphaunique\nneedleunique"))));
+    assert!(remote.messages.iter().flat_map(|m| &m.blocks).any(|b| b
+        .text
+        .as_deref()
+        .is_some_and(|s| s.contains("assistantunique\nanswerunique"))));
+    let local_path = receiver_home
+        .path()
+        .join(".cline/data/sessions/fixture-success-01/fixture-success-01.messages.json");
+    std::fs::create_dir_all(local_path.parent().unwrap()).unwrap();
+    std::fs::write(&local_path, serde_json::to_vec(&snapshot).unwrap()).unwrap();
+    receiver
+        .discover(DiscoveryOptions::default().sources([Source::Cline]))
+        .unwrap();
+    std::fs::remove_file(local_path).unwrap();
+    receiver.sync(SyncOptions::default().force(true)).unwrap();
+    assert!(read(&receiver, "fixture-success-01")
+        .prompts
+        .iter()
+        .any(|p| p
+            .prompt
+            .as_deref()
+            .is_some_and(|s| s.contains("alphaunique\nneedleunique"))));
+}
+
+#[test]
+#[cfg(all(feature = "export", feature = "unstable-internal"))]
 fn oversized_tool_use_exports_and_imports_complete_bounded_evidence() {
     let home = tempfile::tempdir().unwrap();
     let path = stage(home.path(), "fixture-success-01");

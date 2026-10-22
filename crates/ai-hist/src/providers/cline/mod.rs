@@ -8,6 +8,7 @@ use anyhow::Context;
 use std::io::Read;
 mod format;
 mod normalize;
+mod prompts;
 #[cfg(test)]
 mod tests;
 const ID: &str = "cline";
@@ -386,7 +387,12 @@ fn retire_missing(conn: &Connection, roots: &ProviderRoots) -> Result<()> {
         }
         if all_missing {
             let tx = conn.unchecked_transaction()?;
-            crate::providers::file_history::retire_local_session(&tx, ID, &sid)?;
+            crate::providers::file_history::retire_local_session_with_prompts(
+                &tx,
+                ID,
+                &sid,
+                prompts::reconcile_retired,
+            )?;
             tx.commit()?;
         }
     }

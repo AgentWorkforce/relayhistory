@@ -22,7 +22,7 @@ pub(super) fn write(conn: &Connection, payload: &Value, path: &Path) -> Result<u
     let shared = Snapshot::capture(conn, ID, sid)?;
     let (inserted, first, last, last_assistant, mut keys) =
         write_rows(conn, sid, messages, &times, updated)?;
-    file_history::retire(conn, ID, sid, &keys)?;
+    file_history::retire_with_prompts(conn, ID, sid, &keys, prompts::reconcile)?;
     let order = ordered_events(messages, &times)?;
     let replay = file_history::reconcile_event_order(conn, ID, sid, &order)?;
     if !replay.is_empty() {
@@ -79,7 +79,7 @@ fn write_rows(
         if message["role"] == "assistant" {
             let text = format::text(&message["content"]);
             if !text.trim().is_empty() {
-                last_assistant = Some(text);
+                last_assistant = Some(format::bounded_visible_text(&text));
             }
         }
     }
@@ -141,6 +141,7 @@ fn write_message(
     if text.trim().is_empty() {
         return Ok(0);
     }
+    let text = format::bounded_visible_text(&text);
     let hash = crate::prompt_hash(&text);
     keys.prompts.insert(format!("{ts}:{hash}"));
     insert_history(
@@ -192,8 +193,8 @@ fn write_blocks(
         match kind {
             "text" | "thinking" | "tool_use" => {
                 let text = match kind {
-                    "text" => block["text"].as_str().map(str::to_owned),
-                    "thinking" => block["thinking"].as_str().map(str::to_owned),
+                    "text" => block["text"].as_str().map(format::bounded_visible_text),
+                    "thinking" => block["thinking"].as_str().map(format::bounded_visible_text),
                     _ => {
                         if !replay {
                             call(conn, base, block, keys)?;

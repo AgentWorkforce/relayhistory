@@ -58,6 +58,18 @@ pub(crate) fn check_identity(
 
 /// Retire the local evidence a complete normalization did not write again.
 pub(crate) fn retire(conn: &Connection, source: &str, sid: &str, keys: &Keys) -> Result<()> {
+    retire_with_prompts(conn, source, sid, keys, reconcile_prompts)
+}
+
+/// Retire a rewritten snapshot while allowing a provider to match its own
+/// bounded prompt projection against retained remote evidence.
+pub(crate) fn retire_with_prompts(
+    conn: &Connection,
+    source: &str,
+    sid: &str,
+    keys: &Keys,
+    reconcile: fn(&Connection, &str, &str, &str) -> Result<()>,
+) -> Result<()> {
     let prompts = serde_json::to_string(&keys.prompts)?;
     let results = serde_json::to_string(&keys.results)?;
     conn.execute(
@@ -83,14 +95,19 @@ pub(crate) fn retire(conn: &Connection, source: &str, sid: &str, keys: &Keys) ->
             crate::SessionLocation::Local,
         )?;
     }
-    reconcile_prompts(conn, source, sid, &prompts)
+    reconcile(conn, source, sid, &prompts)
 }
 
 // Reconcile after local shares retire: surviving remote events in this session
 // and other sessions still support prompt rows. Compare complete ordered user
 // text projections, and prefer the existing owner when its evidence survives.
 // A control row (harness-written user text) never supports a prompt.
-fn reconcile_prompts(conn: &Connection, source: &str, sid: &str, keep: &str) -> Result<()> {
+pub(crate) fn reconcile_prompts(
+    conn: &Connection,
+    source: &str,
+    sid: &str,
+    keep: &str,
+) -> Result<()> {
     // `+e.source` keeps the planner on the timestamp index: without
     // statistics it would otherwise walk every event of the source to
     // satisfy the GROUP BY, once per prompt row.
