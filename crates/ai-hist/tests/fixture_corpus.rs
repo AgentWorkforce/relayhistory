@@ -524,7 +524,7 @@ fn redact_provider_root(value: Value, prefix: &str, replacement: &str) -> Value 
 #[test]
 fn default_provider_fixture_paths_are_portable() {
     let home = tempfile::tempdir().unwrap();
-    assert!(provider_default_root("cortex", home.path()).starts_with(home.path()));
+    assert!(provider_default_root("hermes", home.path()).starts_with(home.path()));
     for prefix in [
         "<home>/.local/share/goose",
         "<home>/AppData/Roaming/Block/goose/data",
