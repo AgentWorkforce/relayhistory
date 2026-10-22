@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -88,4 +89,30 @@ test('population declarations reject unknown evidence and accounting', t => {
 test('sandbox ignores non-JSON descriptor-directory documentation',t=>{
   const root=sandbox(t,true);
   assert.ok(descriptors(root).length);
+});
+
+// Compile the generated ordinal tables against distinct metadata sentinels.
+// Both cfg modes matter: a test-only variant must not shift production entries.
+test('source names, aliases and metadata agree with enum ordinals in both cfg modes', t => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'history-source-tables-'));
+  t.after(() => fs.rmSync(dir, {recursive:true, force:true}));
+  const items = descriptors();
+  const generated = outputs().get('crates/ai-hist/src/session_store/generated_sources.rs')
+    .replace('use serde::{Deserialize, Serialize};', '')
+    .replace(', Serialize, Deserialize', '')
+    .replace(/    #\[serde\(rename = "[^"\n]+"\)\]\n/g, '');
+  const providers = items.map((item, index) =>
+    `pub mod ${item.rust_id} { pub const METADATA: super::ProviderMetadata = super::ProviderMetadata(${index}); }`).join('\n');
+  for (const testMode of [false, true]) {
+    const assertions = items.filter(item => testMode || !item.testOnly).flatMap((item) => [
+      `assert_eq!(Source::${item.variant}.as_str(), ${JSON.stringify(item.id)});`,
+      `assert_eq!(Source::${item.variant}.metadata().0, ${items.indexOf(item)});`,
+      ...[item.id, ...item.aliases].map(name => `assert_eq!(Source::parse(${JSON.stringify(name)}), Some(Source::${item.variant}));`),
+    ]).join('\n');
+    const input = path.join(dir, 'main.rs');
+    const binary = path.join(dir, (testMode ? 'with-test-source' : 'production') + (process.platform === 'win32' ? '.exe' : ''));
+    fs.writeFileSync(input, `mod providers { pub struct ProviderMetadata(pub usize); ${providers} }\n${generated}\nfn main() { ${assertions} assert_eq!(Source::parse("unknown-source"), None); }`);
+    execFileSync('rustc', ['--edition', '2021', '--cap-lints', 'allow', ...(testMode ? ['--cfg', 'test'] : []), input, '-o', binary]);
+    execFileSync(binary);
+  }
 });

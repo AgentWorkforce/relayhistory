@@ -4,6 +4,7 @@ pub(crate) mod claude;
 pub(crate) mod codebuddy;
 pub(crate) mod codex;
 pub(crate) mod copilot;
+pub(crate) mod cortex;
 pub(crate) mod cursor;
 pub(crate) mod devin;
 pub(crate) mod grok;

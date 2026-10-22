@@ -1,0 +1,31 @@
+{
+  "id": "cortex",
+  "rust_id": "cortex",
+  "variant": "Cortex",
+  "order": 440,
+  "aliases": [],
+  "fixtures": [
+    {
+      "source": "cortex",
+      "name": "native",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": ["cortex/native"],
+      "quirk": "Official Cortex Code CLI 1.2.18 native writer merged, flat, rewritten, zero-byte empty sidecar and untimed sessions; raw native restart-reader oracles for IDs, order and content."
+    }
+  ],
+  "capture": [
+    {
+      "evidence": "Messages and identity",
+      "coverage": "Cortex Code CLI 1.2.18 local conversation snapshots and JSONL sidecars; persisted native session/message IDs, recorded timestamps when present, working directory, title, model and text. Missing native timestamps use a marked inference."
+    },
+    {
+      "evidence": "Tools and control",
+      "coverage": "Nested tool-use and tool-result records joined by persisted tool_use_id and status; unsupported blocks remain markers. Per-message billable usage, file edits and child relationships are not claimed."
+    }
+  ],
+  "population": {
+    "evidence": ["history", "session_event", "tool_call", "session_marker"],
+    "usage_accounting": "none"
+  }
+}

@@ -1,0 +1,25 @@
+[
+  {
+    "role": "user",
+    "id": "timed-user",
+    "content": [
+      {
+        "type": "text",
+        "text": "Keep both messages",
+        "is_user_prompt": true,
+        "message_id": "timed-user"
+      }
+    ]
+  },
+  {
+    "role": "assistant",
+    "id": "untimed-answer",
+    "content": [
+      {
+        "type": "text",
+        "text": "Both retained.",
+        "message_id": "untimed-answer"
+      }
+    ]
+  }
+]

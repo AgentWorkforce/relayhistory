@@ -1,0 +1,14 @@
+[
+  {
+    "role": "user",
+    "id": "rewrite-user",
+    "content": [
+      {
+        "type": "text",
+        "text": "Keep this",
+        "is_user_prompt": true,
+        "message_id": "rewrite-user"
+      }
+    ]
+  }
+]
