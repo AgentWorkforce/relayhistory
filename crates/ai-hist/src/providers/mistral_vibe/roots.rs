@@ -42,10 +42,11 @@ fn absolute(home: &Path, path: PathBuf) -> Result<PathBuf> {
     } else {
         path
     };
-    if path.is_absolute() {
-        return Ok(path);
-    }
-    Ok(std::env::current_dir()?.join(path))
+    anyhow::ensure!(
+        path.is_absolute(),
+        "relative Vibe roots depend on the Vibe process working directory; pass an explicit absolute provider root"
+    );
+    Ok(path)
 }
 
 pub(super) fn identity(roots: &ProviderRoots, path: &Path) -> Result<(String, String)> {

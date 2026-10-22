@@ -152,7 +152,7 @@
       "text": "A synthetic README",
       "token_json": null,
       "tool_use_id": "effect-action-1",
-      "ts_ms": 1792609201000
+      "ts_ms": 1792609201250
     },
     {
       "agent_id": null,
@@ -234,7 +234,7 @@
       "repo_url": null,
       "session_id": "vibe-synthetic-001",
       "source": "mistral-vibe",
-      "source_stamp": "mistral_vibe_unified_v1_minor9_v1:sha256:f7c629c5fe0b9073fa20e5b542beeb1be7e07c1fa878d75c83d1fb65920fdc2f",
+      "source_stamp": "mistral_vibe_unified_v1_minor9_v1:sha256:25b2c746d0f01b56194dccc269e9d51e0ac33d3210ef38d229bce7d46de3abd8",
       "title": "Synthetic Vibe session",
       "workspace_roots_json": null
     }

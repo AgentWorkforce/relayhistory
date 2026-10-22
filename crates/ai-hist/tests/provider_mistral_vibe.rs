@@ -152,6 +152,68 @@ fn root_is_empty_until_a_real_unified_store_is_present() {
 }
 
 #[test]
+fn absolute_save_dir_precedes_vibe_home_and_from_home_ignores_overrides() {
+    const CHILD: &str = "RH_VIBE_ROOT_PROOF_CHILD";
+    if let Some(home) = std::env::var_os(CHILD) {
+        let home = PathBuf::from(home);
+        let env_store = SessionStore::open(
+            StoreOptions::default()
+                .db_path(home.join("environment.db"))
+                .roots(ProviderRoots::from_env(home.clone())),
+        )
+        .unwrap();
+        assert_eq!(
+            env_store
+                .discover(DiscoveryOptions::default().sources([Source::MistralVibe]))
+                .unwrap()
+                .discovered,
+            1,
+            "absolute save_dir overrides VIBE_HOME"
+        );
+        let home_store = open(&home);
+        assert_eq!(
+            home_store
+                .discover(DiscoveryOptions::default().sources([Source::MistralVibe]))
+                .unwrap()
+                .discovered,
+            0,
+            "from_home must ignore ambient Vibe overrides"
+        );
+        std::env::set_var("VIBE_SESSION_LOGGING__SAVE_DIR", "relative-session-logs");
+        let relative = SessionStore::open(
+            StoreOptions::default()
+                .db_path(home.join("relative.db"))
+                .roots(ProviderRoots::from_env(home.clone())),
+        )
+        .unwrap();
+        assert!(relative
+            .discover(DiscoveryOptions::default().sources([Source::MistralVibe]))
+            .is_err());
+        return;
+    }
+    let home = tempfile::tempdir().unwrap();
+    let save_dir = home.path().join("configured-logs");
+    let source = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/mistral-vibe/fixture-home/.vibe/logs/session/unified");
+    copy_tree(&source, &save_dir.join("unified"));
+    let result = std::process::Command::new(std::env::current_exe().unwrap())
+        .arg("--exact")
+        .arg("absolute_save_dir_precedes_vibe_home_and_from_home_ignores_overrides")
+        .arg("--nocapture")
+        .env(CHILD, home.path())
+        .env("VIBE_HOME", home.path().join("other-vibe-home"))
+        .env("VIBE_SESSION_LOGGING__SAVE_DIR", save_dir)
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&result.stdout),
+        String::from_utf8_lossy(&result.stderr)
+    );
+}
+
+#[test]
 fn native_generation_rewrite_retires_old_local_evidence() {
     let home = tempfile::tempdir().unwrap();
     let current = stage(home.path());
@@ -421,4 +483,136 @@ fn native_deletion_preserves_remote_catalog_after_locator_changes() {
     let remaining = evidence(&store);
     assert!(remaining.messages.is_empty());
     assert!(remaining.tool_calls.is_empty());
+}
+
+#[cfg(feature = "export")]
+#[test]
+fn native_export_remote_intake_preserves_evidence_on_local_order_conflict() {
+    use ai_hist::export::{ExportLimits, ExportSelection, ExportSnapshot};
+    use ai_hist::{
+        EvidenceKind, EvidenceRecord, NormalizedSourceEvidence, ObservationKey,
+        SourceEvidenceSubmission,
+    };
+    let origin = tempfile::tempdir().unwrap();
+    stage(origin.path());
+    let source = open(origin.path());
+    source
+        .discover(DiscoveryOptions::default().sources([Source::MistralVibe]))
+        .unwrap();
+    source
+        .hydrate(
+            &SessionRef::id(Source::MistralVibe, SID),
+            HydrateOptions::default(),
+        )
+        .unwrap();
+    let kinds = vec![
+        EvidenceKind::SessionEvent,
+        EvidenceKind::SessionMarker,
+        EvidenceKind::ToolCall,
+    ];
+    let mut snapshot = ExportSnapshot::open(
+        rusqlite::Connection::open(origin.path().join("vibe.db")).unwrap(),
+        &ExportSelection {
+            sources: vec!["mistral-vibe".into()],
+            kinds: kinds.iter().map(|kind| kind.as_str().into()).collect(),
+            ..Default::default()
+        },
+        &ExportLimits::default(),
+        60_000,
+        1_000,
+    )
+    .unwrap();
+    let mut cursor = Some(snapshot.handle().cursor);
+    let mut records = Vec::new();
+    while let Some(value) = cursor {
+        let page = snapshot.page(&value, 1_000).unwrap();
+        cursor = page.next_cursor;
+        for record in page.records {
+            let mut payload = record.payload.as_object().unwrap().clone();
+            payload.remove("id");
+            payload.remove("location");
+            records.push(EvidenceRecord {
+                kind: serde_json::from_value(serde_json::json!(record.kind)).unwrap(),
+                payload,
+                record_id: Some(record.record_id),
+                revision_id: Some(record.revision_id),
+            });
+        }
+    }
+    assert!(records
+        .iter()
+        .any(|record| record.kind == EvidenceKind::ToolCall));
+    let receiver = tempfile::tempdir().unwrap();
+    let store = open(receiver.path());
+    let key = ObservationKey {
+        source: "mistral-vibe".into(),
+        session_id: SID.into(),
+        location: SessionLocation::Remote,
+        connector_id: "fixture-remote".into(),
+        connector_instance: "default".into(),
+    };
+    store
+        .apply_source_observations(SourceObservationBatch::new(
+            "fixture-remote",
+            "default",
+            SessionLocation::Remote,
+            vec![SourceObservation {
+                session: ShallowSession {
+                    source: "mistral-vibe".into(),
+                    session_id: SID.into(),
+                    source_stamp: Some("remote-vibe-fixture".into()),
+                    ..Default::default()
+                },
+                raw_locator: None,
+            }],
+        ))
+        .unwrap();
+    let revision = store.source_observation(&key).unwrap().revision.unwrap();
+    store
+        .apply_source_evidence(
+            SourceEvidenceSubmission::new(
+                key,
+                revision,
+                NormalizedSourceEvidence {
+                    source_stamp: "remote-vibe-fixture".into(),
+                    source_bytes: 1,
+                    covered_kinds: kinds,
+                    records,
+                },
+            )
+            .include_related(false),
+        )
+        .unwrap();
+    let remote = evidence(&store);
+    assert_eq!(remote.tool_calls[0].tool_use_id, "effect-action-1");
+    let event_ids = |read: &ai_hist::SessionEvidence| {
+        read.messages
+            .iter()
+            .flat_map(|message| &message.blocks)
+            .map(|block| block.event_uid.clone())
+            .collect::<std::collections::BTreeSet<_>>()
+    };
+    assert_eq!(event_ids(&remote), event_ids(&evidence(&source)));
+    assert_eq!(remote.tool_calls, evidence(&source).tool_calls);
+    stage(receiver.path());
+    store
+        .discover(DiscoveryOptions::default().sources([Source::MistralVibe]))
+        .unwrap();
+    // Shared transport does not yet persist native same-ms order (#532).
+    // A remote-first import must keep its complete accepted snapshot rather
+    // than silently replace it with a reordered local projection.
+    for _ in 0..2 {
+        let error = store
+            .hydrate(
+                &SessionRef::id(Source::MistralVibe, SID),
+                HydrateOptions::default(),
+            )
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("FILE_HISTORY_SHARED_ORDER_CONFLICT"));
+        let after = evidence(&store);
+        assert_eq!(after.messages, remote.messages);
+        assert_eq!(after.tool_calls, remote.tool_calls);
+    }
 }

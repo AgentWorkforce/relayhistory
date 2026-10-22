@@ -274,6 +274,80 @@ fn apply_delta(state: &mut Value, delta: &Value) -> Result<()> {
     Ok(())
 }
 
+fn load_generation(
+    context: &AcquisitionContext<'_>,
+    session: &Path,
+    base: &Path,
+    manifest: &Value,
+    native: &str,
+    paths: &mut Vec<(PathBuf, i64)>,
+) -> Result<(Value, Value, u64)> {
+    // The native loader validates every referenced document and transcript,
+    // including checkpoint and pooled runtime chunks, before publishing a
+    // generation. Mirror that boundary even though only the projection is
+    // normalized into RelayHistory evidence.
+    let (checkpoint, _) = descriptor(
+        context,
+        &base,
+        &manifest["checkpoint"],
+        "checkpoint.json",
+        paths,
+    )?;
+    anyhow::ensure!(
+        checkpoint["checkpoint_version"] == manifest["checkpoint"]["checkpoint_version"],
+        "VIBE_CHECKPOINT_VERSION_MISMATCH"
+    );
+    if !manifest["checkpoint"]["chunks"].is_null() {
+        chunks(context, session, &manifest["checkpoint"]["chunks"], paths)?;
+    }
+    let (projection, _) = descriptor(
+        context,
+        &base,
+        &manifest["projection_state"],
+        "projection-state.json",
+        paths,
+    )?;
+    let (runtime, _) = descriptor(
+        context,
+        &base,
+        &manifest["runtime_state"],
+        "runtime-state.json",
+        paths,
+    )?;
+    if !manifest["runtime_state"]["chunks"].is_null() {
+        chunks(
+            context,
+            session,
+            &manifest["runtime_state"]["chunks"],
+            paths,
+        )?;
+    }
+    anyhow::ensure!(
+        projection["session_id"] == native && runtime["session_id"] == native,
+        "VIBE_STATE_ID_MISMATCH"
+    );
+    let mut state = projection["snapshot"].clone();
+    if !manifest["projection_state"]["chunks"].is_null() {
+        let (entries, _) = chunks(
+            context,
+            session,
+            &manifest["projection_state"]["chunks"],
+            paths,
+        )?;
+        anyhow::ensure!(
+            state["history"]["entries"]
+                .as_array()
+                .is_some_and(Vec::is_empty),
+            "VIBE_INVALID_PROJECTION_ENVELOPE"
+        );
+        state["history"]["entries"] = Value::Array(entries);
+    }
+    let watermark = projection["watermark"]
+        .as_u64()
+        .context("VIBE_INVALID_WATERMARK")?;
+    Ok((state, runtime, watermark))
+}
+
 pub(super) fn capture(path: &Path, context: &AcquisitionContext<'_>) -> Result<AcquiredSession> {
     let mut last = None;
     for _ in 0..2 {
@@ -321,71 +395,8 @@ fn capture_once(path: &Path, context: &AcquisitionContext<'_>) -> Result<Acquire
         manifest["snapshot_sequence"] == current["snapshot_sequence"],
         "VIBE_MANIFEST_SEQUENCE_MISMATCH"
     );
-    // The native loader validates every referenced document and transcript,
-    // including checkpoint and pooled runtime chunks, before publishing a
-    // generation. Mirror that boundary even though only the projection is
-    // normalized into RelayHistory evidence.
-    let (checkpoint, _) = descriptor(
-        context,
-        &base,
-        &manifest["checkpoint"],
-        "checkpoint.json",
-        &mut paths,
-    )?;
-    anyhow::ensure!(
-        checkpoint["checkpoint_version"] == manifest["checkpoint"]["checkpoint_version"],
-        "VIBE_CHECKPOINT_VERSION_MISMATCH"
-    );
-    if !manifest["checkpoint"]["chunks"].is_null() {
-        chunks(
-            context,
-            session,
-            &manifest["checkpoint"]["chunks"],
-            &mut paths,
-        )?;
-    }
-    let (projection, _) = descriptor(
-        context,
-        &base,
-        &manifest["projection_state"],
-        "projection-state.json",
-        &mut paths,
-    )?;
-    let (mut runtime, _) = descriptor(
-        context,
-        &base,
-        &manifest["runtime_state"],
-        "runtime-state.json",
-        &mut paths,
-    )?;
-    if !manifest["runtime_state"]["chunks"].is_null() {
-        chunks(
-            context,
-            session,
-            &manifest["runtime_state"]["chunks"],
-            &mut paths,
-        )?;
-    }
-    anyhow::ensure!(
-        projection["session_id"] == native && runtime["session_id"] == native,
-        "VIBE_STATE_ID_MISMATCH"
-    );
-    let mut state = projection["snapshot"].clone();
-    if !manifest["projection_state"]["chunks"].is_null() {
-        let (entries, _) = chunks(
-            context,
-            session,
-            &manifest["projection_state"]["chunks"],
-            &mut paths,
-        )?;
-        anyhow::ensure!(
-            state["history"]["entries"]
-                .as_array()
-                .is_some_and(Vec::is_empty),
-            "VIBE_INVALID_PROJECTION_ENVELOPE"
-        );
-        state["history"]["entries"] = Value::Array(entries);
-    }
+    let (mut state, mut runtime, watermark) =
+        load_generation(context, session, &base, &manifest, &native, &mut paths)?;
     let journal_name = required(&manifest["recovery_journal_segment"], "path")?;
     let first_journal_sequence = current["snapshot_sequence"]
         .as_u64()
@@ -408,9 +419,7 @@ fn capture_once(path: &Path, context: &AcquisitionContext<'_>) -> Result<Acquire
         first_journal_sequence,
         &mut state,
         &mut runtime,
-        projection["watermark"]
-            .as_u64()
-            .context("VIBE_INVALID_WATERMARK")?,
+        watermark,
     )?;
     anyhow::ensure!(!partial, "VIBE_PARTIAL_JOURNAL: incomplete final record");
     let after = bounded_read(context, path, 16 * 1024)?;

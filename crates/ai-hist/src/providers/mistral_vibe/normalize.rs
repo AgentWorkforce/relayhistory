@@ -234,6 +234,132 @@ fn effect(
     Ok(())
 }
 
+struct Projection {
+    keys: Keys,
+    order: Vec<(i64, String)>,
+    first_prompt: Option<String>,
+    last_assistant: Option<String>,
+    first: i64,
+    last: i64,
+    prompts: usize,
+}
+
+fn write_entry(
+    conn: &Connection,
+    sid: &str,
+    cwd: Option<&str>,
+    entry: &Value,
+    projection: &mut Projection,
+) -> Result<()> {
+    if let Some(ts) = entry["createdAt"].as_i64() {
+        projection.first = projection.first.min(ts);
+        projection.last = projection.last.max(ts);
+    }
+    if let Some(ts) = entry["updatedAt"].as_i64() {
+        projection.last = projection.last.max(ts);
+    }
+    if entry["type"] == "message" {
+        if let Some(desired) = event(conn, sid, cwd, entry, &mut projection.keys, false)? {
+            projection.order.push(desired);
+        }
+        let content = text(entry);
+        if entry["role"] == "user" && !content.trim().is_empty() {
+            projection.prompts += 1;
+            if projection.first_prompt.is_none() {
+                projection.first_prompt = Some(content.chars().take(4096).collect());
+            }
+        } else if entry["role"] == "assistant" && !content.trim().is_empty() {
+            projection.last_assistant = Some(content);
+        }
+    } else if entry["type"] == "effect" && entry["detail"]["kind"] == "tool" {
+        effect(
+            conn,
+            sid,
+            cwd,
+            entry,
+            &mut projection.keys,
+            &mut projection.order,
+            None,
+        )?;
+        if matches!(
+            entry["state"]["status"].as_str(),
+            Some("skipped" | "cancelled")
+        ) {
+            marker(conn, sid, entry, &mut projection.keys)?;
+        }
+    } else {
+        marker(conn, sid, entry, &mut projection.keys)?;
+    }
+    Ok(())
+}
+
+fn project_entries(
+    conn: &Connection,
+    sid: &str,
+    cwd: Option<&str>,
+    state: &Value,
+    entries: &[Value],
+) -> Result<Projection> {
+    let mut projection = Projection {
+        keys: Keys::default(),
+        order: Vec::new(),
+        first_prompt: None,
+        last_assistant: None,
+        first: state["session"]["createdAt"].as_i64().unwrap_or(i64::MAX),
+        last: state["session"]["updatedAt"].as_i64().unwrap_or(i64::MIN),
+        prompts: 0,
+    };
+    let mut native_ids = std::collections::HashSet::new();
+    for entry in entries {
+        let id = entry["id"]
+            .as_str()
+            .filter(|id| !id.is_empty())
+            .context("VIBE_INVALID_ENTRY_ID")?;
+        anyhow::ensure!(native_ids.insert(id), "VIBE_DUPLICATE_ENTRY_ID");
+        crate::ingest::check_capture_cancelled()?;
+        write_entry(conn, sid, cwd, entry, &mut projection)?;
+    }
+    Ok(projection)
+}
+
+fn replay_order(
+    conn: &Connection,
+    sid: &str,
+    cwd: Option<&str>,
+    entries: &[Value],
+    projection: &mut Projection,
+) -> Result<()> {
+    let reordered = file_history::reconcile_event_order(conn, ID, sid, &projection.order)?;
+    for entry in entries {
+        if entry["type"] == "message"
+            && entry["createdAt"]
+                .as_i64()
+                .is_some_and(|ts| reordered.contains(&ts))
+        {
+            event(conn, sid, cwd, entry, &mut projection.keys, true)?;
+        } else if entry["type"] == "effect"
+            && entry["detail"]["kind"] == "tool"
+            && (entry["createdAt"]
+                .as_i64()
+                .is_some_and(|ts| reordered.contains(&ts))
+                || entry["updatedAt"]
+                    .as_i64()
+                    .is_some_and(|ts| reordered.contains(&ts)))
+        {
+            effect(
+                conn,
+                sid,
+                cwd,
+                entry,
+                &mut projection.keys,
+                &mut projection.order,
+                Some(&reordered),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn write(conn: &Connection, payload: &Value) -> Result<usize> {
     let sid = payload["sid"]
         .as_str()
@@ -252,85 +378,11 @@ pub(super) fn write(conn: &Connection, payload: &Value) -> Result<usize> {
         .as_array()
         .context("VIBE_INVALID_HISTORY")?;
     let cwd = payload["runtime"]["session_metadata"]["cwd"].as_str();
-    let title = state["session"]["title"].as_str();
     let shared = Snapshot::capture(conn, ID, sid)?;
-    let mut keys = Keys::default();
-    let mut order = Vec::new();
-    let mut first_prompt = None;
-    let mut last_assistant = None;
-    let mut first = state["session"]["createdAt"].as_i64().unwrap_or(i64::MAX);
-    let mut last = state["session"]["updatedAt"].as_i64().unwrap_or(i64::MIN);
-    let mut prompts = 0;
-    let mut native_ids = std::collections::HashSet::new();
-    for entry in entries {
-        let id = entry["id"]
-            .as_str()
-            .filter(|id| !id.is_empty())
-            .context("VIBE_INVALID_ENTRY_ID")?;
-        anyhow::ensure!(native_ids.insert(id), "VIBE_DUPLICATE_ENTRY_ID");
-        crate::ingest::check_capture_cancelled()?;
-        if let Some(ts) = entry["createdAt"].as_i64() {
-            first = first.min(ts);
-            last = last.max(ts);
-        }
-        if let Some(ts) = entry["updatedAt"].as_i64() {
-            last = last.max(ts);
-        }
-        if entry["type"] == "message" {
-            if let Some(desired) = event(conn, sid, cwd, entry, &mut keys, false)? {
-                order.push(desired);
-            }
-            let content = text(entry);
-            if entry["role"] == "user" && !content.trim().is_empty() {
-                prompts += 1;
-                if first_prompt.is_none() {
-                    first_prompt = Some(content.chars().take(4096).collect::<String>());
-                }
-            } else if entry["role"] == "assistant" && !content.trim().is_empty() {
-                last_assistant = Some(content);
-            }
-        } else if entry["type"] == "effect" && entry["detail"]["kind"] == "tool" {
-            effect(conn, sid, cwd, entry, &mut keys, &mut order, None)?;
-            if matches!(
-                entry["state"]["status"].as_str(),
-                Some("skipped" | "cancelled")
-            ) {
-                marker(conn, sid, entry, &mut keys)?;
-            }
-        } else {
-            marker(conn, sid, entry, &mut keys)?;
-        }
-    }
-    file_history::retire(conn, ID, sid, &keys)?;
+    let mut projection = project_entries(conn, sid, cwd, state, entries)?;
+    file_history::retire(conn, ID, sid, &projection.keys)?;
     file_history::retire_locator_sessions(conn, ID, path, Some(sid))?;
-    let reordered = file_history::reconcile_event_order(conn, ID, sid, &order)?;
-    for entry in entries {
-        if entry["type"] == "message"
-            && entry["createdAt"]
-                .as_i64()
-                .is_some_and(|ts| reordered.contains(&ts))
-        {
-            event(conn, sid, cwd, entry, &mut keys, true)?;
-        } else if entry["type"] == "effect"
-            && entry["detail"]["kind"] == "tool"
-            && (entry["createdAt"]
-                .as_i64()
-                .is_some_and(|ts| reordered.contains(&ts))
-                || entry["updatedAt"]
-                    .as_i64()
-                    .is_some_and(|ts| reordered.contains(&ts)))
-        {
-            effect(
-                conn,
-                sid,
-                cwd,
-                entry,
-                &mut keys,
-                &mut order,
-                Some(&reordered),
-            )?;
-        }
-    }
+    replay_order(conn, sid, cwd, entries, &mut projection)?;
     upsert_session_rebuilt(
         conn,
         &SessionCatalogRow {
@@ -338,15 +390,19 @@ pub(super) fn write(conn: &Connection, payload: &Value) -> Result<usize> {
             session_id: sid,
             cwd,
             git_branch: None,
-            first_ts: (first != i64::MAX).then_some(first).unwrap_or(0),
-            last_ts: (last != i64::MIN).then_some(last).unwrap_or(0),
-            last_assistant_text: last_assistant.as_deref(),
+            first_ts: (projection.first != i64::MAX)
+                .then_some(projection.first)
+                .unwrap_or(0),
+            last_ts: (projection.last != i64::MIN)
+                .then_some(projection.last)
+                .unwrap_or(0),
+            last_assistant_text: projection.last_assistant.as_deref(),
             raw_path: Some(&path.to_string_lossy()),
         },
     )?;
     conn.execute("UPDATE sessions SET first_prompt=?3 WHERE source=?1 AND session_id=?2 AND first_prompt IS NOT ?3",
-        rusqlite::params![ID, sid, first_prompt])?;
-    crate::ingest::titles::set_session_title(conn, ID, sid, title)?;
+        rusqlite::params![ID, sid, projection.first_prompt])?;
+    crate::ingest::titles::set_session_title(conn, ID, sid, state["session"]["title"].as_str())?;
     shared.ensure_unchanged(conn, sid)?;
-    Ok(prompts)
+    Ok(projection.prompts)
 }
