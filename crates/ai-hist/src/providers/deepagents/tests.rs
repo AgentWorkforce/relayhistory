@@ -121,6 +121,38 @@ fn native_writer_and_official_inspector_agree_on_all_four_threads() {
     }
 }
 #[test]
+fn current_delta_checkpoint_time_drives_discovery_and_shallow_recency() {
+    let (home, roots, path, _db) = fixture();
+    let full = storage::all(&AcquisitionContext::new(ID, &roots), &path)
+        .unwrap()
+        .sessions;
+    let graph = full.iter().find(|s| s.native_id.ends_with("446")).unwrap();
+    let candidates = storage::enumerate(&roots, None).unwrap();
+    let graph_candidate = candidates
+        .iter()
+        .find(|candidate| candidate.session_id.as_deref() == Some(graph.id.as_str()))
+        .unwrap();
+    assert_eq!(graph_candidate.recency_hint_ms, Some(graph.latest));
+    let store = crate::SessionStore::open(
+        crate::StoreOptions::default()
+            .db_path(home.path().join("catalog.db"))
+            .roots(roots),
+    )
+    .unwrap();
+    store
+        .discover(crate::DiscoveryOptions::default().sources([crate::Source::DeepAgents]))
+        .unwrap();
+    let conn = Connection::open(store.db_path()).unwrap();
+    let shallow: i64 = conn
+        .query_row(
+            "SELECT last_activity_ms FROM sessions WHERE source='deepagents' AND session_id=?1",
+            [&graph.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(shallow, graph.latest);
+}
+#[test]
 fn wal_only_write_and_revision_change_selected_capture_without_source_write() {
     let (_home, roots, path, db) = fixture();
     db.execute_batch("PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0")
@@ -155,11 +187,27 @@ fn malformed_sibling_isolated_and_no_absence_reconciliation() {
     for s in &before.sessions {
         normalize::session(&ledger, s, &path).unwrap();
     }
-    db.execute(
-        "UPDATE writes SET type='pickle' WHERE thread_id LIKE '%445'",
-        [],
-    )
-    .unwrap();
+    let native = rmpv::Value::Array(vec![
+        rmpv::Value::from("langchain_core.messages.tool"),
+        rmpv::Value::from("ToolMessage"),
+        rmpv::Value::Map(vec![
+            (
+                rmpv::Value::from("id"),
+                rmpv::Value::from("bad-tool-result"),
+            ),
+            (rmpv::Value::from("content"), rmpv::Value::from("result")),
+            (
+                rmpv::Value::from("tool_call_id"),
+                rmpv::Value::from("x".repeat(1025)),
+            ),
+        ]),
+        rmpv::Value::from("model_validate_json"),
+    ]);
+    let mut inner = Vec::new();
+    rmpv::encode::write_value(&mut inner, &native).unwrap();
+    let mut encoded = Vec::new();
+    rmpv::encode::write_value(&mut encoded, &rmpv::Value::Ext(5, inner)).unwrap();
+    db.execute("UPDATE writes SET value=?1 WHERE rowid=(SELECT rowid FROM writes WHERE thread_id LIKE '%445' AND channel='messages' LIMIT 1)", params![encoded]).unwrap();
     let after = storage::all(&AcquisitionContext::new(ID, &roots), &path).unwrap();
     assert_eq!(after.unread, 1);
     assert_eq!(after.sessions.len(), 3);
@@ -180,6 +228,21 @@ fn oversized_native_tool_arguments_keep_identity_and_export_all_evidence() {
         .into_iter()
         .find(|s| s.native_id.ends_with("443"))
         .unwrap();
+    let mut large_text = Vec::new();
+    for role in ["user", "assistant", "tool"] {
+        let message = session
+            .messages
+            .iter_mut()
+            .rev()
+            .find(|m| m.role == role)
+            .unwrap();
+        message.content = format!("deepagents-{role}-needle {}", "\"".repeat(2 * 1024 * 1024));
+        large_text.push((
+            message.id.clone(),
+            role,
+            format!("{:x}", Sha256::digest(message.content.as_bytes())),
+        ));
+    }
     let call = session
         .messages
         .iter_mut()
@@ -196,6 +259,42 @@ fn oversized_native_tool_arguments_keep_identity_and_export_all_evidence() {
     let ledger_path = home.path().join("ledger.db");
     let ledger = crate::open_db(&ledger_path).unwrap();
     normalize::session(&ledger, &session, &path).unwrap();
+    for (message_id, role, hash) in &large_text {
+        let kind = if *role == "tool" {
+            "tool_result"
+        } else {
+            "text"
+        };
+        let text: String = ledger
+            .query_row(
+                "SELECT text FROM session_events WHERE source=?1 AND session_id=?2 AND message_id=?3 AND kind=?4",
+                params![ID, session.id, message_id, kind],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(text.len() < 40 * 1024, "{role} event is bounded");
+        assert!(text.starts_with(&format!("deepagents-{role}-needle")));
+        assert!(text.contains(hash));
+        assert!(text.contains("native text truncated"));
+    }
+    let prompt: String = ledger
+        .query_row(
+            "SELECT prompt FROM history WHERE source=?1 AND session_id=?2 ORDER BY id DESC LIMIT 1",
+            params![ID, session.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(prompt.len() < 40 * 1024);
+    assert!(prompt.contains(&large_text[0].2));
+    let summary: String = ledger
+        .query_row(
+            "SELECT last_assistant_text FROM sessions WHERE source=?1 AND session_id=?2",
+            params![ID, session.id],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(summary.len() < 40 * 1024);
+    assert!(summary.contains(&large_text[1].2));
     let arguments: String = ledger
         .query_row(
             "SELECT args_json FROM tool_calls WHERE source=?1 AND session_id=?2 AND tool_use_id=?3",
@@ -260,6 +359,165 @@ fn oversized_native_tool_arguments_keep_identity_and_export_all_evidence() {
             .map(str::to_owned)
             .collect()
     );
+}
+#[test]
+fn native_tool_status_rewrites_and_removal_clear_only_local_call_state() {
+    let (home, roots, path, _db) = fixture();
+    let mut session = storage::all(&AcquisitionContext::new(ID, &roots), &path)
+        .unwrap()
+        .sessions
+        .into_iter()
+        .find(|s| s.native_id.ends_with("443"))
+        .unwrap();
+    let ledger = crate::open_db(&home.path().join("ledger.db")).unwrap();
+    let status = |conn: &Connection| -> Option<i64> {
+        conn.query_row(
+            "SELECT is_error FROM tool_calls WHERE source='deepagents' AND tool_use_id='call-1'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    let result = session
+        .messages
+        .iter_mut()
+        .find(|m| m.role == "tool")
+        .unwrap();
+    result.status = Some("error".into());
+    normalize::session(&ledger, &session, &path).unwrap();
+    assert_eq!(status(&ledger), Some(1));
+    session
+        .messages
+        .iter_mut()
+        .find(|m| m.role == "tool")
+        .unwrap()
+        .status = Some("success".into());
+    normalize::session(&ledger, &session, &path).unwrap();
+    assert_eq!(status(&ledger), Some(0));
+    session
+        .messages
+        .iter_mut()
+        .find(|m| m.role == "tool")
+        .unwrap()
+        .status = None;
+    normalize::session(&ledger, &session, &path).unwrap();
+    assert_eq!(status(&ledger), None);
+    session.messages.retain(|m| m.role != "tool");
+    normalize::session(&ledger, &session, &path).unwrap();
+    assert_eq!(status(&ledger), None);
+}
+#[test]
+fn conclusive_native_tool_status_conflicts_with_remote_backed_outcome() {
+    let (home, roots, path, _db) = fixture();
+    let mut session = storage::all(&AcquisitionContext::new(ID, &roots), &path)
+        .unwrap()
+        .sessions
+        .into_iter()
+        .find(|s| s.native_id.ends_with("443"))
+        .unwrap();
+    let ledger = crate::open_db(&home.path().join("ledger.db")).unwrap();
+    normalize::session(&ledger, &session, &path).unwrap();
+    ledger.execute(
+        "UPDATE tool_calls SET location='both' WHERE source='deepagents' AND session_id=?1 AND tool_use_id='call-1'",
+        [&session.id],
+    ).unwrap();
+    // Native success matches the remote-backed value and remains idempotent.
+    normalize::session(&ledger, &session, &path).unwrap();
+    session
+        .messages
+        .iter_mut()
+        .find(|m| m.role == "tool")
+        .unwrap()
+        .status = Some("error".into());
+    assert!(normalize::session(&ledger, &session, &path).is_err());
+    let (status, location): (Option<i64>, String) = ledger.query_row(
+        "SELECT is_error,location FROM tool_calls WHERE source='deepagents' AND session_id=?1 AND tool_use_id='call-1'",
+        [&session.id], |r| Ok((r.get(0)?, r.get(1)?)),
+    ).unwrap();
+    assert_eq!((status, location.as_str()), (Some(0), "both"));
+}
+#[cfg(feature = "export")]
+#[test]
+fn equal_time_repeated_prompts_keep_distinct_native_events_and_export() {
+    use crate::export::{ExportLimits, ExportSelection, ExportSnapshot, SessionIdentity};
+    let (home, roots, path, _db) = fixture();
+    let mut session = storage::all(&AcquisitionContext::new(ID, &roots), &path)
+        .unwrap()
+        .sessions
+        .into_iter()
+        .find(|s| s.native_id.ends_with("443"))
+        .unwrap();
+    for message in session.messages.iter_mut().filter(|m| m.role == "user") {
+        message.content = "retry native prompt".into();
+    }
+    let ledger_path = home.path().join("ledger.db");
+    let ledger = crate::open_db(&ledger_path).unwrap();
+    normalize::session(&ledger, &session, &path).unwrap();
+    let mut statement = ledger.prepare("SELECT message_id FROM session_events WHERE source='deepagents' AND session_id=?1 AND role='user' AND text='retry native prompt' ORDER BY id").unwrap();
+    let native_ids: Vec<String> = statement
+        .query_map([&session.id], |r| r.get(0))
+        .unwrap()
+        .map(Result::unwrap)
+        .collect();
+    assert_eq!(native_ids, ["human-1", "human-2"]);
+    let history_count: i64 = ledger.query_row("SELECT count(*) FROM history WHERE source='deepagents' AND session_id=?1 AND prompt='retry native prompt'", [&session.id], |r| r.get(0)).unwrap();
+    assert_eq!(history_count, 1, "shared history uniqueness collapses equal-time identical prompts; event evidence retains both");
+    drop(statement);
+    drop(ledger);
+    let store = crate::SessionStore::open(
+        crate::StoreOptions::default()
+            .db_path(&ledger_path)
+            .roots(roots),
+    )
+    .unwrap();
+    let conversation = store
+        .session(
+            &crate::SessionRef::id(crate::Source::DeepAgents, &session.id),
+            crate::SessionQuery::default(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        conversation
+            .messages
+            .iter()
+            .filter(|m| m.role == crate::Role::User
+                && m.blocks
+                    .iter()
+                    .any(|b| b.text.as_deref() == Some("retry native prompt")))
+            .count(),
+        2
+    );
+    let selection = ExportSelection {
+        sessions: vec![SessionIdentity {
+            source: ID.into(),
+            session_id: session.id.clone(),
+        }],
+        kinds: vec!["session_event".into()],
+        ..Default::default()
+    };
+    let mut export = ExportSnapshot::open(
+        Connection::open(&ledger_path).unwrap(),
+        &selection,
+        &ExportLimits::default(),
+        60_000,
+        1_000,
+    )
+    .unwrap();
+    let mut cursor = Some(export.handle().cursor);
+    let mut exported = 0;
+    while let Some(value) = cursor {
+        let page = export.page(&value, 1_000).unwrap();
+        exported += page
+            .records
+            .iter()
+            .filter(|row| {
+                row.kind == "session_event" && row.payload["text"] == "retry native prompt"
+            })
+            .count();
+        cursor = page.next_cursor;
+    }
+    assert_eq!(exported, 2);
 }
 #[test]
 fn normalization_failure_rolls_back_only_that_sibling() {

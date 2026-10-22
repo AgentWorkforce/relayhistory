@@ -7,7 +7,6 @@ use sha2::{Digest, Sha256};
 const MAX_THREADS: usize = 100_000;
 const MAX_WRITES: usize = 100_000;
 const MAX_THREAD_BYTES: usize = 64 * 1024 * 1024;
-const MAX_SWEEP_MESSAGES: usize = 100_000;
 
 fn acknowledge(context: &AcquisitionContext<'_>, path: &Path) -> Result<bool> {
     if !path.try_exists()? {
@@ -60,10 +59,6 @@ fn read<T>(
         }
         f(conn)
     })
-}
-fn modified(path: &Path) -> Result<i64> {
-    let (_, ms) = crate::file_stamp_and_modified(path)?;
-    Ok(ms.unwrap_or(0))
 }
 fn thread_ids(conn: &Connection) -> Result<Vec<String>> {
     let mut stmt = conn.prepare("SELECT DISTINCT CASE WHEN length(thread_id)<=512 THEN thread_id ELSE NULL END FROM checkpoints WHERE checkpoint_ns='' ORDER BY thread_id LIMIT 100001")?;
@@ -148,9 +143,12 @@ fn latest(conn: &Connection, thread: &str) -> Result<(String, String, Vec<u8>, s
     Ok((id, kind, blob, metadata(&raw)?))
 }
 fn latest_metadata(conn: &Connection, thread: &str) -> Result<(String, serde_json::Value)> {
-    let (id, kind, bytes, meta_bytes): (String, String, i64, i64) = conn.query_row(
-        "SELECT checkpoint_id,type,length(checkpoint),length(metadata) FROM checkpoints WHERE thread_id=?1 AND checkpoint_ns='' ORDER BY checkpoint_id DESC LIMIT 1",
+    let (id, kind, bytes, meta_bytes): (Option<String>, Option<String>, i64, i64) = conn.query_row(
+        "SELECT CASE WHEN length(checkpoint_id)<=256 THEN checkpoint_id ELSE NULL END,CASE WHEN length(type)<=64 THEN type ELSE NULL END,length(checkpoint),length(metadata) FROM checkpoints WHERE thread_id=?1 AND checkpoint_ns='' ORDER BY checkpoint_id DESC LIMIT 1",
         [thread], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?,r.get(3)?)))?;
+    let id = id.ok_or_else(|| anyhow::anyhow!("DeepAgents checkpoint ID exceeds limit"))?;
+    let kind =
+        kind.ok_or_else(|| anyhow::anyhow!("DeepAgents checkpoint encoding exceeds limit"))?;
     ensure!(
         kind == "msgpack",
         "unsupported DeepAgents checkpoint encoding {kind}"
@@ -166,35 +164,38 @@ fn latest_metadata(conn: &Connection, thread: &str) -> Result<(String, serde_jso
     let raw: Vec<u8> = conn.query_row("SELECT metadata FROM checkpoints WHERE thread_id=?1 AND checkpoint_ns='' ORDER BY checkpoint_id DESC LIMIT 1", [thread], |r| r.get(0))?;
     Ok((id, metadata(&raw)?))
 }
-fn first_time(conn: &Connection, thread: &str, path: &Path, with_blob: bool) -> Result<i64> {
-    let (raw, blob): (Vec<u8>, Option<Vec<u8>>) = if with_blob {
-        let (bytes, meta_bytes): (i64, i64) = conn.query_row("SELECT length(checkpoint),length(metadata) FROM checkpoints WHERE thread_id=?1 AND checkpoint_ns='' ORDER BY checkpoint_id ASC LIMIT 1", [thread], |r| Ok((r.get(0)?,r.get(1)?)))?;
+fn latest_checkpoint_time(conn: &Connection, thread: &str) -> Result<i64> {
+    let bytes: i64 = conn.query_row(
+        "SELECT length(checkpoint) FROM checkpoints WHERE thread_id=?1 AND checkpoint_ns='' ORDER BY checkpoint_id DESC LIMIT 1",
+        [thread],
+        |r| r.get(0),
+    )?;
+    ensure!(
+        bytes >= 0 && bytes as usize <= decode::MAX_BLOB,
+        "DeepAgents recency checkpoint exceeds limit"
+    );
+    let blob: Vec<u8> = conn.query_row(
+        "SELECT checkpoint FROM checkpoints WHERE thread_id=?1 AND checkpoint_ns='' ORDER BY checkpoint_id DESC LIMIT 1",
+        [thread],
+        |r| r.get(0),
+    )?;
+    decode::checkpoint_time(&blob)
+}
+fn first_time(conn: &Connection, thread: &str) -> Result<i64> {
+    let (bytes, meta_bytes): (i64, i64) = conn.query_row("SELECT length(checkpoint),length(metadata) FROM checkpoints WHERE thread_id=?1 AND checkpoint_ns='' ORDER BY checkpoint_id ASC LIMIT 1", [thread], |r| Ok((r.get(0)?,r.get(1)?)))?;
+    ensure!(
+        (0..=65_536).contains(&meta_bytes),
+        "DeepAgents metadata exceeds limit"
+    );
+    let raw: Vec<u8> = conn.query_row("SELECT metadata FROM checkpoints WHERE thread_id=?1 AND checkpoint_ns='' ORDER BY checkpoint_id ASC LIMIT 1", [thread], |r| r.get(0))?;
+    let meta = metadata(&raw)?;
+    timestamp(&meta, "updated_at").or_else(|_| {
         ensure!(
             bytes >= 0 && bytes as usize <= decode::MAX_BLOB,
             "DeepAgents first checkpoint blob exceeds limit"
         );
-        ensure!(
-            (0..=65_536).contains(&meta_bytes),
-            "DeepAgents metadata exceeds limit"
-        );
-        let raw = conn.query_row("SELECT metadata FROM checkpoints WHERE thread_id=?1 AND checkpoint_ns='' ORDER BY checkpoint_id ASC LIMIT 1", [thread], |r| r.get(0))?;
-        let blob = conn.query_row("SELECT checkpoint FROM checkpoints WHERE thread_id=?1 AND checkpoint_ns='' ORDER BY checkpoint_id ASC LIMIT 1", [thread], |r| r.get(0))?;
-        (raw, Some(blob))
-    } else {
-        let bytes: i64 = conn.query_row("SELECT length(metadata) FROM checkpoints WHERE thread_id=?1 AND checkpoint_ns='' ORDER BY checkpoint_id ASC LIMIT 1", [thread], |r| r.get(0))?;
-        ensure!(
-            (0..=65_536).contains(&bytes),
-            "DeepAgents metadata exceeds limit"
-        );
-        conn.query_row("SELECT metadata FROM checkpoints WHERE thread_id=?1 AND checkpoint_ns='' ORDER BY checkpoint_id ASC LIMIT 1", [thread], |r| Ok((r.get(0)?,None)))?
-    };
-    let meta = metadata(&raw)?;
-    timestamp(&meta, "updated_at").or_else(|_| {
-        if let Some(blob) = blob {
-            decode::checkpoint_time(&blob)
-        } else {
-            modified(path)
-        }
+        let blob: Vec<u8> = conn.query_row("SELECT checkpoint FROM checkpoints WHERE thread_id=?1 AND checkpoint_ns='' ORDER BY checkpoint_id ASC LIMIT 1", [thread], |r| r.get(0))?;
+        decode::checkpoint_time(&blob)
     })
 }
 fn native_creation_time(thread: &str) -> Option<i64> {
@@ -230,7 +231,7 @@ fn session(
     let (checkpoint_id, meta) = latest_metadata(conn, thread)?;
     let started = match native_creation_time(thread) {
         Some(ms) => ms,
-        None => first_time(conn, thread, path, with_messages)?,
+        None => first_time(conn, thread)?,
     };
     let full_checkpoint = if with_messages {
         Some(latest(conn, thread)?.2)
@@ -241,7 +242,7 @@ fn session(
         if let Some(blob) = &full_checkpoint {
             decode::checkpoint_time(blob)
         } else {
-            modified(path)
+            latest_checkpoint_time(conn, thread)
         }
     })?;
     let messages = if let Some(blob) = full_checkpoint.as_deref() {
@@ -258,6 +259,7 @@ fn session(
     let title = title.or_else(|| {
         meta.get("thread_name")
             .and_then(serde_json::Value::as_str)
+            .filter(|value| value.len() <= 4096)
             .map(str::to_owned)
     });
     Ok(Session {
@@ -269,10 +271,12 @@ fn session(
         cwd: meta
             .get("cwd")
             .and_then(serde_json::Value::as_str)
+            .filter(|value| value.len() <= 4096)
             .map(str::to_owned),
         git_branch: meta
             .get("git_branch")
             .and_then(serde_json::Value::as_str)
+            .filter(|value| value.len() <= 1024)
             .map(str::to_owned),
         checkpoint_id,
         messages,
@@ -286,7 +290,7 @@ fn read_messages(
 ) -> Result<Vec<Message>> {
     let inline_messages = decode::inline(blob)?;
     let inline = inline_messages.is_some();
-    let mut messages = inline_messages.unwrap_or_default();
+    let mut messages = decode::Fold::new(inline_messages.unwrap_or_default())?;
     {
         let sql = if inline {
             "SELECT type,value FROM writes WHERE thread_id=?1 AND checkpoint_ns='' AND checkpoint_id=?2 AND channel='messages' ORDER BY task_id,idx LIMIT 100001"
@@ -324,28 +328,30 @@ fn read_messages(
                 kind == "msgpack",
                 "unsupported DeepAgents write encoding {kind}"
             );
-            decode::apply(&mut messages, decode::write(&value)?)?;
+            messages.apply(decode::write(&value)?)?;
         }
     }
-    Ok(messages)
+    Ok(messages.finish())
 }
 pub(super) fn enumerate(roots: &ProviderRoots, limit: Option<usize>) -> Result<Vec<Candidate>> {
     let context = AcquisitionContext::new(ID, roots);
     let mut out = vec![];
     for path in databases(roots)? {
         let stamp = file_stamp(&context, &path)?;
-        let fallback = modified(&path)?;
         read(&context, &path, |conn| {
             for thread in thread_ids(conn)? {
                 check_capture_cancelled()?;
                 let recency = latest_metadata(conn, &thread)
-                    .and_then(|(_, meta)| timestamp(&meta, "updated_at"))
-                    .unwrap_or(fallback);
+                    .and_then(|(_, meta)| {
+                        timestamp(&meta, "updated_at")
+                            .or_else(|_| latest_checkpoint_time(conn, &thread))
+                    })
+                    .ok();
                 out.push(Candidate {
                     source: ID,
                     locator: path.to_string_lossy().into_owned(),
                     session_id: Some(identity(roots, &path, &thread)),
-                    recency_hint_ms: Some(recency),
+                    recency_hint_ms: recency,
                     stamp: stamp.clone(),
                 });
             }
@@ -447,16 +453,10 @@ pub(super) fn visit(
     read(context, path, |conn| {
         let ids = thread_ids(conn)?;
         let mut unread = 0;
-        let mut captured_messages = 0;
         for id in &ids {
             check_capture_cancelled()?;
             match session(conn, context.roots, path, id, true) {
                 Ok(value) => {
-                    captured_messages += value.messages.len();
-                    ensure!(
-                        captured_messages <= MAX_SWEEP_MESSAGES,
-                        "DeepAgents sweep message count exceeds limit"
-                    );
                     if !consume(value)? {
                         unread += 1;
                     }

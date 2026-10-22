@@ -8,7 +8,8 @@ use crate::store::NewSessionMarker;
 use crate::HistoryEntry;
 use anyhow::{ensure, Context};
 use sha2::{Digest, Sha256};
-use std::collections::BTreeSet;
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet};
 
 #[derive(Default)]
 struct Keys {
@@ -86,12 +87,13 @@ fn write(conn: &Connection, s: &Session, path: &Path) -> Result<usize> {
         crate::ingest::check_capture_cancelled()?;
         inserted += message(conn, s, m, &mut keys, &mut indexer, false)?;
     }
+    reconcile_tool_status(conn, s, &keys.tools)?;
     let assistant = s
         .messages
         .iter()
         .rev()
         .find(|m| m.role == "assistant" && !m.content.is_empty())
-        .map(|m| m.content.as_str());
+        .map(|m| bounded_content(&m.content));
     upsert_session_rebuilt(
         conn,
         &SessionCatalogRow {
@@ -101,7 +103,7 @@ fn write(conn: &Connection, s: &Session, path: &Path) -> Result<usize> {
             git_branch: s.git_branch.as_deref(),
             first_ts: s.started,
             last_ts: s.latest,
-            last_assistant_text: assistant,
+            last_assistant_text: assistant.as_deref(),
             raw_path: Some(&path.to_string_lossy()),
         },
     )?;
@@ -148,6 +150,32 @@ fn write(conn: &Connection, s: &Session, path: &Path) -> Result<usize> {
     reconcile_history(conn, &s.id)?;
     Ok(inserted)
 }
+fn reconcile_tool_status(conn: &Connection, s: &Session, tools: &BTreeSet<String>) -> Result<()> {
+    let mut outcomes = BTreeMap::new();
+    for message in &s.messages {
+        if message.role == "tool" {
+            if let Some(id) = &message.tool_call_id {
+                let status = match message.status.as_deref() {
+                    Some("error") => Some(true),
+                    Some("success") => Some(false),
+                    _ => None,
+                };
+                outcomes.insert(id.as_str(), status);
+            }
+        }
+    }
+    for id in tools {
+        let status = outcomes.get(id.as_str()).copied().flatten();
+        // A conclusive native outcome must conflict with a different remote
+        // outcome. Snapshot::ensure_unchanged rolls the transaction back.
+        // Unknown/removal may clear only our own provisional result.
+        conn.execute(
+            "UPDATE tool_calls SET is_error=?4 WHERE source=?1 AND session_id=?2 AND tool_use_id=?3 AND (?4 IS NOT NULL OR location='local') AND is_error IS NOT ?4",
+            rusqlite::params![ID, s.id, id, status.map(i64::from)],
+        )?;
+    }
+    Ok(())
+}
 fn control(_m: &Message) -> bool {
     false
 }
@@ -157,6 +185,22 @@ fn hex(value: &str) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
+}
+fn bounded_content(content: &str) -> Cow<'_, str> {
+    const MAX_PREFIX_BYTES: usize = 32 * 1024;
+    if content.len() <= MAX_PREFIX_BYTES {
+        return Cow::Borrowed(content);
+    }
+    let mut end = MAX_PREFIX_BYTES;
+    while !content.is_char_boundary(end) {
+        end -= 1;
+    }
+    Cow::Owned(format!(
+        "{}\n[DeepAgents native text truncated: {} bytes; sha256={:x}]",
+        &content[..end],
+        content.len(),
+        Sha256::digest(content.as_bytes())
+    ))
 }
 fn message(
     conn: &Connection,
@@ -170,6 +214,7 @@ fn message(
         ["user", "assistant", "tool", "system"].contains(&m.role.as_str()),
         "unsupported DeepAgents role"
     );
+    let content = bounded_content(&m.content);
     let prefix = format!("msg:{}", hex(&m.id));
     if m.role == "system" {
         if !replay {
@@ -182,7 +227,7 @@ fn message(
                     ts_ms: s.started,
                     kind: "system",
                 },
-                &serde_json::json!({"native_message_id":m.id,"content":m.content}),
+                &serde_json::json!({"native_message_id":m.id,"content":content}),
                 keys,
             )?;
         }
@@ -197,7 +242,7 @@ fn message(
                 source: ID.into(),
                 session_id: Some(s.id.clone()),
                 project: s.cwd.clone(),
-                prompt: m.content.clone(),
+                prompt: content.to_string(),
                 prompt_hash: None,
                 timestamp_ms: s.started,
             },
@@ -244,8 +289,9 @@ fn message(
                     &m.role
                 },
                 kind,
-                text: Some(&m.content),
+                text: Some(&content),
                 model: None,
+                project: s.cwd.as_deref(),
                 cwd: s.cwd.as_deref(),
                 git_branch: s.git_branch.as_deref(),
                 raw_kind: Some("messages"),
@@ -328,6 +374,9 @@ fn tool(
             kind: "tool_use",
             text: Some(&event_text),
             model: None,
+            project: s.cwd.as_deref(),
+            cwd: s.cwd.as_deref(),
+            git_branch: s.git_branch.as_deref(),
             raw_kind: Some("tool_calls"),
             tool_result_facts: Some(&facts),
             ..Default::default()

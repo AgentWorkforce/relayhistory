@@ -96,6 +96,30 @@ fn decoded_prompt_is_searchable_by_term_and_phrase() {
             "decoded native prompt missing for {terms:?}"
         );
     }
+    let scoped = ai_hist::QueryFilter {
+        source: Some("deepagents".into()),
+        project: Some("/synthetic/project".into()),
+        limit: 20,
+        ..Default::default()
+    };
+    let hits = ai_hist::history_search::search_all(
+        &conn,
+        &["needle".into()],
+        false,
+        &scoped,
+        ai_hist::history_search::SearchRole::All,
+    )
+    .unwrap();
+    assert!(hits.iter().any(|hit| hit.match_source == "history"));
+    assert!(hits
+        .iter()
+        .any(|hit| hit.match_source == "session_event" && hit.role == "assistant"));
+    assert!(hits
+        .iter()
+        .any(|hit| hit.match_source == "session_event" && hit.role == "tool_result"));
+    assert!(hits
+        .iter()
+        .all(|hit| hit.project.as_deref() == Some("/synthetic/project")));
 }
 
 #[test]

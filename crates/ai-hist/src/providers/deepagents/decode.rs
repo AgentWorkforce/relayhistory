@@ -3,6 +3,7 @@ use super::Message;
 use anyhow::{bail, ensure, Context, Result};
 use rmpv::Value as Mp;
 use serde_json::{Map as JsonMap, Value as Json};
+use std::collections::HashMap;
 use std::io::Cursor;
 
 pub(super) const MAX_BLOB: usize = 8 * 1024 * 1024;
@@ -134,9 +135,17 @@ fn message(value: &Mp) -> Result<Message> {
         "invalid DeepAgents native message id"
     );
     let content = text_content(member(fields, "content").unwrap_or(&Mp::Nil))?;
-    let tool_call_id = member(fields, "tool_call_id")
-        .and_then(Mp::as_str)
-        .map(str::to_owned);
+    let tool_call_id = match member(fields, "tool_call_id") {
+        Some(Mp::Nil) | None => None,
+        Some(value) => {
+            let id = string(value, "tool result call id")?;
+            ensure!(
+                !id.is_empty() && id.len() <= 1024,
+                "invalid DeepAgents tool result call id"
+            );
+            Some(id.to_owned())
+        }
+    };
     let tool_calls = match member(fields, "tool_calls") {
         Some(Mp::Array(values)) => {
             ensure!(
@@ -153,6 +162,7 @@ fn message(value: &Mp) -> Result<Message> {
     };
     let status = member(fields, "status")
         .and_then(Mp::as_str)
+        .filter(|status| status.len() <= 64)
         .map(str::to_owned);
     Ok(Message {
         id,
@@ -227,37 +237,72 @@ pub(super) fn write(blob: &[u8]) -> Result<Delta> {
         _ => bail!("unsupported DeepAgents messages write"),
     }
 }
-pub(super) fn apply(state: &mut Vec<Message>, delta: Delta) -> Result<()> {
-    match delta {
-        Delta::Overwrite(messages) => *state = messages,
-        Delta::Append(messages) => {
-            if let Some(last_remove_all) = messages
-                .iter()
-                .rposition(|m| m.role == "remove" && m.id == "__remove_all__")
-            {
-                state.clear();
-                for message in messages.into_iter().skip(last_remove_all + 1) {
-                    upsert(state, message);
-                }
-            } else {
-                for message in messages {
-                    upsert(state, message);
-                }
-            }
-        }
-    }
-    ensure!(
-        state.len() <= MAX_MESSAGES,
-        "DeepAgents folded message count exceeds limit"
-    );
-    Ok(())
+pub(super) struct Fold {
+    slots: Vec<Option<Message>>,
+    positions: HashMap<String, usize>,
+    active: usize,
 }
-fn upsert(state: &mut Vec<Message>, message: Message) {
-    if message.role == "remove" {
-        state.retain(|current| current.id != message.id);
-    } else if let Some(existing) = state.iter_mut().find(|current| current.id == message.id) {
-        *existing = message;
-    } else {
-        state.push(message);
+impl Fold {
+    pub(super) fn new(initial: Vec<Message>) -> Result<Self> {
+        let mut fold = Self {
+            slots: Vec::new(),
+            positions: HashMap::new(),
+            active: 0,
+        };
+        for message in initial {
+            ensure!(
+                !fold.positions.contains_key(&message.id),
+                "duplicate DeepAgents inline message ID"
+            );
+            fold.upsert(message)?;
+        }
+        Ok(fold)
+    }
+    pub(super) fn apply(&mut self, delta: Delta) -> Result<()> {
+        let messages = match delta {
+            Delta::Overwrite(messages) => {
+                self.clear();
+                messages
+            }
+            Delta::Append(messages) => messages,
+        };
+        let start = messages
+            .iter()
+            .rposition(|m| m.role == "remove" && m.id == "__remove_all__")
+            .map_or(0, |index| {
+                self.clear();
+                index + 1
+            });
+        for message in messages.into_iter().skip(start) {
+            self.upsert(message)?;
+        }
+        Ok(())
+    }
+    fn upsert(&mut self, message: Message) -> Result<()> {
+        if message.role == "remove" {
+            if let Some(index) = self.positions.remove(&message.id) {
+                self.slots[index] = None;
+                self.active -= 1;
+            }
+        } else if let Some(index) = self.positions.get(&message.id).copied() {
+            self.slots[index] = Some(message);
+        } else {
+            ensure!(
+                self.active < MAX_MESSAGES,
+                "DeepAgents folded message count exceeds limit"
+            );
+            self.positions.insert(message.id.clone(), self.slots.len());
+            self.slots.push(Some(message));
+            self.active += 1;
+        }
+        Ok(())
+    }
+    fn clear(&mut self) {
+        self.slots.clear();
+        self.positions.clear();
+        self.active = 0;
+    }
+    pub(super) fn finish(self) -> Vec<Message> {
+        self.slots.into_iter().flatten().collect()
     }
 }
