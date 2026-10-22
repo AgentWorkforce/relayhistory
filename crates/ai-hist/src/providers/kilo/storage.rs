@@ -255,7 +255,9 @@ fn read_parts(
         .enumerate()
         .map(|(index, message)| (message.id.clone(), index))
         .collect();
-    let mut stmt = conn.prepare("SELECT CASE WHEN length(CAST(id AS BLOB))<=512 THEN id ELSE '' END,CASE WHEN length(CAST(message_id AS BLOB))<=512 THEN message_id ELSE '' END,time_created,CASE WHEN length(CAST(data AS BLOB))<=?3 THEN data ELSE '' END,length(CAST(data AS BLOB)) FROM part WHERE session_id=?1 ORDER BY message_id,id LIMIT ?2")?;
+    // The native primary-key index supplies ID order without a SQLite sort;
+    // each message receives the corresponding ordered subsequence.
+    let mut stmt = conn.prepare("SELECT CASE WHEN length(CAST(id AS BLOB))<=512 THEN id ELSE '' END,CASE WHEN length(CAST(message_id AS BLOB))<=512 THEN message_id ELSE '' END,time_created,CASE WHEN length(CAST(data AS BLOB))<=?3 THEN data ELSE '' END,length(CAST(data AS BLOB)) FROM part WHERE session_id=?1 ORDER BY id LIMIT ?2")?;
     let rows = stmt.query_map(
         rusqlite::params![native, (MAX_PARTS + 1) as i64, MAX_ROW_BYTES],
         |row| {
@@ -274,15 +276,15 @@ fn read_parts(
         let (id, message_id, timestamp, raw, bytes) = row?;
         count += 1;
         ensure!(count <= MAX_PARTS, "Kilo part capture exceeds safety limit");
-        let Some(&position) = positions.get(message_id.as_str()) else {
-            continue;
-        };
         ensure!(bytes <= MAX_ROW_BYTES, "oversized Kilo part data");
         *total_bytes += bytes;
         ensure!(
             *total_bytes <= MAX_SESSION_BYTES,
             "Kilo session exceeds source size limit"
         );
+        let Some(&position) = positions.get(message_id.as_str()) else {
+            continue;
+        };
         ensure!(
             !id.is_empty() && id.len() <= 512 && timestamp >= 0,
             "invalid Kilo part identity/timestamp"
