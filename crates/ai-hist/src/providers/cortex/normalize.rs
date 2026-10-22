@@ -198,11 +198,14 @@ fn write_catalog(
     meta: &Value,
     written: &WrittenRows,
 ) -> Result<()> {
-    let first = if let Some(entry) = entries.first() {
-        format::time(entry)?.context("CORTEX_INVALID_RECORD: first timestamp")?
-    } else {
-        format::created_at(meta)?
-    };
+    let first = entries
+        .iter()
+        .map(format::time)
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .min()
+        .map_or_else(|| format::created_at(meta), Ok)?;
     upsert_session_rebuilt(
         conn,
         &SessionCatalogRow {
@@ -288,6 +291,29 @@ fn message(
     }
     let mid = format::string(entry, "uuid")?;
     let ts = format::time(entry)?.context("CORTEX_INVALID_RECORD: message timestamp")?;
+    if let Some(origin) = entry["timestamp_origin"]
+        .as_str()
+        .filter(|o| *o != "native")
+    {
+        let uid = format!("{mid}:timestamp_inferred");
+        let payload = serde_json::to_string(
+            &serde_json::json!({"native_message_id":mid,"native_timestamp":null,"inferred_from":origin,"effective_timestamp_ms":ts}),
+        )?;
+        insert_session_marker(
+            conn,
+            ID,
+            sid,
+            &NewSessionMarker {
+                marker_uid: &uid,
+                kind: "timestamp_inferred",
+                ts_ms: Some(ts),
+                message_id: Some(mid),
+                payload_json: Some(&payload),
+                ..Default::default()
+            },
+        )?;
+        keys.markers.insert(uid);
+    }
     let base = EventRow {
         source: ID,
         session_id: sid,

@@ -11,13 +11,13 @@
       "layout": "HomeTree",
       "origin": "RelayHistory",
       "files": ["cortex/native"],
-      "quirk": "Official Cortex Code CLI 1.2.18 native writer merged, flat, rewritten and zero-byte empty sidecar sessions; raw native restart-reader oracles for IDs, order and content."
+      "quirk": "Official Cortex Code CLI 1.2.18 native writer merged, flat, rewritten, zero-byte empty sidecar and untimed sessions; raw native restart-reader oracles for IDs, order and content."
     }
   ],
   "capture": [
     {
       "evidence": "Messages and identity",
-      "coverage": "Cortex Code CLI 1.2.18 local conversation snapshots and JSONL sidecars; persisted native session/message IDs, timestamps, working directory, title, model and text."
+      "coverage": "Cortex Code CLI 1.2.18 local conversation snapshots and JSONL sidecars; persisted native session/message IDs, recorded timestamps when present, working directory, title, model and text. Missing native timestamps use a marked inference."
     },
     {
       "evidence": "Tools and control",

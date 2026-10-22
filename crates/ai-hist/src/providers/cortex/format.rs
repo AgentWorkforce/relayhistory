@@ -137,12 +137,28 @@ pub(super) fn history(meta: &Value, bytes: Option<&[u8]>) -> Result<(Vec<Value>,
     for (index, message) in messages.iter().enumerate() {
         last.insert(string(message, "id")?.to_owned(), index);
     }
-    let entries = messages
+    let mut entries = messages
         .iter()
         .enumerate()
         .filter(|(i, m)| last.get(m["id"].as_str().unwrap_or_default()) == Some(i))
         .map(|(_, m)| record_to_entry(meta, m))
         .collect::<Result<Vec<_>>>()?;
+    let mut previous = None;
+    for entry in &mut entries {
+        if let Some(recorded) = time(entry)? {
+            previous = Some(recorded);
+            entry["timestamp_origin"] = Value::String("native".into());
+        } else {
+            let (inferred, origin) = if let Some(previous) = previous {
+                (previous, "previous_message")
+            } else {
+                (created_at(meta)?, "metadata.created_at")
+            };
+            entry["timestamp"] = Value::from(inferred);
+            entry["timestamp_origin"] = Value::String(origin.into());
+            previous = Some(inferred);
+        }
+    }
     Ok((entries, partial))
 }
 fn merge_flat(rows: Vec<Value>) -> Result<Vec<Value>> {

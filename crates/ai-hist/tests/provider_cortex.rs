@@ -18,6 +18,9 @@ const EMPTY_ID: &str = "55555555-5555-4555-8555-555555555555";
 const EMPTY_META: &str = include_str!("fixtures/cortex/native/.snowflake/cortex/conversations/55555555-5555-4555-8555-555555555555.json");
 const EMPTY_BEFORE: &str =
     include_str!("../../../plans/history-providers/fixtures/cortex/empty-before.jsonl");
+const UNTIMED_ID: &str = "66666666-6666-4666-8666-666666666666";
+const UNTIMED_META: &str = include_str!("fixtures/cortex/native/.snowflake/cortex/conversations/66666666-6666-4666-8666-666666666666.json");
+const UNTIMED_HISTORY: &str = include_str!("fixtures/cortex/native/.snowflake/cortex/conversations/66666666-6666-4666-8666-666666666666.history.jsonl");
 fn stage(home: &Path) -> (PathBuf, PathBuf) {
     let dir = home.join(".snowflake/cortex/conversations");
     std::fs::create_dir_all(&dir).unwrap();
@@ -136,6 +139,80 @@ fn native_empty_sidecar_rewrite_retires_stale_prompt() {
     assert!(after.messages.is_empty());
 }
 #[test]
+fn native_untimed_answer_retains_evidence_with_inference_marker() {
+    let home = tempfile::tempdir().unwrap();
+    let dir = home.path().join(".snowflake/cortex/conversations");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join(format!("{UNTIMED_ID}.json")), UNTIMED_META).unwrap();
+    std::fs::write(
+        dir.join(format!("{UNTIMED_ID}.history.jsonl")),
+        UNTIMED_HISTORY,
+    )
+    .unwrap();
+    let store = open(home.path());
+    let reference = SessionRef::id(Source::Cortex, UNTIMED_ID);
+    store
+        .discover(DiscoveryOptions::default().sources([Source::Cortex]))
+        .unwrap();
+    store
+        .hydrate(&reference, HydrateOptions::default())
+        .unwrap();
+    let evidence = store
+        .session(&reference, SessionQuery::default())
+        .unwrap()
+        .unwrap();
+    assert_eq!(evidence.messages.len(), 2);
+    assert_eq!(
+        evidence.messages[1].message_id.as_deref(),
+        Some("untimed-answer")
+    );
+    let marker = evidence
+        .markers
+        .iter()
+        .find(|m| m.kind == "timestamp_inferred")
+        .unwrap();
+    assert_eq!(marker.message_id.as_deref(), Some("untimed-answer"));
+    assert_eq!(
+        marker.payload.as_ref().unwrap()["native_timestamp"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        marker.payload.as_ref().unwrap()["inferred_from"],
+        "previous_message"
+    );
+}
+#[test]
+fn duplicate_native_id_keeps_earliest_catalog_activity() {
+    let home = tempfile::tempdir().unwrap();
+    let (_, side) = stage(home.path());
+    let first = HISTORY.lines().next().unwrap();
+    let mut rewritten = HISTORY.to_owned();
+    rewritten.push_str(first);
+    rewritten.push('\n');
+    std::fs::write(side, rewritten).unwrap();
+    let store = open(home.path());
+    let reference = SessionRef::id(Source::Cortex, ID);
+    store
+        .discover(DiscoveryOptions::default().sources([Source::Cortex]))
+        .unwrap();
+    store
+        .hydrate(&reference, HydrateOptions::default())
+        .unwrap();
+    let evidence = store
+        .session(&reference, SessionQuery::default())
+        .unwrap()
+        .unwrap();
+    assert_eq!(evidence.session.first_activity_ms, Some(1_792_576_800_000));
+    assert_eq!(
+        evidence
+            .messages
+            .iter()
+            .filter(|m| m.message_id.as_deref() == Some("user-1"))
+            .count(),
+        1
+    );
+}
+#[test]
 fn sidecar_append_partial_tail_and_rewrite() {
     let home = tempfile::tempdir().unwrap();
     let (_, side) = stage(home.path());
@@ -240,6 +317,66 @@ fn both_native_files_must_disappear_before_local_retirement() {
             .is_none(),
         "native wipe removes both files"
     );
+}
+#[test]
+fn moved_native_pair_keeps_local_evidence_until_all_paths_are_gone() {
+    let home = tempfile::tempdir().unwrap();
+    let (old_meta, old_side) = stage(home.path());
+    let old_dir = old_meta.parent().unwrap().to_path_buf();
+    let new_dir = home.path().join("second-conversations");
+    std::fs::create_dir_all(&new_dir).unwrap();
+    let mut roots = serde_json::to_value(ProviderRoots::from_home(
+        home.path().into(),
+        home.path().join("opencode.db"),
+    ))
+    .unwrap();
+    roots["provider_roots"]["cortex"] = serde_json::json!([old_dir, new_dir]);
+    let store = SessionStore::open(
+        StoreOptions::default()
+            .db_path(home.path().join("relocated.db"))
+            .roots(serde_json::from_value(roots).unwrap()),
+    )
+    .unwrap();
+    let reference = SessionRef::id(Source::Cortex, ID);
+    let sweep = || {
+        store
+            .sync(SyncOptions::default().sources([Source::Cortex]).force(true))
+            .unwrap()
+    };
+    sweep();
+    let before = store
+        .session(&reference, SessionQuery::default())
+        .unwrap()
+        .unwrap();
+    let new_meta = new_dir.join(old_meta.file_name().unwrap());
+    let new_side = new_dir.join(old_side.file_name().unwrap());
+    std::fs::rename(&old_meta, &new_meta).unwrap();
+    std::fs::rename(&old_side, &new_side).unwrap();
+    sweep();
+    let evidence = store
+        .session(&reference, SessionQuery::default())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        evidence.messages, before.messages,
+        "the old locator must not retire a relocated session"
+    );
+    let conn = rusqlite::Connection::open(home.path().join("relocated.db")).unwrap();
+    let current: String = conn
+        .query_row(
+            "SELECT raw_path FROM sessions WHERE source='cortex' AND session_id=?1",
+            [ID],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(current, new_meta.to_string_lossy());
+    std::fs::remove_file(new_meta).unwrap();
+    std::fs::remove_file(new_side).unwrap();
+    sweep();
+    assert!(store
+        .session(&reference, SessionQuery::default())
+        .unwrap()
+        .is_none());
 }
 #[test]
 fn missing_root_preserves_prior_local_evidence() {

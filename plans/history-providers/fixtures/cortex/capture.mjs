@@ -86,4 +86,14 @@ if (emptyObserved.length !== 0 || readFileSync(join(conversations, `${emptyId}.h
   throw new Error('native empty rewrite was not empty');
 }
 writeFileSync(join(import.meta.dirname, 'empty-reader-oracle.json'), JSON.stringify(emptyObserved, null, 2) + '\n');
-console.log(`native writer/reader captured ${observed.length} merged, ${flatObserved.length} flat, ${rewrittenObserved.length} rewritten, ${emptyObserved.length} empty messages`);
+const untimedId = '66666666-6666-4666-8666-666666666666';
+const untimed = new ConversationHistory(untimedId, '/workspace/cortex-demo', [], { conversationsDir: conversations });
+untimed.addMessage({role:'user',id:'timed-user',userSentTime:'2026-10-21T14:00:00.000Z',content:[{type:'text',text:'Keep both messages',is_user_prompt:true}]});
+untimed.addMessage({role:'assistant',id:'untimed-answer',content:[{type:'text',text:'Both retained.'}]});
+await untimed.flushAllWrites();
+const untimedObserved = await readHistory(untimed.storage, join(conversations, `${untimedId}.history.jsonl`));
+if (untimedObserved.length !== 2 || untimedObserved[1].assistantSentTime !== undefined) {
+  throw new Error('native untimed reader contract changed');
+}
+writeFileSync(join(import.meta.dirname, 'untimed-reader-oracle.json'), JSON.stringify(untimedObserved.map(({role,id,content,assistantSentTime}) => ({role,id,content,assistantSentTime})), null, 2) + '\n');
+console.log(`native writer/reader captured ${observed.length} merged, ${flatObserved.length} flat, ${rewrittenObserved.length} rewritten, ${emptyObserved.length} empty, ${untimedObserved.length} untimed messages`);

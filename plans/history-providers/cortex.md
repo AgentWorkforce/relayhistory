@@ -23,7 +23,12 @@ capture uses the native writer in both configurations and compares its
 result with the released `Otr` restart reader: four merged messages, three
 flat messages, a one-message sidecar after `removeLastMessage` rewrote a
 two-message session, and an empty zero-byte sidecar after removing the final
-message. Metadata can still report `history_length: 1` for that empty sidecar,
+message. A fifth native writer/restart-reader capture retains an assistant
+message with no `assistant_sent_time`, `user_sent_time`, or `created_on`.
+RelayHistory assigns such a row the preceding message's effective time (or
+metadata `created_at` for the first row) and emits a `timestamp_inferred`
+marker with the missing native timestamp and inference basis, rather than
+presenting the fallback as a recorded native time. Metadata can still report `history_length: 1` for that empty sidecar,
 so the sidecar determines complete history. The raw reader oracles are in
 `plans/history-providers/fixtures/cortex/`. The sidecar
 is authoritative when present. Older snapshots can carry `history` or

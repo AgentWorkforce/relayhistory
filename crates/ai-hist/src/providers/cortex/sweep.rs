@@ -22,24 +22,52 @@ fn cache_hit(
 }
 fn retire_missing_native(conn: &Connection, roots: &ProviderRoots) -> Result<()> {
     let mut statement = conn.prepare(
-        "SELECT session_id, raw_path FROM sessions WHERE source='cortex' AND raw_path IS NOT NULL \
-         UNION SELECT session_id, raw_locator FROM session_observations WHERE source='cortex' AND location='local' AND raw_locator IS NOT NULL \
-         UNION SELECT session_id, raw_locator FROM session_presences WHERE source='cortex' AND location='local' AND raw_locator IS NOT NULL",
+        "SELECT session_id, raw_path, 1 AS catalog FROM sessions WHERE source='cortex' AND raw_path IS NOT NULL \
+         UNION SELECT session_id, raw_locator, 0 FROM session_observations WHERE source='cortex' AND location='local' AND raw_locator IS NOT NULL \
+         UNION SELECT session_id, raw_locator, 0 FROM session_presences WHERE source='cortex' AND location='local' AND raw_locator IS NOT NULL",
     )?;
     let paths = statement
         .query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? != 0,
+            ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
-    for (sid, raw) in paths {
+    let mut by_session: std::collections::BTreeMap<String, Vec<String>> =
+        std::collections::BTreeMap::new();
+    for (sid, raw, catalog) in paths {
+        // Remote intake may replace the catalog's raw_path. Only a catalog
+        // locator naming a configured native metadata file is local evidence;
+        // explicit local observations remain blockers even if their root was
+        // subsequently removed from configuration.
+        if catalog
+            && !roots
+                .for_provider(ID)
+                .iter()
+                .any(|root| Path::new(&raw).parent() == Some(root.as_path()))
+        {
+            continue;
+        }
+        by_session.entry(sid).or_default().push(raw);
+    }
+    for (sid, paths) in by_session {
         crate::ingest::check_capture_cancelled()?;
-        let path = PathBuf::from(raw);
-        let side = sidecar(&path)?;
-        if crate::providers::file_history::confirmed_missing_with_extension(
-            ID, roots, &path, "json",
-        )? && crate::providers::file_history::confirmed_missing_with_extension(
-            ID, roots, &side, "jsonl",
-        )? {
+        let mut all_missing = true;
+        for raw in paths {
+            let path = PathBuf::from(raw);
+            let side = sidecar(&path)?;
+            if !crate::providers::file_history::confirmed_missing_with_extension(
+                ID, roots, &path, "json",
+            )? || !crate::providers::file_history::confirmed_missing_with_extension(
+                ID, roots, &side, "jsonl",
+            )? {
+                all_missing = false;
+                break;
+            }
+        }
+        if all_missing {
             let tx = conn.unchecked_transaction()?;
             crate::providers::file_history::retire_local_session(&tx, ID, &sid)?;
             tx.commit()?;
