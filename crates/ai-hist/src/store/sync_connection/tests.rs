@@ -63,6 +63,52 @@ fn a_write_during_acquisition_is_not_adopted_as_already_validated() {
 }
 
 #[test]
+fn a_writer_during_validation_allows_the_call_without_caching_or_extra_retries() {
+    let (_temp, db, mut cache) = fixture();
+    let external = open_db(&db).unwrap();
+    AFTER_VALIDATION.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            external
+                .execute(
+                    "DELETE FROM schema_migrations WHERE name='claude_standalone_records_v1'",
+                    [],
+                )
+                .unwrap();
+        }));
+    });
+    let before = validations();
+    with_cache(&mut cache, || {
+        with_connection(&db, |conn| {
+            assert!(needs_migration(conn)?);
+            Ok(())
+        })
+    })
+    .unwrap();
+    assert_eq!(
+        validations() - before,
+        1,
+        "use the existing single initialization pass"
+    );
+    assert!(
+        cache.0.is_none(),
+        "an unstable bracket cannot authorize future reuse"
+    );
+    with_cache(&mut cache, || {
+        with_connection(&db, |conn| {
+            assert!(!needs_migration(conn)?);
+            Ok(())
+        })
+    })
+    .unwrap();
+    assert_eq!(validations() - before, 2);
+    // Repair can change the schema cookie itself. Reuse starts after a
+    // subsequent quiet validation, without retrying inside either call.
+    use_connection(&mut cache, &db);
+    assert_eq!(validations() - before, 3);
+    assert!(cache.0.is_some());
+}
+
+#[test]
 fn nested_auxiliary_paths_never_borrow_the_outer_connection() {
     let (temp, db, mut cache) = fixture();
     let other = temp.path().join("other.db");

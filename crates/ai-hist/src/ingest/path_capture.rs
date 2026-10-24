@@ -30,26 +30,32 @@ pub(crate) fn sync_facade_tick<B, R>(
         return Ok(None);
     };
     crate::store::sync_connection::with_connection(db_path, |conn| {
-        let baseline = before(conn)?;
-        let captured =
-            try_capture_paths(conn, db_path, roots, scope, force).and_then(|scoped| match scoped {
-                Some(swept) => Ok(swept),
-                None => sync_basic(conn, db_path, roots, force, scope)
-                    .map_err(|error| enrich_sync_error(db_path, error)),
-            });
-        let tick = SyncTick {
-            attempted: true,
-            swept: captured.as_ref().copied().unwrap_or(false),
-        };
-        // A cancelled/failed acquisition can already have committed earlier
-        // files. Capture that bracket before unlocking, retaining its delta for
-        // the next successful report instead of swallowing it as an outside write.
-        let outcome = after(conn, baseline, tick, captured.is_ok());
-        captured?;
-        let outcome = outcome?;
-        Ok(Some((tick, outcome, sync_lock)))
+        // Keep setup diagnostics separate from provider errors: legacy full
+        // sync already enriches its own contention, and probing twice would
+        // add waits without changing the failed acquisition.
+        Ok((|| {
+            let baseline = before(conn)?;
+            let captured = try_capture_paths(conn, db_path, roots, scope, force).and_then(
+                |scoped| match scoped {
+                    Some(swept) => Ok(swept),
+                    None => sync_basic(conn, db_path, roots, force, scope)
+                        .map_err(|error| enrich_sync_error(db_path, error)),
+                },
+            );
+            let tick = SyncTick {
+                attempted: true,
+                swept: captured.as_ref().copied().unwrap_or(false),
+            };
+            // A cancelled/failed acquisition can already have committed earlier
+            // files. Capture that bracket before unlocking, retaining its delta for
+            // the next successful report instead of swallowing it as an outside write.
+            let outcome = after(conn, baseline, tick, captured.is_ok());
+            captured?;
+            let outcome = outcome?;
+            Ok(Some((tick, outcome, sync_lock)))
+        })())
     })
-    .map_err(|error| enrich_sync_error(db_path, error))
+    .map_err(|error| enrich_sync_error(db_path, error))?
 }
 
 pub(crate) fn reconcile_pending(db: &Path, source: &str) -> Result<bool> {

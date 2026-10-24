@@ -22,7 +22,7 @@ struct Entry {
     resolved: PathBuf,
     cwd: Option<PathBuf>,
     identity: Option<FileIdentity>,
-    validated: Versions,
+    validated: Option<Versions>,
 }
 
 #[derive(PartialEq, Eq)]
@@ -42,6 +42,8 @@ impl Versions {
 thread_local! { static CURRENT: RefCell<Option<Cache>> = const { RefCell::new(None) }; }
 #[cfg(test)]
 thread_local! { static VALIDATIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) }; }
+#[cfg(test)]
+thread_local! { static AFTER_VALIDATION: RefCell<Option<Box<dyn FnOnce()>>> = const { RefCell::new(None) }; }
 
 pub(crate) fn with_cache<T>(cache: &mut Cache, run: impl FnOnce() -> T) -> T {
     struct Restore<'a>(&'a mut Cache, Option<Cache>);
@@ -70,13 +72,15 @@ pub(crate) fn with_connection<T>(
         return run(&open_db(path)?);
     }
     let entry = CURRENT.with(|slot| slot.borrow_mut().as_mut().and_then(|cache| cache.0.take()));
-    let mut entry = match entry.filter(|entry| entry.matches(path)) {
-        Some(entry) => entry,
+    let entry = match entry.filter(|entry| entry.matches(path)) {
+        Some(mut entry) => {
+            if Some(Versions::read(&entry.conn)?) != entry.validated {
+                entry.validated = validate(&entry.conn)?;
+            }
+            entry
+        }
         None => Entry::open(path)?,
     };
-    if Versions::read(&entry.conn)? != entry.validated {
-        entry.validated = validate(&entry.conn)?;
-    }
     anyhow::ensure!(
         entry.identity.is_none() || entry.matches(path),
         "database replaced while checking writable connection"
@@ -84,11 +88,9 @@ pub(crate) fn with_connection<T>(
     struct Return(Option<Entry>);
     impl Drop for Return {
         fn drop(&mut self) {
-            if let Some(entry) = self
-                .0
-                .take()
-                .filter(|entry| entry.conn.is_autocommit() && entry.identity.is_some())
-            {
+            if let Some(entry) = self.0.take().filter(|entry| {
+                entry.conn.is_autocommit() && entry.identity.is_some() && entry.validated.is_some()
+            }) {
                 CURRENT.with(|slot| {
                     if let Some(cache) = slot.borrow_mut().as_mut() {
                         cache.0 = Some(entry);
@@ -155,16 +157,17 @@ pub(super) fn open_uninitialized(path: &Path) -> Result<Connection> {
     Ok(conn)
 }
 
-fn validate(conn: &Connection) -> Result<Versions> {
-    for _ in 0..3 {
-        let before = Versions::read(conn)?;
-        init_db(conn)?;
-        let after = Versions::read(conn)?;
-        if before == after {
-            return Ok(after);
-        }
+fn validate(conn: &Connection) -> Result<Option<Versions>> {
+    let before = Versions::read(conn)?;
+    init_db(conn)?;
+    #[cfg(test)]
+    if let Some(hook) = AFTER_VALIDATION.with(|hook| hook.borrow_mut().take()) {
+        hook();
     }
-    anyhow::bail!("database kept changing during writable connection validation")
+    let after = Versions::read(conn)?;
+    // Preserve fresh-open operation under active external writers. A changing
+    // bracket withholds reuse, rather than adding retries or a new error.
+    Ok((before == after).then_some(after))
 }
 
 #[cfg(test)]
