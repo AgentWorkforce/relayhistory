@@ -1291,3 +1291,9 @@ retain up to 256 MiB of earlier transcript data plus its current file (at most
 thread bound, not a process-wide memory budget. Nested hydration shares its outer
 acquisition cache. Completion, errors and panic unwinding drop retained handles,
 bytes and map allocations, so idle worker threads do not retain these buffers.
+
+Full-sweep discovery parses cache-backed candidates on the acquisition owner
+thread, where the retained bytes live. It preserves parallel filesystem reads
+for uncached candidates. This routing inspects only the current read window and
+copies no retained payloads; the actual shallow reader rechecks stat and ctime
+before using cached regions, including a rewrite after scheduling.

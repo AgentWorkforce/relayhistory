@@ -241,6 +241,23 @@ fn retained_stat(path: &Path) -> Option<Stat> {
     stat.ctime_ns.is_some().then_some(stat)
 }
 
+/// Whether an owner-thread shallow read can reuse retained evidence. The
+/// reader still revalidates the generation when it obtains the bytes.
+pub(crate) fn has_live_regions(path: &Path) -> bool {
+    let Some(stat) = retained_stat(path) else {
+        return false;
+    };
+    STATE.with(|state| {
+        let state = state.borrow();
+        matching_bytes(state.full.as_ref(), path, &stat).is_some()
+            || matching_bytes(state.kept.get(path), path, &stat).is_some()
+            || state
+                .bounded
+                .get(path)
+                .is_some_and(|bounded| bounded.stat == stat)
+    })
+}
+
 /// The head and tail discovery would have read, from bytes already in hand.
 pub(crate) fn live_regions(path: &Path) -> Option<(Vec<u8>, Vec<u8>)> {
     let stat = retained_stat(path)?;
