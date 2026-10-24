@@ -1178,8 +1178,9 @@ catalog delta for the next successful report; changes committed by another write
 before that retry are still excluded from the attempt bracket.
 
 `SessionStore::reconcile()` starts a round-robin reconciliation of provider-owned
-watch roots. `step(max_entries, max_paths, SyncOptions::default())` inspects at
-most that many directory entries and attempts at most that many exact paths.
+watch roots. `step(max_entries, max_paths, SyncOptions::default())` clamps both limits to
+at least one, then inspects at most that many directory entries and attempts at
+most that many exact paths. A zero limit can therefore process one entry/path.
 Retain the round between calls: restarting discovery with a row limit repeatedly
 visits the same newest prefix and is not reconciliation. Each provider rotates
 after every slice, including errors; failed paths remain pending. A fresh round

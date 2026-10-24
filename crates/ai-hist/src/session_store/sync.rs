@@ -4,8 +4,17 @@ use super::*;
 #[derive(Debug)]
 pub(super) struct SyncBaseline {
     pub(super) catalog: CatalogFingerprint,
-    pending: std::collections::BTreeSet<SessionRef>,
+    pending: std::collections::BTreeMap<SessionRef, PendingEntry>,
 }
+
+#[derive(Clone, Copy, Debug)]
+struct PendingEntry {
+    revision: u64,
+    digest: [u8; 32],
+}
+
+#[cfg(test)]
+thread_local! { pub(super) static STOP_AFTER_BRACKET: std::cell::RefCell<Option<StopToken>> = const {std::cell::RefCell::new(None)}; }
 
 impl SyncBaseline {
     fn new(catalog: CatalogFingerprint) -> Self {
@@ -15,14 +24,59 @@ impl SyncBaseline {
         }
     }
 
-    fn finish(&mut self, conn: &Connection, succeeded: bool) -> anyhow::Result<Vec<SessionRef>> {
-        self.pending
-            .extend(catalog_digest::advance(conn, &mut self.catalog)?);
+    fn finish(
+        &mut self,
+        conn: &Connection,
+        succeeded: bool,
+    ) -> anyhow::Result<Vec<(SessionRef, u64)>> {
+        let changed = catalog_digest::advance(conn, &mut self.catalog)?;
+        let revision = self.catalog.head.map_or(0, |head| head.revision);
+        self.prune_pending();
+        for session in changed {
+            if let SessionRef::Id { source, session_id } = &session {
+                if let Some(digest) = self
+                    .catalog
+                    .rows
+                    .get(&(source.as_str().into(), session_id.clone()))
+                {
+                    self.pending.insert(
+                        session,
+                        PendingEntry {
+                            revision,
+                            digest: *digest,
+                        },
+                    );
+                }
+            }
+        }
+        #[cfg(test)]
+        if succeeded {
+            STOP_AFTER_BRACKET.with(|token| {
+                if let Some(token) = token.take() {
+                    token.stop();
+                }
+            });
+        }
+
         Ok(if succeeded {
-            std::mem::take(&mut self.pending).into_iter().collect()
+            self.pending
+                .iter()
+                .map(|(session, pending)| (session.clone(), pending.revision))
+                .collect()
         } else {
             Vec::new()
         })
+    }
+    fn prune_pending(&mut self) {
+        self.pending.retain(|session, pending| match session {
+            SessionRef::Id { source, session_id } => {
+                self.catalog
+                    .rows
+                    .get(&(source.as_str().into(), session_id.clone()))
+                    == Some(&pending.digest)
+            }
+            _ => false,
+        });
     }
 }
 
@@ -34,10 +88,12 @@ impl SessionStore {
     /// discovery at the end. When another process holds the lock this waits
     /// up to [`SyncOptions::lock_timeout_ms`] and then returns
     /// [`Error::SyncLocked`] — never a silent no-op.
-    pub fn sync(&self, opts: SyncOptions) -> Result<SyncReport, Error> {
+    pub fn sync(&self, mut opts: SyncOptions) -> Result<SyncReport, Error> {
         if self.read_only {
             return Err(Error::read_only("sync"));
         }
+        opts.sources =
+            path_scope::selected_sources(&self.roots, opts.paths.as_deref(), opts.sources);
         if opts.paths.as_ref().is_some_and(Vec::is_empty)
             || opts.sources.as_ref().is_some_and(Vec::is_empty)
         {
@@ -55,7 +111,7 @@ impl SessionStore {
             opts.paths.as_deref(),
             opts.sources.as_deref(),
         ));
-        let (tick, changed) = crate::providers::codex::sqlite::with_sweep_policy(
+        let (tick, pending) = crate::providers::codex::sqlite::with_sweep_policy(
             opts.codex_sqlite_max_age_days,
             || {
                 controlled(opts.stop.as_ref(), opts.progress.as_ref(), || {
@@ -63,10 +119,31 @@ impl SessionStore {
                 })
             },
         )?;
+        let head_revision = self.head_revision()?.revision;
+        let changed = pending.iter().map(|(session, _)| session.clone()).collect();
+        // Only acknowledge after every fallible control/query step succeeds.
+        // A newer concurrent attempt may have queued the same session again;
+        // its revision must survive this older report's acknowledgement.
+        if let Some(baseline) = self
+            .sync_baseline
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .as_mut()
+        {
+            for (session, revision) in pending {
+                if baseline
+                    .pending
+                    .get(&session)
+                    .is_some_and(|pending| pending.revision == revision)
+                {
+                    baseline.pending.remove(&session);
+                }
+            }
+        }
         Ok(SyncReport {
             swept: tick.swept,
             changed,
-            head_revision: self.head_revision()?.revision,
+            head_revision,
         })
     }
 
@@ -123,7 +200,7 @@ impl SessionStore {
         force: bool,
         lock_timeout_ms: u64,
         scope: &SweepScope,
-    ) -> Result<(SyncTick, Vec<SessionRef>), Error> {
+    ) -> Result<(SyncTick, Vec<(SessionRef, u64)>), Error> {
         let started = Instant::now();
         // Bounded where it enters, like every watch interval: `Instant +
         // Duration` panics when the sum is not representable, and a caller
@@ -158,6 +235,7 @@ impl SessionStore {
                     } else if let Some(before) = baseline.as_mut() {
                         // Exclude other writers' commits preceding this call.
                         catalog_digest::advance(conn, &mut before.catalog)?;
+                        before.prune_pending();
                     }
                     Ok(())
                 },

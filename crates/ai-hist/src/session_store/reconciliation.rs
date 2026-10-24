@@ -19,9 +19,9 @@ pub struct Reconciliation {
 #[derive(Debug, Default)]
 #[non_exhaustive]
 pub struct ReconciliationStep {
-    /// Directory entries inspected in this slice (at most the supplied bound).
+    /// Directory entries inspected (at most the supplied bound, clamped to one).
     pub entries: usize,
-    /// Exact paths attempted (at most the supplied bound).
+    /// Exact paths attempted (at most the supplied bound, clamped to one).
     pub paths: usize,
     /// All roots in this round have been exhausted.
     pub complete: bool,
@@ -36,11 +36,31 @@ struct SourceWalk {
     source: Source,
     roots: VecDeque<WatchedPath>,
     queued: VecDeque<PathBuf>,
-    current: Option<(ReadDir, WatchedPath)>,
+    current: Option<OpenDirectory>,
+    retry_entry: Option<(std::fs::DirEntry, WatchedPath)>,
     root: Option<WatchedPath>,
     visited: HashSet<PathBuf>,
     pending: Vec<PathBuf>,
     finalized: bool,
+}
+
+#[derive(Debug)]
+struct OpenDirectory {
+    entries: ReadDir,
+    root: WatchedPath,
+    path: PathBuf,
+    canonical: PathBuf,
+}
+
+#[cfg(test)]
+thread_local! {static FAIL_ENTRY_TYPE: std::cell::Cell<bool> = const {std::cell::Cell::new(false)};}
+
+fn entry_type(entry: &std::fs::DirEntry) -> std::io::Result<std::fs::FileType> {
+    #[cfg(test)]
+    if FAIL_ENTRY_TYPE.with(|fail| fail.replace(false)) {
+        return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    }
+    entry.file_type()
 }
 
 impl SessionStore {
@@ -64,6 +84,7 @@ impl SessionStore {
                     roots: roots.into(),
                     queued: VecDeque::new(),
                     current: None,
+                    retry_entry: None,
                     root: None,
                     visited: HashSet::new(),
                     pending: Vec::new(),
@@ -192,13 +213,9 @@ impl Reconciliation {
         }
         options.sources = Some(vec![source.source]);
         options.paths = Some(source.pending[..step.paths].to_vec());
-        match self.store.sync(options.clone()) {
-            Ok(report) => {
-                source.pending.drain(..step.paths);
-                step.report = Some(report);
-            }
-            Err(error) => return Err(error),
-        }
+        let report = self.store.sync(options)?;
+        source.pending.drain(..step.paths);
+        step.report = Some(report);
         Ok(step)
     }
 }
@@ -211,6 +228,7 @@ impl SourceWalk {
     fn enumerated(&self) -> bool {
         self.pending.is_empty()
             && self.current.is_none()
+            && self.retry_entry.is_none()
             && self.queued.is_empty()
             && self.roots.is_empty()
     }
@@ -222,7 +240,7 @@ impl SourceWalk {
         entries: &mut usize,
     ) -> Result<(), Error> {
         while *entries < max_entries && self.pending.len() < max_paths {
-            if self.current.is_some() {
+            if self.current.is_some() || self.retry_entry.is_some() {
                 self.next_entry(entries)?;
                 continue;
             }
@@ -263,8 +281,13 @@ impl SourceWalk {
         }
         match fs::read_dir(&path) {
             Ok(dir) => {
-                self.visited.insert(canonical);
-                self.current = Some((dir, root));
+                self.visited.insert(canonical.clone());
+                self.current = Some(OpenDirectory {
+                    entries: dir,
+                    root,
+                    path,
+                    canonical,
+                });
                 Ok(())
             }
             Err(error) => {
@@ -274,23 +297,53 @@ impl SourceWalk {
         }
     }
 
-    fn next_entry(&mut self, entries: &mut usize) -> Result<(), Error> {
-        let Some((dir, root)) = self.current.as_mut() else {
-            return Ok(());
+    fn read_entry(
+        &mut self,
+        entries: &mut usize,
+    ) -> Result<Option<(std::fs::DirEntry, WatchedPath)>, Error> {
+        if let Some(retry) = self.retry_entry.take() {
+            *entries += 1;
+            return Ok(Some(retry));
+        }
+        let Some(current) = self.current.as_mut() else {
+            return Ok(None);
         };
-        let Some(entry) = dir.next() else {
+        let Some(entry) = current.entries.next() else {
             self.current = None;
-            return Ok(());
+            return Ok(None);
         };
         *entries += 1;
-        let entry = entry.map_err(|error| Error::Discovery(error.to_string()))?;
+        match entry {
+            Ok(entry) => Ok(Some((entry, current.root.clone()))),
+            Err(error) => {
+                // No filename is available: retain this directory and restart
+                // its bounded enumeration rather than skip an unknown entry.
+                let path = current.path.clone();
+                let canonical = current.canonical.clone();
+                self.current = None;
+                self.visited.remove(&canonical);
+                self.queued.push_front(path);
+                Err(Error::Discovery(error.to_string()))
+            }
+        }
+    }
+
+    fn next_entry(&mut self, entries: &mut usize) -> Result<(), Error> {
+        let Some((entry, root)) = self.read_entry(entries)? else {
+            return Ok(());
+        };
         if !root.admits(&entry.file_name()) {
             return Ok(());
         }
         let path = entry.path();
-        let kind = entry
-            .file_type()
-            .map_err(|error| Error::Discovery(error.to_string()))?;
+        let kind = match entry_type(&entry) {
+            Ok(kind) => kind,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => {
+                self.retry_entry = Some((entry, root));
+                return Err(Error::Discovery(error.to_string()));
+            }
+        };
         if kind.is_dir() || (kind.is_symlink() && path.is_dir()) {
             if root.scope == WatchScope::Tree {
                 self.queued.push_back(path);
@@ -1062,11 +1115,19 @@ mod tests {
             before,
             "unchanged repaired identity must not advance the feed"
         );
-        assert_eq!(
-            crate::ingest::transcript_file::take_read_bytes(),
-            0,
-            "a repaired identity must stay repaired on the next settled pass"
-        );
+        let read = crate::ingest::transcript_file::take_read_bytes();
+        let metadata = crate::ingest::transcript_file::metadata(&path).unwrap();
+        if crate::ingest::transcript_cursor::filesystem_keeps_change_time(&path, &metadata) {
+            assert_eq!(
+                read, 0,
+                "a repaired identity must stay repaired on the next settled pass"
+            );
+        } else {
+            assert!(
+                read < 1024 * 1024,
+                "unknown filesystems retain bounded validation, read {read}"
+            );
+        }
         assert_eq!(crate::ingest::state_work::take(), (0, 0));
         let conn = crate::store::open_db(store.db_path()).unwrap();
         assert_eq!(conn.query_row("SELECT COUNT(*) FROM session_observations WHERE source='claude' AND access_state='available' AND raw_locator=?1",[path.to_string_lossy()],|row|row.get::<_,i64>(0)).unwrap(),1);
@@ -1308,5 +1369,191 @@ mod tests {
             }
         }
         assert_eq!(store.sessions(Default::default()).count(), 3);
+    }
+    #[test]
+    fn an_unacknowledged_successful_bracket_stays_pending_until_a_public_report() {
+        let (_temp, store, project) = fixture();
+        let path = project.join("a.jsonl");
+        write(&path, "a", "one");
+        let scope = crate::ingest::SweepScope::only(["claude"])
+            .with_paths(crate::ingest::path_scope::PathScope::from_paths([path]));
+        store.sync_tick(false, 0, &scope).unwrap();
+        let report = store
+            .sync(SyncOptions::default().sources([Source::Claude]))
+            .unwrap();
+        assert!(report
+            .changed
+            .contains(&super::super::SessionRef::id(Source::Claude, "a")));
+        assert!(store
+            .sync(SyncOptions::default().sources([Source::Claude]))
+            .unwrap()
+            .changed
+            .is_empty());
+    }
+    #[test]
+    fn failed_entry_metadata_retains_the_same_directory_entry_until_retry() {
+        let (_temp, store, project) = fixture();
+        for id in ["a", "b", "c"] {
+            write(&project.join(format!("{id}.jsonl")), id, "one");
+        }
+        let mut round = store.reconcile().unwrap().sources([Source::Claude]);
+        FAIL_ENTRY_TYPE.with(|fail| fail.set(true));
+        assert!(round.step(64, 3, SyncOptions::default()).is_err());
+        assert!(round
+            .sources
+            .iter()
+            .any(|source| source.retry_entry.is_some()));
+        for _ in 0..100 {
+            if round.step(64, 3, SyncOptions::default()).unwrap().complete {
+                break;
+            }
+        }
+        assert_eq!(store.sessions(Default::default()).count(), 3);
+    }
+
+    #[test]
+    fn paths_without_source_hints_only_discover_their_owning_provider() {
+        let (_temp, store, project) = fixture();
+        let file = project.join("owned.jsonl");
+        write(&file, "owned", "one");
+        fs::write(&store.roots().opencode_db, b"not a SQLite store").unwrap();
+        fs::create_dir_all(&store.roots().devin).unwrap();
+        fs::write(
+            store.roots().devin.join("sessions.db"),
+            b"not a SQLite store",
+        )
+        .unwrap();
+        let options = super::super::DiscoveryOptions {
+            paths: Some(vec![file.clone()]),
+            ..Default::default()
+        };
+        let report = store.discover(options).unwrap();
+        assert_eq!(report.discovered, 1);
+        assert!(
+            report.diagnostics.is_empty(),
+            "unrelated broken stores must not be consulted: {:?}",
+            report.diagnostics
+        );
+        assert_eq!(
+            super::super::path_scope::selected_sources(
+                store.roots(),
+                Some(std::slice::from_ref(&file)),
+                None
+            ),
+            Some(vec![Source::Claude])
+        );
+        store.sync(SyncOptions::default().paths([file])).unwrap();
+    }
+
+    #[test]
+    fn deleted_failed_attempt_keys_are_not_reported_by_an_unrelated_retry() {
+        let (_temp, store, project) = fixture();
+        let a = project.join("a.jsonl");
+        let b = project.join("b.jsonl");
+        write(&a, "a", "one");
+        write(&b, "b", "one");
+        let stop = super::super::StopToken::new();
+        let observer_stop = stop.clone();
+        let mut options = SyncOptions::default()
+            .sources([Source::Claude])
+            .paths([a.clone(), b.clone()]);
+        options.stop = Some(stop);
+        options.progress = Some(super::super::ProgressObserver::new(move |progress| {
+            if progress.processed_files >= 1 {
+                observer_stop.stop();
+            }
+        }));
+        assert!(store.sync(options).is_err());
+        fs::remove_file(a).unwrap();
+        crate::open_db(store.db_path())
+            .unwrap()
+            .execute(
+                "DELETE FROM sessions WHERE source='claude' AND session_id='a'",
+                [],
+            )
+            .unwrap();
+        let report = store
+            .sync(SyncOptions::default().sources([Source::Claude]).paths([b]))
+            .unwrap();
+        assert!(
+            !report
+                .changed
+                .contains(&super::super::SessionRef::id(Source::Claude, "a")),
+            "deleted external keys must leave the retained delta"
+        );
+    }
+
+    #[test]
+    fn late_cancellation_retains_current_and_previously_failed_catalog_deltas() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                super::super::sync::STOP_AFTER_BRACKET.with(|token| token.take());
+            }
+        }
+        let _reset = Reset;
+        let (_temp, store, project) = fixture();
+        let a = project.join("a.jsonl");
+        let b = project.join("b.jsonl");
+        write(&a, "a", "one");
+        write(&b, "b", "one");
+        let stop = super::super::StopToken::new();
+        let observer_stop = stop.clone();
+        let mut options = SyncOptions::default()
+            .sources([Source::Claude])
+            .paths([a, b]);
+        options.stop = Some(stop);
+        options.progress = Some(super::super::ProgressObserver::new(move |progress| {
+            if progress.processed_files >= 1 {
+                observer_stop.stop();
+            }
+        }));
+        assert!(store.sync(options.clone()).is_err());
+        let late = super::super::StopToken::new();
+        options.stop = Some(late.clone());
+        options.progress = None;
+        super::super::sync::STOP_AFTER_BRACKET.with(|token| *token.borrow_mut() = Some(late));
+        assert!(matches!(
+            store.sync(options.clone()),
+            Err(Error::Cancelled(_))
+        ));
+        options.stop = None;
+        let report = store.sync(options.clone()).unwrap();
+        for id in ["a", "b"] {
+            assert!(
+                report
+                    .changed
+                    .contains(&super::super::SessionRef::id(Source::Claude, id)),
+                "late cancellation must preserve {id}"
+            );
+        }
+        assert!(store.sync(options).unwrap().changed.is_empty());
+    }
+    #[test]
+    fn externally_replaced_failed_delta_is_not_attributed_to_an_unrelated_retry() {
+        let (_temp, store, project) = fixture();
+        let a = project.join("a.jsonl");
+        let b = project.join("b.jsonl");
+        write(&a, "a", "one");
+        write(&b, "b", "one");
+        let stop = super::super::StopToken::new();
+        let observer_stop = stop.clone();
+        let mut options = SyncOptions::default()
+            .sources([Source::Claude])
+            .paths([a, b.clone()]);
+        options.stop = Some(stop);
+        options.progress = Some(super::super::ProgressObserver::new(move |progress| {
+            if progress.processed_files >= 1 {
+                observer_stop.stop();
+            }
+        }));
+        assert!(store.sync(options).is_err());
+        crate::open_db(store.db_path()).unwrap().execute("UPDATE sessions SET title='outside-writer' WHERE source='claude' AND session_id='a'",[]).unwrap();
+        let report = store
+            .sync(SyncOptions::default().sources([Source::Claude]).paths([b]))
+            .unwrap();
+        assert!(!report
+            .changed
+            .contains(&super::super::SessionRef::id(Source::Claude, "a")));
     }
 }

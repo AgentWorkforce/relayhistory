@@ -28,6 +28,45 @@ pub(super) fn scope(
     }))
 }
 
+pub(super) fn selected_sources(
+    roots: &ProviderRoots,
+    paths: Option<&[PathBuf]>,
+    sources: Option<Vec<Source>>,
+) -> Option<Vec<Source>> {
+    if sources.is_some() {
+        return sources;
+    }
+    let paths = paths?;
+    if paths.is_empty() {
+        return Some(Vec::new());
+    }
+    let paths: Vec<_> = paths.iter().map(|path| resolved(path)).collect();
+    Some(
+        Source::ALL
+            .iter()
+            .copied()
+            .filter(|source| {
+                source.capabilities().watch_roots(roots).iter().any(|root| {
+                    let base = resolved(&root.path);
+                    paths.iter().any(|path| {
+                        if base.starts_with(path) {
+                            return true;
+                        }
+                        match root.scope {
+                            crate::WatchScope::File => path == &base,
+                            crate::WatchScope::Directory => {
+                                path.parent() == Some(base.as_path())
+                                    && path.file_name().is_some_and(|name| root.admits(name))
+                            }
+                            _ => path.starts_with(&base),
+                        }
+                    })
+                })
+            })
+            .collect(),
+    )
+}
+
 /// Deleted/renamed paths still resolve their existing ancestor. Resolve links
 /// before restoring absent suffixes so /var and /private/var stay one identity.
 fn resolved(path: &Path) -> PathBuf {

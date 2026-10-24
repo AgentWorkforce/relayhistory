@@ -135,7 +135,8 @@ pub struct DiscoveryOptions {
     pub sources: Option<Vec<Source>>,
     /// Exact watcher paths or a bounded reconciliation slice. `None` means
     /// unrestricted; `Some(vec![])` reads no providers. Provider-owned path
-    /// rules remain authoritative.
+    /// rules remain authoritative. With no `sources` hint, the SDK selects
+    /// only providers whose watch roots own these paths.
     #[serde(default)]
     pub paths: Option<Vec<PathBuf>>,
     /// Cap on rows read, newest first across providers. `None` (the default)
@@ -254,8 +255,9 @@ pub struct SyncOptions {
     #[serde(default)]
     pub codex_sqlite_max_age_days: Option<u64>,
     /// Exact filesystem paths reported by an embedder's watcher. `None` means
-    /// no path restriction; `Some(vec![])` reads no providers. Always combine
-    /// with the owning `sources`.
+    /// no path restriction; `Some(vec![])` reads no providers. An explicit
+    /// `sources` hint bypasses inference; otherwise the SDK derives owning
+    /// providers from their watch roots.
     /// Partial passes never publish a full-source fingerprint.
     #[serde(default)]
     pub paths: Option<Vec<PathBuf>>,
