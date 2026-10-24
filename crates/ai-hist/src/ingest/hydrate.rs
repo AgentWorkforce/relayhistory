@@ -410,7 +410,7 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
     claude_snapshot: Option<ClaudeTranscriptSnapshot>,
 ) -> Result<HydrateSessionResult> {
     let home = &roots.home;
-    begin_hydration(options, home, connectors)?;
+    let _reads = begin_hydration(options, home, connectors)?;
     let started = Instant::now();
     // Acquisition and replacement are one per-session critical section. The
     // provider call has to be inside it: otherwise an older response can wait
@@ -570,7 +570,7 @@ fn begin_hydration(
     options: &HydrateSessionOptions,
     home: &Path,
     connectors: &crate::remote::SourceConnectorSelection,
-) -> Result<()> {
+) -> Result<cold_read::ReadScope> {
     super::check_capture_cancelled()?;
     validate_options(options)?;
     // One hydration is one acquisition pass; see `begin_acquisition_pass`.
@@ -584,7 +584,7 @@ fn begin_hydration(
         )
         .map_err(|error| hydration_error("CONNECTOR_NOT_CONFIGURED", error))?;
     }
-    Ok(())
+    Ok(cold_read::begin_read_scope())
 }
 
 /// A changed pass over a session with a stamped checkpoint updated it; any

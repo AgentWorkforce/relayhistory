@@ -7,12 +7,13 @@
 //! discovery, use that copy while the file's stat still matches. A resume
 //! from a cursor, or a file too large to hold, keeps the streaming reader.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 #[cfg(test)]
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
 use crate::discover::{HEAD_SCAN_MAX_BYTES, TAIL_SCAN_MAX_BYTES};
 
@@ -63,8 +64,6 @@ struct Parked {
 }
 
 struct State {
-    #[cfg(test)]
-    opens: HashMap<PathBuf, u64>,
     parked: Option<Parked>,
     /// Change time of the first open of a path. A walk publishes only when
     /// that time still matches, so a rewrite cannot be stored under the new one.
@@ -82,8 +81,6 @@ struct State {
 impl State {
     fn empty() -> Self {
         Self {
-            #[cfg(test)]
-            opens: HashMap::new(),
             parked: None,
             opened: HashMap::new(),
             full: None,
@@ -94,19 +91,44 @@ impl State {
     }
 }
 
-fn lock() -> std::sync::MutexGuard<'static, State> {
-    state()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn state() -> &'static Mutex<State> {
-    static STATE: OnceLock<Mutex<State>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(State::empty()))
-}
-
 thread_local! {
+    // A sweep's guard and all transcript readers run on its owning thread.
+    // Other stores may capture hot paths concurrently; sharing parked handles
+    // or retained bytes with them would evict this sweep's reusable evidence.
+    static STATE: RefCell<State> = RefCell::new(State::empty());
     static IN_SWEEP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static READ_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+thread_local! { static OPENS: RefCell<HashMap<PathBuf, u64>> = RefCell::new(HashMap::new()); }
+
+/// Bound retained bytes and handles to the outermost acquisition, including
+/// nested hydration calls and unwinding. No user code runs with State borrowed.
+pub(crate) struct ReadScope(std::marker::PhantomData<std::rc::Rc<()>>);
+
+pub(crate) fn begin_read_scope() -> ReadScope {
+    if READ_DEPTH.with(|depth| {
+        let previous = depth.get();
+        depth.set(previous + 1);
+        previous
+    }) == 0
+    {
+        STATE.with(|state| *state.borrow_mut() = State::empty());
+    }
+    ReadScope(std::marker::PhantomData)
+}
+
+impl Drop for ReadScope {
+    fn drop(&mut self) {
+        if READ_DEPTH.with(|depth| {
+            let next = depth.get() - 1;
+            depth.set(next);
+            next
+        }) == 0
+        {
+            STATE.with(|state| *state.borrow_mut() = State::empty());
+        }
+    }
 }
 
 /// Held across one sweep so discovery can see bytes the ingest already read.
@@ -116,46 +138,22 @@ pub(crate) struct SweepGuard {
     previous: bool,
     _local: std::marker::PhantomData<std::rc::Rc<()>>,
     _codex_sqlite: crate::providers::codex::sqlite::SyncPass,
-    /// Tests sweep many stores in one process, and this state is the
-    /// process's: one sweep at a time keeps each sweep's open counts its own.
-    #[cfg(test)]
-    _serial: std::sync::MutexGuard<'static, ()>,
+    _reads: ReadScope,
 }
 
 impl Drop for SweepGuard {
     fn drop(&mut self) {
-        let mut state = lock();
         IN_SWEEP.with(|value| value.set(self.previous));
-        state.full = None;
-        state.kept.clear();
-        state.bounded.clear();
-        state.retained = 0;
-        state.parked = None;
-        state.opened.clear();
     }
 }
 
 pub(crate) fn begin_sweep() -> SweepGuard {
-    #[cfg(test)]
-    let serial = {
-        static SWEEPS: Mutex<()> = Mutex::new(());
-        SWEEPS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    };
-    let mut state = lock();
-    state.full = None;
-    state.kept.clear();
-    state.bounded.clear();
-    state.retained = 0;
-    state.parked = None;
-    state.opened.clear();
+    let reads = begin_read_scope();
     SweepGuard {
+        _reads: reads,
         previous: IN_SWEEP.with(|value| value.replace(true)),
         _local: std::marker::PhantomData,
         _codex_sqlite: crate::providers::codex::sqlite::SyncPass::begin(),
-        #[cfg(test)]
-        _serial: serial,
     }
 }
 
@@ -163,17 +161,18 @@ pub(crate) fn in_sweep() -> bool {
     IN_SWEEP.with(|value| value.get())
 }
 
-/// How many times `path` was opened through this module since the process started.
+/// How many times this thread opened `path` through this module.
 #[cfg(test)]
 pub(crate) fn opens(path: &Path) -> u64 {
-    lock().opens.get(path).copied().unwrap_or(0)
+    OPENS.with(|opens| opens.borrow().get(path).copied().unwrap_or(0))
 }
 
 fn note_open(path: &Path) {
     #[cfg(test)]
     {
-        let mut state = lock();
-        *state.opens.entry(path.to_path_buf()).or_insert(0) += 1;
+        OPENS.with(|opens| {
+            *opens.borrow_mut().entry(path.to_path_buf()).or_insert(0) += 1;
+        });
     }
     #[cfg(not(test))]
     let _ = path;
@@ -221,11 +220,13 @@ pub(crate) fn small_file_len(path: &Path) -> io::Result<Option<u64>> {
 /// were read under.
 pub(crate) fn fresh(path: &Path) -> Option<Arc<[u8]>> {
     let stat = retained_stat(path)?;
-    let state = lock();
-    if let Some(bytes) = matching_bytes(state.full.as_ref(), path, &stat) {
-        return Some(bytes);
-    }
-    matching_bytes(state.kept.get(path), path, &stat)
+    STATE.with(|state| {
+        let state = state.borrow();
+        if let Some(bytes) = matching_bytes(state.full.as_ref(), path, &stat) {
+            return Some(bytes);
+        }
+        matching_bytes(state.kept.get(path), path, &stat)
+    })
 }
 
 fn matching_bytes(capture: Option<&Capture>, path: &Path, stat: &Stat) -> Option<Arc<[u8]>> {
@@ -243,15 +244,17 @@ fn retained_stat(path: &Path) -> Option<Stat> {
 /// The head and tail discovery would have read, from bytes already in hand.
 pub(crate) fn live_regions(path: &Path) -> Option<(Vec<u8>, Vec<u8>)> {
     let stat = retained_stat(path)?;
-    let state = lock();
-    if let Some(bytes) = matching_bytes(state.full.as_ref(), path, &stat) {
-        return Some(split_live(&bytes));
-    }
-    if let Some(bytes) = matching_bytes(state.kept.get(path), path, &stat) {
-        return Some(split_live(&bytes));
-    }
-    let bounded = state.bounded.get(path)?;
-    (bounded.stat == stat).then(|| (bounded.head.clone(), bounded.tail.clone()))
+    STATE.with(|state| {
+        let state = state.borrow();
+        if let Some(bytes) = matching_bytes(state.full.as_ref(), path, &stat) {
+            return Some(split_live(&bytes));
+        }
+        if let Some(bytes) = matching_bytes(state.kept.get(path), path, &stat) {
+            return Some(split_live(&bytes));
+        }
+        let bounded = state.bounded.get(path)?;
+        (bounded.stat == stat).then(|| (bounded.head.clone(), bounded.tail.clone()))
+    })
 }
 
 fn publish_locked(state: &mut State, path: PathBuf, bytes: Arc<[u8]>, stat: Stat) {
@@ -313,8 +316,7 @@ pub(crate) fn publish(path: &Path, bytes: Arc<[u8]>, stat_at_read: &TranscriptMe
     if stat.len != bytes.len() as u64 {
         return;
     }
-    let mut state = lock();
-    publish_locked(&mut state, path.to_path_buf(), bytes, stat);
+    STATE.with(|state| publish_locked(&mut state.borrow_mut(), path.to_path_buf(), bytes, stat));
 }
 
 /// Read `path` whole when it fits in [`CAPTURE_MAX_BYTES`]. A parked handle
@@ -391,12 +393,24 @@ pub(crate) fn publish_walk(path: &Path, walked: &[u8], opened_len: u64, opened_m
 }
 
 fn take_opened_ctime(path: &Path) -> Option<i64> {
-    lock().opened.remove(path).and_then(|stat| stat.ctime_ns)
+    STATE.with(|state| {
+        state
+            .borrow_mut()
+            .opened
+            .remove(path)
+            .and_then(|stat| stat.ctime_ns)
+    })
 }
 
 fn remember_open(path: &Path, metadata: &TranscriptMetadata) {
     let stat = stat_from(metadata);
-    lock().opened.entry(path.to_path_buf()).or_insert(stat);
+    STATE.with(|state| {
+        state
+            .borrow_mut()
+            .opened
+            .entry(path.to_path_buf())
+            .or_insert(stat);
+    });
 }
 
 /// SHA-256 of the first `offset` bytes already in hand, and the hasher that
@@ -498,26 +512,29 @@ pub(crate) fn open_shared(path: &Path) -> io::Result<SharedFile> {
 /// read that parked it.
 fn take_parked(path: &Path) -> Option<TranscriptFile> {
     let current = stat_of(path).ok()?;
-    let mut state = lock();
-    match state.parked.take()? {
-        parked if parked.path == path && parked.stat == current => Some(parked.file),
-        parked if parked.path != path => {
-            state.parked = Some(parked);
-            None
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        match state.parked.take()? {
+            parked if parked.path == path && parked.stat == current => Some(parked.file),
+            parked if parked.path != path => {
+                state.parked = Some(parked);
+                None
+            }
+            _ => None,
         }
-        _ => None,
-    }
+    })
 }
 
 fn park(path: &Path, file: TranscriptFile) {
     let Ok(stat) = stat_of(path) else {
         return;
     };
-    let mut state = lock();
-    state.parked = Some(Parked {
-        path: path.to_path_buf(),
-        file,
-        stat,
+    STATE.with(|state| {
+        state.borrow_mut().parked = Some(Parked {
+            path: path.to_path_buf(),
+            file,
+            stat,
+        });
     });
 }
 
@@ -574,6 +591,72 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_concurrent_hot_probe_does_not_evict_a_cold_parked_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let cold = dir.path().join("cold.jsonl");
+        let hot = dir.path().join("hot.jsonl");
+        fs::write(&cold, b"cold\n").unwrap();
+        fs::write(&hot, b"hot\n").unwrap();
+        let _sweep = begin_sweep();
+        assert!(probe(&cold));
+        std::thread::spawn(move || assert!(probe(&hot)))
+            .join()
+            .unwrap();
+        drop(open_file(&cold).unwrap());
+        assert_eq!(opens(&cold), 1, "unrelated hot reads retain the cold open");
+    }
+
+    #[test]
+    fn independent_cold_sweeps_can_reach_their_own_work_concurrently() {
+        let _sweep = begin_sweep();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let running = std::thread::spawn(move || {
+            let _sweep = begin_sweep();
+            tx.send(()).unwrap();
+        });
+        let reached = rx.recv_timeout(std::time::Duration::from_secs(2));
+        drop(_sweep);
+        running.join().unwrap();
+        assert!(
+            reached.is_ok(),
+            "unrelated stores must not queue behind a test sweep"
+        );
+    }
+
+    #[test]
+    fn acquisition_scope_releases_retained_bytes_and_handles_after_unwinding() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scope.jsonl");
+        fs::write(&path, b"scope\n").unwrap();
+        let _ = std::panic::catch_unwind(|| {
+            let _scope = begin_read_scope();
+            read_all(&path).unwrap();
+            assert!(fresh(&path).is_some());
+            {
+                let _nested = begin_read_scope();
+                assert!(
+                    fresh(&path).is_some(),
+                    "nested hydration reuses the outer cache"
+                );
+                assert!(probe(&path));
+            }
+            assert!(fresh(&path).is_some());
+            panic!("synthetic callback panic");
+        });
+        STATE.with(|state| {
+            let state = state.borrow();
+            assert!(state.full.is_none() && state.parked.is_none());
+            assert!(state.kept.is_empty() && state.bounded.is_empty() && state.opened.is_empty());
+            assert_eq!(
+                state.kept.capacity(),
+                0,
+                "idle threads release map allocations"
+            );
+        });
+        assert_eq!(READ_DEPTH.with(std::cell::Cell::get), 0);
+    }
 
     fn claude_line(session_id: &str) -> String {
         format!(

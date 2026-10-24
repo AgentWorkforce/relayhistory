@@ -1283,3 +1283,11 @@ current session before skipping it. Embedders should retain an infrequent full `
 repair commands. A full audit and each atomic input can still be slow. Keep hot
 capture and cold scheduling separate, and do not add their individual duty
 fractions up as a claim about measured combined CPU usage.
+
+Transcript read reuse belongs to the acquisition thread. Concurrent stores cannot
+evict one another's parked handles or retained bytes. Each active acquisition can
+retain up to 256 MiB of earlier transcript data plus its current file (at most
+8 MiB), bounded head/tail snapshots and one parked handle; this is a per-active-
+thread bound, not a process-wide memory budget. Nested hydration shares its outer
+acquisition cache. Completion, errors and panic unwinding drop retained handles,
+bytes and map allocations, so idle worker threads do not retain these buffers.

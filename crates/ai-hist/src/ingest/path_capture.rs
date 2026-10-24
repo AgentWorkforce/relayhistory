@@ -29,6 +29,7 @@ pub(crate) fn sync_facade_tick<B, R>(
     let Some(sync_lock) = try_acquire_sync_lock(db_path)? else {
         return Ok(None);
     };
+    let _reads = cold_read::begin_read_scope();
     crate::store::sync_connection::with_connection(db_path, |conn| {
         // Keep setup diagnostics separate from provider errors: legacy full
         // sync already enriches its own contention, and probing twice would

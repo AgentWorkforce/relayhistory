@@ -26,6 +26,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Same-size transcript rewrites with a changed trusted filesystem timestamp replay their records even when bounded prefix hashes are unchanged.
 - Exact-path acquisition refreshes admitted project identities without resolving unrelated catalog rows on every slice.
 - Cold acquisition slices reuse validated writable connections instead of initializing the whole schema for every small file batch.
+- Concurrent acquisition threads retain independent transcript caches and release their buffers and handles when each acquisition finishes.
 - Reconciliation reports SQLite busy waits separately for work-based scheduling.
 - Capture cancellation stops SQLite busy retries so maintenance releases its sync lease while another writer remains held.
 
