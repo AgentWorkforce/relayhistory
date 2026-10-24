@@ -112,6 +112,8 @@ mod tests {
         let alias = home.path().join("alias");
         std::os::unix::fs::symlink(&workspace, &alias).unwrap();
         let resolved = resolve_workspaces(vec![alias, workspace.clone()]);
-        assert_eq!(resolved.paths, vec![workspace.join(".vtcode/sessions")]);
+        // Existing targets, including macOS /var aliases, use canonical roots.
+        let expected = std::fs::canonicalize(&workspace).unwrap();
+        assert_eq!(resolved.paths, vec![expected.join(".vtcode/sessions")]);
     }
 }

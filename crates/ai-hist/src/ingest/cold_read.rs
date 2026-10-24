@@ -7,18 +7,22 @@
 //! discovery, use that copy while the file's stat still matches. A resume
 //! from a cursor, or a file too large to hold, keeps the streaming reader.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 #[cfg(test)]
 use std::fs;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
 use crate::discover::{HEAD_SCAN_MAX_BYTES, TAIL_SCAN_MAX_BYTES};
 
 use super::metadata_mtime_ns;
 use super::transcript_cursor::{change_time_ns, file_identity, filesystem_keeps_change_time};
 use super::transcript_file::{self, TranscriptFile, TranscriptMetadata};
+
+mod opening;
+pub(crate) use opening::opening_record;
 
 /// Largest transcript retained so a second pass can reuse the first read.
 ///
@@ -60,8 +64,6 @@ struct Parked {
 }
 
 struct State {
-    #[cfg(test)]
-    opens: HashMap<PathBuf, u64>,
     parked: Option<Parked>,
     /// Change time of the first open of a path. A walk publishes only when
     /// that time still matches, so a rewrite cannot be stored under the new one.
@@ -74,98 +76,103 @@ struct State {
     kept: HashMap<PathBuf, Capture>,
     bounded: HashMap<PathBuf, Bounded>,
     retained: usize,
-    sweep: bool,
 }
 
 impl State {
     fn empty() -> Self {
         Self {
-            #[cfg(test)]
-            opens: HashMap::new(),
             parked: None,
             opened: HashMap::new(),
             full: None,
             kept: HashMap::new(),
             bounded: HashMap::new(),
             retained: 0,
-            sweep: false,
         }
     }
 }
 
-fn lock() -> std::sync::MutexGuard<'static, State> {
-    state()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+thread_local! {
+    // A sweep's guard and all transcript readers run on its owning thread.
+    // Other stores may capture hot paths concurrently; sharing parked handles
+    // or retained bytes with them would evict this sweep's reusable evidence.
+    static STATE: RefCell<State> = RefCell::new(State::empty());
+    static IN_SWEEP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static READ_DEPTH: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+thread_local! { static OPENS: RefCell<HashMap<PathBuf, u64>> = RefCell::new(HashMap::new()); }
+
+/// Bound retained bytes and handles to the outermost acquisition, including
+/// nested hydration calls and unwinding. No user code runs with State borrowed.
+pub(crate) struct ReadScope(std::marker::PhantomData<std::rc::Rc<()>>);
+
+pub(crate) fn begin_read_scope() -> ReadScope {
+    if READ_DEPTH.with(|depth| {
+        let previous = depth.get();
+        depth.set(previous + 1);
+        previous
+    }) == 0
+    {
+        STATE.with(|state| *state.borrow_mut() = State::empty());
+    }
+    ReadScope(std::marker::PhantomData)
 }
 
-fn state() -> &'static Mutex<State> {
-    static STATE: OnceLock<Mutex<State>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(State::empty()))
+impl Drop for ReadScope {
+    fn drop(&mut self) {
+        if READ_DEPTH.with(|depth| {
+            let next = depth.get() - 1;
+            depth.set(next);
+            next
+        }) == 0
+        {
+            STATE.with(|state| *state.borrow_mut() = State::empty());
+        }
+    }
 }
 
 /// Held across one sweep so discovery can see bytes the ingest already read.
 /// Dropping it forgets those bytes. Open counts stay, for the test that reads
 /// them after the sweep returns.
 pub(crate) struct SweepGuard {
+    previous: bool,
+    _local: std::marker::PhantomData<std::rc::Rc<()>>,
     _codex_sqlite: crate::providers::codex::sqlite::SyncPass,
-    /// Tests sweep many stores in one process, and this state is the
-    /// process's: one sweep at a time keeps each sweep's open counts its own.
-    #[cfg(test)]
-    _serial: std::sync::MutexGuard<'static, ()>,
+    _reads: ReadScope,
 }
 
 impl Drop for SweepGuard {
     fn drop(&mut self) {
-        let mut state = lock();
-        state.sweep = false;
-        state.full = None;
-        state.kept.clear();
-        state.bounded.clear();
-        state.retained = 0;
-        state.parked = None;
-        state.opened.clear();
+        IN_SWEEP.with(|value| value.set(self.previous));
     }
 }
 
 pub(crate) fn begin_sweep() -> SweepGuard {
-    #[cfg(test)]
-    let serial = {
-        static SWEEPS: Mutex<()> = Mutex::new(());
-        SWEEPS
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-    };
-    let mut state = lock();
-    state.sweep = true;
-    state.full = None;
-    state.kept.clear();
-    state.bounded.clear();
-    state.retained = 0;
-    state.parked = None;
-    state.opened.clear();
+    let reads = begin_read_scope();
     SweepGuard {
+        _reads: reads,
+        previous: IN_SWEEP.with(|value| value.replace(true)),
+        _local: std::marker::PhantomData,
         _codex_sqlite: crate::providers::codex::sqlite::SyncPass::begin(),
-        #[cfg(test)]
-        _serial: serial,
     }
 }
 
 pub(crate) fn in_sweep() -> bool {
-    lock().sweep
+    IN_SWEEP.with(|value| value.get())
 }
 
-/// How many times `path` was opened through this module since the process started.
+/// How many times this thread opened `path` through this module.
 #[cfg(test)]
 pub(crate) fn opens(path: &Path) -> u64 {
-    lock().opens.get(path).copied().unwrap_or(0)
+    OPENS.with(|opens| opens.borrow().get(path).copied().unwrap_or(0))
 }
 
 fn note_open(path: &Path) {
     #[cfg(test)]
     {
-        let mut state = lock();
-        *state.opens.entry(path.to_path_buf()).or_insert(0) += 1;
+        OPENS.with(|opens| {
+            *opens.borrow_mut().entry(path.to_path_buf()).or_insert(0) += 1;
+        });
     }
     #[cfg(not(test))]
     let _ = path;
@@ -213,11 +220,13 @@ pub(crate) fn small_file_len(path: &Path) -> io::Result<Option<u64>> {
 /// were read under.
 pub(crate) fn fresh(path: &Path) -> Option<Arc<[u8]>> {
     let stat = retained_stat(path)?;
-    let state = lock();
-    if let Some(bytes) = matching_bytes(state.full.as_ref(), path, &stat) {
-        return Some(bytes);
-    }
-    matching_bytes(state.kept.get(path), path, &stat)
+    STATE.with(|state| {
+        let state = state.borrow();
+        if let Some(bytes) = matching_bytes(state.full.as_ref(), path, &stat) {
+            return Some(bytes);
+        }
+        matching_bytes(state.kept.get(path), path, &stat)
+    })
 }
 
 fn matching_bytes(capture: Option<&Capture>, path: &Path, stat: &Stat) -> Option<Arc<[u8]>> {
@@ -232,18 +241,37 @@ fn retained_stat(path: &Path) -> Option<Stat> {
     stat.ctime_ns.is_some().then_some(stat)
 }
 
+/// Whether an owner-thread shallow read can reuse retained evidence. The
+/// reader still revalidates the generation when it obtains the bytes.
+pub(crate) fn has_live_regions(path: &Path) -> bool {
+    let Some(stat) = retained_stat(path) else {
+        return false;
+    };
+    STATE.with(|state| {
+        let state = state.borrow();
+        matching_bytes(state.full.as_ref(), path, &stat).is_some()
+            || matching_bytes(state.kept.get(path), path, &stat).is_some()
+            || state
+                .bounded
+                .get(path)
+                .is_some_and(|bounded| bounded.stat == stat)
+    })
+}
+
 /// The head and tail discovery would have read, from bytes already in hand.
 pub(crate) fn live_regions(path: &Path) -> Option<(Vec<u8>, Vec<u8>)> {
     let stat = retained_stat(path)?;
-    let state = lock();
-    if let Some(bytes) = matching_bytes(state.full.as_ref(), path, &stat) {
-        return Some(split_live(&bytes));
-    }
-    if let Some(bytes) = matching_bytes(state.kept.get(path), path, &stat) {
-        return Some(split_live(&bytes));
-    }
-    let bounded = state.bounded.get(path)?;
-    (bounded.stat == stat).then(|| (bounded.head.clone(), bounded.tail.clone()))
+    STATE.with(|state| {
+        let state = state.borrow();
+        if let Some(bytes) = matching_bytes(state.full.as_ref(), path, &stat) {
+            return Some(split_live(&bytes));
+        }
+        if let Some(bytes) = matching_bytes(state.kept.get(path), path, &stat) {
+            return Some(split_live(&bytes));
+        }
+        let bounded = state.bounded.get(path)?;
+        (bounded.stat == stat).then(|| (bounded.head.clone(), bounded.tail.clone()))
+    })
 }
 
 fn publish_locked(state: &mut State, path: PathBuf, bytes: Arc<[u8]>, stat: Stat) {
@@ -257,7 +285,7 @@ fn publish_locked(state: &mut State, path: PathBuf, bytes: Arc<[u8]>, stat: Stat
 }
 
 fn retain_full(state: &mut State, capture: Capture) {
-    if !state.sweep {
+    if !in_sweep() {
         return;
     }
     let cost = capture.bytes.len();
@@ -281,7 +309,7 @@ fn forget_retained(state: &mut State, path: &Path) {
 }
 
 fn retain_bounded(state: &mut State, capture: Capture) {
-    if !state.sweep {
+    if !in_sweep() {
         return;
     }
     let (head, tail) = split_live(&capture.bytes);
@@ -305,8 +333,7 @@ pub(crate) fn publish(path: &Path, bytes: Arc<[u8]>, stat_at_read: &TranscriptMe
     if stat.len != bytes.len() as u64 {
         return;
     }
-    let mut state = lock();
-    publish_locked(&mut state, path.to_path_buf(), bytes, stat);
+    STATE.with(|state| publish_locked(&mut state.borrow_mut(), path.to_path_buf(), bytes, stat));
 }
 
 /// Read `path` whole when it fits in [`CAPTURE_MAX_BYTES`]. A parked handle
@@ -357,80 +384,6 @@ fn utf8_string(bytes: Vec<u8>) -> io::Result<String> {
     String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
 }
 
-/// The first record of `path`, from bytes already read or from one shared open.
-pub(crate) fn opening_record(path: &Path) -> io::Result<Option<(Vec<u8>, u64)>> {
-    if let Some(bytes) = fresh(path) {
-        return Ok(first_record(&bytes));
-    }
-    // Outside a sweep the caller only needs the first record. Slurping here
-    // would read every sibling rollout a hydration merely classifies.
-    if in_sweep() && small_file_len(path)?.is_some() {
-        let bytes = read_all(path)?;
-        return Ok(first_record(&bytes));
-    }
-    read_one_record(path)
-}
-
-fn first_record(bytes: &[u8]) -> Option<(Vec<u8>, u64)> {
-    if bytes.is_empty() {
-        return None;
-    }
-    let end = bytes
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .map(|index| index + 1)
-        .unwrap_or(bytes.len());
-    Some((bytes[..end].to_vec(), end as u64))
-}
-
-fn read_one_record(path: &Path) -> io::Result<Option<(Vec<u8>, u64)>> {
-    use std::io::BufRead;
-    let mut shared = open_shared(path)?;
-    let mut reader = std::io::BufReader::new(shared.file()?);
-    let mut raw = Vec::new();
-    let ceiling = crate::ingest::transcript_cursor::MAX_RECORD_BYTES;
-    let read = reader.by_ref().take(ceiling).read_until(b'\n', &mut raw)? as u64;
-    if read == 0 {
-        return Ok(None);
-    }
-    if raw.last() == Some(&b'\n') || read < ceiling {
-        return Ok(Some((raw, read)));
-    }
-    match reader.fill_buf()?.first().copied() {
-        Some(b'\n') => {
-            reader.consume(1);
-            raw.push(b'\n');
-            Ok(Some((raw, read + 1)))
-        }
-        None => Ok(Some((raw, read))),
-        Some(_) => {
-            let skipped = skip_to_newline(&mut reader)?;
-            Ok(Some((Vec::new(), read + skipped)))
-        }
-    }
-}
-
-fn skip_to_newline(reader: &mut impl std::io::BufRead) -> io::Result<u64> {
-    let mut skipped = 0u64;
-    loop {
-        let buffered = reader.fill_buf()?;
-        if buffered.is_empty() {
-            return Ok(skipped);
-        }
-        match buffered.iter().position(|byte| *byte == b'\n') {
-            Some(index) => {
-                reader.consume(index + 1);
-                return Ok(skipped + index as u64 + 1);
-            }
-            None => {
-                let len = buffered.len();
-                reader.consume(len);
-                skipped += len as u64;
-            }
-        }
-    }
-}
-
 /// Publish `walked` when it is still the generation the walk opened.
 ///
 /// Size and mtime are not enough: a same-length rewrite can restore mtime.
@@ -457,12 +410,24 @@ pub(crate) fn publish_walk(path: &Path, walked: &[u8], opened_len: u64, opened_m
 }
 
 fn take_opened_ctime(path: &Path) -> Option<i64> {
-    lock().opened.remove(path).and_then(|stat| stat.ctime_ns)
+    STATE.with(|state| {
+        state
+            .borrow_mut()
+            .opened
+            .remove(path)
+            .and_then(|stat| stat.ctime_ns)
+    })
 }
 
 fn remember_open(path: &Path, metadata: &TranscriptMetadata) {
     let stat = stat_from(metadata);
-    lock().opened.entry(path.to_path_buf()).or_insert(stat);
+    STATE.with(|state| {
+        state
+            .borrow_mut()
+            .opened
+            .entry(path.to_path_buf())
+            .or_insert(stat);
+    });
 }
 
 /// SHA-256 of the first `offset` bytes already in hand, and the hasher that
@@ -564,26 +529,29 @@ pub(crate) fn open_shared(path: &Path) -> io::Result<SharedFile> {
 /// read that parked it.
 fn take_parked(path: &Path) -> Option<TranscriptFile> {
     let current = stat_of(path).ok()?;
-    let mut state = lock();
-    match state.parked.take()? {
-        parked if parked.path == path && parked.stat == current => Some(parked.file),
-        parked if parked.path != path => {
-            state.parked = Some(parked);
-            None
+    STATE.with(|state| {
+        let mut state = state.borrow_mut();
+        match state.parked.take()? {
+            parked if parked.path == path && parked.stat == current => Some(parked.file),
+            parked if parked.path != path => {
+                state.parked = Some(parked);
+                None
+            }
+            _ => None,
         }
-        _ => None,
-    }
+    })
 }
 
 fn park(path: &Path, file: TranscriptFile) {
     let Ok(stat) = stat_of(path) else {
         return;
     };
-    let mut state = lock();
-    state.parked = Some(Parked {
-        path: path.to_path_buf(),
-        file,
-        stat,
+    STATE.with(|state| {
+        state.borrow_mut().parked = Some(Parked {
+            path: path.to_path_buf(),
+            file,
+            stat,
+        });
     });
 }
 
@@ -617,7 +585,95 @@ fn keep_complete_lines(buffer: &mut Vec<u8>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_cold_sweeps_eager_read_policy_never_leaks_to_another_thread() {
+        let (ready, received) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let cold = std::thread::spawn(move || {
+            let _guard = super::begin_sweep();
+            assert!(super::in_sweep());
+            ready.send(()).unwrap();
+            released.recv().unwrap();
+        });
+        received
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap();
+        let leaked = super::in_sweep();
+        release.send(()).unwrap();
+        cold.join().unwrap();
+        assert!(
+            !leaked,
+            "an unrelated cold sweep must not make hot metadata read whole files"
+        );
+    }
+
     use super::*;
+
+    #[test]
+    fn a_concurrent_hot_probe_does_not_evict_a_cold_parked_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let cold = dir.path().join("cold.jsonl");
+        let hot = dir.path().join("hot.jsonl");
+        fs::write(&cold, b"cold\n").unwrap();
+        fs::write(&hot, b"hot\n").unwrap();
+        let _sweep = begin_sweep();
+        assert!(probe(&cold));
+        std::thread::spawn(move || assert!(probe(&hot)))
+            .join()
+            .unwrap();
+        drop(open_file(&cold).unwrap());
+        assert_eq!(opens(&cold), 1, "unrelated hot reads retain the cold open");
+    }
+
+    #[test]
+    fn independent_cold_sweeps_can_reach_their_own_work_concurrently() {
+        let _sweep = begin_sweep();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let running = std::thread::spawn(move || {
+            let _sweep = begin_sweep();
+            tx.send(()).unwrap();
+        });
+        let reached = rx.recv_timeout(std::time::Duration::from_secs(2));
+        drop(_sweep);
+        running.join().unwrap();
+        assert!(
+            reached.is_ok(),
+            "unrelated stores must not queue behind a test sweep"
+        );
+    }
+
+    #[test]
+    fn acquisition_scope_releases_retained_bytes_and_handles_after_unwinding() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scope.jsonl");
+        fs::write(&path, b"scope\n").unwrap();
+        let _ = std::panic::catch_unwind(|| {
+            let _scope = begin_read_scope();
+            read_all(&path).unwrap();
+            assert!(fresh(&path).is_some());
+            {
+                let _nested = begin_read_scope();
+                assert!(
+                    fresh(&path).is_some(),
+                    "nested hydration reuses the outer cache"
+                );
+                assert!(probe(&path));
+            }
+            assert!(fresh(&path).is_some());
+            panic!("synthetic callback panic");
+        });
+        STATE.with(|state| {
+            let state = state.borrow();
+            assert!(state.full.is_none() && state.parked.is_none());
+            assert!(state.kept.is_empty() && state.bounded.is_empty() && state.opened.is_empty());
+            assert_eq!(
+                state.kept.capacity(),
+                0,
+                "idle threads release map allocations"
+            );
+        });
+        assert_eq!(READ_DEPTH.with(std::cell::Cell::get), 0);
+    }
 
     fn claude_line(session_id: &str) -> String {
         format!(

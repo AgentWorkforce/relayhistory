@@ -18,14 +18,11 @@ pub(super) fn turn_usage(rows: &[Value], native: &str) -> Result<BTreeMap<String
                 if matches!(
                     row["item"]["type"].as_str(),
                     Some("agent_message" | "tool_invocation")
-                ) =>
-            {
-                if current_turn.is_some()
+                ) && current_turn.is_some()
                     && row["item"]["context"]["actor_id"] == native
-                    && row["item"]["context"]["turn_id"].as_str() == current_turn
-                {
-                    last_assistant = row["item"]["id"].as_str();
-                }
+                    && row["item"]["context"]["turn_id"].as_str() == current_turn =>
+            {
+                last_assistant = row["item"]["id"].as_str();
             }
             Some("turn.completed" | "turn.failed") => {
                 if let Some(id) = last_assistant {

@@ -408,6 +408,7 @@ pub struct DiscoveryEnv<'a> {
     /// every candidate. Never set on the fingerprint environment: a partial
     /// listing must not become the cached picture of a source.
     path_scope: Option<crate::ingest::path_scope::PathScope>,
+    pub(crate) fresh_paths: bool,
     /// Read by provider-owned adapters.
     pub(crate) provider_roots: crate::ProviderRoots,
 }
@@ -437,6 +438,7 @@ impl<'a> DiscoveryEnv<'a> {
             conn,
             counters: CounterCell::default(),
             path_scope: None,
+            fresh_paths: false,
         }
     }
 
@@ -450,9 +452,6 @@ impl<'a> DiscoveryEnv<'a> {
         self
     }
 
-    pub(crate) fn path_scope(&self) -> Option<&crate::ingest::path_scope::PathScope> {
-        self.path_scope.as_ref()
-    }
 
     /// Build an environment with explicit roots, for hosts that keep provider
     /// data somewhere other than `$HOME` (and for tests, which must not mutate
@@ -3756,6 +3755,8 @@ pub(crate) const OBSERVED_SESSION_BY_LOCATOR_SQL: &str = "SELECT session_id FROM
 /// case: these are reconsidered because they *might* be upgradable, and almost
 /// never are.
 fn upgrade_cached_project_identity(conn: &Connection, row: &mut ShallowSession) -> Result<()> {
+    #[cfg(test)]
+    crate::store::project_identity_resolver::note_observation();
     let stored = row.project_key_method.as_deref();
     if stored == Some(ProjectKeyMethod::Remote.as_str()) {
         // The strongest answer there is. Nothing this function can learn
@@ -4401,21 +4402,9 @@ pub(crate) fn discover_sessions_for_sweep(
     )
 }
 
-/// Who brings project identity up to date around a discovery pass.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IdentityRefresh {
-    /// Rows are streamed to the caller. Each cached row is upgraded before it
-    /// is streamed (see [`upgrade_cached_project_identity`]), and the pass
-    /// ends with the incremental catalog refresh.
-    Streamed,
-    /// The sweep: no row is streamed, and the sweep runs the refresh itself
-    /// right after the pass. That refresh stores exactly the key the per-row
-    /// upgrade would have -- the upgrade exists only so a *streamed* row
-    /// agrees with it -- so upgrading every cached row here as well was the
-    /// same resolution and ancestor walk twice, once per candidate file, on
-    /// every tick (#318).
-    Sweep,
-}
+mod cached_reads;
+pub(crate) mod identity_refresh;
+use identity_refresh::IdentityRefresh;
 
 // An explicit limit lets regression tests exercise both read paths regardless
 // of the host's CPU quota; the public entry point uses available parallelism.
@@ -4590,11 +4579,11 @@ fn discover_sessions_with_worker_limit(
             let expected = stored_stamp(&candidate.stamp);
             let unchanged = match observed_stamps::observed_candidate_stamp(conn, provider, candidate)?
             {
-                Some((id, stamp)) if stamp.as_deref() == Some(expected.as_str()) => {
+                Some((id, stamp)) if observed_stamps::matches(env.fresh_paths, stamp.as_deref(), &expected) => {
                     match identity {
                         // Nothing is streamed, so the row itself is not needed.
                         IdentityRefresh::Sweep => Some(WindowEntry::Unchanged),
-                        IdentityRefresh::Streamed => {
+                        IdentityRefresh::Streamed | IdentityRefresh::ExactPaths => {
                             match fetch_catalog_row(conn, candidate.source, &id)? {
                                 Some(mut cached) => {
                                     cached.source_stamp = stamp;
@@ -4659,55 +4648,7 @@ fn discover_sessions_with_worker_limit(
             });
         }
 
-        let fs_reads: Vec<usize> = entries
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| {
-                matches!(entry, WindowEntry::Read { provider, .. }
-                    if provider.read_access() == ShallowReadAccess::Filesystem)
-            })
-            .map(|(index, _)| index)
-            .collect();
-        let workers = worker_limit.min(fs_reads.len()).min(MAX_READ_WORKERS);
-        if workers > 1 {
-            let stop = crate::ingest::shared_capture_stop();
-            let next = AtomicUsize::new(0);
-            let results = Mutex::new(Vec::with_capacity(fs_reads.len()));
-            std::thread::scope(|scope| {
-                for _ in 0..workers {
-                    scope.spawn(|| loop {
-                        if stop.as_ref().is_some_and(crate::StopToken::is_stopped) {
-                            break;
-                        }
-                        let slot = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(&entry_index) = fs_reads.get(slot) else {
-                            break;
-                        };
-                        let WindowEntry::Read {
-                            candidate,
-                            provider,
-                            ..
-                        } = &entries[entry_index]
-                        else {
-                            continue;
-                        };
-                        let outcome = provider.read_shallow(&scan, None, candidate);
-                        results
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner)
-                            .push((entry_index, outcome));
-                    });
-                }
-            });
-            let results = results
-                .into_inner()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            for (entry_index, outcome) in results {
-                if let WindowEntry::Read { result, .. } = &mut entries[entry_index] {
-                    *result = Some(outcome);
-                }
-            }
-        }
+        cached_reads::read_files(&mut entries, &scan, worker_limit)?;
 
         // Shallow reads are bounded; stop before opening the next write transaction.
         crate::ingest::check_capture_cancelled()?;
@@ -4945,29 +4886,7 @@ fn discover_sessions_with_worker_limit(
         crate::ingest::check_capture_cancelled()?;
     }
 
-    // A candidate whose bytes have not changed is served from the catalog
-    // without ever reaching `upsert_shallow_session_in_transaction`, so the
-    // stamp shortcut is also a shortcut past project-identity resolution. A
-    // session first discovered before its checkout had an `origin` would then
-    // keep its path key on every later `sessions discover`, no matter how many
-    // times it ran: the transcript is unchanged, so the row is never revisited.
-    //
-    // The refresh is what revisits it. Pass 1 reconsiders exactly the rows a
-    // path key is not final for, and probes before writing, so a pass with
-    // nothing to upgrade stays read-only. The inheriting passes are scoped to
-    // the rows written since the last refresh and their delegation
-    // descendants, so a pass over an unchanged catalog does not re-walk every
-    // delegated child. Reporting rather than failing, for the same reason the
-    // sync path does: the rows this discovery wrote are already committed, and
-    // every key here is derived from them.
-    if identity == IdentityRefresh::Streamed {
-        if let Err(error) = crate::store::refresh_project_identity_incrementally(env.conn) {
-            eprintln!(
-                "ai-hist: could not refresh canonical project identity after discovery: {error:#} \
-                 (project keys stay as they were; the next pass retries)"
-            );
-        }
-    }
+    identity.refresh(env.conn);
     summary.counters = env.counters();
     Ok(summary)
 }

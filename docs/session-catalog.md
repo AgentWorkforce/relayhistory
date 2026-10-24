@@ -281,9 +281,20 @@ project".
 
 A key is resolved from the working directory, or from a remote the provider
 recorded (Codex's `session_meta.payload.git.repository_url`). A `path` key is
-never final: every sync reconsiders it, so a session whose checkout was deleted
-picks up the canonical key as soon as a recorded remote makes one available. A
-`remote` key is never downgraded.
+never final: full sync and general discovery reconsider eligible catalog rows,
+so a session whose checkout was deleted picks up the canonical key when a
+recorded remote makes one available. Exact-path capture instead observes each
+admitted session and its delegation ancestors afresh, including unchanged
+transcripts whose checkout gained Git metadata, then propagates actual identity
+changes through dependent sessions and events. It does not run the global
+filesystem resolver over unrelated catalog rows on every small slice. Those rows
+refresh on their own admission, ancestor traversal, or explicit full maintenance.
+Complete cold reconciliation rounds cover current transcripts under provider
+roots; catalog-only or orphan rows outside those roots may need full maintenance.
+The revision checkpoint tracks inheritance/event reconciliation, not filesystem
+freshness: an unchanged catalog head cannot rule out new or retargeted Git
+metadata. Resolver caches remain limited to one acquisition pass. A `remote` key
+is never downgraded.
 
 Filter a listing to one project with `ai-hist sessions list --project <key>`
 (SDK: `listSessionCatalogPage({ projectKey })`). It is an exact match on the
