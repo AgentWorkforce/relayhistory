@@ -20,6 +20,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Unchanged Claude transcripts avoid duplicate file reads when record and metadata cursors have the same byte proof.
+
 - Filesystem-event sync can retain exact dirty paths and reuse catalog deltas, avoiding directory enumeration, whole-catalog digest copies and a silent full-history count for an active transcript append.
 - Cold reconciliation reuses current native transcript proofs without rehydrating unchanged archives.
 - Safety polling can reuse native transcript proofs without creating hydration checkpoints or metadata-only revisions for unchanged history.

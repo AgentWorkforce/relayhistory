@@ -539,6 +539,10 @@ fn prefix_window_digest_counted(
         while remaining > 0 {
             let wanted =
                 usize::try_from(remaining.min(buffer.len() as u64)).unwrap_or(buffer.len());
+            #[cfg(test)]
+            if let Some(hook) = BEFORE_PREFIX_READ.with(|slot| slot.borrow_mut().take()) {
+                hook();
+            }
             let read = file.read(&mut buffer[..wanted])?;
             anyhow::ensure!(
                 read > 0,
@@ -857,6 +861,13 @@ pub(crate) type BeforeCommitHook = Box<dyn Fn(&Path)>;
 #[cfg(test)]
 thread_local! {
     static VALIDATION_METER: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+    static BEFORE_PREFIX_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Run once after metadata was checked and before validation reads provider bytes.
+#[cfg(test)]
+pub(crate) fn set_before_prefix_read_for_test(hook: Option<Box<dyn FnOnce()>>) {
+    BEFORE_PREFIX_READ.with(|slot| *slot.borrow_mut() = hook);
 }
 
 /// Start counting validation bytes from zero on this thread.

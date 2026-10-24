@@ -54,9 +54,9 @@ fn transcript_unchanged_with_settle(
     // skipped anyway. Shared with hydration's own skip path, which asks the
     // same question about the same cursor.
     //
-    // Note the *two* digests below: a Claude transcript carries the record
-    // walk's position and the metadata fold's in one document, and both have
-    // to be current. That is the real per-file ceiling on this path.
+    // A Claude transcript carries the record walk's position and the
+    // metadata fold's in one document. Both must be current; identical proof
+    // inputs can share one digest within this call, otherwise each is checked.
     //
     // Both positions in the document have to be current, not just the record
     // walk's: a superseded metadata scan leaves a fold that has to be made
@@ -65,8 +65,9 @@ fn transcript_unchanged_with_settle(
     if settled_proves_unchanged(&cursor, file, path, &metadata) {
         return Ok(true);
     }
-    let valid =
-        committed_prefix_matches(file, path).valid && scan_position_current(&cursor, path).valid;
+    let valid = committed_prefix_matches(file, path).valid
+        && (metadata_shares_record_prefix(&cursor, file)
+            || scan_position_current(&cursor, path).valid);
     if valid && settle {
         if let Some(ctime_ns) = settled_change_time(path, &metadata) {
             // Proven by the digests just taken, over a stat taken before them
@@ -95,3 +96,27 @@ fn transcript_unchanged_with_settle(
     }
     Ok(valid)
 }
+
+/// Only the quiescence age is bookkeeping: `committed_prefix_matches` does
+/// not read it. Compare every other field, including any added in the future,
+/// without changing either walk's own quiescence state. This shares one
+/// point-in-time byte proof, never a cached answer across calls.
+fn metadata_shares_record_prefix(
+    cursor: &TranscriptCursorState,
+    record: &TranscriptFileCursor,
+) -> bool {
+    let Some(metadata) = cursor
+        .claude
+        .as_ref()
+        .and_then(|c| c.scan.as_ref())
+        .and_then(|scan| scan.file.as_ref())
+    else {
+        return false;
+    };
+    let mut normalized = metadata.clone();
+    normalized.unchanged_since_ms = record.unchanged_since_ms;
+    normalized == *record
+}
+
+#[cfg(test)]
+mod tests;
