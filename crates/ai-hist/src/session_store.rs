@@ -72,9 +72,9 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 mod catalog_digest;
+mod discovery;
 mod reconciliation;
 mod sync;
-mod discovery;
 pub use reconciliation::{Reconciliation, ReconciliationStep};
 mod catalog_row;
 mod options;
