@@ -29,25 +29,27 @@ pub(crate) fn sync_facade_tick<B, R>(
     let Some(sync_lock) = try_acquire_sync_lock(db_path)? else {
         return Ok(None);
     };
-    let conn = open_db(db_path).map_err(|error| enrich_sync_error(db_path, error))?;
-    let baseline = before(&conn)?;
-    let captured =
-        try_capture_paths(&conn, db_path, roots, scope, force).and_then(|scoped| match scoped {
-            Some(swept) => Ok(swept),
-            None => sync_basic(&conn, db_path, roots, force, scope)
-                .map_err(|error| enrich_sync_error(db_path, error)),
-        });
-    let tick = SyncTick {
-        attempted: true,
-        swept: captured.as_ref().copied().unwrap_or(false),
-    };
-    // A cancelled/failed acquisition can already have committed earlier
-    // files. Capture that bracket before unlocking, retaining its delta for
-    // the next successful report instead of swallowing it as an outside write.
-    let outcome = after(&conn, baseline, tick, captured.is_ok());
-    captured?;
-    let outcome = outcome?;
-    Ok(Some((tick, outcome, sync_lock)))
+    crate::store::sync_connection::with_connection(db_path, |conn| {
+        let baseline = before(conn)?;
+        let captured =
+            try_capture_paths(conn, db_path, roots, scope, force).and_then(|scoped| match scoped {
+                Some(swept) => Ok(swept),
+                None => sync_basic(conn, db_path, roots, force, scope)
+                    .map_err(|error| enrich_sync_error(db_path, error)),
+            });
+        let tick = SyncTick {
+            attempted: true,
+            swept: captured.as_ref().copied().unwrap_or(false),
+        };
+        // A cancelled/failed acquisition can already have committed earlier
+        // files. Capture that bracket before unlocking, retaining its delta for
+        // the next successful report instead of swallowing it as an outside write.
+        let outcome = after(conn, baseline, tick, captured.is_ok());
+        captured?;
+        let outcome = outcome?;
+        Ok(Some((tick, outcome, sync_lock)))
+    })
+    .map_err(|error| enrich_sync_error(db_path, error))
 }
 
 pub(crate) fn reconcile_pending(db: &Path, source: &str) -> Result<bool> {
@@ -55,10 +57,11 @@ pub(crate) fn reconcile_pending(db: &Path, source: &str) -> Result<bool> {
     let Some(_lock) = try_acquire_sync_lock(db)? else {
         return Ok(false);
     };
-    let conn = open_db(db)?;
-    crate::continuity::reconcile(&conn, source)?;
-    check_capture_cancelled()?;
-    Ok(true)
+    crate::store::sync_connection::with_connection(db, |conn| {
+        crate::continuity::reconcile(conn, source)?;
+        check_capture_cancelled()?;
+        Ok(true)
+    })
 }
 
 /// `None` retains the complete legacy source path for flat prompt logs,

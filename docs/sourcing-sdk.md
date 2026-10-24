@@ -1193,6 +1193,14 @@ after completion covers roots created after registration, lost events and
 concurrent directory moves. `sources([Source::Claude])` restricts an additional
 login/root to its own provider. `discover_step` takes `DiscoveryOptions` and only
 writes shallow catalog metadata; it must be used for selected-only inventory.
+Acquisition slices also retain one writable connection within the round, avoiding
+repeated schema initialization for every small batch. Each checkout still takes
+the existing cancellable sync lease first. File identity and both SQLite schema
+and external-data versions must match the last validation; replacement, DDL or
+data-only readiness changes reopen or revalidate normally. No transaction or sync
+lease remains held between slices. Uncertain identities and SQLite URI paths
+retain fresh-open behavior. This cache applies to acquisition, not shallow
+discovery, and does not relax any file/evidence proof.
 `ReconciliationStep::sqlite_busy_wait` reports actual elapsed sleeps in the SDK's
 SQLite busy handler on the executing thread. It excludes other worker threads
 and waits outside that handler, and is not CPU time. The default busy handler observes the public stop token

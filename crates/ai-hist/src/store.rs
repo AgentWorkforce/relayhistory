@@ -14,6 +14,7 @@ use std::time::Duration;
 pub(crate) mod busy_wait;
 mod event_row;
 mod retired_sources;
+pub(crate) mod sync_connection;
 pub use retired_sources::is_retired_source;
 mod schema_check;
 mod user_turn_page;
@@ -609,20 +610,8 @@ fn enable_wal_for_migration(conn: &Connection) -> Result<()> {
     }
 }
 
-/// Prepared statements a writable connection keeps compiled.
-const STATEMENT_CACHE_CAPACITY: usize = 128;
-
 pub fn open_db(path: &Path) -> Result<Connection> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let conn = Connection::open(path)?;
-    // A sweep and a hydration cycle through a few dozen statements per
-    // session -- more than rusqlite's default cache of 16 holds -- so each
-    // one would be compiled again, triggers and all, for every session.
-    conn.set_prepared_statement_cache_capacity(STATEMENT_CACHE_CAPACITY);
-    // Before init_db: creating the schema takes a write lock too.
-    configure_busy_retry(&conn)?;
+    let conn = sync_connection::open_uninitialized(path)?;
     init_db(&conn)?;
     Ok(conn)
 }
@@ -1195,6 +1184,8 @@ pub fn open_db_readonly(path: &Path) -> Result<Connection> {
 }
 
 pub fn init_db(conn: &Connection) -> Result<()> {
+    #[cfg(test)]
+    sync_connection::count_validation();
     // REPLACE must fire delete triggers so the change feed tombstones the
     // row it replaces.
     conn.pragma_update(None, "recursive_triggers", true)?;

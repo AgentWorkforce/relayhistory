@@ -14,6 +14,9 @@ pub struct Reconciliation {
     store: SessionStore,
     sources: VecDeque<SourceWalk>,
     cold_proof: crate::ingest::path_capture::cold_proof::ColdProof,
+    // get_mut only: preserve the round's Send + Sync traits without adding
+    // another lock wait beside the existing cancellable SyncRunLock.
+    writer: std::sync::Mutex<crate::store::sync_connection::Cache>,
 }
 
 /// Content-free work accounting for a bounded reconciliation slice.
@@ -101,6 +104,7 @@ impl SessionStore {
             store: self.clone(),
             sources,
             cold_proof: Default::default(),
+            writer: Default::default(),
         })
     }
 }
@@ -132,7 +136,12 @@ impl Reconciliation {
             });
         };
         let mut cold_proof = std::mem::take(&mut self.cold_proof);
-        let result =
+        let mut writer = std::mem::take(
+            self.writer
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let result = crate::store::sync_connection::with_cache(&mut writer, || {
             crate::ingest::path_capture::cold_proof::with_cold_proof(&mut cold_proof, || {
                 self.take_step(
                     &mut source,
@@ -152,7 +161,12 @@ impl Reconciliation {
                     }
                     Ok(step)
                 })
-            });
+            })
+        });
+        *self
+            .writer
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = writer;
         self.cold_proof = cold_proof;
         // Keep a failed path until a successful retry or the caller drops this
         // round. Missing paths succeed as empty scopes; the next round repairs
@@ -404,6 +418,94 @@ mod tests {
             "{line}"
         )
         .unwrap();
+    }
+
+    #[test]
+    fn a_thousand_unchanged_files_share_one_writable_validation_per_round() {
+        fn send_sync<T: Send + Sync>() {}
+        send_sync::<Reconciliation>();
+        let (_temp, store, project) = fixture();
+        for n in 0..1000 {
+            write(
+                &project.join(format!("bench-{n}.jsonl")),
+                &format!("bench-{n}"),
+                "one",
+            );
+        }
+        store
+            .sync(SyncOptions::default().sources([Source::Claude]))
+            .unwrap();
+        let head = store.head_revision().unwrap();
+        let before = crate::store::sync_connection::validations();
+        let mut round = store.reconcile().unwrap().sources([Source::Claude]);
+        let mut paths = 0;
+        let mut slices = 0;
+        loop {
+            let step = round.step(64, 8, SyncOptions::default()).unwrap();
+            paths += step.paths;
+            slices += 1;
+            assert!(step
+                .report
+                .as_ref()
+                .is_none_or(|report| report.changed.is_empty()));
+            if step.complete {
+                break;
+            }
+        }
+        assert_eq!(paths, 1000);
+        assert!(slices >= 125);
+        assert_eq!(store.head_revision().unwrap(), head);
+        assert_eq!(
+            crate::store::sync_connection::validations() - before,
+            1,
+            "unchanged slices must not reopen and validate the whole writable schema"
+        );
+    }
+
+    #[test]
+    fn retained_writer_cache_does_not_bypass_sync_lock_timeout_or_cancellation() {
+        let (_temp, store, project) = fixture();
+        for id in ["a", "b", "c"] {
+            write(&project.join(format!("{id}.jsonl")), id, "one");
+        }
+        store
+            .sync(SyncOptions::default().sources([Source::Claude]))
+            .unwrap();
+        let mut round = store.reconcile().unwrap().sources([Source::Claude]);
+        assert_eq!(round.step(64, 1, SyncOptions::default()).unwrap().paths, 1);
+        let lease = crate::ingest::try_acquire_sync_lock(store.db_path())
+            .unwrap()
+            .unwrap();
+        let before = crate::store::sync_connection::validations();
+        assert!(matches!(
+            round.step(64, 1, SyncOptions::default().lock_timeout_ms(0)),
+            Err(Error::SyncLocked { .. })
+        ));
+        assert_eq!(
+            crate::store::sync_connection::validations(),
+            before,
+            "lease precedes cached connection access"
+        );
+        let stop = crate::StopToken::new();
+        let token = stop.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let running = std::thread::spawn(move || {
+            let result = round.step(
+                64,
+                1,
+                SyncOptions::default().lock_timeout_ms(30_000).stop(token),
+            );
+            tx.send((round, result)).unwrap();
+        });
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        stop.stop();
+        let received = rx.recv_timeout(std::time::Duration::from_secs(2));
+        drop(lease);
+        let (mut round, result) =
+            received.expect("cancellation must finish while the lease is held");
+        running.join().unwrap();
+        assert!(matches!(result, Err(Error::Cancelled(_))));
+        assert_eq!(round.step(64, 1, SyncOptions::default()).unwrap().paths, 1);
     }
 
     #[test]
