@@ -11,6 +11,13 @@ const AFFECTED_SQL: &str = "SELECT locator FROM session_continuity_evidence WHER
          CROSS JOIN session_continuity_evidence c INDEXED BY idx_session_continuity_parent_uuid \
            ON c.source=e.source AND c.first_parent_uuid=e.message_id \
            WHERE e.source=?1 AND e.revision>?5 AND e.message_id IS NOT NULL \
+             AND c.pending_reason IS NOT NULL \
+         UNION SELECT c.locator FROM session_events e INDEXED BY idx_session_events_revision \
+         CROSS JOIN session_continuity_evidence c INDEXED BY idx_session_continuity_parent_uuid \
+           ON c.source=e.source AND c.first_parent_uuid=substr(e.event_uid,1,length(e.event_uid)-2) \
+           WHERE e.source='claude' AND e.source=?1 AND e.revision>?5 \
+             AND substr(e.event_uid,-2)=':0' \
+             AND (e.message_id IS NULL OR e.event_uid<>e.message_id||':0') \
              AND c.pending_reason IS NOT NULL";
 
 pub(crate) struct CaptureScope {
@@ -260,5 +267,30 @@ mod tests {
             plan.contains("idx_session_continuity_parent_uuid (source=? AND first_parent_uuid=?)"),
             "{plan}"
         );
+    }
+    #[test]
+    fn uid_only_parent_delta_resolves_its_pending_continuation_immediately() {
+        let temp = tempfile::tempdir().unwrap();
+        let conn = crate::open_db(&temp.path().join("history.db")).unwrap();
+        conn.execute_batch("INSERT INTO sessions(source,session_id) VALUES ('claude','parent'),('claude','child');").unwrap();
+        record_evidence(
+            &conn,
+            &ContinuityEvidence {
+                source: "claude".into(),
+                locator: "child.jsonl".into(),
+                session_id: "child".into(),
+                first_parent_uuid: Some("parent-record".into()),
+                first_ts_ms: Some(2),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        reconcile(&conn, "claude").unwrap();
+        let before = CaptureScope::begin(&conn, "claude", Path::new("parent.jsonl")).unwrap();
+        conn.execute_batch("INSERT INTO session_events(source,session_id,message_id,event_uid,ts_ms,role,kind,text) VALUES ('claude','parent',NULL,'parent-record:0',1,'user','text','synthetic');").unwrap();
+        let result =
+            reconcile_captured(&conn, "claude", Path::new("parent.jsonl"), before).unwrap();
+        assert_eq!(result.considered, 1);
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM session_relationships WHERE source='claude' AND parent_session_id='parent' AND child_session_id='child' AND relationship='continuation'",[],|r|r.get::<_,i64>(0)).unwrap(),1);
     }
 }

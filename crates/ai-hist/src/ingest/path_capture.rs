@@ -21,7 +21,7 @@ pub(crate) fn sync_facade_tick<B, R>(
     force: bool,
     scope: &SweepScope,
     before: impl FnOnce(&Connection) -> Result<B>,
-    after: impl FnOnce(&Connection, B, SyncTick) -> Result<R>,
+    after: impl FnOnce(&Connection, B, SyncTick, bool) -> Result<R>,
 ) -> Result<Option<(SyncTick, R)>> {
     SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
     check_capture_cancelled()?;
@@ -30,16 +30,22 @@ pub(crate) fn sync_facade_tick<B, R>(
     };
     let conn = open_db(db_path).map_err(|error| enrich_sync_error(db_path, error))?;
     let baseline = before(&conn)?;
-    let swept = match try_capture_paths(&conn, db_path, roots, scope, force)? {
-        Some(swept) => swept,
-        None => sync_basic(&conn, db_path, roots, force, scope)
-            .map_err(|error| enrich_sync_error(db_path, error))?,
-    };
+    let captured =
+        try_capture_paths(&conn, db_path, roots, scope, force).and_then(|scoped| match scoped {
+            Some(swept) => Ok(swept),
+            None => sync_basic(&conn, db_path, roots, force, scope)
+                .map_err(|error| enrich_sync_error(db_path, error)),
+        });
     let tick = SyncTick {
         attempted: true,
-        swept,
+        swept: captured.as_ref().copied().unwrap_or(false),
     };
-    let outcome = after(&conn, baseline, tick)?;
+    // A cancelled/failed acquisition can already have committed earlier
+    // files. Capture that bracket before unlocking, retaining its delta for
+    // the next successful report instead of swallowing it as an outside write.
+    let outcome = after(&conn, baseline, tick, captured.is_ok());
+    captured?;
+    let outcome = outcome?;
     Ok(Some((tick, outcome)))
 }
 

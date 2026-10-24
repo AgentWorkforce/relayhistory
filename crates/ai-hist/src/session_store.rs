@@ -568,7 +568,7 @@ pub struct SessionStore {
     roots: ProviderRoots,
     read_only: bool,
     readers: Arc<ReadPool>,
-    sync_baseline: Arc<Mutex<Option<CatalogFingerprint>>>,
+    sync_baseline: Arc<Mutex<Option<sync::SyncBaseline>>>,
     sync_identity: Arc<Mutex<Option<crate::read_pool::FileIdentity>>>,
 }
 
@@ -3743,7 +3743,7 @@ mod tests {
                 )?;
                 Ok(before)
             },
-            |conn, before, tick| {
+            |conn, before, tick, _succeeded| {
                 assert!(!tick.swept, "the sources did not move");
                 Ok(changes_under_lock(conn, &before)?.1)
             },

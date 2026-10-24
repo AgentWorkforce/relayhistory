@@ -1173,7 +1173,9 @@ retrying a cached identity forever. Keep the `SessionStore` handle: successive s
 update an exclusive catalog baseline from the database change feed, without
 copying or walking unrelated catalog keys. Writes from other handles are folded
 in before the call's bracket; database replacement/feed epoch changes rebuild the
-baseline instead of trusting old identities.
+baseline instead of trusting old identities. A failed attempt retains its committed
+catalog delta for the next successful report; changes committed by another writer
+before that retry are still excluded from the attempt bracket.
 
 `SessionStore::reconcile()` starts a round-robin reconciliation of provider-owned
 watch roots. `step(max_entries, max_paths, SyncOptions::default())` inspects at
@@ -1185,10 +1187,12 @@ after completion covers roots created after registration, lost events and
 concurrent directory moves. `sources([Source::Claude])` restricts an additional
 login/root to its own provider. `discover_step` takes `DiscoveryOptions` and only
 writes shallow catalog metadata; it must be used for selected-only inventory.
+A discovery row `limit` is rejected before consuming any iterator position: use
+`max_entries`/`max_paths` to bound a round without dropping unexamined candidates.
 
 Primary continuity fields are banked without enumerating related families. The
 current locator, affected origins/dependents and children naming newly arrived
-parent records reconcile immediately through indexed identity/revision lookups.
+parent records (message IDs or Claude block-0 UIDs) reconcile immediately through indexed identity/revision lookups.
 A completed Claude/Codex source round retries all still-unresolved continuity once under the
 sync lock. This recovery can scale with unresolved evidence; it does not run for
 each hot append. Existing public `hydrate(include_related: false)` semantics and

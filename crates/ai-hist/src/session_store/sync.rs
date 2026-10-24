@@ -1,6 +1,31 @@
 //! Bounded and path-scoped acquisition through the shared sync engine.
 use super::*;
 
+#[derive(Debug)]
+pub(super) struct SyncBaseline {
+    pub(super) catalog: CatalogFingerprint,
+    pending: std::collections::BTreeSet<SessionRef>,
+}
+
+impl SyncBaseline {
+    fn new(catalog: CatalogFingerprint) -> Self {
+        Self {
+            catalog,
+            pending: Default::default(),
+        }
+    }
+
+    fn finish(&mut self, conn: &Connection, succeeded: bool) -> anyhow::Result<Vec<SessionRef>> {
+        self.pending
+            .extend(catalog_digest::advance(conn, &mut self.catalog)?);
+        Ok(if succeeded {
+            std::mem::take(&mut self.pending).into_iter().collect()
+        } else {
+            Vec::new()
+        })
+    }
+}
+
 impl SessionStore {
     /// One full local sweep into this store, under the `SyncRunLock`.
     ///
@@ -129,23 +154,21 @@ impl SessionStore {
                     }
                     *previous_identity = identity;
                     if baseline.is_none() {
-                        *baseline = Some(catalog_fingerprint(conn)?);
+                        *baseline = Some(SyncBaseline::new(catalog_fingerprint(conn)?));
                     } else if let Some(before) = baseline.as_mut() {
                         // Exclude other writers' commits preceding this call.
-                        catalog_digest::advance(conn, before)?;
+                        catalog_digest::advance(conn, &mut before.catalog)?;
                     }
                     Ok(())
                 },
-                |conn, (), _tick| {
+                |conn, (), _tick, succeeded| {
                     // The before callback holds this baseline exclusively.
                     let mut baseline = self
                         .sync_baseline
                         .lock()
                         .unwrap_or_else(PoisonError::into_inner);
                     match baseline.as_mut() {
-                        Some(before) => {
-                            catalog_digest::advance(conn, before).map_err(anyhow::Error::from)
-                        }
+                        Some(before) => before.finish(conn, succeeded),
                         None => anyhow::bail!("sync catalog baseline unavailable"),
                     }
                 },

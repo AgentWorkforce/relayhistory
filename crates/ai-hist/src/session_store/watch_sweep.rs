@@ -254,7 +254,7 @@ impl WatchSweep {
                 }
                 Ok(before)
             },
-            |conn, before, _tick| {
+            |conn, before, _tick, _succeeded| {
                 let (after, changed) = changes_under_lock(conn, &before)?;
                 Ok((after, changed))
             },

@@ -142,6 +142,9 @@ impl Reconciliation {
         max_paths: usize,
         mut options: super::DiscoveryOptions,
     ) -> Result<ReconciliationStep, Error> {
+        if options.limit.is_some() {
+            return Err(Error::InvalidArgument("reconciliation cannot use a discovery row limit; bound work with max_entries/max_paths".into()));
+        }
         let Some(mut source) = self.sources.pop_front() else {
             return Ok(ReconciliationStep {
                 complete: true,
@@ -363,7 +366,7 @@ mod tests {
         let _ = crate::ingest::take_dirs_read();
         let baseline_ptr = {
             let base = store.sync_baseline.lock().unwrap();
-            std::sync::Arc::as_ptr(&base.as_ref().unwrap().rows)
+            std::sync::Arc::as_ptr(&base.as_ref().unwrap().catalog.rows)
         };
         write(&active, "active", "appended");
         let report = store
@@ -387,7 +390,7 @@ mod tests {
         );
         let base = store.sync_baseline.lock().unwrap();
         assert_eq!(
-            std::sync::Arc::as_ptr(&base.as_ref().unwrap().rows),
+            std::sync::Arc::as_ptr(&base.as_ref().unwrap().catalog.rows),
             baseline_ptr,
             "the delta must not copy the 4.7k-entry map"
         );
@@ -1226,5 +1229,84 @@ mod tests {
             .unwrap(),
             0
         );
+    }
+    #[test]
+    fn failed_attempt_commits_are_reported_on_retry_without_claiming_other_writers() {
+        let (_temp, store, project) = fixture();
+        let a = project.join("a.jsonl");
+        let b = project.join("b.jsonl");
+        write(&a, "a", "one");
+        write(&b, "b", "one");
+        let token = super::super::StopToken::new();
+        let observer_stop = token.clone();
+        let mut options = SyncOptions::default()
+            .sources([Source::Claude])
+            .paths([a, b]);
+        options.stop = Some(token);
+        options.progress = Some(super::super::ProgressObserver::new(move |progress| {
+            if progress.processed_files >= 1 {
+                observer_stop.stop();
+            }
+        }));
+        assert!(matches!(
+            store.sync(options.clone()),
+            Err(Error::Cancelled(_))
+        ));
+        let external = project.join("external.jsonl");
+        write(&external, "external", "one");
+        let other = SessionStore::open(
+            super::super::StoreOptions::default()
+                .db_path(store.db_path())
+                .roots(store.roots().clone()),
+        )
+        .unwrap();
+        other
+            .sync(
+                SyncOptions::default()
+                    .sources([Source::Claude])
+                    .paths([external]),
+            )
+            .unwrap();
+        options.stop = None;
+        options.progress = None;
+        let retry = store.sync(options.clone()).unwrap();
+        assert!(
+            retry
+                .changed
+                .contains(&super::super::SessionRef::id(Source::Claude, "a")),
+            "a committed before cancellation must be reported: {:?}",
+            retry.changed
+        );
+        assert!(!retry
+            .changed
+            .contains(&super::super::SessionRef::id(Source::Claude, "external")));
+        assert!(
+            store.sync(options).unwrap().changed.is_empty(),
+            "failed-attempt deltas are reported once"
+        );
+    }
+
+    #[test]
+    fn capped_discovery_cannot_consume_unexamined_reconciliation_paths() {
+        let (_temp, store, project) = fixture();
+        for id in ["a", "b", "c"] {
+            write(&project.join(format!("{id}.jsonl")), id, "one");
+        }
+        let mut round = store.reconcile().unwrap().sources([Source::Claude]);
+        let error = round
+            .discover_step(64, 3, super::super::DiscoveryOptions::default().limit(1))
+            .unwrap_err();
+        assert!(matches!(error, Error::InvalidArgument(_)));
+        assert_eq!(store.sessions(Default::default()).count(), 0);
+        for _ in 0..100 {
+            if round
+                .discover_step(64, 3, Default::default())
+                .unwrap()
+                .complete
+            {
+                break;
+            }
+        }
+        assert_eq!(store.sessions(Default::default()).count(), 3);
     }
 }
