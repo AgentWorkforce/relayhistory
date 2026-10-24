@@ -9,7 +9,7 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 pub(crate) mod busy_wait;
 mod event_row;
@@ -547,19 +547,8 @@ fn busy_retry_backoff_ms(prior_attempts: i32) -> Option<u64> {
     )
 }
 
-fn busy_retry_handler(prior_attempts: i32) -> bool {
-    let Some(backoff_ms) = busy_retry_backoff_ms(prior_attempts) else {
-        return false;
-    };
-    let clock = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos() as u64;
-    let seed = clock ^ u64::from(std::process::id()) ^ prior_attempts as u64;
-    let jitter_ms = seed % (backoff_ms / BUSY_RETRY_JITTER_DIVISOR + 1);
-    busy_wait::sleep(Duration::from_millis(backoff_ms + jitter_ms));
-    true
-}
+#[cfg(test)]
+use busy_wait::busy_retry_handler;
 
 pub(crate) use busy_wait::configure_busy_retry;
 

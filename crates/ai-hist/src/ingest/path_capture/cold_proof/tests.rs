@@ -246,3 +246,69 @@ fn unchanged_native_codex_rollout_reuses_its_global_proof() {
     assert_eq!(store.head_revision().unwrap(), before);
     assert_eq!(state_work::take(), (1, 0));
 }
+
+#[cfg(unix)]
+#[test]
+fn trusted_change_time_rejects_a_middle_rewrite_outside_native_prefix_windows() {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            transcript_cursor::set_filesystem_keeps_change_time_for_test(None);
+            transcript_cursor::set_settle_window_for_test(None);
+        }
+    }
+    transcript_cursor::set_filesystem_keeps_change_time_for_test(Some(true));
+    transcript_cursor::set_settle_window_for_test(Some(0));
+    let _reset = Reset;
+    let (_temp, store, paths) = fixture(1);
+    let mut text = String::new();
+    for (n, marker) in ["head", "middle-before", "tail"].iter().enumerate() {
+        let mut record = line("s0", &format!("{marker}{}", "x".repeat(100 * 1024)));
+        record = record.replace("\"uuid\":\"m\"", &format!("\"uuid\":\"m{n}\""));
+        text.push_str(&record);
+    }
+    fs::write(&paths[0], &text).unwrap();
+    store
+        .sync(SyncOptions::default().sources([Source::Claude]))
+        .unwrap();
+    let conn = open_db(store.db_path()).unwrap();
+    assert!(transcript_cursor::transcript_unchanged(&conn, "claude", &paths[0]).unwrap());
+    let cursor = transcript_cursor::load_cursor(
+        &conn,
+        &transcript_cursor::CursorKey::Locator {
+            source: "claude",
+            locator: &paths[0].to_string_lossy(),
+        },
+    )
+    .unwrap();
+    let settled = cursor.settled.unwrap();
+    let modified = fs::metadata(&paths[0]).unwrap().modified().unwrap();
+    let middle = text.find("middle-before").unwrap();
+    assert!(middle > 64 * 1024 && middle + 13 < text.len() - 64 * 1024);
+    let rewrite = text.replacen("middle-before", "middle-after_", 1);
+    assert_eq!(text.len(), rewrite.len());
+    fs::write(&paths[0], rewrite).unwrap();
+    fs::File::options()
+        .write(true)
+        .open(&paths[0])
+        .unwrap()
+        .set_modified(modified)
+        .unwrap();
+    assert_ne!(
+        transcript_cursor::change_time_ns(&fs::metadata(&paths[0]).unwrap()),
+        Some(settled.ctime_ns)
+    );
+    round(&store, Source::Claude);
+    assert_eq!(checkpoints(&store), 1);
+    let captured: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_events WHERE text LIKE 'middle-after_%')",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        captured,
+        "a changed trusted ctime must force acquisition despite unchanged head/tail windows"
+    );
+}

@@ -432,6 +432,46 @@ mod tests {
     }
 
     #[test]
+    fn cancelled_sqlite_busy_wait_releases_sync_lease_before_the_writer_finishes() {
+        let (_temp, store, project) = fixture();
+        write(&project.join("a.jsonl"), "a", "one");
+        let writer = crate::open_db(store.db_path()).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let stop = super::super::StopToken::new();
+        let token = stop.clone();
+        let other = store.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let running = std::thread::spawn(move || {
+            crate::store::busy_wait::observe_next_wait(entered_tx);
+            result_tx
+                .send(other.sync(SyncOptions::default().sources([Source::Claude]).stop(token)))
+                .unwrap();
+        });
+        let entered = entered_rx.recv_timeout(std::time::Duration::from_secs(5));
+        stop.stop();
+        let cancelled = result_rx.recv_timeout(std::time::Duration::from_secs(2));
+        let lease = crate::ingest::try_acquire_sync_lock(store.db_path()).unwrap();
+        let released_before_rollback = lease.is_some();
+        drop(lease);
+        // Cleanup comes after the observations: releasing this writer must not
+        // be what allows cancellation or the sync lease to complete.
+        writer.execute_batch("ROLLBACK").unwrap();
+        running.join().unwrap();
+        assert!(entered.is_ok(), "the real SDK busy handler must have slept");
+        assert!(matches!(cancelled, Ok(Err(Error::Cancelled(_)))));
+        assert!(
+            released_before_rollback,
+            "preemption must release the sync lease while the writer still owns SQLite"
+        );
+        assert!(!store
+            .sync(SyncOptions::default().sources([Source::Claude]))
+            .unwrap()
+            .changed
+            .is_empty());
+    }
+
+    #[test]
     fn dirty_append_does_not_walk_or_rehash_unrelated_history() {
         let (_temp, store, project) = fixture();
         let active = project.join("active.jsonl");

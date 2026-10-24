@@ -1195,15 +1195,20 @@ login/root to its own provider. `discover_step` takes `DiscoveryOptions` and onl
 writes shallow catalog metadata; it must be used for selected-only inventory.
 `ReconciliationStep::sqlite_busy_wait` reports actual elapsed sleeps in the SDK's
 SQLite busy handler on the executing thread. It excludes other worker threads
-and waits outside that handler, and is not CPU time. Cost-based scheduling may
+and waits outside that handler, and is not CPU time. The default busy handler observes the public stop token
+before each retry sleep, so cancellation can release the capture sync lease
+while another SQLite writer remains held; ordinary retry timeouts are unchanged.
+Cost-based scheduling may
 subtract this known blocked time from the full wall duration using saturating
 subtraction; the full wall duration remains useful diagnostic information.
 
 Cold acquisition can reuse a current native global-sync unchanged-file proof
 without creating an independent hydration checkpoint. One read-only sync-state
 snapshot is cached for the round; file/state/database identity, parser generations,
-existing native evidence and continuity still have to match. Changed or uncertain
-paths use ordinary acquisition. A present destination marker is compared with
+existing native evidence and continuity still have to match. A recorded trusted
+ctime change rejects reuse even when the bounded head/tail hashes match. Native
+cursors without that prior proof retain their existing bounded-window validation
+contract. Changed or uncertain paths use ordinary acquisition. A present destination marker is compared with
 that session's current indexed holdings. Without a marker, the existing native
 evidence-presence guard applies and cannot independently detect partial historical
 row loss. Hot and selected-only acquisition do not install this cold proof scope,

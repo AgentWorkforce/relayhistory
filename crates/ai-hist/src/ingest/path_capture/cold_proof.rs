@@ -180,6 +180,17 @@ impl Snapshot {
                 locator: &locator,
             },
         )?;
+        // A known trusted change time moving is stronger evidence than an
+        // unchanged bounded prefix. Do not let a middle-only rewrite fall
+        // back from that evidence to the weaker head/tail-window proof.
+        let metadata = transcript_file::metadata(path)?;
+        if transcript_cursor::filesystem_keeps_change_time(path, &metadata)
+            && cursor.settled.as_ref().is_some_and(|settled| {
+                transcript_cursor::change_time_ns(&metadata) != Some(settled.ctime_ns)
+            })
+        {
+            return Ok(false);
+        }
         let current = match source {
             "claude" => {
                 cursor.claude.as_ref().is_some_and(|state| {
@@ -189,28 +200,36 @@ impl Snapshot {
                     && !claude_transcript_lacks_continuity_evidence(conn, path)?
                     && !claude_delegation_cites(conn, path)?
             }
-            "codex" => {
-                let record = self
-                    .state
-                    .get("codex_rollouts_v7")
-                    .and_then(Value::as_object)
-                    .and_then(|files| files.get(locator.as_ref()))
-                    .and_then(Value::as_object);
-                cursor.codex.as_ref().is_some_and(|state| {
-                    state.state_markers >= CODEX_STATE_MARKER_GENERATION
-                        && state.fork_replay >= CODEX_FORK_REPLAY_GENERATION
-                }) && record.is_some_and(|row| {
-                    row.get("session").and_then(Value::as_str) == Some(session)
-                        && row.get("stamp").and_then(Value::as_str)
-                            == file_stamp(path).ok().as_deref()
-                        && row.get("subagent") == Some(&Value::Bool(false))
-                }) && !images::rollout_owes_capture(record, true)
-                    && codex_session_evidence_exists(conn, session)?
-                    && codex_continuity_evidence_exists(conn, path)?
-            }
+            "codex" => self.codex_current(conn, session, path, &cursor)?,
             _ => false,
         };
         Ok(current && transcript_cursor::transcript_unchanged_readonly(conn, source, path)?)
+    }
+
+    fn codex_current(
+        &self,
+        conn: &Connection,
+        session: &str,
+        path: &Path,
+        cursor: &transcript_cursor::TranscriptCursorState,
+    ) -> Result<bool> {
+        let locator = path.to_string_lossy();
+        let record = self
+            .state
+            .get("codex_rollouts_v7")
+            .and_then(Value::as_object)
+            .and_then(|files| files.get(locator.as_ref()))
+            .and_then(Value::as_object);
+        Ok(cursor.codex.as_ref().is_some_and(|state| {
+            state.state_markers >= CODEX_STATE_MARKER_GENERATION
+                && state.fork_replay >= CODEX_FORK_REPLAY_GENERATION
+        }) && record.is_some_and(|row| {
+            row.get("session").and_then(Value::as_str) == Some(session)
+                && row.get("stamp").and_then(Value::as_str) == file_stamp(path).ok().as_deref()
+                && row.get("subagent") == Some(&Value::Bool(false))
+        }) && !images::rollout_owes_capture(record, true)
+            && codex_session_evidence_exists(conn, session)?
+            && codex_continuity_evidence_exists(conn, path)?)
     }
 }
 

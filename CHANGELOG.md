@@ -22,6 +22,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Filesystem-event sync can retain exact dirty paths and reuse catalog deltas, avoiding directory enumeration, whole-catalog digest copies and a silent full-history count for an active transcript append.
 - Cold reconciliation reuses current native transcript proofs without rehydrating unchanged archives and reports SQLite busy waits separately for work-based scheduling.
+- Capture cancellation stops SQLite busy retries so maintenance releases its sync lease while another writer remains held.
 
 ### Rust API
 
