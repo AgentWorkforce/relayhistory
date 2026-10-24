@@ -21,10 +21,11 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - Filesystem-event sync can retain exact dirty paths and reuse catalog deltas, avoiding directory enumeration, whole-catalog digest copies and a silent full-history count for an active transcript append.
+- Cold reconciliation reuses current native transcript proofs without rehydrating unchanged archives and reports SQLite busy waits separately for work-based scheduling.
 
 ### Rust API
 
-- Added `SyncOptions::paths`, `DiscoveryOptions::paths`, and resumable `SessionStore::reconcile` rounds with bounded directory-entry/path slices and a discovery-only mode; atomic transcript/database acquisition boundaries are unchanged.
+- Added `SyncOptions::paths`, `DiscoveryOptions::paths`, and resumable `SessionStore::reconcile` rounds with bounded directory-entry/path slices, `ReconciliationStep::sqlite_busy_wait` and a discovery-only mode; atomic transcript/database acquisition boundaries are unchanged.
 
 - Added `Source::Kilo` for filtering and reading persisted Kilo CLI history.
 - Added `Source::DeepAgents` for filtering and reading persisted DeepAgents Code history.

@@ -136,7 +136,7 @@ macro_rules! sync_note {
 }
 
 // After `sync_note!`, which the phases report through.
-mod path_capture;
+pub(crate) mod path_capture;
 #[cfg(test)]
 pub(crate) mod state_work;
 mod sweep_phases;

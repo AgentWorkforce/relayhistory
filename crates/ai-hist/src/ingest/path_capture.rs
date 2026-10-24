@@ -1,5 +1,6 @@
 //! Provider-owned exact transcript acquisition without global sync state.
 use super::*;
+pub(crate) mod cold_proof;
 use crate::observations;
 use crate::remote::SourceConnectorSelection;
 
@@ -133,7 +134,7 @@ fn capture_paths(
         check_capture_cancelled()?;
         capture_progress(&source, index, Some(paths.paths().len()));
         let path = PathBuf::from(path.context("discovered transcript has no locator")?);
-        if !force && cached && hydrate::can_skip_exact_capture(conn, &source, &session_id, &path)? {
+        if !force && cached && unchanged(conn, db, &source, &session_id, &path)? {
             continue;
         }
         let validate =
@@ -159,6 +160,19 @@ fn capture_paths(
         }
     }
     Ok(Some(true))
+}
+
+fn unchanged(
+    conn: &Connection,
+    db: &Path,
+    source: &str,
+    session: &str,
+    path: &Path,
+) -> Result<bool> {
+    Ok(
+        hydrate::can_skip_exact_capture(conn, source, session, path)?
+            || cold_proof::unchanged(conn, db, source, session, path)?,
+    )
 }
 
 /// Retain old evidence/provenance, but stop resolving a replaced locator to

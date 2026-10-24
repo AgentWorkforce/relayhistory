@@ -11,6 +11,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+pub(crate) mod busy_wait;
 mod event_row;
 mod retired_sources;
 pub use retired_sources::is_retired_source;
@@ -556,14 +557,11 @@ fn busy_retry_handler(prior_attempts: i32) -> bool {
         .subsec_nanos() as u64;
     let seed = clock ^ u64::from(std::process::id()) ^ prior_attempts as u64;
     let jitter_ms = seed % (backoff_ms / BUSY_RETRY_JITTER_DIVISOR + 1);
-    std::thread::sleep(Duration::from_millis(backoff_ms + jitter_ms));
+    busy_wait::sleep(Duration::from_millis(backoff_ms + jitter_ms));
     true
 }
 
-pub(crate) fn configure_busy_retry(conn: &Connection) -> Result<()> {
-    conn.busy_handler(Some(busy_retry_handler))?;
-    Ok(())
-}
+pub(crate) use busy_wait::configure_busy_retry;
 
 /// A short busy budget for the calls made while it lives, in place of the
 /// production retry sequence.

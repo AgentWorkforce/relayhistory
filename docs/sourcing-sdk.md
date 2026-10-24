@@ -1193,6 +1193,22 @@ after completion covers roots created after registration, lost events and
 concurrent directory moves. `sources([Source::Claude])` restricts an additional
 login/root to its own provider. `discover_step` takes `DiscoveryOptions` and only
 writes shallow catalog metadata; it must be used for selected-only inventory.
+`ReconciliationStep::sqlite_busy_wait` reports actual elapsed sleeps in the SDK's
+SQLite busy handler on the executing thread. It excludes other worker threads
+and waits outside that handler, and is not CPU time. Cost-based scheduling may
+subtract this known blocked time from the full wall duration using saturating
+subtraction; the full wall duration remains useful diagnostic information.
+
+Cold acquisition can reuse a current native global-sync unchanged-file proof
+without creating an independent hydration checkpoint. One read-only sync-state
+snapshot is cached for the round; file/state/database identity, parser generations,
+existing native evidence and continuity still have to match. Changed or uncertain
+paths use ordinary acquisition. A present destination marker is compared with
+that session's current indexed holdings. Without a marker, the existing native
+evidence-presence guard applies and cannot independently detect partial historical
+row loss. Hot and selected-only acquisition do not install this cold proof scope,
+and hot exact appends still do no global sync-state I/O.
+
 A discovery row `limit` is rejected before consuming any iterator position: use
 `max_entries`/`max_paths` to bound a round without dropping unexamined candidates.
 
@@ -1218,12 +1234,14 @@ sync can have committed evidence chunks without publishing its final byte cursor
 and Codex rewrite repair is atomic across a rollout. A time limit implemented by
 cancelling the same large input on every retry can therefore starve it forever.
 Let that input finish, keep stop cancellation for shutdown, and pace subsequent
-cold work by its full elapsed cost without an upper sleep clamp. Completed
+cold work by its elapsed work cost without an upper sleep clamp, excluding only
+known blocked time reported by the SDK. Completed
 per-file checkpoints survive a dropped/restarted round; the filesystem iterator
 position itself is in memory and is rebuilt after a process restart.
 
-Partial passes do not seal global parser generations or audit destination
-shortfalls. Embedders should retain an infrequent full `sync` maintenance audit
+Partial passes do not seal global parser generations or perform a full
+destination audit. Cold native proof reuse checks a present marker only for the
+current session before skipping it. Embedders should retain an infrequent full `sync` maintenance audit
 (for example after initial reconciliation, then daily), and explicit full-sync
 repair commands. A full audit and each atomic input can still be slow. Keep hot
 capture and cold scheduling separate, and do not add their individual duty

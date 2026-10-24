@@ -606,6 +606,7 @@ pub ai_hist::ReconciliationStep::discovery: core::option::Option<ai_hist::Discov
 pub ai_hist::ReconciliationStep::entries: usize
 pub ai_hist::ReconciliationStep::paths: usize
 pub ai_hist::ReconciliationStep::report: core::option::Option<ai_hist::SyncReport>
+pub ai_hist::ReconciliationStep::sqlite_busy_wait: core::time::Duration
 #[non_exhaustive] pub struct ai_hist::Relationship
 pub ai_hist::Relationship::child_agent_name: core::option::Option<alloc::string::String>
 pub ai_hist::Relationship::child_agent_type: core::option::Option<alloc::string::String>

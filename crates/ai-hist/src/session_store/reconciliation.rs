@@ -13,12 +13,17 @@ use std::{
 pub struct Reconciliation {
     store: SessionStore,
     sources: VecDeque<SourceWalk>,
+    cold_proof: crate::ingest::path_capture::cold_proof::ColdProof,
 }
 
 /// Content-free work accounting for a bounded reconciliation slice.
 #[derive(Debug, Default)]
 #[non_exhaustive]
 pub struct ReconciliationStep {
+    /// Actual elapsed sleeps in the SDK SQLite busy handler on this executing
+    /// thread. Excludes worker-thread and other waits; this is not CPU time.
+    /// Embedders may exclude this known blocked time from work-based pacing.
+    pub sqlite_busy_wait: std::time::Duration,
     /// Directory entries inspected (at most the supplied bound, clamped to one).
     pub entries: usize,
     /// Exact paths attempted (at most the supplied bound, clamped to one).
@@ -95,6 +100,7 @@ impl SessionStore {
         Ok(Reconciliation {
             store: self.clone(),
             sources,
+            cold_proof: Default::default(),
         })
     }
 }
@@ -118,31 +124,36 @@ impl Reconciliation {
         max_paths: usize,
         options: SyncOptions,
     ) -> Result<ReconciliationStep, Error> {
+        let busy_before = crate::store::busy_wait::total();
         let Some(mut source) = self.sources.pop_front() else {
             return Ok(ReconciliationStep {
                 complete: true,
                 ..Default::default()
             });
         };
-        let result = self
-            .take_step(
-                &mut source,
-                max_entries.max(1),
-                max_paths.max(1),
-                options.clone(),
-            )
-            .and_then(|mut step| {
-                if source.enumerated() && !source.finalized {
-                    let recovered = self.store.reconcile_pending(source.source, &options)?;
-                    if let Some(report) = &mut step.report {
-                        report.head_revision = recovered.head_revision;
-                    } else {
-                        step.report = Some(recovered);
+        let mut cold_proof = std::mem::take(&mut self.cold_proof);
+        let result =
+            crate::ingest::path_capture::cold_proof::with_cold_proof(&mut cold_proof, || {
+                self.take_step(
+                    &mut source,
+                    max_entries.max(1),
+                    max_paths.max(1),
+                    options.clone(),
+                )
+                .and_then(|mut step| {
+                    if source.enumerated() && !source.finalized {
+                        let recovered = self.store.reconcile_pending(source.source, &options)?;
+                        if let Some(report) = &mut step.report {
+                            report.head_revision = recovered.head_revision;
+                        } else {
+                            step.report = Some(recovered);
+                        }
+                        source.finalized = true;
                     }
-                    source.finalized = true;
-                }
-                Ok(step)
+                    Ok(step)
+                })
             });
+        self.cold_proof = cold_proof;
         // Keep a failed path until a successful retry or the caller drops this
         // round. Missing paths succeed as empty scopes; the next round repairs
         // renames/new arrivals not represented by this iterator.
@@ -150,6 +161,7 @@ impl Reconciliation {
             self.sources.push_back(source);
         }
         result.map(|mut step| {
+            step.sqlite_busy_wait = crate::store::busy_wait::total().saturating_sub(busy_before);
             step.complete = self.sources.is_empty();
             step
         })
@@ -163,6 +175,7 @@ impl Reconciliation {
         max_paths: usize,
         mut options: super::DiscoveryOptions,
     ) -> Result<ReconciliationStep, Error> {
+        let busy_before = crate::store::busy_wait::total();
         if options.limit.is_some() {
             return Err(Error::InvalidArgument("reconciliation cannot use a discovery row limit; bound work with max_entries/max_paths".into()));
         }
@@ -191,6 +204,7 @@ impl Reconciliation {
             self.sources.push_back(source);
         }
         result.map(|mut step: ReconciliationStep| {
+            step.sqlite_busy_wait = crate::store::busy_wait::total().saturating_sub(busy_before);
             step.complete = self.sources.is_empty();
             step
         })
@@ -390,6 +404,31 @@ mod tests {
             "{line}"
         )
         .unwrap();
+    }
+
+    #[test]
+    fn sqlite_writer_wait_is_reported_only_by_its_own_reconciliation_step() {
+        let (_temp, store, project) = fixture();
+        write(&project.join("a.jsonl"), "a", "one");
+        let mut round = store.reconcile().unwrap().sources([Source::Claude]);
+        let writer = crate::open_db(store.db_path()).unwrap();
+        writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let started = std::time::Instant::now();
+        let running = std::thread::spawn(move || {
+            let blocked = round.step(64, 8, SyncOptions::default()).unwrap();
+            let next = round.step(64, 8, SyncOptions::default()).unwrap();
+            (blocked, next)
+        });
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        writer.execute_batch("ROLLBACK").unwrap();
+        let (blocked, next) = running.join().unwrap();
+        assert_eq!(blocked.paths, 1);
+        assert!(blocked.sqlite_busy_wait >= std::time::Duration::from_millis(150));
+        assert!(blocked.sqlite_busy_wait <= started.elapsed());
+        assert_eq!(next.sqlite_busy_wait, std::time::Duration::ZERO);
+        let mut inventory = store.reconcile().unwrap().sources([Source::Claude]);
+        let shallow = inventory.discover_step(64, 8, Default::default()).unwrap();
+        assert_eq!(shallow.sqlite_busy_wait, std::time::Duration::ZERO);
     }
 
     #[test]
