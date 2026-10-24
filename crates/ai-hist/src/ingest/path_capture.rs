@@ -22,10 +22,10 @@ pub(crate) fn sync_facade_tick<B, R>(
     scope: &SweepScope,
     before: impl FnOnce(&Connection) -> Result<B>,
     after: impl FnOnce(&Connection, B, SyncTick, bool) -> Result<R>,
-) -> Result<Option<(SyncTick, R)>> {
+) -> Result<Option<(SyncTick, R, SyncRunLock)>> {
     SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
     check_capture_cancelled()?;
-    let Some(_sync_lock) = try_acquire_sync_lock(db_path)? else {
+    let Some(sync_lock) = try_acquire_sync_lock(db_path)? else {
         return Ok(None);
     };
     let conn = open_db(db_path).map_err(|error| enrich_sync_error(db_path, error))?;
@@ -46,7 +46,7 @@ pub(crate) fn sync_facade_tick<B, R>(
     let outcome = after(&conn, baseline, tick, captured.is_ok());
     captured?;
     let outcome = outcome?;
-    Ok(Some((tick, outcome)))
+    Ok(Some((tick, outcome, sync_lock)))
 }
 
 pub(crate) fn reconcile_pending(db: &Path, source: &str) -> Result<bool> {

@@ -1159,7 +1159,10 @@ feature.
 
 An embedder with its own filesystem watcher should retain exact event paths in
 `SyncOptions::paths` together with their owning `sources`, rather than turn a
-single append into provider-wide sync. `None` keeps the legacy whole-source behavior; `Some(vec![])` does no
+single append into provider-wide sync. Without explicit source hints, known
+paths select their owning providers; an unrecognized legacy/deleted-profile path
+retains the prior unrestricted-source fallback because current watch roots are
+not an exhaustive ownership catalog. `None` keeps the legacy whole-source behavior; `Some(vec![])` does no
 provider I/O. The SDK applies the same provider-owned locator rules as its watcher,
 continues from durable transcript byte cursors, and never publishes a full-source
 fingerprint for a partial pass. Exact primary Claude/Codex transcripts use shallow
@@ -1175,7 +1178,9 @@ copying or walking unrelated catalog keys. Writes from other handles are folded
 in before the call's bracket; database replacement/feed epoch changes rebuild the
 baseline instead of trusting old identities. A failed attempt retains its committed
 catalog delta for the next successful report; changes committed by another writer
-before that retry are still excluded from the attempt bracket.
+before that retry are still excluded from the attempt bracket. The existing
+cancellable sync lock remains held through successful public report publication,
+so concurrent calls cannot consume the same retained changes twice.
 
 `SessionStore::reconcile()` starts a round-robin reconciliation of provider-owned
 watch roots. `step(max_entries, max_paths, SyncOptions::default())` clamps both limits to

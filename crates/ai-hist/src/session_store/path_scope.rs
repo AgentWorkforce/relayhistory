@@ -40,31 +40,53 @@ pub(super) fn selected_sources(
     if paths.is_empty() {
         return Some(Vec::new());
     }
-    let paths: Vec<_> = paths.iter().map(|path| resolved(path)).collect();
-    Some(
-        Source::ALL
-            .iter()
-            .copied()
-            .filter(|source| {
-                source.capabilities().watch_roots(roots).iter().any(|root| {
+    let candidates: Vec<_> = Source::ALL
+        .iter()
+        .copied()
+        .map(|source| {
+            let roots = source
+                .capabilities()
+                .watch_roots(roots)
+                .into_iter()
+                .map(|root| {
                     let base = resolved(&root.path);
-                    paths.iter().any(|path| {
-                        if base.starts_with(path) {
-                            return true;
+                    (root, base)
+                })
+                .collect::<Vec<_>>();
+            (source, roots)
+        })
+        .collect();
+    let mut selected = std::collections::BTreeSet::new();
+    for path in paths {
+        let path = resolved(path);
+        let owners: Vec<_> = candidates
+            .iter()
+            .filter(|(_, roots)| {
+                roots.iter().any(|(root, base)| {
+                    if base.starts_with(&path) {
+                        return true;
+                    }
+                    match root.scope {
+                        crate::WatchScope::File => &path == base,
+                        crate::WatchScope::Directory => {
+                            path.parent() == Some(base.as_path())
+                                && path.file_name().is_some_and(|name| root.admits(name))
                         }
-                        match root.scope {
-                            crate::WatchScope::File => path == &base,
-                            crate::WatchScope::Directory => {
-                                path.parent() == Some(base.as_path())
-                                    && path.file_name().is_some_and(|name| root.admits(name))
-                            }
-                            _ => path.starts_with(&base),
-                        }
-                    })
+                        _ => path.starts_with(base),
+                    }
                 })
             })
-            .collect(),
-    )
+            .map(|(source, _)| *source)
+            .collect();
+        // Watch roots describe currently active inputs, not every legacy or
+        // deleted profile locator. Unknown ownership must retain the prior
+        // unrestricted source selection rather than silently skip cleanup.
+        if owners.is_empty() {
+            return None;
+        }
+        selected.extend(owners);
+    }
+    Some(selected.into_iter().collect())
 }
 
 /// Deleted/renamed paths still resolve their existing ancestor. Resolve links

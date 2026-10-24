@@ -1556,4 +1556,171 @@ mod tests {
             .changed
             .contains(&super::super::SessionRef::id(Source::Claude, "a")));
     }
+    #[test]
+    fn publication_holds_the_existing_sync_lock_and_cannot_duplicate_pending_changes() {
+        let (_temp, store, project) = fixture();
+        let path = project.join("a.jsonl");
+        write(&path, "a", "one");
+        let options = SyncOptions::default()
+            .sources([Source::Claude])
+            .paths([path]);
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let first_store = store.clone();
+        let first_options = options.clone();
+        let first = std::thread::spawn(move || {
+            super::super::sync::BEFORE_REPORT.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move || {
+                    ready_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                }))
+            });
+            first_store.sync(first_options)
+        });
+        ready_rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        let start = std::time::Instant::now();
+        let mut second_options = options.clone();
+        second_options.lock_timeout_ms = 0;
+        let second = store.sync(second_options);
+        let zero_elapsed = start.elapsed();
+        let token = super::super::StopToken::new();
+        let cancelled_options = options.clone().lock_timeout_ms(30_000).stop(token.clone());
+        let waiting_store = store.clone();
+        let (cancel_tx, cancel_rx) = std::sync::mpsc::channel();
+        let waiting = std::thread::spawn(move || {
+            cancel_tx
+                .send(waiting_store.sync(cancelled_options))
+                .unwrap();
+        });
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        token.stop();
+        let cancelled = cancel_rx.recv_timeout(std::time::Duration::from_millis(500));
+        release_tx.send(()).unwrap();
+        waiting.join().unwrap();
+        let report = first.join().unwrap().unwrap();
+        assert!(
+            matches!(second, Err(Error::SyncLocked { .. })),
+            "publication remains in the same cancellable sync-lock bracket"
+        );
+        assert!(zero_elapsed < std::time::Duration::from_secs(1));
+        assert!(matches!(cancelled, Ok(Err(Error::Cancelled(_)))));
+        assert_eq!(
+            report.changed,
+            vec![super::super::SessionRef::id(Source::Claude, "a")]
+        );
+        assert!(store.sync(options).unwrap().changed.is_empty());
+    }
+
+    #[test]
+    fn legacy_opencode_paths_without_source_hints_discover_and_capture_evidence() {
+        let (_temp, store, _project) = fixture();
+        let storage = &store.roots().opencode_storage_dir;
+        let session = storage.join("session/global/ses_tree.json");
+        let message = storage.join("message/ses_tree/msg_tree.json");
+        let part = storage.join("part/msg_tree/part_tree.json");
+        for path in [&session, &message, &part] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+        }
+        fs::write(
+            &session,
+            r#"{"id":"ses_tree","directory":"/work/tree","time":{"created":10,"updated":20}}"#,
+        )
+        .unwrap();
+        fs::write(
+            &message,
+            r#"{"id":"msg_tree","sessionID":"ses_tree","role":"user","time":{"created":10}}"#,
+        )
+        .unwrap();
+        fs::write(&part, r#"{"id":"part_tree","sessionID":"ses_tree","messageID":"msg_tree","type":"text","text":"tree prompt"}"#).unwrap();
+        let discovery = store
+            .discover(super::super::DiscoveryOptions {
+                paths: Some(vec![session.clone()]),
+                ..Default::default()
+            })
+            .unwrap();
+        assert!(discovery.discovered + discovery.skipped_unchanged > 0);
+        store.sync(SyncOptions::default().paths([session])).unwrap();
+        let captured: bool = crate::open_db(store.db_path()).unwrap().query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_events WHERE source='opencode' AND session_id='ses_tree' AND text='tree prompt')",
+            [], |row| row.get(0),
+        ).unwrap();
+        assert!(
+            captured,
+            "a legacy locator must retain discovery and acquisition"
+        );
+    }
+
+    #[test]
+    fn deleted_hermes_profile_path_without_source_hints_retires_its_sessions() {
+        let (_temp, store, _project) = fixture();
+        let profile = store.roots().home.join(".hermes/profiles/work/state.db");
+        fs::create_dir_all(profile.parent().unwrap()).unwrap();
+        let db = rusqlite::Connection::open(&profile).unwrap();
+        db.execute_batch(include_str!("../../tests/fixtures/hermes/schema31.sql"))
+            .unwrap();
+        drop(db);
+        store
+            .sync(SyncOptions::default().sources([Source::Hermes]))
+            .unwrap();
+        let conn = crate::open_db(store.db_path()).unwrap();
+        let count = || {
+            conn.query_row(
+                "SELECT COUNT(*) FROM sessions WHERE source='hermes'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+        assert!(count() > 0);
+        fs::remove_dir_all(profile.parent().unwrap()).unwrap();
+        store.sync(SyncOptions::default().paths([profile])).unwrap();
+        assert_eq!(
+            count(),
+            0,
+            "a deleted dynamic root must still reach provider retirement"
+        );
+    }
+
+    #[test]
+    fn unknown_legacy_and_deleted_profile_paths_preserve_unrestricted_source_fallback() {
+        let (_temp, store, _project) = fixture();
+        let legacy = store
+            .roots()
+            .home
+            .join(".local/share/opencode/storage/session/project/ses_legacy.json");
+        let deleted_profile = store
+            .roots()
+            .home
+            .join("unregistered-provider/profile-deleted/sessions.db");
+        assert_eq!(
+            super::super::path_scope::selected_sources(
+                store.roots(),
+                Some(std::slice::from_ref(&deleted_profile)),
+                None
+            ),
+            None
+        );
+        let inferred = super::super::path_scope::selected_sources(
+            store.roots(),
+            Some(std::slice::from_ref(&legacy)),
+            None,
+        );
+        assert!(
+            inferred.is_none()
+                || inferred
+                    .as_ref()
+                    .is_some_and(|sources| sources.contains(&Source::OpenCode)),
+            "a legacy locator cannot become an empty allowlist"
+        );
+        assert_eq!(
+            super::super::path_scope::selected_sources(
+                store.roots(),
+                Some(&[legacy, deleted_profile]),
+                Some(vec![Source::OpenCode])
+            ),
+            Some(vec![Source::OpenCode])
+        );
+    }
 }

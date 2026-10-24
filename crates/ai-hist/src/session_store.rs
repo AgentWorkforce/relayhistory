@@ -3730,6 +3730,8 @@ mod tests {
             vec![SessionRef::id(Source::Claude, "hydrated-meanwhile")]
         );
 
+        // The private bracket returns its lock for public report publication.
+        drop(outcome);
         // And the public call over the same store: unswept, nothing moved
         // under its lock, nothing reported — the earlier write was before it.
         let again = store.sync(SyncOptions::default()).unwrap();
