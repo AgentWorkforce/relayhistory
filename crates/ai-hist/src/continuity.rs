@@ -28,6 +28,8 @@ use std::path::Path;
 mod parse;
 mod resolve;
 mod storage;
+mod scoped;
+pub(crate) use scoped::{ensure_indexes, reconcile_captured, CaptureScope};
 
 pub use parse::scan_claude_transcript;
 pub(crate) use parse::{capture_folded, finish_claude_fold, fold_claude_record};
@@ -591,39 +593,7 @@ pub struct ContinuityReconciliation {
 /// edge yet. `record_relationship` is an idempotent upsert, so re-emitting an
 /// edge that already exists changes nothing but `updated_ms`.
 pub fn reconcile(conn: &Connection, source: &str) -> Result<ContinuityReconciliation> {
-    let pending = load_pending(conn, source)?;
-    let mut report = ContinuityReconciliation {
-        considered: pending.len(),
-        ..ContinuityReconciliation::default()
-    };
-    for evidence in &pending {
-        let mut reasons: Vec<String> = Vec::new();
-        // Every uid this locator establishes on this pass. What it established
-        // on an earlier pass and no longer does is retracted below, so a
-        // rewritten transcript cannot leave a stale edge queryable.
-        let mut written: Vec<(String, String)> = Vec::new();
-        resolve_explicit(conn, evidence, &mut written)?;
-        resolve_resume(conn, evidence, &mut written)?;
-        resolve_cross_file_parent(conn, evidence, &mut reasons, &mut written)?;
-        // Last of the explicit signals: only when none of the above applied.
-        resolve_explicit_source(conn, evidence, &mut written)?;
-        let lineage = written.len();
-        resolve_fork_group(conn, evidence, lineage > 0, &mut reasons, &mut written)?;
-        report.edges_written += written.len();
-        report.retracted += retract_edges(conn, &evidence.source, &evidence.locator, &written)?;
-        let reason = (!reasons.is_empty()).then(|| reasons.join("; "));
-        if reason.is_none() {
-            report.resolved += 1;
-        } else {
-            report.pending += 1;
-        }
-        conn.execute(
-            "UPDATE session_continuity_evidence SET pending_reason = ?, updated_ms = ? \
-             WHERE source = ? AND locator = ?",
-            params![reason, crate::now_ms(), evidence.source, evidence.locator],
-        )?;
-    }
-    Ok(report)
+    scoped::reconcile_rows(conn, load_pending(conn, source)?)
 }
 
 /// Diagnostics for evidence about `session_id` that is still waiting.

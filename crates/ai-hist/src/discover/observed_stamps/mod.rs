@@ -1171,3 +1171,7 @@ mod tests {
         assert_eq!(left, 0);
     }
 }
+
+pub(super) fn matches(fresh: bool, stamp: Option<&str>, expected: &str) -> bool {
+    !fresh && stamp == Some(expected)
+}

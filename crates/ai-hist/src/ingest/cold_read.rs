@@ -20,6 +20,9 @@ use super::metadata_mtime_ns;
 use super::transcript_cursor::{change_time_ns, file_identity, filesystem_keeps_change_time};
 use super::transcript_file::{self, TranscriptFile, TranscriptMetadata};
 
+mod opening;
+pub(crate) use opening::opening_record;
+
 /// Largest transcript retained so a second pass can reuse the first read.
 ///
 /// Above this the streaming reader stays: an incremental resume must not pull
@@ -74,7 +77,6 @@ struct State {
     kept: HashMap<PathBuf, Capture>,
     bounded: HashMap<PathBuf, Bounded>,
     retained: usize,
-    sweep: bool,
 }
 
 impl State {
@@ -88,7 +90,6 @@ impl State {
             kept: HashMap::new(),
             bounded: HashMap::new(),
             retained: 0,
-            sweep: false,
         }
     }
 }
@@ -104,10 +105,16 @@ fn state() -> &'static Mutex<State> {
     STATE.get_or_init(|| Mutex::new(State::empty()))
 }
 
+thread_local! {
+    static IN_SWEEP: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// Held across one sweep so discovery can see bytes the ingest already read.
 /// Dropping it forgets those bytes. Open counts stay, for the test that reads
 /// them after the sweep returns.
 pub(crate) struct SweepGuard {
+    previous: bool,
+    _local: std::marker::PhantomData<std::rc::Rc<()>>,
     _codex_sqlite: crate::providers::codex::sqlite::SyncPass,
     /// Tests sweep many stores in one process, and this state is the
     /// process's: one sweep at a time keeps each sweep's open counts its own.
@@ -118,7 +125,7 @@ pub(crate) struct SweepGuard {
 impl Drop for SweepGuard {
     fn drop(&mut self) {
         let mut state = lock();
-        state.sweep = false;
+        IN_SWEEP.with(|value| value.set(self.previous));
         state.full = None;
         state.kept.clear();
         state.bounded.clear();
@@ -137,7 +144,6 @@ pub(crate) fn begin_sweep() -> SweepGuard {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     };
     let mut state = lock();
-    state.sweep = true;
     state.full = None;
     state.kept.clear();
     state.bounded.clear();
@@ -145,6 +151,8 @@ pub(crate) fn begin_sweep() -> SweepGuard {
     state.parked = None;
     state.opened.clear();
     SweepGuard {
+        previous: IN_SWEEP.with(|value| value.replace(true)),
+        _local: std::marker::PhantomData,
         _codex_sqlite: crate::providers::codex::sqlite::SyncPass::begin(),
         #[cfg(test)]
         _serial: serial,
@@ -152,7 +160,7 @@ pub(crate) fn begin_sweep() -> SweepGuard {
 }
 
 pub(crate) fn in_sweep() -> bool {
-    lock().sweep
+    IN_SWEEP.with(|value| value.get())
 }
 
 /// How many times `path` was opened through this module since the process started.
@@ -257,7 +265,7 @@ fn publish_locked(state: &mut State, path: PathBuf, bytes: Arc<[u8]>, stat: Stat
 }
 
 fn retain_full(state: &mut State, capture: Capture) {
-    if !state.sweep {
+    if !in_sweep() {
         return;
     }
     let cost = capture.bytes.len();
@@ -281,7 +289,7 @@ fn forget_retained(state: &mut State, path: &Path) {
 }
 
 fn retain_bounded(state: &mut State, capture: Capture) {
-    if !state.sweep {
+    if !in_sweep() {
         return;
     }
     let (head, tail) = split_live(&capture.bytes);
@@ -355,80 +363,6 @@ pub(crate) fn read_string(path: &Path) -> io::Result<String> {
 
 fn utf8_string(bytes: Vec<u8>) -> io::Result<String> {
     String::from_utf8(bytes).map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
-}
-
-/// The first record of `path`, from bytes already read or from one shared open.
-pub(crate) fn opening_record(path: &Path) -> io::Result<Option<(Vec<u8>, u64)>> {
-    if let Some(bytes) = fresh(path) {
-        return Ok(first_record(&bytes));
-    }
-    // Outside a sweep the caller only needs the first record. Slurping here
-    // would read every sibling rollout a hydration merely classifies.
-    if in_sweep() && small_file_len(path)?.is_some() {
-        let bytes = read_all(path)?;
-        return Ok(first_record(&bytes));
-    }
-    read_one_record(path)
-}
-
-fn first_record(bytes: &[u8]) -> Option<(Vec<u8>, u64)> {
-    if bytes.is_empty() {
-        return None;
-    }
-    let end = bytes
-        .iter()
-        .position(|byte| *byte == b'\n')
-        .map(|index| index + 1)
-        .unwrap_or(bytes.len());
-    Some((bytes[..end].to_vec(), end as u64))
-}
-
-fn read_one_record(path: &Path) -> io::Result<Option<(Vec<u8>, u64)>> {
-    use std::io::BufRead;
-    let mut shared = open_shared(path)?;
-    let mut reader = std::io::BufReader::new(shared.file()?);
-    let mut raw = Vec::new();
-    let ceiling = crate::ingest::transcript_cursor::MAX_RECORD_BYTES;
-    let read = reader.by_ref().take(ceiling).read_until(b'\n', &mut raw)? as u64;
-    if read == 0 {
-        return Ok(None);
-    }
-    if raw.last() == Some(&b'\n') || read < ceiling {
-        return Ok(Some((raw, read)));
-    }
-    match reader.fill_buf()?.first().copied() {
-        Some(b'\n') => {
-            reader.consume(1);
-            raw.push(b'\n');
-            Ok(Some((raw, read + 1)))
-        }
-        None => Ok(Some((raw, read))),
-        Some(_) => {
-            let skipped = skip_to_newline(&mut reader)?;
-            Ok(Some((Vec::new(), read + skipped)))
-        }
-    }
-}
-
-fn skip_to_newline(reader: &mut impl std::io::BufRead) -> io::Result<u64> {
-    let mut skipped = 0u64;
-    loop {
-        let buffered = reader.fill_buf()?;
-        if buffered.is_empty() {
-            return Ok(skipped);
-        }
-        match buffered.iter().position(|byte| *byte == b'\n') {
-            Some(index) => {
-                reader.consume(index + 1);
-                return Ok(skipped + index as u64 + 1);
-            }
-            None => {
-                let len = buffered.len();
-                reader.consume(len);
-                skipped += len as u64;
-            }
-        }
-    }
 }
 
 /// Publish `walked` when it is still the generation the walk opened.
@@ -617,6 +551,28 @@ fn keep_complete_lines(buffer: &mut Vec<u8>) {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_cold_sweeps_eager_read_policy_never_leaks_to_another_thread() {
+        let (ready, received) = std::sync::mpsc::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let cold = std::thread::spawn(move || {
+            let _guard = super::begin_sweep();
+            assert!(super::in_sweep());
+            ready.send(()).unwrap();
+            released.recv().unwrap();
+        });
+        received
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .unwrap();
+        let leaked = super::in_sweep();
+        release.send(()).unwrap();
+        cold.join().unwrap();
+        assert!(
+            !leaked,
+            "an unrelated cold sweep must not make hot metadata read whole files"
+        );
+    }
+
     use super::*;
 
     fn claude_line(session_id: &str) -> String {

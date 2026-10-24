@@ -18,7 +18,13 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - VT Code history is discoverable and searchable from canonical workspace journals under explicitly configured workspace roots, preserving recorded turns, tool identities, usage and control events.
 - Junie CLI history is discoverable and searchable from native session journals, including recorded prompts, assistant text, tool output and event markers.
 
+### Fixed
+
+- Filesystem-event sync can retain exact dirty paths and reuse catalog deltas, avoiding directory enumeration, whole-catalog digest copies and a silent full-history count for an active transcript append.
+
 ### Rust API
+
+- Added `SyncOptions::paths`, `DiscoveryOptions::paths`, and resumable `SessionStore::reconcile` rounds with bounded directory-entry/path slices and a discovery-only mode; atomic transcript/database acquisition boundaries are unchanged.
 
 - Added `Source::Kilo` for filtering and reading persisted Kilo CLI history.
 - Added `Source::DeepAgents` for filtering and reading persisted DeepAgents Code history.

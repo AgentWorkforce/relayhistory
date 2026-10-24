@@ -2,6 +2,7 @@
 //! names from `session_index.jsonl`.
 
 use super::*;
+use std::collections::HashSet;
 
 /// Codex's rollout scanner. Thread names live outside the rollouts, in
 /// `session_index.jsonl`; the index is read once per pass, on the first
@@ -34,6 +35,20 @@ impl CodexProvider {
             .as_ref()
             .and_then(|names| names.get(session_id).cloned()))
     }
+}
+
+/// A rollout event does not admit unrelated SQLite-only threads. Hydration
+/// still resolves that rollout's own projection by its indexed thread id.
+fn enumerate_sqlite(env: &DiscoveryEnv<'_>) -> Result<(Vec<Candidate>, HashSet<PathBuf>)> {
+    if env.path_scope().is_some_and(|scope| {
+        scope.paths().iter().all(|path| {
+            path.starts_with(env.codex_home.join("sessions"))
+                || path.starts_with(env.codex_home.join("archived_sessions"))
+        })
+    }) {
+        return Ok(Default::default());
+    }
+    crate::providers::codex::sqlite::enumerate(&env.codex_home, &env.provider_roots)
 }
 
 impl ShallowSessionProvider for CodexProvider {
@@ -101,7 +116,7 @@ impl ShallowSessionProvider for CodexProvider {
             files.extend(crate::ingest::codex_rollout_locators(&root, scope)?);
         }
         let (sqlite, incomplete_rollouts) =
-            match crate::providers::codex::sqlite::enumerate(&env.codex_home, &env.provider_roots) {
+            match enumerate_sqlite(env) {
                 Ok(found) => found,
                 Err(error) if error.is::<crate::ingest::CaptureCancelled>() => return Err(error),
                 Err(error) => {

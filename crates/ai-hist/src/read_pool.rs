@@ -36,13 +36,13 @@ const MAX_IDLE: usize = 4;
 /// platform gives no stable identity; such connections are never reused.
 #[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct FileIdentity {
+pub(crate) struct FileIdentity {
     device: u64,
     inode: u64,
 }
 
 #[cfg(unix)]
-fn file_identity(path: &Path) -> Option<FileIdentity> {
+pub(crate) fn file_identity(path: &Path) -> Option<FileIdentity> {
     use std::os::unix::fs::MetadataExt;
     let metadata = std::fs::metadata(path).ok()?;
     Some(FileIdentity {
@@ -53,10 +53,10 @@ fn file_identity(path: &Path) -> Option<FileIdentity> {
 
 #[cfg(windows)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct FileIdentity(Arc<same_file::Handle>);
+pub(crate) struct FileIdentity(Arc<same_file::Handle>);
 
 #[cfg(windows)]
-fn file_identity(path: &Path) -> Option<FileIdentity> {
+pub(crate) fn file_identity(path: &Path) -> Option<FileIdentity> {
     // Keep the handle alive: Windows may recycle file indexes after close.
     same_file::Handle::from_path(path)
         .ok()
@@ -65,10 +65,10 @@ fn file_identity(path: &Path) -> Option<FileIdentity> {
 
 #[cfg(not(any(unix, windows)))]
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct FileIdentity;
+pub(crate) struct FileIdentity;
 
 #[cfg(not(any(unix, windows)))]
-fn file_identity(_path: &Path) -> Option<FileIdentity> {
+pub(crate) fn file_identity(_path: &Path) -> Option<FileIdentity> {
     None
 }
 

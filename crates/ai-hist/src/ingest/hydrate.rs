@@ -10,11 +10,18 @@ use std::fs::OpenOptions;
 use std::time::Instant;
 
 mod codex_selected;
+mod continuity;
+mod exact;
+pub(super) use exact::{
+    can_skip as can_skip_exact_capture, mark as mark_exact_capture,
+    needs_validation as exact_capture_needs_validation,
+};
 mod probe;
 mod snapshot;
 mod unified_diff;
 
 pub(crate) use codex_selected::ingest_selected_codex;
+use probe::requires_local_pass;
 pub(crate) use probe::HydrationProbe;
 use snapshot::source_snapshot;
 use unified_diff::codex_diff_records;
@@ -433,8 +440,8 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
     // whether a pass runs at all, so leaving it to fire here would mean the
     // held records were never looked at again and the message was lost rather
     // than deferred.
-    let holding_records = holds_unfinished_records(&conn, options, &snapshot)?;
-    let stamp_matches = !holding_records
+    let parse_required = requires_local_pass(&conn, options, &snapshot)?;
+    let stamp_matches = !parse_required
         && checkpoint_covers(previous.as_ref(), &snapshot.stamp, options.include_related)
         && target.discovery_state.as_deref() == Some("full");
     // The stamp says the size and mtime are where they were. That is not the
@@ -1918,53 +1925,6 @@ fn unchanged_cursor_check(
     })
 }
 
-/// Whether any transcript this session is built from ended its last pass with
-/// records held back.
-///
-/// The session's own transcript is not the only one that defers: every Claude
-/// sidecar keeps its parser state in its own locator-keyed cursor, and a
-/// sidecar that held an unfinished message needs a pass to run before it can
-/// release those records. Consulting only the session cursor meant the
-/// unchanged shortcut returned first and the child's message stayed unindexed
-/// for as long as nothing else about the session changed.
-fn holds_unfinished_records(
-    conn: &Connection,
-    options: &HydrateSessionOptions,
-    snapshot: &SourceSnapshot,
-) -> Result<bool> {
-    let session = load_cursor(
-        conn,
-        &CursorKey::Session {
-            source: &options.source,
-            session_id: &options.session_id,
-            location: "local",
-        },
-    )?;
-    if session
-        .claude
-        .is_some_and(|claude| !claude.in_progress.is_empty())
-    {
-        return Ok(true);
-    }
-    for evidence in &snapshot.claude_subagents {
-        let locator = evidence.path.to_string_lossy().to_string();
-        let sidecar = load_cursor(
-            conn,
-            &CursorKey::Locator {
-                source: "claude",
-                locator: &locator,
-            },
-        )?;
-        if sidecar
-            .claude
-            .is_some_and(|claude| !claude.in_progress.is_empty())
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 /// Whether a catalog locator points inside the configured legacy tree. The
 /// comparison is on canonical paths so a symlinked storage root still matches,
 /// and a locator outside it is rejected rather than read.
@@ -2459,6 +2419,10 @@ fn ingest_claude(
     cursor: &mut TranscriptCursorState,
     parser_upgrade: bool,
 ) -> Result<IngestOutcome> {
+    let exact = super::path_capture::capturing_exact_paths()
+        .then(|| crate::continuity::CaptureScope::begin(conn, "claude", path))
+        .transpose()?;
+
     // Resumed from the same cursor document the record walk uses, so a
     // hydration of a transcript that grew by a kilobyte reads a kilobyte in
     // total. Skipped entirely when the hook already handed over the bytes:
@@ -2532,24 +2496,15 @@ fn ingest_claude(
             }
         }
     }
-    record_claude_remote_relationship(conn, &meta, options.include_related)?;
-    if options.include_related {
-        // Bank this transcript's continuity evidence for reconciliation now.
-        // A request for this session alone leaves relationship evidence for
-        // a later hydration that includes related sessions.
-        //
-        // Folded by the metadata walk above when there was one, so that path
-        // reads nothing here. The hook's bytes have no such walk behind them,
-        // so they are folded from the text.
-        //
-        // A superseded fold is not published. Its records came from bytes that
-        // were rewritten under the walk, and an absent continuity row
-        // *retracts* the edges it established — so a partial fold would
-        // replace real topology, and there is no "leave it alone" to express
-        // by passing one.
-        capture_claude_continuity(conn, path, snapshot, scan_superseded, scan_continuity)?;
-        crate::continuity::reconcile(conn, "claude")?;
-    }
+    continuity::capture_claude(
+        conn,
+        options,
+        path,
+        &meta,
+        exact,
+        snapshot,
+        (scan_superseded, scan_continuity),
+    )?;
     // The snapshot already walked and parsed these sidecars to stamp them, so
     // this pass indexes that evidence instead of finding it a second time.
     // Each sidecar carries its own locator-keyed cursor, so one that grows
@@ -2611,24 +2566,6 @@ fn ingest_claude_hook_snapshot(
         }
     }
     Ok(())
-}
-
-/// Record the transcript's continuity evidence: folded from the hook's text,
-/// or the metadata walk's fold unless the walk was superseded.
-fn capture_claude_continuity(
-    conn: &Connection,
-    path: &Path,
-    snapshot: Option<&ClaudeTranscriptSnapshot>,
-    scan_superseded: bool,
-    scan_continuity: Option<crate::continuity::ContinuityEvidence>,
-) -> Result<()> {
-    match snapshot {
-        Some(snapshot) => {
-            crate::continuity::capture_claude_transcript_text(conn, path, &snapshot.text)
-        }
-        None if !scan_superseded => crate::continuity::capture_folded(conn, path, scan_continuity),
-        None => Ok(()),
-    }
 }
 
 /// Send a sidecar's next record walk back to byte zero when another parser

@@ -1154,3 +1154,67 @@ gap and the facade grows instead. A consumer outside this repository that
 finds itself reaching for `unstable-internal` has found a gap in this
 document; open an issue against the facade rather than depending on the
 feature.
+
+## Incremental embedder scheduling
+
+An embedder with its own filesystem watcher should retain exact event paths in
+`SyncOptions::paths` together with their owning `sources`, rather than turn a
+single append into provider-wide sync. `None` keeps the legacy whole-source behavior; `Some(vec![])` does no
+provider I/O. The SDK applies the same provider-owned locator rules as its watcher,
+continues from durable transcript byte cursors, and never publishes a full-source
+fingerprint for a partial pass. Exact primary Claude/Codex transcripts use shallow
+discovery and targeted acquisition without loading or saving the global
+`.sync-state.json` archive map. Dirty event passes should set `force(true)` so
+same-stat writes reach content validation; cold reconciliation retains current
+parser/ctime proofs and reads no body bytes for settled unchanged files on trusted
+filesystems. Unknown filesystems retain bounded digest validation. Replaced
+identities trigger one fresh shallow read of the admitted paths instead of
+retrying a cached identity forever. Keep the `SessionStore` handle: successive syncs
+update an exclusive catalog baseline from the database change feed, without
+copying or walking unrelated catalog keys. Writes from other handles are folded
+in before the call's bracket; database replacement/feed epoch changes rebuild the
+baseline instead of trusting old identities.
+
+`SessionStore::reconcile()` starts a round-robin reconciliation of provider-owned
+watch roots. `step(max_entries, max_paths, SyncOptions::default())` inspects at
+most that many directory entries and attempts at most that many exact paths.
+Retain the round between calls: restarting discovery with a row limit repeatedly
+visits the same newest prefix and is not reconciliation. Each provider rotates
+after every slice, including errors; failed paths remain pending. A fresh round
+after completion covers roots created after registration, lost events and
+concurrent directory moves. `sources([Source::Claude])` restricts an additional
+login/root to its own provider. `discover_step` takes `DiscoveryOptions` and only
+writes shallow catalog metadata; it must be used for selected-only inventory.
+
+Primary continuity fields are banked without enumerating related families. The
+current locator, affected origins/dependents and children naming newly arrived
+parent records reconcile immediately through indexed identity/revision lookups.
+A completed source round retries all still-unresolved continuity once under the
+sync lock. This recovery can scale with unresolved evidence; it does not run for
+each hot append. Existing public `hydrate(include_related: false)` semantics and
+selected-only family consent are unchanged.
+
+| Input | Exact-path work | Remaining acquisition boundary |
+| --- | --- | --- |
+| Primary Claude/Codex JSONL | Indexed shallow observation + durable byte cursor; no global stamp map | One transcript; metadata and record cursor must both finish |
+| Claude sidecars / Codex delegated files without root metadata | Provider-owned scoped legacy acquisition | Existing relationship ownership and global stamp bookkeeping |
+| Provider SQLite / other flat logs | Provider-owned scoped fallback | Existing provider snapshot/selection; Codex SQLite retains its bounded thread backlog |
+| Selected-only inventory | Bounded directory/file scheduling and shallow discovery | No unselected evidence hydration |
+
+These are **enumeration/file-count bounds**, not hard CPU, byte or elapsed-time
+bounds. One transcript and provider SQLite snapshot retain their established
+transaction and cursor publication boundaries. In particular, interrupted Claude
+sync can have committed evidence chunks without publishing its final byte cursor,
+and Codex rewrite repair is atomic across a rollout. A time limit implemented by
+cancelling the same large input on every retry can therefore starve it forever.
+Let that input finish, keep stop cancellation for shutdown, and pace subsequent
+cold work by its full elapsed cost without an upper sleep clamp. Completed
+per-file checkpoints survive a dropped/restarted round; the filesystem iterator
+position itself is in memory and is rebuilt after a process restart.
+
+Partial passes do not seal global parser generations or audit destination
+shortfalls. Embedders should retain an infrequent full `sync` maintenance audit
+(for example after initial reconciliation, then daily), and explicit full-sync
+repair commands. A full audit and each atomic input can still be slow. Keep hot
+capture and cold scheduling separate, and do not add their individual duty
+fractions up as a claim about measured combined CPU usage.

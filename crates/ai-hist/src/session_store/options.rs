@@ -133,6 +133,11 @@ pub struct DiscoveryOptions {
     /// Restrict to these sources. `None` means every local source;
     /// `Some(vec![])` admits none and reads nothing.
     pub sources: Option<Vec<Source>>,
+    /// Exact watcher paths or a bounded reconciliation slice. `None` means
+    /// unrestricted; `Some(vec![])` reads no providers. Provider-owned path
+    /// rules remain authoritative.
+    #[serde(default)]
+    pub paths: Option<Vec<PathBuf>>,
     /// Cap on rows read, newest first across providers. `None` (the default)
     /// reads the whole catalog; a caller repeating a capped sweep only ever
     /// sees the same newest sessions.
@@ -157,6 +162,11 @@ pub struct DiscoveryOptions {
 }
 
 impl DiscoveryOptions {
+    pub(crate) fn reads_nothing(&self) -> bool {
+        self.sources.as_ref().is_some_and(Vec::is_empty)
+            || self.paths.as_ref().is_some_and(Vec::is_empty)
+    }
+
     /// Read only these sources; see [`DiscoveryOptions::sources`].
     #[must_use]
     pub fn sources(mut self, sources: impl IntoIterator<Item = Source>) -> Self {
@@ -243,6 +253,12 @@ pub struct SyncOptions {
     /// the age cutoff. Each sweep still reads at most 50 projected threads.
     #[serde(default)]
     pub codex_sqlite_max_age_days: Option<u64>,
+    /// Exact filesystem paths reported by an embedder's watcher. `None` means
+    /// no path restriction; `Some(vec![])` reads no providers. Always combine
+    /// with the owning `sources`.
+    /// Partial passes never publish a full-source fingerprint.
+    #[serde(default)]
+    pub paths: Option<Vec<PathBuf>>,
 }
 
 impl SyncOptions {
@@ -250,6 +266,13 @@ impl SyncOptions {
     #[must_use]
     pub fn sources(mut self, sources: impl IntoIterator<Item = Source>) -> Self {
         self.sources = Some(sources.into_iter().collect());
+        self
+    }
+
+    /// Restrict this sweep to changed paths; see [`SyncOptions::paths`].
+    #[must_use]
+    pub fn paths(mut self, paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        self.paths = Some(paths.into_iter().collect());
         self
     }
 
@@ -344,6 +367,16 @@ pub enum WatchTick {
     /// A shallow [`super::SessionStore::discover`] of the sources the tick
     /// names. No evidence is written and no transcript is parsed.
     Discover,
+}
+
+pub(super) fn resolve_db_path(opts: &StoreOptions) -> PathBuf {
+    if let Some(path) = &opts.db_path {
+        return path.clone();
+    }
+    match &opts.home {
+        None => crate::store::default_db_path(),
+        Some(home) => home.join(".local/share/ai-hist/ai-history.db"),
+    }
 }
 
 #[cfg(test)]

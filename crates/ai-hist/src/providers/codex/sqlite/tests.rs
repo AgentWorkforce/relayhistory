@@ -871,3 +871,29 @@ fn retry_restart_uses_the_current_cutoff() {
     assert!(outcome.read.is_empty());
     assert!(state["codex_sqlite_sweep_cursor_v1"].is_null());
 }
+
+
+#[test]
+fn exact_rollout_sync_does_not_enumerate_or_hydrate_sqlite_siblings() {
+    let temp = tempfile::tempdir().unwrap();
+    let codex = temp.path().join(".codex");
+    install_thread_set(&codex,&vec![crate::now_ms();1000]);
+    let path = codex.join("sessions/2026/10/23/rollout-2026-10-23T10-00-00-12345678-1234-1234-1234-123456789abc.jsonl");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let record = |uuid| serde_json::json!({"timestamp":"2026-10-23T10:00:00Z","type":"event_msg","payload":{"type":"user_message","message":uuid}}).to_string()+"\n";
+    std::fs::write(&path,serde_json::json!({"type":"session_meta","payload":{"id":"12345678-1234-1234-1234-123456789abc","cwd":"/tmp/p"}}).to_string()+"\n"+&record("first")).unwrap();
+    let mut roots = crate::ProviderRoots::from_home(temp.path().to_owned(),temp.path().join("opencode.db"));
+    roots.codex=codex;
+    let store=crate::SessionStore::open(crate::StoreOptions::default().db_path(temp.path().join("history.db")).roots(roots)).unwrap();
+    let options=crate::SyncOptions::default().sources([crate::Source::Codex]).paths([path.clone()]);
+    store.sync(options.clone()).unwrap();
+    use std::io::Write;
+    std::fs::OpenOptions::new().append(true).open(&path).unwrap().write_all(record("delta").as_bytes()).unwrap();
+    crate::ingest::state_work::take();
+    let report=store.sync(options).unwrap();
+    assert_eq!(crate::ingest::state_work::take(),(0,0));
+    assert!(report.changed.len()<=1);
+    let conn=crate::open_db(store.db_path()).unwrap();
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM sessions",[],|row|row.get::<_,i64>(0)).unwrap(),1,"SQLite-only siblings must stay untouched");
+    assert_eq!(conn.query_row("SELECT COUNT(*) FROM session_events",[],|row|row.get::<_,i64>(0)).unwrap(),2);
+}

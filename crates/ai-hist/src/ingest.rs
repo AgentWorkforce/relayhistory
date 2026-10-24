@@ -136,7 +136,11 @@ macro_rules! sync_note {
 }
 
 // After `sync_note!`, which the phases report through.
+mod path_capture;
+#[cfg(test)]
+pub(crate) mod state_work;
 mod sweep_phases;
+pub(crate) use path_capture::{reconcile_pending, sync_facade_tick};
 // After `sync_note!`, which it uses.
 mod codex_history;
 // After `sync_note!`, which an unreadable rollout reports through.
@@ -332,43 +336,6 @@ pub(crate) fn sync_local_at_with_home(db_path: &Path, home: &Path) -> Result<boo
     let roots = crate::ProviderRoots::from_env(home.to_path_buf());
     SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
     sync_exclusive_with_roots(db_path, &roots, false).map(|tick| tick.attempted)
-}
-
-/// One local sweep for [`crate::SessionStore`]: silent, against the store's
-/// resolved provider roots, forcing past the source fingerprint when asked,
-/// with two reads bracketing the sweep **inside the locked section**.
-///
-/// `before` runs once the `SyncRunLock` is held and before anything is
-/// written; `after` runs when the sweep has finished, on the same connection,
-/// still under the lock. That is what lets the facade say what *this* sweep
-/// changed: a baseline taken before the lock would also count whatever
-/// another sync wrote while this call waited for it. `None` means the lock
-/// was held elsewhere and nothing ran — the facade turns that into an error
-/// rather than a silent no-op. `scope` names the sources the sweep reads;
-/// see [`SweepScope`] for what a scoped sweep leaves alone.
-pub(crate) fn sync_facade_tick<B, R>(
-    db_path: &Path,
-    roots: &crate::ProviderRoots,
-    force: bool,
-    scope: &SweepScope,
-    before: impl FnOnce(&Connection) -> Result<B>,
-    after: impl FnOnce(&Connection, B, SyncTick) -> Result<R>,
-) -> Result<Option<(SyncTick, R)>> {
-    SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
-    check_capture_cancelled()?;
-    let Some(_sync_lock) = try_acquire_sync_lock(db_path)? else {
-        return Ok(None);
-    };
-    let conn = open_db(db_path).map_err(|error| enrich_sync_error(db_path, error))?;
-    let baseline = before(&conn)?;
-    let swept = sync_basic(&conn, db_path, roots, force, scope)
-        .map_err(|error| enrich_sync_error(db_path, error))?;
-    let tick = SyncTick {
-        attempted: true,
-        swept,
-    };
-    let outcome = after(&conn, baseline, tick)?;
-    Ok(Some((tick, outcome)))
 }
 
 /// One live-capture tick against an explicit provider home.
@@ -2257,7 +2224,6 @@ fn sync_basic(
     if let Err(error) = crate::store::refresh_planner_statistics(conn) {
         sync_note!("  [sync] planner statistics not refreshed: {error:#}");
     }
-    let total: i64 = conn.query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))?;
     // Fold the WAL back into the database now that the writes are done.
     // Left unchecked the WAL grows without bound (156MB observed in the wild).
     let checkpoint = checkpoint_after_sweep(conn, db_path, WAL_TRUNCATE_BYTES);
@@ -2269,7 +2235,7 @@ fn sync_basic(
         );
     }
     sync_note!("  [rust-sync] +{total_inserted} rows");
-    sync_note!("  Total: {total} entries");
+    sweep_phases::note_total(conn)?;
     Ok(true)
 }
 
@@ -2813,6 +2779,8 @@ fn load_sync_state(path: &Path) -> Result<Map<String, Value>> {
 /// lands mid-read can only make the stamp disagree with the file later --
 /// which costs a re-read -- never vouch for a document it did not describe.
 fn load_sync_state_stamped(path: &Path) -> (Map<String, Value>, Option<SyncStateStamp>) {
+    #[cfg(test)]
+    state_work::loaded();
     let mut file = match fs::File::open(path) {
         Ok(file) => file,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return (Map::new(), None),
@@ -3801,6 +3769,8 @@ fn cleanup_stale_sync_state_temps(path: &Path) -> Result<usize> {
 /// rename failing on a path the faster one already moved — reintroducing the
 /// class of failure this function exists to prevent.
 fn save_sync_state(path: &Path, state: &Map<String, Value>) -> Result<()> {
+    #[cfg(test)]
+    state_work::saved();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }

@@ -379,6 +379,7 @@ pub ai_hist::Diagnostic::message: alloc::string::String
 pub ai_hist::Diagnostic::subject: core::option::Option<alloc::string::String>
 #[non_exhaustive] pub struct ai_hist::DiscoveryOptions
 pub ai_hist::DiscoveryOptions::limit: core::option::Option<usize>
+pub ai_hist::DiscoveryOptions::paths: core::option::Option<alloc::vec::Vec<std::path::PathBuf>>
 pub ai_hist::DiscoveryOptions::skip_protected_folder_identity: bool
 pub ai_hist::DiscoveryOptions::sources: core::option::Option<alloc::vec::Vec<ai_hist::Source>>
 pub ai_hist::DiscoveryOptions::stop: core::option::Option<ai_hist::StopToken>
@@ -594,6 +595,17 @@ pub ai_hist::ProviderRoots::use_env_roots: bool
 impl ai_hist::ProviderRoots
 pub fn ai_hist::ProviderRoots::from_env(std::path::PathBuf) -> Self
 pub fn ai_hist::ProviderRoots::from_home(std::path::PathBuf, std::path::PathBuf) -> Self
+pub struct ai_hist::Reconciliation
+impl ai_hist::Reconciliation
+pub fn ai_hist::Reconciliation::discover_step(&mut self, usize, usize, ai_hist::DiscoveryOptions) -> core::result::Result<ai_hist::ReconciliationStep, ai_hist::Error>
+pub fn ai_hist::Reconciliation::sources(self, impl core::iter::traits::collect::IntoIterator<Item = ai_hist::Source>) -> Self
+pub fn ai_hist::Reconciliation::step(&mut self, usize, usize, ai_hist::SyncOptions) -> core::result::Result<ai_hist::ReconciliationStep, ai_hist::Error>
+#[non_exhaustive] pub struct ai_hist::ReconciliationStep
+pub ai_hist::ReconciliationStep::complete: bool
+pub ai_hist::ReconciliationStep::discovery: core::option::Option<ai_hist::DiscoveryReport>
+pub ai_hist::ReconciliationStep::entries: usize
+pub ai_hist::ReconciliationStep::paths: usize
+pub ai_hist::ReconciliationStep::report: core::option::Option<ai_hist::SyncReport>
 #[non_exhaustive] pub struct ai_hist::Relationship
 pub ai_hist::Relationship::child_agent_name: core::option::Option<alloc::string::String>
 pub ai_hist::Relationship::child_agent_type: core::option::Option<alloc::string::String>
@@ -792,7 +804,6 @@ pub fn ai_hist::SessionStore::read_only(&self) -> bool
 pub fn ai_hist::SessionStore::roots(&self) -> &ai_hist::ProviderRoots
 pub fn ai_hist::SessionStore::session(&self, &ai_hist::SessionRef, ai_hist::SessionQuery) -> core::result::Result<core::option::Option<ai_hist::SessionEvidence>, ai_hist::Error>
 pub fn ai_hist::SessionStore::sessions(&self, ai_hist::CatalogQuery) -> ai_hist::CatalogIter
-pub fn ai_hist::SessionStore::sync(&self, ai_hist::SyncOptions) -> core::result::Result<ai_hist::SyncReport, ai_hist::Error>
 pub fn ai_hist::SessionStore::watch(&self, ai_hist::WatchOptions) -> core::result::Result<ai_hist::WatchHandle, ai_hist::Error>
 pub fn ai_hist::SessionStore::watch_discover(&self, ai_hist::WatchOptions) -> core::result::Result<ai_hist::WatchHandle, ai_hist::Error>
 impl ai_hist::SessionStore
@@ -801,7 +812,11 @@ pub fn ai_hist::SessionStore::delegated_descendants(&self, &[ai_hist::SessionIde
 pub fn ai_hist::SessionStore::has_session(&self, &ai_hist::SessionIdentity) -> core::result::Result<bool, ai_hist::Error>
 pub fn ai_hist::SessionStore::session_identities(&self, ai_hist::IdentityQuery) -> core::result::Result<alloc::vec::Vec<ai_hist::SessionIdentity>, ai_hist::Error>
 impl ai_hist::SessionStore
+pub fn ai_hist::SessionStore::reconcile(&self) -> core::result::Result<ai_hist::Reconciliation, ai_hist::Error>
+impl ai_hist::SessionStore
 pub fn ai_hist::SessionStore::resumes_from(&self, ai_hist::Watermark, &ai_hist::ChangeQuery) -> core::result::Result<bool, ai_hist::Error>
+impl ai_hist::SessionStore
+pub fn ai_hist::SessionStore::sync(&self, ai_hist::SyncOptions) -> core::result::Result<ai_hist::SyncReport, ai_hist::Error>
 pub struct ai_hist::SessionToolCall
 pub ai_hist::SessionToolCall::args_json: core::option::Option<alloc::string::String>
 pub ai_hist::SessionToolCall::id: i64
@@ -933,6 +948,7 @@ pub fn ai_hist::StoredRow::deserialize<D: serde_core::de::Deserializer<'de>>(D) 
 pub ai_hist::SyncOptions::codex_sqlite_max_age_days: core::option::Option<u64>
 pub ai_hist::SyncOptions::force: bool
 pub ai_hist::SyncOptions::lock_timeout_ms: u64
+pub ai_hist::SyncOptions::paths: core::option::Option<alloc::vec::Vec<std::path::PathBuf>>
 pub ai_hist::SyncOptions::progress: core::option::Option<ai_hist::ProgressObserver>
 pub ai_hist::SyncOptions::sources: core::option::Option<alloc::vec::Vec<ai_hist::Source>>
 pub ai_hist::SyncOptions::stop: core::option::Option<ai_hist::StopToken>
@@ -940,6 +956,7 @@ impl ai_hist::SyncOptions
 pub fn ai_hist::SyncOptions::codex_sqlite_max_age_days(self, u64) -> Self
 pub fn ai_hist::SyncOptions::force(self, bool) -> Self
 pub fn ai_hist::SyncOptions::lock_timeout_ms(self, u64) -> Self
+pub fn ai_hist::SyncOptions::paths(self, impl core::iter::traits::collect::IntoIterator<Item = std::path::PathBuf>) -> Self
 pub fn ai_hist::SyncOptions::progress(self, ai_hist::ProgressObserver) -> Self
 pub fn ai_hist::SyncOptions::sources(self, impl core::iter::traits::collect::IntoIterator<Item = ai_hist::Source>) -> Self
 pub fn ai_hist::SyncOptions::stop(self, ai_hist::StopToken) -> Self

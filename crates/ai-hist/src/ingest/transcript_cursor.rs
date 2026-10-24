@@ -110,8 +110,8 @@ mod store;
 #[cfg(test)]
 pub(crate) use reader::QUIESCENT_GRACE_MS;
 pub(crate) use reader::{CommitOutcome, ReadRecord, TranscriptReader, MAX_RECORD_BYTES};
-use store::load_cursor_with_document;
 pub(crate) use store::{load_cursor, store_cursor, CursorKey};
+pub(crate) use store::{load_cursor_with_document, settle_session_if_unchanged};
 
 use change_time::now_wall_ms;
 pub(crate) use change_time::{
@@ -789,7 +789,7 @@ fn scan_prefix_hash(cursor: &TranscriptCursorState) -> Option<String> {
 /// Whether the [`SettledStat`] recorded for this cursor still describes the
 /// file, which proves every position in it without reading a byte. The caller
 /// has already matched the record cursor's offset, mtime and identity.
-fn settled_proves_unchanged(
+pub(crate) fn settled_proves_unchanged(
     cursor: &TranscriptCursorState,
     file: &TranscriptFileCursor,
     path: &Path,

@@ -408,6 +408,7 @@ pub struct DiscoveryEnv<'a> {
     /// every candidate. Never set on the fingerprint environment: a partial
     /// listing must not become the cached picture of a source.
     path_scope: Option<crate::ingest::path_scope::PathScope>,
+    pub(crate) fresh_paths: bool,
     /// Read by provider-owned adapters.
     pub(crate) provider_roots: crate::ProviderRoots,
 }
@@ -437,6 +438,7 @@ impl<'a> DiscoveryEnv<'a> {
             conn,
             counters: CounterCell::default(),
             path_scope: None,
+            fresh_paths: false,
         }
     }
 
@@ -450,9 +452,6 @@ impl<'a> DiscoveryEnv<'a> {
         self
     }
 
-    pub(crate) fn path_scope(&self) -> Option<&crate::ingest::path_scope::PathScope> {
-        self.path_scope.as_ref()
-    }
 
     /// Build an environment with explicit roots, for hosts that keep provider
     /// data somewhere other than `$HOME` (and for tests, which must not mutate
@@ -4590,7 +4589,7 @@ fn discover_sessions_with_worker_limit(
             let expected = stored_stamp(&candidate.stamp);
             let unchanged = match observed_stamps::observed_candidate_stamp(conn, provider, candidate)?
             {
-                Some((id, stamp)) if stamp.as_deref() == Some(expected.as_str()) => {
+                Some((id, stamp)) if observed_stamps::matches(env.fresh_paths, stamp.as_deref(), &expected) => {
                     match identity {
                         // Nothing is streamed, so the row itself is not needed.
                         IdentityRefresh::Sweep => Some(WindowEntry::Unchanged),

@@ -899,6 +899,7 @@ const REQUIRED_INDEXES: &[&str] = &[
     "idx_session_events_provider_message",
     "idx_session_continuity_parent_uuid",
     "idx_session_continuity_pending",
+    "idx_session_continuity_origin",
     "idx_sessions_project_key",
     // The identity listing merges every table in `(source, session_id)`
     // order; the catalog's primary key leads with `session_id`.
@@ -1065,6 +1066,7 @@ const REQUIRED_RELATIONSHIP_READ_INDEXES: &[&str] = &[
     // `getSessionRelationships` reports still-unresolved continuity evidence
     // for the session it was asked about.
     "idx_session_continuity_pending",
+    "idx_session_continuity_origin",
 ];
 const REQUIRED_TRIGGERS: &[&str] = &[
     "delete_session_presences",
@@ -1784,17 +1786,7 @@ VALUES ('session_presences_local_backfill_v1');
         "CREATE INDEX IF NOT EXISTS idx_session_relationships_locator ON session_relationships(source, evidence_locator)",
         [],
     )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_session_continuity_parent_uuid ON session_continuity_evidence(source, first_parent_uuid)",
-        [],
-    )?;
-    // Reconciliation and the pending-evidence diagnostic both read only the
-    // rows still waiting on something, so the index is partial: a database
-    // whose evidence has all resolved carries almost no index at all.
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_session_continuity_pending ON session_continuity_evidence(source, session_id) WHERE pending_reason IS NOT NULL",
-        [],
-    )?;
+    crate::continuity::ensure_indexes(conn)?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_session_events_session ON session_events(source, session_id)",
         [],
