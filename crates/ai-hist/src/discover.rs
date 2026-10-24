@@ -3755,6 +3755,8 @@ pub(crate) const OBSERVED_SESSION_BY_LOCATOR_SQL: &str = "SELECT session_id FROM
 /// case: these are reconsidered because they *might* be upgradable, and almost
 /// never are.
 fn upgrade_cached_project_identity(conn: &Connection, row: &mut ShallowSession) -> Result<()> {
+    #[cfg(test)]
+    crate::store::project_identity_resolver::note_observation();
     let stored = row.project_key_method.as_deref();
     if stored == Some(ProjectKeyMethod::Remote.as_str()) {
         // The strongest answer there is. Nothing this function can learn
@@ -4400,21 +4402,8 @@ pub(crate) fn discover_sessions_for_sweep(
     )
 }
 
-/// Who brings project identity up to date around a discovery pass.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IdentityRefresh {
-    /// Rows are streamed to the caller. Each cached row is upgraded before it
-    /// is streamed (see [`upgrade_cached_project_identity`]), and the pass
-    /// ends with the incremental catalog refresh.
-    Streamed,
-    /// The sweep: no row is streamed, and the sweep runs the refresh itself
-    /// right after the pass. That refresh stores exactly the key the per-row
-    /// upgrade would have -- the upgrade exists only so a *streamed* row
-    /// agrees with it -- so upgrading every cached row here as well was the
-    /// same resolution and ancestor walk twice, once per candidate file, on
-    /// every tick (#318).
-    Sweep,
-}
+pub(crate) mod identity_refresh;
+use identity_refresh::IdentityRefresh;
 
 // An explicit limit lets regression tests exercise both read paths regardless
 // of the host's CPU quota; the public entry point uses available parallelism.
@@ -4593,7 +4582,7 @@ fn discover_sessions_with_worker_limit(
                     match identity {
                         // Nothing is streamed, so the row itself is not needed.
                         IdentityRefresh::Sweep => Some(WindowEntry::Unchanged),
-                        IdentityRefresh::Streamed => {
+                        IdentityRefresh::Streamed | IdentityRefresh::ExactPaths => {
                             match fetch_catalog_row(conn, candidate.source, &id)? {
                                 Some(mut cached) => {
                                     cached.source_stamp = stamp;
@@ -4944,29 +4933,7 @@ fn discover_sessions_with_worker_limit(
         crate::ingest::check_capture_cancelled()?;
     }
 
-    // A candidate whose bytes have not changed is served from the catalog
-    // without ever reaching `upsert_shallow_session_in_transaction`, so the
-    // stamp shortcut is also a shortcut past project-identity resolution. A
-    // session first discovered before its checkout had an `origin` would then
-    // keep its path key on every later `sessions discover`, no matter how many
-    // times it ran: the transcript is unchanged, so the row is never revisited.
-    //
-    // The refresh is what revisits it. Pass 1 reconsiders exactly the rows a
-    // path key is not final for, and probes before writing, so a pass with
-    // nothing to upgrade stays read-only. The inheriting passes are scoped to
-    // the rows written since the last refresh and their delegation
-    // descendants, so a pass over an unchanged catalog does not re-walk every
-    // delegated child. Reporting rather than failing, for the same reason the
-    // sync path does: the rows this discovery wrote are already committed, and
-    // every key here is derived from them.
-    if identity == IdentityRefresh::Streamed {
-        if let Err(error) = crate::store::refresh_project_identity_incrementally(env.conn) {
-            eprintln!(
-                "ai-hist: could not refresh canonical project identity after discovery: {error:#} \
-                 (project keys stay as they were; the next pass retries)"
-            );
-        }
-    }
+    identity.refresh(env.conn);
     summary.counters = env.counters();
     Ok(summary)
 }

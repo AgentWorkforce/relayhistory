@@ -26,17 +26,17 @@ rust_roots = ["crates/ai-hist-cli/src", "crates/ai-hist-napi/src", "crates/ai-hi
 "crates/ai-hist-cli/src/lib.rs" = 2777
 "crates/ai-hist-napi/src/lib.rs" = 2116
 "crates/ai-hist/src/change_feed.rs" = 1197
-"crates/ai-hist/src/discover.rs" = 3330
+"crates/ai-hist/src/discover.rs" = 3323
 "crates/ai-hist/src/ingest.rs" = 11482
 "crates/ai-hist/src/ingest/devin.rs" = 828
 "crates/ai-hist/src/ingest/hydrate.rs" = 3386
 "crates/ai-hist/src/ingest/opencode.rs" = 1453
 "crates/ai-hist/src/session_store.rs" = 1758
-"crates/ai-hist/src/store.rs" = 3147
+"crates/ai-hist/src/store.rs" = 3111
 
 [baseline.cyclomatic]
 "crates/ai-hist-cli/src/lib.rs::run" = 88
-"crates/ai-hist/src/discover.rs::discover_sessions_with_worker_limit" = 76
+"crates/ai-hist/src/discover.rs::discover_sessions_with_worker_limit" = 74
 "crates/ai-hist/src/ingest.rs::ingest_claude_record" = 74
 "crates/ai-hist/src/ingest.rs::ingest_codex_rollout_incremental" = 116
 "crates/ai-hist/src/ingest.rs::ingest_cursor_transcript" = 49
@@ -52,7 +52,7 @@ rust_roots = ["crates/ai-hist-cli/src", "crates/ai-hist-napi/src", "crates/ai-hi
 
 [baseline.cognitive]
 "crates/ai-hist-cli/src/lib.rs::run" = 82
-"crates/ai-hist/src/discover.rs::discover_sessions_with_worker_limit" = 157
+"crates/ai-hist/src/discover.rs::discover_sessions_with_worker_limit" = 154
 "crates/ai-hist/src/ingest.rs::ingest_claude_record" = 81
 "crates/ai-hist/src/ingest.rs::ingest_codex_rollout_incremental" = 181
 "crates/ai-hist/src/ingest.rs::ingest_cursor_transcript" = 102

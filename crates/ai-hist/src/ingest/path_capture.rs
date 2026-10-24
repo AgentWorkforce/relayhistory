@@ -122,15 +122,16 @@ fn capture_paths(
     };
     let mut sessions = std::collections::BTreeMap::new();
     let mut covered = HashSet::new();
-    let report = discover_sessions_with_env(&env, &options, |row| {
-        if let Some(path) = &row.raw_path {
-            covered.insert(transcript_file::locator_of(Path::new(path)));
-        }
-        sessions.insert(
-            (row.source.clone(), row.session_id.clone()),
-            (row.raw_path.clone(), row.discovery_state == "full"),
-        );
-    })?;
+    let report =
+        crate::discover::identity_refresh::discover_sessions_for_capture(&env, &options, |row| {
+            if let Some(path) = &row.raw_path {
+                covered.insert(transcript_file::locator_of(Path::new(path)));
+            }
+            sessions.insert(
+                (row.source.clone(), row.session_id.clone()),
+                (row.raw_path.clone(), row.discovery_state == "full"),
+            );
+        })?;
     if !report.diagnostics.is_empty()
         || paths
             .paths()
@@ -296,3 +297,6 @@ mod tests {
         assert!(!validating_content());
     }
 }
+
+#[cfg(test)]
+mod identity_tests;
