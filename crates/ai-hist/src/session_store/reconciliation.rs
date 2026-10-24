@@ -1030,6 +1030,14 @@ mod tests {
     }
     #[test]
     fn a_same_stat_identity_replacement_is_rediscovered_without_global_state() {
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                crate::ingest::transcript_cursor::set_settle_window_for_test(None);
+            }
+        }
+        let _reset = Reset;
+        crate::ingest::transcript_cursor::set_settle_window_for_test(Some(0));
         let (_temp, store, project) = fixture();
         let path = project.join("same.jsonl");
         write(&path, "first", "first");
@@ -1043,9 +1051,22 @@ mod tests {
         fs::File::open(&path).unwrap().set_modified(mtime).unwrap();
         crate::ingest::state_work::take();
         store.sync(options.clone()).unwrap();
+        crate::ingest::transcript_file::take_read_bytes();
+        let before = store.head_revision().unwrap();
         store.sync(options).unwrap();
+        assert_eq!(
+            store.head_revision().unwrap(),
+            before,
+            "unchanged repaired identity must not advance the feed"
+        );
+        assert_eq!(
+            crate::ingest::transcript_file::take_read_bytes(),
+            0,
+            "a repaired identity must stay repaired on the next settled pass"
+        );
         assert_eq!(crate::ingest::state_work::take(), (0, 0));
         let conn = crate::store::open_db(store.db_path()).unwrap();
+        assert_eq!(conn.query_row("SELECT COUNT(*) FROM session_observations WHERE source='claude' AND access_state='available' AND raw_locator=?1",[path.to_string_lossy()],|row|row.get::<_,i64>(0)).unwrap(),1);
         assert_eq!(
             conn.query_row(
                 "SELECT COUNT(*) FROM session_events WHERE session_id='other'",
@@ -1125,12 +1146,85 @@ mod tests {
         store_cursor(&conn, &key, &cursor).unwrap();
         crate::ingest::transcript_file::take_read_bytes();
         store.sync(options).unwrap();
-        assert!(crate::ingest::transcript_file::take_read_bytes() > 0);
         assert!(load_cursor(&conn, &key)
             .unwrap()
             .claude
             .unwrap()
             .scan
             .is_some());
+    }
+    #[test]
+    fn the_write_only_continuity_index_does_not_block_older_read_only_stores() {
+        let (_temp, store, _project) = fixture();
+        let db = store.db_path().to_owned();
+        crate::open_db(&db)
+            .unwrap()
+            .execute_batch("DROP INDEX idx_session_continuity_origin")
+            .unwrap();
+        assert!(SessionStore::open(
+            super::super::StoreOptions::default()
+                .db_path(db)
+                .read_only(true)
+        )
+        .is_ok());
+    }
+    #[test]
+    fn cancelled_round_finalization_keeps_recovery_pending_and_retry_finishes() {
+        let (_temp, store, _project) = fixture();
+        let conn = crate::open_db(store.db_path()).unwrap();
+        for n in 0..100 {
+            crate::continuity::record_evidence(
+                &conn,
+                &crate::continuity::ContinuityEvidence {
+                    source: "claude".into(),
+                    locator: format!("pending-{n}"),
+                    session_id: format!("pending-{n}"),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+        let mut round = store.reconcile().unwrap().sources([Source::Claude]);
+        round.sources[0].roots.clear();
+        let checks = std::rc::Rc::new(std::cell::Cell::new(0));
+        let stop_checks = checks.clone();
+        let result = crate::ingest::with_capture_stop(
+            move || {
+                let n = stop_checks.get() + 1;
+                stop_checks.set(n);
+                n >= 5
+            },
+            || {
+                round
+                    .step(8, 8, SyncOptions::default())
+                    .map_err(anyhow::Error::from)
+            },
+        );
+        assert!(result.is_err());
+        assert!(
+            !round.sources.is_empty(),
+            "cancelled finalization must stay retryable"
+        );
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_continuity_evidence WHERE pending_reason IS NOT NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            remaining > 0 && remaining < 100,
+            "some row-boundary progress survives: {remaining}"
+        );
+        assert!(round.step(8, 8, SyncOptions::default()).unwrap().complete);
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM session_continuity_evidence WHERE pending_reason IS NOT NULL",
+                [],
+                |r| r.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
     }
 }

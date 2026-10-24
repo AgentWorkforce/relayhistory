@@ -1,5 +1,6 @@
 //! Provider-owned exact transcript acquisition without global sync state.
 use super::*;
+use crate::observations;
 use crate::remote::SourceConnectorSelection;
 
 /// One local sweep for [`crate::SessionStore`]: silent, against the store's
@@ -49,6 +50,7 @@ pub(crate) fn reconcile_pending(db: &Path, source: &str) -> Result<bool> {
     };
     let conn = open_db(db)?;
     crate::continuity::reconcile(&conn, source)?;
+    check_capture_cancelled()?;
     Ok(true)
 }
 
@@ -146,8 +148,46 @@ fn capture_paths(
             )
         })?;
         hydrate::mark_exact_capture(conn, &source, &session_id, &path, observed_change_time)?;
+        if fresh {
+            retire_replaced_observations(conn, &source, &session_id, &path)?;
+        }
     }
     Ok(Some(true))
+}
+
+/// Retain old evidence/provenance, but stop resolving a replaced locator to
+/// its former identity on every subsequent unchanged pass. Only a successful
+/// fresh acquisition proves which local default observation owns this path.
+fn retire_replaced_observations(
+    conn: &Connection,
+    source: &str,
+    current: &str,
+    path: &Path,
+) -> Result<()> {
+    let ids: Vec<String> = conn
+        .prepare_cached(
+            "SELECT session_id FROM session_observations WHERE source=?1 AND location='local' \
+         AND connector_id=?1 AND connector_instance='default' AND raw_locator=?2 \
+         AND access_state='available' AND session_id!=?3",
+        )?
+        .query_map(params![source, path.to_string_lossy(), current], |row| {
+            row.get(0)
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    for session_id in ids {
+        observations::set_access(
+            conn,
+            &observations::ObservationKey {
+                source: source.into(),
+                session_id,
+                location: SessionLocation::Local,
+                connector_id: source.into(),
+                connector_instance: "default".into(),
+            },
+            "unavailable",
+        )?;
+    }
+    Ok(())
 }
 
 /// Admission stays beside the provider acquisition implementation. A path we

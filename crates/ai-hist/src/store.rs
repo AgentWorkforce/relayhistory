@@ -1066,7 +1066,6 @@ const REQUIRED_RELATIONSHIP_READ_INDEXES: &[&str] = &[
     // `getSessionRelationships` reports still-unresolved continuity evidence
     // for the session it was asked about.
     "idx_session_continuity_pending",
-    "idx_session_continuity_origin",
 ];
 const REQUIRED_TRIGGERS: &[&str] = &[
     "delete_session_presences",

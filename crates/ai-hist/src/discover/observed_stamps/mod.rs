@@ -524,6 +524,10 @@ fn rollback_count() -> u64 {
     ROLLBACKS.with(Cell::get)
 }
 
+pub(super) fn matches(fresh: bool, stamp: Option<&str>, expected: &str) -> bool {
+    !fresh && stamp == Some(expected)
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::{
@@ -1170,8 +1174,4 @@ mod tests {
             .unwrap();
         assert_eq!(left, 0);
     }
-}
-
-pub(super) fn matches(fresh: bool, stamp: Option<&str>, expected: &str) -> bool {
-    !fresh && stamp == Some(expected)
 }

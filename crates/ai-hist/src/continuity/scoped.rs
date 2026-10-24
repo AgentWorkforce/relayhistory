@@ -4,7 +4,7 @@ use super::*;
 const AFFECTED_SQL: &str = "SELECT locator FROM session_continuity_evidence WHERE source=?1 AND locator=?2 \
          UNION SELECT locator FROM session_continuity_evidence WHERE source=?1 \
            AND origin_session_id IN (SELECT value FROM json_each(?3)) \
-         UNION SELECT evidence_locator FROM session_relationships WHERE source=?1 \
+         UNION SELECT evidence_locator FROM session_relationships INDEXED BY idx_session_relationships_parent WHERE source=?1 \
            AND parent_session_id IN (SELECT value FROM json_each(?4)) \
            AND relationship IN ('continuation','fork','resume') AND evidence_locator IS NOT NULL \
          UNION SELECT c.locator FROM session_events e INDEXED BY idx_session_events_revision \
@@ -41,11 +41,23 @@ pub(crate) fn reconcile_captured(
     let current = stored_identity(conn, source, &locator)?;
     let identities: Vec<_> = [captured.previous, current].into_iter().flatten().collect();
     let sessions: Vec<_> = identities.iter().map(|(session, _)| session).collect();
-    let origins: Vec<_> = identities.iter().filter_map(|(_, origin)| origin.as_ref()).collect();
-    let keys: Vec<String> = conn.prepare_cached(
-        AFFECTED_SQL
-    )?.query_map(params![source,locator,serde_json::to_string(&origins)?,serde_json::to_string(&sessions)?,captured.revision],|row|row.get(0))?
-      .collect::<rusqlite::Result<_>>()?;
+    let origins: Vec<_> = identities
+        .iter()
+        .filter_map(|(_, origin)| origin.as_ref())
+        .collect();
+    let keys: Vec<String> = conn
+        .prepare_cached(AFFECTED_SQL)?
+        .query_map(
+            params![
+                source,
+                locator,
+                serde_json::to_string(&origins)?,
+                serde_json::to_string(&sessions)?,
+                captured.revision
+            ],
+            |row| row.get(0),
+        )?
+        .collect::<rusqlite::Result<_>>()?;
     let mut pending = Vec::new();
     let mut statement = conn.prepare_cached(
         "SELECT source, locator, session_id, file_session_id, first_parent_uuid, first_ts_ms, \
@@ -53,11 +65,14 @@ pub(crate) fn reconcile_captured(
          FROM session_continuity_evidence WHERE source=?1 AND locator=?2 AND pending_reason IS NOT NULL"
     )?;
     for key in keys {
-        if let Some(evidence) = statement.query_row(params![source,key],storage::map_evidence).optional()? {
+        if let Some(evidence) = statement
+            .query_row(params![source, key], storage::map_evidence)
+            .optional()?
+        {
             pending.push(evidence);
         }
     }
-    reconcile_rows(conn,pending)
+    reconcile_rows(conn, pending)
 }
 
 pub(super) fn reconcile_rows(
@@ -69,6 +84,7 @@ pub(super) fn reconcile_rows(
         ..ContinuityReconciliation::default()
     };
     for evidence in &pending {
+        crate::ingest::check_capture_cancelled()?;
         let mut reasons: Vec<String> = Vec::new();
         // Every uid this locator establishes on this pass. What it established
         // on an earlier pass and no longer does is retracted below, so a
@@ -117,23 +133,132 @@ pub(crate) fn ensure_indexes(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+const REOPEN_ORIGINS: &str =
+    "UPDATE session_continuity_evidence INDEXED BY idx_session_continuity_origin \
+    SET pending_reason='unreconciled' WHERE source=?1 \
+    AND origin_session_id IN (SELECT value FROM json_each(?2)) AND pending_reason IS NULL";
+const DEPENDENT_LOCATORS: &str = "SELECT evidence_locator FROM session_relationships INDEXED BY idx_session_relationships_parent \
+    WHERE source=?1 AND parent_session_id IN (SELECT value FROM json_each(?2)) \
+    AND relationship IN ('continuation','fork','resume') AND evidence_locator IS NOT NULL";
+const REOPEN_LOCATOR: &str =
+    "UPDATE session_continuity_evidence SET pending_reason='unreconciled' \
+    WHERE source=?1 AND locator=?2 AND pending_reason IS NULL";
+
+pub(super) fn reopen_dependents(
+    conn: &Connection,
+    source: &str,
+    identities: &[Option<(String, Option<String>)>],
+) -> Result<usize> {
+    let sessions: BTreeSet<_> = identities.iter().flatten().map(|(id, _)| id).collect();
+    let origins: BTreeSet<_> = identities
+        .iter()
+        .flatten()
+        .filter_map(|(_, origin)| origin.as_ref())
+        .collect();
+    let mut changed = conn
+        .prepare_cached(REOPEN_ORIGINS)?
+        .execute(params![source, serde_json::to_string(&origins)?])?;
+    let locators: Vec<String> = conn
+        .prepare_cached(DEPENDENT_LOCATORS)?
+        .query_map(params![source, serde_json::to_string(&sessions)?], |row| {
+            row.get(0)
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut update = conn.prepare_cached(REOPEN_LOCATOR)?;
+    for locator in locators {
+        changed += update.execute(params![source, locator])?;
+    }
+    Ok(changed)
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
     #[test]
     fn affected_continuity_uses_identity_and_delta_indexes_with_47k_unrelated_rows() {
-        let temp=tempfile::tempdir().unwrap();
-        let conn=crate::open_db(&temp.path().join("history.db")).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let conn = crate::open_db(&temp.path().join("history.db")).unwrap();
         conn.execute_batch("WITH RECURSIVE n(x) AS (VALUES(0) UNION ALL SELECT x+1 FROM n WHERE x<46999) INSERT INTO session_continuity_evidence(source,locator,session_id,in_log_session_ids_json,has_resume_marker,explicit_targets_json,source_version,origin_session_id,pending_reason,updated_ms) SELECT 'claude','unrelated-'||x,'unrelated-'||x,'[]',0,'{}',1,'origin-'||x,'unresolved',0 FROM n;").unwrap();
-        crate::continuity::record_evidence(&conn,&ContinuityEvidence {source:"claude".into(),locator:"active".into(),session_id:"active".into(),..Default::default()}).unwrap();
-        let capture=CaptureScope::begin(&conn,"claude",Path::new("active")).unwrap();
-        let report=reconcile_captured(&conn,"claude",Path::new("active"),capture).unwrap();
-        assert_eq!(report.considered,1,"unrelated pending archive must not multiply append work");
-        let plans:Vec<String>=conn.prepare(&format!("EXPLAIN QUERY PLAN {AFFECTED_SQL}")).unwrap().query_map(params!["claude","active","[]","[\"active\"]",0],|r|r.get(3)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
-        let plan=plans.join("\n");
-        assert!(plan.contains("idx_session_continuity_origin (source=? AND origin_session_id=?)"),"{plan}");
-        assert!(plan.contains("idx_session_events_revision (revision>?)"),"{plan}");
-        assert!(plan.contains("idx_session_continuity_parent_uuid (source=? AND first_parent_uuid=?)"),"{plan}");
+        crate::continuity::record_evidence(
+            &conn,
+            &ContinuityEvidence {
+                source: "claude".into(),
+                locator: "active".into(),
+                session_id: "active".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let capture = CaptureScope::begin(&conn, "claude", Path::new("active")).unwrap();
+        let report = reconcile_captured(&conn, "claude", Path::new("active"), capture).unwrap();
+        assert_eq!(
+            report.considered, 1,
+            "unrelated pending archive must not multiply append work"
+        );
+        let plans: Vec<String> = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {AFFECTED_SQL}"))
+            .unwrap()
+            .query_map(params!["claude", "active", "[]", "[\"active\"]", 0], |r| {
+                r.get(3)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        for (sql, expected) in [
+            (
+                REOPEN_ORIGINS,
+                "idx_session_continuity_origin (source=? AND origin_session_id=?)",
+            ),
+            (
+                DEPENDENT_LOCATORS,
+                "idx_session_relationships_parent (source=? AND parent_session_id=?)",
+            ),
+            (
+                REOPEN_LOCATOR,
+                "sqlite_autoindex_session_continuity_evidence_1 (source=? AND locator=?)",
+            ),
+        ] {
+            let plan: Vec<String> = conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap()
+                .query_map(params!["claude", "[]"], |r| r.get(3))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert!(plan.join("\n").contains(expected), "{}", plan.join("\n"));
+        }
+        let mut reopen = conn.prepare(REOPEN_ORIGINS).unwrap();
+        reopen.execute(params!["claude", "[]"]).unwrap();
+        let origin_steps = reopen.get_status(rusqlite::StatementStatus::VmStep);
+        let mut dependents = conn.prepare(DEPENDENT_LOCATORS).unwrap();
+        let _: Vec<String> = dependents
+            .query_map(params!["claude", "[\"active\"]"], |r| r.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let dependent_steps = dependents.get_status(rusqlite::StatementStatus::VmStep);
+        let mut affected = conn.prepare(AFFECTED_SQL).unwrap();
+        let _: Vec<String> = affected
+            .query_map(params!["claude", "active", "[]", "[\"active\"]", 0], |r| {
+                r.get(0)
+            })
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        let affected_steps = affected.get_status(rusqlite::StatementStatus::VmStep);
+        assert!(origin_steps+dependent_steps+affected_steps<1000,"origin {origin_steps}, dependent {dependent_steps}, affected {affected_steps}: 47k unrelated rows must not become VM work");
+        let plan = plans.join("\n");
+        assert!(
+            plan.contains("idx_session_continuity_origin (source=? AND origin_session_id=?)"),
+            "{plan}"
+        );
+        assert!(
+            plan.contains("idx_session_events_revision (revision>?)"),
+            "{plan}"
+        );
+        assert!(
+            plan.contains("idx_session_continuity_parent_uuid (source=? AND first_parent_uuid=?)"),
+            "{plan}"
+        );
     }
 }
