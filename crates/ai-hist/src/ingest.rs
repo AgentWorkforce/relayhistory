@@ -27629,7 +27629,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_unreadable_codex_rollout_does_not_retire_the_backfill_pass() {
-        let dir = tempfile::tempdir().unwrap();
+        // The unreadable fixture binds a Unix socket at the rollout path;
+        // macOS TMPDIR plus the provider filename exceeds sockaddr_un.sun_path.
+        let dir = tempfile::Builder::new()
+            .prefix("rh")
+            .tempdir_in("/tmp")
+            .unwrap();
         let home = dir.path();
         let state_path = home.join(".sync-state.json");
         let day = home.join(".codex/sessions/2026/04/20");
