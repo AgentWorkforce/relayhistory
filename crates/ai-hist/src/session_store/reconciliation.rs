@@ -413,15 +413,24 @@ mod tests {
         let mut round = store.reconcile().unwrap().sources([Source::Claude]);
         let writer = crate::open_db(store.db_path()).unwrap();
         writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
         let started = std::time::Instant::now();
         let running = std::thread::spawn(move || {
+            crate::store::busy_wait::observe_next_wait(entered_tx);
             let blocked = round.step(64, 8, SyncOptions::default()).unwrap();
             let next = round.step(64, 8, SyncOptions::default()).unwrap();
             (blocked, next)
         });
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        let entered = entered_rx.recv_timeout(std::time::Duration::from_secs(5));
+        if entered.is_ok() {
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
         writer.execute_batch("ROLLBACK").unwrap();
         let (blocked, next) = running.join().unwrap();
+        assert!(
+            entered.is_ok(),
+            "the real SDK busy handler must have entered"
+        );
         assert_eq!(blocked.paths, 1);
         assert!(blocked.sqlite_busy_wait >= std::time::Duration::from_millis(150));
         assert!(blocked.sqlite_busy_wait <= started.elapsed());
