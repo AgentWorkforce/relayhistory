@@ -23,6 +23,19 @@ fn cursor_key<'a>(source: &'a str, session_id: &'a str) -> CursorKey<'a> {
     }
 }
 
+/// The same file stamp, parser and related-evidence choice as the last pass.
+pub(super) fn checkpoint_covers(
+    previous: Option<&ObservationCheckpoint>,
+    stamp: &str,
+    include_related: bool,
+) -> bool {
+    previous.is_some_and(|previous| {
+        previous.source_stamp.as_deref() == Some(stamp)
+            && previous.parser_version == HYDRATION_PARSER_VERSION
+            && previous.include_related == include_related
+    })
+}
+
 /// A metadata stat is trusted only with the current parser checkpoint and a
 /// previously validated, unchanged ctime on an allowlisted filesystem.
 pub(crate) fn can_skip(
@@ -91,6 +104,26 @@ fn identity_matches(
         && file.compressed == metadata.compressed()
 }
 
+/// A same-size file with a changed previously trusted ctime is not a proven
+/// append. Bounded head/tail hashes cannot authenticate its middle. Restart
+/// both primary walks; growing files keep their ordinary incremental cursor.
+pub(super) fn restart_same_size_rewrite(
+    cursor: &mut TranscriptCursorState,
+    path: &Path,
+) -> Result<()> {
+    let (Some(file), Some(settled)) = (&cursor.file, &cursor.settled) else {
+        return Ok(());
+    };
+    let metadata = super::super::transcript_file::metadata(path)?;
+    if metadata.len() == file.size
+        && super::super::transcript_cursor::filesystem_keeps_change_time(path, &metadata)
+        && change_time_ns(&metadata) != Some(settled.ctime_ns)
+    {
+        *cursor = TranscriptCursorState::default();
+    }
+    Ok(())
+}
+
 /// The parser already checked these bytes at commit. Preserve its existing
 /// SettledStat shape; recent/racy or unsupported filesystems keep digest reads.
 pub(crate) fn mark(
@@ -144,3 +177,6 @@ pub(crate) fn mark(
         &cursor,
     )
 }
+
+#[cfg(test)]
+mod tests;

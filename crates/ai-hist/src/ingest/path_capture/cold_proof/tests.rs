@@ -1,5 +1,6 @@
 use super::*;
 use crate::{ProviderRoots, SessionStore, Source, StoreOptions, SyncOptions};
+mod safety;
 
 fn fixture(count: usize) -> (tempfile::TempDir, SessionStore, Vec<PathBuf>) {
     let temp = tempfile::tempdir().unwrap();
@@ -299,7 +300,6 @@ fn trusted_change_time_rejects_a_middle_rewrite_outside_native_prefix_windows() 
         Some(settled.ctime_ns)
     );
     round(&store, Source::Claude);
-    assert_eq!(checkpoints(&store), 1);
     let captured: bool = conn
         .query_row(
             "SELECT EXISTS(SELECT 1 FROM session_events WHERE text LIKE 'middle-after_%')",
@@ -311,4 +311,5 @@ fn trusted_change_time_rejects_a_middle_rewrite_outside_native_prefix_windows() 
         captured,
         "a changed trusted ctime must force acquisition despite unchanged head/tail windows"
     );
+    assert_eq!(checkpoints(&store), 1);
 }

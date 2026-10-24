@@ -12,6 +12,7 @@ use std::time::Instant;
 mod codex_selected;
 mod continuity;
 mod exact;
+use exact::checkpoint_covers;
 pub(super) use exact::{
     can_skip as can_skip_exact_capture, mark as mark_exact_capture,
     needs_validation as exact_capture_needs_validation,
@@ -586,20 +587,6 @@ fn begin_hydration(
     Ok(())
 }
 
-/// Whether the last checkpoint recorded this stamp, under this parser, with
-/// the same related-evidence choice.
-fn checkpoint_covers(
-    previous: Option<&ObservationCheckpoint>,
-    stamp: &str,
-    include_related: bool,
-) -> bool {
-    previous.is_some_and(|previous| {
-        previous.source_stamp.as_deref() == Some(stamp)
-            && previous.parser_version == HYDRATION_PARSER_VERSION
-            && previous.include_related == include_related
-    })
-}
-
 /// A changed pass over a session with a stamped checkpoint updated it; any
 /// other changed pass hydrated it.
 fn changed_pass_status(previous: Option<&ObservationCheckpoint>) -> &'static str {
@@ -687,6 +674,13 @@ fn commit_local_pass(
     } else {
         load_cursor(&tx, &cursor_key)?
     };
+    if let Some(path) = snapshot.path.as_deref().filter(|_| {
+        snapshot.provider_session.is_none()
+            && snapshot.claude_transcript.is_none()
+            && matches!(options.source.as_str(), "claude" | "codex")
+    }) {
+        exact::restart_same_size_rewrite(&mut cursor, path)?;
+    }
     let (indexed, source_diagnostics, cursor_consumed_through) = ingest_selected(SelectedIngest {
         conn: &tx,
         options,

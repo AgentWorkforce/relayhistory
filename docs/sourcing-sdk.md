@@ -1222,6 +1222,30 @@ evidence-presence guard applies and cannot independently detect partial historic
 row loss. Hot and selected-only acquisition do not install this cold proof scope,
 and hot exact appends still do no global sync-state I/O.
 
+For a safety poll that names known paths, retain a separate
+`Reconciliation` and call `capture_paths(SyncOptions { paths: Some(paths),
+..Default::default() })`. This uses the same native proof and writable-connection
+contexts as `step`, without advancing directory iterators. The caller bounds the
+path batch. `paths: None` is rejected; an empty allowlist performs no provider
+I/O. `sources(...)` restrictions still apply after enumeration completes, and
+repeated restrictions intersect. A forced request bypasses native proof reuse;
+retain forced acquisition for actual filesystem events and explicit repair.
+Recreate the safety context when roots or consent change and after successful
+full maintenance. If its retained sync-state proof becomes stale, it withholds
+reuse rather than repeatedly loading the global map or trusting old evidence.
+
+An unchanged native-only file need not initialize a second hydration cursor.
+A real append fails that unchanged proof and takes ordinary acquisition; the
+first append can still replay that one native-only transcript, while subsequent
+Session-cursor appends remain incremental. A same-size file whose previously
+trusted ctime changed restarts both primary walks, so a middle-only rewrite
+outside the bounded hash windows cannot resume at EOF. Growing files keep
+ordinary append cursors. Filesystems without a prior trusted ctime retain the
+existing bounded-window contract. These proofs do not replace global parser
+sealing or destination audits. Compare actual feed head revisions when deciding
+whether to wake delivery: an attempted exact scope can report `swept` even if
+every path was proven unchanged.
+
 A discovery row `limit` is rejected before consuming any iterator position: use
 `max_entries`/`max_paths` to bound a round without dropping unexamined candidates.
 

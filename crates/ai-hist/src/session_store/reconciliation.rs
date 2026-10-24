@@ -17,6 +17,7 @@ pub struct Reconciliation {
     // get_mut only: preserve the round's Send + Sync traits without adding
     // another lock wait beside the existing cancellable SyncRunLock.
     writer: std::sync::Mutex<crate::store::sync_connection::Cache>,
+    source_filter: Option<HashSet<Source>>,
 }
 
 /// Content-free work accounting for a bounded reconciliation slice.
@@ -105,6 +106,7 @@ impl SessionStore {
             sources,
             cold_proof: Default::default(),
             writer: Default::default(),
+            source_filter: None,
         })
     }
 }
@@ -116,7 +118,56 @@ impl Reconciliation {
     pub fn sources(mut self, sources: impl IntoIterator<Item = Source>) -> Self {
         let sources: HashSet<_> = sources.into_iter().collect();
         self.sources.retain(|walk| sources.contains(&walk.source));
+        match &mut self.source_filter {
+            Some(allowed) => allowed.retain(|source| sources.contains(source)),
+            None => self.source_filter = Some(sources),
+        }
         self
+    }
+
+    /// Capture explicit safety-poll paths using this round's retained native
+    /// proof, without consuming directory positions. Unknown/changed proofs
+    /// retain ordinary acquisition. Forced requests bypass native proof reuse.
+    /// Source restrictions survive completion; `paths: None` is rejected.
+    pub fn capture_paths(&mut self, mut options: SyncOptions) -> Result<SyncReport, Error> {
+        if options.paths.is_none() {
+            return Err(Error::InvalidArgument(
+                "capture_paths requires an explicit paths allowlist".into(),
+            ));
+        }
+        if let Some(allowed) = &self.source_filter {
+            options.sources = Some(match options.sources {
+                Some(sources) => sources
+                    .into_iter()
+                    .filter(|source| allowed.contains(source))
+                    .collect(),
+                None => Source::ALL
+                    .iter()
+                    .copied()
+                    .filter(|source| allowed.contains(source))
+                    .collect(),
+            });
+        }
+        if options.force {
+            return self.store.sync(options);
+        }
+        let mut proof = std::mem::take(&mut self.cold_proof);
+        let mut writer = std::mem::take(
+            self.writer
+                .get_mut()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        );
+        let result = crate::store::sync_connection::with_cache(&mut writer, || {
+            crate::ingest::path_capture::cold_proof::with_cold_proof(&mut proof, || {
+                self.store.sync(options)
+            })
+        });
+        self.cold_proof = proof;
+        *self
+            .writer
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = writer;
+        result
     }
 
     /// Take one source's turn, retaining incomplete work on cancellation, lock
