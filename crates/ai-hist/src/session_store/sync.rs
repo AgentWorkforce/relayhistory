@@ -53,6 +53,15 @@ impl SessionStore {
         options: &SyncOptions,
     ) -> Result<SyncReport, Error> {
         controlled(options.stop.as_ref(), options.progress.as_ref(), || {
+            // Only these providers bank ContinuityEvidence during acquisition.
+            // Empty/other providers must not open the writable schema merely
+            // to finish a directory iterator with no continuity work.
+            if !matches!(source, Source::Claude | Source::Codex) {
+                return Ok(SyncReport {
+                    head_revision: self.head_revision()?.revision,
+                    ..Default::default()
+                });
+            }
             let started = Instant::now();
             let deadline =
                 started + Duration::from_millis(options.lock_timeout_ms.min(MAX_LOCK_WAIT_MS));

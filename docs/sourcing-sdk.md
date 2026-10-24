@@ -1189,7 +1189,7 @@ writes shallow catalog metadata; it must be used for selected-only inventory.
 Primary continuity fields are banked without enumerating related families. The
 current locator, affected origins/dependents and children naming newly arrived
 parent records reconcile immediately through indexed identity/revision lookups.
-A completed source round retries all still-unresolved continuity once under the
+A completed Claude/Codex source round retries all still-unresolved continuity once under the
 sync lock. This recovery can scale with unresolved evidence; it does not run for
 each hot append. Existing public `hydrate(include_related: false)` semantics and
 selected-only family consent are unchanged.
