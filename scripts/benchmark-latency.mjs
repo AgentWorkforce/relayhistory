@@ -1,6 +1,6 @@
 // Session-visible latency benchmark, and the 5 ms CI gate.
 //
-//   node scripts/benchmark-latency.mjs --gate                    # what CI runs
+//   node scripts/benchmark-latency.mjs --gate --base origin/main  # what CI runs on a PR
 //   node scripts/benchmark-latency.mjs --profile full --output latency.json --markdown latency.md
 //   node scripts/benchmark-latency.mjs --report-only latency.json  # re-render / re-gate a saved run
 //   node scripts/benchmark-latency.mjs --gate --update-baselines   # on the baseline runner class
@@ -12,7 +12,7 @@
 // See docs/benchmarks.md, "Session-visible latency".
 
 import { spawnSync } from "node:child_process";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { copyFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { arch, cpus, platform, totalmem } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -72,21 +72,71 @@ export function findLatencyExecutable(stdout) {
 /**
  * Release only: the budgets are release-build numbers on the machine that
  * will run the desktop, and an unoptimized parser is several times slower.
+ * `targetDir` is shared between the head and base builds so the base build
+ * reuses every compiled dependency and rebuilds only the workspace crates.
  */
-function buildHarness() {
+function buildHarness(sourceDir, targetDir) {
   const result = spawnSync(
     "cargo",
     ["test", "--release", "-p", "ai-hist-cli", "--test", "latency_bench", "--no-run",
       "--message-format", "json-render-diagnostics"],
-    { cwd: repositoryRoot, encoding: "utf8", maxBuffer: 64 * 1024 * 1024 },
+    {
+      cwd: sourceDir,
+      env: { ...process.env, CARGO_TARGET_DIR: targetDir },
+      encoding: "utf8",
+      maxBuffer: 64 * 1024 * 1024,
+    },
   );
   if (result.error) throw new Error(`cargo could not be started: ${result.error.message}`);
   if (result.status !== 0) {
-    throw new Error(`building the latency harness failed:\n${result.stdout}\n${result.stderr}`);
+    throw new Error(`building the latency harness in ${sourceDir} failed:\n${result.stdout}\n${result.stderr}`);
   }
   const executable = findLatencyExecutable(result.stdout);
   if (!executable) throw new Error(`cargo built no latency_bench executable:\n${result.stderr}`);
   return executable;
+}
+
+const HARNESS = "crates/ai-hist-cli/tests/latency_bench.rs";
+const CLI_MANIFEST = "crates/ai-hist-cli/Cargo.toml";
+const NOTIFY_DEV_DEP =
+  'notify = { version = "8", default-features = false, features = ["macos_fsevent"] }';
+
+/**
+ * Give a base manifest the harness's one extra dev-dependency, unless it
+ * already has it. Exported for the test; the base is a throwaway worktree.
+ */
+export function withNotifyDevDependency(manifest) {
+  const section = manifest.indexOf("[dev-dependencies]");
+  const next = section < 0 ? -1 : manifest.indexOf("\n[", section + 1);
+  const devDeps = section < 0 ? "" : manifest.slice(section, next < 0 ? undefined : next);
+  if (/^notify\s*=/m.test(devDeps)) return manifest;
+  if (section < 0) return `${manifest.trimEnd()}\n\n[dev-dependencies]\n${NOTIFY_DEV_DEP}\n`;
+  const at = section + "[dev-dependencies]".length;
+  return `${manifest.slice(0, at)}\n${NOTIFY_DEV_DEP}${manifest.slice(at)}`;
+}
+
+/**
+ * A detached worktree of `ref` carrying this checkout's harness. The harness
+ * uses only the crate's public API, so it measures the base's library with
+ * the head's measurement code: a base that predates the harness can still be
+ * compared, and a change to the harness itself moves both sides at once.
+ */
+function prepareBase(ref) {
+  const dir = join(repositoryRoot, "target/latency-base");
+  spawnSync("git", ["-C", repositoryRoot, "worktree", "remove", "--force", dir], { encoding: "utf8" });
+  rmSync(dir, { recursive: true, force: true });
+  const added = spawnSync("git", ["-C", repositoryRoot, "worktree", "add", "--detach", dir, ref], {
+    encoding: "utf8",
+  });
+  if (added.status !== 0) throw new Error(`git worktree add ${ref} failed:\n${added.stderr}`);
+  copyFileSync(join(repositoryRoot, HARNESS), join(dir, HARNESS));
+  const manifest = join(dir, CLI_MANIFEST);
+  writeFileSync(manifest, withNotifyDevDependency(readFileSync(manifest, "utf8")));
+  return dir;
+}
+
+function removeBase(dir) {
+  spawnSync("git", ["-C", repositoryRoot, "worktree", "remove", "--force", dir], { encoding: "utf8" });
 }
 
 function runOnce(executable, run, profile, workDir) {
@@ -116,32 +166,51 @@ function runOnce(executable, run, profile, workDir) {
   return JSON.parse(readFileSync(reportPath, "utf8"));
 }
 
-function measure(profileName, thresholds, rounds) {
+function measure(profileName, thresholds, rounds, baseRef) {
   const profile = thresholds.profiles[profileName];
   if (!profile) throw new Error(`unknown profile ${profileName}`);
-  const executable = buildHarness();
+  const targetDir = resolve(process.env.CARGO_TARGET_DIR ?? join(repositoryRoot, "target"));
+  const head = buildHarness(repositoryRoot, targetDir);
+  const baseDir = baseRef ? prepareBase(baseRef) : null;
+  const base = baseDir ? buildHarness(baseDir, targetDir) : null;
   // Under target/, on the disk the build used: never the system temp dir,
-  // which is tmpfs on some Linux hosts and would make every fsync free.
-  const workDir = resolve(process.env.AI_HIST_LATENCY_DIR ?? join(repositoryRoot, "target/latency-bench"));
-  rmSync(workDir, { recursive: true, force: true });
-  mkdirSync(workDir, { recursive: true });
+  // which is tmpfs on some Linux hosts and would make every fsync free. Head
+  // and base keep separate stores: a cached store built by one library is
+  // not a store the other necessarily reads without migrating.
+  const root = resolve(process.env.AI_HIST_LATENCY_DIR ?? join(repositoryRoot, "target/latency-bench"));
+  rmSync(root, { recursive: true, force: true });
+  const headDir = join(root, "head");
+  const baseWork = join(root, "base");
+  mkdirSync(headDir, { recursive: true });
+  if (base) mkdirSync(baseWork, { recursive: true });
   const runs = [];
   for (const run of profile.runs) {
     const results = [];
+    const baseResults = [];
     for (let round = 0; round < rounds; round++) {
+      // Interleaved, so a runner that slows down part-way slows both sides.
+      if (base) baseResults.push(runOnce(base, run, profile, baseWork));
       const started = Date.now();
-      results.push(runOnce(executable, run, profile, workDir));
+      results.push(runOnce(head, run, profile, headDir));
       process.stderr.write(`${runId(run)} round ${round + 1}/${rounds}: ${Date.now() - started} ms\n`);
     }
-    runs.push({ ...run, result: aggregateRounds(results) });
+    runs.push({
+      ...run,
+      result: aggregateRounds(results),
+      ...(base ? { base: aggregateRounds(baseResults) } : {}),
+    });
   }
-  rmSync(workDir, { recursive: true, force: true });
+  rmSync(root, { recursive: true, force: true });
+  if (baseDir) removeBase(baseDir);
+  const rev = (ref) =>
+    spawnSync("git", ["-C", repositoryRoot, "rev-parse", ref], { encoding: "utf8" }).stdout?.trim();
   return {
     profile: profileName,
     rounds,
     release: true,
     machine: machine(),
-    commit: spawnSync("git", ["-C", repositoryRoot, "rev-parse", "HEAD"], { encoding: "utf8" }).stdout?.trim(),
+    commit: rev("HEAD"),
+    baseCommit: baseRef ? rev(baseRef) : null,
     measuredAt: new Date().toISOString(),
     runs,
   };
@@ -154,7 +223,7 @@ async function main(argv) {
   const rounds = Number(option(argv, "rounds", thresholds.profiles[profileName]?.rounds ?? 1));
   const report = reportOnly
     ? JSON.parse(readFileSync(reportOnly, "utf8"))
-    : measure(profileName, thresholds, rounds);
+    : measure(profileName, thresholds, rounds, option(argv, "base", null));
   const output = option(argv, "output", null);
   if (output) writeFileSync(output, `${JSON.stringify(report, null, 2)}\n`);
 

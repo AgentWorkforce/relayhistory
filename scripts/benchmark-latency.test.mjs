@@ -10,7 +10,7 @@ import {
   mergeBaselines,
   renderMarkdown,
 } from "./benchmark-latency-lib.mjs";
-import { findLatencyExecutable } from "./benchmark-latency.mjs";
+import { findLatencyExecutable, withNotifyDevDependency } from "./benchmark-latency.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
@@ -24,20 +24,21 @@ const thresholds = {
   },
   baselines: {
     "linux-x64": {
+      measuredOn: { cpusSeen: ["test"] },
       metrics: {
-        "stages@30d.fs_event": { p99: 0.2 },
-        "stages@30d.ingest_hook": { p99: 20 },
+        "stages@30d.fs_event": { p50: 0.1, p99: 0.2 },
+        "stages@30d.ingest_hook": { p50: 20, p99: 200 },
       },
     },
   },
 };
 
-const report = (metrics) => ({
+const report = (metrics, { base, cpu = "test" } = {}) => ({
   profile: "gate",
   rounds: 1,
   release: true,
-  machine: { platform: "linux", arch: "x64", cpu: "test", cores: 4 },
-  runs: [{ phase: "stages", days: 30, result: { metrics } }],
+  machine: { platform: "linux", arch: "x64", cpu, cores: 4 },
+  runs: [{ phase: "stages", days: 30, result: { metrics }, ...(base ? { base: { metrics: base } } : {}) }],
 });
 
 test("an enforced budget at or over its p99 fails", () => {
@@ -64,23 +65,48 @@ test("a budget enforced on a list of classes fails only on those", () => {
   assert.equal(mac.checks[0].status, "warn");
 });
 
-test("a p99 more than 10% plus the floor over baseline fails", () => {
-  // 20 * 1.1 + 0.05 = 22.05
-  assert.equal(evaluateGate(report({ ingest_hook: summary(22.05) }), thresholds, "linux-x64").passed, true);
-  assert.equal(evaluateGate(report({ ingest_hook: summary(22.06) }), thresholds, "linux-x64").passed, false);
-});
-
-test("the floor keeps microsecond jitter on a tiny stage from failing", () => {
-  // 0.2 * 1.1 = 0.22, but 0.26 is within the 0.05 ms floor.
-  assert.equal(evaluateGate(report({ fs_event: summary(0.26) }), thresholds, "linux-x64").passed, true);
+test("an enforced stage regresses on p99: 10% plus the floor over the stored baseline fails", () => {
+  // 0.2 * 1.1 + 0.05 = 0.27
+  assert.equal(evaluateGate(report({ fs_event: summary(0.27) }), thresholds, "linux-x64").passed, true);
   assert.equal(evaluateGate(report({ fs_event: summary(0.28) }), thresholds, "linux-x64").passed, false);
 });
 
-test("a platform without baselines gets budgets only, and a warning", () => {
+test("a tracked stage regresses on p50, not on its tail", () => {
+  // p50 20 * 1.1 + 0.05 = 22.05; summary() sets p50 = p99 / 2.
+  const tail = evaluateGate(report({ ingest_hook: summary(44) }), thresholds, "linux-x64");
+  assert.equal(tail.passed, true, "a p99 of 44 against a stored 200 is not the question");
+  assert.equal(evaluateGate(report({ ingest_hook: summary(44.2) }), thresholds, "linux-x64").passed, false);
+});
+
+test("against a base measurement, the base decides and stored baselines only advise", () => {
+  const head = { fs_event: summary(0.5) };
+  const slowerThanStored = evaluateGate(report(head, { base: { fs_event: summary(0.48) } }), thresholds, "linux-x64");
+  assert.equal(slowerThanStored.passed, true, "a slower runner moved both sides");
+  assert.equal(slowerThanStored.checks.find((c) => c.rule === "vs stored p99").status, "warn");
+  const regressed = evaluateGate(report(head, { base: { fs_event: summary(0.3) } }), thresholds, "linux-x64");
+  assert.equal(regressed.passed, false);
+  assert.equal(regressed.checks.find((c) => c.rule === "vs base p99").status, "fail");
+});
+
+test("on a CPU the baselines were never recorded on, the stored check is advisory", () => {
+  const gate = evaluateGate(report({ fs_event: summary(0.5) }, { cpu: "other" }), thresholds, "linux-x64");
+  assert.equal(gate.passed, true);
+  assert.match(gate.warnings[0], /is not one the linux-x64 baselines were recorded on/);
+});
+
+test("with neither a base nor stored baselines, only budgets are checked", () => {
   const gate = evaluateGate(report({ ingest_hook: summary(500) }), thresholds, "darwin-arm64");
   assert.equal(gate.passed, true);
-  assert.equal(gate.checks.filter((c) => c.rule === "regression").length, 0);
-  assert.match(gate.warnings[0], /no stored baselines for darwin-arm64/);
+  assert.deepEqual(gate.checks.map((c) => c.rule), ["budget"]);
+  assert.match(gate.warnings[0], /only budgets are checked/);
+});
+
+test("a base manifest gains the harness's notify dev-dependency exactly once", () => {
+  const without = '[package]\nname = "x"\n\n[dev-dependencies]\nlibc = "0.2"\n';
+  const once = withNotifyDevDependency(without);
+  assert.match(once, /\[dev-dependencies\]\nnotify = /);
+  assert.equal(withNotifyDevDependency(once), once);
+  assert.match(withNotifyDevDependency('[package]\nname = "x"\n'), /\[dev-dependencies\]\nnotify = /);
 });
 
 test("rounds fold to the median percentile, keeping the worst round visible", () => {
@@ -97,18 +123,19 @@ test("rounds fold to the median percentile, keeping the worst round visible", ()
 
 test("recorded baselines take the worst round, round up, and never tighten when merged", () => {
   const recorded = baselinesFromReport(
-    report({ fs_event: summary(0.2, { worstP99: 0.2341 }), open_db: summary(4) }),
+    report({ fs_event: summary(0.2, { worstP50: 0.12, worstP99: 0.2341 }), open_db: summary(4) }),
     thresholds.budgets,
   );
   // open_db has no budget, so it is reported but never gated.
-  assert.deepEqual(recorded, { "stages@30d.fs_event": { p99: 0.235 } });
-  const merged = mergeBaselines({ "stages@30d.fs_event": { p99: 0.3 } }, recorded);
-  assert.equal(merged["stages@30d.fs_event"].p99, 0.3);
+  assert.deepEqual(recorded, { "stages@30d.fs_event": { p50: 0.12, p99: 0.235 } });
+  const merged = mergeBaselines({ "stages@30d.fs_event": { p50: 0.1, p99: 0.3 } }, recorded);
+  assert.deepEqual(merged["stages@30d.fs_event"], { p50: 0.12, p99: 0.3 });
 });
 
 test("the markdown table names every metric and the verdict", () => {
   const r = report({ fs_event: summary(0.2), ingest_hook: summary(19) });
   const text = renderMarkdown(r, evaluateGate(r, thresholds, "linux-x64"), thresholds);
+  // summary(19) has p50 9.5, well under the stored p50 of 20.
   assert.match(text, /`stages@30d.fs_event`/);
   assert.match(text, /1\.500 \(tracked\)/);
   assert.match(text, /\*\*Gate: pass\*\*/);

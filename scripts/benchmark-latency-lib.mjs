@@ -45,6 +45,7 @@ export function aggregateRounds(rounds) {
       p90: median(series.map((m) => m.p90)),
       p99: median(series.map((m) => m.p99)),
       max: Math.max(...series.map((m) => m.max)),
+      worstP50: Math.max(...series.map((m) => m.p50)),
       worstP99: Math.max(...series.map((m) => m.p99)),
       rounds: series.length,
     };
@@ -65,62 +66,99 @@ export function budgetEnforced(budget, platform) {
 }
 
 /**
- * Apply budgets and baselines to an aggregated report.
+ * The percentile a regression is judged on. An enforced stage is held to
+ * its p99, the number the budget is about. A tracked stage -- one the code
+ * does not meet yet -- is judged on its p50: its tail is lock waits and WAL
+ * checkpoints that land on whichever samples they land on (the hook ingest's
+ * p99 was 257 ms in one job and 31 ms in the next, p50 23-24 ms in both), so
+ * a 10% bound on that tail measures luck, while the p50 is the cost the fix
+ * for that stage will move.
+ */
+export function regressionPercentile(budget, platform) {
+  return budgetEnforced(budget, platform) ? "p99" : "p50";
+}
+
+/**
+ * Apply budgets and the regression rule to an aggregated report.
  *
- * Two independent rules, each producing `ok`, `warn` or `fail` per metric:
+ * Every rule produces `ok`, `warn` or `fail` per budgeted metric -- the
+ * stages of the 5 ms path; everything else in the table is diagnostic:
  *
- * - **Budget.** A metric listed in `thresholds.budgets` fails when its p99 is
- *   at or above the budget, if the budget is enforced on this platform class
- *   (see `budgetEnforced`). An unenforced
- *   budget is one the code does not meet yet: a breach is a `warn` and the
- *   run stays green, so the gate can land before the fix does and is flipped
- *   to enforced by the change that brings the stage under budget.
- * - **Regression.** A metric with a stored baseline for this platform class
- *   fails when its p99 exceeds `baseline × (1 + maxRegression)` plus
- *   `regressionFloorMs`. The floor exists because a 10% bound on a 0.1 ms
- *   number is 10 µs, which is scheduler jitter rather than code.
+ * - **Budget.** p99 at or above the budget fails if the budget is enforced on
+ *   this platform class (see `budgetEnforced`), and warns otherwise: a stage
+ *   the code does not meet yet is tracked, so the gate can land before the
+ *   fix does, and the fix flips it to enforced.
+ * - **Regression against base.** When the report carries a base measurement
+ *   (`--base`: the same harness over the base commit's library, interleaved
+ *   round by round on the same runner), the head fails if its
+ *   `regressionPercentile` exceeds the base's by more than `maxRegression`
+ *   plus `regressionFloorMs`. This is the rule that decides: the first CI
+ *   runs showed the same metric 20-40% apart on two runners of one class,
+ *   so only a comparison made on one machine can see 10%.
+ * - **Regression against stored baselines.** Advisory (`warn`) whenever a
+ *   base comparison exists, and whenever this CPU is not one the baselines
+ *   were recorded on; it fails only without a base, on a recorded CPU --
+ *   the `main` push and a manual run, where there is nothing to compare with.
  *
- * A platform with no baselines gets the budget rule alone and a warning
- * saying so, rather than a failure: a baseline belongs to the machine class
- * that produced it.
+ * The floor exists because 10% of a 0.1 ms stage is 10 us, which is
+ * scheduler jitter rather than code.
  */
 export function evaluateGate(report, thresholds, platform) {
   const policy = thresholds.policy;
-  const baselines = thresholds.baselines?.[platform]?.metrics ?? null;
+  const stored = thresholds.baselines?.[platform] ?? null;
+  const cpuKnown = stored?.measuredOn?.cpusSeen?.includes(report.machine?.cpu) ?? false;
   const checks = [];
   const warnings = [];
-  if (!baselines) {
+  const anyBase = report.runs.some((run) => run.base);
+  if (!anyBase && !stored) {
     warnings.push(
-      `no stored baselines for ${platform}; only budgets are checked. ` +
-        `Record them with --update-baselines on that runner class.`,
+      `no base comparison and no stored baselines for ${platform}; only budgets are checked.`,
+    );
+  } else if (!anyBase && !cpuKnown) {
+    warnings.push(
+      `${report.machine?.cpu} is not one the ${platform} baselines were recorded on ` +
+        `(${stored.measuredOn?.cpusSeen?.join(", ")}); the stored-baseline check is advisory.`,
     );
   }
+  const bound = (value) =>
+    Math.round((value * (1 + policy.maxRegression) + policy.regressionFloorMs) * 1000) / 1000;
   for (const run of report.runs) {
     for (const [name, measured] of Object.entries(run.result.metrics)) {
       const id = metricId(run, name);
-      if (!measured || measured.n === 0) continue;
       const budget = thresholds.budgets?.[id];
-      if (budget) {
-        const over = measured.p99 >= budget.p99Ms;
+      if (!budget || !measured || measured.n === 0) continue;
+      checks.push({
+        id,
+        rule: "budget",
+        value: measured.p99,
+        bound: budget.p99Ms,
+        status: measured.p99 < budget.p99Ms ? "ok" : budgetEnforced(budget, platform) ? "fail" : "warn",
+        stage: budget.stage,
+      });
+      const percentile = regressionPercentile(budget, platform);
+      const base = run.base?.metrics?.[name];
+      if (base && base.n > 0) {
+        const limit = bound(base[percentile]);
         checks.push({
           id,
-          rule: "budget",
-          value: measured.p99,
-          bound: budget.p99Ms,
-          status: !over ? "ok" : budgetEnforced(budget, platform) ? "fail" : "warn",
-          stage: budget.stage,
+          rule: `vs base ${percentile}`,
+          value: measured[percentile],
+          bound: limit,
+          baseline: base[percentile],
+          status: measured[percentile] > limit ? "fail" : "ok",
         });
       }
-      const baseline = baselines?.[id];
-      if (baseline && typeof baseline.p99 === "number") {
-        const bound = baseline.p99 * (1 + policy.maxRegression) + policy.regressionFloorMs;
+      const recorded = stored?.metrics?.[id]?.[percentile];
+      if (typeof recorded === "number") {
+        const limit = bound(recorded);
+        const over = measured[percentile] > limit;
         checks.push({
           id,
-          rule: "regression",
-          value: measured.p99,
-          bound: Math.round(bound * 1000) / 1000,
-          baseline: baseline.p99,
-          status: measured.p99 > bound ? "fail" : "ok",
+          rule: `vs stored ${percentile}`,
+          value: measured[percentile],
+          bound: limit,
+          baseline: recorded,
+          status: !over ? "ok" : anyBase || !cpuKnown ? "warn" : "fail",
         });
       }
     }
@@ -133,23 +171,22 @@ export function evaluateGate(report, thresholds, platform) {
 }
 
 /**
- * Baselines from an aggregated report, for the metrics that have a budget --
- * the stages of the 5 ms path; everything else in the table is diagnostic.
- *
- * Each is the *worst round's* p99, rounded up to the next microsecond. The
- * gate compares a median-of-rounds p99 against it, so the round-to-round
- * spread the recording run itself showed is headroom rather than a flake: on
- * the first CI runs the tail stages moved ~10% between rounds of one job,
- * which is the whole regression allowance.
+ * Baselines from an aggregated report, for the budgeted metrics: each
+ * metric's p50 and p99, the *worst round's* where the report has rounds,
+ * rounded up to the next microsecond, so a stored bound is never stricter
+ * than the run that produced it.
  */
 export function baselinesFromReport(report, budgets) {
   const metrics = {};
+  const up = (value) => Math.ceil(value * 1000) / 1000;
   for (const run of report.runs) {
     for (const [name, measured] of Object.entries(run.result.metrics)) {
       const id = metricId(run, name);
       if (!measured || measured.n === 0 || !budgets?.[id]) continue;
-      const p99 = measured.worstP99 ?? measured.p99;
-      metrics[id] = { p99: Math.ceil(p99 * 1000) / 1000 };
+      metrics[id] = {
+        p50: up(measured.worstP50 ?? measured.p50),
+        p99: up(measured.worstP99 ?? measured.p99),
+      };
     }
   }
   return metrics;
@@ -162,7 +199,10 @@ export function baselinesFromReport(report, budgets) {
 export function mergeBaselines(previous, next) {
   const merged = { ...(previous ?? {}) };
   for (const [id, value] of Object.entries(next)) {
-    merged[id] = { p99: Math.max(value.p99, merged[id]?.p99 ?? 0) };
+    merged[id] = {
+      p50: Math.max(value.p50 ?? 0, merged[id]?.p50 ?? 0),
+      p99: Math.max(value.p99, merged[id]?.p99 ?? 0),
+    };
   }
   return merged;
 }
@@ -180,8 +220,12 @@ export function renderMarkdown(report, gate, thresholds) {
       `Each value is the median across rounds of that round's nearest-rank percentile, in ms.`,
   );
   lines.push("");
-  lines.push("| Metric | Budget p99 | p50 | p90 | p99 | worst-round p99 | max | n | Gate |");
-  lines.push("|---|---:|---:|---:|---:|---:|---:|---:|:--|");
+  const hasBase = report.runs.some((run) => run.base);
+  if (hasBase) lines.push(`Base: \`${report.baseCommit}\`, measured interleaved on the same runner.`, "");
+  lines.push(
+    `| Metric | Budget p99 | p50 | p90 | p99 | worst-round p99 | max | n |${hasBase ? " base p50 | base p99 |" : ""} Gate |`,
+  );
+  lines.push(`|---|---:|---:|---:|---:|---:|---:|---:|${hasBase ? "---:|---:|" : ""}:--|`);
   const byId = new Map();
   for (const check of gate.checks) {
     const list = byId.get(check.id) ?? [];
@@ -200,7 +244,9 @@ export function renderMarkdown(report, gate, thresholds) {
       lines.push(
         `| \`${id}\` | ${budget ? fmt(budget.p99Ms) + tracked : ""} | ` +
           `${fmt(measured.p50)} | ${fmt(measured.p90)} | ${fmt(measured.p99)} | ${fmt(measured.worstP99)} | ` +
-          `${fmt(measured.max)} | ${measured.n ?? 0} | ${verdict} |`,
+          `${fmt(measured.max)} | ${measured.n ?? 0} |` +
+          (hasBase ? ` ${fmt(run.base?.metrics?.[name]?.p50)} | ${fmt(run.base?.metrics?.[name]?.p99)} |` : "") +
+          ` ${verdict} |`,
       );
     }
   }

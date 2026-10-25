@@ -1214,45 +1214,63 @@ the budget is set for the macOS desktop. It is a workflow of its own, not a
 step in `verify`, because the budgets are release-build numbers and `verify`
 builds debug.
 
-Two rules, each per metric:
+Every rule applies to the metrics with a budget -- the stages of the 5 ms
+path. Everything else in the table (`open_db`, `open_raw`, the uploader's own
+drain and commit, the quiet reads) is diagnostic.
 
-* **Budget.** p99 at or above the budget fails, for a budget marked
-  `"enforced": true`. A stage the code does not meet yet is
-  `"enforced": false`: it is printed as `warn (tracked)` and does not fail, so
-  the gate can land before the fixes do. The change that brings a stage under
-  budget flips it to enforced in the same pull request; never the other way.
-* **Regression.** p99 above `baseline × 1.10 + 0.05 ms` fails, against the
-  baseline stored for the runner's platform class (`linux-x64`,
-  `darwin-arm64`). The 0.05 ms floor exists because 10% of a 0.1 ms stage is
-  scheduler jitter. A platform with no baselines is gated on budgets only, with
-  a warning.
+* **Budget.** p99 at or above the budget fails if the budget is enforced on
+  the runner's platform class. `enforced` is `true`, `false`, or a list of
+  classes: the raw filesystem event meets its budget under inotify and not
+  under FSEvents, and holding Linux to it is worth more than waiting for
+  macOS. A stage the code does not meet yet is tracked: printed as `warn` and
+  not failing, so the gate can land before the fixes do. The change that
+  brings a stage under budget enforces it in the same pull request, never
+  the other way.
+* **Regression against base.** On a pull request the workflow passes
+  `--base <base sha>`. The driver checks the base out into a worktree under
+  `target/latency-base`, copies this checkout's harness into it (the harness
+  uses only the public API, so a base that predates it still builds), and
+  runs both, interleaved round by round, on the same runner. The head fails
+  if it is more than 10% plus 0.05 ms over the base: on **p99** for an
+  enforced stage, on **p50** for a tracked one.
+* **Regression against stored baselines.** `scripts/latency-thresholds.json`
+  keeps per-class baselines: for each budgeted metric, the worst round's p50
+  and p99 of each recorded run, merged worst-of across runs. They fail only
+  when there is no base (a push to `main`, a manual run) *and* the runner's
+  CPU is in `cpusSeen`; otherwise they are advisory.
 
-Each round is its own process and the reported percentile is the median across
-rounds, so one noisy round does not decide the gate; the table still prints
-the worst round. Record baselines on the runner class itself, from that
-class's CI artifact, with `--report-only <artifact> --update-baselines`.
-Recording merges with what is stored by keeping the worse value per metric, so
-a second runner of the same class can loosen a bound but never tighten one;
-lowering a baseline after a speed-up means deleting that class's entry and
-re-recording.
+Why a same-runner comparison and not stored numbers: on this change's first
+four CI jobs, the same metric was 20-40% apart between two `ubuntu-latest`
+runners (EPYC 9V74 and EPYC 7763, the list query at 0.28 and 0.38 ms p99),
+and the macOS runner's list p99 went from 0.53 to 1.72 ms between two jobs on
+the same CPU model while its p50 held at ~0.25 ms. A 10% bound against a
+stored number on that pool would fail most healthy pull requests -- the
+lesson the sync gate above learned on #194, #199 and #204. Two runs on one
+machine, minutes apart and interleaved, share the machine's speed and its
+neighbours.
 
-Only metrics with a budget are gated for regression; everything else in the
-table (`open_db`, `open_raw`, the uploader's own drain and commit, the quiet
-reads) is diagnostic. Each stored baseline is the **worst round's** p99 of
-the recording job, while the gate compares the median-of-rounds p99 against
-it: the first CI jobs showed the tail stages moving ~10% between rounds of
-one job, which is the entire regression allowance, so a median baseline
-would have failed healthy runs.
+Why p50 for tracked stages: their tails are lock waits and WAL checkpoints
+that land on whichever samples they land on. The hook ingest's p99 was
+257 ms in one job and 31 ms in the next, while its p50 was 23 and 24 ms. A
+10% bound on that tail measures luck; the p50 is the cost the fix for that
+stage will move.
 
-A budget's `enforced` may be `true`, `false`, or a list of platform classes:
-the raw filesystem event meets its budget under inotify and does not under
-FSEvents, and holding Linux to it is worth more than waiting for macOS.
+Each round is its own process and each reported percentile is the median
+across rounds; the table also prints the worst round. Record or extend
+baselines from a CI artifact with
+`--report-only <artifact.json> --update-baselines`. Lowering a baseline after
+a speed-up means deleting that class's entry and re-recording, since merging
+only ever keeps the worse value.
+
+`--profile smoke` runs every phase on a tiny store in seconds (its numbers mean
+nothing) to check the driver and the base worktree end to end.
 
 ### 2026-10-25 baseline
 
-First runs of `--gate` (3 rounds × 100 samples, 60 for `e2e`, 20 per round
+First run of `--gate` (3 rounds × 100 samples, 60 for `e2e`, 20 per round
 for the sweep), from this change's own CI jobs. p99 in ms; p50 in brackets
-where the tail hides the typical case.
+where the tail hides the typical case. A second job of each lies within the
+spread described above; the stored baselines are the worse of both.
 
 | Stage | Budget | ubuntu-latest (EPYC 9V74, 4 cores) | macos-latest (Apple M1, virtual, 3 cores) |
 |---|---:|---:|---:|

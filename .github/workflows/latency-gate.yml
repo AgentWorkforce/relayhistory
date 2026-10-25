@@ -1,8 +1,9 @@
 name: Session-visible latency gate
 
 # "A new session is visible in the desktop in < 5 ms": per-stage p99 budgets
-# and a 10% regression bound against the baseline stored for each runner
-# class in scripts/latency-thresholds.json. macOS is in the matrix because the
+# and a 10% regression bound against the pull request's base commit, measured
+# on the same runner (stored per-class baselines in
+# scripts/latency-thresholds.json when there is no base). macOS is in the matrix because the
 # filesystem-event stage is FSEvents there and inotify on Linux, and the
 # budget is set for the macOS desktop. See docs/benchmarks.md,
 # "Session-visible latency".
@@ -47,6 +48,9 @@ jobs:
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The base commit is measured beside the head on this runner.
+          fetch-depth: 0
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -61,10 +65,17 @@ jobs:
       - name: Build the latency harness
         run: cargo test --release -p ai-hist-cli --test latency_bench --no-run
 
+      # On a pull request the regression rule compares against the base
+      # commit, measured interleaved on this same runner; runners of one
+      # class differ by more than the 10% allowance. Without a base (a push
+      # to main, a manual run) it falls back to the stored baselines.
       - name: Measure and gate
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
         run: |
           node scripts/benchmark-latency.mjs --gate \
             --profile "${{ inputs.profile || 'gate' }}" \
+            ${BASE_SHA:+--base "$BASE_SHA"} \
             --output "latency-${{ matrix.os }}.json" \
             --markdown "latency-${{ matrix.os }}.md"
 

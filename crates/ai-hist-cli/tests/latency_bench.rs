@@ -802,6 +802,7 @@ fn prune(config: &Config) -> Value {
     let ingest_stop = Arc::new(AtomicBool::new(false));
     let ingest_flag = ingest_stop.clone();
     let (writer_bench_dir, turns) = (bench.project_dir(0), bench.turns);
+    fs::create_dir_all(&writer_bench_dir).unwrap();
     let ingester = std::thread::spawn(move || {
         let mut out = Vec::new();
         let mut n = 1u64 << 44;
