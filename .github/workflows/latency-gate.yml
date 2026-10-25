@@ -1,0 +1,81 @@
+name: Session-visible latency gate
+
+# "A new session is visible in the desktop in < 5 ms": per-stage p99 budgets
+# and a 10% regression bound against the baseline stored for each runner
+# class in scripts/latency-thresholds.json. macOS is in the matrix because the
+# filesystem-event stage is FSEvents there and inotify on Linux, and the
+# budget is set for the macOS desktop. See docs/benchmarks.md,
+# "Session-visible latency".
+#
+# Separate from ci.yml's `verify` job because the budgets are release-build
+# numbers and `verify` builds debug; a second, release-profile cache keeps
+# this job from evicting that one.
+
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Profile in scripts/latency-thresholds.json"
+        required: false
+        default: "gate"
+  pull_request:
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "scripts/benchmark-latency*"
+      - "scripts/latency-thresholds.json"
+      - ".github/workflows/latency-gate.yml"
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: latency-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  latency:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: latency-release
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Build the latency harness
+        run: cargo test --release -p ai-hist-cli --test latency_bench --no-run
+
+      - name: Measure and gate
+        run: |
+          node scripts/benchmark-latency.mjs --gate \
+            --profile "${{ inputs.profile || 'gate' }}" \
+            --output "latency-${{ matrix.os }}.json" \
+            --markdown "latency-${{ matrix.os }}.md"
+
+      - name: Summarize
+        if: always()
+        run: cat "latency-${{ matrix.os }}.md" >> "$GITHUB_STEP_SUMMARY" || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: latency-${{ matrix.os }}
+          path: |
+            latency-${{ matrix.os }}.json
+            latency-${{ matrix.os }}.md

@@ -1,0 +1,119 @@
+{
+  "comment": [
+    "Budgets and baselines for scripts/benchmark-latency.mjs. A budget is the product",
+    "limit for one stage of 'a new session is visible in the desktop in < 5 ms' (p99,",
+    "release build); `enforced: false` marks a stage the code does not meet yet, whose",
+    "breach is reported but does not fail the gate. The change that brings a stage under",
+    "its budget flips it to `enforced: true` in the same pull request. Baselines are",
+    "per platform class and are recorded on that class with --update-baselines; see",
+    "docs/benchmarks.md, 'Session-visible latency'."
+  ],
+  "policy": {
+    "maxRegression": 0.1,
+    "regressionFloorMs": 0.05,
+    "regressionComment": [
+      "A p99 more than 10% over its stored baseline fails. The floor is added to every",
+      "bound because 10% of a 0.1 ms stage is 10 us, which is scheduler jitter on a",
+      "shared runner, not a code change."
+    ]
+  },
+  "budgets": {
+    "stages@30d.fs_event": {
+      "stage": "fs event -> watcher",
+      "p99Ms": 1.0,
+      "enforced": true
+    },
+    "stages@30d.ingest_hook": {
+      "stage": "parse + SQLite txn (hook path)",
+      "p99Ms": 1.5,
+      "enforced": false
+    },
+    "stages@30d.sweep_scoped_sync": {
+      "stage": "parse + SQLite txn (watch tick / collector sweep)",
+      "p99Ms": 1.5,
+      "enforced": false
+    },
+    "stages@30d.feed_pull": {
+      "stage": "change-feed notify -> desktop",
+      "p99Ms": 1.0,
+      "enforced": false
+    },
+    "stages@30d.list_first_paint": {
+      "stage": "desktop query (indexed, LIMIT 50)",
+      "p99Ms": 1.5,
+      "enforced": true
+    },
+    "list_scale@30d.list_first_paint": {
+      "stage": "desktop query (indexed, LIMIT 50), 30 days",
+      "p99Ms": 1.5,
+      "enforced": true
+    },
+    "list_scale@365d.list_first_paint": {
+      "stage": "desktop query (indexed, LIMIT 50), 1 year",
+      "p99Ms": 1.5,
+      "enforced": true
+    },
+    "list_scale@365d.list_desktop_page": {
+      "stage": "desktop query (LIMIT 500, the desktop's page), 1 year",
+      "p99Ms": 1.5,
+      "enforced": false
+    },
+    "e2e@30d.e2e_visible": {
+      "stage": "total: write -> visible",
+      "p99Ms": 5.0,
+      "enforced": false
+    },
+    "ingest_upload@30d.ingest_with_uploader": {
+      "stage": "parse + SQLite txn while an uploader runs",
+      "p99Ms": 1.5,
+      "enforced": false
+    },
+    "prune@365d.read_during_prune": {
+      "stage": "desktop query while retention prunes",
+      "p99Ms": 1.5,
+      "enforced": true
+    },
+    "prune@365d.ingest_during_prune": {
+      "stage": "parse + SQLite txn while retention prunes",
+      "p99Ms": 1.5,
+      "enforced": false
+    }
+  },
+  "profiles": {
+    "gate": {
+      "description": "The pull-request gate: release build, 40 sessions a day, a 30-day and a 1-year store, three rounds per run.",
+      "rounds": 3,
+      "samples": 100,
+      "sweepSamples": 20,
+      "sessionsPerDay": 40,
+      "turns": 2,
+      "retainDays": 30,
+      "runs": [
+        { "phase": "stages", "days": 30 },
+        { "phase": "e2e", "days": 30, "samples": 60 },
+        { "phase": "list_scale", "days": 30 },
+        { "phase": "list_scale", "days": 365 },
+        { "phase": "ingest_upload", "days": 30 },
+        { "phase": "prune", "days": 365 }
+      ]
+    },
+    "full": {
+      "description": "The published matrix: the gate's runs with more samples and rounds.",
+      "rounds": 5,
+      "samples": 300,
+      "sweepSamples": 60,
+      "sessionsPerDay": 40,
+      "turns": 2,
+      "retainDays": 30,
+      "runs": [
+        { "phase": "stages", "days": 30 },
+        { "phase": "e2e", "days": 30, "samples": 200 },
+        { "phase": "list_scale", "days": 30 },
+        { "phase": "list_scale", "days": 365 },
+        { "phase": "ingest_upload", "days": 30 },
+        { "phase": "prune", "days": 365 }
+      ]
+    }
+  },
+  "baselines": {}
+}

@@ -27,4 +27,7 @@ tempfile = "3"
 
 [dev-dependencies]
 libc = "0.2"
+# The latency harness times the raw backend event (FSEvents, inotify) apart
+# from the watch loop; same version and backend the crate's `fs-events` uses.
+notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 url = "2"
