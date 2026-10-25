@@ -45,17 +45,19 @@ id is untouched. The rule (all three steps decided by Khaliq on 2026-10-25):
 - Drop apostrophes, both straight and curly. macOS's ComputerName
   `Khaliq's MacBook Pro` and its LocalHostName `Khaliqs-MacBook-Pro` are then
   one name.
-- Within each DNS label, turn every other run of punctuation, spaces,
-  underscores and symbols into one `-`. Combining marks (general category
-  M) stay on their letters, so the Devanagari `की` and `कु` stay distinct.
-- A label with non-ASCII letters is written whole in Punycode behind the
-  IDNA `xn--` prefix, exactly as IDNA encodes a label: `café-box` becomes
-  `xn--caf-box-dya`. An `xn--` label is decoded first, so a name and its
-  IDNA spelling are one name.
-- Join the labels with `-` and cut the result at 63 characters from the
-  right, so the most specific labels stay. The cut never lands inside an
-  `xn--` label: the label is kept whole or left out, and one too long on its
-  own is named `h-` plus 16 hex digits of its SHA-256.
+- Decode every `xn--` label to Unicode. Then treat the whole name as one
+  label: turn every other run of dots, punctuation, spaces, underscores and
+  symbols into one `-`. Combining marks (general category M) stay on their
+  letters, so the Devanagari `की` and `कु` stay distinct.
+- If the result has non-ASCII letters, write it whole in Punycode behind
+  the IDNA `xn--` prefix, exactly as IDNA encodes a label. `café-box`,
+  `café.box` and `xn--caf-box-dya` are then one name. A canonical name
+  canonicalizes to itself, because a single label decodes back
+  unambiguously, whereas per-label encoding joined by `-` does not.
+- An ASCII result is cut at 63 characters from the right, so the most
+  specific labels stay. Punycode doesn't survive a cut, so a non-ASCII name
+  too long to encode in 63 characters is named `h-` plus 16 hex digits of
+  its SHA-256.
 
 Rule 1 turned apostrophes into hyphens and kept only the first DNS label.
 Rule 2 dropped apostrophes. Rule 3 keeps every label except network

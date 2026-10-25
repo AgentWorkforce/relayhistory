@@ -48,15 +48,16 @@ const NETWORK_SUFFIXES: &[&str] = &[
 /// Lowercased, NFC-normalized and trimmed of whitespace and trailing dots;
 /// every [`NETWORK_SUFFIXES`] entry stripped; for a cloud `*.internal` name
 /// only the first label kept, since the rest names a zone or project. Then
-/// each DNS label on its own, as IDNA treats one: an `xn--` label decoded to
-/// Unicode, apostrophes (`'`, `‘`, `’`) dropped, every run of anything but
-/// letters, digits and combining marks -- punctuation, spaces, underscores,
-/// symbols -- one `-`, and a label with non-ASCII letters written whole in
-/// Punycode behind `xn--`, so `café-box` and its IDNA spelling
-/// `xn--caf-box-dya` are one name. The labels are joined by `-`, at most 63
-/// characters, cut from the right so the most specific labels stay, and
-/// never inside an `xn--` label (a lone label too long for the limit is
-/// named by a hash). A name with nothing left is [`UNKNOWN_HOSTNAME`].
+/// one label of the rest, as IDNA would write it: each `xn--` label decoded
+/// to Unicode, apostrophes (`'`, `‘`, `’`) dropped, every run of anything but
+/// letters, digits and combining marks -- dots, punctuation, spaces,
+/// underscores, symbols -- one `-`, and the result, when it has non-ASCII
+/// letters, written whole in Punycode behind `xn--`. `café-box`, `café.box`
+/// and the IDNA spelling `xn--caf-box-dya` are therefore one name, and a
+/// canonical name canonicalizes to itself. At most 63 characters: an ASCII
+/// name is cut from the right, so the most specific labels stay; Punycode
+/// does not survive a cut, so a non-ASCII name too long to encode is named
+/// by a hash. A name with nothing left is [`UNKNOWN_HOSTNAME`].
 ///
 /// `Khaliqs-MacBook-Pro.local` -> `khaliqs-macbook-pro`;
 /// `Khaliq's MacBook Pro` -> `khaliqs-macbook-pro`;
@@ -85,62 +86,57 @@ pub fn canonical_hostname(hostname: &str) -> String {
 }
 
 fn slug(name: &str) -> String {
-    let mut slug = String::with_capacity(MAX_HOSTNAME_LEN);
-    for (unicode, ascii) in name.split('.').filter_map(label) {
-        let room = MAX_HOSTNAME_LEN.saturating_sub(slug.len() + usize::from(!slug.is_empty()));
-        if ascii.len() > room {
-            // Punycode does not survive a cut: an `xn--` label is kept whole
-            // or not at all, and one too long even alone is named by a
-            // hash. A plain label is cut, keeping its leading characters.
-            if !ascii.starts_with("xn--") {
-                push_label(&mut slug, ascii[..room].trim_end_matches('-'));
-            } else if slug.is_empty() {
-                slug.push_str(&overlong_label(&unicode));
-            }
-            break;
-        }
-        push_label(&mut slug, &ascii);
+    // Every `xn--` label back to Unicode first, so a name and its IDNA
+    // spelling meet; then the whole name is one label, its dots separators
+    // like any other punctuation.
+    let unicode = text(
+        &name
+            .split('.')
+            .map(decode_idna)
+            .collect::<Vec<_>>()
+            .join("-"),
+    );
+    if unicode.is_empty() {
+        return UNKNOWN_HOSTNAME.to_string();
     }
-    if slug.is_empty() {
-        UNKNOWN_HOSTNAME.to_string()
-    } else {
-        slug
+    if unicode.is_ascii() {
+        return unicode[..unicode.len().min(MAX_HOSTNAME_LEN)]
+            .trim_end_matches('-')
+            .to_string();
+    }
+    // One Punycode label, so the result is decoded back by the same rule:
+    // canonicalizing a canonical name returns it unchanged. Punycode does
+    // not survive a cut, so a name too long to encode is named by a hash.
+    match idna::punycode::encode_str(&unicode).map(|encoded| format!("xn--{encoded}")) {
+        Some(ascii) if ascii.len() <= MAX_HOSTNAME_LEN => ascii,
+        _ => overlong_label(&unicode),
     }
 }
 
-/// One DNS label as the rule names it, Unicode and ASCII: an `xn--` label
-/// decoded back to Unicode first, so a name and its IDNA spelling meet;
-/// apostrophes dropped; every run of anything but letters, digits and marks
-/// one `-`, trimmed; then the whole label in Punycode behind `xn--` when it
-/// has non-ASCII letters, exactly as IDNA encodes a label. `None` when
-/// nothing is left.
-fn label(raw: &str) -> Option<(String, String)> {
-    let decoded = raw
+/// `label` with an IDNA `xn--` prefix decoded to lowercase NFC Unicode; any
+/// other label, or one that does not decode, as it is.
+fn decode_idna(label: &str) -> String {
+    label
         .strip_prefix("xn--")
         .and_then(idna::punycode::decode_to_string)
-        .map(|unicode| nfc(&unicode.to_lowercase()));
-    let raw = decoded.as_deref().unwrap_or(raw);
-    let mut unicode = String::with_capacity(raw.len());
-    for ch in raw.chars() {
+        .map_or_else(|| label.to_string(), |unicode| nfc(&unicode.to_lowercase()))
+}
+
+/// The name's text: apostrophes dropped, letters, digits and combining marks
+/// kept, every other run one `-`, no leading or trailing `-`.
+fn text(name: &str) -> String {
+    let mut text = String::with_capacity(name.len());
+    for ch in name.chars() {
         if APOSTROPHES.contains(&ch) {
             continue;
         }
         if is_word_char(ch) {
-            unicode.push(ch);
-        } else if !unicode.is_empty() && !unicode.ends_with('-') {
-            unicode.push('-');
+            text.push(ch);
+        } else if !text.is_empty() && !text.ends_with('-') {
+            text.push('-');
         }
     }
-    let unicode = unicode.trim_end_matches('-').to_string();
-    if unicode.is_empty() {
-        return None;
-    }
-    let ascii = if unicode.is_ascii() {
-        unicode.clone()
-    } else {
-        format!("xn--{}", idna::punycode::encode_str(&unicode)?)
-    };
-    Some((unicode, ascii))
+    text.trim_end_matches('-').to_string()
 }
 
 fn nfc(text: &str) -> String {
@@ -149,18 +145,8 @@ fn nfc(text: &str) -> String {
         .into_owned()
 }
 
-fn push_label(slug: &mut String, label: &str) {
-    if label.is_empty() {
-        return;
-    }
-    if !slug.is_empty() {
-        slug.push('-');
-    }
-    slug.push_str(label);
-}
-
-/// The name of a non-ASCII label whose Punycode alone is longer than a
-/// hostname may be: `h-` and 16 hex digits of a SHA-256 of the label.
+/// The name of a non-ASCII hostname whose Punycode is longer than a
+/// hostname may be: `h-` and 16 hex digits of a SHA-256 of its text.
 /// Bounded and deterministic, so the same overlong name always maps to the
 /// same canonical name; it cannot be decoded, which only a name longer than
 /// DNS allows gives up.

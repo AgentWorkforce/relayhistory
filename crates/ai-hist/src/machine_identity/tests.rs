@@ -133,13 +133,14 @@ fn canonical_hostname_folds_odd_spellings_into_one_dns_label() {
         ),
         ("my.lan.box", "my-lan-box"),
         ("DESKTOP_7F3A__X", "desktop-7f3a-x"),
-        // A non-ASCII label is encoded whole, as IDNA does, so a name and
-        // its IDNA spelling are one name.
+        // A non-ASCII name is one label, encoded whole as IDNA does, so a
+        // name, its dotted form and its IDNA spelling are one name.
         ("café-box", "xn--caf-box-dya"),
+        ("café.box", "xn--caf-box-dya"),
         ("Café-Box.local", "xn--caf-box-dya"),
         ("xn--caf-box-dya", "xn--caf-box-dya"),
         ("XN--CAF-BOX-DYA.lan", "xn--caf-box-dya"),
-        ("café-box.studio", "xn--caf-box-dya-studio"),
+        ("xn--caf-dma.box", "xn--caf-box-dya"),
         ("linuyc-desktop\n", "linuyc-desktop"),
         ("ip-10-0-0-1.ec2.internal", "ip-10-0-0-1"),
         ("", UNKNOWN_HOSTNAME),
@@ -214,6 +215,37 @@ fn non_ascii_hostnames_stay_distinct_and_decodable() {
 }
 
 #[test]
+fn a_canonical_name_canonicalizes_to_itself() {
+    // The rule is a fixed point: a stored name recanonicalized on the next
+    // open, or a cloud row canonicalized twice, never moves.
+    for raw in [
+        "café.box",
+        "café.a",
+        "café-box.studio",
+        "box.café",
+        "Ñandú's Box.lan",
+        "山田のMac.local",
+        "की",
+        "q\u{307}-box",
+        "xn--caf-box-dya",
+        "Khaliqs-MacBook-Pro.local",
+        "build-01.corp.example.com",
+        "ip-10-0-0-1.ec2.internal",
+        "",
+        &format!("{}ñ{}", "a".repeat(55), "a"),
+        &"a-".repeat(100),
+    ] {
+        let once = canonical_hostname(raw);
+        assert_eq!(canonical_hostname(&once), once, "{raw:?} -> {once}");
+        assert!(once.len() <= 63, "{once}");
+    }
+    // An international label followed by an ordinary one decodes back whole.
+    let mixed = canonical_hostname("café.box");
+    let decoded = idna::punycode::decode_to_string(mixed.strip_prefix("xn--").unwrap());
+    assert_eq!(decoded.as_deref(), Some("café-box"));
+}
+
+#[test]
 fn combining_marks_stay_on_their_letters() {
     // A Devanagari vowel sign is a mark, not a separator: these differ.
     let (ki, ku) = (canonical_hostname("की"), canonical_hostname("कु"));
@@ -249,10 +281,10 @@ fn a_long_non_ascii_name_is_never_cut_inside_its_punycode() {
     let slug = canonical_hostname(&fits);
     let decoded = idna::punycode::decode_to_string(slug.strip_prefix("xn--").unwrap());
     assert_eq!(decoded.as_deref(), Some(fits.as_str()));
-    // After an ASCII label, a Punycode label that does not fit is left out
-    // whole; nothing in the result is a partial encoding.
+    // The whole name is one label, so a long tail makes it overlong too;
+    // nothing in the result is ever a partial encoding.
     let tail = format!("box.{}ñ", "a".repeat(58));
-    assert_eq!(canonical_hostname(&tail), "box");
+    assert!(canonical_hostname(&tail).starts_with("h-"));
     // A plain word is still cut, keeping its leading characters.
     assert_eq!(canonical_hostname(&"a".repeat(80)), "a".repeat(63));
 }
