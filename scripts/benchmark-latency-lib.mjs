@@ -144,7 +144,12 @@ export function evaluateGate(report, thresholds, platform) {
     for (const [name, measured] of Object.entries(run.result.metrics)) {
       const id = metricId(run, name);
       const budget = thresholds.budgets?.[id];
-      if (!budget || !measured || measured.n === 0) continue;
+      if (!budget) continue;
+      if (!measured || !(measured.n > 0)) {
+        // A budgeted stage with nothing measured is not a pass.
+        checks.push({ id, rule: "samples", value: 0, bound: 1, status: "fail", stage: budget.stage });
+        continue;
+      }
       const enforced = budgetEnforced(budget, platform);
       const withinBudget = measured.p99 < budget.p99Ms;
       checks.push({

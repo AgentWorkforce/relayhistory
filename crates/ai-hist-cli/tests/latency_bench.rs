@@ -315,6 +315,7 @@ impl Bench {
         };
         self.next_id.store(sessions + 1, Ordering::Relaxed);
         let store = self.open();
+
         let db_bytes = fs::metadata(&self.db).map(|m| m.len()).unwrap_or(0);
         let info = json!({
             "days": days,
@@ -337,6 +338,13 @@ fn checkpoint(db: &Path) {
         .expect("checkpoint");
 }
 
+/// Copy a store: the database files are copied, every transcript is hard
+/// linked. A link keeps the inode and mtime, which is what the store's
+/// per-transcript stamp checks, so a restored store looks unchanged to the
+/// next sweep instead of costing it a re-read of every session. No phase
+/// writes into a transcript the populate step created -- new sessions are
+/// new files, and a prune deletes rows, not files -- so sharing them with the
+/// cache is safe. Cache and work dir sit under one parent, on one filesystem.
 fn copy_dir(from: &Path, to: &Path) {
     fs::create_dir_all(to).unwrap();
     for entry in fs::read_dir(from).unwrap() {
@@ -344,8 +352,14 @@ fn copy_dir(from: &Path, to: &Path) {
         let target = to.join(entry.file_name());
         if entry.file_type().unwrap().is_dir() {
             copy_dir(&entry.path(), &target);
-        } else {
+        } else if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("ai-history.db")
+        {
             fs::copy(entry.path(), target).unwrap();
+        } else {
+            fs::hard_link(entry.path(), target).unwrap();
         }
     }
 }
@@ -390,7 +404,9 @@ fn names(report: &[SessionRef], id: &str) -> bool {
 /// Write → first watcher callback for that path. The floor of stage 1; what
 /// the production watch loop adds on top shows up in `e2e`.
 fn fs_event_latency(bench: &Bench, samples: u64) -> Vec<Duration> {
-    let dir = bench.home.join(".claude/projects/-work-fsevents");
+    // Outside every provider root: these files are not transcripts, and the
+    // timed sweeps that follow must not walk them.
+    let dir = bench.root.join("fs-events");
     fs::create_dir_all(&dir).unwrap();
     let (tx, rx) = mpsc::channel::<(Instant, Vec<PathBuf>)>();
     let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
@@ -592,6 +608,13 @@ fn e2e(config: &Config) -> Value {
         while let Some(Ok(_)) = handle.next_timeout(Duration::ZERO) {}
     }
     handle.stop();
+    // A session that never became visible is the worst latency there is, not
+    // a sample to leave out: the phase fails, and with it the gate.
+    assert_eq!(
+        misses, 0,
+        "{misses} of {} new sessions were not reported by watch within 10 s",
+        config.samples
+    );
     json!({
         "store": store_info,
         "driver": match driver {
@@ -638,7 +661,10 @@ fn list_scale(config: &Config) -> Value {
                 store
                     .sessions(query)
                     .take(FIRST_PAINT_PAGE as usize)
-                    .count()
+                    .fold(0usize, |rows, row| {
+                        row.expect("catalog row");
+                        rows + 1
+                    })
             })
             .1,
         );

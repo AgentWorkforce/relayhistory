@@ -185,7 +185,12 @@ function measure(profileName, thresholds, rounds, baseRef) {
   // which is tmpfs on some Linux hosts and would make every fsync free. Head
   // and base keep separate stores: a cached store built by one library is
   // not a store the other necessarily reads without migrating.
-  const root = resolve(process.env.AI_HIST_LATENCY_DIR ?? join(repositoryRoot, "target/latency-bench"));
+  // A directory of its own inside the configured one, so the cleanup below
+  // never touches anything the caller keeps there.
+  const root = join(
+    resolve(process.env.AI_HIST_LATENCY_DIR ?? join(repositoryRoot, "target")),
+    "latency-bench",
+  );
   rmSync(root, { recursive: true, force: true });
   const headDir = join(root, "head");
   const baseWork = join(root, "base");

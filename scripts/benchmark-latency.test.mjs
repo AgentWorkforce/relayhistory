@@ -134,6 +134,12 @@ test("with neither a base nor stored numbers, only budgets are checked", () => {
   assert.match(result.warnings[0], /only budgets are checked/);
 });
 
+test("a budgeted stage with no samples fails", () => {
+  const result = gate({ fs_event: { n: 0 } });
+  assert.equal(result.passed, false);
+  assert.equal(status(result, "samples"), "fail");
+});
+
 test("rounds fold to the median percentile, keeping the worst round visible", () => {
   const folded = aggregateRounds([
     { phase: "stages", metrics: { x: summary(1) } },
