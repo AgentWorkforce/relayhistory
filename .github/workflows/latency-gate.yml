@@ -49,8 +49,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # The base commit is measured beside the head on this runner.
+          # The base commit is measured beside the head on this runner; the
+          # full history is fetched here, so nothing later needs the token.
           fetch-depth: 0
+          persist-credentials: false
 
       - uses: dtolnay/rust-toolchain@stable
 
@@ -72,9 +74,10 @@ jobs:
       - name: Measure and gate
         env:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PROFILE: ${{ inputs.profile || 'gate' }}
         run: |
           node scripts/benchmark-latency.mjs --gate \
-            --profile "${{ inputs.profile || 'gate' }}" \
+            --profile "$PROFILE" \
             ${BASE_SHA:+--base "$BASE_SHA"} \
             --output "latency-${{ matrix.os }}.json" \
             --markdown "latency-${{ matrix.os }}.md"
