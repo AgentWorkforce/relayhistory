@@ -1,9 +1,9 @@
 # Machine identity and per-session trace ids live in the history database
 
-- **Status:** Proposed. The machine-id scheme is decided (Khaliq,
-  2026-10-25): the canonical hostname plus an install suffix, never the
-  hostname alone. The name privacy mode (`DEFAULT_MACHINE_NAME_PRIVACY`,
-  slug for now) is still open.
+- **Status:** Proposed. Decided by Khaliq on 2026-10-25: the machine id is
+  the canonical hostname plus an install suffix, never the hostname alone,
+  and it carries the plain slug (`DEFAULT_MACHINE_NAME_PRIVACY = Slug`) so
+  ids and object paths stay readable.
 - **Date:** 2026-10-25
 - **Related:** Sessions Pipeline Redesign, workstream W2;
   [plan 009](../../plans/009-local-history-cloud-boundary.md)
@@ -59,7 +59,8 @@ The 6-digit suffix is 24 bits. Among 1,000 machines that share one hostname,
 the chance that any two collide is about 3%. With 4 digits it would be about
 99.9%.
 
-`MachineNamePrivacy::Hashed` replaces the slug with `h` plus 12 hex digits of
+The default is the plain slug, for readability. `MachineNamePrivacy::Hashed`
+stays available as an option: it replaces the slug with `h` plus 12 hex digits of
 a SHA-256 of it. That keeps the hostname out of object keys, but hostnames are
 guessable, so the hash is pseudonymity, not anonymity. It stays deterministic
 so a name maps to one pseudonym.

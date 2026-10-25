@@ -70,8 +70,9 @@ impl MachineNamePrivacy {
     }
 }
 
-/// PENDING DECISION (Khaliq, sessions pipeline W2): whether ids carry the
-/// slug or its hash.
+/// How a new identity's id carries the machine name: the plain slug, so ids
+/// and object-storage paths stay readable. [`MachineNamePrivacy::Hashed`]
+/// remains available to an embedder that calls [`machine_id`] itself.
 pub const DEFAULT_MACHINE_NAME_PRIVACY: MachineNamePrivacy = MachineNamePrivacy::Slug;
 
 /// Hex digits of the install id the machine id carries. Six digits, 24 bits:
