@@ -1,0 +1,207 @@
+{
+  "date": "2026-10-25",
+  "cpu": "Apple M3",
+  "rust": "1.94.0",
+  "profile": "release",
+  "baseline": "d7ed1560",
+  "change": "6afd8d4e",
+  "sessions": 2000,
+  "samples_per_run": 500,
+  "warmup": 50,
+  "runs": [
+    {
+      "label": "before",
+      "run": 0,
+      "metrics": {
+        "list50": {
+          "p50": 0.2179,
+          "p95": 0.3492,
+          "p99": 0.5968
+        },
+        "write_to_list1": {
+          "p50": 0.3833,
+          "p95": 0.8183,
+          "p99": 2.637
+        }
+      }
+    },
+    {
+      "label": "after",
+      "run": 0,
+      "metrics": {
+        "list50": {
+          "p50": 0.2269,
+          "p95": 0.3701,
+          "p99": 0.532
+        },
+        "write_to_list1": {
+          "p50": 0.4037,
+          "p95": 0.7817,
+          "p99": 1.2821
+        }
+      }
+    },
+    {
+      "label": "after",
+      "run": 1,
+      "metrics": {
+        "list50": {
+          "p50": 0.2259,
+          "p95": 0.3539,
+          "p99": 0.522
+        },
+        "write_to_list1": {
+          "p50": 0.4082,
+          "p95": 0.7551,
+          "p99": 1.3137
+        }
+      }
+    },
+    {
+      "label": "before",
+      "run": 1,
+      "metrics": {
+        "list50": {
+          "p50": 0.2159,
+          "p95": 0.2639,
+          "p99": 0.385
+        },
+        "write_to_list1": {
+          "p50": 0.3972,
+          "p95": 0.687,
+          "p99": 3.6408
+        }
+      }
+    },
+    {
+      "label": "before",
+      "run": 2,
+      "metrics": {
+        "list50": {
+          "p50": 0.2149,
+          "p95": 0.242,
+          "p99": 0.3166
+        },
+        "write_to_list1": {
+          "p50": 0.3792,
+          "p95": 0.4886,
+          "p99": 1.2223
+        }
+      }
+    },
+    {
+      "label": "after",
+      "run": 2,
+      "metrics": {
+        "list50": {
+          "p50": 0.2157,
+          "p95": 0.2912,
+          "p99": 0.4022
+        },
+        "write_to_list1": {
+          "p50": 0.3799,
+          "p95": 0.5542,
+          "p99": 1.1651
+        }
+      }
+    },
+    {
+      "label": "after",
+      "run": 3,
+      "metrics": {
+        "list50": {
+          "p50": 0.2175,
+          "p95": 0.2426,
+          "p99": 0.3598
+        },
+        "write_to_list1": {
+          "p50": 0.3693,
+          "p95": 0.49,
+          "p99": 1.143
+        }
+      }
+    },
+    {
+      "label": "before",
+      "run": 3,
+      "metrics": {
+        "list50": {
+          "p50": 0.2165,
+          "p95": 0.2618,
+          "p99": 0.3646
+        },
+        "write_to_list1": {
+          "p50": 0.3997,
+          "p95": 0.6068,
+          "p99": 1.5992
+        }
+      }
+    },
+    {
+      "label": "before",
+      "run": 4,
+      "metrics": {
+        "list50": {
+          "p50": 0.2114,
+          "p95": 0.2272,
+          "p99": 0.2567
+        },
+        "write_to_list1": {
+          "p50": 0.3754,
+          "p95": 0.4683,
+          "p99": 1.0099
+        }
+      }
+    },
+    {
+      "label": "after",
+      "run": 4,
+      "metrics": {
+        "list50": {
+          "p50": 0.2279,
+          "p95": 0.4757,
+          "p99": 0.8283
+        },
+        "write_to_list1": {
+          "p50": 0.4146,
+          "p95": 0.9419,
+          "p99": 1.5603
+        }
+      }
+    },
+    {
+      "label": "concurrent",
+      "run": 0,
+      "metrics": {
+        "list50": {
+          "p50": 0.2196,
+          "p95": 0.3354,
+          "p99": 0.4843
+        },
+        "write_to_list1": {
+          "p50": 0.3965,
+          "p95": 1.1147,
+          "p99": 3.0997
+        }
+      },
+      "output": "\nrunning 1 test\npruned (rows, sessions)=(0, 0)\nlist50: p50=0.2196ms p95=0.3354ms p99=0.4843ms n=500\nwrite_to_list1: p50=0.3965ms p95=1.1147ms p99=3.0997ms n=500\ntest local_retention_read_path_measurement ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.63s\n\n"
+    },
+    {
+      "label": "concurrent",
+      "run": 1,
+      "metrics": {
+        "list50": {
+          "p50": 0.2366,
+          "p95": 0.5234,
+          "p99": 0.9617
+        },
+        "write_to_list1": {
+          "p50": 0.4447,
+          "p95": 1.1798,
+          "p99": 1.8274
+        }
+      },
+      "output": "\nrunning 1 test\npruned (rows, sessions)=(0, 4)\nlist50: p50=0.2366ms p95=0.5234ms p99=0.9617ms n=500\nwrite_to_list1: p50=0.4447ms p95=1.1798ms p99=1.8274ms n=500\ntest local_retention_read_path_measurement ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.91s\n\n"
+    }
+  ]
+}

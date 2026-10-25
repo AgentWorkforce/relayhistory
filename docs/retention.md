@@ -124,3 +124,6 @@ The schema adds `store_settings`, `retention_consumers`, `retention_sweep` and
 `retention_pending`. It adds no indexes or triggers to captured evidence tables.
 Partial batches can leave a session with some logs already evicted until its
 next batch; clients should not treat an expiring session as an archival copy.
+
+Focused before/after timings and their scope are recorded in
+[the W1 measurement report](retention-benchmarks.md).
