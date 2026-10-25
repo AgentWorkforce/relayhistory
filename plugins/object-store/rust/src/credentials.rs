@@ -144,6 +144,24 @@ mod provider {
         }
     }
 
+    /// A vendor outage (timeout, 503) must stay retryable: carry it as
+    /// `Generic` with the original `Error` as source, which `Error::from_store`
+    /// classifies by `is_retryable()`. Anything else is an authentication
+    /// failure.
+    fn vend_error(err: crate::Error) -> object_store::Error {
+        if err.is_retryable() {
+            object_store::Error::Generic {
+                store: "credential-vendor",
+                source: Box::new(err),
+            }
+        } else {
+            object_store::Error::Unauthenticated {
+                path: String::new(),
+                source: Box::new(err),
+            }
+        }
+    }
+
     #[async_trait]
     impl<T: Send + Sync + 'static> object_store::CredentialProvider for VendedProvider<T> {
         type Credential = T;
@@ -156,12 +174,7 @@ mod provider {
                     return Ok(Arc::clone(credential));
                 }
             }
-            let vended = self.vendor.vend(&self.scope).await.map_err(|e| {
-                object_store::Error::Unauthenticated {
-                    path: String::new(),
-                    source: Box::new(e),
-                }
-            })?;
+            let vended = self.vendor.vend(&self.scope).await.map_err(vend_error)?;
             let expires_at = vended.expires_at();
             let kind = vended.kind();
             let credential =
@@ -257,6 +270,32 @@ mod tests {
             err.contains("gcp-bearer credential for a s3 store"),
             "{err}"
         );
+    }
+
+    struct DownVendor;
+
+    #[async_trait]
+    impl CredentialVendor for DownVendor {
+        async fn vend(&self, _scope: &CredentialScope) -> Result<VendedCredential> {
+            Err(crate::Error::Transient {
+                backend: "vendor",
+                source: "credential broker returned 503".into(),
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn vendor_outage_stays_retryable() {
+        let scope = CredentialScope {
+            backend: "gcs",
+            bucket: "b".into(),
+            prefix: None,
+        };
+        let provider: VendedProvider<String> =
+            VendedProvider::new(Arc::new(DownVendor), scope, |_| None);
+        let err = provider.get_credential().await.unwrap_err();
+        let mapped = crate::Error::from_store("gcs", "k", err);
+        assert!(mapped.is_retryable(), "{mapped:?}");
     }
 
     #[test]

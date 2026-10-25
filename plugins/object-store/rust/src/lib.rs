@@ -199,6 +199,22 @@ impl ObjectMeta {
     }
 }
 
+/// Body and attributes from one [`ObjectStore::get_object`] response.
+pub struct GetObject {
+    /// Attributes of the whole object (not of the range), including its
+    /// version and user metadata.
+    pub meta: ObjectMeta,
+    pub body: ByteStream,
+}
+
+impl std::fmt::Debug for GetObject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GetObject")
+            .field("meta", &self.meta)
+            .finish_non_exhaustive()
+    }
+}
+
 /// One page of a listing. Pass `next_cursor` back to continue; `None` means
 /// the listing is complete. Cursors are opaque.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,7 +249,16 @@ pub trait ObjectStore: Send + Sync + std::fmt::Debug {
 
     /// Stream the body, or the half-open byte `range` of it.
     /// [`Error::NotFound`] when the object does not exist.
-    async fn get(&self, key: &ObjectKey, range: Option<Range<u64>>) -> Result<ByteStream>;
+    async fn get(&self, key: &ObjectKey, range: Option<Range<u64>>) -> Result<ByteStream> {
+        Ok(self.get_object(key, range).await?.body)
+    }
+
+    /// Like [`ObjectStore::get`], plus the attributes and version **of the
+    /// same response**. A compare-and-swap writer (the manifest protocol) must
+    /// take `meta.version` from here: a separate `head` could describe a newer
+    /// version than the body it read, and the next `if_match` write would then
+    /// silently discard the other writer's change.
+    async fn get_object(&self, key: &ObjectKey, range: Option<Range<u64>>) -> Result<GetObject>;
 
     /// List objects whose key starts with `prefix` on a `/` boundary, in
     /// lexicographic key order, at most [`DEFAULT_PAGE_SIZE`] per page.

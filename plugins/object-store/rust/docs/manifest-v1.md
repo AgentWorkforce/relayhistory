@@ -130,8 +130,11 @@ Readers ignore unknown fields. Writers preserve them.
 
 Every manifest write, by either side, follows the same steps:
 
-1. **Read.** `get` the manifest and keep its `ObjectVersion` (S3/Azure ETag, GCS
-   generation).
+1. **Read.** `get_object` the manifest and keep `meta.version` (S3/Azure ETag,
+   GCS generation) **from that same response**. Never pair a body with the
+   version from a separate `head`: another writer can commit in between, and
+   the next conditional write would then silently discard that writer's
+   change.
 2. **Modify only owned fields** on that copy (see [Ownership](#ownership)).
    Set `revision = read.revision + 1` and `updated_at = now`.
 3. **Write.** First write: `PutOpts::create()`. Every later write:

@@ -23,12 +23,12 @@ macro_rules! delegate_object_store {
                 self.core.head(key).await
             }
 
-            async fn get(
+            async fn get_object(
                 &self,
                 key: &$crate::ObjectKey,
                 range: Option<std::ops::Range<u64>>,
-            ) -> $crate::Result<$crate::ByteStream> {
-                self.core.get(key, range).await
+            ) -> $crate::Result<$crate::GetObject> {
+                self.core.get_object(key, range).await
             }
 
             async fn list(

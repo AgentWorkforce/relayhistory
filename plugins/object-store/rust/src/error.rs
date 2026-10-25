@@ -113,6 +113,10 @@ impl Error {
 fn is_transient(err: &(dyn std::error::Error + 'static)) -> bool {
     let mut current = Some(err);
     while let Some(e) = current {
+        // A vended-credential outage surfaces as this crate's own error.
+        if let Some(own) = e.downcast_ref::<Error>() {
+            return own.is_retryable();
+        }
         #[cfg(any(feature = "s3", feature = "gcs", feature = "azure"))]
         if e.downcast_ref::<object_store::client::HttpError>()
             .is_some()

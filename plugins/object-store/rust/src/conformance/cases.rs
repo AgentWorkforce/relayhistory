@@ -101,19 +101,28 @@ pub(super) async fn compare_and_swap(store: &dyn ObjectStore, base: &ObjectKey) 
         .put(&k, Bytes::from_static(b"{\"v\":1}"), PutOpts::create())
         .await
         .map_err(|e| format!("create manifest: {e}"))?;
-    let head = store
-        .head(&k)
+    // The protocol's read: body and version from the same response.
+    let current = store
+        .get_object(&k, None)
         .await
-        .map_err(|e| e.to_string())?
-        .ok_or("manifest vanished")?;
+        .map_err(|e| format!("get_object: {e}"))?;
+    ensure!(
+        current.meta.version.e_tag.is_some() || current.meta.version.version.is_some(),
+        "get_object returned no version"
+    );
+    ensure!(
+        current.meta.content_sha256() == Some(v1.content_sha256.as_str()),
+        "get_object metadata {:?}",
+        current.meta.metadata
+    );
     let v2 = store
         .put(
             &k,
             Bytes::from_static(b"{\"v\":2}"),
-            PutOpts::replace(head.version.clone()),
+            PutOpts::replace(current.meta.version.clone()),
         )
         .await
-        .map_err(|e| format!("CAS with current version (from head): {e}"))?;
+        .map_err(|e| format!("CAS with the version from get_object: {e}"))?;
     match store
         .put(
             &k,

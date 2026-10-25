@@ -25,7 +25,7 @@ use url::Url;
 use crate::codec::{infer_content_type, sha256_hex};
 use crate::metadata::{attributes, checked_user_metadata, user_metadata, with_digest};
 use crate::{
-    ByteStream, Error, Metadata, MultipartOpts, MultipartUpload, ObjectKey, ObjectMeta,
+    ByteStream, Error, GetObject, Metadata, MultipartOpts, MultipartUpload, ObjectKey, ObjectMeta,
     ObjectVersion, Page, PutAck, PutOpts, Result, DEFAULT_PAGE_SIZE, MAX_PRESIGN_TTL,
     META_CONTENT_SHA256, META_TRACE_ID,
 };
@@ -77,6 +77,23 @@ pub(crate) trait Backend: Send + Sync + std::fmt::Debug + 'static {
         ))
     }
 
+    /// User metadata of a `get` response. Cloud responses carry it as
+    /// attributes; `FsStore` reads its sidecar for the returned version.
+    async fn metadata_of_get(
+        &self,
+        _path: &Path,
+        _meta: &object_store::ObjectMeta,
+        attributes: &object_store::Attributes,
+    ) -> object_store::Result<Metadata> {
+        Ok(user_metadata(attributes, Self::META_SEPARATOR))
+    }
+
+    /// Held across a multipart commit. `FsStore` returns its write lock so a
+    /// commit cannot interleave with a compare-and-swap.
+    async fn commit_guard(&self) -> Result<Option<Box<dyn Send>>> {
+        Ok(None)
+    }
+
     /// Objects under `prefix` with keys strictly greater than `offset`, in
     /// ascending key order. Cloud listings are already ordered.
     fn list_objects(
@@ -106,7 +123,26 @@ pub(crate) trait Backend: Send + Sync + std::fmt::Debug + 'static {
     }
 
     /// Called after a multipart upload committed.
-    async fn finish_multipart(&self, _path: &Path, _metadata: &Metadata) -> Result<()> {
+    async fn finish_multipart(
+        &self,
+        _path: &Path,
+        _result: &PutResult,
+        _metadata: &Metadata,
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Called when a create found identical bytes stored without the
+    /// adapter's digest metadata. Cloud metadata is atomic with the object, so
+    /// there it means another tool wrote the object and is left alone; `FsStore`
+    /// keeps metadata in a sidecar that a crash can lose, and rewrites it.
+    async fn repair_metadata(
+        &self,
+        _path: &Path,
+        _e_tag: Option<&str>,
+        _metadata: &Metadata,
+        _content_type: &str,
+    ) -> Result<()> {
         Ok(())
     }
 }
@@ -214,7 +250,10 @@ impl<B: Backend> Core<B> {
             Err(
                 object_store::Error::AlreadyExists { .. }
                 | object_store::Error::Precondition { .. },
-            ) if is_create => self.reconcile_existing(key, &sha, size).await,
+            ) if is_create => {
+                self.reconcile_existing(key, &sha, size, &metadata, &content_type)
+                    .await
+            }
             // S3 reports `If-Match` against a missing object as 404; the
             // contract is "your version is stale" either way.
             Err(object_store::Error::NotFound { .. }) if is_update => {
@@ -228,7 +267,14 @@ impl<B: Backend> Core<B> {
 
     /// An `if_none_match` put hit an existing object: succeed if it holds the
     /// same bytes, otherwise report the conflict.
-    async fn reconcile_existing(&self, key: &ObjectKey, sha: &str, size: u64) -> Result<PutAck> {
+    async fn reconcile_existing(
+        &self,
+        key: &ObjectKey,
+        sha: &str,
+        size: u64,
+        metadata: &Metadata,
+        content_type: &str,
+    ) -> Result<PutAck> {
         let Some(existing) = self.head(key).await? else {
             // Deleted between the failed create and the head; the caller's
             // retry will create it.
@@ -237,14 +283,25 @@ impl<B: Backend> Core<B> {
                 source: format!("{key} vanished while reconciling a create").into(),
             });
         };
-        let stored_sha = match existing.content_sha256() {
-            Some(stored) => stored.to_string(),
-            // Written by another tool or a backend that drops metadata: hash
-            // the stored body instead. Chunks are bounded, so this is cheap.
+        let recorded = existing.content_sha256().map(str::to_string);
+        let stored_sha = match &recorded {
+            Some(stored) => stored.clone(),
+            // Written by another tool, or metadata lost or stale: hash the
+            // stored body instead. Chunks are bounded, so this is cheap.
             None => sha256_hex(&self.read_all(key).await?),
         };
         if existing.size == size && stored_sha.eq_ignore_ascii_case(sha) {
             tracing::debug!(key = %key, "idempotent re-put of identical content");
+            if recorded.is_none() {
+                self.backend
+                    .repair_metadata(
+                        &key.to_path(),
+                        existing.version.e_tag.as_deref(),
+                        metadata,
+                        content_type,
+                    )
+                    .await?;
+            }
             Ok(PutAck {
                 key: key.clone(),
                 version: existing.version,
@@ -278,11 +335,11 @@ impl<B: Backend> Core<B> {
         }
     }
 
-    pub(crate) async fn get(
+    pub(crate) async fn get_object(
         &self,
         key: &ObjectKey,
         range: Option<Range<u64>>,
-    ) -> Result<ByteStream> {
+    ) -> Result<GetObject> {
         if let Some(r) = &range {
             if r.start >= r.end {
                 return Err(Error::InvalidArgument(format!("empty range {r:?}")));
@@ -300,11 +357,23 @@ impl<B: Backend> Core<B> {
             .instrument(span)
             .await
             .map_err(|e| self.err(key, e))?;
+        let path = key.to_path();
+        let metadata = self
+            .backend
+            .metadata_of_get(&path, &result.meta, &result.attributes)
+            .await
+            .map_err(|e| self.err(key, e))?;
+        let meta = object_meta(key.clone(), &result.meta, metadata);
         let key = key.to_string();
-        Ok(result
+        let body = result
             .into_stream()
             .map_err(move |e| Error::from_store(B::NAME, &key, e))
-            .boxed())
+            .boxed();
+        Ok(GetObject { meta, body })
+    }
+
+    async fn get(&self, key: &ObjectKey, range: Option<Range<u64>>) -> Result<ByteStream> {
+        Ok(self.get_object(key, range).await?.body)
     }
 
     pub(crate) async fn list(
@@ -385,6 +454,7 @@ impl<B: Backend> Core<B> {
             expected_sha,
             hasher: Sha256::new(),
             size: 0,
+            failed: false,
         }))
     }
 }
@@ -398,23 +468,52 @@ struct CoreUpload<B> {
     expected_sha: Option<String>,
     hasher: Sha256,
     size: u64,
+    /// Set when a part failed. `object_store` numbers a part when it is
+    /// submitted, so a failed part leaves a hole that a retry cannot fill:
+    /// the upload must be aborted and restarted.
+    failed: bool,
+}
+
+impl<B: Backend> CoreUpload<B> {
+    fn check_usable(&self) -> Result<()> {
+        if self.failed {
+            return Err(Error::InvalidArgument(format!(
+                "multipart upload of {} had a failed part; abort it and start a new upload",
+                self.key
+            )));
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
 impl<B: Backend> MultipartUpload for CoreUpload<B> {
     async fn put_part(&mut self, part: Bytes) -> Result<()> {
+        self.check_usable()?;
         if part.is_empty() {
             return Err(Error::InvalidArgument("empty multipart part".into()));
         }
-        self.hasher.update(&part);
-        self.size += part.len() as u64;
-        self.inner
-            .put_part(PutPayload::from_bytes(part))
+        let len = part.len() as u64;
+        match self
+            .inner
+            .put_part(PutPayload::from_bytes(part.clone()))
             .await
-            .map_err(|e| Error::from_store(B::NAME, self.key.as_str(), e))
+        {
+            Ok(()) => {
+                // Only parts the backend accepted count toward the digest.
+                self.hasher.update(&part);
+                self.size += len;
+                Ok(())
+            }
+            Err(e) => {
+                self.failed = true;
+                Err(Error::from_store(B::NAME, self.key.as_str(), e))
+            }
+        }
     }
 
     async fn complete(mut self: Box<Self>) -> Result<PutAck> {
+        self.check_usable()?;
         let trace_id = self
             .metadata
             .get(META_TRACE_ID)
@@ -442,13 +541,14 @@ impl<B: Backend> MultipartUpload for CoreUpload<B> {
                     });
                 }
             }
+            let _guard = self.backend.commit_guard().await?;
             let result = self
                 .inner
                 .complete()
                 .await
                 .map_err(|e| Error::from_store(B::NAME, self.key.as_str(), e))?;
             self.backend
-                .finish_multipart(&self.path, &self.metadata)
+                .finish_multipart(&self.path, &result, &self.metadata)
                 .await?;
             Ok(PutAck {
                 key: self.key.clone(),

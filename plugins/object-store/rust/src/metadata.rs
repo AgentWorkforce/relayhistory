@@ -7,6 +7,14 @@ use crate::{Error, Metadata, Result, META_CONTENT_SHA256};
 /// S3's limit on the total size of user metadata, the strictest of the three.
 const MAX_METADATA_BYTES: usize = 2048;
 
+/// Room the adapter keeps for its own `content-sha256` entry (key plus a
+/// 64-character hex digest), so caller metadata that validates still fits on
+/// S3 once the digest is added.
+const RESERVED_DIGEST_BYTES: usize = META_CONTENT_SHA256.len() + 64;
+
+/// Largest total caller metadata accepted.
+pub(crate) const MAX_USER_METADATA_BYTES: usize = MAX_METADATA_BYTES - RESERVED_DIGEST_BYTES;
+
 /// Validate user metadata and add the content digest.
 pub(crate) fn with_digest(metadata: Metadata, sha: &str) -> Result<Metadata> {
     let mut metadata = checked_user_metadata(metadata)?;
@@ -25,7 +33,8 @@ pub(crate) fn checked_user_metadata(metadata: Metadata) -> Result<Metadata> {
 
 /// Metadata must survive every backend unchanged: S3 lowercases keys, Azure
 /// requires C# identifiers (handled by `Backend::META_SEPARATOR`, which is why
-/// `_` is not allowed here), and S3 caps the total at 2 KiB.
+/// `_` is not allowed here), and S3 caps the total at 2 KiB, which includes the
+/// adapter's own digest entry.
 pub(crate) fn validate_metadata(metadata: Metadata) -> Result<Metadata> {
     let mut total = 0;
     for (k, v) in &metadata {
@@ -46,9 +55,10 @@ pub(crate) fn validate_metadata(metadata: Metadata) -> Result<Metadata> {
         }
         total += k.len() + v.len();
     }
-    if total > MAX_METADATA_BYTES {
+    if total > MAX_USER_METADATA_BYTES {
         return Err(Error::InvalidArgument(format!(
-            "metadata is {total} bytes; the limit is {MAX_METADATA_BYTES}"
+            "metadata is {total} bytes; the limit is {MAX_USER_METADATA_BYTES} \
+             ({MAX_METADATA_BYTES} minus {RESERVED_DIGEST_BYTES} reserved for `{META_CONTENT_SHA256}`)"
         )));
     }
     Ok(metadata)
@@ -80,4 +90,26 @@ pub(crate) fn user_metadata(attrs: &Attributes, separator: char) -> Metadata {
             _ => None,
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sized(total: usize) -> Metadata {
+        // key "k" (1 byte) plus a value making up the rest.
+        [("k".to_string(), "v".repeat(total - 1))].into()
+    }
+
+    #[test]
+    fn caller_metadata_leaves_room_for_the_digest() {
+        let sha = "a".repeat(64);
+        let fits = with_digest(sized(MAX_USER_METADATA_BYTES), &sha).unwrap();
+        let total: usize = fits.iter().map(|(k, v)| k.len() + v.len()).sum();
+        assert_eq!(
+            total, MAX_METADATA_BYTES,
+            "digest fills the reserve exactly"
+        );
+        assert!(with_digest(sized(MAX_USER_METADATA_BYTES + 1), &sha).is_err());
+    }
 }

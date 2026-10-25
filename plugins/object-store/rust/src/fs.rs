@@ -54,6 +54,11 @@ impl FsConfig {
 struct Sidecar {
     content_type: String,
     metadata: Metadata,
+    /// ETag of the object version this sidecar describes. A sidecar whose
+    /// `e_tag` does not match the current object (a crash between the object
+    /// write and the sidecar write) is ignored, never trusted.
+    #[serde(default)]
+    e_tag: Option<String>,
 }
 
 #[derive(Debug)]
@@ -70,12 +75,14 @@ impl FsBackend {
     async fn write_sidecar(
         &self,
         path: &Path,
+        e_tag: Option<&str>,
         metadata: &Metadata,
         content_type: &str,
     ) -> object_store::Result<()> {
         let sidecar = Sidecar {
             content_type: content_type.to_string(),
             metadata: metadata.clone(),
+            e_tag: e_tag.map(str::to_string),
         };
         let body = serde_json::to_vec(&sidecar).map_err(|e| generic(e.into()))?;
         self.store
@@ -88,7 +95,13 @@ impl FsBackend {
             .map(|_| ())
     }
 
-    async fn read_metadata(&self, path: &Path) -> object_store::Result<Metadata> {
+    /// Metadata of the object whose current ETag is `e_tag`; empty when the
+    /// sidecar is missing, torn, or describes a different version.
+    async fn read_metadata(
+        &self,
+        path: &Path,
+        e_tag: Option<&str>,
+    ) -> object_store::Result<Metadata> {
         let result = self
             .store
             .get_opts(&Self::sidecar_path(path), Default::default())
@@ -96,9 +109,11 @@ impl FsBackend {
         match result {
             Ok(result) => {
                 let body = result.bytes().await?;
-                // A torn or foreign sidecar degrades to "no metadata"; the
-                // idempotency check then falls back to hashing the body.
+                // A torn, foreign or stale sidecar degrades to "no metadata";
+                // the idempotency check then hashes the body instead.
                 Ok(serde_json::from_slice::<Sidecar>(&body)
+                    .ok()
+                    .filter(|s| s.e_tag.is_some() && s.e_tag.as_deref() == e_tag)
                     .map(|s| s.metadata)
                     .unwrap_or_default())
             }
@@ -163,19 +178,52 @@ impl Backend for FsBackend {
                     .store
                     .put_opts(path, payload, PutOptions::default())
                     .await?;
-                self.write_sidecar(path, metadata, content_type).await?;
+                self.write_sidecar(path, result.e_tag.as_deref(), metadata, content_type)
+                    .await?;
                 return Ok(result);
             }
-            mode => {
+            PutMode::Overwrite => {
+                // Replacements take the same lock as compare-and-swap, so an
+                // unconditional write cannot land between a CAS's compare and
+                // its rename.
+                let _guard = self.lock().await?;
+                let result = self
+                    .store
+                    .put_opts(path, payload, PutOptions::default())
+                    .await?;
+                self.write_sidecar(path, result.e_tag.as_deref(), metadata, content_type)
+                    .await?;
+                return Ok(result);
+            }
+            PutMode::Create => {
+                // A hard link is atomic and never replaces anything.
                 let opts = PutOptions {
-                    mode,
+                    mode: PutMode::Create,
                     ..PutOptions::default()
                 };
                 self.store.put_opts(path, payload, opts).await?
             }
         };
-        self.write_sidecar(path, metadata, content_type).await?;
+        self.write_sidecar(path, result.e_tag.as_deref(), metadata, content_type)
+            .await?;
         Ok(result)
+    }
+
+    async fn metadata_of_get(
+        &self,
+        path: &Path,
+        meta: &object_store::ObjectMeta,
+        _attributes: &object_store::Attributes,
+    ) -> object_store::Result<Metadata> {
+        self.read_metadata(path, meta.e_tag.as_deref()).await
+    }
+
+    async fn commit_guard(&self) -> Result<Option<Box<dyn Send>>> {
+        let file = self
+            .lock()
+            .await
+            .map_err(|e| Error::from_store(Self::NAME, "", e))?;
+        Ok(Some(Box::new(file)))
     }
 
     async fn head_object(
@@ -183,7 +231,8 @@ impl Backend for FsBackend {
         path: &Path,
     ) -> object_store::Result<(object_store::ObjectMeta, Metadata)> {
         let meta = self.store.head(path).await?;
-        Ok((meta, self.read_metadata(path).await?))
+        let metadata = self.read_metadata(path, meta.e_tag.as_deref()).await?;
+        Ok((meta, metadata))
     }
 
     fn list_objects(
@@ -231,9 +280,27 @@ impl Backend for FsBackend {
             .await
     }
 
-    async fn finish_multipart(&self, path: &Path, metadata: &Metadata) -> Result<()> {
+    async fn finish_multipart(
+        &self,
+        path: &Path,
+        result: &PutResult,
+        metadata: &Metadata,
+    ) -> Result<()> {
         let content_type = crate::codec::infer_content_type(path.as_ref());
-        self.write_sidecar(path, metadata, content_type)
+        self.write_sidecar(path, result.e_tag.as_deref(), metadata, content_type)
+            .await
+            .map_err(|e| Error::from_store(Self::NAME, path.as_ref(), e))
+    }
+
+    /// Rewrite a sidecar that was lost or went stale (see `Backend`).
+    async fn repair_metadata(
+        &self,
+        path: &Path,
+        e_tag: Option<&str>,
+        metadata: &Metadata,
+        content_type: &str,
+    ) -> Result<()> {
+        self.write_sidecar(path, e_tag, metadata, content_type)
             .await
             .map_err(|e| Error::from_store(Self::NAME, path.as_ref(), e))
     }
@@ -282,5 +349,67 @@ impl FsStore {
 
     pub fn root(&self) -> &std::path::Path {
         &self.core.backend().root
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{ObjectKey, ObjectStore as _, PutOpts};
+
+    fn store() -> (tempfile::TempDir, FsStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FsStore::new(FsConfig::new(dir.path())).unwrap();
+        (dir, store)
+    }
+
+    #[tokio::test]
+    async fn lost_sidecar_is_repaired_by_an_idempotent_retry() {
+        let (dir, store) = store();
+        let key = ObjectKey::new("s/raw/0000000000-0-aaaaaaaa.jsonl.zst").unwrap();
+        let body = Bytes::from_static(b"chunk");
+        store
+            .put(&key, body.clone(), PutOpts::create().with_trace_id("t-1"))
+            .await
+            .unwrap();
+        // Crash between object write and sidecar write.
+        std::fs::remove_file(
+            dir.path()
+                .join(".rh/meta/s/raw/0000000000-0-aaaaaaaa.jsonl.zst.json"),
+        )
+        .unwrap();
+        assert!(store.head(&key).await.unwrap().unwrap().metadata.is_empty());
+
+        let ack = store
+            .put(&key, body, PutOpts::create().with_trace_id("t-1"))
+            .await
+            .unwrap();
+        assert!(!ack.created);
+        let meta = store.head(&key).await.unwrap().unwrap();
+        assert_eq!(meta.trace_id(), Some("t-1"));
+        assert_eq!(meta.content_sha256(), Some(ack.content_sha256.as_str()));
+    }
+
+    #[tokio::test]
+    async fn stale_sidecar_is_never_trusted() {
+        let (dir, store) = store();
+        let key = ObjectKey::new("s/manifest.json").unwrap();
+        store
+            .put(&key, Bytes::from_static(b"old!"), PutOpts::create())
+            .await
+            .unwrap();
+        // Crash after replacing the body but before the sidecar: same length,
+        // different bytes, old sidecar left behind.
+        std::fs::write(dir.path().join("s/manifest.json"), b"new!").unwrap();
+        assert!(
+            store.head(&key).await.unwrap().unwrap().metadata.is_empty(),
+            "sidecar for another version must be ignored"
+        );
+        // A create retry of the *old* bytes must not be acknowledged.
+        let err = store
+            .put(&key, Bytes::from_static(b"old!"), PutOpts::create())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::AlreadyExists { .. }), "{err:?}");
     }
 }
