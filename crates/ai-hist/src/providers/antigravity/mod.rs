@@ -88,9 +88,9 @@ impl ShallowSessionProvider for Provider {
                     format::role(r) == Some("user")
                         && r["status"] == "DONE"
                         && r["is_truncated"] != true
-                        && !r["truncated_fields"]
+                        && r["truncated_fields"]
                             .as_array()
-                            .is_some_and(|fields| !fields.is_empty())
+                            .is_none_or(|fields| fields.is_empty())
                 })
                 .and_then(format::text)
                 .map(str::to_owned),

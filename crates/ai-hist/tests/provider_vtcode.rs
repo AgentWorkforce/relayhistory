@@ -24,6 +24,8 @@ fn sid(home: &Path) -> String {
     sid_named(home, NATIVE)
 }
 fn sid_named(home: &Path, native: &str) -> String {
+    // Existing workspace aliases share the provider's canonical namespace.
+    let home = std::fs::canonicalize(home).expect("existing synthetic workspace");
     format!(
         "root:{:x}:{native}",
         Sha256::digest(home.join(".vtcode/sessions").to_string_lossy().as_bytes())
@@ -52,6 +54,66 @@ fn contains(evidence: &ai_hist::SessionEvidence, text: &str) -> bool {
         .iter()
         .flat_map(|m| &m.blocks)
         .any(|block| block.text.as_deref() == Some(text))
+}
+
+#[cfg(unix)]
+#[test]
+fn workspace_alias_discovers_and_hydrates_the_canonical_native_identity() {
+    let parent = tempfile::tempdir().unwrap();
+    let workspace = parent.path().join("workspace");
+    std::fs::create_dir(&workspace).unwrap();
+    let alias = parent.path().join("workspace-alias");
+    std::os::unix::fs::symlink(&workspace, &alias).unwrap();
+    let staged = stage(&alias);
+    let store = open(&alias);
+    let report = store
+        .discover(DiscoveryOptions::default().sources([Source::Vtcode]))
+        .unwrap();
+    assert_eq!(report.discovered, 1, "{report:?}");
+    assert!(report.diagnostics.is_empty(), "{report:?}");
+    let mut query = CatalogQuery::default();
+    query.sources = Some(vec![Source::Vtcode]);
+    let rows = store
+        .sessions(query)
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    let canonical = std::fs::canonicalize(&workspace).unwrap();
+    let expected = format!(
+        "root:{:x}:{NATIVE}",
+        Sha256::digest(
+            canonical
+                .join(".vtcode/sessions")
+                .to_string_lossy()
+                .as_bytes()
+        )
+    );
+    assert_eq!(rows[0].session_id, expected);
+    assert_eq!(
+        rows[0].raw_path,
+        Some(std::fs::canonicalize(staged).unwrap())
+    );
+    eprintln!(
+        "VTCode alias discovery registered one canonical row: {:?}; raw_path={:?}",
+        rows[0].session_id, rows[0].raw_path
+    );
+    assert_eq!(
+        sid(&alias),
+        rows[0].session_id,
+        "the fixture must hash the provider's canonical workspace root"
+    );
+    store
+        .hydrate(&rows[0].session_ref(), HydrateOptions::default())
+        .unwrap();
+    assert!(contains(
+        &evidence(&store, &expected),
+        "I found one safe fixture file."
+    ));
+    assert_eq!(
+        sid(&workspace),
+        expected,
+        "alias and target must share one fixture identity"
+    );
 }
 
 #[test]

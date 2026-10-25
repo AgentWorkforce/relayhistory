@@ -66,7 +66,7 @@ impl SweepScope {
 
     /// Whether this is a full sweep.
     pub(crate) fn is_everything(&self) -> bool {
-        self.only.is_none()
+        self.only.is_none() && self.paths.is_none()
     }
 
     /// Whether the sweep reads `source`.
@@ -106,6 +106,16 @@ pub(super) fn discover_for_sweep(
 }
 
 /// The sources with a local sweep phase, in the order the sweep runs them.
+/// Count history only when its total will actually be printed.
+pub(super) fn note_total(conn: &Connection) -> Result<()> {
+    sync_note!(
+        "  Total: {} entries",
+        conn.query_row("SELECT COUNT(*) FROM history", [], |row| row
+            .get::<_, i64>(0))?
+    );
+    Ok(())
+}
+
 #[cfg(test)]
 const SWEEP_PHASE_SOURCES: &[&str] = &[
     "claude", "codex", "cursor", "grok", "muse", "opencode", "devin",

@@ -522,7 +522,7 @@ fn codex_scope_as(scope: &PathScope, encode: impl Fn(&Path) -> PathBuf) -> PathS
     .unwrap_or_else(|| scope.clone())
 }
 
-fn is_codex_rollout_locator(path: &Path) -> bool {
+pub(super) fn is_codex_rollout_locator(path: &Path) -> bool {
     path.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
         && path
             .file_name()

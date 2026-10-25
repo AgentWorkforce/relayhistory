@@ -1789,10 +1789,28 @@ fn a_root_recreated_between_backstops_is_watched_without_waiting_for_one() {
 
     let refreshes = Arc::new(AtomicUsize::new(0));
     let counted = refreshes.clone();
+    // Pause the loop after it reports lost coverage. This makes the old
+    // quiet-period race deterministic even on a lightly loaded runner.
+    let recovery = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+    let recovery_callback = recovery.clone();
+    let pending_root = root.clone();
     let running = RunningLoop::reporting({
         let root = root.clone();
         move |watch| {
             watch
+                .on_driver(Arc::new(move |status| {
+                    if status.pending.contains(&pending_root) {
+                        let (released, wake) = &*recovery_callback;
+                        // A failing assertion must not strand the watch thread.
+                        let _ = wake
+                            .wait_timeout_while(
+                                released.lock().unwrap(),
+                                ARRIVES_WITHIN,
+                                |released| !*released,
+                            )
+                            .unwrap();
+                    }
+                }))
                 .with_immediate(false)
                 .with_fs_events(true)
                 .with_roots(vec![ai_hist::discover::WatchRoot::tree(root.clone())])
@@ -1847,10 +1865,32 @@ fn a_root_recreated_between_backstops_is_watched_without_waiting_for_one() {
     }
     std::fs::create_dir_all(&root).expect("recreate the root");
 
-    // From quiet: the removal itself matched the root and drove a tick of its
-    // own, and reading that one as the write's would prove nothing. This is
-    // the trap rounds 7 and 8 fell into.
-    running.settle("after recreating the directory");
+    // Quiet only describes delivered ticks: it does not prove registration.
+    running.settle("while the recovery callback is held");
+    assert!(
+        running.watch.status().unwrap().pending.contains(&root),
+        "the old 400ms quiet precondition can precede reattachment"
+    );
+    {
+        let (released, wake) = &*recovery;
+        *released.lock().unwrap() = true;
+        wake.notify_all();
+    }
+    let deadline = std::time::Instant::now() + ARRIVES_WITHIN;
+    loop {
+        let status = running.watch.status().expect("recovery status");
+        if status.watched.contains(&root) && !status.pending.contains(&root) {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the recreated root was not registered before the backstop: {status:?}"
+        );
+        std::thread::yield_now();
+    }
+    // Registration is a prerequisite, not proof of backend delivery. Consume
+    // removal/trailing ticks, then require a real event from the new directory.
+    running.settle("after recovering the directory registration");
     std::fs::write(root.join("rollout-2.jsonl"), "{}\n").expect("write under the new root");
     assert_eq!(
         running.next_tick(),

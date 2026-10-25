@@ -228,3 +228,52 @@ fn observed_target(
     }
     Ok(Some(target))
 }
+/// Whether any transcript this session is built from ended its last pass with
+/// records held back.
+///
+/// The session's own transcript is not the only one that defers: every Claude
+/// sidecar keeps its parser state in its own locator-keyed cursor, and a
+/// sidecar that held an unfinished message needs a pass to run before it can
+/// release those records. Consulting only the session cursor meant the
+/// unchanged shortcut returned first and the child's message stayed unindexed
+/// for as long as nothing else about the session changed.
+pub(super) fn requires_local_pass(
+    conn: &Connection,
+    options: &HydrateSessionOptions,
+    snapshot: &SourceSnapshot,
+) -> Result<bool> {
+    if super::super::path_capture::validating_content() {
+        return Ok(true);
+    }
+    let session = load_cursor(
+        conn,
+        &CursorKey::Session {
+            source: &options.source,
+            session_id: &options.session_id,
+            location: "local",
+        },
+    )?;
+    if session
+        .claude
+        .is_some_and(|claude| !claude.in_progress.is_empty())
+    {
+        return Ok(true);
+    }
+    for evidence in &snapshot.claude_subagents {
+        let locator = evidence.path.to_string_lossy().to_string();
+        let sidecar = load_cursor(
+            conn,
+            &CursorKey::Locator {
+                source: "claude",
+                locator: &locator,
+            },
+        )?;
+        if sidecar
+            .claude
+            .is_some_and(|claude| !claude.in_progress.is_empty())
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}

@@ -254,12 +254,12 @@ impl WatchSweep {
                 }
                 Ok(before)
             },
-            |conn, before, _tick| {
+            |conn, before, _tick, _succeeded| {
                 let (after, changed) = changes_under_lock(conn, &before)?;
                 Ok((after, changed))
             },
         )?;
-        Ok(outcome.map(|(tick, (after, changed))| (tick, after, changed)))
+        Ok(outcome.map(|(tick, (after, changed), _sync_lock)| (tick, after, changed)))
     }
 
     /// Diff the catalog against the baseline a cancelled sweep started from,
