@@ -84,6 +84,7 @@ struct Config {
     turns: u64,
     samples: u64,
     sweep_samples: u64,
+    fs_samples: u64,
     retain_days: u64,
 }
 
@@ -97,6 +98,7 @@ impl Config {
             turns: env_u64("AI_HIST_LATENCY_TURNS", 2),
             samples: env_u64("AI_HIST_LATENCY_SAMPLES", 200),
             sweep_samples: env_u64("AI_HIST_LATENCY_SWEEP_SAMPLES", 20),
+            fs_samples: env_u64("AI_HIST_LATENCY_FS_SAMPLES", 1000),
             retain_days: env_u64("AI_HIST_LATENCY_RETAIN_DAYS", 30),
         }
     }
@@ -433,7 +435,9 @@ fn stages(config: &Config) -> Value {
     let (store, store_info) = bench.populate(config.days, config.sessions_per_day);
     let samples = config.samples;
 
-    let fs_event = fs_event_latency(&bench, samples);
+    // Cheap (one small write and a 5 ms settle each), and a raw-event tail
+    // needs more than a hundred samples before its p99 stops being its max.
+    let fs_event = fs_event_latency(&bench, config.fs_samples);
 
     // Hook path: one new transcript, parsed and committed in its own
     // transaction. This is the parse + SQLite txn stage.

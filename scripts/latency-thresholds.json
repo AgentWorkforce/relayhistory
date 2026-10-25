@@ -11,6 +11,7 @@
   "policy": {
     "maxRegression": 0.1,
     "regressionFloorMs": 0.05,
+    "regressionFloorBudgetShare": 0.1,
     "regressionComment": [
       "The deciding regression rule compares this commit against its base, measured interleaved on the",
       "same runner (--base): the same metric was 20-40% apart on two runners of one class, so only a",
@@ -19,7 +20,8 @@
       "tracked (a tracked stage's tail is lock waits and checkpoints that land on random samples).",
       "Stored baselines are the worst round of each recorded run, merged worst-of across runs; they gate",
       "only when there is no base and the CPU is in cpusSeen, and advise otherwise. The floor is added",
-      "because 10% of a 0.1 ms stage is 10 us of scheduler jitter."
+      "because 10% of a 0.1 ms stage is 10 us of scheduler jitter.",
+      "The floor is max(regressionFloorMs, regressionFloorBudgetShare x the stage's budget): a no-change A/B on a busy machine moved the raw fs-event p99 0.15 -> 0.60 ms."
     ]
   },
   "budgets": {
@@ -136,7 +138,8 @@
           "phase": "prune",
           "days": 365
         }
-      ]
+      ],
+      "fsSamples": 1000
     },
     "full": {
       "description": "The published matrix: the gate's runs with more samples and rounds.",
@@ -174,7 +177,8 @@
           "phase": "prune",
           "days": 365
         }
-      ]
+      ],
+      "fsSamples": 3000
     },
     "smoke": {
       "description": "Seconds-long check that the driver, the base worktree and every phase run; its numbers mean nothing.",

@@ -79,6 +79,18 @@ export function regressionPercentile(budget, platform) {
 }
 
 /**
+ * The absolute allowance added to every regression bound: the policy floor,
+ * or `regressionFloorBudgetShare` of the stage's own budget when that is
+ * larger. A slowdown smaller than a tenth of what the stage may spend is not
+ * one a pull request should fail on, and below that size a same-runner
+ * comparison still sees the raw-event tail move by a few hundred
+ * microseconds on a busy machine with no code change at all.
+ */
+export function regressionFloor(policy, budget) {
+  return Math.max(policy.regressionFloorMs, (policy.regressionFloorBudgetShare ?? 0) * budget.p99Ms);
+}
+
+/**
  * Apply budgets and the regression rule to an aggregated report.
  *
  * Every rule produces `ok`, `warn` or `fail` per budgeted metric -- the
@@ -100,8 +112,8 @@ export function regressionPercentile(budget, platform) {
  *   were recorded on; it fails only without a base, on a recorded CPU --
  *   the `main` push and a manual run, where there is nothing to compare with.
  *
- * The floor exists because 10% of a 0.1 ms stage is 10 us, which is
- * scheduler jitter rather than code.
+ * Every bound adds `regressionFloor`: 10% of a 0.1 ms stage is 10 us, which
+ * is scheduler jitter rather than code.
  */
 export function evaluateGate(report, thresholds, platform) {
   const policy = thresholds.policy;
@@ -120,8 +132,8 @@ export function evaluateGate(report, thresholds, platform) {
         `(${stored.measuredOn?.cpusSeen?.join(", ")}); the stored-baseline check is advisory.`,
     );
   }
-  const bound = (value) =>
-    Math.round((value * (1 + policy.maxRegression) + policy.regressionFloorMs) * 1000) / 1000;
+  const bound = (value, budget) =>
+    Math.round((value * (1 + policy.maxRegression) + regressionFloor(policy, budget)) * 1000) / 1000;
   for (const run of report.runs) {
     for (const [name, measured] of Object.entries(run.result.metrics)) {
       const id = metricId(run, name);
@@ -138,7 +150,7 @@ export function evaluateGate(report, thresholds, platform) {
       const percentile = regressionPercentile(budget, platform);
       const base = run.base?.metrics?.[name];
       if (base && base.n > 0) {
-        const limit = bound(base[percentile]);
+        const limit = bound(base[percentile], budget);
         checks.push({
           id,
           rule: `vs base ${percentile}`,
@@ -150,7 +162,7 @@ export function evaluateGate(report, thresholds, platform) {
       }
       const recorded = stored?.metrics?.[id]?.[percentile];
       if (typeof recorded === "number") {
-        const limit = bound(recorded);
+        const limit = bound(recorded, budget);
         const over = measured[percentile] > limit;
         checks.push({
           id,

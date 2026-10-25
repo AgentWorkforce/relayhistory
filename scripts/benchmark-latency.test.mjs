@@ -101,6 +101,14 @@ test("with neither a base nor stored baselines, only budgets are checked", () =>
   assert.match(gate.warnings[0], /only budgets are checked/);
 });
 
+test("the regression floor grows to a share of the stage's budget", () => {
+  const policy = { maxRegression: 0.1, regressionFloorMs: 0.05, regressionFloorBudgetShare: 0.1 };
+  const withShare = { ...thresholds, policy };
+  // fs_event budget 1.0 -> floor 0.1: 0.2 * 1.1 + 0.1 = 0.32
+  assert.equal(evaluateGate(report({ fs_event: summary(0.32) }), withShare, "linux-x64").passed, true);
+  assert.equal(evaluateGate(report({ fs_event: summary(0.33) }), withShare, "linux-x64").passed, false);
+});
+
 test("a base manifest gains the harness's notify dev-dependency exactly once", () => {
   const without = '[package]\nname = "x"\n\n[dev-dependencies]\nlibc = "0.2"\n';
   const once = withNotifyDevDependency(without);

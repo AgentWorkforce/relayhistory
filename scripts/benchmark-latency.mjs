@@ -12,7 +12,7 @@
 // See docs/benchmarks.md, "Session-visible latency".
 
 import { spawnSync } from "node:child_process";
-import { copyFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, copyFileSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { arch, cpus, platform, totalmem } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -75,7 +75,7 @@ export function findLatencyExecutable(stdout) {
  * `targetDir` is shared between the head and base builds so the base build
  * reuses every compiled dependency and rebuilds only the workspace crates.
  */
-function buildHarness(sourceDir, targetDir) {
+function buildHarness(sourceDir, targetDir, label) {
   const result = spawnSync(
     "cargo",
     ["test", "--release", "-p", "ai-hist-cli", "--test", "latency_bench", "--no-run",
@@ -93,7 +93,14 @@ function buildHarness(sourceDir, targetDir) {
   }
   const executable = findLatencyExecutable(result.stdout);
   if (!executable) throw new Error(`cargo built no latency_bench executable:\n${result.stderr}`);
-  return executable;
+  // Copied out at once: cargo hashes a workspace member by its path relative
+  // to the workspace root, so the base worktree's build writes the very same
+  // file name into the shared target dir and would replace the head's binary.
+  const kept = join(targetDir, "latency-bin", label);
+  mkdirSync(dirname(kept), { recursive: true });
+  copyFileSync(executable, kept);
+  chmodSync(kept, 0o755);
+  return kept;
 }
 
 const HARNESS = "crates/ai-hist-cli/tests/latency_bench.rs";
@@ -150,6 +157,7 @@ function runOnce(executable, run, profile, workDir) {
     AI_HIST_LATENCY_TURNS: String(profile.turns),
     AI_HIST_LATENCY_SAMPLES: String(run.samples ?? profile.samples),
     AI_HIST_LATENCY_SWEEP_SAMPLES: String(profile.sweepSamples ?? 20),
+    AI_HIST_LATENCY_FS_SAMPLES: String(profile.fsSamples ?? 1000),
     AI_HIST_LATENCY_RETAIN_DAYS: String(profile.retainDays),
     AI_HIST_LATENCY_DIR: workDir,
     AI_HIST_LATENCY_REPORT: reportPath,
@@ -170,9 +178,9 @@ function measure(profileName, thresholds, rounds, baseRef) {
   const profile = thresholds.profiles[profileName];
   if (!profile) throw new Error(`unknown profile ${profileName}`);
   const targetDir = resolve(process.env.CARGO_TARGET_DIR ?? join(repositoryRoot, "target"));
-  const head = buildHarness(repositoryRoot, targetDir);
+  const head = buildHarness(repositoryRoot, targetDir, "head");
   const baseDir = baseRef ? prepareBase(baseRef) : null;
-  const base = baseDir ? buildHarness(baseDir, targetDir) : null;
+  const base = baseDir ? buildHarness(baseDir, targetDir, "base") : null;
   // Under target/, on the disk the build used: never the system temp dir,
   // which is tmpfs on some Linux hosts and would make every fsync free. Head
   // and base keep separate stores: a cached store built by one library is
@@ -252,7 +260,7 @@ async function main(argv) {
   if (flag(argv, "gate") && !gate.passed) {
     process.stderr.write("\nsession-visible latency gate FAILED:\n");
     for (const check of gate.checks.filter((c) => c.status === "fail")) {
-      process.stderr.write(`  - ${check.id}: p99 ${check.value} ms over ${check.rule} bound ${check.bound} ms\n`);
+      process.stderr.write(`  - ${check.id}: ${check.value} ms over the ${check.rule} bound of ${check.bound} ms\n`);
     }
     process.stderr.write(
       "\nIf this is an intended cost, re-measure with `--gate --update-baselines` on the " +
