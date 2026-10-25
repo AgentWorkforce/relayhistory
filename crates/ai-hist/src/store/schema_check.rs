@@ -7,6 +7,7 @@ use super::{
     REQUIRED_SESSION_PRESENCE_COLUMNS, REQUIRED_SESSION_RELATIONSHIP_COLUMNS, REQUIRED_TABLES,
     REQUIRED_TRIGGERS,
 };
+use crate::machine_identity;
 use anyhow::Result;
 use rusqlite::Connection;
 use std::collections::HashSet;
@@ -18,7 +19,10 @@ pub(super) fn schema_has_required_indexes(
     required_indexes: &[&str],
 ) -> Result<bool> {
     let mut table = conn.prepare("SELECT 1 FROM sqlite_master WHERE name = ? LIMIT 1")?;
-    if !all_exist(&mut table, REQUIRED_TABLES)? || !all_exist(&mut table, REQUIRED_TRIGGERS)? {
+    if !all_exist(&mut table, REQUIRED_TABLES)?
+        || !all_exist(&mut table, REQUIRED_TRIGGERS)?
+        || !all_exist(&mut table, machine_identity::SCHEMA_OBJECTS)?
+    {
         return Ok(false);
     }
     // A view is a query shape, not a row set: it can be present and still be
@@ -28,7 +32,10 @@ pub(super) fn schema_has_required_indexes(
         return Ok(false);
     }
     let mut migration = conn.prepare("SELECT 1 FROM schema_migrations WHERE name = ? LIMIT 1")?;
-    if !all_exist(&mut migration, REQUIRED_SCHEMA_MIGRATIONS)? || !required_columns_exist(conn)? {
+    if !all_exist(&mut migration, REQUIRED_SCHEMA_MIGRATIONS)?
+        || !all_exist(&mut migration, &[machine_identity::TRACE_ID_MIGRATION])?
+        || !required_columns_exist(conn)?
+    {
         return Ok(false);
     }
     let mut index =
@@ -75,6 +82,10 @@ fn required_columns_exist(conn: &Connection) -> Result<bool> {
         (
             "SELECT name FROM pragma_table_info('sessions')",
             REQUIRED_SESSIONS_COLUMNS,
+        ),
+        (
+            "SELECT name FROM pragma_table_info('sessions')",
+            machine_identity::SESSION_COLUMNS,
         ),
         (
             "SELECT name FROM pragma_table_info('session_hydration_checkpoints')",

@@ -1453,7 +1453,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     source_stamp TEXT,
     discovery_state TEXT,
     project_key TEXT,
-    project_key_method TEXT, title TEXT, session_kind TEXT,
+    project_key_method TEXT, title TEXT, session_kind TEXT, trace_id TEXT,
     PRIMARY KEY (session_id, source)
 );
 CREATE TABLE IF NOT EXISTS session_presences (
@@ -1622,7 +1622,7 @@ END;
     // above, so both paths converge on the same shape.
     ensure_text_columns(conn, "session_relationships", &["origin_session_id"])?;
     ensure_text_columns(conn, "history", REQUIRED_HISTORY_COLUMNS)?;
-    ensure_text_columns(conn, "sessions", REQUIRED_SESSIONS_COLUMNS)?;
+    crate::machine_identity::migrate(conn, REQUIRED_SESSIONS_COLUMNS)?;
     ensure_text_columns(conn, "session_presences", REQUIRED_SESSION_PRESENCE_COLUMNS)?;
     ensure_columns(conn, "session_markers", REQUIRED_SESSION_MARKER_COLUMNS)?;
     conn.execute_batch(
@@ -2218,7 +2218,7 @@ fn migrate_tool_result_fidelity_v1(conn: &Connection) -> Result<()> {
 /// columns are altered and concurrent opens cannot race the same statement.
 /// This avoids both guaranteed failing ALTERs and locale/version-sensitive
 /// matching on SQLite error strings.
-fn ensure_text_columns(conn: &Connection, table: &str, required: &[&str]) -> Result<()> {
+pub(crate) fn ensure_text_columns(conn: &Connection, table: &str, required: &[&str]) -> Result<()> {
     let declared: Vec<(&str, &str)> = required.iter().map(|column| (*column, "TEXT")).collect();
     ensure_columns(conn, table, &declared)
 }

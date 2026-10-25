@@ -49,7 +49,7 @@ zstd = { version = "0.13", default-features = false }
 [target.'cfg(unix)'.dependencies]
 # Safe wrappers for the statfs/statvfs, flock and kill(pid, 0) calls the crate
 # makes, so it needs no `unsafe` of its own.
-rustix = { version = "1", features = ["fs", "process"] }
+rustix = { version = "1", features = ["fs", "process", "system"] }
 
 [target.'cfg(windows)'.dependencies]
 fs2 = "0.4"

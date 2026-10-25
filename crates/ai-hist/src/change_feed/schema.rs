@@ -62,6 +62,12 @@ pub(super) fn trigger_names(kind: ChangeKind) -> [String; 3] {
 /// - `session_relationships.created_ms` and
 ///   `session_commit_links.created_at_ms` are written once; no upsert
 ///   rewrites them.
+/// - `sessions.trace_id` is minted from NULL by its insert trigger in the
+///   same statement as the insert, which stamps the row once; only a later
+///   rewrite of a minted id takes a revision of its own
+///   ([`crate::machine_identity::MINTED_ON_INSERT`]). A backfill of rows
+///   that predate the column is restamped by the export-schema
+///   reconciliation instead.
 /// - `sessions.source_stamp` / `discovery_state` / `parser_version` and the
 ///   presence and observation stamps move only when the source moved or the
 ///   parser changed, and the catalog digest behind `SyncReport::changed`
@@ -90,7 +96,16 @@ fn update_guard(conn: &Connection, table: &str) -> Result<String> {
     );
     let changed = columns
         .iter()
-        .map(|column| format!("NEW.{column} IS NOT OLD.{column}"))
+        .map(|column| {
+            if crate::machine_identity::MINTED_ON_INSERT.contains(&(table, column.as_str())) {
+                // Filled from NULL by its own insert trigger, inside the
+                // insert the row is already stamped for: only a rewrite of
+                // a minted value is a change.
+                format!("(OLD.{column} IS NOT NULL AND NEW.{column} IS NOT OLD.{column})")
+            } else {
+                format!("NEW.{column} IS NOT OLD.{column}")
+            }
+        })
         .collect::<Vec<_>>()
         .join(" OR ");
     Ok(format!(

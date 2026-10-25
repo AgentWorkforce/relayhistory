@@ -133,6 +133,16 @@ pub ai_hist::HydrateStatus::Missing
 pub ai_hist::HydrateStatus::Unchanged
 pub ai_hist::HydrateStatus::Unidentified
 pub ai_hist::HydrateStatus::Updated
+pub enum ai_hist::MachineIdStrategy
+pub ai_hist::MachineIdStrategy::HostnameSlug
+pub ai_hist::MachineIdStrategy::HostnameSlugWithInstallSuffix
+impl ai_hist::MachineIdStrategy
+pub fn ai_hist::MachineIdStrategy::as_str(self) -> &'static str
+pub enum ai_hist::MachineNamePrivacy
+pub ai_hist::MachineNamePrivacy::Hashed
+pub ai_hist::MachineNamePrivacy::Slug
+impl ai_hist::MachineNamePrivacy
+pub fn ai_hist::MachineNamePrivacy::as_str(self) -> &'static str
 #[non_exhaustive] pub enum ai_hist::MessageIdOrigin
 pub ai_hist::MessageIdOrigin::Mixed
 pub ai_hist::MessageIdOrigin::None
@@ -488,6 +498,15 @@ impl ai_hist::IdentityQuery
 pub fn ai_hist::IdentityQuery::after(self, ai_hist::SessionIdentity) -> Self
 pub fn ai_hist::IdentityQuery::exclude_delegated(self) -> Self
 pub fn ai_hist::IdentityQuery::limit(self, usize) -> Self
+pub struct ai_hist::MachineIdentity
+pub ai_hist::MachineIdentity::aliases: alloc::vec::Vec<alloc::string::String>
+pub ai_hist::MachineIdentity::created_ms: i64
+pub ai_hist::MachineIdentity::install_id: alloc::string::String
+pub ai_hist::MachineIdentity::machine_id: alloc::string::String
+pub ai_hist::MachineIdentity::machine_name: alloc::string::String
+pub ai_hist::MachineIdentity::name_privacy: ai_hist::MachineNamePrivacy
+pub ai_hist::MachineIdentity::strategy: ai_hist::MachineIdStrategy
+pub ai_hist::MachineIdentity::updated_ms: i64
 #[non_exhaustive] pub struct ai_hist::Marker
 pub ai_hist::Marker::kind: alloc::string::String
 pub ai_hist::Marker::marker_uid: alloc::string::String
@@ -787,12 +806,14 @@ impl ai_hist::SessionStore
 pub fn ai_hist::SessionStore::db_path(&self) -> &std::path::Path
 pub fn ai_hist::SessionStore::discover(&self, ai_hist::DiscoveryOptions) -> core::result::Result<ai_hist::DiscoveryReport, ai_hist::Error>
 pub fn ai_hist::SessionStore::hydrate(&self, &ai_hist::SessionRef, ai_hist::HydrateOptions) -> core::result::Result<ai_hist::HydrateReport, ai_hist::Error>
+pub fn ai_hist::SessionStore::machine_identity(&self) -> core::result::Result<core::option::Option<ai_hist::MachineIdentity>, ai_hist::Error>
 pub fn ai_hist::SessionStore::open(ai_hist::StoreOptions) -> core::result::Result<Self, ai_hist::Error>
 pub fn ai_hist::SessionStore::read_only(&self) -> bool
 pub fn ai_hist::SessionStore::roots(&self) -> &ai_hist::ProviderRoots
 pub fn ai_hist::SessionStore::session(&self, &ai_hist::SessionRef, ai_hist::SessionQuery) -> core::result::Result<core::option::Option<ai_hist::SessionEvidence>, ai_hist::Error>
 pub fn ai_hist::SessionStore::sessions(&self, ai_hist::CatalogQuery) -> ai_hist::CatalogIter
 pub fn ai_hist::SessionStore::sync(&self, ai_hist::SyncOptions) -> core::result::Result<ai_hist::SyncReport, ai_hist::Error>
+pub fn ai_hist::SessionStore::trace_id(&self, ai_hist::Source, &str) -> core::result::Result<core::option::Option<alloc::string::String>, ai_hist::Error>
 pub fn ai_hist::SessionStore::watch(&self, ai_hist::WatchOptions) -> core::result::Result<ai_hist::WatchHandle, ai_hist::Error>
 pub fn ai_hist::SessionStore::watch_discover(&self, ai_hist::WatchOptions) -> core::result::Result<ai_hist::WatchHandle, ai_hist::Error>
 impl ai_hist::SessionStore
@@ -1061,13 +1082,19 @@ impl ai_hist::Watermark
 pub const ai_hist::Watermark::CONSUMER: ai_hist::Watermark
 pub const ai_hist::Watermark::START: ai_hist::Watermark
 pub const ai_hist::DEFAULT_CHANGE_BATCH: usize
+pub const ai_hist::DEFAULT_MACHINE_ID_STRATEGY: ai_hist::MachineIdStrategy
+pub const ai_hist::DEFAULT_MACHINE_NAME_PRIVACY: ai_hist::MachineNamePrivacy
 pub const ai_hist::FULL_SESSION_KINDS: &[ai_hist::EvidenceKind]
+pub const ai_hist::INSTALL_SUFFIX_HEX_DIGITS: usize
 pub const ai_hist::MAX_CHANGE_BATCH: usize
 pub const ai_hist::NORMALIZABLE_SOURCES: &[&str]
 pub const ai_hist::PARSED_SESSION_KINDS: &[ai_hist::EvidenceKind]
 pub const ai_hist::SESSION_USAGE_CONTRACT_VERSION: u32
+pub const ai_hist::UNKNOWN_MACHINE_NAME: &str
 pub fn ai_hist::attribute_usage_to_prompts(&[ai_hist::SessionEvent], &str) -> std::collections::hash::map::HashMap<ai_hist::PromptKey, ai_hist::NormalizedUsage>
+pub fn ai_hist::canonical_machine_name(&str) -> alloc::string::String
 pub fn ai_hist::declared_evidence_kinds(&str) -> &'static [ai_hist::EvidenceKind]
+pub fn ai_hist::machine_id(ai_hist::MachineIdStrategy, ai_hist::MachineNamePrivacy, &str, &str) -> alloc::string::String
 pub fn ai_hist::missing_evidence_kinds(&str) -> alloc::vec::Vec<ai_hist::EvidenceKind>
 pub fn ai_hist::normalize_usage(&str, &serde_json::value::Value) -> core::result::Result<core::option::Option<ai_hist::NormalizedUsage>, ai_hist::UsageError>
 pub fn ai_hist::normalize_usage_str(&str, &str) -> core::result::Result<core::option::Option<ai_hist::NormalizedUsage>, ai_hist::UsageError>
