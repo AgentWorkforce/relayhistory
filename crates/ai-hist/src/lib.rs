@@ -41,6 +41,7 @@ mod change_feed;
 mod file_lock;
 mod forget;
 mod jsonl_temp;
+mod machine_identity;
 mod read_pool;
 mod session_identities;
 mod session_store;
@@ -86,6 +87,11 @@ pub use discover::{
 pub use forget::{CompactOptions, CompactReport, ForgetOptions, ForgetReport, ForgetScope};
 pub use ingest::CaptureProgress;
 pub use ingest::HydrateSessionResult;
+pub use machine_identity::{
+    canonical_hostname, machine_id, HostnameAlias, MachineIdentity, MachineNamePrivacy,
+    RetiredMachineId, CANONICAL_HOSTNAME_RULE_VERSION, DEFAULT_MACHINE_NAME_PRIVACY,
+    INSTALL_SUFFIX_HEX_DIGITS, MACHINE_ID_SCHEME, UNKNOWN_HOSTNAME,
+};
 pub use observations::{ObservationCheckpoint, ObservationKey, SessionObservation};
 pub use relationship_graph::{RelationshipCapabilities, SessionRelationship};
 pub use session_identities::{IdentityQuery, SessionIdentity};

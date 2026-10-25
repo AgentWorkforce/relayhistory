@@ -62,6 +62,10 @@ pub(super) fn trigger_names(kind: ChangeKind) -> [String; 3] {
 /// - `session_relationships.created_ms` and
 ///   `session_commit_links.created_at_ms` are written once; no upsert
 ///   rewrites them.
+/// - `sessions.trace_id` is minted by the insert trigger's own stamp (see
+///   [`crate::machine_identity::insert_fill_sql`]), so a new session takes
+///   one revision; any later write of it, a repair of a NULL included, is
+///   an update like any other and takes its own.
 /// - `sessions.source_stamp` / `discovery_state` / `parser_version` and the
 ///   presence and observation stamps move only when the source moved or the
 ///   parser changed, and the catalog digest behind `SyncReport::changed`
@@ -269,7 +273,8 @@ fn kind_feed_is_current(
         return Ok(false);
     }
     let [insert, update, delete] = trigger_names(kind);
-    if !all_exist(object, [insert, delete])? {
+    let fill = crate::machine_identity::insert_fill_sql(conn, table.name)?;
+    if !all_exist(object, [&delete])? || !update_trigger_is_current(conn, &insert, &fill)? {
         return Ok(false);
     }
     // The update trigger must also guard on the table's columns as they
@@ -443,11 +448,17 @@ fn feed_table(conn: &Connection, kind: ChangeKind) -> Result<()> {
     if !update_trigger_is_current(conn, &update, &guard)? {
         conn.execute_batch(&format!("DROP TRIGGER IF EXISTS {update};"))?;
     }
+    // Columns the insert stamp fills in the same statement; a trigger built
+    // before them is rebuilt.
+    let fill = crate::machine_identity::insert_fill_sql(conn, name)?;
+    if !update_trigger_is_current(conn, &insert, &fill)? {
+        conn.execute_batch(&format!("DROP TRIGGER IF EXISTS {insert};"))?;
+    }
     conn.execute_batch(&format!(
         "CREATE TRIGGER IF NOT EXISTS {insert} AFTER INSERT ON {name} BEGIN
              UPDATE observation_clock SET version = version + 1 WHERE singleton = 1;
              UPDATE {name} SET {REVISION_COLUMN} = \
-                 (SELECT version FROM observation_clock WHERE singleton = 1) \
+                 (SELECT version FROM observation_clock WHERE singleton = 1){fill} \
                  WHERE rowid = NEW.rowid;
              DELETE FROM evidence_tombstones WHERE kind = '{kind}' \
                  AND source = {new_source} AND session_id = {new_session} \

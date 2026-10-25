@@ -20,6 +20,7 @@ mod schema_check;
 mod user_turn_page;
 use crate::ingest::evidence_reconcile::{record_history_presence, record_marker_presence};
 pub(crate) use event_row::row_to_session_event;
+pub(crate) use schema_check::needs_migration;
 use schema_check::schema_has_required_indexes;
 use user_turn_page::UserTurnHeader;
 
@@ -1192,15 +1193,6 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     init_db_once(conn)
 }
 
-/// Whether [`init_db`] has migration work to do on this database. A leftover
-/// retired index counts as outstanding work: its DROP is a real write.
-fn needs_migration(conn: &Connection) -> Result<bool> {
-    Ok(!schema_is_current(conn)?
-        || retired_indexes_present(conn)?
-        || retired_capture_present(conn)?
-        || crate::ingest::standalone_records_migration_pending(conn)?)
-}
-
 /// A schema migration an open in this process runs on an existing database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MigrationEvent {
@@ -1432,7 +1424,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     source_stamp TEXT,
     discovery_state TEXT,
     project_key TEXT,
-    project_key_method TEXT, title TEXT, session_kind TEXT,
+    project_key_method TEXT, title TEXT, session_kind TEXT, trace_id TEXT,
     PRIMARY KEY (session_id, source)
 );
 CREATE TABLE IF NOT EXISTS session_presences (
@@ -1601,7 +1593,7 @@ END;
     // above, so both paths converge on the same shape.
     ensure_text_columns(conn, "session_relationships", &["origin_session_id"])?;
     ensure_text_columns(conn, "history", REQUIRED_HISTORY_COLUMNS)?;
-    ensure_text_columns(conn, "sessions", REQUIRED_SESSIONS_COLUMNS)?;
+    crate::machine_identity::migrate(conn, REQUIRED_SESSIONS_COLUMNS)?;
     ensure_text_columns(conn, "session_presences", REQUIRED_SESSION_PRESENCE_COLUMNS)?;
     ensure_columns(conn, "session_markers", REQUIRED_SESSION_MARKER_COLUMNS)?;
     conn.execute_batch(
@@ -2187,7 +2179,7 @@ fn migrate_tool_result_fidelity_v1(conn: &Connection) -> Result<()> {
 /// columns are altered and concurrent opens cannot race the same statement.
 /// This avoids both guaranteed failing ALTERs and locale/version-sensitive
 /// matching on SQLite error strings.
-fn ensure_text_columns(conn: &Connection, table: &str, required: &[&str]) -> Result<()> {
+pub(crate) fn ensure_text_columns(conn: &Connection, table: &str, required: &[&str]) -> Result<()> {
     let declared: Vec<(&str, &str)> = required.iter().map(|column| (*column, "TEXT")).collect();
     ensure_columns(conn, table, &declared)
 }

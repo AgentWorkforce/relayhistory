@@ -17,6 +17,10 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Qoder global CLI session history is discoverable and searchable from its native project transcripts, preserving recorded messages, tools, results, and resume appends.
 - VT Code history is discoverable and searchable from canonical workspace journals under explicitly configured workspace roots, preserving recorded turns, tool identities, usage and control events.
 - Junie CLI history is discoverable and searchable from native session journals, including recorded prompts, assistant text, tool output and event markers.
+- The history database records a machine identity at first run: a canonical hostname plus a machine id frozen at that point (the hostname and a random install suffix).
+- Every hostname spelling a machine reports is kept as an alias that resolves to the same machine.
+- A history database restored onto other hardware is issued a new machine id on its first writable open, and keeps the old id as history.
+- Every session carries a `trace_id`: a UUIDv7 minted locally when the session is first catalogued (an id supplied on insert is kept), included in change-feed and export session records; existing sessions are backfilled once on upgrade.
 
 ### Fixed
 
@@ -54,6 +58,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Added `Source::Qoder` for filtering and reading persisted Qoder global CLI history.
 - Added `Source::Vtcode` for filtering and reading persisted VT Code session history.
 - Added `Source::Junie` for filtering and reading persisted Junie CLI history.
+- Added `SessionStore::machine_identity`, `SessionStore::trace_id`, `MachineIdentity`, `HostnameAlias`, `RetiredMachineId`, `MachineNamePrivacy`, `MACHINE_ID_SCHEME`, `canonical_hostname`, `CANONICAL_HOSTNAME_RULE_VERSION` and `machine_id`.
 
 ## [0.50.1] - 2026-10-21
 

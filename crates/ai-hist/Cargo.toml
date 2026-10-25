@@ -28,6 +28,10 @@ unstable-internal = []
 
 [dependencies]
 base64 = "0.22"
+# Canonical hostnames: NFC normalization, then Punycode for non-ASCII words.
+icu_normalizer = { version = "2.3", default-features = false, features = ["compiled_data"] }
+idna = "1.1"
+icu_properties = { version = "2.3", default-features = false, features = ["compiled_data"] }
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 libc = "0.2"
@@ -49,7 +53,13 @@ zstd = { version = "0.13", default-features = false }
 [target.'cfg(unix)'.dependencies]
 # Safe wrappers for the statfs/statvfs, flock and kill(pid, 0) calls the crate
 # makes, so it needs no `unsafe` of its own.
-rustix = { version = "1", features = ["fs", "process"] }
+rustix = { version = "1", features = ["fs", "process", "system"] }
+
+# The hardware id behind the machine identity's clone detection, read
+# without spawning a process: `/etc/machine-id`, `gethostuuid(2)`, the
+# registry's `MachineGuid`. Its FFI keeps this crate free of `unsafe`.
+[target.'cfg(any(target_os = "linux", target_os = "macos", windows))'.dependencies]
+machine-uid = "0.6"
 
 [target.'cfg(windows)'.dependencies]
 fs2 = "0.4"
