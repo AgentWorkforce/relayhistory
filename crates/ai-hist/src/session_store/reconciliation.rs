@@ -44,13 +44,33 @@ pub struct ReconciliationStep {
 struct SourceWalk {
     source: Source,
     roots: VecDeque<WatchedPath>,
-    queued: VecDeque<PathBuf>,
+    queued: VecDeque<(PathBuf, WatchedPath)>,
     current: Option<OpenDirectory>,
-    retry_entry: Option<(std::fs::DirEntry, WatchedPath)>,
-    root: Option<WatchedPath>,
+    paused: VecDeque<OpenDirectory>,
+    deferred: VecDeque<DeferredWork>,
+    deferred_turn: bool,
     visited: HashSet<PathBuf>,
     pending: Vec<PathBuf>,
     finalized: bool,
+}
+
+// Only error recovery can pause a healthy iterator. Never accumulate an open
+// ReadDir per repaired location; ordinary traversal still holds one iterator.
+const MAX_OPEN_DIRECTORIES: usize = 2;
+
+#[derive(Debug)]
+enum DeferredWork {
+    Directory(PathBuf, WatchedPath),
+    Entry(PathBuf, WatchedPath),
+}
+
+impl DeferredWork {
+    fn key(&self) -> (&PathBuf, &WatchedPath, bool) {
+        match self {
+            Self::Directory(path, root) => (path, root, true),
+            Self::Entry(path, root) => (path, root, false),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -63,10 +83,19 @@ struct OpenDirectory {
 
 #[cfg(test)]
 thread_local! {static FAIL_ENTRY_TYPE: std::cell::Cell<bool> = const {std::cell::Cell::new(false)};}
+#[cfg(test)]
+thread_local! {
+    static FAIL_ENTRY_PATH: std::cell::RefCell<Option<PathBuf>> = const {std::cell::RefCell::new(None)};
+    static FAIL_READ_DIRECTORY: std::cell::RefCell<Option<PathBuf>> = const {std::cell::RefCell::new(None)};
+}
 
 fn entry_type(entry: &std::fs::DirEntry) -> std::io::Result<std::fs::FileType> {
     #[cfg(test)]
     if FAIL_ENTRY_TYPE.with(|fail| fail.replace(false)) {
+        return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
+    }
+    #[cfg(test)]
+    if FAIL_ENTRY_PATH.with(|path| path.borrow().as_ref() == Some(&entry.path())) {
         return Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied));
     }
     entry.file_type()
@@ -93,8 +122,9 @@ impl SessionStore {
                     roots: roots.into(),
                     queued: VecDeque::new(),
                     current: None,
-                    retry_entry: None,
-                    root: None,
+                    paused: VecDeque::new(),
+                    deferred: VecDeque::new(),
+                    deferred_turn: false,
                     visited: HashSet::new(),
                     pending: Vec::new(),
                     finalized: false,
@@ -123,6 +153,45 @@ impl Reconciliation {
             None => self.source_filter = Some(sources),
         }
         self
+    }
+
+    /// Whether this pass has drained ready traversal and acquisition. Failed
+    /// enumeration obligations remain retryable and keep `complete` false.
+    /// This level query is valid after either a successful step or an error.
+    pub fn healthy_pass_exhausted(&self) -> bool {
+        self.sources.iter().all(SourceWalk::healthy_drained)
+    }
+
+    /// Revisit the retained, validated roots after healthy work has drained.
+    /// Returns false without changing an active pass. Deferred failures and
+    /// their owning watch scopes survive; completed providers are reseeded too.
+    /// This does not declare successful coverage or change retry/backstop timing.
+    pub fn refresh_healthy_pass(&mut self) -> bool {
+        if !self.healthy_pass_exhausted() {
+            return false;
+        }
+        let Ok(mut fresh) = self.store.reconcile() else {
+            return false;
+        };
+        if let Some(allowed) = &self.source_filter {
+            fresh = fresh.sources(allowed.iter().copied());
+        }
+        for mut old in std::mem::take(&mut self.sources) {
+            if let Some(new) = fresh.sources.iter_mut().find(|s| s.source == old.source) {
+                new.deferred = std::mem::take(&mut old.deferred);
+                new.deferred_turn = old.deferred_turn;
+                new.roots.retain(|root| !new.deferred.iter().any(|item| {
+                    matches!(item, DeferredWork::Directory(path, owner) if path == &root.path && owner == root)
+                }));
+            }
+        }
+        self.sources = fresh.sources;
+        self.cold_proof = Default::default();
+        *self
+            .writer
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Default::default();
+        true
     }
 
     /// Capture explicit safety-poll paths using this round's retained native
@@ -222,6 +291,7 @@ impl Reconciliation {
         // Keep a failed path until a successful retry or the caller drops this
         // round. Missing paths succeed as empty scopes; the next round repairs
         // renames/new arrivals not represented by this iterator.
+        source.rotate_reader();
         if !source.finished() {
             self.sources.push_back(source);
         }
@@ -252,6 +322,7 @@ impl Reconciliation {
         };
         let result = (|| {
             let mut step = ReconciliationStep::default();
+            let retained_pending = !source.pending.is_empty();
             if source.pending.is_empty() {
                 source.collect(max_entries.max(1), max_paths.max(1), &mut step.entries)?;
             }
@@ -261,10 +332,14 @@ impl Reconciliation {
                 options.paths = Some(source.pending[..step.paths].to_vec());
                 step.discovery = Some(self.store.discover(options)?);
                 source.pending.drain(..step.paths);
+                if retained_pending {
+                    source.deferred_turn = !source.deferred.is_empty();
+                }
             }
             Ok(step)
         })();
         source.finalized = source.enumerated();
+        source.rotate_reader();
         if !source.finished() {
             self.sources.push_back(source);
         }
@@ -283,6 +358,7 @@ impl Reconciliation {
         mut options: SyncOptions,
     ) -> Result<ReconciliationStep, Error> {
         let mut step = ReconciliationStep::default();
+        let retained_pending = !source.pending.is_empty();
         if source.pending.is_empty() {
             source.collect(max_entries, max_paths, &mut step.entries)?;
         }
@@ -294,151 +370,23 @@ impl Reconciliation {
         options.paths = Some(source.pending[..step.paths].to_vec());
         let report = self.store.sync(options)?;
         source.pending.drain(..step.paths);
+        if retained_pending {
+            source.deferred_turn = !source.deferred.is_empty();
+        }
         step.report = Some(report);
         Ok(step)
     }
 }
 
-impl SourceWalk {
-    fn finished(&self) -> bool {
-        self.finalized && self.enumerated()
-    }
-
-    fn enumerated(&self) -> bool {
-        self.pending.is_empty()
-            && self.current.is_none()
-            && self.retry_entry.is_none()
-            && self.queued.is_empty()
-            && self.roots.is_empty()
-    }
-
-    fn collect(
-        &mut self,
-        max_entries: usize,
-        max_paths: usize,
-        entries: &mut usize,
-    ) -> Result<(), Error> {
-        while *entries < max_entries && self.pending.len() < max_paths {
-            if self.current.is_some() || self.retry_entry.is_some() {
-                self.next_entry(entries)?;
-                continue;
-            }
-            if let Some(path) = self.queued.pop_front() {
-                *entries += 1;
-                let Some(root) = self.root.clone() else {
-                    continue;
-                };
-                self.open_dir(path, root)?;
-            } else if let Some(root) = self.roots.pop_front() {
-                *entries += 1;
-                if root.scope == WatchScope::File {
-                    if root.path.exists() {
-                        self.pending.push(root.path.clone());
-                    }
-                } else {
-                    self.root = Some(root.clone());
-                    self.open_dir(root.path.clone(), root)?;
-                }
-            } else {
-                break;
-            }
-        }
-        Ok(())
-    }
-
-    fn open_dir(&mut self, path: PathBuf, root: WatchedPath) -> Result<(), Error> {
-        let canonical = match path.canonicalize() {
-            Ok(path) => path,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => {
-                self.queued.push_front(path);
-                return Err(Error::Discovery(error.to_string()));
-            }
-        };
-        if self.visited.contains(&canonical) {
-            return Ok(());
-        }
-        match fs::read_dir(&path) {
-            Ok(dir) => {
-                self.visited.insert(canonical.clone());
-                self.current = Some(OpenDirectory {
-                    entries: dir,
-                    root,
-                    path,
-                    canonical,
-                });
-                Ok(())
-            }
-            Err(error) => {
-                self.queued.push_front(path);
-                Err(Error::Discovery(error.to_string()))
-            }
-        }
-    }
-
-    fn read_entry(
-        &mut self,
-        entries: &mut usize,
-    ) -> Result<Option<(std::fs::DirEntry, WatchedPath)>, Error> {
-        if let Some(retry) = self.retry_entry.take() {
-            *entries += 1;
-            return Ok(Some(retry));
-        }
-        let Some(current) = self.current.as_mut() else {
-            return Ok(None);
-        };
-        let Some(entry) = current.entries.next() else {
-            self.current = None;
-            return Ok(None);
-        };
-        *entries += 1;
-        match entry {
-            Ok(entry) => Ok(Some((entry, current.root.clone()))),
-            Err(error) => {
-                // No filename is available: retain this directory and restart
-                // its bounded enumeration rather than skip an unknown entry.
-                let path = current.path.clone();
-                let canonical = current.canonical.clone();
-                self.current = None;
-                self.visited.remove(&canonical);
-                self.queued.push_front(path);
-                Err(Error::Discovery(error.to_string()))
-            }
-        }
-    }
-
-    fn next_entry(&mut self, entries: &mut usize) -> Result<(), Error> {
-        let Some((entry, root)) = self.read_entry(entries)? else {
-            return Ok(());
-        };
-        if !root.admits(&entry.file_name()) {
-            return Ok(());
-        }
-        let path = entry.path();
-        let kind = match entry_type(&entry) {
-            Ok(kind) => kind,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) => {
-                self.retry_entry = Some((entry, root));
-                return Err(Error::Discovery(error.to_string()));
-            }
-        };
-        if kind.is_dir() || (kind.is_symlink() && path.is_dir()) {
-            if root.scope == WatchScope::Tree {
-                self.queued.push_back(path);
-            }
-        } else if !entry.file_name().to_string_lossy().ends_with("-shm") {
-            self.pending.push(path);
-        }
-        Ok(())
-    }
-}
+mod walk;
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::{ProviderRoots, StoreOptions};
     use std::io::Write;
+
+    mod recovery_tests;
 
     fn fixture() -> (tempfile::TempDir, SessionStore, PathBuf) {
         let temp = tempfile::tempdir().unwrap();
@@ -1643,7 +1591,7 @@ mod tests {
         assert!(round
             .sources
             .iter()
-            .any(|source| source.retry_entry.is_some()));
+            .any(|source| !source.deferred.is_empty()));
         for _ in 0..100 {
             if round.step(64, 3, SyncOptions::default()).unwrap().complete {
                 break;

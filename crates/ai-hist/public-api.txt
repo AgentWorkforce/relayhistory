@@ -599,6 +599,8 @@ pub struct ai_hist::Reconciliation
 impl ai_hist::Reconciliation
 pub fn ai_hist::Reconciliation::capture_paths(&mut self, ai_hist::SyncOptions) -> core::result::Result<ai_hist::SyncReport, ai_hist::Error>
 pub fn ai_hist::Reconciliation::discover_step(&mut self, usize, usize, ai_hist::DiscoveryOptions) -> core::result::Result<ai_hist::ReconciliationStep, ai_hist::Error>
+pub fn ai_hist::Reconciliation::healthy_pass_exhausted(&self) -> bool
+pub fn ai_hist::Reconciliation::refresh_healthy_pass(&mut self) -> bool
 pub fn ai_hist::Reconciliation::sources(self, impl core::iter::traits::collect::IntoIterator<Item = ai_hist::Source>) -> Self
 pub fn ai_hist::Reconciliation::step(&mut self, usize, usize, ai_hist::SyncOptions) -> core::result::Result<ai_hist::ReconciliationStep, ai_hist::Error>
 #[non_exhaustive] pub struct ai_hist::ReconciliationStep

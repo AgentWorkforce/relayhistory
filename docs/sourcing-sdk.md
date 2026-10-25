@@ -1188,9 +1188,26 @@ at least one, then inspects at most that many directory entries and attempts at
 most that many exact paths. A zero limit can therefore process one entry/path.
 Retain the round between calls: restarting discovery with a row limit repeatedly
 visits the same newest prefix and is not reconciliation. Each provider rotates
-after every slice, including errors; failed paths remain pending. A fresh round
-after completion covers roots created after registration, lost events and
-concurrent directory moves. `sources([Source::Claude])` restricts an additional
+after every slice, including errors. Failed enumeration items remain pending in
+a fair retry queue, so an unreadable directory or entry does not monopolize the
+healthy work behind it. Errors still return through `Err`; unresolved failures
+keep `complete` false.
+
+`healthy_pass_exhausted()` is a level query that remains usable after `Err`. It
+means ready enumeration and pending acquisition have drained, not that all
+coverage succeeded. At an existing periodic backstop or loss-recovery boundary,
+`refresh_healthy_pass()` can revisit the retained validated roots without dropping
+failed obligations. It returns `false` without mutation while ready work or
+pending acquisitions remain. It also refreshes providers that already completed,
+preserves source filters and each failed item's owning watch scope, and resets
+per-pass proof/connection caches. Consumers must keep ordinary failure retries
+running between refreshes; this API adds no retry timer and must not move failed
+paths onto the longer healthy backstop. It is not a successful-completion signal
+for maintenance, progress, or health reporting. Changed consent/root settings
+still require the caller's newly validated store/round.
+
+A fresh round after completion covers roots created after registration, lost
+events and concurrent directory moves. `sources([Source::Claude])` restricts an additional
 login/root to its own provider. `discover_step` takes `DiscoveryOptions` and only
 writes shallow catalog metadata; it must be used for selected-only inventory.
 Acquisition slices also retain one writable connection within the round, avoiding

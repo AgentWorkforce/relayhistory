@@ -20,6 +20,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Reconciliation advances healthy roots past persistent enumeration errors while retaining failed locations for retry.
 - Exact-path capture avoids materializing unused cached transcript metadata and locations.
 - Unchanged Claude transcripts avoid duplicate file reads when record and metadata cursors have the same byte proof.
 
@@ -35,6 +36,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Rust API
 
+- Added `Reconciliation::healthy_pass_exhausted` and `refresh_healthy_pass` for revisiting healthy roots without discarding unresolved enumeration failures.
 - Added `SyncOptions::paths` for exact-path capture.
 - Added `DiscoveryOptions::paths` for exact-path shallow discovery.
 - Added resumable `SessionStore::reconcile` rounds with bounded directory-entry and path slices.
