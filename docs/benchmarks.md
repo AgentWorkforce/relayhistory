@@ -1289,56 +1289,63 @@ nothing) to check the driver and the base worktree end to end.
 
 ### 2026-10-25 baseline
 
-First run of `--gate` (3 rounds × 100 samples, 60 for `e2e`, 20 per round
-for the sweep), from this change's own CI jobs. p99 in ms; p50 in brackets
-where the tail hides the typical case. A second job of each lies within the
-spread described above; the stored baselines are the worse of both.
+From the gate's CI job on this change (3 rounds per run; 100 samples, 1,000
+for the raw event and the 1-year list, 60 for `e2e`, 20 per round for the
+sweep). p99 in ms, with p50 in brackets where the tail hides the typical case.
+The interleaved base run on the same runner agreed within a few percent on
+every stage. Earlier jobs reported longer write-stage tails (forced sweep
+p99 12 s, hook ingest p99 257 ms). Those were the harness's own cache
+restore: it gave every transcript a new inode, so the first sweeps re-read
+all of history. Restore now hard-links, and the numbers below are from after
+that fix.
 
-| Stage | Budget | ubuntu-latest (EPYC 9V74, 4 cores) | macos-latest (Apple M1, virtual, 3 cores) |
+| Stage | Budget | ubuntu-latest (EPYC 7763, 4 cores) | macos-latest (Apple M1, virtual, 3 cores) |
 |---|---:|---:|---:|
-| `fs_event` (raw backend event) | 1.0 | **0.129** | 18.958 [15.7] |
-| `ingest_hook` (parse + txn, hook path) | 1.5 | 257.2 [23.3] | 54.2 [24.9] |
-| `sweep_scoped_sync` (forced Claude-scoped sync) | 1.5 | 12,259 [240] | 3,594 [116] |
-| `open_db` (diagnostic) | — | 4.3 [3.7] | 9.4 [4.5] |
-| `open_raw` (diagnostic) | — | 0.066 | 0.168 |
-| `feed_pull` (one-session change-feed read) | 1.0 | 1.131 [1.05] | 2.582 [1.04] |
-| `list_first_paint`, 30 days | 1.5 | **0.280** | **0.529** |
-| `list_first_paint`, 1 year (14,600 sessions, 250 MiB) | 1.5 | **0.298** | **0.575** |
-| `list_desktop_page` (500 rows), 1 year | 1.5 | 2.115 [1.96] | 3.346 [1.55] |
-| `e2e_visible` (write → `watch` tick → listed) | 5.0 | 4,927 [63] | 151.9 [87.6] |
-| `ingest_with_uploader` | 1.5 | 356.2 [22.6] | 78.8 [21.8] |
-| `read_during_prune` (quiet: 0.263 / 0.537) | 1.5 | **0.521** | 1.789 |
-| `ingest_during_prune` | 1.5 | 5,091 [311] | 4,306 [421] |
+| `fs_event` (raw backend event) | 1.0 | **0.127** | 19.2 [14.4] |
+| `ingest_hook` (parse + txn, hook path) | 1.5 | 29.8 [24.0] | 53.9 [19.3] |
+| `sweep_scoped_sync` (forced Claude-scoped sync) | 1.5 | 565 [86] | 603 [75] |
+| `open_db` (diagnostic) | — | 4.9 [4.8] | 6.9 [4.5] |
+| `open_raw` (diagnostic) | — | 0.082 | 0.135 |
+| `feed_pull` (one-session change-feed read) | 1.0 | 1.37 [1.28] | 2.53 [0.85] |
+| `list_first_paint`, 30 days | 1.5 | **0.370** | **0.585** |
+| `list_first_paint`, 1 year (14,600 sessions, 252 MiB) | 1.5 | **0.382** | **0.574** |
+| `list_desktop_page` (500 rows), 1 year | 1.5 | 2.60 [2.51] | 3.00 [1.58] |
+| `e2e_visible` (write → `watch` tick → listed) | 5.0 | 35.1 [28.0] | 184.7 [87.6] |
+| `ingest_with_uploader` (alone: 28.7 / 91.1) | 1.5 | 43.1 [29.1] | 109.3 [30.3] |
+| `read_during_prune` (quiet: 0.36 / 0.37) | 1.5 | **0.767** | 1.476 |
+| `ingest_during_prune` | 1.5 | 9,712 [159] | 5,151 [190] |
 
-Bold is within budget. Ingest throughput with a concurrent uploader was
-0.32× of ingest alone on Linux (12.2 vs 38.7 sessions/s) and 0.91× on macOS;
-the uploader's cursor commit reached 684 ms p99 on Linux. Pruning 13,401
-sessions out of a year took 16.4 s on Linux and 27.2 s on macOS, and left
-24 MB of WAL.
+Bold is within budget. With a concurrent uploader, ingest throughput was
+0.87× of ingest alone on Linux (35 vs 40 sessions/s) and 0.72× on macOS. The
+uploader's cursor commit reached 86 ms p99 on Linux and 546 ms on macOS.
+Pruning 13,401 sessions out of a year took 12.7 s on Linux and 22.4 s on
+macOS.
 
 What the numbers say:
 
 * **The read side is already inside budget.** The indexed list query is
-  0.3 ms p99 on Linux whether the store holds 30 days or a year
-  (`idx_sessions_recency`); a deep page costs the same as the first. Only the
-  desktop's 500-row page is over, at ~2 ms: page size, not store size.
-* **`open_db` is a fixed 3.7–4.5 ms, and ~99% of it is the schema check.**
-  SQLite's own open is 0.05 ms. Every `sync`, hook ingest (at least twice),
-  `forget_evidence` and `Changes::commit` pays it, so it alone is over the
-  1.5 ms write budget before any parsing.
-* **The write stages are 15–150× over budget.** A hook ingest of one
-  six-record session is ~23 ms typical, with a tail into hundreds of ms. A
-  forced Claude-scoped `sync` re-walks the whole Claude root: ~240 ms on a
-  30-day store, with a tail of seconds.
-* **FSEvents alone costs 15–19 ms on the macOS runner** even with notify's
-  `latency 0.0` and `kFSEventStreamCreateFlagNoDefer`; inotify costs 0.1 ms.
+  0.37–0.38 ms p99 on Linux whether the store holds 30 days or a year
+  (`idx_sessions_recency`), and a deep page costs the same as the first.
+  Only the desktop's 500-row page is over, at ~2.6 ms. That is page size,
+  not store size.
+* **`open_db` is a fixed 4.5–4.9 ms, and ~99% of it is the schema check.**
+  SQLite's own open is 0.05–0.08 ms. Every `sync`, hook ingest (at least
+  twice), `forget_evidence` and `Changes::commit` pays it. That alone is over
+  the 1.5 ms write budget before any parsing starts.
+* **The write stages are 15–60× over budget.** A hook ingest of one
+  six-record session is ~24 ms typical. A forced Claude-scoped `sync`
+  re-walks the whole Claude root: ~80 ms on a 30-day store, with a tail past
+  half a second.
+* **FSEvents alone costs 14–19 ms on the macOS runner**, even with notify's
+  `latency 0.0` and `kFSEventStreamCreateFlagNoDefer`. inotify costs 0.1 ms.
   The runner is virtualized, so this needs confirming on M-series hardware,
-  but no stage after it can win that time back.
-* **The change-feed pull is ~1.1 ms**, just over its budget, and it is a pull:
+  but no later stage can win that time back. It is also why `e2e` is 3× slower
+  on macOS than on Linux.
+* **The change-feed pull is ~1.3 ms**, just over its budget, and it is a pull:
   a consumer that polls adds its interval on top. The only push today is
   `WatchHandle`'s `TickReport` channel, which costs nothing measurable once
-  the tick ends (`e2e_tick_to_listed` 0.4–0.6 ms includes the list query).
+  the tick ends (`e2e_tick_to_listed`, 0.3–0.5 ms, includes the list query).
 * **Retention blocks capture.** `forget_evidence` holds the `SyncRunLock` for
-  the whole run and deletes in batches, so a new session's ingest waited
-  ~5 s p99 during a year-scale prune. Readers were barely touched on Linux;
-  on macOS the read p99 tripled, over budget.
+  the whole run and deletes in batches, so a new session's ingest waited up
+  to ~10 s (p99) during a year-scale prune. Linux readers were barely
+  touched; on macOS the read p99 quadrupled, to just under budget.

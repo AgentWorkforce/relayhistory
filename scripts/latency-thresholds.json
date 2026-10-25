@@ -36,8 +36,8 @@
       "enforcedComment": "FSEvents on the macos-latest runner (Apple M1, virtual) delivered at 15.7 ms p50 / 19 ms p99 with notify's latency 0.0 and NoDefer; inotify meets the budget at 0.13 ms. Enforced where it is met.",
       "known": {
         "darwin-arm64": {
-          "p50": 15.735,
-          "p99": 19.122
+          "p50": 14.999,
+          "p99": 19.405
         }
       }
     },
@@ -47,12 +47,12 @@
       "enforced": false,
       "known": {
         "linux-x64": {
-          "p50": 23.96,
-          "p99": 277.95
+          "p50": 24.156,
+          "p99": 30.333
         },
         "darwin-arm64": {
-          "p50": 26.312,
-          "p99": 83.569
+          "p50": 26.995,
+          "p99": 82.131
         }
       }
     },
@@ -62,12 +62,12 @@
       "enforced": false,
       "known": {
         "linux-x64": {
-          "p50": 919.528,
-          "p99": 13626.151
+          "p50": 86.721,
+          "p99": 586.892
         },
         "darwin-arm64": {
-          "p50": 499.043,
-          "p99": 5262.672
+          "p50": 90.465,
+          "p99": 770.21
         }
       }
     },
@@ -77,12 +77,12 @@
       "enforced": false,
       "known": {
         "linux-x64": {
-          "p50": 1.272,
-          "p99": 1.443
+          "p50": 1.287,
+          "p99": 1.374
         },
         "darwin-arm64": {
-          "p50": 1.129,
-          "p99": 3.767
+          "p50": 0.957,
+          "p99": 2.882
         }
       }
     },
@@ -95,8 +95,8 @@
       "enforcedComment": "macos-latest is a 3-vCPU Apple M1 VM: p50 0.20-0.28 ms, but its p99 tail went 0.53 -> 1.72 ms between two runs on the same CPU model. Tracked there until a real M-series runner measures it.",
       "known": {
         "darwin-arm64": {
-          "p50": 0.277,
-          "p99": 2.032
+          "p50": 0.269,
+          "p99": 0.84
         }
       }
     },
@@ -109,8 +109,8 @@
       "enforcedComment": "macos-latest is a 3-vCPU Apple M1 VM: p50 0.20-0.28 ms, but its p99 tail went 0.53 -> 1.72 ms between two runs on the same CPU model. Tracked there until a real M-series runner measures it.",
       "known": {
         "darwin-arm64": {
-          "p50": 0.251,
-          "p99": 4.57
+          "p50": 0.211,
+          "p99": 0.59
         }
       }
     },
@@ -123,8 +123,8 @@
       "enforcedComment": "macos-latest is a 3-vCPU Apple M1 VM: p50 0.20-0.28 ms, but its p99 tail went 0.53 -> 1.72 ms between two runs on the same CPU model. Tracked there until a real M-series runner measures it.",
       "known": {
         "darwin-arm64": {
-          "p50": 0.278,
-          "p99": 1.502
+          "p50": 0.22,
+          "p99": 0.641
         }
       }
     },
@@ -134,12 +134,12 @@
       "enforced": false,
       "known": {
         "linux-x64": {
-          "p50": 2.505,
-          "p99": 2.948
+          "p50": 2.53,
+          "p99": 2.65
         },
         "darwin-arm64": {
-          "p50": 1.972,
-          "p99": 4.804
+          "p50": 1.603,
+          "p99": 3.965
         }
       }
     },
@@ -149,12 +149,12 @@
       "enforced": false,
       "known": {
         "linux-x64": {
-          "p50": 63.148,
-          "p99": 7023.314
+          "p50": 28.08,
+          "p99": 35.942
         },
         "darwin-arm64": {
-          "p50": 121.049,
-          "p99": 256.08
+          "p50": 109.477,
+          "p99": 196.353
         }
       }
     },
@@ -164,12 +164,12 @@
       "enforced": false,
       "known": {
         "linux-x64": {
-          "p50": 27.959,
-          "p99": 359.875
+          "p50": 30.182,
+          "p99": 44.229
         },
         "darwin-arm64": {
-          "p50": 23.345,
-          "p99": 127.581
+          "p50": 30.523,
+          "p99": 121.784
         }
       }
     },
@@ -182,8 +182,8 @@
       "enforcedComment": "macos-latest read 1.47-1.79 ms p99 during a 1-year prune (0.54-0.70 ms quiet); linux-x64 0.52-0.75 ms. Enforced where it is met.",
       "known": {
         "darwin-arm64": {
-          "p50": 0.341,
-          "p99": 2.085
+          "p50": 0.336,
+          "p99": 1.527
         }
       }
     },
@@ -193,12 +193,12 @@
       "enforced": false,
       "known": {
         "linux-x64": {
-          "p50": 310.789,
-          "p99": 10606.177
+          "p50": 160.448,
+          "p99": 10295.026
         },
         "darwin-arm64": {
-          "p50": 420.643,
-          "p99": 8048.045
+          "p50": 286.142,
+          "p99": 10076.418
         }
       }
     }
@@ -319,33 +319,32 @@
     "linux-x64": {
       "measuredOn": {
         "cpusSeen": [
-          "AMD EPYC 9V74 80-Core Processor",
           "AMD EPYC 7763 64-Core Processor"
         ],
-        "commit": "5f9f18efc6a5c14d81c30e8b82548ca0ddd06f88",
-        "measuredAt": "2026-10-25T21:03:45.910Z",
+        "commit": "d3646dc8f3d961bc580db123660ec6ad15e1ca78",
+        "measuredAt": "2026-10-25T21:31:17.484Z",
         "profile": "gate"
       },
       "metrics": {
         "stages@30d.fs_event": {
-          "p50": 0.088,
-          "p99": 0.134
+          "p50": 0.081,
+          "p99": 0.128
         },
         "stages@30d.list_first_paint": {
-          "p50": 0.331,
-          "p99": 0.542
+          "p50": 0.335,
+          "p99": 0.414
         },
         "list_scale@30d.list_first_paint": {
-          "p50": 0.315,
-          "p99": 0.577
+          "p50": 0.314,
+          "p99": 0.379
         },
         "list_scale@365d.list_first_paint": {
           "p50": 0.339,
-          "p99": 0.573
+          "p99": 0.39
         },
         "prune@365d.read_during_prune": {
-          "p50": 0.395,
-          "p99": 0.805
+          "p50": 0.394,
+          "p99": 0.768
         }
       }
     },
@@ -354,8 +353,8 @@
         "cpusSeen": [
           "Apple M1 (Virtual)"
         ],
-        "commit": "5f9f18efc6a5c14d81c30e8b82548ca0ddd06f88",
-        "measuredAt": "2026-10-25T21:10:20.946Z",
+        "commit": "d3646dc8f3d961bc580db123660ec6ad15e1ca78",
+        "measuredAt": "2026-10-25T21:40:00.087Z",
         "profile": "gate"
       },
       "metrics": {}
