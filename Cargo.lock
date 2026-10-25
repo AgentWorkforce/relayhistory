@@ -38,6 +38,8 @@ dependencies = [
  "chrono",
  "fs2",
  "fs4",
+ "icu_normalizer",
+ "idna",
  "libc",
  "machine-uid",
  "notify",

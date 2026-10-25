@@ -133,7 +133,10 @@ fn canonical_hostname_folds_odd_spellings_into_one_dns_label() {
         ),
         ("my.lan.box", "my-lan-box"),
         ("DESKTOP_7F3A__X", "desktop-7f3a-x"),
-        ("ñandú-box", "and-box"),
+        ("ñandú-box", "xn--and-6ma2c-box"),
+        ("Ñandú-Box.local", "xn--and-6ma2c-box"),
+        // Already in IDNA form: the same name.
+        ("xn--and-6ma2c-box", "xn--and-6ma2c-box"),
         ("linuyc-desktop\n", "linuyc-desktop"),
         ("ip-10-0-0-1.ec2.internal", "ip-10-0-0-1"),
         ("", UNKNOWN_HOSTNAME),
@@ -163,6 +166,48 @@ fn canonical_hostname_folds_odd_spellings_into_one_dns_label() {
         let once = canonical_hostname(raw);
         assert_eq!(canonical_hostname(&once), once);
     }
+}
+
+#[test]
+fn non_ascii_hostnames_stay_distinct_and_decodable() {
+    // Rule 3 sent every one of these to `unknown-host`.
+    let names = [
+        "山田のMac",
+        "李雷的电脑",
+        "Ноутбук-Ивана",
+        "café.lan",
+        "Größe-PC",
+    ];
+    let canonical: Vec<String> = names.iter().map(|raw| canonical_hostname(raw)).collect();
+    let distinct: BTreeSet<&String> = canonical.iter().collect();
+    assert_eq!(distinct.len(), names.len(), "{canonical:?}");
+    for (raw, slug) in names.iter().zip(&canonical) {
+        assert!(slug.is_ascii() && slug.contains("xn--"), "{raw} -> {slug}");
+        assert!(
+            slug.chars()
+                .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '-'),
+            "{slug}"
+        );
+        assert_eq!(canonical_hostname(slug), *slug, "idempotent: {slug}");
+    }
+    // The non-ASCII word decodes back to its lowercased NFC original.
+    let encoded = canonical_hostname("山田のMac");
+    let decoded = idna::punycode::decode_to_string(encoded.strip_prefix("xn--").unwrap());
+    assert_eq!(decoded.as_deref(), Some("山田のmac"));
+    // NFC first: precomposed and decomposed spellings are one name.
+    assert_eq!(
+        canonical_hostname("Ca\u{301}fe\u{301}-Box"),
+        canonical_hostname("Cáfé-Box")
+    );
+    assert_eq!(canonical_hostname("café.lan"), canonical_hostname("CAFÉ"));
+    // Apostrophes are still dropped around non-ASCII words.
+    assert_eq!(
+        canonical_hostname("Ñandú's Box"),
+        canonical_hostname("Ñandús Box")
+    );
+    // Symbols are still separators, so a name of only symbols has nothing left.
+    assert_eq!(canonical_hostname("\u{1F600}"), UNKNOWN_HOSTNAME);
+    assert_eq!(canonical_hostname("box-\u{1F600}-2"), "box-2");
 }
 
 #[test]
@@ -676,6 +721,26 @@ fn a_spelling_not_yet_recorded_is_recorded_by_the_next_writable_open() {
         .map(|a| a.observed.as_str())
         .collect();
     assert_eq!(observed, [local_hostname().trim()]);
+}
+
+#[test]
+fn reading_an_unchanged_identity_does_not_wait_for_a_writer() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = db(&dir, "ai-history.db");
+    let store = store(&path);
+    let first = store.machine_identity().unwrap().unwrap();
+    // Another writer -- a sweep, say -- holds the write lock throughout.
+    let writer = reopen(&path);
+    writer.execute_batch("BEGIN IMMEDIATE").unwrap();
+    let started = Instant::now();
+    let seen = store.machine_identity().unwrap().unwrap();
+    assert!(
+        started.elapsed().as_secs() < 2,
+        "waited {:?} behind the writer",
+        started.elapsed()
+    );
+    assert_eq!(seen, first);
+    writer.execute_batch("ROLLBACK").unwrap();
 }
 
 #[test]

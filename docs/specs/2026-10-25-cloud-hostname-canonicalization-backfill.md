@@ -14,15 +14,16 @@ Grouping by the raw hostname splits one machine into several.
 ## Rule
 
 `ai_hist::canonical_hostname` (rule version
-`CANONICAL_HOSTNAME_RULE_VERSION = 3`) is pure and deterministic:
+`CANONICAL_HOSTNAME_RULE_VERSION = 4`) is pure and deterministic:
 
-1. Lowercase, and trim whitespace and trailing dots.
+1. Lowercase, NFC-normalize, and trim whitespace and trailing dots.
 2. Strip network suffixes, repeatedly: `.local`, `.localdomain`, `.lan`,
    `.home`, `.home.arpa`, `.internal`. For a `*.internal` name, keep only the
    first label.
-3. Drop apostrophes (`'`, `‘`, `’`). Turn every other run of anything but
-   `[a-z0-9]` (dots, punctuation, spaces, underscores, non-ASCII) into one
-   `-`, so no other label is lost.
+3. Drop apostrophes (`'`, `‘`, `’`). Split into words on every other run
+   of anything but letters and digits (dots, punctuation, spaces,
+   underscores, symbols), and join the words with one `-`, so no label is
+   lost. A word with non-ASCII letters becomes its Punycode `xn--` form.
 4. Trim leading and trailing hyphens, and cut at 63 characters from the
    right.
 
@@ -81,7 +82,7 @@ ALTER TABLE <machines_table>
 
 -- one UPDATE per reviewed mapping row, generated from report.json
 UPDATE <machines_table>
-   SET canonical_hostname = $canonical, canonical_hostname_rule = 3
+   SET canonical_hostname = $canonical, canonical_hostname_rule = 4
  WHERE hostname = $hostname AND canonical_hostname IS NULL;
 
 CREATE TABLE <hostname_aliases_table> (
@@ -111,6 +112,9 @@ rows on the old version.
   2026-10-25). `khaliqs.macbook.pro` becomes `khaliqs-macbook-pro`. As a
   consequence, an FQDN-named server keeps its domain:
   `build-01.corp.example.com` becomes `build-01-corp-example-com`.
+- **Non-ASCII names:** NFC, then Punycode (rule 4, Khaliq, 2026-10-25). The
+  CJK names that collapsed to `unknown-host` under rule 3 are now distinct,
+  decodable `xn--` names.
 
 ## Observed data (2026-10-25)
 
@@ -135,9 +139,3 @@ here. Findings:
 - **Factory-default names** (`MacBook-Pro.local`, `mac.lan`) collapse to
   generic names. That's expected, and it's why the hostname alone is never
   the id.
-
-## Open questions
-
-- **Non-ASCII hostnames:** a rule 4 is proposed but not implemented. The
-  options are Punycode (IDNA, which is reversible) for non-ASCII labels, or
-  a hash fallback when nothing usable is left. It's waiting on Khaliq.

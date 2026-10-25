@@ -12,7 +12,11 @@
 /// - `3`: only network suffixes are stripped ([`NETWORK_SUFFIXES`]); every
 ///   other dot is a separator, so `khaliqs.macbook.pro` keeps all three
 ///   labels. A `*.internal` cloud name keeps its first label.
-pub const CANONICAL_HOSTNAME_RULE_VERSION: u32 = 3;
+/// - `4`: a word with non-ASCII letters becomes its Punycode (`xn--`) form
+///   after NFC normalization, instead of being dropped, so non-ASCII names
+///   stay distinct (they all collapsed to [`UNKNOWN_HOSTNAME`] under rule 3)
+///   and the original can be decoded back.
+pub const CANONICAL_HOSTNAME_RULE_VERSION: u32 = 4;
 
 /// The canonical hostname of a name with no usable character.
 pub const UNKNOWN_HOSTNAME: &str = "unknown-host";
@@ -38,22 +42,27 @@ const NETWORK_SUFFIXES: &[&str] = &[
 
 /// The canonical hostname: one deterministic spelling per machine name.
 ///
-/// Lowercased and trimmed of whitespace and trailing dots; every
-/// [`NETWORK_SUFFIXES`] entry stripped; for a cloud `*.internal` name only
-/// the first label kept, since the rest names a zone or project; apostrophes
-/// (`'`, `‘`, `’`) dropped; every other run of anything but `[a-z0-9]` --
-/// dots, punctuation, spaces, underscores, non-ASCII -- one `-`; leading and
-/// trailing hyphens trimmed; cut at 63 characters from the right, so the
-/// most specific labels stay. A name with nothing left is
-/// [`UNKNOWN_HOSTNAME`].
+/// Lowercased, NFC-normalized and trimmed of whitespace and trailing dots;
+/// every [`NETWORK_SUFFIXES`] entry stripped; for a cloud `*.internal` name
+/// only the first label kept, since the rest names a zone or project;
+/// apostrophes (`'`, `‘`, `’`) dropped; split into words on every run of
+/// anything but letters and digits -- dots, punctuation, spaces,
+/// underscores, symbols -- and the words joined by one `-`, a word with
+/// non-ASCII letters in its Punycode (`xn--`) form; cut at 63 characters
+/// from the right, so the most specific labels stay. A name with nothing
+/// left is [`UNKNOWN_HOSTNAME`].
 ///
 /// `Khaliqs-MacBook-Pro.local` -> `khaliqs-macbook-pro`;
 /// `Khaliq's MacBook Pro` -> `khaliqs-macbook-pro`;
 /// `khaliqs.macbook.pro` -> `khaliqs-macbook-pro`;
 /// `ip-10-0-0-1.ec2.internal` -> `ip-10-0-0-1`;
-/// `build_01.corp.example.com` -> `build-01-corp-example-com`.
+/// `build_01.corp.example.com` -> `build-01-corp-example-com`;
+/// `Ñandú-Box` -> `xn--and-6ma2c-box`.
 pub fn canonical_hostname(hostname: &str) -> String {
-    let mut host = hostname.trim().trim_end_matches('.').to_ascii_lowercase();
+    let lower = hostname.trim().trim_end_matches('.').to_lowercase();
+    let mut host = icu_normalizer::ComposingNormalizer::new_nfc()
+        .normalize(&lower)
+        .into_owned();
     let mut cloud_internal = false;
     while let Some(suffix) = NETWORK_SUFFIXES.iter().find(|suffix| {
         host.len() > suffix.len() + 1
@@ -74,15 +83,24 @@ pub fn canonical_hostname(hostname: &str) -> String {
 
 fn slug(name: &str) -> String {
     let mut slug = String::with_capacity(name.len());
-    for ch in name.chars() {
-        if APOSTROPHES.contains(&ch) {
+    let mut words = words(name).into_iter().peekable();
+    while let Some((word, separator)) = words.next() {
+        // An IDNA `xn--` prefix is one word: its `--` is not two separators.
+        let word = if word == "xn" && separator == "--" {
+            match words.next() {
+                Some((rest, _)) => format!("xn--{rest}"),
+                None => word,
+            }
+        } else {
+            word
+        };
+        let Some(word) = ascii_word(word) else {
             continue;
-        }
-        if ch.is_ascii_alphanumeric() {
-            slug.push(ch);
-        } else if !slug.is_empty() && !slug.ends_with('-') {
+        };
+        if !slug.is_empty() {
             slug.push('-');
         }
+        slug.push_str(&word);
     }
     let slug = slug[..slug.len().min(MAX_HOSTNAME_LEN)].trim_end_matches('-');
     if slug.is_empty() {
@@ -90,6 +108,42 @@ fn slug(name: &str) -> String {
     } else {
         slug.to_string()
     }
+}
+
+/// `name` split into its words -- runs of letters and digits, apostrophes
+/// dropped -- each with the separator run that follows it.
+fn words(name: &str) -> Vec<(String, String)> {
+    let mut words: Vec<(String, String)> = Vec::new();
+    let mut word = String::new();
+    let mut separator = String::new();
+    for ch in name.chars() {
+        if APOSTROPHES.contains(&ch) {
+            continue;
+        }
+        if ch.is_alphanumeric() {
+            if !separator.is_empty() && !word.is_empty() {
+                words.push((std::mem::take(&mut word), std::mem::take(&mut separator)));
+            }
+            separator.clear();
+            word.push(ch);
+        } else {
+            separator.push(ch);
+        }
+    }
+    if !word.is_empty() {
+        words.push((word, separator));
+    }
+    words
+}
+
+/// `word` as ASCII: itself, or its Punycode form behind the IDNA `xn--`
+/// prefix when it has non-ASCII letters. `None` only for a word too long for
+/// Punycode to encode.
+fn ascii_word(word: String) -> Option<String> {
+    if word.is_ascii() {
+        return Some(word);
+    }
+    idna::punycode::encode_str(&word).map(|encoded| format!("xn--{encoded}"))
 }
 
 /// This host's name as the OS reports it, without spawning a process.

@@ -28,11 +28,11 @@ resets when a database is replaced, so it is not the machine id.
 
 `machine_identity` is a single-row table written by the first writable open.
 `machine_name` is the canonical hostname (`canonical_hostname`, rule version
-3). The version is stored beside every name it produced. A later rule change
+4). The version is stored beside every name it produced. A later rule change
 makes the next writable open recanonicalize stored names and aliases, and the
 id is untouched. The rule (all three steps decided by Khaliq on 2026-10-25):
 
-- Lowercase, and trim whitespace and trailing dots.
+- Lowercase, NFC-normalize, and trim whitespace and trailing dots.
 - Strip network suffixes, repeatedly: `.local`, `.localdomain`, `.lan`,
   `.home`, `.home.arpa` and `.internal`. Each only matches after a dot, so a
   bare `local` stays a name.
@@ -45,13 +45,22 @@ id is untouched. The rule (all three steps decided by Khaliq on 2026-10-25):
 - Drop apostrophes, both straight and curly. macOS's ComputerName
   `Khaliq's MacBook Pro` and its LocalHostName `Khaliqs-MacBook-Pro` are then
   one name.
-- Turn every other run of punctuation, spaces and underscores into one `-`.
-- Trim hyphens, and cut the result at 63 characters from the right, so the
-  most specific labels stay.
+- Split into words on every other run of punctuation, spaces, underscores
+  and symbols, and join the words with one `-`.
+- A word with non-ASCII letters becomes its Punycode form behind the IDNA
+  `xn--` prefix (`ñandú-box` becomes `xn--and-6ma2c-box`). An `xn--` word
+  already in that form is kept, so a name and its IDNA spelling are one
+  name.
+- Cut the result at 63 characters from the right, so the most specific
+  labels stay.
 
 Rule 1 turned apostrophes into hyphens and kept only the first DNS label.
 Rule 2 dropped apostrophes. Rule 3 keeps every label except network
-suffixes. Keeping labels was chosen over stripping a domain because
+suffixes. Rule 4 (Khaliq, 2026-10-25) encodes non-ASCII words in Punycode
+instead of dropping them. Under rule 3 every hostname with no ASCII letters
+collapsed to `unknown-host`, which the cloud dry run showed for CJK names.
+Punycode was chosen over a hash fallback because it's the DNS standard, it
+can be decoded, and it keeps mixed names whole. Keeping labels was chosen over stripping a domain because
 `khaliqs.macbook.pro` and an ordinary `host.example.pro` can't be told
 apart (`.pro` is a real TLD). A split name is repaired by `hostname_aliases`
 locally and shows up in the cloud dry-run report. A false merge can't be

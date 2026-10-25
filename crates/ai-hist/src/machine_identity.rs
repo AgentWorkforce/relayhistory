@@ -263,6 +263,15 @@ fn retired_ids(conn: &Connection) -> Result<Vec<RetiredMachineId>> {
     Ok(retired)
 }
 
+/// [`read`] inside one read transaction, so the row, its aliases and its
+/// retired ids come from one saved state even while a writer refreshes them.
+fn read_snapshot(conn: &Connection) -> Result<Option<MachineIdentity>> {
+    let tx = conn.unchecked_transaction()?;
+    let identity = read(&tx)?;
+    tx.commit()?;
+    Ok(identity)
+}
+
 fn hostname_aliases(conn: &Connection) -> Result<Vec<HostnameAlias>> {
     let mut statement = conn.prepare(
         "SELECT observed_hostname, canonical_hostname, rule_version, first_seen_ms \
@@ -569,7 +578,7 @@ impl SessionStore {
     pub fn machine_identity(&self) -> std::result::Result<Option<MachineIdentity>, Error> {
         if self.read_only() {
             let conn = self.read_conn()?;
-            let identity = read(&conn).map_err(Error::query)?;
+            let identity = read_snapshot(&conn).map_err(Error::query)?;
             let moved = identity.as_ref().is_some_and(|identity| {
                 local_hardware_hash().is_some_and(|now| {
                     identity
@@ -587,10 +596,16 @@ impl SessionStore {
             }
             return Ok(identity);
         }
+        // The open already refreshed an identity that needed it, so this is
+        // almost always a read: it takes no write lock and never waits
+        // behind a sweep. Only identity work left to do -- a rename or new
+        // hardware since the open -- takes one immediate transaction, so a
+        // reissue's writes are atomic and two callers never interleave them.
         let mut conn = crate::store::open_db(self.db_path())
             .map_err(|error| Error::DatabaseOpen(format!("{error:#}")))?;
-        // One immediate transaction: a reissue is several writes, and two
-        // callers must not interleave them.
+        if !needs_refresh(&conn).map_err(Error::query)? {
+            return read_snapshot(&conn).map_err(Error::query);
+        }
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(Error::sql)?;
