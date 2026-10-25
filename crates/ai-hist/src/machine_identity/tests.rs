@@ -60,12 +60,13 @@ fn canonical_hostname_folds_odd_spellings_into_one_dns_label() {
             "  Khaliqs--MacBook__Pro  ",
             "-Khaliqs-MacBook-Pro-",
             "Khaliqs-MacBook-Pro.corp.example.com",
-        ][..],
-        &[
+            // macOS ComputerName forms: the apostrophe is dropped, not
+            // hyphenated, so they meet the LocalHostName above.
             "Khaliq's MacBook Pro",
             "Khaliq\u{2019}s MacBook Pro",
-            "khaliq-s-macbook-pro",
-        ],
+            "Khaliq\u{2018}s MacBook Pro",
+            "KHALIQ'S MACBOOK PRO.local",
+        ][..],
         &["build_01", "build-01.corp.example.com", "BUILD 01"],
         &["", "   ", "...", "'", "___", "\u{1F600}"],
     ] {
@@ -77,7 +78,10 @@ fn canonical_hostname_folds_odd_spellings_into_one_dns_label() {
     }
     for (raw, slug) in [
         ("Khaliqs-MacBook-Pro.local", "khaliqs-macbook-pro"),
-        ("Khaliq's MacBook Pro", "khaliq-s-macbook-pro"),
+        ("Khaliq's MacBook Pro", "khaliqs-macbook-pro"),
+        ("Khaliqs-MacBook-Pro", "khaliqs-macbook-pro"),
+        ("khaliq-s-macbook-pro", "khaliq-s-macbook-pro"),
+        ("O'Brien's iMac", "obriens-imac"),
         ("khaliqs.macbook.pro", "khaliqs"),
         ("DESKTOP_7F3A__X", "desktop-7f3a-x"),
         ("ñandú-box", "and-box"),
@@ -321,6 +325,45 @@ fn identity_tables_from_an_earlier_shape_are_upgraded_in_place() {
         .iter()
         .all(|alias| alias.rule_version == CANONICAL_HOSTNAME_RULE_VERSION));
     assert!(crate::store::schema_is_current(&open_db(&path).unwrap()).unwrap());
+}
+
+#[test]
+fn a_rule_v1_name_with_an_apostrophe_is_folded_on_the_next_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = db(&dir, "ai-history.db");
+    let first = first_run(&path, "Khaliq's MacBook Pro");
+    let conn = open_db(&path).unwrap();
+    // What rule 1 stored for the ComputerName spelling.
+    conn.execute_batch(
+        "UPDATE machine_identity SET machine_name = 'khaliq-s-macbook-pro', \
+         name_rule_version = 1; \
+         UPDATE hostname_aliases SET canonical_hostname = 'khaliq-s-macbook-pro', \
+         rule_version = 1;",
+    )
+    .unwrap();
+    // The next open reports the LocalHostName spelling.
+    let seen = ensure_with(&conn, "Khaliqs-MacBook-Pro", MachineNamePrivacy::Slug).unwrap();
+    assert_eq!(seen.machine_id, first.machine_id, "the id stays frozen");
+    assert_eq!(seen.machine_name, "khaliqs-macbook-pro");
+    assert_eq!(seen.name_rule_version, 2);
+    let aliases: Vec<_> = seen
+        .hostname_aliases
+        .iter()
+        .map(|alias| {
+            (
+                alias.observed.as_str(),
+                alias.canonical.as_str(),
+                alias.rule_version,
+            )
+        })
+        .collect();
+    assert_eq!(
+        aliases,
+        [
+            ("Khaliq's MacBook Pro", "khaliqs-macbook-pro", 2),
+            ("Khaliqs-MacBook-Pro", "khaliqs-macbook-pro", 2)
+        ]
+    );
 }
 
 #[test]

@@ -28,10 +28,18 @@ resets when a database is replaced, so it is not the machine id.
 
 `machine_identity` is a single-row table written by the first writable open.
 `machine_name` is the canonical hostname (`canonical_hostname`, rule version
-1, stored beside every name it produced so a later rule change
-recanonicalizes stored names on the next open without touching the id): lowercased, `.local` and the domain stripped, every run of punctuation,
-spaces, underscores and apostrophes turned into one `-`, hyphens trimmed, 63
-characters at most. Every hostname spelling the machine has reported is kept
+2). The version is stored beside every name it produced, so a later rule
+change recanonicalizes stored names on the next open without touching the
+id. The rule:
+
+- Lowercase, and strip `.local` and the domain.
+- Drop apostrophes, both straight and curly (decided by Khaliq,
+  2026-10-25). macOS's ComputerName `Khaliq's MacBook Pro` and its
+  LocalHostName `Khaliqs-MacBook-Pro` are then one name.
+- Turn every other run of punctuation, spaces and underscores into one `-`.
+- Trim hyphens, and cap the result at 63 characters.
+
+Rule 1 turned apostrophes into hyphens. Every hostname spelling the machine has reported is kept
 in `hostname_aliases` with its canonical form, so all of them resolve to the
 one machine. A spelling already recorded is never written again. The
 [cloud backfill proposal](../specs/2026-10-25-cloud-hostname-canonicalization-backfill.md)

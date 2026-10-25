@@ -14,13 +14,13 @@ Grouping by the raw hostname splits one machine into several.
 ## Rule
 
 `ai_hist::canonical_hostname` (rule version
-`CANONICAL_HOSTNAME_RULE_VERSION = 1`) is pure and deterministic:
+`CANONICAL_HOSTNAME_RULE_VERSION = 2`) is pure and deterministic:
 
 1. Lowercase.
 2. Strip trailing dots and `.local`.
 3. Keep only the first DNS label, dropping the domain.
-4. Turn every run of anything but `[a-z0-9]` (punctuation, spaces,
-   underscores, apostrophes, non-ASCII) into one `-`.
+4. Drop apostrophes (`'`, `‘`, `’`), then turn every other run of anything
+   but `[a-z0-9]` (punctuation, spaces, underscores, non-ASCII) into one `-`.
 5. Trim leading and trailing hyphens and cap the result at 63 characters.
 
 An empty result becomes `unknown-host`. New installs store the canonical form
@@ -78,7 +78,7 @@ ALTER TABLE <machines_table>
 
 -- one UPDATE per reviewed mapping row, generated from report.json
 UPDATE <machines_table>
-   SET canonical_hostname = $canonical, canonical_hostname_rule = 1
+   SET canonical_hostname = $canonical, canonical_hostname_rule = 2
  WHERE hostname = $hostname AND canonical_hostname IS NULL;
 
 CREATE TABLE <hostname_aliases_table> (
@@ -102,12 +102,8 @@ rows on the old version.
 
 ## Open questions
 
-- **Apostrophes.** Under the requested rule they become hyphens, so macOS's
-  ComputerName (`Khaliq's MacBook Pro`) canonicalizes to
-  `khaliq-s-macbook-pro`, while its LocalHostName (`Khaliqs-MacBook-Pro`)
-  becomes `khaliqs-macbook-pro`. Dropping apostrophes instead would fold the
-  two together. Locally both spellings resolve to one machine through
-  `hostname_aliases` either way, but a cloud grouping by canonical name would
-  see two names. Which spellings does the cloud data actually hold?
+- **Apostrophes:** decided by Khaliq (2026-10-25). They are dropped (rule 2),
+  so `Khaliq's MacBook Pro` and `Khaliqs-MacBook-Pro` both canonicalize to
+  `khaliqs-macbook-pro`.
 - **Dotted short names.** Taking the first DNS label turns `khaliqs.macbook.pro`
   into `khaliqs`. Is a dotted non-FQDN hostname present in the data?

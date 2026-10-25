@@ -84,7 +84,12 @@ pub const INSTALL_SUFFIX_HEX_DIGITS: usize = 6;
 /// `hostname_aliases` row record the version they were computed with, so a
 /// later rule change recanonicalizes them on the next open (the machine id
 /// stays frozen) instead of leaving old and new names silently mixed.
-pub const CANONICAL_HOSTNAME_RULE_VERSION: u32 = 1;
+///
+/// - `1`: apostrophes became hyphens (`khaliq-s-macbook-pro`).
+/// - `2`: apostrophes, straight and curly, are dropped, so macOS's
+///   ComputerName (`Khaliq's MacBook Pro`) and LocalHostName
+///   (`Khaliqs-MacBook-Pro`) are one name.
+pub const CANONICAL_HOSTNAME_RULE_VERSION: u32 = 2;
 
 /// The canonical hostname of a name with no usable character.
 pub const UNKNOWN_HOSTNAME: &str = "unknown-host";
@@ -149,13 +154,14 @@ CREATE TABLE IF NOT EXISTS hostname_aliases (
 /// The canonical hostname: one deterministic spelling per machine name.
 ///
 /// Lowercased; trailing dots and `.local` stripped; only the first DNS label
-/// kept (the domain dropped); every run of anything but `[a-z0-9]` --
-/// punctuation, spaces, underscores, apostrophes, non-ASCII -- one `-`;
+/// kept (the domain dropped); apostrophes (`'`, `‘`, `’`) dropped;
+/// every other run of anything but `[a-z0-9]` -- punctuation, spaces,
+/// underscores, non-ASCII -- one `-`;
 /// leading and trailing hyphens trimmed; at most 63 characters. A name with
 /// nothing left is [`UNKNOWN_HOSTNAME`].
 ///
 /// `Khaliqs-MacBook-Pro.local` -> `khaliqs-macbook-pro`;
-/// `Khaliq's MacBook Pro` -> `khaliq-s-macbook-pro`;
+/// `Khaliq's MacBook Pro` -> `khaliqs-macbook-pro`;
 /// `build_01.corp.example.com` -> `build-01`.
 pub fn canonical_hostname(hostname: &str) -> String {
     let lower = hostname.trim().trim_end_matches('.').to_ascii_lowercase();
@@ -163,6 +169,9 @@ pub fn canonical_hostname(hostname: &str) -> String {
     let label = host.split('.').next().unwrap_or_default();
     let mut slug = String::with_capacity(label.len());
     for ch in label.chars() {
+        if APOSTROPHES.contains(&ch) {
+            continue;
+        }
         if ch.is_ascii_alphanumeric() {
             slug.push(ch);
         } else if !slug.is_empty() && !slug.ends_with('-') {
@@ -176,6 +185,9 @@ pub fn canonical_hostname(hostname: &str) -> String {
         slug.to_string()
     }
 }
+
+/// The apostrophes [`canonical_hostname`] drops rather than hyphenates.
+const APOSTROPHES: &[char] = &['\'', '\u{2018}', '\u{2019}'];
 
 /// The machine id for `machine_name`: the single place the id is decided.
 /// `install_id` is the random UUID from first run; its first
