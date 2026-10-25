@@ -11,14 +11,14 @@ struct ResetHooks;
 impl Drop for ResetHooks {
     fn drop(&mut self) {
         FAIL_ENTRY_PATH.with(|p| *p.borrow_mut() = None);
-        FAIL_READ_DIRECTORY.with(|p| *p.borrow_mut() = None);
+        FAIL_READ_DIRECTORY.with(|p| p.borrow_mut().clear());
     }
 }
-fn codex(path: &std::path::Path, id: &str) {
+pub(super) fn codex(path: &std::path::Path, id: &str) {
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     fs::write(path, format!("{{\"timestamp\":\"2026-10-23T12:00:00Z\",\"type\":\"session_meta\",\"payload\":{{\"id\":\"{id}\",\"cwd\":\"/synthetic\"}}}}\n{{\"timestamp\":\"2026-10-23T12:00:01Z\",\"type\":\"event_msg\",\"payload\":{{\"type\":\"user_message\",\"message\":\"fixture\"}}}}\n")).unwrap();
 }
-fn ids(store: &SessionStore) -> HashSet<String> {
+pub(super) fn ids(store: &SessionStore) -> HashSet<String> {
     store
         .sessions(Default::default())
         .map(|r| r.unwrap().session_id)
@@ -72,7 +72,7 @@ fn persistent_case(shallow: bool, failure: Failure) {
         Failure::Open => fs::write(&archive, b"not a directory").unwrap(),
         Failure::Read => {
             codex(&bad_entry, "repaired");
-            FAIL_READ_DIRECTORY.with(|p| *p.borrow_mut() = Some(archive.clone()));
+            FAIL_READ_DIRECTORY.with(|p| *p.borrow_mut() = vec![archive.clone()]);
         }
         Failure::Entry => {
             codex(&bad_entry, "repaired");
@@ -167,7 +167,7 @@ fn persistent_case(shallow: bool, failure: Failure) {
             fs::remove_file(&archive).unwrap();
             codex(&bad_entry, "repaired");
         }
-        Failure::Read => FAIL_READ_DIRECTORY.with(|p| *p.borrow_mut() = None),
+        Failure::Read => FAIL_READ_DIRECTORY.with(|p| p.borrow_mut().clear()),
         Failure::Entry => FAIL_ENTRY_PATH.with(|p| *p.borrow_mut() = None),
     }
     let mut complete = false;

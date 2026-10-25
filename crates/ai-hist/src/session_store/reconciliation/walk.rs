@@ -166,6 +166,9 @@ impl SourceWalk {
                 let canonical = current.canonical.clone();
                 self.current = None;
                 self.visited.remove(&canonical);
+                // A reopened iterator that fails has not earned another retry
+                // ahead of the ready queue. Let healthy traversal advance first.
+                self.deferred_turn = false;
                 self.defer(DeferredWork::Directory(path, root));
                 Err(Error::Discovery(error.to_string()))
             }
@@ -217,7 +220,8 @@ fn deferred_entry_type(path: &std::path::Path) -> std::io::Result<std::fs::FileT
 
 fn read_directory_entry(current: &mut OpenDirectory) -> Option<std::io::Result<std::fs::DirEntry>> {
     #[cfg(test)]
-    if FAIL_READ_DIRECTORY.with(|failed| failed.borrow().as_ref() == Some(&current.path)) {
+    if FAIL_READ_DIRECTORY.with(|failed| failed.borrow().contains(&current.path)) {
+        FAILED_DIRECTORY_READS.with(|reads| reads.borrow_mut().push(current.path.clone()));
         return Some(Err(std::io::Error::from(
             std::io::ErrorKind::PermissionDenied,
         )));

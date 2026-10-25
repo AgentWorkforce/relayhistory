@@ -86,7 +86,8 @@ thread_local! {static FAIL_ENTRY_TYPE: std::cell::Cell<bool> = const {std::cell:
 #[cfg(test)]
 thread_local! {
     static FAIL_ENTRY_PATH: std::cell::RefCell<Option<PathBuf>> = const {std::cell::RefCell::new(None)};
-    static FAIL_READ_DIRECTORY: std::cell::RefCell<Option<PathBuf>> = const {std::cell::RefCell::new(None)};
+    static FAIL_READ_DIRECTORY: std::cell::RefCell<Vec<PathBuf>> = const {std::cell::RefCell::new(Vec::new())};
+    static FAILED_DIRECTORY_READS: std::cell::RefCell<Vec<PathBuf>> = const {std::cell::RefCell::new(Vec::new())};
 }
 
 fn entry_type(entry: &std::fs::DirEntry) -> std::io::Result<std::fs::FileType> {
@@ -386,6 +387,7 @@ mod tests {
     use crate::{ProviderRoots, StoreOptions};
     use std::io::Write;
 
+    mod multi_failure_tests;
     mod recovery_tests;
 
     fn fixture() -> (tempfile::TempDir, SessionStore, PathBuf) {
