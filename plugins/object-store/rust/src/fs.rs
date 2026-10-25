@@ -292,7 +292,10 @@ impl Backend for FsBackend {
             .map_err(|e| Error::from_store(Self::NAME, path.as_ref(), e))
     }
 
-    /// Rewrite a sidecar that was lost or went stale (see `Backend`).
+    /// Rewrite a sidecar that was lost or went stale (see `Backend`). Runs
+    /// under the write lock and only if the object is still the version that
+    /// was verified, so it can never stamp an old ETag over a newer write's
+    /// sidecar.
     async fn repair_metadata(
         &self,
         path: &Path,
@@ -300,9 +303,20 @@ impl Backend for FsBackend {
         metadata: &Metadata,
         content_type: &str,
     ) -> Result<()> {
+        let map = |e| Error::from_store(Self::NAME, path.as_ref(), e);
+        let _guard = self.lock().await.map_err(map)?;
+        let current = match self.store.head(path).await {
+            Ok(meta) => meta,
+            Err(object_store::Error::NotFound { .. }) => return Ok(()),
+            Err(e) => return Err(map(e)),
+        };
+        if current.e_tag.as_deref() != e_tag {
+            tracing::debug!(%path, "object changed since it was verified; skipping sidecar repair");
+            return Ok(());
+        }
         self.write_sidecar(path, e_tag, metadata, content_type)
             .await
-            .map_err(|e| Error::from_store(Self::NAME, path.as_ref(), e))
+            .map_err(map)
     }
 }
 
@@ -388,6 +402,39 @@ mod tests {
         let meta = store.head(&key).await.unwrap().unwrap();
         assert_eq!(meta.trace_id(), Some("t-1"));
         assert_eq!(meta.content_sha256(), Some(ack.content_sha256.as_str()));
+    }
+
+    #[tokio::test]
+    async fn repair_never_overwrites_a_newer_version() {
+        let (_dir, store) = store();
+        let key = ObjectKey::new("s/manifest.json").unwrap();
+        let v1 = store
+            .put(&key, Bytes::from_static(b"{\"v\":1}"), PutOpts::create())
+            .await
+            .unwrap();
+        let v2 = store
+            .put(
+                &key,
+                Bytes::from_static(b"{\"v\":2}"),
+                PutOpts::replace(v1.version.clone()).with_trace_id("t-2"),
+            )
+            .await
+            .unwrap();
+        // A repair verified against v1 arrives after v2 committed.
+        store
+            .core
+            .backend()
+            .repair_metadata(
+                &key.to_path(),
+                v1.version.e_tag.as_deref(),
+                &Metadata::new(),
+                "application/json",
+            )
+            .await
+            .unwrap();
+        let meta = store.head(&key).await.unwrap().unwrap();
+        assert_eq!(meta.trace_id(), Some("t-2"));
+        assert_eq!(meta.content_sha256(), Some(v2.content_sha256.as_str()));
     }
 
     #[tokio::test]
