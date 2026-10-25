@@ -3,6 +3,9 @@
 - **Status:** Proposed (draft for review). The ownership model (two writers,
   each owning its own sections) was decided by Khaliq on 2026-10-25. The epoch
   rule and chunk fields are still pending review.
+- **Implementations:** Rust `relayhistory_object_store::manifest` (types,
+  validation, `update_manifest`, client and server helpers); TypeScript
+  `parseManifest` in relayhistory-cloud's `@relayhistory/object-store`.
 - **Object:** `{prefix}/v1/ws={workspace_id}/m={machine_id}/h={harness}/d={yyyy}/{mm}/{dd}/s={session_id}/manifest.json`,
   built by `layout::SessionLocation::manifest()`
 - **Writers:** two of them, each owning its own sections

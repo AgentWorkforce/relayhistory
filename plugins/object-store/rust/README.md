@@ -54,6 +54,20 @@ pub trait ObjectStore: Send + Sync + Debug {
     normalized/v{N}/...
 ```
 
+`manifest` implements the [v1 manifest](docs/manifest-v1.md) for both writers:
+
+- **Types:** serde types that preserve unknown fields.
+- **Validation:** `parse_manifest` / `validate` check every invariant, matching
+  the TypeScript validator in relayhistory-cloud.
+- **Writes:** `update_manifest` reads with `get_object`, applies one writer's
+  `Edit`, and writes with compare-and-swap. It retries up to 8 times with
+  jittered backoff. An edit can only replace its own writer's sections, so the
+  other side's fields are carried through untouched.
+- **Client helpers (`manifest::client`):** `new_manifest`, `plan_chunks` /
+  `apply_chunks`, `open_epoch`, and `classify` for stale-writer detection.
+- **Server helpers (`manifest::server`):** lifecycle, normalized output and
+  `pointer_fields`.
+
 `compress_zstd` / `decompress_zstd` wrap raw chunk bodies (level 3). Objects
 are stored as `application/zstd` without `Content-Encoding`, so a presigned
 download returns the exact `.zst` object.
