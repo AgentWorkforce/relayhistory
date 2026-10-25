@@ -76,7 +76,8 @@ the desktop must not enable this override as part of selecting a shorter limit.
 
 ## Maintenance and cloud copies
 
-Each invocation plans at most 32 candidate session identities on a reader,
+Each invocation plans at most 32 candidate session identities on its own
+read-only connection, leaving the foreground connection pool warm,
 then revalidates and processes at most one expired session on a writer. It
 removes at most `max_rows` payload/auxiliary rows (default 128, allowed 1–1024),
 with individual delete statements limited to 32 rows. Large sessions and

@@ -80,7 +80,9 @@ fn prepare(store: &SessionStore, opts: &RetentionOptions, now: i64) -> Result<Pr
             "retention max_rows must be 1..=1024".into(),
         ));
     }
-    let reader = store.read_conn()?;
+    // Do not borrow the foreground pool: maintenance can otherwise take its
+    // warm connection and force a simultaneous catalog read through cold open.
+    let reader = crate::store::open_db_readonly(store.db_path()).map_err(Error::query)?;
     let Some(days) = super::policy(&reader).map_err(Error::query)?.days else {
         return Ok(Prepared::Skip(RetentionReport {
             cycle_complete: true,

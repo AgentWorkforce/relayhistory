@@ -20,7 +20,7 @@ means forever. Expose policy read/write and explicit maintenance through the
 Rust SDK. The SQLite value is authoritative across clients.
 
 The host schedules `prune_expired` on its maintenance worker. Each call plans
-at most 32 identities on a reader, rechecks one expired session under an
+at most 32 identities on a separate read-only connection, rechecks one expired session under an
 immediate transaction, and removes bounded chunks. Persist pending activity and
 the scan cursor so large sessions resume across batches/restarts. Default
 batches have a 100 ms cooldown; compile trigger-heavy statements before taking
