@@ -394,11 +394,18 @@ There are two independent fences.
    payload, and applies it only if it is newer:
 
    ```sql
+   -- Conflict key as in relayhistory-cloud#171's session_index:
+   -- (org, workspace, harness, session_id, machine_id).
    insert into sessions (...) values (...)
-   on conflict (workspace_id, session_id, harness)
+   on conflict (org_id, workspace_id, harness, session_id, machine_id)
    do update set ...
    where excluded.manifest_revision > sessions.manifest_revision;
    ```
+
+   `machine_id` is part of the key because the same harness session id can
+   occur on two machines. Each machine has its own manifest under its own
+   `m=` prefix and its own `revision` sequence, so revisions are compared only
+   within one machine's row.
 
    `revision` is global across both writers and strictly increasing, so one
    fence covers both. A stale event is a no-op.
