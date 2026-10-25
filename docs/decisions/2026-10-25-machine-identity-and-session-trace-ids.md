@@ -1,8 +1,9 @@
 # Machine identity and per-session trace ids live in the history database
 
-- **Status:** Proposed. The id strategy (A or B) and the name privacy mode
-  wait on Khaliq's decision; the code ships B and the slug as marked interim
-  defaults (`DEFAULT_MACHINE_ID_STRATEGY`, `DEFAULT_MACHINE_NAME_PRIVACY`).
+- **Status:** Proposed. The machine-id scheme is decided (Khaliq,
+  2026-10-25): the canonical hostname plus an install suffix, never the
+  hostname alone. The name privacy mode (`DEFAULT_MACHINE_NAME_PRIVACY`,
+  slug for now) is still open.
 - **Date:** 2026-10-25
 - **Related:** Sessions Pipeline Redesign, workstream W2;
   [plan 009](../../plans/009-local-history-cloud-boundary.md)
@@ -25,35 +26,42 @@ resets when a database is replaced, so it is not the machine id.
 
 ### Machine identity
 
-`machine_identity` is a single-row table written by the first writable open,
-with `machine_aliases` beside it. `machine_name` is the canonical hostname slug:
-lowercase `[a-z0-9-]`, `.local` stripped, first DNS label, apostrophes dropped,
-63 characters at most. The hostname comes from `uname(2)` (`COMPUTERNAME` on
+`machine_identity` is a single-row table written by the first writable open.
+`machine_name` is the canonical hostname (`canonical_hostname`, rule version
+1): lowercased, `.local` and the domain stripped, every run of punctuation,
+spaces, underscores and apostrophes turned into one `-`, hyphens trimmed, 63
+characters at most. Every hostname spelling the machine has reported is kept
+in `hostname_aliases` with its canonical form, so all of them resolve to the
+one machine. A spelling already recorded is never written again. The
+[cloud backfill proposal](../specs/2026-10-25-cloud-hostname-canonicalization-backfill.md)
+applies the same rule to existing cloud rows, additively. The hostname comes from `uname(2)` (`COMPUTERNAME` on
 Windows). No process is spawned and nothing touches the network.
 
-`machine_id` is computed once by `machine_id()`, the single function that
-decides it, and is then frozen. The row records the strategy that produced
-it, so changing the default never re-keys a machine that has already
-uploaded. A rename updates `machine_name` and adds an alias; it never changes
-the id. Two strategies are implemented and tested:
+`machine_id` is the canonical hostname, a `-`, and the first 6 hex digits of
+a random install UUID generated at first run (`khaliqs-mbp-7f3a9c`). It is
+computed once by `machine_id()`, the single function that decides it, and
+then frozen. The row's `id_scheme` (`hostname_install_suffix_v1`) records
+which version of that function produced it, so a future change never re-keys
+a machine that has already uploaded. A rename or respelling updates
+`machine_name` and adds a `hostname_aliases` entry. It never changes the id,
+and neither does canonicalization.
 
-| | A: slug is the id (`macbook-pro`) | B: slug + install suffix (`macbook-pro-7f3a9c`) |
-|---|---|---|
-| Two machines named `macbook-pro` | **same id**: histories merge silently, and an upload can't be separated afterwards | distinct ids |
-| Re-image or new disk, same hostname | same id, so the history continues | new id, seen as a new machine (aliases/UI can link them) |
-| Database copied to a second machine | same id (also a collision) | same id (clone; needs detection, see below) |
-| Readability in paths and UI | best | good: the slug stays readable |
-| Rename | id frozen; name and alias updated | id frozen; name and alias updated |
+| Case | Result |
+|---|---|
+| Two machines named `macbook-pro` | distinct ids |
+| Hostname renamed or respelled | same id; `machine_name` and aliases updated |
+| Restart | same id (stored, not recomputed) |
+| Re-image or new disk, same hostname | new install, so a new id. The shared canonical name lets the UI link them |
+| Database copied to a second machine | same id (clone; needs detection, see below) |
 
-B's suffix is the first 6 hex digits of a random install UUID (24 bits).
-Among 1,000 machines that share one hostname, the chance that any two collide
-is about 3%. With the 4-digit suffix from the design sketch it would be about
+The 6-digit suffix is 24 bits. Among 1,000 machines that share one hostname,
+the chance that any two collide is about 3%. With 4 digits it would be about
 99.9%.
 
 `MachineNamePrivacy::Hashed` replaces the slug with `h` plus 12 hex digits of
 a SHA-256 of it. That keeps the hostname out of object keys, but hostnames are
 guessable, so the hash is pseudonymity, not anonymity. It stays deterministic
-so strategy A keeps its re-image property.
+so a name maps to one pseudonym.
 
 ### Trace ids
 
@@ -86,6 +94,11 @@ old head.
   new session still takes exactly one revision. Measured in release, minting
   adds about 11 µs to a new session's insert (62 to 73 µs) and nothing to
   later upserts or event writes.
+- **The canonical hostname alone as the machine id.** Readable, and it
+  survives a re-image. But a rename or respelling would change the id, and
+  every unrenamed `macbook-pro` would share one id, silently merging those
+  machines' histories with no way to separate them after upload. Rejected by
+  Khaliq.
 - **Use the change-feed epoch as the machine id.** It's per database and
   resets on replacement.
 - **Hardware ids (IOPlatformUUID, `/etc/machine-id`) as the id.** They're

@@ -5,19 +5,17 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-use MachineIdStrategy::{HostnameSlug as A, HostnameSlugWithInstallSuffix as B};
-
 /// A migrated database whose identity row is cleared, as a database is
 /// before its first run would have it, so a test chooses the hostname.
 fn blank(path: &Path) -> Connection {
     let conn = open_db(path).unwrap();
-    conn.execute_batch("DELETE FROM machine_identity; DELETE FROM machine_aliases;")
+    conn.execute_batch("DELETE FROM machine_identity; DELETE FROM hostname_aliases;")
         .unwrap();
     conn
 }
 
-fn first_run(path: &Path, hostname: &str, strategy: MachineIdStrategy) -> MachineIdentity {
-    ensure_with(&blank(path), hostname, strategy, MachineNamePrivacy::Slug).unwrap()
+fn first_run(path: &Path, hostname: &str) -> MachineIdentity {
+    ensure_with(&blank(path), hostname, MachineNamePrivacy::Slug).unwrap()
 }
 
 fn store(path: &Path) -> SessionStore {
@@ -50,88 +48,104 @@ fn uuid_v7_ms(value: &str) -> i64 {
 }
 
 #[test]
-fn canonical_name_is_a_lowercase_dns_label() {
+fn canonical_hostname_folds_odd_spellings_into_one_dns_label() {
+    // Every spelling of one Mac its tools report, and other odd forms.
+    for spellings in [
+        &[
+            "Khaliqs-MacBook-Pro",
+            "Khaliqs-MacBook-Pro.local",
+            "khaliqs-macbook-pro.LOCAL.",
+            "KHALIQS_MACBOOK_PRO",
+            "Khaliqs MacBook Pro",
+            "  Khaliqs--MacBook__Pro  ",
+            "-Khaliqs-MacBook-Pro-",
+            "Khaliqs-MacBook-Pro.corp.example.com",
+        ][..],
+        &[
+            "Khaliq's MacBook Pro",
+            "Khaliq\u{2019}s MacBook Pro",
+            "khaliq-s-macbook-pro",
+        ],
+        &["build_01", "build-01.corp.example.com", "BUILD 01"],
+        &["", "   ", "...", "'", "___", "\u{1F600}"],
+    ] {
+        let canonical: BTreeSet<String> = spellings
+            .iter()
+            .map(|raw| canonical_hostname(raw))
+            .collect();
+        assert_eq!(canonical.len(), 1, "{spellings:?} -> {canonical:?}");
+    }
     for (raw, slug) in [
         ("Khaliqs-MacBook-Pro.local", "khaliqs-macbook-pro"),
-        ("Khaliqs-MacBook-Pro.LOCAL.", "khaliqs-macbook-pro"),
-        ("Khaliq's MacBook Pro", "khaliqs-macbook-pro"),
-        ("Khaliq\u{2019}s MacBook Pro", "khaliqs-macbook-pro"),
-        ("build-01.corp.example.com", "build-01"),
-        ("  linuyc-desktop\n", "linuyc-desktop"),
+        ("Khaliq's MacBook Pro", "khaliq-s-macbook-pro"),
+        ("khaliqs.macbook.pro", "khaliqs"),
         ("DESKTOP_7F3A__X", "desktop-7f3a-x"),
-        ("--edge--", "edge"),
-        ("", UNKNOWN_MACHINE_NAME),
-        ("...", UNKNOWN_MACHINE_NAME),
-        ("ñandú", "and"),
+        ("ñandú-box", "and-box"),
+        ("linuyc-desktop\n", "linuyc-desktop"),
+        ("ip-10-0-0-1.ec2.internal", "ip-10-0-0-1"),
+        ("", UNKNOWN_HOSTNAME),
     ] {
-        assert_eq!(canonical_machine_name(raw), slug, "{raw:?}");
+        assert_eq!(canonical_hostname(raw), slug, "{raw:?}");
     }
-    let long = canonical_machine_name(&"a-".repeat(100));
+    let long = canonical_hostname(&"a-".repeat(100));
     assert!(long.len() <= 63 && !long.ends_with('-'), "{long}");
+    // Idempotent: a canonical name is its own canonical form.
+    for raw in ["Khaliq's MacBook Pro", "build_01.x", "ñandú", ""] {
+        let once = canonical_hostname(raw);
+        assert_eq!(canonical_hostname(&once), once);
+    }
 }
 
 #[test]
-fn machine_id_is_the_one_strategy_function() {
+fn machine_id_is_the_hostname_plus_an_install_suffix() {
     let install = "7f3a9c12-0000-4000-8000-000000000000";
     assert_eq!(
-        machine_id(A, MachineNamePrivacy::Slug, "khaliq-mbp", install),
-        "khaliq-mbp"
-    );
-    assert_eq!(
-        machine_id(B, MachineNamePrivacy::Slug, "khaliq-mbp", install),
+        machine_id(MachineNamePrivacy::Slug, "khaliq-mbp", install),
         "khaliq-mbp-7f3a9c"
     );
-    let hashed = machine_id(A, MachineNamePrivacy::Hashed, "khaliq-mbp", install);
-    assert!(hashed.starts_with('h') && hashed.len() == 13, "{hashed}");
+    let hashed = machine_id(MachineNamePrivacy::Hashed, "khaliq-mbp", install);
+    let (name, suffix) = hashed.rsplit_once('-').unwrap();
+    assert!(name.starts_with('h') && name.len() == 13, "{hashed}");
     assert!(!hashed.contains("khaliq"));
-    // Deterministic, so strategy A keeps its re-image property when hashed.
-    assert_eq!(
-        hashed,
-        machine_id(A, MachineNamePrivacy::Hashed, "khaliq-mbp", "other")
-    );
-    assert_eq!(
-        machine_id(B, MachineNamePrivacy::Hashed, "khaliq-mbp", install),
-        format!("{hashed}-7f3a9c")
-    );
+    assert_eq!(suffix, "7f3a9c");
 }
 
 #[test]
-fn first_run_creates_one_identity_with_the_default_strategy() {
+fn first_run_creates_one_identity_with_the_current_scheme() {
     let dir = tempfile::tempdir().unwrap();
     let path = db(&dir, "ai-history.db");
     let identity = store(&path).machine_identity().unwrap().unwrap();
-    assert_eq!(identity.strategy, DEFAULT_MACHINE_ID_STRATEGY);
+    assert_eq!(identity.id_scheme, MACHINE_ID_SCHEME);
     assert_eq!(identity.name_privacy, DEFAULT_MACHINE_NAME_PRIVACY);
-    assert_eq!(
-        identity.machine_name,
-        canonical_machine_name(&local_hostname())
-    );
-    assert_eq!(identity.aliases, vec![identity.machine_name.clone()]);
+    assert_eq!(identity.machine_name, canonical_hostname(&local_hostname()));
+    let [alias] = &identity.hostname_aliases[..] else {
+        panic!("{identity:?}");
+    };
+    assert_eq!(alias.observed, local_hostname().trim());
+    assert_eq!(alias.canonical, identity.machine_name);
     assert_eq!(
         identity.machine_id,
         machine_id(
-            identity.strategy,
             identity.name_privacy,
             &identity.machine_name,
             &identity.install_id
         )
+    );
+    assert_ne!(
+        identity.machine_id, identity.machine_name,
+        "never the hostname alone"
     );
     let install = identity.install_id.split('-').collect::<Vec<_>>();
     assert_eq!(install[2].chars().next(), Some('4'), "{:?}", identity);
 }
 
 #[test]
-fn same_hostname_collides_under_a_and_not_under_b() {
+fn two_machines_with_one_hostname_get_two_ids() {
     let dir = tempfile::tempdir().unwrap();
-    let laptop = |name: &str, strategy| first_run(&db(&dir, name), "MacBook-Pro.local", strategy);
-
-    let (one, two) = (laptop("a1.db", A), laptop("a2.db", A));
-    assert_eq!(one.machine_id, "macbook-pro");
-    assert_eq!(one.machine_id, two.machine_id, "A: two machines, one id");
-    assert_ne!(one.install_id, two.install_id);
-
-    let (one, two) = (laptop("b1.db", B), laptop("b2.db", B));
-    assert_ne!(one.machine_id, two.machine_id, "B: two machines, two ids");
+    let laptop = |name: &str| first_run(&db(&dir, name), "MacBook-Pro.local");
+    let (one, two) = (laptop("one.db"), laptop("two.db"));
+    assert_eq!(one.machine_name, two.machine_name);
+    assert_ne!(one.machine_id, two.machine_id);
     for identity in [&one, &two] {
         let suffix = identity.machine_id.strip_prefix("macbook-pro-").unwrap();
         assert_eq!(suffix.len(), INSTALL_SUFFIX_HEX_DIGITS);
@@ -141,29 +155,87 @@ fn same_hostname_collides_under_a_and_not_under_b() {
 
 #[test]
 fn hostname_rename_updates_the_name_and_records_an_alias_never_the_id() {
-    for strategy in [A, B] {
-        let dir = tempfile::tempdir().unwrap();
-        let path = db(&dir, "ai-history.db");
-        let before = first_run(&path, "khaliq-mbp", strategy);
-        let conn = open_db(&path).unwrap();
-        let after = ensure_with(
-            &conn,
-            "Khaliqs-MacBook-Air.local",
-            B,
-            MachineNamePrivacy::Hashed,
-        )
-        .unwrap();
-        assert_eq!(after.machine_id, before.machine_id, "{strategy:?}");
-        assert_eq!(after.install_id, before.install_id);
-        assert_eq!(after.strategy, strategy, "a later strategy never re-keys");
-        assert_eq!(after.machine_name, "khaliqs-macbook-air");
-        assert_eq!(after.aliases, ["khaliq-mbp", "khaliqs-macbook-air"]);
-        assert_eq!(read(&conn).unwrap().unwrap(), after);
-        // Renaming back reuses the alias rather than adding a third.
-        let back = ensure_with(&conn, "khaliq-mbp", strategy, MachineNamePrivacy::Slug).unwrap();
-        assert_eq!(back.machine_name, "khaliq-mbp");
-        assert_eq!(back.aliases.len(), 2);
+    let dir = tempfile::tempdir().unwrap();
+    let path = db(&dir, "ai-history.db");
+    let before = first_run(&path, "khaliq-mbp");
+    let conn = open_db(&path).unwrap();
+    // A different privacy on a later run changes nothing about the id either.
+    let after = ensure_with(
+        &conn,
+        "Khaliqs-MacBook-Air.local",
+        MachineNamePrivacy::Hashed,
+    )
+    .unwrap();
+    assert_eq!(after.machine_id, before.machine_id);
+    assert_eq!(after.install_id, before.install_id);
+    assert_eq!(after.name_privacy, MachineNamePrivacy::Slug);
+    assert_eq!(after.machine_name, "khaliqs-macbook-air");
+    let observed: Vec<_> = after.hostname_aliases.iter().map(|a| &a.observed).collect();
+    assert_eq!(observed, ["khaliq-mbp", "Khaliqs-MacBook-Air.local"]);
+    assert_eq!(after.hostname_aliases[1].canonical, "khaliqs-macbook-air");
+    assert_eq!(read(&conn).unwrap().unwrap(), after);
+    // Renaming back reuses the alias rather than adding a third.
+    let back = ensure_with(&conn, "khaliq-mbp", MachineNamePrivacy::Slug).unwrap();
+    assert_eq!(back.machine_name, "khaliq-mbp");
+    assert_eq!(back.machine_id, before.machine_id);
+    assert_eq!(back.hostname_aliases.len(), 2);
+}
+
+#[test]
+fn every_spelling_of_one_hostname_resolves_to_one_machine() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = db(&dir, "ai-history.db");
+    let first = first_run(&path, "Khaliqs-MacBook-Pro.local");
+    let conn = open_db(&path).unwrap();
+    let spellings = [
+        "Khaliqs-MacBook-Pro",
+        "KHALIQS_MACBOOK_PRO",
+        "khaliqs macbook pro",
+    ];
+    for spelling in spellings {
+        let seen = ensure_with(&conn, spelling, MachineNamePrivacy::Slug).unwrap();
+        assert_eq!(seen.machine_id, first.machine_id, "{spelling}");
+        assert_eq!(seen.machine_name, "khaliqs-macbook-pro");
+        assert_eq!(
+            seen.updated_ms, first.updated_ms,
+            "no rename for a respelling"
+        );
     }
+    let stored = read(&conn).unwrap().unwrap();
+    assert_eq!(stored.hostname_aliases.len(), 1 + spellings.len());
+    assert!(stored
+        .hostname_aliases
+        .iter()
+        .all(|alias| alias.canonical == "khaliqs-macbook-pro"));
+    // A spelling already recorded is not a write.
+    let changes = || -> i64 {
+        conn.query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap()
+    };
+    let before = changes();
+    ensure_with(&conn, "KHALIQS_MACBOOK_PRO", MachineNamePrivacy::Slug).unwrap();
+    assert_eq!(changes(), before);
+}
+
+#[test]
+fn a_stored_machine_id_never_changes_with_canonicalization() {
+    // An id written under another rule keeps its value and its references:
+    // canonicalization only names, it never re-keys.
+    let dir = tempfile::tempdir().unwrap();
+    let path = db(&dir, "ai-history.db");
+    let conn = blank(&path);
+    conn.execute(
+        "INSERT INTO machine_identity (singleton, machine_id, machine_name, install_id, \
+         id_scheme, name_privacy, created_ms, updated_ms) \
+         VALUES (1, 'Khaliqs_MBP-abc', 'Khaliqs_MBP', 'abc', 'earlier', 'slug', 1, 1)",
+        [],
+    )
+    .unwrap();
+    let seen = ensure_with(&conn, "Khaliqs_MBP", MachineNamePrivacy::Hashed).unwrap();
+    assert_eq!(seen.machine_id, "Khaliqs_MBP-abc");
+    assert_eq!(seen.install_id, "abc");
+    assert_eq!(seen.id_scheme, "earlier");
+    assert_eq!(seen.machine_name, "khaliqs-mbp");
 }
 
 #[test]
@@ -196,19 +268,18 @@ fn identity_is_stable_across_restarts_and_a_current_open_writes_nothing() {
 }
 
 #[test]
-fn reimage_keeps_the_id_under_a_and_mints_a_new_one_under_b() {
+fn a_reimage_is_a_new_install_and_a_new_id() {
     let dir = tempfile::tempdir().unwrap();
     let path = db(&dir, "ai-history.db");
-    for (strategy, same) in [(A, true), (B, false)] {
-        let before = first_run(&path, "khaliq-mbp", strategy);
-        // A re-image is a new disk: no database, same hostname.
-        for suffix in ["", "-wal", "-shm"] {
-            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
-        }
-        let after = first_run(&path, "khaliq-mbp", strategy);
-        assert_ne!(after.install_id, before.install_id);
-        assert_eq!(after.machine_id == before.machine_id, same, "{strategy:?}");
+    let before = first_run(&path, "khaliq-mbp");
+    // A re-image is a new disk: no database, same hostname.
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
     }
+    let after = first_run(&path, "khaliq-mbp");
+    assert_eq!(after.machine_name, before.machine_name);
+    assert_ne!(after.install_id, before.install_id);
+    assert_ne!(after.machine_id, before.machine_id);
 }
 
 #[test]

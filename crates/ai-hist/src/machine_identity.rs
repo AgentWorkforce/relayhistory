@@ -9,15 +9,19 @@
 //! Windows), the install id from SQLite's `randomblob`. No network, no extra
 //! process, and a current database pays one `SELECT` to read it.
 //!
-//! - `machine_name` is the canonical hostname slug ([`canonical_machine_name`]),
-//!   kept current: a rename updates it and records the new name in
-//!   `machine_aliases`, so the history of names is never lost.
-//! - `machine_id` is computed once, by [`machine_id`] -- the one function that
-//!   decides the id, so the strategy can be swapped without touching callers --
-//!   and then frozen. A rename never changes it.
-//! - `strategy` records which [`MachineIdStrategy`] produced the id, so a
-//!   later change of [`DEFAULT_MACHINE_ID_STRATEGY`] applies only to new
-//!   databases and never re-keys a machine that already uploaded.
+//! - `machine_name` is the canonical hostname ([`canonical_hostname`]), kept
+//!   current: a rename updates it. Every spelling of the hostname the machine
+//!   has reported is kept in `hostname_aliases` with its canonical form, so
+//!   all of them resolve to this one machine.
+//! - `machine_id` is the canonical hostname plus a short suffix from a random
+//!   install UUID generated at first run (`khaliqs-mbp-7f3a9c`), computed once
+//!   by [`machine_id`] and then frozen. The hostname alone is never the id: a
+//!   rename or respelling would change it, and two machines that share a
+//!   hostname would share it. A rename updates `machine_name` and adds an
+//!   alias; the id stays.
+//! - `id_scheme` records which version of [`machine_id`] produced the id
+//!   ([`MACHINE_ID_SCHEME`]), so a future change to the function applies only
+//!   to new databases and never re-keys a machine that already uploaded.
 //!
 //! # Trace ids
 //!
@@ -34,34 +38,10 @@ use sha2::{Digest, Sha256};
 
 use crate::{now_ms, Error, SessionStore, Source};
 
-/// How [`machine_id`] derives the id from the machine name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum MachineIdStrategy {
-    /// Strategy A: the canonical machine name *is* the id (`khaliq-mbp`).
-    /// Readable and the same after a re-image, but two machines with the
-    /// same hostname (every unrenamed `macbook-pro`) share one id.
-    HostnameSlug,
-    /// Strategy B: the canonical name plus a short suffix from the random
-    /// install id (`khaliq-mbp-7f3a9c`). Distinct for same-named machines;
-    /// a re-image is a new id.
-    HostnameSlugWithInstallSuffix,
-}
-
-impl MachineIdStrategy {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::HostnameSlug => "hostname_slug",
-            Self::HostnameSlugWithInstallSuffix => "hostname_slug_with_install_suffix",
-        }
-    }
-
-    fn parse(value: &str) -> Option<Self> {
-        [Self::HostnameSlug, Self::HostnameSlugWithInstallSuffix]
-            .into_iter()
-            .find(|strategy| strategy.as_str() == value)
-    }
-}
+/// The version of [`machine_id`] a new identity is created with: the
+/// canonical hostname, then `-`, then [`INSTALL_SUFFIX_HEX_DIGITS`] hex digits
+/// of the install UUID.
+pub const MACHINE_ID_SCHEME: &str = "hostname_install_suffix_v1";
 
 /// How the machine name appears inside the id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -90,29 +70,25 @@ impl MachineNamePrivacy {
     }
 }
 
-/// PENDING DECISION (Khaliq, sessions pipeline W2): strategy A
-/// ([`MachineIdStrategy::HostnameSlug`]) or B
-/// ([`MachineIdStrategy::HostnameSlugWithInstallSuffix`]). B is the interim
-/// default because a same-named collision silently merges two machines'
-/// history and cannot be undone after upload. Changing this constant only
-/// affects databases created afterwards.
-pub const DEFAULT_MACHINE_ID_STRATEGY: MachineIdStrategy =
-    MachineIdStrategy::HostnameSlugWithInstallSuffix;
-
 /// PENDING DECISION (Khaliq, sessions pipeline W2): whether ids carry the
 /// slug or its hash.
 pub const DEFAULT_MACHINE_NAME_PRIVACY: MachineNamePrivacy = MachineNamePrivacy::Slug;
 
-/// Hex digits of the install id that strategy B appends. Six digits, 24 bits:
+/// Hex digits of the install id the machine id carries. Six digits, 24 bits:
 /// among 1,000 machines that share one hostname the chance that any two
 /// collide is about 3%, against about 99.9% with four.
 pub const INSTALL_SUFFIX_HEX_DIGITS: usize = 6;
 
-/// The name used when the hostname has no usable character.
-pub const UNKNOWN_MACHINE_NAME: &str = "unknown-host";
+/// The version of the [`canonical_hostname`] rule. A stored canonical name
+/// records it, so a later rule change is a visible, re-runnable migration
+/// rather than a silent drift between old and new rows.
+pub const CANONICAL_HOSTNAME_RULE_VERSION: u32 = 1;
 
-/// Longest canonical name: one DNS label.
-const MAX_MACHINE_NAME_LEN: usize = 63;
+/// The canonical hostname of a name with no usable character.
+pub const UNKNOWN_HOSTNAME: &str = "unknown-host";
+
+/// Longest canonical hostname: one DNS label.
+const MAX_HOSTNAME_LEN: usize = 63;
 
 /// This database's machine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -121,15 +97,26 @@ pub struct MachineIdentity {
     pub machine_id: String,
     /// The current canonical hostname slug.
     pub machine_name: String,
-    /// Random UUID generated at first run. Local; never part of a strategy-A id.
+    /// Random UUID generated at first run; its first hex digits are the id's
+    /// suffix.
     pub install_id: String,
-    pub strategy: MachineIdStrategy,
+    /// The [`MACHINE_ID_SCHEME`] the id was created with.
+    pub id_scheme: String,
     pub name_privacy: MachineNamePrivacy,
     pub created_ms: i64,
     pub updated_ms: i64,
-    /// Every name this machine has had, the current one included, oldest
-    /// first.
-    pub aliases: Vec<String>,
+    /// Every hostname spelling this machine has reported, the current one
+    /// included, oldest first.
+    pub hostname_aliases: Vec<HostnameAlias>,
+}
+
+/// One spelling of the hostname, as the OS reported it, and its canonical
+/// form.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostnameAlias {
+    pub observed: String,
+    pub canonical: String,
+    pub first_seen_ms: i64,
 }
 
 const MACHINE_IDENTITY_DDL: &str = r#"
@@ -138,58 +125,54 @@ CREATE TABLE IF NOT EXISTS machine_identity (
     machine_id TEXT NOT NULL,
     machine_name TEXT NOT NULL,
     install_id TEXT NOT NULL,
-    strategy TEXT NOT NULL,
+    id_scheme TEXT NOT NULL,
     name_privacy TEXT NOT NULL,
     created_ms INTEGER NOT NULL,
     updated_ms INTEGER NOT NULL
 );
-CREATE TABLE IF NOT EXISTS machine_aliases (
-    machine_name TEXT PRIMARY KEY,
-    first_seen_ms INTEGER NOT NULL,
-    last_seen_ms INTEGER NOT NULL
+CREATE TABLE IF NOT EXISTS hostname_aliases (
+    observed_hostname TEXT PRIMARY KEY,
+    canonical_hostname TEXT NOT NULL,
+    first_seen_ms INTEGER NOT NULL
 );
 "#;
 
-/// The canonical machine name: lowercase `[a-z0-9-]`, `.local` stripped,
-/// first DNS label only, apostrophes dropped, every other run of characters
-/// one `-`, at most 63 characters.
+/// The canonical hostname: one deterministic spelling per machine name.
+///
+/// Lowercased; trailing dots and `.local` stripped; only the first DNS label
+/// kept (the domain dropped); every run of anything but `[a-z0-9]` --
+/// punctuation, spaces, underscores, apostrophes, non-ASCII -- one `-`;
+/// leading and trailing hyphens trimmed; at most 63 characters. A name with
+/// nothing left is [`UNKNOWN_HOSTNAME`].
 ///
 /// `Khaliqs-MacBook-Pro.local` -> `khaliqs-macbook-pro`;
-/// `Khaliq's MacBook Pro` -> `khaliqs-macbook-pro`;
-/// `build-01.corp.example.com` -> `build-01`.
-pub fn canonical_machine_name(hostname: &str) -> String {
-    let trimmed = hostname.trim().trim_end_matches('.');
-    let lower = trimmed.to_ascii_lowercase();
+/// `Khaliq's MacBook Pro` -> `khaliq-s-macbook-pro`;
+/// `build_01.corp.example.com` -> `build-01`.
+pub fn canonical_hostname(hostname: &str) -> String {
+    let lower = hostname.trim().trim_end_matches('.').to_ascii_lowercase();
     let host = lower.strip_suffix(".local").unwrap_or(&lower);
     let label = host.split('.').next().unwrap_or_default();
     let mut slug = String::with_capacity(label.len());
     for ch in label.chars() {
-        if ch == '\'' || ch == '\u{2019}' {
-            continue;
-        }
         if ch.is_ascii_alphanumeric() {
             slug.push(ch);
-        } else if !slug.ends_with('-') {
+        } else if !slug.is_empty() && !slug.ends_with('-') {
             slug.push('-');
         }
     }
-    let slug = slug.trim_matches('-');
-    let slug = slug[..slug.len().min(MAX_MACHINE_NAME_LEN)].trim_end_matches('-');
+    let slug = slug[..slug.len().min(MAX_HOSTNAME_LEN)].trim_end_matches('-');
     if slug.is_empty() {
-        UNKNOWN_MACHINE_NAME.to_string()
+        UNKNOWN_HOSTNAME.to_string()
     } else {
         slug.to_string()
     }
 }
 
-/// The machine id for `machine_name` under `strategy`: the single place the
-/// id is decided. `install_id` is the random UUID from first run.
-pub fn machine_id(
-    strategy: MachineIdStrategy,
-    privacy: MachineNamePrivacy,
-    machine_name: &str,
-    install_id: &str,
-) -> String {
+/// The machine id for `machine_name`: the single place the id is decided.
+/// `install_id` is the random UUID from first run; its first
+/// [`INSTALL_SUFFIX_HEX_DIGITS`] hex digits keep two machines that share a
+/// hostname apart.
+pub fn machine_id(privacy: MachineNamePrivacy, machine_name: &str, install_id: &str) -> String {
     let name = match privacy {
         MachineNamePrivacy::Slug => machine_name.to_string(),
         MachineNamePrivacy::Hashed => {
@@ -197,18 +180,13 @@ pub fn machine_id(
             format!("h{}", &format!("{digest:x}")[..12])
         }
     };
-    match strategy {
-        MachineIdStrategy::HostnameSlug => name,
-        MachineIdStrategy::HostnameSlugWithInstallSuffix => {
-            let hex: String = install_id
-                .chars()
-                .filter(char::is_ascii_hexdigit)
-                .map(|ch| ch.to_ascii_lowercase())
-                .take(INSTALL_SUFFIX_HEX_DIGITS)
-                .collect();
-            format!("{name}-{hex}")
-        }
-    }
+    let suffix: String = install_id
+        .chars()
+        .filter(char::is_ascii_hexdigit)
+        .map(|ch| ch.to_ascii_lowercase())
+        .take(INSTALL_SUFFIX_HEX_DIGITS)
+        .collect();
+    format!("{name}-{suffix}")
 }
 
 /// This host's name as the OS reports it, without spawning a process.
@@ -230,7 +208,7 @@ pub(crate) fn local_hostname() -> String {
 pub(crate) fn read(conn: &Connection) -> Result<Option<MachineIdentity>> {
     let row = conn
         .query_row(
-            "SELECT machine_id, machine_name, install_id, strategy, name_privacy, \
+            "SELECT machine_id, machine_name, install_id, id_scheme, name_privacy, \
              created_ms, updated_ms FROM machine_identity WHERE singleton = 1",
             [],
             |row| {
@@ -246,7 +224,7 @@ pub(crate) fn read(conn: &Connection) -> Result<Option<MachineIdentity>> {
             },
         )
         .optional()?;
-    let Some((machine_id, machine_name, install_id, strategy, privacy, created_ms, updated_ms)) =
+    let Some((machine_id, machine_name, install_id, id_scheme, privacy, created_ms, updated_ms)) =
         row
     else {
         return Ok(None);
@@ -255,36 +233,44 @@ pub(crate) fn read(conn: &Connection) -> Result<Option<MachineIdentity>> {
         machine_id,
         machine_name,
         install_id,
-        strategy: MachineIdStrategy::parse(&strategy)
-            .with_context(|| format!("unknown machine id strategy {strategy}"))?,
+        id_scheme,
         name_privacy: MachineNamePrivacy::parse(&privacy)
             .with_context(|| format!("unknown machine name privacy {privacy}"))?,
         created_ms,
         updated_ms,
-        aliases: aliases(conn)?,
+        hostname_aliases: hostname_aliases(conn)?,
     }))
 }
 
-fn aliases(conn: &Connection) -> Result<Vec<String>> {
-    let mut statement = conn
-        .prepare("SELECT machine_name FROM machine_aliases ORDER BY first_seen_ms, machine_name")?;
-    let names = statement
-        .query_map([], |row| row.get(0))?
-        .collect::<rusqlite::Result<Vec<String>>>()?;
-    Ok(names)
+fn hostname_aliases(conn: &Connection) -> Result<Vec<HostnameAlias>> {
+    let mut statement = conn.prepare(
+        "SELECT observed_hostname, canonical_hostname, first_seen_ms FROM hostname_aliases \
+         ORDER BY first_seen_ms, observed_hostname",
+    )?;
+    let aliases = statement
+        .query_map([], |row| {
+            Ok(HostnameAlias {
+                observed: row.get(0)?,
+                canonical: row.get(1)?,
+                first_seen_ms: row.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(aliases)
 }
 
 /// The identity for a host named `hostname`: created on first run with
-/// `strategy` and `privacy`, otherwise the stored one with `machine_name`
-/// brought up to date. Writes only when it creates the row or the name
-/// changed. Neither argument changes a stored id.
+/// `privacy`, otherwise the stored one with `machine_name`
+/// brought up to date and the spelling recorded. Writes only when it creates
+/// the row, the canonical name changed, or the spelling is new. Neither
+/// argument changes a stored id.
 pub(crate) fn ensure_with(
     conn: &Connection,
     hostname: &str,
-    strategy: MachineIdStrategy,
     privacy: MachineNamePrivacy,
 ) -> Result<MachineIdentity> {
-    let name = canonical_machine_name(hostname);
+    let observed = hostname.trim();
+    let name = canonical_hostname(observed);
     let now = now_ms();
     if let Some(mut identity) = read(conn)? {
         if identity.machine_name != name {
@@ -293,56 +279,60 @@ pub(crate) fn ensure_with(
                  WHERE singleton = 1",
                 params![name, now],
             )?;
-            record_alias(conn, &name, now)?;
-            identity.machine_name = name;
+            identity.machine_name = name.clone();
             identity.updated_ms = now;
-            identity.aliases = aliases(conn)?;
+        }
+        if !identity
+            .hostname_aliases
+            .iter()
+            .any(|alias| alias.observed == observed)
+        {
+            record_alias(conn, observed, &name, now)?;
+            identity.hostname_aliases = hostname_aliases(conn)?;
         }
         return Ok(identity);
     }
     let install_id = random_uuid_v4(conn)?;
     let identity = MachineIdentity {
-        machine_id: machine_id(strategy, privacy, &name, &install_id),
+        machine_id: machine_id(privacy, &name, &install_id),
         machine_name: name.clone(),
         install_id,
-        strategy,
+        id_scheme: MACHINE_ID_SCHEME.to_string(),
         name_privacy: privacy,
         created_ms: now,
         updated_ms: now,
-        aliases: vec![name.clone()],
+        hostname_aliases: vec![HostnameAlias {
+            observed: observed.to_string(),
+            canonical: name.clone(),
+            first_seen_ms: now,
+        }],
     };
     conn.execute(
         "INSERT INTO machine_identity (singleton, machine_id, machine_name, install_id, \
-         strategy, name_privacy, created_ms, updated_ms) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+         id_scheme, name_privacy, created_ms, updated_ms) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?6)",
         params![
             identity.machine_id,
             identity.machine_name,
             identity.install_id,
-            strategy.as_str(),
+            MACHINE_ID_SCHEME,
             privacy.as_str(),
             now
         ],
     )?;
-    record_alias(conn, &identity.machine_name, now)?;
+    record_alias(conn, observed, &identity.machine_name, now)?;
     Ok(identity)
 }
 
-/// [`ensure_with`] for this host and the default strategy.
+/// [`ensure_with`] for this host and the default name privacy.
 pub(crate) fn ensure(conn: &Connection) -> Result<MachineIdentity> {
-    ensure_with(
-        conn,
-        &local_hostname(),
-        DEFAULT_MACHINE_ID_STRATEGY,
-        DEFAULT_MACHINE_NAME_PRIVACY,
-    )
+    ensure_with(conn, &local_hostname(), DEFAULT_MACHINE_NAME_PRIVACY)
 }
 
-fn record_alias(conn: &Connection, name: &str, now: i64) -> Result<()> {
+fn record_alias(conn: &Connection, observed: &str, canonical: &str, now: i64) -> Result<()> {
     conn.execute(
-        "INSERT INTO machine_aliases (machine_name, first_seen_ms, last_seen_ms) \
-         VALUES (?1, ?2, ?2) \
-         ON CONFLICT(machine_name) DO UPDATE SET last_seen_ms = excluded.last_seen_ms",
-        params![name, now],
+        "INSERT OR IGNORE INTO hostname_aliases \
+         (observed_hostname, canonical_hostname, first_seen_ms) VALUES (?1, ?2, ?3)",
+        params![observed, canonical, now],
     )?;
     Ok(())
 }
@@ -432,7 +422,7 @@ pub(crate) const SESSION_COLUMNS: &[&str] = &["trace_id"];
 
 /// The tables and trigger a current schema has, by `sqlite_master` name.
 pub(crate) const SCHEMA_OBJECTS: &[&str] =
-    &["machine_identity", "machine_aliases", TRACE_ID_TRIGGER];
+    &["machine_identity", "hostname_aliases", TRACE_ID_TRIGGER];
 
 /// The trigger that gives a new session row its trace id.
 pub(crate) const TRACE_ID_TRIGGER: &str = "sessions_trace_id_insert";
