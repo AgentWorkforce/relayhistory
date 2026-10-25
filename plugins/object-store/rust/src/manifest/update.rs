@@ -198,7 +198,8 @@ fn create_doc(mut manifest: Manifest) -> Result<Doc> {
 /// stored section that is *not* listed here was added by a newer writer and
 /// is carried over even if the edit was built from a fresh struct (whose
 /// `extra` is empty); known keys follow the edit, so clearing an optional
-/// field still works.
+/// field still works. To delete an unknown key it owns, a writer sets it to
+/// `Value::Null` in the section's `extra`.
 fn known_fields(section: &str) -> &'static [&'static str] {
     match section {
         "session" => &[
@@ -243,13 +244,18 @@ fn known_fields(section: &str) -> &'static [&'static str] {
 fn put_section<T: serde::Serialize>(doc: &mut Doc, name: &str, section: &T) -> Result<()> {
     let mut value =
         serde_json::to_value(section).map_err(|e| Error::InvalidArgument(e.to_string()))?;
-    if let (Some(Value::Object(stored)), Value::Object(next)) = (doc.get(name), &mut value) {
+    if let Value::Object(next) = &mut value {
         let known = known_fields(name);
-        for (k, v) in stored {
-            if !known.contains(&k.as_str()) && !next.contains_key(k) {
-                next.insert(k.clone(), v.clone());
+        if let Some(Value::Object(stored)) = doc.get(name) {
+            for (k, v) in stored {
+                if !known.contains(&k.as_str()) && !next.contains_key(k) {
+                    next.insert(k.clone(), v.clone());
+                }
             }
         }
+        // An unknown key set to `null` in `extra` is an explicit deletion:
+        // the owner clears it, rather than having it carried over.
+        next.retain(|k, v| known.contains(&k.as_str()) || !v.is_null());
     }
     doc.insert(name.to_string(), value);
     Ok(())

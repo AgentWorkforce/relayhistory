@@ -561,3 +561,46 @@ async fn a_fresh_section_struct_keeps_a_newer_writers_fields() {
         "known fields follow the edit"
     );
 }
+
+#[tokio::test]
+async fn an_owner_can_delete_an_unknown_field_with_null() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsStore::new(FsConfig::new(dir.path())).unwrap();
+    let loc = location("fs-delete");
+    let key = loc.manifest().unwrap();
+    let mut doc = serde_json::to_value(first_manifest(&loc)).unwrap();
+    doc["server"] = serde_json::json!({
+        "updated_at": "2026-10-25T19:00:00.000Z",
+        "normalized": null,
+        "lifecycle": "idle",
+        "lifecycle_at": "2026-10-25T19:00:00.000Z",
+        "server.review_state": "pending",
+        "server.keep": 1
+    });
+    store
+        .put(
+            &key,
+            bytes::Bytes::from(serde_json::to_vec(&doc).unwrap()),
+            PutOpts::create(),
+        )
+        .await
+        .unwrap();
+    update_manifest(&store, &key, &fast(), |m| {
+        let mut s = m.unwrap().server.clone().unwrap();
+        s.extra
+            .insert("server.review_state".into(), serde_json::Value::Null);
+        Ok(Edit::Server(Box::new(s)))
+    })
+    .await
+    .unwrap();
+    let body: Vec<bytes::Bytes> =
+        futures::TryStreamExt::try_collect(store.get(&key, None).await.unwrap())
+            .await
+            .unwrap();
+    let after: serde_json::Value = serde_json::from_slice(&body.concat()).unwrap();
+    assert!(
+        after["server"].get("server.review_state").is_none(),
+        "{after}"
+    );
+    assert_eq!(after["server"]["server.keep"], 1);
+}

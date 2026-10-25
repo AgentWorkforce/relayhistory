@@ -34,6 +34,9 @@ copies the other writer's sections, and **any field the writer does not
 recognize**, through byte-for-byte unchanged. A writer never rebuilds the
 manifest from scratch; it always edits the copy it just read.
 
+To delete an unrecognized field in a section it owns, a writer sets that
+field to `null`. The field is then removed rather than carried through.
+
 | Fields | Owner | Notes |
 | ------ | ----- | ----- |
 | `session.*` | client | Only the client sees the harness metadata. |
