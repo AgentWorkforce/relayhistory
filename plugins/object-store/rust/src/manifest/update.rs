@@ -11,6 +11,7 @@ use bytes::Bytes;
 use futures::TryStreamExt;
 use serde_json::{Map, Value};
 
+use super::merge::put_section;
 use super::types::{Manifest, Raw, Server, Session, Writer};
 use super::validate::{ensure_valid, parse_manifest};
 use crate::{Error, ObjectKey, ObjectStore, ObjectVersion, PutOpts, Result};
@@ -229,78 +230,6 @@ fn create_doc(mut manifest: Manifest) -> Result<Doc> {
             "manifest did not serialize to an object".into(),
         )),
     }
-}
-
-/// Fields this version knows in each writer-owned section. A key in the
-/// stored section that is *not* listed here was added by a newer writer and
-/// is carried over even if the edit was built from a fresh struct (whose
-/// `extra` is empty); known keys follow the edit, so clearing an optional
-/// field still works. To delete an unknown key it owns, a writer lists it in
-/// the edit's `remove`; a `null` value is just a value and is kept.
-fn known_fields(section: &str) -> &'static [&'static str] {
-    match section {
-        "session" => &[
-            "workspace_id",
-            "machine_id",
-            "harness",
-            "session_id",
-            "started_at",
-            "ended_at",
-            "harness_version",
-            "cwd_sha256",
-            "parent_session_id",
-        ],
-        "writer" => &["delivery_instance_id", "plugin_version", "host_version"],
-        "raw" => &[
-            "owner",
-            "state",
-            "updated_at",
-            "format",
-            "compression",
-            "chunk_count",
-            "raw_bytes",
-            "stored_bytes",
-            "content_sha256",
-            "epoch",
-            "epochs",
-            "next_offset",
-            "chunks",
-        ],
-        "server" => &[
-            "updated_at",
-            "normalized",
-            "lifecycle",
-            "lifecycle_at",
-            "lifecycle_reason",
-            "retention",
-        ],
-        _ => &[],
-    }
-}
-
-fn put_section<T: serde::Serialize>(
-    doc: &mut Doc,
-    name: &str,
-    section: &T,
-    remove: &[String],
-) -> Result<()> {
-    let mut value =
-        serde_json::to_value(section).map_err(|e| Error::InvalidArgument(e.to_string()))?;
-    if let Value::Object(next) = &mut value {
-        let known = known_fields(name);
-        if let Some(Value::Object(stored)) = doc.get(name) {
-            for (k, v) in stored {
-                if !known.contains(&k.as_str()) && !next.contains_key(k) {
-                    next.insert(k.clone(), v.clone());
-                }
-            }
-        }
-        // Explicit deletions apply only to unknown keys; known fields are
-        // controlled by the typed struct.
-        next.retain(|k, _| known.contains(&k.as_str()) || !remove.contains(k));
-    }
-    doc.insert(name.to_string(), value);
-    Ok(())
 }
 
 /// `revision + 1` and `updated_at = now`, whoever writes.

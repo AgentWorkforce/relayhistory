@@ -364,6 +364,14 @@ fn validator_rejects_corruption() {
         ("raw.next_offset", Box::new(|m| m.raw.next_offset = 1)),
         ("raw.epoch", Box::new(|m| m.raw.epoch = 1)),
         ("trace_id", Box::new(|m| m.trace_id = "nope".into())),
+        (
+            "first_ts",
+            Box::new(|m| m.raw.chunks[0].first_ts = Some("not-a-date".into())),
+        ),
+        (
+            "last_ts",
+            Box::new(|m| m.raw.chunks[1].last_ts = Some("2026-13-45".into())),
+        ),
         ("$key", Box::new(|m| m.session.harness = "codex".into())),
     ];
     for (path, corrupt) in cases {
@@ -720,4 +728,30 @@ async fn client_removals_match_exact_keys_per_section() {
         after["raw"]["future_flag"], "raw-owned",
         "other sections untouched"
     );
+}
+
+#[test]
+fn every_epochs_first_seq_is_checked_even_without_chunks() {
+    let loc = location("unit");
+    let mut m = first_manifest(&loc);
+    let planned = plan_chunks(&m.raw, vec![chunk(0, 0, 10), chunk(1, 10, 10)]).unwrap();
+    apply_chunks(&mut m.raw, &planned).unwrap();
+    open_epoch(&mut m.raw, EpochReason::Truncated).unwrap();
+    ensure_valid(&m, None).unwrap();
+    m.raw.epochs[1].first_seq = 99;
+    let issues = validate(&m, None);
+    assert!(
+        issues.iter().any(|i| i.path == "raw.epochs[1].first_seq"),
+        "{issues:?}"
+    );
+
+    let mut m2 = first_manifest(&loc);
+    m2.server = Some(server::server_section(&m2));
+    m2.server.as_mut().unwrap().retention = Some(Retention {
+        delete_after: Some("someday".into()),
+        ..Default::default()
+    });
+    assert!(validate(&m2, None)
+        .iter()
+        .any(|i| i.path == "server.retention.delete_after"));
 }

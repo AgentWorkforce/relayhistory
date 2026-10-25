@@ -226,6 +226,18 @@ impl Checker {
                 );
             }
             self.timestamp(&format!("raw.epochs[{i}].opened_at"), &e.opened_at);
+            // Every epoch, including one with no chunks yet, starts where
+            // the earlier epochs' chunks end.
+            let before = raw.chunks.iter().filter(|c| c.epoch < e.epoch).count() as u64;
+            if e.first_seq != before {
+                self.issue(
+                    format!("raw.epochs[{i}].first_seq"),
+                    format!(
+                        "is {}, but {before} chunks precede epoch {}",
+                        e.first_seq, e.epoch
+                    ),
+                );
+            }
         }
         if raw.epoch as usize + 1 != raw.epochs.len() {
             self.issue(
@@ -258,6 +270,12 @@ impl Checker {
         }
         self.hex64(&format!("{at}.sha256"), &c.sha256);
         self.hex64(&format!("{at}.stored_sha256"), &c.stored_sha256);
+        if let Some(t) = &c.first_ts {
+            self.timestamp(&format!("{at}.first_ts"), t);
+        }
+        if let Some(t) = &c.last_ts {
+            self.timestamp(&format!("{at}.last_ts"), t);
+        }
         if c.sha256.get(..8) != Some(c.sha256_8.as_str()) {
             self.issue(format!("{at}.sha256_8"), "is not sha256[0..8]");
         }
@@ -351,6 +369,9 @@ impl Checker {
                 self.issue("server.normalized.source_epoch", "is beyond raw.epoch");
             }
             self.timestamp("server.normalized.built_at", &n.built_at);
+        }
+        if let Some(t) = s.retention.as_ref().and_then(|r| r.delete_after.as_ref()) {
+            self.timestamp("server.retention.delete_after", t);
         }
     }
 
