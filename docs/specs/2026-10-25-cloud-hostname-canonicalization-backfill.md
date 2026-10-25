@@ -112,7 +112,32 @@ rows on the old version.
   consequence, an FQDN-named server keeps its domain:
   `build-01.corp.example.com` becomes `build-01-corp-example-com`.
 
+## Observed data (2026-10-25)
+
+A read-only dry run on production, approved by Khaliq and run by
+query-agent with the tool at rule 3. No hostnames were shared or recorded
+here. Findings:
+
+- **Where hostnames are:** the cloud has no general machine or session
+  hostname table. Only desktop sign-in rows carry one:
+  `api_token_sessions.desktop_host_name` and
+  `cli_device_authorizations.desktop_host_name`. Those are the
+  `<machines_table>` placeholders above, until relayhistory's own upload
+  grows a machine table.
+- **Volume:** 11 distinct spellings and 11 canonical names (about 15 rows),
+  with 0 merge groups and 1 `unknown-host`. It's too small a sample to prove
+  much.
+- **Non-ASCII names:** a hostname with no ASCII letters or digits (CJK, in
+  this data) canonicalizes to `unknown-host`, so every such machine shares
+  one name. Machine ids stay distinct through the install suffix, but
+  grouping by canonical name would merge them. Mixed names are also lossy
+  (`ñandú-box` becomes `and-box`).
+- **Factory-default names** (`MacBook-Pro.local`, `mac.lan`) collapse to
+  generic names. That's expected, and it's why the hostname alone is never
+  the id.
+
 ## Open questions
 
-- **Observed variants:** someone with read access runs step 1 and shares the
-  dry-run `merges`. The tool has no database access of its own.
+- **Non-ASCII hostnames:** a rule 4 is proposed but not implemented. The
+  options are Punycode (IDNA, which is reversible) for non-ASCII labels, or
+  a hash fallback when nothing usable is left. It's waiting on Khaliq.
