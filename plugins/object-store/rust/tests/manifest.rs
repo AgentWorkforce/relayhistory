@@ -673,3 +673,51 @@ fn plan_chunks_rejects_bad_digests_before_upload() {
         assert!(plan_chunks(&m.raw, vec![bad]).is_err());
     }
 }
+
+#[tokio::test]
+async fn client_removals_match_exact_keys_per_section() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsStore::new(FsConfig::new(dir.path())).unwrap();
+    let loc = location("fs-client-remove");
+    let key = loc.manifest().unwrap();
+    let mut doc = serde_json::to_value(first_manifest(&loc)).unwrap();
+    doc["session"]["session.future_flag"] = true.into();
+    doc["session"]["future_flag"] = 7.into();
+    doc["raw"]["future_flag"] = "raw-owned".into();
+    store
+        .put(
+            &key,
+            bytes::Bytes::from(serde_json::to_vec(&doc).unwrap()),
+            PutOpts::create(),
+        )
+        .await
+        .unwrap();
+    update_manifest(&store, &key, &fast(), |m| {
+        let m = m.unwrap();
+        Ok(Edit::Client {
+            session: Box::new(m.session.clone()),
+            writer: Box::new(m.writer.clone()),
+            raw: Box::new(m.raw.clone()),
+            remove: ClientRemovals {
+                session: vec!["session.future_flag".into()],
+                ..Default::default()
+            },
+        })
+    })
+    .await
+    .unwrap();
+    let body: Vec<bytes::Bytes> =
+        futures::TryStreamExt::try_collect(store.get(&key, None).await.unwrap())
+            .await
+            .unwrap();
+    let after: serde_json::Value = serde_json::from_slice(&body.concat()).unwrap();
+    assert!(
+        after["session"].get("session.future_flag").is_none(),
+        "exact key removed"
+    );
+    assert_eq!(after["session"]["future_flag"], 7, "similar key kept");
+    assert_eq!(
+        after["raw"]["future_flag"], "raw-owned",
+        "other sections untouched"
+    );
+}

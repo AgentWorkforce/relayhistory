@@ -14,5 +14,5 @@ pub mod update;
 pub mod validate;
 
 pub use types::*;
-pub use update::{update_manifest, Edit, UpdateOpts, Updated};
+pub use update::{update_manifest, ClientRemovals, Edit, UpdateOpts, Updated};
 pub use validate::{content_sha256, ensure_valid, parse_manifest, validate, Issue};

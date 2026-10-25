@@ -28,9 +28,9 @@ pub enum Edit {
         session: Box<Session>,
         writer: Box<Writer>,
         raw: Box<Raw>,
-        /// Unknown keys to delete, as `"session.key"`, `"writer.key"` or
-        /// `"raw.key"`. Unknown keys not listed are always kept.
-        remove: Vec<String>,
+        /// Unknown keys to delete, per section. Unknown keys not listed are
+        /// always kept.
+        remove: ClientRemovals,
     },
     /// Replace the server-owned section.
     Server {
@@ -47,7 +47,7 @@ impl Edit {
             session: Box::new(session),
             writer: Box::new(writer),
             raw: Box::new(raw),
-            remove: Vec::new(),
+            remove: ClientRemovals::default(),
         }
     }
 
@@ -58,6 +58,15 @@ impl Edit {
             remove: Vec::new(),
         }
     }
+}
+
+/// Unknown keys a client edit deletes, by section. Keys are exact JSON keys
+/// within that section (they may themselves contain dots).
+#[derive(Debug, Clone, Default)]
+pub struct ClientRemovals {
+    pub session: Vec<String>,
+    pub writer: Vec<String>,
+    pub raw: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -138,16 +147,9 @@ where
                 remove,
             } => {
                 let mut doc = require(doc, key)?;
-                let removals = |section: &str| -> Vec<String> {
-                    let prefix = format!("{section}.");
-                    remove
-                        .iter()
-                        .filter_map(|r| r.strip_prefix(&prefix).map(str::to_string))
-                        .collect()
-                };
-                put_section(&mut doc, "session", &*session, &removals("session"))?;
-                put_section(&mut doc, "writer", &*writer, &removals("writer"))?;
-                put_section(&mut doc, "raw", &*raw, &removals("raw"))?;
+                put_section(&mut doc, "session", &*session, &remove.session)?;
+                put_section(&mut doc, "writer", &*writer, &remove.writer)?;
+                put_section(&mut doc, "raw", &*raw, &remove.raw)?;
                 bump(&mut doc);
                 (doc, false)
             }
