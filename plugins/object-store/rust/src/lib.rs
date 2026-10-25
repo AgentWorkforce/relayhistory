@@ -42,6 +42,7 @@ mod fs;
 mod key;
 pub mod layout;
 mod metadata;
+mod upload;
 
 #[cfg(feature = "azure")]
 mod azure;
