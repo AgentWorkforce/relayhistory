@@ -1191,7 +1191,7 @@ node scripts/benchmark-latency.mjs --report-only latency.json   # re-render or r
 
 | Phase | Store | Timed work |
 |---|---|---|
-| `stages` | 30 days | each stage above in isolation, plus `open_db` (the writable open every sync, hydrate, forget and change-feed commit performs) and `open_raw` (SQLite's own open, for comparison) |
+| `stages` | 30 days | each stage above in isolation, plus diagnostics: `open_db` (the writable open every sync, hydrate, forget and change-feed commit performs), `open_raw` (SQLite's own open), `schema_check_cached` (what a cached "schema is current" check would cost per write: stat the file's dev/ino, so a replaced database invalidates it, and read `PRAGMA schema_version` on an open connection), and on macOS `fs_event_kqueue` / `fs_event_kqueue_resolved` (a raw-libc kqueue `EVFILT_VNODE`/`NOTE_WRITE` watch on the project directory, and that plus the `read_dir` diff that finds which file is new, since a vnode event names none). The kqueue probe is raw libc because enabling notify's `macos_kqueue` feature, even in a test, switches ai-hist's own watcher to kqueue |
 | `e2e` | 30 days | write a new transcript → `TickReport` naming it → list query returns it. Samples are spaced past the debounce window, so each is a leading-edge tick: the new-session case |
 | `list_scale` | 30 days, 1 year | the list query alone: first page, the desktop's 500-row page, and a page halfway back through history |
 | `ingest_upload` | 30 days | hook-path ingest of N new sessions alone, then again while an uploader on its own `SessionStore` drains the change feed from a named cursor, serializes each row and commits the cursor. The uploader drains its backlog before the measured batch starts |

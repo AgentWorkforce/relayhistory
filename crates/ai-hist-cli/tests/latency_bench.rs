@@ -371,6 +371,112 @@ fn now_ms() -> i64 {
         .as_millis() as i64
 }
 
+/// `(device, inode)` of a file: what a cached schema check compares to
+/// notice the database was replaced underneath an open connection.
+#[cfg(unix)]
+fn file_identity(path: &Path) -> (u64, u64) {
+    use std::os::unix::fs::MetadataExt;
+    let meta = fs::metadata(path).expect("stat database");
+    (meta.dev(), meta.ino())
+}
+
+#[cfg(not(unix))]
+fn file_identity(path: &Path) -> (u64, u64) {
+    (fs::metadata(path).expect("stat database").len(), 0)
+}
+
+/// The macOS alternative to FSEvents for a new transcript: a kqueue
+/// `EVFILT_VNODE` / `NOTE_WRITE` watch on the project *directory*, which fires
+/// when an entry is created in it. Raw libc rather than notify's kqueue
+/// backend: enabling notify's `macos_kqueue` feature, even for this test,
+/// unifies into ai-hist's own notify and switches its `RecommendedWatcher` to
+/// kqueue, which would change what every other phase measures.
+///
+/// A vnode event names no file, so a watcher still has to find which entry
+/// is new. `resolved` adds that step -- `read_dir` of the project directory
+/// diffed against the names already known -- to the event time.
+#[cfg(target_os = "macos")]
+mod kqueue {
+    use super::{session_id, write_file};
+    use std::collections::HashSet;
+    use std::ffi::{CString, OsString};
+    use std::fs;
+    use std::os::unix::ffi::OsStrExt;
+    use std::path::Path;
+    use std::time::{Duration, Instant};
+
+    /// Sessions already in the directory, so the rescan reads a project
+    /// directory of realistic size rather than an empty one.
+    const EXISTING: u64 = 200;
+
+    fn names(dir: &Path) -> HashSet<OsString> {
+        fs::read_dir(dir)
+            .expect("read project dir")
+            .map(|entry| entry.expect("entry").file_name())
+            .collect()
+    }
+
+    pub(super) fn dir_latency(root: &Path, samples: u64) -> (Vec<Duration>, Vec<Duration>) {
+        let dir = root.join("kqueue-events");
+        fs::create_dir_all(&dir).unwrap();
+        for n in 0..EXISTING {
+            write_file(
+                &dir.join(format!("{}.jsonl", session_id(2 << 40 | n))),
+                "{}\n",
+            );
+        }
+        let path = CString::new(dir.as_os_str().as_bytes()).unwrap();
+        // SAFETY: plain syscalls on a NUL-terminated path and fds this
+        // function owns and closes; the kevent structs are fully initialized.
+        unsafe {
+            let fd = libc::open(path.as_ptr(), libc::O_EVTONLY);
+            assert!(fd >= 0, "open project dir for events");
+            let kq = libc::kqueue();
+            assert!(kq >= 0, "kqueue");
+            let mut change: libc::kevent = std::mem::zeroed();
+            change.ident = fd as libc::uintptr_t;
+            change.filter = libc::EVFILT_VNODE;
+            change.flags = libc::EV_ADD | libc::EV_CLEAR;
+            change.fflags = libc::NOTE_WRITE;
+            let added = libc::kevent(kq, &change, 1, std::ptr::null_mut(), 0, std::ptr::null());
+            assert_eq!(added, 0, "register EVFILT_VNODE");
+            let mut known = names(&dir);
+            let timeout = libc::timespec {
+                tv_sec: 2,
+                tv_nsec: 0,
+            };
+            let mut event_times = Vec::new();
+            let mut resolved_times = Vec::new();
+            for n in 0..samples {
+                let name = format!("{}.jsonl", session_id(3 << 40 | n));
+                let started = Instant::now();
+                write_file(&dir.join(&name), "{}\n");
+                let mut event: libc::kevent = std::mem::zeroed();
+                let got = libc::kevent(kq, std::ptr::null(), 0, &mut event, 1, &timeout);
+                assert_eq!(got, 1, "no kqueue event for {name} within 2 s");
+                event_times.push(started.elapsed());
+                let now = names(&dir);
+                let new: Vec<_> = now.difference(&known).cloned().collect();
+                assert!(
+                    new.iter().any(|entry| entry.as_bytes() == name.as_bytes()),
+                    "rescan did not find {name}"
+                );
+                resolved_times.push(started.elapsed());
+                known = now;
+                // Drain anything else this write raised before the next clock.
+                let zero = libc::timespec {
+                    tv_sec: 0,
+                    tv_nsec: 0,
+                };
+                while libc::kevent(kq, std::ptr::null(), 0, &mut event, 1, &zero) > 0 {}
+            }
+            libc::close(kq);
+            libc::close(fd);
+            (event_times, resolved_times)
+        }
+    }
+}
+
 fn write_file(path: &Path, body: &str) {
     let mut file = fs::File::create(path).unwrap();
     file.write_all(body.as_bytes()).unwrap();
@@ -454,6 +560,8 @@ fn stages(config: &Config) -> Value {
     // Cheap (one small write and a 5 ms settle each), and a raw-event tail
     // needs more than a hundred samples before its p99 stops being its max.
     let fs_event = fs_event_latency(&bench, config.fs_samples);
+    #[cfg(target_os = "macos")]
+    let (kq_event, kq_resolved) = kqueue::dir_latency(&bench.root, config.fs_samples);
 
     // Hook path: one new transcript, parsed and committed in its own
     // transaction. This is the parse + SQLite txn stage.
@@ -513,6 +621,31 @@ fn stages(config: &Config) -> Value {
         open_raw.push(elapsed);
     }
 
+    // What a cached "schema is current" check would cost per write instead
+    // of `open_db`'s full check: on a connection already open, stat the
+    // database file for the (dev, ino) it was opened as -- a replaced file
+    // must invalidate the cache -- and read `PRAGMA schema_version`, which
+    // moves on any DDL. Measures the proposal; no cache exists yet.
+    let mut schema_cached = Vec::new();
+    {
+        let conn = rusqlite::Connection::open(&bench.db).expect("open");
+        let opened_as = file_identity(&bench.db);
+        let version: i64 = conn
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .expect("schema_version");
+        for _ in 0..samples {
+            let (current, elapsed) = time(|| {
+                file_identity(&bench.db) == opened_as
+                    && conn
+                        .query_row("PRAGMA schema_version", [], |row| row.get::<_, i64>(0))
+                        .expect("schema_version")
+                        == version
+            });
+            assert!(current, "nothing replaced the database mid-measurement");
+            schema_cached.push(elapsed);
+        }
+    }
+
     // A pull consumer learning about one new session: the read a polling
     // desktop would do on each tick, after the commit.
     let mut feed = Vec::new();
@@ -544,7 +677,9 @@ fn stages(config: &Config) -> Value {
         desktop_page.push(time(|| list_query(&store, DESKTOP_PAGE)).1);
     }
 
-    json!({
+    // Only macOS adds to it below.
+    #[cfg_attr(not(target_os = "macos"), allow(unused_mut))]
+    let mut report = json!({
         "store": store_info,
         "metrics": {
             "fs_event": summary(&fs_event),
@@ -552,11 +687,18 @@ fn stages(config: &Config) -> Value {
             "sweep_scoped_sync": summary(&sweep),
             "open_db": summary(&open),
             "open_raw": summary(&open_raw),
+            "schema_check_cached": summary(&schema_cached),
             "feed_pull": summary(&feed),
             "list_first_paint": summary(&first_paint),
             "list_desktop_page": summary(&desktop_page),
         }
-    })
+    });
+    #[cfg(target_os = "macos")]
+    {
+        report["metrics"]["fs_event_kqueue"] = summary(&kq_event);
+        report["metrics"]["fs_event_kqueue_resolved"] = summary(&kq_resolved);
+    }
+    report
 }
 
 fn e2e(config: &Config) -> Value {
