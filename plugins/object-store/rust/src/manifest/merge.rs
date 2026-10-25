@@ -8,6 +8,8 @@
 //! optional field works. Only explicitly listed top-level unknown keys are
 //! deleted.
 
+use std::collections::HashMap;
+
 use serde_json::{Map, Value};
 
 use crate::{Error, Result};
@@ -133,18 +135,27 @@ fn carry_unknown(stored: &Value, next: &mut Value, path: &str) {
 
 /// Match array entries by their identity field (`seq` for chunks, `epoch`
 /// for epochs), never by position, so a mismatched list cannot graft one
-/// entry's fields onto another.
+/// entry's fields onto another. Stored entries are indexed once, so a
+/// 10,000-chunk manifest costs O(n), not O(n²), per write.
 fn carry_unknown_in_array(stored: &Value, next: &mut Value, path: &str, id: &str) {
     let (Value::Array(stored), Value::Array(next)) = (stored, next) else {
         return;
     };
+    // Entries whose identity is not an unsigned integer cannot be matched
+    // and are skipped (the validator rejects them anyway).
+    let by_id: HashMap<u64, &Value> = stored
+        .iter()
+        .filter_map(|o| Some((o.get(id)?.as_u64()?, o)))
+        .collect();
     for entry in next.iter_mut() {
-        let Some(key) = entry.get(id).cloned() else {
+        let Some(old) = entry
+            .get(id)
+            .and_then(Value::as_u64)
+            .and_then(|k| by_id.get(&k))
+        else {
             continue;
         };
-        if let Some(old) = stored.iter().find(|o| o.get(id) == Some(&key)) {
-            carry_unknown(old, entry, path);
-        }
+        carry_unknown(old, entry, path);
     }
 }
 
@@ -196,6 +207,27 @@ mod tests {
         assert!(r["chunks"][2].get("future_c").is_none());
         assert_eq!(r["epochs"][0]["future_e"], "e0");
         assert!(r["epochs"][1].get("future_e").is_none());
+    }
+
+    #[test]
+    fn large_chunk_lists_merge_in_linear_time() {
+        let n = 20_000u64;
+        let chunk = |seq: u64, extra: bool| {
+            let mut c = json!({"seq": seq, "bytes": 1});
+            if extra {
+                c["future"] = json!(seq);
+            }
+            c
+        };
+        let stored: Vec<Value> = (0..n).map(|s| chunk(s, true)).collect();
+        let mut doc: Doc = serde_json::from_value(json!({"raw": {"chunks": stored}})).unwrap();
+        let next: Vec<Value> = (0..=n).map(|s| chunk(s, false)).collect();
+        let started = std::time::Instant::now();
+        put_section(&mut doc, "raw", &json!({"chunks": next}), &[]).unwrap();
+        // Quadratic matching took seconds at this size; linear takes milliseconds.
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert_eq!(doc["raw"]["chunks"][(n - 1) as usize]["future"], n - 1);
+        assert!(doc["raw"]["chunks"][n as usize].get("future").is_none());
     }
 
     #[test]
