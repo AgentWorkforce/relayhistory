@@ -3391,23 +3391,9 @@ fn file_candidates(
 // catalog reads and writes
 // ---------------------------------------------------------------------------
 
-pub(crate) const SESSION_COLUMNS: &str = "source, session_id, cwd, git_branch, first_activity_ms, \
-     last_activity_ms, first_prompt, last_assistant_text, models_json, originator, \
-     agent_version, repo_url, initial_commit, workspace_roots_json, raw_path, source_stamp, \
-     discovery_state, project_key, project_key_method, title, session_kind, \
-     CASE \
-       WHEN EXISTS (SELECT 1 FROM session_presences p WHERE p.source = sessions.source AND p.session_id = sessions.session_id AND p.location = 'local') \
-        AND EXISTS (SELECT 1 FROM session_presences p WHERE p.source = sessions.source AND p.session_id = sessions.session_id AND p.location = 'remote') \
-       THEN '[\"local\",\"remote\"]' \
-       WHEN EXISTS (SELECT 1 FROM session_presences p WHERE p.source = sessions.source AND p.session_id = sessions.session_id AND p.location = 'remote') \
-       THEN '[\"remote\"]' \
-       WHEN EXISTS (SELECT 1 FROM session_presences p WHERE p.source = sessions.source AND p.session_id = sessions.session_id AND p.location = 'local') \
-       THEN '[\"local\"]' \
-       ELSE '[]' \
-     END";
-
+mod catalog_columns;
 mod catalog_row;
-pub(crate) use catalog_row::row_to_session;
+pub(crate) use {catalog_columns::SESSION_COLUMNS, catalog_row::row_to_session};
 
 /// A precise continuation point in the catalog's total order.
 ///
@@ -4584,7 +4570,7 @@ fn discover_sessions_with_worker_limit(
                         // Nothing is streamed, so the row itself is not needed.
                         IdentityRefresh::Sweep => Some(WindowEntry::Unchanged),
                         IdentityRefresh::Streamed | IdentityRefresh::ExactPaths => {
-                            match fetch_catalog_row(conn, candidate.source, &id)? {
+                            match identity.cached_row(conn, candidate.source, &id)? {
                                 Some(mut cached) => {
                                     cached.source_stamp = stamp;
                                     // Before the row is queued for emission,

@@ -240,3 +240,72 @@ fn exact_identity_observes_an_unadmitted_delegation_ancestor() {
     assert_local_work(f.capture());
     f.assert_promoted();
 }
+
+/// A bounded profile of the actual unchanged exact-capture path. No collector,
+/// process-global roots, or wall-clock performance threshold is involved.
+#[test]
+#[ignore = "bounded exact-capture catalog work diagnostic"]
+fn exact_capture_catalog_work_diagnostic() {
+    for excerpt_bytes in [32, 2000] {
+        profile_exact_capture_catalog(excerpt_bytes);
+    }
+}
+
+fn profile_exact_capture_catalog(excerpt_bytes: usize) {
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+    use std::sync::{Arc, Mutex};
+    let f = Fixture::new();
+    let excerpt = "x".repeat(excerpt_bytes);
+    f.conn.execute(
+        "UPDATE sessions SET first_prompt=?1, last_assistant_text=?1, title='Profile session', models_json='[\"gpt-5\",\"gpt-5-codex\"]', workspace_roots_json='[\"/work/repo\",\"/work/library\"]', git_branch='feature', originator='codex_cli_rs', agent_version='0.148.0', initial_commit='abcdef', session_kind='main' WHERE session_id='admitted'",
+        [&excerpt],
+    ).unwrap();
+    f.capture(); // settle revisions before measuring unchanged work
+    f.conn.flush_prepared_statement_cache();
+    let reads = Arc::new(Mutex::new(
+        std::collections::BTreeMap::<String, usize>::new(),
+    ));
+    let observed = Arc::clone(&reads);
+    f.conn.authorizer(Some(move |context: AuthContext<'_>| {
+        if let AuthAction::Read {
+            table_name,
+            column_name,
+        } = context.action
+        {
+            *observed
+                .lock()
+                .unwrap()
+                .entry(format!("{table_name}.{column_name}"))
+                .or_default() += 1;
+        }
+        Authorization::Allow
+    }));
+    let steps = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counted = Arc::clone(&steps);
+    f.conn.progress_handler(
+        1,
+        Some(move || {
+            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            false
+        }),
+    );
+    let started = std::time::Instant::now();
+    for _ in 0..1000 {
+        assert_local_work(f.capture());
+    }
+    let elapsed = started.elapsed();
+    f.conn.progress_handler(0, None::<fn() -> bool>);
+    f.conn
+        .authorizer(None::<fn(AuthContext<'_>) -> Authorization>);
+    println!("EXACT_CAPTURE_CATALOG_PROFILE calls=1000 distinct_paths=1 excerpt_bytes_each={excerpt_bytes} source_bytes={} sqlite_vm_steps={} instrumented_wall_us={} prepare_reads={:?}", fs::metadata(&f.path).unwrap().len(), steps.load(std::sync::atomic::Ordering::Relaxed), elapsed.as_micros(), reads.lock().unwrap());
+    assert_eq!(
+        f.conn
+            .query_row(
+                "SELECT first_prompt FROM sessions WHERE session_id='admitted'",
+                [],
+                |row| row.get::<_, String>(0)
+            )
+            .unwrap(),
+        excerpt
+    );
+}

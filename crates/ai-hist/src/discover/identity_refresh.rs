@@ -1,4 +1,5 @@
 //! Separate whole-catalog maintenance from exact capture observations.
+use super::catalog_columns::SESSION_SCALAR_COLUMNS;
 use super::*;
 
 /// Who brings project identity up to date around a discovery pass.
@@ -21,6 +22,28 @@ pub(super) enum IdentityRefresh {
 }
 
 impl IdentityRefresh {
+    pub(super) fn cached_row(
+        self,
+        conn: &Connection,
+        source: &str,
+        session_id: &str,
+    ) -> Result<Option<ShallowSession>> {
+        if self != Self::ExactPaths {
+            return fetch_catalog_row(conn, source, session_id);
+        }
+        // Keep the same read point and error-as-cache-miss behavior as general
+        // discovery. Only the private capture callback receives this projection.
+        Ok(conn
+            .prepare_cached(&CAPTURE_ROW_SQL)
+            .and_then(|mut stmt| {
+                stmt.query_row(
+                    params![source, session_id],
+                    catalog_row::row_to_capture_session,
+                )
+            })
+            .ok())
+    }
+
     pub(super) fn refresh(self, conn: &Connection) {
         let result = match self {
             Self::Sweep => return,
@@ -36,6 +59,12 @@ impl IdentityRefresh {
     }
 }
 
+static CAPTURE_ROW_SQL: LazyLock<String> = LazyLock::new(|| {
+    // The scalar columns keep their catalog decoder positions. Capture does
+    // not consume locations, so do not run the correlated presence subqueries.
+    format!("SELECT {SESSION_SCALAR_COLUMNS} FROM sessions WHERE source = ? AND session_id = ?")
+});
+
 /// Private exact-capture policy. General discovery retains global promotion,
 /// even when it happens to carry a path filter.
 pub(crate) fn discover_sessions_for_capture(
@@ -50,5 +79,15 @@ pub(crate) fn discover_sessions_for_capture(
     )?;
     let providers: Vec<_> = providers.iter().map(|provider| provider.as_ref()).collect();
     let workers = std::thread::available_parallelism().map_or(1, |n| n.get());
-    discover_sessions_with_worker_limit(env, options, &providers, on_row, workers, IdentityRefresh::ExactPaths)
+    discover_sessions_with_worker_limit(
+        env,
+        options,
+        &providers,
+        on_row,
+        workers,
+        IdentityRefresh::ExactPaths,
+    )
 }
+
+#[cfg(test)]
+mod tests;

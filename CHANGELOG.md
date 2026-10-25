@@ -20,6 +20,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Exact-path capture avoids materializing unused cached transcript metadata and locations.
 - Unchanged Claude transcripts avoid duplicate file reads when record and metadata cursors have the same byte proof.
 
 - Filesystem-event sync can retain exact dirty paths and reuse catalog deltas, avoiding directory enumeration, whole-catalog digest copies and a silent full-history count for an active transcript append.
