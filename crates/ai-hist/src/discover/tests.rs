@@ -4392,3 +4392,172 @@ fn a_long_claude_title_record_is_read() {
         .unwrap();
     assert_eq!(session.title.as_deref(), Some(title.as_str()));
 }
+
+#[test]
+fn captured_files_keep_zero_discovery_opens_beside_parallel_uncached_reads() {
+    struct CountedProvider {
+        caller: std::thread::ThreadId,
+        owner_reads: AtomicUsize,
+        worker_reads: AtomicUsize,
+    }
+    impl ShallowSessionProvider for CountedProvider {
+        fn source(&self) -> &'static str {
+            "codex"
+        }
+        fn enumerate(
+            &self,
+            env: &DiscoveryEnv<'_>,
+            limit: Option<usize>,
+        ) -> Result<Vec<Candidate>> {
+            CodexProvider::default().enumerate(env, limit)
+        }
+        fn read_shallow(
+            &self,
+            scan: &ScanEnv<'_>,
+            catalog: Option<&Connection>,
+            candidate: &Candidate,
+        ) -> Result<Option<ShallowSession>> {
+            if std::thread::current().id() == self.caller {
+                self.owner_reads.fetch_add(1, Ordering::SeqCst);
+            } else {
+                self.worker_reads.fetch_add(1, Ordering::SeqCst);
+            }
+            CodexProvider::default().read_shallow(scan, catalog, candidate)
+        }
+    }
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let _capture = crate::ingest::cold_read::begin_sweep();
+    for index in 0..4 {
+        let id = format!("codex-{index}");
+        let path = codex_rollout(
+            home.path(),
+            &id,
+            &CODEX_BODY.replace("codex-1", &id),
+            1_750_000_000_000,
+        );
+        if index < 2 {
+            crate::ingest::cold_read::read_all(&path).unwrap();
+        }
+    }
+    let provider = CountedProvider {
+        caller: std::thread::current().id(),
+        owner_reads: AtomicUsize::new(0),
+        worker_reads: AtomicUsize::new(0),
+    };
+    let env = env_at(&conn, home.path());
+    let summary = discover_sessions_with_worker_limit(
+        &env,
+        &only(&["codex"]),
+        &[&provider],
+        |_| {},
+        2,
+        IdentityRefresh::Streamed,
+    )
+    .unwrap();
+    assert_eq!(summary.discovered, 4);
+    assert_eq!(
+        summary.counters.shallow_reads, 4,
+        "all files required actual shallow parsing"
+    );
+    assert_eq!(
+        summary.counters.files_opened, 2,
+        "only uncaptured files may open on workers"
+    );
+    assert_eq!(summary.counters.bytes_read, 2 * CODEX_BODY.len() as u64);
+    assert_eq!(provider.owner_reads.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        provider.worker_reads.load(Ordering::SeqCst),
+        2,
+        "uncached reads retain parallel dispatch"
+    );
+}
+
+#[test]
+fn a_rewrite_after_cached_read_selection_revalidates_before_using_bytes() {
+    struct RewritingProvider {
+        caller: std::thread::ThreadId,
+        path: PathBuf,
+    }
+    impl ShallowSessionProvider for RewritingProvider {
+        fn source(&self) -> &'static str {
+            "codex"
+        }
+        fn enumerate(
+            &self,
+            env: &DiscoveryEnv<'_>,
+            limit: Option<usize>,
+        ) -> Result<Vec<Candidate>> {
+            CodexProvider::default().enumerate(env, limit)
+        }
+        fn read_shallow(
+            &self,
+            scan: &ScanEnv<'_>,
+            catalog: Option<&Connection>,
+            candidate: &Candidate,
+        ) -> Result<Option<ShallowSession>> {
+            if Path::new(&candidate.locator) == self.path {
+                assert_eq!(
+                    std::thread::current().id(),
+                    self.caller,
+                    "cached candidate uses owner context"
+                );
+                assert!(crate::ingest::cold_read::fresh(&self.path).is_some());
+                let before = fs::metadata(&self.path).unwrap();
+                let bytes =
+                    CODEX_BODY.replace("add a retry to the client", "fix a retry to the client");
+                assert_eq!(bytes.len() as u64, before.len());
+                fs::write(&self.path, bytes).unwrap();
+                fs::File::open(&self.path)
+                    .unwrap()
+                    .set_modified(before.modified().unwrap())
+                    .unwrap();
+                assert_eq!(fs::metadata(&self.path).unwrap().len(), before.len());
+                assert_eq!(
+                    fs::metadata(&self.path).unwrap().modified().unwrap(),
+                    before.modified().unwrap()
+                );
+            }
+            CodexProvider::default().read_shallow(scan, catalog, candidate)
+        }
+    }
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let path = codex_rollout(home.path(), "codex-1", CODEX_BODY, 1_750_000_000_000);
+    let other = codex_rollout(
+        home.path(),
+        "codex-2",
+        &CODEX_BODY.replace("codex-1", "codex-2"),
+        1_750_000_000_000,
+    );
+    let _capture = crate::ingest::cold_read::begin_sweep();
+    crate::ingest::cold_read::read_all(&path).unwrap();
+    crate::ingest::cold_read::read_all(&other).unwrap();
+    let provider = RewritingProvider {
+        caller: std::thread::current().id(),
+        path,
+    };
+    let env = env_at(&conn, home.path());
+    let mut rows = Vec::new();
+    let summary = discover_sessions_with_worker_limit(
+        &env,
+        &only(&["codex"]),
+        &[&provider],
+        |row| rows.push(row.clone()),
+        2,
+        IdentityRefresh::Streamed,
+    )
+    .unwrap();
+    assert_eq!(
+        rows.iter()
+            .find(|row| row.session_id == "codex-1")
+            .unwrap()
+            .first_prompt
+            .as_deref(),
+        Some("fix a retry to the client")
+    );
+    assert_eq!(
+        summary.counters.files_opened, 1,
+        "changed generation is read again; unchanged sibling is reused"
+    );
+}

@@ -562,3 +562,14 @@ image-only turn. Unsupported or oversized references become explicit unavailable
 blocks. Copies increase database and upload size; replay therefore needs bounded
 pages that preserve whole supported images. This policy validates raster headers
 and size, not image semantics or visual redaction.
+
+## Incremental acquisition scheduling (2026-10-24)
+
+The capture matrix above remains the evidence contract. Embedders can now retain
+exact watcher paths through `SyncOptions::paths` and reconcile provider-owned
+watch roots with a resumable `Reconciliation` round. Primary Claude/Codex JSONL
+uses durable byte cursors without global stamp-map work; sidecar and provider DB
+inputs retain their existing acquisition boundaries. This does not broaden
+selected-only consent or replace the full destination-repair audit. See
+[sourcing SDK scheduling](../sourcing-sdk.md#incremental-embedder-scheduling)
+for the per-input limitations and continuity recovery cadence.

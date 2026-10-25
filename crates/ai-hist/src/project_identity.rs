@@ -1003,7 +1003,9 @@ mod tests {
     #[test]
     fn a_linked_worktree_resolves_an_onbranch_include_against_its_own_branch() {
         let temp = tempdir().unwrap();
-        let root = temp.path();
+        // Git matches gitdir conditions against the canonical worktree path.
+        let canonical_root = fs::canonicalize(temp.path()).unwrap();
+        let root = canonical_root.as_path();
 
         // The main checkout, on `main`, whose config carries the rewrite
         // behind an `onbranch:feature` condition.

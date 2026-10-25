@@ -18,7 +18,32 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - VT Code history is discoverable and searchable from canonical workspace journals under explicitly configured workspace roots, preserving recorded turns, tool identities, usage and control events.
 - Junie CLI history is discoverable and searchable from native session journals, including recorded prompts, assistant text, tool output and event markers.
 
+### Fixed
+
+- Reconciliation advances healthy roots past persistent enumeration errors while retaining failed locations for retry.
+- Exact-path capture avoids materializing unused cached transcript metadata and locations.
+- Unchanged Claude transcripts avoid duplicate file reads when record and metadata cursors have the same byte proof.
+
+- Filesystem-event sync can retain exact dirty paths and reuse catalog deltas, avoiding directory enumeration, whole-catalog digest copies and a silent full-history count for an active transcript append.
+- Cold reconciliation reuses current native transcript proofs without rehydrating unchanged archives.
+- Safety polling can reuse native transcript proofs without creating hydration checkpoints or metadata-only revisions for unchanged history.
+- Same-size transcript rewrites with a changed trusted filesystem timestamp replay their records even when bounded prefix hashes are unchanged.
+- Exact-path acquisition refreshes admitted project identities without resolving unrelated catalog rows on every slice.
+- Cold acquisition slices reuse validated writable connections instead of initializing the whole schema for every small file batch.
+- Concurrent acquisition threads retain independent transcript caches, avoid duplicate discovery reads of captured files and release buffers and handles when each acquisition finishes.
+- Reconciliation reports SQLite busy waits separately for work-based scheduling.
+- Capture cancellation stops SQLite busy retries so maintenance releases its sync lease while another writer remains held.
+
 ### Rust API
+
+- Added `Reconciliation::healthy_pass_exhausted` and `refresh_healthy_pass` for revisiting healthy roots without discarding unresolved enumeration failures.
+- Added `SyncOptions::paths` for exact-path capture.
+- Added `DiscoveryOptions::paths` for exact-path shallow discovery.
+- Added resumable `SessionStore::reconcile` rounds with bounded directory-entry and path slices.
+- Added `Reconciliation::discover_step` for bounded discovery without evidence acquisition.
+- Added `Reconciliation::capture_paths` for explicit safety batches using retained native proofs without advancing directory iterators.
+- Added `ReconciliationStep::sqlite_busy_wait` for measured SQLite busy-handler sleeps.
+- Reconciliation retains existing atomic transcript and database acquisition boundaries.
 
 - Added `Source::Kilo` for filtering and reading persisted Kilo CLI history.
 - Added `Source::DeepAgents` for filtering and reading persisted DeepAgents Code history.

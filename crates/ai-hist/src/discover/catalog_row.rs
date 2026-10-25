@@ -38,7 +38,37 @@ pub(crate) fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<Shallo
     })
 }
 
+/// Exact capture consumes identity and the hydration locator/state, never
+/// previews, model/root lists or presence. Borrow-check the remaining scalar
+/// values so malformed catalog data still takes the original cache-miss path,
+/// including invalid UTF-8; checking SQL `typeof` alone would miss that case.
+pub(super) fn row_to_capture_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<ShallowSession> {
+    for index in [3, 6, 7, 8, 9, 10, 12, 13, 15, 19, 20] {
+        let value = row.get_ref(index)?;
+        value.as_str_or_null().map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(index, value.data_type(), Box::new(error))
+        })?;
+    }
+    // The general decoder rejects non-integral timestamps, even though
+    // capture does not consume them. These conversions do not allocate.
+    row.get::<_, Option<i64>>(4)?;
+    row.get::<_, Option<i64>>(5)?;
+    Ok(ShallowSession {
+        source: row.get(0)?,
+        session_id: row.get(1)?,
+        cwd: row.get(2)?,
+        repo_url: row.get(11)?,
+        raw_path: row.get(14)?,
+        discovery_state: row
+            .get::<_, Option<String>>(16)?
+            .unwrap_or_else(|| "full".to_string()),
+        project_key: row.get(17)?,
+        project_key_method: row.get(18)?,
+        from_cache: true,
+        ..ShallowSession::default()
+    })
+}
+
 fn kind_and_locations(row: &rusqlite::Row<'_>) -> rusqlite::Result<(Option<String>, Vec<String>)> {
     Ok((row.get(20)?, json_string_list(row.get(21)?)))
 }
-
