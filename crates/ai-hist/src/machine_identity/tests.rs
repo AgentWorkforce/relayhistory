@@ -20,6 +20,12 @@ fn here() -> Option<String> {
     local_hardware_hash()
 }
 
+/// The database as a plain connection, without the writable open's identity
+/// refresh, so a test that simulated another hostname keeps it.
+fn reopen(path: &Path) -> Connection {
+    Connection::open(path).unwrap()
+}
+
 fn first_run(path: &Path, hostname: &str) -> MachineIdentity {
     ensure_with(
         &blank(path),
@@ -221,7 +227,7 @@ fn hostname_rename_updates_the_name_and_records_an_alias_never_the_id() {
     let dir = tempfile::tempdir().unwrap();
     let path = db(&dir, "ai-history.db");
     let before = first_run(&path, "khaliq-mbp");
-    let conn = open_db(&path).unwrap();
+    let conn = reopen(&path);
     // A different privacy on a later run changes nothing about the id either.
     let after = ensure_with(
         &conn,
@@ -256,7 +262,7 @@ fn every_spelling_of_one_hostname_resolves_to_one_machine() {
     let dir = tempfile::tempdir().unwrap();
     let path = db(&dir, "ai-history.db");
     let first = first_run(&path, "Khaliqs-MacBook-Pro.local");
-    let conn = open_db(&path).unwrap();
+    let conn = reopen(&path);
     let spellings = [
         "Khaliqs-MacBook-Pro",
         "KHALIQS_MACBOOK_PRO",
@@ -331,7 +337,7 @@ fn names_record_their_rule_and_an_older_rule_is_recanonicalized() {
         .hostname_aliases
         .iter()
         .all(|alias| alias.rule_version == CANONICAL_HOSTNAME_RULE_VERSION));
-    let conn = open_db(&path).unwrap();
+    let conn = reopen(&path);
     ensure_with(
         &conn,
         "Old_Laptop",
@@ -423,7 +429,7 @@ fn a_rule_v1_name_with_an_apostrophe_is_folded_on_the_next_open() {
     let dir = tempfile::tempdir().unwrap();
     let path = db(&dir, "ai-history.db");
     let first = first_run(&path, "Khaliq's MacBook Pro");
-    let conn = open_db(&path).unwrap();
+    let conn = reopen(&path);
     // What rule 1 stored for the ComputerName spelling.
     conn.execute_batch(
         "UPDATE machine_identity SET machine_name = 'khaliq-s-macbook-pro', \
@@ -601,7 +607,7 @@ fn the_hardware_id_is_stored_only_as_a_hash() {
     assert_eq!(hash, hardware_hash("abcdef-1234"), "case and spacing fold");
     assert!(!hash.contains("abcdef"));
     #[cfg(target_os = "linux")]
-    if let Ok(raw) = std::fs::read_to_string("/etc/machine-id") {
+    if let Ok(raw) = machine_uid::get() {
         let local = local_hardware_hash().unwrap();
         assert_eq!(local, hardware_hash(&raw));
         assert!(!local.contains(raw.trim()));
@@ -647,6 +653,29 @@ fn a_restored_database_is_reissued_by_the_next_writable_open() {
     assert_eq!(stored.previous.len(), 1);
     assert_eq!(stored.previous[0].machine_id, first.machine_id);
     assert!(!crate::store::needs_migration(&conn).unwrap());
+}
+
+#[test]
+fn a_spelling_not_yet_recorded_is_recorded_by_the_next_writable_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = db(&dir, "ai-history.db");
+    let first = store(&path).machine_identity().unwrap().unwrap();
+    {
+        // This host's spelling, as if it had never been seen.
+        let conn = reopen(&path);
+        conn.execute("DELETE FROM hostname_aliases", []).unwrap();
+        assert!(crate::store::needs_migration(&conn).unwrap());
+    }
+    let conn = open_db(&path).unwrap();
+    assert!(!crate::store::needs_migration(&conn).unwrap());
+    let stored = read(&conn).unwrap().unwrap();
+    assert_eq!(stored.machine_id, first.machine_id);
+    let observed: Vec<_> = stored
+        .hostname_aliases
+        .iter()
+        .map(|a| a.observed.as_str())
+        .collect();
+    assert_eq!(observed, [local_hostname().trim()]);
 }
 
 #[test]

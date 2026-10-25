@@ -133,7 +133,7 @@ pub ai_hist::HydrateStatus::Missing
 pub ai_hist::HydrateStatus::Unchanged
 pub ai_hist::HydrateStatus::Unidentified
 pub ai_hist::HydrateStatus::Updated
-pub enum ai_hist::MachineNamePrivacy
+#[non_exhaustive] pub enum ai_hist::MachineNamePrivacy
 pub ai_hist::MachineNamePrivacy::Hashed
 pub ai_hist::MachineNamePrivacy::Slug
 impl ai_hist::MachineNamePrivacy
@@ -455,7 +455,7 @@ pub ai_hist::HistoryEntry::prompt_hash: core::option::Option<alloc::string::Stri
 pub ai_hist::HistoryEntry::session_id: core::option::Option<alloc::string::String>
 pub ai_hist::HistoryEntry::source: alloc::string::String
 pub ai_hist::HistoryEntry::timestamp_ms: i64
-pub struct ai_hist::HostnameAlias
+#[non_exhaustive] pub struct ai_hist::HostnameAlias
 pub ai_hist::HostnameAlias::canonical: alloc::string::String
 pub ai_hist::HostnameAlias::first_seen_ms: i64
 pub ai_hist::HostnameAlias::observed: alloc::string::String
@@ -498,7 +498,7 @@ impl ai_hist::IdentityQuery
 pub fn ai_hist::IdentityQuery::after(self, ai_hist::SessionIdentity) -> Self
 pub fn ai_hist::IdentityQuery::exclude_delegated(self) -> Self
 pub fn ai_hist::IdentityQuery::limit(self, usize) -> Self
-pub struct ai_hist::MachineIdentity
+#[non_exhaustive] pub struct ai_hist::MachineIdentity
 pub ai_hist::MachineIdentity::created_ms: i64
 pub ai_hist::MachineIdentity::hardware_id_hash: core::option::Option<alloc::string::String>
 pub ai_hist::MachineIdentity::hostname_aliases: alloc::vec::Vec<ai_hist::HostnameAlias>
@@ -640,7 +640,7 @@ pub ai_hist::RelationshipCapabilities::records_evidence_locator: bool
 pub ai_hist::RelationshipCapabilities::records_spawn_time: bool
 pub ai_hist::RelationshipCapabilities::source: alloc::string::String
 pub ai_hist::RelationshipCapabilities::stable_child_identity: alloc::string::String
-pub struct ai_hist::RetiredMachineId
+#[non_exhaustive] pub struct ai_hist::RetiredMachineId
 pub ai_hist::RetiredMachineId::install_id: alloc::string::String
 pub ai_hist::RetiredMachineId::machine_id: alloc::string::String
 pub ai_hist::RetiredMachineId::machine_name: alloc::string::String

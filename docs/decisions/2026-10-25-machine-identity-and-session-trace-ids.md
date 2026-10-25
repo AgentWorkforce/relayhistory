@@ -97,7 +97,7 @@ process, without spawning anything:
 
 | Platform | Source |
 |---|---|
-| Linux | `/etc/machine-id`, falling back to `/var/lib/dbus/machine-id` |
+| Linux | `/var/lib/dbus/machine-id`, falling back to `/etc/machine-id` |
 | macOS | `gethostuuid(2)`, the IOPlatformUUID |
 | Windows | `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid` (64-bit view) |
 

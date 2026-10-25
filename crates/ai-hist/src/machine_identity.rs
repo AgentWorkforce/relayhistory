@@ -61,6 +61,7 @@ pub const MACHINE_ID_SCHEME: &str = "hostname_install_suffix_v1";
 /// How the machine name appears inside the id.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum MachineNamePrivacy {
     /// The slug itself.
     Slug,
@@ -97,6 +98,7 @@ pub const INSTALL_SUFFIX_HEX_DIGITS: usize = 6;
 
 /// This database's machine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct MachineIdentity {
     /// Frozen at first run; see [`machine_id`].
     pub machine_id: String,
@@ -127,6 +129,7 @@ pub struct MachineIdentity {
 
 /// A machine id a database no longer uses.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct RetiredMachineId {
     pub machine_id: String,
     pub install_id: String,
@@ -142,6 +145,7 @@ const HARDWARE_CHANGED: &str = "hardware_changed";
 /// One spelling of the hostname, as the OS reported it, and its canonical
 /// form.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[non_exhaustive]
 pub struct HostnameAlias {
     pub observed: String,
     pub canonical: String,
@@ -449,23 +453,41 @@ pub(crate) fn ensure(conn: &Connection) -> Result<MachineIdentity> {
 }
 
 /// Whether a writable open has identity work to do on an otherwise current
-/// schema: a name or alias computed under an earlier
-/// [`CANONICAL_HOSTNAME_RULE_VERSION`], a hardware hash not yet recorded, or
-/// one that changed because the database moved to another machine. Two
-/// indexed reads and a hash cached for the process, so a current database
-/// stays cheap to open. Only called once the identity tables are current.
+/// schema: a renamed host or a spelling not yet recorded, a name or alias
+/// computed under an earlier [`CANONICAL_HOSTNAME_RULE_VERSION`], a hardware
+/// hash not yet recorded, or one that changed because the database moved to
+/// another machine. A `uname`, three indexed reads and a hash cached for the
+/// process, so a current database stays cheap to open. Only called once the
+/// identity tables are current.
 pub(crate) fn needs_refresh(conn: &Connection) -> Result<bool> {
-    let Some((rule, issued)) = conn
+    let Some((name, rule, issued)) = conn
         .query_row(
-            "SELECT name_rule_version, hardware_id_hash FROM machine_identity \
+            "SELECT machine_name, name_rule_version, hardware_id_hash FROM machine_identity \
              WHERE singleton = 1",
             [],
-            |row| Ok((row.get::<_, u32>(0)?, row.get::<_, Option<String>>(1)?)),
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, u32>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                ))
+            },
         )
         .optional()?
     else {
         return Ok(true);
     };
+    let hostname = local_hostname();
+    let observed = hostname.trim();
+    let spelling_recorded: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM hostname_aliases \
+         WHERE observed_hostname = ?1 AND rule_version = ?2)",
+        params![observed, CANONICAL_HOSTNAME_RULE_VERSION],
+        |row| row.get(0),
+    )?;
+    if name != canonical_hostname(observed) || !spelling_recorded {
+        return Ok(true);
+    }
     let stale_alias: bool = conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM hostname_aliases WHERE rule_version <> ?1)",
         [CANONICAL_HOSTNAME_RULE_VERSION],
@@ -565,9 +587,16 @@ impl SessionStore {
             }
             return Ok(identity);
         }
-        let conn = crate::store::open_db(self.db_path())
+        let mut conn = crate::store::open_db(self.db_path())
             .map_err(|error| Error::DatabaseOpen(format!("{error:#}")))?;
-        ensure(&conn).map(Some).map_err(Error::query)
+        // One immediate transaction: a reissue is several writes, and two
+        // callers must not interleave them.
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(Error::sql)?;
+        let identity = ensure(&tx).map_err(Error::query)?;
+        tx.commit().map_err(Error::sql)?;
+        Ok(Some(identity))
     }
 
     /// The session's trace id: a UUIDv7 minted when its catalog row was

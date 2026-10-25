@@ -2,8 +2,9 @@
 //! onto another machine from one that never moved.
 //!
 //! The raw id never leaves this module: only a SHA-256 of it is stored. It is
-//! read through `machine-uid` without spawning a process -- `/etc/machine-id`
-//! (or `/var/lib/dbus/machine-id`) on Linux, `gethostuuid(2)` (the
+//! read through `machine-uid` without spawning a process --
+//! `/var/lib/dbus/machine-id`, else `/etc/machine-id`, on Linux;
+//! `gethostuuid(2)` (the
 //! IOPlatformUUID) on macOS, `MachineGuid` from the registry on Windows --
 //! and once per process.
 use sha2::{Digest, Sha256};
