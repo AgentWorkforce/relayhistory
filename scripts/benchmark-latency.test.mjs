@@ -44,9 +44,17 @@ const report = (metrics, { base, cpu = "test" } = {}) => ({
   runs: [{ phase: "stages", days: 30, result: { metrics }, ...(base ? { base: { metrics: base } } : {}) }],
 });
 
+// Every budgeted metric must be present, so a test that steers one gets a
+// healthy value for the other.
+const healthy = { fs_event: summary(0.1), ingest_hook: summary(30) };
 const gate = (metrics, options, platform = "linux-x64", t = thresholds) =>
-  evaluateGate(report(metrics, options), t, platform);
-const status = (result, rule) => result.checks.find((c) => c.rule === rule)?.status;
+  evaluateGate(
+    report({ ...healthy, ...metrics }, { ...options, base: options?.base && { ...healthy, ...options.base } }),
+    t,
+    platform,
+  );
+const status = (result, rule, id) =>
+  result.checks.find((c) => c.rule === rule && (!id || c.id === id))?.status;
 
 test("an enforced budget at or over its p99 fails", () => {
   const result = gate({ fs_event: summary(1.0) });
@@ -83,12 +91,12 @@ test("an enforced stage: against a base, the base decides and stored numbers onl
 test("a tracked stage over budget is an expected failure, and stays green", () => {
   const result = gate({ ingest_hook: summary(40) });
   assert.equal(result.passed, true);
-  assert.equal(status(result, "budget"), "xfail");
+  assert.equal(status(result, "budget", "stages@30d.ingest_hook"), "xfail");
 });
 
 test("a tracked stage that meets its budget is flagged for enforcement", () => {
   const result = gate({ ingest_hook: summary(1.2) });
-  assert.equal(status(result, "budget"), "xpass");
+  assert.equal(status(result, "budget", "stages@30d.ingest_hook"), "xpass");
   assert.match(result.warnings.join("\n"), /stages@30d.ingest_hook is within its 1.5 ms budget/);
 });
 
@@ -130,7 +138,7 @@ test("the regression floor grows to a share of the stage's budget", () => {
 test("with neither a base nor stored numbers, only budgets are checked", () => {
   const result = gate({ fs_event: summary(0.5) }, {}, "darwin-arm64");
   assert.equal(result.passed, true);
-  assert.deepEqual(result.checks.map((c) => c.rule), ["budget"]);
+  assert.deepEqual(result.checks.map((c) => c.rule), ["budget", "budget"]);
   assert.match(result.warnings[0], /only budgets are checked/);
 });
 
@@ -138,6 +146,14 @@ test("a budgeted stage with no samples fails", () => {
   const result = gate({ fs_event: { n: 0 } });
   assert.equal(result.passed, false);
   assert.equal(status(result, "samples"), "fail");
+});
+
+test("a budgeted metric missing from a measured run fails; budgets of unmeasured runs do not", () => {
+  const missing = evaluateGate(report({ fs_event: summary(0.1) }), thresholds, "linux-x64");
+  assert.equal(missing.passed, false);
+  assert.equal(missing.checks.find((c) => c.id === "stages@30d.ingest_hook").rule, "samples");
+  const otherRun = { ...report({}), runs: [{ phase: "e2e", days: 30, result: { metrics: {} } }] };
+  assert.equal(evaluateGate(otherRun, thresholds, "linux-x64").passed, true);
 });
 
 test("rounds fold to the median percentile, keeping the worst round visible", () => {

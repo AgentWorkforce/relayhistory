@@ -198,6 +198,15 @@ export function evaluateGate(report, thresholds, platform) {
       }
     }
   }
+  // A budget whose run was measured but whose metric never appeared -- the
+  // harness stopped emitting it, or a key was renamed -- is a failure, not
+  // a stage nobody checks. Budgets of runs this profile skips are left out.
+  const seen = new Set(checks.map((check) => check.id));
+  const measuredRuns = new Set(report.runs.map(runId));
+  for (const [id, budget] of Object.entries(thresholds.budgets ?? {})) {
+    if (seen.has(id) || !measuredRuns.has(id.split(".")[0])) continue;
+    checks.push({ id, rule: "samples", value: 0, bound: 1, status: "fail", stage: budget.stage });
+  }
   return {
     passed: checks.every((check) => check.status !== "fail"),
     checks,
