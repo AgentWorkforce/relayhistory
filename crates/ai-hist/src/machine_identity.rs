@@ -397,7 +397,7 @@ impl SessionStore {
     /// writable handle (a write only when the name changed). A read-only
     /// handle returns what is stored, or `None` for a database no writable
     /// open has migrated yet. Local only; never a network call.
-    pub fn machine_identity(&self) -> Result<Option<MachineIdentity>, Error> {
+    pub fn machine_identity(&self) -> std::result::Result<Option<MachineIdentity>, Error> {
         if self.read_only() {
             let conn = self.read_conn()?;
             return read(&conn).map_err(Error::query);
@@ -410,7 +410,11 @@ impl SessionStore {
     /// The session's trace id: a UUIDv7 minted when its catalog row was
     /// first written, never rewritten. `None` when the session is not
     /// catalogued.
-    pub fn trace_id(&self, source: Source, session_id: &str) -> Result<Option<String>, Error> {
+    pub fn trace_id(
+        &self,
+        source: Source,
+        session_id: &str,
+    ) -> std::result::Result<Option<String>, Error> {
         let conn = self.read_conn()?;
         conn.query_row(
             "SELECT trace_id FROM sessions WHERE source = ?1 AND session_id = ?2",
