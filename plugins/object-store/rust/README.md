@@ -13,7 +13,7 @@ implementations:
 
 Transports come from the Apache [`object_store`](https://crates.io/crates/object_store)
 crate; this crate adds the guarantees the delivery coordinator depends on.
-See the [decision record](../../../docs/decisions/2026-10-25-object-storage-adapters.md)
+The `manifest.json` schema is specified in [docs/manifest-v1.md](docs/manifest-v1.md). See the [decision record](../../../docs/decisions/2026-10-25-object-storage-adapters.md)
 for why.
 
 **Not part of the local hot path.** This crate is not a root-workspace member,
