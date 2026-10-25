@@ -1214,30 +1214,39 @@ the budget is set for the macOS desktop. It is a workflow of its own, not a
 step in `verify`, because the budgets are release-build numbers and `verify`
 builds debug.
 
-Every rule applies to the metrics with a budget -- the stages of the 5 ms
-path. Everything else in the table (`open_db`, `open_raw`, the uploader's own
-drain and commit, the quiet reads) is diagnostic.
+Only the metrics with a budget are gated: the stages of the 5 ms path.
+Everything else in the table (`open_db`, `open_raw`, the uploader's own drain
+and commit, the quiet reads) is diagnostic. A budgeted metric is **enforced**
+on a platform class or **tracked** there. `enforced` is `true`, `false`, or a
+list of classes: the raw filesystem event meets its budget under inotify and
+not under FSEvents, and holding Linux to it is worth more than waiting for
+macOS.
 
-* **Budget.** p99 at or above the budget fails if the budget is enforced on
-  the runner's platform class. `enforced` is `true`, `false`, or a list of
-  classes: the raw filesystem event meets its budget under inotify and not
-  under FSEvents, and holding Linux to it is worth more than waiting for
-  macOS. A stage the code does not meet yet is tracked: printed as `warn` and
-  not failing, so the gate can land before the fixes do. The change that
-  brings a stage under budget enforces it in the same pull request, never
-  the other way.
-* **Regression against base.** On a pull request the workflow passes
-  `--base <base sha>`. The driver checks the base out into a worktree under
-  `target/latency-base`, copies this checkout's harness into it (the harness
-  uses only the public API, so a base that predates it still builds), and
-  runs both, interleaved round by round, on the same runner. The head fails
-  if it is more than 10% plus 0.05 ms over the base: on **p99** for an
-  enforced stage, on **p50** for a tracked one.
-* **Regression against stored baselines.** `scripts/latency-thresholds.json`
-  keeps per-class baselines: for each budgeted metric, the worst round's p50
-  and p99 of each recorded run, merged worst-of across runs. They fail only
-  when there is no base (a push to `main`, a manual run) *and* the runner's
-  CPU is in `cpusSeen`; otherwise they are advisory.
+**Enforced stage** (the code meets the budget):
+
+* p99 at or above the budget fails.
+* p99 more than 10% plus the floor over the **base commit** fails. On a pull
+  request the workflow passes `--base <base sha>`. The driver checks the base
+  out into a worktree under `target/latency-base` and copies this checkout's
+  harness into it; the harness uses only the public API, so a base that
+  predates it still builds. It then runs both, interleaved round by round, on
+  the same runner.
+* p99 over the stored baseline in `baselines` fails only when there is no
+  base (a push to `main`, a manual run) and the runner's CPU is in
+  `cpusSeen`. Otherwise it is advisory.
+
+**Tracked stage** (known over budget; its current numbers are the `known`
+block of its budget, per platform class):
+
+* Over budget is `xfail`: expected, printed in the "Known over budget" table,
+  and not failing. Under budget is `xpass`, a warning that names the stage as
+  ready to enforce. The change that brings a stage under budget enforces it
+  in the same pull request, never the other way.
+* Getting worse fails. "Worse" means the p50 is more than 25% over the base
+  *and* more than 10% over its known p50. With no base, the known number
+  alone decides, on a recorded CPU.
+
+Every bound adds a floor of max(0.05 ms, 10% of the stage's budget).
 
 Why a same-runner comparison and not stored numbers: on this change's first
 four CI jobs, the same metric was 20-40% apart between two `ubuntu-latest`
@@ -1251,13 +1260,26 @@ neighbours.
 
 Why p50 for tracked stages: their tails are lock waits and WAL checkpoints
 that land on whichever samples they land on. The hook ingest's p99 was
-257 ms in one job and 31 ms in the next, while its p50 was 23 and 24 ms. A
-10% bound on that tail measures luck; the p50 is the cost the fix for that
-stage will move.
+257 ms in one job and 31 ms in the next, while its p50 was 23 and 24 ms. Why
+both tests for "worse": on a pull request that changes no library code, the
+same-runner comparison still moved tracked stages 12-27%
+(`ingest_during_prune` 151 vs 119 ms p50, `e2e_visible` 121 vs 108 ms). A
+25% bound alone fails some of those runs, and a known number alone fails on
+a slower runner. A real regression clears both.
+
+Why the floor grows with the budget: a no-change comparison on a busy
+machine moved the raw fs-event p99 from 0.15 to 0.60 ms over 100 samples.
+That stage now takes 1,000 samples, and a slowdown smaller than a tenth of
+what a stage may spend is not one to fail a pull request on.
+
+The comparison is shown to catch a regression. With a 300 µs sleep injected
+into `SessionStore::sessions`, the list stage failed against its base (p99
+0.624 ms against a bound of 0.302 ms). The stored-baseline bound (0.685 ms)
+would have let it through.
 
 Each round is its own process and each reported percentile is the median
 across rounds; the table also prints the worst round. Record or extend
-baselines from a CI artifact with
+baselines and known numbers from a CI artifact with
 `--report-only <artifact.json> --update-baselines`. Lowering a baseline after
 a speed-up means deleting that class's entry and re-recording, since merging
 only ever keeps the worse value.

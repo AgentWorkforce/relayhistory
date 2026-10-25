@@ -237,6 +237,7 @@ async function main(argv) {
 
   const cls = platformClass(report.machine.platform, report.machine.arch);
   if (flag(argv, "update-baselines")) {
+    const recorded = baselinesFromReport(report, thresholds.budgets, cls);
     const previous = thresholds.baselines?.[cls];
     thresholds.baselines ??= {};
     thresholds.baselines[cls] = {
@@ -246,10 +247,15 @@ async function main(argv) {
         measuredAt: report.measuredAt,
         profile: report.profile,
       },
-      metrics: mergeBaselines(previous?.metrics, baselinesFromReport(report, thresholds.budgets)),
+      metrics: mergeBaselines(previous?.metrics, recorded.baselines),
     };
+    for (const [id, numbers] of Object.entries(recorded.known)) {
+      const budget = thresholds.budgets[id];
+      budget.known ??= {};
+      budget.known[cls] = mergeBaselines({ [id]: budget.known[cls] }, { [id]: numbers })[id];
+    }
     writeFileSync(THRESHOLDS, `${JSON.stringify(thresholds, null, 2)}\n`);
-    process.stderr.write(`baselines for ${cls} written to ${THRESHOLDS}\n`);
+    process.stderr.write(`baselines and known numbers for ${cls} written to ${THRESHOLDS}\n`);
   }
 
   const gate = evaluateGate(report, thresholds, cls);

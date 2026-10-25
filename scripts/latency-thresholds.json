@@ -10,18 +10,20 @@
   ],
   "policy": {
     "maxRegression": 0.1,
+    "trackedMaxRegression": 0.25,
     "regressionFloorMs": 0.05,
     "regressionFloorBudgetShare": 0.1,
     "regressionComment": [
-      "The deciding regression rule compares this commit against its base, measured interleaved on the",
-      "same runner (--base): the same metric was 20-40% apart on two runners of one class, so only a",
-      "same-machine comparison can see 10%. A budgeted metric fails when it exceeds the base by",
-      "maxRegression plus regressionFloorMs -- on p99 where its budget is enforced, on p50 where it is",
-      "tracked (a tracked stage's tail is lock waits and checkpoints that land on random samples).",
-      "Stored baselines are the worst round of each recorded run, merged worst-of across runs; they gate",
-      "only when there is no base and the CPU is in cpusSeen, and advise otherwise. The floor is added",
-      "because 10% of a 0.1 ms stage is 10 us of scheduler jitter.",
-      "The floor is max(regressionFloorMs, regressionFloorBudgetShare x the stage's budget): a no-change A/B on a busy machine moved the raw fs-event p99 0.15 -> 0.60 ms."
+      "Enforced stages (within budget on that class): p99 at/over budget fails; p99 more than maxRegression",
+      "over the base commit, measured interleaved on the same runner (--base), fails. Stored baselines decide",
+      "only with no base and on a CPU in cpusSeen; the same metric was 20-40% apart on two runners of one class.",
+      "Tracked stages (known over budget, current numbers in each budget's `known`): over budget is an expected",
+      "failure; getting worse fails, judged on p50 because their tails are lock waits that land on random",
+      "samples. Worse = p50 more than trackedMaxRegression over the base AND more than maxRegression over the",
+      "known p50: on identical code these stages moved 12-27% between interleaved base and head runs, so",
+      "either test alone fails healthy pull requests.",
+      "Every bound adds max(regressionFloorMs, regressionFloorBudgetShare x the stage's budget): a no-change",
+      "A/B on a busy machine moved the raw fs-event p99 0.15 -> 0.60 ms over 100 samples."
     ]
   },
   "budgets": {
@@ -31,22 +33,58 @@
       "enforced": [
         "linux-x64"
       ],
-      "enforcedComment": "FSEvents on the macos-latest runner (Apple M1, virtual) delivered at 15.7 ms p50 / 19 ms p99 with notify's latency 0.0 and NoDefer; inotify meets the budget at 0.13 ms. Enforced where it is met."
+      "enforcedComment": "FSEvents on the macos-latest runner (Apple M1, virtual) delivered at 15.7 ms p50 / 19 ms p99 with notify's latency 0.0 and NoDefer; inotify meets the budget at 0.13 ms. Enforced where it is met.",
+      "known": {
+        "darwin-arm64": {
+          "p50": 15.735,
+          "p99": 19.122
+        }
+      }
     },
     "stages@30d.ingest_hook": {
       "stage": "parse + SQLite txn (hook path)",
       "p99Ms": 1.5,
-      "enforced": false
+      "enforced": false,
+      "known": {
+        "linux-x64": {
+          "p50": 23.96,
+          "p99": 277.95
+        },
+        "darwin-arm64": {
+          "p50": 26.312,
+          "p99": 83.569
+        }
+      }
     },
     "stages@30d.sweep_scoped_sync": {
       "stage": "parse + SQLite txn (watch tick / collector sweep)",
       "p99Ms": 1.5,
-      "enforced": false
+      "enforced": false,
+      "known": {
+        "linux-x64": {
+          "p50": 919.528,
+          "p99": 13626.151
+        },
+        "darwin-arm64": {
+          "p50": 499.043,
+          "p99": 5262.672
+        }
+      }
     },
     "stages@30d.feed_pull": {
       "stage": "change-feed notify -> desktop",
       "p99Ms": 1,
-      "enforced": false
+      "enforced": false,
+      "known": {
+        "linux-x64": {
+          "p50": 1.272,
+          "p99": 1.443
+        },
+        "darwin-arm64": {
+          "p50": 1.129,
+          "p99": 3.767
+        }
+      }
     },
     "stages@30d.list_first_paint": {
       "stage": "desktop query (indexed, LIMIT 50)",
@@ -54,7 +92,13 @@
       "enforced": [
         "linux-x64"
       ],
-      "enforcedComment": "macos-latest is a 3-vCPU Apple M1 VM: p50 0.20-0.28 ms, but its p99 tail went 0.53 -> 1.72 ms between two runs on the same CPU model. Tracked there until a real M-series runner measures it."
+      "enforcedComment": "macos-latest is a 3-vCPU Apple M1 VM: p50 0.20-0.28 ms, but its p99 tail went 0.53 -> 1.72 ms between two runs on the same CPU model. Tracked there until a real M-series runner measures it.",
+      "known": {
+        "darwin-arm64": {
+          "p50": 0.277,
+          "p99": 2.032
+        }
+      }
     },
     "list_scale@30d.list_first_paint": {
       "stage": "desktop query (indexed, LIMIT 50), 30 days",
@@ -62,7 +106,13 @@
       "enforced": [
         "linux-x64"
       ],
-      "enforcedComment": "macos-latest is a 3-vCPU Apple M1 VM: p50 0.20-0.28 ms, but its p99 tail went 0.53 -> 1.72 ms between two runs on the same CPU model. Tracked there until a real M-series runner measures it."
+      "enforcedComment": "macos-latest is a 3-vCPU Apple M1 VM: p50 0.20-0.28 ms, but its p99 tail went 0.53 -> 1.72 ms between two runs on the same CPU model. Tracked there until a real M-series runner measures it.",
+      "known": {
+        "darwin-arm64": {
+          "p50": 0.251,
+          "p99": 4.57
+        }
+      }
     },
     "list_scale@365d.list_first_paint": {
       "stage": "desktop query (indexed, LIMIT 50), 1 year",
@@ -70,22 +120,58 @@
       "enforced": [
         "linux-x64"
       ],
-      "enforcedComment": "macos-latest is a 3-vCPU Apple M1 VM: p50 0.20-0.28 ms, but its p99 tail went 0.53 -> 1.72 ms between two runs on the same CPU model. Tracked there until a real M-series runner measures it."
+      "enforcedComment": "macos-latest is a 3-vCPU Apple M1 VM: p50 0.20-0.28 ms, but its p99 tail went 0.53 -> 1.72 ms between two runs on the same CPU model. Tracked there until a real M-series runner measures it.",
+      "known": {
+        "darwin-arm64": {
+          "p50": 0.278,
+          "p99": 1.502
+        }
+      }
     },
     "list_scale@365d.list_desktop_page": {
       "stage": "desktop query (LIMIT 500, the desktop's page), 1 year",
       "p99Ms": 1.5,
-      "enforced": false
+      "enforced": false,
+      "known": {
+        "linux-x64": {
+          "p50": 2.505,
+          "p99": 2.948
+        },
+        "darwin-arm64": {
+          "p50": 1.972,
+          "p99": 4.804
+        }
+      }
     },
     "e2e@30d.e2e_visible": {
       "stage": "total: write -> visible",
       "p99Ms": 5,
-      "enforced": false
+      "enforced": false,
+      "known": {
+        "linux-x64": {
+          "p50": 63.148,
+          "p99": 7023.314
+        },
+        "darwin-arm64": {
+          "p50": 121.049,
+          "p99": 256.08
+        }
+      }
     },
     "ingest_upload@30d.ingest_with_uploader": {
       "stage": "parse + SQLite txn while an uploader runs",
       "p99Ms": 1.5,
-      "enforced": false
+      "enforced": false,
+      "known": {
+        "linux-x64": {
+          "p50": 27.959,
+          "p99": 359.875
+        },
+        "darwin-arm64": {
+          "p50": 23.345,
+          "p99": 127.581
+        }
+      }
     },
     "prune@365d.read_during_prune": {
       "stage": "desktop query while retention prunes",
@@ -93,12 +179,28 @@
       "enforced": [
         "linux-x64"
       ],
-      "enforcedComment": "macos-latest read 1.47-1.79 ms p99 during a 1-year prune (0.54-0.70 ms quiet); linux-x64 0.52-0.75 ms. Enforced where it is met."
+      "enforcedComment": "macos-latest read 1.47-1.79 ms p99 during a 1-year prune (0.54-0.70 ms quiet); linux-x64 0.52-0.75 ms. Enforced where it is met.",
+      "known": {
+        "darwin-arm64": {
+          "p50": 0.341,
+          "p99": 2.085
+        }
+      }
     },
     "prune@365d.ingest_during_prune": {
       "stage": "parse + SQLite txn while retention prunes",
       "p99Ms": 1.5,
-      "enforced": false
+      "enforced": false,
+      "known": {
+        "linux-x64": {
+          "p50": 310.789,
+          "p99": 10606.177
+        },
+        "darwin-arm64": {
+          "p50": 420.643,
+          "p99": 8048.045
+        }
+      }
     }
   },
   "profiles": {
@@ -220,54 +322,26 @@
           "AMD EPYC 9V74 80-Core Processor",
           "AMD EPYC 7763 64-Core Processor"
         ],
-        "commit": "d4d5b663e769fc1c54556d08bee650423339448c",
-        "measuredAt": "2026-10-25T20:29:10.776Z",
+        "commit": "5f9f18efc6a5c14d81c30e8b82548ca0ddd06f88",
+        "measuredAt": "2026-10-25T21:03:45.910Z",
         "profile": "gate"
       },
       "metrics": {
-        "stages@30d.feed_pull": {
-          "p50": 1.272,
-          "p99": 1.443
-        },
         "stages@30d.fs_event": {
           "p50": 0.088,
           "p99": 0.134
-        },
-        "stages@30d.ingest_hook": {
-          "p50": 23.96,
-          "p99": 277.95
         },
         "stages@30d.list_first_paint": {
           "p50": 0.331,
           "p99": 0.542
         },
-        "stages@30d.sweep_scoped_sync": {
-          "p50": 239.584,
-          "p99": 13626.151
-        },
-        "e2e@30d.e2e_visible": {
-          "p50": 63.148,
-          "p99": 7023.314
-        },
         "list_scale@30d.list_first_paint": {
           "p50": 0.315,
           "p99": 0.577
         },
-        "list_scale@365d.list_desktop_page": {
-          "p50": 2.505,
-          "p99": 2.948
-        },
         "list_scale@365d.list_first_paint": {
           "p50": 0.339,
           "p99": 0.573
-        },
-        "ingest_upload@30d.ingest_with_uploader": {
-          "p50": 27.959,
-          "p99": 359.875
-        },
-        "prune@365d.ingest_during_prune": {
-          "p50": 310.789,
-          "p99": 10606.177
         },
         "prune@365d.read_during_prune": {
           "p50": 0.395,
@@ -280,60 +354,11 @@
         "cpusSeen": [
           "Apple M1 (Virtual)"
         ],
-        "commit": "d4d5b663e769fc1c54556d08bee650423339448c",
-        "measuredAt": "2026-10-25T20:31:52.486Z",
+        "commit": "5f9f18efc6a5c14d81c30e8b82548ca0ddd06f88",
+        "measuredAt": "2026-10-25T21:10:20.946Z",
         "profile": "gate"
       },
-      "metrics": {
-        "stages@30d.feed_pull": {
-          "p50": 1.129,
-          "p99": 3.767
-        },
-        "stages@30d.fs_event": {
-          "p50": 15.735,
-          "p99": 19.122
-        },
-        "stages@30d.ingest_hook": {
-          "p50": 26.312,
-          "p99": 83.569
-        },
-        "stages@30d.list_first_paint": {
-          "p50": 0.277,
-          "p99": 2.032
-        },
-        "stages@30d.sweep_scoped_sync": {
-          "p50": 115.543,
-          "p99": 5262.672
-        },
-        "e2e@30d.e2e_visible": {
-          "p50": 87.637,
-          "p99": 256.08
-        },
-        "list_scale@30d.list_first_paint": {
-          "p50": 0.251,
-          "p99": 4.57
-        },
-        "list_scale@365d.list_desktop_page": {
-          "p50": 1.861,
-          "p99": 4.804
-        },
-        "list_scale@365d.list_first_paint": {
-          "p50": 0.255,
-          "p99": 1.502
-        },
-        "ingest_upload@30d.ingest_with_uploader": {
-          "p50": 23.345,
-          "p99": 91.96
-        },
-        "prune@365d.ingest_during_prune": {
-          "p50": 420.643,
-          "p99": 8048.045
-        },
-        "prune@365d.read_during_prune": {
-          "p50": 0.341,
-          "p99": 2.085
-        }
-      }
+      "metrics": {}
     }
   }
 }
