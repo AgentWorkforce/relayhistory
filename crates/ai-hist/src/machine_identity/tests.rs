@@ -249,22 +249,50 @@ fn names_record_their_rule_and_an_older_rule_is_recanonicalized() {
         .iter()
         .all(|alias| alias.rule_version == CANONICAL_HOSTNAME_RULE_VERSION));
     let conn = open_db(&path).unwrap();
-    // What a database written under an earlier rule would hold.
+    ensure_with(&conn, "Old_Laptop", MachineNamePrivacy::Slug).unwrap();
+    // What a database written under an earlier rule would hold: every
+    // name, the historical spelling's included, at rule 0.
     conn.execute_batch(
         "UPDATE machine_identity SET machine_name = 'Khaliqs_MBP', name_rule_version = 0; \
-         UPDATE hostname_aliases SET canonical_hostname = 'Khaliqs_MBP', rule_version = 0;",
+         UPDATE hostname_aliases SET canonical_hostname = observed_hostname, rule_version = 0;",
     )
     .unwrap();
+    let firsts: Vec<i64> = read(&conn)
+        .unwrap()
+        .unwrap()
+        .hostname_aliases
+        .iter()
+        .map(|alias| alias.first_seen_ms)
+        .collect();
     let seen = ensure_with(&conn, "Khaliqs_MBP.local", MachineNamePrivacy::Slug).unwrap();
     assert_eq!(seen.machine_id, first.machine_id, "the id stays frozen");
     assert_eq!(seen.machine_name, "khaliqs-mbp");
     assert_eq!(seen.name_rule_version, CANONICAL_HOSTNAME_RULE_VERSION);
-    let [alias] = &seen.hostname_aliases[..] else {
-        panic!("{seen:?}");
-    };
-    assert_eq!(alias.canonical, "khaliqs-mbp");
-    assert_eq!(alias.rule_version, CANONICAL_HOSTNAME_RULE_VERSION);
-    assert_eq!(alias.first_seen_ms, first.hostname_aliases[0].first_seen_ms);
+    let aliases: Vec<_> = seen
+        .hostname_aliases
+        .iter()
+        .map(|alias| {
+            (
+                alias.observed.as_str(),
+                alias.canonical.as_str(),
+                alias.rule_version,
+            )
+        })
+        .collect();
+    let rule = CANONICAL_HOSTNAME_RULE_VERSION;
+    assert_eq!(
+        aliases,
+        [
+            ("Khaliqs_MBP.local", "khaliqs-mbp", rule),
+            ("Old_Laptop", "old-laptop", rule)
+        ]
+    );
+    let after: Vec<i64> = seen
+        .hostname_aliases
+        .iter()
+        .map(|a| a.first_seen_ms)
+        .collect();
+    assert_eq!(after, firsts, "first sightings are kept");
 }
 
 #[test]

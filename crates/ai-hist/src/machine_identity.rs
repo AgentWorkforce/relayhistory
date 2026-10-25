@@ -290,11 +290,22 @@ pub(crate) fn ensure_with(
         identity.name_rule_version = rule;
         identity.updated_ms = now;
     }
+    let stale: Vec<&str> = identity
+        .hostname_aliases
+        .iter()
+        .filter(|alias| alias.rule_version != rule)
+        .map(|alias| alias.observed.as_str())
+        .collect();
     let recorded = identity
         .hostname_aliases
         .iter()
         .any(|alias| alias.observed == observed && alias.rule_version == rule);
-    if !recorded {
+    if !stale.is_empty() || !recorded {
+        // Every spelling computed under an earlier rule is recomputed, not
+        // only the current one, so no alias is left under a mixed rule.
+        for spelling in stale {
+            record_alias(conn, spelling, &canonical_hostname(spelling), now)?;
+        }
         record_alias(conn, observed, &name, now)?;
         identity.hostname_aliases = hostname_aliases(conn)?;
     }
