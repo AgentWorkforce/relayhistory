@@ -34,8 +34,10 @@ copies the other writer's sections, and **any field the writer does not
 recognize**, through byte-for-byte unchanged. A writer never rebuilds the
 manifest from scratch; it always edits the copy it just read.
 
-To delete an unrecognized field in a section it owns, a writer sets that
-field to `null`. The field is then removed rather than carried through.
+To delete an unrecognized field in a section it owns, a writer must name it
+explicitly (in the Rust helper, the edit's `remove` list). A field that is
+merely absent from the writer's copy, or has a `null` value, is carried
+through unchanged.
 
 | Fields | Owner | Notes |
 | ------ | ----- | ----- |

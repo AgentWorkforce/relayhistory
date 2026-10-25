@@ -28,9 +28,36 @@ pub enum Edit {
         session: Box<Session>,
         writer: Box<Writer>,
         raw: Box<Raw>,
+        /// Unknown keys to delete, as `"session.key"`, `"writer.key"` or
+        /// `"raw.key"`. Unknown keys not listed are always kept.
+        remove: Vec<String>,
     },
     /// Replace the server-owned section.
-    Server(Box<Server>),
+    Server {
+        server: Box<Server>,
+        /// Unknown keys of `server` to delete. Others are always kept.
+        remove: Vec<String>,
+    },
+}
+
+impl Edit {
+    /// Replace the client sections, deleting nothing.
+    pub fn client(session: Session, writer: Writer, raw: Raw) -> Self {
+        Self::Client {
+            session: Box::new(session),
+            writer: Box::new(writer),
+            raw: Box::new(raw),
+            remove: Vec::new(),
+        }
+    }
+
+    /// Replace the server section, deleting nothing.
+    pub fn server(server: Server) -> Self {
+        Self::Server {
+            server: Box::new(server),
+            remove: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -108,17 +135,25 @@ where
                 session,
                 writer,
                 raw,
+                remove,
             } => {
                 let mut doc = require(doc, key)?;
-                put_section(&mut doc, "session", &*session)?;
-                put_section(&mut doc, "writer", &*writer)?;
-                put_section(&mut doc, "raw", &*raw)?;
+                let removals = |section: &str| -> Vec<String> {
+                    let prefix = format!("{section}.");
+                    remove
+                        .iter()
+                        .filter_map(|r| r.strip_prefix(&prefix).map(str::to_string))
+                        .collect()
+                };
+                put_section(&mut doc, "session", &*session, &removals("session"))?;
+                put_section(&mut doc, "writer", &*writer, &removals("writer"))?;
+                put_section(&mut doc, "raw", &*raw, &removals("raw"))?;
                 bump(&mut doc);
                 (doc, false)
             }
-            Edit::Server(server) => {
+            Edit::Server { server, remove } => {
                 let mut doc = require(doc, key)?;
-                put_section(&mut doc, "server", &*server)?;
+                put_section(&mut doc, "server", &*server, &remove)?;
                 bump(&mut doc);
                 (doc, false)
             }
@@ -198,8 +233,8 @@ fn create_doc(mut manifest: Manifest) -> Result<Doc> {
 /// stored section that is *not* listed here was added by a newer writer and
 /// is carried over even if the edit was built from a fresh struct (whose
 /// `extra` is empty); known keys follow the edit, so clearing an optional
-/// field still works. To delete an unknown key it owns, a writer sets it to
-/// `Value::Null` in the section's `extra`.
+/// field still works. To delete an unknown key it owns, a writer lists it in
+/// the edit's `remove`; a `null` value is just a value and is kept.
 fn known_fields(section: &str) -> &'static [&'static str] {
     match section {
         "session" => &[
@@ -241,7 +276,12 @@ fn known_fields(section: &str) -> &'static [&'static str] {
     }
 }
 
-fn put_section<T: serde::Serialize>(doc: &mut Doc, name: &str, section: &T) -> Result<()> {
+fn put_section<T: serde::Serialize>(
+    doc: &mut Doc,
+    name: &str,
+    section: &T,
+    remove: &[String],
+) -> Result<()> {
     let mut value =
         serde_json::to_value(section).map_err(|e| Error::InvalidArgument(e.to_string()))?;
     if let Value::Object(next) = &mut value {
@@ -253,9 +293,9 @@ fn put_section<T: serde::Serialize>(doc: &mut Doc, name: &str, section: &T) -> R
                 }
             }
         }
-        // An unknown key set to `null` in `extra` is an explicit deletion:
-        // the owner clears it, rather than having it carried over.
-        next.retain(|k, v| known.contains(&k.as_str()) || !v.is_null());
+        // Explicit deletions apply only to unknown keys; known fields are
+        // controlled by the typed struct.
+        next.retain(|k, _| known.contains(&k.as_str()) || !remove.contains(k));
     }
     doc.insert(name.to_string(), value);
     Ok(())

@@ -139,11 +139,7 @@ fn append_one(m: Option<&Manifest>, n: u64) -> Result<Edit> {
     let mut raw = m.raw.clone();
     let planned = plan_chunks(&raw, vec![chunk(n, raw.next_offset, 100 + n)])?;
     apply_chunks(&mut raw, &planned)?;
-    Ok(Edit::Client {
-        session: Box::new(m.session.clone()),
-        writer: Box::new(m.writer.clone()),
-        raw: Box::new(raw),
-    })
+    Ok(Edit::client(m.session.clone(), m.writer.clone(), raw))
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -185,7 +181,7 @@ async fn client_and_server_write_concurrently_without_losing_updates() {
                             .unwrap_or_else(|| server::server_section(m));
                         s.normalized = with_normalized(m, m, 1, None).normalized;
                         s.lifecycle_reason = Some(format!("round {n}"));
-                        Ok(Edit::Server(Box::new(s)))
+                        Ok(Edit::server(s))
                     })
                     .await
                     .unwrap();
@@ -411,7 +407,7 @@ async fn lost_race_reapplies_only_the_writers_own_change() {
                         update_manifest(store.as_ref(), &key, &fast(), |m| {
                             let s =
                                 with_lifecycle(m.unwrap(), Lifecycle::Idle, Some("race".into()));
-                            Ok(Edit::Server(Box::new(s.unwrap())))
+                            Ok(Edit::server(s.unwrap()))
                         })
                         .await
                         .unwrap();
@@ -535,7 +531,7 @@ async fn a_fresh_section_struct_keeps_a_newer_writers_fields() {
         .unwrap();
     // An older server builds its section from scratch (empty `extra`).
     update_manifest(&store, &key, &fast(), |_| {
-        Ok(Edit::Server(Box::new(Server {
+        Ok(Edit::server(Server {
             updated_at: "2026-10-26T00:00:00.000Z".into(),
             normalized: None,
             lifecycle: Lifecycle::Active,
@@ -543,7 +539,7 @@ async fn a_fresh_section_struct_keeps_a_newer_writers_fields() {
             lifecycle_reason: None,
             retention: None,
             extra: Default::default(),
-        })))
+        }))
     })
     .await
     .unwrap();
@@ -563,7 +559,7 @@ async fn a_fresh_section_struct_keeps_a_newer_writers_fields() {
 }
 
 #[tokio::test]
-async fn an_owner_can_delete_an_unknown_field_with_null() {
+async fn unknown_fields_are_deleted_only_when_listed_and_nulls_are_kept() {
     let dir = tempfile::tempdir().unwrap();
     let store = FsStore::new(FsConfig::new(dir.path())).unwrap();
     let loc = location("fs-delete");
@@ -575,7 +571,7 @@ async fn an_owner_can_delete_an_unknown_field_with_null() {
         "lifecycle": "idle",
         "lifecycle_at": "2026-10-25T19:00:00.000Z",
         "server.review_state": "pending",
-        "server.keep": 1
+        "server.future_flag": null
     });
     store
         .put(
@@ -585,24 +581,49 @@ async fn an_owner_can_delete_an_unknown_field_with_null() {
         )
         .await
         .unwrap();
+
+    // An unrelated edit keeps both, including the stored null.
     update_manifest(&store, &key, &fast(), |m| {
-        let mut s = m.unwrap().server.clone().unwrap();
-        s.extra
-            .insert("server.review_state".into(), serde_json::Value::Null);
-        Ok(Edit::Server(Box::new(s)))
+        let s = with_lifecycle(m.unwrap(), Lifecycle::Active, None).unwrap();
+        Ok(Edit::server(s))
     })
     .await
     .unwrap();
-    let body: Vec<bytes::Bytes> =
-        futures::TryStreamExt::try_collect(store.get(&key, None).await.unwrap())
-            .await
-            .unwrap();
-    let after: serde_json::Value = serde_json::from_slice(&body.concat()).unwrap();
+    let read = |store: FsStore, key: ObjectKey| async move {
+        let body: Vec<bytes::Bytes> =
+            futures::TryStreamExt::try_collect(store.get(&key, None).await.unwrap())
+                .await
+                .unwrap();
+        (
+            store,
+            serde_json::from_slice::<serde_json::Value>(&body.concat()).unwrap(),
+        )
+    };
+    let (store, after) = read(store, key.clone()).await;
+    assert_eq!(after["server"]["server.review_state"], "pending");
+    assert!(after["server"]
+        .as_object()
+        .unwrap()
+        .contains_key("server.future_flag"));
+
+    // An explicit removal deletes exactly the listed key.
+    update_manifest(&store, &key, &fast(), |m| {
+        Ok(Edit::Server {
+            server: Box::new(m.unwrap().server.clone().unwrap()),
+            remove: vec!["server.review_state".into()],
+        })
+    })
+    .await
+    .unwrap();
+    let (_store, after) = read(store, key).await;
     assert!(
         after["server"].get("server.review_state").is_none(),
         "{after}"
     );
-    assert_eq!(after["server"]["server.keep"], 1);
+    assert!(after["server"]
+        .as_object()
+        .unwrap()
+        .contains_key("server.future_flag"));
 }
 
 #[test]
