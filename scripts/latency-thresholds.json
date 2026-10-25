@@ -1,0 +1,384 @@
+{
+  "comment": [
+    "Budgets and baselines for scripts/benchmark-latency.mjs. A budget is the product",
+    "limit for one stage of 'a new session is visible in the desktop in < 5 ms' (p99,",
+    "release build); `enforced: false` marks a stage the code does not meet yet, whose",
+    "breach is reported but does not fail the gate. The change that brings a stage under",
+    "its budget flips it to `enforced: true` in the same pull request. Baselines are",
+    "per platform class and are recorded on that class with --update-baselines; see",
+    "docs/benchmarks.md, 'Session-visible latency'."
+  ],
+  "policy": {
+    "maxRegression": 0.1,
+    "trackedMaxRegression": 0.25,
+    "regressionFloorMs": 0.05,
+    "regressionFloorBudgetShare": 0.1,
+    "regressionComment": [
+      "Enforced stages (within budget on that class): p99 at/over budget fails; p99 more than maxRegression",
+      "over the base commit, measured interleaved on the same runner (--base), fails. Stored baselines decide",
+      "only with no base and on a CPU in cpusSeen; the same metric was 20-40% apart on two runners of one class.",
+      "Tracked stages (known over budget, current numbers in each budget's `known`): over budget is an expected",
+      "failure; getting worse fails, judged on p50 because their tails are lock waits that land on random",
+      "samples. Worse = p50 more than trackedMaxRegression over the base AND more than maxRegression over the",
+      "known p50: on identical code these stages moved 12-27% between interleaved base and head runs, so",
+      "either test alone fails healthy pull requests.",
+      "Every bound adds max(regressionFloorMs, regressionFloorBudgetShare x the stage's budget): a no-change",
+      "A/B on a busy machine moved the raw fs-event p99 0.15 -> 0.60 ms over 100 samples."
+    ]
+  },
+  "budgets": {
+    "stages@30d.fs_event": {
+      "stage": "fs event -> watcher",
+      "p99Ms": 1,
+      "enforced": [
+        "linux-x64"
+      ],
+      "enforcedComment": "FSEvents on the macos-latest runner (Apple M1, virtual) delivered at 15.7 ms p50 / 19 ms p99 with notify's latency 0.0 and NoDefer; inotify meets the budget at 0.13 ms. Enforced where it is met.",
+      "known": {
+        "darwin-arm64": {
+          "p50": 14.999,
+          "p99": 19.405
+        }
+      }
+    },
+    "stages@30d.ingest_hook": {
+      "stage": "parse + SQLite txn (hook path)",
+      "p99Ms": 1.5,
+      "enforced": false,
+      "known": {
+        "linux-x64": {
+          "p50": 24.156,
+          "p99": 30.333
+        },
+        "darwin-arm64": {
+          "p50": 26.995,
+          "p99": 82.131
+        }
+      }
+    },
+    "stages@30d.sweep_scoped_sync": {
+      "stage": "parse + SQLite txn (watch tick / collector sweep)",
+      "p99Ms": 1.5,
+      "enforced": false,
+      "known": {
+        "linux-x64": {
+          "p50": 86.721,
+          "p99": 586.892
+        },
+        "darwin-arm64": {
+          "p50": 90.465,
+          "p99": 770.21
+        }
+      }
+    },
+    "stages@30d.feed_pull": {
+      "stage": "change-feed notify -> desktop",
+      "p99Ms": 1,
+      "enforced": false,
+      "known": {
+        "linux-x64": {
+          "p50": 1.287,
+          "p99": 1.374
+        },
+        "darwin-arm64": {
+          "p50": 0.957,
+          "p99": 2.882
+        }
+      }
+    },
+    "stages@30d.list_first_paint": {
+      "stage": "desktop query (indexed, LIMIT 50)",
+      "p99Ms": 1.5,
+      "enforced": [
+        "linux-x64"
+      ],
+      "enforcedComment": "macos-latest is a 3-vCPU Apple M1 VM: p50 0.20-0.28 ms, but its p99 tail went 0.53 -> 1.72 ms between two runs on the same CPU model. Tracked there until a real M-series runner measures it.",
+      "known": {
+        "darwin-arm64": {
+          "p50": 0.269,
+          "p99": 0.84
+        }
+      }
+    },
+    "list_scale@30d.list_first_paint": {
+      "stage": "desktop query (indexed, LIMIT 50), 30 days",
+      "p99Ms": 1.5,
+      "enforced": [
+        "linux-x64"
+      ],
+      "enforcedComment": "macos-latest is a 3-vCPU Apple M1 VM: p50 0.20-0.28 ms, but its p99 tail went 0.53 -> 1.72 ms between two runs on the same CPU model. Tracked there until a real M-series runner measures it.",
+      "known": {
+        "darwin-arm64": {
+          "p50": 0.211,
+          "p99": 0.59
+        }
+      }
+    },
+    "list_scale@365d.list_first_paint": {
+      "stage": "desktop query (indexed, LIMIT 50), 1 year",
+      "p99Ms": 1.5,
+      "enforced": [
+        "linux-x64"
+      ],
+      "enforcedComment": "macos-latest is a 3-vCPU Apple M1 VM: p50 0.20-0.28 ms, but its p99 tail went 0.53 -> 1.72 ms between two runs on the same CPU model. Tracked there until a real M-series runner measures it.",
+      "known": {
+        "darwin-arm64": {
+          "p50": 0.22,
+          "p99": 0.641
+        }
+      }
+    },
+    "list_scale@30d.list_desktop_page": {
+      "stage": "desktop page (LIMIT 500), 30 days",
+      "p99Ms": 4,
+      "enforced": [
+        "linux-x64"
+      ],
+      "enforcedComment": "Its own budget, not the 1.5 ms first paint: the desktop's 500-row page (SESSION_LIST_LIMIT) is filled after the first 50 rows are on screen, so it is not on the 5 ms new-session path. 4.0 ms p99 is ~1.5x the ubuntu-latest p99 (2.45 ms at 30 days, 2.60 ms at a year) and ~1.3x the macOS VM's (2.9-3.0 ms), so it fails a real regression in the catalog query or row decoding without failing the page size itself. Enforced on linux-x64; tracked on the macOS VM, whose worst round reached 3.97 ms. Approved by Khaliq, 2026-10-25.",
+      "known": {
+        "darwin-arm64": {
+          "p50": 1.459,
+          "p99": 3.595
+        }
+      }
+    },
+    "list_scale@365d.list_desktop_page": {
+      "stage": "desktop page (LIMIT 500), 1 year",
+      "p99Ms": 4,
+      "enforced": [
+        "linux-x64"
+      ],
+      "enforcedComment": "Its own budget, not the 1.5 ms first paint: the desktop's 500-row page (SESSION_LIST_LIMIT) is filled after the first 50 rows are on screen, so it is not on the 5 ms new-session path. 4.0 ms p99 is ~1.5x the ubuntu-latest p99 (2.45 ms at 30 days, 2.60 ms at a year) and ~1.3x the macOS VM's (2.9-3.0 ms), so it fails a real regression in the catalog query or row decoding without failing the page size itself. Enforced on linux-x64; tracked on the macOS VM, whose worst round reached 3.97 ms. Approved by Khaliq, 2026-10-25.",
+      "known": {
+        "darwin-arm64": {
+          "p50": 1.603,
+          "p99": 3.965
+        }
+      }
+    },
+    "e2e@30d.e2e_visible": {
+      "stage": "total: write -> visible",
+      "p99Ms": 5,
+      "enforced": false,
+      "known": {
+        "linux-x64": {
+          "p50": 28.08,
+          "p99": 35.942
+        },
+        "darwin-arm64": {
+          "p50": 109.477,
+          "p99": 196.353
+        }
+      }
+    },
+    "ingest_upload@30d.ingest_with_uploader": {
+      "stage": "parse + SQLite txn while an uploader runs",
+      "p99Ms": 1.5,
+      "enforced": false,
+      "known": {
+        "linux-x64": {
+          "p50": 30.182,
+          "p99": 44.229
+        },
+        "darwin-arm64": {
+          "p50": 30.523,
+          "p99": 121.784
+        }
+      }
+    },
+    "prune@365d.read_during_prune": {
+      "stage": "desktop query while retention prunes",
+      "p99Ms": 1.5,
+      "enforced": [
+        "linux-x64"
+      ],
+      "enforcedComment": "macos-latest read 1.47-1.79 ms p99 during a 1-year prune (0.54-0.70 ms quiet); linux-x64 0.52-0.75 ms. Enforced where it is met.",
+      "known": {
+        "darwin-arm64": {
+          "p50": 0.336,
+          "p99": 1.527
+        }
+      }
+    },
+    "prune@365d.ingest_during_prune": {
+      "stage": "parse + SQLite txn while retention prunes",
+      "p99Ms": 1.5,
+      "enforced": false,
+      "known": {
+        "linux-x64": {
+          "p50": 160.448,
+          "p99": 10295.026
+        },
+        "darwin-arm64": {
+          "p50": 286.142,
+          "p99": 10076.418
+        }
+      }
+    }
+  },
+  "profiles": {
+    "gate": {
+      "description": "The pull-request gate: release build, 40 sessions a day, a 30-day and a 1-year store, three rounds per run.",
+      "rounds": 3,
+      "samples": 100,
+      "sweepSamples": 20,
+      "sessionsPerDay": 40,
+      "turns": 2,
+      "retainDays": 30,
+      "runs": [
+        {
+          "phase": "stages",
+          "days": 30
+        },
+        {
+          "phase": "e2e",
+          "days": 30,
+          "samples": 60
+        },
+        {
+          "phase": "list_scale",
+          "days": 30,
+          "samples": 1000
+        },
+        {
+          "phase": "list_scale",
+          "days": 365,
+          "samples": 1000
+        },
+        {
+          "phase": "ingest_upload",
+          "days": 30
+        },
+        {
+          "phase": "prune",
+          "days": 365
+        }
+      ],
+      "fsSamples": 1000
+    },
+    "full": {
+      "description": "The published matrix: the gate's runs with more samples and rounds.",
+      "rounds": 5,
+      "samples": 300,
+      "sweepSamples": 60,
+      "sessionsPerDay": 40,
+      "turns": 2,
+      "retainDays": 30,
+      "runs": [
+        {
+          "phase": "stages",
+          "days": 30
+        },
+        {
+          "phase": "e2e",
+          "days": 30,
+          "samples": 200
+        },
+        {
+          "phase": "list_scale",
+          "days": 30,
+          "samples": 3000
+        },
+        {
+          "phase": "list_scale",
+          "days": 365,
+          "samples": 3000
+        },
+        {
+          "phase": "ingest_upload",
+          "days": 30
+        },
+        {
+          "phase": "prune",
+          "days": 365
+        }
+      ],
+      "fsSamples": 3000
+    },
+    "smoke": {
+      "description": "Seconds-long check that the driver, the base worktree and every phase run; its numbers mean nothing.",
+      "rounds": 1,
+      "samples": 10,
+      "sweepSamples": 2,
+      "sessionsPerDay": 4,
+      "turns": 2,
+      "retainDays": 2,
+      "runs": [
+        {
+          "phase": "stages",
+          "days": 3
+        },
+        {
+          "phase": "e2e",
+          "days": 3,
+          "samples": 3
+        },
+        {
+          "phase": "list_scale",
+          "days": 3
+        },
+        {
+          "phase": "ingest_upload",
+          "days": 3
+        },
+        {
+          "phase": "prune",
+          "days": 3
+        }
+      ]
+    }
+  },
+  "baselines": {
+    "linux-x64": {
+      "measuredOn": {
+        "cpusSeen": [
+          "AMD EPYC 7763 64-Core Processor"
+        ],
+        "commit": "d3646dc8f3d961bc580db123660ec6ad15e1ca78",
+        "measuredAt": "2026-10-25T21:31:17.484Z",
+        "profile": "gate"
+      },
+      "metrics": {
+        "stages@30d.fs_event": {
+          "p50": 0.081,
+          "p99": 0.128
+        },
+        "stages@30d.list_first_paint": {
+          "p50": 0.335,
+          "p99": 0.414
+        },
+        "list_scale@30d.list_first_paint": {
+          "p50": 0.314,
+          "p99": 0.379
+        },
+        "list_scale@365d.list_first_paint": {
+          "p50": 0.339,
+          "p99": 0.39
+        },
+        "prune@365d.read_during_prune": {
+          "p50": 0.394,
+          "p99": 0.768
+        },
+        "list_scale@30d.list_desktop_page": {
+          "p50": 2.316,
+          "p99": 2.487
+        },
+        "list_scale@365d.list_desktop_page": {
+          "p50": 2.53,
+          "p99": 2.65
+        }
+      }
+    },
+    "darwin-arm64": {
+      "measuredOn": {
+        "cpusSeen": [
+          "Apple M1 (Virtual)"
+        ],
+        "commit": "d3646dc8f3d961bc580db123660ec6ad15e1ca78",
+        "measuredAt": "2026-10-25T21:40:00.087Z",
+        "profile": "gate"
+      },
+      "metrics": {}
+    }
+  }
+}
