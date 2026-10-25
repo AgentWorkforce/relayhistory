@@ -399,8 +399,30 @@ pub(crate) fn migrate(conn: &Connection, session_columns: &[&str]) -> Result<()>
     crate::store::ensure_text_columns(conn, "sessions", SESSION_COLUMNS)?;
     init_trace_ids(conn)?;
     conn.execute_batch(MACHINE_IDENTITY_DDL)?;
+    // A table an earlier shape of this schema created keeps that shape
+    // through `IF NOT EXISTS`; its missing columns are added here. Rule
+    // version 0 is "an earlier rule", which `ensure` then recanonicalizes.
+    for (table, columns) in IDENTITY_COLUMNS {
+        crate::store::ensure_columns(conn, table, columns)?;
+    }
     ensure(conn).map(drop)
 }
+
+/// Identity columns added after their table first shipped, with the
+/// declaration that backfills a row that predates them.
+pub(crate) const IDENTITY_COLUMNS: &[(&str, &[(&str, &str)])] = &[
+    (
+        "machine_identity",
+        &[
+            ("name_rule_version", "INTEGER NOT NULL DEFAULT 0"),
+            ("id_scheme", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ],
+    ),
+    (
+        "hostname_aliases",
+        &[("rule_version", "INTEGER NOT NULL DEFAULT 0")],
+    ),
+];
 
 impl SessionStore {
     /// This database's machine: created by the first writable open, its

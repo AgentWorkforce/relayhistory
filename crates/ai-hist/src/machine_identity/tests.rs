@@ -268,6 +268,34 @@ fn names_record_their_rule_and_an_older_rule_is_recanonicalized() {
 }
 
 #[test]
+fn identity_tables_from_an_earlier_shape_are_upgraded_in_place() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = db(&dir, "ai-history.db");
+    let first = store(&path).machine_identity().unwrap().unwrap();
+    {
+        // The identity tables as an earlier revision created them: no rule
+        // versions, and a migration pending for another reason.
+        let conn = open_db(&path).unwrap();
+        conn.execute_batch(
+            "ALTER TABLE machine_identity DROP COLUMN name_rule_version; \
+             ALTER TABLE hostname_aliases DROP COLUMN rule_version; \
+             DROP TRIGGER change_feed_sessions_insert;",
+        )
+        .unwrap();
+        assert!(!crate::store::schema_is_current(&conn).unwrap());
+    }
+    let upgraded = store(&path).machine_identity().unwrap().unwrap();
+    assert_eq!(upgraded.machine_id, first.machine_id);
+    assert_eq!(upgraded.install_id, first.install_id);
+    assert_eq!(upgraded.name_rule_version, CANONICAL_HOSTNAME_RULE_VERSION);
+    assert!(upgraded
+        .hostname_aliases
+        .iter()
+        .all(|alias| alias.rule_version == CANONICAL_HOSTNAME_RULE_VERSION));
+    assert!(crate::store::schema_is_current(&open_db(&path).unwrap()).unwrap());
+}
+
+#[test]
 fn identity_is_stable_across_restarts_and_a_current_open_writes_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let path = db(&dir, "ai-history.db");

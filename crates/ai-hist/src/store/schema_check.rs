@@ -88,6 +88,14 @@ fn required_columns_exist(conn: &Connection) -> Result<bool> {
             machine_identity::SESSION_COLUMNS,
         ),
         (
+            "SELECT name FROM pragma_table_info('machine_identity')",
+            &["name_rule_version", "id_scheme"],
+        ),
+        (
+            "SELECT name FROM pragma_table_info('hostname_aliases')",
+            &["rule_version"],
+        ),
+        (
             "SELECT name FROM pragma_table_info('session_hydration_checkpoints')",
             REQUIRED_HYDRATION_CHECKPOINT_COLUMNS,
         ),
