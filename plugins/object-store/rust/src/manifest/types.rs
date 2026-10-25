@@ -213,12 +213,17 @@ impl Manifest {
         }
     }
 
-    /// The normalized output, if it was built from the current raw content.
+    /// Whether normalized output exists and was built from the current raw
+    /// content **and** epoch. Opening an epoch adds no chunk, so the content
+    /// digest alone would not show that the output is for the previous epoch.
     pub fn normalized_is_current(&self) -> bool {
         self.server
             .as_ref()
             .and_then(|s| s.normalized.as_ref())
-            .is_some_and(|n| n.source_content_sha256 == self.raw.content_sha256)
+            .is_some_and(|n| {
+                n.source_content_sha256 == self.raw.content_sha256
+                    && n.source_epoch == self.raw.epoch
+            })
     }
 }
 

@@ -23,7 +23,8 @@ impl Default for LifecyclePolicy {
 }
 
 /// The lifecycle the server should record now, computed from the
-/// client-owned `raw.updated_at`. `archived` is set by retention and is kept.
+/// client-owned `raw.updated_at`. `archived` is set by retention and is kept;
+/// a closed session goes idle but is never `abandoned`.
 pub fn lifecycle_for(
     m: &Manifest,
     now: chrono::DateTime<chrono::Utc>,
@@ -36,7 +37,7 @@ pub fn lifecycle_for(
         .map(|t| t.with_timezone(&chrono::Utc))
         .unwrap_or(now);
     let quiet = (now - last).to_std().unwrap_or_default();
-    if quiet >= policy.abandoned_after {
+    if quiet >= policy.abandoned_after && m.raw.state == super::types::RawState::Open {
         Lifecycle::Abandoned
     } else if quiet >= policy.idle_after {
         Lifecycle::Idle
@@ -151,7 +152,6 @@ pub fn pointer_fields(m: &Manifest) -> PointerFields {
         raw_epoch: m.raw.epoch,
         content_sha256: m.raw.content_sha256.clone(),
         normalized_version: normalized.map(|n| n.version),
-        normalized_stale: normalized
-            .is_some_and(|n| n.source_content_sha256 != m.raw.content_sha256),
+        normalized_stale: normalized.is_some() && !m.normalized_is_current(),
     }
 }

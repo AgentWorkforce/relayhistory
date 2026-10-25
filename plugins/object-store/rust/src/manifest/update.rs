@@ -194,8 +194,63 @@ fn create_doc(mut manifest: Manifest) -> Result<Doc> {
     }
 }
 
+/// Fields this version knows in each writer-owned section. A key in the
+/// stored section that is *not* listed here was added by a newer writer and
+/// is carried over even if the edit was built from a fresh struct (whose
+/// `extra` is empty); known keys follow the edit, so clearing an optional
+/// field still works.
+fn known_fields(section: &str) -> &'static [&'static str] {
+    match section {
+        "session" => &[
+            "workspace_id",
+            "machine_id",
+            "harness",
+            "session_id",
+            "started_at",
+            "ended_at",
+            "harness_version",
+            "cwd_sha256",
+            "parent_session_id",
+        ],
+        "writer" => &["delivery_instance_id", "plugin_version", "host_version"],
+        "raw" => &[
+            "owner",
+            "state",
+            "updated_at",
+            "format",
+            "compression",
+            "chunk_count",
+            "raw_bytes",
+            "stored_bytes",
+            "content_sha256",
+            "epoch",
+            "epochs",
+            "next_offset",
+            "chunks",
+        ],
+        "server" => &[
+            "updated_at",
+            "normalized",
+            "lifecycle",
+            "lifecycle_at",
+            "lifecycle_reason",
+            "retention",
+        ],
+        _ => &[],
+    }
+}
+
 fn put_section<T: serde::Serialize>(doc: &mut Doc, name: &str, section: &T) -> Result<()> {
-    let value = serde_json::to_value(section).map_err(|e| Error::InvalidArgument(e.to_string()))?;
+    let mut value =
+        serde_json::to_value(section).map_err(|e| Error::InvalidArgument(e.to_string()))?;
+    if let (Some(Value::Object(stored)), Value::Object(next)) = (doc.get(name), &mut value) {
+        let known = known_fields(name);
+        for (k, v) in stored {
+            if !known.contains(&k.as_str()) && !next.contains_key(k) {
+                next.insert(k.clone(), v.clone());
+            }
+        }
+    }
     doc.insert(name.to_string(), value);
     Ok(())
 }

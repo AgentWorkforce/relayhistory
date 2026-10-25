@@ -42,9 +42,11 @@ pub enum RemoteState {
     /// `raw` is what this client acknowledged; only the server (or nobody)
     /// wrote since. Re-apply and continue.
     Unchanged,
-    /// `raw` extends the acknowledged state: this client's own write whose
-    /// acknowledgment it never saw (e.g. a crash after the PUT). Adopt it.
-    Extended { new_chunks: u64 },
+    /// `raw` extends the acknowledged state (more chunks and/or a newer
+    /// epoch, possibly with no chunks yet): this client's own write whose
+    /// acknowledgment it never saw (e.g. a crash after the PUT). Adopt it,
+    /// including the epoch, before reading the source again.
+    Extended { new_chunks: u64, new_epochs: u32 },
 }
 
 impl RemoteState {
@@ -87,9 +89,20 @@ pub fn classify(remote: &Manifest, owner: &str, ack: Option<&ClientAck>) -> Remo
             reason: "acknowledged chunks are not a prefix of the remote chunk list".into(),
         };
     }
-    match remote.raw.chunk_count - ack.chunk_count {
-        0 => RemoteState::Unchanged,
-        n => RemoteState::Extended { new_chunks: n },
+    if remote.raw.epoch < ack.epoch {
+        return RemoteState::RolledBack {
+            reason: format!("epoch {} < acknowledged {}", remote.raw.epoch, ack.epoch),
+        };
+    }
+    match (
+        remote.raw.chunk_count - ack.chunk_count,
+        remote.raw.epoch - ack.epoch,
+    ) {
+        (0, 0) => RemoteState::Unchanged,
+        (new_chunks, new_epochs) => RemoteState::Extended {
+            new_chunks,
+            new_epochs,
+        },
     }
 }
 
@@ -125,7 +138,9 @@ pub fn plan_chunks(raw: &Raw, chunks: Vec<NewChunk>) -> Result<Vec<ChunkEntry>> 
                 "chunk {i} is empty or has a bad digest"
             )));
         }
-        next_offset += c.bytes;
+        next_offset = next_offset.checked_add(c.bytes).ok_or_else(|| {
+            Error::InvalidArgument(format!("chunk {i} overflows the offset space"))
+        })?;
         out.push(ChunkEntry {
             seq: raw.chunk_count + i as u64,
             epoch: raw.epoch,
@@ -200,15 +215,23 @@ pub fn set_state(raw: &mut Raw, state: RawState) {
 
 fn recompute(raw: &mut Raw) {
     raw.chunk_count = raw.chunks.len() as u64;
-    raw.raw_bytes = raw.chunks.iter().map(|c| c.bytes).sum();
-    raw.stored_bytes = raw.chunks.iter().map(|c| c.stored_bytes).sum();
+    // Saturating: an overflow cannot be represented, and the validator run
+    // before every write rejects the result.
+    raw.raw_bytes = raw
+        .chunks
+        .iter()
+        .fold(0u64, |a, c| a.saturating_add(c.bytes));
+    raw.stored_bytes = raw
+        .chunks
+        .iter()
+        .fold(0u64, |a, c| a.saturating_add(c.stored_bytes));
     raw.content_sha256 = content_sha256(&raw.chunks);
     raw.next_offset = raw
         .chunks
         .iter()
         .rev()
         .find(|c| c.epoch == raw.epoch)
-        .map_or(0, |c| c.start_offset + c.bytes);
+        .map_or(0, |c| c.start_offset.saturating_add(c.bytes));
 }
 
 /// Everything needed for revision 1.

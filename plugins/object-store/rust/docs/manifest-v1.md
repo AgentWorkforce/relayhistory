@@ -264,7 +264,8 @@ On every read before a write, the client classifies the remote copy:
 | `raw.owner != self` | Another instance took over (reinstall, new machine identity) | **Fenced.** Stop writing this session, mark it read-only locally and report it. Never write `raw` again. |
 | `revision < ack.revision`, or `raw.chunk_count < ack.chunk_count`, or `ack.content_sha256` is not on the remote hash chain at position `ack.chunk_count` | The manifest went backwards: restored from backup, or corrupted | **Stop and alert** (`ManifestRolledBack`). Do not overwrite. |
 | `raw` identical to `ack` (only `server` / `revision` moved) | The server wrote | Re-apply and continue. |
-| `raw` extends `ack` and this instance is the owner | Its own earlier write that it did not see acknowledged, e.g. a crash after the PUT | Adopt it as the new `ack` and append only what is missing. |
+| `raw.epoch < ack.epoch` | The manifest went backwards | **Stop and alert**, as above. |
+| `raw` extends `ack` (more chunks and/or a newer epoch, even with no new chunks) and this instance is the owner | Its own earlier write that it did not see acknowledged, e.g. a crash after the PUT | Adopt it as the new `ack`, including the epoch, and append only what is missing. Never open the epoch a second time. |
 
 **Ownership transfer.** A new client instance takes over only through an
 explicit takeover write: it sets `raw.owner` to itself under compare-and-swap,
@@ -295,9 +296,11 @@ section, and it recomputes that section from the copy it just read.
   `raw.updated_at`, and the next server write returns `lifecycle` to
   `"active"`. The server never needs to coordinate with the client to do this.
 - **`normalized_version` is current** only when
-  `server.normalized.source_content_sha256 == raw.content_sha256`. Otherwise
-  the pointer row carries the version with `normalized_stale = true` until the
-  rebuild lands.
+  `server.normalized.source_content_sha256 == raw.content_sha256` **and**
+  `server.normalized.source_epoch == raw.epoch`. Opening an epoch adds no chunk
+  until the source has new bytes, so the digest alone cannot show that the
+  output belongs to the previous epoch. Otherwise the pointer row carries the
+  version with `normalized_stale = true` until the rebuild lands.
 
 ## Client offline for days
 
@@ -409,7 +412,7 @@ There are two independent fences.
 | `raw_bytes`, `stored_bytes`, `chunk_count`, `raw_epoch` | `raw.raw_bytes`, `raw.stored_bytes`, `raw.chunk_count`, `raw.epoch` |
 | `content_sha256` | `raw.content_sha256` |
 | `normalized_version` | `server.normalized.version`, or `null` |
-| `normalized_stale` | `server.normalized.source_content_sha256 != raw.content_sha256` |
+| `normalized_stale` | `normalized` exists and is not current (digest or epoch differs) |
 | `lifecycle` | `server.lifecycle`, or `"active"` when `server` is `null` |
 
 ## Example

@@ -179,21 +179,31 @@ impl Checker {
                 format!("is {}, chunks has {}", raw.chunk_count, raw.chunks.len()),
             );
         }
-        if raw.raw_bytes != raw.chunks.iter().map(|c| c.bytes).sum::<u64>() {
-            self.issue("raw.raw_bytes", "does not equal the sum of chunks[].bytes");
-        }
-        if raw.stored_bytes != raw.chunks.iter().map(|c| c.stored_bytes).sum::<u64>() {
-            self.issue(
-                "raw.stored_bytes",
-                "does not equal the sum of chunks[].stored_bytes",
-            );
-        }
+        self.total(
+            "raw.raw_bytes",
+            raw.raw_bytes,
+            raw.chunks.iter().map(|c| c.bytes),
+        );
+        self.total(
+            "raw.stored_bytes",
+            raw.stored_bytes,
+            raw.chunks.iter().map(|c| c.stored_bytes),
+        );
         self.hex64("raw.content_sha256", &raw.content_sha256);
         if content_sha256(&raw.chunks) != raw.content_sha256 {
             self.issue(
                 "raw.content_sha256",
                 "does not match the hash chain over chunks",
             );
+        }
+    }
+
+    /// `declared` must equal the sum of `values`, computed without overflow.
+    fn total(&mut self, path: &str, declared: u64, mut values: impl Iterator<Item = u64>) {
+        match values.try_fold(0u64, u64::checked_add) {
+            Some(sum) if sum == declared => {}
+            Some(_) => self.issue(path, "does not equal the sum over chunks"),
+            None => self.issue(path, "the sum over chunks overflows u64"),
         }
     }
 
@@ -266,8 +276,15 @@ impl Checker {
         let first_of_epoch = prev.is_none_or(|p| p.epoch != c.epoch);
         self.epoch_start(raw, &at, c, first_of_epoch);
         let expected = match prev {
-            Some(p) if !first_of_epoch => p.start_offset + p.bytes,
-            _ => 0,
+            Some(p) if !first_of_epoch => p.start_offset.checked_add(p.bytes),
+            _ => Some(0),
+        };
+        let Some(expected) = expected else {
+            self.issue(
+                format!("{at}.start_offset"),
+                "previous chunk end overflows u64",
+            );
+            return;
         };
         if c.start_offset != expected {
             self.issue(
@@ -302,7 +319,11 @@ impl Checker {
             .iter()
             .rev()
             .find(|c| c.epoch == raw.epoch)
-            .map_or(0, |c| c.start_offset + c.bytes);
+            .map_or(Some(0), |c| c.start_offset.checked_add(c.bytes));
+        let Some(expected) = expected else {
+            self.issue("raw.next_offset", "end of the current epoch overflows u64");
+            return;
+        };
         if raw.next_offset != expected {
             self.issue(
                 "raw.next_offset",

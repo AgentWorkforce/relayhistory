@@ -288,7 +288,10 @@ fn stale_writers_are_detected() {
     extended.revision = 4;
     assert_eq!(
         classify(&extended, OWNER, Some(&ack)),
-        RemoteState::Extended { new_chunks: 1 }
+        RemoteState::Extended {
+            new_chunks: 1,
+            new_epochs: 0
+        }
     );
 
     assert!(matches!(
@@ -435,4 +438,126 @@ async fn lost_race_reapplies_only_the_writers_own_change() {
         );
         assert_eq!(m.server.unwrap().lifecycle_reason.as_deref(), Some("race"));
     }
+}
+
+#[test]
+fn an_unacknowledged_empty_epoch_is_detected_and_invalidates_normalized_output() {
+    let loc = location("unit");
+    let mut m = first_manifest(&loc);
+    let planned = plan_chunks(&m.raw, vec![chunk(0, 0, 10)]).unwrap();
+    apply_chunks(&mut m.raw, &planned).unwrap();
+    m.server = Some(with_normalized(&m, &m, 1, None));
+    assert!(m.normalized_is_current());
+    let ack = ClientAck::of(&m);
+
+    // The client opened an epoch (source emptied) and crashed before seeing
+    // the acknowledgment: no new chunk, same content digest.
+    let mut remote = m.clone();
+    open_epoch(&mut remote.raw, EpochReason::Truncated).unwrap();
+    remote.revision += 1;
+    assert_eq!(
+        classify(&remote, OWNER, Some(&ack)),
+        RemoteState::Extended {
+            new_chunks: 0,
+            new_epochs: 1
+        }
+    );
+    assert!(
+        !remote.normalized_is_current(),
+        "output is for the previous epoch"
+    );
+    assert!(server::needs_transform(&remote));
+    assert!(pointer_fields(&remote).normalized_stale);
+
+    let mut older = m.clone();
+    older.raw.epoch = 0;
+    let mut ahead = ClientAck::of(&remote);
+    ahead.revision = older.revision;
+    assert!(matches!(
+        classify(&older, OWNER, Some(&ahead)),
+        RemoteState::RolledBack { .. }
+    ));
+}
+
+#[test]
+fn closed_sessions_are_never_abandoned() {
+    use relayhistory_object_store::manifest::client::set_state;
+    use relayhistory_object_store::manifest::server::{lifecycle_for, LifecyclePolicy};
+    let loc = location("unit");
+    let mut m = first_manifest(&loc);
+    m.raw.updated_at = "2026-01-01T00:00:00.000Z".into();
+    let later = chrono::DateTime::parse_from_rfc3339("2026-03-01T00:00:00Z")
+        .unwrap()
+        .with_timezone(&chrono::Utc);
+    let policy = LifecyclePolicy::default();
+    assert_eq!(lifecycle_for(&m, later, &policy), Lifecycle::Abandoned);
+    set_state(&mut m.raw, RawState::Closed);
+    m.raw.updated_at = "2026-01-01T00:00:00.000Z".into();
+    assert_eq!(lifecycle_for(&m, later, &policy), Lifecycle::Idle);
+}
+
+#[test]
+fn overflowing_chunk_totals_are_rejected_not_wrapped() {
+    let loc = location("unit");
+    let mut m = first_manifest(&loc);
+    let planned = plan_chunks(&m.raw, vec![chunk(0, 0, 10), chunk(1, 10, 10)]).unwrap();
+    apply_chunks(&mut m.raw, &planned).unwrap();
+    m.raw.chunks[0].bytes = u64::MAX;
+    m.raw.chunks[1].start_offset = 0;
+    let issues = validate(&m, None);
+    assert!(
+        issues.iter().any(|i| i.message.contains("overflows")),
+        "{issues:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_fresh_section_struct_keeps_a_newer_writers_fields() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsStore::new(FsConfig::new(dir.path())).unwrap();
+    let loc = location("fs-fresh");
+    let key = loc.manifest().unwrap();
+    let mut doc = serde_json::to_value(first_manifest(&loc)).unwrap();
+    doc["server"] = serde_json::json!({
+        "updated_at": "2026-10-25T19:00:00.000Z",
+        "normalized": null,
+        "lifecycle": "idle",
+        "lifecycle_at": "2026-10-25T19:00:00.000Z",
+        "added_by_a_newer_server": {"keep": true}
+    });
+    store
+        .put(
+            &key,
+            bytes::Bytes::from(serde_json::to_vec(&doc).unwrap()),
+            PutOpts::create(),
+        )
+        .await
+        .unwrap();
+    // An older server builds its section from scratch (empty `extra`).
+    update_manifest(&store, &key, &fast(), |_| {
+        Ok(Edit::Server(Box::new(Server {
+            updated_at: "2026-10-26T00:00:00.000Z".into(),
+            normalized: None,
+            lifecycle: Lifecycle::Active,
+            lifecycle_at: "2026-10-26T00:00:00.000Z".into(),
+            lifecycle_reason: None,
+            retention: None,
+            extra: Default::default(),
+        })))
+    })
+    .await
+    .unwrap();
+    let body: Vec<bytes::Bytes> =
+        futures::TryStreamExt::try_collect(store.get(&key, None).await.unwrap())
+            .await
+            .unwrap();
+    let after: serde_json::Value = serde_json::from_slice(&body.concat()).unwrap();
+    assert_eq!(
+        after["server"]["added_by_a_newer_server"],
+        serde_json::json!({"keep": true})
+    );
+    assert_eq!(
+        after["server"]["lifecycle"], "active",
+        "known fields follow the edit"
+    );
 }
