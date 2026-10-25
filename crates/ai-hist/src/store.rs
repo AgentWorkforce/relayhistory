@@ -18,6 +18,7 @@ mod schema_check;
 mod user_turn_page;
 use crate::ingest::evidence_reconcile::{record_history_presence, record_marker_presence};
 pub(crate) use event_row::row_to_session_event;
+pub(crate) use schema_check::needs_migration;
 use schema_check::schema_has_required_indexes;
 use user_turn_page::UserTurnHeader;
 
@@ -1211,15 +1212,6 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     // row it replaces.
     conn.pragma_update(None, "recursive_triggers", true)?;
     init_db_once(conn)
-}
-
-/// Whether [`init_db`] has migration work to do on this database. A leftover
-/// retired index counts as outstanding work: its DROP is a real write.
-fn needs_migration(conn: &Connection) -> Result<bool> {
-    Ok(!schema_is_current(conn)?
-        || retired_indexes_present(conn)?
-        || retired_capture_present(conn)?
-        || crate::ingest::standalone_records_migration_pending(conn)?)
 }
 
 /// A schema migration an open in this process runs on an existing database.

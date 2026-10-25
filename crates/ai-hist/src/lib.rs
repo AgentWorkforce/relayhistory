@@ -89,8 +89,8 @@ pub use ingest::CaptureProgress;
 pub use ingest::HydrateSessionResult;
 pub use machine_identity::{
     canonical_hostname, machine_id, HostnameAlias, MachineIdentity, MachineNamePrivacy,
-    CANONICAL_HOSTNAME_RULE_VERSION, DEFAULT_MACHINE_NAME_PRIVACY, INSTALL_SUFFIX_HEX_DIGITS,
-    MACHINE_ID_SCHEME, UNKNOWN_HOSTNAME,
+    RetiredMachineId, CANONICAL_HOSTNAME_RULE_VERSION, DEFAULT_MACHINE_NAME_PRIVACY,
+    INSTALL_SUFFIX_HEX_DIGITS, MACHINE_ID_SCHEME, UNKNOWN_HOSTNAME,
 };
 pub use observations::{ObservationCheckpoint, ObservationKey, SessionObservation};
 pub use relationship_graph::{RelationshipCapabilities, SessionRelationship};

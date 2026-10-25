@@ -28,18 +28,34 @@ resets when a database is replaced, so it is not the machine id.
 
 `machine_identity` is a single-row table written by the first writable open.
 `machine_name` is the canonical hostname (`canonical_hostname`, rule version
-2). The version is stored beside every name it produced, so a later rule
-change recanonicalizes stored names on the next open without touching the
-id. The rule:
+3). The version is stored beside every name it produced. A later rule change
+makes the next writable open recanonicalize stored names and aliases, and the
+id is untouched. The rule (all three steps decided by Khaliq on 2026-10-25):
 
-- Lowercase, and strip `.local` and the domain.
-- Drop apostrophes, both straight and curly (decided by Khaliq,
-  2026-10-25). macOS's ComputerName `Khaliq's MacBook Pro` and its
-  LocalHostName `Khaliqs-MacBook-Pro` are then one name.
+- Lowercase, and trim whitespace and trailing dots.
+- Strip network suffixes, repeatedly: `.local`, `.localdomain`, `.lan`,
+  `.home`, `.home.arpa` and `.internal`. Each only matches after a dot, so a
+  bare `local` stays a name.
+- For a cloud `*.internal` name, keep only the first label
+  (`ip-10-0-0-1.ec2.internal` becomes `ip-10-0-0-1`); the rest names a zone
+  or project.
+- Every other dot is a separator, so no label is lost:
+  `khaliqs.macbook.pro` becomes `khaliqs-macbook-pro`, and
+  `build-01.corp.example.com` becomes `build-01-corp-example-com`.
+- Drop apostrophes, both straight and curly. macOS's ComputerName
+  `Khaliq's MacBook Pro` and its LocalHostName `Khaliqs-MacBook-Pro` are then
+  one name.
 - Turn every other run of punctuation, spaces and underscores into one `-`.
-- Trim hyphens, and cap the result at 63 characters.
+- Trim hyphens, and cut the result at 63 characters from the right, so the
+  most specific labels stay.
 
-Rule 1 turned apostrophes into hyphens. Every hostname spelling the machine has reported is kept
+Rule 1 turned apostrophes into hyphens and kept only the first DNS label.
+Rule 2 dropped apostrophes. Rule 3 keeps every label except network
+suffixes. Keeping labels was chosen over stripping a domain because
+`khaliqs.macbook.pro` and an ordinary `host.example.pro` can't be told
+apart (`.pro` is a real TLD). A split name is repaired by `hostname_aliases`
+locally and shows up in the cloud dry-run report. A false merge can't be
+undone. Every hostname spelling the machine has reported is kept
 in `hostname_aliases` with its canonical form, so all of them resolve to the
 one machine. A spelling already recorded is never written again. The
 [cloud backfill proposal](../specs/2026-10-25-cloud-hostname-canonicalization-backfill.md)
@@ -61,7 +77,7 @@ and neither does canonicalization.
 | Hostname renamed or respelled | same id; `machine_name` and aliases updated |
 | Restart | same id (stored, not recomputed) |
 | Re-image or new disk, same hostname | new install, so a new id. The shared canonical name lets the UI link them |
-| Database copied to a second machine | same id (clone; needs detection, see below) |
+| Database restored or copied onto other hardware | new id on the first writable open there; the old id is kept in `machine_identity_history` |
 
 The 6-digit suffix is 24 bits. Among 1,000 machines that share one hostname,
 the chance that any two collide is about 3%. With 4 digits it would be about
@@ -72,6 +88,43 @@ stays available as an option: it replaces the slug with `h` plus 12 hex digits o
 a SHA-256 of it. That keeps the hostname out of object keys, but hostnames are
 guessable, so the hash is pseudonymity, not anonymity. It stays deterministic
 so a name maps to one pseudonym.
+
+### Clone detection
+
+The row stores `hardware_id_hash`, a domain-separated SHA-256 of the
+machine's hardware id. The raw id is never stored. It's read once per
+process, without spawning anything:
+
+| Platform | Source |
+|---|---|
+| Linux | `/etc/machine-id`, falling back to `/var/lib/dbus/machine-id` |
+| macOS | `gethostuuid(2)`, the IOPlatformUUID |
+| Windows | `HKLM\SOFTWARE\Microsoft\Cryptography\MachineGuid` (64-bit view) |
+
+If the hash differs from the one the id was issued on, the database has moved
+to another machine. The writable open then:
+
+- moves the old id, install id, name and hostname aliases to
+  `machine_identity_history` (reason `hardware_changed`);
+- mints a fresh install id;
+- issues a new id with the same canonical slug and a new suffix.
+
+`MachineIdentity::previous` lists the retired ids. A read-only handle won't
+hand out an id issued on other hardware; it fails until a writable open has
+reissued it. When no hardware id is available (a container without
+`/etc/machine-id`), clone detection is off rather than guessed. A row
+written before hashes existed records its first hash without being reissued.
+
+Both clone detection and rule recanonicalization run on the writable open,
+not only when the identity is requested. A schema can be current while an
+identity is still stale, so `needs_migration` also asks
+`machine_identity::needs_refresh`. That check costs two indexed reads plus
+the process-cached hash.
+
+The reads go through the `machine-uid` crate (MIT, no dependencies beyond
+`libc` and the Windows registry crates). Its FFI keeps this crate free of
+`unsafe`, which rust-oleum enforces. Version 0.6 calls `gethostuuid(2)`
+directly on macOS rather than spawning `ioreg`.
 
 ### Trace ids
 
@@ -116,17 +169,14 @@ old head.
 - **Use the change-feed epoch as the machine id.** It's per database and
   resets on replacement.
 - **Hardware ids (IOPlatformUUID, `/etc/machine-id`) as the id.** They're
-  privacy-sensitive, need a process spawn on macOS, and VM images clone them.
+  privacy-sensitive and VM images clone them. They're used only as a hash,
+  and only to detect a moved database.
 
 ## Consequences and open items
 
 - A session row deleted and later re-inserted (a catalog drop followed by
-  rediscovery) gets a new trace id.
+  rediscovery) gets a new trace id. Khaliq accepted this.
 - The upgrade restamps every session row once, so a feed consumer re-reads
   each catalog row one time.
-- Clone detection (a database restored onto a different machine) isn't
-  implemented. A cheap check would compare a hash of `/etc/machine-id` or
-  IOPlatformUUID at first run and on open, and mint a new install id when it
-  moves.
 - `machine_id` isn't yet on any export envelope. The delivery coordinator
   reads `SessionStore::machine_identity()` when it builds object keys.

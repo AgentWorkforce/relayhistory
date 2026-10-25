@@ -89,7 +89,7 @@ fn required_columns_exist(conn: &Connection) -> Result<bool> {
         ),
         (
             "SELECT name FROM pragma_table_info('machine_identity')",
-            &["name_rule_version", "id_scheme"],
+            &["name_rule_version", "id_scheme", "hardware_id_hash"],
         ),
         (
             "SELECT name FROM pragma_table_info('hostname_aliases')",
@@ -144,4 +144,19 @@ fn evidence_tables_have_location(conn: &Connection) -> Result<bool> {
         }
     }
     Ok(true)
+}
+
+/// Whether [`super::init_db`] has migration work to do on this database. A
+/// leftover retired index counts as outstanding work: its DROP is a real
+/// write. So does identity work on a current schema
+/// ([`machine_identity::needs_refresh`]): a hostname rule bump or a database
+/// opened on new hardware is handled by the first writable open, not left
+/// for whoever next asks for the identity. Evaluated last, so it only reads
+/// identity tables a current schema has.
+pub(crate) fn needs_migration(conn: &Connection) -> Result<bool> {
+    Ok(!super::schema_is_current(conn)?
+        || super::retired_indexes_present(conn)?
+        || super::retired_capture_present(conn)?
+        || crate::ingest::standalone_records_migration_pending(conn)?
+        || machine_identity::needs_refresh(conn)?)
 }

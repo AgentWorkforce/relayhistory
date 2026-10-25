@@ -32,7 +32,7 @@ rust_roots = ["crates/ai-hist-cli/src", "crates/ai-hist-napi/src", "crates/ai-hi
 "crates/ai-hist/src/ingest/hydrate.rs" = 3424
 "crates/ai-hist/src/ingest/opencode.rs" = 1453
 "crates/ai-hist/src/session_store.rs" = 1835
-"crates/ai-hist/src/store.rs" = 3169
+"crates/ai-hist/src/store.rs" = 3164
 
 [baseline.cyclomatic]
 "crates/ai-hist-cli/src/lib.rs::run" = 88

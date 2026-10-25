@@ -500,6 +500,7 @@ pub fn ai_hist::IdentityQuery::exclude_delegated(self) -> Self
 pub fn ai_hist::IdentityQuery::limit(self, usize) -> Self
 pub struct ai_hist::MachineIdentity
 pub ai_hist::MachineIdentity::created_ms: i64
+pub ai_hist::MachineIdentity::hardware_id_hash: core::option::Option<alloc::string::String>
 pub ai_hist::MachineIdentity::hostname_aliases: alloc::vec::Vec<ai_hist::HostnameAlias>
 pub ai_hist::MachineIdentity::id_scheme: alloc::string::String
 pub ai_hist::MachineIdentity::install_id: alloc::string::String
@@ -507,6 +508,7 @@ pub ai_hist::MachineIdentity::machine_id: alloc::string::String
 pub ai_hist::MachineIdentity::machine_name: alloc::string::String
 pub ai_hist::MachineIdentity::name_privacy: ai_hist::MachineNamePrivacy
 pub ai_hist::MachineIdentity::name_rule_version: u32
+pub ai_hist::MachineIdentity::previous: alloc::vec::Vec<ai_hist::RetiredMachineId>
 pub ai_hist::MachineIdentity::updated_ms: i64
 #[non_exhaustive] pub struct ai_hist::Marker
 pub ai_hist::Marker::kind: alloc::string::String
@@ -638,6 +640,12 @@ pub ai_hist::RelationshipCapabilities::records_evidence_locator: bool
 pub ai_hist::RelationshipCapabilities::records_spawn_time: bool
 pub ai_hist::RelationshipCapabilities::source: alloc::string::String
 pub ai_hist::RelationshipCapabilities::stable_child_identity: alloc::string::String
+pub struct ai_hist::RetiredMachineId
+pub ai_hist::RetiredMachineId::install_id: alloc::string::String
+pub ai_hist::RetiredMachineId::machine_id: alloc::string::String
+pub ai_hist::RetiredMachineId::machine_name: alloc::string::String
+pub ai_hist::RetiredMachineId::reason: alloc::string::String
+pub ai_hist::RetiredMachineId::retired_ms: i64
 pub struct ai_hist::SessionEvent
 pub ai_hist::SessionEvent::agent_id: core::option::Option<alloc::string::String>
 pub ai_hist::SessionEvent::agent_version: core::option::Option<alloc::string::String>

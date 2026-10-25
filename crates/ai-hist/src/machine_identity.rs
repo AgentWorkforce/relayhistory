@@ -22,6 +22,10 @@
 //! - `id_scheme` records which version of [`machine_id`] produced the id
 //!   ([`MACHINE_ID_SCHEME`]), so a future change to the function applies only
 //!   to new databases and never re-keys a machine that already uploaded.
+//! - `hardware_id_hash` is a SHA-256 of the machine's hardware id. A
+//!   database restored onto a different machine sees it change: the open
+//!   retires the old id into `machine_identity_history` and mints a new
+//!   install id, so two machines never upload under one id.
 //!
 //! # Trace ids
 //!
@@ -37,6 +41,17 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::{now_ms, Error, SessionStore, Source};
+
+mod hardware;
+mod hostname;
+mod trace;
+
+#[cfg(test)]
+pub(crate) use hardware::hardware_hash;
+pub(crate) use hardware::local_hardware_hash;
+pub(crate) use hostname::local_hostname;
+pub use hostname::{canonical_hostname, CANONICAL_HOSTNAME_RULE_VERSION, UNKNOWN_HOSTNAME};
+pub(crate) use trace::{insert_fill_sql, SESSION_COLUMNS, TRACE_ID_MIGRATION};
 
 /// The version of [`machine_id`] a new identity is created with: the
 /// canonical hostname, then `-`, then [`INSTALL_SUFFIX_HEX_DIGITS`] hex digits
@@ -80,23 +95,6 @@ pub const DEFAULT_MACHINE_NAME_PRIVACY: MachineNamePrivacy = MachineNamePrivacy:
 /// collide is about 3%, against about 99.9% with four.
 pub const INSTALL_SUFFIX_HEX_DIGITS: usize = 6;
 
-/// The version of the [`canonical_hostname`] rule. `machine_name` and every
-/// `hostname_aliases` row record the version they were computed with, so a
-/// later rule change recanonicalizes them on the next open (the machine id
-/// stays frozen) instead of leaving old and new names silently mixed.
-///
-/// - `1`: apostrophes became hyphens (`khaliq-s-macbook-pro`).
-/// - `2`: apostrophes, straight and curly, are dropped, so macOS's
-///   ComputerName (`Khaliq's MacBook Pro`) and LocalHostName
-///   (`Khaliqs-MacBook-Pro`) are one name.
-pub const CANONICAL_HOSTNAME_RULE_VERSION: u32 = 2;
-
-/// The canonical hostname of a name with no usable character.
-pub const UNKNOWN_HOSTNAME: &str = "unknown-host";
-
-/// Longest canonical hostname: one DNS label.
-const MAX_HOSTNAME_LEN: usize = 63;
-
 /// This database's machine.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MachineIdentity {
@@ -115,10 +113,31 @@ pub struct MachineIdentity {
     pub name_privacy: MachineNamePrivacy,
     pub created_ms: i64,
     pub updated_ms: i64,
+    /// SHA-256 of the hardware id the identity was issued on, or `None`
+    /// where the platform reports none; see [`MachineIdentity::previous`].
+    pub hardware_id_hash: Option<String>,
     /// Every hostname spelling this machine has reported, the current one
     /// included, oldest first.
     pub hostname_aliases: Vec<HostnameAlias>,
+    /// Ids this database held before, oldest first: each one retired because
+    /// the database was opened on different hardware (restored or copied
+    /// onto another machine).
+    pub previous: Vec<RetiredMachineId>,
 }
+
+/// A machine id a database no longer uses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetiredMachineId {
+    pub machine_id: String,
+    pub install_id: String,
+    pub machine_name: String,
+    pub retired_ms: i64,
+    /// Why it was retired: `hardware_changed`.
+    pub reason: String,
+}
+
+/// Why [`ensure_with`] retires an id when the hardware hash moves.
+const HARDWARE_CHANGED: &str = "hardware_changed";
 
 /// One spelling of the hostname, as the OS reported it, and its canonical
 /// form.
@@ -141,7 +160,20 @@ CREATE TABLE IF NOT EXISTS machine_identity (
     id_scheme TEXT NOT NULL,
     name_privacy TEXT NOT NULL,
     created_ms INTEGER NOT NULL,
-    updated_ms INTEGER NOT NULL
+    updated_ms INTEGER NOT NULL,
+    hardware_id_hash TEXT
+);
+CREATE TABLE IF NOT EXISTS machine_identity_history (
+    machine_id TEXT NOT NULL,
+    install_id TEXT NOT NULL,
+    machine_name TEXT NOT NULL,
+    id_scheme TEXT NOT NULL,
+    hardware_id_hash TEXT,
+    created_ms INTEGER NOT NULL,
+    retired_ms INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    hostname_aliases_json TEXT NOT NULL,
+    PRIMARY KEY (machine_id, install_id)
 );
 CREATE TABLE IF NOT EXISTS hostname_aliases (
     observed_hostname TEXT PRIMARY KEY,
@@ -150,44 +182,6 @@ CREATE TABLE IF NOT EXISTS hostname_aliases (
     first_seen_ms INTEGER NOT NULL
 );
 "#;
-
-/// The canonical hostname: one deterministic spelling per machine name.
-///
-/// Lowercased; trailing dots and `.local` stripped; only the first DNS label
-/// kept (the domain dropped); apostrophes (`'`, `‘`, `’`) dropped;
-/// every other run of anything but `[a-z0-9]` -- punctuation, spaces,
-/// underscores, non-ASCII -- one `-`;
-/// leading and trailing hyphens trimmed; at most 63 characters. A name with
-/// nothing left is [`UNKNOWN_HOSTNAME`].
-///
-/// `Khaliqs-MacBook-Pro.local` -> `khaliqs-macbook-pro`;
-/// `Khaliq's MacBook Pro` -> `khaliqs-macbook-pro`;
-/// `build_01.corp.example.com` -> `build-01`.
-pub fn canonical_hostname(hostname: &str) -> String {
-    let lower = hostname.trim().trim_end_matches('.').to_ascii_lowercase();
-    let host = lower.strip_suffix(".local").unwrap_or(&lower);
-    let label = host.split('.').next().unwrap_or_default();
-    let mut slug = String::with_capacity(label.len());
-    for ch in label.chars() {
-        if APOSTROPHES.contains(&ch) {
-            continue;
-        }
-        if ch.is_ascii_alphanumeric() {
-            slug.push(ch);
-        } else if !slug.is_empty() && !slug.ends_with('-') {
-            slug.push('-');
-        }
-    }
-    let slug = slug[..slug.len().min(MAX_HOSTNAME_LEN)].trim_end_matches('-');
-    if slug.is_empty() {
-        UNKNOWN_HOSTNAME.to_string()
-    } else {
-        slug.to_string()
-    }
-}
-
-/// The apostrophes [`canonical_hostname`] drops rather than hyphenates.
-const APOSTROPHES: &[char] = &['\'', '\u{2018}', '\u{2019}'];
 
 /// The machine id for `machine_name`: the single place the id is decided.
 /// `install_id` is the random UUID from first run; its first
@@ -210,27 +204,13 @@ pub fn machine_id(privacy: MachineNamePrivacy, machine_name: &str, install_id: &
     format!("{name}-{suffix}")
 }
 
-/// This host's name as the OS reports it, without spawning a process.
-pub(crate) fn local_hostname() -> String {
-    #[cfg(unix)]
-    {
-        rustix::system::uname()
-            .nodename()
-            .to_string_lossy()
-            .into_owned()
-    }
-    #[cfg(not(unix))]
-    {
-        std::env::var("COMPUTERNAME").unwrap_or_default()
-    }
-}
-
 /// The stored identity, if the database has one yet. A pure read.
 pub(crate) fn read(conn: &Connection) -> Result<Option<MachineIdentity>> {
     let row = conn
         .query_row(
             "SELECT machine_id, machine_name, name_rule_version, install_id, id_scheme, \
-             name_privacy, created_ms, updated_ms FROM machine_identity WHERE singleton = 1",
+             name_privacy, created_ms, updated_ms, hardware_id_hash \
+             FROM machine_identity WHERE singleton = 1",
             [],
             |row| {
                 let identity = MachineIdentity {
@@ -242,7 +222,9 @@ pub(crate) fn read(conn: &Connection) -> Result<Option<MachineIdentity>> {
                     name_privacy: MachineNamePrivacy::Slug,
                     created_ms: row.get(6)?,
                     updated_ms: row.get(7)?,
+                    hardware_id_hash: row.get(8)?,
                     hostname_aliases: Vec::new(),
+                    previous: Vec::new(),
                 };
                 Ok((identity, row.get::<_, String>(5)?))
             },
@@ -254,7 +236,27 @@ pub(crate) fn read(conn: &Connection) -> Result<Option<MachineIdentity>> {
     identity.name_privacy = MachineNamePrivacy::parse(&privacy)
         .with_context(|| format!("unknown machine name privacy {privacy}"))?;
     identity.hostname_aliases = hostname_aliases(conn)?;
+    identity.previous = retired_ids(conn)?;
     Ok(Some(identity))
+}
+
+fn retired_ids(conn: &Connection) -> Result<Vec<RetiredMachineId>> {
+    let mut statement = conn.prepare(
+        "SELECT machine_id, install_id, machine_name, retired_ms, reason \
+         FROM machine_identity_history ORDER BY retired_ms, machine_id",
+    )?;
+    let retired = statement
+        .query_map([], |row| {
+            Ok(RetiredMachineId {
+                machine_id: row.get(0)?,
+                install_id: row.get(1)?,
+                machine_name: row.get(2)?,
+                retired_ms: row.get(3)?,
+                reason: row.get(4)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(retired)
 }
 
 fn hostname_aliases(conn: &Connection) -> Result<Vec<HostnameAlias>> {
@@ -280,19 +282,38 @@ fn hostname_aliases(conn: &Connection) -> Result<Vec<HostnameAlias>> {
 /// date -- for a rename, or for a stored name computed by an earlier
 /// [`CANONICAL_HOSTNAME_RULE_VERSION`] -- and the spelling recorded. Writes
 /// only when it creates the row, the name or its rule changed, or the
-/// spelling is new under the current rule. Never changes a stored id.
+/// spelling is new under the current rule. A stored id changes only when
+/// `hardware` (a [`hardware_hash`]) differs from the hash it was issued on:
+/// the database moved to another machine, so the old id is retired and a new
+/// install id minted. `None` for `hardware` detects nothing.
 pub(crate) fn ensure_with(
     conn: &Connection,
     hostname: &str,
     privacy: MachineNamePrivacy,
+    hardware: Option<&str>,
 ) -> Result<MachineIdentity> {
     let observed = hostname.trim();
     let name = canonical_hostname(observed);
     let rule = CANONICAL_HOSTNAME_RULE_VERSION;
     let now = now_ms();
     let Some(mut identity) = read(conn)? else {
-        return create(conn, observed, name, privacy, now);
+        return create(conn, observed, name, privacy, hardware, now);
     };
+    if let Some(hardware) = hardware {
+        match identity.hardware_id_hash.as_deref() {
+            Some(issued) if issued != hardware => {
+                identity = reissue(conn, &identity, &name, hardware, now)?;
+            }
+            None => {
+                conn.execute(
+                    "UPDATE machine_identity SET hardware_id_hash = ?1 WHERE singleton = 1",
+                    [hardware],
+                )?;
+                identity.hardware_id_hash = Some(hardware.to_string());
+            }
+            Some(_) => {}
+        }
+    }
     if identity.machine_name != name || identity.name_rule_version != rule {
         conn.execute(
             "UPDATE machine_identity SET machine_name = ?1, name_rule_version = ?2, \
@@ -325,11 +346,58 @@ pub(crate) fn ensure_with(
     Ok(identity)
 }
 
+/// Retire `old` into `machine_identity_history` and issue this database a
+/// new install id and machine id on `hardware`, under the same privacy. The
+/// old machine's hostname spellings go with it; the caller records this
+/// machine's.
+fn reissue(
+    conn: &Connection,
+    old: &MachineIdentity,
+    name: &str,
+    hardware: &str,
+    now: i64,
+) -> Result<MachineIdentity> {
+    conn.execute(
+        "INSERT OR IGNORE INTO machine_identity_history (machine_id, install_id, machine_name, \
+         id_scheme, hardware_id_hash, created_ms, retired_ms, reason, hostname_aliases_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![
+            old.machine_id,
+            old.install_id,
+            old.machine_name,
+            old.id_scheme,
+            old.hardware_id_hash,
+            old.created_ms,
+            now,
+            HARDWARE_CHANGED,
+            serde_json::to_string(&old.hostname_aliases)?
+        ],
+    )?;
+    conn.execute("DELETE FROM hostname_aliases", [])?;
+    let install_id = random_uuid_v4(conn)?;
+    conn.execute(
+        "UPDATE machine_identity SET machine_id = ?1, install_id = ?2, id_scheme = ?3, \
+         machine_name = ?4, name_rule_version = ?5, hardware_id_hash = ?6, \
+         created_ms = ?7, updated_ms = ?7 WHERE singleton = 1",
+        params![
+            machine_id(old.name_privacy, name, &install_id),
+            install_id,
+            MACHINE_ID_SCHEME,
+            name,
+            CANONICAL_HOSTNAME_RULE_VERSION,
+            hardware,
+            now
+        ],
+    )?;
+    read(conn)?.context("the machine identity row vanished while it was reissued")
+}
+
 fn create(
     conn: &Connection,
     observed: &str,
     name: String,
     privacy: MachineNamePrivacy,
+    hardware: Option<&str>,
     now: i64,
 ) -> Result<MachineIdentity> {
     let install_id = random_uuid_v4(conn)?;
@@ -348,11 +416,13 @@ fn create(
         name_privacy: privacy,
         created_ms: now,
         updated_ms: now,
+        hardware_id_hash: hardware.map(str::to_string),
+        previous: Vec::new(),
     };
     conn.execute(
         "INSERT INTO machine_identity (singleton, machine_id, machine_name, name_rule_version, \
-         install_id, id_scheme, name_privacy, created_ms, updated_ms) \
-         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+         install_id, id_scheme, name_privacy, created_ms, updated_ms, hardware_id_hash) \
+         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?8)",
         params![
             identity.machine_id,
             identity.machine_name,
@@ -360,16 +430,49 @@ fn create(
             identity.install_id,
             MACHINE_ID_SCHEME,
             privacy.as_str(),
-            now
+            now,
+            hardware
         ],
     )?;
     record_alias(conn, observed, &identity.machine_name, now)?;
     Ok(identity)
 }
 
-/// [`ensure_with`] for this host and the default name privacy.
+/// [`ensure_with`] for this host, its hardware and the default name privacy.
 pub(crate) fn ensure(conn: &Connection) -> Result<MachineIdentity> {
-    ensure_with(conn, &local_hostname(), DEFAULT_MACHINE_NAME_PRIVACY)
+    ensure_with(
+        conn,
+        &local_hostname(),
+        DEFAULT_MACHINE_NAME_PRIVACY,
+        local_hardware_hash().as_deref(),
+    )
+}
+
+/// Whether a writable open has identity work to do on an otherwise current
+/// schema: a name or alias computed under an earlier
+/// [`CANONICAL_HOSTNAME_RULE_VERSION`], a hardware hash not yet recorded, or
+/// one that changed because the database moved to another machine. Two
+/// indexed reads and a hash cached for the process, so a current database
+/// stays cheap to open. Only called once the identity tables are current.
+pub(crate) fn needs_refresh(conn: &Connection) -> Result<bool> {
+    let Some((rule, issued)) = conn
+        .query_row(
+            "SELECT name_rule_version, hardware_id_hash FROM machine_identity \
+             WHERE singleton = 1",
+            [],
+            |row| Ok((row.get::<_, u32>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?
+    else {
+        return Ok(true);
+    };
+    let stale_alias: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM hostname_aliases WHERE rule_version <> ?1)",
+        [CANONICAL_HOSTNAME_RULE_VERSION],
+        |row| row.get(0),
+    )?;
+    let moved = local_hardware_hash().is_some_and(|now| issued.as_deref() != Some(now.as_str()));
+    Ok(rule != CANONICAL_HOSTNAME_RULE_VERSION || stale_alias || moved)
 }
 
 /// Record `observed` under the current rule. A spelling seen under an
@@ -397,23 +500,6 @@ fn random_uuid_v4(conn: &Connection) -> Result<String> {
     )?)
 }
 
-/// A fresh UUIDv7 as one SQL expression: 48 bits of Unix milliseconds, the
-/// version and variant nibbles, 74 random bits.
-///
-/// Inline rather than a subquery, so an `UPDATE` evaluates it per row: SQLite
-/// runs an uncorrelated subquery once per statement. `'now'` is fixed for one
-/// statement, so both timestamp halves agree; each random group draws its own
-/// `randomblob`. Only core functions -- `julianday` rather than
-/// `unixepoch('subsec')`, which older SQLite builds lack -- so any client that
-/// writes a session row can run the trigger. `random() & 3` rather than
-/// `abs(random()) % 4`: `abs` overflows on the smallest integer.
-pub(crate) const UUID_V7_SQL: &str = "lower(\
-     substr(printf('%012x', CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER)), 1, 8) \
-     || '-' || substr(printf('%012x', CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER)), 9, 4) \
-     || '-7' || substr(hex(randomblob(2)), 2, 3) \
-     || '-' || substr('89ab', (random() & 3) + 1, 1) || substr(hex(randomblob(2)), 2, 3) \
-     || '-' || hex(randomblob(6)))";
-
 /// The `sessions` catalog columns, then the trace ids and the machine
 /// identity over them. Runs in the migration transaction: after `trace_id`
 /// exists, and before the change feed reconciles its export schema, which
@@ -421,7 +507,7 @@ pub(crate) const UUID_V7_SQL: &str = "lower(\
 pub(crate) fn migrate(conn: &Connection, session_columns: &[&str]) -> Result<()> {
     crate::store::ensure_text_columns(conn, "sessions", session_columns)?;
     crate::store::ensure_text_columns(conn, "sessions", SESSION_COLUMNS)?;
-    init_trace_ids(conn)?;
+    trace::init_trace_ids(conn)?;
     conn.execute_batch(MACHINE_IDENTITY_DDL)?;
     // A table an earlier shape of this schema created keeps that shape
     // through `IF NOT EXISTS`; its missing columns are added here. Rule
@@ -440,6 +526,7 @@ pub(crate) const IDENTITY_COLUMNS: &[(&str, &[(&str, &str)])] = &[
         &[
             ("name_rule_version", "INTEGER NOT NULL DEFAULT 0"),
             ("id_scheme", "TEXT NOT NULL DEFAULT 'unknown'"),
+            ("hardware_id_hash", "TEXT"),
         ],
     ),
     (
@@ -451,13 +538,32 @@ pub(crate) const IDENTITY_COLUMNS: &[(&str, &[(&str, &str)])] = &[
 impl SessionStore {
     /// This database's machine: created by the first writable open, its
     /// `machine_name` refreshed from the current hostname by this call on a
-    /// writable handle (a write only when the name, its rule, or the spelling is new). A read-only
-    /// handle returns what is stored, or `None` for a database no writable
-    /// open has migrated yet. Local only; never a network call.
+    /// writable handle (a write only when the name, its rule, the spelling or
+    /// the hardware is new). A read-only handle returns what is stored, or
+    /// `None` for a database no writable open has migrated yet -- and fails
+    /// instead when the stored id was issued on other hardware, since that id
+    /// belongs to another machine until a writable open reissues it. Local
+    /// only; never a network call.
     pub fn machine_identity(&self) -> std::result::Result<Option<MachineIdentity>, Error> {
         if self.read_only() {
             let conn = self.read_conn()?;
-            return read(&conn).map_err(Error::query);
+            let identity = read(&conn).map_err(Error::query)?;
+            let moved = identity.as_ref().is_some_and(|identity| {
+                local_hardware_hash().is_some_and(|now| {
+                    identity
+                        .hardware_id_hash
+                        .as_deref()
+                        .is_some_and(|issued| issued != now)
+                })
+            });
+            if moved {
+                return Err(Error::query(anyhow::anyhow!(
+                    "this database's machine id was issued on other hardware (it was restored \
+                     or copied from another machine); open it writable once to issue this \
+                     machine its own id"
+                )));
+            }
+            return Ok(identity);
         }
         let conn = crate::store::open_db(self.db_path())
             .map_err(|error| Error::DatabaseOpen(format!("{error:#}")))?;
@@ -484,56 +590,12 @@ impl SessionStore {
     }
 }
 
-/// The `sessions` columns this module adds.
-pub(crate) const SESSION_COLUMNS: &[&str] = &["trace_id"];
-
 /// The tables a current schema has, by `sqlite_master` name.
-pub(crate) const SCHEMA_OBJECTS: &[&str] = &["machine_identity", "hostname_aliases"];
-
-/// What the change feed's insert stamp on `table` also sets, as a `, col =
-/// expr` suffix of its `UPDATE ... SET`: a new session's trace id, unless the
-/// insert gave one. Filling it in the stamp's own statement means a new
-/// session takes one revision, not one for the insert and one for the fill.
-/// Empty for every other table, and for `sessions` before the column exists.
-pub(crate) fn insert_fill_sql(conn: &Connection, table: &str) -> Result<String> {
-    if table != "sessions" {
-        return Ok(String::new());
-    }
-    let has_column: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'trace_id')",
-        [],
-        |row| row.get(0),
-    )?;
-    Ok(if has_column {
-        format!(", trace_id = COALESCE(trace_id, {UUID_V7_SQL})")
-    } else {
-        String::new()
-    })
-}
-
-/// The standalone trigger an earlier revision of this change minted trace
-/// ids with; the change feed's insert stamp does it now.
-const RETIRED_TRACE_ID_TRIGGER: &str = "sessions_trace_id_insert";
-
-/// The marker for the one-time trace id backfill of rows that predate it.
-pub(crate) const TRACE_ID_MIGRATION: &str = "session_trace_id_v1";
-
-/// Once, give every existing session row a trace id. Runs inside the
-/// caller's migration transaction, after the `trace_id` column exists and
-/// before the change feed reconciles its export schema, which then restamps
-/// the backfilled rows once.
-fn init_trace_ids(conn: &Connection) -> Result<()> {
-    conn.execute_batch(&format!(
-        "DROP TRIGGER IF EXISTS {RETIRED_TRACE_ID_TRIGGER};"
-    ))?;
-    if !crate::store::migration_applied(conn, TRACE_ID_MIGRATION)? {
-        conn.execute_batch(&format!(
-            "UPDATE sessions SET trace_id = {UUID_V7_SQL} WHERE trace_id IS NULL; \
-             INSERT OR IGNORE INTO schema_migrations (name) VALUES ('{TRACE_ID_MIGRATION}');"
-        ))?;
-    }
-    Ok(())
-}
+pub(crate) const SCHEMA_OBJECTS: &[&str] = &[
+    "machine_identity",
+    "hostname_aliases",
+    "machine_identity_history",
+];
 
 #[cfg(test)]
 mod tests;

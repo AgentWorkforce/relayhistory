@@ -14,14 +14,17 @@ Grouping by the raw hostname splits one machine into several.
 ## Rule
 
 `ai_hist::canonical_hostname` (rule version
-`CANONICAL_HOSTNAME_RULE_VERSION = 2`) is pure and deterministic:
+`CANONICAL_HOSTNAME_RULE_VERSION = 3`) is pure and deterministic:
 
-1. Lowercase.
-2. Strip trailing dots and `.local`.
-3. Keep only the first DNS label, dropping the domain.
-4. Drop apostrophes (`'`, `‘`, `’`), then turn every other run of anything
-   but `[a-z0-9]` (punctuation, spaces, underscores, non-ASCII) into one `-`.
-5. Trim leading and trailing hyphens and cap the result at 63 characters.
+1. Lowercase, and trim whitespace and trailing dots.
+2. Strip network suffixes, repeatedly: `.local`, `.localdomain`, `.lan`,
+   `.home`, `.home.arpa`, `.internal`. For a `*.internal` name, keep only the
+   first label.
+3. Drop apostrophes (`'`, `‘`, `’`). Turn every other run of anything but
+   `[a-z0-9]` (dots, punctuation, spaces, underscores, non-ASCII) into one
+   `-`, so no other label is lost.
+4. Trim leading and trailing hyphens, and cut at 63 characters from the
+   right.
 
 An empty result becomes `unknown-host`. New installs store the canonical form
 locally as `machine_name`, and every observed spelling goes in
@@ -78,7 +81,7 @@ ALTER TABLE <machines_table>
 
 -- one UPDATE per reviewed mapping row, generated from report.json
 UPDATE <machines_table>
-   SET canonical_hostname = $canonical, canonical_hostname_rule = 2
+   SET canonical_hostname = $canonical, canonical_hostname_rule = 3
  WHERE hostname = $hostname AND canonical_hostname IS NULL;
 
 CREATE TABLE <hostname_aliases_table> (
@@ -100,10 +103,16 @@ hostname, so the column fills itself without another backfill. A later rule
 change bumps `CANONICAL_HOSTNAME_RULE_VERSION` and re-runs steps 1 to 3 for
 rows on the old version.
 
+## Decisions
+
+- **Apostrophes:** dropped (rule 2, Khaliq, 2026-10-25). `Khaliq's MacBook Pro`
+  and `Khaliqs-MacBook-Pro` both become `khaliqs-macbook-pro`.
+- **Dotted names:** keep every label except network suffixes (rule 3, Khaliq,
+  2026-10-25). `khaliqs.macbook.pro` becomes `khaliqs-macbook-pro`. As a
+  consequence, an FQDN-named server keeps its domain:
+  `build-01.corp.example.com` becomes `build-01-corp-example-com`.
+
 ## Open questions
 
-- **Apostrophes:** decided by Khaliq (2026-10-25). They are dropped (rule 2),
-  so `Khaliq's MacBook Pro` and `Khaliqs-MacBook-Pro` both canonicalize to
-  `khaliqs-macbook-pro`.
-- **Dotted short names.** Taking the first DNS label turns `khaliqs.macbook.pro`
-  into `khaliqs`. Is a dotted non-FQDN hostname present in the data?
+- **Observed variants:** someone with read access runs step 1 and shares the
+  dry-run `merges`. The tool has no database access of its own.

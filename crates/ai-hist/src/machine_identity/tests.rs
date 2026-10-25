@@ -14,8 +14,20 @@ fn blank(path: &Path) -> Connection {
     conn
 }
 
+/// This machine's hardware hash, which every open in these tests sees: a
+/// test that ran under another one would be reissued by the next open.
+fn here() -> Option<String> {
+    local_hardware_hash()
+}
+
 fn first_run(path: &Path, hostname: &str) -> MachineIdentity {
-    ensure_with(&blank(path), hostname, MachineNamePrivacy::Slug).unwrap()
+    ensure_with(
+        &blank(path),
+        hostname,
+        MachineNamePrivacy::Slug,
+        here().as_deref(),
+    )
+    .unwrap()
 }
 
 fn store(path: &Path) -> SessionStore {
@@ -59,7 +71,11 @@ fn canonical_hostname_folds_odd_spellings_into_one_dns_label() {
             "Khaliqs MacBook Pro",
             "  Khaliqs--MacBook__Pro  ",
             "-Khaliqs-MacBook-Pro-",
-            "Khaliqs-MacBook-Pro.corp.example.com",
+            // Dots as separators keep every label (rule 3).
+            "khaliqs.macbook.pro",
+            "Khaliqs.MacBook.Pro.local",
+            "Khaliq's.MacBook.Pro",
+            "khaliqs-macbook-pro.lan",
             // macOS ComputerName forms: the apostrophe is dropped, not
             // hyphenated, so they meet the LocalHostName above.
             "Khaliq's MacBook Pro",
@@ -67,7 +83,20 @@ fn canonical_hostname_folds_odd_spellings_into_one_dns_label() {
             "Khaliq\u{2018}s MacBook Pro",
             "KHALIQ'S MACBOOK PRO.local",
         ][..],
-        &["build_01", "build-01.corp.example.com", "BUILD 01"],
+        &[
+            "build_01",
+            "build-01.lan",
+            "BUILD 01",
+            "build_01.localdomain",
+        ],
+        &[
+            "host",
+            "host.lan",
+            "host.home",
+            "host.localdomain",
+            "host.home.arpa",
+            "host.lan.local",
+        ],
         &["", "   ", "...", "'", "___", "\u{1F600}"],
     ] {
         let canonical: BTreeSet<String> = spellings
@@ -82,7 +111,21 @@ fn canonical_hostname_folds_odd_spellings_into_one_dns_label() {
         ("Khaliqs-MacBook-Pro", "khaliqs-macbook-pro"),
         ("khaliq-s-macbook-pro", "khaliq-s-macbook-pro"),
         ("O'Brien's iMac", "obriens-imac"),
-        ("khaliqs.macbook.pro", "khaliqs"),
+        ("khaliqs.macbook.pro", "khaliqs-macbook-pro"),
+        ("khaliqs.macbook.pro.local", "khaliqs-macbook-pro"),
+        ("localhost.localdomain", "localhost"),
+        ("local", "local"),
+        ("lan", "lan"),
+        (".local", "local"),
+        (".", UNKNOWN_HOSTNAME),
+        ("instance-1.us-central1-a.c.my-proj.internal", "instance-1"),
+        ("build-01.corp.example.com", "build-01-corp-example-com"),
+        ("host.example.com", "host-example-com"),
+        (
+            "Khaliqs-MacBook-Pro.corp.example.com",
+            "khaliqs-macbook-pro-corp-example-com",
+        ),
+        ("my.lan.box", "my-lan-box"),
         ("DESKTOP_7F3A__X", "desktop-7f3a-x"),
         ("ñandú-box", "and-box"),
         ("linuyc-desktop\n", "linuyc-desktop"),
@@ -93,8 +136,24 @@ fn canonical_hostname_folds_odd_spellings_into_one_dns_label() {
     }
     let long = canonical_hostname(&"a-".repeat(100));
     assert!(long.len() <= 63 && !long.ends_with('-'), "{long}");
+    // A long FQDN is cut from the right, keeping the most specific labels,
+    // and a cut that lands on a separator leaves no trailing hyphen.
+    let fqdn = format!("{}.department.example.edu", "k".repeat(51));
+    let cut = canonical_hostname(&fqdn);
+    assert_eq!(cut, format!("{}-department", "k".repeat(51)));
+    assert!(cut.len() <= 63);
+    let on_separator = canonical_hostname(&format!("{}.department.x", "k".repeat(62)));
+    assert_eq!(on_separator, "k".repeat(62));
     // Idempotent: a canonical name is its own canonical form.
-    for raw in ["Khaliq's MacBook Pro", "build_01.x", "ñandú", ""] {
+    for raw in [
+        "Khaliq's MacBook Pro",
+        "build_01.x",
+        "ñandú",
+        "",
+        "khaliqs.macbook.pro.local",
+        "build-01.corp.example.com",
+        "ip-10-0-0-1.ec2.internal",
+    ] {
         let once = canonical_hostname(raw);
         assert_eq!(canonical_hostname(&once), once);
     }
@@ -168,6 +227,7 @@ fn hostname_rename_updates_the_name_and_records_an_alias_never_the_id() {
         &conn,
         "Khaliqs-MacBook-Air.local",
         MachineNamePrivacy::Hashed,
+        here().as_deref(),
     )
     .unwrap();
     assert_eq!(after.machine_id, before.machine_id);
@@ -179,7 +239,13 @@ fn hostname_rename_updates_the_name_and_records_an_alias_never_the_id() {
     assert_eq!(after.hostname_aliases[1].canonical, "khaliqs-macbook-air");
     assert_eq!(read(&conn).unwrap().unwrap(), after);
     // Renaming back reuses the alias rather than adding a third.
-    let back = ensure_with(&conn, "khaliq-mbp", MachineNamePrivacy::Slug).unwrap();
+    let back = ensure_with(
+        &conn,
+        "khaliq-mbp",
+        MachineNamePrivacy::Slug,
+        here().as_deref(),
+    )
+    .unwrap();
     assert_eq!(back.machine_name, "khaliq-mbp");
     assert_eq!(back.machine_id, before.machine_id);
     assert_eq!(back.hostname_aliases.len(), 2);
@@ -197,7 +263,8 @@ fn every_spelling_of_one_hostname_resolves_to_one_machine() {
         "khaliqs macbook pro",
     ];
     for spelling in spellings {
-        let seen = ensure_with(&conn, spelling, MachineNamePrivacy::Slug).unwrap();
+        let seen =
+            ensure_with(&conn, spelling, MachineNamePrivacy::Slug, here().as_deref()).unwrap();
         assert_eq!(seen.machine_id, first.machine_id, "{spelling}");
         assert_eq!(seen.machine_name, "khaliqs-macbook-pro");
         assert_eq!(
@@ -217,7 +284,13 @@ fn every_spelling_of_one_hostname_resolves_to_one_machine() {
             .unwrap()
     };
     let before = changes();
-    ensure_with(&conn, "KHALIQS_MACBOOK_PRO", MachineNamePrivacy::Slug).unwrap();
+    ensure_with(
+        &conn,
+        "KHALIQS_MACBOOK_PRO",
+        MachineNamePrivacy::Slug,
+        here().as_deref(),
+    )
+    .unwrap();
     assert_eq!(changes(), before);
 }
 
@@ -235,7 +308,13 @@ fn a_stored_machine_id_never_changes_with_canonicalization() {
         [],
     )
     .unwrap();
-    let seen = ensure_with(&conn, "Khaliqs_MBP", MachineNamePrivacy::Hashed).unwrap();
+    let seen = ensure_with(
+        &conn,
+        "Khaliqs_MBP",
+        MachineNamePrivacy::Hashed,
+        here().as_deref(),
+    )
+    .unwrap();
     assert_eq!(seen.machine_id, "Khaliqs_MBP-abc");
     assert_eq!(seen.install_id, "abc");
     assert_eq!(seen.id_scheme, "earlier");
@@ -253,7 +332,13 @@ fn names_record_their_rule_and_an_older_rule_is_recanonicalized() {
         .iter()
         .all(|alias| alias.rule_version == CANONICAL_HOSTNAME_RULE_VERSION));
     let conn = open_db(&path).unwrap();
-    ensure_with(&conn, "Old_Laptop", MachineNamePrivacy::Slug).unwrap();
+    ensure_with(
+        &conn,
+        "Old_Laptop",
+        MachineNamePrivacy::Slug,
+        here().as_deref(),
+    )
+    .unwrap();
     // What a database written under an earlier rule would hold: every
     // name, the historical spelling's included, at rule 0.
     conn.execute_batch(
@@ -268,7 +353,13 @@ fn names_record_their_rule_and_an_older_rule_is_recanonicalized() {
         .iter()
         .map(|alias| alias.first_seen_ms)
         .collect();
-    let seen = ensure_with(&conn, "Khaliqs_MBP.local", MachineNamePrivacy::Slug).unwrap();
+    let seen = ensure_with(
+        &conn,
+        "Khaliqs_MBP.local",
+        MachineNamePrivacy::Slug,
+        here().as_deref(),
+    )
+    .unwrap();
     assert_eq!(seen.machine_id, first.machine_id, "the id stays frozen");
     assert_eq!(seen.machine_name, "khaliqs-mbp");
     assert_eq!(seen.name_rule_version, CANONICAL_HOSTNAME_RULE_VERSION);
@@ -342,10 +433,16 @@ fn a_rule_v1_name_with_an_apostrophe_is_folded_on_the_next_open() {
     )
     .unwrap();
     // The next open reports the LocalHostName spelling.
-    let seen = ensure_with(&conn, "Khaliqs-MacBook-Pro", MachineNamePrivacy::Slug).unwrap();
+    let seen = ensure_with(
+        &conn,
+        "Khaliqs-MacBook-Pro",
+        MachineNamePrivacy::Slug,
+        here().as_deref(),
+    )
+    .unwrap();
     assert_eq!(seen.machine_id, first.machine_id, "the id stays frozen");
     assert_eq!(seen.machine_name, "khaliqs-macbook-pro");
-    assert_eq!(seen.name_rule_version, 2);
+    assert_eq!(seen.name_rule_version, CANONICAL_HOSTNAME_RULE_VERSION);
     let aliases: Vec<_> = seen
         .hostname_aliases
         .iter()
@@ -360,10 +457,196 @@ fn a_rule_v1_name_with_an_apostrophe_is_folded_on_the_next_open() {
     assert_eq!(
         aliases,
         [
-            ("Khaliq's MacBook Pro", "khaliqs-macbook-pro", 2),
-            ("Khaliqs-MacBook-Pro", "khaliqs-macbook-pro", 2)
+            (
+                "Khaliq's MacBook Pro",
+                "khaliqs-macbook-pro",
+                CANONICAL_HOSTNAME_RULE_VERSION
+            ),
+            (
+                "Khaliqs-MacBook-Pro",
+                "khaliqs-macbook-pro",
+                CANONICAL_HOSTNAME_RULE_VERSION
+            )
         ]
     );
+}
+
+#[test]
+fn a_rule_v2_dotted_name_keeps_its_labels_on_the_next_writable_open() {
+    // Through the reopen path, not `ensure_with`: a rule bump alone has to
+    // make an otherwise current database refresh its names.
+    let dir = tempfile::tempdir().unwrap();
+    let path = db(&dir, "ai-history.db");
+    let first = first_run(&path, "khaliqs.macbook.pro");
+    {
+        let conn = open_db(&path).unwrap();
+        // What rule 2 stored: only the first label.
+        conn.execute_batch(
+            "UPDATE machine_identity SET machine_name = 'khaliqs', name_rule_version = 2; \
+             UPDATE hostname_aliases SET canonical_hostname = 'khaliqs', rule_version = 2;",
+        )
+        .unwrap();
+        assert!(crate::store::needs_migration(&conn).unwrap());
+    }
+    let conn = open_db(&path).unwrap();
+    assert!(!crate::store::needs_migration(&conn).unwrap());
+    let stored = read(&conn).unwrap().unwrap();
+    assert_eq!(stored.machine_id, first.machine_id, "the id stays frozen");
+    let alias = stored
+        .hostname_aliases
+        .iter()
+        .find(|alias| alias.observed == "khaliqs.macbook.pro")
+        .unwrap();
+    assert_eq!(alias.canonical, "khaliqs-macbook-pro");
+    assert_eq!(alias.rule_version, CANONICAL_HOSTNAME_RULE_VERSION);
+    assert_eq!(stored.name_rule_version, CANONICAL_HOSTNAME_RULE_VERSION);
+}
+
+#[test]
+fn a_database_restored_onto_other_hardware_gets_a_new_id_and_keeps_the_old() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = db(&dir, "ai-history.db");
+    let conn = blank(&path);
+    let (laptop, desktop) = (hardware_hash("laptop-uuid"), hardware_hash("desktop-uuid"));
+    let before = ensure_with(
+        &conn,
+        "Khaliqs-MBP.local",
+        MachineNamePrivacy::Slug,
+        Some(&laptop),
+    )
+    .unwrap();
+    assert_eq!(before.hardware_id_hash.as_deref(), Some(laptop.as_str()));
+    assert!(before.previous.is_empty());
+    // The same file, opened on another machine.
+    let after = ensure_with(&conn, "Desktop-7", MachineNamePrivacy::Slug, Some(&desktop)).unwrap();
+    assert_ne!(after.machine_id, before.machine_id);
+    assert_ne!(after.install_id, before.install_id);
+    assert!(
+        after.machine_id.starts_with("desktop-7-"),
+        "{}",
+        after.machine_id
+    );
+    assert_eq!(after.hardware_id_hash.as_deref(), Some(desktop.as_str()));
+    let [retired] = &after.previous[..] else {
+        panic!("{after:?}");
+    };
+    assert_eq!(retired.machine_id, before.machine_id);
+    assert_eq!(retired.install_id, before.install_id);
+    assert_eq!(retired.machine_name, "khaliqs-mbp");
+    assert_eq!(retired.reason, "hardware_changed");
+    let observed: Vec<_> = after.hostname_aliases.iter().map(|a| &a.observed).collect();
+    assert_eq!(
+        observed,
+        ["Desktop-7"],
+        "the old machine's spellings went with it"
+    );
+    let json: String = conn
+        .query_row(
+            "SELECT hostname_aliases_json FROM machine_identity_history",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(json.contains("Khaliqs-MBP.local"), "{json}");
+    // Settled on the new hardware: no further write, and the same id.
+    let changes = || -> i64 {
+        conn.query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap()
+    };
+    let settled = changes();
+    let again = ensure_with(&conn, "Desktop-7", MachineNamePrivacy::Slug, Some(&desktop)).unwrap();
+    assert_eq!(again, after);
+    assert_eq!(changes(), settled);
+}
+
+#[test]
+fn unchanged_or_unknown_hardware_writes_nothing_and_keeps_the_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = db(&dir, "ai-history.db");
+    let conn = blank(&path);
+    let laptop = hardware_hash("laptop-uuid");
+    let first = ensure_with(&conn, "khaliq-mbp", MachineNamePrivacy::Slug, Some(&laptop)).unwrap();
+    let changes = || -> i64 {
+        conn.query_row("SELECT total_changes()", [], |row| row.get(0))
+            .unwrap()
+    };
+    let settled = changes();
+    for hardware in [Some(laptop.as_str()), None] {
+        let seen = ensure_with(&conn, "khaliq-mbp", MachineNamePrivacy::Slug, hardware).unwrap();
+        assert_eq!(seen.machine_id, first.machine_id);
+        assert!(seen.previous.is_empty());
+    }
+    assert_eq!(changes(), settled);
+}
+
+#[test]
+fn an_identity_from_before_hardware_hashes_records_one_without_reissuing() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = db(&dir, "ai-history.db");
+    let conn = blank(&path);
+    let first = ensure_with(&conn, "khaliq-mbp", MachineNamePrivacy::Slug, None).unwrap();
+    assert_eq!(first.hardware_id_hash, None);
+    let laptop = hardware_hash("laptop-uuid");
+    let seen = ensure_with(&conn, "khaliq-mbp", MachineNamePrivacy::Slug, Some(&laptop)).unwrap();
+    assert_eq!(seen.machine_id, first.machine_id);
+    assert_eq!(seen.hardware_id_hash.as_deref(), Some(laptop.as_str()));
+    assert!(seen.previous.is_empty());
+}
+
+#[test]
+fn the_hardware_id_is_stored_only_as_a_hash() {
+    let hash = hardware_hash("  ABCDEF-1234  ");
+    assert_eq!(hash.len(), 64);
+    assert!(hash.chars().all(|ch| ch.is_ascii_hexdigit()));
+    assert_eq!(hash, hardware_hash("abcdef-1234"), "case and spacing fold");
+    assert!(!hash.contains("abcdef"));
+    #[cfg(target_os = "linux")]
+    if let Ok(raw) = std::fs::read_to_string("/etc/machine-id") {
+        let local = local_hardware_hash().unwrap();
+        assert_eq!(local, hardware_hash(&raw));
+        assert!(!local.contains(raw.trim()));
+        let dir = tempfile::tempdir().unwrap();
+        let stored: Option<String> = open_db(&db(&dir, "ai-history.db"))
+            .unwrap()
+            .query_row("SELECT hardware_id_hash FROM machine_identity", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(stored, Some(local));
+    }
+}
+
+#[test]
+fn a_restored_database_is_reissued_by_the_next_writable_open() {
+    // The reopen path: a database whose id was issued on other hardware is
+    // not current, so the first writable open on this machine reissues it,
+    // and a read-only handle refuses to hand out the other machine's id.
+    let Some(local) = local_hardware_hash() else {
+        return;
+    };
+    let dir = tempfile::tempdir().unwrap();
+    let path = db(&dir, "ai-history.db");
+    let first = store(&path).machine_identity().unwrap().unwrap();
+    open_db(&path)
+        .unwrap()
+        .execute(
+            "UPDATE machine_identity SET hardware_id_hash = ?1",
+            [hardware_hash("another-machine")],
+        )
+        .unwrap();
+    let options = StoreOptions {
+        db_path: Some(path.clone()),
+        ..StoreOptions::default()
+    };
+    let read_only = SessionStore::open(options.read_only(true)).unwrap();
+    assert!(read_only.machine_identity().is_err());
+    let conn = open_db(&path).unwrap();
+    let stored = read(&conn).unwrap().unwrap();
+    assert_ne!(stored.machine_id, first.machine_id);
+    assert_eq!(stored.hardware_id_hash.as_deref(), Some(local.as_str()));
+    assert_eq!(stored.previous.len(), 1);
+    assert_eq!(stored.previous[0].machine_id, first.machine_id);
+    assert!(!crate::store::needs_migration(&conn).unwrap());
 }
 
 #[test]
