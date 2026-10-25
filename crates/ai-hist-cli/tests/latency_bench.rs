@@ -510,7 +510,7 @@ fn stages(config: &Config) -> Value {
             store
                 .changes_since(head, ChangeQuery::default())
                 .expect("changes_since")
-                .map(|change| change.expect("change"))
+                .inspect(|change| assert!(change.is_ok(), "change"))
                 .count()
         });
         assert!(count > 0);
@@ -871,6 +871,13 @@ fn latency_phase() {
     report["turns"] = json!(config.turns);
     report["phaseWallMs"] = json!(started.elapsed().as_millis() as u64);
     report["release"] = json!(!cfg!(debug_assertions));
+    // How much un-checkpointed WAL the phase left behind: every reader pays
+    // to search it, so a list query after a burst of writes is slower than
+    // the same query on a checkpointed store.
+    if let Some(dir) = std::env::var_os("AI_HIST_LATENCY_DIR") {
+        let wal = PathBuf::from(dir).join("work/ai-history.db-wal");
+        report["walBytesAtEnd"] = json!(fs::metadata(wal).map(|m| m.len()).unwrap_or(0));
+    }
     let line = report.to_string();
     if let Some(path) = std::env::var_os("AI_HIST_LATENCY_REPORT") {
         fs::write(path, &line).expect("write report");
