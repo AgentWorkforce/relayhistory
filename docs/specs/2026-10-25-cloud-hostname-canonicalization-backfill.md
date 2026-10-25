@@ -20,12 +20,14 @@ Grouping by the raw hostname splits one machine into several.
 2. Strip network suffixes, repeatedly: `.local`, `.localdomain`, `.lan`,
    `.home`, `.home.arpa`, `.internal`. For a `*.internal` name, keep only the
    first label.
-3. Drop apostrophes (`'`, `‘`, `’`). Split into words on every other run
-   of anything but letters and digits (dots, punctuation, spaces,
-   underscores, symbols), and join the words with one `-`, so no label is
-   lost. A word with non-ASCII letters becomes its Punycode `xn--` form.
-4. Trim leading and trailing hyphens, and cut at 63 characters from the
-   right.
+3. Per DNS label: decode an `xn--` label to Unicode, drop apostrophes
+   (`'`, `‘`, `’`), and turn every run of anything but letters, digits and
+   combining marks into one `-`. A label with non-ASCII letters is written
+   whole in IDNA Punycode (`café-box` becomes `xn--caf-box-dya`). Labels
+   are joined by `-`, so no label is lost.
+4. Cut at 63 characters from the right, never inside an `xn--` label. A
+   single label too long on its own becomes `h-` plus 16 hex digits of its
+   hash.
 
 An empty result becomes `unknown-host`. New installs store the canonical form
 locally as `machine_name`, and every observed spelling goes in

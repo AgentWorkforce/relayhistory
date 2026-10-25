@@ -45,14 +45,17 @@ id is untouched. The rule (all three steps decided by Khaliq on 2026-10-25):
 - Drop apostrophes, both straight and curly. macOS's ComputerName
   `Khaliq's MacBook Pro` and its LocalHostName `Khaliqs-MacBook-Pro` are then
   one name.
-- Split into words on every other run of punctuation, spaces, underscores
-  and symbols, and join the words with one `-`.
-- A word with non-ASCII letters becomes its Punycode form behind the IDNA
-  `xn--` prefix (`ñandú-box` becomes `xn--and-6ma2c-box`). An `xn--` word
-  already in that form is kept, so a name and its IDNA spelling are one
-  name.
-- Cut the result at 63 characters from the right, so the most specific
-  labels stay.
+- Within each DNS label, turn every other run of punctuation, spaces,
+  underscores and symbols into one `-`. Combining marks (general category
+  M) stay on their letters, so the Devanagari `की` and `कु` stay distinct.
+- A label with non-ASCII letters is written whole in Punycode behind the
+  IDNA `xn--` prefix, exactly as IDNA encodes a label: `café-box` becomes
+  `xn--caf-box-dya`. An `xn--` label is decoded first, so a name and its
+  IDNA spelling are one name.
+- Join the labels with `-` and cut the result at 63 characters from the
+  right, so the most specific labels stay. The cut never lands inside an
+  `xn--` label: the label is kept whole or left out, and one too long on its
+  own is named `h-` plus 16 hex digits of its SHA-256.
 
 Rule 1 turned apostrophes into hyphens and kept only the first DNS label.
 Rule 2 dropped apostrophes. Rule 3 keeps every label except network

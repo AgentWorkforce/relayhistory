@@ -133,10 +133,13 @@ fn canonical_hostname_folds_odd_spellings_into_one_dns_label() {
         ),
         ("my.lan.box", "my-lan-box"),
         ("DESKTOP_7F3A__X", "desktop-7f3a-x"),
-        ("ñandú-box", "xn--and-6ma2c-box"),
-        ("Ñandú-Box.local", "xn--and-6ma2c-box"),
-        // Already in IDNA form: the same name.
-        ("xn--and-6ma2c-box", "xn--and-6ma2c-box"),
+        // A non-ASCII label is encoded whole, as IDNA does, so a name and
+        // its IDNA spelling are one name.
+        ("café-box", "xn--caf-box-dya"),
+        ("Café-Box.local", "xn--caf-box-dya"),
+        ("xn--caf-box-dya", "xn--caf-box-dya"),
+        ("XN--CAF-BOX-DYA.lan", "xn--caf-box-dya"),
+        ("café-box.studio", "xn--caf-box-dya-studio"),
         ("linuyc-desktop\n", "linuyc-desktop"),
         ("ip-10-0-0-1.ec2.internal", "ip-10-0-0-1"),
         ("", UNKNOWN_HOSTNAME),
@@ -208,6 +211,50 @@ fn non_ascii_hostnames_stay_distinct_and_decodable() {
     // Symbols are still separators, so a name of only symbols has nothing left.
     assert_eq!(canonical_hostname("\u{1F600}"), UNKNOWN_HOSTNAME);
     assert_eq!(canonical_hostname("box-\u{1F600}-2"), "box-2");
+}
+
+#[test]
+fn combining_marks_stay_on_their_letters() {
+    // A Devanagari vowel sign is a mark, not a separator: these differ.
+    let (ki, ku) = (canonical_hostname("की"), canonical_hostname("कु"));
+    assert_ne!(ki, ku);
+    for (raw, slug) in [("की", &ki), ("कु", &ku)] {
+        let decoded = idna::punycode::decode_to_string(slug.strip_prefix("xn--").unwrap());
+        assert_eq!(decoded.as_deref(), Some(raw), "{slug}");
+    }
+    // A mark NFC cannot compose stays too, so the label round-trips whole.
+    let marked = canonical_hostname("q\u{307}-box");
+    let encoded = marked.strip_prefix("xn--").unwrap();
+    assert_eq!(
+        idna::punycode::decode_to_string(encoded).as_deref(),
+        Some("q\u{307}-box")
+    );
+}
+
+#[test]
+fn a_long_non_ascii_name_is_never_cut_inside_its_punycode() {
+    // 55 `a`, `ñ`, `a`: 64 bytes once encoded, one over the limit.
+    let long = format!("{}ñ{}", "a".repeat(55), "a");
+    let slug = canonical_hostname(&long);
+    assert!(slug.len() <= 63, "{slug}");
+    assert!(!slug.starts_with("xn--"), "a cut Punycode word: {slug}");
+    assert!(slug.starts_with("h-"), "{slug}");
+    assert_eq!(slug, canonical_hostname(&long), "deterministic");
+    assert_ne!(
+        slug,
+        canonical_hostname(&format!("{}ñ{}", "a".repeat(55), "b"))
+    );
+    // One that fits is kept whole and decodes back.
+    let fits = format!("{}ñ", "a".repeat(50));
+    let slug = canonical_hostname(&fits);
+    let decoded = idna::punycode::decode_to_string(slug.strip_prefix("xn--").unwrap());
+    assert_eq!(decoded.as_deref(), Some(fits.as_str()));
+    // After an ASCII label, a Punycode label that does not fit is left out
+    // whole; nothing in the result is a partial encoding.
+    let tail = format!("box.{}ñ", "a".repeat(58));
+    assert_eq!(canonical_hostname(&tail), "box");
+    // A plain word is still cut, keeping its leading characters.
+    assert_eq!(canonical_hostname(&"a".repeat(80)), "a".repeat(63));
 }
 
 #[test]

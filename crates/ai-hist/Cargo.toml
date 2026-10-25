@@ -31,6 +31,7 @@ base64 = "0.22"
 # Canonical hostnames: NFC normalization, then Punycode for non-ASCII words.
 icu_normalizer = { version = "2.3", default-features = false, features = ["compiled_data"] }
 idna = "1.1"
+icu_properties = { version = "2.3", default-features = false, features = ["compiled_data"] }
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 libc = "0.2"

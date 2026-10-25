@@ -39,6 +39,7 @@ dependencies = [
  "fs2",
  "fs4",
  "icu_normalizer",
+ "icu_properties",
  "idna",
  "libc",
  "machine-uid",
