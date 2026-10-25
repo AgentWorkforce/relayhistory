@@ -126,3 +126,32 @@ fn evidence_tables_have_location(conn: &Connection) -> Result<bool> {
     }
     Ok(true)
 }
+
+/// Initialize derived evidence and local maintenance schemas after core DDL.
+pub(super) fn init_evidence_schemas(conn: &Connection) -> Result<()> {
+    // Derived from `session_events`, so it must come after the DDL and the
+    // column migrations above, and needs no backfill: the first query over an
+    // upgraded database already sees every request its events describe.
+    crate::session_usage::ensure_session_requests_view(conn)?;
+    crate::observations::init_schema(conn)?;
+    crate::retention::init_schema(conn)?;
+    // After the observation schema: the stamping triggers draw on its clock.
+    // The retired-source rows go last; see `delete_retired_source_rows`.
+    crate::change_feed::init_schema(conn)
+        .and_then(|()| super::retired_sources::delete_retired_source_rows(conn))
+}
+
+/// Maintenance-only tables do not raise the bar for older read-only stores.
+pub(super) fn writable_schema_is_current(conn: &Connection) -> Result<bool> {
+    let mut table = conn.prepare("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?1")?;
+    Ok(schema_has_required_indexes(conn, super::REQUIRED_INDEXES)?
+        && all_exist(
+            &mut table,
+            &[
+                "store_settings",
+                "retention_consumers",
+                "retention_sweep",
+                "retention_pending",
+            ],
+        )?)
+}

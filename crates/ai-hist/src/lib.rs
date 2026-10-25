@@ -42,6 +42,7 @@ mod file_lock;
 mod forget;
 mod jsonl_temp;
 mod read_pool;
+pub mod retention;
 mod session_identities;
 mod session_store;
 mod session_usage;

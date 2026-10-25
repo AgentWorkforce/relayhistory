@@ -9,8 +9,10 @@ use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
+mod busy;
+pub(crate) use busy::{configure_busy_retry, ShortBusyBudget};
 mod event_row;
 mod retired_sources;
 pub use retired_sources::is_retired_source;
@@ -517,81 +519,8 @@ pub fn default_db_path() -> PathBuf {
         })
 }
 
-/// Maximum number of times SQLite asks us to retry a contended lock.
-///
-/// A busy handler is preferable to one flat timeout for normal writer overlap:
-/// exponential delays stop hammering the lock and per-process/time jitter keeps
-/// two scheduled syncs from waking and colliding in lockstep. The callback is
-/// never useful for a permanently suspended holder, so the sequence stays
-/// bounded while preserving the previous 30-second grace window for a healthy writer that is
-/// merely slow. Even with zero jitter the sequence waits at least 30 seconds; jitter can extend
-/// that to roughly 33 seconds so simultaneous syncs do not keep waking in lockstep.
-const BUSY_RETRY_ATTEMPTS: i32 = 65;
-const BUSY_RETRY_BASE_MS: u64 = 10;
-const BUSY_RETRY_CAP_MS: u64 = 500;
-const BUSY_RETRY_JITTER_DIVISOR: u64 = 10;
 const JOURNAL_MODE_RETRY_ATTEMPTS: i32 = 20;
 const JOURNAL_MODE_RETRY_MS: u64 = 10;
-
-fn busy_retry_backoff_ms(prior_attempts: i32) -> Option<u64> {
-    if !(0..BUSY_RETRY_ATTEMPTS).contains(&prior_attempts) {
-        return None;
-    }
-
-    let shift = (prior_attempts as u32).min(6);
-    Some(
-        BUSY_RETRY_BASE_MS
-            .saturating_mul(1_u64 << shift)
-            .min(BUSY_RETRY_CAP_MS),
-    )
-}
-
-fn busy_retry_handler(prior_attempts: i32) -> bool {
-    let Some(backoff_ms) = busy_retry_backoff_ms(prior_attempts) else {
-        return false;
-    };
-    let clock = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos() as u64;
-    let seed = clock ^ u64::from(std::process::id()) ^ prior_attempts as u64;
-    let jitter_ms = seed % (backoff_ms / BUSY_RETRY_JITTER_DIVISOR + 1);
-    std::thread::sleep(Duration::from_millis(backoff_ms + jitter_ms));
-    true
-}
-
-pub(crate) fn configure_busy_retry(conn: &Connection) -> Result<()> {
-    conn.busy_handler(Some(busy_retry_handler))?;
-    Ok(())
-}
-
-/// A short busy budget for the calls made while it lives, in place of the
-/// production retry sequence.
-///
-/// SQLite keeps one busy handler per connection, and `busy_timeout` replaces
-/// it, so this swaps the ~30 s [`busy_retry_handler`] out for a plain timeout
-/// and puts it back when dropped. It cannot read back what was installed
-/// before — SQLite has no getter for a busy handler — so it is only for
-/// connections opened through [`open_db`] or [`open_db_readonly`], which is
-/// what it restores.
-pub(crate) struct ShortBusyBudget<'a> {
-    conn: &'a Connection,
-}
-
-impl<'a> ShortBusyBudget<'a> {
-    pub(crate) fn new(conn: &'a Connection, budget: Duration) -> Result<Self> {
-        conn.busy_timeout(budget)?;
-        Ok(Self { conn })
-    }
-}
-
-impl Drop for ShortBusyBudget<'_> {
-    fn drop(&mut self) {
-        // Best effort, like discovery's scoped `synchronous`: installing a
-        // busy handler only fails on a connection being torn down.
-        let _ = configure_busy_retry(self.conn);
-    }
-}
 
 fn sqlite_lock_error(error: &rusqlite::Error) -> bool {
     matches!(
@@ -1117,7 +1046,7 @@ const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &[
 /// first search instead of a silent migration. Callers fall back to a writable
 /// open (which migrates) when this returns false.
 pub fn schema_is_current(conn: &Connection) -> Result<bool> {
-    Ok(schema_has_required_indexes(conn, REQUIRED_INDEXES)?
+    Ok(schema_check::writable_schema_is_current(conn)?
         && crate::observations::schema_is_current(conn)?
         && crate::change_feed::schema_is_current(conn)?)
 }
@@ -1937,15 +1866,7 @@ VALUES ('session_presences_local_backfill_v1');
     )?;
     // After the marker migration, whose columns the healed notices move into.
     crate::ingest::migrate_claude_request_evidence(conn)?;
-    // Derived from `session_events`, so it must come after the DDL and the
-    // column migrations above, and needs no backfill: the first query over an
-    // upgraded database already sees every request its events describe.
-    crate::session_usage::ensure_session_requests_view(conn)?;
-    crate::observations::init_schema(conn)?;
-    // After the observation schema: the stamping triggers draw on its clock.
-    // The retired-source rows go last; see `delete_retired_source_rows`.
-    crate::change_feed::init_schema(conn)
-        .and_then(|()| retired_sources::delete_retired_source_rows(conn))
+    schema_check::init_evidence_schemas(conn)
 }
 
 /// Whether a named migration has already run, on a database that may predate
@@ -6171,30 +6092,6 @@ mod tests {
         releaser.join().unwrap();
 
         fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
-    fn busy_retry_sequence_is_bounded() {
-        let minimum_ms: u64 = (0..BUSY_RETRY_ATTEMPTS)
-            .map(|attempt| busy_retry_backoff_ms(attempt).unwrap())
-            .sum();
-        assert!(
-            (30_000..31_000).contains(&minimum_ms),
-            "minimum retry grace changed unexpectedly: {minimum_ms}ms"
-        );
-        let maximum_ms: u64 = (0..BUSY_RETRY_ATTEMPTS)
-            .map(|attempt| {
-                let backoff = busy_retry_backoff_ms(attempt).unwrap();
-                backoff + backoff / BUSY_RETRY_JITTER_DIVISOR
-            })
-            .sum();
-        assert!(
-            (33_000..34_000).contains(&maximum_ms),
-            "maximum retry grace changed unexpectedly: {maximum_ms}ms"
-        );
-        assert!(busy_retry_backoff_ms(BUSY_RETRY_ATTEMPTS).is_none());
-        assert!(!busy_retry_handler(BUSY_RETRY_ATTEMPTS));
-        assert!(!busy_retry_handler(BUSY_RETRY_ATTEMPTS + 1));
     }
 
     #[test]

@@ -1154,3 +1154,11 @@ gap and the facade grows instead. A consumer outside this repository that
 finds itself reaching for `unstable-internal` has found a gap in this
 document; open an issue against the facade rather than depending on the
 feature.
+
+## Local retention maintenance
+
+The `retention` module provides a persisted 30-day policy, explicit batched
+`SessionStore::prune_expired` maintenance and upload-consumer acknowledgements.
+The host schedules maintenance off the session read/write path; nothing runs
+implicitly on policy writes. See [retention](retention.md) for the desktop
+adapter, acknowledgement contract, safety tradeoff and batch reports.
