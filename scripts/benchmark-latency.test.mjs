@@ -52,6 +52,18 @@ test("a tracked budget over its p99 warns and stays green", () => {
   assert.equal(gate.checks.find((c) => c.rule === "budget").status, "warn");
 });
 
+test("a budget enforced on a list of classes fails only on those", () => {
+  const perPlatform = {
+    ...thresholds,
+    budgets: { "stages@30d.fs_event": { stage: "fs", p99Ms: 1.0, enforced: ["linux-x64"] } },
+  };
+  const r = report({ fs_event: summary(16) });
+  assert.equal(evaluateGate(r, perPlatform, "linux-x64").passed, false);
+  const mac = evaluateGate(r, perPlatform, "darwin-arm64");
+  assert.equal(mac.passed, true);
+  assert.equal(mac.checks[0].status, "warn");
+});
+
 test("a p99 more than 10% plus the floor over baseline fails", () => {
   // 20 * 1.1 + 0.05 = 22.05
   assert.equal(evaluateGate(report({ ingest_hook: summary(22.05) }), thresholds, "linux-x64").passed, true);
@@ -83,8 +95,12 @@ test("rounds fold to the median percentile, keeping the worst round visible", ()
   assert.equal(folded.phase, "stages");
 });
 
-test("recorded baselines round up and never tighten when merged", () => {
-  const recorded = baselinesFromReport(report({ fs_event: summary(0.2341) }));
+test("recorded baselines take the worst round, round up, and never tighten when merged", () => {
+  const recorded = baselinesFromReport(
+    report({ fs_event: summary(0.2, { worstP99: 0.2341 }), open_db: summary(4) }),
+    thresholds.budgets,
+  );
+  // open_db has no budget, so it is reported but never gated.
   assert.deepEqual(recorded, { "stages@30d.fs_event": { p99: 0.235 } });
   const merged = mergeBaselines({ "stages@30d.fs_event": { p99: 0.3 } }, recorded);
   assert.equal(merged["stages@30d.fs_event"].p99, 0.3);

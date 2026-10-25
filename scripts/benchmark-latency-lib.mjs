@@ -54,12 +54,24 @@ export function aggregateRounds(rounds) {
 }
 
 /**
+ * Whether a budget fails the gate on this platform class. `enforced` is
+ * `true` (everywhere), `false` (tracked everywhere), or the list of classes it
+ * is enforced on: a stage can meet its budget on one platform and not yet on
+ * another -- inotify does, FSEvents does not -- and holding the platform that
+ * meets it is worth more than waiting for both.
+ */
+export function budgetEnforced(budget, platform) {
+  return Array.isArray(budget.enforced) ? budget.enforced.includes(platform) : budget.enforced === true;
+}
+
+/**
  * Apply budgets and baselines to an aggregated report.
  *
  * Two independent rules, each producing `ok`, `warn` or `fail` per metric:
  *
  * - **Budget.** A metric listed in `thresholds.budgets` fails when its p99 is
- *   at or above the budget, if the budget is `enforced`. An unenforced
+ *   at or above the budget, if the budget is enforced on this platform class
+ *   (see `budgetEnforced`). An unenforced
  *   budget is one the code does not meet yet: a breach is a `warn` and the
  *   run stays green, so the gate can land before the fix does and is flipped
  *   to enforced by the change that brings the stage under budget.
@@ -95,7 +107,7 @@ export function evaluateGate(report, thresholds, platform) {
           rule: "budget",
           value: measured.p99,
           bound: budget.p99Ms,
-          status: !over ? "ok" : budget.enforced ? "fail" : "warn",
+          status: !over ? "ok" : budgetEnforced(budget, platform) ? "fail" : "warn",
           stage: budget.stage,
         });
       }
@@ -121,16 +133,23 @@ export function evaluateGate(report, thresholds, platform) {
 }
 
 /**
- * Baselines from an aggregated report: each metric's p99, rounded up to the
- * next microsecond so the stored bound is never stricter than the run that
- * produced it.
+ * Baselines from an aggregated report, for the metrics that have a budget --
+ * the stages of the 5 ms path; everything else in the table is diagnostic.
+ *
+ * Each is the *worst round's* p99, rounded up to the next microsecond. The
+ * gate compares a median-of-rounds p99 against it, so the round-to-round
+ * spread the recording run itself showed is headroom rather than a flake: on
+ * the first CI runs the tail stages moved ~10% between rounds of one job,
+ * which is the whole regression allowance.
  */
-export function baselinesFromReport(report) {
+export function baselinesFromReport(report, budgets) {
   const metrics = {};
   for (const run of report.runs) {
     for (const [name, measured] of Object.entries(run.result.metrics)) {
-      if (!measured || measured.n === 0) continue;
-      metrics[metricId(run, name)] = { p99: Math.ceil(measured.p99 * 1000) / 1000 };
+      const id = metricId(run, name);
+      if (!measured || measured.n === 0 || !budgets?.[id]) continue;
+      const p99 = measured.worstP99 ?? measured.p99;
+      metrics[id] = { p99: Math.ceil(p99 * 1000) / 1000 };
     }
   }
   return metrics;
@@ -176,8 +195,10 @@ export function renderMarkdown(report, gate, thresholds) {
       const verdict = (byId.get(id) ?? [])
         .map((check) => `${check.status} (${check.rule} ${fmt(check.bound)})`)
         .join(", ");
+      const platform = `${m.platform}-${m.arch}`;
+      const tracked = budget && !budgetEnforced(budget, platform) ? " (tracked)" : "";
       lines.push(
-        `| \`${id}\` | ${budget ? fmt(budget.p99Ms) + (budget.enforced ? "" : " (tracked)") : ""} | ` +
+        `| \`${id}\` | ${budget ? fmt(budget.p99Ms) + tracked : ""} | ` +
           `${fmt(measured.p50)} | ${fmt(measured.p90)} | ${fmt(measured.p99)} | ${fmt(measured.worstP99)} | ` +
           `${fmt(measured.max)} | ${measured.n ?? 0} | ${verdict} |`,
       );

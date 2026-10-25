@@ -169,7 +169,7 @@ async function main(argv) {
         measuredAt: report.measuredAt,
         profile: report.profile,
       },
-      metrics: mergeBaselines(previous?.metrics, baselinesFromReport(report)),
+      metrics: mergeBaselines(previous?.metrics, baselinesFromReport(report, thresholds.budgets)),
     };
     writeFileSync(THRESHOLDS, `${JSON.stringify(thresholds, null, 2)}\n`);
     process.stderr.write(`baselines for ${cls} written to ${THRESHOLDS}\n`);
