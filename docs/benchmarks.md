@@ -1170,7 +1170,7 @@ stage has a budget a change can be held to.
 | parse + SQLite transaction | 1.5 ms | `stages.ingest_hook` (`hydrate` by path, the hook fast path) and `stages.sweep_scoped_sync` (the forced, source-scoped `sync` a watch tick and the desktop collector run) |
 | change-feed notify → desktop | 1.0 ms | `stages.feed_pull`: `changes_since` from the previous head after one new session, i.e. the read a pull consumer pays per wake-up |
 | desktop query + render | 1.5 ms | `stages.list_first_paint` / `list_scale.list_first_paint`: `SessionStore::sessions` with the desktop's filter (`scope: All`, `exclude_delegated`), LIMIT 50. Render is the desktop's and is not measured here |
-| desktop page (LIMIT 500) | 4.0 ms (proposed) | `list_scale.list_desktop_page`: the same query at the desktop's 500-row page (`SESSION_LIST_LIMIT`). Its own budget, because the page is filled after the first 50 rows are on screen and is not on the new-session path |
+| desktop page (LIMIT 500) | 4.0 ms | `list_scale.list_desktop_page`: the same query at the desktop's 500-row page (`SESSION_LIST_LIMIT`). Its own budget, because the page is filled after the first 50 rows are on screen and is not on the new-session path |
 | **total** | **< 5 ms** | `e2e.e2e_visible`: write → `SessionStore::watch` (production defaults) reports the session in `TickReport::changed` → it is first on the list |
 
 Three pieces, mirroring the sync benchmark:

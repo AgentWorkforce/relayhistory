@@ -134,7 +134,7 @@
       "enforced": [
         "linux-x64"
       ],
-      "enforcedComment": "Its own budget, not the 1.5 ms first paint: the desktop's 500-row page (SESSION_LIST_LIMIT) is filled after the first 50 rows are on screen, so it is not on the 5 ms new-session path. 4.0 ms p99 is ~1.5x the ubuntu-latest p99 (2.45 ms at 30 days, 2.60 ms at a year) and ~1.3x the macOS VM's (2.9-3.0 ms), so it fails a real regression in the catalog query or row decoding without failing the page size itself. Enforced on linux-x64; tracked on the macOS VM, whose worst round reached 3.97 ms. Proposed by W0, pending Khaliq's confirmation of the number.",
+      "enforcedComment": "Its own budget, not the 1.5 ms first paint: the desktop's 500-row page (SESSION_LIST_LIMIT) is filled after the first 50 rows are on screen, so it is not on the 5 ms new-session path. 4.0 ms p99 is ~1.5x the ubuntu-latest p99 (2.45 ms at 30 days, 2.60 ms at a year) and ~1.3x the macOS VM's (2.9-3.0 ms), so it fails a real regression in the catalog query or row decoding without failing the page size itself. Enforced on linux-x64; tracked on the macOS VM, whose worst round reached 3.97 ms. Approved by Khaliq, 2026-10-25.",
       "known": {
         "darwin-arm64": {
           "p50": 1.459,
@@ -148,7 +148,7 @@
       "enforced": [
         "linux-x64"
       ],
-      "enforcedComment": "Its own budget, not the 1.5 ms first paint: the desktop's 500-row page (SESSION_LIST_LIMIT) is filled after the first 50 rows are on screen, so it is not on the 5 ms new-session path. 4.0 ms p99 is ~1.5x the ubuntu-latest p99 (2.45 ms at 30 days, 2.60 ms at a year) and ~1.3x the macOS VM's (2.9-3.0 ms), so it fails a real regression in the catalog query or row decoding without failing the page size itself. Enforced on linux-x64; tracked on the macOS VM, whose worst round reached 3.97 ms. Proposed by W0, pending Khaliq's confirmation of the number.",
+      "enforcedComment": "Its own budget, not the 1.5 ms first paint: the desktop's 500-row page (SESSION_LIST_LIMIT) is filled after the first 50 rows are on screen, so it is not on the 5 ms new-session path. 4.0 ms p99 is ~1.5x the ubuntu-latest p99 (2.45 ms at 30 days, 2.60 ms at a year) and ~1.3x the macOS VM's (2.9-3.0 ms), so it fails a real regression in the catalog query or row decoding without failing the page size itself. Enforced on linux-x64; tracked on the macOS VM, whose worst round reached 3.97 ms. Approved by Khaliq, 2026-10-25.",
       "known": {
         "darwin-arm64": {
           "p50": 1.603,
