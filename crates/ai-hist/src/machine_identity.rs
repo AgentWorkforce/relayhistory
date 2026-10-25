@@ -26,8 +26,8 @@
 //! # Trace ids
 //!
 //! Every `sessions` row carries a `trace_id`, a UUIDv7 minted when the row is
-//! first written (by a trigger, so none of the catalog's write sites can
-//! forget it) and kept by every later upsert. It is a stored column, so the
+//! first written (by the change feed's insert trigger, so none of the
+//! catalog's write sites can forget it) and kept by every later upsert. It is a stored column, so the
 //! change feed and the export carry it in the session record's payload with
 //! no further plumbing. Minting is pure SQL in the same statement as the
 //! insert: no fsync, no custom function, nothing outside the transaction.
@@ -79,9 +79,10 @@ pub const DEFAULT_MACHINE_NAME_PRIVACY: MachineNamePrivacy = MachineNamePrivacy:
 /// collide is about 3%, against about 99.9% with four.
 pub const INSTALL_SUFFIX_HEX_DIGITS: usize = 6;
 
-/// The version of the [`canonical_hostname`] rule. A stored canonical name
-/// records it, so a later rule change is a visible, re-runnable migration
-/// rather than a silent drift between old and new rows.
+/// The version of the [`canonical_hostname`] rule. `machine_name` and every
+/// `hostname_aliases` row record the version they were computed with, so a
+/// later rule change recanonicalizes them on the next open (the machine id
+/// stays frozen) instead of leaving old and new names silently mixed.
 pub const CANONICAL_HOSTNAME_RULE_VERSION: u32 = 1;
 
 /// The canonical hostname of a name with no usable character.
@@ -95,8 +96,11 @@ const MAX_HOSTNAME_LEN: usize = 63;
 pub struct MachineIdentity {
     /// Frozen at first run; see [`machine_id`].
     pub machine_id: String,
-    /// The current canonical hostname slug.
+    /// The current canonical hostname.
     pub machine_name: String,
+    /// The [`CANONICAL_HOSTNAME_RULE_VERSION`] `machine_name` was computed
+    /// with.
+    pub name_rule_version: u32,
     /// Random UUID generated at first run; its first hex digits are the id's
     /// suffix.
     pub install_id: String,
@@ -116,6 +120,8 @@ pub struct MachineIdentity {
 pub struct HostnameAlias {
     pub observed: String,
     pub canonical: String,
+    /// The [`CANONICAL_HOSTNAME_RULE_VERSION`] `canonical` was computed with.
+    pub rule_version: u32,
     pub first_seen_ms: i64,
 }
 
@@ -124,6 +130,7 @@ CREATE TABLE IF NOT EXISTS machine_identity (
     singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
     machine_id TEXT NOT NULL,
     machine_name TEXT NOT NULL,
+    name_rule_version INTEGER NOT NULL,
     install_id TEXT NOT NULL,
     id_scheme TEXT NOT NULL,
     name_privacy TEXT NOT NULL,
@@ -133,6 +140,7 @@ CREATE TABLE IF NOT EXISTS machine_identity (
 CREATE TABLE IF NOT EXISTS hostname_aliases (
     observed_hostname TEXT PRIMARY KEY,
     canonical_hostname TEXT NOT NULL,
+    rule_version INTEGER NOT NULL,
     first_seen_ms INTEGER NOT NULL
 );
 "#;
@@ -208,51 +216,46 @@ pub(crate) fn local_hostname() -> String {
 pub(crate) fn read(conn: &Connection) -> Result<Option<MachineIdentity>> {
     let row = conn
         .query_row(
-            "SELECT machine_id, machine_name, install_id, id_scheme, name_privacy, \
-             created_ms, updated_ms FROM machine_identity WHERE singleton = 1",
+            "SELECT machine_id, machine_name, name_rule_version, install_id, id_scheme, \
+             name_privacy, created_ms, updated_ms FROM machine_identity WHERE singleton = 1",
             [],
             |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, String>(3)?,
-                    row.get::<_, String>(4)?,
-                    row.get::<_, i64>(5)?,
-                    row.get::<_, i64>(6)?,
-                ))
+                let identity = MachineIdentity {
+                    machine_id: row.get(0)?,
+                    machine_name: row.get(1)?,
+                    name_rule_version: row.get(2)?,
+                    install_id: row.get(3)?,
+                    id_scheme: row.get(4)?,
+                    name_privacy: MachineNamePrivacy::Slug,
+                    created_ms: row.get(6)?,
+                    updated_ms: row.get(7)?,
+                    hostname_aliases: Vec::new(),
+                };
+                Ok((identity, row.get::<_, String>(5)?))
             },
         )
         .optional()?;
-    let Some((machine_id, machine_name, install_id, id_scheme, privacy, created_ms, updated_ms)) =
-        row
-    else {
+    let Some((mut identity, privacy)) = row else {
         return Ok(None);
     };
-    Ok(Some(MachineIdentity {
-        machine_id,
-        machine_name,
-        install_id,
-        id_scheme,
-        name_privacy: MachineNamePrivacy::parse(&privacy)
-            .with_context(|| format!("unknown machine name privacy {privacy}"))?,
-        created_ms,
-        updated_ms,
-        hostname_aliases: hostname_aliases(conn)?,
-    }))
+    identity.name_privacy = MachineNamePrivacy::parse(&privacy)
+        .with_context(|| format!("unknown machine name privacy {privacy}"))?;
+    identity.hostname_aliases = hostname_aliases(conn)?;
+    Ok(Some(identity))
 }
 
 fn hostname_aliases(conn: &Connection) -> Result<Vec<HostnameAlias>> {
     let mut statement = conn.prepare(
-        "SELECT observed_hostname, canonical_hostname, first_seen_ms FROM hostname_aliases \
-         ORDER BY first_seen_ms, observed_hostname",
+        "SELECT observed_hostname, canonical_hostname, rule_version, first_seen_ms \
+         FROM hostname_aliases ORDER BY first_seen_ms, observed_hostname",
     )?;
     let aliases = statement
         .query_map([], |row| {
             Ok(HostnameAlias {
                 observed: row.get(0)?,
                 canonical: row.get(1)?,
-                first_seen_ms: row.get(2)?,
+                rule_version: row.get(2)?,
+                first_seen_ms: row.get(3)?,
             })
         })?
         .collect::<rusqlite::Result<_>>()?;
@@ -260,10 +263,11 @@ fn hostname_aliases(conn: &Connection) -> Result<Vec<HostnameAlias>> {
 }
 
 /// The identity for a host named `hostname`: created on first run with
-/// `privacy`, otherwise the stored one with `machine_name`
-/// brought up to date and the spelling recorded. Writes only when it creates
-/// the row, the canonical name changed, or the spelling is new. Neither
-/// argument changes a stored id.
+/// `privacy`, otherwise the stored one with `machine_name` brought up to
+/// date -- for a rename, or for a stored name computed by an earlier
+/// [`CANONICAL_HOSTNAME_RULE_VERSION`] -- and the spelling recorded. Writes
+/// only when it creates the row, the name or its rule changed, or the
+/// spelling is new under the current rule. Never changes a stored id.
 pub(crate) fn ensure_with(
     conn: &Connection,
     hostname: &str,
@@ -271,48 +275,64 @@ pub(crate) fn ensure_with(
 ) -> Result<MachineIdentity> {
     let observed = hostname.trim();
     let name = canonical_hostname(observed);
+    let rule = CANONICAL_HOSTNAME_RULE_VERSION;
     let now = now_ms();
-    if let Some(mut identity) = read(conn)? {
-        if identity.machine_name != name {
-            conn.execute(
-                "UPDATE machine_identity SET machine_name = ?1, updated_ms = ?2 \
-                 WHERE singleton = 1",
-                params![name, now],
-            )?;
-            identity.machine_name = name.clone();
-            identity.updated_ms = now;
-        }
-        if !identity
-            .hostname_aliases
-            .iter()
-            .any(|alias| alias.observed == observed)
-        {
-            record_alias(conn, observed, &name, now)?;
-            identity.hostname_aliases = hostname_aliases(conn)?;
-        }
-        return Ok(identity);
+    let Some(mut identity) = read(conn)? else {
+        return create(conn, observed, name, privacy, now);
+    };
+    if identity.machine_name != name || identity.name_rule_version != rule {
+        conn.execute(
+            "UPDATE machine_identity SET machine_name = ?1, name_rule_version = ?2, \
+             updated_ms = ?3 WHERE singleton = 1",
+            params![name, rule, now],
+        )?;
+        identity.machine_name = name.clone();
+        identity.name_rule_version = rule;
+        identity.updated_ms = now;
     }
+    let recorded = identity
+        .hostname_aliases
+        .iter()
+        .any(|alias| alias.observed == observed && alias.rule_version == rule);
+    if !recorded {
+        record_alias(conn, observed, &name, now)?;
+        identity.hostname_aliases = hostname_aliases(conn)?;
+    }
+    Ok(identity)
+}
+
+fn create(
+    conn: &Connection,
+    observed: &str,
+    name: String,
+    privacy: MachineNamePrivacy,
+    now: i64,
+) -> Result<MachineIdentity> {
     let install_id = random_uuid_v4(conn)?;
     let identity = MachineIdentity {
         machine_id: machine_id(privacy, &name, &install_id),
-        machine_name: name.clone(),
+        hostname_aliases: vec![HostnameAlias {
+            observed: observed.to_string(),
+            canonical: name.clone(),
+            rule_version: CANONICAL_HOSTNAME_RULE_VERSION,
+            first_seen_ms: now,
+        }],
+        machine_name: name,
+        name_rule_version: CANONICAL_HOSTNAME_RULE_VERSION,
         install_id,
         id_scheme: MACHINE_ID_SCHEME.to_string(),
         name_privacy: privacy,
         created_ms: now,
         updated_ms: now,
-        hostname_aliases: vec![HostnameAlias {
-            observed: observed.to_string(),
-            canonical: name.clone(),
-            first_seen_ms: now,
-        }],
     };
     conn.execute(
-        "INSERT INTO machine_identity (singleton, machine_id, machine_name, install_id, \
-         id_scheme, name_privacy, created_ms, updated_ms) VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?6)",
+        "INSERT INTO machine_identity (singleton, machine_id, machine_name, name_rule_version, \
+         install_id, id_scheme, name_privacy, created_ms, updated_ms) \
+         VALUES (1, ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
         params![
             identity.machine_id,
             identity.machine_name,
+            identity.name_rule_version,
             identity.install_id,
             MACHINE_ID_SCHEME,
             privacy.as_str(),
@@ -328,11 +348,17 @@ pub(crate) fn ensure(conn: &Connection) -> Result<MachineIdentity> {
     ensure_with(conn, &local_hostname(), DEFAULT_MACHINE_NAME_PRIVACY)
 }
 
+/// Record `observed` under the current rule. A spelling seen under an
+/// earlier rule is recanonicalized in place, keeping its first sighting.
 fn record_alias(conn: &Connection, observed: &str, canonical: &str, now: i64) -> Result<()> {
     conn.execute(
-        "INSERT OR IGNORE INTO hostname_aliases \
-         (observed_hostname, canonical_hostname, first_seen_ms) VALUES (?1, ?2, ?3)",
-        params![observed, canonical, now],
+        "INSERT INTO hostname_aliases \
+         (observed_hostname, canonical_hostname, rule_version, first_seen_ms) \
+         VALUES (?1, ?2, ?3, ?4) \
+         ON CONFLICT(observed_hostname) DO UPDATE SET \
+         canonical_hostname = excluded.canonical_hostname, \
+         rule_version = excluded.rule_version",
+        params![observed, canonical, CANONICAL_HOSTNAME_RULE_VERSION, now],
     )?;
     Ok(())
 }
@@ -364,11 +390,6 @@ pub(crate) const UUID_V7_SQL: &str = "lower(\
      || '-' || substr('89ab', (random() & 3) + 1, 1) || substr(hex(randomblob(2)), 2, 3) \
      || '-' || hex(randomblob(6)))";
 
-/// Columns an insert trigger fills from NULL in the inserting statement. The
-/// change feed's update guard does not count that fill as a change, so a new
-/// session takes one revision, not two.
-pub(crate) const MINTED_ON_INSERT: &[(&str, &str)] = &[("sessions", "trace_id")];
-
 /// The `sessions` catalog columns, then the trace ids and the machine
 /// identity over them. Runs in the migration transaction: after `trace_id`
 /// exists, and before the change feed reconciles its export schema, which
@@ -384,7 +405,7 @@ pub(crate) fn migrate(conn: &Connection, session_columns: &[&str]) -> Result<()>
 impl SessionStore {
     /// This database's machine: created by the first writable open, its
     /// `machine_name` refreshed from the current hostname by this call on a
-    /// writable handle (a write only when the name changed). A read-only
+    /// writable handle (a write only when the name, its rule, or the spelling is new). A read-only
     /// handle returns what is stored, or `None` for a database no writable
     /// open has migrated yet. Local only; never a network call.
     pub fn machine_identity(&self) -> std::result::Result<Option<MachineIdentity>, Error> {
@@ -420,26 +441,44 @@ impl SessionStore {
 /// The `sessions` columns this module adds.
 pub(crate) const SESSION_COLUMNS: &[&str] = &["trace_id"];
 
-/// The tables and trigger a current schema has, by `sqlite_master` name.
-pub(crate) const SCHEMA_OBJECTS: &[&str] =
-    &["machine_identity", "hostname_aliases", TRACE_ID_TRIGGER];
+/// The tables a current schema has, by `sqlite_master` name.
+pub(crate) const SCHEMA_OBJECTS: &[&str] = &["machine_identity", "hostname_aliases"];
 
-/// The trigger that gives a new session row its trace id.
-pub(crate) const TRACE_ID_TRIGGER: &str = "sessions_trace_id_insert";
+/// What the change feed's insert stamp on `table` also sets, as a `, col =
+/// expr` suffix of its `UPDATE ... SET`: a new session's trace id, unless the
+/// insert gave one. Filling it in the stamp's own statement means a new
+/// session takes one revision, not one for the insert and one for the fill.
+/// Empty for every other table, and for `sessions` before the column exists.
+pub(crate) fn insert_fill_sql(conn: &Connection, table: &str) -> Result<String> {
+    if table != "sessions" {
+        return Ok(String::new());
+    }
+    let has_column: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'trace_id')",
+        [],
+        |row| row.get(0),
+    )?;
+    Ok(if has_column {
+        format!(", trace_id = COALESCE(trace_id, {UUID_V7_SQL})")
+    } else {
+        String::new()
+    })
+}
+
+/// The standalone trigger an earlier revision of this change minted trace
+/// ids with; the change feed's insert stamp does it now.
+const RETIRED_TRACE_ID_TRIGGER: &str = "sessions_trace_id_insert";
 
 /// The marker for the one-time trace id backfill of rows that predate it.
 pub(crate) const TRACE_ID_MIGRATION: &str = "session_trace_id_v1";
 
-/// Install the trace id trigger and, once, give every existing session row a
-/// trace id. Runs inside the caller's migration transaction, after the
-/// `trace_id` column exists and before the change feed reconciles its
-/// export schema, which then restamps the backfilled rows once.
-pub(crate) fn init_trace_ids(conn: &Connection) -> Result<()> {
+/// Once, give every existing session row a trace id. Runs inside the
+/// caller's migration transaction, after the `trace_id` column exists and
+/// before the change feed reconciles its export schema, which then restamps
+/// the backfilled rows once.
+fn init_trace_ids(conn: &Connection) -> Result<()> {
     conn.execute_batch(&format!(
-        "CREATE TRIGGER IF NOT EXISTS {TRACE_ID_TRIGGER} AFTER INSERT ON sessions \
-         WHEN NEW.trace_id IS NULL BEGIN \
-             UPDATE sessions SET trace_id = {UUID_V7_SQL} WHERE rowid = NEW.rowid; \
-         END;"
+        "DROP TRIGGER IF EXISTS {RETIRED_TRACE_ID_TRIGGER};"
     ))?;
     if !crate::store::migration_applied(conn, TRACE_ID_MIGRATION)? {
         conn.execute_batch(&format!(

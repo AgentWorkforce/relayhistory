@@ -459,6 +459,7 @@ pub struct ai_hist::HostnameAlias
 pub ai_hist::HostnameAlias::canonical: alloc::string::String
 pub ai_hist::HostnameAlias::first_seen_ms: i64
 pub ai_hist::HostnameAlias::observed: alloc::string::String
+pub ai_hist::HostnameAlias::rule_version: u32
 #[non_exhaustive] pub struct ai_hist::HydrateOptions
 pub ai_hist::HydrateOptions::include_related: bool
 pub ai_hist::HydrateOptions::stop: core::option::Option<ai_hist::StopToken>
@@ -505,6 +506,7 @@ pub ai_hist::MachineIdentity::install_id: alloc::string::String
 pub ai_hist::MachineIdentity::machine_id: alloc::string::String
 pub ai_hist::MachineIdentity::machine_name: alloc::string::String
 pub ai_hist::MachineIdentity::name_privacy: ai_hist::MachineNamePrivacy
+pub ai_hist::MachineIdentity::name_rule_version: u32
 pub ai_hist::MachineIdentity::updated_ms: i64
 #[non_exhaustive] pub struct ai_hist::Marker
 pub ai_hist::Marker::kind: alloc::string::String

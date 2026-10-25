@@ -226,8 +226,8 @@ fn a_stored_machine_id_never_changes_with_canonicalization() {
     let conn = blank(&path);
     conn.execute(
         "INSERT INTO machine_identity (singleton, machine_id, machine_name, install_id, \
-         id_scheme, name_privacy, created_ms, updated_ms) \
-         VALUES (1, 'Khaliqs_MBP-abc', 'Khaliqs_MBP', 'abc', 'earlier', 'slug', 1, 1)",
+         name_rule_version, id_scheme, name_privacy, created_ms, updated_ms) \
+         VALUES (1, 'Khaliqs_MBP-abc', 'Khaliqs_MBP', 'abc', 0, 'earlier', 'slug', 1, 1)",
         [],
     )
     .unwrap();
@@ -236,6 +236,35 @@ fn a_stored_machine_id_never_changes_with_canonicalization() {
     assert_eq!(seen.install_id, "abc");
     assert_eq!(seen.id_scheme, "earlier");
     assert_eq!(seen.machine_name, "khaliqs-mbp");
+}
+
+#[test]
+fn names_record_their_rule_and_an_older_rule_is_recanonicalized() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = db(&dir, "ai-history.db");
+    let first = first_run(&path, "Khaliqs_MBP.local");
+    assert_eq!(first.name_rule_version, CANONICAL_HOSTNAME_RULE_VERSION);
+    assert!(first
+        .hostname_aliases
+        .iter()
+        .all(|alias| alias.rule_version == CANONICAL_HOSTNAME_RULE_VERSION));
+    let conn = open_db(&path).unwrap();
+    // What a database written under an earlier rule would hold.
+    conn.execute_batch(
+        "UPDATE machine_identity SET machine_name = 'Khaliqs_MBP', name_rule_version = 0; \
+         UPDATE hostname_aliases SET canonical_hostname = 'Khaliqs_MBP', rule_version = 0;",
+    )
+    .unwrap();
+    let seen = ensure_with(&conn, "Khaliqs_MBP.local", MachineNamePrivacy::Slug).unwrap();
+    assert_eq!(seen.machine_id, first.machine_id, "the id stays frozen");
+    assert_eq!(seen.machine_name, "khaliqs-mbp");
+    assert_eq!(seen.name_rule_version, CANONICAL_HOSTNAME_RULE_VERSION);
+    let [alias] = &seen.hostname_aliases[..] else {
+        panic!("{seen:?}");
+    };
+    assert_eq!(alias.canonical, "khaliqs-mbp");
+    assert_eq!(alias.rule_version, CANONICAL_HOSTNAME_RULE_VERSION);
+    assert_eq!(alias.first_seen_ms, first.hostname_aliases[0].first_seen_ms);
 }
 
 #[test]
@@ -380,11 +409,10 @@ fn a_database_from_before_trace_ids_backfills_every_row_once() {
         for n in 0..500 {
             insert_session(&conn, &format!("old-{n}"));
         }
-        // The shape an older release left: no column, no trigger, no
-        // marker, and a change feed whose fingerprint of the session row
-        // predates the column.
+        // The shape an older release left: no column, a feed whose
+        // triggers and fingerprint of the session row predate it, no marker.
         conn.execute_batch(&format!(
-            "DROP TRIGGER {TRACE_ID_TRIGGER}; DROP TRIGGER change_feed_sessions_update; \
+            "DROP TRIGGER change_feed_sessions_insert; DROP TRIGGER change_feed_sessions_update; \
              ALTER TABLE sessions DROP COLUMN trace_id; \
              DELETE FROM schema_migrations WHERE name = '{TRACE_ID_MIGRATION}';"
         ))
@@ -428,6 +456,41 @@ fn a_database_from_before_trace_ids_backfills_every_row_once() {
 
 fn migration_applied(conn: &Connection, name: &str) -> bool {
     crate::store::migration_applied(conn, name).unwrap()
+}
+
+#[test]
+fn a_repaired_trace_id_takes_a_revision_of_its_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = db(&dir, "ai-history.db");
+    let conn = open_db(&path).unwrap();
+    insert_session(&conn, "s1");
+    conn.execute("UPDATE sessions SET trace_id = NULL", [])
+        .unwrap();
+    let cleared = crate::change_feed::read_head(&conn).unwrap();
+    conn.execute(
+        "UPDATE sessions SET trace_id = 'repaired' WHERE session_id = 's1'",
+        [],
+    )
+    .unwrap();
+    let query = ChangeQuery {
+        kinds: Some(vec![ChangeKind::Session]),
+        ..ChangeQuery::default()
+    };
+    let changes: Vec<_> = store(&path)
+        .changes_since(cleared, query)
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        changes.len(),
+        1,
+        "a consumer past the clear sees the repair"
+    );
+    let columns = changes[0].columns.as_ref().unwrap();
+    assert_eq!(
+        columns.get("trace_id").and_then(|value| value.as_str()),
+        Some("repaired")
+    );
 }
 
 #[test]
@@ -482,23 +545,26 @@ fn the_export_carries_the_trace_id_in_the_session_payload() {
     assert_eq!(page.records[0].payload["trace_id"], minted.as_str());
 }
 
-/// The trace id is minted in the insert's own statement: what it costs a
-/// new session row, measured against the same insert with the trigger gone.
-/// Run with `--nocapture` to see the numbers.
+/// The trace id is minted in the insert's own stamp: what it costs a new
+/// session row, measured against the same insert carrying its own id, which
+/// `COALESCE` passes through without evaluating the mint. Run with
+/// `--nocapture` to see the numbers.
 #[test]
 fn minting_a_trace_id_stays_far_inside_the_ingest_budget() {
     const ROWS: usize = 2_000;
-    let time = |with_trigger: bool| {
+    let time = |mint: bool| {
         let dir = tempfile::tempdir().unwrap();
         let conn = open_db(&db(&dir, "ai-history.db")).unwrap();
-        if !with_trigger {
-            conn.execute_batch(&format!("DROP TRIGGER {TRACE_ID_TRIGGER};"))
-                .unwrap();
-        }
         conn.execute_batch("BEGIN").unwrap();
         let started = Instant::now();
         for n in 0..ROWS {
-            insert_session(&conn, &format!("s-{n}"));
+            let id = format!("s-{n}");
+            conn.execute(
+                "INSERT INTO sessions (session_id, source, cwd, trace_id) \
+                 VALUES (?1, 'claude', '/p', ?2)",
+                rusqlite::params![id, (!mint).then(|| id.clone())],
+            )
+            .unwrap();
         }
         let elapsed = started.elapsed();
         conn.execute_batch("COMMIT").unwrap();

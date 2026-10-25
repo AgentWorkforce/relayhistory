@@ -28,7 +28,8 @@ resets when a database is replaced, so it is not the machine id.
 
 `machine_identity` is a single-row table written by the first writable open.
 `machine_name` is the canonical hostname (`canonical_hostname`, rule version
-1): lowercased, `.local` and the domain stripped, every run of punctuation,
+1, stored beside every name it produced so a later rule change
+recanonicalizes stored names on the next open without touching the id): lowercased, `.local` and the domain stripped, every run of punctuation,
 spaces, underscores and apostrophes turned into one `-`, hyphens trimmed, 63
 characters at most. Every hostname spelling the machine has reported is kept
 in `hostname_aliases` with its canonical form, so all of them resolve to the
@@ -65,14 +66,19 @@ so a name maps to one pseudonym.
 
 ### Trace ids
 
-`sessions.trace_id` is a UUIDv7 minted by an `AFTER INSERT` trigger when a
-session row is first written. Every catalog upsert is `ON CONFLICT DO
+`sessions.trace_id` is a UUIDv7 minted when a session row is first written,
+by the change feed's own insert-stamp `UPDATE` (`SET revision = ...,
+trace_id = COALESCE(trace_id, <uuidv7>)`). Every catalog upsert is `ON CONFLICT DO
 UPDATE` and never names the column, so it is never rewritten. An explicit
 value (an import) is kept. The expression is pure core SQL (`julianday`,
 `randomblob`, `printf`). Minting happens inside the insert's own statement
 and transaction, so it adds no fsync, no custom function, and no network.
 A trigger, not the write sites, because the catalog has dozens of insert
 sites and the change feed already relies on triggers for the same reason.
+It's the feed's insert trigger rather than one of its own, so the mint and
+the stamp are a single write. A new session takes exactly one revision, and
+the feed's update guard needs no exception: any later change to `trace_id`,
+including a repair of a NULL, takes a revision like any other column.
 
 Because it is a stored column, the change feed's `StoredRow` and the export's
 session payload carry it with no new wire field. The TS `HistoryExportBatch`
@@ -88,12 +94,11 @@ old head.
 - **A column `DEFAULT (randomblob ...)`.** SQLite refuses a non-constant
   default in `ALTER TABLE ADD COLUMN`, so existing databases would need a
   rebuild of `sessions`.
-- **Fold minting into the change feed's insert trigger.** That would couple
-  two features' DDL. The change feed's update guard instead treats a NULL to
-  value fill of `sessions.trace_id` as no change (`MINTED_ON_INSERT`), so a
-  new session still takes exactly one revision. Measured in release, minting
-  adds about 11 µs to a new session's insert (62 to 73 µs) and nothing to
-  later upserts or event writes.
+- **A standalone `AFTER INSERT` trigger that fills `trace_id`.** Its second
+  write either stamps a new session twice, or needs the update guard to
+  ignore NULL to value fills. The guard exception (an earlier revision of this
+  change) also hid a later repair of a NULL id from feed consumers, so it was
+  replaced by minting in the feed's own stamp.
 - **The canonical hostname alone as the machine id.** Readable, and it
   survives a re-image. But a rename or respelling would change the id, and
   every unrenamed `macbook-pro` would share one id, silently merging those
