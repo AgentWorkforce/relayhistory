@@ -604,3 +604,51 @@ async fn an_owner_can_delete_an_unknown_field_with_null() {
     );
     assert_eq!(after["server"]["server.keep"], 1);
 }
+
+#[test]
+fn server_helpers_keep_reasons_and_unknown_normalized_fields() {
+    let loc = location("unit");
+    let mut m = first_manifest(&loc);
+    let s = with_lifecycle(&m, Lifecycle::Idle, Some("quiet 24h".into())).unwrap();
+    let at = s.lifecycle_at.clone();
+    m.server = Some(s);
+    assert!(with_lifecycle(&m, Lifecycle::Idle, Some("quiet 24h".into())).is_none());
+    let reason_only = with_lifecycle(&m, Lifecycle::Idle, Some("quiet 30h".into())).unwrap();
+    assert_eq!(reason_only.lifecycle_reason.as_deref(), Some("quiet 30h"));
+    assert_eq!(
+        reason_only.lifecycle_at, at,
+        "lifecycle_at moves only with the lifecycle"
+    );
+
+    let mut n = with_normalized(&m, &m, 1, None);
+    n.normalized
+        .as_mut()
+        .unwrap()
+        .extra
+        .insert("future".into(), serde_json::json!("kept"));
+    m.server = Some(n);
+    let rebuilt = with_normalized(&m, &m, 2, None);
+    assert_eq!(rebuilt.normalized.unwrap().extra["future"], "kept");
+}
+
+#[test]
+fn plan_chunks_rejects_bad_digests_before_upload() {
+    let loc = location("unit");
+    let m = first_manifest(&loc);
+    for bad in [
+        NewChunk {
+            sha256: "A".repeat(64),
+            ..chunk(0, 0, 10)
+        },
+        NewChunk {
+            stored_sha256: "not hex".into(),
+            ..chunk(0, 0, 10)
+        },
+        NewChunk {
+            sha256: "é".repeat(32),
+            ..chunk(0, 0, 10)
+        },
+    ] {
+        assert!(plan_chunks(&m.raw, vec![bad]).is_err());
+    }
+}

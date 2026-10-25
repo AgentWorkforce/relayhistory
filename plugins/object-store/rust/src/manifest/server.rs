@@ -62,20 +62,24 @@ pub fn server_section(m: &Manifest) -> Server {
     })
 }
 
-/// Server section with `lifecycle` updated; `None` if it would not change
-/// (so the caller can skip the write).
+/// Server section with `lifecycle` (and its reason) updated; `None` if
+/// neither would change, so the caller can skip the write. `lifecycle_at`
+/// moves only when the lifecycle itself changes.
 pub fn with_lifecycle(
     m: &Manifest,
     lifecycle: Lifecycle,
     reason: Option<String>,
 ) -> Option<Server> {
     let mut s = server_section(m);
-    if m.server.is_some() && s.lifecycle == lifecycle {
+    let lifecycle_changed = m.server.is_none() || s.lifecycle != lifecycle;
+    if !lifecycle_changed && s.lifecycle_reason == reason {
         return None;
     }
     let now = now_rfc3339();
-    s.lifecycle = lifecycle;
-    s.lifecycle_at = now.clone();
+    if lifecycle_changed {
+        s.lifecycle = lifecycle;
+        s.lifecycle_at = now.clone();
+    }
     s.lifecycle_reason = reason;
     s.updated_at = now;
     Some(s)
@@ -92,13 +96,19 @@ pub fn with_normalized(
 ) -> Server {
     let mut s = server_section(current);
     let now = now_rfc3339();
+    // Fields a newer transform recorded survive a rebuild by this one.
+    let extra = s
+        .normalized
+        .as_ref()
+        .map(|n| n.extra.clone())
+        .unwrap_or_default();
     s.normalized = Some(Normalized {
         version,
         source_content_sha256: read.raw.content_sha256.clone(),
         source_epoch: read.raw.epoch,
         built_at: now.clone(),
         manifest_key,
-        extra: Default::default(),
+        extra,
     });
     s.updated_at = now;
     s

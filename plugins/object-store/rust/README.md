@@ -60,8 +60,8 @@ pub trait ObjectStore: Send + Sync + Debug {
 - **Validation:** `parse_manifest` / `validate` check every invariant, matching
   the TypeScript validator in relayhistory-cloud.
 - **Writes:** `update_manifest` reads with `get_object`, applies one writer's
-  `Edit`, and writes with compare-and-swap. It retries up to 8 times with
-  jittered backoff. An edit can only replace its own writer's sections, so the
+  `Edit`, and writes with compare-and-swap. It makes up to 8 attempts in total,
+  with jittered backoff between them. An edit can only replace its own writer's sections, so the
   other side's fields are carried through untouched.
 - **Client helpers (`manifest::client`):** `new_manifest`, `plan_chunks` /
   `apply_chunks`, `open_epoch`, and `classify` for stale-writer detection.

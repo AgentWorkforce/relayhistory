@@ -133,9 +133,13 @@ pub fn plan_chunks(raw: &Raw, chunks: Vec<NewChunk>) -> Result<Vec<ChunkEntry>> 
                 c.start_offset
             )));
         }
-        if c.bytes == 0 || c.stored_bytes == 0 || c.sha256.len() != 64 {
+        if c.bytes == 0
+            || c.stored_bytes == 0
+            || !is_hex64(&c.sha256)
+            || !is_hex64(&c.stored_sha256)
+        {
             return Err(Error::InvalidArgument(format!(
-                "chunk {i} is empty or has a bad digest"
+                "chunk {i} is empty or a digest is not 64 lowercase hex characters"
             )));
         }
         next_offset = next_offset.checked_add(c.bytes).ok_or_else(|| {
@@ -211,6 +215,14 @@ pub fn set_state(raw: &mut Raw, state: RawState) {
         raw.state = state;
         raw.updated_at = now_rfc3339();
     }
+}
+
+/// Validated before any upload, so a bad digest never leaves an orphan chunk
+/// behind a manifest write that would be rejected; also makes `[..8]` safe.
+fn is_hex64(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
 fn recompute(raw: &mut Raw) {
