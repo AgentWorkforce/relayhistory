@@ -5,10 +5,11 @@
 //! other harnesses keep the name on a row or file their reader already has
 //! open, and only need it cleaned.
 
-use super::{upsert_session_inner, ActivityWindow, SessionCatalogRow};
+use super::{upsert_session_inner, ActivityWindow, ClaudeSessionMeta, SessionCatalogRow};
 use anyhow::Result;
 use rusqlite::{params, Connection};
 use serde_json::Value;
+use std::path::Path;
 
 /// Sets a catalog row's `title`, returning whether it changed.
 ///
@@ -96,6 +97,37 @@ pub(crate) fn grok_title(summary: Option<&Value>) -> Option<String> {
     ["generated_title", "session_summary", "title"]
         .iter()
         .find_map(|key| non_blank_title(summary.get(key).and_then(Value::as_str)))
+}
+
+/// Record what the whole-transcript fold found as the session's first prompt.
+///
+/// The shallow catalog upsert coalesces a null `first_prompt` into whatever
+/// the row already holds, because a shallow or remote read may simply not
+/// have seen the prompt. The metadata fold has seen every record, so its
+/// answer replaces the row's -- including with null. Without that, a session
+/// whose stored title was a row the classifier now types as control (a bare
+/// `/resume <id>`, a task notification) would keep it for good on an upgraded
+/// install, while a fresh database stores nothing.
+pub(crate) fn set_claude_first_prompt(
+    conn: &Connection,
+    meta: &ClaudeSessionMeta,
+    path: &Path,
+) -> Result<()> {
+    // Every sibling transcript is folded. The prompt and title stay with the
+    // file the catalog row names; `upsert_session` has already kept or claimed
+    // that file, so this compares the path and does not stat again.
+    let recorded = path.to_string_lossy();
+    if !crate::catalog_owner::recorded_path_is(conn, "claude", &meta.session_id, recorded.as_ref())?
+    {
+        return Ok(());
+    }
+    conn.execute(
+        "UPDATE sessions SET first_prompt = ?1 WHERE source = 'claude' AND session_id = ?2",
+        params![meta.first_prompt, meta.session_id],
+    )?;
+    set_session_title(conn, "claude", &meta.session_id, meta.title.as_deref())?;
+    set_session_agent_name(conn, "claude", &meta.session_id, meta.agent_name.as_deref())?;
+    Ok(())
 }
 
 #[cfg(test)]

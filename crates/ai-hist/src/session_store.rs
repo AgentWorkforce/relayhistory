@@ -1160,31 +1160,7 @@ fn delegated_child_session(
                     crate::relationships::RELATIONSHIP_DELEGATED
                 ],
                 |row| {
-                    let session = CatalogSession {
-                        source,
-                        session_id: session_id.to_string(),
-                        cwd: row.get(2)?,
-                        git_branch: row.get(3)?,
-                        first_activity_ms: row.get(0)?,
-                        last_activity_ms: row.get(1)?,
-                        first_prompt: None,
-                        last_assistant_text: None,
-                        title: None,
-                        session_kind: None,
-                        agent_name: None,
-                        models: Vec::new(),
-                        originator: None,
-                        agent_version: row.get(4)?,
-                        repo_url: None,
-                        initial_commit: None,
-                        workspace_roots: Vec::new(),
-                        project_key: row.get(5)?,
-                        project_key_method: row.get(6)?,
-                        raw_path: row.get::<_, Option<String>>(8)?.map(PathBuf::from),
-                        source_stamp: None,
-                        discovery_state: DiscoveryState::Delegated,
-                        locations: Vec::new(),
-                    };
+                    let session = CatalogSession::delegated(source, session_id, row)?;
                     Ok((session, row.get::<_, Option<String>>(7)?))
                 },
             ))
