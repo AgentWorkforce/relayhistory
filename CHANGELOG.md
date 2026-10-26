@@ -15,9 +15,6 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Rust API
 
 - Added `ShallowSession::agent_name` and `CatalogSession::agent_name`.
-- Added `SessionStore::retention_generation` and `retention::read_retention_generation` so retained catalogs can invalidate after committed local eviction without uploading deletion records.
-- Added `SessionStore::session_profile`, `SessionProfile`, and `SessionAvatar` for locally observed Grok Bot names, avatar shapes, colors, and inline raster images without transcript hydration or network access.
-- Added local `retention` policy read/write APIs and `SessionStore` maintenance and upload-acknowledgement methods; maintenance must be scheduled by the host.
 
 ## [0.52.0] - 2026-10-26
 
