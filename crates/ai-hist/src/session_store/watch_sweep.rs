@@ -157,6 +157,22 @@ pub(super) struct WatchSweep {
     pub(super) kind: WatchTick,
 }
 
+/// How the watch loop reads a sweep's result.
+///
+/// One conversion rather than one per caller: a tick that never took the lock
+/// looked at nothing, and a caller that folded that into `skipped_unchanged`
+/// would be telling the loop the change had been considered and dismissed.
+impl From<crate::ingest::SyncTick> for crate::watch::TickOutcome {
+    fn from(tick: crate::ingest::SyncTick) -> Self {
+        Self {
+            swept: tick.swept,
+            skipped_unchanged: tick.skipped_unchanged(),
+            contended: !tick.attempted,
+            changed_nothing: false,
+        }
+    }
+}
+
 /// What one tick hands the next.
 #[derive(Default)]
 pub(super) struct Carry {
@@ -200,7 +216,8 @@ impl WatchSweep {
             })
         });
         match result {
-            Ok((outcome, changed)) => {
+            Ok((mut outcome, changed)) => {
+                outcome.changed_nothing = !outcome.contended && changed.is_empty();
                 self.notes
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)

@@ -756,12 +756,18 @@ fn e2e(config: &Config) -> Value {
     let mut to_tick = Vec::new();
     let mut query = Vec::new();
     let mut misses = 0u64;
+    // Why a slow sample was slow: the ticks that reported before the one
+    // that named the new session. A session the first tick after the write
+    // misses waits out the debounce window for the trailing tick.
+    let mut late = 0u64;
+    let mut late_examples = Vec::new();
     for _ in 0..config.samples {
         let (id, path, body) = bench.next_session(now_ms());
         let started = Instant::now();
         write_file(&path, &body);
         let deadline = started + Duration::from_secs(10);
         let mut seen = None;
+        let mut before = Vec::new();
         while let Some(report) =
             handle.next_timeout(deadline.saturating_duration_since(Instant::now()))
         {
@@ -769,6 +775,25 @@ fn e2e(config: &Config) -> Value {
             if names(&report.changed, &id) {
                 seen = Some(Instant::now());
                 break;
+            }
+            before.push(json!({
+                "atMs": started.elapsed().as_secs_f64() * 1000.0,
+                "trigger": format!("{:?}", report.trigger),
+                "swept": report.swept,
+                "contended": report.contended,
+                "elapsedMs": report.elapsed_ms,
+                "firstEventAgeMs": report.first_event_age_ms,
+                "changed": report.changed.len(),
+                "sources": report.sources.as_ref().map(|s| s.len()),
+            }));
+        }
+        if !before.is_empty() {
+            late += 1;
+            if late_examples.len() < 8 {
+                late_examples.push(json!({
+                    "visibleMs": seen.map(|at| at.duration_since(started).as_secs_f64() * 1000.0),
+                    "ticksBefore": before,
+                }));
             }
         }
         let Some(ticked) = seen else {
@@ -806,9 +831,11 @@ fn e2e(config: &Config) -> Value {
         },
         "watchDefaults": {
             "debounceMs": ai_hist_watch_default_debounce(),
-            "leadingEdgeSettleMs": 10,
+            "leadingEdgeSettleMs": ai_hist::watch::LEADING_EDGE_SETTLE_MS,
         },
         "misses": misses,
+        "lateSamples": late,
+        "lateExamples": late_examples,
         "metrics": {
             "e2e_visible": summary(&total),
             "e2e_write_to_tick": summary(&to_tick),
