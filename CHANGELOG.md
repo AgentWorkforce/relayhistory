@@ -48,6 +48,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - VT Code history is discoverable and searchable from canonical workspace journals under explicitly configured workspace roots, preserving recorded turns, tool identities, usage and control events.
 - Junie CLI history is discoverable and searchable from native session journals, including recorded prompts, assistant text, tool output and event markers.
 - The optional object-storage plugin (`plugins/object-store`) validates session `manifest.json` v1 and lets the desktop and server update it concurrently with compare-and-swap, without losing either side's changes.
+- Object-storage session manifests can carry repository evidence (`session.repo`: canonical remote and root commit, never credentials), so sessions keep one repository identity across renames, transfers and remote URL changes.
 
 ### Fixed
 

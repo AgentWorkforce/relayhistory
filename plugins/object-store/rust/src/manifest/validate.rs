@@ -20,6 +20,32 @@ impl std::fmt::Display for Issue {
     }
 }
 
+/// `host/path` as `canonicalize_remote_url` produces it: a lowercase host
+/// (a bracketed IPv6 literal, or a name starting with an alphanumeric or `_`,
+/// such as `intranet` or an ssh alias `_corp`) with no port, then a non-empty
+/// path. The path is kept as the canonicalizer leaves it, so it may end in
+/// `.git` (a repo named `api.git`). No scheme, no `@` anywhere (so no
+/// userinfo), no `:`, `?` or `#` in the path (a query string can carry a
+/// token), no whitespace or control characters, no trailing `/`.
+pub(crate) fn canonical_remote_shape(url: &str) -> bool {
+    let Some((host, path)) = url.split_once('/') else {
+        return false;
+    };
+    let host_ok = if host.starts_with('[') {
+        host.len() > 2 && host.ends_with(']') && !host[1..host.len() - 1].contains(['[', ']'])
+    } else {
+        host.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
+            && host == host.to_lowercase()
+            && !host.contains([':', '@'])
+    };
+    host_ok
+        && !path.is_empty()
+        && !url.contains('@')
+        && !path.contains([':', '?', '#'])
+        && !url.chars().any(|c| c.is_whitespace() || c.is_control())
+        && !path.ends_with('/')
+}
+
 /// Hash chain over the ordered chunk list (spec section `content_sha256`).
 pub fn content_sha256<'a>(chunks: impl IntoIterator<Item = &'a ChunkEntry>) -> String {
     let mut h = [0u8; 32];
@@ -164,6 +190,26 @@ impl Checker {
         }
         if let Some(h) = &s.cwd_sha256 {
             self.hex64("session.cwd_sha256", h);
+        }
+        if let Some(repo) = &s.repo {
+            if let Some(url) = &repo.remote_url {
+                if !canonical_remote_shape(url) {
+                    self.issue(
+                        "session.repo.remote_url",
+                        "must be a canonical `host/path` remote: no scheme, credentials, port or whitespace",
+                    );
+                }
+            }
+            if let Some(root) = &repo.root_commit {
+                let ok = (root.len() == 40 || root.len() == 64)
+                    && root.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'));
+                if !ok {
+                    self.issue(
+                        "session.repo.root_commit",
+                        "must be a lowercase 40- or 64-char hex commit id",
+                    );
+                }
+            }
         }
         if m.raw.owner.is_empty() {
             self.issue("raw.owner", "must not be empty");
