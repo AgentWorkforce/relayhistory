@@ -156,6 +156,39 @@ fn a_claude_agent_name_is_catalogued_apart_from_the_title() {
     );
 }
 
+/// A rename that touches only `agent_name` is still a catalog change, even when
+/// discovery stamped the transcript first and the title and activity are stable.
+#[test]
+fn an_agent_only_rename_is_reported_as_changed() {
+    let home = tempfile::tempdir().unwrap();
+    let transcript = claude_transcript_with_agent_name(home.path());
+    let store = store(home.path());
+    store.sync(Default::default()).unwrap();
+    append(
+        &transcript,
+        &format!(
+            r#"{{"type":"agent-name","agentName":"renamed-worker","sessionId":"{CLAUDE_ID}"}}"#
+        ),
+    );
+    store.discover(DiscoveryOptions::default()).unwrap();
+    let report = store.sync(Default::default()).unwrap();
+    assert_eq!(
+        agent_name(&store, CLAUDE_ID).as_deref(),
+        Some("renamed-worker")
+    );
+    assert_eq!(
+        title(&store, Source::Claude, CLAUDE_ID, true).as_deref(),
+        Some("Changelog videos")
+    );
+    assert!(
+        report
+            .changed
+            .contains(&SessionRef::id(Source::Claude, CLAUDE_ID)),
+        "an agent-only rename is a catalog change: {:?}",
+        report.changed
+    );
+}
+
 #[test]
 fn discovery_alone_catalogs_a_claude_agent_name() {
     let home = tempfile::tempdir().unwrap();
