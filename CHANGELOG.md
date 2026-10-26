@@ -9,7 +9,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - The object-storage plugin can scrub PII and secrets, including PGP private keys, card numbers and phone numbers, from raw session chunks before upload (`scrub::scrub_chunk`, uploaded only through `scrub::seal::put_raw_chunk`), using the same rules as the hosted service.
-- Claude sessions catalog their `agent-name` (the name Agent Relay and other sessions address them by) as `agent_name`, apart from the title, and session change records carry it so destinations can look sessions up by agent name. The session catalog contract is now 7.
+- Claude sessions catalog their `agent-name` (the name Agent Relay and other sessions address them by) as `agent_name`, apart from the title, and session change records carry it so destinations can look sessions up by agent name. The session catalog contract is now 7. Sessions already catalogued are not re-scanned to fill it: a session gets its agent name when it is first catalogued or when its transcript next changes.
 
 ### Rust API
 

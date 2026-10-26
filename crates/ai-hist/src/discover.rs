@@ -97,7 +97,7 @@ pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 7;
 /// invalidates every stored stamp, so a scanner that learns to extract a new
 /// field re-reads sources whose bytes never changed. `parser_version` keeps its
 /// existing meaning (full-ingest parser generation) and is untouched.
-pub const SHALLOW_SCANNER_VERSION: u32 = 18;
+pub const SHALLOW_SCANNER_VERSION: u32 = 17;
 
 // Version 17 reads Grok Bot names from account rosters. Cached transcripts
 // whose bytes are unchanged must still be revisited after upgrading.
@@ -197,12 +197,6 @@ const _: () = assert!(SHALLOW_SCANNER_VERSION > 13);
 /// history (`codex::pages_history`), so a fork of any other build whose own
 /// first turn nothing orders is catalogued under its own first prompt again.
 const _: () = assert!(SHALLOW_SCANNER_VERSION > 14);
-
-/// Version 18 reads a Claude session's `agent-name` into its own column
-/// (`agent_name`), apart from the title it already fed. A finished transcript
-/// never changes on disk, so only this bump sends each cached Claude row
-/// through the reader that fills it.
-const _: () = assert!(SHALLOW_SCANNER_VERSION > 17);
 
 /// Most bytes a shallow head read may consume from one transcript.
 pub const HEAD_SCAN_MAX_BYTES: u64 = 256 * 1024;
