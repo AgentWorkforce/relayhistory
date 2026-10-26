@@ -53,9 +53,9 @@ fn first_manifest(loc: &SessionLocation) -> Manifest {
 async fn sealed_chunks_produce_a_valid_scrubbed_manifest() {
     // Two source chunks, each ending on a record boundary; scrubbing changes
     // both their length and their bytes.
-    let parts: [&[u8]; 2] = [
-        b"{\"m\":\"key sk-abcdefghijklmnopqrstuvwxyz0123\"}\n",
-        b"{\"m\":\"mail alice.smith@example.org\"}\n{\"n\":1}\n",
+    let parts: [(&[u8], u64); 2] = [
+        (b"{\"m\":\"key sk-abcdefghijklmnopqrstuvwxyz0123\"}\n", 1),
+        (b"{\"m\":\"mail alice.smith@example.org\"}\n{\"n\":1}\n", 2),
     ];
     let dir = tempfile::tempdir().unwrap();
     let store = FsStore::new(FsConfig::new(dir.path())).unwrap();
@@ -65,7 +65,7 @@ async fn sealed_chunks_produce_a_valid_scrubbed_manifest() {
     // The marker goes on before the first chunk it covers.
     record_sealed_scrub(&mut m.raw).unwrap();
     let mut offset = 0;
-    for part in parts {
+    for (part, records) in parts {
         let sealed = SealedChunk::seal(&scrub_chunk(part)).unwrap();
         let planned = plan_chunks(&m.raw, vec![sealed.new_chunk(offset)]).unwrap();
         let entry = &planned[0];
@@ -97,6 +97,12 @@ async fn sealed_chunks_produce_a_valid_scrubbed_manifest() {
         }
         let raw = decompress_zstd(&body).unwrap();
         assert_eq!(sha256_hex(&raw), sealed.raw_sha256());
+        // Lengths and counts, not only digests: a swapped source/stored length
+        // would still pass validation, which only checks they are positive.
+        assert_eq!(entry.stored_bytes, body.len() as u64);
+        assert_eq!(entry.stored_raw_bytes, Some(raw.len() as u64));
+        assert_ne!(entry.stored_raw_bytes, Some(entry.bytes));
+        assert_eq!(entry.records, Some(records));
         let text = String::from_utf8(raw).unwrap();
         assert!(
             !text.contains("sk-abc") && !text.contains("alice.smith"),
