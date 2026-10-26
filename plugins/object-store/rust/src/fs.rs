@@ -276,6 +276,7 @@ impl Backend for FsBackend {
     ) -> BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
         let listing = self.store.list(Some(prefix));
         let offset = offset.cloned();
+        let root = self.root.clone();
         futures::stream::once(async move {
             let mut all: Vec<_> = listing
                 .try_filter(|m| {
@@ -285,6 +286,19 @@ impl Backend for FsBackend {
                 })
                 .try_collect()
                 .await?;
+            // `LocalFileSystem::list` follows symbolic links below the prefix;
+            // drop every entry whose path traverses one, so a listing never
+            // exposes names or metadata from outside the root.
+            all = tokio::task::spawn_blocking(move || {
+                all.retain(|m| {
+                    let segments: Vec<String> =
+                        m.location.parts().map(|p| p.as_ref().to_string()).collect();
+                    no_symlink_under(&root, &segments, m.location.as_ref()).is_ok()
+                });
+                all
+            })
+            .await
+            .map_err(|e| generic(e.into()))?;
             all.sort_by(|a, b| a.location.cmp(&b.location));
             Ok::<_, object_store::Error>(futures::stream::iter(all.into_iter().map(Ok)))
         })
@@ -561,6 +575,33 @@ mod tests {
             .unwrap_or_default();
         assert!(staged.is_empty(), "staged parts left behind: {staged:?}");
         assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn listing_skips_entries_below_a_symlink() {
+        let (dir, store) = store();
+        store
+            .put(
+                &ObjectKey::new("s/inside").unwrap(),
+                Bytes::from_static(b"in"),
+                PutOpts::default(),
+            )
+            .await
+            .unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), b"host").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("s").join("escape")).unwrap();
+        let page = store
+            .list(&ObjectKey::new("s").unwrap(), None)
+            .await
+            .unwrap();
+        let keys: Vec<&str> = page.items.iter().map(|m| m.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["s/inside"],
+            "nothing reachable through the link is listed"
+        );
     }
 
     #[tokio::test]

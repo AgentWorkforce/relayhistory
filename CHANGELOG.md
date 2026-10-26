@@ -19,10 +19,14 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Junie CLI history is discoverable and searchable from native session journals, including recorded prompts, assistant text, tool output and event markers.
 - The optional object-storage plugin (`plugins/object-store`) validates session `manifest.json` v1 and lets the desktop and server update it concurrently with compare-and-swap, without losing either side's changes.
 
+### Changed
+
+- The object-storage plugin rejects metadata values that start or end with a space (`Error::InvalidArgument`), because HTTP stores strip them.
+
 ### Fixed
 
-- The object-storage plugin's filesystem store refuses keys that traverse a symbolic link under its root, and presigned URLs require a lifetime of at least one second.
-- The object-storage plugin rejects metadata values that start or end with a space (`Error::InvalidArgument`), since HTTP stores strip them and the filesystem store would otherwise keep a different value.
+- The object-storage plugin's filesystem store refuses keys that traverse a symbolic link under its root and never lists entries reached through one.
+- Object-storage presigned URLs require a lifetime of at least one second.
 
 - Reconciliation advances healthy roots past persistent enumeration errors while retaining failed locations for retry.
 - Exact-path capture avoids materializing unused cached transcript metadata and locations.
