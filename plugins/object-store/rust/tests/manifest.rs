@@ -410,6 +410,10 @@ fn validator_rejects_corruption() {
         ),
         (
             "session.repo.remote_url",
+            Box::new(|m| m.session.repo = Some(repo("../src/app", None))),
+        ),
+        (
+            "session.repo.remote_url",
             Box::new(|m| m.session.repo = Some(repo("github.com/acme/\u{7}api", None))),
         ),
         (

@@ -31,7 +31,9 @@ pub(crate) fn canonical_remote_shape(url: &str) -> bool {
     let host_ok = if host.starts_with('[') {
         host.len() > 2 && host.ends_with(']') && !host[1..host.len() - 1].contains(['[', ']'])
     } else {
-        !host.is_empty() && host == host.to_lowercase() && !host.contains([':', '@'])
+        host.starts_with(|c: char| c.is_ascii_alphanumeric())
+            && host == host.to_lowercase()
+            && !host.contains([':', '@'])
     };
     host_ok
         && !path.is_empty()
