@@ -157,3 +157,20 @@ fn relationship_batches_reopen_survivors_before_deleting_both_edge_directions() 
     assert_eq!(count(&conn, "session_continuity_evidence"), 7);
     assert_eq!(count(&conn, "sessions"), 1);
 }
+
+#[test]
+fn anonymous_cursor_seek_skips_large_equal_timestamp_prefixes() {
+    let (_dir, _store, conn) = fixture();
+    conn.execute_batch("WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i+1 FROM n WHERE i<30000) INSERT INTO history(source,prompt,timestamp_ms) SELECT 'codex','prompt-'||i,1 FROM n;").unwrap();
+    let mut stmt = conn.prepare(anonymous::AFTER_CURSOR).unwrap();
+    let rows = stmt
+        .query_map(params![NOW, 32, 1, 29900], |_| Ok(()))
+        .unwrap()
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .unwrap();
+    assert_eq!(rows.len(), 32);
+    assert!(
+        stmt.get_status(StatementStatus::VmStep) < 1000,
+        "cursor seek scanned the consumed prefix"
+    );
+}

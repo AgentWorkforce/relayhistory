@@ -189,7 +189,7 @@ fn apply_batch(
     if let Some(key) = &plan.scanned_through {
         targets::advance(conn, key).map_err(Error::query)?;
     } else {
-        let (removed, inspected) = anonymous_prompts(
+        let (removed, inspected) = super::anonymous::prune(
             conn,
             cutoff,
             if opts.allow_unuploaded {
@@ -295,8 +295,8 @@ fn warm_connection(conn: &Connection) -> anyhow::Result<()> {
         drop(conn.prepare_cached(&delete_sql(table, column))?);
     }
     super::relationships::warm(conn)?;
-    drop(conn.prepare_cached(ANONYMOUS_CANDIDATES)?);
-    drop(conn.prepare_cached(DELETE_ANONYMOUS)?);
+    super::anonymous::warm(conn)?;
+    super::replay::warm(conn)?;
     drop(conn.prepare_cached(SUPPRESS_TOMBSTONES)?);
     for table in ["sessions", "session_presences", "retention_pending"] {
         drop(conn.prepare_cached(&format!(
@@ -339,6 +339,9 @@ fn delete_grok_state(
     for table in ["grok_unified_usage", "grok_session_turns"] {
         let limit = (*remaining).min(32);
         let removed = conn.prepare_cached(&format!("DELETE FROM {table} WHERE rowid IN (SELECT rowid FROM {table} WHERE session_id=?1 LIMIT ?2)"))?.execute(params![key.1,limit])? as u64;
+        if table == "grok_unified_usage" && removed > 0 {
+            super::replay::mark(conn, &key.1)?;
+        }
         report.rows += removed;
         *remaining -= removed;
         if removed == limit {
@@ -348,8 +351,8 @@ fn delete_grok_state(
     Ok(true)
 }
 
-pub(super) const ANONYMOUS_CANDIDATES: &str = "SELECT id,revision FROM history INDEXED BY idx_retention_anonymous_activity WHERE session_id IS NULL AND timestamp_ms<?1 ORDER BY timestamp_ms,id LIMIT ?2";
-const DELETE_ANONYMOUS: &str = "DELETE FROM history WHERE id=?1 AND revision<=?2";
+#[cfg(test)]
+pub(super) use super::anonymous::CANDIDATES as ANONYMOUS_CANDIDATES;
 pub(super) const SUPPRESS_TOMBSTONES: &str = "DELETE FROM evidence_tombstones INDEXED BY idx_evidence_tombstones_kind_revision WHERE kind=?1 AND revision>?2";
 
 pub(super) fn suppress_tombstones(conn: &Connection, after: i64) -> anyhow::Result<()> {
@@ -360,25 +363,4 @@ pub(super) fn suppress_tombstones(conn: &Connection, after: i64) -> anyhow::Resu
         stmt.execute(params![kind.as_str(), after])?;
     }
     Ok(())
-}
-fn anonymous_prompts(
-    conn: &Connection,
-    cutoff: i64,
-    floor: i64,
-    limit: u32,
-) -> anyhow::Result<(u64, u64)> {
-    let rows = conn
-        .prepare_cached(ANONYMOUS_CANDIDATES)?
-        .query_map(params![cutoff, limit], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let mut removed = 0;
-    let mut stmt = conn.prepare_cached(DELETE_ANONYMOUS)?;
-    for (id, revision) in &rows {
-        if *revision <= floor {
-            removed += stmt.execute(params![id, floor])? as u64;
-        }
-    }
-    Ok((removed, rows.len() as u64))
 }

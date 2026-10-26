@@ -61,3 +61,25 @@ fn blocked_anonymous_prompts_do_not_starve_newly_acknowledged_sessions() {
     assert_eq!(count(&conn, "history"), 32);
     assert_eq!(count(&conn, "evidence_tombstones"), 0);
 }
+
+#[test]
+fn blocked_anonymous_prefix_does_not_starve_later_acknowledged_prompts() {
+    let (_dir, store, conn) = fixture();
+    conn.execute("INSERT INTO history(source,prompt,timestamp_ms) VALUES('codex','acknowledged later timestamp',?1)", [NOW-40*DAY]).unwrap();
+    acknowledge(&store, "cloud");
+    blocked_prompts(&conn);
+    assert!(
+        run(&store, &RetentionOptions::default(), NOW)
+            .unwrap()
+            .awaiting_upload_ack
+    );
+    let reopened = SessionStore::open(StoreOptions::default().db_path(store.db_path())).unwrap();
+    assert_eq!(
+        run(&reopened, &RetentionOptions::default(), NOW)
+            .unwrap()
+            .rows,
+        1
+    );
+    assert_eq!(count(&conn, "history"), 32);
+    assert_eq!(count(&conn, "evidence_tombstones"), 0);
+}

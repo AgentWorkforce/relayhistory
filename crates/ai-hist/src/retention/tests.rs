@@ -439,3 +439,4 @@ fn default_cooldown_prevents_back_to_back_writer_batches() {
 
 mod plans;
 mod progress;
+mod replay;

@@ -3,6 +3,8 @@
 //! per-inference usage events.
 
 use super::*;
+mod read;
+use read::read_unified;
 
 /// Where Grok writes its process-wide per-inference log, under the Grok home
 /// (`GROK_HOME`, else `~/.grok`).
@@ -34,10 +36,11 @@ pub(crate) struct GrokUnifiedPass {
     /// Catalogued sessions that gained usage events.
     pub sessions_materialized: usize,
     /// Stored rows, from any pass, whose session is not in the catalog. They
-    /// are kept — the log is never re-read, so dropping them would lose the
-    /// usage for good if the session is indexed later — and counted so the
-    /// retained backlog is visible.
+    /// are kept because ordinary incremental passes do not replay old bytes;
+    /// the original journal can rotate before the session is indexed. The
+    /// retained backlog is counted explicitly.
     pub orphan_rows: usize,
+    cursor_committed: bool,
 }
 
 /// Read what `logs/unified.jsonl` gained since the last pass, in one
@@ -67,8 +70,8 @@ pub(crate) fn sync_grok_unified_log(
 /// It is read once from the start, because that pass stepped over Grok Build
 /// inference rows, and the row digest keeps a row that was already stored
 /// from being inserted again. Each usage row is copied into
-/// `grok_unified_usage` — the durable copy, because the bytes are never read
-/// again — keyed on [`grok::unified_row_key`], so a region read twice after a
+/// `grok_unified_usage` as the durable staging copy for ordinary incremental
+/// passes, keyed on [`grok::unified_row_key`], so a region read twice after a
 /// rotation writes the same rows. A trailing line with no newline is withheld
 /// until it has one. A terminated row that is not JSON is counted and passed
 /// over: the log is Grok's process log, not a session's evidence, and holding
@@ -77,95 +80,67 @@ pub(crate) fn sync_grok_unified_log_in(
     conn: &Connection,
     grok_home: &Path,
 ) -> Result<GrokUnifiedPass> {
-    let mut pass = GrokUnifiedPass::default();
-    let path = grok_unified_log_path(grok_home);
-    if !grok_unified_log_exists(&path)? {
-        return Ok(pass);
-    }
-    let locator = path.to_string_lossy().to_string();
-    let key = transcript_cursor::CursorKey::Locator {
-        source: "grok",
-        locator: &locator,
-    };
-    let mut cursor = transcript_cursor::load_cursor(conn, &key)?;
-    let saved = saved_unified_cursor(&cursor);
-    let mut reader = transcript_cursor::TranscriptReader::open(&path, saved, None)
-        .with_context(|| format!("read Grok unified log {}", path.display()))?;
-    let start = reader.start_offset();
-    // Which model each process last named. Only meaningful for the bytes
-    // after the cursor, so a log read from the start begins with none.
-    let mut pid_models: HashMap<i64, String> = if start == 0 {
-        HashMap::new()
-    } else {
-        cursor
-            .extra
-            .get(GROK_UNIFIED_CURSOR_KEY)
-            .and_then(|state| state.get("pid_models"))
-            .and_then(|models| serde_json::from_value(models.clone()).ok())
-            .unwrap_or_default()
-    };
-    let mut touched: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut line = String::new();
-    loop {
-        check_capture_cancelled()?;
-        let offset = reader.position();
-        match reader.next_line(&mut line)? {
-            None | Some(transcript_cursor::ReadRecord::Unterminated) => break,
-            Some(transcript_cursor::ReadRecord::Oversized { .. }) => {
-                pass.malformed += 1;
-                continue;
-            }
-            Some(transcript_cursor::ReadRecord::Terminated) => {}
-        }
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
-            pass.malformed += 1;
-            continue;
-        };
-        match grok::parse_unified_row(&value, &pid_models) {
-            grok::GrokUnifiedRow::Usage(usage) => {
-                pass.usage_rows += 1;
-                pass.new_rows += insert_grok_unified_usage(conn, &value, &usage, &locator, offset)?;
-                touched.insert(usage.session_id);
-            }
-            grok::GrokUnifiedRow::ModelChange { pid, model } => {
-                pid_models.insert(pid, model);
-            }
-            grok::GrokUnifiedRow::Unattributed => pass.unattributed += 1,
-            grok::GrokUnifiedRow::Other => {}
-        }
-    }
-    pass.bytes_read = reader.position().saturating_sub(start);
-    match reader.commit(reader.position())? {
-        transcript_cursor::CommitOutcome::Published(file) => {
-            cursor.file = Some(file);
-            cursor.extra.insert(
-                GROK_UNIFIED_CURSOR_KEY.to_string(),
-                json!({ "pid_models": pid_models, "row_shape": GROK_UNIFIED_ROW_SHAPE }),
-            );
-            transcript_cursor::store_cursor(conn, &key, &cursor)?;
-        }
-        // The log was replaced or truncated while it was being read. The rows
-        // already copied are keyed on their content, so keeping them is
-        // harmless; the cursor stays where it was and the next pass re-reads.
-        transcript_cursor::CommitOutcome::Superseded => {}
-    }
-    for session_id in touched {
-        if materialize_unified_usage_into(conn, &session_id)? {
-            pass.sessions_materialized += 1;
-        }
-    }
-    let orphans: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM grok_unified_usage u WHERE NOT EXISTS \
-         (SELECT 1 FROM sessions s WHERE s.source = 'grok' AND s.session_id = u.session_id)",
-        [],
-        |row| row.get(0),
-    )?;
-    pass.orphan_rows = orphans as usize;
+    read_unified(conn, grok_home, None)
+}
+
+/// Explicitly restore only the evicted session, preserving the shared append cursor.
+pub(super) fn replay_for_hydration(
+    conn: &Connection,
+    grok_home: &Path,
+    session: &str,
+) -> Result<GrokUnifiedPass> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)?;
+    let pass = replay_in(&tx, grok_home, session)?;
+    tx.commit()?;
     Ok(pass)
+}
+
+fn replay_in(conn: &Connection, grok_home: &Path, session: &str) -> Result<GrokUnifiedPass> {
+    let pass = read_unified(conn, grok_home, Some(session))?;
+    if pass.cursor_committed {
+        crate::retention::clear_grok_usage_replay(conn, session)?;
+    }
+    Ok(pass)
+}
+
+/// Restore usage before the reconciliation guard snapshots this session.
+pub(super) fn begin_session(
+    conn: &Connection,
+    session: &str,
+    raw_path: &str,
+) -> Result<super::evidence_reconcile::Guard> {
+    replay_for_transcript(conn, session, raw_path)?;
+    super::evidence_reconcile::begin_grok(conn, session)
+}
+
+/// A changed/resumed Grok transcript must also recover its evicted usage.
+/// The caller owns the session's existing acquisition transaction.
+fn replay_for_transcript(conn: &Connection, session: &str, raw_path: &str) -> Result<()> {
+    if !crate::retention::grok_usage_replay_needed(conn, session)? {
+        return Ok(());
+    }
+    let Some(home) = Path::new(raw_path)
+        .ancestors()
+        .find(|p| p.file_name().is_some_and(|n| n == "sessions"))
+        .and_then(Path::parent)
+    else {
+        return Ok(());
+    };
+    replay_in(conn, home, session)?;
+    Ok(())
+}
+
+fn materialize_touched(
+    conn: &Connection,
+    touched: std::collections::BTreeSet<String>,
+) -> Result<usize> {
+    let mut count = 0;
+    for session in touched {
+        if materialize_unified_usage_into(conn, &session)? {
+            count += 1;
+        }
+    }
+    Ok(count)
 }
 
 /// The file cursor to resume from. A document that does not name the current
@@ -618,6 +593,19 @@ pub(super) fn grok_turn_coverage(
         &unified_timestamps,
         grok_turn_census(conn, session_id)?,
     ))
+}
+
+/// The request span of a Grok assistant row: the `updates.jsonl` turn it
+/// belongs to.
+///
+/// Grok names none of its API calls, and the only usage it reports is one
+/// `turn_completed.usage` per turn, so the turn is the finest unit a request
+/// can be measured at. Without a shared span each assistant row of a turn —
+/// its thinking, every tool call, its prose — grouped as a request of its
+/// own, and a turn that called a tool read as several requests, all but one
+/// unmeasured.
+pub(super) fn grok_turn_span(turn: Option<usize>) -> Option<String> {
+    turn.map(|turn| turn.to_string())
 }
 
 #[cfg(test)]

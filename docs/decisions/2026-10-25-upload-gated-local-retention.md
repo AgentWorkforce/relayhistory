@@ -22,7 +22,9 @@ Rust SDK. The SQLite value is authoritative across clients.
 The host schedules `prune_expired` on its maintenance worker. Each call plans
 at most 32 identities on a separate read-only connection, rechecks one expired session under an
 immediate transaction, and removes bounded chunks. Persist pending activity and
-the scan cursor so large sessions resume across batches/restarts. Default
+the scan cursor so large sessions resume across batches/restarts. Anonymous
+prompts use a separate persisted timestamp/id walk so unuploaded prefixes cannot
+starve later acknowledged rows. Default
 batches have a 100 ms cooldown; compile trigger-heavy statements before taking
 the writer locks. Short busy retries precede the existing long-contention grace
 window so capture can recover from brief overlap without a 10 ms retry floor.
@@ -36,7 +38,10 @@ accepted batches, memberships and explicit exclusions.
 
 Remove only the pruning transaction's own feed tombstones before committing,
 as existing local evidence eviction does. Preserve earlier ordinary tombstones.
-Provider originals, user-created tags/commit links and cloud copies remain.
+Provider originals, user-created tags/commit links and cloud copies remain. Grok
+usage staging eviction leaves a small replay obligation: targeted hydration or
+native reacquisition can reread that session from the original unified journal
+without rewinding its shared cursor or restoring other expired sessions.
 Unknown-age or active sessions remain. By default, logs are protected until all
 registered destinations acknowledge them. A caller can relinquish protection by
 explicitly enabling `allow_unuploaded`, or by explicitly retiring an

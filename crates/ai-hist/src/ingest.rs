@@ -14481,19 +14481,6 @@ pub(crate) struct GrokIngestOutcome {
     pub unified_coverage: GrokUnifiedCoverage,
 }
 
-/// The request span of a Grok assistant row: the `updates.jsonl` turn it
-/// belongs to.
-///
-/// Grok names none of its API calls, and the only usage it reports is one
-/// `turn_completed.usage` per turn, so the turn is the finest unit a request
-/// can be measured at. Without a shared span each assistant row of a turn —
-/// its thinking, every tool call, its prose — grouped as a request of its
-/// own, and a turn that called a tool read as several requests, all but one
-/// unmeasured.
-fn grok_turn_span(turn: Option<usize>) -> Option<String> {
-    turn.map(|turn| turn.to_string())
-}
-
 /// Index one Grok session directory: prompts, events, tools, edits, markers
 /// and subagent delegations.
 fn ingest_grok_session(
@@ -14505,7 +14492,7 @@ fn ingest_grok_session(
     let sid = session.session_id.as_str();
     let project = session.cwd.as_deref();
     let branch = session.git_branch.as_deref();
-    let mut reconcile = evidence_reconcile::begin_grok(conn, sid)?;
+    let mut reconcile = grok_unified::begin_session(conn, sid, raw_path)?;
     let mut outcome = GrokIngestOutcome {
         missing_updates: !session.updates_present,
         updates_yielded_no_timing: session.updates_present && session.updates.is_empty(),
@@ -14733,7 +14720,7 @@ fn ingest_grok_session(
                         text: Some(summary),
                         event_uid: &uid,
                         raw_facts: RawMessageFacts {
-                            request_span: grok_turn_span(turn).as_deref(),
+                            request_span: grok_unified::grok_turn_span(turn).as_deref(),
                             ..RawMessageFacts::default()
                         },
                         ..EventRow::default()
@@ -14778,7 +14765,7 @@ fn ingest_grok_session(
                             model: model.as_deref(),
                             event_uid: &uid,
                             raw_facts: RawMessageFacts {
-                                request_span: grok_turn_span(turn).as_deref(),
+                                request_span: grok_unified::grok_turn_span(turn).as_deref(),
                                 ..RawMessageFacts::default()
                             },
                             ..EventRow::default()
@@ -14827,7 +14814,7 @@ fn ingest_grok_session(
                             model: model.as_deref(),
                             event_uid: &uid,
                             raw_facts: RawMessageFacts {
-                                request_span: grok_turn_span(call_turn).as_deref(),
+                                request_span: grok_unified::grok_turn_span(call_turn).as_deref(),
                                 ..RawMessageFacts::default()
                             },
                             ..EventRow::default()

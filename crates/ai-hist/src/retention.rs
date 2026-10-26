@@ -3,8 +3,10 @@
 //! Settings do not prune synchronously. A host runs [`SessionStore::prune_expired`]
 //! on its maintenance worker, publishes durable upload acknowledgements, and
 //! yields between batches. Local eviction never retracts remote copies.
+mod anonymous;
 mod maintenance;
 mod relationships;
+mod replay;
 mod schema;
 mod targets;
 #[cfg(test)]
@@ -108,6 +110,7 @@ impl SessionStore {
             params![RETENTION_CONFIG_KEY, value.days.map_or(0, NonZeroU32::get).to_string()]).map_err(Error::sql)?;
         tx.execute("DELETE FROM retention_sweep", [])
             .map_err(Error::sql)?;
+        anonymous::reset(&tx).map_err(Error::query)?;
         tx.commit().map_err(Error::sql)
     }
     /// Register every required upload destination *before* capture/delivery.
@@ -166,6 +169,12 @@ impl SessionStore {
     }
 }
 
+pub(crate) fn grok_usage_replay_needed(conn: &Connection, session: &str) -> anyhow::Result<bool> {
+    replay::needed(conn, session)
+}
+pub(crate) fn clear_grok_usage_replay(conn: &Connection, session: &str) -> anyhow::Result<()> {
+    replay::clear(conn, session)
+}
 pub(crate) fn init_indexes(conn: &Connection) -> anyhow::Result<()> {
     schema::init_indexes(conn)
 }

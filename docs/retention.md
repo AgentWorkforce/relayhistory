@@ -93,8 +93,12 @@ removed, and a persistent sweep cursor resumes across process restarts. A
 changed policy or new activity is checked again before further deletion.
 Anonymous prompt-log rows use their own timestamps and acknowledged revisions.
 If anonymous cleanup awaits upload, the session sweep resets so other sessions
-can still expire as they age or their acknowledgements advance. Full acknowledged
-anonymous batches continue draining without restarting the session scan.
+can still expire as they age or their acknowledgements advance. A separate
+persisted `(timestamp_ms, id)` cursor advances past every inspected anonymous
+batch, including unuploaded rows, so a blocked prefix cannot starve later
+acknowledged prompts. It wraps at the end of the range and resets on policy
+changes. Full acknowledged anonymous batches continue draining without
+restarting the session scan.
 
 Batches have a persisted 100 ms cooldown by default. `deferred` means the host
 should schedule its next invocation after that delay. This prevents a tight
@@ -127,6 +131,13 @@ tags/commit links and transcript byte cursors survive. Provider originals are
 untouched; an explicit hydration or a later provider rewrite can capture them
 again, and subsequent maintenance reapplies the policy. Retention is local
 cache eviction, not secure erasure or deletion of provider/cloud history.
+Native byte positions are retained during eviction; ordinary unchanged sync is
+not a restore command. Explicit discovery/hydration can recover provider originals.
+Evicting Grok's usage staging rows records a small replay obligation. On targeted
+Grok hydration or native reacquisition, the original unified journal can be read
+from its start for that session alone, without rewinding the shared byte cursor
+or restoring unrelated expired sessions. An unavailable journal leaves the replay
+obligation pending. This explicit recovery can read a large provider log.
 
 The schema adds `store_settings`, `retention_consumers`, `retention_sweep` and
 `retention_pending`. Ten covering `(source, session identity, revision)` indexes
