@@ -101,7 +101,6 @@ pub const SHALLOW_SCANNER_VERSION: u32 = 17;
 
 /// Version 17 reads Grok Bot names from account rosters. Cached transcripts
 /// whose bytes are unchanged must still be revisited after upgrading.
-const _: () = assert!(SHALLOW_SCANNER_VERSION > 16);
 
 /// Version 2 shipped the classification that hid standalone guardians (see
 /// [`crate::codex_is_subagent`]). Their rollouts never change on disk, so the

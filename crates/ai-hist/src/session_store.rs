@@ -78,6 +78,7 @@ mod reconciliation;
 mod sync;
 pub use reconciliation::{Reconciliation, ReconciliationStep};
 mod catalog_row;
+use catalog_row::catalog_session;
 mod profile;
 pub use profile::{SessionAvatar, SessionProfile};
 mod options;
@@ -966,41 +967,6 @@ impl SessionStore {
         }
         evidence.loaded = selected;
         Ok(Some(evidence))
-    }
-}
-
-/// The catalog row `r` names, or the delegated child its id names, or
-/// `None` when the store has neither.
-fn catalog_session(
-    conn: &Connection,
-    r: &SessionRef,
-    include_text: bool,
-) -> Result<Option<CatalogSession>, Error> {
-    let source = r.source();
-    let name = source.as_str();
-    let row = match r {
-        SessionRef::Id { session_id, .. } => {
-            discover::catalog_row(conn, name, session_id, include_text)
-        }
-        SessionRef::Path { path, .. } => {
-            // A path names one session only where the provider keeps one
-            // session per file. OpenCode's rows all carry the provider
-            // database as their locator, so a lookup by it would answer
-            // with whichever session sorts first — well-formed and wrong.
-            path_names_one_session(source)?;
-            discover::catalog_row_by_path(conn, name, &path.to_string_lossy(), include_text)
-        }
-    }
-    .map_err(Error::query)?;
-    match (row, r) {
-        (Some(row), _) => CatalogSession::from_row(row).map(Some),
-        // A delegated child — a Claude subagent sidecar, a Codex child
-        // thread — is kept out of the catalog because it is part of its
-        // parent's work, but its evidence is stored under its own id.
-        (None, SessionRef::Id { session_id, .. }) => {
-            delegated_child_session(conn, source, session_id)
-        }
-        (None, SessionRef::Path { .. }) => Ok(None),
     }
 }
 
