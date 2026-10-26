@@ -351,6 +351,19 @@ mod tests {
     }
 
     #[test]
+    fn card_numbers_held_as_json_integers_are_redacted() {
+        // 4111111111111111110 is a Luhn-valid 19-digit Visa number above 2^53,
+        // which the reference cannot check; its neighbour fails Luhn.
+        let line = br#"{"pan":4111111111111111110,"near":4111111111111111111,"short":4111111111111111,"neg":-4111111111111111,"f":4111111111111111.0}"#;
+        let out: Value = serde_json::from_slice(&scrub_record(line).unwrap()).unwrap();
+        assert_eq!(out["pan"], "[REDACTED]");
+        assert_eq!(out["short"], "[REDACTED]");
+        assert_eq!(out["near"].to_string(), "4111111111111111111");
+        assert_eq!(out["neg"].to_string(), "-4111111111111111");
+        assert_eq!(out["f"].to_string(), "4111111111111111.0");
+    }
+
+    #[test]
     fn numbers_and_key_order_survive_reserialization() {
         let line = br#"{"z":1,"a":12345678901234567890123,"f":1.50}"#;
         assert_eq!(scrub_record(line).unwrap(), line.to_vec());
