@@ -4,6 +4,7 @@
 //! on its maintenance worker, publishes durable upload acknowledgements, and
 //! yields between batches. Local eviction never retracts remote copies.
 mod anonymous;
+mod generation;
 mod maintenance;
 mod relationships;
 mod replay;
@@ -48,6 +49,12 @@ impl RetentionPolicy {
 pub fn read_retention_policy(path: &Path) -> Result<RetentionPolicy, Error> {
     let conn = crate::store::open_db_readonly(path).map_err(Error::query)?;
     policy(&conn).map_err(Error::query)
+}
+/// Read the committed local eviction generation without migrating the store.
+/// Older stores without the settings table or generation key return zero.
+pub fn read_retention_generation(path: &Path) -> Result<u64, Error> {
+    let conn = crate::store::open_db_readonly(path).map_err(Error::query)?;
+    generation::read(&conn).map_err(Error::query)
 }
 /// Persist the setting, migrating this local store if needed. Run off the UI
 /// thread. This does not start maintenance or delete anything.
@@ -97,6 +104,15 @@ pub struct RetentionReport {
 }
 
 impl SessionStore {
+    /// Durable local retention invalidation token, independent of feed revisions.
+    /// Advances once per committed batch that evicts payload/auxiliary or
+    /// catalog/presence rows. No-op and upload-blocked batches leave it unchanged.
+    /// Compare alongside the store epoch and normal feed position; this token
+    /// does not track ordinary writes or identify a replacement store.
+    pub fn retention_generation(&self) -> Result<u64, Error> {
+        let conn = self.read_conn()?;
+        generation::read(&conn).map_err(Error::query)
+    }
     pub fn retention_policy(&self) -> Result<RetentionPolicy, Error> {
         let conn = self.read_conn()?;
         policy(&conn).map_err(Error::query)

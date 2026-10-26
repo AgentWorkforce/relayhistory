@@ -437,6 +437,7 @@ fn default_cooldown_prevents_back_to_back_writer_batches() {
     assert_eq!(maintenance::run(&store, &opts, now + 1000).unwrap().rows, 1);
 }
 
+mod generation;
 mod plans;
 mod progress;
 mod replay;
