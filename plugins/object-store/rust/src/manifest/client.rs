@@ -117,7 +117,8 @@ pub struct NewChunk {
     pub sha256: String,
     pub stored_sha256: String,
     /// Uncompressed length and SHA-256 of the scrubbed records that were
-    /// stored (see `crate::scrub::scrub_chunk`). Required once the manifest
+    /// stored. The scrubber, `scrub::scrub_chunk` behind the `scrub`
+    /// feature, arrives with relayhistory#550. Required once the manifest
     /// carries `raw.scrub`.
     pub stored_raw_bytes: Option<u64>,
     pub raw_sha256: Option<String>,

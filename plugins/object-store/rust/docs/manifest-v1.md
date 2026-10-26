@@ -334,7 +334,9 @@ Raw chunks are scrubbed of PII and secrets **on the client, before they reach
 object storage**. This was decided by Khaliq on 2026-10-25.
 
 - **Where it runs.** The client's delivery worker runs
-  `relayhistory_object_store::scrub::scrub_chunk` when it seals a chunk. Each
+  `relayhistory_object_store::scrub::scrub_chunk` when it seals a chunk. That
+  function sits behind the crate's `scrub` feature and lands with
+  relayhistory#550; until then this section describes the contract. Each
   record is parsed, every string value and key is scrubbed with the same rules
   as the server's `scrubText`, and the record is re-serialized. The result is
   then compressed and uploaded. The unscrubbed source never leaves the machine.
