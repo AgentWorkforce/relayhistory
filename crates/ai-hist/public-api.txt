@@ -660,6 +660,10 @@ pub ai_hist::RelationshipCapabilities::records_evidence_locator: bool
 pub ai_hist::RelationshipCapabilities::records_spawn_time: bool
 pub ai_hist::RelationshipCapabilities::source: alloc::string::String
 pub ai_hist::RelationshipCapabilities::stable_child_identity: alloc::string::String
+#[non_exhaustive] pub struct ai_hist::SessionAvatar
+pub ai_hist::SessionAvatar::color: core::option::Option<alloc::string::String>
+pub ai_hist::SessionAvatar::image_data_url: core::option::Option<alloc::string::String>
+pub ai_hist::SessionAvatar::shape: core::option::Option<alloc::string::String>
 pub struct ai_hist::SessionEvent
 pub ai_hist::SessionEvent::agent_id: core::option::Option<alloc::string::String>
 pub ai_hist::SessionEvent::agent_version: core::option::Option<alloc::string::String>
@@ -768,6 +772,9 @@ pub ai_hist::SessionObservation::last_assistant_text: core::option::Option<alloc
 pub ai_hist::SessionObservation::raw_locator: core::option::Option<alloc::string::String>
 pub ai_hist::SessionObservation::source_stamp: core::option::Option<alloc::string::String>
 pub ai_hist::SessionObservation::updated_ms: i64
+#[non_exhaustive] pub struct ai_hist::SessionProfile
+pub ai_hist::SessionProfile::avatar: core::option::Option<ai_hist::SessionAvatar>
+pub ai_hist::SessionProfile::name: core::option::Option<alloc::string::String>
 #[non_exhaustive] pub struct ai_hist::SessionQuery
 pub ai_hist::SessionQuery::include_text: bool
 pub ai_hist::SessionQuery::kinds: core::option::Option<alloc::vec::Vec<ai_hist::EvidenceKind>>
@@ -853,6 +860,8 @@ impl ai_hist::SessionStore
 pub fn ai_hist::SessionStore::reconcile(&self) -> core::result::Result<ai_hist::Reconciliation, ai_hist::Error>
 impl ai_hist::SessionStore
 pub fn ai_hist::SessionStore::resumes_from(&self, ai_hist::Watermark, &ai_hist::ChangeQuery) -> core::result::Result<bool, ai_hist::Error>
+impl ai_hist::SessionStore
+pub fn ai_hist::SessionStore::session_profile(&self, &ai_hist::SessionRef) -> core::result::Result<core::option::Option<ai_hist::SessionProfile>, ai_hist::Error>
 impl ai_hist::SessionStore
 pub fn ai_hist::SessionStore::sync(&self, ai_hist::SyncOptions) -> core::result::Result<ai_hist::SyncReport, ai_hist::Error>
 pub struct ai_hist::SessionToolCall

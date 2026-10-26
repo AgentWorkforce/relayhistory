@@ -5,7 +5,7 @@
 //! — stays behind the `unstable-internal` feature. Cargo semver is the
 //! contract; there is no separate Rust contract-version constant.
 //!
-//! Twelve operations, one entry type:
+//! Operations on one entry type:
 //!
 //! | Method | What it does |
 //! |---|---|
@@ -16,6 +16,7 @@
 //! | [`SessionStore::watch`] | the live-capture loop, sync or discover, as an iterator of ticks |
 //! | [`SessionStore::sessions`] | the catalog, keyset-paged internally |
 //! | [`SessionStore::session`] | everything the store holds about one session, typed |
+//! | [`SessionStore::session_profile`] | optional local profile metadata without transcript hydration |
 //! | [`SessionStore::changes_since`] | the revision-stamped change feed, with named consumer cursors |
 //! | [`SessionStore::head_revision`] | the feed head, for a consumer checking its stored watermark |
 //! | [`SessionStore::forget_evidence`] | drop sessions' evidence, keeping their catalog rows |
@@ -77,6 +78,9 @@ mod reconciliation;
 mod sync;
 pub use reconciliation::{Reconciliation, ReconciliationStep};
 mod catalog_row;
+use catalog_row::catalog_session;
+mod profile;
+pub use profile::{SessionAvatar, SessionProfile};
 mod options;
 use options::resolve_db_path;
 mod path_scope;
@@ -963,41 +967,6 @@ impl SessionStore {
         }
         evidence.loaded = selected;
         Ok(Some(evidence))
-    }
-}
-
-/// The catalog row `r` names, or the delegated child its id names, or
-/// `None` when the store has neither.
-fn catalog_session(
-    conn: &Connection,
-    r: &SessionRef,
-    include_text: bool,
-) -> Result<Option<CatalogSession>, Error> {
-    let source = r.source();
-    let name = source.as_str();
-    let row = match r {
-        SessionRef::Id { session_id, .. } => {
-            discover::catalog_row(conn, name, session_id, include_text)
-        }
-        SessionRef::Path { path, .. } => {
-            // A path names one session only where the provider keeps one
-            // session per file. OpenCode's rows all carry the provider
-            // database as their locator, so a lookup by it would answer
-            // with whichever session sorts first — well-formed and wrong.
-            path_names_one_session(source)?;
-            discover::catalog_row_by_path(conn, name, &path.to_string_lossy(), include_text)
-        }
-    }
-    .map_err(Error::query)?;
-    match (row, r) {
-        (Some(row), _) => CatalogSession::from_row(row).map(Some),
-        // A delegated child — a Claude subagent sidecar, a Codex child
-        // thread — is kept out of the catalog because it is part of its
-        // parent's work, but its evidence is stored under its own id.
-        (None, SessionRef::Id { session_id, .. }) => {
-            delegated_child_session(conn, source, session_id)
-        }
-        (None, SessionRef::Path { .. }) => Ok(None),
     }
 }
 

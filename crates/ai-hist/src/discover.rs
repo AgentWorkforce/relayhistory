@@ -97,7 +97,10 @@ pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 6;
 /// invalidates every stored stamp, so a scanner that learns to extract a new
 /// field re-reads sources whose bytes never changed. `parser_version` keeps its
 /// existing meaning (full-ingest parser generation) and is untouched.
-pub const SHALLOW_SCANNER_VERSION: u32 = 15;
+pub const SHALLOW_SCANNER_VERSION: u32 = 17;
+
+// Version 17 reads Grok Bot names from account rosters. Cached transcripts
+// whose bytes are unchanged must still be revisited after upgrading.
 
 /// Version 2 shipped the classification that hid standalone guardians (see
 /// [`crate::codex_is_subagent`]). Their rollouts never change on disk, so the
@@ -254,8 +257,8 @@ pub struct ShallowSession {
     pub last_assistant_text: Option<String>,
     /// The name the harness gave the session, last observed. Observed. Per
     /// provider: claude — the latest `custom-title` record (set by the user or
-    /// by the Claude app), else `ai-title`, else `agent-name`; every other
-    /// provider — none yet. A shallow read sees only the head and tail of a
+    /// by the Claude app), else `ai-title`, else `agent-name`; Grok Bot — the
+    /// companion account roster's name, else title. A shallow read sees only the head and tail of a
     /// transcript, so a rename recorded in neither waits for the full ingest.
     pub title: Option<String>,
     /// Provider-native session kind, when recorded. Grok writes `subagent`
@@ -3831,7 +3834,7 @@ static UPSERT_SESSION_SQL: LazyLock<String> = LazyLock::new(|| {
           agent_version, repo_url, initial_commit, workspace_roots_json, source_stamp, \
           project_key, project_key_method, title, session_kind, \
           discovery_state) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?18, ?19, ?20, ?21, 'shallow') \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?18, ?19, CASE WHEN ?2 = 'grok-bot' THEN NULLIF(?20, '') ELSE ?20 END, ?21, 'shallow') \
          ON CONFLICT(session_id, source) DO UPDATE SET \
          {project_key_merge}, \
          cwd = COALESCE(excluded.cwd, sessions.cwd), \
@@ -3854,6 +3857,7 @@ static UPSERT_SESSION_SQL: LazyLock<String> = LazyLock::new(|| {
              ELSE COALESCE(excluded.raw_path, sessions.raw_path) END, \
          first_prompt = COALESCE(excluded.first_prompt, sessions.first_prompt), \
          title = CASE \
+             WHEN excluded.source = 'grok-bot' AND ?17 = 'local' AND ?20 IS NOT NULL THEN NULLIF(?20, '') \
              WHEN sessions.discovery_state IS NULL OR sessions.discovery_state = 'full' \
              THEN COALESCE(sessions.title, excluded.title) \
              ELSE COALESCE(excluded.title, sessions.title) END, \
