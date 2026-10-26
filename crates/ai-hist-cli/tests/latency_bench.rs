@@ -22,7 +22,7 @@
 //! | `e2e` | the whole path through the public API: write a new transcript, `SessionStore::watch` (production defaults) reports it in `TickReport::changed`, the list query returns it first. Each sample is spaced past the debounce window so it is a leading-edge tick, the case a newly started session hits |
 //! | `list_scale` | the list query alone at `days` of history, first page and a deep page |
 //! | `ingest_upload` | ingest throughput and per-session latency, first alone, then while an uploader drains the change feed and commits its cursor on its own `SessionStore` (its own connections) |
-//! | `prune` | list-query latency on a reader thread, first alone, then while `forget_evidence` drops every session older than `retain_days`; plus how long a new session's hook ingest waits while the prune runs |
+//! | `prune` | list-query latency on a reader thread, first alone, then while retention maintenance (`SessionStore::prune_expired`, its default batch and cooldown, uploads acknowledged) evicts sessions older than `retain_days` for `prune_window_ms`; plus how long a new session's hook ingest waits meanwhile |
 //!
 //! # What is measured, and how
 //!
@@ -40,10 +40,11 @@
 //! It is `#[ignore]`d for the same reason `sync_bench.rs` is: its headline
 //! numbers are wall clocks.
 
+use ai_hist::retention::{RetentionOptions, RetentionPolicy};
 use ai_hist::{
-    CatalogQuery, ChangeQuery, ForgetOptions, ForgetScope, HydrateOptions, HydrateStatus,
-    ProviderRoots, SessionRef, SessionScope, SessionStore, Source, StoreOptions, SyncOptions,
-    WatchDriver, WatchOptions, Watermark,
+    CatalogQuery, ChangeQuery, HydrateOptions, HydrateStatus, ProviderRoots, SessionRef,
+    SessionScope, SessionStore, Source, StoreOptions, SyncOptions, WatchDriver, WatchOptions,
+    Watermark,
 };
 use notify::{RecursiveMode, Watcher};
 use serde_json::{json, Value};
@@ -86,6 +87,7 @@ struct Config {
     sweep_samples: u64,
     fs_samples: u64,
     retain_days: u64,
+    prune_window_ms: u64,
 }
 
 impl Config {
@@ -100,6 +102,7 @@ impl Config {
             sweep_samples: env_u64("AI_HIST_LATENCY_SWEEP_SAMPLES", 20),
             fs_samples: env_u64("AI_HIST_LATENCY_FS_SAMPLES", 1000),
             retain_days: env_u64("AI_HIST_LATENCY_RETAIN_DAYS", 30),
+            prune_window_ms: env_u64("AI_HIST_LATENCY_PRUNE_WINDOW_MS", 10_000),
         }
     }
 }
@@ -1001,17 +1004,21 @@ fn ingest_upload(config: &Config) -> Value {
 fn prune(config: &Config) -> Value {
     let bench = Bench::new(config.turns);
     let (store, store_info) = bench.populate(config.days, config.sessions_per_day);
-    let cutoff = now_ms() - config.retain_days as i64 * DAY_MS;
-
-    let mut keep_query = CatalogQuery::default();
-    keep_query.scope = SessionScope::All;
-    keep_query.page_size = 1000;
-    let keep: Vec<SessionRef> = store
-        .sessions(keep_query)
-        .map(|row| row.expect("catalog row"))
-        .filter(|row| row.last_activity_ms.unwrap_or(0) >= cutoff)
-        .map(|row| SessionRef::id(row.source, row.session_id))
-        .collect();
+    // The retention a desktop would configure, and an uploader that has
+    // durably delivered everything so far: without an acknowledgement
+    // retention evicts nothing, by design.
+    store
+        .set_retention_policy(RetentionPolicy::from_days(config.retain_days as u32))
+        .expect("retention policy");
+    store
+        .register_retention_consumer("latency-bench-uploader")
+        .expect("register consumer");
+    store
+        .acknowledge_retention(
+            "latency-bench-uploader",
+            store.head_revision().expect("head"),
+        )
+        .expect("acknowledge");
 
     // One reader, its own store handle, sampling the first-paint list query
     // back to back until told to stop.
@@ -1065,13 +1072,45 @@ fn prune(config: &Config) -> Value {
         }
         out
     });
-    let (report, prune_elapsed) = time(|| {
-        store
-            .forget_evidence(
-                ForgetScope::AllExcept(keep.clone()),
-                ForgetOptions::default().lock_timeout_ms(60_000),
-            )
-            .expect("forget_evidence")
+    // Maintenance as a host runs it: one bounded batch per call, yielding
+    // between calls, honouring the cooldown and retrying when the store is
+    // busy -- for a fixed window, or until the cycle completes. A year's
+    // expiry at the default batch size and cooldown takes minutes; the
+    // window measures what capture and reads see while it runs.
+    let window = Duration::from_millis(config.prune_window_ms);
+    let mut maintenance = json!({ "batches": 0, "rows": 0, "sessions": 0, "busy": 0,
+        "deferred": 0, "awaitingUploadAck": 0, "cycleComplete": false });
+    let (_, prune_elapsed) = time(|| {
+        let started = Instant::now();
+        let options = RetentionOptions::default();
+        while started.elapsed() < window {
+            let batch = store.prune_expired(options.clone()).expect("prune_expired");
+            let count = |key: &str, by: u64, m: &mut Value| {
+                m[key] = json!(m[key].as_u64().unwrap_or(0) + by);
+            };
+            count("batches", 1, &mut maintenance);
+            count("rows", batch.rows, &mut maintenance);
+            count("sessions", batch.sessions, &mut maintenance);
+            count("busy", u64::from(batch.busy), &mut maintenance);
+            count("deferred", u64::from(batch.deferred), &mut maintenance);
+            count(
+                "awaitingUploadAck",
+                u64::from(batch.awaiting_upload_ack),
+                &mut maintenance,
+            );
+            if batch.cycle_complete {
+                maintenance["cycleComplete"] = json!(true);
+                break;
+            }
+            // The cooldown is the store's own pacing; a host schedules the
+            // next call rather than spinning.
+            let pause = if batch.busy {
+                10
+            } else {
+                u64::from(options.min_interval_ms)
+            };
+            std::thread::sleep(Duration::from_millis(pause));
+        }
     });
     stop.store(true, Ordering::Relaxed);
     ingest_stop.store(true, Ordering::Relaxed);
@@ -1081,9 +1120,7 @@ fn prune(config: &Config) -> Value {
     json!({
         "store": store_info,
         "retainDays": config.retain_days,
-        "kept": keep.len(),
-        "forgotten": report.sessions,
-        "eventsForgotten": report.events,
+        "maintenance": maintenance,
         "pruneMs": prune_elapsed.as_millis() as u64,
         "metrics": {
             "read_quiet": summary(&quiet),

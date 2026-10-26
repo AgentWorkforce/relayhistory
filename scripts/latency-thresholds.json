@@ -254,7 +254,8 @@
           "days": 365
         }
       ],
-      "fsSamples": 1000
+      "fsSamples": 1000,
+      "pruneWindowMs": 10000
     },
     "full": {
       "description": "The published matrix: the gate's runs with more samples and rounds.",
@@ -293,7 +294,8 @@
           "days": 365
         }
       ],
-      "fsSamples": 3000
+      "fsSamples": 3000,
+      "pruneWindowMs": 30000
     },
     "smoke": {
       "description": "Seconds-long check that the driver, the base worktree and every phase run; its numbers mean nothing.",
@@ -325,7 +327,8 @@
           "phase": "prune",
           "days": 3
         }
-      ]
+      ],
+      "pruneWindowMs": 2000
     }
   },
   "baselines": {
