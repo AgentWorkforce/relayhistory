@@ -307,7 +307,7 @@ jobs:
         run: cargo fmt --manifest-path "$MANIFEST" -- --check
       - name: Lint (every feature combination)
         run: |
-          for features in s3 gcs azure conformance "s3,gcs,azure,conformance"; do
+          for features in s3 gcs azure conformance scrub "s3,gcs,azure,conformance,scrub"; do
             cargo clippy --manifest-path "$MANIFEST" --locked --all-targets --no-default-features --features "$features" -- -D warnings
           done
           cargo clippy --manifest-path "$MANIFEST" --locked --all-targets --no-default-features -- -D warnings
