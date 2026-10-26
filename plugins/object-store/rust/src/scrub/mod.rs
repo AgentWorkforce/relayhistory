@@ -23,6 +23,7 @@
 
 mod numbers;
 mod rules;
+pub mod seal;
 
 use std::borrow::Cow;
 
@@ -245,15 +246,38 @@ fn is_card_json_number(n: &serde_json::Number) -> bool {
     text.bytes().all(|b| b.is_ascii_digit()) && numbers::is_card_number(&text)
 }
 
-/// Result of scrubbing one chunk.
+/// Result of scrubbing one chunk. Opaque: only [`scrub_chunk`] builds one,
+/// so holding a `ScrubbedChunk` proves its bytes went through the rules.
+/// [`seal::SealedChunk::seal`] turns it into what [`seal::put_raw_chunk`],
+/// the only sanctioned upload path for raw chunks, accepts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScrubbedChunk {
+    bytes: Vec<u8>,
+    records: u64,
+    dropped_unparseable: u64,
+    dropped_key_collision: u64,
+}
+
+impl ScrubbedChunk {
     /// Scrubbed, newline-delimited records (what gets compressed and stored).
-    pub bytes: Vec<u8>,
-    pub records: u64,
-    /// Records replaced by a placeholder, by reason.
-    pub dropped_unparseable: u64,
-    pub dropped_key_collision: u64,
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Non-blank records, including any replaced by a placeholder.
+    pub fn records(&self) -> u64 {
+        self.records
+    }
+
+    /// Records replaced by a placeholder because they could not be parsed.
+    pub fn dropped_unparseable(&self) -> u64 {
+        self.dropped_unparseable
+    }
+
+    /// Records replaced by a placeholder because keys collided after scrubbing.
+    pub fn dropped_key_collision(&self) -> u64 {
+        self.dropped_key_collision
+    }
 }
 
 /// Scrub a newline-delimited chunk record by record. Record boundaries and
