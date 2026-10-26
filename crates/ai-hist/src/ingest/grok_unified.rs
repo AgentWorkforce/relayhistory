@@ -126,7 +126,15 @@ fn replay_for_transcript(conn: &Connection, session: &str, raw_path: &str) -> Re
     else {
         return Ok(());
     };
-    replay_in(conn, home, session)?;
+    match replay_in(conn, home, session) {
+        Ok(_) => {}
+        Err(error)
+            if !error.is::<crate::ingest::CaptureCancelled>() && error.is::<std::io::Error>() =>
+        {
+            eprintln!("warning: Grok usage replay remains pending for {session}: {error:#}");
+        }
+        Err(error) => return Err(error),
+    }
     Ok(())
 }
 
@@ -606,6 +614,45 @@ pub(super) fn grok_turn_coverage(
 /// unmeasured.
 pub(super) fn grok_turn_span(turn: Option<usize>) -> Option<String> {
     turn.map(|turn| turn.to_string())
+}
+
+/// Whether a Grok session whose stamp says unchanged is still indexed.
+///
+/// The stamp says the file has not changed. That is only half the question:
+/// `.sync-state.json` lives beside the database, so a deleted or rebuilt
+/// `history.db` keeps this file, and a stamp read on its own would answer
+/// "already indexed" for a session whose rows are gone -- until some file in
+/// the directory changes, which for a finished session is never. The Codex and
+/// Claude walks check the database for the same reason.
+///
+/// The other half of that is knowing what "its rows" means for *this* session.
+/// Not every Grok session produces `session_events` -- one made only of
+/// `system` lines, synthetic turns or encrypted reasoning is stored entirely as
+/// markers, and one with an empty transcript and a `subagents/` entry only a
+/// relationship -- so asking only about events would find nothing and re-read
+/// such a session on every run, forever. The answer is not to guess from the
+/// tables but to record what the indexing run actually produced, and then to
+/// ask about that. Unchanged, and what it did write is missing: re-index it.
+pub(super) fn recorded_still_indexed(conn: &Connection, recorded: Option<&Value>) -> Result<bool> {
+    match (
+        recorded.and_then(grok_state_session),
+        recorded.and_then(grok_state_had_evidence),
+    ) {
+        // Written by an older build that saved the stamp alone, so there is no
+        // session id to look the evidence up by. Trust the stamp, as that
+        // build did.
+        (None, _) => Ok(true),
+        (Some(id), _) if crate::retention::grok_usage_replay_needed(conn, id)? => Ok(false),
+        // The run that indexed it wrote no evidence rows at all. It still
+        // wrote a catalog row -- every ingestion does -- so that is what there
+        // is to check, and it is enough: a session with no evidence *is* its
+        // catalog row. Skipping without asking anything is what let an empty
+        // session disappear for good when the database was rebuilt.
+        (Some(id), Some(false)) => grok_catalog_row_exists(conn, id),
+        (Some(id), Some(true) | None) => {
+            grok_indexed_evidence_remains(conn, id, recorded.and_then(grok_state_transcript_events))
+        }
+    }
 }
 
 #[cfg(test)]

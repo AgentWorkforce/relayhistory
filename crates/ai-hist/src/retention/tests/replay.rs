@@ -95,11 +95,27 @@ fn grok_hydration_recovers_evicted_usage_without_rewinding_other_sessions() {
     store
         .discover(crate::DiscoveryOptions::default().sources([Source::Grok]))
         .unwrap();
-    let unavailable = log.with_extension("saved");
-    std::fs::rename(&log, &unavailable).unwrap();
-    store.hydrate(&target, HydrateOptions::default()).unwrap();
+    // A non-directory parent produces a portable journal I/O error, including
+    // when tests run as root and chmod-based unreadability would not work.
+    let log_dir = log.parent().unwrap();
+    let unavailable = log_dir.with_file_name("logs-saved");
+    std::fs::rename(log_dir, &unavailable).unwrap();
+    std::fs::write(log_dir, "blocked journal path").unwrap();
+    let fallback = store.hydrate(&target, HydrateOptions::default()).unwrap();
+    assert!(fallback
+        .diagnostics
+        .iter()
+        .any(|d| d.code == "GROK_UNIFIED_LOG_UNREADABLE"));
     assert_eq!(usages(&conn, "grok-uni-0001"), 0);
-    std::fs::rename(&unavailable, &log).unwrap();
+    std::fs::remove_file(log_dir).unwrap();
+    std::fs::rename(&unavailable, log_dir).unwrap();
+    conn.execute_batch("CREATE TRIGGER reject_usage_replay BEFORE INSERT ON grok_unified_usage BEGIN SELECT RAISE(ABORT,'test database integrity refusal'); END;").unwrap();
+    assert!(
+        store.hydrate(&target, HydrateOptions::default()).is_err(),
+        "database failures must not be downgraded to journal warnings"
+    );
+    conn.execute_batch("DROP TRIGGER reject_usage_replay;")
+        .unwrap();
     store.hydrate(&target, HydrateOptions::default()).unwrap();
     assert_eq!(usages(&conn, "grok-uni-0001"), before);
     assert_eq!(
@@ -115,6 +131,19 @@ fn grok_hydration_recovers_evicted_usage_without_rewinding_other_sessions() {
     store.hydrate(&target, HydrateOptions::default()).unwrap();
     assert_eq!(usages(&conn, "grok-uni-0001"), before);
     expire(&store);
+    std::fs::rename(log_dir, &unavailable).unwrap();
+    std::fs::write(log_dir, "blocked journal path").unwrap();
+    store
+        .sync(
+            crate::SyncOptions::default()
+                .sources([Source::Grok])
+                .paths([sessions.join("grok-uni-0001/chat_history.jsonl")])
+                .force(true),
+        )
+        .unwrap();
+    assert_eq!(usages(&conn, "grok-uni-0001"), 0);
+    std::fs::remove_file(log_dir).unwrap();
+    std::fs::rename(&unavailable, log_dir).unwrap();
     store
         .sync(
             crate::SyncOptions::default()

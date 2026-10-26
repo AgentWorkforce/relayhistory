@@ -32,7 +32,11 @@ pub(super) fn read_grok_unified_log_for_hydration(
     };
     match pass {
         Ok(_) => Ok(Vec::new()),
-        Err(error) if error.is::<crate::ingest::CaptureCancelled>() => Err(error),
+        Err(error)
+            if error.is::<crate::ingest::CaptureCancelled>() || !error.is::<std::io::Error>() =>
+        {
+            Err(error)
+        }
         Err(error) => Ok(vec![HydrationDiagnostic {
             code: "GROK_UNIFIED_LOG_UNREADABLE".to_string(),
             message: format!(

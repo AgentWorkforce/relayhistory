@@ -137,7 +137,10 @@ Evicting Grok's usage staging rows records a small replay obligation. On targete
 Grok hydration or native reacquisition, the original unified journal can be read
 from its start for that session alone, without rewinding the shared byte cursor
 or restoring unrelated expired sessions. An unavailable journal leaves the replay
-obligation pending. This explicit recovery can read a large provider log.
+obligation pending without blocking its readable transcript. Cancellation and
+database failures still surface as errors. Pending replay also invalidates Grok's
+unchanged-session skip so a repaired journal can be retried without editing the
+transcript. This explicit recovery can read a large provider log.
 
 The schema adds `store_settings`, `retention_consumers`, `retention_sweep` and
 `retention_pending`. Ten covering `(source, session identity, revision)` indexes
