@@ -44,6 +44,9 @@ fn retry_delay(prior_attempts: i32) -> Option<Duration> {
     }
 }
 fn busy_retry_handler(prior_attempts: i32) -> bool {
+    if crate::ingest::shared_capture_stop().is_some_and(|stop| stop.is_stopped()) {
+        return false;
+    }
     let Some(delay) = retry_delay(prior_attempts) else {
         return false;
     };
@@ -53,7 +56,7 @@ fn busy_retry_handler(prior_attempts: i32) -> bool {
         .subsec_nanos() as u64;
     let seed = clock ^ u64::from(std::process::id()) ^ prior_attempts as u64;
     let jitter_us = seed % (delay.as_micros() as u64 / BUSY_RETRY_JITTER_DIVISOR + 1);
-    std::thread::sleep(delay + Duration::from_micros(jitter_us));
+    super::busy_wait::sleep(delay + Duration::from_micros(jitter_us));
     true
 }
 
@@ -116,6 +119,15 @@ mod tests {
         let total_attempts = BUSY_RETRY_ATTEMPTS + FAST_RETRY_US.len() as i32;
         assert!(!busy_retry_handler(total_attempts));
         assert!(!busy_retry_handler(total_attempts + 1));
+    }
+
+    #[test]
+    fn short_retry_sleeps_are_reported_to_reconciliation() {
+        let before = super::super::busy_wait::total();
+        assert!(busy_retry_handler(0));
+        assert!(
+            super::super::busy_wait::total().saturating_sub(before) >= Duration::from_micros(100)
+        );
     }
 
     #[test]

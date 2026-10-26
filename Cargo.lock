@@ -62,6 +62,7 @@ dependencies = [
  "clap",
  "flate2",
  "libc",
+ "notify",
  "rusqlite",
  "serde_json",
  "tempfile",

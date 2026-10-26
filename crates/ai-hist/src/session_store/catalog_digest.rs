@@ -89,6 +89,44 @@ pub(super) fn rows_since(
     Ok(Arc::new(rows))
 }
 
+/// Advance an exclusively held baseline, comparing only the delta. Unlike
+/// `rows_since`, this does not copy or walk unrelated historical keys.
+pub(super) fn advance(
+    conn: &Connection,
+    before: &mut CatalogFingerprint,
+) -> Result<Vec<super::SessionRef>, Error> {
+    let head = super::catalog_head(conn)?;
+    if head.is_some() && head == before.head {
+        return Ok(Vec::new());
+    }
+    let Some(since) = comparable_floor(before, head) else {
+        let after = super::catalog_fingerprint(conn)?;
+        let changed = super::catalog_changes(before, &after);
+        *before = after;
+        return Ok(changed);
+    };
+    let (dropped, stamped) = revisions_since(conn, since)?;
+    let rows = Arc::make_mut(&mut before.rows);
+    for key in dropped {
+        // A delete/reinsert inside this bracket compares covered columns as
+        // before; a deletion observed by an earlier call has removed its key.
+        if !stamped.contains_key(&key) {
+            rows.remove(&key);
+        }
+    }
+    let mut changed = Vec::new();
+    for (key, digest) in stamped {
+        if rows.get(&key) != Some(&digest) {
+            if let Some(source) = super::Source::parse(&key.0) {
+                changed.push(super::SessionRef::id(source, key.1.clone()));
+            }
+            rows.insert(key, digest);
+        }
+    }
+    before.head = head;
+    Ok(changed)
+}
+
 /// The revision floor of a delta, or `None` when the rolling map has to be
 /// rebuilt. A missing feed, a new epoch, or a clock that moved backwards
 /// does not identify rows by `revision > floor`.

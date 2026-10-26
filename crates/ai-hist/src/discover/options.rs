@@ -27,3 +27,10 @@ impl DiscoverOptions {
         }
     }
 }
+
+impl super::DiscoveryEnv<'_> {
+    pub(crate) fn path_scope(&self) -> Option<&crate::ingest::path_scope::PathScope> {
+        self.path_scope.as_ref()
+    }
+
+}

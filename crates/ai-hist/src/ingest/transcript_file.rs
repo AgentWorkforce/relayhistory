@@ -216,12 +216,25 @@ impl TranscriptFile {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static READ_BYTES: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+pub(crate) fn take_read_bytes() -> u64 {
+    READ_BYTES.with(|bytes| bytes.replace(0))
+}
+
 impl Read for TranscriptFile {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        match self {
+        let read = match self {
             Self::Plain(file) => file.read(buf),
             Self::Zstd(zstd) => zstd.read(buf),
-        }
+        }?;
+        #[cfg(test)]
+        READ_BYTES.with(|bytes| bytes.set(bytes.get() + read as u64));
+        Ok(read)
     }
 }
 

@@ -52,7 +52,7 @@ use crate::remote::SourceConnectorSelection;
 use crate::session_usage::{session_requests_all, SessionRequest, SessionUsageSummary};
 use crate::source_evidence::EvidenceKind;
 use crate::store::{
-    default_db_path, open_db, open_db_readonly, prompt_hash, schema_is_event_read_current,
+    open_db, open_db_readonly, prompt_hash, schema_is_event_read_current,
     schema_is_evidence_read_current, schema_is_relationship_read_current,
     schema_is_usage_read_current, session_events_sized, session_file_edits, session_prompts_sized,
     session_tool_calls, session_user_turns_all, PromptRow, SessionEvent, SessionFileEdit,
@@ -72,8 +72,14 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 mod catalog_digest;
+mod discovery;
+mod reconciliation;
+mod sync;
+pub use reconciliation::{Reconciliation, ReconciliationStep};
 mod catalog_row;
 mod options;
+use options::resolve_db_path;
+mod path_scope;
 mod source_intake;
 mod watch_sweep;
 
@@ -563,6 +569,8 @@ pub struct SessionStore {
     roots: ProviderRoots,
     read_only: bool,
     readers: Arc<ReadPool>,
+    sync_baseline: Arc<Mutex<Option<sync::SyncBaseline>>>,
+    sync_identity: Arc<Mutex<Option<crate::read_pool::FileIdentity>>>,
 }
 
 impl SessionStore {
@@ -603,6 +611,8 @@ impl SessionStore {
             roots,
             read_only: opts.read_only,
             readers: Arc::new(readers),
+            sync_baseline: Arc::new(Mutex::new(None)),
+            sync_identity: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -628,82 +638,6 @@ impl SessionStore {
         self.readers.get(&self.db_path)
     }
 
-    // -- sync ---------------------------------------------------------------
-
-    /// One full local sweep into this store, under the `SyncRunLock`.
-    ///
-    /// The sweep is the one `ai-hist sync` runs: every local provider, the
-    /// stat-only source fingerprint fast path unless `force`, shallow
-    /// discovery at the end. When another process holds the lock this waits
-    /// up to [`SyncOptions::lock_timeout_ms`] and then returns
-    /// [`Error::SyncLocked`] — never a silent no-op.
-    pub fn sync(&self, opts: SyncOptions) -> Result<SyncReport, Error> {
-        if self.read_only {
-            return Err(Error::read_only("sync"));
-        }
-        let scope = match &opts.sources {
-            None => SweepScope::everything(),
-            Some(sources) => SweepScope::only(sources.iter().map(|source| source.as_str())),
-        };
-        let (tick, changed) = crate::providers::codex::sqlite::with_sweep_policy(
-            opts.codex_sqlite_max_age_days,
-            || {
-                controlled(opts.stop.as_ref(), opts.progress.as_ref(), || {
-                    self.sync_tick(opts.force, opts.lock_timeout_ms, &scope)
-                })
-            },
-        )?;
-        Ok(SyncReport {
-            swept: tick.swept,
-            changed,
-            head_revision: self.head_revision()?.revision,
-        })
-    }
-
-    /// Run the sweep, retrying a held lock until `lock_timeout_ms` is spent.
-    ///
-    /// The catalog digest is taken and compared inside the locked section —
-    /// see [`sync_facade_tick`] — so `changed` is what the catalog gained
-    /// between this sweep taking the lock and releasing it, not since some
-    /// earlier read that another process's sync could have moved past.
-    fn sync_tick(
-        &self,
-        force: bool,
-        lock_timeout_ms: u64,
-        scope: &SweepScope,
-    ) -> Result<(SyncTick, Vec<SessionRef>), Error> {
-        let started = Instant::now();
-        // Bounded where it enters, like every watch interval: `Instant +
-        // Duration` panics when the sum is not representable, and a caller
-        // passing `u64::MAX` to mean "wait as long as it takes" would die
-        // here before the first attempt. Seven days is far longer than any
-        // lock this crate holds.
-        let deadline = started + Duration::from_millis(lock_timeout_ms.min(MAX_LOCK_WAIT_MS));
-        loop {
-            let outcome = sync_facade_tick(
-                &self.db_path,
-                &self.roots,
-                force,
-                scope,
-                |conn| catalog_fingerprint(conn).map_err(anyhow::Error::from),
-                |conn, before, _tick| Ok(changes_under_lock(conn, &before)?.1),
-            )
-            .map_err(Error::sync)?;
-            if let Some(outcome) = outcome {
-                return Ok(outcome);
-            }
-            crate::ingest::check_capture_cancelled().map_err(Error::sync)?;
-            let now = Instant::now();
-            if now >= deadline {
-                return Err(Error::SyncLocked {
-                    path: self.db_path.clone(),
-                    waited_ms: started.elapsed().as_millis() as u64,
-                });
-            }
-            std::thread::sleep((deadline - now).min(SYNC_LOCK_RETRY));
-        }
-    }
-
     // -- discover -----------------------------------------------------------
 
     /// One shallow catalog sweep: every local provider's sessions, read from
@@ -720,31 +654,6 @@ impl SessionStore {
             return Err(Error::read_only("discover"));
         }
         controlled(opts.stop.as_ref(), None, || self.discover_now(&opts))
-    }
-
-    fn discover_now(&self, opts: &DiscoveryOptions) -> Result<DiscoveryReport, Error> {
-        if opts.sources.as_ref().is_some_and(Vec::is_empty) {
-            return Ok(DiscoveryReport::default());
-        }
-        let conn =
-            open_db(&self.db_path).map_err(|error| Error::DatabaseOpen(format!("{error:#}")))?;
-        let env = discover::DiscoveryEnv::with_provider_roots(&conn, self.roots.clone());
-        let options = opts.discover_options();
-        let summary = discover::discover_sessions_with_env(&env, &options, |_| {})
-            .map_err(|error| Error::classify(error, Error::Discovery))?;
-        Ok(DiscoveryReport {
-            discovered: summary.discovered,
-            skipped_unchanged: summary.skipped_unchanged,
-            diagnostics: summary
-                .diagnostics
-                .into_iter()
-                .map(|diagnostic| Diagnostic {
-                    code: "DISCOVERY_FAILED".into(),
-                    message: format!("{}: {}", diagnostic.source, diagnostic.error),
-                    subject: diagnostic.locator,
-                })
-                .collect(),
-        })
     }
 
     // -- hydrate ------------------------------------------------------------
@@ -1375,16 +1284,6 @@ const SYNC_LOCK_RETRY: Duration = Duration::from_millis(100);
 /// the same ceiling the watch intervals have.
 const MAX_LOCK_WAIT_MS: u64 = crate::watch::MAX_INTERVAL_MS;
 
-fn resolve_db_path(opts: &StoreOptions) -> PathBuf {
-    if let Some(path) = &opts.db_path {
-        return path.clone();
-    }
-    match &opts.home {
-        None => default_db_path(),
-        Some(home) => home.join(".local/share/ai-hist/ai-history.db"),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // sync
 // ---------------------------------------------------------------------------
@@ -1427,7 +1326,9 @@ pub struct SyncReport {
     /// the next tick, and per-row attribution is what the change feed's
     /// `revision` stamp is for — see [`SessionStore::changes_since`]). A
     /// session whose only change was inside a table the catalog row does not
-    /// summarise is not listed.
+    /// summarise is not listed. Committed catalog changes retained from this
+    /// handle's failed attempts are reported on the next successful call only
+    /// while their covered catalog values still match.
     pub changed: Vec<SessionRef>,
     /// The store's change-feed head after this sweep: the revision of the
     /// newest stamped row. [`SessionStore::head_revision`] reports it with
@@ -3817,7 +3718,7 @@ mod tests {
                 )?;
                 Ok(before)
             },
-            |conn, before, tick| {
+            |conn, before, tick, _succeeded| {
                 assert!(!tick.swept, "the sources did not move");
                 Ok(changes_under_lock(conn, &before)?.1)
             },
@@ -3829,6 +3730,8 @@ mod tests {
             vec![SessionRef::id(Source::Claude, "hydrated-meanwhile")]
         );
 
+        // The private bracket returns its lock for public report publication.
+        drop(outcome);
         // And the public call over the same store: unswept, nothing moved
         // under its lock, nothing reported — the earlier write was before it.
         let again = store.sync(SyncOptions::default()).unwrap();

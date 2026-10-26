@@ -31,7 +31,10 @@ fn repo_with_origin(root: &Path, name: &str, origin: &str) -> std::path::PathBuf
 #[test]
 fn global_and_conditional_git_config_resolve_a_rewritten_remote() {
     let temp = tempfile::tempdir().unwrap();
-    let home = temp.path();
+    // Git resolves the repository directory before matching includeIf gitdir.
+    // macOS temp roots may use /var, a symlink to /private/var.
+    let canonical_home = fs::canonicalize(temp.path()).unwrap();
+    let home = canonical_home.as_path();
     std::env::set_var("HOME", home);
     std::env::set_var("USERPROFILE", home);
     std::env::remove_var("XDG_CONFIG_HOME");

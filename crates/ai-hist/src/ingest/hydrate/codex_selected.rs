@@ -129,6 +129,10 @@ fn ingest_codex(
     cursor: &mut TranscriptCursorState,
     parser_upgrade: bool,
 ) -> Result<IngestOutcome> {
+    let exact = super::super::path_capture::capturing_exact_paths()
+        .then(|| crate::continuity::CaptureScope::begin(conn, "codex", path))
+        .transpose()?;
+
     let (meta, meta_bytes) = read_codex_session_meta_counted(path)?;
     let meta = meta.ok_or_else(|| {
         hydration_error(
@@ -163,15 +167,21 @@ fn ingest_codex(
             },
         )?;
     }
-    if options.include_related {
+    if options.include_related || exact.is_some() {
         // Codex records continuity only when a producer writes explicit
         // fields on `session_meta`; a plain `codex resume` leaves no signal.
         indexed.bytes_read += crate::continuity::capture_codex_rollout(conn, path)? as i64;
         // Each child's own continuity is captured with it (a spawned
         // subagent's `thread_spawn` parent is a fork edge that lives only in
         // the child's `session_meta`), so reconcile once they are all banked.
-        indexed.absorb_outcome(ingest_codex_children(conn, options, path, parser_upgrade)?);
-        crate::continuity::reconcile(conn, "codex")?;
+        if options.include_related {
+            indexed.absorb_outcome(ingest_codex_children(conn, options, path, parser_upgrade)?);
+        }
+        if let Some(exact) = exact {
+            crate::continuity::reconcile_captured(conn, "codex", path, exact)?;
+        } else {
+            crate::continuity::reconcile(conn, "codex")?;
+        }
     }
     Ok(indexed)
 }

@@ -640,3 +640,17 @@ created them, and it rebuilds an old install from two of their facts:
 when the table is dropped, so this crate never drops or alters them.
 
 See [export](export.md) for the NDJSON snapshot surface.
+
+Incremental embedders retain dirty paths through `SyncOptions::paths` and keep
+one `SessionStore` to advance its catalog digest from change-feed deltas. Cold
+reconciliation uses the SDK's round-robin provider-root iterator; bounded
+metadata/file slices reuse the same parsing, evidence ownership and byte cursor
+paths as ordinary sync. Primary Claude/Codex JSONL dispatch bypasses the global
+stamp map, keeps related-family enumeration separate, and resolves only affected
+continuity identities on the hot path. Enumeration failures retain retry
+obligations while healthy work continues. A drained healthy pass can refresh its
+validated roots without claiming complete coverage or discarding failures. A
+source round ends with unresolved continuity recovery once all work succeeds. Mixed Codex rollout/SQLite discovery admits only the scoped
+input; its own projection still resolves by thread id during acquisition.
+This changes scheduling, not provider transaction boundaries. See [incremental embedder scheduling](sourcing-sdk.md#incremental-embedder-scheduling)
+for atomic-input limits, cancellation semantics and the full-maintenance audit.
