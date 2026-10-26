@@ -295,10 +295,7 @@ fn tool_part(item: &Map<String, Value>) -> Option<Map<String, Value>> {
     if let Some(output) = state.and_then(result_text) {
         v1_state.insert("output".into(), Value::String(output));
     }
-    if let Some(error) = state
-        .and_then(|state| state.get("error"))
-        .and_then(|error| error.get("message").or(Some(error)))
-    {
+    if let Some(error) = state.and_then(error_message) {
         v1_state.insert("error".into(), error.clone());
     }
     Some(object(json!({
@@ -309,20 +306,35 @@ fn tool_part(item: &Map<String, Value>) -> Option<Map<String, Value>> {
     })))
 }
 
-/// A tool result's text items joined, as V1 stored `state.output`. Only a
-/// completed call has a result: an errored one's content is its message.
+/// What the model read back from a finished call, as V1's `state.output`:
+/// the result's text items joined, or for a failed call without content its
+/// error message. A call still running has no result.
 fn result_text(state: &Map<String, Value>) -> Option<String> {
-    if state.get("status").and_then(Value::as_str) != Some("completed") {
+    let status = state.get("status").and_then(Value::as_str);
+    if !matches!(status, Some("completed" | "error")) {
         return None;
     }
     let texts: Vec<&str> = state
-        .get("content")?
-        .as_array()?
-        .iter()
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
         .filter(|item| item.get("type").and_then(Value::as_str) == Some("text"))
         .filter_map(|item| item.get("text").and_then(Value::as_str))
         .collect();
+    if texts.is_empty() && status == Some("error") {
+        return error_message(state)
+            .and_then(Value::as_str)
+            .map(str::to_string);
+    }
     Some(texts.join("\n"))
+}
+
+/// A failed call's `error.message`, or the `error` value itself when the
+/// provider wrote a bare one.
+fn error_message(state: &Map<String, Value>) -> Option<&Value> {
+    let error = state.get("error")?;
+    error.get("message").or(Some(error))
 }
 
 fn object(value: Value) -> Map<String, Value> {
@@ -476,7 +488,7 @@ mod tests {
         let shell = as_tool_part_of(parts, "call-2");
         assert_eq!(shell["state"]["status"], "error");
         assert_eq!(shell["state"]["error"], "exit 1");
-        assert!(shell["state"].get("output").is_none());
+        assert_eq!(shell["state"]["output"], "exit 1");
 
         assert_eq!(session.parts("s1")[0].raw["synthetic"], true);
         assert_eq!(session.parts("c1")[0].kind, "compaction");
@@ -505,6 +517,34 @@ mod tests {
         ids.sort_unstable();
         assert_eq!(ids, ["fresh", "old", "resumed"]);
         assert!(all.failures.is_empty());
+    }
+
+    #[test]
+    fn a_store_opencode_2_created_has_no_v1_tables_and_still_reads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("opencode.db");
+        let conn = Connection::open(&path).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, parent_id TEXT, directory TEXT NOT NULL,
+                                      title TEXT, time_created INTEGER NOT NULL,
+                                      time_updated INTEGER NOT NULL);
+             CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                                           type TEXT NOT NULL, seq INTEGER NOT NULL,
+                                           time_created INTEGER NOT NULL,
+                                           time_updated INTEGER NOT NULL, data TEXT NOT NULL);
+             INSERT INTO session_v2 VALUES ('only', NULL, '/w', 'Only', 1, 2);
+             INSERT INTO session_message VALUES
+               ('u1', 'only', 'user', 0, 1, 1, '{\"time\":{\"created\":1},\"text\":\"hi\"}');",
+        )
+        .unwrap();
+        assert!(super::super::sqlite_store_holds_session(&path, "only").unwrap());
+        assert!(!super::super::sqlite_store_holds_session(&path, "missing").unwrap());
+        let loaded = super::super::load_from_sqlite(&conn, "only")
+            .unwrap()
+            .unwrap();
+        assert_eq!(loaded.first_user_text(), Some("hi"));
+        let all = super::super::load_all_from_sqlite(&conn).unwrap();
+        assert_eq!(all.sessions.len(), 1);
     }
 
     fn as_tool_part_of<'a>(parts: &'a [OpencodePart], call: &str) -> &'a Map<String, Value> {
