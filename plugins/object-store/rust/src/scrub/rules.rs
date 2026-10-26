@@ -358,12 +358,13 @@ pub(crate) static RULES: LazyLock<Result<Vec<Rule>, String>> = LazyLock::new(|| 
         ),
         gated(
             r(
-                // Parentheses only around an area code right after the
-                // country code, so a match cannot run into the next number.
+                // The whole run after `+` (digit groups joined by one separator,
+                // parenthesised groups anywhere), redacted if it holds at least
+                // 8 digits. Groups are delimited, so it cannot backtrack badly.
                 fancy(
-                    r"(^|[^A-Za-z0-9_+])\+[1-9](?:[0-9]{0,2}[ .-]?\([0-9]{1,4}\)(?:[ .-]?[0-9]){4,12}|(?:[ .-]?[0-9]){7,14})(?![A-Za-z0-9_]|[.-]?[0-9])",
+                    r"(^|[^A-Za-z0-9_+])\+[1-9][0-9]*(?:[ .-]?\([0-9]{1,4}\)[0-9]*|[ .-][0-9]+)*(?![A-Za-z0-9_]|[.-]?[0-9])",
                 ),
-                Template("$1[REDACTED]"),
+                Func(super::numbers::redact_e164),
                 &["+"],
             ),
             super::numbers::has_e164_shape,

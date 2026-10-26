@@ -166,6 +166,22 @@ pub(crate) fn has_nanp_shape(text: &str) -> bool {
     })
 }
 
+/// The E.164 rule's replacer: an optional lead character (never `+`), then a
+/// `+` run, redacted if it holds at least 8 digits.
+pub(crate) fn redact_e164(m: &str) -> String {
+    let split = m
+        .chars()
+        .next()
+        .filter(|c| *c != '+')
+        .map_or(0, char::len_utf8);
+    let (lead, run) = m.split_at(split);
+    if run.bytes().filter(u8::is_ascii_digit).count() >= 8 {
+        format!("{lead}{}", super::rules::REDACTED)
+    } else {
+        m.to_string()
+    }
+}
+
 /// The card rule's replacer: the match is an optional lead character (never a
 /// digit) followed by a run of digit groups.
 pub(crate) fn redact_cards(m: &str) -> String {
