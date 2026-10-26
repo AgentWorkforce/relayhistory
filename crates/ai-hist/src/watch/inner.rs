@@ -452,9 +452,9 @@ impl WatchInner {
                 report(outcome, false);
                 // The window exists to fold a burst of writes into one
                 // trailing tick. A filesystem-event tick that changed nothing
-                // -- the trailing tick for a second backend's report of a
-                // write already captured, as FSEvents gives after kqueue on
-                // macOS, or noise under a root -- is not a burst. Leaving the
+                // -- the trailing tick for a backend's second report of a
+                // write already captured, or noise under a root -- is not a
+                // burst. Leaving the
                 // window armed would make the *next* new session, a moment
                 // later, wait out a window nothing is using.
                 if trigger == TickTrigger::FsEvent && outcome.changed_nothing {

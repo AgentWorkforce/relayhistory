@@ -1405,10 +1405,10 @@ What changed, and why each is safe:
 * **The leading-edge settle is 2 ms**, down from 10. It only gathers one
   write's callbacks; a straggler lands in the window's trailing tick, which
   finds the transcript unchanged.
-* **macOS: kqueue directory watches** beside FSEvents (`watch/kqueue_dirs.rs`)
-  report a new file through the same root matching as an FSEvents event. Only
-  directories, recently changed ones first, at most 128 descriptors.
-  FSEvents remains the backstop for appends and for anything not watched.
+* **A tick that wrote nothing closes the window it opened.** The debounce
+  window folds a burst of writes into one trailing tick; a tick whose sweep
+  left the store's change-feed head where it was is not a burst, and leaving
+  the window armed would make the next new session wait it out.
 
 Local A/B against `main` on one machine, interleaved, release build, 30-day
 store (a shared, busy machine, so treat the absolute numbers loosely and the
@@ -1423,6 +1423,12 @@ ratios with more confidence; CI's labelled run is the published number):
 
 Still over budget, in order of size: discovery's pass for one candidate
 (~2 ms), evidence rows and their triggers (~1.5-2 ms), the plain `sync`
-path's own validation, and on macOS whatever FSEvents still drives. The
+path's own validation, and on macOS FSEvents itself (14-19 ms before the
+loop hears of the file). A kqueue directory watcher beside FSEvents reports
+the event in under a millisecond, but on the macOS CI runner it doubled the
+end-to-end p99 (165 -> 345 ms) while halving the p50: a tick it triggers can
+miss the session and leave the debounce window armed for the write that
+follows. It is held back on its own branch until that interaction is
+understood on real hardware. The
 `synchronous` change is scoped to exact capture; extending it to the hook
 path needs the same proof for its Cursor checkpoint first.

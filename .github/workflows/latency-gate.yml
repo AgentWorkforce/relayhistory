@@ -81,9 +81,10 @@ jobs:
       - name: Build the latency harness
         run: cargo test --release -p ai-hist-cli --test latency_bench --no-run
 
-      # The kqueue directory watcher is macOS-only code, and ci.yml has no
-      # macOS job: this is where it is compiled and tested.
-      - name: Watch-loop and kqueue tests (macOS)
+      # ci.yml has no macOS job, and the watch loop's timing depends on the
+      # backend (FSEvents here, inotify on Linux): this is where it is tested
+      # on macOS.
+      - name: Watch-loop tests (macOS)
         if: runner.os == 'macOS'
         run: cargo test --release -p ai-hist --all-features --lib watch
 

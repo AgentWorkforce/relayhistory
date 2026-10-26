@@ -749,11 +749,6 @@ impl WatchLoop {
 
 #[cfg(feature = "fs-events")]
 mod fs_events;
-#[cfg(feature = "fs-events")]
-// Only the macOS backend runs the watcher itself; elsewhere the planning and
-// diffing are exercised by their own tests.
-#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
-mod kqueue_dirs;
 
 #[cfg(not(feature = "fs-events"))]
 mod fs_events {
@@ -1344,9 +1339,9 @@ mod tests {
     }
 
     /// The debounce window folds a burst into one trailing tick. A tick that
-    /// changed nothing -- macOS FSEvents reporting a create kqueue already
-    /// delivered and the loop already captured -- is not a burst, so the next
-    /// change is a leading edge again rather than waiting out the window.
+    /// wrote nothing -- a backend's second report of a write the loop already
+    /// captured, or noise under a root -- is not a burst, so the next change
+    /// is a leading edge again rather than waiting out the window.
     #[test]
     fn a_tick_that_changed_nothing_does_not_hold_the_next_change_for_the_window() {
         let after_quiet = second_change_waits(true);

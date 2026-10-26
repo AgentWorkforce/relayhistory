@@ -21,7 +21,7 @@ export = []
 # Filesystem-event driver for the live-capture watch loop. Optional so the
 # crate still builds with --no-default-features on a host with no watcher
 # backend; without it `watch` falls back to polling.
-fs-events = ["dep:notify", "dep:kqueue"]
+fs-events = ["dep:notify"]
 opencode-backup = ["dep:tempfile", "rusqlite/backup"]
 git-hooks = ["dep:url"]
 unstable-internal = []
@@ -45,12 +45,6 @@ url = { version = "2", optional = true }
 # Codex compresses finished rollouts to `.jsonl.zst`; read with the same
 # libzstd binding Codex writes them with.
 zstd = { version = "0.13", default-features = false }
-
-[target.'cfg(target_os = "macos")'.dependencies]
-# New-file detection beside FSEvents (watch/kqueue_dirs.rs): FSEvents takes
-# 14-19 ms to report a new file, a kqueue directory watch well under one. The
-# same safe wrapper notify's own kqueue backend uses; already in the lockfile.
-kqueue = { version = "1.1", optional = true }
 
 [target.'cfg(unix)'.dependencies]
 # Safe wrappers for the statfs/statvfs, flock and kill(pid, 0) calls the crate

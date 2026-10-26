@@ -37,7 +37,6 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 
 - A new session reaches the catalog sooner through `watch` and exact-path capture: one validated writer per capture and across watch ticks, no per-commit fsync for exact capture, and a 2 ms leading-edge settle instead of 10 ms.
-- On macOS, `watch` learns of a new transcript from kqueue directory watches in under a millisecond, where FSEvents took 14-19 ms to report it; FSEvents remains the backstop.
 
 ### Fixed
 
