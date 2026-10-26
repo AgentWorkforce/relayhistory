@@ -1,0 +1,35 @@
+{
+  "id": "vtcode",
+  "rust_id": "vtcode",
+  "variant": "Vtcode",
+  "order": 460,
+  "aliases": ["vt-code"],
+  "fixtures": [
+    {
+      "source": "vtcode",
+      "name": "basic",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": ["vtcode/basic"],
+      "quirk": "Synthetic VT Code 0.180.2 native-writer canonical schema-0.18.0 journal, independently reopened through visit_snapshot: two user turns, assistant items, actual tool IDs, per-turn usage, compaction control and thread aggregate."
+    }
+  ],
+  "capture": [
+    {
+      "evidence": "Messages and identity",
+      "coverage": "Workspace-scoped canonical events preserve native turn/item IDs and exact user-origin prompts; multi-workspace identities are namespaced to prevent same-ID collapse."
+    },
+    {
+      "evidence": "Tools and usage",
+      "coverage": "Native tool_call_id and call_id join; turn.completed usage recorded once on the final assistant item, thread aggregate remains a marker; no model or file-edit inference."
+    },
+    {
+      "evidence": "Control and lifecycle",
+      "coverage": "Compaction, completion and unrecognized records remain markers; no native resume or delegation claim. Partial tails defer replacement and complete rewrites retire removed records."
+    }
+  ],
+  "population": {
+    "evidence": ["history", "session_event", "tool_call", "session_marker"],
+    "usage_accounting": "per-request"
+  }
+}

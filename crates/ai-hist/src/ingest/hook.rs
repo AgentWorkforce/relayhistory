@@ -196,46 +196,17 @@ pub(crate) fn ingest_transcript_at_with_roots(
         let conn = open_db(db_path)?;
         let env = DiscoveryEnv::with_provider_roots(&conn, roots.clone());
         if claude_sidecar {
-            let authoritative_parent = claude_snapshot
-                .as_ref()
-                .and_then(ClaudeTranscriptSnapshot::session_id)
-                .expect("classified Claude sidecar has a parent identity");
-            remove_disproved_claude_filename_alias(
+            return index_claude_sidecar(
                 &conn,
-                source,
-                transcript,
-                &authoritative_parent,
-            )?;
-            discover_sessions_with_provider_refs(
                 &env,
-                &DiscoverOptions::default(),
-                &[&single],
-                |_| {},
-            )?;
-            return Ok(TranscriptIngest::short(
+                &single,
                 source,
                 transcript,
-                TranscriptStatus::Unidentified,
-            ));
+                claude_snapshot.as_ref(),
+            );
         }
-        // Read before anything is written. The payload says which session
-        // fired *and* which file holds it, and those are two claims: a
-        // delayed or replayed hook can pair a live session id with a
-        // transcript that belongs to another one. For Claude, require the
-        // provider-native `sessionId`: its ordinary shallow adapter may fall
-        // back to the filename for old transcripts, but a hook must not turn
-        // that guess into a catalog row. Other providers retain their adapter
-        // identity path; none currently advertises lifecycle-hook support.
-        let observed_session = if source == "claude" {
-            claude_snapshot
-                .as_ref()
-                .expect("Claude hook snapshot exists")
-                .session_id()
-        } else {
-            single
-                .read_shallow(&env.scan(), Some(&conn), &single.candidate)?
-                .map(|observed| observed.session_id)
-        };
+        let observed_session =
+            observed_hook_session(&conn, &env, &single, source, claude_snapshot.as_ref())?;
         let Some(observed_session) = observed_session else {
             return Ok(TranscriptIngest::short(
                 source,
@@ -301,6 +272,55 @@ pub(crate) fn ingest_transcript_at_with_roots(
         status,
         hydration: Some(hydration),
     })
+}
+
+/// Record a classified Claude sidecar through discovery as a known
+/// non-session, retiring any filename alias its parent identity disproves.
+fn index_claude_sidecar(
+    conn: &Connection,
+    env: &DiscoveryEnv<'_>,
+    single: &SingleCandidate<'_>,
+    source: &str,
+    transcript: &Path,
+    claude_snapshot: Option<&ClaudeTranscriptSnapshot>,
+) -> Result<TranscriptIngest> {
+    let authoritative_parent = claude_snapshot
+        .and_then(ClaudeTranscriptSnapshot::session_id)
+        .context("classified Claude sidecar has a parent identity")?;
+    remove_disproved_claude_filename_alias(conn, source, transcript, &authoritative_parent)?;
+    discover_sessions_with_provider_refs(env, &DiscoverOptions::default(), &[single], |_| {})?;
+    Ok(TranscriptIngest::short(
+        source,
+        transcript,
+        TranscriptStatus::Unidentified,
+    ))
+}
+
+/// The session the hook's transcript actually holds, read before anything is
+/// written.
+///
+/// The payload says which session fired *and* which file holds it, and those
+/// are two claims: a delayed or replayed hook can pair a live session id with
+/// a transcript that belongs to another one. For Claude, require the
+/// provider-native `sessionId`: its ordinary shallow adapter may fall back to
+/// the filename for old transcripts, but a hook must not turn that guess into
+/// a catalog row. Other providers retain their adapter identity path; none
+/// currently advertises lifecycle-hook support.
+fn observed_hook_session(
+    conn: &Connection,
+    env: &DiscoveryEnv<'_>,
+    single: &SingleCandidate<'_>,
+    source: &str,
+    claude_snapshot: Option<&ClaudeTranscriptSnapshot>,
+) -> Result<Option<String>> {
+    if source == "claude" {
+        return Ok(claude_snapshot
+            .context("Claude hook snapshot exists")?
+            .session_id());
+    }
+    Ok(single
+        .read_shallow(&env.scan(), Some(conn), &single.candidate)?
+        .map(|observed| observed.session_id))
 }
 
 /// Whether the hook's transcript is a regular file there is something to

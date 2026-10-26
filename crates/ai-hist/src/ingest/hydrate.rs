@@ -10,14 +10,22 @@ use std::fs::OpenOptions;
 use std::time::Instant;
 
 mod codex_selected;
+mod continuity;
+mod exact;
+use exact::checkpoint_covers;
+pub(super) use exact::{
+    can_skip as can_skip_exact_capture, mark as mark_exact_capture,
+    needs_validation as exact_capture_needs_validation,
+};
 mod probe;
 mod snapshot;
 mod unified_diff;
 
 pub(crate) use codex_selected::ingest_selected_codex;
+use probe::requires_local_pass;
 pub(crate) use probe::HydrationProbe;
 use snapshot::source_snapshot;
-use unified_diff::split_unified_diff;
+use unified_diff::codex_diff_records;
 
 /// Bumped to 3 on two counts that landed together: capability became derived
 /// from declared evidence coverage, and `bytesRead` began reporting what a
@@ -402,7 +410,7 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
     claude_snapshot: Option<ClaudeTranscriptSnapshot>,
 ) -> Result<HydrateSessionResult> {
     let home = &roots.home;
-    begin_hydration(options, home, connectors)?;
+    let _reads = begin_hydration(options, home, connectors)?;
     let started = Instant::now();
     // Acquisition and replacement are one per-session critical section. The
     // provider call has to be inside it: otherwise an older response can wait
@@ -433,8 +441,8 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
     // whether a pass runs at all, so leaving it to fire here would mean the
     // held records were never looked at again and the message was lost rather
     // than deferred.
-    let holding_records = holds_unfinished_records(&conn, options, &snapshot)?;
-    let stamp_matches = !holding_records
+    let parse_required = requires_local_pass(&conn, options, &snapshot)?;
+    let stamp_matches = !parse_required
         && checkpoint_covers(previous.as_ref(), &snapshot.stamp, options.include_related)
         && target.discovery_state.as_deref() == Some("full");
     // The stamp says the size and mtime are where they were. That is not the
@@ -562,7 +570,7 @@ fn begin_hydration(
     options: &HydrateSessionOptions,
     home: &Path,
     connectors: &crate::remote::SourceConnectorSelection,
-) -> Result<()> {
+) -> Result<cold_read::ReadScope> {
     super::check_capture_cancelled()?;
     validate_options(options)?;
     // One hydration is one acquisition pass; see `begin_acquisition_pass`.
@@ -576,21 +584,7 @@ fn begin_hydration(
         )
         .map_err(|error| hydration_error("CONNECTOR_NOT_CONFIGURED", error))?;
     }
-    Ok(())
-}
-
-/// Whether the last checkpoint recorded this stamp, under this parser, with
-/// the same related-evidence choice.
-fn checkpoint_covers(
-    previous: Option<&ObservationCheckpoint>,
-    stamp: &str,
-    include_related: bool,
-) -> bool {
-    previous.is_some_and(|previous| {
-        previous.source_stamp.as_deref() == Some(stamp)
-            && previous.parser_version == HYDRATION_PARSER_VERSION
-            && previous.include_related == include_related
-    })
+    Ok(cold_read::begin_read_scope())
 }
 
 /// A changed pass over a session with a stamped checkpoint updated it; any
@@ -680,6 +674,13 @@ fn commit_local_pass(
     } else {
         load_cursor(&tx, &cursor_key)?
     };
+    if let Some(path) = snapshot.path.as_deref().filter(|_| {
+        snapshot.provider_session.is_none()
+            && snapshot.claude_transcript.is_none()
+            && matches!(options.source.as_str(), "claude" | "codex")
+    }) {
+        exact::restart_same_size_rewrite(&mut cursor, path)?;
+    }
     let (indexed, source_diagnostics, cursor_consumed_through) = ingest_selected(SelectedIngest {
         conn: &tx,
         options,
@@ -1354,7 +1355,10 @@ fn hydrate_remote_codex_diff_observed(
             })
             .unwrap_or_else(|| "remote-diff:".into());
         tx.execute("DELETE FROM file_edits WHERE source='codex' AND session_id=? AND tool_name='codex cloud diff' AND substr(tool_use_id,1,?)=?",params![options.session_id,prefix.len(),prefix])?;
-        for (index, patch) in split_unified_diff(diff).into_iter().enumerate() {
+        for (index, patch) in unified_diff::split_unified_diff(diff)
+            .into_iter()
+            .enumerate()
+        {
             // Old releases materialized the only remote diff under this bare
             // provider key. Its overwritten presence cannot identify an owner.
             // Retain that canonical projection instead of duplicating it under
@@ -1915,53 +1919,6 @@ fn unchanged_cursor_check(
     })
 }
 
-/// Whether any transcript this session is built from ended its last pass with
-/// records held back.
-///
-/// The session's own transcript is not the only one that defers: every Claude
-/// sidecar keeps its parser state in its own locator-keyed cursor, and a
-/// sidecar that held an unfinished message needs a pass to run before it can
-/// release those records. Consulting only the session cursor meant the
-/// unchanged shortcut returned first and the child's message stayed unindexed
-/// for as long as nothing else about the session changed.
-fn holds_unfinished_records(
-    conn: &Connection,
-    options: &HydrateSessionOptions,
-    snapshot: &SourceSnapshot,
-) -> Result<bool> {
-    let session = load_cursor(
-        conn,
-        &CursorKey::Session {
-            source: &options.source,
-            session_id: &options.session_id,
-            location: "local",
-        },
-    )?;
-    if session
-        .claude
-        .is_some_and(|claude| !claude.in_progress.is_empty())
-    {
-        return Ok(true);
-    }
-    for evidence in &snapshot.claude_subagents {
-        let locator = evidence.path.to_string_lossy().to_string();
-        let sidecar = load_cursor(
-            conn,
-            &CursorKey::Locator {
-                source: "claude",
-                locator: &locator,
-            },
-        )?;
-        if sidecar
-            .claude
-            .is_some_and(|claude| !claude.in_progress.is_empty())
-        {
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
 /// Whether a catalog locator points inside the configured legacy tree. The
 /// comparison is on canonical paths so a symlinked storage root still matches,
 /// and a locator outside it is rejected rather than read.
@@ -2290,7 +2247,7 @@ pub(crate) struct SelectedIngest<'a> {
     pub(crate) claude_subagents: &'a [ClaudeSubagentEvidence],
     pub(crate) claude_snapshot: Option<&'a ClaudeTranscriptSnapshot>,
     pub(crate) devin_session: Option<&'a crate::ingest::devin::DevinSession>,
-    #[allow(dead_code)] // Used by provider-owned selected parsers.
+    /// Read by provider-owned selected parsers.
     pub(crate) provider_session: Option<&'a crate::providers::AcquiredSession>,
     pub(crate) cursor: &'a mut TranscriptCursorState,
     /// A checkpoint exists and another parser generation wrote it, so the
@@ -2312,8 +2269,9 @@ pub(crate) type IngestSelectedFn = fn(SelectedIngest<'_>) -> Result<SelectedInge
 impl<'a> SelectedIngest<'a> {
     /// The locator every file-backed parser requires; `source_snapshot`
     /// always resolves one before a parser runs.
-    fn file(&self) -> &'a Path {
-        self.path.unwrap()
+    fn file(&self) -> Result<&'a Path> {
+        self.path
+            .context("a file-backed parser ran without a resolved transcript path")
     }
 
     /// A provider whose reader still re-reads the file on every change reports
@@ -2347,7 +2305,7 @@ fn ingest_selected(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
 }
 
 pub(crate) fn ingest_selected_claude(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
-    let path = ctx.file();
+    let path = ctx.file()?;
     ingest_claude(
         ctx.conn,
         ctx.options,
@@ -2361,17 +2319,17 @@ pub(crate) fn ingest_selected_claude(ctx: SelectedIngest<'_>) -> Result<Selected
 }
 
 pub(crate) fn ingest_selected_cursor(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
-    let (diagnostics, consumed) = ingest_cursor(ctx.conn, ctx.options, ctx.target, ctx.file())?;
+    let (diagnostics, consumed) = ingest_cursor(ctx.conn, ctx.options, ctx.target, ctx.file()?)?;
     Ok((ctx.whole_file(), diagnostics, Some(consumed)))
 }
 
 pub(crate) fn ingest_selected_grok(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
-    ingest_grok(ctx.conn, ctx.options, ctx.file())
+    ingest_grok(ctx.conn, ctx.options, ctx.file()?)
         .map(|diagnostics| (ctx.whole_file(), diagnostics, None))
 }
 
 pub(crate) fn ingest_selected_muse(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
-    let path = ctx.file();
+    let path = ctx.file()?;
     let diagnostics = ingest_muse(ctx.conn, ctx.options, path)?;
     let mut outcome = ctx.whole_file();
     // With related evidence the read covers every subagent log too.
@@ -2386,7 +2344,7 @@ pub(crate) fn ingest_selected_muse(ctx: SelectedIngest<'_>) -> Result<SelectedIn
 }
 
 pub(crate) fn ingest_selected_opencode(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
-    let path = ctx.file();
+    let path = ctx.file()?;
     // Whichever layout `source_snapshot` validated this locator
     // against. Not the file extension: `OPENCODE_DB` is an arbitrary
     // path, so a perfectly good SQLite store may be called
@@ -2428,7 +2386,7 @@ pub(crate) fn ingest_selected_devin(ctx: SelectedIngest<'_>) -> Result<SelectedI
     // `path` is the `sessions.db` whose provenance `source_snapshot`
     // verified; its parent is the Devin CLI data directory that also holds
     // `transcripts/`.
-    let path = ctx.file();
+    let path = ctx.file()?;
     let loaded = ctx.devin_session.ok_or_else(|| {
         hydration_error(
             "SESSION_SOURCE_UNAVAILABLE",
@@ -2455,6 +2413,10 @@ fn ingest_claude(
     cursor: &mut TranscriptCursorState,
     parser_upgrade: bool,
 ) -> Result<IngestOutcome> {
+    let exact = super::path_capture::capturing_exact_paths()
+        .then(|| crate::continuity::CaptureScope::begin(conn, "claude", path))
+        .transpose()?;
+
     // Resumed from the same cursor document the record walk uses, so a
     // hydration of a transcript that grew by a kilobyte reads a kilobyte in
     // total. Skipped entirely when the hook already handed over the bytes:
@@ -2528,24 +2490,15 @@ fn ingest_claude(
             }
         }
     }
-    record_claude_remote_relationship(conn, &meta, options.include_related)?;
-    if options.include_related {
-        // Bank this transcript's continuity evidence for reconciliation now.
-        // A request for this session alone leaves relationship evidence for
-        // a later hydration that includes related sessions.
-        //
-        // Folded by the metadata walk above when there was one, so that path
-        // reads nothing here. The hook's bytes have no such walk behind them,
-        // so they are folded from the text.
-        //
-        // A superseded fold is not published. Its records came from bytes that
-        // were rewritten under the walk, and an absent continuity row
-        // *retracts* the edges it established — so a partial fold would
-        // replace real topology, and there is no "leave it alone" to express
-        // by passing one.
-        capture_claude_continuity(conn, path, snapshot, scan_superseded, scan_continuity)?;
-        crate::continuity::reconcile(conn, "claude")?;
-    }
+    continuity::capture_claude(
+        conn,
+        options,
+        path,
+        &meta,
+        exact,
+        snapshot,
+        (scan_superseded, scan_continuity),
+    )?;
     // The snapshot already walked and parsed these sidecars to stamp them, so
     // this pass indexes that evidence instead of finding it a second time.
     // Each sidecar carries its own locator-keyed cursor, so one that grows
@@ -2607,24 +2560,6 @@ fn ingest_claude_hook_snapshot(
         }
     }
     Ok(())
-}
-
-/// Record the transcript's continuity evidence: folded from the hook's text,
-/// or the metadata walk's fold unless the walk was superseded.
-fn capture_claude_continuity(
-    conn: &Connection,
-    path: &Path,
-    snapshot: Option<&ClaudeTranscriptSnapshot>,
-    scan_superseded: bool,
-    scan_continuity: Option<crate::continuity::ContinuityEvidence>,
-) -> Result<()> {
-    match snapshot {
-        Some(snapshot) => {
-            crate::continuity::capture_claude_transcript_text(conn, path, &snapshot.text)
-        }
-        None if !scan_superseded => crate::continuity::capture_folded(conn, path, scan_continuity),
-        None => Ok(()),
-    }
 }
 
 /// Send a sidecar's next record walk back to byte zero when another parser
@@ -4378,7 +4313,7 @@ pub(crate) fn save_observation_progress(
             committed_offset: cursor.map_or(0, |cursor| cursor.committed_offset()),
             prefix_hash: cursor.and_then(|cursor| cursor.prefix_hash()),
             dev_ino: cursor.and_then(|cursor| cursor.dev_ino()),
-            parser_state_json: cursor.map(|cursor| cursor.encode()),
+            parser_state_json: cursor.map(|cursor| cursor.encode()).transpose()?,
         },
     )
 }
@@ -4465,11 +4400,7 @@ pub fn normalize_source_evidence(
                 source == "codex",
                 "CONNECTOR_FAILURE: Codex evidence returned for another source"
             );
-            let records=split_unified_diff(&diff).into_iter().enumerate().map(|(index,patch)| {
-                let (added,removed)=count_unified_diff_lines(&patch.text);
-                let payload=json!({"source":source,"session_id":session_id,"tool_use_id":format!("remote-diff:{index}"),"file_path":patch.path,"tool_name":"codex cloud diff","lines_added":added,"lines_removed":removed,"structured_patch_json":json!({"unified_diff":patch.text}).to_string()}).as_object().unwrap().clone();
-                EvidenceRecord{kind:EvidenceKind::FileEdit,payload,record_id:None,revision_id:None}
-            }).collect();
+            let records = codex_diff_records(source, session_id, &diff);
             (
                 source_stamp,
                 source_bytes,
@@ -8234,6 +8165,7 @@ mod tests {
     /// The `bytes_read` half of the scope runs on every CI pass, at a size
     /// that costs nothing, in
     /// `an_append_to_a_large_transcript_reads_only_the_append`.
+    #[cfg(unix)]
     #[test]
     #[ignore = "measures process-wide peak RSS; run alone with --test-threads=1"]
     fn reading_a_200mb_transcript_stays_under_a_memory_ceiling() {
@@ -9143,6 +9075,7 @@ mod tests {
     /// happened. Both readers used it, so a transcript with one 500 MiB
     /// record made the reader allocate 500 MiB whatever the caps said. The
     /// ceiling is now on the reader.
+    #[cfg(unix)]
     #[test]
     fn a_record_over_the_ceiling_is_skipped_rather_than_held() {
         let dir = tempfile::tempdir().unwrap();
@@ -10809,7 +10742,7 @@ mod tests {
         let decoded = TranscriptCursorState::decode(Some(&raw));
         assert_eq!(decoded.committed_offset(), 12);
         assert_eq!(decoded.claude.as_ref().unwrap().next_line_index, 3);
-        let round_tripped: Value = serde_json::from_str(&decoded.encode()).unwrap();
+        let round_tripped: Value = serde_json::from_str(&decoded.encode().unwrap()).unwrap();
         assert_eq!(
             round_tripped["tool_results"],
             serde_json::json!({"call_index": 9, "event_index": 41}),

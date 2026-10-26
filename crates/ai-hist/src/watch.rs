@@ -51,7 +51,7 @@ use std::collections::HashSet;
 #[cfg(any(feature = "fs-events", test))]
 use std::path::Path;
 use std::path::PathBuf;
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -349,8 +349,8 @@ impl WatchLoop {
             on_driver: None,
             inner: Arc::new(WatchInner {
                 tick,
-                on_report: None,
-                on_error: None,
+                on_report: Mutex::new(None),
+                on_error: Mutex::new(None),
                 wake: Mutex::new(WakeState::default()),
                 wake_cv: Condvar::new(),
                 run: Mutex::new(RunState::default()),
@@ -395,17 +395,13 @@ impl WatchLoop {
         self
     }
 
-    pub fn on_report(mut self, sink: ReportSink) -> Self {
-        Arc::get_mut(&mut self.inner)
-            .expect("watch loop is not shared before run")
-            .on_report = Some(sink);
+    pub fn on_report(self, sink: ReportSink) -> Self {
+        *self.inner.on_report.lock().unwrap_or_else(PoisonError::into_inner) = Some(sink);
         self
     }
 
-    pub fn on_error(mut self, sink: ErrorSink) -> Self {
-        Arc::get_mut(&mut self.inner)
-            .expect("watch loop is not shared before run")
-            .on_error = Some(sink);
+    pub fn on_error(self, sink: ErrorSink) -> Self {
+        *self.inner.on_error.lock().unwrap_or_else(PoisonError::into_inner) = Some(sink);
         self
     }
 
@@ -428,7 +424,7 @@ impl WatchLoop {
 
     /// What drives the loop right now, once it has started.
     pub fn status(&self) -> Option<DriverStatus> {
-        self.inner.driver.lock().expect("watch driver").clone()
+        self.inner.driver.lock().unwrap_or_else(PoisonError::into_inner).clone()
     }
 
     /// The driver [`run`](WatchLoop::run) is using, once it has started.
@@ -729,7 +725,7 @@ impl WatchLoop {
             },
         };
         let changed = {
-            let mut held = self.inner.driver.lock().expect("watch driver");
+            let mut held = self.inner.driver.lock().unwrap_or_else(PoisonError::into_inner);
             let changed = held.as_ref() != Some(&status);
             *held = Some(status.clone());
             changed

@@ -71,9 +71,54 @@ const REGISTRATIONS: &[Registration] = &[
         adapter: kimi::ADAPTER,
     },
     Registration {
+        id: "cline",
+        metadata: cline::METADATA,
+        adapter: cline::ADAPTER,
+    },
+    Registration {
         id: "codebuddy",
         metadata: codebuddy::METADATA,
         adapter: codebuddy::ADAPTER,
+    },
+    Registration {
+        id: "cortex",
+        metadata: cortex::METADATA,
+        adapter: cortex::ADAPTER,
+    },
+    Registration {
+        id: "deepagents",
+        metadata: deepagents::METADATA,
+        adapter: deepagents::ADAPTER,
+    },
+    Registration {
+        id: "goose",
+        metadata: goose::METADATA,
+        adapter: goose::ADAPTER,
+    },
+    Registration {
+        id: "junie",
+        metadata: junie::METADATA,
+        adapter: junie::ADAPTER,
+    },
+    Registration {
+        id: "kilo",
+        metadata: kilo::METADATA,
+        adapter: kilo::ADAPTER,
+    },
+    Registration {
+        id: "mistral-vibe",
+        metadata: mistral_vibe::METADATA,
+        adapter: mistral_vibe::ADAPTER,
+    },
+    Registration {
+        id: "qoder",
+        metadata: qoder::METADATA,
+        adapter: qoder::ADAPTER,
+    },
+    Registration {
+        id: "vtcode",
+        metadata: vtcode::METADATA,
+        adapter: vtcode::ADAPTER,
     },
     Registration {
         id: "grok-bot",

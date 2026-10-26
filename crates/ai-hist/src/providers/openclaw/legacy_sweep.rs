@@ -111,7 +111,7 @@ fn sweep_dir(
             .and_then(|n| n.to_str())
             .unwrap_or_default();
         let (stamp, _) = legacy::stamp(path, index.get(name))?;
-        let stamp = format!("{}/{stamp}", ADAPTER.unwrap().generation);
+        let stamp = format!("{GENERATION}/{stamp}");
         if let Some(native) = unchanged(ctx, cache.get(&key), &stamp, &held)? {
             seen.insert(native);
             continue;

@@ -36,8 +36,9 @@ pub(crate) const METADATA: ProviderMetadata = ProviderMetadata {
         splits_requests: false,
     }),
 };
+const GENERATION: &str = "omp_v3_3";
 pub(crate) const ADAPTER: Option<ProviderAdapter> = Some(ProviderAdapter {
-    generation: "omp_v3_3",
+    generation: GENERATION,
     acquire,
     sweep,
     resolve_roots: |home, use_env| roots::resolve(home, use_env),
@@ -223,7 +224,7 @@ fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
     for candidate in candidates {
         crate::ingest::check_capture_cancelled()?;
         let path = Path::new(&candidate.locator);
-        let generation = ADAPTER.unwrap().generation;
+        let generation = GENERATION;
         if unchanged(&ctx, cache.get(&candidate.locator), &candidate)? {
             continue;
         }
@@ -282,7 +283,7 @@ fn unchanged(
         return Ok(false);
     };
     if previous["stamp"].as_str() != Some(&candidate.stamp)
-        || previous["generation"].as_str() != Some(ADAPTER.unwrap().generation)
+        || previous["generation"].as_str() != Some(GENERATION)
         || ctx.repairs.contains(ID, sid)
     {
         return Ok(false);

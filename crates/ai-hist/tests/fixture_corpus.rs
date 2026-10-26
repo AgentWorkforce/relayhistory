@@ -21,11 +21,12 @@
 //! the attribute.
 
 use ai_hist::{
-    discover_sessions_with_env, hydrate_session_at, open_db, sync_scoped_at, DiscoverOptions,
-    DiscoveryEnv, HydrateSessionOptions, SessionScope,
+    discover_sessions_with_env, hydrate_session_at_with_home, open_db, sync_scoped_at,
+    DiscoverOptions, DiscoveryEnv, HydrateSessionOptions, SessionScope,
 };
 use rusqlite::Connection;
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -55,6 +56,9 @@ enum Layout {
     /// SQL fixture applied at a provider-owned relative home path.
     #[allow(dead_code)] // Used by admitted SQLite providers.
     Sqlite(&'static str),
+    /// SQL fixture relative to the provider's platform-specific default root.
+    #[allow(dead_code)] // Used by admitted SQLite providers.
+    SqliteProviderDefault(&'static str),
     /// A `.sql` file executed into `~/.local/share/opencode/opencode.db`.
     OpencodeSqlite,
     /// `.sql` files executed into `~/.local/share/devin/cli/sessions.db`;
@@ -211,8 +215,13 @@ fn stage(fixture: &Fixture, home: &Path) {
         Layout::GrokBotReplicas => {
             grok_bot_fixture::stage(home);
         }
-        Layout::Sqlite(relative) => {
-            let path = home.join(relative);
+        Layout::Sqlite(relative) | Layout::SqliteProviderDefault(relative) => {
+            let path = match fixture.layout {
+                Layout::SqliteProviderDefault(_) => {
+                    provider_default_root(fixture.source, home).join(relative)
+                }
+                _ => home.join(relative),
+            };
             fs::create_dir_all(path.parent().expect("SQLite parent")).unwrap();
             let db = Connection::open(path).unwrap();
             for file in fixture.files {
@@ -362,6 +371,9 @@ fn capture(fixture: &Fixture, home: &Path) -> Value {
     // fixture run.
     std::env::set_var("XDG_DATA_HOME", home.join(".local/share"));
     std::env::remove_var("AI_HIST_DB");
+    // The corpus stages Goose's default root. A host override must not make
+    // the environment-backed sync read a different database from discovery.
+    std::env::remove_var("GOOSE_PATH_ROOT");
     // Historical fixtures deliberately predate the production 30-day Codex
     // SQLite recovery window; the corpus tests parser fidelity, not recency.
     std::env::set_var("AI_HIST_CODEX_SQLITE_MAX_AGE_DAYS", "0");
@@ -404,7 +416,9 @@ fn capture(fixture: &Fixture, home: &Path) -> Value {
 
     let mut hydrations = Vec::new();
     for (source, session_id) in &discovered {
-        let result = hydrate_session_at(
+        // Hydrate against the same explicit fixture roots used for discovery.
+        // A workspace-scoped provider need not declare those roots in process env.
+        let result = hydrate_session_at_with_home(
             &db,
             &HydrateSessionOptions {
                 source: source.clone(),
@@ -412,6 +426,7 @@ fn capture(fixture: &Fixture, home: &Path) -> Value {
                 scope: SessionScope::Local,
                 include_related: true,
             },
+            home,
         );
         // Only what hydration *decided* is snapshotted. `capability`,
         // `discovery_state` and the `evidence` counters are derived bookkeeping
@@ -455,7 +470,72 @@ fn capture(fixture: &Fixture, home: &Path) -> Value {
         "session_markers": dump(&conn, SESSION_MARKERS_SQL),
         "history": dump(&conn, HISTORY_SQL),
     });
-    redact(snapshot, home)
+    let snapshot = redact(snapshot, home);
+    if matches!(fixture.layout, Layout::SqliteProviderDefault(_)) {
+        let root = provider_default_root(fixture.source, home);
+        let relative = root
+            .strip_prefix(home)
+            .expect("fixture default root beneath home");
+        let prefix = format!("<home>/{}", relative.to_string_lossy().replace('\\', "/"));
+        redact_provider_root(
+            snapshot,
+            &prefix,
+            &format!("<provider-root:{}>", fixture.source),
+        )
+    } else {
+        snapshot
+    }
+}
+
+fn provider_default_root(source: &str, home: &Path) -> PathBuf {
+    let roots = ai_hist::ProviderRoots::from_home(
+        home.to_path_buf(),
+        home.join(".local/share/opencode/opencode.db"),
+    );
+    let roots = serde_json::to_value(roots).expect("serialize fixture roots");
+    PathBuf::from(
+        roots["provider_default_roots"][source]
+            .as_str()
+            .expect("provider default fixture root"),
+    )
+}
+
+fn redact_provider_root(value: Value, prefix: &str, replacement: &str) -> Value {
+    match value {
+        Value::String(text) => {
+            Value::String(text.replace(&format!("{prefix}/"), &format!("{replacement}/")))
+        }
+        Value::Array(values) => Value::Array(
+            values
+                .into_iter()
+                .map(|v| redact_provider_root(v, prefix, replacement))
+                .collect(),
+        ),
+        Value::Object(values) => Value::Object(
+            values
+                .into_iter()
+                .map(|(k, v)| (k, redact_provider_root(v, prefix, replacement)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+#[test]
+fn default_provider_fixture_paths_are_portable() {
+    let home = tempfile::tempdir().unwrap();
+    assert!(provider_default_root("hermes", home.path()).starts_with(home.path()));
+    for prefix in [
+        "<home>/.local/share/goose",
+        "<home>/AppData/Roaming/Block/goose/data",
+    ] {
+        let value =
+            json!({"raw_path": format!("{prefix}/sessions/sessions.db"), "text": "ordinary text"});
+        assert_eq!(
+            redact_provider_root(value, prefix, "<provider-root:goose>"),
+            json!({"raw_path":"<provider-root:goose>/sessions/sessions.db", "text":"ordinary text"})
+        );
+    }
 }
 
 /// `sessions.parser_version` is deliberately not selected. It is the ingest
@@ -632,9 +712,18 @@ fn redact_string(text: String, homes: &[String], stamp: bool) -> String {
     if stamp && text.starts_with("codex-sqlite-v2:sha256:") {
         return "codex-sqlite-v2:sha256:<content>".into();
     }
+    if stamp && text.starts_with("vtcode_0_18_v1:sha256:") {
+        return "vtcode_0_18_v1:sha256:<content>".into();
+    }
     let mut text = text;
     let mut replaced = false;
     for home in homes {
+        // VT Code namespaces native ids by the declared workspace root. Its
+        // fixture HOME is temporary, so keep the namespace shape and native
+        // id while dropping only the path-derived digest.
+        let workspace_root = Path::new(home).join(".vtcode/sessions");
+        let digest = Sha256::digest(workspace_root.to_string_lossy().as_bytes());
+        text = text.replace(&format!("root:{digest:x}:"), "root:<workspace>:");
         if home.is_empty() || !text.contains(home.as_str()) {
             continue;
         }
@@ -821,6 +910,21 @@ fn corpus_snapshots_match_committed_evidence() {
          `UPDATE_SNAPSHOTS=1 cargo test -p ai-hist --all-features --test fixture_corpus`:\n{}",
         mismatched.join("\n")
     );
+}
+
+#[test]
+fn vtcode_corpus_hydrates_native_evidence() {
+    let key = "vtcode/basic";
+    assert_eq!(text(&rows(key, "hydration")[0], "status"), "hydrated");
+    let events = rows(key, "session_events");
+    assert!(events.iter().any(|row| text(row, "message_id") == "turn-a"));
+    assert!(events
+        .iter()
+        .any(|row| text(row, "message_id") == "assistant-b"));
+    assert!(events
+        .iter()
+        .any(|row| text(row, "tool_use_id") == "call-b"));
+    assert_eq!(rows(key, "tool_calls").len(), 1);
 }
 
 /// The first line that moved, so a failure names the behaviour that changed

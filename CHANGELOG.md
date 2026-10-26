@@ -8,6 +8,60 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Kilo CLI history is discoverable and searchable from its native session database, preserving recorded messages, tool results and session rewrites.
+- DeepAgents Code history is discoverable and searchable from native root checkpoints and message writes, including recorded tools, message revisions and compaction.
+- Cline core history is discoverable and searchable from canonical message snapshots, preserving recorded messages, tool identities and rewritten conversations.
+- Cortex Code history is discoverable and searchable from native snapshots and journals, preserving messages, tool results, rewrites and recorded event markers.
+- Mistral Vibe 3 history is discoverable and searchable from its native session store, including journal appends, generation rewrites, messages and tool effects.
+- goose history is discoverable and searchable from its native session database, preserving messages, tool results and native conversation rewrites.
+- Qoder global CLI session history is discoverable and searchable from its native project transcripts, preserving recorded messages, tools, results, and resume appends.
+- VT Code history is discoverable and searchable from canonical workspace journals under explicitly configured workspace roots, preserving recorded turns, tool identities, usage and control events.
+- Junie CLI history is discoverable and searchable from native session journals, including recorded prompts, assistant text, tool output and event markers.
+- The optional object-storage plugin (`plugins/object-store`) validates session `manifest.json` v1 and lets the desktop and server update it concurrently with compare-and-swap, without losing either side's changes.
+
+### Fixed
+
+- Grok Bot discovery shows each bot's profile name instead of its native UUID, including cached chats and later renames.
+- Reconciliation advances healthy roots past persistent enumeration errors while retaining failed locations for retry.
+- Exact-path capture avoids materializing unused cached transcript metadata and locations.
+- Unchanged Claude transcripts avoid duplicate file reads when record and metadata cursors have the same byte proof.
+
+- Filesystem-event sync can retain exact dirty paths and reuse catalog deltas, avoiding directory enumeration, whole-catalog digest copies and a silent full-history count for an active transcript append.
+- Cold reconciliation reuses current native transcript proofs without rehydrating unchanged archives.
+- Safety polling can reuse native transcript proofs without creating hydration checkpoints or metadata-only revisions for unchanged history.
+- Same-size transcript rewrites with a changed trusted filesystem timestamp replay their records even when bounded prefix hashes are unchanged.
+- Exact-path acquisition refreshes admitted project identities without resolving unrelated catalog rows on every slice.
+- Cold acquisition slices reuse validated writable connections instead of initializing the whole schema for every small file batch.
+- Concurrent acquisition threads retain independent transcript caches, avoid duplicate discovery reads of captured files and release buffers and handles when each acquisition finishes.
+- Reconciliation reports SQLite busy waits separately for work-based scheduling.
+- Capture cancellation stops SQLite busy retries so maintenance releases its sync lease while another writer remains held.
+
+### Rust API
+
+- Added `SessionStore::session_profile`, `SessionProfile`, and `SessionAvatar` for locally observed Grok Bot names, avatar shapes, colors, and inline raster images without transcript hydration or network access.
+- Added `Reconciliation::healthy_pass_exhausted` and `refresh_healthy_pass` for revisiting healthy roots without discarding unresolved enumeration failures.
+- Added `SyncOptions::paths` for exact-path capture.
+- Added `DiscoveryOptions::paths` for exact-path shallow discovery.
+- Added resumable `SessionStore::reconcile` rounds with bounded directory-entry and path slices.
+- Added `Reconciliation::discover_step` for bounded discovery without evidence acquisition.
+- Added `Reconciliation::capture_paths` for explicit safety batches using retained native proofs without advancing directory iterators.
+- Added `ReconciliationStep::sqlite_busy_wait` for measured SQLite busy-handler sleeps.
+- Reconciliation retains existing atomic transcript and database acquisition boundaries.
+
+- Added `Source::Kilo` for filtering and reading persisted Kilo CLI history.
+- Added `Source::DeepAgents` for filtering and reading persisted DeepAgents Code history.
+- Added `Source::Cline` for filtering and reading persisted Cline core history.
+- Added `Source::Cortex` for filtering and reading persisted Cortex Code history.
+- Added `Source::MistralVibe` for filtering and reading persisted Mistral Vibe history.
+- Added `Source::Goose` for filtering and reading persisted goose history.
+- Added `Source::Qoder` for filtering and reading persisted Qoder global CLI history.
+- Added `Source::Vtcode` for filtering and reading persisted VT Code session history.
+- Added `Source::Junie` for filtering and reading persisted Junie CLI history.
+
+## [0.50.1] - 2026-10-21
+
+### Added
+
 - Windows arm64 (`aarch64-pc-windows-msvc`) is supported: `npm install` pulls the prebuilt `ai-hist-native-win32-arm64-msvc` addon, and `@relayhistory/provider-sources` ships a native `win32-arm64-msvc` helper.
 - Qwen Code interactive session history is discoverable and searchable from native transcript files, preserving the active conversation branch, recorded messages and tool evidence.
 - Kimi Code history is discoverable and searchable from current native session journals, including recorded messages, tools and separate subagent transcripts.
@@ -17,12 +71,19 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - The source-built Rust CLI no longer installs a background sync service: `ai-hist sync --install-service`, `--uninstall-service` and `--interval` (launchd on macOS, cron on Linux) are gone. Run `ai-hist watch`, or schedule `ai-hist sync` yourself. A service installed earlier keeps running until you remove it: `launchctl unload ~/Library/LaunchAgents/com.ai-hist.sync.plist` and delete that file on macOS, or delete the `# ai-hist sync (managed)` line from `crontab -e` on Linux.
 
+### Fixed
+
+- A desktop socket pointer file with more than one line (LF or CRLF) names the socket by its first line instead of never connecting.
+- The relay roster, status, join and leave tools move on to the next desktop socket candidate when a Windows named pipe is busy, and report `socket_busy` (not "desktop isn't running") when none answers.
+- Hermes hydration preserves remote-backed evidence when a local transcript changes, rejecting conflicting rewrites without replacing shared history.
+- Source evidence intake rejects blank tool call identifiers while preserving recorded Hermes call and result identities.
+
 ### Rust API
 
-- Added `SessionStore::session_profile`, `SessionProfile`, and `SessionAvatar` for locally observed Grok Bot names, avatar shapes, colors, and inline raster images without transcript hydration or network access.
 - Added `Source::QwenCode` for filtering and reading persisted Qwen Code history.
 - Added `Source::Kimi` for filtering and reading persisted Kimi Code history.
 - Added `Source::Codebuddy` for filtering and reading persisted Codebuddy Code history.
+- `ChangeOp::Upsert` now holds a `Box<EvidenceRow>` and `EvidenceRow::SessionEvent` a `Box<SessionEvent>`, shrinking every `Change`; match through the box (e.g. `ChangeOp::Upsert(row) => match row.as_ref() { .. }`) and wrap constructed values with `Box::new`. The serialized change feed is unchanged.
 
 ## [0.49.0] - 2026-10-21
 
@@ -40,10 +101,6 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - Grok Build sessions show the name recorded in `generated_title` or `session_summary`; previously cached sessions refresh their missing titles on the next discovery, sync or hydration.
-### Fixed
-
-- Grok Bot discovery shows each bot's profile name instead of its native UUID, including cached chats and later renames.
-
 ### Removed
 
 - Removed the zero-caller `discoverAndList` helper from the TypeScript SDK; callers run `discoverSessions` then `listSessionCatalogPage` directly.
@@ -1097,7 +1154,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - The SDK reads provider JSONL natively and works without the Python CLI.
 
-[Unreleased]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.49.0...HEAD
+[Unreleased - Minor]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.50.1...HEAD
+[0.50.1]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.49.0...sdk-ts-v0.50.1
 [0.49.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.48.0...sdk-ts-v0.49.0
 [0.48.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.47.0...sdk-ts-v0.48.0
 [0.47.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.46.0...sdk-ts-v0.47.0

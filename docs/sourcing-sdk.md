@@ -5,8 +5,8 @@ coding-agent session evidence without parsing harness logs itself. This guide
 is for that program's author: the surface the crate exposes on its **default
 features**, and the rules that surface is governed by.
 
-Everything a consumer needs is one type, `ai_hist::SessionStore`, seventeen
-operations, and the typed structs they return. Nothing on this surface names a
+Everything a consumer needs is one type, `ai_hist::SessionStore`, its operations,
+and the typed structs they return. Nothing on this surface names a
 `rusqlite` type, and no JSON column reaches a consumer as a string. This is the
 surface [`docs/sourcing-contract.md`](sourcing-contract.md) is delivered
 through and the ADR
@@ -586,14 +586,14 @@ tombstone at its own revision, which a later insert of the same key clears.
 `Change { kind, source, source_name, session_id, record_key, key, revision, op, columns }`
 in `(revision, kind, record_key)` order, bounded to the head at open, in
 `batch`-sized indexed reads of at most `MAX_CHANGE_BATCH`; `op` is
-`Upsert(EvidenceRow)` — the typed row, so no second read is needed, or
+`Upsert(Box<EvidenceRow>)` — the typed row, so no second read is needed, or
 `EvidenceRow::Untyped` for a kind with none — or `Delete`. A re-seen key is a
 replace, never a duplicate.
 
 | `ChangeKind`          | Table                   | `key` after the kind                                                  | Typed row             |
 | --------------------- | ----------------------- | --------------------------------------------------------------------- | --------------------- |
 | `Session`             | `sessions`              | `source, session_id`                                                  | `ShallowSession`      |
-| `SessionEvent`        | `session_events`        | `source, session_id, event_uid`                                       | `SessionEvent`        |
+| `SessionEvent`        | `session_events`        | `source, session_id, event_uid`                                       | `Box<SessionEvent>`   |
 | `ToolCall`            | `tool_calls`            | `source, session_id, tool_use_id`                                     | `SessionToolCall`     |
 | `FileEdit`            | `file_edits`            | `source, session_id, tool_use_id`                                     | `SessionFileEdit`     |
 | `SessionMarker`       | `session_markers`       | `source, session_id, marker_uid`                                      | `SessionMarker`       |
@@ -1010,21 +1010,30 @@ handle.
 | --- | --- | --- | --- | --- | --- | --- |
 | antigravity | ✓ | ✓ | — | — | — | none |
 | claude | ✓ | ✓ | ✓ | ✓ | ✓ | per-message |
+| cline | ✓ | ✓ | ✓ | — | — | none |
 | codebuddy | ✓ | ✓ | ✓ | — | — | per-message |
 | codex | ✓ | ✓ | ✓ | ✓ | ✓ | cumulative-delta |
 | copilot | ✓ | ✓ | ✓ | — | — | per-message |
+| cortex | ✓ | ✓ | ✓ | — | — | none |
 | cursor | ✓ | ✓ | ✓ | ✓ | — | none |
+| deepagents | ✓ | ✓ | ✓ | — | — | none |
 | devin | ✓ | ✓ | ✓ | ✓ | — | none |
+| goose | ✓ | ✓ | ✓ | — | — | none |
 | grok | ✓ | ✓ | ✓ | ✓ | ✓ | per-request |
 | grok-bot | ✓ | ✓ | — | — | ✓ | none |
 | hermes | ✓ | ✓ | ✓ | — | — | none |
+| junie | ✓ | ✓ | ✓ | — | — | none |
+| kilo | ✓ | ✓ | ✓ | — | — | none |
 | kimi | ✓ | ✓ | ✓ | — | — | none |
+| mistral-vibe | ✓ | ✓ | ✓ | — | — | none |
 | muse | ✓ | ✓ | ✓ | ✓ | ✓ | per-request |
 | omp | ✓ | ✓ | ✓ | — | — | per-message |
 | openclaw | ✓ | ✓ | ✓ | — | — | per-message |
 | opencode | ✓ | ✓ | ✓ | ✓ | ✓ | none |
 | pi | ✓ | ✓ | ✓ | — | — | per-message |
+| qoder | ✓ | ✓ | ✓ | — | — | none |
 | qwen-code | ✓ | ✓ | ✓ | — | — | per-message |
+| vtcode | ✓ | ✓ | ✓ | — | — | per-request |
 <!-- sourcing-sdk-population-table:end -->
 
 The ADR's [capture matrix](decisions/2026-09-19-relayhistory-owns-session-sourcing.md#capture-matrix)
@@ -1152,3 +1161,163 @@ gap and the facade grows instead. A consumer outside this repository that
 finds itself reaching for `unstable-internal` has found a gap in this
 document; open an issue against the facade rather than depending on the
 feature.
+
+## Incremental embedder scheduling
+
+An embedder with its own filesystem watcher should retain exact event paths in
+`SyncOptions::paths` together with their owning `sources`, rather than turn a
+single append into provider-wide sync. Without explicit source hints, known
+paths select their owning providers; an unrecognized legacy/deleted-profile path
+retains the prior unrestricted-source fallback because current watch roots are
+not an exhaustive ownership catalog. `None` keeps the legacy whole-source behavior; `Some(vec![])` does no
+provider I/O. The SDK applies the same provider-owned locator rules as its watcher,
+continues from durable transcript byte cursors, and never publishes a full-source
+fingerprint for a partial pass. Exact primary Claude/Codex transcripts use shallow
+discovery and targeted acquisition without loading or saving the global
+`.sync-state.json` archive map. Dirty event passes should set `force(true)` so
+same-stat writes reach content validation; cold reconciliation retains current
+parser/ctime proofs and reads no body bytes for settled unchanged files on trusted
+filesystems. Unknown filesystems retain bounded digest validation. Replaced
+identities trigger one fresh shallow read of the admitted paths instead of
+retrying a cached identity forever. Keep the `SessionStore` handle: successive syncs
+update an exclusive catalog baseline from the database change feed, without
+copying or walking unrelated catalog keys. Writes from other handles are folded
+in before the call's bracket; database replacement/feed epoch changes rebuild the
+baseline instead of trusting old identities. A failed attempt retains its committed
+catalog delta for the next successful report; changes committed by another writer
+before that retry are still excluded from the attempt bracket. The existing
+cancellable sync lock remains held through successful public report publication,
+so concurrent calls cannot consume the same retained changes twice.
+
+`SessionStore::reconcile()` starts a round-robin reconciliation of provider-owned
+watch roots. `step(max_entries, max_paths, SyncOptions::default())` clamps both limits to
+at least one, then inspects at most that many directory entries and attempts at
+most that many exact paths. A zero limit can therefore process one entry/path.
+Retain the round between calls: restarting discovery with a row limit repeatedly
+visits the same newest prefix and is not reconciliation. Each provider rotates
+after every slice, including errors. Failed enumeration items remain pending in
+a fair retry queue, so an unreadable directory or entry does not monopolize the
+healthy work behind it. Errors still return through `Err`; unresolved failures
+keep `complete` false.
+
+`healthy_pass_exhausted()` is a level query that remains usable after `Err`. It
+means ready enumeration and pending acquisition have drained, not that all
+coverage succeeded. At an existing periodic backstop or loss-recovery boundary,
+`refresh_healthy_pass()` can revisit the retained validated roots without dropping
+failed obligations. It returns `false` without mutation while ready work or
+pending acquisitions remain. It also refreshes providers that already completed,
+preserves source filters and each failed item's owning watch scope, and resets
+per-pass proof/connection caches. Consumers must keep ordinary failure retries
+running between refreshes; this API adds no retry timer and must not move failed
+paths onto the longer healthy backstop. It is not a successful-completion signal
+for maintenance, progress, or health reporting. Changed consent/root settings
+still require the caller's newly validated store/round.
+
+A fresh round after completion covers roots created after registration, lost
+events and concurrent directory moves. `sources([Source::Claude])` restricts an additional
+login/root to its own provider. `discover_step` takes `DiscoveryOptions` and only
+writes shallow catalog metadata; it must be used for selected-only inventory.
+Acquisition slices also retain one writable connection within the round, avoiding
+repeated schema initialization for every small batch. Each checkout still takes
+the existing cancellable sync lease first. File identity and both SQLite schema
+and external-data versions must match the last validation; replacement, DDL or
+data-only readiness changes reopen or revalidate normally. No transaction or sync
+lease remains held between slices. Uncertain identities and SQLite URI paths
+retain fresh-open behavior. This cache applies to acquisition, not shallow
+discovery, and does not relax any file/evidence proof.
+`ReconciliationStep::sqlite_busy_wait` reports actual elapsed sleeps in the SDK's
+SQLite busy handler on the executing thread. It excludes other worker threads
+and waits outside that handler, and is not CPU time. The default busy handler observes the public stop token
+before each retry sleep, so cancellation can release the capture sync lease
+while another SQLite writer remains held; ordinary retry timeouts are unchanged.
+Cost-based scheduling may
+subtract this known blocked time from the full wall duration using saturating
+subtraction; the full wall duration remains useful diagnostic information.
+
+Cold acquisition can reuse a current native global-sync unchanged-file proof
+without creating an independent hydration checkpoint. One read-only sync-state
+snapshot is cached for the round; file/state/database identity, parser generations,
+existing native evidence and continuity still have to match. A recorded trusted
+ctime change rejects reuse even when the bounded head/tail hashes match. Native
+cursors without that prior proof retain their existing bounded-window validation
+contract. Changed or uncertain paths use ordinary acquisition. A present destination marker is compared with
+that session's current indexed holdings. Without a marker, the existing native
+evidence-presence guard applies and cannot independently detect partial historical
+row loss. Hot and selected-only acquisition do not install this cold proof scope,
+and hot exact appends still do no global sync-state I/O.
+
+For a safety poll that names known paths, retain a separate
+`Reconciliation` and call `capture_paths(SyncOptions { paths: Some(paths),
+..Default::default() })`. This uses the same native proof and writable-connection
+contexts as `step`, without advancing directory iterators. The caller bounds the
+path batch. `paths: None` is rejected; an empty allowlist performs no provider
+I/O. `sources(...)` restrictions still apply after enumeration completes, and
+repeated restrictions intersect. A forced request bypasses native proof reuse;
+retain forced acquisition for actual filesystem events and explicit repair.
+Recreate the safety context when roots or consent change and after successful
+full maintenance. If its retained sync-state proof becomes stale, it withholds
+reuse rather than repeatedly loading the global map or trusting old evidence.
+
+An unchanged native-only file need not initialize a second hydration cursor.
+A real append fails that unchanged proof and takes ordinary acquisition; the
+first append can still replay that one native-only transcript, while subsequent
+Session-cursor appends remain incremental. A same-size file whose previously
+trusted ctime changed restarts both primary walks, so a middle-only rewrite
+outside the bounded hash windows cannot resume at EOF. Growing files keep
+ordinary append cursors. Filesystems without a prior trusted ctime retain the
+existing bounded-window contract. These proofs do not replace global parser
+sealing or destination audits. Compare actual feed head revisions when deciding
+whether to wake delivery: an attempted exact scope can report `swept` even if
+every path was proven unchanged.
+
+A discovery row `limit` is rejected before consuming any iterator position: use
+`max_entries`/`max_paths` to bound a round without dropping unexamined candidates.
+
+Primary continuity fields are banked without enumerating related families. The
+current locator, affected origins/dependents and children naming newly arrived
+parent records (message IDs or Claude block-0 UIDs) reconcile immediately through indexed identity/revision lookups.
+A completed Claude/Codex source round retries all still-unresolved continuity once under the
+sync lock. This recovery can scale with unresolved evidence; it does not run for
+each hot append. Existing public `hydrate(include_related: false)` semantics and
+selected-only family consent are unchanged.
+
+| Input | Exact-path work | Remaining acquisition boundary |
+| --- | --- | --- |
+| Primary Claude/Codex JSONL | Indexed shallow observation + durable byte cursor; no global stamp map | One transcript; metadata and record cursor must both finish |
+| Claude sidecars / Codex delegated files without root metadata | Provider-owned scoped legacy acquisition | Existing relationship ownership and global stamp bookkeeping |
+| Provider SQLite / other flat logs | Provider-owned scoped fallback | Existing provider snapshot/selection; Codex SQLite retains its bounded thread backlog |
+| Selected-only inventory | Bounded directory/file scheduling and shallow discovery | No unselected evidence hydration |
+
+These are **enumeration/file-count bounds**, not hard CPU, byte or elapsed-time
+bounds. One transcript and provider SQLite snapshot retain their established
+transaction and cursor publication boundaries. In particular, interrupted Claude
+sync can have committed evidence chunks without publishing its final byte cursor,
+and Codex rewrite repair is atomic across a rollout. A time limit implemented by
+cancelling the same large input on every retry can therefore starve it forever.
+Let that input finish, keep stop cancellation for shutdown, and pace subsequent
+cold work by its elapsed work cost without an upper sleep clamp, excluding only
+known blocked time reported by the SDK. Completed
+per-file checkpoints survive a dropped/restarted round; the filesystem iterator
+position itself is in memory and is rebuilt after a process restart.
+
+Partial passes do not seal global parser generations or perform a full
+destination audit. Cold native proof reuse checks a present marker only for the
+current session before skipping it. Embedders should retain an infrequent full `sync` maintenance audit
+(for example after initial reconciliation, then daily), and explicit full-sync
+repair commands. A full audit and each atomic input can still be slow. Keep hot
+capture and cold scheduling separate, and do not add their individual duty
+fractions up as a claim about measured combined CPU usage.
+
+Transcript read reuse belongs to the acquisition thread. Concurrent stores cannot
+evict one another's parked handles or retained bytes. Each active acquisition can
+retain up to 256 MiB of earlier transcript data plus its current file (at most
+8 MiB), bounded head/tail snapshots and one parked handle; this is a per-active-
+thread bound, not a process-wide memory budget. Nested hydration shares its outer
+acquisition cache. Completion, errors and panic unwinding drop retained handles,
+bytes and map allocations, so idle worker threads do not retain these buffers.
+
+Full-sweep discovery parses cache-backed candidates on the acquisition owner
+thread, where the retained bytes live. It preserves parallel filesystem reads
+for uncached candidates. This routing inspects only the current read window and
+copies no retained payloads; the actual shallow reader rechecks stat and ctime
+before using cached regions, including a rewrite after scheduling.

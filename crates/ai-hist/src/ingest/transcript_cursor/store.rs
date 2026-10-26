@@ -25,7 +25,7 @@ pub(crate) fn load_cursor(conn: &Connection, key: &CursorKey<'_>) -> Result<Tran
 
 /// [`load_cursor`], and the stored document it decoded, for a writer that
 /// must only replace exactly what it read.
-pub(super) fn load_cursor_with_document(
+pub(crate) fn load_cursor_with_document(
     conn: &Connection,
     key: &CursorKey<'_>,
 ) -> Result<(TranscriptCursorState, Option<String>)> {
@@ -64,7 +64,7 @@ pub(crate) fn store_cursor(
     key: &CursorKey<'_>,
     state: &TranscriptCursorState,
 ) -> Result<()> {
-    let encoded = state.encode();
+    let encoded = state.encode()?;
     let offset = state.committed_offset();
     let prefix_hash = state.prefix_hash();
     let dev_ino = state.dev_ino();
@@ -112,5 +112,22 @@ pub(crate) fn store_cursor(
             )?;
         }
     }
+    Ok(())
+}
+
+/// Settlement adds metadata only and must not roll back a concurrent parser's
+/// position. The checkpoint's byte columns remain untouched.
+pub(crate) fn settle_session_if_unchanged(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+    expected: Option<&str>,
+    state: &TranscriptCursorState,
+) -> Result<()> {
+    let Some(expected) = expected else {
+        return Ok(());
+    };
+    conn.execute("UPDATE session_hydration_checkpoints SET parser_state_json=?1         WHERE source=?2 AND session_id=?3 AND location='local' AND parser_state_json=?4",
+        params![state.encode()?, source, session_id, expected])?;
     Ok(())
 }

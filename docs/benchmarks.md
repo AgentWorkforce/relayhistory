@@ -1155,3 +1155,218 @@ phase, CPU medians:
 - The remaining forced-sweep time on the real store is evenly spread:
   Codex existence probes, discovery's per-candidate stamp reads, the OpenCode
   holdings scan and the catalog digest, each 1–2 s of mostly I/O.
+
+## Session-visible latency
+
+The product limit: **a new session is visible in the desktop in under 5 ms**,
+p99, release build, with nothing on the read or write path waiting on the
+network. The tables above measure throughput; this section measures how long
+one new session takes to show up, and splits that time into stages so each
+stage has a budget a change can be held to.
+
+| Stage | Budget (p99) | Measured by |
+|---|---:|---|
+| filesystem event → watcher | 1.0 ms | `stages.fs_event`: the raw `notify` callback (FSEvents on macOS, inotify on Linux) for a newly written transcript |
+| parse + SQLite transaction | 1.5 ms | `stages.ingest_hook` (`hydrate` by path, the hook fast path) and `stages.sweep_scoped_sync` (the forced, source-scoped `sync` a watch tick and the desktop collector run) |
+| change-feed notify → desktop | 1.0 ms | `stages.feed_pull`: `changes_since` from the previous head after one new session, i.e. the read a pull consumer pays per wake-up |
+| desktop query + render | 1.5 ms | `stages.list_first_paint` / `list_scale.list_first_paint`: `SessionStore::sessions` with the desktop's filter (`scope: All`, `exclude_delegated`), LIMIT 50. Render is the desktop's and is not measured here |
+| desktop page (LIMIT 500) | 4.0 ms | `list_scale.list_desktop_page`: the same query at the desktop's 500-row page (`SESSION_LIST_LIMIT`). Its own budget, because the page is filled after the first 50 rows are on screen and is not on the new-session path |
+| **total** | **< 5 ms** | `e2e.e2e_visible`: write → `SessionStore::watch` (production defaults) reports the session in `TickReport::changed` → it is first on the list |
+
+Three pieces, mirroring the sync benchmark:
+
+| File | Role |
+|---|---|
+| `crates/ai-hist-cli/tests/latency_bench.rs` | The `#[ignore]`d harness. One phase per process; reports nearest-rank p50/p90/p99/max per metric. |
+| `scripts/benchmark-latency.mjs` (+ `-lib.mjs`) | Builds the release harness, runs each run of a profile for N rounds, takes the median of each percentile across rounds, applies the gate, renders the table. |
+| `scripts/latency-thresholds.json` | Budgets per metric, the regression policy, the `gate` and `full` profiles, and per-platform baselines. |
+
+```bash
+node scripts/benchmark-latency.mjs --gate                       # what CI runs
+node scripts/benchmark-latency.mjs --profile full --output latency.json --markdown latency.md
+node scripts/benchmark-latency.mjs --report-only latency.json   # re-render or re-gate a saved run
+```
+
+### The phases
+
+| Phase | Store | Timed work |
+|---|---|---|
+| `stages` | 30 days | each stage above in isolation, plus diagnostics: `open_db` (the writable open every sync, hydrate, forget and change-feed commit performs), `open_raw` (SQLite's own open), `schema_check_cached` (what a cached "schema is current" check would cost per write: stat the file's dev/ino, so a replaced database invalidates it, and read `PRAGMA schema_version` on an open connection), and on macOS `fs_event_kqueue` / `fs_event_kqueue_resolved` (a raw-libc kqueue `EVFILT_VNODE`/`NOTE_WRITE` watch on the project directory, and that plus the `read_dir` diff that finds which file is new, since a vnode event names none). The kqueue probe is raw libc because enabling notify's `macos_kqueue` feature, even in a test, switches ai-hist's own watcher to kqueue |
+| `e2e` | 30 days | write a new transcript → `TickReport` naming it → list query returns it. Samples are spaced past the debounce window, so each is a leading-edge tick: the new-session case |
+| `list_scale` | 30 days, 1 year | the list query alone: first page, the desktop's 500-row page, and a page halfway back through history |
+| `ingest_upload` | 30 days | hook-path ingest of N new sessions alone, then again while an uploader on its own `SessionStore` drains the change feed from a named cursor, serializes each row and commits the cursor. The uploader drains its backlog before the measured batch starts |
+| `prune` | 1 year | a reader thread running the list query back to back, first alone, then while `forget_evidence` keeps only the last 30 days; plus a writer ingesting a new session every 20 ms during the prune |
+
+The store is a fake HOME of Claude transcripts, 40 sessions a day, two turns
+each, read through `ProviderRoots::from_home` so the process environment cannot
+point a phase at real history. A populated store is cached under
+`target/latency-bench/cache` and restored to a fixed path for each phase (the
+catalog records absolute transcript paths), so a year of history is built once
+per run, not once per phase. The store lives under `target/`, not the system
+temp directory, because that is tmpfs on some Linux hosts and makes every fsync
+free.
+
+### The gate
+
+`.github/workflows/latency-gate.yml` runs `--gate` on `ubuntu-latest` and
+`macos-latest`. macOS is in the matrix because stage 1 is FSEvents there and
+the budget is set for the macOS desktop. It is a workflow of its own, not a
+step in `verify`, because the budgets are release-build numbers and `verify`
+builds debug.
+
+It is **opt-in**, because a release build of head and base plus the
+measurement costs ~11 min on ubuntu and ~20 min on macOS. It runs:
+
+* on every push to `main`, against the stored baselines and known numbers;
+* on manual dispatch (`gh workflow run latency-gate.yml --ref <branch>`,
+  optionally `-f profile=full`). This also uses the stored numbers, since a
+  dispatch has no base;
+* on a pull request that carries the **`latency`** label and touches
+  `crates/`, the lockfile or the gate. Adding the label starts a run, and each
+  push to a labelled pull request runs it again, against the pull request's
+  base commit. Adding any other label does not restart a run in progress.
+  Label a pull request that touches capture, the store, the change feed,
+  the catalog query or retention.
+
+Required checks: none exist on `main` today. If `latency` is ever made a
+required status check, an unlabelled pull request reports the job as
+*skipped*, which GitHub counts as passing. So a required check would not by
+itself force the measurement to run; a reviewer or a labelling rule has to
+add the label.
+
+Only the metrics with a budget are gated: the stages of the 5 ms path.
+Everything else in the table (`open_db`, `open_raw`, the uploader's own drain
+and commit, the quiet reads) is diagnostic. A budgeted metric is **enforced**
+on a platform class or **tracked** there. `enforced` is `true`, `false`, or a
+list of classes: the raw filesystem event meets its budget under inotify and
+not under FSEvents, and holding Linux to it is worth more than waiting for
+macOS.
+
+**Enforced stage** (the code meets the budget):
+
+* p99 at or above the budget fails.
+* p99 more than 10% plus the floor over the **base commit** fails. On a pull
+  request the workflow passes `--base <base sha>`. The driver checks the base
+  out into a worktree under `target/latency-base` and copies this checkout's
+  harness into it; the harness uses only the public API, so a base that
+  predates it still builds. It then runs both, interleaved round by round, on
+  the same runner.
+* p99 over the stored baseline in `baselines` fails only when there is no
+  base (a push to `main`, a manual run) and the runner's CPU is in
+  `cpusSeen`. Otherwise it is advisory.
+
+**Tracked stage** (known over budget; its current numbers are the `known`
+block of its budget, per platform class):
+
+* Over budget is `xfail`: expected, printed in the "Known over budget" table,
+  and not failing. Under budget is `xpass`, a warning that names the stage as
+  ready to enforce. The change that brings a stage under budget enforces it
+  in the same pull request, never the other way.
+* Getting worse fails. "Worse" means the p50 is more than 25% over the base
+  *and* more than 10% over its known p50. With no base, the known number
+  alone decides, on a recorded CPU.
+
+Every bound adds a floor of max(0.05 ms, 10% of the stage's budget).
+
+Why a same-runner comparison and not stored numbers: on this change's first
+four CI jobs, the same metric was 20-40% apart between two `ubuntu-latest`
+runners (EPYC 9V74 and EPYC 7763, the list query at 0.28 and 0.38 ms p99),
+and the macOS runner's list p99 went from 0.53 to 1.72 ms between two jobs on
+the same CPU model while its p50 held at ~0.25 ms. A 10% bound against a
+stored number on that pool would fail most healthy pull requests -- the
+lesson the sync gate above learned on #194, #199 and #204. Two runs on one
+machine, minutes apart and interleaved, share the machine's speed and its
+neighbours.
+
+Why p50 for tracked stages: their tails are lock waits and WAL checkpoints
+that land on whichever samples they land on. The hook ingest's p99 was
+257 ms in one job and 31 ms in the next, while its p50 was 23 and 24 ms. Why
+both tests for "worse": on a pull request that changes no library code, the
+same-runner comparison still moved tracked stages 12-27%
+(`ingest_during_prune` 151 vs 119 ms p50, `e2e_visible` 121 vs 108 ms). A
+25% bound alone fails some of those runs, and a known number alone fails on
+a slower runner. A real regression clears both.
+
+Why the floor grows with the budget: a no-change comparison on a busy
+machine moved the raw fs-event p99 from 0.15 to 0.60 ms over 100 samples.
+That stage now takes 1,000 samples, and a slowdown smaller than a tenth of
+what a stage may spend is not one to fail a pull request on.
+
+The comparison is shown to catch a regression. With a 300 µs sleep injected
+into `SessionStore::sessions`, the list stage failed against its base (p99
+0.624 ms against a bound of 0.302 ms). The stored-baseline bound (0.685 ms)
+would have let it through.
+
+Each round is its own process and each reported percentile is the median
+across rounds; the table also prints the worst round. Record or extend
+baselines and known numbers from a CI artifact with
+`--report-only <artifact.json> --update-baselines`. Lowering a baseline after
+a speed-up means deleting that class's entry and re-recording, since merging
+only ever keeps the worse value.
+
+`--profile smoke` runs every phase on a tiny store in seconds (its numbers mean
+nothing) to check the driver and the base worktree end to end.
+
+### 2026-10-25 baseline
+
+From the gate's CI job on this change (3 rounds per run; 100 samples, 1,000
+for the raw event and the 1-year list, 60 for `e2e`, 20 per round for the
+sweep). p99 in ms, with p50 in brackets where the tail hides the typical case.
+The interleaved base run on the same runner agreed within a few percent on
+every stage. Earlier jobs reported longer write-stage tails (forced sweep
+p99 12 s, hook ingest p99 257 ms). Those were the harness's own cache
+restore: it gave every transcript a new inode, so the first sweeps re-read
+all of history. Restore now hard-links, and the numbers below are from after
+that fix.
+
+| Stage | Budget | ubuntu-latest (EPYC 7763, 4 cores) | macos-latest (Apple M1, virtual, 3 cores) |
+|---|---:|---:|---:|
+| `fs_event` (raw backend event) | 1.0 | **0.127** | 19.2 [14.4] |
+| `ingest_hook` (parse + txn, hook path) | 1.5 | 29.8 [24.0] | 53.9 [19.3] |
+| `sweep_scoped_sync` (forced Claude-scoped sync) | 1.5 | 565 [86] | 603 [75] |
+| `open_db` (diagnostic) | — | 4.9 [4.8] | 6.9 [4.5] |
+| `open_raw` (diagnostic) | — | 0.082 | 0.135 |
+| `feed_pull` (one-session change-feed read) | 1.0 | 1.37 [1.28] | 2.53 [0.85] |
+| `list_first_paint`, 30 days | 1.5 | **0.370** | **0.585** |
+| `list_first_paint`, 1 year (14,600 sessions, 252 MiB) | 1.5 | **0.382** | **0.574** |
+| `list_desktop_page` (500 rows), 30 days | 4.0 | **2.45** [2.31] | 2.88 [1.32] |
+| `list_desktop_page` (500 rows), 1 year | 4.0 | **2.60** [2.51] | 3.00 [1.58] |
+| `e2e_visible` (write → `watch` tick → listed) | 5.0 | 35.1 [28.0] | 184.7 [87.6] |
+| `ingest_with_uploader` (alone: 28.7 / 91.1) | 1.5 | 43.1 [29.1] | 109.3 [30.3] |
+| `read_during_prune` (quiet: 0.36 / 0.37) | 1.5 | **0.767** | 1.476 |
+| `ingest_during_prune` | 1.5 | 9,712 [159] | 5,151 [190] |
+
+Bold is within budget. With a concurrent uploader, ingest throughput was
+0.87× of ingest alone on Linux (35 vs 40 sessions/s) and 0.72× on macOS. The
+uploader's cursor commit reached 86 ms p99 on Linux and 546 ms on macOS.
+Pruning 13,401 sessions out of a year took 12.7 s on Linux and 22.4 s on
+macOS.
+
+What the numbers say:
+
+* **The read side is already inside budget.** The indexed list query is
+  0.37–0.38 ms p99 on Linux whether the store holds 30 days or a year
+  (`idx_sessions_recency`), and a deep page costs the same as the first.
+  The desktop's 500-row page takes ~2.6 ms. That is page size, not store
+  size, and the page has its own 4.0 ms budget.
+* **`open_db` is a fixed 4.5–4.9 ms, and ~99% of it is the schema check.**
+  SQLite's own open is 0.05–0.08 ms. Every `sync`, hook ingest (at least
+  twice), `forget_evidence` and `Changes::commit` pays it. That alone is over
+  the 1.5 ms write budget before any parsing starts.
+* **The write stages are 15–60× over budget.** A hook ingest of one
+  six-record session is ~24 ms typical. A forced Claude-scoped `sync`
+  re-walks the whole Claude root: ~80 ms on a 30-day store, with a tail past
+  half a second.
+* **FSEvents alone costs 14–19 ms on the macOS runner**, even with notify's
+  `latency 0.0` and `kFSEventStreamCreateFlagNoDefer`. inotify costs 0.1 ms.
+  The runner is virtualized, so this needs confirming on M-series hardware,
+  but no later stage can win that time back. It is also why `e2e` is 3× slower
+  on macOS than on Linux.
+* **The change-feed pull is ~1.3 ms**, just over its budget, and it is a pull:
+  a consumer that polls adds its interval on top. The only push today is
+  `WatchHandle`'s `TickReport` channel, which costs nothing measurable once
+  the tick ends (`e2e_tick_to_listed`, 0.3–0.5 ms, includes the list query).
+* **Retention blocks capture.** `forget_evidence` holds the `SyncRunLock` for
+  the whole run and deletes in batches, so a new session's ingest waited up
+  to ~10 s (p99) during a year-scale prune. Linux readers were barely
+  touched; on macOS the read p99 quadrupled, to just under budget.

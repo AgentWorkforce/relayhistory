@@ -1,0 +1,59 @@
+[package]
+name = "relayhistory-object-store"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+# `std::fs::File::lock` (FsStore's conditional-update lock) is stable from 1.89.
+rust-version = "1.89"
+description = "Object-storage destination adapters (S3, GCS, Azure Blob, filesystem) for RelayHistory raw session delivery"
+publish = false
+
+# Not a member of the root workspace, on purpose: the local read/write hot path
+# (`ai-hist`, the napi addon, the CLI) must never link a cloud SDK. CI's
+# `verify` job deletes `plugins/` before building the core to prove it.
+[workspace]
+
+[features]
+default = ["s3", "gcs", "azure"]
+s3 = ["object_store/aws"]
+gcs = ["object_store/gcp"]
+azure = ["object_store/azure"]
+# Exposes `conformance::run_suite` so out-of-tree adapters can prove themselves
+# against the same contract.
+conformance = ["dep:rand"]
+
+[dependencies]
+async-trait = "0.1"
+bytes = "1"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
+hex = "0.4"
+object_store = { version = "0.14.2", default-features = false, features = ["fs"] }
+rand = { version = "0.9", optional = true }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"
+tokio = { version = "1", features = ["rt", "sync", "fs", "time"] }
+tracing = "0.1"
+url = "2"
+zstd = { version = "0.13", default-features = false }
+
+[dev-dependencies]
+rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
+tempfile = "3"
+base64 = "0.22"
+hmac = "0.12"
+sha2 = "0.10"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
+httpdate = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+
+[[test]]
+name = "conformance"
+required-features = ["conformance", "s3", "gcs", "azure"]
+
+[[test]]
+name = "manifest"
+required-features = ["s3", "azure"]

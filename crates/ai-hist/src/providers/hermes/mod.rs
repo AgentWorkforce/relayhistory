@@ -106,7 +106,10 @@ fn ingest(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
         .provider_session
         .ok_or_else(|| anyhow::anyhow!("missing Hermes snapshot"))?;
     let session: Session = serde_json::from_value(snapshot.payload.clone())?;
-    normalize::session(ctx.conn, &session, ctx.path.unwrap())?;
+    let path = ctx
+        .path
+        .ok_or_else(|| anyhow::anyhow!("missing Hermes session path"))?;
+    normalize::session(ctx.conn, &session, path)?;
     Ok((
         IngestOutcome {
             records: snapshot.records,

@@ -54,7 +54,6 @@ pub(crate) const ADAPTER: Option<ProviderAdapter> = Some(ProviderAdapter {
 });
 
 #[derive(Clone, Copy)]
-#[allow(dead_code)] // All variants are exercised by the cross-platform root test.
 enum DesktopPlatform {
     Macos,
     Windows,
@@ -62,12 +61,15 @@ enum DesktopPlatform {
 }
 
 fn resolve_roots(home: &Path, use_env: bool) -> ResolvedProviderRoots {
-    #[cfg(target_os = "macos")]
-    let platform = DesktopPlatform::Macos;
-    #[cfg(target_os = "windows")]
-    let platform = DesktopPlatform::Windows;
-    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    let platform = DesktopPlatform::Linux;
+    // `cfg!` rather than `#[cfg]`, so every variant is built on every target
+    // and the cross-platform root test exercises the same code.
+    let platform = if cfg!(target_os = "macos") {
+        DesktopPlatform::Macos
+    } else if cfg!(target_os = "windows") {
+        DesktopPlatform::Windows
+    } else {
+        DesktopPlatform::Linux
+    };
     resolve_roots_for_platform(home, use_env, platform)
 }
 

@@ -1,5 +1,4 @@
 //! Internal admission seam for provider-owned acquisition. No runtime loading.
-#![allow(dead_code)] // Optional adapter hooks are exercised by the test provider until pilots land.
 use crate::discover::WatchRoot;
 use crate::hydrate::HydrateSessionOptions;
 use crate::{MessageIdOrigin, NormalizedUsage, ProviderRoots, UsageAccounting, UsageError};
@@ -11,6 +10,7 @@ use std::path::{Path, PathBuf};
 include!("generated_modules.rs");
 mod acquisition;
 pub(crate) mod file_history;
+pub(crate) mod shared_evidence;
 mod sweep;
 pub(crate) use acquisition::*;
 pub(crate) use sweep::{qualify_source_fingerprint, sweep_generation};

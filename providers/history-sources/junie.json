@@ -1,0 +1,39 @@
+{
+  "id": "junie",
+  "rust_id": "junie",
+  "variant": "Junie",
+  "order": 451,
+  "aliases": [],
+  "fixtures": [
+    {
+      "source": "junie",
+      "name": "native",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": ["junie/native"],
+      "quirk": "Pinned Junie CLI 3110.7 SessionStore native writer capture across separate JVM processes; third-process official reader oracle, two prompts, A2UX assistant blocks, repeated tool step and parent-side subagent notice."
+    },
+    {
+      "source": "junie",
+      "name": "official-reader",
+      "layout": "Reference",
+      "origin": "RelayHistory",
+      "files": ["junie/official-reader.tsv"],
+      "quirk": "Third-process SessionStore.readStoredEventsFromFile oracle from the pinned released jar, independent of RelayHistory."
+    }
+  ],
+  "capture": [
+    {
+      "evidence": "Messages and tool blocks",
+      "coverage": "Junie CLI 3110.7 native event journal: UserPromptEvent request IDs, A2UX Markdown/Result step IDs, latest native ToolBlockUpdatedEvent step status and output; raw journal rows retained as markers."
+    },
+    {
+      "evidence": "Limits",
+      "coverage": "No billable usage, file edits, native resume control or child relationship claimed. SubagentSpawnedEvent is a marker only; no native child session ID or child transcript was captured. Derived Markdown transcripts are not authoritative extra messages."
+    }
+  ],
+  "population": {
+    "evidence": ["history", "session_event", "tool_call", "session_marker"],
+    "usage_accounting": "none"
+  }
+}

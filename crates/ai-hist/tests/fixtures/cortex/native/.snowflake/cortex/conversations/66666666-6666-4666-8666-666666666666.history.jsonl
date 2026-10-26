@@ -1,0 +1,2 @@
+{"role":"user","id":"timed-user","content":[{"type":"text","text":"Keep both messages","is_user_prompt":true,"message_id":"timed-user"}],"user_sent_time":"2026-10-21T14:00:00.000Z"}
+{"role":"assistant","id":"untimed-answer","content":[{"type":"text","text":"Both retained.","message_id":"untimed-answer"}]}

@@ -5,7 +5,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 mod cursor;
-use cursor::{load as load_cursor, store as store_cursor, SweepCursor};
+use cursor::{clear as clear_cursor, load as load_cursor, store as store_cursor, SweepCursor};
 
 const STAMPS_KEY: &str = "codex_sqlite_v2";
 const PAGE_THREADS: usize = 128;
@@ -386,7 +386,7 @@ pub(crate) fn backlog_pending(state: &serde_json::Map<String, Value>) -> bool {
 }
 
 pub(crate) fn reset_backlog(state: &mut serde_json::Map<String, Value>) {
-    store_cursor(state, None);
+    clear_cursor(state);
 }
 
 fn traversal_changed(
@@ -521,7 +521,7 @@ pub(crate) fn sync(
     let cursor_pending = selection.cursor.is_some();
     let source_changed_during_traversal =
         traversal_changed(cursor_pending, &traversal_fingerprint, &source_fingerprint);
-    store_cursor(state, selection.cursor);
+    store_cursor(state, selection.cursor)?;
     Ok(SyncOutcome {
         inserted,
         read,

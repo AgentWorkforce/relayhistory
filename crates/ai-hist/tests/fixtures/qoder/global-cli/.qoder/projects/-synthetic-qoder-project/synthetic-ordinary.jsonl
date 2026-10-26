@@ -1,0 +1,6 @@
+{"type":"user","uuid":"ordinary-u1","message":{"role":"user","content":"Explain the synthetic project."},"parentUuid":null,"isSidechain":false,"cwd":"/synthetic/qoder/project","sessionId":"synthetic-ordinary","userType":"external","entrypoint":"cli","version":"1.1.75","timestamp":"2026-10-21T18:11:51.766Z"}
+{"type":"active-leaf","sessionId":"synthetic-ordinary","leafUuid":"ordinary-u1","explicit":false,"timestamp":1792606311766}
+{"type":"assistant","uuid":"ordinary-a1","message":{"role":"assistant","model":"synthetic-model","content":[{"type":"text","text":"It contains sample files."}]},"parentUuid":"ordinary-u1","isSidechain":false,"cwd":"/synthetic/qoder/project","sessionId":"synthetic-ordinary","userType":"external","entrypoint":"cli","version":"1.1.75","timestamp":"2026-10-21T18:11:51.886Z"}
+{"type":"active-leaf","sessionId":"synthetic-ordinary","leafUuid":"ordinary-a1","explicit":false,"timestamp":1792606311886}
+{"type":"last-prompt","sessionId":"synthetic-ordinary","lastPrompt":"Explain the synthetic project."}
+{"type":"active-leaf","sessionId":"synthetic-ordinary","leafUuid":"ordinary-a1","explicit":false,"timestamp":1792606311886}

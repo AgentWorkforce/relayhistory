@@ -529,13 +529,13 @@ pub fn session_requests_page(
         raw.truncate(limit as usize);
     }
     let tool_use_ids = tool_use_ids_for(conn, source, session_id, &raw)?;
-    let next_cursor = has_more.then(|| {
-        let last = raw.last().expect("non-empty page");
-        SessionRequestCursor {
+    let next_cursor = raw
+        .last()
+        .filter(|_| has_more)
+        .map(|last| SessionRequestCursor {
             ts_ms: last.first_ts_ms,
             id: last.id,
-        }
-    });
+        });
     let requests = raw
         .into_iter()
         .map(|raw| {

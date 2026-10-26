@@ -33,8 +33,26 @@ pub enum Source {
     QwenCode,
     #[serde(rename = "kimi")]
     Kimi,
+    #[serde(rename = "cline")]
+    Cline,
     #[serde(rename = "codebuddy")]
     Codebuddy,
+    #[serde(rename = "cortex")]
+    Cortex,
+    #[serde(rename = "deepagents")]
+    DeepAgents,
+    #[serde(rename = "goose")]
+    Goose,
+    #[serde(rename = "junie")]
+    Junie,
+    #[serde(rename = "kilo")]
+    Kilo,
+    #[serde(rename = "mistral-vibe")]
+    MistralVibe,
+    #[serde(rename = "qoder")]
+    Qoder,
+    #[serde(rename = "vtcode")]
+    Vtcode,
     #[serde(rename = "grok-bot")]
     GrokBot,
     #[serde(rename = "openclaw")]
@@ -61,7 +79,16 @@ impl Source {
         Self::Copilot,
         Self::QwenCode,
         Self::Kimi,
+        Self::Cline,
         Self::Codebuddy,
+        Self::Cortex,
+        Self::DeepAgents,
+        Self::Goose,
+        Self::Junie,
+        Self::Kilo,
+        Self::MistralVibe,
+        Self::Qoder,
+        Self::Vtcode,
         Self::GrokBot,
         Self::OpenClaw,
         #[cfg(test)]
@@ -70,52 +97,113 @@ impl Source {
 
     /// Canonical lowercase identifier stored in the ledger.
     pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Claude => "claude",
-            Self::Codex => "codex",
-            Self::Cursor => "cursor",
-            Self::Grok => "grok",
-            Self::OpenCode => "opencode",
-            Self::Muse => "muse",
-            Self::Devin => "devin",
-            Self::Pi => "pi",
-            Self::Hermes => "hermes",
-            Self::Omp => "omp",
-            Self::Antigravity => "antigravity",
-            Self::Copilot => "copilot",
-            Self::QwenCode => "qwen-code",
-            Self::Kimi => "kimi",
-            Self::Codebuddy => "codebuddy",
-            Self::GrokBot => "grok-bot",
-            Self::OpenClaw => "openclaw",
+        // Enum ordinals and this table are emitted together, with identical cfg gates.
+        const NAMES: [&str; Source::ALL.len()] = [
+            "claude",
+            "codex",
+            "cursor",
+            "grok",
+            "opencode",
+            "muse",
+            "devin",
+            "pi",
+            "hermes",
+            "omp",
+            "antigravity",
+            "copilot",
+            "qwen-code",
+            "kimi",
+            "cline",
+            "codebuddy",
+            "cortex",
+            "deepagents",
+            "goose",
+            "junie",
+            "kilo",
+            "mistral-vibe",
+            "qoder",
+            "vtcode",
+            "grok-bot",
+            "openclaw",
             #[cfg(test)]
-            Self::TestFixture => "test-fixture",
-        }
+            "test-fixture",
+        ];
+        NAMES[self as usize]
     }
 
     /// Parse an admitted identifier or explicit alias.
     pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "claude" => Some(Self::Claude),
-            "codex" => Some(Self::Codex),
-            "cursor" => Some(Self::Cursor),
-            "grok" => Some(Self::Grok),
-            "opencode" => Some(Self::OpenCode),
-            "muse" => Some(Self::Muse),
-            "devin" => Some(Self::Devin),
-            "pi" => Some(Self::Pi),
-            "hermes" => Some(Self::Hermes),
-            "omp" => Some(Self::Omp),
-            "antigravity" => Some(Self::Antigravity),
-            "copilot" => Some(Self::Copilot),
-            "qwen-code" => Some(Self::QwenCode),
-            "kimi" => Some(Self::Kimi),
-            "codebuddy" => Some(Self::Codebuddy),
-            "grok-bot" => Some(Self::GrokBot),
-            "openclaw" => Some(Self::OpenClaw),
+        const NAMES: &[(&str, Source)] = &[
+            ("claude", Source::Claude),
+            ("codex", Source::Codex),
+            ("cursor", Source::Cursor),
+            ("grok", Source::Grok),
+            ("opencode", Source::OpenCode),
+            ("muse", Source::Muse),
+            ("devin", Source::Devin),
+            ("pi", Source::Pi),
+            ("hermes", Source::Hermes),
+            ("omp", Source::Omp),
+            ("antigravity", Source::Antigravity),
+            ("copilot", Source::Copilot),
+            ("qwen-code", Source::QwenCode),
+            ("kimi", Source::Kimi),
+            ("cline", Source::Cline),
+            ("codebuddy", Source::Codebuddy),
+            ("cortex", Source::Cortex),
+            ("deepagents", Source::DeepAgents),
+            ("goose", Source::Goose),
+            ("junie", Source::Junie),
+            ("kilo", Source::Kilo),
+            ("mistral-vibe", Source::MistralVibe),
+            ("vibe", Source::MistralVibe),
+            ("qoder", Source::Qoder),
+            ("vtcode", Source::Vtcode),
+            ("vt-code", Source::Vtcode),
+            ("grok-bot", Source::GrokBot),
+            ("openclaw", Source::OpenClaw),
             #[cfg(test)]
-            "test-fixture" | "test-fixture-alias" => Some(Self::TestFixture),
-            _ => None,
-        }
+            ("test-fixture", Source::TestFixture),
+            #[cfg(test)]
+            ("test-fixture-alias", Source::TestFixture),
+        ];
+        NAMES
+            .iter()
+            .find_map(|(name, source)| (*name == value).then_some(*source))
+    }
+
+    /// The provider metadata this source registers; total, so no lookup can miss.
+    pub(crate) fn metadata(self) -> &'static crate::providers::ProviderMetadata {
+        const METADATA: [&crate::providers::ProviderMetadata; Source::ALL.len()] = [
+            &crate::providers::claude::METADATA,
+            &crate::providers::codex::METADATA,
+            &crate::providers::cursor::METADATA,
+            &crate::providers::grok::METADATA,
+            &crate::providers::opencode::METADATA,
+            &crate::providers::muse::METADATA,
+            &crate::providers::devin::METADATA,
+            &crate::providers::pi::METADATA,
+            &crate::providers::hermes::METADATA,
+            &crate::providers::omp::METADATA,
+            &crate::providers::antigravity::METADATA,
+            &crate::providers::copilot::METADATA,
+            &crate::providers::qwen_code::METADATA,
+            &crate::providers::kimi::METADATA,
+            &crate::providers::cline::METADATA,
+            &crate::providers::codebuddy::METADATA,
+            &crate::providers::cortex::METADATA,
+            &crate::providers::deepagents::METADATA,
+            &crate::providers::goose::METADATA,
+            &crate::providers::junie::METADATA,
+            &crate::providers::kilo::METADATA,
+            &crate::providers::mistral_vibe::METADATA,
+            &crate::providers::qoder::METADATA,
+            &crate::providers::vtcode::METADATA,
+            &crate::providers::grok_bot::METADATA,
+            &crate::providers::openclaw::METADATA,
+            #[cfg(test)]
+            &crate::providers::test_fixture::METADATA,
+        ];
+        METADATA[self as usize]
     }
 }

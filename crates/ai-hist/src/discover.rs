@@ -97,7 +97,11 @@ pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 6;
 /// invalidates every stored stamp, so a scanner that learns to extract a new
 /// field re-reads sources whose bytes never changed. `parser_version` keeps its
 /// existing meaning (full-ingest parser generation) and is untouched.
-pub const SHALLOW_SCANNER_VERSION: u32 = 16;
+pub const SHALLOW_SCANNER_VERSION: u32 = 17;
+
+/// Version 17 reads Grok Bot names from account rosters. Cached transcripts
+/// whose bytes are unchanged must still be revisited after upgrading.
+const _: () = assert!(SHALLOW_SCANNER_VERSION > 16);
 
 /// Version 2 shipped the classification that hid standalone guardians (see
 /// [`crate::codex_is_subagent`]). Their rollouts never change on disk, so the
@@ -408,7 +412,8 @@ pub struct DiscoveryEnv<'a> {
     /// every candidate. Never set on the fingerprint environment: a partial
     /// listing must not become the cached picture of a source.
     path_scope: Option<crate::ingest::path_scope::PathScope>,
-    #[allow(dead_code)] // Used by provider-owned adapters.
+    pub(crate) fresh_paths: bool,
+    /// Read by provider-owned adapters.
     pub(crate) provider_roots: crate::ProviderRoots,
 }
 
@@ -437,6 +442,7 @@ impl<'a> DiscoveryEnv<'a> {
             conn,
             counters: CounterCell::default(),
             path_scope: None,
+            fresh_paths: false,
         }
     }
 
@@ -450,9 +456,6 @@ impl<'a> DiscoveryEnv<'a> {
         self
     }
 
-    pub(crate) fn path_scope(&self) -> Option<&crate::ingest::path_scope::PathScope> {
-        self.path_scope.as_ref()
-    }
 
     /// Build an environment with explicit roots, for hosts that keep provider
     /// data somewhere other than `$HOME` (and for tests, which must not mutate
@@ -568,7 +571,6 @@ pub struct ScanEnv<'a> {
     /// Root of OpenCode's legacy `storage/` JSON tree.
     pub opencode_storage_dir: &'a Path,
     counters: &'a CounterCell,
-    #[allow(dead_code)]
     pub(crate) provider_roots: &'a crate::ProviderRoots,
 }
 
@@ -2207,7 +2209,7 @@ impl OpencodeProvider {
     /// layout — either it has the legacy JSON tree, or it has no OpenCode
     /// store at all.
     fn snapshot(&self, scan: &ScanEnv<'_>) -> Result<MutexGuard<'_, Option<OpencodeLive>>> {
-        let mut guard = self.live.lock().expect("opencode live snapshot lock");
+        let mut guard = self.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if guard.is_none() {
             let listing =
                 crate::paths::list_opencode_db_files(scan.opencode_db, scan.opencode_db_pinned);
@@ -2366,18 +2368,18 @@ struct OpencodePassGuard<'a> {
 
 impl Drop for OpencodePassGuard<'_> {
     fn drop(&mut self) {
-        *self.live.lock().expect("opencode live snapshot lock") = None;
+        *self.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 }
 
 impl ShallowSessionProvider for OpencodeProvider {
     fn begin_discovery_pass(&self) -> Result<Option<Box<dyn DiscoveryPassGuard + '_>>> {
-        let pass = self.pass.lock().expect("opencode discovery pass lock");
+        let pass = self.pass.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         // A SourceRegistry retains this adapter across calls. Drop the last
         // call's SQLite transaction before detecting this call's layout, while
         // the pass lock prevents a concurrent call from replacing the state
         // between enumeration and reads.
-        *self.live.lock().expect("opencode live snapshot lock") = None;
+        *self.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         Ok(Some(Box::new(OpencodePassGuard {
             _pass: pass,
             live: &self.live,
@@ -2528,7 +2530,7 @@ impl ShallowSessionProvider for OpencodeProvider {
         // directory). Do not re-detect the host here: OpenCode can create its
         // SQLite store after JSON enumeration, and those locators must still
         // be read by the layout that produced them.
-        let guard = self.live.lock().expect("opencode live snapshot lock");
+        let guard = self.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if candidate.session_id.is_none() {
             // A store this run could not open: the engine reports the
             // failure against its path.
@@ -2749,7 +2751,7 @@ struct DevinReadSnapshot {
 
 impl DevinProvider {
     fn snapshot(&self, scan: &ScanEnv<'_>) -> Result<MutexGuard<'_, Option<DevinReadSnapshot>>> {
-        let mut guard = self.live.lock().expect("devin live snapshot lock");
+        let mut guard = self.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if guard.is_none() && crate::ingest::devin::sessions_db_path(scan.devin_dir).is_file() {
             *guard = Some(open_devin_snapshot(scan)?);
         }
@@ -2808,14 +2810,14 @@ struct DevinPassGuard<'a> {
 
 impl Drop for DevinPassGuard<'_> {
     fn drop(&mut self) {
-        *self.live.lock().expect("devin live snapshot lock") = None;
+        *self.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     }
 }
 
 impl ShallowSessionProvider for DevinProvider {
     fn begin_discovery_pass(&self) -> Result<Option<Box<dyn DiscoveryPassGuard + '_>>> {
-        let pass = self.pass.lock().expect("devin discovery pass lock");
-        *self.live.lock().expect("devin live snapshot lock") = None;
+        let pass = self.pass.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        *self.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
         Ok(Some(Box::new(DevinPassGuard {
             _pass: pass,
             live: &self.live,
@@ -3031,7 +3033,7 @@ impl ShallowSessionProvider for DevinProvider {
         _catalog: Option<&Connection>,
         candidate: &Candidate,
     ) -> Result<Option<ShallowSession>> {
-        let guard = self.live.lock().expect("devin live snapshot lock");
+        let guard = self.live.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         let Some(snapshot) = guard.as_ref() else {
             return Ok(None);
         };
@@ -3393,23 +3395,9 @@ fn file_candidates(
 // catalog reads and writes
 // ---------------------------------------------------------------------------
 
-pub(crate) const SESSION_COLUMNS: &str = "source, session_id, cwd, git_branch, first_activity_ms, \
-     last_activity_ms, first_prompt, last_assistant_text, models_json, originator, \
-     agent_version, repo_url, initial_commit, workspace_roots_json, raw_path, source_stamp, \
-     discovery_state, project_key, project_key_method, title, session_kind, \
-     CASE \
-       WHEN EXISTS (SELECT 1 FROM session_presences p WHERE p.source = sessions.source AND p.session_id = sessions.session_id AND p.location = 'local') \
-        AND EXISTS (SELECT 1 FROM session_presences p WHERE p.source = sessions.source AND p.session_id = sessions.session_id AND p.location = 'remote') \
-       THEN '[\"local\",\"remote\"]' \
-       WHEN EXISTS (SELECT 1 FROM session_presences p WHERE p.source = sessions.source AND p.session_id = sessions.session_id AND p.location = 'remote') \
-       THEN '[\"remote\"]' \
-       WHEN EXISTS (SELECT 1 FROM session_presences p WHERE p.source = sessions.source AND p.session_id = sessions.session_id AND p.location = 'local') \
-       THEN '[\"local\"]' \
-       ELSE '[]' \
-     END";
-
+mod catalog_columns;
 mod catalog_row;
-pub(crate) use catalog_row::row_to_session;
+pub(crate) use {catalog_columns::SESSION_COLUMNS, catalog_row::row_to_session};
 
 /// A precise continuation point in the catalog's total order.
 ///
@@ -3757,6 +3745,8 @@ pub(crate) const OBSERVED_SESSION_BY_LOCATOR_SQL: &str = "SELECT session_id FROM
 /// case: these are reconsidered because they *might* be upgradable, and almost
 /// never are.
 fn upgrade_cached_project_identity(conn: &Connection, row: &mut ShallowSession) -> Result<()> {
+    #[cfg(test)]
+    crate::store::project_identity_resolver::note_observation();
     let stored = row.project_key_method.as_deref();
     if stored == Some(ProjectKeyMethod::Remote.as_str()) {
         // The strongest answer there is. Nothing this function can learn
@@ -4403,21 +4393,9 @@ pub(crate) fn discover_sessions_for_sweep(
     )
 }
 
-/// Who brings project identity up to date around a discovery pass.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IdentityRefresh {
-    /// Rows are streamed to the caller. Each cached row is upgraded before it
-    /// is streamed (see [`upgrade_cached_project_identity`]), and the pass
-    /// ends with the incremental catalog refresh.
-    Streamed,
-    /// The sweep: no row is streamed, and the sweep runs the refresh itself
-    /// right after the pass. That refresh stores exactly the key the per-row
-    /// upgrade would have -- the upgrade exists only so a *streamed* row
-    /// agrees with it -- so upgrading every cached row here as well was the
-    /// same resolution and ancestor walk twice, once per candidate file, on
-    /// every tick (#318).
-    Sweep,
-}
+mod cached_reads;
+pub(crate) mod identity_refresh;
+use identity_refresh::IdentityRefresh;
 
 // An explicit limit lets regression tests exercise both read paths regardless
 // of the host's CPU quota; the public entry point uses available parallelism.
@@ -4592,12 +4570,12 @@ fn discover_sessions_with_worker_limit(
             let expected = stored_stamp(&candidate.stamp);
             let unchanged = match observed_stamps::observed_candidate_stamp(conn, provider, candidate)?
             {
-                Some((id, stamp)) if stamp.as_deref() == Some(expected.as_str()) => {
+                Some((id, stamp)) if observed_stamps::matches(env.fresh_paths, stamp.as_deref(), &expected) => {
                     match identity {
                         // Nothing is streamed, so the row itself is not needed.
                         IdentityRefresh::Sweep => Some(WindowEntry::Unchanged),
-                        IdentityRefresh::Streamed => {
-                            match fetch_catalog_row(conn, candidate.source, &id)? {
+                        IdentityRefresh::Streamed | IdentityRefresh::ExactPaths => {
+                            match identity.cached_row(conn, candidate.source, &id)? {
                                 Some(mut cached) => {
                                     cached.source_stamp = stamp;
                                     // Before the row is queued for emission,
@@ -4661,52 +4639,7 @@ fn discover_sessions_with_worker_limit(
             });
         }
 
-        let fs_reads: Vec<usize> = entries
-            .iter()
-            .enumerate()
-            .filter(|(_, entry)| {
-                matches!(entry, WindowEntry::Read { provider, .. }
-                    if provider.read_access() == ShallowReadAccess::Filesystem)
-            })
-            .map(|(index, _)| index)
-            .collect();
-        let workers = worker_limit.min(fs_reads.len()).min(MAX_READ_WORKERS);
-        if workers > 1 {
-            let stop = crate::ingest::shared_capture_stop();
-            let next = AtomicUsize::new(0);
-            let results = Mutex::new(Vec::with_capacity(fs_reads.len()));
-            std::thread::scope(|scope| {
-                for _ in 0..workers {
-                    scope.spawn(|| loop {
-                        if stop.as_ref().is_some_and(crate::StopToken::is_stopped) {
-                            break;
-                        }
-                        let slot = next.fetch_add(1, Ordering::Relaxed);
-                        let Some(&entry_index) = fs_reads.get(slot) else {
-                            break;
-                        };
-                        let WindowEntry::Read {
-                            candidate,
-                            provider,
-                            ..
-                        } = &entries[entry_index]
-                        else {
-                            continue;
-                        };
-                        let outcome = provider.read_shallow(&scan, None, candidate);
-                        results
-                            .lock()
-                            .expect("window read results")
-                            .push((entry_index, outcome));
-                    });
-                }
-            });
-            for (entry_index, outcome) in results.into_inner().expect("window read results") {
-                if let WindowEntry::Read { result, .. } = &mut entries[entry_index] {
-                    *result = Some(outcome);
-                }
-            }
-        }
+        cached_reads::read_files(&mut entries, &scan, worker_limit)?;
 
         // Shallow reads are bounded; stop before opening the next write transaction.
         crate::ingest::check_capture_cancelled()?;
@@ -4944,29 +4877,7 @@ fn discover_sessions_with_worker_limit(
         crate::ingest::check_capture_cancelled()?;
     }
 
-    // A candidate whose bytes have not changed is served from the catalog
-    // without ever reaching `upsert_shallow_session_in_transaction`, so the
-    // stamp shortcut is also a shortcut past project-identity resolution. A
-    // session first discovered before its checkout had an `origin` would then
-    // keep its path key on every later `sessions discover`, no matter how many
-    // times it ran: the transcript is unchanged, so the row is never revisited.
-    //
-    // The refresh is what revisits it. Pass 1 reconsiders exactly the rows a
-    // path key is not final for, and probes before writing, so a pass with
-    // nothing to upgrade stays read-only. The inheriting passes are scoped to
-    // the rows written since the last refresh and their delegation
-    // descendants, so a pass over an unchanged catalog does not re-walk every
-    // delegated child. Reporting rather than failing, for the same reason the
-    // sync path does: the rows this discovery wrote are already committed, and
-    // every key here is derived from them.
-    if identity == IdentityRefresh::Streamed {
-        if let Err(error) = crate::store::refresh_project_identity_incrementally(env.conn) {
-            eprintln!(
-                "ai-hist: could not refresh canonical project identity after discovery: {error:#} \
-                 (project keys stay as they were; the next pass retries)"
-            );
-        }
-    }
+    identity.refresh(env.conn);
     summary.counters = env.counters();
     Ok(summary)
 }

@@ -60,34 +60,7 @@ pub(crate) fn ingest_selected_codex(ctx: SelectedIngest<'_>) -> Result<SelectedI
                 crate::providers::codex::sqlite::normalize(ctx.conn, child, path)?;
             }
             for child in &capture.related_rollouts {
-                let meta = read_codex_session_meta(&child.path)?
-                    .ok_or_else(|| anyhow::anyhow!("Codex related rollout has no metadata"))?;
-                anyhow::ensure!(
-                    meta.session_id == child.id,
-                    "SESSION_SOURCE_MISMATCH: Codex related rollout identity changed"
-                );
-                let outcome = ingest_codex_rollout_at_locator(ctx.conn, &child.path, &meta, false)?;
-                if meta.is_subagent {
-                    cleanup_codex_subagent_history(ctx.conn, &meta.session_id)?;
-                    cleanup_codex_subagent_registration(ctx.conn, &meta.session_id)?;
-                    if let Some(parent) = meta.parent_session_id.as_deref() {
-                        record_codex_delegation(ctx.conn, parent, &meta, &child.path)?;
-                    }
-                } else if let Some(first) = outcome.first_ts {
-                    upsert_session(
-                        ctx.conn,
-                        &SessionCatalogRow {
-                            session_id: &meta.session_id,
-                            source: "codex",
-                            cwd: Some(&meta.cwd),
-                            git_branch: meta.git_branch.as_deref(),
-                            first_ts: first,
-                            last_ts: outcome.last_ts.unwrap_or(first),
-                            last_assistant_text: outcome.last_assistant_text.as_deref(),
-                            raw_path: Some(&child.path.to_string_lossy()),
-                        },
-                    )?;
-                }
+                ingest_related_codex_rollout(ctx.conn, child)?;
             }
             // Parent edges precede both SQLite and rollout child events.
             ctx.conn.execute(
@@ -107,9 +80,46 @@ pub(crate) fn ingest_selected_codex(ctx: SelectedIngest<'_>) -> Result<SelectedI
             None,
         ));
     }
-    let path = ctx.file();
+    let path = ctx.file()?;
     ingest_codex(ctx.conn, ctx.options, path, ctx.cursor, ctx.parser_upgrade)
         .map(|outcome| (outcome, Vec::new(), None))
+}
+
+/// Index one related rollout a SQLite capture named, under the identity the
+/// capture recorded for it.
+fn ingest_related_codex_rollout(
+    conn: &Connection,
+    child: &crate::providers::codex::sqlite::RelatedRollout,
+) -> Result<()> {
+    let meta = read_codex_session_meta(&child.path)?
+        .ok_or_else(|| anyhow::anyhow!("Codex related rollout has no metadata"))?;
+    anyhow::ensure!(
+        meta.session_id == child.id,
+        "SESSION_SOURCE_MISMATCH: Codex related rollout identity changed"
+    );
+    let outcome = ingest_codex_rollout_at_locator(conn, &child.path, &meta, false)?;
+    if meta.is_subagent {
+        cleanup_codex_subagent_history(conn, &meta.session_id)?;
+        cleanup_codex_subagent_registration(conn, &meta.session_id)?;
+        if let Some(parent) = meta.parent_session_id.as_deref() {
+            record_codex_delegation(conn, parent, &meta, &child.path)?;
+        }
+    } else if let Some(first) = outcome.first_ts {
+        upsert_session(
+            conn,
+            &SessionCatalogRow {
+                session_id: &meta.session_id,
+                source: "codex",
+                cwd: Some(&meta.cwd),
+                git_branch: meta.git_branch.as_deref(),
+                first_ts: first,
+                last_ts: outcome.last_ts.unwrap_or(first),
+                last_assistant_text: outcome.last_assistant_text.as_deref(),
+                raw_path: Some(&child.path.to_string_lossy()),
+            },
+        )?;
+    }
+    Ok(())
 }
 
 fn ingest_codex(
@@ -119,6 +129,10 @@ fn ingest_codex(
     cursor: &mut TranscriptCursorState,
     parser_upgrade: bool,
 ) -> Result<IngestOutcome> {
+    let exact = super::super::path_capture::capturing_exact_paths()
+        .then(|| crate::continuity::CaptureScope::begin(conn, "codex", path))
+        .transpose()?;
+
     let (meta, meta_bytes) = read_codex_session_meta_counted(path)?;
     let meta = meta.ok_or_else(|| {
         hydration_error(
@@ -153,15 +167,21 @@ fn ingest_codex(
             },
         )?;
     }
-    if options.include_related {
+    if options.include_related || exact.is_some() {
         // Codex records continuity only when a producer writes explicit
         // fields on `session_meta`; a plain `codex resume` leaves no signal.
         indexed.bytes_read += crate::continuity::capture_codex_rollout(conn, path)? as i64;
         // Each child's own continuity is captured with it (a spawned
         // subagent's `thread_spawn` parent is a fork edge that lives only in
         // the child's `session_meta`), so reconcile once they are all banked.
-        indexed.absorb_outcome(ingest_codex_children(conn, options, path, parser_upgrade)?);
-        crate::continuity::reconcile(conn, "codex")?;
+        if options.include_related {
+            indexed.absorb_outcome(ingest_codex_children(conn, options, path, parser_upgrade)?);
+        }
+        if let Some(exact) = exact {
+            crate::continuity::reconcile_captured(conn, "codex", path, exact)?;
+        } else {
+            crate::continuity::reconcile(conn, "codex")?;
+        }
     }
     Ok(indexed)
 }

@@ -1,0 +1,56 @@
+{
+  "id": "kilo",
+  "rust_id": "kilo",
+  "variant": "Kilo",
+  "order": 452,
+  "aliases": [],
+  "fixtures": [
+    {
+      "source": "kilo",
+      "name": "sqlite-7-8-15",
+      "layout": "Sqlite",
+      "target": ".local/share/kilo/kilo.db",
+      "origin": "RelayHistory",
+      "files": ["kilo/schema-7-8-15.sql"],
+      "quirk": "Kilo CLI 7.8.15 native import writer: user, assistant, completed tool, and resumed turns after process restart."
+    },
+    {
+      "source": "kilo",
+      "name": "before-resume",
+      "layout": "Sqlite",
+      "target": ".local/share/kilo/kilo.db",
+      "origin": "RelayHistory",
+      "files": ["kilo/before-resume.sql"],
+      "quirk": "Same native writer before resumed turns are imported in a separate process."
+    },
+    {
+      "source": "kilo",
+      "name": "before-resume-official-export",
+      "layout": "Reference",
+      "origin": "RelayHistory",
+      "files": ["kilo/before-resume-official-export.json"],
+      "quirk": "Independent Kilo export after first native writer process exited."
+    },
+    {
+      "source": "kilo",
+      "name": "after-resume-official-export",
+      "layout": "Reference",
+      "origin": "RelayHistory",
+      "files": ["kilo/after-resume-official-export.json"],
+      "quirk": "Independent Kilo export after append in another native writer process."
+    },
+    {
+      "source": "kilo",
+      "name": "native-capture-inputs",
+      "layout": "Reference",
+      "origin": "RelayHistory",
+      "files": ["kilo/native-import-before.json", "kilo/native-import-after.json", "kilo/README.md"],
+      "quirk": "Synthetic native import inputs and capture procedure, no account, paid model, or private history."
+    }
+  ],
+  "capture": [
+    {"evidence":"Messages and tools","coverage":"Kilo CLI 7.8.15 SQLite session/message/part writer and independent export; user/assistant text, completed tool call/result, WAL-visible coherent snapshot."},
+    {"evidence":"Usage and relationships","coverage":"Session totals are context counters, not billable request usage; parent IDs and richer parts remain bounded metadata; no native resume or legacy extension coverage advertised."}
+  ],
+  "population": {"evidence":["history","session_event","tool_call","session_marker"],"usage_accounting":"none"}
+}

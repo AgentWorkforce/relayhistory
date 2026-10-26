@@ -25,16 +25,22 @@ pub(super) fn load(state: &Map<String, Value>) -> Option<SweepCursor> {
     })
 }
 
-pub(super) fn store(state: &mut Map<String, Value>, cursor: Option<SweepCursor>) {
+pub(super) fn store(
+    state: &mut Map<String, Value>,
+    cursor: Option<SweepCursor>,
+) -> serde_json::Result<()> {
     match cursor {
         Some(cursor) => {
-            let encoded = serde_json::to_string(&cursor).expect("cursor");
+            let encoded = serde_json::to_string(&cursor)?;
             state.insert(KEY.into(), Value::String(encoded));
         }
-        None => {
-            // Sync-state checkpoints merge keys forward. An explicit scalar
-            // reset both survives that merge and replaces the cursor atomically.
-            state.insert(KEY.into(), Value::Null);
-        }
+        None => clear(state),
     }
+    Ok(())
+}
+
+pub(super) fn clear(state: &mut Map<String, Value>) {
+    // Sync-state checkpoints merge keys forward. An explicit scalar reset both
+    // survives that merge and replaces the cursor atomically.
+    state.insert(KEY.into(), Value::Null);
 }

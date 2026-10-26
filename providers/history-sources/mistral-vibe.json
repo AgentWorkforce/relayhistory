@@ -1,0 +1,40 @@
+{
+  "id": "mistral-vibe",
+  "rust_id": "mistral_vibe",
+  "variant": "MistralVibe",
+  "order": 454,
+  "aliases": [
+    "vibe"
+  ],
+  "fixtures": [
+    {
+      "source": "mistral-vibe",
+      "name": "unified-3-0-1",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "mistral-vibe/fixture-home"
+      ],
+      "quirk": "Pinned v1 minor 9 chunked projection with native CURRENT/manifest digests, tool effect, and chained journal delta; synthetic entries survive a separate-process reader."
+    }
+  ],
+  "capture": [
+    {
+      "evidence": "Messages and identity",
+      "coverage": "Vibe 3.0.1 Unified store v1/minor 9 public projection entries, native entry IDs and millisecond timestamps, source and root-scoped session identity, title and cwd. Current stores only; legacy 2.x JSONL import is not covered."
+    },
+    {
+      "evidence": "Control and tools",
+      "coverage": "Public tool effect entries provide one stable effect ID for tool-use/result join and explicit settled status. Other non-message entries are bounded markers. No per-request usage is claimed from session or context totals; native resume remains unavailable."
+    }
+  ],
+  "population": {
+    "evidence": [
+      "history",
+      "session_event",
+      "session_marker",
+      "tool_call"
+    ],
+    "usage_accounting": "none"
+  }
+}

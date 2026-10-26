@@ -4,6 +4,7 @@ use crate::ingest::{
     ToolCallRef, ToolResultFacts,
 };
 use crate::providers::file_history::{self, Keys};
+use crate::providers::shared_evidence::Snapshot;
 use crate::{insert_history, insert_session_marker, HistoryEntry, NewSessionMarker};
 pub(super) fn check_identity(conn: &Connection, sid: &str, path: &Path) -> Result<()> {
     file_history::check_identity(conn, ID, "KIMI", sid, path)
@@ -19,7 +20,7 @@ pub(super) fn write(conn: &Connection, payload: &Value) -> Result<usize> {
     if !complete {
         return Ok(0);
     }
-    let shared = super::shared_evidence::Snapshot::capture(conn, sid)?;
+    let shared = Snapshot::capture(conn, ID, sid)?;
     let mut keys = Keys::default();
     let mut outcome = MessageOutcome::default();
     let mut first = i64::MAX;
@@ -73,7 +74,7 @@ fn finish(
     first: i64,
     last: i64,
     outcome: MessageOutcome,
-    shared: super::shared_evidence::Snapshot,
+    shared: Snapshot,
 ) -> Result<usize> {
     catalog(
         conn,

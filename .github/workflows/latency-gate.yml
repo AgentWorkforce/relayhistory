@@ -1,0 +1,109 @@
+name: Session-visible latency gate
+
+# "A new session is visible in the desktop in < 5 ms": per-stage p99 budgets
+# and a 10% regression bound against the pull request's base commit, measured
+# on the same runner (stored per-class baselines in
+# scripts/latency-thresholds.json when there is no base). macOS is in the matrix because the
+# filesystem-event stage is FSEvents there and inotify on Linux, and the
+# budget is set for the macOS desktop. See docs/benchmarks.md,
+# "Session-visible latency".
+#
+# Separate from ci.yml's `verify` job because the budgets are release-build
+# numbers and `verify` builds debug; a second, release-profile cache keeps
+# this job from evicting that one.
+
+# Opt-in, not on every pull request: a release build of head and base plus
+# the measurement costs ~11 min on ubuntu and ~20 min on macOS. It runs on
+# every push to main (against the stored baselines), on manual dispatch, and
+# on a pull request carrying the `latency` label -- labelling one starts a
+# run, and each push to a labelled pull request runs it again.
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: "Profile in scripts/latency-thresholds.json"
+        required: false
+        default: "gate"
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+    paths:
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "scripts/benchmark-latency*"
+      - "scripts/latency-thresholds.json"
+      - ".github/workflows/latency-gate.yml"
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  latency:
+    # On a pull request: only with the `latency` label, and on a `labeled`
+    # event only when that label is the one just added, so labelling a
+    # running PR with something unrelated does not restart the measurement.
+    if: >-
+      github.event_name != 'pull_request' ||
+      (contains(github.event.pull_request.labels.*.name, 'latency') &&
+       (github.event.action != 'labeled' || github.event.label.name == 'latency'))
+    # Job-level, so a skipped run (an unlabelled push, an unrelated label)
+    # never cancels a measurement in progress.
+    concurrency:
+      group: latency-${{ github.event.pull_request.number || github.ref }}-${{ matrix.os }}
+      cancel-in-progress: true
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The base commit is measured beside the head on this runner; the
+          # full history is fetched here, so nothing later needs the token.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: latency-release
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Build the latency harness
+        run: cargo test --release -p ai-hist-cli --test latency_bench --no-run
+
+      # On a pull request the regression rule compares against the base
+      # commit, measured interleaved on this same runner; runners of one
+      # class differ by more than the 10% allowance. Without a base (a push
+      # to main, a manual run) it falls back to the stored baselines.
+      - name: Measure and gate
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          PROFILE: ${{ inputs.profile || 'gate' }}
+        run: |
+          node scripts/benchmark-latency.mjs --gate \
+            --profile "$PROFILE" \
+            ${BASE_SHA:+--base "$BASE_SHA"} \
+            --output "latency-${{ matrix.os }}.json" \
+            --markdown "latency-${{ matrix.os }}.md"
+
+      - name: Summarize
+        if: always()
+        run: cat "latency-${{ matrix.os }}.md" >> "$GITHUB_STEP_SUMMARY" || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: latency-${{ matrix.os }}
+          path: |
+            latency-${{ matrix.os }}.json
+            latency-${{ matrix.os }}.md

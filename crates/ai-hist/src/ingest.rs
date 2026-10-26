@@ -136,14 +136,20 @@ macro_rules! sync_note {
 }
 
 // After `sync_note!`, which the phases report through.
+pub(crate) mod path_capture;
+#[cfg(test)]
+pub(crate) mod state_work;
 mod sweep_phases;
+pub(crate) use path_capture::{reconcile_pending, sync_facade_tick};
 // After `sync_note!`, which it uses.
 mod codex_history;
 // After `sync_note!`, which an unreadable rollout reports through.
 mod fork_replay;
+mod jsonl_sync_steps;
 mod rederived;
 mod rollout_head;
 use fork_replay::{inherited_baseline_verdict, record_codex_fork_replay, ForkReplaySpan};
+use jsonl_sync_steps::{cursor_scan_checkpoint, insert_history_line, settle_unchanged_jsonl};
 pub(crate) use rollout_head::read_codex_session_meta;
 #[cfg(test)]
 use rollout_head::LEADING_BYTE_LIMIT;
@@ -330,43 +336,6 @@ pub(crate) fn sync_local_at_with_home(db_path: &Path, home: &Path) -> Result<boo
     let roots = crate::ProviderRoots::from_env(home.to_path_buf());
     SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
     sync_exclusive_with_roots(db_path, &roots, false).map(|tick| tick.attempted)
-}
-
-/// One local sweep for [`crate::SessionStore`]: silent, against the store's
-/// resolved provider roots, forcing past the source fingerprint when asked,
-/// with two reads bracketing the sweep **inside the locked section**.
-///
-/// `before` runs once the `SyncRunLock` is held and before anything is
-/// written; `after` runs when the sweep has finished, on the same connection,
-/// still under the lock. That is what lets the facade say what *this* sweep
-/// changed: a baseline taken before the lock would also count whatever
-/// another sync wrote while this call waited for it. `None` means the lock
-/// was held elsewhere and nothing ran — the facade turns that into an error
-/// rather than a silent no-op. `scope` names the sources the sweep reads;
-/// see [`SweepScope`] for what a scoped sweep leaves alone.
-pub(crate) fn sync_facade_tick<B, R>(
-    db_path: &Path,
-    roots: &crate::ProviderRoots,
-    force: bool,
-    scope: &SweepScope,
-    before: impl FnOnce(&Connection) -> Result<B>,
-    after: impl FnOnce(&Connection, B, SyncTick) -> Result<R>,
-) -> Result<Option<(SyncTick, R)>> {
-    SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
-    check_capture_cancelled()?;
-    let Some(_sync_lock) = try_acquire_sync_lock(db_path)? else {
-        return Ok(None);
-    };
-    let conn = open_db(db_path).map_err(|error| enrich_sync_error(db_path, error))?;
-    let baseline = before(&conn)?;
-    let swept = sync_basic(&conn, db_path, roots, force, scope)
-        .map_err(|error| enrich_sync_error(db_path, error))?;
-    let tick = SyncTick {
-        attempted: true,
-        swept,
-    };
-    let outcome = after(&conn, baseline, tick)?;
-    Ok(Some((tick, outcome)))
 }
 
 /// One live-capture tick against an explicit provider home.
@@ -2255,7 +2224,6 @@ fn sync_basic(
     if let Err(error) = crate::store::refresh_planner_statistics(conn) {
         sync_note!("  [sync] planner statistics not refreshed: {error:#}");
     }
-    let total: i64 = conn.query_row("SELECT COUNT(*) FROM history", [], |row| row.get(0))?;
     // Fold the WAL back into the database now that the writes are done.
     // Left unchecked the WAL grows without bound (156MB observed in the wild).
     let checkpoint = checkpoint_after_sweep(conn, db_path, WAL_TRUNCATE_BYTES);
@@ -2267,7 +2235,7 @@ fn sync_basic(
         );
     }
     sync_note!("  [rust-sync] +{total_inserted} rows");
-    sync_note!("  Total: {total} entries");
+    sweep_phases::note_total(conn)?;
     Ok(true)
 }
 
@@ -2811,6 +2779,8 @@ fn load_sync_state(path: &Path) -> Result<Map<String, Value>> {
 /// lands mid-read can only make the stamp disagree with the file later --
 /// which costs a re-read -- never vouch for a document it did not describe.
 fn load_sync_state_stamped(path: &Path) -> (Map<String, Value>, Option<SyncStateStamp>) {
+    #[cfg(test)]
+    state_work::loaded();
     let mut file = match fs::File::open(path) {
         Ok(file) => file,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return (Map::new(), None),
@@ -2991,12 +2961,12 @@ impl<'a> SweepCheckpoints<'a> {
         let _lock = SyncStateLock::acquire(self.path)?;
         let current = SyncStateStamp::at(self.path);
         let changed = if !self.dirty && current.is_some() && current == self.stamp {
-            fold_sync_state(&mut self.disk, delta, state)
+            fold_sync_state(&mut self.disk, delta, state)?
         } else {
             let (on_disk, stamp) = load_sync_state_stamped(self.path);
             self.disk = on_disk;
             self.stamp = stamp;
-            fold_sync_state(&mut self.disk, state, state)
+            fold_sync_state(&mut self.disk, state, state)?
         };
         if !changed {
             return Ok(());
@@ -3424,7 +3394,7 @@ pub(crate) fn record_cursor_hydrate_checkpoint(
         .committed_cursor(consumed, true)
         .with_context(|| format!("validate Cursor transcript {}", transcript.display()))?;
     let mut cursor_state = Map::new();
-    cursor_state.insert(key, cursor.to_value());
+    cursor_state.insert(key, cursor.to_value()?);
     let mut ours = Map::new();
     ours.insert(
         CURSOR_SYNC_STATE_KEY.to_string(),
@@ -3463,7 +3433,7 @@ const GROK_SYNC_STATE_KEY: &str = "grok_events_v4";
 
 fn merged_sync_state(path: &Path, ours: &Map<String, Value>) -> Result<Option<Map<String, Value>>> {
     let mut merged = load_sync_state(path)?;
-    Ok(fold_sync_state(&mut merged, ours, ours).then_some(merged))
+    Ok(fold_sync_state(&mut merged, ours, ours)?.then_some(merged))
 }
 
 /// Fold `delta` into `merged` -- the document on disk -- and then apply the
@@ -3481,14 +3451,14 @@ fn fold_sync_state(
     merged: &mut Map<String, Value>,
     delta: &Map<String, Value>,
     ours: &Map<String, Value>,
-) -> bool {
+) -> Result<bool> {
     let mut changed = false;
     for (key, value) in delta {
         // Applied after the fold, and never persisted.
         if key == FORGOTTEN_PATHS_KEY {
             continue;
         }
-        changed |= fold_sync_key(merged, key, value);
+        changed |= fold_sync_key(merged, key, value)?;
     }
     changed |= sweep_retired_sync_keys(merged, ours);
     changed |= forget_dropped_stamps(merged, ours);
@@ -3497,11 +3467,11 @@ fn fold_sync_state(
     if merged.remove(FORGOTTEN_PATHS_KEY).is_some() {
         changed = true;
     }
-    changed
+    Ok(changed)
 }
 
 /// Folds one delta key into `merged`; `true` when that changed it.
-fn fold_sync_key(merged: &mut Map<String, Value>, key: &str, value: &Value) -> bool {
+fn fold_sync_key(merged: &mut Map<String, Value>, key: &str, value: &Value) -> Result<bool> {
     // A stamp map is merged entry by entry in place: the same result as
     // `merge_object_values`, without copying thousands of untouched
     // stamps to change one.
@@ -3517,23 +3487,26 @@ fn fold_sync_key(merged: &mut Map<String, Value>, key: &str, value: &Value) -> b
         return fold_stamp_entries(stamps, theirs);
     }
     let next = match merged.get(key) {
-        Some(existing) if key == CURSOR_SYNC_STATE_KEY => merge_file_cursor_map(existing, value),
-        Some(existing) => merge_sync_value(existing, value),
+        Some(existing) if key == CURSOR_SYNC_STATE_KEY => merge_file_cursor_map(existing, value)?,
+        Some(existing) => merge_sync_value(existing, value)?,
         None => value.clone(),
     };
     if merged.get(key) == Some(&next) {
-        return false;
+        return Ok(false);
     }
     merged.insert(key.to_owned(), next);
-    true
+    Ok(true)
 }
 
 /// Overlays `theirs` onto a stamp map entry by entry; `true` when any changed.
-fn fold_stamp_entries(stamps: &mut Map<String, Value>, theirs: &Map<String, Value>) -> bool {
+fn fold_stamp_entries(
+    stamps: &mut Map<String, Value>,
+    theirs: &Map<String, Value>,
+) -> Result<bool> {
     let mut changed = false;
     for (entry, stamp) in theirs {
         let next = match stamps.get(entry) {
-            Some(saved) => merge_sync_value(saved, stamp),
+            Some(saved) => merge_sync_value(saved, stamp)?,
             None => stamp.clone(),
         };
         if stamps.get(entry) != Some(&next) {
@@ -3541,7 +3514,7 @@ fn fold_stamp_entries(stamps: &mut Map<String, Value>, theirs: &Map<String, Valu
             changed = true;
         }
     }
-    changed
+    Ok(changed)
 }
 
 /// Removes every retired key whose successor this run carries.
@@ -3666,7 +3639,7 @@ fn is_file_cursor(value: &Value) -> bool {
     FileCursor::decode(value).is_some()
 }
 
-fn merge_sync_value(on_disk: &Value, ours: &Value) -> Value {
+fn merge_sync_value(on_disk: &Value, ours: &Value) -> Result<Value> {
     match (FileCursor::decode(on_disk), FileCursor::decode(ours)) {
         (Some(DecodedFileCursor::Typed(on_disk)), Some(DecodedFileCursor::Typed(ours))) => {
             FileCursor::merge(on_disk, ours).to_value()
@@ -3680,45 +3653,51 @@ fn merge_sync_value(on_disk: &Value, ours: &Value) -> Value {
             ours.to_value()
         }
         (Some(DecodedFileCursor::Legacy(on_disk)), Some(DecodedFileCursor::Legacy(ours))) => {
-            json!(on_disk.max(ours))
+            Ok(json!(on_disk.max(ours)))
         }
-        _ if on_disk.is_object() && ours.is_object() => merge_object_values(on_disk, ours),
-        _ if on_disk == ours => on_disk.clone(),
-        _ => ours.clone(),
+        _ => match (on_disk, ours) {
+            (Value::Object(on_disk), Value::Object(ours)) => merge_object_values(on_disk, ours),
+            _ if on_disk == ours => Ok(on_disk.clone()),
+            _ => Ok(ours.clone()),
+        },
     }
 }
 
-fn merge_object_values(on_disk: &Value, ours: &Value) -> Value {
-    let on_disk = on_disk.as_object().expect("checked object");
-    let ours = ours.as_object().expect("checked object");
+fn merge_object_values(on_disk: &Map<String, Value>, ours: &Map<String, Value>) -> Result<Value> {
     let mut merged = on_disk.clone();
     for (key, value) in ours {
-        let next = merged
-            .get(key)
-            .map_or_else(|| value.clone(), |saved| merge_sync_value(saved, value));
+        let next = match merged.get(key) {
+            Some(saved) => merge_sync_value(saved, value)?,
+            None => value.clone(),
+        };
         merged.insert(key.clone(), next);
     }
-    Value::Object(merged)
+    Ok(Value::Object(merged))
 }
 
-fn merge_file_cursor_map(on_disk: &Value, ours: &Value) -> Value {
-    if !on_disk.is_object() || !ours.is_object() {
-        return merge_sync_value(on_disk, ours);
+fn merge_file_cursor_map(on_disk: &Value, ours: &Value) -> Result<Value> {
+    match (on_disk, ours) {
+        (Value::Object(on_disk), Value::Object(ours)) => merge_object_values(on_disk, ours),
+        _ => merge_sync_value(on_disk, ours),
     }
-    merge_object_values(on_disk, ours)
 }
 
 const STALE_SYNC_STATE_TMP_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[cfg(unix)]
 fn process_is_alive(pid: u32) -> bool {
-    let Ok(pid) = libc::pid_t::try_from(pid) else {
+    let Some(pid) = i32::try_from(pid)
+        .ok()
+        .and_then(rustix::process::Pid::from_raw)
+    else {
         return false;
     };
-    // SAFETY: signal 0 does not deliver a signal; it performs only existence
-    // and permission checks. EPERM therefore still means the process is live.
-    let result = unsafe { libc::kill(pid, 0) };
-    result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    // Signal 0 is only an existence and permission check, so EPERM still
+    // means the process is live.
+    match rustix::process::test_kill_process(pid) {
+        Ok(()) => true,
+        Err(error) => error == rustix::io::Errno::PERM,
+    }
 }
 
 #[cfg(not(unix))]
@@ -3790,6 +3769,8 @@ fn cleanup_stale_sync_state_temps(path: &Path) -> Result<usize> {
 /// rename failing on a path the faster one already moved — reintroducing the
 /// class of failure this function exists to prevent.
 fn save_sync_state(path: &Path, state: &Map<String, Value>) -> Result<()> {
+    #[cfg(test)]
+    state_work::saved();
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
@@ -3893,8 +3874,8 @@ impl FileCursor {
             .map(DecodedFileCursor::Typed)
     }
 
-    fn to_value(&self) -> Value {
-        serde_json::to_value(self).expect("file cursor serialization cannot fail")
+    fn to_value(&self) -> Result<Value> {
+        Ok(serde_json::to_value(self)?)
     }
 
     /// Whether this cursor's [`FileSettled`] still describes `path`: the file
@@ -4087,15 +4068,18 @@ impl CompleteJsonlReader {
                     .transpose()
                     .ok()
                     .flatten();
-                let prefix_changed = verified_prefix.as_ref().is_none_or(|(current, _)| {
-                    saved.prefix_hash.as_deref() != Some(current.as_str())
-                });
-                let replaced = identity_changed
-                    || size < saved.offset
-                    || mtime_ns < saved.observed_mtime_ns
-                    || prefix_changed;
-                if replaced {
-                    (
+                // The prefix hasher survives only when it still matches the
+                // saved hash; a missing or different prefix is a replacement.
+                let unchanged_prefix = verified_prefix
+                    .filter(|(current, _)| saved.prefix_hash.as_deref() == Some(current.as_str()))
+                    .map(|(_, prefix_hasher)| prefix_hasher);
+                let replaced =
+                    identity_changed || size < saved.offset || mtime_ns < saved.observed_mtime_ns;
+                match unchanged_prefix {
+                    Some(prefix_hasher) if !replaced => {
+                        (saved.offset, saved.generation, prefix_hasher)
+                    }
+                    _ => (
                         0,
                         FileGeneration {
                             device,
@@ -4106,15 +4090,7 @@ impl CompleteJsonlReader {
                             rewrite_epoch: saved.generation.rewrite_epoch.saturating_add(1),
                         },
                         Sha256::new(),
-                    )
-                } else {
-                    (
-                        saved.offset,
-                        saved.generation,
-                        verified_prefix
-                            .expect("validated typed cursor has a prefix hash")
-                            .1,
-                    )
+                    ),
                 }
             }
             // A numeric cursor has no generation or prefix identity. Seeking
@@ -4360,11 +4336,7 @@ fn sync_jsonl_incremental(
     let mut source = CompleteJsonlReader::open(path, state.get(name))?;
     let offset = source.position;
     let size = source.reader.get_ref().metadata()?.len();
-    let opened_cursor = source.cursor.to_value();
-    if offset >= size && same_opened_cursor(state.get(name), &opened_cursor) {
-        if let Some(settled) = source.settled_cursor() {
-            state.insert(name.to_string(), settled.to_value());
-        }
+    if offset >= size && settle_unchanged_jsonl(state, name, &source)? {
         sync_note!("  [{name}] up to date");
         return Ok(0);
     }
@@ -4388,19 +4360,15 @@ fn sync_jsonl_incremental(
                     break;
                 };
                 consumed = position;
-                if !line.trim().is_empty() {
-                    match parser(&line) {
-                        Ok(Some(entry)) => inserted += insert_history(conn, &entry)?,
-                        Ok(None) => {}
-                        Err(_) => errors += 1,
-                    }
-                }
+                let (added, failed) = insert_history_line(conn, parser, &line)?;
+                inserted += added;
+                errors += failed;
                 pending += 1;
                 if pending >= JSONL_CHUNK_LINES {
                     conn.execute_batch("COMMIT")?;
                     state.insert(
                         name.to_string(),
-                        source.committed_cursor(consumed, false)?.to_value(),
+                        source.committed_cursor(consumed, false)?.to_value()?,
                     );
                     checkpoint(state);
                     conn.execute_batch("BEGIN")?;
@@ -4410,7 +4378,7 @@ fn sync_jsonl_incremental(
             conn.execute_batch("COMMIT")?;
             state.insert(
                 name.to_string(),
-                source.committed_cursor(consumed, true)?.to_value(),
+                source.committed_cursor(consumed, true)?.to_value()?,
             );
             Ok(())
         };
@@ -8620,10 +8588,10 @@ fn legacy_positional_message_ids(
         let mut rows = statement.query([session_id])?;
         while let Some(row) = rows.next()? {
             let id: Option<String> = row.get(0)?;
-            if id.as_deref().is_some_and(|id| {
+            if let Some(id) = id.filter(|id| {
                 id.starts_with(&prefix) && id[prefix.len()..].chars().all(|c| c.is_ascii_digit())
             }) {
-                ids.push(id.unwrap());
+                ids.push(id);
             }
         }
     }
@@ -8713,8 +8681,8 @@ fn claude_record_facts(record: ClaudeRecordParts<'_>) -> ClaudeRecordFacts {
                     .get("thinking")
                     .or_else(|| block.get("text"))
                     .and_then(Value::as_str);
-                if text.is_some_and(|s| !s.trim().is_empty()) {
-                    push(Some(text.unwrap().to_string()), "assistant", "thinking");
+                if let Some(text) = text.filter(|s| !s.trim().is_empty()) {
+                    push(Some(text.to_string()), "assistant", "thinking");
                 }
             }
             "tool_use" => {
@@ -12082,7 +12050,7 @@ fn scan_cursor_transcript_with(
             DecodedFileCursor::Typed(cursor) => cursor.offset,
             DecodedFileCursor::Legacy(offset) => offset,
         });
-    let opened_cursor = source.cursor.to_value();
+    let opened_cursor = source.cursor.to_value()?;
     // The generation comes from the cursor this scan commits, whose prefix
     // hash is the digest of the bytes the reader *actually read* — not a
     // re-read of the file afterwards. That distinction is the whole point: a
@@ -12137,13 +12105,7 @@ fn scan_cursor_transcript_with(
             None => cursor_generation(jsonl, consumed)?,
         }
     };
-    // Unchanged, proven by the whole-prefix hash `open` just took, and old
-    // enough to settle on: record that, so the next sweep can stop at a stat.
-    let checkpoint = match committed {
-        Some(cursor) => Some(cursor.to_value()),
-        None if !advanced => source.settled_cursor().map(|cursor| cursor.to_value()),
-        None => None,
-    };
+    let checkpoint = cursor_scan_checkpoint(&source, committed, advanced)?;
     Ok(ScannedCursorTranscript {
         timestamp_ms,
         parse_errors,
@@ -17156,6 +17118,7 @@ mod tests {
             settled: None,
         }
         .to_value()
+        .unwrap()
     }
 
     fn decode_typed_cursor(value: Value) -> super::FileCursor {
@@ -17463,7 +17426,7 @@ mod tests {
         later_open.generation.started_mtime_ns += 10;
         later_open.generation.started_size += 50;
         later_open.generation.observed_at_ns += 10;
-        slow_same_generation.insert("claude".into(), later_open.to_value());
+        slow_same_generation.insert("claude".into(), later_open.to_value().unwrap());
         slow_same_generation.insert(
             super::CURSOR_SYNC_STATE_KEY.into(),
             json!({transcript: test_file_cursor(14, 10, 200)}),
@@ -17489,7 +17452,7 @@ mod tests {
         let mut reset = decode_typed_cursor(test_file_cursor(0, 10, 200));
         reset.generation.rewrite_epoch = 1;
         let mut rewritten = Map::new();
-        rewritten.insert("claude".into(), reset.to_value());
+        rewritten.insert("claude".into(), reset.to_value().unwrap());
         checkpoint_sync_state(&path, &rewritten);
 
         let saved = load_sync_state(&path).unwrap();
@@ -17503,13 +17466,13 @@ mod tests {
         let mut old_cursor = decode_typed_cursor(test_file_cursor(900, 10, 100));
         old_cursor.generation.rewrite_epoch = 10;
         let mut old = Map::new();
-        old.insert("claude".into(), old_cursor.to_value());
+        old.insert("claude".into(), old_cursor.to_value().unwrap());
         checkpoint_sync_state(&path, &old);
 
         let mut replacement = decode_typed_cursor(test_file_cursor(0, 11, 200));
         replacement.generation.rewrite_epoch = 2;
         let mut new = Map::new();
-        new.insert("claude".into(), replacement.to_value());
+        new.insert("claude".into(), replacement.to_value().unwrap());
         checkpoint_sync_state(&path, &new);
 
         let saved = load_sync_state(&path).unwrap();
@@ -24402,8 +24365,8 @@ mod tests {
 
         let mut whole = disk.clone();
         let mut partial = disk.clone();
-        assert!(fold_sync_state(&mut whole, &ours, &ours));
-        assert!(fold_sync_state(&mut partial, &delta, &ours));
+        assert!(fold_sync_state(&mut whole, &ours, &ours).unwrap());
+        assert!(fold_sync_state(&mut partial, &delta, &ours).unwrap());
         assert_eq!(partial, whole);
         assert!(!partial.contains_key("codex_rollouts_v5"));
         assert!(!partial["grok_events_v4"]
@@ -24415,7 +24378,7 @@ mod tests {
         // empty: the legacy cursor behind the disk
         // still differs, and folding it is a no-op.)
         let again = sync_state_delta(&whole, &ours).unwrap_or_default();
-        assert!(!fold_sync_state(&mut whole, &again, &ours));
+        assert!(!fold_sync_state(&mut whole, &again, &ours).unwrap());
         // A state equal to the disk has no delta at all.
         assert!(sync_state_delta(&whole, &whole.clone()).is_none());
     }
@@ -24441,7 +24404,7 @@ mod tests {
         state.insert("source_fingerprint".into(), json!("f"));
 
         let mut expected = on_disk.clone();
-        assert!(fold_sync_state(&mut expected, &state, &state));
+        assert!(fold_sync_state(&mut expected, &state, &state).unwrap());
 
         if cfg!(unix) {
             let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
@@ -27666,7 +27629,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn an_unreadable_codex_rollout_does_not_retire_the_backfill_pass() {
-        let dir = tempfile::tempdir().unwrap();
+        // The unreadable fixture binds a Unix socket at the rollout path;
+        // macOS TMPDIR plus the provider filename exceeds sockaddr_un.sun_path.
+        let dir = tempfile::Builder::new()
+            .prefix("rh")
+            .tempdir_in("/tmp")
+            .unwrap();
         let home = dir.path();
         let state_path = home.join(".sync-state.json");
         let day = home.join(".codex/sessions/2026/04/20");
@@ -36379,10 +36347,16 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let state_path = dir.path().join(".sync-state.json");
         let mut on_disk = Map::new();
-        on_disk.insert("claude".into(), cursor(Some(proof.clone())).to_value());
+        on_disk.insert(
+            "claude".into(),
+            cursor(Some(proof.clone())).to_value().unwrap(),
+        );
         fs::write(&state_path, serde_json::to_vec(&on_disk).unwrap()).unwrap();
         let mut ours = Map::new();
-        ours.insert("claude".into(), cursor(Some(renewed.clone())).to_value());
+        ours.insert(
+            "claude".into(),
+            cursor(Some(renewed.clone())).to_value().unwrap(),
+        );
         let written = merged_sync_state(&state_path, &ours)
             .unwrap()
             .expect("a renewed settle is a change to checkpoint");

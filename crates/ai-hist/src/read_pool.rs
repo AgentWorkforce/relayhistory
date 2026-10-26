@@ -22,7 +22,7 @@ use std::ops::{Deref, DerefMut};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
-use rusqlite::Connection;
+use rusqlite::{Connection, OpenFlags};
 
 use crate::session_store::Error;
 use crate::store::open_db_readonly;
@@ -36,13 +36,13 @@ const MAX_IDLE: usize = 4;
 /// platform gives no stable identity; such connections are never reused.
 #[cfg(unix)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct FileIdentity {
+pub(crate) struct FileIdentity {
     device: u64,
     inode: u64,
 }
 
 #[cfg(unix)]
-fn file_identity(path: &Path) -> Option<FileIdentity> {
+pub(crate) fn file_identity(path: &Path) -> Option<FileIdentity> {
     use std::os::unix::fs::MetadataExt;
     let metadata = std::fs::metadata(path).ok()?;
     Some(FileIdentity {
@@ -53,10 +53,10 @@ fn file_identity(path: &Path) -> Option<FileIdentity> {
 
 #[cfg(windows)]
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct FileIdentity(Arc<same_file::Handle>);
+pub(crate) struct FileIdentity(Arc<same_file::Handle>);
 
 #[cfg(windows)]
-fn file_identity(path: &Path) -> Option<FileIdentity> {
+pub(crate) fn file_identity(path: &Path) -> Option<FileIdentity> {
     // Keep the handle alive: Windows may recycle file indexes after close.
     same_file::Handle::from_path(path)
         .ok()
@@ -65,10 +65,10 @@ fn file_identity(path: &Path) -> Option<FileIdentity> {
 
 #[cfg(not(any(unix, windows)))]
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct FileIdentity;
+pub(crate) struct FileIdentity;
 
 #[cfg(not(any(unix, windows)))]
-fn file_identity(_path: &Path) -> Option<FileIdentity> {
+pub(crate) fn file_identity(_path: &Path) -> Option<FileIdentity> {
     None
 }
 
@@ -164,7 +164,7 @@ impl ReadPool {
         if let Some(entry) = idle.pop() {
             if identity_now().as_ref() == Some(&entry.identity) {
                 return Ok(PooledConnection {
-                    conn: Some(entry.conn),
+                    conn: entry.conn,
                     identity: Some(entry.identity),
                     gates: entry.gates,
                     pool: Some(Arc::clone(self)),
@@ -184,7 +184,7 @@ impl ReadPool {
             }
             let pool = identity.as_ref().map(|_| Arc::clone(self));
             return Ok(PooledConnection {
-                conn: Some(conn),
+                conn,
                 identity,
                 gates: Gates::default(),
                 pool,
@@ -206,7 +206,7 @@ impl ReadPool {
 /// is back in autocommit; one still inside a transaction is closed instead,
 /// so no snapshot ever outlives the call that took it.
 pub(crate) struct PooledConnection {
-    conn: Option<Connection>,
+    conn: Connection,
     identity: Option<FileIdentity>,
     gates: Gates,
     pool: Option<Arc<ReadPool>>,
@@ -217,7 +217,7 @@ impl PooledConnection {
     #[cfg(test)]
     pub(crate) fn detached(conn: Connection) -> Self {
         Self {
-            conn: Some(conn),
+            conn,
             identity: None,
             gates: Gates::default(),
             pool: None,
@@ -233,11 +233,7 @@ impl PooledConnection {
         name: &'static str,
         check: impl FnOnce(&Connection) -> anyhow::Result<bool>,
     ) -> anyhow::Result<bool> {
-        let conn = self
-            .conn
-            .as_ref()
-            .expect("a pooled connection is present until drop");
-        let version: i64 = conn.query_row("PRAGMA schema_version", [], |row| row.get(0))?;
+        let version: i64 = self.query_row("PRAGMA schema_version", [], |row| row.get(0))?;
         if version != self.gates.schema_version {
             self.gates = Gates {
                 schema_version: version,
@@ -247,7 +243,7 @@ impl PooledConnection {
         if self.gates.passed.contains(&name) {
             return Ok(true);
         }
-        let passed = check(conn)?;
+        let passed = check(self)?;
         if passed {
             self.gates.passed.push(name);
         }
@@ -259,30 +255,35 @@ impl Deref for PooledConnection {
     type Target = Connection;
 
     fn deref(&self) -> &Connection {
-        self.conn
-            .as_ref()
-            .expect("a pooled connection is present until drop")
+        &self.conn
     }
 }
 
 impl DerefMut for PooledConnection {
     fn deref_mut(&mut self) -> &mut Connection {
-        self.conn
-            .as_mut()
-            .expect("a pooled connection is present until drop")
+        &mut self.conn
     }
 }
 
 impl Drop for PooledConnection {
     fn drop(&mut self) {
-        let (Some(conn), Some(identity), Some(pool)) =
-            (self.conn.take(), self.identity.take(), self.pool.take())
-        else {
+        let (Some(identity), Some(pool)) = (self.identity.take(), self.pool.take()) else {
             return;
         };
-        if !conn.is_autocommit() {
+        if !self.conn.is_autocommit() {
             return;
         }
+        // Moving the connection out of `&mut self` needs something left in
+        // its place: an empty in-memory connection, with no file and no
+        // schema, closed as this guard finishes dropping. Should even that
+        // fail to open, the connection is closed rather than pooled, which
+        // is always safe.
+        let Ok(stand_in) = Connection::open_in_memory_with_flags(
+            OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        ) else {
+            return;
+        };
+        let conn = std::mem::replace(&mut self.conn, stand_in);
         let mut idle = pool
             .idle
             .lock()

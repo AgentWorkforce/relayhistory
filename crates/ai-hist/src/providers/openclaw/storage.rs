@@ -395,7 +395,7 @@ pub(super) fn shallow(scan: &ScanEnv<'_>, c: &Candidate) -> Result<Option<Shallo
             });
             first_prompt = format::first_prompt(&head).or(first_prompt);
         }
-        let latest = conv.latest();
+        let latest = conv.latest()?;
         Ok(Some(ShallowSession {
             source: ID.into(),
             session_id: conv.id.clone(),

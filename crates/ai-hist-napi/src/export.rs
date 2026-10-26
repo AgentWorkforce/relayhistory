@@ -136,71 +136,82 @@ pub async fn history_export(request_json: String, db_path: Option<String>) -> na
         .map_err(|_| crate::native_error("INVALID_ARGUMENT", "invalid export request"))?;
     let path = crate::db_path(db_path);
     napi::tokio::task::spawn_blocking(move || {
-        // Only a new snapshot opens the store; every other operation acts on
-        // snapshots this process already holds.
-        let conn = match request {
-            Request::CreateExport { .. } => {
-                Some(ai_hist::open_db(&path).map_err(|e| crate::database_error(&path, e))?)
+        let value = match request {
+            // Only a new snapshot opens the store; every other operation acts
+            // on snapshots this process already holds.
+            Request::CreateExport {
+                selection,
+                limits,
+                ttl_ms,
+                now_ms,
+            } => {
+                let conn = ai_hist::open_db(&path).map_err(|e| crate::database_error(&path, e))?;
+                create_export(conn, &selection, &limits, ttl_ms, now_ms)
             }
-            _ => None,
-        };
-        let value = (move || -> anyhow::Result<serde_json::Value> {
-            Ok(match request {
-                Request::CreateExport {
-                    selection,
-                    limits,
-                    ttl_ms,
-                    now_ms,
-                } => {
-                    let conn = conn.expect("a create request opened the store");
-                    let snapshot =
-                        core::ExportSnapshot::open(conn, &selection, &limits, ttl_ms, now_ms)?;
-                    let handle = snapshot.handle();
-                    let mut open = open_snapshots();
-                    expire(&mut open, now_ms, usize::MAX);
-                    anyhow::ensure!(
-                        open.len() < MAX_OPEN_EXPORTS,
-                        "maximum open exports reached; close or expire old snapshots"
-                    );
-                    open.push(snapshot);
-                    drop(open);
-                    start_reaper();
-                    REAPER_WAKE.notify_all();
-                    serde_json::to_value(handle)?
-                }
-                Request::ExportPage { cursor, now_ms } => {
-                    let mut open = open_snapshots();
-                    let index = open
-                        .iter()
-                        .position(|snapshot| snapshot.owns_cursor(&cursor))
-                        .ok_or_else(|| anyhow::anyhow!("export cursor not found"))?;
-                    // An expired snapshot is released as soon as its cursor
-                    // comes back, so its read transaction never outlives it
-                    // and holds back WAL checkpoints.
-                    if open[index].expired(now_ms) {
-                        open.remove(index);
-                        anyhow::bail!("export snapshot expired");
-                    }
-                    let page = open[index].page(&cursor, now_ms)?;
-                    expire(&mut open, now_ms, MAX_OPEN_EXPORTS);
-                    serde_json::to_value(page)?
-                }
-                Request::CloseExport { snapshot_id } => {
-                    open_snapshots().retain(|snapshot| snapshot.snapshot_id() != snapshot_id);
-                    serde_json::Value::Null
-                }
-                Request::ExpireExports { now_ms, limit } => {
-                    anyhow::ensure!(
-                        (1..=MAX_OPEN_EXPORTS).contains(&limit),
-                        "invalid export cleanup limit"
-                    );
-                    serde_json::to_value(expire(&mut open_snapshots(), now_ms, limit))?
-                }
-            })
-        })()
+            Request::ExportPage { cursor, now_ms } => export_page(&cursor, now_ms),
+            Request::CloseExport { snapshot_id } => {
+                open_snapshots().retain(|snapshot| snapshot.snapshot_id() != snapshot_id);
+                Ok(serde_json::Value::Null)
+            }
+            Request::ExpireExports { now_ms, limit } => expire_exports(now_ms, limit),
+        }
         .map_err(|e| crate::native_error("HISTORY_EXPORT_FAILED", e))?;
         serde_json::to_string(&value).map_err(|e| crate::native_error("HISTORY_EXPORT_FAILED", e))
     })
     .await
     .map_err(crate::worker_error)?
+}
+
+/// Open a snapshot over `conn` and register it with the reaper.
+fn create_export(
+    conn: rusqlite::Connection,
+    selection: &core::ExportSelection,
+    limits: &core::ExportLimits,
+    ttl_ms: i64,
+    now_ms: i64,
+) -> anyhow::Result<serde_json::Value> {
+    let snapshot = core::ExportSnapshot::open(conn, selection, limits, ttl_ms, now_ms)?;
+    let handle = snapshot.handle();
+    let mut open = open_snapshots();
+    expire(&mut open, now_ms, usize::MAX);
+    anyhow::ensure!(
+        open.len() < MAX_OPEN_EXPORTS,
+        "maximum open exports reached; close or expire old snapshots"
+    );
+    open.push(snapshot);
+    drop(open);
+    start_reaper();
+    REAPER_WAKE.notify_all();
+    Ok(serde_json::to_value(handle)?)
+}
+
+/// Read the page `cursor` names from the snapshot that issued it.
+fn export_page(cursor: &str, now_ms: i64) -> anyhow::Result<serde_json::Value> {
+    let mut open = open_snapshots();
+    let index = open
+        .iter()
+        .position(|snapshot| snapshot.owns_cursor(cursor))
+        .ok_or_else(|| anyhow::anyhow!("export cursor not found"))?;
+    // An expired snapshot is released as soon as its cursor comes back, so
+    // its read transaction never outlives it and holds back WAL checkpoints.
+    if open[index].expired(now_ms) {
+        open.remove(index);
+        anyhow::bail!("export snapshot expired");
+    }
+    let page = open[index].page(cursor, now_ms)?;
+    expire(&mut open, now_ms, MAX_OPEN_EXPORTS);
+    Ok(serde_json::to_value(page)?)
+}
+
+/// Close up to `limit` expired snapshots, returning how many.
+fn expire_exports(now_ms: i64, limit: usize) -> anyhow::Result<serde_json::Value> {
+    anyhow::ensure!(
+        (1..=MAX_OPEN_EXPORTS).contains(&limit),
+        "invalid export cleanup limit"
+    );
+    Ok(serde_json::to_value(expire(
+        &mut open_snapshots(),
+        now_ms,
+        limit,
+    ))?)
 }

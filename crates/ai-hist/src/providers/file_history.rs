@@ -3,6 +3,8 @@
 //! dropped, and retirement of a locator a full sweep confirmed missing.
 //! Every function is keyed on the provider's canonical source id.
 mod order;
+#[cfg(test)]
+mod tests;
 pub(crate) use order::reconcile_event_order;
 
 use super::AcquisitionContext;
@@ -56,6 +58,18 @@ pub(crate) fn check_identity(
 
 /// Retire the local evidence a complete normalization did not write again.
 pub(crate) fn retire(conn: &Connection, source: &str, sid: &str, keys: &Keys) -> Result<()> {
+    retire_with_prompts(conn, source, sid, keys, reconcile_prompts)
+}
+
+/// Retire a rewritten snapshot while allowing a provider to match its own
+/// bounded prompt projection against retained remote evidence.
+pub(crate) fn retire_with_prompts(
+    conn: &Connection,
+    source: &str,
+    sid: &str,
+    keys: &Keys,
+    reconcile: fn(&Connection, &str, &str, &str) -> Result<()>,
+) -> Result<()> {
     let prompts = serde_json::to_string(&keys.prompts)?;
     let results = serde_json::to_string(&keys.results)?;
     conn.execute(
@@ -81,14 +95,19 @@ pub(crate) fn retire(conn: &Connection, source: &str, sid: &str, keys: &Keys) ->
             crate::SessionLocation::Local,
         )?;
     }
-    reconcile_prompts(conn, source, sid, &prompts)
+    reconcile(conn, source, sid, &prompts)
 }
 
 // Reconcile after local shares retire: surviving remote events in this session
 // and other sessions still support prompt rows. Compare complete ordered user
 // text projections, and prefer the existing owner when its evidence survives.
 // A control row (harness-written user text) never supports a prompt.
-fn reconcile_prompts(conn: &Connection, source: &str, sid: &str, keep: &str) -> Result<()> {
+pub(crate) fn reconcile_prompts(
+    conn: &Connection,
+    source: &str,
+    sid: &str,
+    keep: &str,
+) -> Result<()> {
     // `+e.source` keeps the planner on the timestamp index: without
     // statistics it would otherwise walk every event of the source to
     // satisfy the GROUP BY, once per prompt row.
@@ -149,8 +168,22 @@ pub(crate) fn retire_locator_sessions(
 /// Retire the local share of one session: its local-only evidence, prompt
 /// ownership, local presence, and the catalog row once nothing backs it.
 pub(crate) fn retire_local_session(conn: &Connection, source: &str, sid: &str) -> Result<()> {
+    retire_local_session_with_prompts(conn, source, sid, |conn, source, sid| {
+        reconcile_prompts(conn, source, sid, "[]")
+    })
+}
+
+/// Retire a local session with the provider's native prompt-order projection.
+/// Providers whose event IDs do not encode a numeric block offset supply their
+/// own reconciliation while sharing evidence and catalog retirement.
+pub(crate) fn retire_local_session_with_prompts(
+    conn: &Connection,
+    source: &str,
+    sid: &str,
+    reconcile: fn(&Connection, &str, &str) -> Result<()>,
+) -> Result<()> {
     crate::ingest::retire_local_session_evidence(conn, source, sid)?;
-    reconcile_prompts(conn, source, sid, "[]")?;
+    reconcile(conn, source, sid)?;
     for table in [
         "session_observations",
         "session_hydration_checkpoints",
@@ -192,7 +225,7 @@ pub(crate) fn retire_missing(conn: &Connection, source: &str, roots: &ProviderRo
     for path in paths {
         crate::ingest::check_capture_cancelled()?;
         let path = PathBuf::from(path);
-        if confirmed_missing(source, roots, &path)? {
+        if confirmed_missing_with_extension(source, roots, &path, "jsonl")? {
             let tx = conn.unchecked_transaction()?;
             retire_missing_locator(&tx, source, &path)?;
             tx.commit()?;
@@ -201,8 +234,16 @@ pub(crate) fn retire_missing(conn: &Connection, source: &str, roots: &ProviderRo
     Ok(())
 }
 
-fn confirmed_missing(source: &str, roots: &ProviderRoots, path: &Path) -> Result<bool> {
-    if path.extension().is_none_or(|e| e != "jsonl") {
+/// Prove a file is absent beneath an accessible, contained provider root.
+/// Providers with multiple authoritative files must check every companion
+/// before retiring a session; one absent metadata file is not sufficient.
+pub(crate) fn confirmed_missing_with_extension(
+    source: &str,
+    roots: &ProviderRoots,
+    path: &Path,
+    extension: &str,
+) -> Result<bool> {
+    if path.extension().is_none_or(|e| e != extension) {
         return Ok(false);
     }
     let context = AcquisitionContext::new(source, roots);

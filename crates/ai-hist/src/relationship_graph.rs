@@ -489,8 +489,7 @@ pub fn session_children_page(
     if has_more {
         children.truncate(limit as usize);
     }
-    let next_cursor = (has_more && !children.is_empty()).then(|| {
-        let last = children.last().expect("non-empty page");
+    let next_cursor = children.last().filter(|_| has_more).map(|last| {
         RelationshipCursor {
             spawned_at_ms: last.spawned_at_ms,
             relationship_uid: last.relationship_uid.clone(),

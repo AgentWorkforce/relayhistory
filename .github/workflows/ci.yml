@@ -138,10 +138,10 @@ jobs:
         id: rust-oleum-cache
         with:
           path: ~/.cargo/bin/rust-oleum
-          key: rust-oleum-${{ runner.os }}-0.1.2
+          key: rust-oleum-${{ runner.os }}-0.1.3
       - name: Install rust-oleum
         if: steps.rust-oleum-cache.outputs.cache-hit != 'true'
-        run: cargo install rust-oleum --version 0.1.2 --locked
+        run: cargo install rust-oleum --version 0.1.3 --locked
       - name: Quality ratchet
         run: rust-oleum --github-summary "$GITHUB_STEP_SUMMARY"
 
@@ -278,6 +278,51 @@ jobs:
       - name: Test SDK on Node 22
         working-directory: sdk-ts
         run: npm ci && npm test
+
+  # The object-storage destination adapters (S3/R2/MinIO, GCS, Azure, local
+  # directory). Not a workspace member, so nothing above builds or tests it;
+  # the shared conformance suite runs against every adapter on local emulators.
+  object-store-plugin:
+    runs-on: ubuntu-latest
+    env:
+      MANIFEST: plugins/object-store/rust/Cargo.toml
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: plugins/object-store/rust -> target
+          key: ci-object-store-plugin
+      - name: The local hot path never links an object-storage client
+        run: |
+          for crate in ai-hist ai-hist-cli ai-hist-napi; do
+            if cargo tree -p "$crate" -e normal,build --all-features -i object_store >/dev/null 2>&1; then
+              echo "::error::$crate depends on object_store; cloud SDKs must stay in plugins/object-store"
+              exit 1
+            fi
+          done
+      - name: Format
+        run: cargo fmt --manifest-path "$MANIFEST" -- --check
+      - name: Lint (every feature combination)
+        run: |
+          for features in s3 gcs azure conformance "s3,gcs,azure,conformance"; do
+            cargo clippy --manifest-path "$MANIFEST" --locked --all-targets --no-default-features --features "$features" -- -D warnings
+          done
+          cargo clippy --manifest-path "$MANIFEST" --locked --all-targets --no-default-features -- -D warnings
+      - name: Start MinIO, fake-gcs-server and Azurite
+        run: plugins/object-store/rust/scripts/emulators.sh up > "$RUNNER_TEMP/emulators.env"
+      - name: Conformance suite on every adapter
+        run: |
+          . "$RUNNER_TEMP/emulators.env"
+          cargo test --manifest-path "$MANIFEST" --locked --all-features -- --nocapture
+      - name: Emulator logs
+        if: failure()
+        run: |
+          for c in rh-objstore-minio rh-objstore-gcs rh-objstore-azurite; do
+            echo "::group::$c"; docker logs "$c" 2>&1 | tail -200; echo "::endgroup::"
+          done
 
   optional-history-plugins:
     runs-on: ubuntu-latest

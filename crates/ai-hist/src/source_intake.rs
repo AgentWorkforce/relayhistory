@@ -484,14 +484,10 @@ impl ShallowSessionProvider for BatchProvider {
                         .unwrap_or_else(|| row.session_id.clone()),
                     session_id: Some(row.session_id.clone()),
                     recency_hint_ms: row.last_activity_ms,
-                    stamp: row.source_stamp.clone().unwrap_or_else(|| {
-                        format!(
-                            "{:x}",
-                            Sha256::digest(
-                                serde_json::to_vec(row).expect("serializable observation")
-                            )
-                        )
-                    }),
+                    stamp: match row.source_stamp.clone() {
+                        Some(stamp) => stamp,
+                        None => format!("{:x}", Sha256::digest(serde_json::to_vec(row)?)),
+                    },
                 })
             })
             .collect()

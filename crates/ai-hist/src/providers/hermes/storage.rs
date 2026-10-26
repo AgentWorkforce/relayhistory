@@ -7,20 +7,25 @@ const MAX_SESSIONS: usize = 100_000;
 fn hex(text: &[u8]) -> String {
     text.iter().map(|b| format!("{b:02x}")).collect()
 }
-pub(super) fn profile(roots: &ProviderRoots, path: &Path) -> String {
-    let dir = path.parent().unwrap();
+pub(super) fn profile(roots: &ProviderRoots, path: &Path) -> Result<String> {
+    let dir = path
+        .parent()
+        .with_context(|| format!("HERMES_INVALID_PATH: {} has no parent", path.display()))?;
     if let Some(default) = roots.default_for_provider(ID) {
         if dir == default {
-            return "default".into();
+            return Ok("default".into());
         }
         if let Ok(relative) = dir.strip_prefix(default.join("profiles")) {
-            return format!("profile:{}", hex(relative.as_os_str().as_encoded_bytes()));
+            return Ok(format!(
+                "profile:{}",
+                hex(relative.as_os_str().as_encoded_bytes())
+            ));
         }
     }
-    format!(
+    Ok(format!(
         "root:{:x}",
         Sha256::digest(dir.as_os_str().as_encoded_bytes())
-    )
+    ))
 }
 fn identity(profile: &str, native: &str) -> String {
     format!("{profile}:{}", hex(native.as_bytes()))
@@ -143,7 +148,7 @@ fn sessions(
     limit: usize,
     native: Option<&str>,
 ) -> Result<Vec<Session>> {
-    let profile = profile(roots, path);
+    let profile = profile(roots, path)?;
     let query = session_query(native.is_some());
     let mut stmt = conn.prepare(&query)?;
     let rows = stmt.query_map(rusqlite::params![native, limit as i64], |r| {
@@ -422,7 +427,7 @@ pub(super) fn fingerprint_inputs(roots: &ProviderRoots) -> Result<Vec<Candidate>
                     recency_hint_ms: modified,
                     // Namespace is frozen acquisition metadata: identical files
                     // can project different ledger IDs. Keep the stat length last.
-                    stamp: format!("{}/{stamp}", profile(roots, &db)),
+                    stamp: format!("{}/{stamp}", profile(roots, &db)?),
                 });
             }
         }

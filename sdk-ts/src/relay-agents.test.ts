@@ -412,6 +412,38 @@ test('Linux discovery tries both runtime and data-directory defaults', async () 
   ]);
 });
 
+test('Windows discovery has no fixed default pipe another process could claim first', async () => {
+  // Pipe names are machine-wide, so only a pipe the desktop publishes is tried.
+  const root = await mkdtemp(join(tmpdir(), 'relay-agents-win32-'));
+  try {
+    const published = await relaySocketCandidates({
+      env: { AGENT_RELAY_SOCKET: '\\\\.\\pipe\\chosen', USERNAME: 'alice' },
+      home: root, platform: 'win32', temporaryDirectory: root, uid: 0,
+    });
+    assert.deepEqual(published, ['\\\\.\\pipe\\chosen']);
+    const unpublished = await relaySocketCandidates({
+      env: { USERNAME: 'alice' }, home: root, platform: 'win32', temporaryDirectory: root, uid: 0,
+    });
+    assert.deepEqual(unpublished, []);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('a CRLF pointer file names only its first line', async (t) => {
+  const root = await mkdtemp(join(tmpdir(), 'relay-agents-crlf-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const pointer = join(root, '.agentworkforce', 'desktop', 'relay-socket');
+  await mkdir(dirname(pointer), { recursive: true });
+  await writeFile(pointer, '\\\\.\\pipe\\agent-relay-desktop\r\nstale second line\r\n', { mode: 0o600 });
+
+  const paths = await relaySocketCandidates({
+    env: { USERNAME: 'alice' }, home: root, platform: 'win32', temporaryDirectory: root, uid: 0,
+  });
+
+  assert.deepEqual(paths, ['\\\\.\\pipe\\agent-relay-desktop']);
+});
+
 test('missing desktop is a clear non-fatal result', async () => {
   const root = await mkdtemp(join(tmpdir(), 'relay-agents-missing-'));
   try {

@@ -558,14 +558,14 @@ fn sync_hydrate_and_the_change_feed_store_the_same_turn_contexts() {
         .unwrap()
         .map(|change| change.unwrap())
         .filter_map(|change| match change.op {
-            ChangeOp::Upsert(EvidenceRow::SessionMarker(marker))
-                if marker.kind == "turn_context" =>
-            {
-                Some((
-                    marker.turn_id.clone().unwrap(),
-                    serde_json::from_str(marker.payload_json.as_deref().unwrap()).unwrap(),
-                ))
-            }
+            ChangeOp::Upsert(row) => Some(*row),
+            _ => None,
+        })
+        .filter_map(|row| match row {
+            EvidenceRow::SessionMarker(marker) if marker.kind == "turn_context" => Some((
+                marker.turn_id.clone().unwrap(),
+                serde_json::from_str(marker.payload_json.as_deref().unwrap()).unwrap(),
+            )),
             _ => None,
         })
         .collect();

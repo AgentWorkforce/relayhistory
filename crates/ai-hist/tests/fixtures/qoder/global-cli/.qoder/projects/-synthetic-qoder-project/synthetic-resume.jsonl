@@ -1,0 +1,12 @@
+{"type":"user","uuid":"resume-u1","message":{"role":"user","content":"Start the sample."},"parentUuid":null,"isSidechain":false,"cwd":"/synthetic/qoder/project","sessionId":"synthetic-resume","userType":"external","entrypoint":"cli","version":"1.1.75","timestamp":"2026-10-21T18:11:52.583Z"}
+{"type":"active-leaf","sessionId":"synthetic-resume","leafUuid":"resume-u1","explicit":false,"timestamp":1792606312583}
+{"type":"assistant","uuid":"resume-a1","message":{"role":"assistant","model":"synthetic-model","content":[{"type":"text","text":"Started."}]},"parentUuid":"resume-u1","isSidechain":false,"cwd":"/synthetic/qoder/project","sessionId":"synthetic-resume","userType":"external","entrypoint":"cli","version":"1.1.75","timestamp":"2026-10-21T18:11:52.700Z"}
+{"type":"active-leaf","sessionId":"synthetic-resume","leafUuid":"resume-a1","explicit":false,"timestamp":1792606312700}
+{"type":"last-prompt","sessionId":"synthetic-resume","lastPrompt":"Start the sample."}
+{"type":"active-leaf","sessionId":"synthetic-resume","leafUuid":"resume-a1","explicit":false,"timestamp":1792606312700}
+{"type":"user","uuid":"resume-u2","message":{"role":"user","content":"Continue the sample."},"parentUuid":"resume-a1","isSidechain":false,"cwd":"/synthetic/qoder/project","sessionId":"synthetic-resume","userType":"external","entrypoint":"cli","version":"1.1.75","timestamp":"2026-10-21T18:11:52.819Z"}
+{"type":"active-leaf","sessionId":"synthetic-resume","leafUuid":"resume-u2","explicit":false,"timestamp":1792606312820}
+{"type":"assistant","uuid":"resume-a2","message":{"role":"assistant","model":"synthetic-model","content":[{"type":"text","text":"Continued."}]},"parentUuid":"resume-u2","isSidechain":false,"cwd":"/synthetic/qoder/project","sessionId":"synthetic-resume","userType":"external","entrypoint":"cli","version":"1.1.75","timestamp":"2026-10-21T18:11:52.937Z"}
+{"type":"active-leaf","sessionId":"synthetic-resume","leafUuid":"resume-a2","explicit":false,"timestamp":1792606312937}
+{"type":"last-prompt","sessionId":"synthetic-resume","lastPrompt":"Continue the sample."}
+{"type":"active-leaf","sessionId":"synthetic-resume","leafUuid":"resume-a2","explicit":false,"timestamp":1792606312937}

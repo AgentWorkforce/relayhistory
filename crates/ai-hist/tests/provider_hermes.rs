@@ -41,3 +41,7 @@ fn hermes_public_history_conformance() {
     assert!(blocks.iter().all(|b| b.tool_use_id.as_ref() == Some(id)));
     assert!(evidence.requests.iter().all(|r| r.usage.is_none()));
 }
+
+#[cfg(all(feature = "unstable-internal", feature = "export"))]
+#[path = "provider_hermes/transport.rs"]
+mod transport;

@@ -250,6 +250,7 @@ source without deciding which one fails the test.
 | kimi/subagent | Kimi Code 2.2.0 native protocol 1.5 writer, localhost model fixture, independently restored by pinned official foldWireRecords; subagent case. |
 | kimi/rewound | Native 2.2 binary journal plus pinned official buildUndoSwitchRecords writer constructor; official flattenChain+fold confirms prior messages are retired. |
 | kimi/official-reader | Pinned official source restart replay oracle, independent of RelayHistory. |
+| cline/native | Pinned Cline core version-1 messages artifact; native golden ordinary, reasoning, tool, and final text. Synthetic rewrite/resume snapshots exercise stable message IDs. |
 | codebuddy/ordinary | Official @tencent-ai/codebuddy-code 2.171.0 CLI writer with isolated localhost model and independent native historical deserializer: ordinary. |
 | codebuddy/resumed | Official @tencent-ai/codebuddy-code 2.171.0 CLI writer with isolated localhost model and independent native historical deserializer: resumed. |
 | codebuddy/tool | Official @tencent-ai/codebuddy-code 2.171.0 CLI writer with isolated localhost model and independent native historical deserializer: tool. |
@@ -263,6 +264,26 @@ source without deciding which one fails the test.
 | codebuddy/metadata | Published native LocalJsonlSessionStore 2.171.0 offline recorder and fresh high-level historical reader replay; metadata. Not a CLI model-loop capture. |
 | codebuddy/string-content | Published native LocalJsonlSessionStore 2.171.0 offline recorder and fresh high-level historical reader replay; string-content. Not a CLI model-loop capture. |
 | codebuddy/official-reader | Fresh-process native SessionStoreImpl historical reader oracle for all five CLI captures, plus high-level historical replay for the seven recorder controls. |
+| cortex/native | Official Cortex Code CLI 1.2.18 native writer merged, flat, rewritten, zero-byte empty sidecar and untimed sessions; raw native restart-reader oracles for IDs, order and content. |
+| deepagents/dcode-checkpoints | Pinned dcode 0.1.88 writer and current SDK DeltaChannel: 171 checkpoints crossing snapshot frequency 50, pending writes, native tool IDs, same-ID revision/removal, and Overwrite compaction. |
+| deepagents/native-oracles | Fresh-process bundled inspector transcript exports and the fully synthetic native capture recipe. |
+| goose/schema17 | Goose 1.56.0 native schema-17 writer: ordinary and tool turns, then appended turns after process restart. |
+| goose/before-resume | Same native writer before process restart; four messages including matching tool request and response IDs. |
+| goose/schema17-official-export | Independent SessionManager::get_session/export_session read in a fresh process after resume. |
+| goose/before-resume-official-export | Independent SessionManager::get_session/export_session read in a fresh process before resume. |
+| goose/rewritten | Native replace_conversation deletes and reinserts rows with the same message IDs, removes the tool result, and changes the final text. |
+| goose/rewritten-official-export | Independent get_session/export_session read in a fresh process after native conversation replacement. |
+| goose/native-capture-source | The exact synthetic harness and capture instructions run against the pinned Goose API. |
+| junie/native | Pinned Junie CLI 3110.7 SessionStore native writer capture across separate JVM processes; third-process official reader oracle, two prompts, A2UX assistant blocks, repeated tool step and parent-side subagent notice. |
+| junie/official-reader | Third-process SessionStore.readStoredEventsFromFile oracle from the pinned released jar, independent of RelayHistory. |
+| kilo/sqlite-7-8-15 | Kilo CLI 7.8.15 native import writer: user, assistant, completed tool, and resumed turns after process restart. |
+| kilo/before-resume | Same native writer before resumed turns are imported in a separate process. |
+| kilo/before-resume-official-export | Independent Kilo export after first native writer process exited. |
+| kilo/after-resume-official-export | Independent Kilo export after append in another native writer process. |
+| kilo/native-capture-inputs | Synthetic native import inputs and capture procedure, no account, paid model, or private history. |
+| mistral-vibe/unified-3-0-1 | Pinned v1 minor 9 chunked projection with native CURRENT/manifest digests, tool effect, and chained journal delta; synthetic entries survive a separate-process reader. |
+| qoder/global-cli | Official global Qoder CLI npm 1.1.75 TranscriptStore native writer; ordinary, tool, resumed, and same-millisecond synthetic sessions with released Repository historical restart-reader oracle. |
+| vtcode/basic | Synthetic VT Code 0.180.2 native-writer canonical schema-0.18.0 journal, independently reopened through visit_snapshot: two user turns, assistant items, actual tool IDs, per-turn usage, compaction control and thread aggregate. |
 | grok-bot/replicas | Synthetic complete and truncated transcript tails in two account slots, roster titles, widget response, cloud-agent round trip, and voice turns. |
 | openclaw/agent24 | OpenClaw 2026.10.4 writer, agent schema 24, deterministic clock/UUIDs: Pi v4 entries in transcript_events incl. one writer-compressed zstd row, session keys as conversation identity, main and Telegram keys, thinking/tool calls/results with isError, per-message usage, zero-usage delivery mirror, shared-mode heartbeat polls (marker and legacy prompt) with quiet acknowledgements. |
 | openclaw/agent24-ops | Second agent database from the same writer run: relay DM key under a non-main agent ID, and an isolated cron job whose two runs are two windows of one session key. |

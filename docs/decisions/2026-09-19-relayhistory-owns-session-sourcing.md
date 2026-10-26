@@ -518,9 +518,28 @@ Generated from provider-owned acquisition records; these cells describe fixture-
 | qwen-code | Usage and limits | Stored assistant usage metadata per message with inclusive cache subtraction; upstream reasoning/cache-write reporting provenance is unavailable. QWEN_RUNTIME_DIR overrides QWEN_HOME; explicit roots represent runtime configuration. No live resume or managed-session transactional replay; reasoning remains raw marker evidence and managed envelopes fail explicitly. |
 | kimi | Messages and tools | Current Kimi Code 2.2 native wire 1.5 canonical message events, native tool IDs/results and separate subagent wires. Streaming/context duplicates are markers rather than duplicate human turns. Millisecond timestamps, state v2 title/cwd and root/session/agent identity preserved. |
 | kimi | Control and limits | Bounded raw wire markers retain controls, observed usage, reasoning and media references. No derived costs, inferred token totals, pricing, file edits, parent relationships or native resume. Legacy Python context/wire/checkpoints are unsupported; KIMI_SHARE_DIR is a legacy migration setting, current root override is KIMI_CODE_HOME. |
+| cline | Messages and identity | Cline core v1 sessionId and per-message stable id, user/assistant text and thinking, assistant modelInfo and ts; user timestamps are derived from the nearest following assistant or snapshot updated_at. CLI/SDK data/sessions only; legacy VS Code tasks excluded. |
+| cline | Tools and usage | tool_use.id joins tool_result.tool_use_id; is_error retained. Terminal assistant metrics are retained as bounded raw markers; request-normalized usage is unavailable because the writer can stamp aggregate run fallback. Unknown blocks remain bounded markers. No native relationship, edit or resume capability inferred. |
 | codebuddy | Messages and identity | Native linear project JSONL user/assistant text, native item IDs and integer millisecond clocks, project/root-namespaced session identities, recorded cwd. CODEBUDDY_CONFIG_DIR overrides the config root; global input history and active-session metadata are excluded. |
 | codebuddy | Tools and usage | Native function call/result callId joins, full inline toolResult.content including spills, raw markers and per-upstream-message rawUsage counters counted once. Embedded output paths are never read. Sidecar-only outputs, unrecognized control facts fail closed; no delegation or resume execution inferred. |
 | codebuddy | Native replay | Published native recorder and fresh high-level historical restore/replay oracle prove branch tombstone, pending rewind and compaction ancestry; retained pre-compaction messages stay searchable, controls and summaries remain markers. Native reasoning nodes stay opaque; adjacent native message fragments are preserved. Native title facts use custom/AI/topic precedence. Runtime-only lane moves without durable facts cannot be inferred. |
+| cortex | Messages and identity | Cortex Code CLI 1.2.18 local conversation snapshots and JSONL sidecars; persisted native session/message IDs, recorded timestamps when present, working directory, title, model and text. Missing native timestamps use a marked inference. |
+| cortex | Tools and control | Nested tool-use and tool-result records joined by persisted tool_use_id and status; unsupported blocks remain markers. Per-message billable usage, file edits and child relationships are not claimed. |
+| deepagents | Messages and tools | Pinned DeepAgents Code SQLite MsgPack root checkpoints v2 and v4 plus ordered messages writes; text-only message projection with native IDs and tool call/result IDs. |
+| deepagents | Usage and relationships | No measured usage, file edits, child namespace relationships, offloaded history, or native resume claimed. |
+| goose | Messages and tools | Schema-17 SQLite text blocks and native tool request/response IDs; WAL-visible coherent snapshot. |
+| goose | Usage and relationships | Session totals are not per-request usage; parent ID remains metadata; no file edits, delegation, or native resume advertised. |
+| junie | Messages and tool blocks | Junie CLI 3110.7 native event journal: UserPromptEvent request IDs, A2UX Markdown/Result step IDs, latest native ToolBlockUpdatedEvent step status and output; raw journal rows retained as markers. |
+| junie | Limits | No billable usage, file edits, native resume control or child relationship claimed. SubagentSpawnedEvent is a marker only; no native child session ID or child transcript was captured. Derived Markdown transcripts are not authoritative extra messages. |
+| kilo | Messages and tools | Kilo CLI 7.8.15 SQLite session/message/part writer and independent export; user/assistant text, completed tool call/result, WAL-visible coherent snapshot. |
+| kilo | Usage and relationships | Session totals are context counters, not billable request usage; parent IDs and richer parts remain bounded metadata; no native resume or legacy extension coverage advertised. |
+| mistral-vibe | Messages and identity | Vibe 3.0.1 Unified store v1/minor 9 public projection entries, native entry IDs and millisecond timestamps, source and root-scoped session identity, title and cwd. Current stores only; legacy 2.x JSONL import is not covered. |
+| mistral-vibe | Control and tools | Public tool effect entries provide one stable effect ID for tool-use/result join and explicit settled status. Other non-message entries are bounded markers. No per-request usage is claimed from session or context totals; native resume remains unavailable. |
+| qoder | Messages and identity | Global CLI 1.1.x projects JSONL, observed sessionId and UUID/parentUuid, timestamps, cwd, model and user/assistant text; same native ID at distinct paths is rejected with a collision diagnostic. |
+| qoder | Tools and control | Persisted tool_use and tool_result IDs joined; active-leaf and last-prompt retained as markers. Same-millisecond remote ordering conflict reports retryable failure under #463. Usage objects supplied to writer are discarded, so per-request usage stays unknown. No file edits or relationships inferred. Qoder CN and IDE schemas are excluded. |
+| vtcode | Messages and identity | Workspace-scoped canonical events preserve native turn/item IDs and exact user-origin prompts; multi-workspace identities are namespaced to prevent same-ID collapse. |
+| vtcode | Tools and usage | Native tool_call_id and call_id join; turn.completed usage recorded once on the final assistant item, thread aggregate remains a marker; no model or file-edit inference. |
+| vtcode | Control and lifecycle | Compaction, completion and unrecognized records remain markers; no native resume or delegation claim. Partial tails defer replacement and complete rewrites retire removed records. |
 | grok-bot | Messages and identity | Base32 transcript keys, native agent and entry IDs, roster titles during shallow discovery, local avatar shape/color and inline raster profiles through `SessionStore::session_profile`, complete and truncated tails across account slots; bounded local window accumulates across captures. |
 | grok-bot | Control and lineage | Widget responses, voice turns, approvals, attachments and app events retained; Cursor cloud-agent IDs recorded as observed delegation without a local child transcript. |
 | grok-bot | Usage and acquisition | No local model, token or cost usage; passive local blobs only, with no host backfill, network calls or credential reads. |
@@ -543,3 +562,14 @@ image-only turn. Unsupported or oversized references become explicit unavailable
 blocks. Copies increase database and upload size; replay therefore needs bounded
 pages that preserve whole supported images. This policy validates raster headers
 and size, not image semantics or visual redaction.
+
+## Incremental acquisition scheduling (2026-10-24)
+
+The capture matrix above remains the evidence contract. Embedders can now retain
+exact watcher paths through `SyncOptions::paths` and reconcile provider-owned
+watch roots with a resumable `Reconciliation` round. Primary Claude/Codex JSONL
+uses durable byte cursors without global stamp-map work; sidecar and provider DB
+inputs retain their existing acquisition boundaries. This does not broaden
+selected-only consent or replace the full destination-repair audit. See
+[sourcing SDK scheduling](../sourcing-sdk.md#incremental-embedder-scheduling)
+for the per-input limitations and continuity recovery cadence.

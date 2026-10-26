@@ -1,0 +1,174 @@
+{
+  "info": {
+    "id": "ses_kiloTool002",
+    "slug": "synthetic",
+    "projectID": "global",
+    "directory": "/private/tmp/rh-kilo-capture",
+    "path": "private/tmp/rh-kilo-capture",
+    "title": "Synthetic Kilo tool history",
+    "version": "7.8.15",
+    "cost": 0,
+    "tokens": {
+      "input": 0,
+      "output": 0,
+      "reasoning": 0,
+      "cache": {
+        "read": 0,
+        "write": 0
+      }
+    },
+    "time": {
+      "created": 1792653000000,
+      "updated": 1792653223919
+    }
+  },
+  "messages": [
+    {
+      "info": {
+        "role": "user",
+        "time": {
+          "created": 1792653001000
+        },
+        "agent": "build",
+        "model": {
+          "providerID": "synthetic",
+          "modelID": "synthetic"
+        },
+        "id": "msg_kiloToolUser002",
+        "sessionID": "ses_kiloTool002"
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "Find the synthetic Kilo needle",
+          "id": "prt_kiloToolUserText002",
+          "sessionID": "ses_kiloTool002",
+          "messageID": "msg_kiloToolUser002"
+        }
+      ]
+    },
+    {
+      "info": {
+        "role": "assistant",
+        "time": {
+          "created": 1792653002000,
+          "completed": 1792653005000
+        },
+        "parentID": "msg_kiloToolUser002",
+        "modelID": "synthetic",
+        "providerID": "synthetic",
+        "mode": "build",
+        "agent": "build",
+        "path": {
+          "cwd": "/private/tmp/rh-kilo-capture",
+          "root": "/private/tmp/rh-kilo-capture"
+        },
+        "cost": 0,
+        "tokens": {
+          "input": 0,
+          "output": 0,
+          "reasoning": 0,
+          "cache": {
+            "read": 0,
+            "write": 0
+          }
+        },
+        "id": "msg_kiloToolAssistant002",
+        "sessionID": "ses_kiloTool002"
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "Found the synthetic Kilo needle.",
+          "id": "prt_kiloToolAssistantText002",
+          "sessionID": "ses_kiloTool002",
+          "messageID": "msg_kiloToolAssistant002"
+        },
+        {
+          "type": "tool",
+          "callID": "call_kiloNative001",
+          "tool": "read",
+          "state": {
+            "status": "completed",
+            "input": {
+              "filePath": "/synthetic.txt"
+            },
+            "output": "Kilo tool result needle",
+            "title": "Read synthetic file",
+            "metadata": {},
+            "time": {
+              "start": 1792653002000,
+              "end": 1792653003000
+            }
+          },
+          "id": "prt_kiloToolPart002",
+          "sessionID": "ses_kiloTool002",
+          "messageID": "msg_kiloToolAssistant002"
+        }
+      ]
+    },
+    {
+      "info": {
+        "role": "user",
+        "time": {
+          "created": 1792653010000
+        },
+        "agent": "build",
+        "model": {
+          "providerID": "synthetic",
+          "modelID": "synthetic"
+        },
+        "id": "msg_kiloResumeUser003",
+        "sessionID": "ses_kiloTool002"
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "Continue after restart",
+          "id": "prt_kiloResumeUserText003",
+          "sessionID": "ses_kiloTool002",
+          "messageID": "msg_kiloResumeUser003"
+        }
+      ]
+    },
+    {
+      "info": {
+        "role": "assistant",
+        "time": {
+          "created": 1792653011000,
+          "completed": 1792653012000
+        },
+        "parentID": "msg_kiloResumeUser003",
+        "modelID": "synthetic",
+        "providerID": "synthetic",
+        "mode": "build",
+        "agent": "build",
+        "path": {
+          "cwd": "/private/tmp/rh-kilo-capture",
+          "root": "/private/tmp/rh-kilo-capture"
+        },
+        "cost": 0,
+        "tokens": {
+          "input": 0,
+          "output": 0,
+          "reasoning": 0,
+          "cache": {
+            "read": 0,
+            "write": 0
+          }
+        },
+        "id": "msg_kiloResumeAssistant003",
+        "sessionID": "ses_kiloTool002"
+      },
+      "parts": [
+        {
+          "type": "text",
+          "text": "Historical Kilo answer persists.",
+          "id": "prt_kiloResumeAssistantText003",
+          "sessionID": "ses_kiloTool002",
+          "messageID": "msg_kiloResumeAssistant003"
+        }
+      ]
+    }
+  ]
+}

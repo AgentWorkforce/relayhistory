@@ -1,0 +1,123 @@
+{
+  "session_id": "vibe-synthetic-001",
+  "format_minor": 9,
+  "cwd": "/synthetic/repository",
+  "title": "Synthetic Vibe session",
+  "entries": [
+    {
+      "content": [
+        {
+          "text": "Explain the synthetic repository",
+          "type": "text"
+        }
+      ],
+      "createdAt": 1792609200000,
+      "generationStatus": "completed",
+      "id": "user-1",
+      "inputEntryId": null,
+      "relatedEntryId": null,
+      "role": "user",
+      "sessionId": "vibe-synthetic-001",
+      "source": "turn_start",
+      "turnId": "turn-1",
+      "type": "message",
+      "updatedAt": 1792609200000
+    },
+    {
+      "createdAt": 1792609201000,
+      "detail": {
+        "display": {
+          "statusText": "Read file",
+          "summary": "Read file"
+        },
+        "input": {
+          "path": "/synthetic/repository/README.md"
+        },
+        "kind": "tool",
+        "toolName": "read_file"
+      },
+      "generationStatus": "completed",
+      "id": "effect-action-1",
+      "inputEntryId": "user-1",
+      "relatedEntryId": null,
+      "sessionId": "vibe-synthetic-001",
+      "state": {
+        "display": {
+          "message": "Read file",
+          "success": true
+        },
+        "durationMs": 25,
+        "output": {
+          "text": "A synthetic README"
+        },
+        "outputText": "A synthetic README",
+        "status": "completed"
+      },
+      "title": "read_file",
+      "turnId": "turn-1",
+      "type": "effect",
+      "updatedAt": 1792609201250
+    },
+    {
+      "content": [
+        {
+          "text": "It contains one fixture.",
+          "type": "text"
+        }
+      ],
+      "createdAt": 1792609201000,
+      "generationStatus": "completed",
+      "id": "assistant-1",
+      "inputEntryId": "user-1",
+      "relatedEntryId": null,
+      "role": "assistant",
+      "sessionId": "vibe-synthetic-001",
+      "source": "harness",
+      "turnId": "turn-1",
+      "type": "message",
+      "updatedAt": 1792609201000
+    },
+    {
+      "content": [
+        {
+          "text": "Check the journal",
+          "type": "text"
+        }
+      ],
+      "createdAt": 1792609202000,
+      "generationStatus": "completed",
+      "id": "user-2",
+      "inputEntryId": null,
+      "relatedEntryId": null,
+      "role": "user",
+      "sessionId": "vibe-synthetic-001",
+      "source": "turn_start",
+      "turnId": "turn-1",
+      "type": "message",
+      "updatedAt": 1792609202000
+    },
+    {
+      "content": [
+        {
+          "text": "Journal captured.",
+          "type": "text"
+        }
+      ],
+      "createdAt": 1792609203000,
+      "generationStatus": "completed",
+      "id": "assistant-2",
+      "inputEntryId": "user-1",
+      "relatedEntryId": null,
+      "role": "assistant",
+      "sessionId": "vibe-synthetic-001",
+      "source": "harness",
+      "turnId": "turn-1",
+      "type": "message",
+      "updatedAt": 1792609203000
+    }
+  ],
+  "interop_roles": [
+    "user",
+    "assistant"
+  ]
+}

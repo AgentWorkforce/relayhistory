@@ -270,8 +270,9 @@ fn sweep_database(
             let stamp = format!("{GENERATION}/{}", conv.stamp());
             let cursor = previous.get(&conv.id);
             let repair = ctx.repairs.contains(ID, &conv.id) || !present(ctx.conn, &conv.id)?;
-            if !repair && cursor.and_then(|c| c["stamp"].as_str()) == Some(&stamp) {
-                stamps.insert(conv.id.clone(), cursor.unwrap().clone());
+            if let Some(cursor) = cursor.filter(|c| !repair && c["stamp"].as_str() == Some(&stamp))
+            {
+                stamps.insert(conv.id.clone(), cursor.clone());
                 continue;
             }
             let plan = cursor

@@ -55,17 +55,7 @@ fn measured_dir(path: &Path) -> Option<PathBuf> {
 /// and would trip the free-space floor. Its `statfs` carries 64-bit counts.
 #[cfg(any(target_os = "macos", target_os = "ios"))]
 fn free_bytes_at(target: &Path) -> Option<u64> {
-    use std::os::unix::ffi::OsStrExt;
-    let path = std::ffi::CString::new(target.as_os_str().as_bytes()).ok()?;
-    let mut stats = std::mem::MaybeUninit::<libc::statfs>::uninit();
-    // SAFETY: `path` is a valid NUL-terminated string and `stats` points to
-    // writable memory of the right size; `statfs` initializes it on success.
-    let rc = unsafe { libc::statfs(path.as_ptr(), stats.as_mut_ptr()) };
-    if rc != 0 {
-        return None;
-    }
-    // SAFETY: `statfs` returned 0, so the struct is initialized.
-    let stats = unsafe { stats.assume_init() };
+    let stats = rustix::fs::statfs(target).ok()?;
     stats.f_bavail.checked_mul(u64::from(stats.f_bsize))
 }
 
@@ -73,47 +63,18 @@ fn free_bytes_at(target: &Path) -> Option<u64> {
 /// this builds for.
 #[cfg(all(unix, not(any(target_os = "macos", target_os = "ios"))))]
 fn free_bytes_at(target: &Path) -> Option<u64> {
-    use std::os::unix::ffi::OsStrExt;
-    let path = std::ffi::CString::new(target.as_os_str().as_bytes()).ok()?;
-    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
-    // SAFETY: `path` is a valid NUL-terminated string and `stats` points to
-    // writable memory of the right size; `statvfs` initializes it on success.
-    let rc = unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) };
-    if rc != 0 {
-        return None;
-    }
-    // SAFETY: `statvfs` returned 0, so the struct is initialized.
-    let stats = unsafe { stats.assume_init() };
-    #[allow(clippy::unnecessary_cast)] // the field widths differ by platform
-    let (available, fragment) = (stats.f_bavail as u64, stats.f_frsize as u64);
-    available.checked_mul(fragment)
+    // rustix widens the platform-specific field types to `u64`.
+    let stats = rustix::fs::statvfs(target).ok()?;
+    stats.f_bavail.checked_mul(stats.f_frsize)
 }
 
-/// `GetDiskFreeSpaceExW`: a 64-bit byte count (the cluster counts of
-/// `GetDiskFreeSpaceW` are 32-bit) that honors per-user quotas, like
-/// `f_bavail`.
+/// `GetDiskFreeSpaceExW` on the volume holding `dir`: a 64-bit byte count
+/// (the cluster counts of `GetDiskFreeSpaceW` are 32-bit) that honors
+/// per-user quotas, like `f_bavail`. fs4 resolves the volume root first, so a
+/// UNC directory needs no trailing backslash.
 #[cfg(windows)]
 fn free_bytes_at(dir: &Path) -> Option<u64> {
-    use std::os::windows::ffi::OsStrExt;
-    // A UNC directory -- including the `\\?\UNC\` form `canonicalize`
-    // returns -- must end in a backslash; a local one may.
-    let mut wide: Vec<u16> = dir.as_os_str().encode_wide().collect();
-    if !matches!(wide.last(), Some(&c) if c == u16::from(b'\\') || c == u16::from(b'/')) {
-        wide.push(u16::from(b'\\'));
-    }
-    wide.push(0);
-    let mut available = 0u64;
-    // SAFETY: `wide` is a NUL-terminated UTF-16 path; the out-pointer is a
-    // valid `u64` and the unused outputs may be null.
-    let ok = unsafe {
-        windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW(
-            wide.as_ptr(),
-            &mut available,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    (ok != 0).then_some(available)
+    fs4::available_space(dir).ok()
 }
 
 /// A process holding the database file open, and whether it can still release it.
