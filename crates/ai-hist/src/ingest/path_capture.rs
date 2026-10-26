@@ -2,7 +2,6 @@
 use super::*;
 pub(crate) mod cold_proof;
 use crate::observations;
-use crate::remote::SourceConnectorSelection;
 
 /// One local sweep for [`crate::SessionStore`]: silent, against the store's
 /// resolved provider roots, forcing past the source fingerprint when asked,
@@ -114,6 +113,20 @@ fn capture_paths(
         .iter()
         .filter_map(|path| transcript_source(roots, scope, path))
         .collect();
+    // `synchronous = NORMAL` for the whole capture -- discovery, hydration
+    // and the capture marker -- rather than an fsync per commit. That is the
+    // durability the sweep deliberately does *not* take (docs/benchmarks.md):
+    // there a power loss can drop the last commits while `.sync-state.json`
+    // stamps survive and vouch for them. Exact capture writes no sidecar
+    // state -- it only reads `.sync-state.json` through the cold proof, and
+    // the one out-of-database checkpoint, the Cursor transcript cursor, is for
+    // a source `transcript_source` never admits here -- so every checkpoint it
+    // writes is in the same database and a lost commit loses its checkpoint
+    // with it; the next capture of the path, or the next reconciliation round,
+    // reads it again. In WAL mode NORMAL still keeps the database consistent.
+    // The guard restores the connection's level on drop, so a retained writer
+    // goes back to full durability for whatever uses it next.
+    let _relaxed = crate::discover::RelaxedSynchronous::new(conn)?;
     let mut env =
         DiscoveryEnv::with_provider_roots(conn, roots.clone()).with_path_scope(Some(paths.clone()));
     env.fresh_paths = fresh;
@@ -153,7 +166,10 @@ fn capture_paths(
         let observed_metadata = transcript_file::metadata(&path)?;
         let observed_change_time = super::transcript_cursor::change_time_ns(&observed_metadata);
         with_content_validation(validate, || {
-            hydrate::hydrate_session_at_with_roots_and_connectors(
+            // On the capture's own connection: one validated writer for
+            // the whole capture, see `hydrate_local_session_on`.
+            hydrate::hydrate_local_session_on(
+                conn,
                 db,
                 &hydrate::HydrateSessionOptions {
                     source: source.clone(),
@@ -162,7 +178,7 @@ fn capture_paths(
                     include_related: false,
                 },
                 roots,
-                &SourceConnectorSelection::default(),
+                None,
             )
         })?;
         hydrate::mark_exact_capture(conn, &source, &session_id, &path, observed_change_time)?;

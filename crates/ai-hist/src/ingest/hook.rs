@@ -22,8 +22,7 @@
 //! hook fails the tool call the agent was in the middle of.
 
 use super::hydrate::{
-    hydrate_session_at_with_roots_connectors_and_claude_snapshot, validate_provider_path,
-    HydrateSessionOptions, HydrateSessionResult,
+    hydrate_local_session_on, validate_provider_path, HydrateSessionOptions, HydrateSessionResult,
 };
 use super::*;
 use crate::discover::{
@@ -192,8 +191,10 @@ pub(crate) fn ingest_transcript_at_with_roots(
     // given rather than the process one. No hook harness is database-backed
     // today, so this only keeps the environment honest.
     let mut session_id = None;
+    // One connection for the whole ingest: discovery's catalog write and the
+    // hydration after it, rather than a second `open_db` and its schema check.
+    let conn = open_db(db_path)?;
     {
-        let conn = open_db(db_path)?;
         let env = DiscoveryEnv::with_provider_roots(&conn, roots.clone());
         if claude_sidecar {
             return index_claude_sidecar(
@@ -248,7 +249,8 @@ pub(crate) fn ingest_transcript_at_with_roots(
         ));
     };
 
-    let hydration = hydrate_session_at_with_roots_connectors_and_claude_snapshot(
+    let hydration = hydrate_local_session_on(
+        &conn,
         db_path,
         &HydrateSessionOptions {
             source: source.to_string(),
@@ -257,7 +259,6 @@ pub(crate) fn ingest_transcript_at_with_roots(
             include_related,
         },
         roots,
-        &crate::remote::SourceConnectorSelection::default(),
         claude_snapshot,
     )?;
     let status = if hydration.status == "unchanged" {

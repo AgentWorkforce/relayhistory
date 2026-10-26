@@ -450,6 +450,19 @@ impl WatchInner {
         let owed = match result {
             Ok(outcome) => {
                 report(outcome, false);
+                // The window exists to fold a burst of writes into one
+                // trailing tick. A filesystem-event tick that changed nothing
+                // -- the trailing tick for a backend's second report of a
+                // write already captured, or noise under a root -- is not a
+                // burst. Leaving the
+                // window armed would make the *next* new session, a moment
+                // later, wait out a window nothing is using.
+                if trigger == TickTrigger::FsEvent && outcome.changed_nothing {
+                    self.wake
+                        .lock()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .window_until = None;
+                }
                 forced && outcome.contended
             }
             Err(error) if is_cancellation(&error) => {

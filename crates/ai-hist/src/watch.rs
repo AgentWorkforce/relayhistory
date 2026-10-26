@@ -121,9 +121,13 @@ pub const DEFAULT_DEBOUNCE_MS: u64 = 200;
 /// Not a debounce: one write reaches the loop as several backend callbacks
 /// (FSEvents delivers a create or an append as two or three, within about a
 /// millisecond), and a tick that swept on the first of them would leave the
-/// rest to drive a trailing sweep for the same write. A few milliseconds
-/// gathers one write's callbacks without being perceptible.
-pub const LEADING_EDGE_SETTLE_MS: u64 = 10;
+/// rest to drive a trailing sweep for the same write. Two milliseconds
+/// gathers one write's callbacks; a callback that lands later is read by the
+/// window's one trailing tick, which finds the transcript unchanged and
+/// skips it. It was 10 ms, which on its own was twice the 5 ms a new session
+/// has to become visible in (see docs/benchmarks.md, "Session-visible
+/// latency").
+pub const LEADING_EDGE_SETTLE_MS: u64 = 2;
 /// Default slow polling backstop while the filesystem-event driver is active.
 pub const DEFAULT_SLOW_POLL_MS: u64 = 30_000;
 /// Default cadence for the pure polling driver.
@@ -225,6 +229,11 @@ pub struct TickOutcome {
     /// change it was for still owed, and the loop retries it rather than
     /// counting it done.
     pub contended: bool,
+    /// The sweep ran and wrote nothing: the store's change-feed head did not
+    /// move. A filesystem-event tick like that closes the debounce window it
+    /// opened (see `WatchInner::run_claimed`). `false` when unknown, which
+    /// keeps the window as it always was.
+    pub changed_nothing: bool,
 }
 
 /// One tick, as handed to [`WatchLoop::on_report`].
@@ -1291,6 +1300,59 @@ mod tests {
 
         watch.stop();
         thread.join().unwrap().unwrap();
+    }
+
+    /// When the first of two isolated changes was swept, when the second was
+    /// signalled, and when it was swept, with the first change's tick
+    /// reporting `changed_nothing` as `quiet`.
+    fn two_changes(quiet: bool) -> (Instant, Instant, Instant) {
+        let (sender, requests) = std::sync::mpsc::channel::<Instant>();
+        let sender = Mutex::new(sender);
+        let tick: ScopedTickFn = Arc::new(move |_: &TickRequest| {
+            sender.lock().unwrap().send(Instant::now()).unwrap();
+            Ok(TickOutcome {
+                changed_nothing: quiet,
+                ..TickOutcome::default()
+            })
+        });
+        let watch = Arc::new(
+            WatchLoop::scoped(tick)
+                .with_fs_events(false)
+                .with_immediate(false)
+                .with_leading_edge(true)
+                .with_debounce_ms(600)
+                .with_poll_interval_ms(MAX_INTERVAL_MS),
+        );
+        let runner = watch.clone();
+        let thread = std::thread::spawn(move || runner.run());
+        let wait = Duration::from_secs(10);
+        watch.inner.signal_change(fired(&["/roots/claude"]));
+        let first = requests.recv_timeout(wait).unwrap();
+        while watch.inner.run.lock().expect("watch run state").in_flight {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let second = Instant::now();
+        watch.inner.signal_change(fired(&["/roots/claude"]));
+        let swept = requests.recv_timeout(wait).unwrap();
+        watch.stop();
+        thread.join().unwrap().unwrap();
+        (first, second, swept)
+    }
+
+    /// The debounce window folds a burst into one trailing tick. A tick that
+    /// wrote nothing -- a backend's second report of a write the loop already
+    /// captured, or noise under a root -- is not a burst, so the next change
+    /// is a leading edge again rather than waiting out the window.
+    #[test]
+    fn a_tick_that_changed_nothing_does_not_hold_the_next_change_for_the_window() {
+        let (_, signalled, swept) = two_changes(true);
+        let after_quiet = swept.duration_since(signalled);
+        assert!(after_quiet < Duration::from_millis(300), "{after_quiet:?}");
+        // Measured from the first sweep, which is when the 600 ms window
+        // opened, so a slow test thread cannot shorten what is left of it.
+        let (first, _, swept) = two_changes(false);
+        let after_change = swept.duration_since(first);
+        assert!(after_change >= Duration::from_millis(500), "{after_change:?}");
     }
 
     /// A forced tick deferred behind a running sweep comes back with every

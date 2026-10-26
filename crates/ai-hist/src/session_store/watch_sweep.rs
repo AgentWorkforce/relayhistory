@@ -150,11 +150,45 @@ pub(super) struct WatchSweep {
     pub(super) db_path: PathBuf,
     pub(super) sources: Arc<WatchSources>,
     pub(super) stop: StopToken,
-    pub(super) baseline: Mutex<Option<CatalogFingerprint>>,
+    pub(super) carry: Carry,
     pub(super) notes: Arc<Mutex<TickNotes>>,
     pub(super) reports: ReportSlot,
     pub(super) store: SessionStore,
     pub(super) kind: WatchTick,
+}
+
+/// How the watch loop reads a sweep's result.
+///
+/// One conversion rather than one per caller: a tick that never took the lock
+/// looked at nothing, and a caller that folded that into `skipped_unchanged`
+/// would be telling the loop the change had been considered and dismissed.
+impl From<crate::ingest::SyncTick> for crate::watch::TickOutcome {
+    fn from(tick: crate::ingest::SyncTick) -> Self {
+        Self {
+            swept: tick.swept,
+            skipped_unchanged: tick.skipped_unchanged(),
+            contended: !tick.attempted,
+            changed_nothing: false,
+        }
+    }
+}
+
+/// What one tick hands the next.
+#[derive(Default)]
+pub(super) struct Carry {
+    /// The catalog digest the previous tick ended with.
+    baseline: Mutex<Option<CatalogFingerprint>>,
+    /// The validated writable connection. A tick's sweep only uses it inside
+    /// `sync_facade_tick`, which holds the `SyncRunLock` (the cache's own
+    /// rule), and the cache re-validates whenever another connection moved
+    /// the schema or the data -- so a quiet loop pays `open_db`'s schema
+    /// check once, not per tick.
+    writer: Mutex<crate::store::sync_connection::Cache>,
+    /// Whether the last sweep wrote nothing at all: the store-wide change
+    /// feed head, read under the lock before and after it, did not move. A
+    /// stronger statement than an empty catalog diff, which an append that
+    /// adds evidence rows without moving a catalog column would also give.
+    wrote_nothing: std::sync::atomic::AtomicBool,
 }
 
 impl WatchSweep {
@@ -173,7 +207,11 @@ impl WatchSweep {
         // is one — nothing this loop reported has moved since, and a
         // change another process made in between is a change since the
         // last report either way — and a fresh read otherwise.
-        let mut base = self.baseline.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut base = self
+            .carry
+            .baseline
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         // The baseline this sweep compares against, kept outside it so a
         // cancelled sweep can still say what it committed (below).
         let mut swept_from: Option<CatalogFingerprint> = None;
@@ -183,7 +221,13 @@ impl WatchSweep {
             })
         });
         match result {
-            Ok((outcome, changed)) => {
+            Ok((mut outcome, changed)) => {
+                outcome.changed_nothing = !outcome.contended
+                    && changed.is_empty()
+                    && self
+                        .carry
+                        .wrote_nothing
+                        .load(std::sync::atomic::Ordering::Relaxed);
                 self.notes
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
@@ -235,12 +279,47 @@ impl WatchSweep {
         previous: Option<CatalogFingerprint>,
         swept_from: &mut Option<CatalogFingerprint>,
     ) -> anyhow::Result<Option<(SyncTick, CatalogFingerprint, Vec<SessionRef>)>> {
+        let mut writer = std::mem::take(
+            &mut *self
+                .carry
+                .writer
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        let outcome = crate::store::sync_connection::with_cache(&mut writer, || {
+            self.locked_sweep(previous, plan, force, swept_from)
+        });
+        *self
+            .carry
+            .writer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = writer;
+        outcome
+    }
+
+    fn locked_sweep(
+        &self,
+        previous: Option<CatalogFingerprint>,
+        plan: &SweepPlan,
+        force: bool,
+        swept_from: &mut Option<CatalogFingerprint>,
+    ) -> anyhow::Result<Option<(SyncTick, CatalogFingerprint, Vec<SessionRef>)>> {
+        let head = |conn: &rusqlite::Connection| {
+            crate::change_feed::read_head(conn)
+                .ok()
+                .map(|head| (head.epoch, head.revision))
+        };
+        let head_before = std::cell::Cell::new(None);
+        self.carry
+            .wrote_nothing
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         let outcome = sync_facade_tick(
             &self.db_path,
             &plan.roots,
             force,
             &plan.scope(),
             |conn| {
+                head_before.set(head(conn));
                 let before = match previous {
                     Some(before) => before,
                     None => catalog_fingerprint(conn).map_err(anyhow::Error::from)?,
@@ -255,6 +334,10 @@ impl WatchSweep {
                 Ok(before)
             },
             |conn, before, _tick, _succeeded| {
+                let unmoved = head_before.get().is_some() && head_before.get() == head(conn);
+                self.carry
+                    .wrote_nothing
+                    .store(unmoved, std::sync::atomic::Ordering::Relaxed);
                 let (after, changed) = changes_under_lock(conn, &before)?;
                 Ok((after, changed))
             },
