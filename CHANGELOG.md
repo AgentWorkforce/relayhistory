@@ -13,6 +13,10 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Added `SessionStore::session_profile`, `SessionProfile`, and `SessionAvatar` for locally observed Grok Bot names, avatar shapes, colors, and inline raster images without transcript hydration or network access.
 - Added local `retention` policy read/write APIs and `SessionStore` maintenance and upload-acknowledgement methods; maintenance must be scheduled by the host.
 
+### Changed
+
+- A new session reaches the catalog sooner through `watch` and exact-path capture: one validated writer per capture and across watch ticks, no per-commit fsync for exact capture, and a 2 ms leading-edge settle instead of 10 ms.
+
 ### Fixed
 
 - Grok Bot shows each bot's normalized profile name consistently across discovery and full capture, including cached chats and later renames. Invalid optional names preserve the last title; an explicitly blank name clears it.
@@ -33,10 +37,6 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - VT Code history is discoverable and searchable from canonical workspace journals under explicitly configured workspace roots, preserving recorded turns, tool identities, usage and control events.
 - Junie CLI history is discoverable and searchable from native session journals, including recorded prompts, assistant text, tool output and event markers.
 - The optional object-storage plugin (`plugins/object-store`) validates session `manifest.json` v1 and lets the desktop and server update it concurrently with compare-and-swap, without losing either side's changes.
-
-### Changed
-
-- A new session reaches the catalog sooner through `watch` and exact-path capture: one validated writer per capture and across watch ticks, no per-commit fsync for exact capture, and a 2 ms leading-edge settle instead of 10 ms.
 
 ### Fixed
 
