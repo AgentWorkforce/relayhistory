@@ -5,7 +5,7 @@
 
 use std::time::{Duration, Instant};
 
-use relayhistory_object_store::scrub::{scrub_text, MAX_SCRUB_CHARS};
+use relayhistory_object_store::scrub::{scrub_record, scrub_text, MAX_SCRUB_CHARS};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
@@ -15,6 +15,16 @@ struct Fixture {
     ruleset: String,
     max_scrub_chars: usize,
     vectors: Vec<Vector>,
+    /// JSON records (integers above 2^53 included) for `scrub_record`.
+    #[serde(default)]
+    json_records: Vec<JsonRecord>,
+}
+
+#[derive(Deserialize)]
+struct JsonRecord {
+    id: String,
+    input_masked: String,
+    output_masked: String,
 }
 
 #[derive(Deserialize)]
@@ -135,6 +145,25 @@ fn leaked(out: &str, secret: &str) -> Option<String> {
         .windows(6)
         .map(|w| w.iter().collect::<String>())
         .find(|w| !w.contains('\n') && out.contains(w.as_str()))
+}
+
+/// The reference computes these losslessly (each number's source text), so
+/// Rust, which keeps every digit, must match byte for byte, including the card
+/// decision for integers above 2^53.
+#[test]
+fn json_records_match_the_lossless_reference() {
+    let f = fixture();
+    assert!(!f.json_records.is_empty());
+    for r in &f.json_records {
+        let input = unmask(&r.input_masked);
+        let got = scrub_record(input.as_bytes()).expect("record scrubs");
+        assert_eq!(
+            String::from_utf8(got).unwrap(),
+            unmask(&r.output_masked),
+            "{}",
+            r.id
+        );
+    }
 }
 
 fn unmask(masked: &str) -> String {

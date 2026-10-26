@@ -13112,5 +13112,32 @@
       "output_utf16_len": 82,
       "secret_masked": "cm5rb3N6b29vd2praGk="
     }
+  ],
+  "json_records": [
+    {
+      "id": "json-record-0",
+      "input_masked": "IXgqOzR4YG5ra2tra2tra2tra2tra2t2eDR4YG0n",
+      "output_masked": "IXgqOzR4YHgBCB8eGxkOHx4HeHZ4NHhgbSc="
+    },
+    {
+      "id": "json-record-1",
+      "input_masked": "IXgqOzR4YG5ra2tra2tra2tra2tra2tra2p2eDQ/Oyh4YG5ra2tra2tra2tra2tra2tra2sn",
+      "output_masked": "IXgqOzR4YHgBCB8eGxkOHx4HeHZ4ND87KHhgbmtra2tra2tra2tra2tra2trayc="
+    },
+    {
+      "id": "json-record-2",
+      "input_masked": "IXgzPnhgY2pqbWtjY2hvbm1uamNjaXZ4ODM9eGBraGlub2xtYmNqa2hpbm9sbWJjamtoaSc=",
+      "output_masked": "IXgzPnhgY2pqbWtjY2hvbm1uamNjaXZ4ODM9eGBraGlub2xtYmNqa2hpbm9sbWJjamtoaSc="
+    },
+    {
+      "id": "json-record-3",
+      "input_masked": "IXgqOzR4YHhua2tremtra2t6a2tra3pra2treHZ4PHhga3RvanZ4ND89eGB3bmtra2tra2tra2tra2tra3Z4IHhgaic=",
+      "output_masked": "IXgqOzR4YHgBCB8eGxkOHx4HeHZ4PHhga3RvanZ4ND89eGB3bmtra2tra2tra2tra2tra3Z4IHhgaic="
+    },
+    {
+      "id": "json-record-4",
+      "input_masked": "IXg7eGABb29vb29vb29vb29vbm5ubnYheDh4YGltYmhiaGhubGlrampqb3Z4OXhgeCJ4Jwd2eHUyNTc/dTs2dSJ4YC4oLz8n",
+      "output_masked": "IXg7eGABeAEIHx4bGQ4fHgd4diF4OHhgeAEIHx4bGQ4fHgd4dng5eGB4IngnB3Z4JHUieGAuKC8/Jw=="
+    }
   ]
 }
