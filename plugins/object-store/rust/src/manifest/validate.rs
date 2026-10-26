@@ -366,11 +366,13 @@ impl Checker {
         }
         for (i, c) in m.raw.chunks.iter().enumerate() {
             let at = format!("raw.chunks[{i}]");
-            if c.stored_raw_bytes.is_none() {
-                self.issue(
+            match c.stored_raw_bytes {
+                None => self.issue(
                     format!("{at}.stored_raw_bytes"),
                     "is required when raw.scrub is set",
-                );
+                ),
+                Some(0) => self.issue(format!("{at}.stored_raw_bytes"), "must be >= 1"),
+                Some(_) => {}
             }
             match &c.raw_sha256 {
                 Some(h) => self.hex64(&format!("{at}.raw_sha256"), h),

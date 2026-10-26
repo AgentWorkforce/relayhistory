@@ -354,6 +354,13 @@ object storage**. This was decided by Khaliq on 2026-10-25.
   not transform its chunks or index their content. The pointer row records
   `scrubbed = false`. The server's `scrubText` stays the compliance boundary
   downstream either way.
+- **The marker comes first.** A client writes `raw.scrub` in the same update
+  as, or before, the first chunk it covers. It never adds the marker to a
+  manifest that already lists chunks, because those chunks were stored
+  unscrubbed and the marker would vouch for them
+  (`manifest::client::record_scrub` refuses). Quarantine is therefore sticky:
+  a reader that has seen a revision with chunks and no `raw.scrub` keeps the
+  session quarantined even if a later revision carries the marker.
 
 ## Chunk entries
 

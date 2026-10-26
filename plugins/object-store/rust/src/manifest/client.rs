@@ -142,6 +142,7 @@ pub fn plan_chunks(raw: &Raw, chunks: Vec<NewChunk>) -> Result<Vec<ChunkEntry>> 
         }
         if c.bytes == 0
             || c.stored_bytes == 0
+            || c.stored_raw_bytes == Some(0)
             || !is_hex64(&c.sha256)
             || !is_hex64(&c.stored_sha256)
             || c.raw_sha256.as_deref().is_some_and(|h| !is_hex64(h))
@@ -219,12 +220,23 @@ pub fn open_epoch(raw: &mut Raw, reason: EpochReason) -> Result<u32> {
     Ok(epoch)
 }
 
-/// Record that chunks scrubbed with `ruleset` `version` are listed.
+/// Record that chunks scrubbed with `ruleset` `version` are listed. Call it
+/// **before** `apply_chunks` for the chunks it covers.
+///
 /// `raw.scrub.version` keeps the **lowest** version seen, so readers always
 /// know the weakest scrub any chunk went through. A different rule set name
-/// is an error: one session uses one rule set.
+/// is an error: one session uses one rule set. Adding the first marker to a
+/// manifest that already lists chunks is an error too: those chunks were
+/// stored unscrubbed, and the marker would vouch for them, so the session
+/// stays quarantined.
 pub fn record_scrub(raw: &mut Raw, ruleset: &str, version: u32) -> Result<()> {
     match &mut raw.scrub {
+        None if !raw.chunks.is_empty() => {
+            return Err(Error::InvalidArgument(format!(
+                "{} chunks were stored without raw.scrub; the session stays quarantined",
+                raw.chunks.len()
+            )))
+        }
         None => {
             raw.scrub = Some(ScrubMarker {
                 ruleset: ruleset.to_string(),
@@ -232,7 +244,12 @@ pub fn record_scrub(raw: &mut Raw, ruleset: &str, version: u32) -> Result<()> {
                 extra: Default::default(),
             })
         }
-        Some(m) if m.ruleset == ruleset => m.version = m.version.min(version),
+        Some(m) if m.ruleset == ruleset => {
+            if version >= m.version {
+                return Ok(());
+            }
+            m.version = version;
+        }
         Some(m) => {
             return Err(Error::InvalidArgument(format!(
                 "raw.scrub.ruleset is {:?}, cannot record {ruleset:?}",
@@ -240,6 +257,7 @@ pub fn record_scrub(raw: &mut Raw, ruleset: &str, version: u32) -> Result<()> {
             )))
         }
     }
+    raw.updated_at = now_rfc3339();
     Ok(())
 }
 
