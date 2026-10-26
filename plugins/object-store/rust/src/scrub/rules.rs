@@ -235,7 +235,8 @@ pub(crate) static RULES: LazyLock<Result<Vec<Rule>, String>> = LazyLock::new(|| 
     [
         r(
             fast(
-                r"-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----(?s:.)*?-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----",
+                // A block with no footer is redacted to the end of the string.
+                r"-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----(?s:.)*?(?:-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----|$)",
             ),
             Template(REDACTED),
             &["-----begin"],
