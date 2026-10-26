@@ -759,7 +759,7 @@ impl SessionStore {
             db_path: self.db_path.clone(),
             sources: sources.clone(),
             stop: stop.clone(),
-            baseline: Mutex::new(None),
+            carry: Default::default(),
             notes: notes.clone(),
             reports: reports.clone(),
             store: self.clone(),

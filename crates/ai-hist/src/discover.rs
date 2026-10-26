@@ -4890,13 +4890,13 @@ const MAX_READ_WORKERS: usize = 16;
 /// so only discovery's own commits (reconstructible catalog rows and skip
 /// markers) run at the relaxed durability, never a callback's writes through
 /// the same connection.
-struct RelaxedSynchronous<'a> {
+pub(crate) struct RelaxedSynchronous<'a> {
     conn: &'a Connection,
     previous: i64,
 }
 
 impl<'a> RelaxedSynchronous<'a> {
-    fn new(conn: &'a Connection) -> Result<Self> {
+    pub(crate) fn new(conn: &'a Connection) -> Result<Self> {
         let previous = conn.query_row("PRAGMA synchronous", [], |row| row.get(0))?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         Ok(Self { conn, previous })

@@ -601,6 +601,44 @@ fn stages(config: &Config) -> Value {
         sweep.push(elapsed);
     }
 
+    // The exact-path capture an embedder's watcher is meant to use
+    // (`SyncOptions::paths`): first through a plain `sync`, then through one
+    // `Reconciliation` round, which retains its validated writer between
+    // calls the way a long-lived watcher would.
+    let mut capture = Vec::new();
+    for _ in 0..samples {
+        let (_, path, body) = bench.next_session(now_ms());
+        write_file(&path, &body);
+        let (_, elapsed) = time(|| {
+            store
+                .sync(
+                    SyncOptions::default()
+                        .sources([Source::Claude])
+                        .paths([path]),
+                )
+                .expect("exact path capture")
+        });
+        capture.push(elapsed);
+    }
+    let mut capture_retained = Vec::new();
+    {
+        let mut round = store.reconcile().expect("reconciliation round");
+        for _ in 0..samples {
+            let (_, path, body) = bench.next_session(now_ms());
+            write_file(&path, &body);
+            let (_, elapsed) = time(|| {
+                round
+                    .capture_paths(
+                        SyncOptions::default()
+                            .sources([Source::Claude])
+                            .paths([path]),
+                    )
+                    .expect("retained exact path capture")
+            });
+            capture_retained.push(elapsed);
+        }
+    }
+
     // Every sync, forget, discover and change-feed commit opens the store
     // writable, which runs the schema check; this is that fixed cost.
     let mut open = Vec::new();
@@ -685,6 +723,8 @@ fn stages(config: &Config) -> Value {
             "fs_event": summary(&fs_event),
             "ingest_hook": summary(&ingest),
             "sweep_scoped_sync": summary(&sweep),
+            "capture_path": summary(&capture),
+            "capture_path_retained": summary(&capture_retained),
             "open_db": summary(&open),
             "open_raw": summary(&open_raw),
             "schema_check_cached": summary(&schema_cached),
