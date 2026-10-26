@@ -72,6 +72,38 @@ pub trait ObjectStore: Send + Sync + Debug {
 are stored as `application/zstd` without `Content-Encoding`, so a presigned
 download returns the exact `.zst` object.
 
+## Scrubbing raw chunks
+
+`scrub` (feature `scrub`, on by default) removes PII and secrets from raw
+chunks **before** they are compressed and uploaded:
+
+- **Rules:** a byte-for-byte port of relayhistory-cloud's `scrubText`. It
+  catches private keys, home-directory usernames, bearer tokens, provider and
+  cloud keys, JWTs, OAuth query values, secret assignments, URL credentials and
+  email addresses. Matches become `[REDACTED]`, and strings over 256 KiB (in
+  UTF-16 units) are truncated with an in-band marker.
+- **Spec:** the golden vectors in `tests/fixtures/scrub-golden-v1.json`. They
+  are generated from the TypeScript reference by relayhistory-cloud's
+  `test/scrub-golden.test.ts`, and both CIs check them. Refresh the fixture by
+  copying it from there; never edit it here. Bump `RULESET_VERSION` when it
+  changes.
+- **`scrub_chunk`:** works record by record. Each JSON record is parsed, every
+  string value and key is scrubbed, and the record is re-serialized with key
+  order and numbers preserved. A record that can't be parsed, or whose keys
+  collide after scrubbing, is replaced by a typed placeholder and is never
+  stored unscrubbed.
+- **Where it runs:** in the background delivery worker when a chunk is sealed,
+  never on the local ingest or read path.
+
+| Benchmark (release, `cargo bench --bench scrub`) | Result |
+| --- | --- |
+| 4 MiB realistic JSONL chunk | ~126 ms (~32 MiB/s, one core) |
+| 128 KiB `AAAA…` (the reference's past O(n²) case) | ~0.08 ms |
+
+Lookaround-free rules run on the linear-time `regex` engine. The four rules
+that need lookarounds use `fancy-regex` with a bounded backtrack budget; if a
+string exceeds it, the whole string is withheld (fail closed).
+
 ## Conformance suite
 
 `conformance::run_suite` (feature `conformance`) is the contract every adapter

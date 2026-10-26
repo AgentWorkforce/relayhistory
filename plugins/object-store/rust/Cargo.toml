@@ -14,7 +14,9 @@ publish = false
 [workspace]
 
 [features]
-default = ["s3", "gcs", "azure"]
+default = ["s3", "gcs", "azure", "scrub"]
+# PII/secret scrubbing of raw chunks before upload (see src/scrub).
+scrub = ["dep:fancy-regex", "dep:regex"]
 s3 = ["object_store/aws"]
 gcs = ["object_store/gcp"]
 azure = ["object_store/azure"]
@@ -31,7 +33,9 @@ hex = "0.4"
 object_store = { version = "0.14.2", default-features = false, features = ["fs"] }
 rand = { version = "0.9", optional = true }
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
+fancy-regex = { version = "0.20", optional = true }
+regex = { version = "1", optional = true }
 sha2 = "0.10"
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "sync", "fs", "time"] }
@@ -40,6 +44,7 @@ url = "2"
 zstd = { version = "0.13", default-features = false }
 
 [dev-dependencies]
+criterion = { version = "0.8", default-features = false }
 rand = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 tempfile = "3"
@@ -57,3 +62,12 @@ required-features = ["conformance", "s3", "gcs", "azure"]
 [[test]]
 name = "manifest"
 required-features = ["s3", "azure"]
+
+[[test]]
+name = "scrub_golden"
+required-features = ["scrub"]
+
+[[bench]]
+name = "scrub"
+harness = false
+required-features = ["scrub"]
