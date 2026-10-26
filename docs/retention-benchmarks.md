@@ -55,6 +55,48 @@ acknowledgement filter and seek past 30,000 pre-existing tombstones. Continuity
 reopening remains bounded by the removed edge batch. These operation counts do
 not bound filesystem latency or the size of one payload row.
 
+## Index footprint and initial construction
+
+Measured against merged SDK code `63d61c9a` on Apple M3 in
+release mode, using three fresh synthetic stores. The fixture has 1,000 sessions
+with 36-byte session identities, 30,000 events, 10,000 tool calls, 5,000 edits,
+2,000 markers, 6,000 linked and 4,000 anonymous prompts, 1,000 observations,
+5,000 observation-evidence rows, 1,000 commit links and 1,000 relationships.
+Event text is 128 bytes and prompts are 64 bytes; this is not a representative
+payload-size distribution for every harness.
+
+| Measurement | Result |
+| --- | ---: |
+| Allocated database pages before indexes | 7,432 × 4,096 bytes (29.03 MiB) |
+| Allocated pages after all twelve indexes | 8,393 × 4,096 bytes (32.79 MiB) |
+| Added index storage, identical across three runs | 3,936,256 bytes (3.75 MiB; +12.93%) |
+| Index DDL plus transaction commit, median | 382.53 ms |
+| Index DDL plus commit, range | 304.24–405.79 ms |
+| Full SDK writable upgrade open, median | 488.45 ms |
+| Full writable upgrade open, range | 428.22–785.47 ms |
+
+SQLite `dbstat` independently attributes all 3,936,256 added bytes to
+the twelve index B-trees. The event revision index is 1568 KiB;
+per-index sizes and construction times are in the
+[raw footprint data](retention-index-footprint-results.json).
+
+For each run, the harness drops only its temporary store's twelve retention
+indexes, seeds the fixture, compacts it and checkpoints its WAL. It copies that
+baseline for a timed `open_db` upgrade, then separately times the twelve captured
+index definitions in one transaction on the seeded connection. Both paths assert
+that the evidence clock does not advance. Page counts and `dbstat` measure stored
+index pages; the final file is checkpointed for comparison. Seeding, compaction
+and checkpoint time are excluded from the build timers. The footprint does not
+measure peak WAL or temporary-sort storage, or process memory.
+
+These are one-time database construction costs. Writable migration holds the
+SQLite writer lock while building the indexes, so initial upgrade can delay
+other writers. It belongs off the UI thread. This timing is not the steady-state
+session visibility measurement or a 5 ms guarantee. The percentage depends on
+row counts, identity lengths and payload sizes; larger real evidence bodies can
+change it substantially. Timings use warmed fixture/OS caches with ordinary
+desktop processes running and are not cold-disk guarantees.
+
 ## Measurement limits
 
 The 5 ms goal remains open: one concurrent catalog run has a 5.9701 ms P99,
@@ -75,6 +117,7 @@ cargo test -p ai-hist --test retention_perf --features unstable-internal --relea
 RETENTION_PERF_PRUNE=1 cargo test -p ai-hist --test retention_perf --features unstable-internal --release -- --ignored --nocapture
 RETENTION_PERF_PAYLOAD=1 cargo test -p ai-hist --test retention_perf --features unstable-internal --release -- --ignored --nocapture
 RETENTION_PERF_PAYLOAD=1 RETENTION_PERF_DROP_INDEXES=1 cargo test -p ai-hist --test retention_perf --features unstable-internal --release -- --ignored --nocapture
+cargo test -p ai-hist --test retention_index_footprint --features unstable-internal --release -- --ignored --nocapture
 ```
 
 The baseline uses the same catalog fixture, timers, warmup and sample counts,

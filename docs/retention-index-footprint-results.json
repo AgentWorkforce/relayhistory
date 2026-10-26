@@ -1,0 +1,366 @@
+{
+  "fixture": {
+    "anonymous_prompts": 4000,
+    "commit_links": 1000,
+    "edits": 5000,
+    "events": 30000,
+    "linked_prompts": 6000,
+    "markers": 2000,
+    "observation_evidence": 5000,
+    "observations": 1000,
+    "relationships": 1000,
+    "session_id_bytes": 36,
+    "sessions": 1000,
+    "tools": 10000
+  },
+  "runs": [
+    {
+      "added_allocated_bytes": 3936256,
+      "after_free_pages": 0,
+      "after_pages": 8393,
+      "allocated_bytes_after": 34377728,
+      "allocated_bytes_before": 30441472,
+      "before_free_pages": 0,
+      "before_pages": 7432,
+      "checkpointed_file_bytes": 34377728,
+      "index_ddl_and_commit_ms": 382.528042,
+      "page_size": 4096,
+      "per_index_dbstat": [
+        {
+          "bytes": 61440,
+          "name": "idx_retention_anonymous_activity"
+        },
+        {
+          "bytes": 274432,
+          "name": "idx_retention_file_edits_session_id_revision"
+        },
+        {
+          "bytes": 401408,
+          "name": "idx_retention_history_activity"
+        },
+        {
+          "bytes": 409600,
+          "name": "idx_retention_history_session_id_revision"
+        },
+        {
+          "bytes": 274432,
+          "name": "idx_retention_observation_evidence_session_id_revision"
+        },
+        {
+          "bytes": 61440,
+          "name": "idx_retention_session_commit_links_session_id_revision"
+        },
+        {
+          "bytes": 1605632,
+          "name": "idx_retention_session_events_session_id_revision"
+        },
+        {
+          "bytes": 114688,
+          "name": "idx_retention_session_markers_session_id_revision"
+        },
+        {
+          "bytes": 61440,
+          "name": "idx_retention_session_observations_session_id_revision"
+        },
+        {
+          "bytes": 61440,
+          "name": "idx_retention_session_relationships_child_session_id_revision"
+        },
+        {
+          "bytes": 61440,
+          "name": "idx_retention_session_relationships_parent_session_id_revision"
+        },
+        {
+          "bytes": 548864,
+          "name": "idx_retention_tool_calls_session_id_revision"
+        }
+      ],
+      "per_index_ddl": [
+        {
+          "ddl_ms": 2.097458,
+          "name": "idx_retention_anonymous_activity"
+        },
+        {
+          "ddl_ms": 3.877625,
+          "name": "idx_retention_file_edits_session_id_revision"
+        },
+        {
+          "ddl_ms": 14.113458000000001,
+          "name": "idx_retention_history_activity"
+        },
+        {
+          "ddl_ms": 18.069667000000003,
+          "name": "idx_retention_history_session_id_revision"
+        },
+        {
+          "ddl_ms": 3.604708,
+          "name": "idx_retention_observation_evidence_session_id_revision"
+        },
+        {
+          "ddl_ms": 6.547459,
+          "name": "idx_retention_session_commit_links_session_id_revision"
+        },
+        {
+          "ddl_ms": 180.2245,
+          "name": "idx_retention_session_events_session_id_revision"
+        },
+        {
+          "ddl_ms": 13.856166,
+          "name": "idx_retention_session_markers_session_id_revision"
+        },
+        {
+          "ddl_ms": 1.273292,
+          "name": "idx_retention_session_observations_session_id_revision"
+        },
+        {
+          "ddl_ms": 6.545083,
+          "name": "idx_retention_session_relationships_child_session_id_revision"
+        },
+        {
+          "ddl_ms": 1.3881670000000002,
+          "name": "idx_retention_session_relationships_parent_session_id_revision"
+        },
+        {
+          "ddl_ms": 18.963125,
+          "name": "idx_retention_tool_calls_session_id_revision"
+        }
+      ],
+      "run": 0,
+      "sdk_writable_upgrade_open_ms": 785.469167
+    },
+    {
+      "added_allocated_bytes": 3936256,
+      "after_free_pages": 0,
+      "after_pages": 8393,
+      "allocated_bytes_after": 34377728,
+      "allocated_bytes_before": 30441472,
+      "before_free_pages": 0,
+      "before_pages": 7432,
+      "checkpointed_file_bytes": 34377728,
+      "index_ddl_and_commit_ms": 304.23979099999997,
+      "page_size": 4096,
+      "per_index_dbstat": [
+        {
+          "bytes": 61440,
+          "name": "idx_retention_anonymous_activity"
+        },
+        {
+          "bytes": 274432,
+          "name": "idx_retention_file_edits_session_id_revision"
+        },
+        {
+          "bytes": 401408,
+          "name": "idx_retention_history_activity"
+        },
+        {
+          "bytes": 409600,
+          "name": "idx_retention_history_session_id_revision"
+        },
+        {
+          "bytes": 274432,
+          "name": "idx_retention_observation_evidence_session_id_revision"
+        },
+        {
+          "bytes": 61440,
+          "name": "idx_retention_session_commit_links_session_id_revision"
+        },
+        {
+          "bytes": 1605632,
+          "name": "idx_retention_session_events_session_id_revision"
+        },
+        {
+          "bytes": 114688,
+          "name": "idx_retention_session_markers_session_id_revision"
+        },
+        {
+          "bytes": 61440,
+          "name": "idx_retention_session_observations_session_id_revision"
+        },
+        {
+          "bytes": 61440,
+          "name": "idx_retention_session_relationships_child_session_id_revision"
+        },
+        {
+          "bytes": 61440,
+          "name": "idx_retention_session_relationships_parent_session_id_revision"
+        },
+        {
+          "bytes": 548864,
+          "name": "idx_retention_tool_calls_session_id_revision"
+        }
+      ],
+      "per_index_ddl": [
+        {
+          "ddl_ms": 1.7525,
+          "name": "idx_retention_anonymous_activity"
+        },
+        {
+          "ddl_ms": 2.662,
+          "name": "idx_retention_file_edits_session_id_revision"
+        },
+        {
+          "ddl_ms": 5.550167,
+          "name": "idx_retention_history_activity"
+        },
+        {
+          "ddl_ms": 5.513458,
+          "name": "idx_retention_history_session_id_revision"
+        },
+        {
+          "ddl_ms": 5.821834,
+          "name": "idx_retention_observation_evidence_session_id_revision"
+        },
+        {
+          "ddl_ms": 0.626459,
+          "name": "idx_retention_session_commit_links_session_id_revision"
+        },
+        {
+          "ddl_ms": 223.319583,
+          "name": "idx_retention_session_events_session_id_revision"
+        },
+        {
+          "ddl_ms": 3.827375,
+          "name": "idx_retention_session_markers_session_id_revision"
+        },
+        {
+          "ddl_ms": 1.115083,
+          "name": "idx_retention_session_observations_session_id_revision"
+        },
+        {
+          "ddl_ms": 1.242,
+          "name": "idx_retention_session_relationships_child_session_id_revision"
+        },
+        {
+          "ddl_ms": 0.802833,
+          "name": "idx_retention_session_relationships_parent_session_id_revision"
+        },
+        {
+          "ddl_ms": 11.397667,
+          "name": "idx_retention_tool_calls_session_id_revision"
+        }
+      ],
+      "run": 1,
+      "sdk_writable_upgrade_open_ms": 428.222334
+    },
+    {
+      "added_allocated_bytes": 3936256,
+      "after_free_pages": 0,
+      "after_pages": 8393,
+      "allocated_bytes_after": 34377728,
+      "allocated_bytes_before": 30441472,
+      "before_free_pages": 0,
+      "before_pages": 7432,
+      "checkpointed_file_bytes": 34377728,
+      "index_ddl_and_commit_ms": 405.789,
+      "page_size": 4096,
+      "per_index_dbstat": [
+        {
+          "bytes": 61440,
+          "name": "idx_retention_anonymous_activity"
+        },
+        {
+          "bytes": 274432,
+          "name": "idx_retention_file_edits_session_id_revision"
+        },
+        {
+          "bytes": 401408,
+          "name": "idx_retention_history_activity"
+        },
+        {
+          "bytes": 409600,
+          "name": "idx_retention_history_session_id_revision"
+        },
+        {
+          "bytes": 274432,
+          "name": "idx_retention_observation_evidence_session_id_revision"
+        },
+        {
+          "bytes": 61440,
+          "name": "idx_retention_session_commit_links_session_id_revision"
+        },
+        {
+          "bytes": 1605632,
+          "name": "idx_retention_session_events_session_id_revision"
+        },
+        {
+          "bytes": 114688,
+          "name": "idx_retention_session_markers_session_id_revision"
+        },
+        {
+          "bytes": 61440,
+          "name": "idx_retention_session_observations_session_id_revision"
+        },
+        {
+          "bytes": 61440,
+          "name": "idx_retention_session_relationships_child_session_id_revision"
+        },
+        {
+          "bytes": 61440,
+          "name": "idx_retention_session_relationships_parent_session_id_revision"
+        },
+        {
+          "bytes": 548864,
+          "name": "idx_retention_tool_calls_session_id_revision"
+        }
+      ],
+      "per_index_ddl": [
+        {
+          "ddl_ms": 16.625625000000003,
+          "name": "idx_retention_anonymous_activity"
+        },
+        {
+          "ddl_ms": 2.327625,
+          "name": "idx_retention_file_edits_session_id_revision"
+        },
+        {
+          "ddl_ms": 2.861584,
+          "name": "idx_retention_history_activity"
+        },
+        {
+          "ddl_ms": 5.38175,
+          "name": "idx_retention_history_session_id_revision"
+        },
+        {
+          "ddl_ms": 2.82375,
+          "name": "idx_retention_observation_evidence_session_id_revision"
+        },
+        {
+          "ddl_ms": 0.5419160000000001,
+          "name": "idx_retention_session_commit_links_session_id_revision"
+        },
+        {
+          "ddl_ms": 301.076,
+          "name": "idx_retention_session_events_session_id_revision"
+        },
+        {
+          "ddl_ms": 1.673042,
+          "name": "idx_retention_session_markers_session_id_revision"
+        },
+        {
+          "ddl_ms": 0.8206249999999999,
+          "name": "idx_retention_session_observations_session_id_revision"
+        },
+        {
+          "ddl_ms": 0.7741659999999999,
+          "name": "idx_retention_session_relationships_child_session_id_revision"
+        },
+        {
+          "ddl_ms": 0.7724169999999999,
+          "name": "idx_retention_session_relationships_parent_session_id_revision"
+        },
+        {
+          "ddl_ms": 14.779250000000001,
+          "name": "idx_retention_tool_calls_session_id_revision"
+        }
+      ],
+      "run": 2,
+      "sdk_writable_upgrade_open_ms": 488.45216600000003
+    }
+  ],
+  "sdk_code_commit": "63d61c9a88056ea94cf5dc65d22030f634e06a88",
+  "merged_main": "a0ab531c0b959dc03e2c58bf5b7a0f57ae05ce7d",
+  "cpu": "Apple M3",
+  "rustc": "rustc 1.94.0 (4a4ef493e 2026-03-02)",
+  "profile": "release",
+  "context": "Three fresh synthetic stores; W1 compilation finished before measurement, ordinary desktop processes running. SDK upgrade uses a checkpointed baseline copy. Index-only builds reuse the seeded connection. Seed/VACUUM/checkpoint time excluded. No production databases accessed."
+}
