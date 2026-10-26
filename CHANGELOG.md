@@ -6,20 +6,25 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased - Minor]
 
-### Added
-
-- Local history retention defaults to 30 days, supports configurable limits or forever, and evicts in maintenance batches while protecting unuploaded logs and preserving cloud copies.
-
-### Fixed
-
-- Grok Bot shows each bot's normalized profile name consistently across discovery and full capture, including cached chats and later renames. Invalid optional names preserve the last title; an explicitly blank name clears it.
-- Grok Bot discovery reads each account roster once per pass and counts its I/O even when a bot is absent from the roster.
-
 ### Rust API
 
 - Added `SessionStore::retention_generation` and `retention::read_retention_generation` so retained catalogs can invalidate after committed local eviction without uploading deletion records.
 - Added `SessionStore::session_profile`, `SessionProfile`, and `SessionAvatar` for locally observed Grok Bot names, avatar shapes, colors, and inline raster images without transcript hydration or network access.
 - Added local `retention` policy read/write APIs and `SessionStore` maintenance and upload-acknowledgement methods; maintenance must be scheduled by the host.
+
+## [0.52.0] - 2026-10-26
+
+### Added
+
+- Local history retention defaults to 30 days, supports configurable limits or forever, and evicts in maintenance batches while protecting unuploaded logs and preserving cloud copies.
+- Added `SessionStore::retention_generation` and `retention::read_retention_generation` so retained catalogs can invalidate after committed local eviction without uploading deletion records.
+- Added `SessionStore::session_profile`, `SessionProfile`, and `SessionAvatar` for locally observed Grok Bot names, avatar shapes, colors, and inline raster images without transcript hydration or network access.
+- Added local `retention` policy read/write APIs and `SessionStore` maintenance and upload-acknowledgement methods; maintenance must be scheduled by the host.
+
+### Fixed
+
+- Grok Bot shows each bot's normalized profile name consistently across discovery and full capture, including cached chats and later renames. Invalid optional names preserve the last title; an explicitly blank name clears it.
+- Grok Bot discovery reads each account roster once per pass and counts its I/O even when a bot is absent from the roster.
 
 ## [0.51.0] - 2026-10-26
 
@@ -1169,7 +1174,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - The SDK reads provider JSONL natively and works without the Python CLI.
 
-[Unreleased]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.51.0...HEAD
+[Unreleased]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.52.0...HEAD
+[0.52.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.51.0...sdk-ts-v0.52.0
 [0.51.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.50.1...sdk-ts-v0.51.0
 [0.50.1]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.49.0...sdk-ts-v0.50.1
 [0.49.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.48.0...sdk-ts-v0.49.0
