@@ -95,6 +95,16 @@ pub(crate) fn owns(src: &Connection, session_id: &str) -> Result<bool> {
     Ok(src.prepare_cached(&sql)?.exists([session_id])?)
 }
 
+/// Whether the store holds the session in either layout. A store OpenCode 2
+/// created has no V1 `session` table at all.
+pub(crate) fn holds(src: &Connection, session_id: &str) -> Result<bool> {
+    let held = table_columns(src, "session")?.contains("id")
+        && src
+            .prepare("SELECT 1 FROM session WHERE id = ?")?
+            .exists([session_id])?;
+    Ok(held || owns(src, session_id)?)
+}
+
 /// The ids of every session OpenCode 2 owns.
 pub(crate) fn owned_ids(src: &Connection) -> Result<Vec<String>> {
     if !present(src)? {

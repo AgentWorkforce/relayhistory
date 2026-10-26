@@ -599,12 +599,7 @@ pub(crate) fn sqlite_store_holds_session(store: &Path, session_id: &str) -> Resu
     )
     .with_context(|| format!("opening {}", store.display()))?;
     src.busy_timeout(std::time::Duration::from_secs(5))?;
-    // A store OpenCode 2 created has no V1 `session` table at all.
-    let held = table_columns(&src, "session")?.contains("id")
-        && src
-            .prepare("SELECT 1 FROM session WHERE id = ?")?
-            .exists([session_id])?;
-    Ok(held || v2::owns(&src, session_id)?)
+    v2::holds(&src, session_id)
 }
 
 /// Whether `columns` holds every one of `names`: the columns a loader reads.

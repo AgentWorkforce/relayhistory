@@ -192,7 +192,9 @@ unlinked evidence). Control rows are `◐`: the system preamble and Grok-injecte
 turns are kept as `system` and `synthetic_turn` markers, but no other lifecycle
 record is. OpenCode's cells are
 `✓`: one normalizer (`src/ingest/opencode.rs`) writes every assistant message
-as evidence from both of its storage layouts.
+as evidence from all three of its storage layouts: the JSON tree, the SQLite
+`session` / `message` / `part` tables, and OpenCode 2's `session_v2` /
+`session_message` tables.
 
 **Cursor, since [#166](https://github.com/AgentWorkforce/relayhistory/issues/166).**
 `ingest_cursor_transcript` replaced the prompt-only `ingest_cursor_line`, so
