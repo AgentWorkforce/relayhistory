@@ -19,6 +19,7 @@ mod retired_sources;
 pub(crate) mod sync_connection;
 pub use retired_sources::is_retired_source;
 mod schema_check;
+use schema_check::REQUIRED_SESSIONS_COLUMNS;
 mod user_turn_page;
 use crate::ingest::evidence_reconcile::{record_history_presence, record_marker_presence};
 pub(crate) use event_row::row_to_session_event;
@@ -627,30 +628,6 @@ const REQUIRED_TABLES: &[&str] = &[
     "discovery_skips",
 ];
 const REQUIRED_HISTORY_COLUMNS: &[&str] = &["prompt_hash", "git_branch"];
-/// Columns [`init_db`] adds to `sessions` after the original DDL. The shallow
-/// session catalog (`ai-hist sessions list` / `discover`) reads every one of
-/// them, so a read-only handle over a database that predates them would fail
-/// with `no such column` instead of migrating.
-const REQUIRED_SESSIONS_COLUMNS: &[&str] = &[
-    "first_prompt",
-    "models_json",
-    "originator",
-    "agent_version",
-    "repo_url",
-    "initial_commit",
-    "workspace_roots_json",
-    "source_stamp",
-    "discovery_state",
-    // Canonical project identity (issue #175). Every catalog read selects
-    // both, so a database that predates them must migrate before a read-only
-    // handle can serve one.
-    "project_key",
-    "project_key_method",
-    // The name the harness gave the session; every catalog read selects it.
-    "title",
-    // Provider-native kind, used when a delegated session has no observed parent.
-    "session_kind",
-];
 /// What a provider's parser reported about the session, kept with the
 /// checkpoint so a later read that parses nothing can still report it. A
 /// diagnostic like "this harness records no billing tokens" is a standing
@@ -1375,7 +1352,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     source_stamp TEXT,
     discovery_state TEXT,
     project_key TEXT,
-    project_key_method TEXT, title TEXT, session_kind TEXT,
+    project_key_method TEXT, title TEXT, session_kind TEXT, agent_name TEXT,
     PRIMARY KEY (session_id, source)
 );
 CREATE TABLE IF NOT EXISTS session_presences (
@@ -7876,6 +7853,7 @@ mod tests {
         assert!(has_column("sessions", "project_key"));
         assert!(has_column("sessions", "project_key_method"));
         assert!(has_column("sessions", "session_kind"));
+        assert!(has_column("sessions", "agent_name"));
         assert!(has_column("session_events", "project_key"));
         assert!(conn
             .prepare("SELECT 1 FROM schema_migrations WHERE name = 'session_project_key_v1'")

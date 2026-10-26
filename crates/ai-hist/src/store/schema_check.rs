@@ -2,14 +2,40 @@
 
 use super::{
     EVIDENCE_LOCATION_TABLES, REQUIRED_HISTORY_COLUMNS, REQUIRED_HYDRATION_CHECKPOINT_COLUMNS,
-    REQUIRED_HYDRATION_CURSOR_COLUMNS, REQUIRED_SCHEMA_MIGRATIONS, REQUIRED_SESSIONS_COLUMNS,
-    REQUIRED_SESSION_EVENT_COLUMNS, REQUIRED_SESSION_MARKER_COLUMNS,
-    REQUIRED_SESSION_PRESENCE_COLUMNS, REQUIRED_SESSION_RELATIONSHIP_COLUMNS, REQUIRED_TABLES,
-    REQUIRED_TRIGGERS,
+    REQUIRED_HYDRATION_CURSOR_COLUMNS, REQUIRED_SCHEMA_MIGRATIONS, REQUIRED_SESSION_EVENT_COLUMNS,
+    REQUIRED_SESSION_MARKER_COLUMNS, REQUIRED_SESSION_PRESENCE_COLUMNS,
+    REQUIRED_SESSION_RELATIONSHIP_COLUMNS, REQUIRED_TABLES, REQUIRED_TRIGGERS,
 };
 use anyhow::Result;
 use rusqlite::Connection;
 use std::collections::HashSet;
+
+/// Columns [`super::init_db`] adds to `sessions` after the original DDL. The shallow
+/// session catalog (`ai-hist sessions list` / `discover`) reads every one of
+/// them, so a read-only handle over a database that predates them would fail
+/// with `no such column` instead of migrating.
+pub(super) const REQUIRED_SESSIONS_COLUMNS: &[&str] = &[
+    "first_prompt",
+    "models_json",
+    "originator",
+    "agent_version",
+    "repo_url",
+    "initial_commit",
+    "workspace_roots_json",
+    "source_stamp",
+    "discovery_state",
+    // Canonical project identity (issue #175). Every catalog read selects
+    // both, so a database that predates them must migrate before a read-only
+    // handle can serve one.
+    "project_key",
+    "project_key_method",
+    // The name the harness gave the session; every catalog read selects it.
+    "title",
+    // Provider-native kind, used when a delegated session has no observed parent.
+    "session_kind",
+    // The name other sessions address this one by (Claude's `agent-name`).
+    "agent_name",
+];
 
 /// Whether the schema has every table, trigger, migration and column the
 /// current version adds, plus `required_indexes`.

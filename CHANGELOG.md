@@ -10,9 +10,11 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Session manifests record raw-chunk scrub status and stored digests; readers quarantine unscrubbed sessions.
 - The object-storage plugin can scrub PII and secrets, including PGP private keys, card numbers and phone numbers, from raw session chunks before upload (`scrub::scrub_chunk`, uploaded only through `scrub::seal::put_raw_chunk`), using the same rules as the hosted service.
+- Claude sessions catalog their `agent-name` (the name Agent Relay and other sessions address them by) as `agent_name`, apart from the title, and session change records carry it so destinations can look sessions up by agent name. The session catalog contract is now 7. Sessions already catalogued are not re-scanned to fill it: a session gets its agent name when it is first catalogued or when its transcript next changes.
 
 ### Rust API
 
+- Added `ShallowSession::agent_name` and `CatalogSession::agent_name`.
 - Added `SessionStore::retention_generation` and `retention::read_retention_generation` so retained catalogs can invalidate after committed local eviction without uploading deletion records.
 - Added `SessionStore::session_profile`, `SessionProfile`, and `SessionAvatar` for locally observed Grok Bot names, avatar shapes, colors, and inline raster images without transcript hydration or network access.
 - Added local `retention` policy read/write APIs and `SessionStore` maintenance and upload-acknowledgement methods; maintenance must be scheduled by the host.

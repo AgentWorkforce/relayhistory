@@ -89,7 +89,7 @@ use opencode_page::{
 /// 4 adds `project_key` / `project_key_method` to every catalog row and the
 /// `project_key` filter to the listing.
 /// 5 adds `title`, the name the harness gave the session.
-pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 6;
+pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 7;
 
 /// Version of the shallow scanners themselves.
 ///
@@ -264,6 +264,12 @@ pub struct ShallowSession {
     /// Provider-native session kind, when recorded. Grok writes `subagent`
     /// even when it does not name the delegating session.
     pub session_kind: Option<String>,
+    /// The name other sessions address this one by, last observed. Observed.
+    /// Claude: the latest `agent-name` record (an Agent Relay worker's name,
+    /// e.g. `agent-relay-social-animation`). Kept apart from [`Self::title`],
+    /// which prefers a custom or AI title, so a session stays findable by the
+    /// name agents use for it.
+    pub agent_name: Option<String>,
     /// Model ids observed in the bounded read. Observed, best effort: never a
     /// reason to widen a read, so an empty list means "not seen cheaply", not
     /// "no model".
@@ -3397,6 +3403,7 @@ fn file_candidates(
 mod catalog_columns;
 mod catalog_row;
 pub(crate) use {catalog_columns::SESSION_COLUMNS, catalog_row::row_to_session};
+use catalog_columns::{SESSION_COLUMNS_NO_TEXT, UPSERT_SESSION_SQL};
 
 /// A precise continuation point in the catalog's total order.
 ///
@@ -3595,15 +3602,6 @@ fn fetch_catalog_row(
         .ok())
 }
 
-/// The catalog columns with the text excerpts and the title replaced by `NULL`, for a
-/// read that asked for no transcript text: the excerpts are bounded, but
-/// "bounded" is not "not moved", and a hash-only consumer is promised the
-/// latter.
-static SESSION_COLUMNS_NO_TEXT: LazyLock<String> = LazyLock::new(|| {
-    SESSION_COLUMNS
-        .replacen("first_prompt, last_assistant_text,", "NULL AS first_prompt, NULL AS last_assistant_text,", 1)
-        .replacen("project_key_method, title,", "project_key_method, NULL AS title,", 1)
-});
 
 fn catalog_columns(include_text: bool) -> &'static str {
     if include_text {
@@ -3825,62 +3823,6 @@ fn upgrade_cached_project_identity(conn: &Connection, row: &mut ShallowSession) 
     Ok(())
 }
 
-static UPSERT_SESSION_SQL: LazyLock<String> = LazyLock::new(|| {
-    let project_key_merge = crate::store::project_key_merge_sql();
-    format!(
-        "INSERT INTO sessions \
-         (session_id, source, cwd, git_branch, first_activity_ms, last_activity_ms, \
-          last_assistant_text, raw_path, parser_version, first_prompt, models_json, originator, \
-          agent_version, repo_url, initial_commit, workspace_roots_json, source_stamp, \
-          project_key, project_key_method, title, session_kind, \
-          discovery_state) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?18, ?19, CASE WHEN ?2 = 'grok-bot' THEN NULLIF(?20, '') ELSE ?20 END, ?21, 'shallow') \
-         ON CONFLICT(session_id, source) DO UPDATE SET \
-         {project_key_merge}, \
-         cwd = COALESCE(excluded.cwd, sessions.cwd), \
-         git_branch = COALESCE(excluded.git_branch, sessions.git_branch), \
-         first_activity_ms = CASE \
-             WHEN excluded.source = 'grok' THEN COALESCE(excluded.first_activity_ms, sessions.first_activity_ms) \
-             WHEN excluded.first_activity_ms IS NULL THEN sessions.first_activity_ms \
-             WHEN sessions.first_activity_ms IS NULL THEN excluded.first_activity_ms \
-             ELSE MIN(sessions.first_activity_ms, excluded.first_activity_ms) END, \
-         last_activity_ms = CASE \
-             WHEN excluded.source = 'grok' THEN COALESCE(excluded.last_activity_ms, sessions.last_activity_ms) \
-             WHEN excluded.last_activity_ms IS NULL THEN sessions.last_activity_ms \
-             WHEN sessions.last_activity_ms IS NULL THEN excluded.last_activity_ms \
-             ELSE MAX(sessions.last_activity_ms, excluded.last_activity_ms) END, \
-         last_assistant_text = COALESCE(excluded.last_assistant_text, sessions.last_assistant_text), \
-         raw_path = CASE WHEN ?17 = 'remote' AND EXISTS ( \
-             SELECT 1 FROM session_presences p WHERE p.source = sessions.source \
-             AND p.session_id = sessions.session_id AND p.location = 'local') \
-             THEN COALESCE(sessions.raw_path, excluded.raw_path) \
-             ELSE COALESCE(excluded.raw_path, sessions.raw_path) END, \
-         first_prompt = COALESCE(excluded.first_prompt, sessions.first_prompt), \
-         title = CASE \
-             WHEN excluded.source = 'grok-bot' AND ?17 = 'local' AND ?20 IS NOT NULL THEN NULLIF(?20, '') \
-             WHEN sessions.discovery_state IS NULL OR sessions.discovery_state = 'full' \
-             THEN COALESCE(sessions.title, excluded.title) \
-             ELSE COALESCE(excluded.title, sessions.title) END, \
-         session_kind = CASE \
-             WHEN excluded.source = 'grok' AND ?17 = 'local' THEN excluded.session_kind \
-             WHEN excluded.source = 'grok' AND EXISTS ( \
-                 SELECT 1 FROM session_presences p WHERE p.source = sessions.source \
-                 AND p.session_id = sessions.session_id AND p.location = 'local') THEN sessions.session_kind \
-             WHEN excluded.source = 'grok' THEN excluded.session_kind \
-             ELSE COALESCE(excluded.session_kind, sessions.session_kind) END, \
-         models_json = COALESCE(excluded.models_json, sessions.models_json), \
-         originator = COALESCE(excluded.originator, sessions.originator), \
-         agent_version = COALESCE(excluded.agent_version, sessions.agent_version), \
-         repo_url = COALESCE(excluded.repo_url, sessions.repo_url), \
-         initial_commit = COALESCE(excluded.initial_commit, sessions.initial_commit), \
-         workspace_roots_json = COALESCE(excluded.workspace_roots_json, sessions.workspace_roots_json), \
-         source_stamp = COALESCE(excluded.source_stamp, sessions.source_stamp), \
-         discovery_state = CASE \
-             WHEN sessions.discovery_state IS NULL OR sessions.discovery_state = 'full' \
-             THEN 'full' ELSE 'shallow' END \
-         RETURNING {SESSION_COLUMNS}"
-    )
-});
 
 /// Write a shallow row into the catalog, returning the merged row as stored.
 ///
@@ -4030,6 +3972,7 @@ fn upsert_shallow_session_in_transaction(
             project_key_method,
             session.title,
             session.session_kind,
+            session.agent_name,
         ],
         row_to_session,
     )?;

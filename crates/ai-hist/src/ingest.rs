@@ -61,6 +61,7 @@ use evidence_probe::{
 use evidence_probe::{CLAUDE_SIDECAR_EVIDENCE_SQL, CLAUDE_TRANSCRIPT_EVENTS_SQL};
 pub(crate) use sweep_write::SweepWrite;
 
+pub(crate) use titles::set_claude_first_prompt;
 use titles::set_session_title;
 
 #[cfg(test)]
@@ -7958,6 +7959,8 @@ pub(crate) struct ClaudeSessionMeta {
     first_prompt: Option<String>,
     /// The name Claude Code gave the session; see [`claude_title`].
     title: Option<String>,
+    /// The latest `agent-name` record, kept apart from the title.
+    agent_name: Option<String>,
     /// This file is a delegated sidecar rather than a session of its own: it
     /// is named as one ([`is_claude_sidecar_file`]) and every identified
     /// record is a sidechain row — the same rule discovery uses to keep
@@ -8159,6 +8162,7 @@ impl ClaudeMetaFold {
             last_assistant_text: self.last_assistant_text.clone(),
             first_prompt: self.first_prompt.clone(),
             title: self.titles.best(),
+            agent_name: self.titles.agent_name.clone(),
             subagent: is_claude_sidecar_file(path)
                 && claude_records_are_all_sidechain(
                     self.identified_records,
@@ -8291,36 +8295,6 @@ fn retire_claude_history_row(
             params![session_id, ts_ms, raw],
         )?;
     }
-    Ok(())
-}
-
-/// Record what the whole-transcript fold found as the session's first prompt.
-///
-/// The shallow catalog upsert coalesces a null `first_prompt` into whatever
-/// the row already holds, because a shallow or remote read may simply not
-/// have seen the prompt. The metadata fold has seen every record, so its
-/// answer replaces the row's -- including with null. Without that, a session
-/// whose stored title was a row the classifier now types as control (a bare
-/// `/resume <id>`, a task notification) would keep it for good on an upgraded
-/// install, while a fresh database stores nothing.
-pub(crate) fn set_claude_first_prompt(
-    conn: &Connection,
-    meta: &ClaudeSessionMeta,
-    path: &Path,
-) -> Result<()> {
-    // Every sibling transcript is folded. The prompt and title stay with the
-    // file the catalog row names; `upsert_session` has already kept or claimed
-    // that file, so this compares the path and does not stat again.
-    let recorded = path.to_string_lossy();
-    if !crate::catalog_owner::recorded_path_is(conn, "claude", &meta.session_id, recorded.as_ref())?
-    {
-        return Ok(());
-    }
-    conn.execute(
-        "UPDATE sessions SET first_prompt = ?1 WHERE source = 'claude' AND session_id = ?2",
-        params![meta.first_prompt, meta.session_id],
-    )?;
-    set_session_title(conn, "claude", &meta.session_id, meta.title.as_deref())?;
     Ok(())
 }
 

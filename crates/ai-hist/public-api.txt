@@ -334,6 +334,7 @@ pub ai_hist::CatalogQuery::sources: core::option::Option<alloc::vec::Vec<ai_hist
 impl core::default::Default for ai_hist::CatalogQuery
 pub fn ai_hist::CatalogQuery::default() -> Self
 #[non_exhaustive] pub struct ai_hist::CatalogSession
+pub ai_hist::CatalogSession::agent_name: core::option::Option<alloc::string::String>
 pub ai_hist::CatalogSession::agent_version: core::option::Option<alloc::string::String>
 pub ai_hist::CatalogSession::cwd: core::option::Option<alloc::string::String>
 pub ai_hist::CatalogSession::discovery_state: ai_hist::DiscoveryState
@@ -905,6 +906,7 @@ pub struct ai_hist::SessionUserTurnPage
 pub ai_hist::SessionUserTurnPage::next_cursor: core::option::Option<ai_hist::SessionEventCursor>
 pub ai_hist::SessionUserTurnPage::user_turns: alloc::vec::Vec<ai_hist::SessionUserTurn>
 pub struct ai_hist::ShallowSession
+pub ai_hist::ShallowSession::agent_name: core::option::Option<alloc::string::String>
 pub ai_hist::ShallowSession::agent_version: core::option::Option<alloc::string::String>
 pub ai_hist::ShallowSession::cwd: core::option::Option<alloc::string::String>
 pub ai_hist::ShallowSession::discovery_state: alloc::string::String

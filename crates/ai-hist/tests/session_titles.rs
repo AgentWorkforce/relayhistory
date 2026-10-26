@@ -2,7 +2,8 @@
 //! rename replaces it.
 
 use ai_hist::{
-    DiscoveryOptions, ProviderRoots, SessionQuery, SessionRef, SessionStore, Source, StoreOptions,
+    ChangeKind, ChangeQuery, DiscoveryOptions, ProviderRoots, SessionQuery, SessionRef,
+    SessionStore, Source, StoreOptions, Watermark,
 };
 use std::fs::{self, OpenOptions};
 use std::io::Write;
@@ -80,6 +81,147 @@ fn a_claude_title_is_catalogued_and_a_rename_replaces_it() {
     );
     // The title is text, so a read that asked for none carries none.
     assert_eq!(title(&store, Source::Claude, CLAUDE_ID, false), None);
+}
+
+/// The Agent Relay worker name the session was addressed by.
+const RELAY_AGENT: &str = "agent-relay-social-animation";
+
+fn agent_name(store: &SessionStore, id: &str) -> Option<String> {
+    store
+        .session(&SessionRef::id(Source::Claude, id), SessionQuery::default())
+        .unwrap()
+        .expect("catalogued")
+        .session
+        .agent_name
+}
+
+fn claude_transcript_with_agent_name(home: &Path) -> PathBuf {
+    let project = home.join(".claude/projects/-tmp-project");
+    fs::create_dir_all(&project).unwrap();
+    let transcript = project.join(format!("{CLAUDE_ID}.jsonl"));
+    fs::copy(fixture("claude/simple-turn.jsonl"), &transcript).unwrap();
+    append(
+        &transcript,
+        &format!(
+            r#"{{"type":"agent-name","agentName":"{RELAY_AGENT}","sessionId":"{CLAUDE_ID}"}}"#
+        ),
+    );
+    append(
+        &transcript,
+        &format!(
+            r#"{{"type":"custom-title","customTitle":"Changelog videos","sessionId":"{CLAUDE_ID}"}}"#
+        ),
+    );
+    transcript
+}
+
+/// A custom title outranks the agent name for `title`, so the agent name is
+/// catalogued in its own column: it is what other agents look the session up by.
+#[test]
+fn a_claude_agent_name_is_catalogued_apart_from_the_title() {
+    let home = tempfile::tempdir().unwrap();
+    claude_transcript_with_agent_name(home.path());
+    let store = store(home.path());
+    store.sync(Default::default()).unwrap();
+    assert_eq!(
+        title(&store, Source::Claude, CLAUDE_ID, true).as_deref(),
+        Some("Changelog videos")
+    );
+    assert_eq!(agent_name(&store, CLAUDE_ID).as_deref(), Some(RELAY_AGENT));
+    // Like the title, it can carry transcript text, so a read that asked for no
+    // text carries none.
+    let mut no_text = SessionQuery::default();
+    no_text.include_text = false;
+    let content_off = store
+        .session(&SessionRef::id(Source::Claude, CLAUDE_ID), no_text)
+        .unwrap()
+        .expect("catalogued")
+        .session;
+    assert_eq!(content_off.agent_name, None);
+
+    // A later rename by the relay replaces it; a read that finds none keeps it.
+    let transcript = home
+        .path()
+        .join(format!(".claude/projects/-tmp-project/{CLAUDE_ID}.jsonl"));
+    append(
+        &transcript,
+        &format!(
+            r#"{{"type":"agent-name","agentName":"renamed-worker","sessionId":"{CLAUDE_ID}"}}"#
+        ),
+    );
+    store.sync(Default::default()).unwrap();
+    assert_eq!(
+        agent_name(&store, CLAUDE_ID).as_deref(),
+        Some("renamed-worker")
+    );
+}
+
+/// A rename that touches only `agent_name` is still a catalog change, even when
+/// discovery stamped the transcript first and the title and activity are stable.
+#[test]
+fn an_agent_only_rename_is_reported_as_changed() {
+    let home = tempfile::tempdir().unwrap();
+    let transcript = claude_transcript_with_agent_name(home.path());
+    let store = store(home.path());
+    store.sync(Default::default()).unwrap();
+    append(
+        &transcript,
+        &format!(
+            r#"{{"type":"agent-name","agentName":"renamed-worker","sessionId":"{CLAUDE_ID}"}}"#
+        ),
+    );
+    store.discover(DiscoveryOptions::default()).unwrap();
+    let report = store.sync(Default::default()).unwrap();
+    assert_eq!(
+        agent_name(&store, CLAUDE_ID).as_deref(),
+        Some("renamed-worker")
+    );
+    assert_eq!(
+        title(&store, Source::Claude, CLAUDE_ID, true).as_deref(),
+        Some("Changelog videos")
+    );
+    assert!(
+        report
+            .changed
+            .contains(&SessionRef::id(Source::Claude, CLAUDE_ID)),
+        "an agent-only rename is a catalog change: {:?}",
+        report.changed
+    );
+}
+
+#[test]
+fn discovery_alone_catalogs_a_claude_agent_name() {
+    let home = tempfile::tempdir().unwrap();
+    claude_transcript_with_agent_name(home.path());
+    let store = store(home.path());
+    store.discover(DiscoveryOptions::default()).unwrap();
+    assert_eq!(agent_name(&store, CLAUDE_ID).as_deref(), Some(RELAY_AGENT));
+}
+
+/// The delivered catalog record carries it, so a destination can index it.
+#[test]
+fn the_change_feed_session_record_carries_the_agent_name() {
+    let home = tempfile::tempdir().unwrap();
+    claude_transcript_with_agent_name(home.path());
+    let store = store(home.path());
+    store.sync(Default::default()).unwrap();
+    let records: Vec<serde_json::Value> = store
+        .changes_since(
+            Watermark::START,
+            ChangeQuery::default().kinds([ChangeKind::Session]),
+        )
+        .unwrap()
+        .map(|change| change.unwrap())
+        .filter(|change| change.session_id == CLAUDE_ID)
+        .filter_map(|change| change.columns)
+        .map(|columns| serde_json::to_value(columns).unwrap())
+        .collect();
+    assert!(
+        records
+            .iter()
+            .any(|row| row["agent_name"] == serde_json::json!(RELAY_AGENT)),
+        "session record carries agent_name: {records:?}"
+    );
 }
 
 #[test]
