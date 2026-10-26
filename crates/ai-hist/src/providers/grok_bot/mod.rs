@@ -11,9 +11,10 @@ use std::io::{Read, Seek};
 mod format;
 mod normalize;
 pub(crate) mod profile;
+mod roster;
 
 const ID: &str = "grok-bot";
-const GENERATION: &str = "grok_bot_v1";
+const GENERATION: &str = "grok_bot_v2";
 const HEAD_LIMIT: u64 = 8 * 1024;
 const TAIL_LIMIT: u64 = 32 * 1024;
 const REPLICA_LIMIT: u64 = 2 * 1024 * 1024;
@@ -21,7 +22,7 @@ const ROSTER_LIMIT: u64 = 512 * 1024;
 
 pub(crate) const LOCAL_SOURCE: LocalSource = LocalSource {
     id: ID,
-    discovery: Discovery::Provider(|| Box::new(Provider)),
+    discovery: Discovery::Provider(|| Box::<Provider>::default()),
     hydration: Hydration::Parser(ingest),
     transcript_roots: |roots| roots.for_provider(ID).to_vec(),
     relationships: Relationships {
@@ -138,8 +139,16 @@ fn candidate_stamp(path: &Path, slot: &str) -> Result<(String, Option<i64>)> {
     Ok((stamp, modified))
 }
 
-struct Provider;
+#[derive(Default)]
+struct Provider {
+    rosters: roster::RosterCache,
+}
 impl ShallowSessionProvider for Provider {
+    fn begin_discovery_pass(
+        &self,
+    ) -> Result<Option<Box<dyn crate::discover::DiscoveryPassGuard + '_>>> {
+        Ok(Some(Box::new(self.rosters.begin())))
+    }
     fn source(&self) -> &'static str {
         ID
     }
@@ -213,12 +222,7 @@ impl ShallowSessionProvider for Provider {
         let last = if tail.is_empty() { &head } else { &tail };
         let persisted = format::number_hint(last, "persistedAt");
         let last_entry = format::last_entry(last);
-        let title = profile::roster_row(path, &AcquisitionContext::new(ID, scan.provider_roots))
-            .and_then(|(row, bytes)| {
-                scan.note_open();
-                scan.note_bytes(bytes as u64);
-                profile::name(&row)
-            });
+        let title = self.rosters.title(path, scan);
         Ok(Some(ShallowSession {
             source: ID.into(),
             session_id: sid,
@@ -267,11 +271,20 @@ fn snapshot(path: &Path, context: &AcquisitionContext<'_>) -> Result<AcquiredSes
 }
 
 fn read_roster(path: &Path, context: &AcquisitionContext<'_>) -> Option<(Value, usize)> {
+    read_roster_observed(path, context, |_| {})
+}
+
+fn read_roster_observed(
+    path: &Path,
+    context: &AcquisitionContext<'_>,
+    observed: impl FnOnce(usize),
+) -> Option<(Value, usize)> {
     let metadata = std::fs::metadata(path).ok()?;
     if !metadata.is_file() || metadata.len() > ROSTER_LIMIT {
         return None;
     }
     let bytes = context.read(path).ok()?;
+    observed(bytes.len());
     let roster = serde_json::from_slice(&bytes).ok()?;
     Some((roster, bytes.len()))
 }
@@ -339,7 +352,7 @@ fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    let candidates = Provider.enumerate(&env, None)?;
+    let candidates = Provider::default().enumerate(&env, None)?;
     if ctx.paths.is_none() {
         let visited: std::collections::BTreeSet<_> =
             candidates.iter().map(|c| c.locator.as_str()).collect();

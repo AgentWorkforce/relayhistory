@@ -560,7 +560,7 @@
       "repo_url": null,
       "session_id": "fixture-bot-complete",
       "source": "grok-bot",
-      "source_stamp": "grok_bot_v1:sha256:c0afe89f0f49814ce91a16a4fb23977e0d5a446b37dca64f52e3ba170b493653",
+      "source_stamp": "grok_bot_v2:sha256:c0afe89f0f49814ce91a16a4fb23977e0d5a446b37dca64f52e3ba170b493653",
       "title": "Fixture Research Bot",
       "workspace_roots_json": null
     },
@@ -580,7 +580,7 @@
       "repo_url": null,
       "session_id": "fixture-bot-second",
       "source": "grok-bot",
-      "source_stamp": "grok_bot_v1:sha256:7eba8c78f58f7faec9c<n>fadb59f6e1285abc<n>f7529",
+      "source_stamp": "grok_bot_v2:sha256:7eba8c78f58f7faec9c<n>fadb59f6e1285abc<n>f7529",
       "title": "Fixture Second Account",
       "workspace_roots_json": null
     },
@@ -600,7 +600,7 @@
       "repo_url": null,
       "session_id": "fixture-bot-window",
       "source": "grok-bot",
-      "source_stamp": "grok_bot_v1:sha256:064ed36d9b1c1e103dff96e84b72ccb1c647049c1eec0f65c6f530faa5546bc9",
+      "source_stamp": "grok_bot_v2:sha256:064ed36d9b1c1e103dff96e84b72ccb1c647049c1eec0f65c6f530faa5546bc9",
       "title": "Fixture Window Bot",
       "workspace_roots_json": null
     }

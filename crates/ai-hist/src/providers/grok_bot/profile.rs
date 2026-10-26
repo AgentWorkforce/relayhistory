@@ -5,14 +5,18 @@ use crate::session_store::{SessionAvatar, SessionProfile};
 use base64::{engine::general_purpose::STANDARD, Engine};
 
 pub(crate) fn name(row: &Value) -> Option<String> {
-    if row.get("name").is_none() && row.get("title").is_none() {
-        return None;
-    }
-    Some(
-        text(&row["name"], 120)
-            .or_else(|| text(&row["title"], 120))
-            .unwrap_or_default(),
-    )
+    text(&row["name"], 120)
+        .or_else(|| text(&row["title"], 120))
+        .or_else(|| {
+            ["name", "title"]
+                .iter()
+                .any(|key| {
+                    row[*key]
+                        .as_str()
+                        .is_some_and(|value| value.trim().is_empty())
+                })
+                .then(String::new)
+        })
 }
 
 fn text(value: &Value, limit: usize) -> Option<String> {
@@ -50,10 +54,8 @@ pub(crate) fn read(path: &Path, session_id: &str, roots: &ProviderRoots) -> Opti
             color,
             image_data_url,
         });
-    Some(SessionProfile {
-        name: name(&row).filter(|name| !name.is_empty()),
-        avatar,
-    })
+    let name = name(&row).filter(|name| !name.is_empty());
+    (name.is_some() || avatar.is_some()).then_some(SessionProfile { name, avatar })
 }
 
 fn inline_image(value: &Value) -> Option<String> {

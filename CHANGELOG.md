@@ -21,7 +21,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- Grok Bot discovery shows each bot's profile name instead of its native UUID, including cached chats and later renames.
+- Grok Bot shows each bot's normalized profile name consistently across discovery and full capture, including cached chats and later renames. Invalid optional names preserve the last title; an explicitly blank name clears it.
+- Grok Bot discovery reads each account roster once per pass and counts its I/O even when a bot is absent from the roster.
 - Reconciliation advances healthy roots past persistent enumeration errors while retaining failed locations for retry.
 - Exact-path capture avoids materializing unused cached transcript metadata and locations.
 - Unchanged Claude transcripts avoid duplicate file reads when record and metadata cursors have the same byte proof.
