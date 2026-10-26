@@ -253,12 +253,24 @@ fn is_card_json_number(n: &serde_json::Number) -> bool {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScrubbedChunk {
     bytes: Vec<u8>,
+    source_bytes: u64,
+    source_sha256: String,
     records: u64,
     dropped_unparseable: u64,
     dropped_key_collision: u64,
 }
 
 impl ScrubbedChunk {
+    /// Length of the unscrubbed input: the source range's `chunk.bytes`.
+    pub fn source_bytes(&self) -> u64 {
+        self.source_bytes
+    }
+
+    /// SHA-256 of the unscrubbed input: the source range's `chunk.sha256`.
+    pub fn source_sha256(&self) -> &str {
+        &self.source_sha256
+    }
+
     /// Scrubbed, newline-delimited records (what gets compressed and stored).
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
@@ -285,6 +297,8 @@ impl ScrubbedChunk {
 pub fn scrub_chunk(raw: &[u8]) -> ScrubbedChunk {
     let mut out = ScrubbedChunk {
         bytes: Vec::with_capacity(raw.len()),
+        source_bytes: raw.len() as u64,
+        source_sha256: crate::codec::sha256_hex(raw),
         records: 0,
         dropped_unparseable: 0,
         dropped_key_collision: 0,

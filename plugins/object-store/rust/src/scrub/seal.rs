@@ -22,11 +22,29 @@ pub const META_RAW_SHA256: &str = "raw-sha256";
 /// Metadata key: length of the decompressed stored chunk (`chunk.stored_raw_bytes`).
 pub const META_RAW_BYTES: &str = "raw-bytes";
 
-/// A scrubbed chunk, compressed and hashed: the stored body and the fields
-/// the manifest records for it. Opaque; built only by [`SealedChunk::seal`].
+/// A scrubbed chunk, compressed and hashed: the stored body and, for its
+/// manifest chunk entry, both the **source** fields (the unscrubbed range,
+/// which drive offsets, epochs and rewrite detection) and the **stored**
+/// fields (what was uploaded). Never swap them: `bytes`/`sha256` are always
+/// the source values. Opaque; built only by [`SealedChunk::seal`].
+///
+/// | Accessor | Manifest field |
+/// | --- | --- |
+/// | [`source_bytes`](Self::source_bytes) | `chunk.bytes` (source) |
+/// | [`source_sha256`](Self::source_sha256) | `chunk.sha256` (source; `sha256_8` derives from it) |
+/// | [`stored_bytes`](Self::stored_bytes) | `chunk.stored_bytes` |
+/// | [`stored_sha256`](Self::stored_sha256) | `chunk.stored_sha256` |
+/// | [`stored_raw_bytes`](Self::stored_raw_bytes) | `chunk.stored_raw_bytes` |
+/// | [`raw_sha256`](Self::raw_sha256) | `chunk.raw_sha256` |
+/// | [`records`](Self::records) | `chunk.records` |
+/// | [`scrub`](Self::scrub) | `raw.scrub` |
+///
+/// `chunk.start_offset` is the caller's: where the source range starts.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SealedChunk {
     stored: Bytes,
+    source_bytes: u64,
+    source_sha256: String,
     stored_sha256: String,
     stored_raw_bytes: u64,
     raw_sha256: String,
@@ -44,12 +62,24 @@ impl SealedChunk {
         let stored = codec::compress_zstd(raw)
             .map_err(|e| Error::InvalidArgument(format!("compressing the chunk failed: {e}")))?;
         Ok(Self {
+            source_bytes: chunk.source_bytes(),
+            source_sha256: chunk.source_sha256().to_string(),
             stored_sha256: codec::sha256_hex(&stored),
             stored_raw_bytes: raw.len() as u64,
             raw_sha256: codec::sha256_hex(raw),
             records: chunk.records(),
             stored,
         })
+    }
+
+    /// `chunk.bytes`: length of the unscrubbed source range.
+    pub fn source_bytes(&self) -> u64 {
+        self.source_bytes
+    }
+
+    /// `chunk.sha256`: SHA-256 of the unscrubbed source range.
+    pub fn source_sha256(&self) -> &str {
+        &self.source_sha256
     }
 
     /// The compressed body to upload.
@@ -130,6 +160,14 @@ mod tests {
     async fn a_sealed_chunk_is_stored_scrubbed_with_its_digests() {
         let raw = b"{\"m\":\"key sk-abcdefghijklmnopqrstuvwxyz0123\"}\n";
         let sealed = SealedChunk::seal(&super::super::scrub_chunk(raw)).unwrap();
+        // Source fields describe the unscrubbed input; stored fields what was uploaded.
+        assert_eq!(sealed.source_bytes(), raw.len() as u64);
+        assert_eq!(sealed.source_sha256(), codec::sha256_hex(raw));
+        assert_ne!(
+            sealed.source_sha256(),
+            sealed.raw_sha256(),
+            "scrubbing changed the bytes"
+        );
         let dir = tempfile::tempdir().unwrap();
         let store = FsStore::new(FsConfig::new(dir.path())).unwrap();
         let key = ObjectKey::new("s/raw/0000000000-0-aaaaaaaa.jsonl.zst").unwrap();

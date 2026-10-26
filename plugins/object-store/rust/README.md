@@ -101,9 +101,11 @@ chunks **before** they are compressed and uploaded:
   stored unscrubbed.
 - **Uploading:** raw chunks go through `scrub::seal`, the only sanctioned
   path. `scrub_chunk` returns an opaque `ScrubbedChunk`;
-  `SealedChunk::seal` compresses and hashes it (`stored_bytes`,
-  `stored_sha256`, `stored_raw_bytes`, `raw_sha256`, `records`, and the
-  `raw.scrub` pair for the manifest); `put_raw_chunk` uploads it create-only
+  `SealedChunk::seal` compresses and hashes it, giving the manifest entry's
+  **source** fields (`source_bytes`/`source_sha256` → `bytes`/`sha256`, the
+  unscrubbed range that drives offsets and epochs) and its **stored** fields
+  (`stored_bytes`, `stored_sha256`, `stored_raw_bytes`, `raw_sha256`), plus
+  `records` and the `raw.scrub` pair; `put_raw_chunk` uploads it create-only
   with `scrub-ruleset`, `scrub-version`, `raw-sha256` and `raw-bytes`
   metadata. Neither type can be built from unscrubbed bytes, so a raw chunk
   uploaded this way has always been scrubbed. The generic `ObjectStore::put`
