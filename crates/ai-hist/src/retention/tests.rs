@@ -436,3 +436,5 @@ fn default_cooldown_prevents_back_to_back_writer_batches() {
     assert_eq!(count(&conn, "session_events"), 2);
     assert_eq!(maintenance::run(&store, &opts, now + 1000).unwrap().rows, 1);
 }
+
+mod plans;

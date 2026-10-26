@@ -121,7 +121,19 @@ again, and subsequent maintenance reapplies the policy. Retention is local
 cache eviction, not secure erasure or deletion of provider/cloud history.
 
 The schema adds `store_settings`, `retention_consumers`, `retention_sweep` and
-`retention_pending`. It adds no indexes or triggers to captured evidence tables.
+`retention_pending`. Ten covering `(source, session identity, revision)` indexes
+bound upload validation, including both relationship endpoints. Two history
+indexes bound latest-activity and anonymous-prompt selection. Existing timestamp
+and tombstone indexes support the other validation seeks; no triggers are added.
+Writable open builds missing indexes after change-feed migration; read-only open
+does not require or build them. Initial migration takes storage and indexing work,
+and subsequent capture maintains these indexes. Validation never scans all payload
+rows of a fully acknowledged session while holding the writer lock.
+
+Relationship cleanup reopens the affected continuity evidence by primary key
+before removing each edge. This preserves reconciliation of surviving sessions
+when an expired origin is later captured again, with at most one evidence update
+per edge in the bounded batch.
 Partial batches can leave a session with some logs already evicted until its
 next batch; clients should not treat an expiring session as an archival copy.
 

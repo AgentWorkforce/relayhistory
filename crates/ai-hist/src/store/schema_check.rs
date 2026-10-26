@@ -137,8 +137,9 @@ pub(super) fn init_evidence_schemas(conn: &Connection) -> Result<()> {
     crate::retention::init_schema(conn)?;
     // After the observation schema: the stamping triggers draw on its clock.
     // The retired-source rows go last; see `delete_retired_source_rows`.
-    crate::change_feed::init_schema(conn)
-        .and_then(|()| super::retired_sources::delete_retired_source_rows(conn))
+    crate::change_feed::init_schema(conn)?;
+    crate::retention::init_indexes(conn)?;
+    super::retired_sources::delete_retired_source_rows(conn)
 }
 
 /// Maintenance-only tables do not raise the bar for older read-only stores.
@@ -153,5 +154,6 @@ pub(super) fn writable_schema_is_current(conn: &Connection) -> Result<bool> {
                 "retention_sweep",
                 "retention_pending",
             ],
-        )?)
+        )?
+        && crate::retention::indexes_current(conn)?)
 }

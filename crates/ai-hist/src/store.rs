@@ -8870,9 +8870,7 @@ mod tests {
                 .nth(1)
                 .expect("the scope is a recursive walk");
             assert!(
-                recursive.contains(
-                    "idx_session_relationships_parent (source=? AND parent_session_id=?)"
-                ),
+                recursive.contains("(source=? AND parent_session_id=?)"),
                 "the descendant walk does not seek by parent (analyze={analyze}): {steps}"
             );
         }

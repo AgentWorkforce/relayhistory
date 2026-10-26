@@ -4,6 +4,8 @@
 //! on its maintenance worker, publishes durable upload acknowledgements, and
 //! yields between batches. Local eviction never retracts remote copies.
 mod maintenance;
+mod relationships;
+mod schema;
 mod targets;
 #[cfg(test)]
 mod tests;
@@ -82,7 +84,7 @@ pub struct RetentionReport {
     pub rows: u64,
     pub sessions: u64,
     pub protected_sessions: u64,
-    /// True if no consumers are registered or any consumer has no valid ack.
+    /// No usable acknowledgement floor, or an anonymous prompt batch awaits upload.
     pub awaiting_upload_ack: bool,
     /// Another capture or writer owns the store. Retry later without waiting.
     pub busy: bool,
@@ -164,6 +166,12 @@ impl SessionStore {
     }
 }
 
+pub(crate) fn init_indexes(conn: &Connection) -> anyhow::Result<()> {
+    schema::init_indexes(conn)
+}
+pub(crate) fn indexes_current(conn: &Connection) -> anyhow::Result<bool> {
+    schema::indexes_current(conn)
+}
 pub(crate) fn init_schema(conn: &Connection) -> anyhow::Result<()> {
     conn.execute_batch("CREATE TABLE IF NOT EXISTS store_settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS retention_consumers(name TEXT PRIMARY KEY,epoch INTEGER NOT NULL,revision INTEGER NOT NULL CHECK(revision>=0));

@@ -55,16 +55,17 @@ pub(super) fn run(
     let report = apply_batch(&tx, &plan, opts, now)?;
     // This IMMEDIATE transaction is the sole writer since head was read.
     // Exactly its eviction tombstones are removed; older real deletions stay.
-    tx.execute(
-        "DELETE FROM evidence_tombstones WHERE revision>?1",
-        [head.revision as i64],
-    )
-    .map_err(Error::sql)?;
-    if !report.awaiting_upload_ack {
-        tx.execute("INSERT INTO store_settings(key,value) VALUES ('retention.last_batch_ms',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [crate::now_ms().max(now).to_string()]).map_err(Error::sql)?;
-    }
+    suppress_tombstones(&tx, head.revision as i64).map_err(Error::query)?;
+    record_batch_time(&tx, &report, now).map_err(Error::query)?;
     tx.commit().map_err(Error::sql)?;
     Ok(report)
+}
+
+fn record_batch_time(conn: &Connection, report: &RetentionReport, now: i64) -> anyhow::Result<()> {
+    if report.rows > 0 || !report.awaiting_upload_ack {
+        conn.execute("INSERT INTO store_settings(key,value) VALUES ('retention.last_batch_ms',?1) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [crate::now_ms().max(now).to_string()])?;
+    }
+    Ok(())
 }
 
 enum Prepared {
@@ -188,7 +189,7 @@ fn apply_batch(
     if let Some(key) = &plan.scanned_through {
         targets::advance(conn, key).map_err(Error::query)?;
     } else {
-        report.rows += anonymous_prompts(
+        let (removed, inspected) = anonymous_prompts(
             conn,
             cutoff,
             if opts.allow_unuploaded {
@@ -199,7 +200,9 @@ fn apply_batch(
             opts.max_rows.min(32),
         )
         .map_err(Error::query)?;
-        report.cycle_complete = report.rows < u64::from(opts.max_rows.min(32));
+        report.rows += removed;
+        report.awaiting_upload_ack = removed < inspected;
+        report.cycle_complete = inspected < u64::from(opts.max_rows.min(32));
         // Drain anonymous rows too before declaring this cycle finished.
         if report.cycle_complete {
             conn.execute("DELETE FROM retention_sweep", [])
@@ -290,6 +293,10 @@ fn warm_connection(conn: &Connection) -> anyhow::Result<()> {
     for (table, column) in AUXILIARY {
         drop(conn.prepare_cached(&delete_sql(table, column))?);
     }
+    super::relationships::warm(conn)?;
+    drop(conn.prepare_cached(ANONYMOUS_CANDIDATES)?);
+    drop(conn.prepare_cached(DELETE_ANONYMOUS)?);
+    drop(conn.prepare_cached(SUPPRESS_TOMBSTONES)?);
     for table in ["sessions", "session_presences", "retention_pending"] {
         drop(conn.prepare_cached(&format!(
             "DELETE FROM {table} WHERE source=?1 AND session_id=?2"
@@ -310,9 +317,12 @@ fn delete_part(
     report: &mut RetentionReport,
 ) -> anyhow::Result<bool> {
     let limit = (*remaining).min(32);
-    let removed = conn
-        .prepare_cached(&delete_sql(table, column))?
-        .execute(params![key.0, key.1, limit])? as u64;
+    let removed = if table == "session_relationships" {
+        super::relationships::delete(conn, column, key, limit)?
+    } else {
+        conn.prepare_cached(&delete_sql(table, column))?
+            .execute(params![key.0, key.1, limit])? as u64
+    };
     report.rows += removed;
     *remaining -= removed;
     // A full chunk yields even when the total budget is larger, bounding
@@ -337,11 +347,37 @@ fn delete_grok_state(
     Ok(true)
 }
 
+pub(super) const ANONYMOUS_CANDIDATES: &str = "SELECT id,revision FROM history INDEXED BY idx_retention_anonymous_activity WHERE session_id IS NULL AND timestamp_ms<?1 ORDER BY timestamp_ms,id LIMIT ?2";
+const DELETE_ANONYMOUS: &str = "DELETE FROM history WHERE id=?1 AND revision<=?2";
+pub(super) const SUPPRESS_TOMBSTONES: &str = "DELETE FROM evidence_tombstones INDEXED BY idx_evidence_tombstones_kind_revision WHERE kind=?1 AND revision>?2";
+
+pub(super) fn suppress_tombstones(conn: &Connection, after: i64) -> anyhow::Result<()> {
+    // The existing (kind, revision) index cannot bound a revision-only delete.
+    // Every kind this writer can emit gets its own indexed range delete.
+    let mut stmt = conn.prepare_cached(SUPPRESS_TOMBSTONES)?;
+    for kind in crate::ChangeKind::ALL {
+        stmt.execute(params![kind.as_str(), after])?;
+    }
+    Ok(())
+}
 fn anonymous_prompts(
     conn: &Connection,
     cutoff: i64,
     floor: i64,
     limit: u32,
-) -> anyhow::Result<u64> {
-    Ok(conn.execute("DELETE FROM history WHERE id IN (SELECT id FROM history WHERE session_id IS NULL AND timestamp_ms<?1 AND revision<=?2 LIMIT ?3)", params![cutoff,floor,limit])? as u64)
+) -> anyhow::Result<(u64, u64)> {
+    let rows = conn
+        .prepare_cached(ANONYMOUS_CANDIDATES)?
+        .query_map(params![cutoff, limit], |row| {
+            Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    let mut removed = 0;
+    let mut stmt = conn.prepare_cached(DELETE_ANONYMOUS)?;
+    for (id, revision) in &rows {
+        if *revision <= floor {
+            removed += stmt.execute(params![id, floor])? as u64;
+        }
+    }
+    Ok((removed, rows.len() as u64))
 }

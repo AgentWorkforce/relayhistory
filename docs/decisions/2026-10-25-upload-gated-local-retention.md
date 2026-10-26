@@ -1,6 +1,6 @@
 # Local retention is upload-gated cache eviction
 
-Status: proposed (W1 draft implementation)
+Status: proposed (W1 implementation under review)
 Date: 2026-10-25
 
 ## Context
@@ -40,6 +40,12 @@ Provider originals, user-created tags/commit links and cloud copies remain.
 Unknown-age or active sessions remain. The default never loses unuploaded logs;
 a caller must explicitly opt into `allow_unuploaded` to relinquish protection.
 
+Covering revision indexes bound the upload recheck for each session. Reuse
+existing timestamp indexes with explicit non-null seeks, add history activity
+indexes, and suppress new tombstones through the existing per-kind revision
+index. Reopen continuity evidence before removing its relationship, bounded by
+the same edge batch. Row limits alone do not bound scans of acknowledged rows.
+
 ## Alternatives rejected
 
 - Timestamp-only deletes: they can discard pending uploads.
@@ -50,6 +56,10 @@ a caller must explicitly opt into `allow_unuploaded` to relinquish protection.
   consumer's private schema and job semantics.
 
 ## Consequences
+
+Twelve additional evidence indexes consume disk and add capture write work;
+writable schema migration builds them once. The bounded writer-lock queries
+avoid repeatedly scanning large acknowledged sessions across cleanup batches.
 
 Offline destinations may retain data past the configured limit. Reports expose
 that condition rather than silently choosing data loss. Retired destinations

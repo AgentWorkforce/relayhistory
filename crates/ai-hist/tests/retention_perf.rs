@@ -14,7 +14,28 @@ fn local_retention_read_path_measurement() {
         tx.execute("INSERT INTO sessions(source,session_id,last_activity_ms,raw_path) VALUES ('codex',?1,?2,'/synthetic')", rusqlite::params![format!("s{i}"), i]).unwrap();
     }
     tx.commit().unwrap();
-    let store = SessionStore::open(StoreOptions::default().db_path(&path)).unwrap();
+    let payloads = std::env::var_os("RETENTION_PERF_PAYLOAD").is_some();
+    let drop_indexes = std::env::var_os("RETENTION_PERF_DROP_INDEXES").is_some();
+    if drop_indexes {
+        let names = conn
+            .prepare(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name GLOB 'idx_retention_*'",
+            )
+            .unwrap()
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        for name in names {
+            conn.execute_batch(&format!("DROP INDEX {name}")).unwrap();
+        }
+    }
+    let store = SessionStore::open(
+        StoreOptions::default()
+            .db_path(&path)
+            .read_only(drop_indexes),
+    )
+    .unwrap();
     let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let worker = if std::env::var_os("RETENTION_PERF_PRUNE").is_some() {
         store.register_retention_consumer("perf").unwrap();
@@ -58,7 +79,19 @@ fn local_retention_read_path_measurement() {
             reads.push(start.elapsed().as_secs_f64() * 1000.0);
         }
         let start = Instant::now();
-        conn.execute("INSERT INTO sessions(source,session_id,last_activity_ms,raw_path) VALUES ('codex',?1,?2,'/synthetic')", rusqlite::params![format!("new{i}"), now+i]).unwrap();
+        let insert = |conn: &rusqlite::Connection| {
+            conn.execute("INSERT INTO sessions(source,session_id,last_activity_ms,raw_path) VALUES ('codex',?1,?2,'/synthetic')", rusqlite::params![format!("new{i}"), now+i]).unwrap()
+        };
+        if payloads {
+            let tx = conn.transaction().unwrap();
+            insert(&tx);
+            tx.execute("INSERT INTO session_events(source,session_id,event_uid,role,kind,text,ts_ms) VALUES('codex',?1,?1,'assistant','text','synthetic answer',?2)",rusqlite::params![format!("new{i}"),now+i]).unwrap();
+            tx.execute("INSERT INTO tool_calls(source,session_id,tool_use_id,name,ts_ms) VALUES('codex',?1,?1,'synthetic',?2)",rusqlite::params![format!("new{i}"),now+i]).unwrap();
+            tx.execute("INSERT INTO history(source,session_id,prompt,timestamp_ms) VALUES('codex',?1,'synthetic prompt',?2)",rusqlite::params![format!("new{i}"),now+i]).unwrap();
+            tx.commit().unwrap();
+        } else {
+            insert(&conn);
+        }
         let first = store
             .sessions(CatalogQuery::default())
             .next()

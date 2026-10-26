@@ -3,8 +3,7 @@ use std::collections::BTreeSet;
 
 pub(super) type Key = (String, String);
 pub(super) const SCAN_LIMIT: usize = 32;
-/// These tables have session-scoped indexes already; retention adds none to
-/// the capture path. Other fed metadata is checked before final eviction.
+/// Payload tables whose rows are drained before retiring catalog metadata.
 pub(super) const PAYLOADS: &[(&str, &str)] = &[
     ("session_events", "ts_ms"),
     ("tool_calls", "ts_ms"),
@@ -22,18 +21,21 @@ pub(super) fn candidates(conn: &Connection, after: &Key) -> anyhow::Result<Vec<K
         .into_iter()
         .chain(PAYLOADS.iter().map(|(table, _)| *table))
     {
-        let sql = format!(
-            "SELECT DISTINCT source,session_id FROM {table}
-            WHERE (source,session_id) > (?1,?2) AND session_id IS NOT NULL
-            ORDER BY source,session_id LIMIT {SCAN_LIMIT}"
-        );
-        keys.extend(
-            conn.prepare(&sql)?
-                .query_map(params![after.0, after.1], |row| {
+        let sql = format!("SELECT source,session_id FROM {table} WHERE (source,session_id) > (?1,?2) AND session_id IS NOT NULL ORDER BY source,session_id LIMIT 1");
+        let mut next = after.clone();
+        let mut stmt = conn.prepare(&sql)?;
+        // Seek past each identity instead of scanning all of its duplicate
+        // index entries with DISTINCT on every partial cleanup batch.
+        for _ in 0..SCAN_LIMIT {
+            let key: Option<Key> = stmt
+                .query_row(params![next.0, next.1], |row| {
                     Ok((row.get(0)?, row.get(1)?))
-                })?
-                .collect::<rusqlite::Result<Vec<Key>>>()?,
-        );
+                })
+                .optional()?;
+            let Some(key) = key else { break };
+            next = key.clone();
+            keys.insert(key);
+        }
     }
     Ok(keys.into_iter().take(SCAN_LIMIT).collect())
 }
@@ -71,12 +73,11 @@ pub(super) fn activity(conn: &Connection, key: &Key) -> anyhow::Result<Option<i6
             .flatten();
         last = last.max(ts);
     }
-    for (table, timestamp) in PAYLOADS.iter().filter(|(_, ts)| !ts.is_empty()) {
+    for sql in super::schema::activity_queries() {
         let value: Option<i64> = conn
-            .prepare_cached(&format!(
-                "SELECT MAX({timestamp}) FROM {table} WHERE source=?1 AND session_id=?2"
-            ))?
-            .query_row(params![key.0, key.1], |r| r.get(0))?;
+            .prepare_cached(&sql)?
+            .query_row(params![key.0, key.1], |row| row.get(0))
+            .optional()?;
         last = last.max(value);
     }
     Ok(last)
@@ -85,27 +86,13 @@ pub(super) fn activity(conn: &Connection, key: &Key) -> anyhow::Result<Option<i6
 /// Protect the entire session if *any* of its feed rows (or an edge naming
 /// it) has not reached every required destination. Rechecked under IMMEDIATE.
 pub(super) fn uploaded(conn: &Connection, key: &Key, floor: i64) -> anyhow::Result<bool> {
-    for table in [
-        "sessions",
-        "session_presences",
-        "session_observations",
-        "session_commit_links",
-    ]
-    .into_iter()
-    .chain(PAYLOADS.iter().map(|(table, _)| *table))
-    {
+    for sql in super::schema::upload_queries() {
         if conn
-            .prepare_cached(&format!(
-                "SELECT 1 FROM {table} WHERE source=?1 AND session_id=?2 AND revision>?3 LIMIT 1"
-            ))?
+            .prepare_cached(&sql)?
             .exists(params![key.0, key.1, floor])?
         {
             return Ok(false);
         }
-    }
-    for endpoint in ["parent_session_id", "child_session_id"] {
-        if conn.prepare_cached(&format!("SELECT 1 FROM session_relationships WHERE source=?1 AND {endpoint}=?2 AND revision>?3 LIMIT 1"))?
-            .exists(params![key.0,key.1,floor])? { return Ok(false); }
     }
     Ok(true)
 }
