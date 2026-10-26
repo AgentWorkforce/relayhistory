@@ -78,6 +78,7 @@ pub fn validate(m: &Manifest, key: Option<&ObjectKey>) -> Vec<Issue> {
     v.raw_totals(m);
     v.epochs(m);
     v.chunks(m);
+    v.scrub(m);
     v.server(m);
     if let Some(key) = key {
         v.key(m, key);
@@ -350,6 +351,36 @@ impl Checker {
                     raw.next_offset
                 ),
             );
+        }
+    }
+
+    /// With `raw.scrub` present, every chunk must record the scrubbed object's
+    /// uncompressed length and digest.
+    fn scrub(&mut self, m: &Manifest) {
+        let Some(marker) = &m.raw.scrub else { return };
+        if marker.ruleset.is_empty() {
+            self.issue("raw.scrub.ruleset", "must not be empty");
+        }
+        if marker.version == 0 {
+            self.issue("raw.scrub.version", "must be >= 1");
+        }
+        for (i, c) in m.raw.chunks.iter().enumerate() {
+            let at = format!("raw.chunks[{i}]");
+            match c.stored_raw_bytes {
+                None => self.issue(
+                    format!("{at}.stored_raw_bytes"),
+                    "is required when raw.scrub is set",
+                ),
+                Some(0) => self.issue(format!("{at}.stored_raw_bytes"), "must be >= 1"),
+                Some(_) => {}
+            }
+            match &c.raw_sha256 {
+                Some(h) => self.hex64(&format!("{at}.raw_sha256"), h),
+                None => self.issue(
+                    format!("{at}.raw_sha256"),
+                    "is required when raw.scrub is set",
+                ),
+            }
         }
     }
 

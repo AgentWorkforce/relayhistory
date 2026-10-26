@@ -8,6 +8,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Session manifests record raw-chunk scrub status and stored digests; readers quarantine unscrubbed sessions.
 - The object-storage plugin can scrub PII and secrets, including PGP private keys, card numbers and phone numbers, from raw session chunks before upload (`scrub::scrub_chunk`, uploaded only through `scrub::seal::put_raw_chunk`), using the same rules as the hosted service.
 
 ### Rust API

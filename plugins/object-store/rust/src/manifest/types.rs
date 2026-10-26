@@ -92,6 +92,23 @@ pub struct Raw {
     pub epochs: Vec<EpochRecord>,
     pub next_offset: u64,
     pub chunks: Vec<ChunkEntry>,
+    /// Which scrub rule set the stored chunks went through. Absent means the
+    /// chunks are **unscrubbed**: readers quarantine such a manifest (no
+    /// transform, no index content) instead of trusting it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scrub: Option<ScrubMarker>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// `raw.scrub`: the rule set applied to stored chunks before upload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScrubMarker {
+    /// Rule set name, e.g. `relayhistory-scrub`.
+    pub ruleset: String,
+    /// The **lowest** rule set version applied to any listed chunk, so readers
+    /// always see the weakest scrub in the session.
+    pub version: u32,
     #[serde(flatten)]
     pub extra: Extra,
 }
@@ -119,14 +136,23 @@ pub struct EpochRecord {
 pub struct ChunkEntry {
     pub seq: u64,
     pub epoch: u32,
+    /// Offset of the chunk in the epoch's **source** stream (unscrubbed).
     pub start_offset: u64,
+    /// Length of the source range (unscrubbed), which keeps resume and offset
+    /// continuity independent of scrubbing.
     pub bytes: u64,
     pub stored_bytes: u64,
-    /// SHA-256 of the uncompressed bytes.
+    /// SHA-256 of the source range (unscrubbed), for rewrite detection.
     pub sha256: String,
     pub sha256_8: String,
     /// SHA-256 of the stored (compressed) object.
     pub stored_sha256: String,
+    /// Length of the stored object once decompressed (the scrubbed records).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stored_raw_bytes: Option<u64>,
+    /// SHA-256 of the stored object once decompressed (the scrubbed records).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_sha256: Option<String>,
     pub compression: Compression,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub records: Option<u64>,
@@ -211,6 +237,12 @@ impl Manifest {
             Lifecycle::Abandoned => EffectiveState::Abandoned,
             Lifecycle::Archived => EffectiveState::Archived,
         }
+    }
+
+    /// Whether the stored chunks were scrubbed (`raw.scrub` present). An
+    /// unscrubbed manifest is quarantined by every reader.
+    pub fn is_scrubbed(&self) -> bool {
+        self.raw.scrub.is_some()
     }
 
     /// Whether normalized output exists and was built from the current raw
