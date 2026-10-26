@@ -1302,9 +1302,10 @@ mod tests {
         thread.join().unwrap().unwrap();
     }
 
-    /// How long after its event the second of two isolated changes is swept,
-    /// when the first change's tick reports `changed_nothing` as `quiet`.
-    fn second_change_waits(quiet: bool) -> Duration {
+    /// When the first of two isolated changes was swept, when the second was
+    /// signalled, and when it was swept, with the first change's tick
+    /// reporting `changed_nothing` as `quiet`.
+    fn two_changes(quiet: bool) -> (Instant, Instant, Instant) {
         let (sender, requests) = std::sync::mpsc::channel::<Instant>();
         let sender = Mutex::new(sender);
         let tick: ScopedTickFn = Arc::new(move |_: &TickRequest| {
@@ -1326,7 +1327,7 @@ mod tests {
         let thread = std::thread::spawn(move || runner.run());
         let wait = Duration::from_secs(10);
         watch.inner.signal_change(fired(&["/roots/claude"]));
-        requests.recv_timeout(wait).unwrap();
+        let first = requests.recv_timeout(wait).unwrap();
         while watch.inner.run.lock().expect("watch run state").in_flight {
             std::thread::sleep(Duration::from_millis(2));
         }
@@ -1335,7 +1336,7 @@ mod tests {
         let swept = requests.recv_timeout(wait).unwrap();
         watch.stop();
         thread.join().unwrap().unwrap();
-        swept.duration_since(second)
+        (first, second, swept)
     }
 
     /// The debounce window folds a burst into one trailing tick. A tick that
@@ -1344,10 +1345,14 @@ mod tests {
     /// is a leading edge again rather than waiting out the window.
     #[test]
     fn a_tick_that_changed_nothing_does_not_hold_the_next_change_for_the_window() {
-        let after_quiet = second_change_waits(true);
+        let (_, signalled, swept) = two_changes(true);
+        let after_quiet = swept.duration_since(signalled);
         assert!(after_quiet < Duration::from_millis(300), "{after_quiet:?}");
-        let after_change = second_change_waits(false);
-        assert!(after_change >= Duration::from_millis(400), "{after_change:?}");
+        // Measured from the first sweep, which is when the 600 ms window
+        // opened, so a slow test thread cannot shorten what is left of it.
+        let (first, _, swept) = two_changes(false);
+        let after_change = swept.duration_since(first);
+        assert!(after_change >= Duration::from_millis(500), "{after_change:?}");
     }
 
     /// A forced tick deferred behind a running sweep comes back with every
