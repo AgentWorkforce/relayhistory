@@ -352,6 +352,14 @@ object storage**. This was decided by Khaliq on 2026-10-25.
   hits `AlreadyExists` because a newer rule set produced different bytes, the
   client keeps the stored object. It records that object's `raw_sha256` and
   version from the object's metadata and bytes, never the new ones.
+  `scrub::seal::put_raw_chunk` stores them as the `raw-sha256`, `raw-bytes`,
+  `scrub-ruleset` and `scrub-version` metadata keys.
+- **Limit: one string at a time.** Every string value and key is scrubbed on
+  its own. A secret split across two strings, JSON values or records (for
+  example a token streamed as separate deltas) is not recognized, because
+  neither part matches a rule. The same holds for the server's `scrubText`.
+  Harness adapters that assemble text from parts should emit the assembled
+  text.
 - **Quarantine.** A manifest without `raw.scrub` is unscrubbed. Readers must
   not transform its chunks or index their content. The pointer row records
   `scrubbed = false`. The server's `scrubText` stays the compliance boundary
