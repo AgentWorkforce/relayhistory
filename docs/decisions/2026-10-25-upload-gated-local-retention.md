@@ -37,8 +37,12 @@ accepted batches, memberships and explicit exclusions.
 Remove only the pruning transaction's own feed tombstones before committing,
 as existing local evidence eviction does. Preserve earlier ordinary tombstones.
 Provider originals, user-created tags/commit links and cloud copies remain.
-Unknown-age or active sessions remain. The default never loses unuploaded logs;
-a caller must explicitly opt into `allow_unuploaded` to relinquish protection.
+Unknown-age or active sessions remain. By default, logs are protected until all
+registered destinations acknowledge them. A caller can relinquish protection by
+explicitly enabling `allow_unuploaded`, or by explicitly retiring an
+unacknowledged destination while the remaining consumers have acknowledged the
+backlog. That retired destination may never receive the evicted logs. Selecting
+a shorter retention limit must not enable the override or retire a destination.
 
 Covering revision indexes bound the upload recheck for each session. Reuse
 existing timestamp indexes with explicit non-null seeks, add history activity

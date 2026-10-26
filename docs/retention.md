@@ -3,7 +3,8 @@
 RelayHistory already writes and reads session evidence in its local SQLite
 store (`ai-history.db` by default; an embedder may name it `history.db`). These
 reads do not contact a network service. Retention adds explicit maintenance;
-it adds no work to session capture, catalog listing, sync or hydration.
+cleanup does not run during session capture, catalog listing, sync or hydration.
+Evidence writes still maintain the additional indexes described below.
 
 ## Policy and desktop integration
 
@@ -70,9 +71,13 @@ Removing a permanently retired destination requires an explicit
 
 **Tradeoff:** an offline destination can keep local logs longer than the saved
 retention limit. `RetentionReport` exposes `awaiting_upload_ack` and
-`protected_sessions` so the host can explain this. Data loss before upload is
-possible only with explicit `RetentionOptions { allow_unuploaded: true, .. }`;
-the desktop must not enable this override as part of selecting a shorter limit.
+`protected_sessions` so the host can explain this. Protection can be relinquished
+with explicit `RetentionOptions { allow_unuploaded: true, .. }`, or by retiring
+an unacknowledged destination while the remaining consumers have acknowledged
+the backlog. In either case, that destination may never receive the evicted logs.
+The host must require an explicit retirement decision before removing a
+consumer. Selecting a shorter retention limit must not enable the override or
+retire a destination.
 
 ## Maintenance and cloud copies
 
