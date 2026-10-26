@@ -539,6 +539,30 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn multipart_rejected_at_commit_is_aborted() {
+        use crate::MultipartOpts;
+        let (dir, store) = store();
+        let key = ObjectKey::new("late/obj").unwrap();
+        let mut upload = store
+            .multipart(&key, MultipartOpts::default())
+            .await
+            .unwrap();
+        upload.put_part(Bytes::from_static(b"part")).await.unwrap();
+        // A link appears in the sidecar tree after the upload started.
+        let outside = tempfile::tempdir().unwrap();
+        let meta = dir.path().join(".rh/meta");
+        std::fs::create_dir_all(&meta).unwrap();
+        std::os::unix::fs::symlink(outside.path(), meta.join("late")).unwrap();
+        assert!(matches!(upload.complete().await, Err(Error::InvalidKey(_))));
+        let staged: Vec<_> = std::fs::read_dir(dir.path().join("late"))
+            .map(|d| d.flatten().map(|e| e.file_name()).collect())
+            .unwrap_or_default();
+        assert!(staged.is_empty(), "staged parts left behind: {staged:?}");
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
     #[tokio::test]
     async fn presign_rejects_sub_second_ttls() {
         let (_dir, store) = store();
