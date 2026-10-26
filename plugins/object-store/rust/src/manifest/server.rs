@@ -116,8 +116,15 @@ pub fn with_normalized(
 
 /// Whether the transform must (re)run: no normalized output yet, or it was
 /// built from different raw content. The server's own writes never trigger it.
+/// A quarantined (unscrubbed) manifest is never transformed.
 pub fn needs_transform(m: &Manifest) -> bool {
-    !m.normalized_is_current()
+    !quarantined(m) && !m.normalized_is_current()
+}
+
+/// An unscrubbed manifest (no `raw.scrub`): readers must not transform its
+/// chunks or index their content; the pointer row records it as quarantined.
+pub fn quarantined(m: &Manifest) -> bool {
+    !m.is_scrubbed()
 }
 
 /// Columns for the Supabase `sessions` pointer row. `manifest_etag` comes
@@ -141,6 +148,8 @@ pub struct PointerFields {
     pub content_sha256: String,
     pub normalized_version: Option<u32>,
     pub normalized_stale: bool,
+    /// `false` when the manifest is quarantined (no `raw.scrub`).
+    pub scrubbed: bool,
 }
 
 pub fn pointer_fields(m: &Manifest) -> PointerFields {
@@ -163,5 +172,6 @@ pub fn pointer_fields(m: &Manifest) -> PointerFields {
         content_sha256: m.raw.content_sha256.clone(),
         normalized_version: normalized.map(|n| n.version),
         normalized_stale: normalized.is_some() && !m.normalized_is_current(),
+        scrubbed: m.is_scrubbed(),
     }
 }

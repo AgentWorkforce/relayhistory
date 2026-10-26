@@ -107,6 +107,7 @@ Readers ignore unknown fields. Writers preserve them.
 | `epochs` | array of [epoch records](#epoch-records) | required | One record per epoch ever opened, `epochs[i].epoch == i`, so `epochs.length == epoch + 1`. |
 | `next_offset` | integer ≥ 0 | required | `start_offset + bytes` of the last chunk in the current epoch, or `0` if the current epoch has no chunks yet. The client resumes reading the source here. |
 | `chunks` | array of [chunk](#chunk-entries) | required | Every chunk of every epoch, ordered by `seq`. |
+| `scrub` | object | optional | `{ ruleset, version }`: the scrub rule set the stored chunks went through ([Scrubbing](#scrubbing)). `version` is the **lowest** version applied to any listed chunk. Absent means the chunks are unscrubbed, and every reader quarantines the manifest. |
 
 #### Epoch records
 
@@ -327,6 +328,50 @@ section, and it recomputes that section from the copy it just read.
    abandoned, then archived, then deleted by retention. The session is never
    blocked on the client.
 
+## Scrubbing
+
+Raw chunks are scrubbed of PII and secrets **on the client, before they reach
+object storage**. This was decided by Khaliq on 2026-10-25.
+
+- **Where it runs.** The client's delivery worker runs
+  `relayhistory_object_store::scrub::scrub_chunk` when it seals a chunk. That
+  function sits behind the crate's `scrub` feature and lands with
+  relayhistory#550; until then this section describes the contract. Each
+  record is parsed, every string value and key is scrubbed with the same rules
+  as the server's `scrubText`, and the record is re-serialized. The result is
+  then compressed and uploaded. The unscrubbed source never leaves the machine.
+  The stored, scrubbed copy is the canonical cloud copy.
+- **Source and stored fields.** `start_offset`, `bytes` and `sha256` describe
+  the source range, so resume, epochs and the hash chain work exactly as
+  before. `stored_raw_bytes` and `raw_sha256` describe what was stored.
+- **`raw.scrub`.** This is `{ ruleset: "relayhistory-scrub", version }`.
+  `version` is the lowest rule-set version applied to any listed chunk, so
+  readers always see the weakest scrub in the session. A rule-set bump applies
+  only to chunks sealed after it; existing objects are never rewritten.
+- **Re-delivery across an upgrade.** If a re-upload of an already-stored chunk
+  hits `AlreadyExists` because a newer rule set produced different bytes, the
+  client keeps the stored object. It records that object's `raw_sha256` and
+  version from the object's metadata and bytes, never the new ones.
+  `scrub::seal::put_raw_chunk` stores them as the `raw-sha256`, `raw-bytes`,
+  `scrub-ruleset` and `scrub-version` metadata keys.
+- **Limit: one string at a time.** Every string value and key is scrubbed on
+  its own. A secret split across two strings, JSON values or records (for
+  example a token streamed as separate deltas) is not recognized, because
+  neither part matches a rule. The same holds for the server's `scrubText`.
+  Harness adapters that assemble text from parts should emit the assembled
+  text.
+- **Quarantine.** A manifest without `raw.scrub` is unscrubbed. Readers must
+  not transform its chunks or index their content. The pointer row records
+  `scrubbed = false`. The server's `scrubText` stays the compliance boundary
+  downstream either way.
+- **The marker comes first.** A client writes `raw.scrub` in the same update
+  as, or before, the first chunk it covers. It never adds the marker to a
+  manifest that already lists chunks, because those chunks were stored
+  unscrubbed and the marker would vouch for them
+  (`manifest::client::record_scrub` refuses). Quarantine is therefore sticky:
+  a reader that has seen a revision with chunks and no `raw.scrub` keeps the
+  session quarantined even if a later revision carries the marker.
+
 ## Chunk entries
 
 Each entry describes one immutable object at
@@ -338,11 +383,13 @@ Each entry describes one immutable object at
 | `seq` | integer ≥ 0 | required | Global, dense chunk number: `chunks[i].seq == i`. It never resets, including across epochs. Zero-padded to 10 digits in the key, so listing order equals `seq` order. |
 | `epoch` | integer ≥ 0 | required | Source epoch of this chunk. |
 | `start_offset` | integer ≥ 0 | required | Offset of the first byte in the epoch's uncompressed source stream: a byte offset in the log file for `jsonl`/`ndjson`, and in the serialized row stream for `sqlite-rows`. |
-| `bytes` | integer ≥ 1 | required | Uncompressed length. |
+| `bytes` | integer ≥ 1 | required | Length of the **source** range, before scrubbing, so offsets and resume never depend on scrubbing. |
 | `stored_bytes` | integer ≥ 1 | required | Compressed object size. It equals the object's `Content-Length`. |
-| `sha256` | string (64 hex) | required | SHA-256 of the **uncompressed** bytes. |
+| `sha256` | string (64 hex) | required | SHA-256 of the **source** range, before scrubbing. Used for rewrite detection; `sha256_8` and the hash chain derive from it. |
 | `sha256_8` | string (8 hex) | required | `sha256[0..8]`, exactly as it appears in the key. |
 | `stored_sha256` | string (64 hex) | required | SHA-256 of the **compressed** object. It equals the object's `content-sha256` metadata, so a download can be verified before decompressing. |
+| `stored_raw_bytes` | integer ≥ 1 | required with `raw.scrub` | Length of the stored object once decompressed: the scrubbed records. |
+| `raw_sha256` | string (64 hex) | required with `raw.scrub` | SHA-256 of the stored object once decompressed. A reader verifies the decompressed chunk against it. |
 | `compression` | string enum | required | `"zstd"`. |
 | `records` | integer ≥ 0 | optional | Complete lines or rows in the chunk. |
 | `first_ts` / `last_ts` | string (RFC 3339) | optional | First and last record timestamps, when the format has them. |
@@ -425,6 +472,7 @@ There are two independent fences.
 | `content_sha256` | `raw.content_sha256` |
 | `normalized_version` | `server.normalized.version`, or `null` |
 | `normalized_stale` | `normalized` exists and is not current (digest or epoch differs) |
+| `scrubbed` | `raw.scrub` is present. When `false`, the row is quarantined and the transform skips it. |
 | `lifecycle` | `server.lifecycle`, or `"active"` when `server` is `null` |
 
 ## Example
