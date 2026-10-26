@@ -135,17 +135,29 @@ fn names(dir: &Path) -> Option<HashSet<OsString>> {
 }
 
 impl DirIndex {
-    /// Start tracking `dir`, remembering what it holds now. False when it is
-    /// already tracked or cannot be read.
-    pub(super) fn add(&mut self, dir: &Path, depth: usize) -> bool {
+    /// Start tracking `dir`. `fresh` is a directory that has just appeared:
+    /// it starts empty, so its first rescan reports everything already in
+    /// it. Otherwise it remembers what it holds now. False when it is already
+    /// tracked or cannot be read.
+    pub(super) fn add(&mut self, dir: &Path, depth: usize, fresh: bool) -> bool {
         if self.dirs.contains_key(dir) {
             return false;
         }
-        let Some(names) = names(dir) else {
-            return false;
+        let names = if fresh {
+            HashSet::new()
+        } else {
+            let Some(names) = names(dir) else {
+                return false;
+            };
+            names
         };
         self.dirs.insert(dir.to_path_buf(), (depth, names));
         true
+    }
+
+    /// Every tracked directory.
+    pub(super) fn dirs(&self) -> Vec<PathBuf> {
+        self.dirs.keys().cloned().collect()
     }
 
     pub(super) fn remove(&mut self, dir: &Path) {
@@ -191,6 +203,7 @@ pub(super) use macos::KqueueDirs;
 #[cfg(target_os = "macos")]
 mod macos {
     use super::{plan, DirIndex, MAX_DIRS};
+    use std::collections::HashSet;
     use crate::discover::{WatchDepth, WatchRoot};
     use crate::watch::fs_events::event_scope;
     use crate::watch::ChangeScope;
@@ -286,7 +299,9 @@ mod macos {
             }
         }
 
-        /// Watch the current plan's directories that are not watched yet.
+        /// Bring the watched set in line with a fresh plan: drop directories
+        /// that fell out of it (roots never do), so the newest directories
+        /// get the descriptors, then watch what is new in it.
         fn replan(&mut self) {
             self.roots = self
                 .shared
@@ -299,30 +314,41 @@ mod macos {
                 .filter(|root| root.depth == WatchDepth::Tree)
                 .map(|root| root.registration_key().to_path_buf())
                 .collect();
-            for (dir, depth) in plan(&trees, MAX_DIRS, SystemTime::now()) {
-                self.watch(&dir, depth);
+            let planned = plan(&trees, MAX_DIRS, SystemTime::now());
+            let keep: HashSet<&PathBuf> = planned.iter().map(|(dir, _)| dir).collect();
+            for dir in self.index.dirs() {
+                if !keep.contains(&dir) {
+                    self.forget(&dir);
+                }
+            }
+            for (dir, depth) in &planned {
+                self.watch(dir, *depth, false);
             }
         }
 
-        fn watch(&mut self, dir: &Path, depth: usize) -> bool {
-            if self.index.len() >= MAX_DIRS || self.index.depth(dir).is_some() {
+        /// Watch `dir`. Its entries are recorded *before* the watch is
+        /// registered and rescanned *after*, so a file created in between is
+        /// reported by that rescan rather than counted as already there. A
+        /// `fresh` directory -- one that has just appeared -- starts empty, so
+        /// everything already in it is reported and its subdirectories are
+        /// watched the same way, down to [`super::MAX_DEPTH`]: a new Codex
+        /// `YYYY/MM/DD` tree is created a level at a time, faster than the
+        /// parent's event is read.
+        fn watch(&mut self, dir: &Path, depth: usize, fresh: bool) -> bool {
+            if self.index.len() >= MAX_DIRS || !self.index.add(dir, depth, fresh) {
                 return false;
             }
             let flags = FilterFlag::NOTE_WRITE | FilterFlag::NOTE_DELETE | FilterFlag::NOTE_RENAME;
-            if self
+            let registered = self
                 .watcher
                 .add_filename(dir, EventFilter::EVFILT_VNODE, flags)
-                .is_err()
-            {
-                return false;
-            }
-            // Indexed *after* the watch is registered, so an entry created
-            // between the two is reported by the next event's rescan rather
-            // than missed.
-            if self.watcher.watch().is_err() || !self.index.add(dir, depth) {
+                .is_ok()
+                && self.watcher.watch().is_ok();
+            if !registered {
                 self.forget(dir);
                 return false;
             }
+            self.rescan(dir);
             true
         }
 
@@ -349,12 +375,7 @@ mod macos {
             self.report(&appeared.files);
             let depth = self.index.depth(dir).unwrap_or(0);
             for child in appeared.dirs {
-                if self.watch(&child, depth + 1) {
-                    // A session written into a directory created a moment ago
-                    // can land before the watch exists: report what the new
-                    // directory already holds.
-                    self.report(&files_in(&child));
-                }
+                self.watch(&child, depth + 1, true);
             }
         }
 
@@ -369,18 +390,6 @@ mod macos {
                 }
             }
         }
-    }
-
-    fn files_in(dir: &Path) -> Vec<PathBuf> {
-        std::fs::read_dir(dir)
-            .map(|entries| {
-                entries
-                    .flatten()
-                    .map(|entry| entry.path())
-                    .filter(|path| path.is_file())
-                    .collect()
-            })
-            .unwrap_or_default()
     }
 }
 
@@ -438,8 +447,8 @@ mod tests {
         let root = dir.path().to_path_buf();
         fs::write(root.join("existing.jsonl"), "{}\n").unwrap();
         let mut index = DirIndex::default();
-        assert!(index.add(&root, 0));
-        assert!(!index.add(&root, 0), "already tracked");
+        assert!(index.add(&root, 0, false));
+        assert!(!index.add(&root, 0, false), "already tracked");
         assert_eq!(index.rescan(&root), Some(Appeared::default()));
 
         fs::write(root.join("new.jsonl"), "{}\n").unwrap();
@@ -450,9 +459,24 @@ mod tests {
         assert_eq!(index.rescan(&root), Some(Appeared::default()), "reported once");
 
         let deepest = root.join("project");
-        assert!(index.add(&deepest, MAX_DEPTH));
+        assert!(index.add(&deepest, MAX_DEPTH, false));
         fs::create_dir(deepest.join("beyond")).unwrap();
         assert!(index.rescan(&deepest).unwrap().dirs.is_empty(), "past MAX_DEPTH");
+    }
+
+    #[test]
+    fn a_fresh_directory_reports_what_it_already_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let day = dir.path().join("25");
+        fs::create_dir(&day).unwrap();
+        fs::write(day.join("rollout.jsonl"), "{}\n").unwrap();
+        fs::create_dir(day.join("nested")).unwrap();
+        let mut index = DirIndex::default();
+        assert!(index.add(&day, 2, true));
+        let appeared = index.rescan(&day).unwrap();
+        assert_eq!(appeared.files, vec![day.join("rollout.jsonl")]);
+        assert_eq!(appeared.dirs, vec![day.join("nested")]);
+        assert_eq!(index.dirs(), vec![day]);
     }
 
     #[test]
@@ -461,7 +485,7 @@ mod tests {
         let gone = dir.path().join("gone");
         fs::create_dir(&gone).unwrap();
         let mut index = DirIndex::default();
-        assert!(index.add(&gone, 1));
+        assert!(index.add(&gone, 1, false));
         fs::remove_dir(&gone).unwrap();
         assert_eq!(index.rescan(&gone), None);
         assert_eq!(index.len(), 1);
