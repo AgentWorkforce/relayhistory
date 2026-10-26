@@ -498,6 +498,14 @@ transcript tail, so repeated syncs retain entries that later leave its local
 window; older history already absent at the first sync cannot be recovered
 from this passive source.
 
+Shallow discovery reads the companion roster in the replica's own account
+slot for its bot name. The roster participates in the change stamp, so a
+rename updates the catalog even when the transcript does not change.
+`SessionStore::session_profile` also exposes the locally recorded avatar shape,
+color, and inline raster image, when present. Rendering and animation belong
+to the consumer; profile reads never hydrate transcripts or request images
+from the network. Missing optional profile data leaves the history readable.
+
 ### Session markers
 
 Not every provider record is a message. Compaction and summary boundaries,

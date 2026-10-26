@@ -5,7 +5,7 @@ coding-agent session evidence without parsing harness logs itself. This guide
 is for that program's author: the surface the crate exposes on its **default
 features**, and the rules that surface is governed by.
 
-Everything a consumer needs is one type, `ai_hist::SessionStore`, sixteen
+Everything a consumer needs is one type, `ai_hist::SessionStore`, seventeen
 operations, and the typed structs they return. Nothing on this surface names a
 `rusqlite` type, and no JSON column reaches a consumer as a string. This is the
 surface [`docs/sourcing-contract.md`](sourcing-contract.md) is delivered
@@ -18,6 +18,13 @@ a standalone Cargo project outside this workspace that depends on the published
 crate, syncs a corpus into a throwaway `HOME`, walks the catalog, prints usage
 totals by model and drains the change feed. It is built on every pull request
 against this checkout and, nightly, against the crate crates.io serves.
+
+For a provider's current local profile, call `store.session_profile(&reference)`.
+Grok Bot returns its roster name and recorded avatar shape/color, plus an inline
+raster image when available. This optional read uses only the companion metadata
+in that session's account slot. It works on read-only stores, does not hydrate
+the transcript, and never fetches network images or credentials. Consumers render
+and animate the observed avatar settings; missing metadata returns `None`.
 
 ```toml
 [dependencies]

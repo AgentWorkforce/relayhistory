@@ -10,6 +10,7 @@ use std::io::{Read, Seek};
 
 mod format;
 mod normalize;
+pub(crate) mod profile;
 
 const ID: &str = "grok-bot";
 const GENERATION: &str = "grok_bot_v1";
@@ -210,9 +211,16 @@ impl ShallowSessionProvider for Provider {
         let last = if tail.is_empty() { &head } else { &tail };
         let persisted = format::number_hint(last, "persistedAt");
         let last_entry = format::last_entry(last);
+        let title = profile::roster_row(path, &AcquisitionContext::new(ID, scan.provider_roots))
+            .and_then(|(row, bytes)| {
+                scan.note_open();
+                scan.note_bytes(bytes as u64);
+                profile::name(&row)
+            });
         Ok(Some(ShallowSession {
             source: ID.into(),
             session_id: sid,
+            title,
             first_activity_ms: format::first_number_hint(&head, "timestampMs"),
             last_activity_ms: last_entry
                 .as_ref()

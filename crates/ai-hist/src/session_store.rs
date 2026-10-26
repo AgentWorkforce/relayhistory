@@ -5,7 +5,7 @@
 //! — stays behind the `unstable-internal` feature. Cargo semver is the
 //! contract; there is no separate Rust contract-version constant.
 //!
-//! Twelve operations, one entry type:
+//! Operations on one entry type:
 //!
 //! | Method | What it does |
 //! |---|---|
@@ -16,6 +16,7 @@
 //! | [`SessionStore::watch`] | the live-capture loop, sync or discover, as an iterator of ticks |
 //! | [`SessionStore::sessions`] | the catalog, keyset-paged internally |
 //! | [`SessionStore::session`] | everything the store holds about one session, typed |
+//! | [`SessionStore::session_profile`] | optional local profile metadata without transcript hydration |
 //! | [`SessionStore::changes_since`] | the revision-stamped change feed, with named consumer cursors |
 //! | [`SessionStore::head_revision`] | the feed head, for a consumer checking its stored watermark |
 //! | [`SessionStore::forget_evidence`] | drop sessions' evidence, keeping their catalog rows |
@@ -73,6 +74,8 @@ use std::time::{Duration, Instant};
 
 mod catalog_digest;
 mod catalog_row;
+mod profile;
+pub use profile::{SessionAvatar, SessionProfile};
 mod options;
 mod source_intake;
 mod watch_sweep;

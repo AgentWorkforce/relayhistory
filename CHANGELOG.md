@@ -19,6 +19,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Rust API
 
+- Added `SessionStore::session_profile`, `SessionProfile`, and `SessionAvatar` for locally observed Grok Bot names, avatar shapes, colors, and inline raster images without transcript hydration or network access.
 - Added `Source::QwenCode` for filtering and reading persisted Qwen Code history.
 - Added `Source::Kimi` for filtering and reading persisted Kimi Code history.
 - Added `Source::Codebuddy` for filtering and reading persisted Codebuddy Code history.
@@ -39,6 +40,10 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - Grok Build sessions show the name recorded in `generated_title` or `session_summary`; previously cached sessions refresh their missing titles on the next discovery, sync or hydration.
+### Fixed
+
+- Grok Bot discovery shows each bot's profile name instead of its native UUID, including cached chats and later renames.
+
 ### Removed
 
 - Removed the zero-caller `discoverAndList` helper from the TypeScript SDK; callers run `discoverSessions` then `listSessionCatalogPage` directly.
