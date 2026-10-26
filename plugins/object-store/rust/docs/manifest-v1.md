@@ -96,7 +96,7 @@ missing or the clone is shallow).
 
 | Field | Type | Req. | Meaning |
 | ----- | ---- | ---- | ------- |
-| `remote_url` | string | optional | The `origin` remote canonicalized to `host/path`, exactly as `ai_hist::project_identity::canonicalize_remote_url` returns it: lowercase host, owner/repo case kept, no scheme, no credentials, no port, no trailing `.git`. Never a raw remote URL, because those can carry tokens. |
+| `remote_url` | string | optional | The `origin` remote canonicalized to `host/path`, exactly as `ai_hist::project_identity::canonicalize_remote_url` returns it: lowercase host (or an ssh alias such as `_corp`), owner/repo case kept, no scheme, no port, exactly one trailing `.git` removed (so a repo named `api.git` keeps it). It never contains `@`, `:` in the path, `?` or `#`: a raw remote URL or a query string can carry tokens. |
 | `root_commit` | string (40 or 64 lowercase hex) | optional | The repository's root commit (`manifest::repo::root_commit`, cached per work tree by `RootCommitCache`). Omitted for shallow clones, whose oldest commit is not the root. Forks share it with their upstream. |
 
 ### `writer`

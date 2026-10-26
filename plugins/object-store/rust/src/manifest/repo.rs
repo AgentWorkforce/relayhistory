@@ -83,8 +83,27 @@ fn is_commit_id(s: &str) -> bool {
     (s.len() == 40 || s.len() == 64) && s.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
 }
 
+/// Variables that make `git` read a repository other than the one `-C`
+/// names. A host started from a git hook inherits `GIT_DIR` and friends, and
+/// `-C` does not override them.
+const REPOSITORY_SELECTION_ENV: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+];
+
 fn git(work_tree: &Path, args: &[&str]) -> Option<String> {
-    let out = Command::new("git")
+    let mut cmd = Command::new("git");
+    for name in REPOSITORY_SELECTION_ENV {
+        cmd.env_remove(name);
+    }
+    let out = cmd
         .arg("-C")
         .arg(work_tree)
         .args(args)

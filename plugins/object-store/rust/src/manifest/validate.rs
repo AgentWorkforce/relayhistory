@@ -21,9 +21,12 @@ impl std::fmt::Display for Issue {
 }
 
 /// `host/path` as `canonicalize_remote_url` produces it: a lowercase host
-/// (or bracketed IPv6 literal, or a single-label host such as `intranet`)
-/// with no port, then a non-empty path. No scheme, no `@` anywhere (so no
-/// credentials), no whitespace or control characters, no trailing `.git` or `/`.
+/// (a bracketed IPv6 literal, or a name starting with an alphanumeric or `_`,
+/// such as `intranet` or an ssh alias `_corp`) with no port, then a non-empty
+/// path. The path is kept as the canonicalizer leaves it, so it may end in
+/// `.git` (a repo named `api.git`). No scheme, no `@` anywhere (so no
+/// userinfo), no `:`, `?` or `#` in the path (a query string can carry a
+/// token), no whitespace or control characters, no trailing `/`.
 pub(crate) fn canonical_remote_shape(url: &str) -> bool {
     let Some((host, path)) = url.split_once('/') else {
         return false;
@@ -31,17 +34,16 @@ pub(crate) fn canonical_remote_shape(url: &str) -> bool {
     let host_ok = if host.starts_with('[') {
         host.len() > 2 && host.ends_with(']') && !host[1..host.len() - 1].contains(['[', ']'])
     } else {
-        host.starts_with(|c: char| c.is_ascii_alphanumeric())
+        host.starts_with(|c: char| c.is_ascii_alphanumeric() || c == '_')
             && host == host.to_lowercase()
             && !host.contains([':', '@'])
     };
     host_ok
         && !path.is_empty()
-        && !url.contains("://")
         && !url.contains('@')
+        && !path.contains([':', '?', '#'])
         && !url.chars().any(|c| c.is_whitespace() || c.is_control())
         && !path.ends_with('/')
-        && !path.ends_with(".git")
 }
 
 /// Hash chain over the ordered chunk list (spec section `content_sha256`).
