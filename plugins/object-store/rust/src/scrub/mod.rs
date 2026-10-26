@@ -250,7 +250,7 @@ fn is_card_json_number(n: &serde_json::Number) -> bool {
 /// so holding a `ScrubbedChunk` proves its bytes went through the rules.
 /// [`seal::SealedChunk::seal`] turns it into what [`seal::put_raw_chunk`],
 /// the only sanctioned upload path for raw chunks, accepts.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct ScrubbedChunk {
     bytes: Vec<u8>,
     source_bytes: u64,
@@ -258,6 +258,20 @@ pub struct ScrubbedChunk {
     records: u64,
     dropped_unparseable: u64,
     dropped_key_collision: u64,
+}
+
+/// Lengths and counts only: never the records or a digest of the unscrubbed
+/// input, so a logged chunk leaks no session content.
+impl std::fmt::Debug for ScrubbedChunk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ScrubbedChunk")
+            .field("bytes", &self.bytes.len())
+            .field("source_bytes", &self.source_bytes)
+            .field("records", &self.records)
+            .field("dropped_unparseable", &self.dropped_unparseable)
+            .field("dropped_key_collision", &self.dropped_key_collision)
+            .finish_non_exhaustive()
+    }
 }
 
 impl ScrubbedChunk {

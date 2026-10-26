@@ -40,7 +40,7 @@ pub const META_RAW_BYTES: &str = "raw-bytes";
 /// | [`scrub`](Self::scrub) | `raw.scrub` |
 ///
 /// `chunk.start_offset` is the caller's: where the source range starts.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct SealedChunk {
     stored: Bytes,
     source_bytes: u64,
@@ -49,6 +49,18 @@ pub struct SealedChunk {
     stored_raw_bytes: u64,
     raw_sha256: String,
     records: u64,
+}
+
+/// Lengths and counts only, like [`ScrubbedChunk`]'s: no body or digests.
+impl std::fmt::Debug for SealedChunk {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SealedChunk")
+            .field("stored_bytes", &self.stored.len())
+            .field("stored_raw_bytes", &self.stored_raw_bytes)
+            .field("source_bytes", &self.source_bytes)
+            .field("records", &self.records)
+            .finish_non_exhaustive()
+    }
 }
 
 impl SealedChunk {
@@ -167,6 +179,12 @@ mod tests {
             sealed.source_sha256(),
             sealed.raw_sha256(),
             "scrubbing changed the bytes"
+        );
+        // Debug output carries no content and no digests.
+        let dbg = format!("{sealed:?} {:?}", super::super::scrub_chunk(raw));
+        assert!(
+            !dbg.contains(sealed.source_sha256()) && !dbg.contains("REDACTED"),
+            "{dbg}"
         );
         let dir = tempfile::tempdir().unwrap();
         let store = FsStore::new(FsConfig::new(dir.path())).unwrap();
