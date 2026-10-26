@@ -405,6 +405,14 @@ fn validator_rejects_corruption() {
             Box::new(|m| m.session.repo = Some(repo("github.com:2222/acme/api", None))),
         ),
         (
+            "session.repo.remote_url",
+            Box::new(|m| m.session.repo = Some(repo("github.com/acme/api@token", None))),
+        ),
+        (
+            "session.repo.remote_url",
+            Box::new(|m| m.session.repo = Some(repo("github.com/acme/\u{7}api", None))),
+        ),
+        (
             "session.repo.root_commit",
             Box::new(|m| m.session.repo = Some(repo("github.com/acme/api", Some(&"A".repeat(40))))),
         ),
@@ -812,6 +820,7 @@ fn session_repo_round_trips_and_feeds_the_pointer_row() {
         "gitlab.example.com/group/sub/repo",
         "[2001:db8::1]/acme/api",
         "github.com/Acme/API",
+        "intranet/team/repo",
     ] {
         m.session.repo = Some(repo(ok, Some(&"b".repeat(64))));
         ensure_valid(&m, Some(&key)).unwrap_or_else(|e| panic!("{ok}: {e:?}"));

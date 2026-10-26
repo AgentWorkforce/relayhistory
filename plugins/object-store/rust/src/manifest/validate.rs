@@ -21,8 +21,9 @@ impl std::fmt::Display for Issue {
 }
 
 /// `host/path` as `canonicalize_remote_url` produces it: a lowercase host
-/// (or bracketed IPv6 literal) with no userinfo or port, then a non-empty
-/// path, no scheme, no whitespace, no trailing `.git` or `/`.
+/// (or bracketed IPv6 literal, or a single-label host such as `intranet`)
+/// with no port, then a non-empty path. No scheme, no `@` anywhere (so no
+/// credentials), no whitespace or control characters, no trailing `.git` or `/`.
 pub(crate) fn canonical_remote_shape(url: &str) -> bool {
     let Some((host, path)) = url.split_once('/') else {
         return false;
@@ -35,7 +36,8 @@ pub(crate) fn canonical_remote_shape(url: &str) -> bool {
     host_ok
         && !path.is_empty()
         && !url.contains("://")
-        && !url.chars().any(char::is_whitespace)
+        && !url.contains('@')
+        && !url.chars().any(|c| c.is_whitespace() || c.is_control())
         && !path.ends_with('/')
         && !path.ends_with(".git")
 }
