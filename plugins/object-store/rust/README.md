@@ -78,11 +78,18 @@ download returns the exact `.zst` object.
 chunks **before** they are compressed and uploaded:
 
 - **Rules:** a byte-for-byte port of relayhistory-cloud's `scrubText`. It
-  catches private keys, home-directory usernames, bearer tokens, provider and
-  cloud keys, JWTs, OAuth query values, secret assignments, URL credentials and
-  email addresses. Matches become `[REDACTED]`, and strings over 256 KiB (in
-  UTF-16 units) are truncated with an in-band marker.
-- **Spec:** the golden vectors in `tests/fixtures/scrub-golden-v1.json`. They
+  catches private keys (PEM and PGP), home-directory usernames, bearer tokens,
+  provider and cloud keys, JWTs, OAuth query values, secret assignments, URL
+  credentials, email addresses, payment card numbers (issuer prefix, length
+  and Luhn) and phone numbers (`+` E.164, or North American with separators).
+  Matches become `[REDACTED]`; a card number held as a JSON integer becomes the
+  string `[REDACTED]`. Strings over 256 KiB (in UTF-16 units) are truncated
+  with an in-band marker, cut only after whitespace and never between digit
+  groups, so a secret is kept whole (and scrubbed) or dropped whole.
+- **Limit:** each string is scrubbed on its own. A secret split across two
+  strings, JSON values or records (a token streamed as separate deltas) is not
+  recognized, because neither part matches a rule.
+- **Spec:** the golden vectors in `tests/fixtures/scrub-golden-v2.json`. They
   are generated from the TypeScript reference by relayhistory-cloud's
   `test/scrub-golden.test.ts`, and both CIs check them. Refresh the fixture by
   copying it from there; never edit it here. Bump `RULESET_VERSION` when it

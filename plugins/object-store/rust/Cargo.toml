@@ -71,3 +71,15 @@ required-features = ["scrub"]
 name = "scrub"
 harness = false
 required-features = ["scrub"]
+
+# The scrub rules run regex engines over 256 KiB strings in the golden and
+# boundary tests; optimizing just these crates keeps debug test runs fast
+# without changing behaviour.
+[profile.dev.package.regex-automata]
+opt-level = 3
+
+[profile.dev.package.regex-syntax]
+opt-level = 3
+
+[profile.dev.package.fancy-regex]
+opt-level = 3
