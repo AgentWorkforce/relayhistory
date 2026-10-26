@@ -229,8 +229,8 @@ pub struct TickOutcome {
     /// change it was for still owed, and the loop retries it rather than
     /// counting it done.
     pub contended: bool,
-    /// The sweep ran and changed nothing a consumer could see: no catalog row
-    /// moved. A filesystem-event tick like that closes the debounce window it
+    /// The sweep ran and wrote nothing: the store's change-feed head did not
+    /// move. A filesystem-event tick like that closes the debounce window it
     /// opened (see `WatchInner::run_claimed`). `false` when unknown, which
     /// keeps the window as it always was.
     pub changed_nothing: bool,
