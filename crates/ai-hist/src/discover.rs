@@ -99,8 +99,8 @@ pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 6;
 /// existing meaning (full-ingest parser generation) and is untouched.
 pub const SHALLOW_SCANNER_VERSION: u32 = 17;
 
-/// Version 17 reads Grok Bot names from account rosters. Cached transcripts
-/// whose bytes are unchanged must still be revisited after upgrading.
+// Version 17 reads Grok Bot names from account rosters. Cached transcripts
+// whose bytes are unchanged must still be revisited after upgrading.
 
 /// Version 2 shipped the classification that hid standalone guardians (see
 /// [`crate::codex_is_subagent`]). Their rollouts never change on disk, so the
