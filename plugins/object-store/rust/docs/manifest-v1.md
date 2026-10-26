@@ -81,6 +81,23 @@ Readers ignore unknown fields. Writers preserve them.
 | `harness_version` | string | optional | Harness version, if the log records one. |
 | `cwd_sha256` | string (hex) | optional | SHA-256 of the working directory. The plaintext path is never stored, because local paths leak usernames and project names. |
 | `parent_session_id` | string | optional | Parent session for subagent or delegated sessions, when known. |
+| `repo` | object | optional | Repository evidence for a stable repo identity, absent when the working directory is not in a git repository ([below](#sessionrepo)). |
+
+#### `session.repo`
+
+The server uses this to give the session a repo identity that survives repo
+renames, transfers, owner renames and SSH/HTTPS remote differences
+(relayhistory-cloud `sessions.resolve_repo`). Both fields are derived offline;
+the client never calls a provider API for them. The host builds the block with
+`manifest::repo::session_repo(remote, root)`: the remote is the `project_key` of
+an `ai_hist::project_identity` that resolved by `Remote`, and the root commit
+comes from the work tree's `git` (off the ingest path; `None` if `git` is
+missing or the clone is shallow).
+
+| Field | Type | Req. | Meaning |
+| ----- | ---- | ---- | ------- |
+| `remote_url` | string | optional | The `origin` remote canonicalized to `host/path`, exactly as `ai_hist::project_identity::canonicalize_remote_url` returns it: lowercase host, owner/repo case kept, no scheme, no credentials, no port, no trailing `.git`. Never a raw remote URL, because those can carry tokens. |
+| `root_commit` | string (40 or 64 lowercase hex) | optional | The repository's root commit (`manifest::repo::root_commit`, cached per work tree by `RootCommitCache`). Omitted for shallow clones, whose oldest commit is not the root. Forks share it with their upstream. |
 
 ### `writer`
 
@@ -426,6 +443,7 @@ There are two independent fences.
 | `normalized_version` | `server.normalized.version`, or `null` |
 | `normalized_stale` | `normalized` exists and is not current (digest or epoch differs) |
 | `lifecycle` | `server.lifecycle`, or `"active"` when `server` is `null` |
+| `git_remote_url`, `git_root_commit` | `session.repo.remote_url`, `session.repo.root_commit`. The upsert resolves `repo_id` from them. |
 
 ## Example
 

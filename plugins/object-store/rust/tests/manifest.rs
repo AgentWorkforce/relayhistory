@@ -100,6 +100,7 @@ fn first_manifest(loc: &SessionLocation) -> Manifest {
             harness_version: None,
             cwd_sha256: None,
             parent_session_id: None,
+            repo: None,
             extra: Default::default(),
         },
         writer: Writer {
@@ -110,6 +111,14 @@ fn first_manifest(loc: &SessionLocation) -> Manifest {
         },
         format: RawFormat::Jsonl,
     })
+}
+
+fn repo(remote_url: &str, root_commit: Option<&str>) -> SessionRepo {
+    SessionRepo {
+        remote_url: Some(remote_url.into()),
+        root_commit: root_commit.map(str::to_string),
+        extra: Default::default(),
+    }
 }
 
 fn chunk(n: u64, start: u64, bytes: u64) -> NewChunk {
@@ -373,6 +382,36 @@ fn validator_rejects_corruption() {
             Box::new(|m| m.raw.chunks[1].last_ts = Some("2026-13-45".into())),
         ),
         ("$key", Box::new(|m| m.session.harness = "codex".into())),
+        (
+            "session.repo.remote_url",
+            Box::new(|m| {
+                m.session.repo = Some(repo("https://bot:token@github.com/acme/api.git", None))
+            }),
+        ),
+        (
+            "session.repo.remote_url",
+            Box::new(|m| m.session.repo = Some(repo("git@github.com:acme/api.git", None))),
+        ),
+        (
+            "session.repo.remote_url",
+            Box::new(|m| m.session.repo = Some(repo("GitHub.com/acme/api", None))),
+        ),
+        (
+            "session.repo.remote_url",
+            Box::new(|m| m.session.repo = Some(repo("github.com/acme/api.git", None))),
+        ),
+        (
+            "session.repo.remote_url",
+            Box::new(|m| m.session.repo = Some(repo("github.com:2222/acme/api", None))),
+        ),
+        (
+            "session.repo.root_commit",
+            Box::new(|m| m.session.repo = Some(repo("github.com/acme/api", Some(&"A".repeat(40))))),
+        ),
+        (
+            "session.repo.root_commit",
+            Box::new(|m| m.session.repo = Some(repo("github.com/acme/api", Some("abc123")))),
+        ),
     ];
     for (path, corrupt) in cases {
         let mut m = good.clone();
@@ -754,4 +793,93 @@ fn every_epochs_first_seq_is_checked_even_without_chunks() {
     assert!(validate(&m2, None)
         .iter()
         .any(|i| i.path == "server.retention.delete_after"));
+}
+
+#[test]
+fn session_repo_round_trips_and_feeds_the_pointer_row() {
+    let loc = location("unit-repo");
+    let key = loc.manifest().unwrap();
+    let mut m = first_manifest(&loc);
+    // Absent repo evidence is omitted, not written as null.
+    let bare = serde_json::to_value(&m).unwrap();
+    assert!(bare["session"].get("repo").is_none(), "{bare}");
+    assert_eq!(pointer_fields(&m).git_remote_url, None);
+
+    let root = "0123456789abcdef0123456789abcdef01234567";
+    m.session.repo = Some(repo("github.com/acme/api", Some(root)));
+    ensure_valid(&m, Some(&key)).unwrap();
+    for ok in [
+        "gitlab.example.com/group/sub/repo",
+        "[2001:db8::1]/acme/api",
+        "github.com/Acme/API",
+    ] {
+        m.session.repo = Some(repo(ok, Some(&"b".repeat(64))));
+        ensure_valid(&m, Some(&key)).unwrap_or_else(|e| panic!("{ok}: {e:?}"));
+    }
+
+    m.session.repo = Some(repo("github.com/acme/api", Some(root)));
+    let body = serde_json::to_vec(&m).unwrap();
+    let parsed = parse_manifest(&body, Some(&key)).unwrap();
+    assert_eq!(parsed.session.repo, m.session.repo);
+    let p = pointer_fields(&parsed);
+    assert_eq!(p.git_remote_url.as_deref(), Some("github.com/acme/api"));
+    assert_eq!(p.git_root_commit.as_deref(), Some(root));
+
+    // A shallow clone sends the remote alone.
+    m.session.repo = Some(SessionRepo {
+        remote_url: Some("github.com/acme/api".into()),
+        ..Default::default()
+    });
+    ensure_valid(&m, Some(&key)).unwrap();
+    assert_eq!(pointer_fields(&m).git_root_commit, None);
+}
+
+#[tokio::test]
+async fn a_client_without_repo_support_keeps_session_repo() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = FsStore::new(FsConfig::new(dir.path())).unwrap();
+    let loc = location("fs-repo");
+    let key = loc.manifest().unwrap();
+    let mut doc = serde_json::to_value(first_manifest(&loc)).unwrap();
+    doc["session"]["repo"] = serde_json::json!({
+        "remote_url": "github.com/acme/api",
+        "root_commit": "0123456789abcdef0123456789abcdef01234567",
+        "added_later": {"keep": true}
+    });
+    store
+        .put(
+            &key,
+            bytes::Bytes::from(serde_json::to_vec(&doc).unwrap()),
+            PutOpts::create(),
+        )
+        .await
+        .unwrap();
+    // A newer client rewrites session.repo with a struct that does not know
+    // `added_later`; the stored key is carried over.
+    update_manifest(&store, &key, &fast(), |m| {
+        let m = m.expect("stored manifest");
+        let mut session = m.session.clone();
+        session.repo = Some(repo("github.com/acme/core-api", None));
+        session.repo.as_mut().unwrap().extra.clear();
+        Ok(Edit::client(session, m.writer.clone(), m.raw.clone()))
+    })
+    .await
+    .unwrap();
+    let body: Vec<bytes::Bytes> =
+        futures::TryStreamExt::try_collect(store.get(&key, None).await.unwrap())
+            .await
+            .unwrap();
+    let after: serde_json::Value = serde_json::from_slice(&body.concat()).unwrap();
+    assert_eq!(
+        after["session"]["repo"]["remote_url"],
+        "github.com/acme/core-api"
+    );
+    assert!(
+        after["session"]["repo"].get("root_commit").is_none(),
+        "known fields follow the edit: {after}"
+    );
+    assert_eq!(
+        after["session"]["repo"]["added_later"],
+        serde_json::json!({"keep": true})
+    );
 }

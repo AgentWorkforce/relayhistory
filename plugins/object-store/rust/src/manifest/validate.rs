@@ -20,6 +20,26 @@ impl std::fmt::Display for Issue {
     }
 }
 
+/// `host/path` as `canonicalize_remote_url` produces it: a lowercase host
+/// (or bracketed IPv6 literal) with no userinfo or port, then a non-empty
+/// path, no scheme, no whitespace, no trailing `.git` or `/`.
+pub(crate) fn canonical_remote_shape(url: &str) -> bool {
+    let Some((host, path)) = url.split_once('/') else {
+        return false;
+    };
+    let host_ok = if host.starts_with('[') {
+        host.len() > 2 && host.ends_with(']') && !host[1..host.len() - 1].contains(['[', ']'])
+    } else {
+        !host.is_empty() && host == host.to_lowercase() && !host.contains([':', '@'])
+    };
+    host_ok
+        && !path.is_empty()
+        && !url.contains("://")
+        && !url.chars().any(char::is_whitespace)
+        && !path.ends_with('/')
+        && !path.ends_with(".git")
+}
+
 /// Hash chain over the ordered chunk list (spec section `content_sha256`).
 pub fn content_sha256<'a>(chunks: impl IntoIterator<Item = &'a ChunkEntry>) -> String {
     let mut h = [0u8; 32];
@@ -164,6 +184,26 @@ impl Checker {
         }
         if let Some(h) = &s.cwd_sha256 {
             self.hex64("session.cwd_sha256", h);
+        }
+        if let Some(repo) = &s.repo {
+            if let Some(url) = &repo.remote_url {
+                if !canonical_remote_shape(url) {
+                    self.issue(
+                        "session.repo.remote_url",
+                        "must be a canonical `host/path` remote: no scheme, credentials, port or whitespace",
+                    );
+                }
+            }
+            if let Some(root) = &repo.root_commit {
+                let ok = (root.len() == 40 || root.len() == 64)
+                    && root.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'));
+                if !ok {
+                    self.issue(
+                        "session.repo.root_commit",
+                        "must be a lowercase 40- or 64-char hex commit id",
+                    );
+                }
+            }
         }
         if m.raw.owner.is_empty() {
             self.issue("raw.owner", "must not be empty");

@@ -141,6 +141,10 @@ pub struct PointerFields {
     pub content_sha256: String,
     pub normalized_version: Option<u32>,
     pub normalized_stale: bool,
+    /// `session.repo.remote_url` (canonical `host/path`), for repo identity.
+    pub git_remote_url: Option<String>,
+    /// `session.repo.root_commit`, for repo identity.
+    pub git_root_commit: Option<String>,
 }
 
 pub fn pointer_fields(m: &Manifest) -> PointerFields {
@@ -163,5 +167,7 @@ pub fn pointer_fields(m: &Manifest) -> PointerFields {
         content_sha256: m.raw.content_sha256.clone(),
         normalized_version: normalized.map(|n| n.version),
         normalized_stale: normalized.is_some() && !m.normalized_is_current(),
+        git_remote_url: m.session.repo.as_ref().and_then(|r| r.remote_url.clone()),
+        git_root_commit: m.session.repo.as_ref().and_then(|r| r.root_commit.clone()),
     }
 }
