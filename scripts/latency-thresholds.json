@@ -195,8 +195,8 @@
       "enforcedComment": "macos-latest read 1.47-1.79 ms p99 during a 1-year prune (0.54-0.70 ms quiet); linux-x64 0.52-0.75 ms. Enforced where it is met.",
       "known": {
         "darwin-arm64": {
-          "p50": 0.336,
-          "p99": 1.527
+          "p50": 0.213,
+          "p99": 1.498
         }
       }
     },
@@ -206,12 +206,12 @@
       "enforced": false,
       "known": {
         "linux-x64": {
-          "p50": 160.448,
-          "p99": 10295.026
+          "p50": 107.688,
+          "p99": 508.777
         },
         "darwin-arm64": {
-          "p50": 286.142,
-          "p99": 10076.418
+          "p50": 133.493,
+          "p99": 787.14
         }
       }
     }
@@ -358,10 +358,6 @@
           "p50": 0.339,
           "p99": 0.39
         },
-        "prune@365d.read_during_prune": {
-          "p50": 0.394,
-          "p99": 0.768
-        },
         "list_scale@30d.list_desktop_page": {
           "p50": 2.316,
           "p99": 2.487
@@ -369,6 +365,10 @@
         "list_scale@365d.list_desktop_page": {
           "p50": 2.53,
           "p99": 2.65
+        },
+        "prune@365d.read_during_prune": {
+          "p50": 0.374,
+          "p99": 0.854
         }
       }
     },
