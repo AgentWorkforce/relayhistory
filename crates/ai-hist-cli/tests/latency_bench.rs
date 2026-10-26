@@ -1116,6 +1116,17 @@ fn prune(config: &Config) -> Value {
     ingest_stop.store(true, Ordering::Relaxed);
     let during = thread.join().unwrap();
     let ingest_during = ingester.join().unwrap();
+    // A window in which maintenance evicted nothing -- busy throughout, or
+    // waiting on an acknowledgement -- measured capture beside an idle store,
+    // which would read as retention costing nothing. The store holds expired
+    // sessions whenever its history is longer than the retention, so that is
+    // a failed run, not a fast one.
+    if config.days > config.retain_days {
+        assert!(
+            maintenance["rows"].as_u64().unwrap_or(0) > 0,
+            "retention maintenance evicted nothing in its window: {maintenance}"
+        );
+    }
 
     json!({
         "store": store_info,
