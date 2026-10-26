@@ -203,8 +203,9 @@ fn apply_batch(
         report.rows += removed;
         report.awaiting_upload_ack = removed < inspected;
         report.cycle_complete = inspected < u64::from(opts.max_rows.min(32));
-        // Drain anonymous rows too before declaring this cycle finished.
-        if report.cycle_complete {
+        // Drain full acknowledged anonymous batches, but a blocked batch must
+        // not pin the session cursor as activity and acknowledgements change.
+        if report.cycle_complete || report.awaiting_upload_ack {
             conn.execute("DELETE FROM retention_sweep", [])
                 .map_err(Error::sql)?;
         }

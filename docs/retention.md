@@ -87,6 +87,9 @@ retains the activity timestamp even after its last timestamped event was
 removed, and a persistent sweep cursor resumes across process restarts. A
 changed policy or new activity is checked again before further deletion.
 Anonymous prompt-log rows use their own timestamps and acknowledged revisions.
+If anonymous cleanup awaits upload, the session sweep resets so other sessions
+can still expire as they age or their acknowledgements advance. Full acknowledged
+anonymous batches continue draining without restarting the session scan.
 
 Batches have a persisted 100 ms cooldown by default. `deferred` means the host
 should schedule its next invocation after that delay. This prevents a tight
