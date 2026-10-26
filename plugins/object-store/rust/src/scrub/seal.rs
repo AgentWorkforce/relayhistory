@@ -9,6 +9,7 @@
 use bytes::Bytes;
 
 use super::{ScrubbedChunk, RULESET, RULESET_VERSION};
+use crate::manifest::{client::record_scrub, client::NewChunk, Raw};
 use crate::{
     codec, Error, Metadata, ObjectKey, ObjectStore, PutAck, PutOpts, Result, CONTENT_TYPE_ZSTD,
 };
@@ -128,6 +129,33 @@ impl SealedChunk {
     pub fn scrub(&self) -> (&'static str, u32) {
         (RULESET, RULESET_VERSION)
     }
+
+    /// The manifest chunk for this sealed chunk, whose source range starts at
+    /// `start_offset`: source fields from the unscrubbed input, stored fields
+    /// from the upload. Pass it to `manifest::client::plan_chunks`, after
+    /// [`record_sealed_scrub`]. `first_ts`/`last_ts` are left for the caller.
+    pub fn new_chunk(&self, start_offset: u64) -> NewChunk {
+        NewChunk {
+            start_offset,
+            bytes: self.source_bytes,
+            stored_bytes: self.stored_bytes(),
+            sha256: self.source_sha256.clone(),
+            stored_sha256: self.stored_sha256.clone(),
+            stored_raw_bytes: Some(self.stored_raw_bytes),
+            raw_sha256: Some(self.raw_sha256.clone()),
+            records: Some(self.records),
+            first_ts: None,
+            last_ts: None,
+        }
+    }
+}
+
+/// Record the scrub contract of chunks sealed by this build on `raw`. Call it
+/// in the same manifest update as, or before, the first chunk it covers: the
+/// marker may not be added once unscrubbed chunks are listed
+/// (`manifest::client::record_scrub`).
+pub fn record_sealed_scrub(raw: &mut Raw) -> Result<()> {
+    record_scrub(raw, RULESET, RULESET_VERSION)
 }
 
 /// Upload a sealed raw chunk, create-only. A retry that finds identical

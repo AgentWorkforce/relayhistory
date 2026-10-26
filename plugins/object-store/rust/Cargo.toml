@@ -83,3 +83,7 @@ opt-level = 3
 
 [profile.dev.package.fancy-regex]
 opt-level = 3
+
+[[test]]
+name = "sealed_flow"
+required-features = ["scrub"]

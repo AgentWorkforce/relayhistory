@@ -117,9 +117,10 @@ pub struct NewChunk {
     pub sha256: String,
     pub stored_sha256: String,
     /// Uncompressed length and SHA-256 of the scrubbed records that were
-    /// stored. The scrubber, `scrub::scrub_chunk` behind the `scrub`
-    /// feature, arrives with relayhistory#550. Required once the manifest
-    /// carries `raw.scrub`.
+    /// stored. Required once the manifest carries `raw.scrub`. With the
+    /// `scrub` feature, build the whole `NewChunk` from a sealed chunk with
+    /// `scrub::seal::SealedChunk::new_chunk`, which fills source and stored
+    /// fields from the right values.
     pub stored_raw_bytes: Option<u64>,
     pub raw_sha256: Option<String>,
     pub records: Option<u64>,
