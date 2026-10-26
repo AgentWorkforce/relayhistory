@@ -39,6 +39,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+pub(crate) mod v2;
 
 /// The session record itself: identity, delegation, working directory.
 #[derive(Debug, Clone, Default)]
@@ -194,7 +195,7 @@ pub(crate) fn load_from_sqlite(
 ) -> Result<Option<OpencodeSession>> {
     super::check_capture_cancelled()?;
     let Some(info) = read_session_info(src, session_id)? else {
-        return Ok(None);
+        return v2::load(src, session_id);
     };
     let messages = read_session_messages(src, session_id)?;
     let parts_by_message = read_session_parts(src, session_id, &messages)?;
@@ -204,14 +205,11 @@ pub(crate) fn load_from_sqlite(
 /// The `session` row for `session_id`, or `None` when the store has no such
 /// session (or no `session.id` column to find it by).
 fn read_session_info(src: &Connection, session_id: &str) -> Result<Option<OpencodeSessionInfo>> {
-    let session_columns = table_columns(src, "session")?;
+    let (session_columns, sql) = v2::v1_sessions(src)?;
     if !session_columns.contains("id") {
         return Ok(None);
     }
-    let sql = format!(
-        "SELECT {} FROM session WHERE id = ?",
-        OpencodeSessionInfo::columns(&session_columns)
-    );
+    let sql = format!("{sql} AND id = ?");
     let info = src
         .query_row(&sql, [session_id], OpencodeSessionInfo::from_row)
         // `optional()`, not `.ok()`. A failed query is not an absent session:
@@ -426,14 +424,10 @@ pub(crate) fn load_all_from_sqlite(src: &Connection) -> Result<OpencodeStoreLoad
     // some of its session's rows have already been collected, and a session
     // read in part is not a session read.
     let mut failed: BTreeMap<String, String> = BTreeMap::new();
-    let session_columns = table_columns(src, "session")?;
+    let (session_columns, sql) = v2::v1_sessions(src)?;
     if !session_columns.contains("id") {
-        return Ok(load);
+        return v2::load_owned(src, load);
     }
-    let sql = format!(
-        "SELECT {} FROM session WHERE id IS NOT NULL AND id <> ''",
-        OpencodeSessionInfo::columns(&session_columns)
-    );
     // Mapped one row at a time. A value the mapping cannot take is one
     // session's problem; failing to *step* the statement is the store's, and
     // that still propagates.
@@ -593,7 +587,7 @@ pub(crate) fn load_all_from_sqlite(src: &Connection) -> Result<OpencodeStoreLoad
         .into_iter()
         .map(|(session_id, error)| OpencodeSessionFailure { session_id, error })
         .collect();
-    Ok(load)
+    v2::load_owned(src, load)
 }
 
 /// Whether the OpenCode store at `store` holds `session_id` — the question
@@ -608,7 +602,7 @@ pub(crate) fn sqlite_store_holds_session(store: &Path, session_id: &str) -> Resu
     let held = src
         .prepare("SELECT 1 FROM session WHERE id = ?")?
         .exists([session_id])?;
-    Ok(held)
+    Ok(held || v2::owns(&src, session_id)?)
 }
 
 /// Whether `columns` holds every one of `names`: the columns a loader reads.
@@ -1181,10 +1175,10 @@ fn pick_target(name: &str, input: &Value) -> Option<String> {
         "read" | "write" | "edit" => field("filePath")
             .or_else(|| field("file_path"))
             .or_else(|| field("path")),
-        "bash" => field("command"),
+        "bash" | "shell" => field("command"),
         "grep" | "glob" => field("pattern"),
         "webfetch" => field("url"),
-        "task" => field("subagent_type")
+        "task" | "subagent" => field("subagent_type")
             .or_else(|| field("description"))
             .or_else(|| field("prompt")),
         _ => field("filePath")

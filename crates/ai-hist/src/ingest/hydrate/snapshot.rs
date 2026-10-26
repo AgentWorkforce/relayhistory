@@ -135,8 +135,13 @@ fn opencode_store_snapshot(
         &path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
     )?;
+    // OpenCode 2 stamps its own row: `session_v2` carries both times.
+    let table = match crate::ingest::opencode::v2::owns(&src, &options.session_id)? {
+        true => "session_v2",
+        false => "session",
+    };
     let columns = src
-        .prepare("SELECT name FROM pragma_table_info('session')")?
+        .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))?
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<std::collections::BTreeSet<_>>>()?;
     let created = if columns.contains("time_created") {
@@ -151,7 +156,7 @@ fn opencode_store_snapshot(
     };
     let stamp_sql = format!(
         "SELECT printf('%lld:%lld', COALESCE({created}, 0), \
-            COALESCE({updated}, {created}, 0)) FROM session WHERE id = ?"
+            COALESCE({updated}, {created}, 0)) FROM {table} WHERE id = ?"
     );
     let stamp = src
         .query_row(&stamp_sql, [&options.session_id], |row| {

@@ -8,6 +8,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- OpenCode 2 sessions are discovered, synced and hydrated from its `session_v2` and `session_message` tables, including V1 sessions resumed under OpenCode 2; sessions OpenCode 2 only migrated keep reading from the V1 tables unchanged.
 - The object-storage plugin can scrub PII and secrets, including PGP private keys, card numbers and phone numbers, from raw session chunks before upload (`scrub::scrub_chunk`, called by the delivery worker), using the same rules as the hosted service.
 
 ### Rust API

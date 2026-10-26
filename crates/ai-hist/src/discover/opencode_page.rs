@@ -142,6 +142,145 @@ pub(super) fn opencode_sqlite_model(
     Ok(model)
 }
 
+/// [`opencode_sqlite_title`] for a session OpenCode 2 owns.
+pub(super) fn opencode_v2_title(
+    snapshot: &OpencodeReadSnapshot,
+    locator: &str,
+) -> Result<Option<String>> {
+    let raw: Option<String> = snapshot
+        .conn
+        .prepare_cached("SELECT title FROM session_v2 WHERE id = ?")?
+        .query_row([locator], |row| row.get(0))
+        .optional()?
+        .flatten();
+    Ok(crate::ingest::titles::opencode_title(raw.as_deref()))
+}
+
+/// [`opencode_sqlite_prompt`] for a session OpenCode 2 owns: its first
+/// `user` message's text, cut in SQL. `session_message` is indexed by
+/// session, so this is one seek.
+pub(super) fn opencode_v2_prompt(
+    scan: &ScanEnv<'_>,
+    snapshot: &OpencodeReadSnapshot,
+    locator: &str,
+) -> Result<Option<String>> {
+    scan.note_query();
+    let prompt = snapshot
+        .conn
+        .prepare_cached(
+            "SELECT substr(json_extract(data, '$.text'), 1, ?) FROM session_message \
+             WHERE session_id = ? AND type = 'user' AND json_valid(data) \
+             AND json_type(data, '$.text') = 'text' \
+             AND trim(substr(json_extract(data, '$.text'), 1, ?), ?) <> '' \
+             ORDER BY seq ASC LIMIT 1",
+        )?
+        .query_row(
+            params![
+                EXCERPT_MAX_CHARS as i64,
+                locator,
+                EXCERPT_MAX_CHARS as i64,
+                EXCERPT_TRIM_WHITESPACE
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    scan.note_records(u64::from(prompt.is_some()));
+    Ok(prompt
+        .map(|text| excerpt(&text))
+        .filter(|text| !text.is_empty()))
+}
+
+/// [`opencode_sqlite_model`] for a session OpenCode 2 owns: the first
+/// assistant message's `model`, which OpenCode 2 nests as `{providerID, id}`.
+pub(super) fn opencode_v2_model(
+    scan: &ScanEnv<'_>,
+    snapshot: &OpencodeReadSnapshot,
+    locator: &str,
+) -> Result<Option<String>> {
+    scan.note_query();
+    let model = snapshot
+        .conn
+        .prepare_cached(
+            "SELECT json_extract(data, '$.model.providerID'), json_extract(data, '$.model.id') \
+             FROM session_message WHERE session_id = ? AND type = 'assistant' \
+             AND json_valid(data) \
+             AND (NULLIF(json_extract(data, '$.model.providerID'), '') IS NOT NULL \
+                  OR NULLIF(json_extract(data, '$.model.id'), '') IS NOT NULL) \
+             ORDER BY seq ASC LIMIT 1",
+        )?
+        .query_row(params![locator], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
+        })
+        .optional()?
+        .and_then(|(provider, model)| {
+            crate::ingest::opencode::build_model(provider.as_deref(), model.as_deref())
+        });
+    scan.note_records(u64::from(model.is_some()));
+    Ok(model)
+}
+
+/// The shallow read's prompt, title and model, from whichever envelope owns
+/// the session.
+pub(super) fn opencode_shallow_fields(
+    scan: &ScanEnv<'_>,
+    snapshot: &OpencodeReadSnapshot,
+    locator: &str,
+) -> Result<(Option<String>, Option<String>, Option<String>)> {
+    if snapshot.v2 && crate::ingest::opencode::v2::owns(&snapshot.conn, locator)? {
+        return Ok((
+            opencode_v2_prompt(scan, snapshot, locator)?,
+            opencode_v2_title(snapshot, locator)?,
+            opencode_v2_model(scan, snapshot, locator)?,
+        ));
+    }
+    Ok((
+        opencode_sqlite_prompt(scan, snapshot, locator)?,
+        opencode_sqlite_title(snapshot, locator)?,
+        opencode_sqlite_model(scan, snapshot, locator)?,
+    ))
+}
+
+/// The session enumeration: the V1 `session` rows, or on a store with
+/// OpenCode 2 the V1 sessions it does not own and then the ones it does, in
+/// one order. Sorting that union reads every session row, which the V1-only
+/// query avoids when the provider indexes `time_updated`; session rows are
+/// small.
+pub(super) fn opencode_enumeration_sql(
+    snapshot: &OpencodeReadSnapshot,
+    [directory, created, updated]: [&str; 3],
+    recency_order: &str,
+    limit_sql: &str,
+) -> Result<String> {
+    use crate::ingest::opencode::v2;
+    let v1 = format!(
+        "SELECT id, {directory}, {created}, {updated} FROM session \
+         WHERE id IS NOT NULL AND id <> ''"
+    );
+    if !snapshot.v2 {
+        return Ok(format!("{v1} ORDER BY {recency_order}{limit_sql}"));
+    }
+    let order = match recency_order {
+        "time_updated DESC, id ASC" => "updated_ms DESC, id ASC",
+        _ => "id ASC",
+    };
+    let owned = v2::owned_sessions_sql(
+        &snapshot.conn,
+        "v.id, v.directory, v.time_created, v.time_updated",
+    )?;
+    let v1 = match snapshot.session_columns.contains("id") {
+        true => format!("{v1}{} UNION ALL ", v2::v1_exclusion(&snapshot.conn)?),
+        false => String::new(),
+    };
+    Ok(format!(
+        "SELECT id, directory, created_ms, updated_ms FROM \
+         (SELECT NULL AS id, NULL AS directory, NULL AS created_ms, NULL AS updated_ms \
+          WHERE 0 UNION ALL {v1}{owned}) ORDER BY {order}{limit_sql}"
+    ))
+}
+
 pub(super) type OpencodeSessionRow = (String, Option<String>, Option<i64>, Option<i64>);
 
 fn opencode_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OpencodeSessionRow> {

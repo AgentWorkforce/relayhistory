@@ -78,8 +78,7 @@ pub(crate) use codex_shallow::CodexProvider;
 mod cursor_files;
 mod opencode_page;
 use opencode_page::{
-    opencode_rows_unpaged, opencode_sqlite_model, opencode_sqlite_prompt, opencode_sqlite_title,
-    page_limited_opencode_rows,
+    opencode_rows_unpaged, opencode_enumeration_sql, opencode_shallow_fields, page_limited_opencode_rows,
 };
 
 /// Version of the machine-readable session-catalog contract.
@@ -2199,6 +2198,7 @@ struct OpencodeReadSnapshot {
     message_by_session: bool,
     part_by_session: bool,
     part_by_message: bool,
+    v2: bool,
     sessions: BTreeMap<String, OpencodeSessionSeed>,
 }
 
@@ -2285,6 +2285,7 @@ fn open_opencode_snapshot(scan: &ScanEnv<'_>, store: &Path) -> Result<OpencodeRe
         }
         return Ok(OpencodeReadSnapshot {
             path: store.to_path_buf(),
+            v2: crate::ingest::opencode::v2::present(&conn)?,
             conn,
             store_identity: format!("{generation_before}:{schema_version}"),
             session_columns,
@@ -2559,13 +2560,9 @@ impl ShallowSessionProvider for OpencodeProvider {
         // hold a whole pasted file, and materializing it just to take the
         // first 4096 characters would break the bounded-read promise for a
         // catalog entry.
-        let first_prompt = opencode_sqlite_prompt(scan, snapshot, &candidate.locator)?;
-        let title = opencode_sqlite_title(snapshot, &candidate.locator)?;
+        let (first_prompt, title, model) = opencode_shallow_fields(scan, snapshot, &candidate.locator)?;
         let mut models = Vec::new();
-        push_unique(
-            &mut models,
-            opencode_sqlite_model(scan, snapshot, &candidate.locator)?.as_deref(),
-        );
+        push_unique(&mut models, model.as_deref());
         Ok(Some(ShallowSession {
             source: "opencode".into(),
             session_id: candidate.locator.clone(),
@@ -2610,13 +2607,12 @@ fn unreadable_opencode_candidate(locator: &str) -> Candidate {
 
 /// Whether an earlier OpenCode store holds `session_id`, and so owns it.
 fn opencode_store_holds(snapshot: &OpencodeReadSnapshot, session_id: &str) -> Result<bool> {
-    if !snapshot.session_columns.contains("id") {
-        return Ok(false);
-    }
-    Ok(snapshot
-        .conn
-        .prepare_cached("SELECT 1 FROM session WHERE id = ?")?
-        .exists([session_id])?)
+    let v1 = snapshot.session_columns.contains("id")
+        && snapshot
+            .conn
+            .prepare_cached("SELECT 1 FROM session WHERE id = ?")?
+            .exists([session_id])?;
+    Ok(v1 || (snapshot.v2 && crate::ingest::opencode::v2::owns(&snapshot.conn, session_id)?))
 }
 
 /// The newest sessions this OpenCode store *owns*, and the seeds the shallow
@@ -2640,7 +2636,7 @@ fn enumerate_opencode_snapshot(
 ) -> Result<Vec<Candidate>> {
     snapshot.sessions.clear();
     let columns = &snapshot.session_columns;
-    if !columns.contains("id") {
+    if !columns.contains("id") && !snapshot.v2 {
         return Ok(Vec::new());
     }
     let updated = if columns.contains("time_updated") {
@@ -2681,10 +2677,8 @@ fn enumerate_opencode_snapshot(
     let limit_sql = sqlite_limit
         .map(|_| " LIMIT ? OFFSET ?")
         .unwrap_or_default();
-    let sql = format!(
-        "SELECT id, {directory}, {created}, {updated} FROM session \
-         WHERE id IS NOT NULL AND id <> '' ORDER BY {recency_order}{limit_sql}"
-    );
+    let sql =
+        opencode_enumeration_sql(snapshot, [directory, created, updated], recency_order, limit_sql)?;
     let mut stmt = snapshot.conn.prepare(&sql)?;
     let rows = match sqlite_limit {
         None => opencode_rows_unpaged(scan, &mut stmt, claimed)?,

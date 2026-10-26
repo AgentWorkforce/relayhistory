@@ -50,6 +50,12 @@ type TableAggregate = HashMap<String, (i64, Option<i64>, i64)>;
 /// they were. The columns read are the ones the loaders read; a schema
 /// without one stamps without it.
 pub(super) fn sqlite_session_stamps(src: &Connection) -> Result<Vec<SessionStampRow>> {
+    let mut stamps = v1_session_stamps(src)?;
+    stamps.extend(v2_session_stamps(src)?);
+    Ok(stamps)
+}
+
+fn v1_session_stamps(src: &Connection) -> Result<Vec<SessionStampRow>> {
     let session_columns = opencode::table_columns(src, "session")?;
     if !session_columns.contains("id") {
         return Ok(Vec::new());
@@ -58,7 +64,7 @@ pub(super) fn sqlite_session_stamps(src: &Connection) -> Result<Vec<SessionStamp
     let messages = message_aggregate(src)?;
     let parts = part_aggregate(src)?;
     let sql = format!(
-        "SELECT id, {}, {}, {}, {}, {} FROM session WHERE id IS NOT NULL AND id <> ''",
+        "SELECT id, {}, {}, {}, {}, {} FROM session WHERE id IS NOT NULL AND id <> ''{}",
         column("parent_id"),
         column("directory"),
         column("time_created"),
@@ -66,6 +72,7 @@ pub(super) fn sqlite_session_stamps(src: &Connection) -> Result<Vec<SessionStamp
         // A rename is not guaranteed to move `time_updated`, and the title
         // is a column the loaders read.
         column("title"),
+        opencode::v2::v1_exclusion(src)?,
     );
     let mut stmt = src.prepare(&sql)?;
     let rows = stmt.query_map([], |row| {
@@ -99,6 +106,60 @@ pub(super) fn sqlite_session_stamps(src: &Connection) -> Result<Vec<SessionStamp
             parts: format!("{fields:?}|m{message:?}|p{part:?}"),
             session_id,
             newest_ms,
+        });
+    }
+    Ok(stamps)
+}
+
+/// The sessions OpenCode 2 owns: the `session_v2` row's fields and one
+/// aggregate over its `session_message` rows, which carry the whole payload.
+fn v2_session_stamps(src: &Connection) -> Result<Vec<SessionStampRow>> {
+    if !opencode::v2::present(src)? {
+        return Ok(Vec::new());
+    }
+    let columns = opencode::table_columns(src, "session_v2")?;
+    let column = |name: &str| match columns.contains(name) {
+        true => format!("v.{name}"),
+        false => "NULL".to_string(),
+    };
+    let messages = aggregate(
+        src,
+        "SELECT session_id, COUNT(*), MAX(time_updated), \
+         SUM(ai_hist_fnv(id || '|' || COALESCE(CAST(time_updated AS TEXT), '') \
+             || '|' || COALESCE(octet_length(data), -1))) \
+         FROM session_message GROUP BY session_id",
+    )?;
+    let sql = opencode::v2::owned_sessions_sql(
+        src,
+        &format!(
+            "v.id, {}, v.directory, v.time_created, v.time_updated, {}",
+            column("parent_id"),
+            column("title"),
+        ),
+    )?;
+    let mut stmt = src.prepare(&sql)?;
+    let rows = stmt.query_map([], |row| {
+        let fields: [rusqlite::types::Value; 5] = [
+            row.get(1)?,
+            row.get(2)?,
+            row.get(3)?,
+            row.get(4)?,
+            row.get(5)?,
+        ];
+        Ok((row.get::<_, String>(0)?, fields))
+    })?;
+    let mut stamps = Vec::new();
+    for row in rows {
+        let (session_id, fields) = row?;
+        let message = messages.get(&session_id).copied().unwrap_or_default();
+        let row_ms = match fields[3] {
+            rusqlite::types::Value::Integer(ms) => Some(ms),
+            _ => None,
+        };
+        stamps.push(SessionStampRow {
+            parts: format!("v2|{fields:?}|m{message:?}"),
+            newest_ms: row_ms.max(message.1).unwrap_or_default(),
+            session_id,
         });
     }
     Ok(stamps)
