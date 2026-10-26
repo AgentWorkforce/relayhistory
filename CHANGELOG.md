@@ -8,6 +8,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Local history retention defaults to 30 days, supports configurable limits or forever, and evicts in maintenance batches while protecting unuploaded logs and preserving cloud copies.
 - Kilo CLI history is discoverable and searchable from its native session database, preserving recorded messages, tool results and session rewrites.
 - DeepAgents Code history is discoverable and searchable from native root checkpoints and message writes, including recorded tools, message revisions and compaction.
 - Cline core history is discoverable and searchable from canonical message snapshots, preserving recorded messages, tool identities and rewritten conversations.
@@ -40,6 +41,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Rust API
 
 - Added `SessionStore::session_profile`, `SessionProfile`, and `SessionAvatar` for locally observed Grok Bot names, avatar shapes, colors, and inline raster images without transcript hydration or network access.
+- Added local `retention` policy read/write APIs and `SessionStore` maintenance and upload-acknowledgement methods; maintenance must be scheduled by the host.
 - Added `Reconciliation::healthy_pass_exhausted` and `refresh_healthy_pass` for revisiting healthy roots without discarding unresolved enumeration failures.
 - Added `SyncOptions::paths` for exact-path capture.
 - Added `DiscoveryOptions::paths` for exact-path shallow discovery.
