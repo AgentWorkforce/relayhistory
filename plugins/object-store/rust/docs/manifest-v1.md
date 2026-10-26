@@ -3,6 +3,9 @@
 - **Status:** Proposed (draft for review). The ownership model (two writers,
   each owning its own sections) was decided by Khaliq on 2026-10-25. The epoch
   rule and chunk fields are still pending review.
+- **Implementations:** Rust `relayhistory_object_store::manifest` (types,
+  validation, `update_manifest`, client and server helpers); TypeScript
+  `parseManifest` in relayhistory-cloud's `@relayhistory/object-store`.
 - **Object:** `{prefix}/v1/ws={workspace_id}/m={machine_id}/h={harness}/d={yyyy}/{mm}/{dd}/s={session_id}/manifest.json`,
   built by `layout::SessionLocation::manifest()`
 - **Writers:** two of them, each owning its own sections
@@ -30,6 +33,11 @@ Each writer owns some fields outright and may change only those. Every write
 copies the other writer's sections, and **any field the writer does not
 recognize**, through byte-for-byte unchanged. A writer never rebuilds the
 manifest from scratch; it always edits the copy it just read.
+
+To delete an unrecognized field in a section it owns, a writer must name it
+explicitly (in the Rust helper, the edit's `remove` list). A field that is
+merely absent from the writer's copy, or has a `null` value, is carried
+through unchanged.
 
 | Fields | Owner | Notes |
 | ------ | ----- | ----- |
@@ -261,7 +269,8 @@ On every read before a write, the client classifies the remote copy:
 | `raw.owner != self` | Another instance took over (reinstall, new machine identity) | **Fenced.** Stop writing this session, mark it read-only locally and report it. Never write `raw` again. |
 | `revision < ack.revision`, or `raw.chunk_count < ack.chunk_count`, or `ack.content_sha256` is not on the remote hash chain at position `ack.chunk_count` | The manifest went backwards: restored from backup, or corrupted | **Stop and alert** (`ManifestRolledBack`). Do not overwrite. |
 | `raw` identical to `ack` (only `server` / `revision` moved) | The server wrote | Re-apply and continue. |
-| `raw` extends `ack` and this instance is the owner | Its own earlier write that it did not see acknowledged, e.g. a crash after the PUT | Adopt it as the new `ack` and append only what is missing. |
+| `raw.epoch < ack.epoch` | The manifest went backwards | **Stop and alert**, as above. |
+| `raw` extends `ack` (more chunks and/or a newer epoch, even with no new chunks) and this instance is the owner | Its own earlier write that it did not see acknowledged, e.g. a crash after the PUT | Adopt it as the new `ack`, including the epoch, and append only what is missing. Never open the epoch a second time. |
 
 **Ownership transfer.** A new client instance takes over only through an
 explicit takeover write: it sets `raw.owner` to itself under compare-and-swap,
@@ -292,9 +301,11 @@ section, and it recomputes that section from the copy it just read.
   `raw.updated_at`, and the next server write returns `lifecycle` to
   `"active"`. The server never needs to coordinate with the client to do this.
 - **`normalized_version` is current** only when
-  `server.normalized.source_content_sha256 == raw.content_sha256`. Otherwise
-  the pointer row carries the version with `normalized_stale = true` until the
-  rebuild lands.
+  `server.normalized.source_content_sha256 == raw.content_sha256` **and**
+  `server.normalized.source_epoch == raw.epoch`. Opening an epoch adds no chunk
+  until the source has new bytes, so the digest alone cannot show that the
+  output belongs to the previous epoch. Otherwise the pointer row carries the
+  version with `normalized_stale = true` until the rebuild lands.
 
 ## Client offline for days
 
@@ -383,11 +394,18 @@ There are two independent fences.
    payload, and applies it only if it is newer:
 
    ```sql
+   -- Conflict key as in relayhistory-cloud#171's session_index:
+   -- (org, workspace, harness, session_id, machine_id).
    insert into sessions (...) values (...)
-   on conflict (workspace_id, session_id, harness)
+   on conflict (org_id, workspace_id, harness, session_id, machine_id)
    do update set ...
    where excluded.manifest_revision > sessions.manifest_revision;
    ```
+
+   `machine_id` is part of the key because the same harness session id can
+   occur on two machines. Each machine has its own manifest under its own
+   `m=` prefix and its own `revision` sequence, so revisions are compared only
+   within one machine's row.
 
    `revision` is global across both writers and strictly increasing, so one
    fence covers both. A stale event is a no-op.
@@ -406,7 +424,7 @@ There are two independent fences.
 | `raw_bytes`, `stored_bytes`, `chunk_count`, `raw_epoch` | `raw.raw_bytes`, `raw.stored_bytes`, `raw.chunk_count`, `raw.epoch` |
 | `content_sha256` | `raw.content_sha256` |
 | `normalized_version` | `server.normalized.version`, or `null` |
-| `normalized_stale` | `server.normalized.source_content_sha256 != raw.content_sha256` |
+| `normalized_stale` | `normalized` exists and is not current (digest or epoch differs) |
 | `lifecycle` | `server.lifecycle`, or `"active"` when `server` is `null` |
 
 ## Example
