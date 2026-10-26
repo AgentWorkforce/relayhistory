@@ -123,6 +123,26 @@ A row budget bounds work, not milliseconds: payload sizes and storage latency
 vary. W0 owns the desktop end-to-end 5 ms gate; this change supplies focused
 local measurements and the held-writer read-concurrency test.
 
+`SessionStore::retention_generation()` returns a durable `u64` local cache
+invalidation token. `read_retention_generation(&Path)` reads the same value
+without opening a writable store. Missing settings tables/keys in older stores
+read as zero; neither reader migrates or initializes anything. Other database
+and malformed-value errors propagate.
+
+Each committed batch that deletes payload/auxiliary rows or catalog/presence
+rows advances `store_settings['retention.catalog_generation']` exactly once
+in the same IMMEDIATE transaction. This conservatively invalidates catalogs
+even for partial evidence eviction. No-op, upload-blocked, cooldown and
+cursor-only maintenance do not advance it. It is independent of batch times,
+so batches supplied the same time still have distinct generations. A malformed
+or exhausted counter aborts and rolls back the entire batch.
+
+Clients retaining catalog rows or facets should compare this token alongside
+the normal feed position and store epoch, rebuilding their local cache when it
+changes. The token tracks retention eviction only, not ordinary mutations or
+store replacement; a generation alone is not a store identity. No query scans
+or idle cache rebuilds are needed while the token is unchanged.
+
 As with `forget_evidence`, eviction deletes its own change-feed tombstones
 **in the same transaction**, before any uploader can see them. Earlier
 ordinary deletion tombstones are preserved. Local retention therefore does

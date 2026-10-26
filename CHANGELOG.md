@@ -38,6 +38,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Rust API
 
+- Added `SessionStore::retention_generation` and `retention::read_retention_generation` so retained catalogs can invalidate after committed local eviction without uploading deletion records.
 - Added local `retention` policy read/write APIs and `SessionStore` maintenance and upload-acknowledgement methods; maintenance must be scheduled by the host.
 - Added `Reconciliation::healthy_pass_exhausted` and `refresh_healthy_pass` for revisiting healthy roots without discarding unresolved enumeration failures.
 - Added `SyncOptions::paths` for exact-path capture.

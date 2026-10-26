@@ -47,6 +47,7 @@ pub ai_hist::retention::RetentionReport::rows: u64
 pub ai_hist::retention::RetentionReport::sessions: u64
 pub const ai_hist::retention::DEFAULT_RETENTION_DAYS: u32
 pub const ai_hist::retention::RETENTION_CONFIG_KEY: &str
+pub fn ai_hist::retention::read_retention_generation(&std::path::Path) -> core::result::Result<u64, ai_hist::Error>
 pub fn ai_hist::retention::read_retention_policy(&std::path::Path) -> core::result::Result<ai_hist::retention::RetentionPolicy, ai_hist::Error>
 pub fn ai_hist::retention::write_retention_policy(&std::path::Path, ai_hist::retention::RetentionPolicy) -> core::result::Result<(), ai_hist::Error>
 #[non_exhaustive] pub enum ai_hist::BlockKind
@@ -819,6 +820,7 @@ pub fn ai_hist::SessionStore::acknowledge_retention(&self, &str, ai_hist::Waterm
 pub fn ai_hist::SessionStore::prune_expired(&self, ai_hist::retention::RetentionOptions) -> core::result::Result<ai_hist::retention::RetentionReport, ai_hist::Error>
 pub fn ai_hist::SessionStore::register_retention_consumer(&self, &str) -> core::result::Result<(), ai_hist::Error>
 pub fn ai_hist::SessionStore::remove_retention_consumer(&self, &str) -> core::result::Result<(), ai_hist::Error>
+pub fn ai_hist::SessionStore::retention_generation(&self) -> core::result::Result<u64, ai_hist::Error>
 pub fn ai_hist::SessionStore::retention_policy(&self) -> core::result::Result<ai_hist::retention::RetentionPolicy, ai_hist::Error>
 pub fn ai_hist::SessionStore::set_retention_policy(&self, ai_hist::retention::RetentionPolicy) -> core::result::Result<(), ai_hist::Error>
 impl ai_hist::SessionStore

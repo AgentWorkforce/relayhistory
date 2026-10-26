@@ -52,7 +52,9 @@ pub(super) fn run(
         });
     }
     let head = crate::change_feed::read_head(&tx).map_err(Error::query)?;
-    let report = apply_batch(&tx, &plan, opts, now)?;
+    let (report, catalog_changed) = apply_batch(&tx, &plan, opts, now)?;
+    super::generation::advance_if_evicted(&tx, report.rows, catalog_changed)
+        .map_err(Error::query)?;
     // This IMMEDIATE transaction is the sole writer since head was read.
     // Exactly its eviction tombstones are removed; older real deletions stay.
     suppress_tombstones(&tx, head.revision as i64).map_err(Error::query)?;
@@ -154,13 +156,13 @@ fn process_session(
     floor: i64,
     opts: &RetentionOptions,
     report: &mut RetentionReport,
-) -> Result<bool, Error> {
+) -> Result<(bool, bool), Error> {
     if !targets::expired(conn, key, cutoff).map_err(Error::query)? {
-        return Ok(true);
+        return Ok((true, false));
     }
     if !opts.allow_unuploaded && !targets::uploaded(conn, key, floor).map_err(Error::query)? {
         report.protected_sessions += 1;
-        return Ok(true);
+        return Ok((true, false));
     }
     evict(conn, key, opts.max_rows as u64, report).map_err(Error::query)
 }
@@ -170,20 +172,27 @@ fn apply_batch(
     plan: &Plan,
     opts: &RetentionOptions,
     now: i64,
-) -> Result<RetentionReport, Error> {
+) -> Result<(RetentionReport, bool), Error> {
     let head = crate::change_feed::read_head(conn).map_err(Error::query)?;
     let floor = upload_floor(conn, head.epoch).map_err(Error::query)?;
     if !opts.allow_unuploaded && floor.is_none() {
-        return Ok(RetentionReport {
-            awaiting_upload_ack: true,
-            ..Default::default()
-        });
+        return Ok((
+            RetentionReport {
+                awaiting_upload_ack: true,
+                ..Default::default()
+            },
+            false,
+        ));
     }
     let cutoff = now.saturating_sub(i64::from(plan.days.get()) * DAY_MS);
     let mut report = RetentionReport::default();
+    let mut catalog_changed = false;
     if let Some(key) = &plan.candidate {
-        if !process_session(conn, key, cutoff, floor.unwrap_or(0), opts, &mut report)? {
-            return Ok(report);
+        let (complete, changed) =
+            process_session(conn, key, cutoff, floor.unwrap_or(0), opts, &mut report)?;
+        catalog_changed = changed;
+        if !complete {
+            return Ok((report, catalog_changed));
         }
     }
     if let Some(key) = &plan.scanned_through {
@@ -210,7 +219,7 @@ fn apply_batch(
                 .map_err(Error::sql)?;
         }
     }
-    Ok(report)
+    Ok((report, catalog_changed))
 }
 
 fn busy(error: &rusqlite::Error) -> bool {
@@ -236,35 +245,38 @@ pub(super) fn evict(
     key: &targets::Key,
     budget: u64,
     report: &mut RetentionReport,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<(bool, bool)> {
     if let Some(activity) = targets::activity(conn, key)? {
         conn.execute("INSERT INTO retention_pending VALUES (?1,?2,?3) ON CONFLICT(source,session_id) DO UPDATE SET last_activity_ms=MAX(last_activity_ms,excluded.last_activity_ms)", params![key.0,key.1,activity])?;
     }
     let mut remaining = budget;
     for (table, _) in targets::PAYLOADS {
         if !delete_part(conn, table, "session_id", key, &mut remaining, report)? {
-            return Ok(false);
+            return Ok((false, false));
         }
     }
     for (table, column) in AUXILIARY {
         if !delete_part(conn, table, column, key, &mut remaining, report)? {
-            return Ok(false);
+            return Ok((false, false));
         }
     }
     if key.0 == "grok" && !delete_grok_state(conn, key, &mut remaining, report)? {
-        return Ok(false);
+        return Ok((false, false));
     }
     // Only fixed-size catalog/presence rows remain. All potentially large
     // trigger cascades were drained above. Keep user tags/commit links and
     // provider byte cursors: they are not session logs.
+    let mut catalog_changed = false;
     for table in ["sessions", "session_presences", "retention_pending"] {
-        conn.prepare_cached(&format!(
-            "DELETE FROM {table} WHERE source=?1 AND session_id=?2"
-        ))?
-        .execute(params![key.0, key.1])?;
+        let removed = conn
+            .prepare_cached(&format!(
+                "DELETE FROM {table} WHERE source=?1 AND session_id=?2"
+            ))?
+            .execute(params![key.0, key.1])?;
+        catalog_changed |= table != "retention_pending" && removed > 0;
     }
     report.sessions += 1;
-    Ok(true)
+    Ok((true, catalog_changed))
 }
 
 const AUXILIARY: &[(&str, &str)] = &[
