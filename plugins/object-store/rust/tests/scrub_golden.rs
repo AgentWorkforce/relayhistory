@@ -28,6 +28,8 @@ struct Vector {
     output_masked: Option<String>,
     output_sha256: Option<String>,
     output_utf16_len: Option<usize>,
+    /// The sensitive part: no 6-character window of it may survive.
+    secret_masked: Option<String>,
 }
 
 /// `prefix + unit * count + suffix`, or the concatenation of each masked
@@ -92,6 +94,14 @@ fn every_golden_vector_matches_the_reference() {
             }
             _ => panic!("{}: no expectation", v.id),
         };
+        if let Some(window) = v
+            .secret_masked
+            .as_deref()
+            .map(unmask)
+            .and_then(|secret| leaked(&got, &secret))
+        {
+            failures.push(format!("{}: fragment {window:?} survived", v.id));
+        }
         if !ok {
             failures.push(format!(
                 "{}: input {:?}\n    expected {:?}\n    got      {:?}",
@@ -116,6 +126,15 @@ fn every_golden_vector_matches_the_reference() {
         f.vectors.len(),
         failures.join("\n")
     );
+}
+
+/// The first 6-character window of `secret` (without a newline) found in `out`.
+fn leaked(out: &str, secret: &str) -> Option<String> {
+    let chars: Vec<char> = secret.chars().collect();
+    chars
+        .windows(6)
+        .map(|w| w.iter().collect::<String>())
+        .find(|w| !w.contains('\n') && out.contains(w.as_str()))
 }
 
 fn unmask(masked: &str) -> String {

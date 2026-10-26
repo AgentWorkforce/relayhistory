@@ -33,7 +33,6 @@ pub const RULESET_VERSION: u32 = 1;
 /// Longest string scrubbed in full, in UTF-16 code units (the reference
 /// counts JavaScript string length). Longer strings are truncated first.
 pub const MAX_SCRUB_CHARS: usize = 262_144;
-const SCRUB_CUT_REWIND: usize = 62_144;
 const TRUNCATION_NOTE: &str = "[relayhistory: truncated";
 /// Replaces a string the rules could not finish within their budget.
 pub const SCRUB_LIMIT_PLACEHOLDER: &str = "[REDACTED: relayhistory scrub limit]";
@@ -102,29 +101,27 @@ fn utf16_len(s: &str) -> usize {
     s.chars().map(char::len_utf16).sum()
 }
 
-/// Port of `boundForScrub`: cut over-long input at whitespace (within the
-/// rewind window), never between the halves of a surrogate pair, never inside
-/// a private-key block the cut would leave without its footer, and announce
-/// the truncation in band.
+/// Port of `boundForScrub`: cut over-long input only right after whitespace,
+/// rewinding as far as needed, so a secret is either wholly kept (and then
+/// scrubbed) or wholly dropped. A run with no whitespace before the limit
+/// (minified JSON, a base64 dump) is dropped whole: a credential can sit
+/// anywhere in it. A private-key block the cut leaves without its footer is
+/// withheld from its header on, since the PEM rule needs both delimiters. The
+/// truncation is announced in band.
+///
+/// Every JavaScript whitespace unit is in the BMP, so a cut after one never
+/// splits a surrogate pair.
 fn bound_for_scrub(value: &str) -> Cow<'_, str> {
     if value.len() <= MAX_SCRUB_CHARS || utf16_len(value) <= MAX_SCRUB_CHARS {
         return Cow::Borrowed(value);
     }
     let units: Vec<u16> = value.encode_utf16().collect();
     let mut cut = MAX_SCRUB_CHARS;
-    let floor = MAX_SCRUB_CHARS - SCRUB_CUT_REWIND;
-    while cut > floor && !is_js_ws_unit(units[cut - 1]) {
+    while cut > 0 && !is_js_ws_unit(units[cut - 1]) {
         cut -= 1;
     }
-    let is_high = |u: u16| (0xD800..=0xDBFF).contains(&u);
-    let is_low = |u: u16| (0xDC00..=0xDFFF).contains(&u);
-    if is_high(units[cut - 1]) && units.get(cut).copied().is_some_and(is_low) {
-        cut -= 1;
-    }
-    // The cut never splits a surrogate pair, so this is exact.
+    // `cut` follows a BMP whitespace unit (or is 0), so this is exact.
     let mut kept = String::from_utf16_lossy(&units[..cut]);
-    // A private key spans lines, so the rewind can keep its header and body
-    // but drop its footer; the PEM rule needs both. Withhold the block.
     if let Some(start) = unclosed_private_key_start(&kept) {
         kept.truncate(start);
     }
@@ -310,6 +307,18 @@ mod tests {
         assert_eq!(scrub_json(v).unwrap(), serde_json::json!({"~/x": 1}));
         let collide = br#"{"/home/a/x":1,"/home/b/x":2}"#;
         assert_eq!(scrub_record(collide), Err(Dropped::KeyCollision));
+    }
+
+    #[test]
+    fn a_record_split_across_chunks_is_withheld_not_passed_through() {
+        let record = br#"{"m":"key sk-abcdefghijklmnopqrstuvwxyz0123"}"#;
+        let (a, b) = record.split_at(20);
+        for half in [a, b] {
+            let out = scrub_chunk(half);
+            let text = String::from_utf8(out.bytes).unwrap();
+            assert!(text.contains("unparseable_record"), "{text}");
+            assert!(!text.contains("sk-") && !text.contains("lmnop"), "{text}");
+        }
     }
 
     #[test]
