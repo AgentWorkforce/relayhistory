@@ -156,6 +156,11 @@ runs all twelve against a real bucket with ambient credentials when
 
 - `FsStore`'s compare-and-swap lock is a host-local `flock`; do not share one
   directory between hosts over NFS.
+- `FsStore` refuses keys that traverse a symbolic link, checked when each
+  operation starts (and again at multipart commit). A concurrent writer
+  inside the root could still swap a directory for a link between the check
+  and the open, so the root must not be shared with untrusted writers.
+- Metadata values may not start or end with a space (HTTP strips them).
 - `FsStore::presign_get` returns a `file://` URL and cannot enforce the TTL.
 - GCS presigning needs a service-account key or ambient credentials with
   `iam.serviceAccounts.signBlob`; a vended bearer token alone returns

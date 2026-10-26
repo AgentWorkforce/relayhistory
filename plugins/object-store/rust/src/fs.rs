@@ -209,6 +209,40 @@ impl Backend for FsBackend {
         Ok(result)
     }
 
+    /// A symbolic link anywhere under the root could point a valid key at
+    /// any file on the host, so the store never traverses one: every component
+    /// of the object path and of its sidecar path is `lstat`ed first.
+    ///
+    /// Threat model: this rejects links that exist when an operation starts
+    /// (or, for multipart, again at commit). It cannot stop a concurrent
+    /// actor who can write inside the root from swapping a checked directory
+    /// for a link between the check and the open, because the underlying
+    /// `LocalFileSystem` opens by path. Closing that race needs
+    /// directory-relative `openat(O_NOFOLLOW)` access throughout; until then,
+    /// treat the root as trusted (same-user, not shared with untrusted
+    /// writers).
+    async fn check_key(&self, key: &crate::ObjectKey) -> Result<()> {
+        let root = self.root.clone();
+        let segments: Vec<String> = key.as_str().split('/').map(str::to_string).collect();
+        let key = key.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut sidecar = vec![RESERVED_DIR.to_string(), "meta".to_string()];
+            sidecar.extend(segments.iter().cloned());
+            if let Some(last) = sidecar.last_mut() {
+                last.push_str(".json");
+            }
+            for path in [segments, sidecar] {
+                no_symlink_under(&root, &path, &key)?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Backend {
+            backend: "fs",
+            source: Box::new(e),
+        })?
+    }
+
     async fn metadata_of_get(
         &self,
         path: &Path,
@@ -242,6 +276,7 @@ impl Backend for FsBackend {
     ) -> BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
         let listing = self.store.list(Some(prefix));
         let offset = offset.cloned();
+        let root = self.root.clone();
         futures::stream::once(async move {
             let mut all: Vec<_> = listing
                 .try_filter(|m| {
@@ -251,6 +286,19 @@ impl Backend for FsBackend {
                 })
                 .try_collect()
                 .await?;
+            // `LocalFileSystem::list` follows symbolic links below the prefix;
+            // drop every entry whose path traverses one, so a listing never
+            // exposes names or metadata from outside the root.
+            all = tokio::task::spawn_blocking(move || {
+                all.retain(|m| {
+                    let segments: Vec<String> =
+                        m.location.parts().map(|p| p.as_ref().to_string()).collect();
+                    no_symlink_under(&root, &segments, m.location.as_ref()).is_ok()
+                });
+                all
+            })
+            .await
+            .map_err(|e| generic(e.into()))?;
             all.sort_by(|a, b| a.location.cmp(&b.location));
             Ok::<_, object_store::Error>(futures::stream::iter(all.into_iter().map(Ok)))
         })
@@ -286,6 +334,9 @@ impl Backend for FsBackend {
         result: &PutResult,
         metadata: &Metadata,
     ) -> Result<()> {
+        // Re-check right before the late sidecar write: the entry check ran
+        // when the upload started, possibly long ago.
+        self.check_key(&crate::ObjectKey::from_path(path)?).await?;
         let content_type = crate::codec::infer_content_type(path.as_ref());
         self.write_sidecar(path, result.e_tag.as_deref(), metadata, content_type)
             .await
@@ -318,6 +369,30 @@ impl Backend for FsBackend {
             .await
             .map_err(map)
     }
+}
+
+fn no_symlink_under(root: &std::path::Path, segments: &[String], key: &str) -> Result<()> {
+    let mut current = root.to_path_buf();
+    for segment in segments {
+        current.push(segment);
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(Error::InvalidKey(format!(
+                    "{key}: {} is a symbolic link; FsStore does not follow links",
+                    current.display()
+                )))
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(Error::Backend {
+                    backend: "fs",
+                    source: Box::new(e),
+                })
+            }
+        }
+    }
+    Ok(())
 }
 
 fn generic(source: Box<dyn std::error::Error + Send + Sync>) -> object_store::Error {
@@ -435,6 +510,114 @@ mod tests {
         let meta = store.head(&key).await.unwrap().unwrap();
         assert_eq!(meta.trace_id(), Some("t-2"));
         assert_eq!(meta.content_sha256(), Some(v2.content_sha256.as_str()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refuses_to_follow_a_symlink_out_of_the_root() {
+        let (dir, store) = store();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), b"host file").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("escape")).unwrap();
+        let key = ObjectKey::new("escape/secret").unwrap();
+        assert!(matches!(
+            store.get(&key, None).await,
+            Err(Error::InvalidKey(_))
+        ));
+        assert!(matches!(store.head(&key).await, Err(Error::InvalidKey(_))));
+        let new = ObjectKey::new("escape/new").unwrap();
+        assert!(matches!(
+            store
+                .put(&new, Bytes::from_static(b"x"), PutOpts::default())
+                .await,
+            Err(Error::InvalidKey(_))
+        ));
+        assert_eq!(
+            std::fs::read_dir(outside.path()).unwrap().count(),
+            1,
+            "nothing written outside"
+        );
+        // A link in the sidecar tree is refused too.
+        let meta = dir.path().join(".rh/meta");
+        std::fs::create_dir_all(&meta).unwrap();
+        std::os::unix::fs::symlink(outside.path(), meta.join("side")).unwrap();
+        assert!(matches!(
+            store
+                .put(
+                    &ObjectKey::new("side/x").unwrap(),
+                    Bytes::from_static(b"x"),
+                    PutOpts::default()
+                )
+                .await,
+            Err(Error::InvalidKey(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn multipart_rejected_at_commit_is_aborted() {
+        use crate::MultipartOpts;
+        let (dir, store) = store();
+        let key = ObjectKey::new("late/obj").unwrap();
+        let mut upload = store
+            .multipart(&key, MultipartOpts::default())
+            .await
+            .unwrap();
+        upload.put_part(Bytes::from_static(b"part")).await.unwrap();
+        // A link appears in the sidecar tree after the upload started.
+        let outside = tempfile::tempdir().unwrap();
+        let meta = dir.path().join(".rh/meta");
+        std::fs::create_dir_all(&meta).unwrap();
+        std::os::unix::fs::symlink(outside.path(), meta.join("late")).unwrap();
+        assert!(matches!(upload.complete().await, Err(Error::InvalidKey(_))));
+        let staged: Vec<_> = std::fs::read_dir(dir.path().join("late"))
+            .map(|d| d.flatten().map(|e| e.file_name()).collect())
+            .unwrap_or_default();
+        assert!(staged.is_empty(), "staged parts left behind: {staged:?}");
+        assert_eq!(std::fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn listing_skips_entries_below_a_symlink() {
+        let (dir, store) = store();
+        store
+            .put(
+                &ObjectKey::new("s/inside").unwrap(),
+                Bytes::from_static(b"in"),
+                PutOpts::default(),
+            )
+            .await
+            .unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), b"host").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("s").join("escape")).unwrap();
+        let page = store
+            .list(&ObjectKey::new("s").unwrap(), None)
+            .await
+            .unwrap();
+        let keys: Vec<&str> = page.items.iter().map(|m| m.key.as_str()).collect();
+        assert_eq!(
+            keys,
+            vec!["s/inside"],
+            "nothing reachable through the link is listed"
+        );
+    }
+
+    #[tokio::test]
+    async fn presign_rejects_sub_second_ttls() {
+        let (_dir, store) = store();
+        let key = ObjectKey::new("a/b").unwrap();
+        for ttl in [Duration::ZERO, Duration::from_millis(500)] {
+            assert!(matches!(
+                store.presign_get(&key, ttl).await,
+                Err(Error::InvalidArgument(_))
+            ));
+        }
+        assert!(store
+            .presign_get(&key, Duration::from_secs(1))
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
