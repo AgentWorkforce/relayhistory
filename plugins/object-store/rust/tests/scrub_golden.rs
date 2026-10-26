@@ -63,7 +63,7 @@ impl Generated {
 fn fixture() -> Fixture {
     let raw = std::fs::read_to_string(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/scrub-golden-v1.json"
+        "/tests/fixtures/scrub-golden-v2.json"
     ))
     .expect("fixture");
     serde_json::from_str(&raw).expect("fixture parses")
@@ -72,7 +72,7 @@ fn fixture() -> Fixture {
 #[test]
 fn every_golden_vector_matches_the_reference() {
     let f = fixture();
-    assert_eq!(f.version, 1);
+    assert_eq!(f.version, relayhistory_object_store::scrub::RULESET_VERSION);
     assert_eq!(f.ruleset, relayhistory_object_store::scrub::RULESET);
     assert_eq!(f.max_scrub_chars, MAX_SCRUB_CHARS);
     let mut failures = Vec::new();

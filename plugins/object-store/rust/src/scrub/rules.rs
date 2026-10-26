@@ -1,6 +1,6 @@
 //! The scrub rules: a faithful port of `scrubText` from relayhistory-cloud
 //! (`packages/relayhistory/src/lib/scrub.ts`), the reference implementation.
-//! The golden vectors in `tests/fixtures/scrub-golden-v1.json` are generated
+//! The golden vectors in `tests/fixtures/scrub-golden-v2.json` are generated
 //! from it and pin this port byte for byte.
 //!
 //! JavaScript semantics are reproduced explicitly, not approximated:
@@ -58,6 +58,17 @@ pub(crate) struct Rule {
     /// the ASCII-lowercased text. Needles are lowercase. Empty means always
     /// run.
     pub(crate) needles: &'static [&'static str],
+    /// A cheap exact check that the rule can change `text`; `false` skips it.
+    pub(crate) gate: fn(&str) -> bool,
+}
+
+fn always(_: &str) -> bool {
+    true
+}
+
+/// Attach a gate to a compiled rule.
+fn gated(rule: Result<Rule, String>, gate: fn(&str) -> bool) -> Result<Rule, String> {
+    rule.map(|r| Rule { gate, ..r })
 }
 
 /// Compile a lookaround-free rule. `\s` is written only inside character
@@ -218,11 +229,14 @@ pub(crate) static RULES: LazyLock<Result<Vec<Rule>, String>> = LazyLock::new(|| 
             re,
             replace,
             needles,
+            gate: always,
         })
     };
     [
         r(
-            fast(r"-----BEGIN [A-Z ]*PRIVATE KEY-----(?s:.)*?-----END [A-Z ]*PRIVATE KEY-----"),
+            fast(
+                r"-----BEGIN [A-Z ]*PRIVATE KEY(?: BLOCK)?-----(?s:.)*?-----END [A-Z ]*PRIVATE KEY(?: BLOCK)?-----",
+            ),
             Template(REDACTED),
             &["-----begin"],
         ),
@@ -332,6 +346,33 @@ pub(crate) static RULES: LazyLock<Result<Vec<Rule>, String>> = LazyLock::new(|| 
             Template(REDACTED),
             &["@"],
         ),
+        // `\d`/`\w` are ASCII in the reference, so they are spelled out here.
+        gated(
+            r(
+                fancy(r"(^|[^A-Za-z0-9_.+-])[0-9]+(?:[ -][0-9]+)*(?![A-Za-z0-9_]|[.-][0-9])"),
+                Func(super::numbers::redact_cards),
+                &[],
+            ),
+            super::numbers::has_card_length_run,
+        ),
+        gated(
+            r(
+                fancy(r"(^|[^A-Za-z0-9_+])\+[1-9](?:[ .-]?\(?[0-9]\)?){7,14}(?![A-Za-z0-9_]|[.-]?[0-9])"),
+                Template("$1[REDACTED]"),
+                &["+"],
+            ),
+            super::numbers::has_e164_shape,
+        ),
+        gated(
+            r(
+                fancy(
+                    r"(^|[^A-Za-z0-9_.+-])(?:\([2-9][0-9]{2}\) ?|[2-9][0-9]{2}[.-])[2-9][0-9]{2}[.-][0-9]{4}(?![A-Za-z0-9_]|[.-]?[0-9])",
+                ),
+                Template("$1[REDACTED]"),
+                &["-", "."],
+            ),
+            super::numbers::has_nanp_shape,
+        ),
     ]
     .into_iter()
     .collect()
@@ -373,7 +414,7 @@ mod tests {
     #[test]
     fn rules_compile() {
         let rules = super::RULES.as_ref().expect("every scrub rule compiles");
-        assert_eq!(rules.len(), 21);
+        assert_eq!(rules.len(), 24);
     }
 
     #[test]

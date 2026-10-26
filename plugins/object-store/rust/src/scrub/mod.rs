@@ -16,7 +16,12 @@
 //!   output is always valid JSON. A record that cannot be parsed, or whose
 //!   keys collide after scrubbing, is replaced by a typed placeholder and is
 //!   never passed through unscrubbed.
+//!
+//! Each string is scrubbed on its own: a secret split across two strings,
+//! JSON values or records (a token streamed as separate deltas) is not
+//! recognized, because neither part matches a rule.
 
+mod numbers;
 mod rules;
 
 use std::borrow::Cow;
@@ -28,7 +33,7 @@ use rules::{expand_template, Engine, Replace, Rule, RULES};
 /// Identifies this rule set in `manifest.raw.scrub`.
 pub const RULESET: &str = "relayhistory-scrub";
 /// Bumped whenever the rules or the golden vectors change.
-pub const RULESET_VERSION: u32 = 1;
+pub const RULESET_VERSION: u32 = 2;
 
 /// Longest string scrubbed in full, in UTF-16 code units (the reference
 /// counts JavaScript string length). Longer strings are truncated first.
@@ -49,7 +54,9 @@ pub fn scrub_text(value: &str) -> String {
     // rule actually changes the text.
     let mut lower = text.to_ascii_lowercase();
     for rule in rules {
-        if !rule.needles.is_empty() && !rule.needles.iter().any(|n| lower.contains(n)) {
+        if !rule.needles.is_empty() && !rule.needles.iter().any(|n| lower.contains(n))
+            || !(rule.gate)(&text)
+        {
             continue;
         }
         let replaced = apply(rule, &text);
@@ -117,7 +124,7 @@ fn bound_for_scrub(value: &str) -> Cow<'_, str> {
     }
     let units: Vec<u16> = value.encode_utf16().collect();
     let mut cut = MAX_SCRUB_CHARS;
-    while cut > 0 && !is_js_ws_unit(units[cut - 1]) {
+    while cut > 0 && !safe_cut(&units, cut) {
         cut -= 1;
     }
     // `cut` follows a BMP whitespace unit (or is 0), so this is exact.
@@ -129,6 +136,17 @@ fn bound_for_scrub(value: &str) -> Cow<'_, str> {
     Cow::Owned(format!(
         "{kept}\n{TRUNCATION_NOTE} {dropped} characters over the {MAX_SCRUB_CHARS}-character scrub limit]"
     ))
+}
+
+/// Port of `safeCut`: right after whitespace, and not between two digit
+/// groups (a digit or `)` before the whitespace, a digit or `(` after it),
+/// since card and phone matches can contain spaces.
+fn safe_cut(units: &[u16], at: usize) -> bool {
+    let unit = |i: Option<usize>| i.and_then(|i| units.get(i)).copied();
+    let is = |u: Option<u16>, extra: u8| {
+        u.is_some_and(|u| (u16::from(b'0')..=u16::from(b'9')).contains(&u) || u == u16::from(extra))
+    };
+    is_js_ws_unit(units[at - 1]) && !(is(unit(at.checked_sub(2)), b')') && is(unit(Some(at)), b'('))
 }
 
 /// Byte offset of the first private-key block in `text` that the PEM rule
@@ -145,7 +163,7 @@ fn unclosed_private_key_start(text: &str) -> Option<usize> {
     }
 }
 
-/// The leftmost `{lead}[A-Z ]*PRIVATE KEY-----` at or after `from`, as
+/// The leftmost `{lead}[A-Z ]*PRIVATE KEY(?: BLOCK)?-----` at or after `from`, as
 /// `(start, end)` byte offsets.
 fn pem_marker(text: &str, from: usize, lead: &str) -> Option<(usize, usize)> {
     let mut at = from;
@@ -156,7 +174,9 @@ fn pem_marker(text: &str, from: usize, lead: &str) -> Option<(usize, usize)> {
             .bytes()
             .take_while(|b| b.is_ascii_uppercase() || *b == b' ')
             .count();
-        if rest[..run].ends_with("PRIVATE KEY") && rest[run..].starts_with("-----") {
+        let named =
+            rest[..run].ends_with("PRIVATE KEY") || rest[..run].ends_with("PRIVATE KEY BLOCK");
+        if named && rest[run..].starts_with("-----") {
             return Some((start, start + lead.len() + run + 5));
         }
         // `lead` starts with an ASCII '-', so `start + 1` is a char boundary.
@@ -197,6 +217,7 @@ impl Dropped {
 pub fn scrub_json(value: Value) -> Result<Value, Dropped> {
     Ok(match value {
         Value::String(s) => Value::String(scrub_text(&s)),
+        Value::Number(n) if is_card_json_number(&n) => Value::String(rules::REDACTED.into()),
         Value::Array(items) => Value::Array(
             items
                 .into_iter()
@@ -214,6 +235,14 @@ pub fn scrub_json(value: Value) -> Result<Value, Dropped> {
         }
         other => other,
     })
+}
+
+/// A JSON integer whose digits are a card number. Unlike the reference, which
+/// can only check integers `JSON.parse` keeps exact (up to 2^53), this checks
+/// every integer: the raw record still has all its digits.
+fn is_card_json_number(n: &serde_json::Number) -> bool {
+    let text = n.to_string();
+    text.bytes().all(|b| b.is_ascii_digit()) && numbers::is_card_number(&text)
 }
 
 /// Result of scrubbing one chunk.
