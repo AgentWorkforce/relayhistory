@@ -9,6 +9,15 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - Local history retention defaults to 30 days, supports configurable limits or forever, and evicts in maintenance batches while protecting unuploaded logs and preserving cloud copies.
+
+### Rust API
+
+- Added local `retention` policy read/write APIs and `SessionStore` maintenance and upload-acknowledgement methods; maintenance must be scheduled by the host.
+
+## [0.51.0] - 2026-10-26
+
+### Added
+
 - Kilo CLI history is discoverable and searchable from its native session database, preserving recorded messages, tool results and session rewrites.
 - DeepAgents Code history is discoverable and searchable from native root checkpoints and message writes, including recorded tools, message revisions and compaction.
 - Cline core history is discoverable and searchable from canonical message snapshots, preserving recorded messages, tool identities and rewritten conversations.
@@ -38,7 +47,6 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Rust API
 
-- Added local `retention` policy read/write APIs and `SessionStore` maintenance and upload-acknowledgement methods; maintenance must be scheduled by the host.
 - Added `Reconciliation::healthy_pass_exhausted` and `refresh_healthy_pass` for revisiting healthy roots without discarding unresolved enumeration failures.
 - Added `SyncOptions::paths` for exact-path capture.
 - Added `DiscoveryOptions::paths` for exact-path shallow discovery.
@@ -1154,7 +1162,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - The SDK reads provider JSONL natively and works without the Python CLI.
 
-[Unreleased - Minor]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.50.1...HEAD
+[Unreleased]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.51.0...HEAD
+[0.51.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.50.1...sdk-ts-v0.51.0
 [0.50.1]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.49.0...sdk-ts-v0.50.1
 [0.49.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.48.0...sdk-ts-v0.49.0
 [0.48.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.47.0...sdk-ts-v0.48.0
