@@ -207,13 +207,33 @@ mod tests {
             "{text}"
         );
 
-        // An identical retry is idempotent; the caller cannot override the scrub keys.
-        let mut forged = Metadata::new();
-        forged.insert(META_SCRUB_VERSION.into(), "999".into());
-        let again = put_raw_chunk(&store, &key, &sealed, forged).await.unwrap();
+        // An identical retry is idempotent.
+        let again = put_raw_chunk(&store, &key, &sealed, Metadata::new())
+            .await
+            .unwrap();
         assert!(!again.created);
-        let meta = store.head(&key).await.unwrap().unwrap().metadata;
+
+        // On a fresh key the write stores the metadata: forged scrub keys lose,
+        // other caller keys are kept.
+        let fresh = ObjectKey::new("s/raw/0000000001-0-bbbbbbbb.jsonl.zst").unwrap();
+        let mut forged = Metadata::new();
+        forged.insert(META_SCRUB_RULESET.into(), "none".into());
+        forged.insert(META_SCRUB_VERSION.into(), "999".into());
+        forged.insert(META_RAW_SHA256.into(), "0".repeat(64));
+        forged.insert(META_RAW_BYTES.into(), "1".into());
+        forged.insert(crate::META_TRACE_ID.into(), "t-1".into());
+        assert!(
+            put_raw_chunk(&store, &fresh, &sealed, forged)
+                .await
+                .unwrap()
+                .created
+        );
+        let meta = store.head(&fresh).await.unwrap().unwrap().metadata;
+        assert_eq!(meta[META_SCRUB_RULESET], RULESET);
         assert_eq!(meta[META_SCRUB_VERSION], RULESET_VERSION.to_string());
+        assert_eq!(meta[META_RAW_SHA256], sealed.raw_sha256());
+        assert_eq!(meta[META_RAW_BYTES], sealed.stored_raw_bytes().to_string());
+        assert_eq!(meta[crate::META_TRACE_ID], "t-1");
     }
 
     #[test]
