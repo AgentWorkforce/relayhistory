@@ -41,6 +41,7 @@ mod error;
 mod fs;
 mod key;
 pub mod layout;
+pub mod manifest;
 mod metadata;
 mod upload;
 

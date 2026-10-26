@@ -55,6 +55,11 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    /// A manifest compare-and-swap lost every race in its attempt budget.
+    /// Retry on the next tick (client) or re-queue (server).
+    #[error("manifest {key}: lost {attempts} compare-and-swap races in a row")]
+    ManifestContended { key: String, attempts: u32 },
+
     #[error("{backend} error: {source}")]
     Backend {
         backend: &'static str,
@@ -69,7 +74,10 @@ impl Error {
     /// Whether the coordinator should retry the same request with backoff.
     /// `PreconditionFailed` is not retryable as-is: re-read the manifest first.
     pub fn is_retryable(&self) -> bool {
-        matches!(self, Self::Transient { .. })
+        matches!(
+            self,
+            Self::Transient { .. } | Self::ManifestContended { .. }
+        )
     }
 
     /// Map an `object_store` error for `key`. `object_store` already retries
