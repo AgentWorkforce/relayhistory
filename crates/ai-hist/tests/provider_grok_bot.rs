@@ -11,6 +11,68 @@ use std::path::Path;
 
 const SID: &str = "fixture-bot-complete";
 
+#[test]
+fn grok_bot_shallow_names_and_local_profiles_follow_their_own_account_roster() {
+    let home = tempfile::tempdir().unwrap();
+    let transcript = grok_bot_fixture::stage(home.path());
+    let roster = grok_bot_fixture::persistence(home.path()).join(format!(
+        "{}.blob",
+        grok_bot_fixture::encode_key("sand.client.slice.account.fixture%7Cp.roster.last-roster")
+    ));
+    let store = open(home.path());
+    let reference = SessionRef::id(Source::GrokBot, SID);
+    for (name, shape, color) in [
+        ("posthogrok", "house", "blue"),
+        ("washgrok", "blob", "black"),
+        ("Recap", "house", "gray"),
+    ] {
+        std::fs::write(
+            &roster,
+            serde_json::json!({"schemaVersion":4,"value":{"rows":[
+                {"id":SID,"name":name,"avatarShape":shape,"avatarColor":color},
+                {"id":"different-bot","name":"Wrong bot","avatarShape":"star"}
+            ]}})
+            .to_string(),
+        )
+        .unwrap();
+        store
+            .discover(DiscoveryOptions::default().sources([Source::GrokBot]))
+            .unwrap();
+        let row = store
+            .sessions(CatalogQuery::default())
+            .map(Result::unwrap)
+            .find(|row| row.session_id == SID)
+            .unwrap();
+        assert_eq!(row.title.as_deref(), Some(name));
+        assert_eq!(row.discovery_state, ai_hist::DiscoveryState::Shallow);
+        let profile = store.session_profile(&reference).unwrap().unwrap();
+        assert_eq!(profile.name.as_deref(), Some(name));
+        let avatar = profile.avatar.unwrap();
+        assert_eq!(avatar.shape.as_deref(), Some(shape));
+        assert_eq!(avatar.color.as_deref(), Some(color));
+        assert_eq!(avatar.image_data_url, None);
+    }
+    std::fs::remove_file(transcript).unwrap();
+    let reader = SessionStore::open(
+        StoreOptions::default()
+            .db_path(home.path().join("conformance.db"))
+            .roots(store.roots().clone())
+            .read_only(true),
+    )
+    .unwrap();
+    assert_eq!(
+        reader
+            .session_profile(&reference)
+            .unwrap()
+            .unwrap()
+            .name
+            .as_deref(),
+        Some("Recap")
+    );
+    std::fs::remove_file(&roster).unwrap();
+    assert_eq!(reader.session_profile(&reference).unwrap(), None);
+}
+
 fn open(home: &Path) -> SessionStore {
     SessionStore::open(
         StoreOptions::default()

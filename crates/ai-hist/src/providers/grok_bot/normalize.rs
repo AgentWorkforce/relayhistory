@@ -81,23 +81,14 @@ pub(super) fn write(conn: &Connection, payload: &Value, path: &Path) -> Result<u
     )?;
     // An explicit blank title clears it. A missing roster row, or one whose
     // newer schema omits both fields, keeps the last known name.
-    let named = |row: &&Value| row.get("name").is_some() || row.get("title").is_some();
-    if let Some(row) = roster.filter(named) {
-        if let Some(title) = row["name"]
-            .as_str()
-            .filter(|name| !name.trim().is_empty())
-            .or_else(|| {
-                row["title"]
-                    .as_str()
-                    .filter(|title| !title.trim().is_empty())
-            })
-        {
-            crate::ingest::set_session_title(conn, ID, sid, Some(title))?;
-        } else {
+    if let Some(title) = roster.and_then(profile::name) {
+        if title.is_empty() {
             conn.execute(
                 "UPDATE sessions SET title=NULL WHERE source=?1 AND session_id=?2 AND title IS NOT NULL",
                 rusqlite::params![ID, sid],
             )?;
+        } else {
+            crate::ingest::set_session_title(conn, ID, sid, Some(&title))?;
         }
     }
     let prompt: Option<String> = conn.query_row(
