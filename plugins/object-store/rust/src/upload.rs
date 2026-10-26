@@ -117,6 +117,9 @@ impl<B: Backend> MultipartUpload for CoreUpload<B> {
                 }
             }
             let _guard = self.backend.commit_guard().await?;
+            // The entry check ran when the upload started; re-check under the
+            // commit lock before the object is moved into place.
+            self.backend.check_key(&self.key).await?;
             let result = self
                 .inner
                 .complete()

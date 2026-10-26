@@ -212,6 +212,15 @@ impl Backend for FsBackend {
     /// A symbolic link anywhere under the root could point a valid key at
     /// any file on the host, so the store never traverses one: every component
     /// of the object path and of its sidecar path is `lstat`ed first.
+    ///
+    /// Threat model: this rejects links that exist when an operation starts
+    /// (or, for multipart, again at commit). It cannot stop a concurrent
+    /// actor who can write inside the root from swapping a checked directory
+    /// for a link between the check and the open, because the underlying
+    /// `LocalFileSystem` opens by path. Closing that race needs
+    /// directory-relative `openat(O_NOFOLLOW)` access throughout; until then,
+    /// treat the root as trusted (same-user, not shared with untrusted
+    /// writers).
     async fn check_key(&self, key: &crate::ObjectKey) -> Result<()> {
         let root = self.root.clone();
         let segments: Vec<String> = key.as_str().split('/').map(str::to_string).collect();
@@ -311,6 +320,9 @@ impl Backend for FsBackend {
         result: &PutResult,
         metadata: &Metadata,
     ) -> Result<()> {
+        // Re-check right before the late sidecar write: the entry check ran
+        // when the upload started, possibly long ago.
+        self.check_key(&crate::ObjectKey::from_path(path)?).await?;
         let content_type = crate::codec::infer_content_type(path.as_ref());
         self.write_sidecar(path, result.e_tag.as_deref(), metadata, content_type)
             .await
