@@ -184,6 +184,11 @@ pub(super) struct Carry {
     /// the schema or the data -- so a quiet loop pays `open_db`'s schema
     /// check once, not per tick.
     writer: Mutex<crate::store::sync_connection::Cache>,
+    /// Whether the last sweep wrote nothing at all: the store-wide change
+    /// feed head, read under the lock before and after it, did not move. A
+    /// stronger statement than an empty catalog diff, which an append that
+    /// adds evidence rows without moving a catalog column would also give.
+    wrote_nothing: std::sync::atomic::AtomicBool,
 }
 
 impl WatchSweep {
@@ -217,7 +222,12 @@ impl WatchSweep {
         });
         match result {
             Ok((mut outcome, changed)) => {
-                outcome.changed_nothing = !outcome.contended && changed.is_empty();
+                outcome.changed_nothing = !outcome.contended
+                    && changed.is_empty()
+                    && self
+                        .carry
+                        .wrote_nothing
+                        .load(std::sync::atomic::Ordering::Relaxed);
                 self.notes
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
@@ -294,12 +304,22 @@ impl WatchSweep {
         force: bool,
         swept_from: &mut Option<CatalogFingerprint>,
     ) -> anyhow::Result<Option<(SyncTick, CatalogFingerprint, Vec<SessionRef>)>> {
+        let head = |conn: &rusqlite::Connection| {
+            crate::change_feed::read_head(conn)
+                .ok()
+                .map(|head| (head.epoch, head.revision))
+        };
+        let head_before = std::cell::Cell::new(None);
+        self.carry
+            .wrote_nothing
+            .store(false, std::sync::atomic::Ordering::Relaxed);
         let outcome = sync_facade_tick(
             &self.db_path,
             &plan.roots,
             force,
             &plan.scope(),
             |conn| {
+                head_before.set(head(conn));
                 let before = match previous {
                     Some(before) => before,
                     None => catalog_fingerprint(conn).map_err(anyhow::Error::from)?,
@@ -314,6 +334,10 @@ impl WatchSweep {
                 Ok(before)
             },
             |conn, before, _tick, _succeeded| {
+                let unmoved = head_before.get().is_some() && head_before.get() == head(conn);
+                self.carry
+                    .wrote_nothing
+                    .store(unmoved, std::sync::atomic::Ordering::Relaxed);
                 let (after, changed) = changes_under_lock(conn, &before)?;
                 Ok((after, changed))
             },
