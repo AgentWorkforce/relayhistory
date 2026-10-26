@@ -54,7 +54,7 @@ pub(crate) fn is_card_number(text: &str) -> bool {
     for c in text.chars() {
         if c.is_ascii_digit() {
             digits.push(c);
-        } else if sep.is_some_and(|s| s != c) {
+        } else if !matches!(c, ' ' | '-') || sep.is_some_and(|s| s != c) {
             return false;
         } else {
             sep = Some(c);
@@ -203,6 +203,8 @@ mod tests {
             "9111111111111111",
             "411111111111111",
             "4111 1111-1111 1111",
+            "4111x1111x1111x1111",
+            "4111.1111.1111.1111",
             "240329225065000960",
             "1729900000000",
         ] {

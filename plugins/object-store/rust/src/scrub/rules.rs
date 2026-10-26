@@ -357,7 +357,11 @@ pub(crate) static RULES: LazyLock<Result<Vec<Rule>, String>> = LazyLock::new(|| 
         ),
         gated(
             r(
-                fancy(r"(^|[^A-Za-z0-9_+])\+[1-9](?:[ .-]?\(?[0-9]\)?){7,14}(?![A-Za-z0-9_]|[.-]?[0-9])"),
+                // Parentheses only around an area code right after the
+                // country code, so a match cannot run into the next number.
+                fancy(
+                    r"(^|[^A-Za-z0-9_+])\+[1-9](?:[0-9]{0,2}[ .-]?\([0-9]{1,4}\)(?:[ .-]?[0-9]){4,12}|(?:[ .-]?[0-9]){7,14})(?![A-Za-z0-9_]|[.-]?[0-9])",
+                ),
                 Template("$1[REDACTED]"),
                 &["+"],
             ),
