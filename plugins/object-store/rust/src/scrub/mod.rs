@@ -1,9 +1,11 @@
 //! PII and secret scrubbing for raw session chunks, applied on the client
 //! before a chunk reaches object storage.
 //!
-//! This runs in the background delivery worker when a chunk is sealed, never
-//! on the local ingest/read path, so it adds nothing to the < 5 ms local
-//! latency budget. The server's `scrubText` remains the compliance boundary
+//! Nothing here runs automatically: uploads are not scrubbed unless the
+//! caller does it. The delivery worker must call [`scrub_chunk`] on each
+//! sealed chunk before hashing, compressing and uploading it. It belongs in
+//! that background worker, never on the local ingest/read path, so it adds
+//! nothing to the < 5 ms local latency budget. The server's `scrubText` remains the compliance boundary
 //! and scrubs again downstream; this is the same rule set applied earlier.
 //!
 //! - [`scrub_text`]: one string, exactly as relayhistory-cloud's `scrubText`.
@@ -101,7 +103,8 @@ fn utf16_len(s: &str) -> usize {
 }
 
 /// Port of `boundForScrub`: cut over-long input at whitespace (within the
-/// rewind window), never between the halves of a surrogate pair, and announce
+/// rewind window), never between the halves of a surrogate pair, never inside
+/// a private-key block the cut would leave without its footer, and announce
 /// the truncation in band.
 fn bound_for_scrub(value: &str) -> Cow<'_, str> {
     if value.len() <= MAX_SCRUB_CHARS || utf16_len(value) <= MAX_SCRUB_CHARS {
@@ -118,12 +121,51 @@ fn bound_for_scrub(value: &str) -> Cow<'_, str> {
     if is_high(units[cut - 1]) && units.get(cut).copied().is_some_and(is_low) {
         cut -= 1;
     }
-    let dropped = units.len() - cut;
     // The cut never splits a surrogate pair, so this is exact.
-    let kept = String::from_utf16_lossy(&units[..cut]);
+    let mut kept = String::from_utf16_lossy(&units[..cut]);
+    // A private key spans lines, so the rewind can keep its header and body
+    // but drop its footer; the PEM rule needs both. Withhold the block.
+    if let Some(start) = unclosed_private_key_start(&kept) {
+        kept.truncate(start);
+    }
+    let dropped = units.len() - utf16_len(&kept);
     Cow::Owned(format!(
         "{kept}\n{TRUNCATION_NOTE} {dropped} characters over the {MAX_SCRUB_CHARS}-character scrub limit]"
     ))
+}
+
+/// Byte offset of the first private-key block in `text` that the PEM rule
+/// cannot close (no footer after its header), pairing headers and footers left
+/// to right as the lazy PEM pattern does.
+fn unclosed_private_key_start(text: &str) -> Option<usize> {
+    let mut pos = 0;
+    loop {
+        let (start, after) = pem_marker(text, pos, "-----BEGIN ")?;
+        match pem_marker(text, after, "-----END ") {
+            Some((_, end)) => pos = end,
+            None => return Some(start),
+        }
+    }
+}
+
+/// The leftmost `{lead}[A-Z ]*PRIVATE KEY-----` at or after `from`, as
+/// `(start, end)` byte offsets.
+fn pem_marker(text: &str, from: usize, lead: &str) -> Option<(usize, usize)> {
+    let mut at = from;
+    while let Some(offset) = text.get(at..)?.find(lead) {
+        let start = at + offset;
+        let rest = &text[start + lead.len()..];
+        let run = rest
+            .bytes()
+            .take_while(|b| b.is_ascii_uppercase() || *b == b' ')
+            .count();
+        if rest[..run].ends_with("PRIVATE KEY") && rest[run..].starts_with("-----") {
+            return Some((start, start + lead.len() + run + 5));
+        }
+        // `lead` starts with an ASCII '-', so `start + 1` is a char boundary.
+        at = start + 1;
+    }
+    None
 }
 
 /// JavaScript `\s` for one UTF-16 code unit (every member is in the BMP).

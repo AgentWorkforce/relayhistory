@@ -30,12 +30,32 @@ struct Vector {
     output_utf16_len: Option<usize>,
 }
 
+/// `prefix + unit * count + suffix`, or the concatenation of each masked
+/// `[unit, count]` in `parts_masked`.
 #[derive(Deserialize)]
 struct Generated {
     prefix: Option<String>,
-    unit: String,
-    count: usize,
+    unit: Option<String>,
+    count: Option<usize>,
     suffix: Option<String>,
+    parts_masked: Option<Vec<(String, usize)>>,
+}
+
+impl Generated {
+    fn expand(&self) -> String {
+        if let Some(parts) = &self.parts_masked {
+            return parts.iter().map(|(u, n)| unmask(u).repeat(*n)).collect();
+        }
+        format!(
+            "{}{}{}",
+            self.prefix.as_deref().unwrap_or(""),
+            self.unit
+                .as_deref()
+                .unwrap_or("")
+                .repeat(self.count.unwrap_or(0)),
+            self.suffix.as_deref().unwrap_or("")
+        )
+    }
 }
 
 fn fixture() -> Fixture {
@@ -58,12 +78,7 @@ fn every_golden_vector_matches_the_reference() {
         let output = v.output_masked.as_deref().map(unmask);
         let input = match (&v.input_masked, &v.generate) {
             (Some(i), _) => unmask(i),
-            (None, Some(g)) => format!(
-                "{}{}{}",
-                g.prefix.as_deref().unwrap_or(""),
-                g.unit.repeat(g.count),
-                g.suffix.as_deref().unwrap_or("")
-            ),
+            (None, Some(g)) => g.expand(),
             _ => panic!("{}: no input", v.id),
         };
         let started = Instant::now();

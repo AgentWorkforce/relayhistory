@@ -92,8 +92,13 @@ chunks **before** they are compressed and uploaded:
   order and numbers preserved. A record that can't be parsed, or whose keys
   collide after scrubbing, is replaced by a typed placeholder and is never
   stored unscrubbed.
-- **Where it runs:** in the background delivery worker when a chunk is sealed,
-  never on the local ingest or read path.
+- **Where it runs:** nothing calls it for you. This crate exports the
+  helpers; uploads are **not** scrubbed automatically, and `compress_zstd`
+  compresses whatever it is given. The delivery worker must call
+  `scrub_chunk` on each sealed chunk **before** computing `raw_sha256`,
+  compressing and uploading it, and record `raw.scrub` (see
+  `docs/manifest-v1.md`). It belongs in that background worker, never on
+  the local ingest or read path.
 
 | Benchmark (release, `cargo bench --bench scrub`) | Result |
 | --- | --- |

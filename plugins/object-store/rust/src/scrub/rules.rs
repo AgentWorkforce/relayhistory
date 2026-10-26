@@ -6,6 +6,9 @@
 //! JavaScript semantics are reproduced explicitly, not approximated:
 //! - `\s` is JavaScript's whitespace set ([`JS_WS`]), not Unicode `White_Space`.
 //! - `\b` and `\w` are ASCII ([`WB`], `[A-Za-z0-9_]`), as in a non-`u` JS regex.
+//! - `(?i)` folds ASCII letters only ([`ascii_case_insensitive`]): a non-`u`
+//!   JS regex never matches U+017F to `s` or U+212A to `k`, as Rust's
+//!   Unicode-aware `(?i)` would.
 //! - Lookarounds and leftmost-backtracking match order come from
 //!   `fancy-regex`, which matches the way V8 does.
 //! - Lengths that matter (the truncation bound) are UTF-16 code units.
@@ -61,6 +64,7 @@ pub(crate) struct Rule {
 /// classes (`[\s]`, `[^/\s]`) and is expanded to the JavaScript whitespace
 /// set there; `\b` becomes an ASCII word boundary.
 fn fast(pattern: &str) -> Result<Engine, String> {
+    let pattern = ascii_case_insensitive(pattern);
     let pattern = pattern.replace(r"\s", JS_WS).replace(r"\b", WB_FAST);
     regex::Regex::new(&pattern)
         .map(Engine::Fast)
@@ -69,12 +73,83 @@ fn fast(pattern: &str) -> Result<Engine, String> {
 
 /// Compile a rule that needs lookarounds.
 fn fancy(pattern: &str) -> Result<Engine, String> {
+    let pattern = ascii_case_insensitive(pattern);
     let pattern = pattern.replace(r"\s", JS_WS).replace(r"\b", WB_FANCY);
     RegexBuilder::new(&pattern)
         .backtrack_limit(BACKTRACK_LIMIT)
         .build()
         .map(Engine::Fancy)
         .map_err(|e| format!("scrub rule {pattern:?}: {e}"))
+}
+
+/// Rewrite a leading `(?i)` as explicit ASCII case pairs, the way a
+/// JavaScript regex without the `u` flag folds: `s` becomes `[sS]`, and a
+/// letter range in a class gains its other case (`A-Z` becomes `A-Za-z`).
+/// Escapes and group flags are copied unchanged. Patterns without `(?i)` are
+/// returned as is.
+fn ascii_case_insensitive(pattern: &str) -> String {
+    let Some(body) = pattern.strip_prefix("(?i)") else {
+        return pattern.to_string();
+    };
+    let c: Vec<char> = body.chars().collect();
+    let mut out = String::with_capacity(body.len() * 2);
+    let (mut i, mut in_class) = (0, false);
+    while i < c.len() {
+        match c[i] {
+            '\\' => {
+                out.extend(&c[i..(i + 2).min(c.len())]);
+                i += 2;
+                continue;
+            }
+            '(' if !in_class && c.get(i + 1) == Some(&'?') => {
+                out.push_str("(?");
+                i += 2;
+                while i < c.len() && (c[i].is_ascii_alphabetic() || c[i] == '-') {
+                    out.push(c[i]);
+                    i += 1;
+                }
+                continue;
+            }
+            '[' if !in_class => in_class = true,
+            ']' if in_class => in_class = false,
+            l if l.is_ascii_alphabetic() && in_class => {
+                let range = (c.get(i + 1) == Some(&'-'))
+                    .then(|| c.get(i + 2).copied())
+                    .flatten()
+                    .filter(char::is_ascii_alphabetic);
+                let (lo, hi) = range.map_or((l, l), |h| (l, h));
+                push_range(&mut out, lo, hi);
+                push_range(&mut out, swap_case(lo), swap_case(hi));
+                i += if range.is_some() { 3 } else { 1 };
+                continue;
+            }
+            l if l.is_ascii_alphabetic() => {
+                out.extend(['[', l, swap_case(l), ']']);
+                i += 1;
+                continue;
+            }
+            _ => {}
+        }
+        out.push(c[i]);
+        i += 1;
+    }
+    out
+}
+
+fn swap_case(c: char) -> char {
+    if c.is_ascii_uppercase() {
+        c.to_ascii_lowercase()
+    } else {
+        c.to_ascii_uppercase()
+    }
+}
+
+fn push_range(out: &mut String, lo: char, hi: char) {
+    out.push(lo);
+    if hi != lo {
+        out.push('-');
+        out.push(hi);
+    }
 }
 
 fn is_word(c: Option<char>) -> bool {
@@ -299,5 +374,15 @@ mod tests {
     fn rules_compile() {
         let rules = super::RULES.as_ref().expect("every scrub rule compiles");
         assert_eq!(rules.len(), 21);
+    }
+
+    #[test]
+    fn case_insensitive_folds_ascii_only() {
+        use super::ascii_case_insensitive as f;
+        assert_eq!(f("abc"), "abc");
+        assert_eq!(f("(?i)St"), "[Ss][tT]");
+        assert_eq!(f(r"(?i)[A-Z0-9._%+-]\\U"), r"[A-Za-z0-9._%+-]\\[Uu]");
+        assert_eq!(f(r"(?i)(?<!://)\b(?!git@)"), r"(?<!://)\b(?![gG][iI][tT]@)");
+        assert_eq!(f(r"(?i)[^&\s]x"), r"[^&\s][xX]");
     }
 }

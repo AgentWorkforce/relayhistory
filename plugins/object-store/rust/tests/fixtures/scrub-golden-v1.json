@@ -392,16 +392,76 @@
     },
     {
       "id": "curated-077",
+      "input_masked": "ZZ/lLjsuP2cyPzY2NQ==",
+      "output_masked": "ZZ/lLjsuP2cyPzY2NQ=="
+    },
+    {
+      "id": "curated-078",
+      "input_masked": "ZZ/lDhsOH2cyPzY2NXw5NT4/Z2s=",
+      "output_masked": "ZZ/lDhsOH2cyPzY2NXw5NT4/Z2s="
+    },
+    {
+      "id": "curated-079",
+      "input_masked": "uN7wPyNnLDs2Lz8=",
+      "output_masked": "uN7wPyNnLDs2Lz8="
+    },
+    {
+      "id": "curated-080",
+      "input_masked": "OyozBbje8D8jYHos",
+      "output_masked": "OyozBbje8D8jYHos"
+    },
+    {
+      "id": "curated-081",
+      "input_masked": "n+U/OSg/LmB6Ozg5",
+      "output_masked": "n+U/OSg/LmB6Ozg5"
+    },
+    {
+      "id": "curated-082",
+      "input_masked": "Kjuf5Z/lLTUoPmcyLzQuPyho",
+      "output_masked": "Kjuf5Z/lLTUoPmcyLzQuPyho"
+    },
+    {
+      "id": "curated-083",
+      "input_masked": "Lyk/KBo/Ijuf5TcqNj90OTU3",
+      "output_masked": "Lyk/KBo/Ijuf5TcqNj90OTU3"
+    },
+    {
+      "id": "curated-084",
+      "input_masked": "n+Wf5TJgdXUvYCoaMjUpLnUi",
+      "output_masked": "n+Wf5TJgdXUvYAEIHx4bGQ4fHgcaMjUpLnUi"
+    },
+    {
+      "id": "curated-085",
+      "input_masked": "GWAGD5/lPygpBjg1OAYi",
+      "output_masked": "GWAGD5/lPygpBjg1OAYi"
+    },
+    {
+      "id": "curated-086",
+      "input_masked": "ZZ7qPgUuNTE/NGc7ODk=",
+      "output_masked": "ZZ7qPgUuNTE/NGcBCB8eGxkOHx4H"
+    },
+    {
+      "id": "curated-087",
+      "input_masked": "ZZ7rPgUuNTE/NGc7ODk=",
+      "output_masked": "ZZ7rPgUuNTE/NGcBCB8eGxkOHx4H"
+    },
+    {
+      "id": "curated-088",
+      "input_masked": "mfM3OzM2epnTGj8iOzcqNj90OTU3",
+      "output_masked": "mfM3OzM2epnTGj8iOzcqNj90OTU3"
+    },
+    {
+      "id": "curated-089",
       "input_masked": "IXguIyo/eGB4Lyk/KHh2eDc/KSk7PT94YCF4OTU0Lj80LnhgeDcjejE/I3ozKXopMXc7ODk+Pzw9MjMwMTY3NDUqKygpLi8sLSIjIGpraGl4Jyc=",
       "output_masked": "IXguIyo/eGB4Lyk/KHh2eDc/KSk7PT94YCF4OTU0Lj80LnhgeDcjejE/I3ozKXoBCB8eGxkOHx4HeCcn"
     },
     {
-      "id": "curated-078",
+      "id": "curated-090",
       "input_masked": "IXg5LT54YHh1Dyk/KCl1OzYzOT91Kig1MHh2eD80LHhgIXgdEw4SDxgFDhURHxR4YHg9MioFOzg5Pj88PTIzMDE2NzQ1KisoKS4vLC0iIyBqa2hpbm9sbWJjeCcn",
       "output_masked": "IXg5LT54YHgkdSooNTB4dng/NCx4YCF4HRMOEg8YBQ4VER8UeGB4AQgfHhsZDh8eB3gnJw=="
     },
     {
-      "id": "curated-079",
+      "id": "curated-091",
       "input_masked": "",
       "output_masked": ""
     },
@@ -1396,6 +1456,46 @@
       "output_masked": "LTUoPno="
     },
     {
+      "id": "scrub-test-literal-199",
+      "input_masked": "LTMuMjI1Nj4pejt6KigzLDsuP3oxPyN6LTI1KT96PDU1Lj8oejw7NjYpeio7KS56LjI/ejkvLg==",
+      "output_masked": "LTMuMjI1Nj4pejt6KigzLDsuP3oxPyN6LTI1KT96PDU1Lj8oejw7NjYpeio7KS56LjI/ejkvLg=="
+    },
+    {
+      "id": "scrub-test-literal-200",
+      "input_masked": "d3d3d3cYHx0TFHo=",
+      "output_masked": "d3d3d3cYHx0TFHo="
+    },
+    {
+      "id": "scrub-test-literal-201",
+      "input_masked": "CggTDBsOH3oRHwN3d3d3dw==",
+      "output_masked": "CggTDBsOH3oRHwN3d3d3dw=="
+    },
+    {
+      "id": "scrub-test-literal-202",
+      "input_masked": "d3d3d3cfFB56",
+      "output_masked": "d3d3d3cfFB56"
+    },
+    {
+      "id": "scrub-test-literal-203",
+      "input_masked": "Cw8QHggfDB0IajIQCTEuFw4PbwoPHBwJD2sIDAw2PgNQ",
+      "output_masked": "Cw8QHggfDB0IajIQCTEuFw4PbwoPHBwJD2sIDAw2PgNQ"
+    },
+    {
+      "id": "scrub-test-literal-204",
+      "input_masked": "Cw8QHggfDB0IajIQCTEuFw4PbwoPHBwJD2sIDAw2PgM=",
+      "output_masked": "Cw8QHggfDB0IajIQCTEuFw4PbwoPHBwJD2sIDAw2PgM="
+    },
+    {
+      "id": "scrub-test-literal-205",
+      "input_masked": "GB8dExR6CggTDBsOH3oRHwM=",
+      "output_masked": "GB8dExR6CggTDBsOH3oRHwM="
+    },
+    {
+      "id": "scrub-test-literal-206",
+      "input_masked": "OTY1KT8+egEIHx4bGQ4fHgd6MT8qLnoieiI=",
+      "output_masked": "OTY1KT8+egEIHx4bGQ4fHgd6MT8qLnoieiI="
+    },
+    {
       "id": "redos-aaaa-128k",
       "generate": {
         "unit": "A",
@@ -1479,6 +1579,71 @@
       },
       "output_sha256": "9c9b663266a1d662e09e205f8107e650876cf9e86f8037f2a23c886d5768460c",
       "output_utf16_len": 200081
+    },
+    {
+      "id": "truncate-surrogate-at-floor",
+      "generate": {
+        "prefix": "a",
+        "unit": "😀",
+        "count": 140000
+      },
+      "output_sha256": "2523994866755da93ee3fc8b440386af97bab62f44a1b761a3bc0685272623b0",
+      "output_utf16_len": 200080
+    },
+    {
+      "id": "truncate-pem-footer-past-cut",
+      "generate": {
+        "parts_masked": [
+          [
+            "OTY1KT8+end3d3d3GB8dExR6CggTDBsOH3oRHwN3d3d3d1AbGxsbUHd3d3d3HxQeegoIEwwbDh96ER8Dd3d3d3d6MT8qLno=",
+            1
+          ],
+          ["Ino=", 128072],
+          ["d3d3d3cYHx0TFHoKCBMMGw4fehEfA3d3d3d3UA==", 1],
+          ["Cw8QHggfDB0IajIQCTEuFw4PbwoPHBwJD2sIDAw2PgNQ", 400],
+          ["d3d3d3cfFB56CggTDBsOH3oRHwN3d3d3d3ouOzM2", 1]
+        ]
+      },
+      "output_sha256": "81fb9a90e3fe506daefa0334cdc62ab6a9026872db616c745173b07502db367f",
+      "output_utf16_len": 256248
+    },
+    {
+      "id": "jwt-oversized",
+      "generate": {
+        "parts_masked": [
+          ["LjUxPzR6PyMQ", 1],
+          ["Ow==", 6000],
+          ["dD8jEA==", 1],
+          ["OA==", 12000],
+          ["dA==", 1],
+          ["OQ==", 6000],
+          ["ej80Pg==", 1]
+        ]
+      },
+      "output_sha256": "cf15cc4fa1bf52a9cb4d4f6862a3c9544341104274c4c8d815e703f6e88c2095",
+      "output_utf16_len": 20
+    },
+    {
+      "id": "jwt-undotted-run",
+      "generate": {
+        "unit": "eyJ-",
+        "count": 50000
+      },
+      "output_sha256": "6159142263354a87512c1214f53f166bf6ddf473428113f698e81b160794b0ae",
+      "output_utf16_len": 200000
+    },
+    {
+      "id": "jwt-undotted-run-then-dot",
+      "generate": {
+        "parts_masked": [
+          ["PyMQdw==", 25000],
+          ["dD8jEA==", 1],
+          ["Ig==", 20],
+          ["dA==", 1]
+        ]
+      },
+      "output_sha256": "1958a91566afcae9a4d91e4b4842cc650b23f5b8aac9823e016cb777fc2160b9",
+      "output_utf16_len": 100025
     }
   ]
 }
