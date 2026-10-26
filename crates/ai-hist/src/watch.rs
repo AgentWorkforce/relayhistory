@@ -121,9 +121,13 @@ pub const DEFAULT_DEBOUNCE_MS: u64 = 200;
 /// Not a debounce: one write reaches the loop as several backend callbacks
 /// (FSEvents delivers a create or an append as two or three, within about a
 /// millisecond), and a tick that swept on the first of them would leave the
-/// rest to drive a trailing sweep for the same write. A few milliseconds
-/// gathers one write's callbacks without being perceptible.
-pub const LEADING_EDGE_SETTLE_MS: u64 = 10;
+/// rest to drive a trailing sweep for the same write. Two milliseconds
+/// gathers one write's callbacks; a callback that lands later is read by the
+/// window's one trailing tick, which finds the transcript unchanged and
+/// skips it. It was 10 ms, which on its own was twice the 5 ms a new session
+/// has to become visible in (see docs/benchmarks.md, "Session-visible
+/// latency").
+pub const LEADING_EDGE_SETTLE_MS: u64 = 2;
 /// Default slow polling backstop while the filesystem-event driver is active.
 pub const DEFAULT_SLOW_POLL_MS: u64 = 30_000;
 /// Default cadence for the pure polling driver.
@@ -740,6 +744,11 @@ impl WatchLoop {
 
 #[cfg(feature = "fs-events")]
 mod fs_events;
+#[cfg(feature = "fs-events")]
+// Only the macOS backend runs the watcher itself; elsewhere the planning and
+// diffing are exercised by their own tests.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod kqueue_dirs;
 
 #[cfg(not(feature = "fs-events"))]
 mod fs_events {

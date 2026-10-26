@@ -34,6 +34,11 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Junie CLI history is discoverable and searchable from native session journals, including recorded prompts, assistant text, tool output and event markers.
 - The optional object-storage plugin (`plugins/object-store`) validates session `manifest.json` v1 and lets the desktop and server update it concurrently with compare-and-swap, without losing either side's changes.
 
+### Changed
+
+- A new session reaches the catalog sooner through `watch` and exact-path capture: one validated writer per capture and across watch ticks, no per-commit fsync for exact capture, and a 2 ms leading-edge settle instead of 10 ms.
+- On macOS, `watch` sees a new transcript through kqueue directory watches in under a millisecond instead of waiting 14-19 ms for FSEvents, which remains the backstop.
+
 ### Fixed
 
 - Reconciliation advances healthy roots past persistent enumeration errors while retaining failed locations for retry.

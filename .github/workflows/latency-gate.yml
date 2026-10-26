@@ -81,6 +81,12 @@ jobs:
       - name: Build the latency harness
         run: cargo test --release -p ai-hist-cli --test latency_bench --no-run
 
+      # The kqueue directory watcher is macOS-only code, and ci.yml has no
+      # macOS job: this is where it is compiled and tested.
+      - name: Watch-loop and kqueue tests (macOS)
+        if: runner.os == 'macOS'
+        run: cargo test --release -p ai-hist --all-features --lib watch
+
       # On a pull request the regression rule compares against the base
       # commit, measured interleaved on this same runner; runners of one
       # class differ by more than the 10% allowance. Without a base (a push

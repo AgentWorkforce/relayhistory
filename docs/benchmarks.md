@@ -1370,3 +1370,59 @@ What the numbers say:
   the whole run and deletes in batches, so a new session's ingest waited up
   to ~10 s (p99) during a year-scale prune. Linux readers were barely
   touched; on macOS the read p99 quadrupled, to just under budget.
+### 2026-10-25 the new-session path, profiled and cut
+
+A per-step profile of the exact-path capture a watch tick runs for one new
+six-record Claude session, taken with temporary timing marks (thread CPU time
+beside wall time, so a contended machine still separates CPU from waiting).
+About 13 ms in all, and almost none of it parsing:
+
+| Step | Wall | What it was |
+|---|---:|---|
+| validating the retained writer | ~1.5 ms | hydration committed through a *second* connection, which moved the retained one's `data_version`, so every call re-ran the schema check |
+| `open_db` for hydration | ~2.3 ms | that second connection's own schema check (SQLite's open is 0.02 ms of it) |
+| discovery pass + identity refresh | ~2.4 ms | one candidate; ~1 ms of it an fsync |
+| evidence rows (`ingest_selected`) | ~2.1 ms | six records and their triggers |
+| hydration commit | ~1.3 ms | ~0.9 ms of it an fsync |
+| parsing | < 0.1 ms | |
+
+What changed, and why each is safe:
+
+* **One connection per capture.** `hydrate_local_session_on` runs the local
+  pass on the connection that just did discovery, in its own `IMMEDIATE`
+  transaction as before. Exact capture and the hook fast path use it.
+* **`watch` keeps its validated writer** between ticks, through the same
+  `sync_connection` cache a `Reconciliation` round uses, and only inside
+  `sync_facade_tick`, which holds the `SyncRunLock`.
+* **Exact capture commits at `synchronous = NORMAL`.** The sweep deliberately
+  does not (see "2026-09-28 sweep profile" above): there a power loss can drop
+  commits while `.sync-state.json` stamps survive and vouch for them. Exact
+  capture writes no sidecar state -- it only reads `.sync-state.json` through
+  the cold proof, and the one out-of-database checkpoint, the Cursor
+  transcript cursor, is for a source exact capture never admits -- so a lost
+  commit loses its checkpoint with it and the path is read again. The guard
+  restores the connection's level afterwards.
+* **The leading-edge settle is 2 ms**, down from 10. It only gathers one
+  write's callbacks; a straggler lands in the window's trailing tick, which
+  finds the transcript unchanged.
+* **macOS: kqueue directory watches** beside FSEvents (`watch/kqueue_dirs.rs`)
+  report a new file through the same root matching as an FSEvents event. Only
+  directories, recently changed ones first, at most 128 descriptors.
+  FSEvents remains the backstop for appends and for anything not watched.
+
+Local A/B against `main` on one machine, interleaved, release build, 30-day
+store (a shared, busy machine, so treat the absolute numbers loosely and the
+ratios with more confidence; CI's labelled run is the published number):
+
+| Metric | `main` p50 | this change p50 |
+|---|---:|---:|
+| `capture_path_retained` (what a watch tick runs) | 13.0 ms | 3.5 ms |
+| `capture_path` (plain `sync` with `paths`) | 13.8 ms | 8.2 ms |
+| `ingest_hook` | 16.9 ms | 12.7 ms |
+| `e2e_visible`, Linux, inotify | 36.3 ms | 13.3 ms |
+
+Still over budget, in order of size: discovery's pass for one candidate
+(~2 ms), evidence rows and their triggers (~1.5-2 ms), the plain `sync`
+path's own validation, and on macOS whatever FSEvents still drives. The
+`synchronous` change is scoped to exact capture; extending it to the hook
+path needs the same proof for its Cursor checkpoint first.

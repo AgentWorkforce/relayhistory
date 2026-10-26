@@ -10,6 +10,10 @@ use std::fs::OpenOptions;
 use std::time::Instant;
 
 mod codex_selected;
+mod entry;
+#[cfg(test)]
+use entry::hydrate_session_at_with_roots_connectors_and_claude_snapshot;
+pub(crate) use entry::{hydrate_local_session_on, hydrate_session_at_with_roots_and_connectors};
 mod continuity;
 mod grok_log;
 use grok_log::read_grok_unified_log_for_hydration;
@@ -393,39 +397,16 @@ fn test_load_sync_state(db_path: &Path) -> Map<String, Value> {
     .unwrap()
 }
 
-pub(crate) fn hydrate_session_at_with_roots_and_connectors(
+/// Everything after the catalog lookup of a local hydration.
+fn hydrate_local(
+    conn: &Connection,
     db_path: &Path,
     options: &HydrateSessionOptions,
     roots: &crate::ProviderRoots,
-    connectors: &crate::remote::SourceConnectorSelection,
-) -> Result<HydrateSessionResult> {
-    hydrate_session_at_with_roots_connectors_and_claude_snapshot(
-        db_path, options, roots, connectors, None,
-    )
-}
-
-pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
-    db_path: &Path,
-    options: &HydrateSessionOptions,
-    roots: &crate::ProviderRoots,
-    connectors: &crate::remote::SourceConnectorSelection,
+    mut target: CatalogTarget,
     claude_snapshot: Option<ClaudeTranscriptSnapshot>,
+    started: Instant,
 ) -> Result<HydrateSessionResult> {
-    let home = &roots.home;
-    let _reads = begin_hydration(options, home, connectors)?;
-    let started = Instant::now();
-    // Acquisition and replacement are one per-session critical section. The
-    // provider call has to be inside it: otherwise an older response can wait
-    // behind a newer writer and then replace that newer evidence. A file lock
-    // covers both threads and independent RelayHistory processes.
-    let _remote_lock = (options.scope == SessionScope::Remote)
-        .then(|| acquire_remote_hydration_lock(db_path, options))
-        .transpose()?;
-    let mut conn = open_db(db_path)?;
-    let mut target = catalog_target(&conn, options)?;
-    if options.scope == SessionScope::Remote {
-        return hydrate_remote_session(&mut conn, options, home, connectors, started);
-    }
     let local_key = ObservationKey {
         source: options.source.clone(),
         session_id: options.session_id.clone(),
@@ -433,17 +414,17 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
         connector_id: options.source.clone(),
         connector_instance: "default".into(),
     };
-    let local_observation = observe_local_target(&conn, options, roots, &mut target, &local_key)?;
+    let local_observation = observe_local_target(conn, options, roots, &mut target, &local_key)?;
     // Before the stamp short-circuit: see `read_grok_unified_log_for_hydration`.
-    let log_diagnostics = read_grok_unified_log_for_hydration(&conn, options, &roots.grok)?;
-    let mut snapshot = source_snapshot(&conn, options, &target, roots, claude_snapshot)?;
-    let previous = observations::checkpoint(&conn, &local_key)?;
+    let log_diagnostics = read_grok_unified_log_for_hydration(conn, options, &roots.grok)?;
+    let mut snapshot = source_snapshot(conn, options, &target, roots, claude_snapshot)?;
+    let previous = observations::checkpoint(conn, &local_key)?;
     // A session whose last pass held records back is not finished with, even
     // though its bytes have not moved. The stamp short-circuit is what decides
     // whether a pass runs at all, so leaving it to fire here would mean the
     // held records were never looked at again and the message was lost rather
     // than deferred.
-    let parse_required = requires_local_pass(&conn, options, &snapshot)?;
+    let parse_required = requires_local_pass(conn, options, &snapshot)?;
     let stamp_matches = !parse_required
         && checkpoint_covers(previous.as_ref(), &snapshot.stamp, options.include_related)
         && target.discovery_state.as_deref() == Some("full");
@@ -458,7 +439,7 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
     // `TranscriptReader::open`, and charging it a second window here would
     // make a 1 KiB append cost 129 KiB.
     let validated = if stamp_matches {
-        unchanged_cursor_check(&conn, options, &snapshot)?
+        unchanged_cursor_check(conn, options, &snapshot)?
     } else {
         UnchangedCursorCheck::default()
     };
@@ -468,7 +449,7 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
 
     if stamp_matches && validated.valid {
         return unchanged_result(
-            &conn,
+            conn,
             options,
             snapshot,
             provider_bytes,
@@ -495,7 +476,7 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
     let records_parsed = snapshot.records.count()?;
 
     let (indexed, source_diagnostics, cursor_consumed_through, records_parsed) = commit_local_pass(
-        &mut conn,
+        conn,
         LocalPass {
             options,
             target: &target,
@@ -521,7 +502,7 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
     // checkpointed.
     source_diagnostics.extend(log_diagnostics);
     build_local_result(
-        &conn,
+        conn,
         options,
         HydrationPass {
             status,
@@ -564,29 +545,6 @@ fn prefer_restored_codex_rollout(
         }
     }
     Ok(())
-}
-
-/// Refuse a cancelled or invalid request, and a remote one whose connector is
-/// not configured, before any acquisition starts.
-fn begin_hydration(
-    options: &HydrateSessionOptions,
-    home: &Path,
-    connectors: &crate::remote::SourceConnectorSelection,
-) -> Result<cold_read::ReadScope> {
-    super::check_capture_cancelled()?;
-    validate_options(options)?;
-    // One hydration is one acquisition pass; see `begin_acquisition_pass`.
-    crate::project_identity::begin_acquisition_pass();
-    if options.scope == SessionScope::Remote {
-        crate::remote::ensure_selected_remote_connectors_configured_for_at(
-            "hydration",
-            home,
-            std::slice::from_ref(&options.source),
-            connectors,
-        )
-        .map_err(|error| hydration_error("CONNECTOR_NOT_CONFIGURED", error))?;
-    }
-    Ok(cold_read::begin_read_scope())
 }
 
 /// A changed pass over a session with a stamped checkpoint updated it; any
@@ -636,7 +594,7 @@ struct LocalPass<'a> {
 /// table has a provider-native uniqueness key, so interruption followed by
 /// retry is safe for both new and growing sessions.
 fn commit_local_pass(
-    conn: &mut Connection,
+    conn: &Connection,
     pass: LocalPass<'_>,
 ) -> Result<(IngestOutcome, Vec<HydrationDiagnostic>, Option<u64>, i64)> {
     let LocalPass {
@@ -651,7 +609,10 @@ fn commit_local_pass(
         local_observation,
     } = pass;
     super::check_capture_cancelled()?;
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // Unchecked because the connection may be shared with the caller (see
+    // `hydrate_local_session_on`); it is in autocommit, so this is the same
+    // IMMEDIATE transaction an owned connection would open.
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     let cursor_key = CursorKey::Session {
         source: &options.source,
         session_id: &options.session_id,

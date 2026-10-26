@@ -150,11 +150,24 @@ pub(super) struct WatchSweep {
     pub(super) db_path: PathBuf,
     pub(super) sources: Arc<WatchSources>,
     pub(super) stop: StopToken,
-    pub(super) baseline: Mutex<Option<CatalogFingerprint>>,
+    pub(super) carry: Carry,
     pub(super) notes: Arc<Mutex<TickNotes>>,
     pub(super) reports: ReportSlot,
     pub(super) store: SessionStore,
     pub(super) kind: WatchTick,
+}
+
+/// What one tick hands the next.
+#[derive(Default)]
+pub(super) struct Carry {
+    /// The catalog digest the previous tick ended with.
+    baseline: Mutex<Option<CatalogFingerprint>>,
+    /// The validated writable connection. A tick's sweep only uses it inside
+    /// `sync_facade_tick`, which holds the `SyncRunLock` (the cache's own
+    /// rule), and the cache re-validates whenever another connection moved
+    /// the schema or the data -- so a quiet loop pays `open_db`'s schema
+    /// check once, not per tick.
+    writer: Mutex<crate::store::sync_connection::Cache>,
 }
 
 impl WatchSweep {
@@ -173,7 +186,11 @@ impl WatchSweep {
         // is one — nothing this loop reported has moved since, and a
         // change another process made in between is a change since the
         // last report either way — and a fresh read otherwise.
-        let mut base = self.baseline.lock().unwrap_or_else(PoisonError::into_inner);
+        let mut base = self
+            .carry
+            .baseline
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         // The baseline this sweep compares against, kept outside it so a
         // cancelled sweep can still say what it committed (below).
         let mut swept_from: Option<CatalogFingerprint> = None;
@@ -233,6 +250,31 @@ impl WatchSweep {
         force: bool,
         plan: &SweepPlan,
         previous: Option<CatalogFingerprint>,
+        swept_from: &mut Option<CatalogFingerprint>,
+    ) -> anyhow::Result<Option<(SyncTick, CatalogFingerprint, Vec<SessionRef>)>> {
+        let mut writer = std::mem::take(
+            &mut *self
+                .carry
+                .writer
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner),
+        );
+        let outcome = crate::store::sync_connection::with_cache(&mut writer, || {
+            self.locked_sweep(previous, plan, force, swept_from)
+        });
+        *self
+            .carry
+            .writer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = writer;
+        outcome
+    }
+
+    fn locked_sweep(
+        &self,
+        previous: Option<CatalogFingerprint>,
+        plan: &SweepPlan,
+        force: bool,
         swept_from: &mut Option<CatalogFingerprint>,
     ) -> anyhow::Result<Option<(SyncTick, CatalogFingerprint, Vec<SessionRef>)>> {
         let outcome = sync_facade_tick(
