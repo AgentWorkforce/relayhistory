@@ -203,7 +203,7 @@ pub(super) use macos::KqueueDirs;
 #[cfg(target_os = "macos")]
 mod macos {
     use super::{plan, DirIndex, MAX_DIRS};
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use crate::discover::{WatchDepth, WatchRoot};
     use crate::watch::fs_events::event_scope;
     use crate::watch::ChangeScope;
@@ -213,7 +213,7 @@ mod macos {
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::{Arc, Mutex, PoisonError};
     use std::thread::JoinHandle;
-    use std::time::{Duration, SystemTime};
+    use std::time::{Duration, Instant, SystemTime};
 
     /// How long one wait for an event lasts before the stop and refresh
     /// flags are looked at again: the most a stop or refresh waits.
@@ -242,6 +242,7 @@ mod macos {
             let state = Loop {
                 watcher,
                 index: DirIndex::default(),
+                pending: HashMap::new(),
                 roots: Vec::new(),
                 shared: roots,
                 on_change,
@@ -274,9 +275,18 @@ mod macos {
         }
     }
 
+    /// New files that were still empty when their directory reported them,
+    /// each watched until its first write. Bounded: past it, an empty file is
+    /// left to FSEvents, which reports its first write as well.
+    const MAX_PENDING_FILES: usize = 32;
+    /// How long an empty file is waited on before it is left to FSEvents.
+    const PENDING_FILE_TTL: Duration = Duration::from_secs(10);
+
     struct Loop {
         watcher: Watcher,
         index: DirIndex,
+        /// Empty new files awaiting their first write, and when each appeared.
+        pending: HashMap<PathBuf, Instant>,
         roots: Vec<WatchRoot>,
         shared: Arc<Mutex<Vec<WatchRoot>>>,
         on_change: OnChange,
@@ -288,6 +298,7 @@ mod macos {
                 if refresh.swap(false, Ordering::SeqCst) {
                     self.replan();
                 }
+                self.expire_pending();
                 let Some(event) = self.watcher.poll(Some(POLL)) else {
                     continue;
                 };
@@ -358,6 +369,10 @@ mod macos {
         }
 
         fn on_event(&mut self, dir: PathBuf, vnode: &Vnode) {
+            if self.pending.contains_key(&dir) {
+                self.on_pending_file(dir, vnode);
+                return;
+            }
             match vnode {
                 // The directory object is gone or moved; its parent's rescan,
                 // or the next refresh, watches whatever replaces it.
@@ -372,10 +387,70 @@ mod macos {
                 self.forget(dir);
                 return;
             };
-            self.report(&appeared.files);
+            for file in appeared.files {
+                self.arrived(file);
+            }
             let depth = self.index.depth(dir).unwrap_or(0);
             for child in appeared.dirs {
                 self.watch(&child, depth + 1, true);
+            }
+        }
+
+        /// A file that just appeared. The directory's event fires when the
+        /// entry is *created*, before the writer's first `write`: a tick that
+        /// swept now would capture an empty transcript, write its bookkeeping,
+        /// and so hold the debounce window open past the write that matters.
+        /// An empty file is therefore watched itself and reported on its first
+        /// write; one that already has bytes is reported at once.
+        fn arrived(&mut self, file: PathBuf) {
+            let empty = std::fs::metadata(&file).is_ok_and(|meta| meta.len() == 0);
+            if !empty || self.pending.len() >= MAX_PENDING_FILES {
+                self.report(&[file]);
+                return;
+            }
+            let flags = FilterFlag::NOTE_WRITE | FilterFlag::NOTE_EXTEND | FilterFlag::NOTE_DELETE;
+            let watched = self
+                .watcher
+                .add_filename(&file, EventFilter::EVFILT_VNODE, flags)
+                .is_ok()
+                && self.watcher.watch().is_ok();
+            if !watched {
+                self.report(&[file]);
+                return;
+            }
+            // The first write can land between the size check and the watch.
+            if std::fs::metadata(&file).is_ok_and(|meta| meta.len() > 0) {
+                let _ = self.watcher.remove_filename(&file, EventFilter::EVFILT_VNODE);
+                self.report(&[file]);
+                return;
+            }
+            self.pending.insert(file, Instant::now());
+        }
+
+        fn on_pending_file(&mut self, file: PathBuf, vnode: &Vnode) {
+            let wrote = matches!(vnode, Vnode::Write | Vnode::Extend);
+            if !wrote && !matches!(vnode, Vnode::Delete | Vnode::Rename) {
+                return;
+            }
+            self.pending.remove(&file);
+            let _ = self.watcher.remove_filename(&file, EventFilter::EVFILT_VNODE);
+            if wrote {
+                self.report(&[file]);
+            }
+        }
+
+        /// Stop waiting on files that stayed empty; FSEvents reports their
+        /// first write whenever it comes.
+        fn expire_pending(&mut self) {
+            let expired: Vec<PathBuf> = self
+                .pending
+                .iter()
+                .filter(|(_, since)| since.elapsed() >= PENDING_FILE_TTL)
+                .map(|(file, _)| file.clone())
+                .collect();
+            for file in expired {
+                self.pending.remove(&file);
+                let _ = self.watcher.remove_filename(&file, EventFilter::EVFILT_VNODE);
             }
         }
 
@@ -543,6 +618,22 @@ mod tests {
             }
         }
         assert!(seen, "a file in a newly created project directory is reported");
+        // A transcript created empty is reported on its first write, not at
+        // creation, so the tick that follows reads its bytes.
+        let third = project.join("00000000-0000-4000-8000-000000000003.jsonl");
+        std::fs::File::create(&third).unwrap();
+        std::thread::sleep(Duration::from_millis(20));
+        while rx.try_recv().is_ok() {}
+        let wrote = std::time::Instant::now();
+        fs::write(&third, "{}\n").unwrap();
+        let scope = rx.recv_timeout(Duration::from_secs(2)).expect("first write reported");
+        assert!(wrote.elapsed() < Duration::from_millis(50), "{:?}", wrote.elapsed());
+        match scope {
+            crate::watch::ChangeScope::Roots { paths, .. } => {
+                assert!(paths.iter().any(|path| path.ends_with(third.file_name().unwrap())), "{paths:?}");
+            }
+            other => panic!("unexpected scope {other:?}"),
+        }
         drop(watcher);
     }
 }
