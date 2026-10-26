@@ -35,6 +35,27 @@ pub(crate) fn set_session_title(
     Ok(changed > 0)
 }
 
+/// Store the name other sessions address this one by. Like the title, a read
+/// that finds none never clears one, and an unchanged name is not rewritten,
+/// so the row is not restamped.
+pub(crate) fn set_session_agent_name(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+    agent_name: Option<&str>,
+) -> Result<bool> {
+    let Some(agent_name) = agent_name else {
+        return Ok(false);
+    };
+    let changed = conn
+        .prepare_cached(
+            "UPDATE sessions SET agent_name = ?1 \
+             WHERE source = ?2 AND session_id = ?3 AND agent_name IS NOT ?1",
+        )?
+        .execute(params![agent_name, source, session_id])?;
+    Ok(changed > 0)
+}
+
 /// A full ingest's catalog write together with the title it read.
 pub(crate) fn upsert_titled(
     conn: &Connection,

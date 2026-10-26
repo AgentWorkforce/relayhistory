@@ -5,7 +5,7 @@ macro_rules! session_scalar_columns {
         "source, session_id, cwd, git_branch, first_activity_ms, \
      last_activity_ms, first_prompt, last_assistant_text, models_json, originator, \
      agent_version, repo_url, initial_commit, workspace_roots_json, raw_path, source_stamp, \
-     discovery_state, project_key, project_key_method, title, session_kind"
+     discovery_state, project_key, project_key_method, title, session_kind, agent_name"
     };
 }
 

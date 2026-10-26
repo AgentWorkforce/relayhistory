@@ -25,6 +25,7 @@ impl CatalogSession {
             last_assistant_text: row.last_assistant_text,
             title: row.title,
             session_kind: row.session_kind,
+            agent_name: row.agent_name,
             models: row.models,
             originator: row.originator,
             agent_version: row.agent_version,

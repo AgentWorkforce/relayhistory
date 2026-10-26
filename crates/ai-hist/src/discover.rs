@@ -89,7 +89,7 @@ use opencode_page::{
 /// 4 adds `project_key` / `project_key_method` to every catalog row and the
 /// `project_key` filter to the listing.
 /// 5 adds `title`, the name the harness gave the session.
-pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 6;
+pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 7;
 
 /// Version of the shallow scanners themselves.
 ///
@@ -97,7 +97,7 @@ pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 6;
 /// invalidates every stored stamp, so a scanner that learns to extract a new
 /// field re-reads sources whose bytes never changed. `parser_version` keeps its
 /// existing meaning (full-ingest parser generation) and is untouched.
-pub const SHALLOW_SCANNER_VERSION: u32 = 17;
+pub const SHALLOW_SCANNER_VERSION: u32 = 18;
 
 // Version 17 reads Grok Bot names from account rosters. Cached transcripts
 // whose bytes are unchanged must still be revisited after upgrading.
@@ -198,6 +198,12 @@ const _: () = assert!(SHALLOW_SCANNER_VERSION > 13);
 /// first turn nothing orders is catalogued under its own first prompt again.
 const _: () = assert!(SHALLOW_SCANNER_VERSION > 14);
 
+/// Version 18 reads a Claude session's `agent-name` into its own column
+/// (`agent_name`), apart from the title it already fed. A finished transcript
+/// never changes on disk, so only this bump sends each cached Claude row
+/// through the reader that fills it.
+const _: () = assert!(SHALLOW_SCANNER_VERSION > 17);
+
 /// Most bytes a shallow head read may consume from one transcript.
 pub const HEAD_SCAN_MAX_BYTES: u64 = 256 * 1024;
 /// Most complete JSONL records a shallow head read may consider.
@@ -264,6 +270,12 @@ pub struct ShallowSession {
     /// Provider-native session kind, when recorded. Grok writes `subagent`
     /// even when it does not name the delegating session.
     pub session_kind: Option<String>,
+    /// The name other sessions address this one by, last observed. Observed.
+    /// Claude: the latest `agent-name` record (an Agent Relay worker's name,
+    /// e.g. `agent-relay-social-animation`). Kept apart from [`Self::title`],
+    /// which prefers a custom or AI title, so a session stays findable by the
+    /// name agents use for it.
+    pub agent_name: Option<String>,
     /// Model ids observed in the bounded read. Observed, best effort: never a
     /// reason to widen a read, so an empty list means "not seen cheaply", not
     /// "no model".
@@ -3832,9 +3844,9 @@ static UPSERT_SESSION_SQL: LazyLock<String> = LazyLock::new(|| {
          (session_id, source, cwd, git_branch, first_activity_ms, last_activity_ms, \
           last_assistant_text, raw_path, parser_version, first_prompt, models_json, originator, \
           agent_version, repo_url, initial_commit, workspace_roots_json, source_stamp, \
-          project_key, project_key_method, title, session_kind, \
+          project_key, project_key_method, title, session_kind, agent_name, \
           discovery_state) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?18, ?19, CASE WHEN ?2 = 'grok-bot' THEN NULLIF(?20, '') ELSE ?20 END, ?21, 'shallow') \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?18, ?19, CASE WHEN ?2 = 'grok-bot' THEN NULLIF(?20, '') ELSE ?20 END, ?21, ?22, 'shallow') \
          ON CONFLICT(session_id, source) DO UPDATE SET \
          {project_key_merge}, \
          cwd = COALESCE(excluded.cwd, sessions.cwd), \
@@ -3868,6 +3880,10 @@ static UPSERT_SESSION_SQL: LazyLock<String> = LazyLock::new(|| {
                  AND p.session_id = sessions.session_id AND p.location = 'local') THEN sessions.session_kind \
              WHEN excluded.source = 'grok' THEN excluded.session_kind \
              ELSE COALESCE(excluded.session_kind, sessions.session_kind) END, \
+         agent_name = CASE \
+             WHEN sessions.discovery_state IS NULL OR sessions.discovery_state = 'full' \
+             THEN COALESCE(sessions.agent_name, excluded.agent_name) \
+             ELSE COALESCE(excluded.agent_name, sessions.agent_name) END, \
          models_json = COALESCE(excluded.models_json, sessions.models_json), \
          originator = COALESCE(excluded.originator, sessions.originator), \
          agent_version = COALESCE(excluded.agent_version, sessions.agent_version), \
@@ -4030,6 +4046,7 @@ fn upsert_shallow_session_in_transaction(
             project_key_method,
             session.title,
             session.session_kind,
+            session.agent_name,
         ],
         row_to_session,
     )?;

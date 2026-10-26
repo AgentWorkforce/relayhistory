@@ -141,6 +141,7 @@ fn fold_claude_shallow_title(session: &mut ShallowSession, bounded: &BoundedJson
         titles.observe(&value);
     }
     session.title = titles.best();
+    session.agent_name = titles.agent_name;
 }
 
 pub(super) fn read_claude_shallow(

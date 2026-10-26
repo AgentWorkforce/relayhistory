@@ -1171,6 +1171,7 @@ fn delegated_child_session(
                         last_assistant_text: None,
                         title: None,
                         session_kind: None,
+                        agent_name: None,
                         models: Vec::new(),
                         originator: None,
                         agent_version: row.get(4)?,
@@ -1887,6 +1888,9 @@ pub struct CatalogSession {
     pub title: Option<String>,
     /// Provider-native kind, such as Grok's `subagent`.
     pub session_kind: Option<String>,
+    /// The name other sessions address this one by. Claude's latest
+    /// `agent-name` (an Agent Relay worker's name), kept apart from `title`.
+    pub agent_name: Option<String>,
     /// Model ids seen in the bounded read; best effort.
     pub models: Vec<String>,
     /// Client that originated the session. Codex.

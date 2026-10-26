@@ -650,6 +650,8 @@ const REQUIRED_SESSIONS_COLUMNS: &[&str] = &[
     "title",
     // Provider-native kind, used when a delegated session has no observed parent.
     "session_kind",
+    // The name other sessions address this one by (Claude's `agent-name`).
+    "agent_name",
 ];
 /// What a provider's parser reported about the session, kept with the
 /// checkpoint so a later read that parses nothing can still report it. A
@@ -1375,7 +1377,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     source_stamp TEXT,
     discovery_state TEXT,
     project_key TEXT,
-    project_key_method TEXT, title TEXT, session_kind TEXT,
+    project_key_method TEXT, title TEXT, session_kind TEXT, agent_name TEXT,
     PRIMARY KEY (session_id, source)
 );
 CREATE TABLE IF NOT EXISTS session_presences (
@@ -7876,6 +7878,7 @@ mod tests {
         assert!(has_column("sessions", "project_key"));
         assert!(has_column("sessions", "project_key_method"));
         assert!(has_column("sessions", "session_kind"));
+        assert!(has_column("sessions", "agent_name"));
         assert!(has_column("session_events", "project_key"));
         assert!(conn
             .prepare("SELECT 1 FROM schema_migrations WHERE name = 'session_project_key_v1'")

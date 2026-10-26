@@ -7958,6 +7958,8 @@ pub(crate) struct ClaudeSessionMeta {
     first_prompt: Option<String>,
     /// The name Claude Code gave the session; see [`claude_title`].
     title: Option<String>,
+    /// The latest `agent-name` record, kept apart from the title.
+    agent_name: Option<String>,
     /// This file is a delegated sidecar rather than a session of its own: it
     /// is named as one ([`is_claude_sidecar_file`]) and every identified
     /// record is a sidechain row — the same rule discovery uses to keep
@@ -8159,6 +8161,7 @@ impl ClaudeMetaFold {
             last_assistant_text: self.last_assistant_text.clone(),
             first_prompt: self.first_prompt.clone(),
             title: self.titles.best(),
+            agent_name: self.titles.agent_name.clone(),
             subagent: is_claude_sidecar_file(path)
                 && claude_records_are_all_sidechain(
                     self.identified_records,
@@ -8321,6 +8324,7 @@ pub(crate) fn set_claude_first_prompt(
         params![meta.first_prompt, meta.session_id],
     )?;
     set_session_title(conn, "claude", &meta.session_id, meta.title.as_deref())?;
+    titles::set_session_agent_name(conn, "claude", &meta.session_id, meta.agent_name.as_deref())?;
     Ok(())
 }
 
