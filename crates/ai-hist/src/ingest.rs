@@ -2601,21 +2601,6 @@ impl SyncTick {
     }
 }
 
-/// How the watch loop reads a sweep's result.
-///
-/// One conversion rather than one per caller: a tick that never took the lock
-/// looked at nothing, and a caller that folded that into `skipped_unchanged`
-/// would be telling the loop the change had been considered and dismissed.
-impl From<SyncTick> for crate::watch::TickOutcome {
-    fn from(tick: SyncTick) -> Self {
-        Self {
-            swept: tick.swept,
-            skipped_unchanged: tick.skipped_unchanged(),
-            contended: !tick.attempted,
-        }
-    }
-}
-
 pub(crate) fn sync_exclusive_with_home(
     db_path: &Path,
     home: &Path,
@@ -17141,6 +17126,7 @@ mod tests {
                 swept: false,
                 skipped_unchanged: false,
                 contended: true,
+                changed_nothing: false,
             },
             "the lock was held elsewhere: nothing was read and nothing compared"
         );
@@ -17153,6 +17139,7 @@ mod tests {
                 swept: false,
                 skipped_unchanged: true,
                 contended: false,
+                changed_nothing: false,
             },
             "the sweep ran and no source had moved"
         );
@@ -17165,6 +17152,7 @@ mod tests {
                 swept: true,
                 skipped_unchanged: false,
                 contended: false,
+                changed_nothing: false,
             },
             "the sweep ran and walked"
         );

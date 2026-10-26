@@ -229,6 +229,11 @@ pub struct TickOutcome {
     /// change it was for still owed, and the loop retries it rather than
     /// counting it done.
     pub contended: bool,
+    /// The sweep ran and changed nothing a consumer could see: no catalog row
+    /// moved. A filesystem-event tick like that closes the debounce window it
+    /// opened (see `WatchInner::run_claimed`). `false` when unknown, which
+    /// keeps the window as it always was.
+    pub changed_nothing: bool,
 }
 
 /// One tick, as handed to [`WatchLoop::on_report`].
@@ -1300,6 +1305,54 @@ mod tests {
 
         watch.stop();
         thread.join().unwrap().unwrap();
+    }
+
+    /// How long after its event the second of two isolated changes is swept,
+    /// when the first change's tick reports `changed_nothing` as `quiet`.
+    fn second_change_waits(quiet: bool) -> Duration {
+        let (sender, requests) = std::sync::mpsc::channel::<Instant>();
+        let sender = Mutex::new(sender);
+        let tick: ScopedTickFn = Arc::new(move |_: &TickRequest| {
+            sender.lock().unwrap().send(Instant::now()).unwrap();
+            Ok(TickOutcome {
+                changed_nothing: quiet,
+                ..TickOutcome::default()
+            })
+        });
+        let watch = Arc::new(
+            WatchLoop::scoped(tick)
+                .with_fs_events(false)
+                .with_immediate(false)
+                .with_leading_edge(true)
+                .with_debounce_ms(600)
+                .with_poll_interval_ms(MAX_INTERVAL_MS),
+        );
+        let runner = watch.clone();
+        let thread = std::thread::spawn(move || runner.run());
+        let wait = Duration::from_secs(10);
+        watch.inner.signal_change(fired(&["/roots/claude"]));
+        requests.recv_timeout(wait).unwrap();
+        while watch.inner.run.lock().expect("watch run state").in_flight {
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let second = Instant::now();
+        watch.inner.signal_change(fired(&["/roots/claude"]));
+        let swept = requests.recv_timeout(wait).unwrap();
+        watch.stop();
+        thread.join().unwrap().unwrap();
+        swept.duration_since(second)
+    }
+
+    /// The debounce window folds a burst into one trailing tick. A tick that
+    /// changed nothing -- macOS FSEvents reporting a create kqueue already
+    /// delivered and the loop already captured -- is not a burst, so the next
+    /// change is a leading edge again rather than waiting out the window.
+    #[test]
+    fn a_tick_that_changed_nothing_does_not_hold_the_next_change_for_the_window() {
+        let after_quiet = second_change_waits(true);
+        assert!(after_quiet < Duration::from_millis(300), "{after_quiet:?}");
+        let after_change = second_change_waits(false);
+        assert!(after_change >= Duration::from_millis(400), "{after_change:?}");
     }
 
     /// A forced tick deferred behind a running sweep comes back with every
