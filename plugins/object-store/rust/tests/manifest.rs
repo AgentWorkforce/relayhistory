@@ -119,6 +119,8 @@ fn chunk(n: u64, start: u64, bytes: u64) -> NewChunk {
         stored_bytes: bytes / 3 + 1,
         sha256: sha256_hex(format!("chunk-{n}").as_bytes()),
         stored_sha256: sha256_hex(format!("stored-{n}").as_bytes()),
+        stored_raw_bytes: Some(bytes),
+        raw_sha256: Some(sha256_hex(format!("scrubbed-{n}").as_bytes())),
         records: Some(1),
         first_ts: None,
         last_ts: None,
@@ -450,6 +452,8 @@ fn an_unacknowledged_empty_epoch_is_detected_and_invalidates_normalized_output()
     let mut m = first_manifest(&loc);
     let planned = plan_chunks(&m.raw, vec![chunk(0, 0, 10)]).unwrap();
     apply_chunks(&mut m.raw, &planned).unwrap();
+    relayhistory_object_store::manifest::client::record_scrub(&mut m.raw, "relayhistory-scrub", 1)
+        .unwrap();
     m.server = Some(with_normalized(&m, &m, 1, None));
     assert!(m.normalized_is_current());
     let ack = ClientAck::of(&m);
@@ -754,4 +758,53 @@ fn every_epochs_first_seq_is_checked_even_without_chunks() {
     assert!(validate(&m2, None)
         .iter()
         .any(|i| i.path == "server.retention.delete_after"));
+}
+
+#[test]
+fn scrub_marker_is_validated_and_keeps_the_weakest_version() {
+    use relayhistory_object_store::manifest::client::record_scrub;
+    let loc = location("unit");
+    let mut m = first_manifest(&loc);
+    let planned = plan_chunks(&m.raw, vec![chunk(0, 0, 10)]).unwrap();
+    apply_chunks(&mut m.raw, &planned).unwrap();
+    assert!(!m.is_scrubbed());
+    record_scrub(&mut m.raw, "relayhistory-scrub", 2).unwrap();
+    record_scrub(&mut m.raw, "relayhistory-scrub", 1).unwrap();
+    record_scrub(&mut m.raw, "relayhistory-scrub", 3).unwrap();
+    assert_eq!(
+        m.raw.scrub.as_ref().unwrap().version,
+        1,
+        "lowest version wins"
+    );
+    assert!(record_scrub(&mut m.raw, "other-rules", 1).is_err());
+    ensure_valid(&m, None).unwrap();
+
+    // With raw.scrub set, every chunk must say what was stored.
+    let mut missing = m.clone();
+    missing.raw.chunks[0].raw_sha256 = None;
+    assert!(validate(&missing, None)
+        .iter()
+        .any(|i| i.path == "raw.chunks[0].raw_sha256"));
+    let mut bad = m.clone();
+    bad.raw.scrub.as_mut().unwrap().version = 0;
+    assert!(validate(&bad, None)
+        .iter()
+        .any(|i| i.path == "raw.scrub.version"));
+}
+
+#[test]
+fn unscrubbed_manifests_are_quarantined() {
+    use relayhistory_object_store::manifest::client::record_scrub;
+    use relayhistory_object_store::manifest::server::{needs_transform, quarantined};
+    let loc = location("unit");
+    let mut m = first_manifest(&loc);
+    let planned = plan_chunks(&m.raw, vec![chunk(0, 0, 10)]).unwrap();
+    apply_chunks(&mut m.raw, &planned).unwrap();
+    assert!(quarantined(&m));
+    assert!(!needs_transform(&m), "never transform unscrubbed chunks");
+    assert!(!pointer_fields(&m).scrubbed);
+    record_scrub(&mut m.raw, "relayhistory-scrub", 1).unwrap();
+    assert!(!quarantined(&m));
+    assert!(needs_transform(&m));
+    assert!(pointer_fields(&m).scrubbed);
 }

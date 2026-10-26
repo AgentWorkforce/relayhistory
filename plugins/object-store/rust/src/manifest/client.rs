@@ -3,8 +3,8 @@
 //! is stale. See the spec sections "Epochs" and "Stale writers".
 
 use super::types::{
-    ChunkEntry, Compression, EpochReason, EpochRecord, Manifest, Raw, RawState, Session, Writer,
-    MANIFEST_SCHEMA_VERSION,
+    ChunkEntry, Compression, EpochReason, EpochRecord, Manifest, Raw, RawState, ScrubMarker,
+    Session, Writer, MANIFEST_SCHEMA_VERSION,
 };
 use super::update::now_rfc3339;
 use super::validate::content_sha256;
@@ -109,11 +109,18 @@ pub fn classify(remote: &Manifest, owner: &str, ack: Option<&ClientAck>) -> Remo
 /// A sealed chunk before it has a `seq`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewChunk {
+    /// Offset and length of the **source** range (unscrubbed).
     pub start_offset: u64,
     pub bytes: u64,
     pub stored_bytes: u64,
+    /// SHA-256 of the source range (unscrubbed).
     pub sha256: String,
     pub stored_sha256: String,
+    /// Uncompressed length and SHA-256 of the scrubbed records that were
+    /// stored (see `crate::scrub::scrub_chunk`). Required once the manifest
+    /// carries `raw.scrub`.
+    pub stored_raw_bytes: Option<u64>,
+    pub raw_sha256: Option<String>,
     pub records: Option<u64>,
     pub first_ts: Option<String>,
     pub last_ts: Option<String>,
@@ -137,6 +144,7 @@ pub fn plan_chunks(raw: &Raw, chunks: Vec<NewChunk>) -> Result<Vec<ChunkEntry>> 
             || c.stored_bytes == 0
             || !is_hex64(&c.sha256)
             || !is_hex64(&c.stored_sha256)
+            || c.raw_sha256.as_deref().is_some_and(|h| !is_hex64(h))
         {
             return Err(Error::InvalidArgument(format!(
                 "chunk {i} is empty or a digest is not 64 lowercase hex characters"
@@ -154,6 +162,8 @@ pub fn plan_chunks(raw: &Raw, chunks: Vec<NewChunk>) -> Result<Vec<ChunkEntry>> 
             sha256_8: c.sha256[..8].to_string(),
             sha256: c.sha256,
             stored_sha256: c.stored_sha256,
+            stored_raw_bytes: c.stored_raw_bytes,
+            raw_sha256: c.raw_sha256,
             compression: Compression::Zstd,
             records: c.records,
             first_ts: c.first_ts,
@@ -207,6 +217,30 @@ pub fn open_epoch(raw: &mut Raw, reason: EpochReason) -> Result<u32> {
     raw.next_offset = 0;
     raw.updated_at = now_rfc3339();
     Ok(epoch)
+}
+
+/// Record that chunks scrubbed with `ruleset` `version` are listed.
+/// `raw.scrub.version` keeps the **lowest** version seen, so readers always
+/// know the weakest scrub any chunk went through. A different rule set name
+/// is an error: one session uses one rule set.
+pub fn record_scrub(raw: &mut Raw, ruleset: &str, version: u32) -> Result<()> {
+    match &mut raw.scrub {
+        None => {
+            raw.scrub = Some(ScrubMarker {
+                ruleset: ruleset.to_string(),
+                version,
+                extra: Default::default(),
+            })
+        }
+        Some(m) if m.ruleset == ruleset => m.version = m.version.min(version),
+        Some(m) => {
+            return Err(Error::InvalidArgument(format!(
+                "raw.scrub.ruleset is {:?}, cannot record {ruleset:?}",
+                m.ruleset
+            )))
+        }
+    }
+    Ok(())
 }
 
 /// Mark the harness session ended (or reopen it).
@@ -281,6 +315,7 @@ pub fn new_manifest(params: NewManifest) -> Manifest {
         }],
         next_offset: 0,
         chunks: Vec::new(),
+        scrub: None,
         extra: Default::default(),
     };
     recompute(&mut raw);
