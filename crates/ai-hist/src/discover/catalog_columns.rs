@@ -84,3 +84,15 @@ pub(super) static UPSERT_SESSION_SQL: LazyLock<String> = LazyLock::new(|| {
          RETURNING {SESSION_COLUMNS}"
     )
 });
+
+/// The catalog columns with the text excerpts, the title and the agent name
+/// replaced by `NULL`, for a
+/// read that asked for no transcript text: the excerpts are bounded, but
+/// "bounded" is not "not moved", and a hash-only consumer is promised the
+/// latter.
+pub(super) static SESSION_COLUMNS_NO_TEXT: LazyLock<String> = LazyLock::new(|| {
+    SESSION_COLUMNS
+        .replacen("first_prompt, last_assistant_text,", "NULL AS first_prompt, NULL AS last_assistant_text,", 1)
+        .replacen("project_key_method, title,", "project_key_method, NULL AS title,", 1)
+        .replacen("session_kind, agent_name", "session_kind, NULL AS agent_name", 1)
+});

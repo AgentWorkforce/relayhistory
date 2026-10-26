@@ -128,6 +128,16 @@ fn a_claude_agent_name_is_catalogued_apart_from_the_title() {
         Some("Changelog videos")
     );
     assert_eq!(agent_name(&store, CLAUDE_ID).as_deref(), Some(RELAY_AGENT));
+    // Like the title, it can carry transcript text, so a read that asked for no
+    // text carries none.
+    let mut no_text = SessionQuery::default();
+    no_text.include_text = false;
+    let content_off = store
+        .session(&SessionRef::id(Source::Claude, CLAUDE_ID), no_text)
+        .unwrap()
+        .expect("catalogued")
+        .session;
+    assert_eq!(content_off.agent_name, None);
 
     // A later rename by the relay replaces it; a read that finds none keeps it.
     let transcript = home

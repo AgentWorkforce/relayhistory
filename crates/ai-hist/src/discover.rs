@@ -3409,7 +3409,7 @@ fn file_candidates(
 mod catalog_columns;
 mod catalog_row;
 pub(crate) use {catalog_columns::SESSION_COLUMNS, catalog_row::row_to_session};
-use catalog_columns::UPSERT_SESSION_SQL;
+use catalog_columns::{SESSION_COLUMNS_NO_TEXT, UPSERT_SESSION_SQL};
 
 /// A precise continuation point in the catalog's total order.
 ///
@@ -3608,15 +3608,6 @@ fn fetch_catalog_row(
         .ok())
 }
 
-/// The catalog columns with the text excerpts and the title replaced by `NULL`, for a
-/// read that asked for no transcript text: the excerpts are bounded, but
-/// "bounded" is not "not moved", and a hash-only consumer is promised the
-/// latter.
-static SESSION_COLUMNS_NO_TEXT: LazyLock<String> = LazyLock::new(|| {
-    SESSION_COLUMNS
-        .replacen("first_prompt, last_assistant_text,", "NULL AS first_prompt, NULL AS last_assistant_text,", 1)
-        .replacen("project_key_method, title,", "project_key_method, NULL AS title,", 1)
-});
 
 fn catalog_columns(include_text: bool) -> &'static str {
     if include_text {

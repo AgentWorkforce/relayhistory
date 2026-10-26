@@ -1866,6 +1866,7 @@ pub struct CatalogSession {
     pub session_kind: Option<String>,
     /// The name other sessions address this one by. Claude's latest
     /// `agent-name` (an Agent Relay worker's name), kept apart from `title`.
+    /// `None` when the query asked for no text.
     pub agent_name: Option<String>,
     /// Model ids seen in the bounded read; best effort.
     pub models: Vec<String>,
