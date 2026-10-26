@@ -21,6 +21,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- The object-storage plugin's filesystem store refuses keys that traverse a symbolic link under its root, and presigned URLs require a lifetime of at least one second.
+
 - Reconciliation advances healthy roots past persistent enumeration errors while retaining failed locations for retry.
 - Exact-path capture avoids materializing unused cached transcript metadata and locations.
 - Unchanged Claude transcripts avoid duplicate file reads when record and metadata cursors have the same byte proof.

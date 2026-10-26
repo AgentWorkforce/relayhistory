@@ -209,6 +209,31 @@ impl Backend for FsBackend {
         Ok(result)
     }
 
+    /// A symbolic link anywhere under the root could point a valid key at
+    /// any file on the host, so the store never traverses one: every component
+    /// of the object path and of its sidecar path is `lstat`ed first.
+    async fn check_key(&self, key: &crate::ObjectKey) -> Result<()> {
+        let root = self.root.clone();
+        let segments: Vec<String> = key.as_str().split('/').map(str::to_string).collect();
+        let key = key.to_string();
+        tokio::task::spawn_blocking(move || {
+            let mut sidecar = vec![RESERVED_DIR.to_string(), "meta".to_string()];
+            sidecar.extend(segments.iter().cloned());
+            if let Some(last) = sidecar.last_mut() {
+                last.push_str(".json");
+            }
+            for path in [segments, sidecar] {
+                no_symlink_under(&root, &path, &key)?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::Backend {
+            backend: "fs",
+            source: Box::new(e),
+        })?
+    }
+
     async fn metadata_of_get(
         &self,
         path: &Path,
@@ -318,6 +343,30 @@ impl Backend for FsBackend {
             .await
             .map_err(map)
     }
+}
+
+fn no_symlink_under(root: &std::path::Path, segments: &[String], key: &str) -> Result<()> {
+    let mut current = root.to_path_buf();
+    for segment in segments {
+        current.push(segment);
+        match std::fs::symlink_metadata(&current) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                return Err(Error::InvalidKey(format!(
+                    "{key}: {} is a symbolic link; FsStore does not follow links",
+                    current.display()
+                )))
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(Error::Backend {
+                    backend: "fs",
+                    source: Box::new(e),
+                })
+            }
+        }
+    }
+    Ok(())
 }
 
 fn generic(source: Box<dyn std::error::Error + Send + Sync>) -> object_store::Error {
@@ -435,6 +484,63 @@ mod tests {
         let meta = store.head(&key).await.unwrap().unwrap();
         assert_eq!(meta.trace_id(), Some("t-2"));
         assert_eq!(meta.content_sha256(), Some(v2.content_sha256.as_str()));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn refuses_to_follow_a_symlink_out_of_the_root() {
+        let (dir, store) = store();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(outside.path().join("secret"), b"host file").unwrap();
+        std::os::unix::fs::symlink(outside.path(), dir.path().join("escape")).unwrap();
+        let key = ObjectKey::new("escape/secret").unwrap();
+        assert!(matches!(
+            store.get(&key, None).await,
+            Err(Error::InvalidKey(_))
+        ));
+        assert!(matches!(store.head(&key).await, Err(Error::InvalidKey(_))));
+        let new = ObjectKey::new("escape/new").unwrap();
+        assert!(matches!(
+            store
+                .put(&new, Bytes::from_static(b"x"), PutOpts::default())
+                .await,
+            Err(Error::InvalidKey(_))
+        ));
+        assert_eq!(
+            std::fs::read_dir(outside.path()).unwrap().count(),
+            1,
+            "nothing written outside"
+        );
+        // A link in the sidecar tree is refused too.
+        let meta = dir.path().join(".rh/meta");
+        std::fs::create_dir_all(&meta).unwrap();
+        std::os::unix::fs::symlink(outside.path(), meta.join("side")).unwrap();
+        assert!(matches!(
+            store
+                .put(
+                    &ObjectKey::new("side/x").unwrap(),
+                    Bytes::from_static(b"x"),
+                    PutOpts::default()
+                )
+                .await,
+            Err(Error::InvalidKey(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn presign_rejects_sub_second_ttls() {
+        let (_dir, store) = store();
+        let key = ObjectKey::new("a/b").unwrap();
+        for ttl in [Duration::ZERO, Duration::from_millis(500)] {
+            assert!(matches!(
+                store.presign_get(&key, ttl).await,
+                Err(Error::InvalidArgument(_))
+            ));
+        }
+        assert!(store
+            .presign_get(&key, Duration::from_secs(1))
+            .await
+            .is_ok());
     }
 
     #[tokio::test]
