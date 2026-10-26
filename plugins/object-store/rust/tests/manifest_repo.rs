@@ -8,10 +8,21 @@ use std::process::Command;
 use relayhistory_object_store::manifest::repo::{root_commit, session_repo, RootCommitCache};
 
 fn git(dir: &Path, args: &[&str]) -> String {
+    // Isolated from the developer's git config (signing, hooks, templates).
     let out = Command::new("git")
         .arg("-C")
         .arg(dir)
+        .args([
+            "-c",
+            "commit.gpgsign=false",
+            "-c",
+            "tag.gpgsign=false",
+            "-c",
+            "core.hooksPath=/dev/null",
+        ])
         .args(args)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_AUTHOR_NAME", "t")
         .env("GIT_AUTHOR_EMAIL", "t@example.com")
         .env("GIT_COMMITTER_NAME", "t")
