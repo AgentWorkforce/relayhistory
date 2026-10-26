@@ -347,15 +347,6 @@ pub(crate) static RULES: LazyLock<Result<Vec<Rule>, String>> = LazyLock::new(|| 
             Template(REDACTED),
             &["@"],
         ),
-        // `\d`/`\w` are ASCII in the reference, so they are spelled out here.
-        gated(
-            r(
-                fancy(r"(^|[^A-Za-z0-9_.+-])[0-9]+(?:[ -][0-9]+)*(?![A-Za-z0-9_]|[.-][0-9])"),
-                Func(super::numbers::redact_cards),
-                &[],
-            ),
-            super::numbers::has_card_length_run,
-        ),
         gated(
             r(
                 // The whole run after `+` (digit groups joined by one separator,
@@ -378,6 +369,17 @@ pub(crate) static RULES: LazyLock<Result<Vec<Rule>, String>> = LazyLock::new(|| 
                 &["-", "."],
             ),
             super::numbers::has_nanp_shape,
+        ),
+        // Cards run after the phone rules, as in the reference: a card rule that
+        // ran first could break a phone's shape and leave part of it visible.
+        // `\d`/`\w` are ASCII in the reference, so they are spelled out here.
+        gated(
+            r(
+                fancy(r"(^|[^A-Za-z0-9_.+-])[0-9]+(?:[ -][0-9]+)*(?![A-Za-z0-9_]|[.-][0-9])"),
+                Func(super::numbers::redact_cards),
+                &[],
+            ),
+            super::numbers::has_card_length_run,
         ),
     ]
     .into_iter()
