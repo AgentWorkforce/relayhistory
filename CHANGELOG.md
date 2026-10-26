@@ -6,6 +6,10 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased - Minor]
 
+### Added
+
+- The object-storage plugin can scrub PII and secrets, including PGP private keys, card numbers and phone numbers, from raw session chunks before upload (`scrub::scrub_chunk`, called by the delivery worker), using the same rules as the hosted service.
+
 ### Rust API
 
 - Added `SessionStore::retention_generation` and `retention::read_retention_generation` so retained catalogs can invalidate after committed local eviction without uploading deletion records.
@@ -40,7 +44,6 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - VT Code history is discoverable and searchable from canonical workspace journals under explicitly configured workspace roots, preserving recorded turns, tool identities, usage and control events.
 - Junie CLI history is discoverable and searchable from native session journals, including recorded prompts, assistant text, tool output and event markers.
 - The optional object-storage plugin (`plugins/object-store`) validates session `manifest.json` v1 and lets the desktop and server update it concurrently with compare-and-swap, without losing either side's changes.
-- The object-storage plugin can scrub PII and secrets, including PGP private keys, card numbers and phone numbers, from raw session chunks before upload (`scrub::scrub_chunk`, called by the delivery worker), using the same rules as the hosted service.
 
 ### Fixed
 
