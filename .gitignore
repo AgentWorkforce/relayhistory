@@ -14,3 +14,11 @@ __pycache__/
 target/
 .tmp/
 .npm-cache/
+
+# Agent tool configs that brokers and agents write at the repo root with
+# live Relay credentials. Never commit them. Anchored to the root so the
+# provider fixture trees (which contain .codex/ and friends) stay tracked.
+/.mcp.json
+/.cursor/mcp.json
+/.codex/
+/.agentworkforce/
