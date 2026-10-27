@@ -24,7 +24,7 @@ rust_roots = ["crates/ai-hist-cli/src", "crates/ai-hist-napi/src", "crates/ai-hi
 
 [baseline.file_loc]
 "crates/ai-hist-cli/src/lib.rs" = 2777
-"crates/ai-hist-napi/src/lib.rs" = 2116
+"crates/ai-hist-napi/src/lib.rs" = 2115
 "crates/ai-hist/src/change_feed.rs" = 1197
 "crates/ai-hist/src/discover.rs" = 3268
 "crates/ai-hist/src/ingest.rs" = 11383
@@ -65,9 +65,6 @@ rust_roots = ["crates/ai-hist-cli/src", "crates/ai-hist-napi/src", "crates/ai-hi
 "crates/ai-hist/src/ingest/opencode.rs::normalize_session" = 52
 "crates/ai-hist/src/source_intake.rs::apply_normalized" = 46
 
-[baseline.deny_warnings]
-"crates/ai-hist-napi/src/lib.rs" = 1
-
 [baseline.pub_wrapper]
 "crates/ai-hist/src/discover.rs::discover_sessions_with_providers" = 1
 "crates/ai-hist/src/discover.rs::shallow_providers" = 1
@@ -79,6 +76,3 @@ rust_roots = ["crates/ai-hist-cli/src", "crates/ai-hist-napi/src", "crates/ai-hi
 "plugins/provider-sources/rust/src/remote/claude_web.rs::ClaudeWebProvider::new" = 1
 "plugins/provider-sources/rust/src/remote/devin_cloud.rs::DevinCloudProvider::new" = 1
 "plugins/provider-sources/rust/src/remote/dispatch.rs::provider" = 1
-
-[baseline.missing_error_impl]
-"plugins/object-store/rust/src/scrub/mod.rs::Dropped" = 1

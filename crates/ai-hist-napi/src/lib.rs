@@ -2,7 +2,6 @@
 //!
 //! This crate maps typed JavaScript requests to reusable Rust operations. It
 //! contains no SQL, provider parsing, migration, or query semantics of its own.
-#![deny(clippy::all)]
 
 pub mod change_feed;
 pub mod export;
