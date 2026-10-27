@@ -138,10 +138,10 @@ jobs:
         id: rust-oleum-cache
         with:
           path: ~/.cargo/bin/rust-oleum
-          key: rust-oleum-${{ runner.os }}-0.1.3
+          key: rust-oleum-${{ runner.os }}-0.3.0
       - name: Install rust-oleum
         if: steps.rust-oleum-cache.outputs.cache-hit != 'true'
-        run: cargo install rust-oleum --version 0.1.3 --locked
+        run: cargo install rust-oleum --version 0.3.0 --locked
       - name: Quality ratchet
         run: rust-oleum --github-summary "$GITHUB_STEP_SUMMARY"
 

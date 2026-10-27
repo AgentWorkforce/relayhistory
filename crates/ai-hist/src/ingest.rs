@@ -146,15 +146,22 @@ pub(crate) use path_capture::{reconcile_pending, sync_facade_tick};
 mod codex_history;
 // After `sync_note!`, which an unreadable rollout reports through.
 mod fork_replay;
+#[cfg(test)]
+mod idle_sweep_tests;
 mod jsonl_sync_steps;
 mod rederived;
 mod rollout_head;
+mod subagent_cleanup;
 use fork_replay::{inherited_baseline_verdict, record_codex_fork_replay, ForkReplaySpan};
 use jsonl_sync_steps::{cursor_scan_checkpoint, insert_history_line, settle_unchanged_jsonl};
 pub(crate) use rollout_head::read_codex_session_meta;
 #[cfg(test)]
 use rollout_head::LEADING_BYTE_LIMIT;
 use rollout_head::{read_codex_session_meta_counted, read_leading_records};
+use subagent_cleanup::{
+    cleanup_codex_subagent_history, cleanup_codex_subagent_registration,
+    cleanup_subagent_registration, codex_session_has_remote_presence, session_has_remote_presence,
+};
 // After `sync_note!`, which the repair note uses.
 pub(crate) mod scoped_files;
 #[cfg(test)]
@@ -4465,99 +4472,6 @@ fn sync_codex_with_repairs_and_coverage(
 /// Each per-file record carries its session id and classification so a wiped
 /// database or an older guardian classification also forces re-ingestion.
 type CodexRolloutWalk = (HashMap<String, String>, HashMap<String, String>, usize);
-
-/// Reconcile the catalog registration for a locally observed subagent.
-///
-/// A local-only subagent stays out of the catalog. If the same canonical
-/// session was separately discovered remotely, its retained local events are
-/// also local evidence, so both presences and the canonical row must survive.
-///
-/// Deleting a `sessions` row fires `delete_session_hydration_state`, which
-/// cascades away every relationship the row takes part in — as parent as well
-/// as child. Undoing a subagent's registration is not that session going away,
-/// so the observed delegation evidence, including the thread's own outgoing
-/// edges, is carried across the delete. The trigger itself cannot be narrowed
-/// instead: `CREATE TRIGGER IF NOT EXISTS` never replaces the one an existing
-/// database already has.
-fn cleanup_subagent_registration(conn: &Connection, source: &str, session_id: &str) -> Result<()> {
-    conn.execute(
-        "DELETE FROM session_presences \
-         WHERE source = ? AND session_id = ? AND location = 'local' \
-           AND NOT EXISTS (\
-             SELECT 1 FROM session_presences \
-             WHERE source = ? AND session_id = ? AND location = 'remote'\
-           )",
-        params![source, session_id, source, session_id],
-    )?;
-    conn.execute_batch(
-        "CREATE TEMP TABLE IF NOT EXISTS retained_relationships \
-           AS SELECT * FROM session_relationships WHERE 0; \
-         DELETE FROM retained_relationships;",
-    )?;
-    // One seek per end of the edge; see `session_continuity_edges`.
-    conn.execute(
-        "INSERT INTO retained_relationships \
-         SELECT * FROM session_relationships WHERE source = ?1 AND parent_session_id = ?2 \
-         UNION ALL \
-         SELECT * FROM session_relationships \
-         WHERE source = ?1 AND child_session_id = ?2 AND parent_session_id <> ?2",
-        params![source, session_id],
-    )?;
-    let sessions = conn.execute(
-        "DELETE FROM sessions \
-         WHERE source = ? AND session_id = ? \
-           AND NOT EXISTS (\
-             SELECT 1 FROM session_presences \
-             WHERE source = ? AND session_id = ?\
-           )",
-        params![source, session_id, source, session_id],
-    )?;
-    conn.execute_batch(
-        "INSERT OR IGNORE INTO session_relationships SELECT * FROM retained_relationships; \
-         DELETE FROM retained_relationships;",
-    )?;
-    // Only the session delete drops evidence the probes join; a presence is
-    // not. Releasing on every changed delegated-thread rollout re-read every
-    // evidence key once per thread.
-    evidence_probe::note_deleted(conn, "sessions", sessions);
-    Ok(())
-}
-
-fn cleanup_codex_subagent_registration(conn: &Connection, session_id: &str) -> Result<()> {
-    cleanup_subagent_registration(conn, "codex", session_id)
-}
-
-fn codex_session_has_remote_presence(conn: &Connection, session_id: &str) -> Result<bool> {
-    session_has_remote_presence(conn, "codex", session_id)
-}
-
-/// Whether a session is also known remotely. Local and remote evidence share
-/// one `(source, session_id)` identity, so a local re-read must not delete
-/// rows a remote observation put there.
-fn session_has_remote_presence(conn: &Connection, source: &str, session_id: &str) -> Result<bool> {
-    conn.query_row(
-        "SELECT EXISTS(\
-           SELECT 1 FROM session_presences \
-           WHERE source = ? AND session_id = ? AND location = 'remote'\
-         )",
-        params![source, session_id],
-        |row| row.get(0),
-    )
-    .map_err(Into::into)
-}
-
-/// Remove prompt history that an older local sync incorrectly attributed to a
-/// subagent. A remote presence makes the history canonical shared evidence, so
-/// it must not be destroyed by a later local scan.
-fn cleanup_codex_subagent_history(conn: &Connection, session_id: &str) -> Result<()> {
-    if !codex_session_has_remote_presence(conn, session_id)? {
-        conn.execute(
-            "DELETE FROM history WHERE source = 'codex' AND session_id = ?",
-            [session_id],
-        )?;
-    }
-    Ok(())
-}
 
 #[cfg(test)]
 fn sync_codex_rollouts(
