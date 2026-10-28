@@ -136,10 +136,12 @@ fn opencode_store_snapshot(
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
     )?;
     // The row the OpenCode reader reads the session from carries both times.
+    // OpenCode 2 keeps them when it copies a V1 session, so its stamps are
+    // marked: a session that moves to OpenCode 2 is read again once.
     use crate::ingest::opencode::v2::{Envelope, Layout};
-    let table = match Layout::detect(&src)?.envelope(&src, &options.session_id)? {
-        Some(Envelope::V2) => "session_v2",
-        _ => "session",
+    let (table, mark) = match Layout::detect(&src)?.envelope(&src, &options.session_id)? {
+        Some(Envelope::V2) => ("session_v2", "v2:"),
+        _ => ("session", ""),
     };
     let columns = src
         .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))?
@@ -156,7 +158,7 @@ fn opencode_store_snapshot(
         "NULL"
     };
     let stamp_sql = format!(
-        "SELECT printf('%lld:%lld', COALESCE({created}, 0), \
+        "SELECT printf('{mark}%lld:%lld', COALESCE({created}, 0), \
             COALESCE({updated}, {created}, 0)) FROM {table} WHERE id = ?"
     );
     let stamp = src

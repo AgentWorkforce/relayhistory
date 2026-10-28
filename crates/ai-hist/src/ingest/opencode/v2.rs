@@ -80,6 +80,16 @@ impl Layout {
         )))
     }
 
+    /// The bulk scan of the V1 `message` table, leaving out the sessions read
+    /// from OpenCode 2 so their V1 rows can neither load nor fail.
+    pub(crate) fn v1_messages_sql(self, fallback_created: &str) -> String {
+        let skip = match self.v2 {
+            true => " AND NOT EXISTS (SELECT 1 FROM session_v2 v WHERE v.id = message.session_id)",
+            false => "",
+        };
+        format!("SELECT id, session_id, data, {fallback_created} FROM message WHERE json_valid(data){skip}")
+    }
+
     /// The clause a query over the V1 `session` table appends so it leaves
     /// out the sessions read from OpenCode 2.
     pub(crate) fn v1_filter(self) -> &'static str {
@@ -415,7 +425,8 @@ mod tests {
 
     /// A store OpenCode 2 is migrating: `old` not copied yet, `migrated` in
     /// both layouts with different content (as a session resumed under
-    /// OpenCode 2 is), `fresh` only in the OpenCode 2 tables.
+    /// OpenCode 2 is, plus a V1 row no loader can map), `fresh` only in the
+    /// OpenCode 2 tables.
     fn migrated_store() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -436,7 +447,8 @@ mod tests {
                                           ('migrated', NULL, '/w', 1, 10, 'Before');
                INSERT INTO message VALUES
                  ('om', 'old', 2, '{"role":"user","time":{"created":2}}'),
-                 ('mm', 'migrated', 2, '{"role":"user","time":{"created":2}}');
+                 ('mm', 'migrated', 2, '{"role":"user","time":{"created":2}}'),
+                 (NULL, 'migrated', 3, '{"role":"user","time":{"created":3}}');
                INSERT INTO part VALUES
                  ('op', 'om', 'old', 2, '{"type":"text","text":"old prompt"}'),
                  ('mp', 'mm', 'migrated', 2, '{"type":"text","text":"v1 prompt"}');

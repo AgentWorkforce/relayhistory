@@ -465,8 +465,7 @@ pub(crate) fn load_all_from_sqlite(src: &Connection) -> Result<OpencodeStoreLoad
     let mut session_of_message: BTreeMap<String, String> = BTreeMap::new();
     if has_columns(&message_columns, &["id", "data", "session_id"]) {
         let fallback = optional_column(&message_columns, "time_created");
-        let sql =
-            format!("SELECT id, session_id, data, {fallback} FROM message WHERE json_valid(data)");
+        let sql = layout.v1_messages_sql(fallback);
         let mut stmt = src.prepare(&sql)?;
         let mapped = stmt.query_map([], |row| {
             // `session_id` first and on its own, because a row that fails is
