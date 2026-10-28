@@ -1,24 +1,25 @@
 //! OpenCode 2's session tables, `session_v2` and `session_message`, in the
 //! same `opencode.db`.
 //!
-//! OpenCode 2 copies every V1 session into these tables the first time it
-//! opens a store, keeping session and message ids and `time_updated`, and from
-//! then on writes only here. The V1 `session`, `message` and `part` rows stay
-//! as they were. So a session belongs to OpenCode 2 when V1 does not hold it,
-//! or when its `session_v2` row is newer than its V1 row (a V1 session resumed
-//! under OpenCode 2). Every other session is still read from the V1 tables and
-//! its evidence does not move.
+//! OpenCode 2 copies every V1 session, messages and parts included, into
+//! these tables the first time it opens a store, and from then on writes only
+//! here. So a session with a `session_v2` row is read from OpenCode 2, and any
+//! other session (a store OpenCode 2 has not finished migrating) from the V1
+//! `session`, `message` and `part` tables. [`Layout`] makes that choice, so
+//! discovery, hydration and the sweep never decide it themselves.
 //!
 //! The loader here rewrites each OpenCode 2 message into the V1 message and
 //! part payloads, so [`super::normalize`] stays the one parser for every
 //! layout.
 
+use super::OpencodeSession;
+use super::OpencodeSessionInfo;
 use super::{finish, has_columns, parse_message, table_columns, OpencodeMessage, OpencodePart};
-use super::{OpencodeSession, OpencodeSessionInfo};
 use anyhow::{Context, Result};
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Map, Value};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
+use std::path::Path;
 
 /// A V1 message payload and its V1 parts.
 type V1Message = (Map<String, Value>, Vec<Map<String, Value>>);
@@ -26,105 +27,163 @@ type V1Message = (Map<String, Value>, Vec<Map<String, Value>>);
 const SESSION_COLUMNS: &[&str] = &["id", "directory", "time_created", "time_updated"];
 const MESSAGE_COLUMNS: &[&str] = &["id", "session_id", "type", "seq", "time_created", "data"];
 
-/// Whether this store has OpenCode 2's session tables with the columns read
-/// here.
-pub(crate) fn present(src: &Connection) -> Result<bool> {
-    Ok(
-        has_columns(&table_columns(src, "session_v2")?, SESSION_COLUMNS)
-            && has_columns(&table_columns(src, "session_message")?, MESSAGE_COLUMNS),
-    )
+/// Which session tables a store has, read once per open connection.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Layout {
+    v1: bool,
+    v2: bool,
 }
 
-/// The predicate, over `session_v2` aliased `v`, that OpenCode 2 owns the
-/// session. Empty when the store has no V1 `session` table to defer to.
-fn owned_predicate(src: &Connection) -> Result<&'static str> {
-    let v1 = table_columns(src, "session")?;
-    Ok(match (v1.contains("id"), v1.contains("time_updated")) {
-        (false, _) => "",
-        (true, true) => {
-            " AND NOT EXISTS (SELECT 1 FROM session s WHERE s.id = v.id \
-             AND COALESCE(s.time_updated, 0) >= v.time_updated)"
+/// The tables one session is read from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Envelope {
+    V1,
+    V2,
+}
+
+impl Layout {
+    pub(crate) fn detect(src: &Connection) -> Result<Self> {
+        Ok(Self {
+            v1: table_columns(src, "session")?.contains("id"),
+            v2: has_columns(&table_columns(src, "session_v2")?, SESSION_COLUMNS)
+                && has_columns(&table_columns(src, "session_message")?, MESSAGE_COLUMNS),
+        })
+    }
+
+    pub(crate) fn has_v2(self) -> bool {
+        self.v2
+    }
+
+    /// Where `session_id` is read from, or `None` when the store does not
+    /// hold it.
+    pub(crate) fn envelope(self, src: &Connection, session_id: &str) -> Result<Option<Envelope>> {
+        let held = |table: &str| -> Result<bool> {
+            let sql = format!("SELECT 1 FROM {table} WHERE id = ?");
+            Ok(src.prepare_cached(&sql)?.exists([session_id])?)
+        };
+        if self.v2 && held("session_v2")? {
+            return Ok(Some(Envelope::V2));
         }
-        (true, false) => " AND NOT EXISTS (SELECT 1 FROM session s WHERE s.id = v.id)",
-    })
-}
-
-/// `SELECT <columns> FROM session_v2 v` over the sessions OpenCode 2 owns.
-pub(crate) fn owned_sessions_sql(src: &Connection, columns: &str) -> Result<String> {
-    Ok(format!(
-        "SELECT {columns} FROM session_v2 v WHERE v.id IS NOT NULL AND v.id <> ''{}",
-        owned_predicate(src)?
-    ))
-}
-
-/// The clause a query over the V1 `session` table appends so it leaves out
-/// the sessions OpenCode 2 owns. Empty on a store without OpenCode 2.
-pub(crate) fn v1_exclusion(src: &Connection) -> Result<&'static str> {
-    if !present(src)? {
-        return Ok("");
+        Ok((self.v1 && held("session")?).then_some(Envelope::V1))
     }
-    Ok(
-        match table_columns(src, "session")?.contains("time_updated") {
-            true => {
-                " AND NOT EXISTS (SELECT 1 FROM session_v2 v WHERE v.id = session.id \
-             AND v.time_updated > COALESCE(session.time_updated, 0))"
-            }
+
+    /// The V1 sessions not read from OpenCode 2, selecting the columns the V1
+    /// loaders read; `None` when the store has no V1 `session` table.
+    pub(crate) fn v1_sessions_sql(self, src: &Connection) -> Result<Option<String>> {
+        if !self.v1 {
+            return Ok(None);
+        }
+        let columns = OpencodeSessionInfo::columns(&table_columns(src, "session")?);
+        Ok(Some(format!(
+            "SELECT {columns} FROM session WHERE id IS NOT NULL AND id <> ''{}",
+            self.v1_filter()
+        )))
+    }
+
+    /// The clause a query over the V1 `session` table appends so it leaves
+    /// out the sessions read from OpenCode 2.
+    pub(crate) fn v1_filter(self) -> &'static str {
+        match self.v2 {
+            true => " AND NOT EXISTS (SELECT 1 FROM session_v2 v WHERE v.id = session.id)",
             false => "",
-        },
+        }
+    }
+}
+
+/// Whether the OpenCode store at `store` holds `session_id` in either
+/// layout: the question that decides which channel store owns a session
+/// present in several.
+pub(crate) fn store_holds(store: &Path, session_id: &str) -> Result<bool> {
+    let src = Connection::open_with_flags(
+        store,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
     )
+    .with_context(|| format!("opening {}", store.display()))?;
+    src.busy_timeout(std::time::Duration::from_secs(5))?;
+    Ok(Layout::detect(&src)?.envelope(&src, session_id)?.is_some())
 }
 
-/// The V1 `session` table's columns, and the query over its sessions that
-/// OpenCode 2 does not own (selecting what the V1 loaders read).
-pub(crate) fn v1_sessions(src: &Connection) -> Result<(BTreeSet<String>, String)> {
-    let columns = table_columns(src, "session")?;
-    let sql = format!(
-        "SELECT {} FROM session WHERE id IS NOT NULL AND id <> ''{}",
-        OpencodeSessionInfo::columns(&columns),
-        v1_exclusion(src)?
-    );
-    Ok((columns, sql))
+/// `SELECT <columns> FROM session_v2 v` over every OpenCode 2 session.
+pub(crate) fn sessions_sql(columns: &str) -> String {
+    format!("SELECT {columns} FROM session_v2 v WHERE v.id IS NOT NULL AND v.id <> ''")
 }
 
-/// Whether OpenCode 2 owns `session_id` in this store.
-pub(crate) fn owns(src: &Connection, session_id: &str) -> Result<bool> {
-    if !present(src)? {
-        return Ok(false);
-    }
-    let sql = format!("{} AND v.id = ?", owned_sessions_sql(src, "1")?);
-    Ok(src.prepare_cached(&sql)?.exists([session_id])?)
-}
-
-/// Whether the store holds the session in either layout. A store OpenCode 2
-/// created has no V1 `session` table at all.
-pub(crate) fn holds(src: &Connection, session_id: &str) -> Result<bool> {
-    let held = table_columns(src, "session")?.contains("id")
-        && src
-            .prepare("SELECT 1 FROM session WHERE id = ?")?
-            .exists([session_id])?;
-    Ok(held || owns(src, session_id)?)
-}
-
-/// The ids of every session OpenCode 2 owns.
-pub(crate) fn owned_ids(src: &Connection) -> Result<Vec<String>> {
-    if !present(src)? {
-        return Ok(Vec::new());
-    }
-    let sql = owned_sessions_sql(src, "v.id")?;
-    let mut stmt = src.prepare(&sql)?;
+/// The ids of every OpenCode 2 session.
+fn session_ids(src: &Connection) -> Result<Vec<String>> {
+    let mut stmt = src.prepare(&sessions_sql("v.id"))?;
     let ids = stmt
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(ids)
 }
 
-/// Add every session OpenCode 2 owns to a whole-store load. `session_message`
-/// is indexed by session, so they are read one at a time on either plan.
-pub(crate) fn load_owned(
+/// The session's title, unless it is still OpenCode's placeholder.
+pub(crate) fn title(src: &Connection, session_id: &str) -> Result<Option<String>> {
+    let raw: Option<String> = src
+        .prepare_cached("SELECT title FROM session_v2 WHERE id = ?")?
+        .query_row([session_id], |row| row.get(0))
+        .optional()?
+        .flatten();
+    Ok(crate::ingest::titles::opencode_title(raw.as_deref()))
+}
+
+/// The first `user` message's text, cut in SQL to `max_chars`, skipping
+/// messages that are only `trim` characters. `session_message` is indexed by
+/// session, so this is one seek.
+pub(crate) fn first_prompt(
     src: &Connection,
+    session_id: &str,
+    max_chars: usize,
+    trim: &str,
+) -> Result<Option<String>> {
+    let max_chars = i64::try_from(max_chars).unwrap_or(i64::MAX);
+    Ok(src
+        .prepare_cached(
+            "SELECT substr(json_extract(data, '$.text'), 1, ?) FROM session_message \
+             WHERE session_id = ? AND type = 'user' AND json_valid(data) \
+             AND json_type(data, '$.text') = 'text' \
+             AND trim(substr(json_extract(data, '$.text'), 1, ?), ?) <> '' \
+             ORDER BY seq ASC LIMIT 1",
+        )?
+        .query_row(params![max_chars, session_id, max_chars, trim], |row| {
+            row.get::<_, String>(0)
+        })
+        .optional()?)
+}
+
+/// The first assistant message's model, which OpenCode 2 nests as
+/// `{providerID, id}`.
+pub(crate) fn first_model(src: &Connection, session_id: &str) -> Result<Option<String>> {
+    Ok(src
+        .prepare_cached(
+            "SELECT json_extract(data, '$.model.providerID'), json_extract(data, '$.model.id') \
+             FROM session_message WHERE session_id = ? AND type = 'assistant' \
+             AND json_valid(data) \
+             AND (NULLIF(json_extract(data, '$.model.providerID'), '') IS NOT NULL \
+                  OR NULLIF(json_extract(data, '$.model.id'), '') IS NOT NULL) \
+             ORDER BY seq ASC LIMIT 1",
+        )?
+        .query_row([session_id], |row| {
+            Ok((
+                row.get::<_, Option<String>>(0)?,
+                row.get::<_, Option<String>>(1)?,
+            ))
+        })
+        .optional()?
+        .and_then(|(provider, model)| super::build_model(provider.as_deref(), model.as_deref())))
+}
+
+/// Add every OpenCode 2 session to a whole-store load. `session_message` is
+/// indexed by session, so they are read one at a time on either plan.
+pub(crate) fn load_all(
+    src: &Connection,
+    layout: Layout,
     mut load: super::OpencodeStoreLoad,
 ) -> Result<super::OpencodeStoreLoad> {
-    for session_id in owned_ids(src)? {
+    if !layout.has_v2() {
+        return Ok(load);
+    }
+    for session_id in session_ids(src)? {
         match self::load(src, &session_id) {
             Ok(Some(session)) => load.sessions.push(session),
             Ok(None) => {}
@@ -137,13 +196,9 @@ pub(crate) fn load_owned(
     Ok(load)
 }
 
-/// Read one OpenCode 2 session. `None` when the store has no such session or
-/// no OpenCode 2 tables.
+/// Read one OpenCode 2 session. `None` when the store has no such session.
 pub(crate) fn load(src: &Connection, session_id: &str) -> Result<Option<OpencodeSession>> {
     super::super::check_capture_cancelled()?;
-    if !present(src)? {
-        return Ok(None);
-    }
     let Some(info) = read_info(src, session_id)? else {
         return Ok(None);
     };
@@ -358,8 +413,9 @@ fn object(value: Value) -> Map<String, Value> {
 mod tests {
     use super::*;
 
-    /// A store OpenCode 2 has migrated: `old` untouched since, `resumed` with
-    /// a newer `session_v2` row, `fresh` only in the OpenCode 2 tables.
+    /// A store OpenCode 2 is migrating: `old` not copied yet, `migrated` in
+    /// both layouts with different content (as a session resumed under
+    /// OpenCode 2 is), `fresh` only in the OpenCode 2 tables.
     fn migrated_store() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
@@ -377,10 +433,18 @@ mod tests {
                                              time_created INTEGER NOT NULL,
                                              time_updated INTEGER NOT NULL, data TEXT NOT NULL);
                INSERT INTO session VALUES ('old', NULL, '/w', 1, 10, 'Old'),
-                                          ('resumed', NULL, '/w', 1, 10, 'Resumed');
-               INSERT INTO session_v2 VALUES ('old', NULL, '/w', 'Old', 1, 10),
-                                             ('resumed', NULL, '/w', 'Resumed', 1, 20),
-                                             ('fresh', 'old', '/w', 'Fresh', 30, 40);"#,
+                                          ('migrated', NULL, '/w', 1, 10, 'Before');
+               INSERT INTO message VALUES
+                 ('om', 'old', 2, '{"role":"user","time":{"created":2}}'),
+                 ('mm', 'migrated', 2, '{"role":"user","time":{"created":2}}');
+               INSERT INTO part VALUES
+                 ('op', 'om', 'old', 2, '{"type":"text","text":"old prompt"}'),
+                 ('mp', 'mm', 'migrated', 2, '{"type":"text","text":"v1 prompt"}');
+               INSERT INTO session_v2 VALUES ('migrated', NULL, '/w', 'After', 1, 20),
+                                             ('fresh', 'old', '/w', 'Fresh', 30, 40);
+               INSERT INTO session_message VALUES
+                 ('mu', 'migrated', 'user', 0, 2, 2, '{"time":{"created":2},"text":"v2 prompt"}'),
+                 ('mu2', 'migrated', 'user', 1, 15, 15, '{"time":{"created":15},"text":"resumed turn"}');"#,
         )
         .unwrap();
         let rows = [
@@ -442,16 +506,18 @@ mod tests {
     }
 
     #[test]
-    fn opencode_2_owns_its_own_sessions_and_the_v1_sessions_it_resumed() {
+    fn a_session_with_a_session_v2_row_is_read_from_opencode_2() {
         let conn = migrated_store();
-        let mut owned = owned_ids(&conn).unwrap();
-        owned.sort_unstable();
-        assert_eq!(owned, ["fresh", "resumed"]);
-        assert!(!owns(&conn, "old").unwrap());
+        let layout = Layout::detect(&conn).unwrap();
+        let envelope = |id| layout.envelope(&conn, id).unwrap();
+        assert_eq!(envelope("old"), Some(Envelope::V1));
+        assert_eq!(envelope("migrated"), Some(Envelope::V2));
+        assert_eq!(envelope("fresh"), Some(Envelope::V2));
+        assert_eq!(envelope("missing"), None);
         let v1: Vec<String> = conn
             .prepare(&format!(
                 "SELECT id FROM session WHERE 1{} ORDER BY id",
-                v1_exclusion(&conn).unwrap()
+                layout.v1_filter()
             ))
             .unwrap()
             .query_map([], |row| row.get(0))
@@ -465,9 +531,14 @@ mod tests {
     fn a_store_without_opencode_2_tables_is_v1_only() {
         let conn = migrated_store();
         conn.execute_batch("DROP TABLE session_message").unwrap();
-        assert!(!present(&conn).unwrap());
-        assert!(owned_ids(&conn).unwrap().is_empty());
-        assert_eq!(v1_exclusion(&conn).unwrap(), "");
+        let layout = Layout::detect(&conn).unwrap();
+        assert!(!layout.has_v2());
+        assert_eq!(layout.v1_filter(), "");
+        assert_eq!(
+            layout.envelope(&conn, "migrated").unwrap(),
+            Some(Envelope::V1)
+        );
+        assert_eq!(layout.envelope(&conn, "fresh").unwrap(), None);
     }
 
     #[test]
@@ -506,26 +577,46 @@ mod tests {
     }
 
     #[test]
-    fn a_resumed_session_is_read_from_opencode_2_and_an_untouched_one_from_v1() {
+    fn a_session_in_both_layouts_reads_its_opencode_2_content() {
         let conn = migrated_store();
-        assert!(super::super::load_from_sqlite(&conn, "resumed")
+        let migrated = super::super::load_from_sqlite(&conn, "migrated")
             .unwrap()
-            .unwrap()
-            .messages
-            .is_empty());
+            .unwrap();
+        assert_eq!(migrated.session.title.as_deref(), Some("After"));
+        assert_eq!(migrated.first_user_text(), Some("v2 prompt"));
+        assert_eq!(migrated.messages.len(), 2);
         assert_eq!(
-            super::super::load_from_sqlite(&conn, "old")
+            first_prompt(&conn, "migrated", 4096, " ")
                 .unwrap()
-                .unwrap()
-                .session
-                .title
                 .as_deref(),
-            Some("Old")
+            Some("v2 prompt")
         );
+        assert_eq!(title(&conn, "migrated").unwrap().as_deref(), Some("After"));
+        assert_eq!(
+            first_model(&conn, "fresh").unwrap().as_deref(),
+            Some("fireworks-ai/glm-5p3")
+        );
+
+        let old = super::super::load_from_sqlite(&conn, "old")
+            .unwrap()
+            .unwrap();
+        assert_eq!(old.first_user_text(), Some("old prompt"));
+
         let all = super::super::load_all_from_sqlite(&conn).unwrap();
-        let mut ids: Vec<&str> = all.sessions.iter().map(|s| s.session.id.as_str()).collect();
-        ids.sort_unstable();
-        assert_eq!(ids, ["fresh", "old", "resumed"]);
+        let mut texts: Vec<(&str, Option<&str>)> = all
+            .sessions
+            .iter()
+            .map(|s| (s.session.id.as_str(), s.first_user_text()))
+            .collect();
+        texts.sort_unstable();
+        assert_eq!(
+            texts,
+            [
+                ("fresh", Some("fix the bug")),
+                ("migrated", Some("v2 prompt")),
+                ("old", Some("old prompt")),
+            ]
+        );
         assert!(all.failures.is_empty());
     }
 

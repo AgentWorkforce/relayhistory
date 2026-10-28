@@ -50,12 +50,18 @@ type TableAggregate = HashMap<String, (i64, Option<i64>, i64)>;
 /// they were. The columns read are the ones the loaders read; a schema
 /// without one stamps without it.
 pub(super) fn sqlite_session_stamps(src: &Connection) -> Result<Vec<SessionStampRow>> {
-    let mut stamps = v1_session_stamps(src)?;
-    stamps.extend(v2_session_stamps(src)?);
+    let layout = opencode::v2::Layout::detect(src)?;
+    let mut stamps = v1_session_stamps(src, layout)?;
+    if layout.has_v2() {
+        stamps.extend(v2_session_stamps(src)?);
+    }
     Ok(stamps)
 }
 
-fn v1_session_stamps(src: &Connection) -> Result<Vec<SessionStampRow>> {
+fn v1_session_stamps(
+    src: &Connection,
+    layout: opencode::v2::Layout,
+) -> Result<Vec<SessionStampRow>> {
     let session_columns = opencode::table_columns(src, "session")?;
     if !session_columns.contains("id") {
         return Ok(Vec::new());
@@ -72,7 +78,7 @@ fn v1_session_stamps(src: &Connection) -> Result<Vec<SessionStampRow>> {
         // A rename is not guaranteed to move `time_updated`, and the title
         // is a column the loaders read.
         column("title"),
-        opencode::v2::v1_exclusion(src)?,
+        layout.v1_filter(),
     );
     let mut stmt = src.prepare(&sql)?;
     let rows = stmt.query_map([], |row| {
@@ -111,12 +117,9 @@ fn v1_session_stamps(src: &Connection) -> Result<Vec<SessionStampRow>> {
     Ok(stamps)
 }
 
-/// The sessions OpenCode 2 owns: the `session_v2` row's fields and one
-/// aggregate over its `session_message` rows, which carry the whole payload.
+/// Every OpenCode 2 session: the `session_v2` row's fields and one aggregate
+/// over its `session_message` rows, which carry the whole payload.
 fn v2_session_stamps(src: &Connection) -> Result<Vec<SessionStampRow>> {
-    if !opencode::v2::present(src)? {
-        return Ok(Vec::new());
-    }
     let columns = opencode::table_columns(src, "session_v2")?;
     let column = |name: &str| match columns.contains(name) {
         true => format!("v.{name}"),
@@ -129,14 +132,11 @@ fn v2_session_stamps(src: &Connection) -> Result<Vec<SessionStampRow>> {
              || '|' || COALESCE(octet_length(data), -1))) \
          FROM session_message GROUP BY session_id",
     )?;
-    let sql = opencode::v2::owned_sessions_sql(
-        src,
-        &format!(
-            "v.id, {}, v.directory, v.time_created, v.time_updated, {}",
-            column("parent_id"),
-            column("title"),
-        ),
-    )?;
+    let sql = opencode::v2::sessions_sql(&format!(
+        "v.id, {}, v.directory, v.time_created, v.time_updated, {}",
+        column("parent_id"),
+        column("title"),
+    ));
     let mut stmt = src.prepare(&sql)?;
     let rows = stmt.query_map([], |row| {
         let fields: [rusqlite::types::Value; 5] = [

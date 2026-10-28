@@ -135,10 +135,11 @@ fn opencode_store_snapshot(
         &path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
     )?;
-    // OpenCode 2 stamps its own row: `session_v2` carries both times.
-    let table = match crate::ingest::opencode::v2::owns(&src, &options.session_id)? {
-        true => "session_v2",
-        false => "session",
+    // The row the OpenCode reader reads the session from carries both times.
+    use crate::ingest::opencode::v2::{Envelope, Layout};
+    let table = match Layout::detect(&src)?.envelope(&src, &options.session_id)? {
+        Some(Envelope::V2) => "session_v2",
+        _ => "session",
     };
     let columns = src
         .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))?

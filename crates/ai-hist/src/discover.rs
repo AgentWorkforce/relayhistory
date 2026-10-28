@@ -2204,7 +2204,7 @@ struct OpencodeReadSnapshot {
     message_by_session: bool,
     part_by_session: bool,
     part_by_message: bool,
-    v2: bool,
+    layout: crate::ingest::opencode::v2::Layout,
     sessions: BTreeMap<String, OpencodeSessionSeed>,
 }
 
@@ -2291,7 +2291,7 @@ fn open_opencode_snapshot(scan: &ScanEnv<'_>, store: &Path) -> Result<OpencodeRe
         }
         return Ok(OpencodeReadSnapshot {
             path: store.to_path_buf(),
-            v2: crate::ingest::opencode::v2::present(&conn)?,
+            layout: crate::ingest::opencode::v2::Layout::detect(&conn)?,
             conn,
             store_identity: format!("{generation_before}:{schema_version}"),
             session_columns,
@@ -2613,12 +2613,7 @@ fn unreadable_opencode_candidate(locator: &str) -> Candidate {
 
 /// Whether an earlier OpenCode store holds `session_id`, and so owns it.
 fn opencode_store_holds(snapshot: &OpencodeReadSnapshot, session_id: &str) -> Result<bool> {
-    let v1 = snapshot.session_columns.contains("id")
-        && snapshot
-            .conn
-            .prepare_cached("SELECT 1 FROM session WHERE id = ?")?
-            .exists([session_id])?;
-    Ok(v1 || (snapshot.v2 && crate::ingest::opencode::v2::owns(&snapshot.conn, session_id)?))
+    Ok(snapshot.layout.envelope(&snapshot.conn, session_id)?.is_some())
 }
 
 /// The newest sessions this OpenCode store *owns*, and the seeds the shallow
@@ -2642,7 +2637,7 @@ fn enumerate_opencode_snapshot(
 ) -> Result<Vec<Candidate>> {
     snapshot.sessions.clear();
     let columns = &snapshot.session_columns;
-    if !columns.contains("id") && !snapshot.v2 {
+    if !columns.contains("id") && !snapshot.layout.has_v2() {
         return Ok(Vec::new());
     }
     let updated = if columns.contains("time_updated") {
