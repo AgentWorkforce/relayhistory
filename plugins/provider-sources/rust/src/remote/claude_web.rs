@@ -389,13 +389,13 @@ impl ClaudeWebProvider {
     pub fn new(
         credentials_path: PathBuf,
         base_url: String,
-        transport: Box<dyn ClaudeSessionsTransport>,
+        transport: impl ClaudeSessionsTransport + 'static,
         limit: Option<usize>,
     ) -> Self {
         Self {
             credentials_path,
             base_url,
-            transport,
+            transport: Box::new(transport),
             limit,
             fetched: FetchedRows::default(),
         }

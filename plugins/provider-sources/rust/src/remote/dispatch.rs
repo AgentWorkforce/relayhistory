@@ -34,10 +34,10 @@ pub fn provider(
         CLAUDE_WEB_CONNECTOR => Box::new(ClaudeWebProvider::new(
             claude_credentials_path(home),
             claude_api_base_url(),
-            Box::new(UreqClaudeTransport),
+            UreqClaudeTransport,
             limit,
         )),
-        CODEX_CLOUD_CONNECTOR => Box::new(CodexCloudProvider::new(Box::new(ExecCodexCli), limit)),
+        CODEX_CLOUD_CONNECTOR => Box::new(CodexCloudProvider::new(ExecCodexCli, limit)),
         DEVIN_CLOUD_CONNECTOR => Box::new(devin_provider(home, limit)),
         _ => anyhow::bail!("INVALID_ARGUMENT: unknown provider source connector"),
     };

@@ -79,7 +79,7 @@ impl SourceRegistry {
             providers: shallow_providers(),
         }
     }
-    pub fn register(&mut self, provider: Box<dyn ShallowSessionProvider>) -> Result<()> {
+    pub fn register(&mut self, provider: impl ShallowSessionProvider + 'static) -> Result<()> {
         ObservationKey {
             source: provider.source().into(),
             session_id: "registration".into(),
@@ -98,7 +98,7 @@ impl SourceRegistry {
                     && other.connector_instance() == provider.connector_instance()),
             "INVALID_ARGUMENT: duplicate source connector instance"
         );
-        self.providers.push(provider);
+        self.providers.push(Box::new(provider));
         Ok(())
     }
     /// Resolve the complete selection before any adapter is allowed to probe auth.

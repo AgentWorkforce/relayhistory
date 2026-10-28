@@ -64,15 +64,3 @@ rust_roots = ["crates/ai-hist-cli/src", "crates/ai-hist-napi/src", "crates/ai-hi
 "crates/ai-hist/src/ingest/opencode.rs::load_all_from_sqlite" = 33
 "crates/ai-hist/src/ingest/opencode.rs::normalize_session" = 52
 "crates/ai-hist/src/source_intake.rs::apply_normalized" = 46
-
-[baseline.pub_wrapper]
-"crates/ai-hist/src/discover.rs::discover_sessions_with_providers" = 1
-"crates/ai-hist/src/discover.rs::shallow_providers" = 1
-"crates/ai-hist/src/discover.rs::source_fingerprint_for" = 1
-"crates/ai-hist/src/discover.rs::watch_roots" = 1
-"crates/ai-hist/src/sources.rs::SourceRegistry::register" = 1
-"plugins/provider-sources/rust/src/remote.rs::CodexCloudProvider::new" = 1
-"plugins/provider-sources/rust/src/remote.rs::selected_remote_providers" = 1
-"plugins/provider-sources/rust/src/remote/claude_web.rs::ClaudeWebProvider::new" = 1
-"plugins/provider-sources/rust/src/remote/devin_cloud.rs::DevinCloudProvider::new" = 1
-"plugins/provider-sources/rust/src/remote/dispatch.rs::provider" = 1

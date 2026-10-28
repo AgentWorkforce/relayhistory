@@ -209,7 +209,7 @@ pub(super) fn devin_provider(home: &Path, limit: Option<usize>) -> DevinCloudPro
     DevinCloudProvider::new(
         devin_credentials_path(home),
         devin_config_path(home),
-        Box::new(UreqDevinTransport),
+        UreqDevinTransport,
         limit,
     )
 }

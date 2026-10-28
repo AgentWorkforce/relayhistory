@@ -436,13 +436,13 @@ impl DevinCloudProvider {
     pub fn new(
         credentials_path: PathBuf,
         config_path: PathBuf,
-        transport: Box<dyn DevinTransport>,
+        transport: impl DevinTransport + 'static,
         limit: Option<usize>,
     ) -> Self {
         Self {
             credentials_path,
             config_path,
-            transport,
+            transport: Box::new(transport),
             limit,
             fetched: FetchedRows::default(),
         }
