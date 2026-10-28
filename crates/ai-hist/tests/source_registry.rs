@@ -313,7 +313,7 @@ fn edges(db: &Path) -> Result<i64> {
 fn declining_related_evidence_is_enforced_against_a_provider_that_returns_it() -> Result<()> {
     let fixture = RelatedFixture;
     let mut registry = SourceRegistry::new();
-    registry.register(Box::new(fixture.clone()))?;
+    registry.register(fixture.clone())?;
     let dir = tempfile::tempdir()?;
     let db = dir.path().join("history.db");
     registry.discover_at(&db, &options(), &[fixture.identity()], |_| {})?;
@@ -343,7 +343,7 @@ fn declining_related_evidence_is_enforced_against_a_provider_that_returns_it() -
 fn explicit_registry_rejects_unknown_and_duplicate_before_auth_or_db() -> Result<()> {
     let fixture = Fixture::new("installed", "account1");
     let mut registry = SourceRegistry::new();
-    registry.register(Box::new(fixture.clone()))?;
+    registry.register(fixture.clone())?;
     let dir = tempfile::tempdir()?;
     let db = dir.path().join("absent.db");
     let selection = [
@@ -369,7 +369,7 @@ fn explicit_registry_rejects_unknown_and_duplicate_before_auth_or_db() -> Result
         .is_err());
     assert!(!db.exists());
     assert_eq!(fixture.probes.load(Ordering::SeqCst), 0);
-    assert!(registry.register(Box::new(fixture)).is_err());
+    assert!(registry.register(fixture).is_err());
     Ok(())
 }
 
@@ -381,7 +381,7 @@ fn independent_connector_snapshots_are_canonical_in_both_scan_and_hydration_orde
         let mut registry = SourceRegistry::new();
         let order = if reverse { [&b, &a] } else { [&a, &b] };
         for fixture in order {
-            registry.register(Box::new(fixture.clone()))?;
+            registry.register(fixture.clone())?;
         }
         let dir = tempfile::tempdir()?;
         let db = dir.path().join("history.db");
@@ -520,8 +520,8 @@ fn connector_instances_and_failed_capture_keep_independent_retry_state() -> Resu
     let a = Fixture::new("installed", "first");
     let b = Fixture::new("installed", "second");
     let mut registry = SourceRegistry::new();
-    registry.register(Box::new(a.clone()))?;
-    registry.register(Box::new(b.clone()))?;
+    registry.register(a.clone())?;
+    registry.register(b.clone())?;
     let dir = tempfile::tempdir()?;
     let db = dir.path().join("history.db");
     registry.sync_at(&db, SessionScope::Remote, &[a.identity(), b.identity()])?;
@@ -587,7 +587,7 @@ fn local_and_remote_observations_keep_the_local_projection_in_either_order() -> 
         } else {
             [&local, &remote]
         } {
-            registry.register(Box::new(fixture.clone()))?;
+            registry.register(fixture.clone())?;
         }
         let dir = tempfile::tempdir()?;
         let db = dir.path().join("history.db");
@@ -626,8 +626,8 @@ fn one_connectors_non_session_skip_cannot_hide_another_connectors_same_locator()
     let mut b = Fixture::new("b", "second");
     b.locator_override = Some("fixture://shared".into());
     let mut registry = SourceRegistry::new();
-    registry.register(Box::new(a.clone()))?;
-    registry.register(Box::new(b.clone()))?;
+    registry.register(a.clone())?;
+    registry.register(b.clone())?;
     let dir = tempfile::tempdir()?;
     let db = dir.path().join("history.db");
     registry.discover_at(&db, &options(), &[a.identity()], |_| {})?;
@@ -661,7 +661,7 @@ fn provider_and_two_recall_instances_keep_four_observations_one_session_two_loca
         }
         let mut registry = SourceRegistry::new();
         for adapter in adapters {
-            registry.register(Box::new(adapter.clone()))?;
+            registry.register(adapter.clone())?;
         }
         let selected = [
             provider.identity(),
@@ -716,7 +716,7 @@ fn opaque_acquisition_locator_is_distinct_from_display_path_and_caches_without_i
     fixture.display_override = Some("https://display.example/session".into());
     fixture.enumeration_knows_id = false;
     let mut registry = SourceRegistry::new();
-    registry.register(Box::new(fixture.clone()))?;
+    registry.register(fixture.clone())?;
     let dir = tempfile::tempdir()?;
     let db = dir.path().join("history.db");
     let first = registry.discover_at(&db, &options(), &[fixture.identity()], |_| {})?;
@@ -752,8 +752,8 @@ fn unavailable_adapter_does_not_block_independent_local_or_remote_sources() -> R
     unavailable.state.lock().unwrap().availability_fail = true;
     let healthy = Fixture::new("healthy", "default");
     let mut registry = SourceRegistry::new();
-    registry.register(Box::new(unavailable.clone()))?;
-    registry.register(Box::new(healthy.clone()))?;
+    registry.register(unavailable.clone())?;
+    registry.register(healthy.clone())?;
     let dir = tempfile::tempdir()?;
     let db = dir.path().join("history.db");
     assert!(registry
@@ -772,7 +772,7 @@ fn unavailable_adapter_does_not_block_independent_local_or_remote_sources() -> R
     assert_eq!(result.diagnostics.len(), 1);
     let mut local = Fixture::new("local", "default");
     local.location = SessionLocation::Local;
-    registry.register(Box::new(local))?;
+    registry.register(local)?;
     let result = registry.discover_at(
         &db,
         &DiscoverOptions {
@@ -793,8 +793,8 @@ fn limited_discovery_defers_unknown_aliases_without_losing_existing_observations
     let mut b = Fixture::new("b", "two");
     b.enumeration_knows_id = false;
     let mut registry = SourceRegistry::new();
-    registry.register(Box::new(a.clone()))?;
-    registry.register(Box::new(b.clone()))?;
+    registry.register(a.clone())?;
+    registry.register(b.clone())?;
     let dir = tempfile::tempdir()?;
     let db = dir.path().join("history.db");
     let both = [a.identity(), b.identity()];
