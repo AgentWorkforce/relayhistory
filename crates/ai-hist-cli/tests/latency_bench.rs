@@ -22,7 +22,8 @@
 //! | `e2e` | the whole path through the public API: write a new transcript, `SessionStore::watch` (production defaults) reports it in `TickReport::changed`, the list query returns it first. Each sample is spaced past the debounce window so it is a leading-edge tick, the case a newly started session hits |
 //! | `list_scale` | the list query alone at `days` of history, first page and a deep page |
 //! | `ingest_upload` | ingest throughput and per-session latency, first alone, then while an uploader drains the change feed and commits its cursor on its own `SessionStore` (its own connections) |
-//! | `prune` | list-query latency on a reader thread, first alone, then while `forget_evidence` drops every session older than `retain_days`; plus how long a new session's hook ingest waits while the prune runs |
+//! | `prune` | list-query latency on a reader thread, first alone, then while retention maintenance (`SessionStore::prune_expired`, its default batch and cooldown, uploads acknowledged) evicts sessions older than `retain_days` for `prune_window_ms`; plus how long a new session's hook ingest waits meanwhile |
+//! | `codex_idle` | a full `SessionStore::sync` over a settled Codex store with nothing new, forced and unforced: `codex_rollouts` rollouts, every `codex_compressed_every`-th one zstd-compressed, every `codex_subagent_every`-th one a delegated subagent of the rollout before it, all named by a Codex thread index (`state_5.sqlite`) |
 //!
 //! # What is measured, and how
 //!
@@ -40,10 +41,11 @@
 //! It is `#[ignore]`d for the same reason `sync_bench.rs` is: its headline
 //! numbers are wall clocks.
 
+use ai_hist::retention::{RetentionOptions, RetentionPolicy};
 use ai_hist::{
-    CatalogQuery, ChangeQuery, ForgetOptions, ForgetScope, HydrateOptions, HydrateStatus,
-    ProviderRoots, SessionRef, SessionScope, SessionStore, Source, StoreOptions, SyncOptions,
-    WatchDriver, WatchOptions, Watermark,
+    CatalogQuery, ChangeQuery, HydrateOptions, HydrateStatus, ProviderRoots, SessionRef,
+    SessionScope, SessionStore, Source, StoreOptions, SyncOptions, WatchDriver, WatchOptions,
+    Watermark,
 };
 use notify::{RecursiveMode, Watcher};
 use serde_json::{json, Value};
@@ -86,6 +88,10 @@ struct Config {
     sweep_samples: u64,
     fs_samples: u64,
     retain_days: u64,
+    prune_window_ms: u64,
+    codex_rollouts: u64,
+    codex_compressed_every: u64,
+    codex_subagent_every: u64,
 }
 
 impl Config {
@@ -100,6 +106,10 @@ impl Config {
             sweep_samples: env_u64("AI_HIST_LATENCY_SWEEP_SAMPLES", 20),
             fs_samples: env_u64("AI_HIST_LATENCY_FS_SAMPLES", 1000),
             retain_days: env_u64("AI_HIST_LATENCY_RETAIN_DAYS", 30),
+            prune_window_ms: env_u64("AI_HIST_LATENCY_PRUNE_WINDOW_MS", 10_000),
+            codex_rollouts: env_u64("AI_HIST_LATENCY_CODEX_ROLLOUTS", 3_000),
+            codex_compressed_every: env_u64("AI_HIST_LATENCY_CODEX_COMPRESSED_EVERY", 2),
+            codex_subagent_every: env_u64("AI_HIST_LATENCY_CODEX_SUBAGENT_EVERY", 5),
         }
     }
 }
@@ -1001,17 +1011,21 @@ fn ingest_upload(config: &Config) -> Value {
 fn prune(config: &Config) -> Value {
     let bench = Bench::new(config.turns);
     let (store, store_info) = bench.populate(config.days, config.sessions_per_day);
-    let cutoff = now_ms() - config.retain_days as i64 * DAY_MS;
-
-    let mut keep_query = CatalogQuery::default();
-    keep_query.scope = SessionScope::All;
-    keep_query.page_size = 1000;
-    let keep: Vec<SessionRef> = store
-        .sessions(keep_query)
-        .map(|row| row.expect("catalog row"))
-        .filter(|row| row.last_activity_ms.unwrap_or(0) >= cutoff)
-        .map(|row| SessionRef::id(row.source, row.session_id))
-        .collect();
+    // The retention a desktop would configure, and an uploader that has
+    // durably delivered everything so far: without an acknowledgement
+    // retention evicts nothing, by design.
+    store
+        .set_retention_policy(RetentionPolicy::from_days(config.retain_days as u32))
+        .expect("retention policy");
+    store
+        .register_retention_consumer("latency-bench-uploader")
+        .expect("register consumer");
+    store
+        .acknowledge_retention(
+            "latency-bench-uploader",
+            store.head_revision().expect("head"),
+        )
+        .expect("acknowledge");
 
     // One reader, its own store handle, sampling the first-paint list query
     // back to back until told to stop.
@@ -1065,30 +1079,224 @@ fn prune(config: &Config) -> Value {
         }
         out
     });
-    let (report, prune_elapsed) = time(|| {
-        store
-            .forget_evidence(
-                ForgetScope::AllExcept(keep.clone()),
-                ForgetOptions::default().lock_timeout_ms(60_000),
-            )
-            .expect("forget_evidence")
+    // Maintenance as a host runs it: one bounded batch per call, yielding
+    // between calls, honouring the cooldown and retrying when the store is
+    // busy -- for a fixed window, or until the cycle completes. A year's
+    // expiry at the default batch size and cooldown takes minutes; the
+    // window measures what capture and reads see while it runs.
+    let window = Duration::from_millis(config.prune_window_ms);
+    let mut maintenance = json!({ "batches": 0, "rows": 0, "sessions": 0, "busy": 0,
+        "deferred": 0, "awaitingUploadAck": 0, "cycleComplete": false });
+    let (_, prune_elapsed) = time(|| {
+        let started = Instant::now();
+        let options = RetentionOptions::default();
+        while started.elapsed() < window {
+            let batch = store.prune_expired(options.clone()).expect("prune_expired");
+            let count = |key: &str, by: u64, m: &mut Value| {
+                m[key] = json!(m[key].as_u64().unwrap_or(0) + by);
+            };
+            count("batches", 1, &mut maintenance);
+            count("rows", batch.rows, &mut maintenance);
+            count("sessions", batch.sessions, &mut maintenance);
+            count("busy", u64::from(batch.busy), &mut maintenance);
+            count("deferred", u64::from(batch.deferred), &mut maintenance);
+            count(
+                "awaitingUploadAck",
+                u64::from(batch.awaiting_upload_ack),
+                &mut maintenance,
+            );
+            if batch.cycle_complete {
+                maintenance["cycleComplete"] = json!(true);
+                break;
+            }
+            // The cooldown is the store's own pacing; a host schedules the
+            // next call rather than spinning.
+            let pause = if batch.busy {
+                10
+            } else {
+                u64::from(options.min_interval_ms)
+            };
+            std::thread::sleep(Duration::from_millis(pause));
+        }
     });
     stop.store(true, Ordering::Relaxed);
     ingest_stop.store(true, Ordering::Relaxed);
     let during = thread.join().unwrap();
     let ingest_during = ingester.join().unwrap();
+    // A window in which maintenance evicted nothing -- busy throughout, or
+    // waiting on an acknowledgement -- measured capture beside an idle store,
+    // which would read as retention costing nothing. The store holds expired
+    // sessions whenever its history is longer than the retention, so that is
+    // a failed run, not a fast one.
+    if config.days > config.retain_days {
+        assert!(
+            maintenance["rows"].as_u64().unwrap_or(0) > 0,
+            "retention maintenance evicted nothing in its window: {maintenance}"
+        );
+    }
 
     json!({
         "store": store_info,
         "retainDays": config.retain_days,
-        "kept": keep.len(),
-        "forgotten": report.sessions,
-        "eventsForgotten": report.events,
+        "maintenance": maintenance,
         "pruneMs": prune_elapsed.as_millis() as u64,
         "metrics": {
             "read_quiet": summary(&quiet),
             "read_during_prune": summary(&during),
             "ingest_during_prune": summary(&ingest_during),
+        }
+    })
+}
+
+/// One Codex rollout: its `session_meta`, then `turns` prompt/reply pairs.
+fn codex_rollout(id: &str, parent: Option<&str>, turns: u64, base_ms: i64) -> String {
+    let meta = match parent {
+        Some(parent) => json!({"id": id, "parent_thread_id": parent, "cwd": "/work/codex",
+            "thread_source": "subagent", "source": {"subagent": {"other": "reviewer"}}}),
+        None => json!({"id": id, "cwd": "/work/codex"}),
+    };
+    let mut out = format!(
+        "{}\n",
+        json!({"timestamp": iso(base_ms), "type": "session_meta", "payload": meta})
+    );
+    for turn in 0..turns {
+        let at = base_ms + 1_000 * (turn as i64 + 1);
+        for (offset, payload) in [
+            (
+                0,
+                json!({"type": "user_message", "message": format!("task {turn} in {id}")}),
+            ),
+            (
+                500,
+                json!({"type": "agent_message", "message": format!("done {turn}")}),
+            ),
+        ] {
+            out.push_str(&format!(
+                "{}\n",
+                json!({"timestamp": iso(at + offset), "type": "event_msg", "payload": payload})
+            ));
+        }
+    }
+    out
+}
+
+/// Codex's own thread index over `threads` (id, rollout locator): what the
+/// SQLite-only thread selection pages through and stats on every sweep.
+fn codex_thread_index(codex: &Path, threads: &[(String, PathBuf)], updated_ms: i64) {
+    let state = rusqlite::Connection::open(codex.join("state_5.sqlite")).expect("state db");
+    state
+        .execute_batch(
+            "CREATE TABLE threads(id TEXT PRIMARY KEY, rollout_path TEXT, created_at_ms INTEGER, \
+             updated_at_ms INTEGER, source TEXT, cwd TEXT, git_branch TEXT, git_origin_url TEXT, \
+             title TEXT, name TEXT, first_user_message TEXT, originator TEXT, cli_version TEXT, \
+             model TEXT, tokens_used INTEGER, archived INTEGER, agent_nickname TEXT, \
+             agent_role TEXT, history_mode TEXT, thread_source TEXT); \
+             CREATE TABLE thread_spawn_edges(parent_thread_id TEXT,child_thread_id TEXT,status TEXT);",
+        )
+        .expect("state schema");
+    let history =
+        rusqlite::Connection::open(codex.join("thread_history_1.sqlite")).expect("history db");
+    history
+        .execute_batch(
+            "CREATE TABLE thread_history_projection_state(thread_id TEXT PRIMARY KEY, \
+             next_rollout_ordinal INTEGER,next_rollout_byte_offset INTEGER); \
+             CREATE TABLE thread_items(thread_id TEXT,turn_id TEXT,item_id TEXT, \
+             rollout_ordinal INTEGER,created_at_ms INTEGER,item_type TEXT,item_json TEXT); \
+             CREATE TABLE thread_turns(thread_id TEXT,turn_id TEXT,rollout_ordinal INTEGER, \
+             started_at INTEGER,error_json TEXT);",
+        )
+        .expect("history schema");
+    for (id, locator) in threads {
+        state
+            .execute(
+                "INSERT INTO threads (id,rollout_path,created_at_ms,updated_at_ms,source,archived,history_mode) \
+                 VALUES (?1,?2,?3,?3,'cli',0,'paginated')",
+                rusqlite::params![id, locator.to_string_lossy(), updated_ms],
+            )
+            .expect("thread row");
+        history
+            .execute(
+                "INSERT INTO thread_history_projection_state VALUES (?1,1,1)",
+                [id],
+            )
+            .expect("projection row");
+    }
+}
+
+/// A full sync over a Codex store with nothing new: the sweep a watch loop or
+/// a desktop collector runs back to back when a file event forces one.
+fn codex_idle(config: &Config) -> Value {
+    let bench = Bench::new(config.turns);
+    let codex = bench.home.join(".codex");
+    let day = codex.join("sessions/2026/10/01");
+    fs::create_dir_all(&day).unwrap();
+    let now = now_ms();
+    let (mut compressed, mut subagents) = (0u64, 0u64);
+    let mut threads = Vec::new();
+    let mut previous: Option<String> = None;
+    for n in 0..config.codex_rollouts {
+        let id = format!("codex-{n:07}");
+        let parent = previous
+            .as_deref()
+            .filter(|_| config.codex_subagent_every > 0 && n % config.codex_subagent_every == 1);
+        subagents += u64::from(parent.is_some());
+        let body = codex_rollout(&id, parent, config.turns, now - DAY_MS + n as i64 * 1_000);
+        let locator = day.join(format!("rollout-2026-10-01T00-00-00-{id}.jsonl"));
+        if config.codex_compressed_every > 0 && n % config.codex_compressed_every == 0 {
+            let mut stored = locator.clone().into_os_string();
+            stored.push(".zst");
+            fs::write(stored, zstd::bulk::compress(body.as_bytes(), 3).unwrap()).unwrap();
+            compressed += 1;
+        } else {
+            fs::write(&locator, body).unwrap();
+        }
+        threads.push((id.clone(), locator));
+        if parent.is_none() {
+            previous = Some(id);
+        }
+    }
+    codex_thread_index(&codex, &threads, now);
+
+    let store = bench.open();
+    // Two untimed sweeps: the first ingests, the second settles whatever the
+    // first left owed (delegation edges, continuity), so the timed sweeps
+    // start from a store that holds everything.
+    let (_, populate) = time(|| {
+        store
+            .sync(SyncOptions::default().force(true))
+            .expect("populating sync")
+    });
+    store
+        .sync(SyncOptions::default().force(true))
+        .expect("settling sync");
+    let head = store.head_revision().expect("head").revision;
+    let sweep = |force: bool| {
+        (0..config.sweep_samples)
+            .map(|_| {
+                time(|| {
+                    store
+                        .sync(SyncOptions::default().force(force))
+                        .expect("idle sync")
+                })
+                .1
+            })
+            .collect::<Vec<_>>()
+    };
+    let forced = sweep(true);
+    let unforced = sweep(false);
+    let head_after = store.head_revision().expect("head").revision;
+    json!({
+        "store": {
+            "rollouts": config.codex_rollouts,
+            "compressed": compressed,
+            "subagents": subagents,
+            "populateMs": populate.as_millis() as u64,
+            "dbBytes": fs::metadata(&bench.db).map(|m| m.len()).unwrap_or(0),
+            "idleSweepsWrote": head_after != head,
+        },
+        "metrics": {
+            "idle_sync_forced": summary(&forced),
+            "idle_sync_unforced": summary(&unforced),
         }
     })
 }
@@ -1104,6 +1312,7 @@ fn latency_phase() {
         "list_scale" => list_scale(&config),
         "ingest_upload" => ingest_upload(&config),
         "prune" => prune(&config),
+        "codex_idle" => codex_idle(&config),
         other => panic!("unknown AI_HIST_LATENCY_PHASE {other}"),
     };
     report["phase"] = json!(config.phase);

@@ -2,7 +2,6 @@
 //!
 //! This crate maps typed JavaScript requests to reusable Rust operations. It
 //! contains no SQL, provider parsing, migration, or query semantics of its own.
-#![deny(clippy::all)]
 
 pub mod change_feed;
 pub mod export;
@@ -87,7 +86,8 @@ use serde::Serialize;
 /// 28 adds `skipProtectedFolderIdentity` on discovery and on source-observation
 /// intake. An addon that lacks it would ignore the option and still read a
 /// protected folder.
-pub const NATIVE_CONTRACT_VERSION: u32 = 28;
+/// 29 adds `agentName` (Claude's `agent-name`) to catalog rows.
+pub const NATIVE_CONTRACT_VERSION: u32 = 29;
 const DEFAULT_LIMIT: i64 = 50;
 const DEFAULT_EVENT_LIMIT: i64 = 200;
 

@@ -181,7 +181,7 @@ fn claude_provider(
     ClaudeWebProvider::new(
         write_claude_credentials(home, FAR_FUTURE_MS),
         "https://api.example.test".to_string(),
-        Box::new(Arc::clone(transport)),
+        Arc::clone(transport),
         limit,
     )
 }
@@ -312,7 +312,7 @@ fn claude_enumeration_reports_an_expired_token_without_a_request() {
     let provider = ClaudeWebProvider::new(
         write_claude_credentials(home.path(), 1_000),
         "https://api.example.test".to_string(),
-        Box::new(Arc::clone(&transport)),
+        Arc::clone(&transport),
         None,
     );
     let conn = catalog();
@@ -738,7 +738,7 @@ fn codex_mapping_carries_the_task_listing_and_stamps_on_status() {
 #[test]
 fn codex_provider_forwards_a_bounded_page_limit_to_the_cli() {
     let lister = Arc::new(ScriptedLister::new(vec![CODEX_LISTING.to_string()]));
-    let provider = CodexCloudProvider::new(Box::new(Arc::clone(&lister)), Some(7));
+    let provider = CodexCloudProvider::new(Arc::clone(&lister), Some(7));
     let home = tempfile::tempdir().unwrap();
     let conn = catalog();
     let env = env_at(&conn, home.path());
@@ -749,7 +749,7 @@ fn codex_provider_forwards_a_bounded_page_limit_to_the_cli() {
     // A global limit above the CLI's window is clamped per page, never
     // forwarded verbatim (the CLI rejects --limit values over 20).
     let lister = Arc::new(ScriptedLister::new(vec![CODEX_LISTING.to_string()]));
-    let provider = CodexCloudProvider::new(Box::new(Arc::clone(&lister)), Some(500));
+    let provider = CodexCloudProvider::new(Arc::clone(&lister), Some(500));
     let env = env_at(&conn, home.path());
     provider.enumerate(&env, None).unwrap();
     assert_eq!(*lister.calls.lock().unwrap(), vec![(20, None)]);
@@ -763,7 +763,7 @@ fn codex_provider_follows_the_cursor_across_pages() {
         page_one.to_string(),
         page_two.to_string(),
     ]));
-    let provider = CodexCloudProvider::new(Box::new(Arc::clone(&lister)), None);
+    let provider = CodexCloudProvider::new(Arc::clone(&lister), None);
     let home = tempfile::tempdir().unwrap();
     let conn = catalog();
     let env = env_at(&conn, home.path());
@@ -779,7 +779,7 @@ fn codex_provider_follows_the_cursor_across_pages() {
         page_one.to_string(),
         page_two.to_string(),
     ]));
-    let provider = CodexCloudProvider::new(Box::new(Arc::clone(&lister)), Some(1));
+    let provider = CodexCloudProvider::new(Arc::clone(&lister), Some(1));
     let env = env_at(&conn, home.path());
     let candidates = provider.enumerate(&env, None).unwrap();
     assert_eq!(candidates.len(), 1);
@@ -945,7 +945,7 @@ fn devin_provider(
     limit: Option<usize>,
 ) -> DevinCloudProvider {
     let (credentials, config) = write_devin_cli_files(home);
-    DevinCloudProvider::new(credentials, config, Box::new(Arc::clone(transport)), limit)
+    DevinCloudProvider::new(credentials, config, Arc::clone(transport), limit)
 }
 
 fn devin_session(id: &str, title: &str) -> Value {
@@ -1240,7 +1240,7 @@ fn devin_enumeration_requires_configuration_and_reports_auth() {
     let provider = DevinCloudProvider::new(
         credentials.clone(),
         config.clone(),
-        Box::new(Arc::clone(&transport)),
+        Arc::clone(&transport),
         None,
     );
     let conn = catalog();
@@ -1260,8 +1260,7 @@ fn devin_enumeration_requires_configuration_and_reports_auth() {
         401,
         "key-secret-must-not-escape".into(),
     )]));
-    let provider =
-        DevinCloudProvider::new(credentials, config, Box::new(Arc::clone(&transport)), None);
+    let provider = DevinCloudProvider::new(credentials, config, Arc::clone(&transport), None);
     let error = provider.enumerate(&env, None).unwrap_err().to_string();
     assert!(error.starts_with("AUTHENTICATION_EXPIRED:"), "{error}");
     assert!(!error.contains("key-secret"), "{error}");
@@ -1457,8 +1456,7 @@ fn devin_organization_id_cannot_alter_the_request_route() {
     let config = home.path().join("config.json");
     std::fs::write(&config, r#"{"devin":{"org_id":"org/x/../../admin"}}"#).unwrap();
     let transport = Arc::new(ScriptedDevinTransport::new(vec![]));
-    let provider =
-        DevinCloudProvider::new(credentials, config, Box::new(Arc::clone(&transport)), None);
+    let provider = DevinCloudProvider::new(credentials, config, Arc::clone(&transport), None);
     let conn = catalog();
     let env = env_at(&conn, home.path());
     let error = provider.enumerate(&env, None).unwrap_err().to_string();
@@ -1571,7 +1569,7 @@ fn real_devin_transport_never_follows_a_redirect_with_credentials() {
         .unwrap();
     });
     std::env::set_var("RELAYHISTORY_DEVIN_API_BASE_URL", &origin_url);
-    let provider = DevinCloudProvider::new(credentials, config, Box::new(UreqDevinTransport), None);
+    let provider = DevinCloudProvider::new(credentials, config, UreqDevinTransport, None);
     let conn = catalog();
     let env = env_at(&conn, home.path());
     let error = provider.enumerate(&env, None).unwrap_err().to_string();
@@ -1857,7 +1855,7 @@ fn send_remote_message_with_dispatches_on_the_connector() {
 
 fn remote_codex_provider(payload: &str, limit: Option<usize>) -> Box<dyn ShallowSessionProvider> {
     Box::new(CodexCloudProvider::new(
-        Box::new(Arc::new(ScriptedLister::new(vec![payload.to_string()]))),
+        Arc::new(ScriptedLister::new(vec![payload.to_string()])),
         limit,
     ))
 }

@@ -105,7 +105,9 @@ chunks **before** they are compressed and uploaded:
   **source** fields (`source_bytes`/`source_sha256` → `bytes`/`sha256`, the
   unscrubbed range that drives offsets and epochs) and its **stored** fields
   (`stored_bytes`, `stored_sha256`, `stored_raw_bytes`, `raw_sha256`), plus
-  `records` and the `raw.scrub` pair; `put_raw_chunk` uploads it create-only
+  `records` and the `raw.scrub` pair. `SealedChunk::new_chunk(start_offset)`
+  turns it into the manifest's `NewChunk`, and `record_sealed_scrub` sets
+  `raw.scrub` before the first chunk it covers; `put_raw_chunk` uploads it create-only
   with `scrub-ruleset`, `scrub-version`, `raw-sha256` and `raw-bytes`
   metadata. Neither type can be built from unscrubbed bytes, so a raw chunk
   uploaded this way has always been scrubbed. The generic `ObjectStore::put`
@@ -156,6 +158,11 @@ runs all twelve against a real bucket with ambient credentials when
 
 - `FsStore`'s compare-and-swap lock is a host-local `flock`; do not share one
   directory between hosts over NFS.
+- `FsStore` refuses keys that traverse a symbolic link, checked when each
+  operation starts (and again at multipart commit). A concurrent writer
+  inside the root could still swap a directory for a link between the check
+  and the open, so the root must not be shared with untrusted writers.
+- Metadata values may not start or end with a space (HTTP strips them).
 - `FsStore::presign_get` returns a `file://` URL and cannot enforce the TTL.
 - GCS presigning needs a service-account key or ambient credentials with
   `iam.serviceAccounts.signBlob`; a vended bearer token alone returns

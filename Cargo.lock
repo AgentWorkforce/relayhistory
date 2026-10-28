@@ -31,7 +31,7 @@ dependencies = [
 
 [[package]]
 name = "ai-hist"
-version = "0.52.0"
+version = "0.53.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -67,11 +67,12 @@ dependencies = [
  "serde_json",
  "tempfile",
  "url",
+ "zstd",
 ]
 
 [[package]]
 name = "ai-hist-napi"
-version = "0.52.0"
+version = "0.53.0"
 dependencies = [
  "ai-hist",
  "anyhow",

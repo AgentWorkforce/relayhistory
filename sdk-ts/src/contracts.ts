@@ -134,6 +134,8 @@ export interface CatalogSession {
   title: string | null;
   /** Provider-native kind, such as Grok's `subagent`. */
   sessionKind: string | null;
+  /** The name other sessions address this one by (Claude's `agent-name`). */
+  agentName: string | null;
   models: string[];
   originator: string | null;
   agentVersion: string | null;

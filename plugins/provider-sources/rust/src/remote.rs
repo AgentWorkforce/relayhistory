@@ -324,16 +324,13 @@ pub fn selected_remote_providers(
         providers.push(Box::new(ClaudeWebProvider::new(
             claude_path,
             claude_api_base_url(),
-            Box::new(UreqClaudeTransport),
+            UreqClaudeTransport,
             limit,
         )));
     }
     let codex_path = codex_auth_path(home);
     if selection.contains(CODEX_CLOUD_CONNECTOR) && applicable("codex") && codex_path.is_file() {
-        providers.push(Box::new(CodexCloudProvider::new(
-            Box::new(ExecCodexCli),
-            limit,
-        )));
+        providers.push(Box::new(CodexCloudProvider::new(ExecCodexCli, limit)));
     }
     if selection.contains(DEVIN_CLOUD_CONNECTOR) && applicable("devin") {
         providers.extend(
@@ -490,9 +487,9 @@ pub struct CodexCloudProvider {
 }
 
 impl CodexCloudProvider {
-    pub fn new(lister: Box<dyn CodexCloudLister>, limit: Option<usize>) -> Self {
+    pub fn new(lister: impl CodexCloudLister + 'static, limit: Option<usize>) -> Self {
         Self {
-            lister,
+            lister: Box::new(lister),
             limit,
             fetched: FetchedRows::default(),
         }

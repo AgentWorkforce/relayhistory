@@ -61,6 +61,7 @@ use evidence_probe::{
 use evidence_probe::{CLAUDE_SIDECAR_EVIDENCE_SQL, CLAUDE_TRANSCRIPT_EVENTS_SQL};
 pub(crate) use sweep_write::SweepWrite;
 
+pub(crate) use titles::set_claude_first_prompt;
 use titles::set_session_title;
 
 #[cfg(test)]
@@ -145,15 +146,22 @@ pub(crate) use path_capture::{reconcile_pending, sync_facade_tick};
 mod codex_history;
 // After `sync_note!`, which an unreadable rollout reports through.
 mod fork_replay;
+#[cfg(test)]
+mod idle_sweep_tests;
 mod jsonl_sync_steps;
 mod rederived;
 mod rollout_head;
+mod subagent_cleanup;
 use fork_replay::{inherited_baseline_verdict, record_codex_fork_replay, ForkReplaySpan};
 use jsonl_sync_steps::{cursor_scan_checkpoint, insert_history_line, settle_unchanged_jsonl};
 pub(crate) use rollout_head::read_codex_session_meta;
 #[cfg(test)]
 use rollout_head::LEADING_BYTE_LIMIT;
 use rollout_head::{read_codex_session_meta_counted, read_leading_records};
+use subagent_cleanup::{
+    cleanup_codex_subagent_history, cleanup_codex_subagent_registration,
+    cleanup_subagent_registration, codex_session_has_remote_presence, session_has_remote_presence,
+};
 // After `sync_note!`, which the repair note uses.
 pub(crate) mod scoped_files;
 #[cfg(test)]
@@ -4465,99 +4473,6 @@ fn sync_codex_with_repairs_and_coverage(
 /// database or an older guardian classification also forces re-ingestion.
 type CodexRolloutWalk = (HashMap<String, String>, HashMap<String, String>, usize);
 
-/// Reconcile the catalog registration for a locally observed subagent.
-///
-/// A local-only subagent stays out of the catalog. If the same canonical
-/// session was separately discovered remotely, its retained local events are
-/// also local evidence, so both presences and the canonical row must survive.
-///
-/// Deleting a `sessions` row fires `delete_session_hydration_state`, which
-/// cascades away every relationship the row takes part in — as parent as well
-/// as child. Undoing a subagent's registration is not that session going away,
-/// so the observed delegation evidence, including the thread's own outgoing
-/// edges, is carried across the delete. The trigger itself cannot be narrowed
-/// instead: `CREATE TRIGGER IF NOT EXISTS` never replaces the one an existing
-/// database already has.
-fn cleanup_subagent_registration(conn: &Connection, source: &str, session_id: &str) -> Result<()> {
-    conn.execute(
-        "DELETE FROM session_presences \
-         WHERE source = ? AND session_id = ? AND location = 'local' \
-           AND NOT EXISTS (\
-             SELECT 1 FROM session_presences \
-             WHERE source = ? AND session_id = ? AND location = 'remote'\
-           )",
-        params![source, session_id, source, session_id],
-    )?;
-    conn.execute_batch(
-        "CREATE TEMP TABLE IF NOT EXISTS retained_relationships \
-           AS SELECT * FROM session_relationships WHERE 0; \
-         DELETE FROM retained_relationships;",
-    )?;
-    // One seek per end of the edge; see `session_continuity_edges`.
-    conn.execute(
-        "INSERT INTO retained_relationships \
-         SELECT * FROM session_relationships WHERE source = ?1 AND parent_session_id = ?2 \
-         UNION ALL \
-         SELECT * FROM session_relationships \
-         WHERE source = ?1 AND child_session_id = ?2 AND parent_session_id <> ?2",
-        params![source, session_id],
-    )?;
-    let sessions = conn.execute(
-        "DELETE FROM sessions \
-         WHERE source = ? AND session_id = ? \
-           AND NOT EXISTS (\
-             SELECT 1 FROM session_presences \
-             WHERE source = ? AND session_id = ?\
-           )",
-        params![source, session_id, source, session_id],
-    )?;
-    conn.execute_batch(
-        "INSERT OR IGNORE INTO session_relationships SELECT * FROM retained_relationships; \
-         DELETE FROM retained_relationships;",
-    )?;
-    // Only the session delete drops evidence the probes join; a presence is
-    // not. Releasing on every changed delegated-thread rollout re-read every
-    // evidence key once per thread.
-    evidence_probe::note_deleted(conn, "sessions", sessions);
-    Ok(())
-}
-
-fn cleanup_codex_subagent_registration(conn: &Connection, session_id: &str) -> Result<()> {
-    cleanup_subagent_registration(conn, "codex", session_id)
-}
-
-fn codex_session_has_remote_presence(conn: &Connection, session_id: &str) -> Result<bool> {
-    session_has_remote_presence(conn, "codex", session_id)
-}
-
-/// Whether a session is also known remotely. Local and remote evidence share
-/// one `(source, session_id)` identity, so a local re-read must not delete
-/// rows a remote observation put there.
-fn session_has_remote_presence(conn: &Connection, source: &str, session_id: &str) -> Result<bool> {
-    conn.query_row(
-        "SELECT EXISTS(\
-           SELECT 1 FROM session_presences \
-           WHERE source = ? AND session_id = ? AND location = 'remote'\
-         )",
-        params![source, session_id],
-        |row| row.get(0),
-    )
-    .map_err(Into::into)
-}
-
-/// Remove prompt history that an older local sync incorrectly attributed to a
-/// subagent. A remote presence makes the history canonical shared evidence, so
-/// it must not be destroyed by a later local scan.
-fn cleanup_codex_subagent_history(conn: &Connection, session_id: &str) -> Result<()> {
-    if !codex_session_has_remote_presence(conn, session_id)? {
-        conn.execute(
-            "DELETE FROM history WHERE source = 'codex' AND session_id = ?",
-            [session_id],
-        )?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 fn sync_codex_rollouts(
     conn: &Connection,
@@ -7958,6 +7873,8 @@ pub(crate) struct ClaudeSessionMeta {
     first_prompt: Option<String>,
     /// The name Claude Code gave the session; see [`claude_title`].
     title: Option<String>,
+    /// The latest `agent-name` record, kept apart from the title.
+    agent_name: Option<String>,
     /// This file is a delegated sidecar rather than a session of its own: it
     /// is named as one ([`is_claude_sidecar_file`]) and every identified
     /// record is a sidechain row — the same rule discovery uses to keep
@@ -8159,6 +8076,7 @@ impl ClaudeMetaFold {
             last_assistant_text: self.last_assistant_text.clone(),
             first_prompt: self.first_prompt.clone(),
             title: self.titles.best(),
+            agent_name: self.titles.agent_name.clone(),
             subagent: is_claude_sidecar_file(path)
                 && claude_records_are_all_sidechain(
                     self.identified_records,
@@ -8291,36 +8209,6 @@ fn retire_claude_history_row(
             params![session_id, ts_ms, raw],
         )?;
     }
-    Ok(())
-}
-
-/// Record what the whole-transcript fold found as the session's first prompt.
-///
-/// The shallow catalog upsert coalesces a null `first_prompt` into whatever
-/// the row already holds, because a shallow or remote read may simply not
-/// have seen the prompt. The metadata fold has seen every record, so its
-/// answer replaces the row's -- including with null. Without that, a session
-/// whose stored title was a row the classifier now types as control (a bare
-/// `/resume <id>`, a task notification) would keep it for good on an upgraded
-/// install, while a fresh database stores nothing.
-pub(crate) fn set_claude_first_prompt(
-    conn: &Connection,
-    meta: &ClaudeSessionMeta,
-    path: &Path,
-) -> Result<()> {
-    // Every sibling transcript is folded. The prompt and title stay with the
-    // file the catalog row names; `upsert_session` has already kept or claimed
-    // that file, so this compares the path and does not stat again.
-    let recorded = path.to_string_lossy();
-    if !crate::catalog_owner::recorded_path_is(conn, "claude", &meta.session_id, recorded.as_ref())?
-    {
-        return Ok(());
-    }
-    conn.execute(
-        "UPDATE sessions SET first_prompt = ?1 WHERE source = 'claude' AND session_id = ?2",
-        params![meta.first_prompt, meta.session_id],
-    )?;
-    set_session_title(conn, "claude", &meta.session_id, meta.title.as_deref())?;
     Ok(())
 }
 

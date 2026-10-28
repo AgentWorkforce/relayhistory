@@ -7,6 +7,41 @@ use rusqlite::Connection;
 use std::path::PathBuf;
 
 impl CatalogSession {
+    /// A delegated child's catalog-shaped description from one row of
+    /// `DELEGATED_CHILD_SQL` (see `delegated_child_session`). `models` is left
+    /// empty for the caller to decode.
+    pub(super) fn delegated(
+        source: Source,
+        session_id: &str,
+        row: &rusqlite::Row<'_>,
+    ) -> rusqlite::Result<Self> {
+        Ok(Self {
+            source,
+            session_id: session_id.to_string(),
+            cwd: row.get(2)?,
+            git_branch: row.get(3)?,
+            first_activity_ms: row.get(0)?,
+            last_activity_ms: row.get(1)?,
+            first_prompt: None,
+            last_assistant_text: None,
+            title: None,
+            session_kind: None,
+            agent_name: None,
+            models: Vec::new(),
+            originator: None,
+            agent_version: row.get(4)?,
+            repo_url: None,
+            initial_commit: None,
+            workspace_roots: Vec::new(),
+            project_key: row.get(5)?,
+            project_key_method: row.get(6)?,
+            raw_path: row.get::<_, Option<String>>(8)?.map(PathBuf::from),
+            source_stamp: None,
+            discovery_state: DiscoveryState::Delegated,
+            locations: Vec::new(),
+        })
+    }
+
     pub(super) fn from_row(row: ShallowSession) -> Result<Self, Error> {
         let source = Source::parse(&row.source).ok_or_else(|| {
             Error::Query(format!(
@@ -25,6 +60,7 @@ impl CatalogSession {
             last_assistant_text: row.last_assistant_text,
             title: row.title,
             session_kind: row.session_kind,
+            agent_name: row.agent_name,
             models: row.models,
             originator: row.originator,
             agent_version: row.agent_version,

@@ -196,11 +196,13 @@ fn is_js_ws_unit(u: u16) -> bool {
 }
 
 /// Why a record could not be scrubbed in place.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum Dropped {
     /// Not valid JSON (or not valid UTF-8).
+    #[error("record is not valid JSON")]
     Unparseable,
     /// Two keys became identical after scrubbing.
+    #[error("two keys of one object became identical after scrubbing")]
     KeyCollision,
 }
 

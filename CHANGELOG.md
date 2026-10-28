@@ -4,19 +4,25 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased - Minor]
+## [Unreleased]
+
+## [0.53.0] - 2026-10-28
 
 ### Added
 
 - OpenCode 2 sessions are discovered, synced and hydrated from its `session_v2` and `session_message` tables, including V1 sessions resumed under OpenCode 2; sessions OpenCode 2 only migrated keep reading from the V1 tables unchanged.
 - Session manifests record raw-chunk scrub status and stored digests; readers quarantine unscrubbed sessions.
 - The object-storage plugin can scrub PII and secrets, including PGP private keys, card numbers and phone numbers, from raw session chunks before upload (`scrub::scrub_chunk`, uploaded only through `scrub::seal::put_raw_chunk`), using the same rules as the hosted service.
+- The object-storage plugin's `scrub::Dropped` implements `Display` and `std::error::Error`, so callers can propagate it with `?`.
+- Claude sessions catalog their `agent-name` (the name Agent Relay and other sessions address them by) as `agent_name`, apart from the title, and session change records carry it so destinations can look sessions up by agent name. The session catalog contract is now 7. Sessions already catalogued are not re-scanned to fill it: a session gets its agent name when it is first catalogued or when its transcript next changes.
+
+### Changed
+
+- A full `sync` that finds nothing new is much cheaper on large Codex stores.
 
 ### Rust API
 
-- Added `SessionStore::retention_generation` and `retention::read_retention_generation` so retained catalogs can invalidate after committed local eviction without uploading deletion records.
-- Added `SessionStore::session_profile`, `SessionProfile`, and `SessionAvatar` for locally observed Grok Bot names, avatar shapes, colors, and inline raster images without transcript hydration or network access.
-- Added local `retention` policy read/write APIs and `SessionStore` maintenance and upload-acknowledgement methods; maintenance must be scheduled by the host.
+- Added `ShallowSession::agent_name` and `CatalogSession::agent_name`.
 
 ## [0.52.0] - 2026-10-26
 
@@ -51,7 +57,14 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Junie CLI history is discoverable and searchable from native session journals, including recorded prompts, assistant text, tool output and event markers.
 - The optional object-storage plugin (`plugins/object-store`) validates session `manifest.json` v1 and lets the desktop and server update it concurrently with compare-and-swap, without losing either side's changes.
 
+### Changed
+
+- The object-storage plugin rejects metadata values that start or end with a space (`Error::InvalidArgument`), because HTTP stores strip them.
+
 ### Fixed
+
+- The object-storage plugin's filesystem store refuses keys that traverse a symbolic link under its root and never lists entries reached through one.
+- Object-storage presigned URLs require a lifetime of at least one second.
 
 - Reconciliation advances healthy roots past persistent enumeration errors while retaining failed locations for retry.
 - Exact-path capture avoids materializing unused cached transcript metadata and locations.
@@ -1184,7 +1197,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - The SDK reads provider JSONL natively and works without the Python CLI.
 
-[Unreleased]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.52.0...HEAD
+[Unreleased]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.53.0...HEAD
+[0.53.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.52.0...sdk-ts-v0.53.0
 [0.52.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.51.0...sdk-ts-v0.52.0
 [0.51.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.50.1...sdk-ts-v0.51.0
 [0.50.1]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.49.0...sdk-ts-v0.50.1
