@@ -50,6 +50,10 @@ impl Layout {
         })
     }
 
+    pub(crate) fn has_v1(self) -> bool {
+        self.v1
+    }
+
     pub(crate) fn has_v2(self) -> bool {
         self.v2
     }

@@ -4479,6 +4479,35 @@ mod tests {
     }
 
     #[test]
+    fn an_opencode_2_session_that_is_gone_is_source_unavailable() {
+        let home = tempfile::tempdir().unwrap();
+        let store = home.path().join("opencode.db");
+        Connection::open(&store)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT NOT NULL,
+                                          time_created INTEGER NOT NULL,
+                                          time_updated INTEGER NOT NULL);
+                 CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                                               type TEXT NOT NULL, seq INTEGER NOT NULL,
+                                               time_created INTEGER NOT NULL, data TEXT NOT NULL);",
+            )
+            .unwrap();
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let roots = crate::ProviderRoots::from_home(home.path().to_path_buf(), store.clone());
+        let target = CatalogTarget {
+            locator: Some(store.to_string_lossy().into_owned()),
+            discovery_state: Some("shallow".into()),
+        };
+        let error = source_snapshot(&conn, &options("opencode", "gone"), &target, &roots, None)
+            .unwrap_err();
+        assert!(
+            error.to_string().starts_with("SESSION_SOURCE_UNAVAILABLE"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
     fn devin_changed_after_the_probe_refreshes_stamp_and_rows_together() {
         let home = tempfile::tempdir().unwrap();
         let cli_dir = home.path().join(".local/share/devin/cli");

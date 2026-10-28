@@ -141,7 +141,8 @@ fn opencode_store_snapshot(
     use crate::ingest::opencode::v2::{Envelope, Layout};
     let (table, mark) = match Layout::detect(&src)?.envelope(&src, &options.session_id)? {
         Some(Envelope::V2) => ("session_v2", "v2:"),
-        _ => ("session", ""),
+        Some(Envelope::V1) => ("session", ""),
+        None => return Err(opencode_session_gone(&options.session_id)),
     };
     let columns = src
         .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))?
@@ -166,12 +167,7 @@ fn opencode_store_snapshot(
             row.get::<_, String>(0)
         })
         .optional()?
-        .ok_or_else(|| {
-            hydration_error(
-                "SESSION_SOURCE_UNAVAILABLE",
-                format!("OpenCode session '{}' no longer exists", options.session_id),
-            )
-        })?;
+        .ok_or_else(|| opencode_session_gone(&options.session_id))?;
     Ok(SourceSnapshot {
         stamp,
         bytes: 0,
@@ -190,6 +186,13 @@ fn opencode_store_snapshot(
         opencode_layout: Some(OpencodeIngestLayout::Sqlite),
         codex_relationship_complete: true,
     })
+}
+
+fn opencode_session_gone(session_id: &str) -> anyhow::Error {
+    hydration_error(
+        "SESSION_SOURCE_UNAVAILABLE",
+        format!("OpenCode session '{session_id}' no longer exists"),
+    )
 }
 
 fn devin_store_snapshot(
