@@ -1454,6 +1454,12 @@ checkpoints. Full sweeps keep the existing bounded-TRUNCATE policy for
 physical space reclamation. Plain `sync`, hook hydration, and
 `Reconciliation` keep their existing connection policies.
 
+The optimization is fail-safe: if the worker thread cannot start, its channel
+disconnects, or a PASSIVE checkpoint cannot catch up, the next retained-writer
+checkout restores SQLite's default 1,000-page automatic checkpoint threshold
+before writing. The failure path may put checkpoint latency back on a commit,
+but it cannot leave the WAL unbounded merely because background upkeep failed.
+
 The exact path also nests discovery's `synchronous = NORMAL` scope. Nested
 guards on the same connection now share the outer policy instead of issuing
 another query, update, and restore. A nested guard on a different connection

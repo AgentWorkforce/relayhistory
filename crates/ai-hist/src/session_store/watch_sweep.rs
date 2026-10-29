@@ -145,9 +145,12 @@ pub(super) struct TickNotes {
 /// The retained watch writer has SQLite's commit-thread auto-checkpoint
 /// disabled. This worker keeps that copy/fsync work off the leading tick while
 /// enforcing a 30 s PASSIVE-checkpoint deadline for a sustained burst. Full
-/// sweeps retain their separate bounded-TRUNCATE space-reclamation role.
+/// sweeps retain their separate bounded-TRUNCATE space-reclamation role. If
+/// the worker is unavailable or cannot complete a checkpoint, the next writer
+/// checkout restores SQLite's default automatic checkpoint threshold.
 pub(super) struct QuietCheckpoint {
     schedule: Option<std::sync::mpsc::Sender<()>>,
+    available: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl QuietCheckpoint {
@@ -170,17 +173,40 @@ impl QuietCheckpoint {
         completed: Option<std::sync::mpsc::Sender<crate::ingest::SweepCheckpoint>>,
     ) -> Self {
         let (schedule, pending) = std::sync::mpsc::channel();
+        let available = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_available = std::sync::Arc::clone(&available);
         let spawned = std::thread::Builder::new()
             .name("ai-hist-wal-checkpoint".into())
-            .spawn(move || checkpoint_after_quiet(&db_path, quiet, max_delay, pending, completed));
+            .spawn(move || {
+                checkpoint_after_quiet(
+                    &db_path,
+                    quiet,
+                    max_delay,
+                    pending,
+                    completed,
+                    &worker_available,
+                );
+            });
+        available.store(spawned.is_ok(), std::sync::atomic::Ordering::Release);
         Self {
             schedule: spawned.ok().map(|_| schedule),
+            available,
         }
     }
 
+    fn enabled(&self) -> bool {
+        self.available.load(std::sync::atomic::Ordering::Acquire)
+    }
+
     fn schedule(&self) {
-        if let Some(schedule) = &self.schedule {
-            let _ = schedule.send(());
+        if self.enabled()
+            && self
+                .schedule
+                .as_ref()
+                .is_some_and(|schedule| schedule.send(()).is_err())
+        {
+            self.available
+                .store(false, std::sync::atomic::Ordering::Release);
         }
     }
 }
@@ -191,6 +217,7 @@ fn checkpoint_after_quiet(
     max_delay: Duration,
     pending: std::sync::mpsc::Receiver<()>,
     completed: Option<std::sync::mpsc::Sender<crate::ingest::SweepCheckpoint>>,
+    available: &std::sync::atomic::AtomicBool,
 ) {
     while pending.recv().is_ok() {
         let cap = std::time::Instant::now() + max_delay;
@@ -208,18 +235,31 @@ fn checkpoint_after_quiet(
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    if let (Some(completed), Some(outcome)) = (&completed, checkpoint_wal(db_path))
-                    {
-                        let _ = completed.send(outcome);
-                    }
+                    finish_quiet_checkpoint(db_path, &completed, available);
                     return;
                 }
             }
         }
-        if let (Some(completed), Some(outcome)) = (&completed, checkpoint_wal(db_path)) {
-            let _ = completed.send(outcome);
+        if !finish_quiet_checkpoint(db_path, &completed, available) {
+            return;
         }
     }
+}
+
+fn finish_quiet_checkpoint(
+    db_path: &Path,
+    completed: &Option<std::sync::mpsc::Sender<crate::ingest::SweepCheckpoint>>,
+    available: &std::sync::atomic::AtomicBool,
+) -> bool {
+    let outcome = checkpoint_wal(db_path);
+    let complete = outcome.is_some_and(|outcome| outcome.complete);
+    if let (Some(completed), Some(outcome)) = (completed, outcome) {
+        let _ = completed.send(outcome);
+    }
+    if !complete {
+        available.store(false, std::sync::atomic::Ordering::Release);
+    }
+    complete
 }
 
 /// One watch loop's sweep: the same locked `sync` as [`SessionStore::sync`],
@@ -426,7 +466,7 @@ impl WatchSweep {
             force,
             &plan.scope(),
             |conn| {
-                disable_auto_checkpoint(conn)?;
+                configure_auto_checkpoint(conn, self.checkpoint.enabled())?;
                 head_before.set(head(conn));
                 let before = match previous {
                     Some(before) => before,
@@ -505,10 +545,19 @@ fn checkpoint_wal(db_path: &Path) -> Option<crate::ingest::SweepCheckpoint> {
     None
 }
 
-fn disable_auto_checkpoint(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+fn configure_auto_checkpoint(
+    conn: &rusqlite::Connection,
+    defer_to_worker: bool,
+) -> rusqlite::Result<()> {
+    const SQLITE_DEFAULT_WAL_AUTOCHECKPOINT_PAGES: i64 = 1_000;
+    let target = if defer_to_worker {
+        0
+    } else {
+        SQLITE_DEFAULT_WAL_AUTOCHECKPOINT_PAGES
+    };
     let current: i64 = conn.query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))?;
-    if current != 0 {
-        conn.pragma_update(None, "wal_autocheckpoint", 0)?;
+    if current != target {
+        conn.pragma_update(None, "wal_autocheckpoint", target)?;
     }
     Ok(())
 }
@@ -690,7 +739,9 @@ mod tests {
     fn quiet_checkpoint_never_creates_a_missing_database() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("missing.db");
-        assert!(checkpoint_wal(&db_path).is_none());
+        let available = std::sync::atomic::AtomicBool::new(true);
+        assert!(!finish_quiet_checkpoint(&db_path, &None, &available));
+        assert!(!available.load(std::sync::atomic::Ordering::Acquire));
         assert!(!db_path.exists());
     }
 
@@ -728,18 +779,29 @@ mod tests {
     }
 
     #[test]
-    fn every_replacement_writer_disables_auto_checkpoint() {
+    fn every_replacement_writer_uses_worker_checkpoint_policy() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("history.db");
         for _ in 0..2 {
             let conn = rusqlite::Connection::open(&db_path).unwrap();
             conn.pragma_update(None, "wal_autocheckpoint", 1_000)
                 .unwrap();
-            disable_auto_checkpoint(&conn).unwrap();
+            configure_auto_checkpoint(&conn, true).unwrap();
             let current: i64 = conn
                 .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))
                 .unwrap();
             assert_eq!(current, 0);
         }
+    }
+
+    #[test]
+    fn unavailable_quiet_worker_restores_auto_checkpoint() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        configure_auto_checkpoint(&conn, false).unwrap();
+        let current: i64 = conn
+            .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(current, 1_000);
     }
 }
