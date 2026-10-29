@@ -200,3 +200,6 @@ fn identified_equal_time_prompts_survive_retirement_and_withdraw_independently()
         assert_eq!(conn.query_row("SELECT count(*) FROM history WHERE session_id='retained'", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
     }
 }
+
+#[path = "order_tests.rs"]
+mod order_tests;

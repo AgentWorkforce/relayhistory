@@ -99,7 +99,14 @@ fn validate_canonical_survivors(
     let incoming: BTreeMap<_, _> = union
         .values()
         .filter(|record| record.kind == EvidenceKind::SessionEvent)
-        .map(|record| Ok((record.payload["event_uid"].as_str().context("validated event identity")?, record)))
+        .map(|record| {
+            Ok((
+                record.payload["event_uid"]
+                    .as_str()
+                    .context("validated event identity")?,
+                record,
+            ))
+        })
         .collect::<Result<BTreeMap<_, _>>>()?;
     let mut positions = BTreeMap::new();
     let mut statement = conn.prepare(
@@ -115,7 +122,11 @@ fn validate_canonical_survivors(
     for row in rows {
         let (uid, ts, rank) = row?;
         if incoming.get(uid.as_str()).is_some_and(|record| {
-            record.payload["source_order"].as_i64().is_some()
+            record
+                .payload
+                .get("source_order")
+                .and_then(Value::as_i64)
+                .is_some()
                 || record.payload["ts_ms"].as_i64() != Some(ts)
         }) {
             continue;
@@ -123,7 +134,7 @@ fn validate_canonical_survivors(
         positions.insert((ts, rank), uid);
     }
     for (uid, record) in incoming {
-        if let Some(rank) = record.payload["source_order"].as_i64() {
+        if let Some(rank) = record.payload.get("source_order").and_then(Value::as_i64) {
             let ts = record.payload["ts_ms"]
                 .as_i64()
                 .context("validated event timestamp")?;
@@ -172,12 +183,14 @@ mod tests {
 
     #[test]
     fn a_candidate_rank_only_fills_a_winners_matching_timestamp() {
-        let record = |ts, rank| EvidenceRecord {
+        let record = |ts, rank| {
+            EvidenceRecord {
             kind: EvidenceKind::SessionEvent,
             payload: serde_json::json!({"source":"claude", "session_id":"s", "event_uid":"same", "ts_ms":ts, "source_order":rank})
                 .as_object().unwrap().clone(),
             record_id: None,
             revision_id: None,
+        }
         };
         let winner = record(200, None::<i64>);
         let identity = winner.identity();

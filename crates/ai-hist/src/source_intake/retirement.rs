@@ -18,7 +18,9 @@ pub(crate) fn capture(conn: &Connection, source: &str, sid: &str) -> Result<Reta
             }
             let identity = item.record.identity();
             if item.record.matches_canonical(conn)? {
-                retained.entry(identity).or_insert(item.record);
+                let mut record = item.record;
+                preserve_canonical_order(conn, &mut record)?;
+                retained.entry(identity).or_insert(record);
             } else {
                 // A conflicting retained snapshot is not authority to replace
                 // the retiring source's data now or on a later replay.
@@ -35,9 +37,41 @@ pub(crate) fn capture(conn: &Connection, source: &str, sid: &str) -> Result<Reta
     Ok(Retained(retained.into_values().collect()))
 }
 
+// Enrich only the transient retirement projection. A legacy observation does
+// not assert order, but a matching canonical row already recorded it. Keep
+// that evidence across deletion without changing the acquired snapshot.
+fn preserve_canonical_order(conn: &Connection, record: &mut EvidenceRecord) -> Result<()> {
+    use rusqlite::OptionalExtension;
+    if record.kind != EvidenceKind::SessionEvent
+        || record
+            .payload
+            .get("source_order")
+            .is_some_and(|value| !value.is_null())
+    {
+        return Ok(());
+    }
+    let rank = conn.query_row(
+        "SELECT source_order FROM session_events WHERE source=?1 AND session_id=?2 AND event_uid=?3 AND ts_ms=?4",
+        rusqlite::params![record.payload["source"].as_str(),record.payload["session_id"].as_str(),record.payload["event_uid"].as_str(),record.payload["ts_ms"].as_i64()],
+        |row| row.get::<_, Option<i64>>(0),
+    ).optional()?.flatten();
+    if let Some(rank) = rank {
+        record
+            .payload
+            .insert("source_order".into(), serde_json::json!(rank));
+    }
+    Ok(())
+}
+
 fn retired_kind(kind: EvidenceKind) -> bool {
-    matches!(kind, EvidenceKind::History | EvidenceKind::SessionEvent |
-        EvidenceKind::ToolCall | EvidenceKind::FileEdit | EvidenceKind::SessionMarker)
+    matches!(
+        kind,
+        EvidenceKind::History
+            | EvidenceKind::SessionEvent
+            | EvidenceKind::ToolCall
+            | EvidenceKind::FileEdit
+            | EvidenceKind::SessionMarker
+    )
 }
 
 impl Retained {
@@ -88,7 +122,9 @@ pub(super) fn previous_winners<'a>(
         for item in &snapshot.records {
             let entry = previous_winners.entry(item.record.identity());
             if item.managed && item.record.matches_canonical(conn)? {
-                entry.and_modify(|record| *record = &item.record).or_insert(&item.record);
+                entry
+                    .and_modify(|record| *record = &item.record)
+                    .or_insert(&item.record);
             } else {
                 entry.or_insert(&item.record);
             }
@@ -122,7 +158,10 @@ pub(super) fn may_inherit(
         rusqlite::params![identity,record.payload.get("source").and_then(Value::as_str),record.payload.get("session_id").and_then(Value::as_str)],
         |row| row.get(0),
     )?;
-    Ok(!supported || prior.iter().any(|item| item.managed && item.record.identity() == identity)
+    Ok(!supported
+        || prior
+            .iter()
+            .any(|item| item.managed && item.record.identity() == identity)
         || record.matches_canonical(conn)?)
 }
 
