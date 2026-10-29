@@ -58,7 +58,9 @@ pub(super) fn session(conn: &Connection, s: &Session, path: &Path) -> Result<usi
         .then(|| conn.unchecked_transaction())
         .transpose()?;
     let shared = crate::providers::shared_evidence::Snapshot::capture(conn, ID, &s.id)?;
+    let order = crate::ingest::native_order::begin(conn, ID, Some(&s.id))?;
     let inserted = write_session(conn, s, path)?;
+    order.finish()?;
     shared.ensure_unchanged(conn, &s.id)?;
     if let Some(transaction) = transaction {
         transaction.commit()?;

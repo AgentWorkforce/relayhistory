@@ -352,11 +352,14 @@ public `Block::source_order` exposes it. Preserve it verbatim through exports,
 including paged exports; do not derive it from array position, record identity
 or destination row IDs. The record array may be shuffled without changing
 conversation order. Absent/null means unknown. Mixed known/unknown buckets
-have deterministic rendering but no claimed order for unknown events.
+have deterministic rendering but no claimed order for unknown events. An
+incremental append to a legacy bucket leaves new ranks unknown until a full
+source read establishes its order.
 
 Known order conflicts across retained observations fail atomically with
 `SOURCE_ORDER_CONFLICT`. A partial-kind submission does not withdraw the prior
-event snapshot. A legacy observation cannot clear known canonical order. Native
+event snapshot. A legacy observation cannot clear known canonical order, even
+when it is the remaining support after local retirement. Native
 rewrites preserve event row IDs and change only ranks when order changes.
 Event cursors retain `{ts_ms,id}`: reads resolve the current rank through that
 stable row, reject a row belonging to another source/session or ordered

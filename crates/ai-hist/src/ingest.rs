@@ -17,7 +17,10 @@ use std::io::{self, BufRead, BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+mod claude_full_order;
 mod claude_record_rows;
+mod session_order_scope;
+use claude_full_order::claude_file_session_id;
 mod claude_standalone;
 pub(crate) mod claude_title;
 pub(crate) mod codex;
@@ -124,6 +127,7 @@ pub use tool_result_facts::{
 
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
+pub(crate) mod native_order;
 #[path = "ingest/output.rs"]
 pub(crate) mod output;
 
@@ -5739,8 +5743,12 @@ fn ingest_codex_rollout_incremental(
     // Codex keeps its existing rule for a trailing line with no newline: it
     // is the half-written tail of a live rollout and the next pass re-reads
     // it. Unlike Claude, no Codex writer leaves its last line unterminated.
-    let (mut reader, mut replay_gate, probe_bytes) =
-        rollout_head::open_codex_walk(conn, path, cursor, meta)?;
+    let native_order::CodexRead {
+        mut reader,
+        gate: mut replay_gate,
+        probe_bytes,
+        order: native_order,
+    } = native_order::codex_read(conn, path, cursor, meta)?;
     let mut pass = transcript_cursor::IncrementalPass {
         rotated: reader.rotated,
         ..Default::default()
@@ -6783,7 +6791,14 @@ fn ingest_codex_rollout_incremental(
         .saturating_add(reader.tail_bytes())
         .saturating_add(pass.validation_bytes)
         .saturating_add(probe_bytes);
-    Ok((outcome, pass))
+    native_order::finish_codex(
+        native_order,
+        &pass,
+        offset,
+        reader.position(),
+        reader.tail_bytes(),
+    )
+    .map(|()| (outcome, pass))
 }
 
 /// One Codex rollout line that has not yet been shown to write anything.
@@ -8165,6 +8180,7 @@ fn ingest_claude_transcript_text_as(
     text: &str,
     attributed_session_id: Option<&str>,
 ) -> Result<()> {
+    let order = native_order::begin(conn, "claude", attributed_session_id)?;
     let file_session_id = text.lines().find_map(|line| {
         serde_json::from_str::<Value>(line)
             .ok()?
@@ -8183,7 +8199,8 @@ fn ingest_claude_transcript_text_as(
         check_capture_cancelled()?;
         walk.feed(line)?;
     }
-    walk.finish()
+    walk.finish()?;
+    order.finish()
 }
 
 pub(crate) fn scan_claude_session_file_resumed(
@@ -8706,6 +8723,7 @@ fn ingest_claude_transcript_as(
     path: &Path,
     attributed_session_id: Option<&str>,
 ) -> Result<()> {
+    let order = native_order::begin(conn, "claude", attributed_session_id)?;
     // The session this file belongs to. Claude writes a conversation's summary
     // as the *first* line and gives it `leafUuid` instead of `sessionId`, so a
     // fallback that learned the id from earlier records would always be too
@@ -8743,37 +8761,8 @@ fn ingest_claude_transcript_as(
         let line = std::str::from_utf8(&raw).unwrap_or("");
         walk.feed(line.trim_end_matches(['\n', '\r']))?;
     }
-    walk.finish()
-}
-
-/// The first in-log session id a transcript carries.
-///
-/// Read ahead of the record walk, and bounded in the case that matters: the
-/// id is normally on the first record, and this stops at the first one that
-/// has it.
-fn claude_file_session_id(path: &Path) -> Result<Option<String>> {
-    let file = fs::File::open(path)
-        .with_context(|| format!("reading claude transcript {}", path.display()))?;
-    let mut reader = BufReader::new(file);
-    let mut raw = Vec::new();
-    loop {
-        raw.clear();
-        if reader.read_until(b'\n', &mut raw)? == 0 {
-            return Ok(None);
-        }
-        let Ok(line) = std::str::from_utf8(&raw) else {
-            continue;
-        };
-        if let Some(id) = serde_json::from_str::<Value>(line.trim_end_matches(['\n', '\r']))
-            .ok()
-            .as_ref()
-            .and_then(|value| value.get("sessionId"))
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())
-        {
-            return Ok(Some(id.to_string()));
-        }
-    }
+    walk.finish()?;
+    order.finish()
 }
 
 /// What one Claude transcript threads through its records, whichever reader
@@ -12259,6 +12248,9 @@ pub(crate) fn ingest_cursor_transcript(
     // update, rolls back and the next sync retries the same offset.
     let text = cold_read::read_string(path)
         .with_context(|| format!("read Cursor transcript {}", path.display()))?;
+    // This walk emits every complete record from byte zero through the
+    // selected boundary; history_from_offset only limits prompt insertion.
+    let order = native_order::begin(conn, "cursor", Some(session_id))?;
     let mut outcome = CursorTranscriptOutcome::default();
     let mut offset: u64 = 0;
     // One query for the session, keyed by record offset. The per-record
@@ -12681,12 +12673,10 @@ pub(crate) fn ingest_cursor_transcript(
                 },
             )?;
         }
-        if emitted_evidence && !ts_is_guessed {
-            outcome.first_ts_ms = Some(outcome.first_ts_ms.map_or(ts_ms, |first| first.min(ts_ms)));
-            outcome.last_ts_ms = Some(outcome.last_ts_ms.map_or(ts_ms, |last| last.max(ts_ms)));
-        }
+        outcome.observe_activity(emitted_evidence, ts_is_guessed, ts_ms);
     }
     outcome.consumed_through = offset;
+    order.finish()?;
     Ok(outcome)
 }
 
@@ -13548,7 +13538,7 @@ pub(crate) fn ingest_muse_session(
     } else {
         HistoryScope::Session
     };
-    let mut reconcile = evidence_reconcile::begin_muse(conn, sid, scope)?;
+    let (order, mut reconcile) = session_order_scope::muse(conn, sid, scope)?;
 
     let mut outcome = MuseIngestOutcome {
         unparsed_lines: transcript.unparsed_lines,
@@ -14015,7 +14005,7 @@ pub(crate) fn ingest_muse_session(
         ],
     )?;
     evidence_reconcile::finish(conn, &mut reconcile)?;
-    Ok(outcome)
+    session_order_scope::finish(order, outcome)
 }
 
 /// Everything a sweep reads under one Grok home: the session directories,
@@ -14254,7 +14244,7 @@ fn ingest_grok_session(
     let sid = session.session_id.as_str();
     let project = session.cwd.as_deref();
     let branch = session.git_branch.as_deref();
-    let mut reconcile = grok_unified::begin_session(conn, sid, raw_path)?;
+    let (order, mut reconcile) = session_order_scope::grok(conn, sid, raw_path)?;
     let mut outcome = GrokIngestOutcome {
         missing_updates: !session.updates_present,
         updates_yielded_no_timing: session.updates_present && session.updates.is_empty(),
@@ -14808,7 +14798,7 @@ fn ingest_grok_session(
     )?;
     outcome.unified_usage_rows = coverage.rows;
     outcome.unified_coverage = coverage;
-    Ok(outcome)
+    session_order_scope::finish(order, outcome)
 }
 
 /// Materialize unified usage, then keep only the evidence this read wrote.
@@ -23676,7 +23666,13 @@ mod tests {
         let path = stage_cursor_fixture(dir.path(), "observed-3.13.25.jsonl", "s-repeat");
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
-        for _ in 0..2 {
+        let ordered_rows = || {
+            conn.prepare("SELECT id,event_uid,source_order FROM session_events WHERE source='cursor' ORDER BY id")
+                .unwrap().query_map([], |row| Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<i64>>(2)?)))
+                .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+        };
+        let mut original = None;
+        for pass in 0..3 {
             super::ingest_cursor_transcript(
                 &conn,
                 &path,
@@ -23687,6 +23683,20 @@ mod tests {
                 u64::MAX,
             )
             .unwrap();
+            let current = ordered_rows();
+            assert!(current.iter().all(|row| row.2.is_some()));
+            if let Some(original) = &original {
+                assert_eq!(
+                    &current, original,
+                    "legacy enrichment keeps event IDs and native order"
+                );
+            } else {
+                original = Some(current);
+            }
+            if pass == 0 {
+                conn.execute("UPDATE session_events SET source_order=NULL", [])
+                    .unwrap();
+            }
         }
         let counts = |table: &str| {
             conn.query_row(

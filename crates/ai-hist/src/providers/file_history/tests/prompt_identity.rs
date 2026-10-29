@@ -170,3 +170,44 @@ fn identified_rewrite_ignores_anonymous_equal_text_keep_tokens() {
     tx.commit().unwrap();
     assert_eq!(prompts(&conn), vec![("a".into(), "a:1".into())]);
 }
+
+#[test]
+fn prompt_support_uses_recorded_order_before_numeric_event_suffix() {
+    let conn = Connection::open_in_memory().unwrap();
+    crate::init_db(&conn).unwrap();
+    conn.execute_batch("INSERT INTO history(source,session_id,prompt,timestamp_ms) VALUES('deepagents','ordered','B'||char(10)||'A',123);
+        INSERT INTO session_events(source,session_id,event_uid,message_id,ts_ms,role,kind,text,source_order,location) VALUES
+        ('deepagents','ordered','m:0','m',123,'user','text','A',1,'remote'),
+        ('deepagents','ordered','m:1','m',123,'user','text','B',0,'remote');").unwrap();
+    let tx = conn.unchecked_transaction().unwrap();
+    retire_local_session(&tx, "deepagents", "ordered").unwrap();
+    tx.commit().unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT prompt FROM history WHERE source='deepagents' AND session_id='ordered'",
+            [],
+            |row| row.get::<_, String>(0)
+        )
+        .unwrap(),
+        "B\nA"
+    );
+    // A legacy bucket retains its old numeric-suffix projection, even if its
+    // insertion order is reversed and no source rank was observed.
+    conn.execute_batch("DELETE FROM history; DELETE FROM session_events;
+        INSERT INTO history(source,session_id,prompt,timestamp_ms) VALUES('deepagents','legacy','A'||char(10)||'B',123);
+        INSERT INTO session_events(source,session_id,event_uid,message_id,ts_ms,role,kind,text,location) VALUES
+        ('deepagents','legacy','m:1','m',123,'user','text','B','remote'),
+        ('deepagents','legacy','m:0','m',123,'user','text','A','remote');").unwrap();
+    let tx = conn.unchecked_transaction().unwrap();
+    retire_local_session(&tx, "deepagents", "legacy").unwrap();
+    tx.commit().unwrap();
+    assert_eq!(
+        conn.query_row(
+            "SELECT prompt FROM history WHERE source='deepagents' AND session_id='legacy'",
+            [],
+            |row| row.get::<_, String>(0)
+        )
+        .unwrap(),
+        "A\nB"
+    );
+}

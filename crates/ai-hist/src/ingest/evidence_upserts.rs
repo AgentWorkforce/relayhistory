@@ -56,6 +56,10 @@ fn session_event_sql(session_key: &str, session_method: &str) -> (String, String
          WHEN session_events.project_key IS NOT NULL THEN session_events.project_key_method \
          ELSE ?17 END"
     );
+    // An incremental cursor does not re-observe a legacy bucket's prefix.
+    // Allocate a rank only when every retained row has known source order;
+    // otherwise append as unknown and preserve the bucket's row-id fallback.
+    // Existing known ranks are retained by the event-identity lookup first.
     let rewrite = format!(
         "INSERT INTO session_events \
          (source, session_id, project, project_key, project_key_method, cwd, git_branch, \
@@ -71,7 +75,8 @@ fn session_event_sql(session_key: &str, session_method: &str) -> (String, String
            ?14, ?15, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, \
            ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, \
            COALESCE((SELECT source_order FROM session_events WHERE source=?1 AND session_id=?2 AND event_uid=?15 AND ts_ms=?8), \
-             (SELECT COALESCE(MAX(source_order),-1)+1 FROM session_events WHERE source=?1 AND session_id=?2 AND ts_ms=?8))) \
+             (SELECT CASE WHEN COUNT(source_order)=COUNT(*) THEN COALESCE(MAX(source_order),-1)+1 END \
+              FROM session_events WHERE source=?1 AND session_id=?2 AND ts_ms=?8))) \
          ON CONFLICT(source, session_id, event_uid) DO UPDATE SET \
          project=excluded.project, \
          project_key={assigned_key}, \
@@ -220,3 +225,6 @@ pub(crate) static FILE_EDIT_UPSERT: LazyLock<String> = LazyLock::new(|| {
 pub(crate) static FILE_EDIT_REWRITE: LazyLock<String> = LazyLock::new(|| {
     format!("{FILE_EDIT_INSERT}{FILE_EDIT_BRANCH_KEPT}, location={EDIT_LOCATION_ASSIGNED}")
 });
+
+#[cfg(test)]
+mod tests;

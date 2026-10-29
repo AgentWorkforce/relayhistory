@@ -122,7 +122,7 @@ pub(crate) fn reconcile_prompts(
           (SELECT text FROM session_events b WHERE b.source = ?1 \
            AND b.session_id = e.session_id AND b.message_id = e.message_id \
            AND b.role = 'user' AND b.kind = 'text' AND b.control_kind IS NULL \
-           ORDER BY CAST(substr(b.event_uid, length(b.message_id) + 2) AS INTEGER))) = history.prompt \
+           ORDER BY COALESCE(b.source_order, CAST(substr(b.event_uid, length(b.message_id) + 2) AS INTEGER)), b.id)) = history.prompt \
         ORDER BY (e.session_id = ?2) DESC, e.session_id LIMIT 1";
     let project = reference.replacen("SELECT e.session_id", "SELECT e.project", 1);
     // Retained prompt rows keep their owner; refresh that owner's finalized
