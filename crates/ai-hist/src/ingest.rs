@@ -35,9 +35,11 @@ pub(crate) mod evidence_reconcile;
 mod evidence_upserts;
 pub(crate) mod grok;
 mod grok_unified;
+mod history_prompts;
 pub(crate) mod hook;
 pub(crate) mod hydrate;
 mod images;
+use history_prompts::retire_claude_history_row;
 pub(crate) use images::image_markdown;
 pub(crate) mod incremental;
 pub(crate) mod jsonl;
@@ -6083,6 +6085,7 @@ fn ingest_codex_rollout_incremental(
                 outcome.prompts += insert_history(
                     conn,
                     &HistoryEntry {
+                        event_uid: None,
                         id: 0,
                         source: "codex".into(),
                         session_id: Some(meta.session_id.clone()),
@@ -8153,65 +8156,6 @@ impl ClaudeScanPass {
     }
 }
 
-/// Retire the history row the previous parser wrote for a record this
-/// session now stores differently, without erasing another session's prompt.
-///
-/// `history` is unique on `(source, timestamp_ms, prompt)` with no session in
-/// the key, so a task notification in one session and a human prompt with the
-/// same text at the same millisecond in another are one row, owned by
-/// whichever transcript was read first. Deleting that row outright when the
-/// owner turns out to be control would erase the other session's prompt --
-/// its own re-read had already been ignored by the unique key -- so before
-/// the delete, the row is handed to a session that has a substantive user
-/// text event at that instant with that text. Only when no such session
-/// exists is it deleted. The lookup runs only when this session actually owns
-/// such a row, which outside the one-time re-read is never.
-fn retire_claude_history_row(
-    conn: &Connection,
-    session_id: &str,
-    ts_ms: i64,
-    raw: &str,
-) -> Result<()> {
-    let owned: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM history \
-         WHERE source = 'claude' AND session_id = ?1 AND timestamp_ms = ?2 AND prompt = ?3)",
-        params![session_id, ts_ms, raw],
-        |row| row.get(0),
-    )?;
-    if !owned {
-        return Ok(());
-    }
-    let handed_over = conn.execute(
-        "UPDATE history SET session_id = ( \
-             SELECT e.session_id FROM session_events e \
-             WHERE e.source = 'claude' AND e.session_id <> ?1 AND e.ts_ms = ?2 \
-               AND e.role = 'user' AND e.kind = 'text' AND e.control_kind IS NULL \
-               AND TRIM(e.text) = ?3 \
-             ORDER BY e.session_id LIMIT 1), \
-           project = COALESCE(( \
-             SELECT e.project FROM session_events e \
-             WHERE e.source = 'claude' AND e.session_id <> ?1 AND e.ts_ms = ?2 \
-               AND e.role = 'user' AND e.kind = 'text' AND e.control_kind IS NULL \
-               AND TRIM(e.text) = ?3 \
-             ORDER BY e.session_id LIMIT 1), project) \
-         WHERE source = 'claude' AND session_id = ?1 AND timestamp_ms = ?2 AND prompt = ?3 \
-           AND EXISTS( \
-             SELECT 1 FROM session_events e \
-             WHERE e.source = 'claude' AND e.session_id <> ?1 AND e.ts_ms = ?2 \
-               AND e.role = 'user' AND e.kind = 'text' AND e.control_kind IS NULL \
-               AND TRIM(e.text) = ?3)",
-        params![session_id, ts_ms, raw],
-    )?;
-    if handed_over == 0 {
-        conn.execute(
-            "DELETE FROM history \
-             WHERE source = 'claude' AND session_id = ?1 AND timestamp_ms = ?2 AND prompt = ?3",
-            params![session_id, ts_ms, raw],
-        )?;
-    }
-    Ok(())
-}
-
 /// The same metadata fold, over bytes the lifecycle hook already captured.
 ///
 /// The hook hands over what it read, so there is no file to walk and no
@@ -9310,6 +9254,7 @@ fn ingest_claude_record(
             insert_history(
                 conn,
                 &HistoryEntry {
+                    event_uid: None,
                     id: 0,
                     source: "claude".into(),
                     session_id: Some(session_id.to_string()),
@@ -12745,6 +12690,7 @@ pub(crate) fn ingest_cursor_transcript(
             outcome.prompts_inserted += insert_history(
                 conn,
                 &HistoryEntry {
+                    event_uid: None,
                     id: 0,
                     source: "cursor".into(),
                     session_id: Some(session_id.to_string()),
@@ -13694,6 +13640,7 @@ pub(crate) fn ingest_muse_session(
                     outcome.prompts += insert_history(
                         conn,
                         &HistoryEntry {
+                            event_uid: None,
                             id: 0,
                             source: SOURCE.into(),
                             session_id: Some(sid.to_string()),
@@ -14488,6 +14435,7 @@ fn ingest_grok_session(
                 outcome.prompts += insert_history(
                     conn,
                     &HistoryEntry {
+                        event_uid: None,
                         id: 0,
                         source: SOURCE.into(),
                         session_id: Some(sid.to_string()),
@@ -18317,6 +18265,7 @@ mod tests {
         insert_history(
             &conn,
             &HistoryEntry {
+                event_uid: None,
                 id: 0,
                 source: "muse".into(),
                 session_id: Some(MUSE_WORKER.to_string()),
@@ -18371,6 +18320,7 @@ mod tests {
         insert_history(
             &conn,
             &HistoryEntry {
+                event_uid: None,
                 id: 0,
                 source: "muse".into(),
                 session_id: Some(MUSE_PARENT.to_string()),
@@ -18907,6 +18857,7 @@ mod tests {
         insert_history(
             &conn,
             &HistoryEntry {
+                event_uid: None,
                 id: 0,
                 source: "muse".into(),
                 session_id: Some(MUSE_WORKER.to_string()),
@@ -20265,6 +20216,7 @@ mod tests {
         // The positive control: the same collapse on a source with per-record
         // times, proving the key and not the Grok parser is what does this.
         let entry = |source: &str, session: &str| HistoryEntry {
+            event_uid: None,
             id: 0,
             source: source.into(),
             session_id: Some(session.to_string()),
@@ -20837,6 +20789,7 @@ mod tests {
             insert_history(
                 &conn,
                 &HistoryEntry {
+                    event_uid: None,
                     id: 0,
                     source: "grok".into(),
                     session_id: Some("grok-evt-0001".into()),
@@ -20850,6 +20803,7 @@ mod tests {
             insert_history(
                 &conn,
                 &HistoryEntry {
+                    event_uid: None,
                     id: 0,
                     source: "grok".into(),
                     session_id: Some("grok-evt-0001".into()),
@@ -23828,6 +23782,7 @@ mod tests {
         insert_history(
             &conn,
             &HistoryEntry {
+                event_uid: None,
                 id: 0,
                 source: "cursor".into(),
                 session_id: Some("s-restamp".into()),
@@ -28774,6 +28729,7 @@ mod tests {
             insert_history(
                 &conn,
                 &HistoryEntry {
+                    event_uid: None,
                     id: 0,
                     source: "claude".into(),
                     session_id: Some(session_id.into()),
@@ -28851,6 +28807,7 @@ mod tests {
             insert_history(
                 &conn,
                 &HistoryEntry {
+                    event_uid: None,
                     id: 0,
                     source: "claude".into(),
                     session_id: Some("sess-control".into()),
@@ -32414,6 +32371,7 @@ mod tests {
         crate::insert_history_at_location(
             &conn,
             &HistoryEntry {
+                event_uid: None,
                 id: 0,
                 source: "codex".into(),
                 session_id: Some("sess-remote-sub".into()),

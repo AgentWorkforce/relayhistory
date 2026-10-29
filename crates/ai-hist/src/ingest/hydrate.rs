@@ -173,7 +173,7 @@ pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 3;
 /// hydrates restores the Codex forks and subagents without paginated history
 /// that generation 17's probe read whole as copied parent history, which
 /// sync's `codex_fork_replay_gate` generation 3 restores.
-pub(crate) const HYDRATION_PARSER_VERSION: i64 = 20;
+pub(crate) const HYDRATION_PARSER_VERSION: i64 = 21;
 
 #[derive(Debug, Clone)]
 pub struct HydrateSessionOptions {

@@ -79,6 +79,8 @@ mod sync;
 pub use reconciliation::{Reconciliation, ReconciliationStep};
 mod catalog_row;
 use catalog_row::catalog_session;
+mod prompt;
+pub use prompt::Prompt;
 mod profile;
 pub use profile::{SessionAvatar, SessionProfile};
 mod options;
@@ -2048,35 +2050,6 @@ pub struct SessionEvidence {
     /// Whether text fields were carried.
     pub include_text: bool,
     pub diagnostics: Vec<Diagnostic>,
-}
-
-/// One `history` row.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct Prompt {
-    /// `None` when the query asked for no text.
-    pub prompt: Option<String>,
-    /// sha256 of the prompt, hex: the hash the ledger stored, or one computed
-    /// from the text when it was carried. `None` only for a row written
-    /// without a stored hash and read without its text.
-    pub prompt_hash: Option<String>,
-    pub prompt_bytes: i64,
-    pub project: Option<String>,
-    pub timestamp_ms: i64,
-}
-
-impl Prompt {
-    fn from_row(row: PromptRow) -> Self {
-        Self {
-            prompt_hash: row
-                .prompt_hash
-                .or_else(|| row.prompt.as_deref().map(prompt_hash)),
-            prompt_bytes: row.prompt_bytes,
-            prompt: row.prompt,
-            project: row.project,
-            timestamp_ms: row.timestamp_ms,
-        }
-    }
 }
 
 /// Who a message came from. Mirrors the `session_events.role` constraint.

@@ -1,3 +1,4 @@
+mod history_identity;
 use anyhow::{Context, Result};
 #[cfg(feature = "opencode-backup")]
 use rusqlite::DatabaseName;
@@ -43,6 +44,9 @@ pub const SOURCE_CHOICES: &[&str] = crate::sources::catalog::SOURCE_CHOICES;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HistoryEntry {
+    /// Stable session-event identity when captured; absent for legacy prompt logs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub event_uid: Option<String>,
     #[serde(default)]
     pub id: i64,
     pub source: String,
@@ -282,7 +286,7 @@ CREATE TABLE IF NOT EXISTS history (
     prompt TEXT NOT NULL,
     prompt_hash TEXT,
     timestamp_ms INTEGER NOT NULL,
-    UNIQUE(source, timestamp_ms, prompt)
+    event_uid TEXT CHECK(event_uid IS NULL OR (length(event_uid)>0 AND session_id IS NOT NULL AND length(session_id)>0))
 );
 CREATE VIRTUAL TABLE IF NOT EXISTS history_fts USING fts5(
     prompt, project, content='history', content_rowid='id'
@@ -627,7 +631,7 @@ const REQUIRED_TABLES: &[&str] = &[
     "schema_migrations",
     "discovery_skips",
 ];
-const REQUIRED_HISTORY_COLUMNS: &[&str] = &["prompt_hash", "git_branch"];
+const REQUIRED_HISTORY_COLUMNS: &[&str] = &["prompt_hash", "git_branch", "event_uid"];
 /// What a provider's parser reported about the session, kept with the
 /// checkpoint so a later read that parses nothing can still report it. A
 /// diagnostic like "this harness records no billing tokens" is a standing
@@ -973,6 +977,7 @@ const REQUIRED_TRIGGERS: &[&str] = &[
 /// Marks `delete_session_hydration_state` rebuilt with one seek per edge end.
 const SESSION_DELETE_EDGE_SEEKS: &str = "session_delete_edge_seeks_v1";
 const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &[
+    "history_event_identity_v1",
     "session_presences_local_backfill_v1",
     "session_relationships_v2",
     "session_markers_v1",
@@ -1520,7 +1525,7 @@ END;
     // continuity kinds need, and a fresh database already has it from the DDL
     // above, so both paths converge on the same shape.
     ensure_text_columns(conn, "session_relationships", &["origin_session_id"])?;
-    ensure_text_columns(conn, "history", REQUIRED_HISTORY_COLUMNS)?;
+    history_identity::ensure_schema(conn)?;
     ensure_text_columns(conn, "sessions", REQUIRED_SESSIONS_COLUMNS)?;
     ensure_text_columns(conn, "session_presences", REQUIRED_SESSION_PRESENCE_COLUMNS)?;
     ensure_columns(conn, "session_markers", REQUIRED_SESSION_MARKER_COLUMNS)?;
@@ -2223,6 +2228,7 @@ pub fn parse_claude(line: &str) -> Result<Option<HistoryEntry>> {
         return Ok(None);
     }
     Ok(Some(HistoryEntry {
+        event_uid: None,
         id: 0,
         source: "claude".into(),
         session_id: obj
@@ -2250,6 +2256,7 @@ pub fn parse_codex(line: &str) -> Result<Option<HistoryEntry>> {
         return Ok(None);
     }
     Ok(Some(HistoryEntry {
+        event_uid: None,
         id: 0,
         source: "codex".into(),
         session_id: obj
@@ -2362,6 +2369,7 @@ pub fn raw_fts_query_error(raw: bool, error: rusqlite::Error) -> anyhow::Error {
 
 fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEntry> {
     Ok(HistoryEntry {
+        event_uid: row.get(6)?,
         id: row.get(0)?,
         source: row.get(1)?,
         session_id: row.get(2)?,
@@ -2574,26 +2582,7 @@ pub fn insert_history_at_location(
     entry: &HistoryEntry,
     location: SessionLocation,
 ) -> Result<usize> {
-    if location == SessionLocation::Remote {
-        anyhow::ensure!(
-            entry
-                .session_id
-                .as_deref()
-                .is_some_and(|session_id| !session_id.is_empty()),
-            "remote history requires a non-empty session id"
-        );
-    }
-    // Presence first preserves the important failure invariant without adding
-    // a transaction per imported prompt: evidence can never commit before its
-    // classification. A lone presence after a later insert failure is harmless
-    // and a duplicate evidence insert still repairs a missing presence.
-    record_history_presence(conn, entry, location)?;
-    let inserted = conn.prepare_cached(
-        "INSERT OR IGNORE INTO history (source, session_id, project, prompt, prompt_hash, timestamp_ms) VALUES (?, ?, ?, ?, ?, ?)",
-    )?.execute(
-        params![entry.source, entry.session_id, entry.project, entry.prompt, entry.prompt_hash, entry.timestamp_ms],
-    )?;
-    Ok(inserted)
+    history_identity::insert(conn, entry, location)
 }
 
 /// Prompts matching a search, newest first: the `prompt` role of
@@ -2637,6 +2626,7 @@ pub fn latest_resumable_match(
 
 fn prompt_entry(row: crate::history_search::SearchRow) -> HistoryEntry {
     HistoryEntry {
+        event_uid: row.event_uid,
         id: row.id,
         source: row.source,
         session_id: row.session_id,
@@ -2649,7 +2639,7 @@ fn prompt_entry(row: crate::history_search::SearchRow) -> HistoryEntry {
 
 pub fn recent(conn: &Connection, filter: &QueryFilter) -> Result<Vec<HistoryEntry>> {
     filter.validate()?;
-    let mut sql = "SELECT h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms FROM history h WHERE 1=1".to_string();
+    let mut sql = "SELECT h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms, h.event_uid FROM history h WHERE 1=1".to_string();
     let mut params_vec = Vec::new();
     append_filters(&mut sql, &mut params_vec, filter, "h");
     append_scope_filter(&mut sql, filter.scope, "h");
@@ -2698,7 +2688,7 @@ pub fn session(
         tag: tag.map(str::to_string),
         ..Default::default()
     };
-    let mut sql = "SELECT h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms FROM history h WHERE h.session_id = ?".to_string();
+    let mut sql = "SELECT h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms, h.event_uid FROM history h WHERE h.session_id = ?".to_string();
     let mut params_vec = vec![session_id.to_string()];
     append_filters(&mut sql, &mut params_vec, &filter, "h");
     sql.push_str(" ORDER BY h.timestamp_ms ASC, h.id ASC");
@@ -3027,6 +3017,7 @@ fn session_events_sized_sql(columns: &str) -> String {
 /// stored hash and byte length always, the prompt only when asked for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PromptRow {
+    pub event_uid: Option<String>,
     pub project: Option<String>,
     pub timestamp_ms: i64,
     /// The stored `prompt_hash`; `None` for a row written without one.
@@ -3046,12 +3037,13 @@ pub(crate) fn session_prompts_sized(
 ) -> Result<Vec<PromptRow>> {
     let prompt = if include_text { "prompt" } else { "NULL" };
     let sql = format!(
-        "SELECT project, timestamp_ms, prompt_hash, octet_length(prompt), {prompt} \
+        "SELECT project, timestamp_ms, prompt_hash, octet_length(prompt), {prompt}, event_uid \
          FROM history WHERE source = ? AND session_id = ? ORDER BY timestamp_ms ASC, id ASC"
     );
     let mut stmt = conn.prepare(&sql)?;
     let rows = stmt.query_map(rusqlite::params![source, session_id], |row| {
         Ok(PromptRow {
+            event_uid: row.get(5)?,
             project: row.get(0)?,
             timestamp_ms: row.get(1)?,
             prompt_hash: row.get(2)?,
@@ -5219,7 +5211,7 @@ fn sync_opencode_session_from_connection(
 }
 
 pub fn export_json(conn: &Connection) -> Result<Vec<HistoryEntry>> {
-    let mut stmt = conn.prepare("SELECT id, source, session_id, project, prompt, timestamp_ms FROM history ORDER BY timestamp_ms ASC")?;
+    let mut stmt = conn.prepare("SELECT id, source, session_id, project, prompt, timestamp_ms, event_uid FROM history ORDER BY timestamp_ms ASC")?;
     let rows = stmt
         .query_map([], row_to_entry)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -5918,6 +5910,7 @@ mod tests {
         insert_history(
             &writer,
             &HistoryEntry {
+                event_uid: None,
                 id: 0,
                 source: "claude".into(),
                 session_id: Some("s".into()),
@@ -6025,6 +6018,7 @@ mod tests {
             insert_history(
                 &conn,
                 &HistoryEntry {
+                    event_uid: None,
                     id: 0,
                     source: "claude".into(),
                     session_id: Some(session_id.into()),
@@ -6138,6 +6132,7 @@ mod tests {
         )
         .unwrap();
         let entry = HistoryEntry {
+            event_uid: None,
             id: 0,
             source: "codex".into(),
             session_id: Some("reject-me".into()),
@@ -6170,6 +6165,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let entry = HistoryEntry {
+            event_uid: None,
             id: 0,
             source: "codex".into(),
             session_id: Some("repair-me".into()),
@@ -6209,6 +6205,7 @@ mod tests {
         init_db(&conn).unwrap();
         for session_id in [None, Some(String::new())] {
             let entry = HistoryEntry {
+                event_uid: None,
                 id: 0,
                 source: "codex".into(),
                 session_id,
@@ -6242,6 +6239,7 @@ mod tests {
         insert_history(
             &conn,
             &HistoryEntry {
+                event_uid: None,
                 id: 0,
                 source: "claude".into(),
                 session_id: Some("s1".into()),
@@ -6279,6 +6277,7 @@ mod tests {
         insert_history(
             &conn,
             &HistoryEntry {
+                event_uid: None,
                 id: 0,
                 source: "grok".into(),
                 session_id: Some("g1".into()),
@@ -6439,6 +6438,7 @@ mod tests {
 
     fn resume_entry(source: &str, session_id: Option<&str>, project: Option<&str>) -> HistoryEntry {
         HistoryEntry {
+            event_uid: None,
             id: 0,
             source: source.into(),
             session_id: session_id.map(str::to_string),

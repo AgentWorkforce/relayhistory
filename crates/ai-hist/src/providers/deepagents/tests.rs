@@ -1,7 +1,7 @@
 use super::*;
 use rusqlite::params;
 const SQL: &str = include_str!("../../../tests/fixtures/deepagents/sessions.sql");
-fn fixture() -> (tempfile::TempDir, ProviderRoots, PathBuf, Connection) {
+pub(super) fn fixture() -> (tempfile::TempDir, ProviderRoots, PathBuf, Connection) {
     let home = tempfile::tempdir().unwrap();
     let roots = ProviderRoots::from_home(home.path().into(), home.path().join("opencode.db"));
     let path = home.path().join(".deepagents/.state/sessions.db");
@@ -491,7 +491,7 @@ fn equal_time_repeated_prompts_keep_distinct_native_events_and_export() {
         .collect();
     assert_eq!(native_ids, ["human-1", "human-2"]);
     let history_count: i64 = ledger.query_row("SELECT count(*) FROM history WHERE source='deepagents' AND session_id=?1 AND prompt='retry native prompt'", [&session.id], |r| r.get(0)).unwrap();
-    assert_eq!(history_count, 1, "shared history uniqueness collapses equal-time identical prompts; event evidence retains both");
+    assert_eq!(history_count, 2, "stable native identities preserve both equal-time prompts");
     drop(statement);
     drop(ledger);
     let store = crate::SessionStore::open(

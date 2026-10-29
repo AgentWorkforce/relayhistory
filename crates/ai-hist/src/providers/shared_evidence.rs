@@ -54,8 +54,7 @@ impl Snapshot {
             "SELECT {selected_columns} FROM observation_evidence oe CROSS JOIN history h \
              WHERE oe.source=?1 AND oe.session_id=?2 AND oe.location='remote' \
              AND h.source=oe.source AND h.session_id=oe.session_id \
-             AND h.timestamp_ms=json_extract(oe.payload_json,'$.item.record.payload.timestamp_ms') \
-             AND h.prompt=json_extract(oe.payload_json,'$.item.record.payload.prompt') \
+             AND ((h.event_uid IS NOT NULL AND h.event_uid=json_extract(oe.payload_json,'$.item.record.payload.event_uid')) OR (h.event_uid IS NULL AND json_extract(oe.payload_json,'$.item.record.payload.event_uid') IS NULL AND h.timestamp_ms=json_extract(oe.payload_json,'$.item.record.payload.timestamp_ms') AND h.prompt=json_extract(oe.payload_json,'$.item.record.payload.prompt'))) \
              AND json_extract(oe.payload_json,'$.item.managed')=1 \
              AND json_extract(oe.payload_json,'$.item.record.kind')='history'"
         ))?;
@@ -63,7 +62,8 @@ impl Snapshot {
         while let Some(row) = selected.next()? {
             let timestamp_ms: i64 = row.get("timestamp_ms")?;
             let prompt: String = row.get("prompt")?;
-            let key = serde_json::to_string(&(timestamp_ms, prompt))?;
+            let event_uid: Option<String> = row.get("event_uid")?;
+            let key = serde_json::to_string(&(timestamp_ms, prompt, event_uid))?;
             rows.insert(("history", key), fingerprint(row, &columns)?);
         }
         Ok(Self { source, rows })

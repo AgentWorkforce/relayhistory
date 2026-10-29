@@ -14,11 +14,20 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - `getSessionEvidence` reads a complete stored session snapshot with evidence-kind selection, optional transcript omission, provider identities and usage.
 
+### Changed
+
+- Export schema version 3 carries stable prompt-event identity and source-order evidence; new readers continue accepting older snapshots.
+
 ### Fixed
 
 - SDK, CLI and MCP event reads preserve provider-native record types, API message IDs and request spans.
 - Retained matching remote evidence survives retirement of its direct local source, without allowing conflicting snapshots to replace local evidence.
+- Repeated DeepAgents prompts with equal text and timestamps retain separate history rows through export and remote intake, using stable native event identity.
 - Selected Codex SQLite sessions report an unavailable source when their backing stores disappear, and fallback diagnostics honor quiet mode.
+
+### Rust API
+
+- Added optional `HistoryEntry::event_uid` and `Prompt::event_uid`; callers constructing `HistoryEntry` literals must supply the field (`None` for anonymous prompt logs).
 
 ## [0.53.0] - 2026-10-28
 

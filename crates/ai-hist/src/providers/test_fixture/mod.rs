@@ -139,6 +139,7 @@ fn normalize(conn: &Connection, payload: &Value, path: &Path) -> Result<usize> {
             inserted += crate::insert_history(
                 conn,
                 &HistoryEntry {
+                    event_uid: None,
                     id: 0,
                     source: ID.into(),
                     session_id: Some(id.into()),

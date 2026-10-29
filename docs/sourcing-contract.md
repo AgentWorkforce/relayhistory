@@ -54,13 +54,16 @@ The per-model-request row. burn's fields, and what the SDK owes each one:
 | `fidelity` / `coverage` | `Source::capabilities()` + per-read coverage | hydration reports `full`, `partial`, or `shallow_only` from effective coverage |
 | `activity`, `retries`, `has_edits` | burn-derived | consumer classification |
 
-Shared history currently deduplicates by `(source, timestamp_ms, prompt)`.
-Distinct native user events with equal text and time remain separate in
-conversation evidence but can share one prompt-history row
-([#539](https://github.com/AgentWorkforce/relayhistory/issues/539)). Native
+Prompt history with an observed `event_uid` is keyed by
+`(source, session_id, event_uid)`. DeepAgents records its stable user-event
+reference, so repeated prompts with equal text and time remain separate through
+export and intake. Anonymous legacy prompt logs retain their exact
+`(source, timestamp_ms, prompt)` identity. Other adapters that do not yet supply
+an event reference retain that legacy deduplication behavior. Native
 equal-time event order also does not yet have a durable export/intake order
 contract ([#532](https://github.com/AgentWorkforce/relayhistory/issues/532)).
-Neither limitation is repaired by inventing timestamps or changing native IDs.
+Anonymous identity and transported ordering are never repaired by inventing
+timestamps or changing native IDs.
 
 `NormalizedUsage` separates ordinary input, output, optional reasoning,
 cache reads, total cache writes and optional five-minute/one-hour cache-write

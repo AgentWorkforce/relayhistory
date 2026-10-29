@@ -106,7 +106,7 @@ struct Spec {
 impl EvidenceKind {
     fn spec(self) -> Spec {
         match self {
-        Self::History=>Spec{table:"history",columns:"source,session_id,project,prompt,prompt_hash,timestamp_ms,git_branch",required:"source,session_id,prompt,timestamp_ms",key:"source,timestamp_ms,prompt",derived:""},
+        Self::History=>Spec{table:"history",columns:"source,session_id,project,prompt,prompt_hash,timestamp_ms,git_branch,event_uid",required:"source,session_id,prompt,timestamp_ms",key:"source,timestamp_ms,prompt",derived:""},
         // `project_key` travels with the event so a snapshot round-trips the
         // canonical identity the emitting side resolved, and `project_key_method`
         // with it so the receiving side can tell a key the emitter resolved for
@@ -289,7 +289,7 @@ fn column_value_has_type(field: &str, value: &Value) -> bool {
 }
 
 /// The record belongs to the observed session and names its own identity.
-fn validate_ownership(key: &ObservationKey, record: &EvidenceRecord, spec: &Spec) -> Result<()> {
+fn validate_ownership(key: &ObservationKey, record: &EvidenceRecord, _spec: &Spec) -> Result<()> {
     let session_field = if record.kind == EvidenceKind::Relationship {
         "parent_session_id"
     } else {
@@ -300,7 +300,7 @@ fn validate_ownership(key: &ObservationKey, record: &EvidenceRecord, spec: &Spec
             && record.payload.get(session_field).and_then(Value::as_str) == Some(&key.session_id),
         "INVALID_ARGUMENT: evidence belongs to another source or session"
     );
-    for field in spec.key.split(',').filter(|field| !numeric(field)) {
+    for field in record.key_fields().split(',').filter(|field| !numeric(field)) {
         ensure!(
             record
                 .payload
@@ -395,13 +395,18 @@ fn sql_value(value: &Value) -> Result<rusqlite::types::Value> {
     })
 }
 impl EvidenceRecord {
+    fn key_fields(&self) -> &str {
+        if self.kind == EvidenceKind::History && self.payload.get("event_uid").is_some_and(|v| !v.is_null()) { "source,session_id,event_uid" } else { self.kind.spec().key }
+    }
+    fn conflict_target(&self) -> String {
+        let key = self.key_fields();
+        match self.kind { EvidenceKind::History => format!("{key}) WHERE event_uid IS {}", if self.payload.get("event_uid").is_some_and(|v| !v.is_null()) { "NOT NULL" } else { "NULL" }), _ => format!("{key})") }
+    }
     pub fn identity(&self) -> String {
         // `Value`'s `Display` is its compact JSON serialization, which cannot fail.
         json!([
             self.kind,
-            self.kind
-                .spec()
-                .key
+            self.key_fields()
                 .split(',')
                 .map(|field| self.payload.get(field).cloned().unwrap_or(Value::Null))
                 .collect::<Vec<_>>()
@@ -409,13 +414,13 @@ impl EvidenceRecord {
         .to_string()
     }
     fn key_sql(&self) -> Result<(String, Vec<rusqlite::types::Value>)> {
-        let columns = self.kind.spec().key.split(',').collect::<Vec<_>>();
+        let columns = self.key_fields().split(',').collect::<Vec<_>>();
         Ok((
             columns
                 .iter()
-                .map(|column| format!("{column}=?"))
+                .map(|column| format!("{column} IS ?"))
                 .collect::<Vec<_>>()
-                .join(" AND "),
+                .join(" AND ") + if self.kind == EvidenceKind::History && self.key_fields() == self.kind.spec().key { " AND event_uid IS NULL" } else { "" },
             columns
                 .iter()
                 .map(|column| sql_value(&self.payload[*column]))
@@ -516,7 +521,7 @@ impl EvidenceRecord {
             .collect::<Result<Vec<_>>>()?;
         let mut updates = columns
             .iter()
-            .filter(|column| !spec.key.split(',').any(|key| key == **column))
+            .filter(|column| !self.key_fields().split(',').any(|key| key == **column))
             .map(|column| format!("{column}=excluded.{column}"))
             .collect::<Vec<_>>();
         if located {
@@ -526,11 +531,11 @@ impl EvidenceRecord {
         }
         conn.execute(
             &format!(
-                "INSERT INTO {}({}) VALUES({}) ON CONFLICT({}) DO UPDATE SET {}",
+                "INSERT INTO {}({}) VALUES({}) ON CONFLICT({} DO UPDATE SET {}",
                 spec.table,
                 columns.join(","),
                 vec!["?"; columns.len()].join(","),
-                spec.key,
+                self.conflict_target(),
                 updates.join(",")
             ),
             params_from_iter(values),

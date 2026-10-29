@@ -539,7 +539,9 @@ the typed row, `ShallowSession`, `SessionEvent`, `SessionToolCall`,
 `SessionFileEdit`, `SessionMarker` or `SessionRelationship` — or `Delete`.
 `record_key` is the record's provider-native identity within its session and
 kind: `event_uid`, `tool_use_id`, `marker_uid`, `relationship_uid`, or the
-session id for a catalog row. The drain is bounded to the head revision at
+session id for a catalog row. History retains its legacy `[timestamp_ms, prompt]`
+record key when anonymous; identified history uses `["event", session_id, event_uid]`
+so timestamp/text edits do not change its identity. The drain is bounded to the head revision at
 open and pages in `batch`-sized reads, at most 10,000. `ChangeKind` is not
 `EvidenceKind`: the catalog row is fed and is not adapter evidence.
 

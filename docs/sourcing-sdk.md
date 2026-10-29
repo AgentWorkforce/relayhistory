@@ -607,7 +607,7 @@ replace, never a duplicate.
 | `FileEdit`            | `file_edits`            | `source, session_id, tool_use_id`                                     | `SessionFileEdit`     |
 | `SessionMarker`       | `session_markers`       | `source, session_id, marker_uid`                                      | `SessionMarker`       |
 | `Relationship`        | `session_relationships` | `source, parent_session_id, relationship_uid`                         | `SessionRelationship` |
-| `History`             | `history`               | `source, timestamp_ms, prompt`                                        | `HistoryEntry`        |
+| `History`             | `history`               | legacy: `source, timestamp_ms, prompt`; identified: `source, "event", session_id, event_uid` | `HistoryEntry`        |
 | `Presence`            | `session_presences`     | `source, session_id, location`                                        | —                     |
 | `CommitLink`          | `session_commit_links`  | `source, session_id, commit_sha, match_method`                        | —                     |
 | `SourceObservation`   | `session_observations`  | `source, session_id, location, connector_id, connector_instance`      | —                     |
@@ -1144,6 +1144,27 @@ declined.
   [Versioning](#versioning-cargo-semver-is-the-contract).
 - `examples/rust-consumer` is the same surface exercised from outside the
   workspace, against the published crate nightly.
+
+## Prompt history identity
+
+`HistoryEntry::event_uid` and `SessionEvidence::prompts[].event_uid` carry an
+optional stable session-event reference. An identified prompt is keyed by
+`(source, session_id, event_uid)`; edits to its text/time update that row.
+The change-feed/export key is `["history", source, "event", session_id,
+event_uid]`. Anonymous rows retain the exact legacy key `["history", source,
+timestamp_ms, prompt]`, including existing exported record IDs, ownership
+snapshots and tombstones. Identity is never inferred from equal text/time.
+
+Export schema version 3 advertises native history identity and source-order
+evidence. New intake accepts old snapshots with absent identity fields; older
+intake rejects unsupported new columns explicitly.
+
+The schema upgrade preserves row IDs, revisions and the autoincrement sequence.
+It does not assign event IDs retrospectively. DeepAgents' next authoritative
+local read replaces its unowned anonymous projection with identified prompts;
+a retained remote-owned anonymous prompt remains independent evidence. Old
+snapshots lacking `event_uid` continue to use the legacy identity. Other
+adapters remain anonymous until they supply a source-observed event reference.
 
 ## Appendix: who still needs `unstable-internal`, and why
 

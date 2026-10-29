@@ -28,7 +28,9 @@ use ai_hist::history_search::{search_all, SearchRole, SearchRow};
 use ai_hist::paths::{default_opencode_db_path, home_dir};
 use ai_hist::{discover, remote, *};
 mod export;
+mod history_entries;
 mod import;
+use history_entries::{get_entry, load_sqlite_entries, query_entries, row_to_entry};
 use import::import_history;
 
 use export::export_history;
@@ -1796,7 +1798,7 @@ fn show_context(conn: &Connection, id: i64, window_minutes: i64) -> Result<()> {
     if let Some(session_id) = &entry.session_id {
         let rows = query_entries(
             conn,
-            "SELECT id, source, session_id, project, prompt, timestamp_ms FROM history WHERE session_id = ? ORDER BY timestamp_ms ASC",
+            "SELECT id, source, session_id, project, prompt, timestamp_ms, event_uid FROM history WHERE session_id = ? ORDER BY timestamp_ms ASC",
             &[session_id],
         )?;
         if !rows.is_empty() {
@@ -1811,7 +1813,7 @@ fn show_context(conn: &Connection, id: i64, window_minutes: i64) -> Result<()> {
     let window_ms = window_minutes * 60 * 1000;
     let sid = entry.session_id.as_deref().unwrap_or("");
     let mut stmt = conn.prepare(
-        "SELECT id, source, session_id, project, prompt, timestamp_ms FROM history \
+        "SELECT id, source, session_id, project, prompt, timestamp_ms, event_uid FROM history \
          WHERE timestamp_ms BETWEEN ? AND ? AND (session_id IS NULL OR session_id != ?) \
          ORDER BY timestamp_ms ASC",
     )?;
@@ -2916,35 +2918,6 @@ fn git_status(repo: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn get_entry(conn: &Connection, id: i64) -> Result<HistoryEntry> {
-    conn.query_row(
-        "SELECT id, source, session_id, project, prompt, timestamp_ms FROM history WHERE id = ?",
-        [id],
-        row_to_entry,
-    )
-    .with_context(|| format!("No entry with id {id}"))
-}
-
-fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEntry> {
-    Ok(HistoryEntry {
-        id: row.get(0)?,
-        source: row.get(1)?,
-        session_id: row.get(2)?,
-        project: row.get(3)?,
-        prompt: row.get(4)?,
-        prompt_hash: None,
-        timestamp_ms: row.get(5)?,
-    })
-}
-
-fn query_entries(conn: &Connection, sql: &str, params_: &[&String]) -> Result<Vec<HistoryEntry>> {
-    let mut stmt = conn.prepare(sql)?;
-    let rows = stmt
-        .query_map(rusqlite::params_from_iter(params_.iter()), row_to_entry)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
-}
-
 /// Restrict a history/event query by where its canonical session is present.
 ///
 /// Legacy rows with no session id or no classification are local so upgrading
@@ -3102,38 +3075,6 @@ fn load_jsonl_entries(path: &Path) -> Result<Vec<HistoryEntry>> {
         }
         entries.push(serde_json::from_value(value)?);
     }
-    Ok(entries)
-}
-
-fn load_sqlite_entries(path: &Path) -> Result<Vec<HistoryEntry>> {
-    let src = Connection::open(path)?;
-    let cols = src
-        .prepare("PRAGMA table_info(history)")?
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let has_hash = cols.iter().any(|col| col == "prompt_hash");
-    let sql = if has_hash {
-        "SELECT id, source, session_id, project, prompt, prompt_hash, timestamp_ms FROM history"
-    } else {
-        "SELECT id, source, session_id, project, prompt, NULL, timestamp_ms FROM history"
-    };
-    let mut stmt = src.prepare(sql)?;
-    let entries = stmt
-        .query_map([], |row| {
-            let prompt: String = row.get(4)?;
-            Ok(HistoryEntry {
-                id: row.get(0)?,
-                source: row.get(1)?,
-                session_id: row.get(2)?,
-                project: row.get(3)?,
-                prompt_hash: row
-                    .get::<_, Option<String>>(5)?
-                    .or_else(|| Some(prompt_hash(&prompt))),
-                prompt,
-                timestamp_ms: row.get(6)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(entries)
 }
 
@@ -3321,6 +3262,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let entry = HistoryEntry {
+            event_uid: None,
             id: 1,
             source: "codex".into(),
             session_id: Some("cloud-session".into()),
@@ -3555,6 +3497,7 @@ mod tests {
             insert_history(
                 conn,
                 &HistoryEntry {
+                    event_uid: None,
                     id: 0,
                     source: source.into(),
                     session_id: Some(session.into()),
@@ -3572,7 +3515,7 @@ mod tests {
 
     fn history_rows(conn: &Connection) -> Vec<ExportedRow> {
         conn.prepare(
-            "SELECT source, session_id, project, prompt, timestamp_ms FROM history \
+            "SELECT source, session_id, project, prompt, timestamp_ms, event_uid FROM history \
              ORDER BY timestamp_ms",
         )
         .unwrap()

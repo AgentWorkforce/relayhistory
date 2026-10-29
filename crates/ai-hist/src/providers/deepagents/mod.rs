@@ -12,6 +12,8 @@ mod roots;
 mod storage;
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod history_identity_tests;
 const ID: &str = "deepagents";
 pub(crate) const LOCAL_SOURCE: LocalSource = LocalSource {
     id: ID,
@@ -34,7 +36,7 @@ pub(crate) const METADATA: ProviderMetadata = ProviderMetadata {
     usage: None,
 };
 pub(crate) const ADAPTER: Option<ProviderAdapter> = Some(ProviderAdapter {
-    generation: "dcode_checkpoint_v1",
+    generation: "dcode_checkpoint_v2",
     acquire,
     sweep,
     resolve_roots: roots::resolve,

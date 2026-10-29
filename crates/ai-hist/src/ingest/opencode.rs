@@ -611,25 +611,8 @@ pub(crate) fn sqlite_store_holds_session(store: &Path, session_id: &str) -> Resu
     Ok(held)
 }
 
-/// Whether `columns` holds every one of `names`: the columns a loader reads.
-pub(crate) fn has_columns(columns: &BTreeSet<String>, names: &[&str]) -> bool {
-    names.iter().all(|name| columns.contains(*name))
-}
-
-pub(crate) fn table_columns(conn: &Connection, table: &str) -> Result<BTreeSet<String>> {
-    Ok(conn
-        .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))?
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<BTreeSet<String>>>()?)
-}
-
-pub(crate) fn optional_column<'a>(columns: &BTreeSet<String>, name: &'a str) -> &'a str {
-    if columns.contains(name) {
-        name
-    } else {
-        "NULL"
-    }
-}
+mod schema;
+pub(crate) use schema::{has_columns, optional_column, table_columns};
 
 // ---------------------------------------------------------------------------
 // Loader: legacy JSON tree (`storage/`)
@@ -1509,6 +1492,7 @@ fn normalize_session(
                     counts.prompts += insert_history(
                         conn,
                         &HistoryEntry {
+                            event_uid: None,
                             id: 0,
                             source: "opencode".into(),
                             session_id: Some(session_id.to_string()),
