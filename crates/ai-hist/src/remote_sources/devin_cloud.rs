@@ -13,7 +13,7 @@ use std::collections::{BTreeMap, HashSet};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use ai_hist::{EvidenceKind, EvidenceRecord, SessionLocation};
+use crate::{EvidenceKind, EvidenceRecord, SessionLocation};
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;
@@ -407,7 +407,7 @@ pub(super) fn acquire_devin_remote_session_at(
         cursor = page.end_cursor.filter(|_| page.has_next_page);
         if cursor.is_none() || page.items.is_empty() {
             return Ok(RemoteSessionEvidence::Normalized(
-                ai_hist::sources::NormalizedSourceEvidence {
+                crate::sources::NormalizedSourceEvidence {
                     source_stamp: format!("messages:{:x}", hasher.finalize()),
                     source_bytes: source_bytes as i64,
                     covered_kinds: vec![EvidenceKind::History, EvidenceKind::SessionEvent],
@@ -458,7 +458,7 @@ impl ShallowSessionProvider for DevinCloudProvider {
     fn acquire(
         &self,
         _home: &Path,
-        observation: &ai_hist::observations::SessionObservation,
+        observation: &crate::observations::SessionObservation,
     ) -> Result<RemoteSessionEvidence> {
         acquire_devin_remote_session_at(
             &self.credentials_path,

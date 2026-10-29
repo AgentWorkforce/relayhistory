@@ -37,6 +37,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "ureq",
  "zstd",
 ]
 
@@ -325,14 +326,10 @@ version = "0.53.0"
 dependencies = [
  "ai-hist",
  "anyhow",
- "chrono",
  "rusqlite",
  "serde",
  "serde_json",
- "sha2",
  "tempfile",
- "ureq",
- "url",
 ]
 
 [[package]]

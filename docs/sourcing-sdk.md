@@ -1094,6 +1094,7 @@ embedder reads before bumping.
 | `opencode-backup` | — | Snapshot a live OpenCode SQLite store through `rusqlite`'s backup API before reading it | The CLI, napi |
 | `git-hooks` | — | Git helpers and hook installation (`url`) | The CLI, napi |
 | `unstable-internal` | — | Every workspace module, public: raw-connection APIs, the parsers, discovery, search, statistics, remote connectors, the connection-level sync and watch entry points. **Not covered by semver.** | This workspace and its plugins only |
+| `remote-sources` | — | `ai_hist::remote_sources`: the `claude-web`, `codex-cloud` and `devin-cloud` connectors — their HTTP/CLI transports (`ureq`), provider-credential reads, `provider`, `send_remote_message_*`, connector statuses. Implies `unstable-internal`, because connectors are `discover::ShallowSessionProvider`s. **Not covered by semver.** | The provider-sources helper, and Rust hosts that run the connectors in-process (the Agent Relay desktop probe) |
 
 An embedder enables nothing. If a feature other than the default is needed for
 something a consumer legitimately does, that is a facade gap — file it.
@@ -1153,7 +1154,7 @@ repository should — each entry is a facade gap or a deliberate non-goal.
 | `crates/ai-hist-napi` | `open_db*`, `schema_is_*_read_current`, `default_db_path` | Node holds one long-lived connection per addon and answers a schema mismatch by reopening writable |
 | | connection-taking `session_*_page`, `session_relationships`, `session_tree`, `session_children_page`, `stats_scoped_by`, `search`, `recent`, `session_locations` | The TypeScript SDK exposes relationships, trees, statistics and search the Rust facade does not; moving these reads onto `SessionStore` facade methods (markers, requests, usage, user turns and the full `SessionEvidence` op), and then dropping `rusqlite` from `ai-hist-napi`, is a follow-up to [#181](https://github.com/AgentWorkforce/relayhistory/issues/181) |
 | | `SESSION_*_CONTRACT_VERSION` constants, `export` | The native contract is versioned separately from Cargo semver; `export` backs the SDK's local `exportHistory` |
-| `plugins/provider-sources/rust` | `discover::DiscoveryEnv`, `ShallowSessionProvider`, `sources::normalize_source_evidence`, `EvidenceKind`, `SOURCE_CHOICES` | Provider adapters enumerate and acquire through engine types (`DiscoveryEnv` borrows a connection); hosts land the results through the facade's `source_observation` / `apply_source_observations` / `apply_source_evidence` |
+| `remote-sources` (`ai_hist::remote_sources`), and through it `plugins/provider-sources/rust` and the Agent Relay desktop probe | `discover::DiscoveryEnv`, `ShallowSessionProvider`, `sources::normalize_source_evidence`, `EvidenceKind`, `SOURCE_CHOICES` | Provider adapters enumerate and acquire through engine types (`DiscoveryEnv` borrows a connection); hosts land the results through the facade's `source_observation` / `apply_source_observations` / `apply_source_evidence`. The one sanctioned route to `unstable-internal` from outside this repository; a host that enables it pins `ai-hist` exactly (`=X.Y.Z`) |
 
 The rule that follows: a new in-tree call site that reaches past the facade
 must be able to say which row of this table it belongs to, or it is a facade

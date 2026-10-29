@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
-use ai_hist::SessionLocation;
+use crate::SessionLocation;
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde_json::Value;
@@ -414,7 +414,7 @@ impl ShallowSessionProvider for ClaudeWebProvider {
     fn acquire(
         &self,
         home: &Path,
-        observation: &ai_hist::observations::SessionObservation,
+        observation: &crate::observations::SessionObservation,
     ) -> Result<RemoteSessionEvidence> {
         acquire_claude_remote_session_at(
             home,

@@ -25,6 +25,12 @@ fs-events = ["dep:notify"]
 opencode-backup = ["dep:tempfile", "rusqlite/backup"]
 git-hooks = ["dep:url"]
 unstable-internal = []
+# The provider-native remote connectors (`ai_hist::remote_sources`): Claude
+# web, Codex cloud and Devin cloud transports and their provider-credential
+# reads. Opt-in, and built on the `unstable-internal` engine types
+# (`discover::ShallowSessionProvider`, `sources`), so it implies that feature
+# and shares its no-semver status. The CLI and napi never enable it.
+remote-sources = ["unstable-internal", "dep:ureq"]
 
 [dependencies]
 base64 = "0.22"
@@ -42,6 +48,8 @@ serde_json = "1"
 sha2 = "0.10"
 tempfile = { version = "3", optional = true }
 url = { version = "2", optional = true }
+# HTTP client for the `remote-sources` connectors only.
+ureq = { version = "2", features = ["json"], optional = true }
 # Codex compresses finished rollouts to `.jsonl.zst`; read with the same
 # libzstd binding Codex writes them with.
 zstd = { version = "0.13", default-features = false }

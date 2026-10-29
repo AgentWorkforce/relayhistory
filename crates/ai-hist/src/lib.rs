@@ -34,6 +34,14 @@ workspace_mod!(history_search);
 workspace_mod!(paths);
 workspace_mod!(discover);
 workspace_mod!(remote);
+/// The provider-native remote connectors (`claude-web`, `codex-cloud`,
+/// `devin-cloud`): their HTTP/CLI transports and provider-credential reads.
+/// Compiled only under the opt-in `remote-sources` feature, which implies
+/// `unstable-internal`; the default, CLI and napi builds carry none of it.
+/// Not to be confused with [`remote`], the transport-free selector the local
+/// engine uses to refuse remote work it was not composed with.
+#[cfg(feature = "remote-sources")]
+pub mod remote_sources;
 workspace_mod!(source_intake);
 workspace_mod!(sources);
 workspace_mod!(watch);

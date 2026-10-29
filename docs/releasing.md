@@ -107,7 +107,10 @@ constant. Any change to a public struct field, enum variant, or behaviour a
 consumer observes is a minor bump pre-1.0 and gets a `### Rust API` entry in
 `CHANGELOG.md`. Default features expose `SessionStore`, evidence structs,
 `Source`, and `Error`. Optional features (`delivery`, `opencode-backup`,
-`git-hooks`, `unstable-internal`) stay off for embedders.
+`git-hooks`, `unstable-internal`, `remote-sources`) stay off for embedders;
+`remote-sources` carries the remote connectors for hosts that run them
+in-process. `history-provider-sources` (the helper executable's crate) is
+`publish = false`: it ships only inside the npm platform helper packages.
 
 ```bash
 cargo add ai-hist

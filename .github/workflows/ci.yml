@@ -47,6 +47,22 @@ jobs:
       - name: Rust formatting
         run: cargo fmt --all -- --check
 
+      # The remote connectors (and their HTTP client) are the crate's opt-in
+      # `remote-sources` feature. The local engine, CLI and native addon must
+      # never compile them, whatever features they enable.
+      - name: The local engine, CLI and native addon never link remote transports
+        run: |
+          for crate in ai-hist-cli ai-hist-napi; do
+            if cargo tree -p "$crate" -e normal,build --all-features -i ureq >/dev/null 2>&1; then
+              echo "::error::$crate links ureq; remote transports must stay behind ai-hist's remote-sources feature"
+              exit 1
+            fi
+          done
+          if cargo tree -p ai-hist -e normal,build --features export,fs-events,opencode-backup,git-hooks,unstable-internal -i ureq >/dev/null 2>&1; then
+            echo "::error::ai-hist links ureq without remote-sources"
+            exit 1
+          fi
+
       - name: Release workflow tests
         run: node --test scripts/*.test.mjs
 

@@ -27,7 +27,9 @@ never invokes remote callbacks; it runs only the local source plugins described
 below. Cached search, recent, catalog and stats preserve
 local/remote/all independently of auth.
 
-The local native engine does not contain remote transports. A remote request
+The local native engine does not contain remote transports: they compile only
+under the `ai-hist` crate's opt-in `remote-sources` feature, which the native
+addon and CLI never enable. A remote request
 without a selected plugin fails explicitly. Discovery with all scope keeps local
 results and reports unavailable selected source plugins. Targeted hydration uses
 an existing observation without listing other tasks; a missing observation can
@@ -51,7 +53,9 @@ A Rust host composes the same boundary through `SessionStore` without the
 native addon: `apply_source_observations` lands a connector's enumerated
 rows, `source_observation` reads the observation and revision fence, and
 `apply_source_evidence` applies the acquired snapshot. See
-[the sourcing SDK](sourcing-sdk.md#source-connector-intake).
+[the sourcing SDK](sourcing-sdk.md#source-connector-intake). A Rust host that
+runs the connectors in-process enables `remote-sources` and calls
+`ai_hist::remote_sources::provider` — no `history-provider-sources` dependency.
 
 Provider limits and authentication stay in the
 [optional provider helper](../plugins/provider-sources/rust/README.md).
