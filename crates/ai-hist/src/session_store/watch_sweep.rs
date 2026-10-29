@@ -12,7 +12,7 @@ use super::*;
 use crate::discover::WatchRoot;
 use crate::ingest::path_scope::PathScope;
 use crate::ingest::{sync_watch_roots_by_source, SweepScope};
-use crate::watch::{ChangeScope, TickRequest, TickTrigger};
+use crate::watch::{ChangeScope, TickRequest, TickTrigger, DEFAULT_SLOW_POLL_MS};
 use std::collections::{BTreeSet, HashMap};
 
 /// Which sources registered each watched root.
@@ -140,6 +140,70 @@ pub(super) struct TickNotes {
     pub(super) kind: WatchTick,
 }
 
+/// Coalesce exact captures and checkpoint only after a short quiet interval.
+///
+/// The retained watch writer has SQLite's commit-thread auto-checkpoint
+/// disabled. This worker keeps that copy/fsync work off the leading tick while
+/// the ordinary full sweep remains the 30 s backstop for a sustained burst.
+pub(super) struct QuietCheckpoint {
+    schedule: Option<std::sync::mpsc::Sender<()>>,
+}
+
+impl QuietCheckpoint {
+    pub(super) fn new(db_path: PathBuf, debounce_ms: u64) -> Self {
+        let quiet_ms = debounce_ms
+            .saturating_mul(5)
+            .clamp(1_000, DEFAULT_SLOW_POLL_MS);
+        Self::with_quiet(db_path, Duration::from_millis(quiet_ms), None)
+    }
+
+    fn with_quiet(
+        db_path: PathBuf,
+        quiet: Duration,
+        completed: Option<std::sync::mpsc::Sender<crate::ingest::SweepCheckpoint>>,
+    ) -> Self {
+        let (schedule, pending) = std::sync::mpsc::channel();
+        let spawned = std::thread::Builder::new()
+            .name("ai-hist-wal-checkpoint".into())
+            .spawn(move || checkpoint_after_quiet(&db_path, quiet, pending, completed));
+        Self {
+            schedule: spawned.ok().map(|_| schedule),
+        }
+    }
+
+    fn schedule(&self) {
+        if let Some(schedule) = &self.schedule {
+            let _ = schedule.send(());
+        }
+    }
+}
+
+fn checkpoint_after_quiet(
+    db_path: &Path,
+    quiet: Duration,
+    pending: std::sync::mpsc::Receiver<()>,
+    completed: Option<std::sync::mpsc::Sender<crate::ingest::SweepCheckpoint>>,
+) {
+    while pending.recv().is_ok() {
+        loop {
+            match pending.recv_timeout(quiet) {
+                Ok(()) => continue,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    if let (Some(completed), Some(outcome)) = (&completed, checkpoint_wal(db_path))
+                    {
+                        let _ = completed.send(outcome);
+                    }
+                    return;
+                }
+            }
+        }
+        if let (Some(completed), Some(outcome)) = (&completed, checkpoint_wal(db_path)) {
+            let _ = completed.send(outcome);
+        }
+    }
+}
+
 /// One watch loop's sweep: the same locked `sync` as [`SessionStore::sync`],
 /// scoped by [`WatchSources`] and diffed against a rolling catalog baseline.
 ///
@@ -155,6 +219,7 @@ pub(super) struct WatchSweep {
     pub(super) reports: ReportSlot,
     pub(super) store: SessionStore,
     pub(super) kind: WatchTick,
+    pub(super) checkpoint: QuietCheckpoint,
 }
 
 /// How the watch loop reads a sweep's result.
@@ -189,9 +254,34 @@ pub(super) struct Carry {
     /// stronger statement than an empty catalog diff, which an append that
     /// adds evidence rows without moving a catalog column would also give.
     wrote_nothing: std::sync::atomic::AtomicBool,
+    /// The retained watch writer has commit-thread auto-checkpoint disabled.
+    /// Quiet-window upkeep checkpoints instead; full sweeps retain their
+    /// existing checkpoint/truncate backstop.
+    checkpoint_deferred: std::sync::atomic::AtomicBool,
 }
 
 impl WatchSweep {
+    pub(super) fn new(
+        store: SessionStore,
+        sources: Arc<WatchSources>,
+        stop: StopToken,
+        notes: Arc<Mutex<TickNotes>>,
+        reports: ReportSlot,
+        opts: &WatchOptions,
+    ) -> Self {
+        Self {
+            db_path: store.db_path.clone(),
+            sources,
+            stop,
+            carry: Default::default(),
+            notes,
+            reports,
+            checkpoint: QuietCheckpoint::new(store.db_path.clone(), opts.debounce_ms),
+            store,
+            kind: opts.kind,
+        }
+    }
+
     pub(super) fn tick(&self, request: &TickRequest) -> anyhow::Result<TickOutcome> {
         if self.kind == WatchTick::Discover {
             return self.discover_tick(request);
@@ -228,6 +318,9 @@ impl WatchSweep {
                         .carry
                         .wrote_nothing
                         .load(std::sync::atomic::Ordering::Relaxed);
+                if request.force && plan.paths.is_some() && outcome.swept {
+                    self.checkpoint.schedule();
+                }
                 self.notes
                     .lock()
                     .unwrap_or_else(PoisonError::into_inner)
@@ -319,6 +412,16 @@ impl WatchSweep {
             force,
             &plan.scope(),
             |conn| {
+                if !self
+                    .carry
+                    .checkpoint_deferred
+                    .load(std::sync::atomic::Ordering::Acquire)
+                {
+                    conn.pragma_update(None, "wal_autocheckpoint", 0)?;
+                    self.carry
+                        .checkpoint_deferred
+                        .store(true, std::sync::atomic::Ordering::Release);
+                }
                 head_before.set(head(conn));
                 let before = match previous {
                     Some(before) => before,
@@ -382,6 +485,19 @@ impl WatchSweep {
             }),
         }
     }
+}
+
+fn checkpoint_wal(db_path: &Path) -> Option<crate::ingest::SweepCheckpoint> {
+    let flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    if let Ok(conn) = rusqlite::Connection::open_with_flags(db_path, flags) {
+        return Some(crate::ingest::checkpoint_after_sweep(
+            &conn,
+            db_path,
+            u64::MAX,
+        ));
+    }
+    None
 }
 
 #[cfg(test)]
@@ -514,5 +630,53 @@ mod tests {
         let plan = sources.plan(&request);
         assert_eq!(plan.sources, None);
         assert_eq!(plan.scope(), SweepScope::everything());
+    }
+
+    #[test]
+    fn quiet_checkpoint_passively_catches_up_a_large_wal() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("history.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE payload (body BLOB NOT NULL);
+             WITH RECURSIVE rows(n) AS (
+               VALUES(1) UNION ALL SELECT n + 1 FROM rows WHERE n < 1100
+             )
+             INSERT INTO payload(body) SELECT zeroblob(4096) FROM rows;",
+        )
+        .unwrap();
+        let wal = crate::diagnostics::wal_path(&db_path);
+        assert!(
+            std::fs::metadata(&wal).unwrap().len() > crate::ingest::WAL_TRUNCATE_BYTES,
+            "fixture must cross the production truncate threshold"
+        );
+
+        let (completed, outcome) = std::sync::mpsc::channel();
+        let checkpoint = QuietCheckpoint::with_quiet(
+            db_path.clone(),
+            Duration::from_millis(10),
+            Some(completed),
+        );
+        checkpoint.schedule();
+        let outcome = outcome.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(outcome.complete, "quiet maintenance catches up every frame");
+        assert!(
+            !outcome.escalated,
+            "visibility-adjacent upkeep stays PASSIVE"
+        );
+        assert!(
+            std::fs::metadata(&wal).unwrap().len() > 0,
+            "physical space reclamation remains the full sweep's job"
+        );
+    }
+
+    #[test]
+    fn quiet_checkpoint_never_creates_a_missing_database() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("missing.db");
+        assert!(checkpoint_wal(&db_path).is_none());
+        assert!(!db_path.exists());
     }
 }

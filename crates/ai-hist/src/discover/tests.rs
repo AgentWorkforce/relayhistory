@@ -2607,6 +2607,64 @@ fn on_row_callbacks_run_at_the_configured_durability_not_discoverys() {
 }
 
 #[test]
+fn nested_relaxed_synchronous_guards_share_one_connection_policy() {
+    let conn = catalog();
+    conn.pragma_update(None, "synchronous", "FULL").unwrap();
+    let full: i64 = conn
+        .query_row("PRAGMA synchronous", [], |row| row.get(0))
+        .unwrap();
+    {
+        let _outer = RelaxedSynchronous::new(&conn).unwrap();
+        let normal: i64 = conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(normal, 1);
+        {
+            let _inner = RelaxedSynchronous::new(&conn).unwrap();
+            let nested: i64 = conn
+                .query_row("PRAGMA synchronous", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(nested, normal);
+        }
+        let after_inner: i64 = conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(after_inner, normal);
+    }
+    let restored: i64 = conn
+        .query_row("PRAGMA synchronous", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(restored, full);
+}
+
+#[test]
+fn nested_relaxed_synchronous_guards_keep_connections_independent() {
+    let first = catalog();
+    let second = catalog();
+    for conn in [&first, &second] {
+        conn.pragma_update(None, "synchronous", "FULL").unwrap();
+    }
+    let full = |conn: &Connection| {
+        conn.query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
+            .unwrap()
+    };
+    let first_full = full(&first);
+    let second_full = full(&second);
+    {
+        let _first = RelaxedSynchronous::new(&first).unwrap();
+        {
+            let _second = RelaxedSynchronous::new(&second).unwrap();
+            assert_eq!(full(&first), 1);
+            assert_eq!(full(&second), 1);
+        }
+        assert_eq!(full(&first), 1);
+        assert_eq!(full(&second), second_full);
+    }
+    assert_eq!(full(&first), first_full);
+    assert_eq!(full(&second), second_full);
+}
+
+#[test]
 fn a_run_fails_only_when_every_provider_fails() {
     let conn = catalog();
     let home = tempfile::tempdir().unwrap();
