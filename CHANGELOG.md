@@ -25,11 +25,13 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Repeated DeepAgents prompts with equal text and timestamps retain separate history rows through export and remote intake, using stable native event identity.
 - Capture operations restore their output policy on return and unwind, and concurrent quiet calls no longer silence progress in other threads.
 - Codex resume commands in the TypeScript SDK no longer depend on the recorded project directory, matching Rust CLI behavior.
+- Session export and source intake preserve recorded same-timestamp event order through replay, rewrites and later local hydration; conflicting retained order rolls back atomically.
 - Selected Codex SQLite sessions report an unavailable source when their backing stores disappear, and fallback diagnostics honor quiet mode.
 
 ### Rust API
 
 - Added optional `HistoryEntry::event_uid` and `Prompt::event_uid`; callers constructing `HistoryEntry` literals must supply the field (`None` for anonymous prompt logs).
+- Added nullable `Block::source_order`; session evidence contract 5 orders events by recorded source position and resolves existing event cursors through stable row identity.
 
 ## [0.53.0] - 2026-10-28
 

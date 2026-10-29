@@ -15,7 +15,11 @@ use std::time::Duration;
 mod busy;
 pub(crate) use busy::{configure_busy_retry, ShortBusyBudget};
 pub(crate) mod busy_wait;
+mod event_order;
 mod event_row;
+use event_order::{
+    event_cursor_order, ranked_turn_header_sql, user_turn_header_sql, user_turn_stream_sql,
+};
 mod retired_sources;
 pub(crate) mod sync_connection;
 pub use retired_sources::is_retired_source;
@@ -682,6 +686,7 @@ const REQUIRED_SESSION_MARKER_COLUMNS: &[(&str, &str)] =
 /// As with the catalog columns above, this list is both the migration list and
 /// the read-only guard list, so the two cannot drift.
 const REQUIRED_SESSION_EVENT_COLUMNS: &[(&str, &str)] = &[
+    ("source_order", "INTEGER CHECK(source_order IS NULL OR (typeof(source_order) = 'integer' AND source_order >= 0))"),
     ("project_key", "TEXT"),
     ("project_key_method", "TEXT"),
     ("provider", "TEXT"),
@@ -1742,14 +1747,7 @@ VALUES ('session_presences_local_backfill_v1');
         ),
         [],
     )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_session_events_source_page ON session_events(source, session_id, ts_ms, id)",
-        [],
-    )?;
-    conn.execute(
-        "CREATE INDEX IF NOT EXISTS idx_session_events_page ON session_events(session_id, ts_ms, id)",
-        [],
-    )?;
+    event_order::ensure_indexes(conn)?;
     conn.execute(
         "CREATE INDEX IF NOT EXISTS idx_session_events_ts ON session_events(ts_ms DESC)",
         [],
@@ -2801,6 +2799,10 @@ pub struct SessionEvent {
     /// wherever `token_json` already is the record's own: every row of other
     /// sources, and a Claude row whose usage settlement did not change.
     pub record_token_json: Option<String>,
+    /// Source-observed ordinal within a timestamp bucket; absent means unknown.
+    /// Independent of event identity and destination database row IDs.
+    #[serde(default)]
+    pub source_order: Option<i64>,
 }
 
 /// Stable continuation for normalized session events.
@@ -2861,10 +2863,12 @@ pub struct SessionFileEdit {
 /// 3: `session_events` rows carry `control_kind`, and the user-turn page
 /// leaves control rows out.
 ///
+/// 5: recorded `source_order` survives transport and determines equal-time order.
+///
 /// 4: `control_kind` may be `synthetic` (OpenCode harness-written user
 /// text), and `session_events` rows carry `record_token_json`, a Claude
 /// record's own usage beside the settled request blob.
-pub const SESSION_EVIDENCE_CONTRACT_VERSION: u32 = 4;
+pub const SESSION_EVIDENCE_CONTRACT_VERSION: u32 = 5;
 
 /// Stable continuation for tool calls and file edits.
 ///
@@ -2940,10 +2944,10 @@ pub(crate) const SESSION_EVENT_COLUMNS: &str =
      payload_truncated, payload_hash, call_index, event_index, result_status, event_source, \
      error_signal, subagent_session_id, agent_id, request_id, provider_message_id, \
      stop_reason, agent_version, is_sidechain, is_meta, turn_id, request_span, raw_kind, \
-     control_kind, record_token_json";
+     control_kind, record_token_json, source_order";
 
 /// The order every whole-session event read uses: oldest first, rows sharing
-/// a timestamp in insertion order.
+/// a timestamp by recorded source order, with row-ID fallback only for unknown order.
 ///
 /// `session_events.ts_ms` is `NOT NULL` and has been since the table was
 /// first created, so the `ts_ms IS NULL` leading term the evidence tables use
@@ -2951,10 +2955,10 @@ pub(crate) const SESSION_EVENT_COLUMNS: &str =
 /// row the read returns, text included: the leading term is an expression
 /// `idx_session_events_source_page` and `idx_session_events_page` do not
 /// carry, so they could not deliver the order. Without it they do.
-const SESSION_EVENT_ORDER: &str = "ORDER BY ts_ms ASC, id ASC";
+const SESSION_EVENT_ORDER: &str = "ORDER BY ts_ms ASC, COALESCE(source_order,id) ASC, id ASC";
 
 /// All normalized events for one session, oldest first. Rows sharing a
-/// timestamp keep insertion order via the rowid tiebreaker.
+/// timestamp keep recorded source order; unknown order falls back to row ID.
 pub fn session_events(
     conn: &Connection,
     session_id: &str,
@@ -3071,12 +3075,13 @@ pub fn session_events_page(
         params_vec.push(source.to_string());
     }
     if let Some(cursor) = after {
-        sql.push_str(" AND (ts_ms > ? OR (ts_ms = ? AND id > ?))");
+        let position = event_cursor_order(conn, session_id, source, cursor)?;
+        sql.push_str(" AND (ts_ms, COALESCE(source_order,id), id) > (?, CAST(? AS INTEGER), ?)");
         params_vec.push(cursor.ts_ms.to_string());
-        params_vec.push(cursor.ts_ms.to_string());
+        params_vec.push(position.to_string());
         params_vec.push(cursor.id.to_string());
     }
-    sql.push_str(" ORDER BY ts_ms ASC, id ASC LIMIT ?");
+    sql.push_str(" ORDER BY ts_ms ASC, COALESCE(source_order,id) ASC, id ASC LIMIT ?");
     params_vec.push((limit + 1).to_string());
 
     let mut stmt = conn.prepare(&sql)?;
@@ -3558,45 +3563,9 @@ const USER_TURN_ROW_FILTER: &str = "(COALESCE(is_sidechain, 0) = 0 \
 /// `idx_session_events_source_page` backwards from the position. Everything
 /// after it is resolved from the one ordered pass in [`fill_user_turns`].
 const USER_TURN_NAMED_BEFORE: &str = "SELECT NULLIF(message_id, '') FROM session_events \
-     WHERE source = ? AND session_id = ? AND (ts_ms, id) < (?, ?) \
+     WHERE source = ? AND session_id = ? AND (ts_ms, COALESCE(source_order,id), id) < (?, ?, ?) \
        AND NULLIF(message_id, '') IS NOT NULL AND message_id <> ? \
-     ORDER BY ts_ms DESC, id DESC LIMIT 1";
-
-/// Every event of one session from a position onwards, in `(ts_ms, id)`
-/// order, with whether it is a user-turn block. One range seek on
-/// `idx_session_events_source_page`; the byte length is only computed for
-/// block rows at or before the page's last block timestamp (the fifth
-/// parameter), so a large tool result's text is never read just to be passed
-/// over, whether it sits inside the page's span or in the rows read past it
-/// while locating the following named message.
-fn user_turn_stream_sql() -> String {
-    format!(
-        "SELECT id, ts_ms, NULLIF(message_id, ''), \
-                CASE WHEN {USER_TURN_ROW_FILTER} THEN 1 ELSE 0 END, \
-                role, kind, tool_use_id, result_status, \
-                CASE WHEN ts_ms <= ? AND {USER_TURN_ROW_FILTER} THEN {USER_TURN_BYTE_LEN} END \
-         FROM session_events \
-         WHERE source = ? AND session_id = ? AND (ts_ms, id) >= (?, ?) \
-         ORDER BY ts_ms ASC, id ASC"
-    )
-}
-
-/// Every turn of one session, grouped once.
-///
-/// The unpaged read uses this. A page does not: `HAVING` and `LIMIT` still
-/// make SQLite aggregate every matching row first, so walking pages would
-/// regroup the turns already returned. Per-key lookups for the whole
-/// session would be one lookup per turn instead of this single pass.
-fn user_turn_header_sql() -> String {
-    format!(
-        "SELECT {USER_TURN_KEY} AS turn_key, MIN(ts_ms) AS turn_ts, MIN(id) AS turn_id, \
-         MIN(NULLIF(message_id, '')) AS turn_message_id, MAX(ts_ms) AS turn_last_ts \
-         FROM session_events \
-         WHERE source = ? AND session_id = ? AND {USER_TURN_ROW_FILTER} \
-         GROUP BY turn_key \
-         ORDER BY turn_ts ASC, turn_id ASC"
-    )
-}
+     ORDER BY ts_ms DESC, COALESCE(source_order,id) DESC, id DESC LIMIT 1";
 
 /// One bounded page of user turns for one session, oldest first.
 ///
@@ -3695,7 +3664,16 @@ fn grouped_turn_headers(
     source: &str,
     session_id: &str,
 ) -> Result<Vec<UserTurnHeader>> {
-    let mut stmt = conn.prepare(&user_turn_header_sql())?;
+    let ranked: bool = conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM session_events WHERE source=?1 AND session_id=?2 AND source_order IS NOT NULL)",
+        params![source,session_id], |row| row.get(0),
+    )?;
+    let query = if ranked {
+        ranked_turn_header_sql()
+    } else {
+        user_turn_header_sql()
+    };
+    let mut stmt = conn.prepare(&query)?;
     let rows = stmt.query_map(params![source, session_id], |row| {
         Ok(UserTurnHeader {
             key: row.get(0)?,
@@ -3703,6 +3681,7 @@ fn grouped_turn_headers(
             id: row.get(2)?,
             message_id: row.get(3)?,
             last_ts_ms: row.get(4)?,
+            order: row.get(5)?,
         })
     })?;
     Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -3763,7 +3742,7 @@ fn fill_user_turns(
     let mut named_before = |skip: &str| -> Result<Option<String>> {
         Ok(before_stmt
             .query_row(
-                params![source, session_id, first.ts_ms, first.id, skip],
+                params![source, session_id, first.ts_ms, first.order, first.id, skip],
                 |row| row.get::<_, Option<String>>(0),
             )
             .optional()?
@@ -3783,6 +3762,7 @@ fn fill_user_turns(
         source,
         session_id,
         first.ts_ms,
+        first.order,
         first.id
     ])?;
     // Turns whose anchor has been reached, still waiting for the named
@@ -3791,16 +3771,15 @@ fn fill_user_turns(
     let mut awaiting_following: Vec<usize> = Vec::new();
     let mut next_anchor = 0;
     while let Some(row) = rows.next()? {
-        let id: i64 = row.get(0)?;
-        let ts_ms: i64 = row.get(1)?;
-        let at = (ts_ms, id);
+        let at = event_order::stream_position(row)?;
+        let (ts_ms, _, id) = at;
         if next_anchor == headers.len() && awaiting_following.is_empty() && ts_ms > last_block_ts {
             break;
         }
         // Rows strictly before an anchor have all been seen once the first
         // row at or past it arrives.
         while let Some(header) = headers.get(next_anchor) {
-            if (header.ts_ms, header.id) > at {
+            if (header.ts_ms, header.order, header.id) > at {
                 break;
             }
             user_turns[next_anchor].preceding_message_id = trail.preceding(&header.key);
@@ -3850,10 +3829,10 @@ impl NamedTrail {
 fn release_following(
     header: &UserTurnHeader,
     turn: &mut SessionUserTurn,
-    at: (i64, i64),
+    at: (i64, i64, i64),
     message_id: &str,
 ) -> bool {
-    let released = (header.ts_ms, header.id) < at && header.key != message_id;
+    let released = (header.ts_ms, header.order, header.id) < at && header.key != message_id;
     if released {
         turn.following_message_id = Some(message_id.to_owned());
     }
@@ -8401,6 +8380,9 @@ mod tests {
     fn drop_session_requests_view(conn: &Connection) {
         conn.execute_batch(
             "DROP VIEW IF EXISTS session_requests; \
+             DROP INDEX IF EXISTS idx_session_events_source_order; \
+             DROP INDEX IF EXISTS idx_session_events_order; \
+             DROP INDEX IF EXISTS idx_session_events_order_sequence; \
              DROP INDEX IF EXISTS idx_session_events_provider_message; \
              DROP INDEX IF EXISTS idx_session_events_project;",
         )
@@ -8648,17 +8630,17 @@ mod tests {
                 (
                     "session_events with a source",
                     bound_query_plan(&conn, &with_source, &[&"s1", &"codex"]),
-                    "idx_session_events_source_page",
+                    "idx_session_events_source_order",
                 ),
                 (
                     "session_events without one",
                     bound_query_plan(&conn, &without_source, &[&"s1"]),
-                    "idx_session_events_page",
+                    "idx_session_events_order",
                 ),
                 (
                     "session_events_sized",
                     bound_query_plan(&conn, &sized, &[&"codex", &"s1"]),
-                    "idx_session_events_source_page",
+                    "idx_session_events_source_order",
                 ),
             ] {
                 assert!(
@@ -9770,7 +9752,7 @@ mod user_turn_pass_tests {
                 let plan = query_plan(&conn, &sql);
                 assert!(
                     plan.contains(
-                        "SEARCH session_events USING INDEX idx_session_events_source_page \
+                        "SEARCH session_events USING INDEX idx_session_events_source_order \
                          (source=? AND session_id=? AND ts_ms"
                     ),
                     "{name} does not seek the page index from its position \
@@ -9798,7 +9780,7 @@ mod user_turn_pass_tests {
             );
             let opened = query_plan(&conn, &user_turn_page::user_turn_walk_sql(false));
             assert!(
-                opened.contains("idx_session_events_source_page"),
+                opened.contains("idx_session_events_source_order"),
                 "the first page does not seek the page index (analyze={analyze}): {opened}"
             );
             assert!(

@@ -42,7 +42,7 @@ The per-model-request row. burn's fields, and what the SDK owes each one:
 | burn field | Source of truth | Status |
 | --- | --- | --- |
 | `source`, `session_id`, `message_id` | `session_events` | present |
-| `turn_index`, `ts` | `session_events.ts_ms` + event ordering | native transcript ordering is retained; transported equal-time ordering remains limited (see below) |
+| `turn_index`, `ts` | `session_events.ts_ms` + event ordering | native timestamp-bucket order travels as optional `source_order`; absent means unknown (see below) |
 | `model` | `session_events.model` | present when recorded, including Claude, Codex, Cursor, Grok and OpenCode; Cursor corpora can omit it |
 | `project` | `session_events.project` | present; cwd string |
 | `project_key` | `session_events.project_key` | present on `Message`; resolved repository identity, optional |
@@ -59,11 +59,27 @@ Prompt history with an observed `event_uid` is keyed by
 reference, so repeated prompts with equal text and time remain separate through
 export and intake. Anonymous legacy prompt logs retain their exact
 `(source, timestamp_ms, prompt)` identity. Other adapters that do not yet supply
-an event reference retain that legacy deduplication behavior. Native
-equal-time event order also does not yet have a durable export/intake order
-contract ([#532](https://github.com/AgentWorkforce/relayhistory/issues/532)).
-Anonymous identity and transported ordering are never repaired by inventing
-timestamps or changing native IDs.
+an event reference retain that legacy deduplication behavior. Anonymous identity
+is never repaired by inventing timestamps or changing native IDs.
+
+Native equal-time event order travels in nullable `session_events.source_order`, a
+nonnegative ordinal within `(source, session_id, ts_ms)`, independent of native
+IDs, timestamps and destination row IDs. Gaps are valid. Export and intake
+preserve the value; snapshot array order is not evidence. Missing values remain
+unknown, including legacy rows: opening a database does not infer native order
+from its existing row IDs. An actual native reread can capture order. Known
+ranks sort within timestamp buckets; unknown rows retain a deterministic local
+fallback without claiming source order. Event and user-turn reads use the same
+order, including block order and neighbor messages.
+
+Retained observations must agree on known ranks for shared event identities,
+and distinct events cannot claim the same known rank at a timestamp. Intake
+returns `SOURCE_ORDER_CONFLICT` and rolls back canonical rows, retained snapshots
+and checkpoint changes on disagreement. A legacy null does not erase known
+order. Kind-partial submissions retain prior ordering for untouched event
+snapshots. Native reorders update ranks in place; remotely backed conflicting
+buckets retain their prior snapshot. This contract never changes native IDs or
+fabricates timestamps. See the [ordering ADR](decisions/2026-10-29-durable-source-event-order.md).
 
 `NormalizedUsage` separates ordinary input, output, optional reasoning,
 cache reads, total cache writes and optional five-minute/one-hour cache-write

@@ -109,20 +109,6 @@ pub(super) fn retain_support<'a>(
     Ok(())
 }
 
-pub(super) fn managed_union(
-    snapshots: &BTreeMap<(u8, String, String), RecordSnapshot>,
-) -> BTreeMap<String, &EvidenceRecord> {
-    let mut union = BTreeMap::new();
-    for snapshot in snapshots.values() {
-        for item in &snapshot.records {
-            if item.managed {
-                union.entry(item.record.identity()).or_insert(&item.record);
-            }
-        }
-    }
-    union
-}
-
 // Retirement proved a particular payload, not permission for a conflicting
 // sibling to inherit another connector's ownership of the same identity.
 pub(super) fn may_inherit(

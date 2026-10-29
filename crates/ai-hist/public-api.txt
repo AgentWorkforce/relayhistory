@@ -308,6 +308,7 @@ pub ai_hist::Block::event_uid: alloc::string::String
 pub ai_hist::Block::kind: ai_hist::BlockKind
 pub ai_hist::Block::raw_kind: core::option::Option<alloc::string::String>
 pub ai_hist::Block::role: ai_hist::Role
+pub ai_hist::Block::source_order: core::option::Option<i64>
 pub ai_hist::Block::text: core::option::Option<alloc::string::String>
 pub ai_hist::Block::text_bytes: core::option::Option<i64>
 pub ai_hist::Block::tool_use_id: core::option::Option<alloc::string::String>
@@ -700,6 +701,7 @@ pub ai_hist::SessionEvent::result_status: core::option::Option<alloc::string::St
 pub ai_hist::SessionEvent::role: alloc::string::String
 pub ai_hist::SessionEvent::session_id: alloc::string::String
 pub ai_hist::SessionEvent::source: alloc::string::String
+pub ai_hist::SessionEvent::source_order: core::option::Option<i64>
 pub ai_hist::SessionEvent::stop_reason: core::option::Option<alloc::string::String>
 pub ai_hist::SessionEvent::subagent_session_id: core::option::Option<alloc::string::String>
 pub ai_hist::SessionEvent::text: core::option::Option<alloc::string::String>

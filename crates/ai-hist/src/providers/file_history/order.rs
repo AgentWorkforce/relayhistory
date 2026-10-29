@@ -1,17 +1,16 @@
-//! Opt-in repair for a complete provider replay whose new events precede
-//! retained rows at the same recorded millisecond. Public reads order by
-//! (timestamp, database id); a native ordinal must not be faked as a timestamp.
+//! In-place repair of source-observed order after a complete native replay.
+//! Ranks are independent of event identity, recorded time and canonical row IDs.
 use anyhow::Result;
 use rusqlite::Connection;
 use std::collections::{BTreeMap, BTreeSet};
 
 /// Call after normalization and retirement inside the caller's transaction.
-/// `desired` contains every emitted event in native order. Retire only buckets
-/// whose retained insertion order disagrees; the caller must replay those
-/// buckets through its existing event writer before committing: replay ALL
-/// desired rows at the returned timestamps, including retained later messages. Remote shares
-/// cannot be reordered by a local parser, so reject the whole transaction.
-/// Unchanged or append-only buckets keep their ids and revisions.
+/// `desired` contains every emitted event in native order. Changed timestamp
+/// buckets receive source ranks in place; remotely backed conflicting buckets
+/// reject the transaction. Unchanged/appended buckets keep ranks and revisions.
+/// The empty return preserves the adapter replay interface without requesting
+/// row retirement/reinsertion, so native event and unnamed-turn identities stay
+/// stable through reorders.
 pub(crate) fn reconcile_event_order(
     conn: &Connection,
     source: &str,
@@ -37,7 +36,7 @@ pub(crate) fn reconcile_event_order(
         .collect();
     let mut observed = BTreeMap::<i64, Vec<String>>::new();
     let mut statement = conn.prepare(
-        "SELECT ts_ms,event_uid FROM session_events WHERE source=?1 AND session_id=?2 ORDER BY ts_ms,id",
+        "SELECT ts_ms,event_uid FROM session_events WHERE source=?1 AND session_id=?2 ORDER BY ts_ms,COALESCE(source_order,id),id",
     )?;
     let rows = statement.query_map([source, sid], |r| {
         Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
@@ -68,14 +67,20 @@ pub(crate) fn reconcile_event_order(
         rusqlite::params![source,sid,times], |r| r.get(0),
     )?;
     anyhow::ensure!(!shared,"FILE_HISTORY_SHARED_ORDER_CONFLICT: native event order changed in a timestamp bucket backed by remote evidence; prior snapshot retained, retry after ownership is reconciled");
-    crate::store::retire_evidence_share(
-        conn,
-        "session_events",
-        "source=?1 AND session_id=?2 AND ts_ms IN (SELECT value FROM json_each(?3))",
-        &[&source, &sid, &times],
-        crate::SessionLocation::Local,
-    )?;
-    Ok(affected)
+    // Update only ordering evidence, preserving canonical IDs, tool joins,
+    // unnamed-turn keys and the rest of each row. The caller has already
+    // normalized every desired event inside this same transaction.
+    let mut ranks = BTreeMap::<i64, i64>::new();
+    for (ts, uid) in desired {
+        let rank = ranks.entry(*ts).or_default();
+        if affected.contains(ts) {
+            conn.execute("UPDATE session_events SET source_order=?1 WHERE source=?2 AND session_id=?3 AND event_uid=?4 AND source_order IS NOT ?1",
+                rusqlite::params![*rank,source,sid,uid])?;
+        }
+        *rank += 1;
+    }
+    // No retirement is needed, so the caller must not replay any bucket.
+    Ok(BTreeSet::new())
 }
 
 #[cfg(test)]
@@ -93,7 +98,7 @@ mod tests {
             .unwrap()
     }
     #[test]
-    fn changed_native_bucket_replays_without_touching_other_evidence_or_stable_repeats() {
+    fn changed_native_bucket_updates_ranks_without_touching_row_ids_or_stable_repeats() {
         let home = tempfile::tempdir().unwrap();
         let conn = crate::open_db(&home.path().join("history.db")).unwrap();
         let tx = conn.unchecked_transaction().unwrap();
@@ -115,15 +120,15 @@ mod tests {
             (1, "later".into()),
             (2, "next".into()),
         ];
-        assert_eq!(
-            reconcile_event_order(&tx, "test-fixture", "s", &desired).unwrap(),
-            BTreeSet::from([1])
-        );
-        assert_eq!(uids(&tx), ["other-session", "other-source", "next"]);
+        let row_ids = uids(&tx);
+        assert!(reconcile_event_order(&tx, "test-fixture", "s", &desired)
+            .unwrap()
+            .is_empty());
+        assert_eq!(uids(&tx), row_ids);
+        let ordered: Vec<String> = tx.prepare("SELECT event_uid FROM session_events WHERE source='test-fixture' AND session_id='s' ORDER BY ts_ms,COALESCE(source_order,id),id").unwrap()
+            .query_map([], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(ordered, ["prefix", "call", "later", "next"]);
         assert_eq!(unaffected(&tx), untouched);
-        for uid in ["prefix", "call", "later"] {
-            event(&tx, "test-fixture", "s", 1, uid, "local");
-        }
         let before = uids(&tx);
         let changes = tx.total_changes();
         let revision = crate::change_feed::read_head(&tx).unwrap();

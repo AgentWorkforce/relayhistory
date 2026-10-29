@@ -7,6 +7,7 @@ pub(crate) mod retirement;
 #[path = "source_intake/retirement/tests.rs"]
 mod retirement_tests;
 
+mod event_order;
 use crate::{discover::*, *};
 use crate::{
     observations::{self, ObservationCheckpoint, ObservationKey, SessionObservation},
@@ -56,7 +57,10 @@ pub fn get_source_observation(request: ObservationRequest) -> Result<Observation
 /// One deferred transaction keeps all three reads on the same snapshot, so
 /// the returned revision cannot fence evidence acquired against a stale
 /// observation that another writer has since replaced.
-pub(crate) fn observation_state(conn: &Connection, key: &ObservationKey) -> Result<ObservationState> {
+pub(crate) fn observation_state(
+    conn: &Connection,
+    key: &ObservationKey,
+) -> Result<ObservationState> {
     let snapshot = conn.unchecked_transaction()?;
     Ok(ObservationState {
         observation: observations::get(&snapshot, key)?,
@@ -326,16 +330,7 @@ pub(crate) fn apply_normalized(
         .into_iter()
         .collect::<Vec<_>>();
     snapshots.insert(owner(key), own);
-    let union = retirement::managed_union(&snapshots);
-    for (identity, record) in &previously_managed {
-        if !union.contains_key(identity) {
-            record.remove(&tx, key.location)?;
-        }
-    }
-    retirement::retain_support(&tx, key, union.keys())?;
-    for record in union.into_values() {
-        record.write(&tx, key.location)?;
-    }
+    event_order::apply_union(&tx, key, &snapshots, &previously_managed)?;
     crate::hydrate::save_observation_progress(
         &tx,
         &observation,
