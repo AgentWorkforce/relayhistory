@@ -1403,7 +1403,7 @@ What changed, and why each is safe:
   transcript cursor, is for a source exact capture never admits -- so a lost
   commit loses its checkpoint with it and the path is read again. The guard
   restores the connection's level afterwards.
-* **The leading-edge settle is 2 ms**, down from 10. It only gathers one
+* **The leading-edge settle is 1 ms**, down from 10. It only gathers one
   write's callbacks; a straggler lands in the window's trailing tick, which
   finds the transcript unchanged.
 * **A tick that wrote nothing closes the window it opened.** The debounce
@@ -1433,3 +1433,62 @@ follows. It is held back on its own branch until that interaction is
 understood on real hardware. The
 `synchronous` change is scoped to exact capture; extending it to the hook
 path needs the same proof for its Cursor checkpoint first.
+
+### 2026-10-29 checkpoint work leaves the visibility path
+
+Profiling the retained exact-capture writer exposed a periodic tail rather
+than a parser regression: SQLite's default 1000-page WAL auto-checkpoint ran
+on roughly every eighth small-session commit. Normal captures were about
+3-4 ms on the profiling host; the commit that copied the ~4 MiB backlog was
+8-12 ms.
+
+`SessionStore::watch` now owns checkpoint timing for its dedicated retained
+writer. It disables that connection's commit-thread auto-checkpoint during
+the untimed startup sweep, coalesces successful exact-event captures, and
+runs a PASSIVE checkpoint after five debounce windows of quiet (at least one
+second). It never takes the WAL writer lock, and a fixed 30-second deadline
+forces the same PASSIVE checkpoint even if events never become quiet. Each
+retained-connection checkout verifies the connection-local setting, so a
+writer reopened after database replacement cannot silently regain automatic
+checkpoints. Full sweeps keep the existing bounded-TRUNCATE policy for
+physical space reclamation. Plain `sync`, hook hydration, and
+`Reconciliation` keep their existing connection policies.
+
+The optimization is fail-safe: if the worker thread cannot start, its channel
+disconnects, the database opens read-only, or three consecutive PASSIVE
+attempts cannot catch up, the next retained-writer checkout restores SQLite's
+default 1,000-page automatic checkpoint threshold before writing. A transient
+busy or reader-pinned attempt schedules its own bounded retry after another
+quiet interval without requiring a new capture; new signals are coalesced into
+that wait, and a later complete pass resets the failure count. The fallback may
+put checkpoint latency back on a commit, but it cannot leave the WAL unbounded
+merely because background upkeep failed.
+
+The exact path also nests discovery's `synchronous = NORMAL` scope. Nested
+guards on the same connection now share the outer policy instead of issuing
+another query, update, and restore. A nested guard on a different connection
+still installs and restores its own policy.
+
+The safety tests grow a WAL past the production 4 MiB truncate threshold,
+schedule quiet upkeep, and require every frame to be caught up without
+escalating beyond PASSIVE. The latency gate remains the acceptance test for
+the timing side; no budget is enabled merely because the mechanism is
+bounded.
+
+Final local A/B, official `gate` profile, three interleaved release rounds
+against `be827d1e`, 30-day/1,200-session store:
+
+| Metric | `main` p50 | head p50 | `main` p99 | head p99 |
+|---|---:|---:|---:|---:|
+| `capture_path` | 12.603 ms | 12.329 ms | 58.825 ms | 22.169 ms |
+| `capture_path_retained` | 5.647 ms | 5.504 ms | 16.678 ms | 16.638 ms |
+| `e2e_visible` | 9.646 ms | 8.085 ms | 337.816 ms | 73.641 ms |
+
+The run passed with zero late samples and zero misses. The 365-day,
+14,600-session list-scale case remained below the 1.5 ms first-paint budget
+at 0.240 ms p99.
+
+All three measured paths improved at p50 and p99 in this run. The 5 ms e2e
+budget is still tracked rather than enforced: this change removes a periodic
+checkpoint from the visibility path without claiming that the remaining
+latency work is complete.

@@ -121,13 +121,15 @@ pub const DEFAULT_DEBOUNCE_MS: u64 = 200;
 /// Not a debounce: one write reaches the loop as several backend callbacks
 /// (FSEvents delivers a create or an append as two or three, within about a
 /// millisecond), and a tick that swept on the first of them would leave the
-/// rest to drive a trailing sweep for the same write. Two milliseconds
+/// rest to drive a trailing sweep for the same write. One millisecond
 /// gathers one write's callbacks; a callback that lands later is read by the
 /// window's one trailing tick, which finds the transcript unchanged and
 /// skips it. It was 10 ms, which on its own was twice the 5 ms a new session
 /// has to become visible in (see docs/benchmarks.md, "Session-visible
-/// latency").
-pub const LEADING_EDGE_SETTLE_MS: u64 = 2;
+/// latency"). One millisecond still covers the measured inotify callback
+/// burst on Linux; a later callback remains owed to the window's trailing
+/// tick, so this is a latency choice rather than a coverage shortcut.
+pub const LEADING_EDGE_SETTLE_MS: u64 = 1;
 /// Default slow polling backstop while the filesystem-event driver is active.
 pub const DEFAULT_SLOW_POLL_MS: u64 = 30_000;
 /// Default cadence for the pure polling driver.

@@ -759,16 +759,14 @@ impl SessionStore {
         let stop = opts.stop.clone().unwrap_or_default();
 
         let notes: Arc<Mutex<TickNotes>> = Arc::default();
-        let sweep = WatchSweep {
-            db_path: self.db_path.clone(),
-            sources: sources.clone(),
-            stop: stop.clone(),
-            carry: Default::default(),
-            notes: notes.clone(),
-            reports: reports.clone(),
-            store: self.clone(),
-            kind: opts.kind,
-        };
+        let sweep = WatchSweep::new(
+            self.clone(),
+            sources.clone(),
+            stop.clone(),
+            notes.clone(),
+            reports.clone(),
+            &opts,
+        );
         let tick: crate::watch::ScopedTickFn = Arc::new(move |request| sweep.tick(request));
 
         let report_sink = reports.clone();
