@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Mutex};
 use std::time::{Duration, Instant};
 
-use ai_hist::{SessionLocation, SOURCE_CHOICES};
+use crate::{SessionLocation, SOURCE_CHOICES};
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 use serde_json::Value;
@@ -508,7 +508,7 @@ impl ShallowSessionProvider for CodexCloudProvider {
     fn acquire(
         &self,
         _home: &Path,
-        observation: &ai_hist::observations::SessionObservation,
+        observation: &crate::observations::SessionObservation,
     ) -> Result<RemoteSessionEvidence> {
         acquire_codex_remote_session(&observation.key.session_id)
     }

@@ -4,7 +4,15 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Minor]
+
+### Added
+
+- The `ai-hist` crate's opt-in `remote-sources` feature carries the Claude web, Codex cloud and Devin cloud connectors, so Rust hosts can depend on crates.io alone instead of a git pin of `history-provider-sources`.
+
+### Rust API
+
+- Added the `remote-sources` feature and `ai_hist::remote_sources` (`provider`, `send_remote_message_at`, `send_remote_message_with`, `RemoteCredential`, `remote_connector_statuses_at`, the connector ID constants). It implies `unstable-internal` and is not covered by semver; pin `ai-hist` exactly when you enable it.
 
 ## [0.53.1] - 2026-10-29
 

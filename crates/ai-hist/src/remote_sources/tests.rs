@@ -17,7 +17,7 @@ static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 use crate::discover::{
     discover_sessions_with_providers, list_session_catalog, CatalogListOptions, DiscoverOptions,
 };
-use ai_hist::{init_db, EvidenceKind, SessionScope};
+use crate::{init_db, EvidenceKind, SessionScope};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -1537,7 +1537,7 @@ fn devin_acquire_skips_messages_the_intake_contract_would_reject() {
         |event| event.payload.get("event_uid").and_then(Value::as_str) == Some("event-again")
     ));
     // And the intake itself accepts the snapshot the connector produced.
-    ai_hist::sources::normalize_source_evidence(
+    crate::sources::normalize_source_evidence(
         "devin",
         DEVIN_SESSION_ID,
         RemoteSessionEvidence::Normalized(snapshot),

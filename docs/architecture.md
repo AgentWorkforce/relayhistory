@@ -113,9 +113,11 @@ The SDK separates contracts, native loading, normalization, pagination, local
 operations and generic plugin orchestration. Core, native, SDK and MCP build
 without the `plugins/` tree; CI physically removes it before local checks.
 
-`plugins/provider-sources` owns remote provider credentials/transports. Its
-Rust helper depends on public local-history APIs and ships in optional platform
-packages. Its JS package shares the installed SDK's public error classes. No
+Remote provider credentials and transports are the `ai-hist` crate's opt-in
+`remote-sources` feature (`ai_hist::remote_sources`), so a Rust host composes
+them from crates.io alone. The CLI and the native addon never enable it, and CI
+fails if either links its HTTP client. `plugins/provider-sources` wraps that
+feature in the helper executable that ships in optional platform packages. Its JS package shares the installed SDK's public error classes. No
 second addon or implicit plugin discovery is involved. Explicit registration is
 inert until an operation selects the plugin; normal local operations do not
 read its auth.
@@ -155,8 +157,8 @@ observation revision acquired before external work. A stale completion fails
 with `SOURCE_REVISION_CONFLICT`. Complete snapshots replace only covered kinds
 for that connector. JavaScript source and destination plugins use the public SDK/native contracts
 and do not open SQLite. Optional Rust compatibility implementations depend on
-public core storage operations; they do not move transport or credential
-dependencies back into the local engine. See [source plugins](source-plugins.md).
+public core storage operations; transport and credential code stays behind
+`remote-sources`, outside every default, CLI and native build. See [source plugins](source-plugins.md).
 
 ## Evidence retention
 

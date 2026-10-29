@@ -2,7 +2,7 @@
 //! not read credentials or invoke a transport.
 use std::path::Path;
 
-use ai_hist::SessionLocation;
+use crate::SessionLocation;
 use anyhow::Result;
 use rusqlite::Connection;
 
@@ -61,7 +61,7 @@ impl ShallowSessionProvider for InstanceProvider {
         self.inner.source()
     }
     /// Instance wrapping does not change what the wrapped connector covers.
-    fn evidence_kinds(&self) -> &'static [ai_hist::EvidenceKind] {
+    fn evidence_kinds(&self) -> &'static [crate::EvidenceKind] {
         self.inner.evidence_kinds()
     }
     fn location(&self) -> SessionLocation {
@@ -73,7 +73,7 @@ impl ShallowSessionProvider for InstanceProvider {
     fn acquire(
         &self,
         home: &Path,
-        observation: &ai_hist::observations::SessionObservation,
+        observation: &crate::observations::SessionObservation,
     ) -> Result<RemoteSessionEvidence> {
         self.inner.acquire(home, observation)
     }

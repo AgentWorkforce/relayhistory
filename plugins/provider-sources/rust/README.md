@@ -1,13 +1,18 @@
 # Optional provider-native history sources
 
-This standalone Cargo workspace installs `history-provider-sources`. It depends
-on the public local-history engine/core; neither local package depends on it.
-It contains the Claude web-session HTTP adapter, the Codex cloud CLI adapter and
-the Devin cloud HTTP adapter, including their existing bounded pagination,
-redirect protection, output limits, and provider-credential behavior. It never
-loads RelayHistory commercial auth.
+This standalone Cargo workspace builds the `history-provider-sources` helper
+executable that the optional npm plugin ships. The connectors it runs — the
+Claude web-session HTTP adapter, the Codex cloud CLI adapter and the Devin
+cloud HTTP adapter, with their bounded pagination, redirect protection, output
+limits and provider-credential behavior — live in the `ai-hist` crate behind
+its opt-in `remote-sources` feature (`ai_hist::remote_sources`). This crate
+adds only the JSON stdin/stdout protocol and re-exports the connectors under
+their historical `history_provider_sources::remote` path. It is not published
+to crates.io, and neither the CLI nor the native addon enables the feature.
+Nothing here loads RelayHistory commercial auth.
 
-Rust hosts explicitly call `remote::provider(home, connector_id, instance, limit)`
+Rust hosts depend on `ai-hist` from crates.io with `features = ["remote-sources"]`,
+explicitly call `ai_hist::remote_sources::provider(home, connector_id, instance, limit)`
 and register the returned `ShallowSessionProvider`. Construction does not read
 credentials or use a transport. Supported connector IDs are `claude-web`,
 `codex-cloud` and `devin-cloud`; unknown IDs fail before any provider activity.
