@@ -195,6 +195,11 @@ async function stagePlugins(crlf = false) {
     join(root, consumerExample, "Cargo.lock"),
     eolCore(consumerFixture.lock),
   );
+  await mkdir(join(root, "examples/rust-local-source"), { recursive: true });
+  await writeFile(
+    join(root, "examples/rust-local-source/Cargo.lock"),
+    eolCore(coreFixture.lock),
+  );
   for (const [plugin, info] of Object.entries(plugins)) {
     const directory = join(root, "plugins", plugin, "sdk");
     await mkdir(directory, { recursive: true });
@@ -226,6 +231,7 @@ const files = (root) =>
   Promise.all([
     readCore(root, "crates/ai-hist/Cargo.toml"),
     readCore(root, "Cargo.lock"),
+    readCore(root, "examples/rust-local-source/Cargo.lock"),
     readCore(root, `${consumerExample}/Cargo.toml`),
     readCore(root, `${consumerExample}/Cargo.lock`),
     ...Object.keys(plugins).flatMap((plugin) => [
@@ -264,6 +270,17 @@ test("the release version reaches every manifest, peer range and lock coordinate
   assert.ok(
     rootLock.includes(`[[package]]\nname = "ai-hist-napi"\nversion = "${stale}"\n`),
     rootLock,
+  );
+  // A standalone path consumer also needs its lock updated for --locked CI.
+  const localSourceLock = await readCore(
+    root,
+    "examples/rust-local-source/Cargo.lock",
+  );
+  assert.ok(
+    localSourceLock.includes(
+      `[[package]]\nname = "ai-hist"\nversion = "${version}"\n`,
+    ),
+    localSourceLock,
   );
   // The out-of-tree consumer resolves the core crate from crates.io. Its
   // requirement follows the release so the pull-request job's

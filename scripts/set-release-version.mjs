@@ -184,6 +184,12 @@ async function setCoreCrateVersion(root, version) {
       ),
     ],
     [resolve(root, "Cargo.lock"), lockVersionPattern(coreCrate)],
+    // This standalone path consumer has its own lock, so --locked CI must
+    // follow the core version even though its dependency has no version pin.
+    [
+      resolve(root, "examples/rust-local-source/Cargo.lock"),
+      lockVersionPattern(coreCrate),
+    ],
   ];
   for (const [path, pattern] of files) {
     const contents = await readFile(path, "utf8");

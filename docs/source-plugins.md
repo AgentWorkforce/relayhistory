@@ -111,3 +111,35 @@ export function createHistoryPlugin({ root }) {
 
 `sdk-ts/fixtures/local-source-plugin` is a complete, dependency-free example,
 and `sdk-ts/src/local-source-plugins.test.ts` runs it end to end.
+
+### Rust local connectors
+
+[`examples/rust-local-source`](../examples/rust-local-source) is a standalone
+crate using the default public API. Run it with:
+
+```sh
+cargo run --locked --manifest-path examples/rust-local-source/Cargo.toml
+```
+
+The host enumerates its own explicitly selected files, calls
+`SessionStore::apply_source_observations`, reads the observation's revision fence
+with `source_observation`, then submits acquired normalized evidence through
+`apply_source_evidence`. The example stages a synthetic host-owned Claude
+response in a temporary directory and verifies the persisted native message
+identity and text after reopening the store. It also checks replay, default
+local catalog scope, exclusion from remote scope, and absence before intake.
+It reads no operator history.
+
+`SourceRegistry` and `ShallowSessionProvider` are internal APIs, unavailable
+with default crate features. A Rust host uses the public intake methods above;
+this does not register callbacks in `SessionStore::sync`, selected hydration or
+its watcher. The host drives enumeration and acquisition itself. The source
+remains an existing harness ID (`claude`); a distinct connector identity names
+the alternate host store. New built-in harness IDs still follow the
+[provider intake contract](provider-intake.md).
+
+The example covers session events only and supplies no usage, tool, edit or
+relationship evidence. Its direct path dependency tests this checkout without a
+release-version dependency pin (release automation updates its lockfile); the separate `rust-consumer` example tests the published
+crate. This demonstrates the supported Rust extension boundary, rather than
+promising a public registry registration API.

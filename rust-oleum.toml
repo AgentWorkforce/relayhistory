@@ -18,7 +18,7 @@ dead_code_max = 0
 redundant_code_max = 0
 
 [sources]
-rust_roots = ["crates/ai-hist-cli/src", "crates/ai-hist-napi/src", "crates/ai-hist/src", "examples/rust-consumer/src", "plugins/provider-sources/rust/src", "plugins/object-store/rust/src"]
+rust_roots = ["crates/ai-hist-cli/src", "crates/ai-hist-napi/src", "crates/ai-hist/src", "examples/rust-consumer/src", "examples/rust-local-source/src", "plugins/provider-sources/rust/src", "plugins/object-store/rust/src"]
 
 [baseline]
 
