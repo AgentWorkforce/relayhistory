@@ -1946,6 +1946,28 @@ How each adapter works:
   read is not stamped, and is read again by the next sweep. `ai-hist
   sync-opencode` reads every session.
 
+  OpenCode 2 keeps the same `opencode.db` and adds its own tables,
+  `session_v2` and `session_message`. The first OpenCode 2 start copies every
+  session into them, messages and parts included, and from then on writes
+  only there; `session`, `message` and `part` are left as they were. A
+  session with a `session_v2` row is enumerated, stamped (row fields plus one
+  `session_message` aggregate), synced and hydrated from the OpenCode 2
+  tables; a session without one (a store whose migration has not finished) is
+  still read from `session`. The OpenCode reader makes that choice once per
+  session, so discovery, hydration and the sweep never decide it themselves.
+  Each `session_message` row is rewritten into the V1 message and part
+  payloads, so the one normalizer parses it: a `user` row's `text`, an
+  `assistant` row's `content` items (`text`, `reasoning`, and `tool` with its
+  result text as `state.output`), `synthetic` rows as synthetic text and
+  `compaction` rows as the compaction marker. `system` and `idle` rows are not
+  transcript. OpenCode 2's `shell` and `subagent` tools take the targets of
+  `bash` and `task`.
+
+  An OpenCode 2 session can carry less than its V1 original: OpenCode's
+  migration replaces attachments with "Attachment unavailable after
+  migration", and only `text`, `reasoning` and `tool` content items are read,
+  so V1 part kinds with no OpenCode 2 counterpart are not in the evidence.
+
   The JSON tree is laid out as `session/<scope>/<sessionId>.json`,
   `message/<sessionId>/<messageId>.json` and `part/<messageId>/<partId>.json`.
   The *payloads* are identical to the `data` columns in the SQLite tables, so

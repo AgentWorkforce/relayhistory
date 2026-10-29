@@ -787,8 +787,8 @@ const SWEEP_PARSER_GENERATIONS: &[&str] = &[
 /// that output changes, so the first sweep after an upgrade re-reads stores
 /// the source fingerprint would otherwise call unchanged. `v2` makes every
 /// assistant message evidence (step-only and reasoning-only messages, thinking
-/// blocks, `synthetic` control rows).
-const OPENCODE_NORMALIZER_GENERATION: &str = "opencode_normalizer_v2";
+/// blocks, `synthetic` control rows). `v3` reads OpenCode 2's own tables.
+const OPENCODE_NORMALIZER_GENERATION: &str = "opencode_normalizer_v3";
 
 /// The generation half of a stored fingerprint: what this build of the sweep
 /// would produce from a given tree, independent of the tree itself.
