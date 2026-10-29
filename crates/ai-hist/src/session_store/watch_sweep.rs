@@ -15,6 +15,14 @@ use crate::ingest::{sync_watch_roots_by_source, SweepScope};
 use crate::watch::{ChangeScope, TickRequest, TickTrigger, DEFAULT_SLOW_POLL_MS};
 use std::collections::{BTreeSet, HashMap};
 
+#[path = "watch_sweep_checkpoint.rs"]
+mod checkpoint_worker;
+use checkpoint_worker::checkpoint_after_quiet;
+#[cfg(test)]
+use checkpoint_worker::{
+    checkpoint_after_quiet_with, checkpoint_wal, note_quiet_checkpoint, QuietCheckpointDecision,
+};
+
 /// Which sources registered each watched root.
 pub(super) struct WatchSources {
     roots: ProviderRoots,
@@ -210,111 +218,6 @@ impl QuietCheckpoint {
                 .store(false, std::sync::atomic::Ordering::Release);
         }
     }
-}
-
-fn checkpoint_after_quiet(
-    db_path: &Path,
-    quiet: Duration,
-    max_delay: Duration,
-    pending: std::sync::mpsc::Receiver<()>,
-    completed: Option<std::sync::mpsc::Sender<crate::ingest::SweepCheckpoint>>,
-    available: &std::sync::atomic::AtomicBool,
-) {
-    let mut incomplete_attempts = 0;
-    while pending.recv().is_ok() {
-        let cap = std::time::Instant::now() + max_delay;
-        let mut quiet_until = std::time::Instant::now() + quiet;
-        loop {
-            let now = std::time::Instant::now();
-            let wait = quiet_until.min(cap).saturating_duration_since(now);
-            match pending.recv_timeout(wait) {
-                Ok(()) => {
-                    quiet_until = std::time::Instant::now() + quiet;
-                    if std::time::Instant::now() < cap {
-                        continue;
-                    }
-                    break;
-                }
-                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
-                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    finish_quiet_checkpoint(
-                        db_path,
-                        &completed,
-                        available,
-                        &mut incomplete_attempts,
-                    );
-                    return;
-                }
-            }
-        }
-        if !finish_quiet_checkpoint(db_path, &completed, available, &mut incomplete_attempts) {
-            return;
-        }
-    }
-}
-
-fn finish_quiet_checkpoint(
-    db_path: &Path,
-    completed: &Option<std::sync::mpsc::Sender<crate::ingest::SweepCheckpoint>>,
-    available: &std::sync::atomic::AtomicBool,
-    incomplete_attempts: &mut u8,
-) -> bool {
-    note_quiet_checkpoint(
-        checkpoint_wal(db_path),
-        completed,
-        available,
-        incomplete_attempts,
-    )
-}
-
-fn note_quiet_checkpoint(
-    outcome: Option<crate::ingest::SweepCheckpoint>,
-    completed: &Option<std::sync::mpsc::Sender<crate::ingest::SweepCheckpoint>>,
-    available: &std::sync::atomic::AtomicBool,
-    incomplete_attempts: &mut u8,
-) -> bool {
-    const MAX_CONSECUTIVE_INCOMPLETE_ATTEMPTS: u8 = 3;
-    if let (Some(completed), Some(outcome)) = (completed, outcome) {
-        let _ = completed.send(outcome);
-    }
-    match outcome {
-        Some(outcome) if outcome.complete => {
-            *incomplete_attempts = 0;
-            true
-        }
-        Some(_) => {
-            *incomplete_attempts += 1;
-            if *incomplete_attempts < MAX_CONSECUTIVE_INCOMPLETE_ATTEMPTS {
-                true
-            } else {
-                available.store(false, std::sync::atomic::Ordering::Release);
-                false
-            }
-        }
-        None => {
-            available.store(false, std::sync::atomic::Ordering::Release);
-            false
-        }
-    }
-}
-
-fn checkpoint_wal(db_path: &Path) -> Option<crate::ingest::SweepCheckpoint> {
-    let flags =
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    if let Ok(conn) = rusqlite::Connection::open_with_flags(db_path, flags) {
-        if conn
-            .is_readonly(rusqlite::DatabaseName::Main)
-            .unwrap_or(true)
-        {
-            return None;
-        }
-        return Some(crate::ingest::checkpoint_after_sweep(
-            &conn,
-            db_path,
-            u64::MAX,
-        ));
-    }
-    None
 }
 
 /// One watch loop's sweep: the same locked `sync` as [`SessionStore::sync`],
@@ -783,12 +686,15 @@ mod tests {
         let db_path = dir.path().join("missing.db");
         let available = std::sync::atomic::AtomicBool::new(true);
         let mut incomplete_attempts = 0;
-        assert!(!finish_quiet_checkpoint(
-            &db_path,
-            &None,
-            &available,
-            &mut incomplete_attempts,
-        ));
+        assert_eq!(
+            note_quiet_checkpoint(
+                checkpoint_wal(&db_path),
+                &None,
+                &available,
+                &mut incomplete_attempts,
+            ),
+            QuietCheckpointDecision::Stop
+        );
         assert!(!available.load(std::sync::atomic::Ordering::Acquire));
         assert!(!db_path.exists());
     }
@@ -862,12 +768,15 @@ mod tests {
             complete: false,
             wal_bytes: 4096,
         };
-        assert!(note_quiet_checkpoint(
-            Some(incomplete),
-            &None,
-            &available,
-            &mut incomplete_attempts,
-        ));
+        assert_eq!(
+            note_quiet_checkpoint(
+                Some(incomplete),
+                &None,
+                &available,
+                &mut incomplete_attempts,
+            ),
+            QuietCheckpointDecision::Retry
+        );
         assert!(available.load(std::sync::atomic::Ordering::Acquire));
         assert_eq!(incomplete_attempts, 1);
 
@@ -875,29 +784,37 @@ mod tests {
             complete: true,
             ..incomplete
         };
-        assert!(note_quiet_checkpoint(
-            Some(complete),
-            &None,
-            &available,
-            &mut incomplete_attempts,
-        ));
+        assert_eq!(
+            note_quiet_checkpoint(Some(complete), &None, &available, &mut incomplete_attempts,),
+            QuietCheckpointDecision::Complete
+        );
         assert_eq!(incomplete_attempts, 0);
 
         for expected in 1..=2 {
-            assert!(note_quiet_checkpoint(
+            assert_eq!(
+                note_quiet_checkpoint(
+                    Some(incomplete),
+                    &None,
+                    &available,
+                    &mut incomplete_attempts,
+                ),
+                QuietCheckpointDecision::Retry
+            );
+            assert_eq!(incomplete_attempts, expected);
+        }
+        assert_eq!(
+            note_quiet_checkpoint(
                 Some(incomplete),
                 &None,
                 &available,
                 &mut incomplete_attempts,
-            ));
-            assert_eq!(incomplete_attempts, expected);
-        }
-        assert!(!note_quiet_checkpoint(
-            Some(incomplete),
-            &None,
-            &available,
-            &mut incomplete_attempts,
-        ));
+            ),
+            QuietCheckpointDecision::Stop
+        );
         assert!(!available.load(std::sync::atomic::Ordering::Acquire));
     }
 }
+
+#[cfg(test)]
+#[path = "watch_sweep_idle_retry_tests.rs"]
+mod idle_retry_tests;

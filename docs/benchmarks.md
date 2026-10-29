@@ -1458,10 +1458,11 @@ The optimization is fail-safe: if the worker thread cannot start, its channel
 disconnects, the database opens read-only, or three consecutive PASSIVE
 attempts cannot catch up, the next retained-writer checkout restores SQLite's
 default 1,000-page automatic checkpoint threshold before writing. A transient
-busy or reader-pinned attempt keeps the worker alive, and a later complete pass
-resets the failure count. The fallback may put checkpoint latency back on a
-commit, but it cannot leave the WAL unbounded merely because background upkeep
-failed.
+busy or reader-pinned attempt schedules its own bounded retry after another
+quiet interval without requiring a new capture; new signals are coalesced into
+that wait, and a later complete pass resets the failure count. The fallback may
+put checkpoint latency back on a commit, but it cannot leave the WAL unbounded
+merely because background upkeep failed.
 
 The exact path also nests discovery's `synchronous = NORMAL` scope. Nested
 guards on the same connection now share the outer policy instead of issuing
@@ -1479,9 +1480,13 @@ against `be827d1e`, 30-day/1,200-session store:
 
 | Metric | `main` p50 | head p50 | `main` p99 | head p99 |
 |---|---:|---:|---:|---:|
-| `capture_path` | 12.169 ms | 12.492 ms | 24.346 ms | 40.989 ms |
-| `capture_path_retained` | 5.524 ms | 5.306 ms | 17.268 ms | 15.930 ms |
-| `e2e_visible` | 10.795 ms | 8.811 ms | 43.806 ms | 50.854 ms |
+| `capture_path` | 12.603 ms | 12.329 ms | 58.825 ms | 22.169 ms |
+| `capture_path_retained` | 5.647 ms | 5.504 ms | 16.678 ms | 16.638 ms |
+| `e2e_visible` | 9.646 ms | 8.085 ms | 337.816 ms | 73.641 ms |
+
+The run passed with zero late samples and zero misses. The 365-day,
+14,600-session list-scale case remained below the 1.5 ms first-paint budget
+at 0.240 ms p99.
 
 The gate passed with zero late or missed sessions. Retained capture improved
 at p50 and p99, and e2e improved at p50; the shared host's plain-capture and
