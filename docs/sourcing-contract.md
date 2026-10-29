@@ -1,10 +1,11 @@
 # Sourcing contract — what the Rust SDK must expose
 
-Skeleton. This document lists the record types `ai-hist` must expose to a Rust
-consumer, why each one exists, and where it stands today. It is the companion to
+This document maps the evidence `ai-hist` exposes to a Rust consumer onto
+burn's sourcing needs and records the limits of that evidence. It is the companion to
 [`docs/decisions/2026-09-19-relayhistory-owns-session-sourcing.md`](decisions/2026-09-19-relayhistory-owns-session-sourcing.md),
-which decides _who owns sourcing_; this file decides _what the surface has to
-carry_ before burn can stop parsing logs.
+which decides _who owns sourcing_; this file describes _what the surface
+carries_. Per-provider availability is documented in the ADR capture matrix
+and [`session-catalog.md`](session-catalog.md).
 
 The shape is `SessionEvidence` from
 [#178](https://github.com/AgentWorkforce/relayhistory/issues/178), served by
@@ -12,10 +13,9 @@ The shape is `SessionEvidence` from
 [`docs/sourcing-sdk.md`](sourcing-sdk.md). The demand
 side is burn's `DerivedRecords` trait
 (`crates/relayburn-sdk/src/ingest/ingest.rs`) and its record types
-(`crates/relayburn-sdk/src/reader/types.rs`). Sections marked **TODO** are
-filled in by the group-1 and group-2 issues named against them; nothing here
-should be treated as shipped until the issue is closed and the ADR's capture
-matrix says `✓`.
+(`crates/relayburn-sdk/src/reader/types.rs`). The descriptions below reflect
+the implemented facade. A field on the shared record does not imply that
+every provider records a value: absent upstream facts remain optional.
 
 ## The consumer's demand, in one place
 
@@ -39,25 +39,38 @@ emits one and by `message_id` where it does not.
 
 The per-model-request row. burn's fields, and what the SDK owes each one:
 
-| burn field                           | Source of truth                           | Status                                                                                                                                        |
-| ------------------------------------ | ----------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `source`, `session_id`, `message_id` | `session_events`                          | present                                                                                                                                       |
-| `turn_index`, `ts`                   | `session_events.ts_ms` + event ordering   | present; ordering key must be stable across re-parses                                                                                         |
-| `model`                              | `session_events.model`                    | present for claude/codex; **TODO** cursor, grok, opencode                                                                                     |
-| `project`                            | `session_events.project` (a cwd string)   | present                                                                                                                                       |
-| `project_key`                        | —                                         | **TODO** [#175](https://github.com/AgentWorkforce/relayhistory/issues/175)                                                                    |
-| `usage`                              | `session_events.token_json`               | **TODO** [#172](https://github.com/AgentWorkforce/relayhistory/issues/172) — must arrive normalized, once per request, not once per block     |
-| `tool_calls`                         | `tool_calls`                              | present for claude/codex                                                                                                                      |
-| `files_touched`                      | `file_edits`                              | present for claude/codex                                                                                                                      |
-| `subagent`                           | `session_relationships` + sidechain flags | **TODO** [#164](https://github.com/AgentWorkforce/relayhistory/issues/164), [#170](https://github.com/AgentWorkforce/relayhistory/issues/170) |
-| `stop_reason`                        | —                                         | **TODO** [#164](https://github.com/AgentWorkforce/relayhistory/issues/164)                                                                    |
-| `fidelity` / `coverage`              | `Source::capabilities()`                  | **TODO** [#169](https://github.com/AgentWorkforce/relayhistory/issues/169) — today `capability` is hard-coded `"full"`                        |
-| `activity`, `retries`, `has_edits`   | burn-derived                              | not ours — burn keeps classification                                                                                                          |
+| burn field | Source of truth | Status |
+| --- | --- | --- |
+| `source`, `session_id`, `message_id` | `session_events` | present |
+| `turn_index`, `ts` | `session_events.ts_ms` + event ordering | native transcript ordering is retained; transported equal-time ordering remains limited (see below) |
+| `model` | `session_events.model` | present when recorded, including Claude, Codex, Cursor, Grok and OpenCode; Cursor corpora can omit it |
+| `project` | `session_events.project` | present; cwd string |
+| `project_key` | `session_events.project_key` | present on `Message`; resolved repository identity, optional |
+| `usage` | `session_events.token_json` + request rollup | normalized `Message::usage` and `SessionEvidence::requests`; sum request usage rather than block copies |
+| `tool_calls` | `tool_calls` | present where supported; see provider capture matrix |
+| `files_touched` | `file_edits` | present where supported; see provider capture matrix |
+| `subagent` | `session_relationships` + envelope facts | recorded delegation and continuity edges, optional `is_sidechain`, and tool-result child identity |
+| `stop_reason` | `session_events.stop_reason` | present on `Message` where recorded, including Claude and OpenCode |
+| `fidelity` / `coverage` | `Source::capabilities()` + per-read coverage | hydration reports `full`, `partial`, or `shallow_only` from effective coverage |
+| `activity`, `retries`, `has_edits` | burn-derived | consumer classification |
 
-`Usage` must carry `input`, `output`, `reasoning`, `cache_read`,
-`cache_create_5m` and `cache_create_1h` as distinct counters. The current
-`token_json` blob is the provider's own shape, differs per harness, and for
-Claude is duplicated across every content block of a message.
+Shared history currently deduplicates by `(source, timestamp_ms, prompt)`.
+Distinct native user events with equal text and time remain separate in
+conversation evidence but can share one prompt-history row
+([#539](https://github.com/AgentWorkforce/relayhistory/issues/539)). Native
+equal-time event order also does not yet have a durable export/intake order
+contract ([#532](https://github.com/AgentWorkforce/relayhistory/issues/532)).
+Neither limitation is repaired by inventing timestamps or changing native IDs.
+
+`NormalizedUsage` separates ordinary input, output, optional reasoning,
+cache reads, total cache writes and optional five-minute/one-hour cache-write
+buckets. It preserves provider totals and provider-reported costs without
+pricing or estimating missing counters. `accounting` and `coverage` describe
+how to interpret the counters; context occupancy is not billed request usage.
+The raw `token_json` remains provider-shaped and can be repeated per block.
+`Message::usage` deduplicates a message's copies; `SessionEvidence::requests`
+settles request identity and usage, with `usage_error` and diagnostics for
+conflicting or invalid evidence. Consumers sum eligible request rollups.
 
 ## 2. Content blocks — `ContentRecord`
 
@@ -71,13 +84,12 @@ record uuid) and, in its payload, the record's `request_id` and
 response in its request and dates the request by it. A response no record of
 which stores rows stores the opening record's thinking event (empty text), so
 every response is a request in `SessionEvidence::requests` with its usage.
-Two obligations:
 
-- `SessionQuery.include_text` must be honoured, mapping onto burn's
-  `ContentStoreMode::{full, hash-only, off}`. A hash-only consumer must not pay
-  to move transcript text.
-- Non-text block types must stop being dropped by the parser's `_ => {}` arms
-  ([#165](https://github.com/AgentWorkforce/relayhistory/issues/165)).
+`SessionQuery.include_text: false` omits transcript text from the facade's
+reads while retaining identities, byte counts and recorded evidence hashes.
+Consumers choose their own content-storage policy. Recorded non-text and
+unsupported blocks are represented by bounded markers where the provider
+adapter supports them; consult the capture matrix for provider coverage.
 
 Codex `input_image` blocks are represented by a separate `kind = text` event
 with `raw_kind = input_image` and self-contained Markdown in `text`:
@@ -152,35 +164,32 @@ null. burn's `slash_triads` classifier reads that payload, not the transcript.
 ## 4. Relationships — `SessionRelationshipRecord`
 
 burn's `RelationshipType` spans delegation _and_ continuity. The ledger writes
-two values today: `delegated` and `materialized_local`.
+`delegated`, `materialized_local`, `continuation`, `fork` and `resume`,
+when deterministic provider evidence supports them.
 
 | burn field                                                       | Status                                                                         |
 | ---------------------------------------------------------------- | ------------------------------------------------------------------------------ |
 | `relationship_type` = delegation                                 | present (`session_relationships.relationship = 'delegated'`)                   |
-| `relationship_type` = fork / resume / continuation               | **TODO** [#170](https://github.com/AgentWorkforce/relayhistory/issues/170)     |
+| `relationship_type` = fork / resume / continuation | present through continuity reconciliation |
 | `related_session_id`                                             | present, nullable — `identity_status` says `observed` or `unlinked`            |
 | `parent_tool_use_id`, `agent_id`, `subagent_type`, `description` | partially present via `child_agent_type` / `child_agent_name` / `evidence_ref` |
-| `source_version`                                                 | **TODO** [#164](https://github.com/AgentWorkforce/relayhistory/issues/164)     |
+| `source_version` | retained in internal continuity evidence when recorded; not a field on the public `SessionRelationship` |
 
 burn's `ClaudeRelationshipEvidence` also needs the raw continuity signals a
 transcript carries — `first_parent_uuid`, `has_resume_marker`,
 `resume_target_session_id`, explicit fork and continuation target ids. Those are
-inputs to [#170](https://github.com/AgentWorkforce/relayhistory/issues/170)'s
-cross-file reconciliation, and the SDK should expose the reconciled
-relationship, not ask the consumer to redo the reconciliation.
+inputs to the crate's cross-file continuity reconciliation. Consumers read
+the reconciled relationships, including `observed` / `unlinked` identity
+status and the captured evidence reference; they do not reparse transcripts.
+See [continuity](architecture.md#continuity) for the resolution policy.
 
 ## 5. Tool results — `ToolResultEventRecord`
 
-The largest single gap, and larger than it looks: the tool-result **event**
-carries no tool identity at all. `session_events` has `message_id`, `ts_ms`,
-`role`, `kind` and `text` — and no `tool_use_id` column
-(`crates/ai-hist/src/store.rs`). Claude ingestion reads the result block's
-`tool_use_id` only to call `set_tool_call_error` and
-`update_file_edit_from_tool_result`, then drops it; Codex ingestion does the
-same with the output record's `call_id` (`crates/ai-hist/src/ingest.rs`). The
-`is_error` that survives is a per-_call_ boolean on `tool_calls`, not a
-per-result one, and with several calls or several results in one turn there is
-no key to join a stored result event back to the call it belongs to.
+Tool-result events retain `tool_use_id` alongside the message, timestamp and
+text. `SessionEvidence::tool_results` exposes result-level status, provenance,
+error signal, stable call/event indexes and payload measurements. Tool-call
+`is_error` is a separate projection; it does not replace result-level evidence.
+Fields remain optional when the source did not record them.
 
 burn needs:
 
@@ -192,9 +201,9 @@ burn needs:
 | `status`, `event_source`                                             | present for Claude and Codex                                                                                   |
 | `call_index`, `event_index`                                          | present for Claude and Codex; stable across re-parses                                                          |
 | `content_length`, `output_bytes`, `output_truncated`, `content_hash` | present as `payload_bytes`, `payload_truncated`, and `payload_hash` for Claude and Codex                       |
-| `usage`, `usage_attribution`                                         | **TODO** [#172](https://github.com/AgentWorkforce/relayhistory/issues/172)                                     |
-| `subagent_session_id`, `agent_id`                                    | **TODO** [#170](https://github.com/AgentWorkforce/relayhistory/issues/170)                                     |
-| `replaced_tools`, `collapsed_calls`                                  | **TODO** [#171](https://github.com/AgentWorkforce/relayhistory/issues/171)                                     |
+| `usage`, `usage_attribution` | normalized request usage and prompt attribution are separate reads; `ToolResult` does not carry per-result usage |
+| `subagent_session_id`, `agent_id` | present when the result records a delegated child |
+| `replaced_tools`, `collapsed_calls` | Claude `_meta.replaces` / `_meta.collapsedCalls` are retained in `tool_replacement` marker payloads as `replaces` / `collapsedCalls` |
 
 `output_bytes` and `output_truncated` must be measured at parse time. They
 cannot be recovered afterwards from a truncated stored string, and a measurement
@@ -203,9 +212,8 @@ that can be destroyed by the truncation it describes is not a measurement.
 ## 6. User turns — `UserTurnRecord`
 
 Blocks of a human turn with `byte_len`, `approx_tokens`, `tool_use_id` and
-`is_error` per block, plus `preceding_message_id` / `following_message_id`. The
-ledger stores the prompt text and the surrounding events but no per-block
-accounting.
+`is_error` per block, plus `preceding_message_id` / `following_message_id`. The facade exposes recorded per-block byte counts and tool-result status;
+it does not estimate token counts.
 
 Shipped for Claude and Codex as `SessionEvidence::user_turns` (read through
 `SessionStore::session`) and the corresponding Node/TypeScript page and
@@ -224,14 +232,17 @@ falls back to `message_id` and then to a row uuid, and records which fallback it
 used in `Inference::request_id_source` — so a real upstream request id is always
 distinguishable from a synthesized key.
 
-Claude emits `requestId`; the crate never reads it. Codex and OpenCode have no
-equivalent and legitimately fall back.
+Claude's recorded `requestId` is stored as `session_events.request_id` and
+exposed on `Message::request_id`; `provider_message_id` preserves the upstream
+message identifier separately. `SessionEvidence::requests` carries
+`request_key` and `request_key_source`, distinguishing provider request IDs,
+provider message IDs, recorded request spans and record-ID fallbacks.
+Codex request spans group the records of a request without inventing a
+provider request ID. The request rollup is the shared grouping contract.
 
-**TODO** [#164](https://github.com/AgentWorkforce/relayhistory/issues/164).
-
-One caveat the facade must not paper over: for Codex the ledger's `message_id`
-is _synthesized_ by the parser (`{line_index}:agent_message`), not a provider
-identifier. It is stable for a given file content and re-parse, but it is not
+One caveat the facade must not paper over: Codex JSONL fallback `message_id` values
+can be _synthesized_ by the parser (`{line_index}:agent_message`), rather than
+provider identifiers. It is stable for a given file content and re-parse, but it is not
 the provider's id, and a consumer keying long-lived state on it should be told
 so — `Source::capabilities()` is the place to say it.
 
@@ -249,13 +260,12 @@ Shipped as `Source::capabilities()` — `evidence_kinds`, `relationships`,
 `None`), `hydrates_by_path` and `watch_roots(&roots)`; `SessionEvidence::coverage`
 repeats the kinds per read.
 
-This is the contract that lets a consumer distinguish "this session has no tool
-calls" from "this source cannot report tool calls". Today the hydration result
-claims `capability: "full"` for every source including prompts-only ones
-([#169](https://github.com/AgentWorkforce/relayhistory/issues/169)), which is
-precisely the well-formed-answer-computed-over-nothing failure mode: a
-prompts-only grok session returns the same shape of success as a fully hydrated
-Claude one.
+This lets a consumer distinguish an absent tool call from an unsupported
+evidence kind. Hydration computes effective coverage for the selected source
+and acquired evidence: all full-session kinds gives `full`, no kinds gives
+`shallow_only`, and any other set gives `partial`. Capability is separate from
+catalog `discovery_state`, which records whether indexing reached the source
+stamp. A successfully indexed session can still have partial evidence coverage.
 
 ## 9. Change feed
 
