@@ -42,6 +42,7 @@ use crate::{
 
 /// Every op the dispatcher answers, in the spelling the SDK sends.
 pub const SESSION_STORE_OPS: &[&str] = &[
+    OP_SESSION,
     OP_MARKERS,
     OP_REQUESTS,
     OP_USAGE_SUMMARY,
@@ -50,6 +51,7 @@ pub const SESSION_STORE_OPS: &[&str] = &[
     crate::change_feed::OP_CHANGES,
     crate::change_feed::OP_COMMIT_CHANGES,
 ];
+const OP_SESSION: &str = "session";
 const OP_MARKERS: &str = "markers";
 const OP_REQUESTS: &str = "requests";
 const OP_USAGE_SUMMARY: &str = "usage_summary";
@@ -270,6 +272,9 @@ pub(crate) fn dispatch(op: &str, args_json: &str) -> napi::Result<String> {
     if op == crate::change_feed::OP_CHANGES || op == crate::change_feed::OP_COMMIT_CHANGES {
         return crate::change_feed::dispatch(op, args_json);
     }
+    if op == OP_SESSION {
+        return super::session_evidence::dispatch(args_json);
+    }
     let mut args = parse_args(args_json)?;
     let source_name = validate_identity(std::mem::take(&mut args.source), "source")?;
     let source = parse_source(&source_name)?;
@@ -292,7 +297,7 @@ pub(crate) fn dispatch(op: &str, args_json: &str) -> napi::Result<String> {
 /// Run `read` against the database at `path`, or answer `None` when there is
 /// no database there — a missing database is an empty answer, and a read
 /// never creates it.
-fn read_existing<T>(
+pub(crate) fn read_existing<T>(
     path: PathBuf,
     read: impl Fn(&SessionStore) -> Result<T, ai_hist::Error>,
 ) -> napi::Result<Option<T>> {

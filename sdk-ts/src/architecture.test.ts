@@ -97,10 +97,10 @@ test('the native session-store dispatcher is named in one place', async () => {
   // there and one arm in Rust, never a string literal scattered across callers.
   const native = await readFile(join(sourceDir, 'native.ts'), 'utf8');
   assert.match(native, /export const SESSION_STORE_OPS = Object\.freeze\(\{/);
-  for (const op of ['markers', 'requests', 'usage_summary', 'user_turns', 'capabilities', 'changes', 'commit_changes']) {
+  for (const op of ['session', 'markers', 'requests', 'usage_summary', 'user_turns', 'capabilities', 'changes', 'commit_changes']) {
     assert.match(native, new RegExp(`'${op}'`), `native.ts names the ${op} op`);
   }
-  const files = ['index.ts', 'cli.ts', 'mcp-server.ts', 'operations.ts', 'normalization.ts', 'pagination.ts', 'sdk-common.ts'];
+  const files = ['index.ts', 'cli.ts', 'mcp-server.ts', 'operations.ts', 'normalization.ts', 'pagination.ts', 'sdk-common.ts', 'session-evidence.ts'];
   const source = (await Promise.all(files.map((file) => readFile(join(sourceDir, file), 'utf8')))).join('\n');
   assert.doesNotMatch(source, /\.sessionStoreCall\(/, 'only native.ts calls the binding directly');
   assert.doesNotMatch(source, /sessionStoreCall\(\s*'/, 'op names are not spelled outside native.ts');

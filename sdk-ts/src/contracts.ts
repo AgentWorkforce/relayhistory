@@ -340,6 +340,12 @@ export interface SessionEvent {
   */
   provider: string | null;
   eventUid: string;
+  /** Provider-native record or block type, when recorded. */
+  rawKind: string | null;
+  /** Upstream API message identity, distinct from the transcript record ID. */
+  providerMessageId: string | null;
+  /** Recorded request grouping when the provider does not name requests. */
+  requestSpan: string | null;
   /**
    * Per-tool-result fidelity. Null on every row that is not a tool result,
    * and on a tool-result row whose provider does not record that fact — the

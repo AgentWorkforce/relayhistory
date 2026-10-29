@@ -92,7 +92,7 @@ explicit plugin modules/options; `--source-connector` selects their IDs and is
 repeatable. `--no-source-connectors` disables remote acquisition. MCP uses
 `AI_HIST_PLUGIN_CONFIG` and `source_connectors`. Scope defaults to local even
 with plugins configured. See [source plugins](../docs/source-plugins.md).
-Native contract 29 requires a matching addon, including current catalog and
+Native contract 30 requires a matching addon, including current catalog and
 source/delivery contracts.
 
 Catalog pages, discovery results, statistics, and sync results echo the requested `scope`,
@@ -125,6 +125,24 @@ becomes `null` while the raw string stays available as `argsJson` and
 `parseStoredJson(raw)` is that same parse, exported for callers that hold a raw
 stored string of their own: it returns the parsed value, or `null` for anything
 that is not a parseable string.
+
+## Full session evidence
+
+`getSessionEvidence(source, sessionId, { dbPath?, kinds?, includeText? })`
+reads all stored evidence on one database snapshot through the Rust
+`SessionStore` facade and returns `SessionEvidence | null`. It does not hydrate
+provider files or create a missing database. Omit `kinds` for all evidence,
+pass an empty array for metadata only, or select kinds such as `history` and
+`session_event`. `coverage` describes the provider's capabilities; `loaded`
+identifies what this query fetched.
+
+`includeText: false` omits transcript text and catalog excerpts while retaining
+prompt hashes and byte lengths. Tool arguments, patches, marker payloads and
+raw usage remain available; this option is not a general content scrubber.
+Provider JSON keys are preserved inside `args`, `structuredPatch`, `payload`
+and `usageSnapshot`. Invalid stored JSON remains in the optional `rawArgs`,
+`rawStructuredPatch`, `rawPayload` and `rawUsage` strings. Usage is reported
+by the provider, with the same safe-counter checks as the paged SDK reads.
 
 ## Session topology
 

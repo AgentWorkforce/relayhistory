@@ -32,7 +32,7 @@ Rust owns provider discovery/parsing, schema creation and migration, direct
 SQLite connections, catalog queries, history/event queries, search,
 statistics, and sync. Blocking filesystem and SQLite work is dispatched away
 from Node's event loop. TypeScript validates inputs, validates native contract
-version 29, catalog contract version 7, hydration contract version 3,
+version 30, catalog contract version 7, hydration contract version 3,
 session-relationship contract version 2, and session evidence contract version
 4 and session usage contract version 3, normalizes nullable fields, maps native
 errors, and supplies pagination
@@ -62,7 +62,12 @@ crosses as `{epoch, revision}` with the epoch as 16 hex digits, because it is a
 random 64-bit store identity a JavaScript number cannot hold. `sdk-ts/src/native.ts` (`SESSION_STORE_OPS`) is the only place
 in the SDK that spells them, and the SDK's request, usage and user-turn reads
 use the dispatcher. The dispatcher validates and opens through `SessionStore`;
-capabilities come from pure tables, while paged evidence reads still open a
+`session` reads the full `SessionStore::session` snapshot with
+`{dbPath?, source, sessionId, kinds?, includeText?}` and returns
+`{evidence: SessionEvidence | null}`. The SDK exposes this as
+`getSessionEvidence`, converting facade field names to camelCase while retaining
+opaque provider JSON unchanged. Missing sessions return null; this read does
+not acquire provider files. Capabilities come from pure tables, while paged evidence reads still open a
 read connection and call connection-level page helpers. Changes and cursor
 commits go through the facade. New operations should extend this dispatcher
 and the facade instead of adding another typed native function. The typed

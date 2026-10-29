@@ -26,11 +26,11 @@ const SHARED_SESSION = 'shared-1';
 
 const CLAUDE_TRANSCRIPT = [
   { type: 'user', uuid: 'u1', sessionId: SHARED_SESSION, cwd: '/work/app', gitBranch: 'main', timestamp: '2026-08-30T10:00:00.000Z', message: { role: 'user', content: 'update auth' } },
-  { type: 'assistant', uuid: 'a1', parentUuid: 'u1', sessionId: SHARED_SESSION, cwd: '/work/app', gitBranch: 'main', timestamp: '2026-08-30T10:00:01.000Z', message: { role: 'assistant', model: 'claude-test', content: [{ type: 'tool_use', id: 'toolu_1', name: 'Edit', input: { file_path: '/work/app/auth.ts', old_string: 'old', new_string: 'new' } }] } },
+  { type: 'assistant', uuid: 'a1', parentUuid: 'u1', sessionId: SHARED_SESSION, cwd: '/work/app', gitBranch: 'main', timestamp: '2026-08-30T10:00:01.000Z', message: { id: 'api-message-a1', role: 'assistant', model: 'claude-test', usage: { input_tokens: 10, output_tokens: 3 }, content: [{ type: 'tool_use', id: 'toolu_1', name: 'Edit', input: { file_path: '/work/app/auth.ts', old_string: 'old', new_string: 'new' } }] } },
   { type: 'user', uuid: 'r1', parentUuid: 'a1', sessionId: SHARED_SESSION, cwd: '/work/app', gitBranch: 'main', timestamp: '2026-08-30T10:00:02.000Z', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_1', content: 'ok', toolUseResult: { filePath: '/work/app/auth.ts', structuredPatch: '--- a/auth.ts\n+++ b/auth.ts\n-old\n+new\n', userModified: true } }] } },
-  { type: 'assistant', uuid: 'a2', parentUuid: 'r1', sessionId: SHARED_SESSION, cwd: '/work/app', gitBranch: 'main', timestamp: '2026-08-30T10:00:03.000Z', message: { role: 'assistant', model: 'claude-test', content: [{ type: 'tool_use', id: 'toolu_2', name: 'Write', input: { file_path: '/work/app/notes.md', content: 'notes' } }] } },
+  { type: 'assistant', uuid: 'a2', parentUuid: 'r1', sessionId: SHARED_SESSION, cwd: '/work/app', gitBranch: 'main', timestamp: '2026-08-30T10:00:03.000Z', message: { id: 'api-message-a2', role: 'assistant', model: 'claude-test', content: [{ type: 'tool_use', id: 'toolu_2', name: 'Write', input: { file_path: '/work/app/notes.md', content: 'notes' } }] } },
   { type: 'user', uuid: 'r2', parentUuid: 'a2', sessionId: SHARED_SESSION, cwd: '/work/app', gitBranch: 'main', timestamp: '2026-08-30T10:00:04.000Z', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_2', content: 'ok', toolUseResult: { filePath: '/work/app/notes.md', structuredPatch: [{ oldStart: 1, newStart: 1, lines: ['+notes'] }], userModified: false } }] } },
-  { type: 'assistant', uuid: 'a3', parentUuid: 'r2', sessionId: SHARED_SESSION, cwd: '/work/app', gitBranch: 'main', timestamp: '2026-08-30T10:00:05.000Z', message: { role: 'assistant', model: 'claude-test', content: [{ type: 'tool_use', id: 'toolu_3', name: 'Bash', input: { command: 'cargo test' } }] } },
+  { type: 'assistant', uuid: 'a3', parentUuid: 'r2', sessionId: SHARED_SESSION, cwd: '/work/app', gitBranch: 'main', timestamp: '2026-08-30T10:00:05.000Z', message: { id: 'api-message-a3', role: 'assistant', model: 'claude-test', content: [{ type: 'tool_use', id: 'toolu_3', name: 'Bash', input: { command: 'cargo test' } }] } },
   { type: 'user', uuid: 'r3', parentUuid: 'a3', sessionId: SHARED_SESSION, cwd: '/work/app', gitBranch: 'main', timestamp: '2026-08-30T10:00:06.000Z', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_3', is_error: true, content: 'failed' }] } },
   // A harness line, not a block on a user message. It is stored as a tool
   // result because that is what it is evidence of, so anything that groups on
@@ -684,4 +684,103 @@ test('recordTokenUsage is the usage of the event\'s own record', () => {
     { input_tokens: 10, output_tokens: 1 },
   );
   assert.equal(sessionEvent({ ...base, tokenJson: settled, recordTokenJson: 'null' }).recordTokenUsage, null);
+});
+
+
+test('event reads retain native record type and provider request identities', async () => {
+  const { dbPath, cleanup } = await seededDatabase();
+  try {
+    const claude = await getSessionEvents(SHARED_SESSION, { dbPath, source: 'claude' });
+    const assistant = claude.find((event) => event.messageId === 'a1');
+    assert.equal(assistant?.providerMessageId, 'api-message-a1');
+    assert.equal(assistant?.requestSpan, null);
+    const notification = claude.find((event) => event.eventSource === 'subagent_notification');
+    assert.equal(notification?.rawKind, 'system_subagent_notification');
+    const codex = await getSessionEvents(SHARED_SESSION, { dbPath, source: 'codex' });
+    const call = codex.find((event) => event.kind === 'tool_use');
+    assert.ok(call, 'the Codex fixture must contain a tool-use event');
+    assert.equal(call?.requestSpan, '0');
+    assert.equal(call?.providerMessageId, null);
+  } finally {
+    await cleanup();
+  }
+});
+
+test('full session evidence preserves provider keys, identities and paged usage', async () => {
+  const { getSessionEvidence, getSessionRequests, getSessionUsage } = await import('./index.js');
+  const { dbPath, cleanup } = await seededDatabase();
+  try {
+    const evidence = await getSessionEvidence('claude', SHARED_SESSION, { dbPath });
+    assert.ok(evidence);
+    assert.equal(evidence.session.sessionId, SHARED_SESSION);
+    assert.equal(evidence.includeText, true);
+    assert.equal(evidence.messages.find((message) => message.messageId === 'a1')?.providerMessageId, 'api-message-a1');
+    const edit = evidence.toolCalls.find((call) => call.toolUseId === 'toolu_1');
+    assert.deepEqual(edit?.args, { file_path: '/work/app/auth.ts', old_string: 'old', new_string: 'new' });
+    assert.deepEqual(JSON.parse(edit!.rawArgs!), edit!.args);
+    assert.ok(evidence.messages.flatMap((message) => message.blocks).every((block) => block.eventUid));
+    assert.equal(evidence.messages.find((message) => message.messageId === 'a1')?.usage?.inputTokens, 10);
+    assert.equal(evidence.usage?.usage?.inputTokens, 10);
+    assert.equal(await getSessionEvidence('claude', 'unknown-session', { dbPath }), null);
+    assert.deepEqual(evidence.requests, await getSessionRequests('claude', SHARED_SESSION, { dbPath }));
+    assert.deepEqual(evidence.usage, await getSessionUsage('claude', SHARED_SESSION, { dbPath }));
+    assert.deepEqual(evidence.userTurns, await getSessionUserTurns('claude', SHARED_SESSION, { dbPath }));
+  } finally { await cleanup(); }
+});
+
+test('full session evidence honors kind selection and transcript omission', async () => {
+  const { getSessionEvidence } = await import('./index.js');
+  const { dbPath, cleanup } = await seededDatabase();
+  try {
+    const evidence = await getSessionEvidence('claude', SHARED_SESSION, { dbPath, includeText: false, kinds: ['history', 'session_event'] });
+    assert.ok(evidence);
+    assert.equal(evidence.includeText, false);
+    assert.deepEqual(evidence.loaded, ['history', 'session_event']);
+    assert.equal(evidence.session.firstPrompt, null);
+    assert.equal(evidence.session.lastAssistantText, null);
+    assert.ok(evidence.prompts.length);
+    assert.ok(evidence.prompts.every((prompt) => prompt.prompt === null && prompt.promptBytes > 0 && prompt.promptHash));
+    assert.ok(evidence.messages.flatMap((message) => message.blocks).every((block) => block.text === null));
+    assert.deepEqual(evidence.toolCalls, []);
+    assert.deepEqual(evidence.fileEdits, []);
+    const metadata = await getSessionEvidence('claude', SHARED_SESSION, { dbPath, kinds: [] });
+    assert.deepEqual(metadata?.loaded, []);
+    assert.deepEqual(metadata?.messages, []);
+  } finally { await cleanup(); }
+});
+
+test('full session evidence handles missing sessions and validates options', async () => {
+  const { getSessionEvidence } = await import('./index.js');
+  const { access } = await import('node:fs/promises');
+  const dir = await mkdtemp(join(tmpdir(), 'relayhistory-evidence-missing-'));
+  const dbPath = join(dir, 'missing.db');
+  try {
+    assert.equal(await getSessionEvidence('claude', 'missing', { dbPath }), null);
+    await assert.rejects(access(dbPath));
+    await assert.rejects(getSessionEvidence('claude', ' ', { dbPath }), InvalidArgumentError);
+    await assert.rejects(getSessionEvidence('claude', 'missing', { dbPath, kinds: ['bogus' as never] }), InvalidArgumentError);
+    await assert.rejects(getSessionEvidence('claude', 'missing', { dbPath, includeText: 'false' as never }), InvalidArgumentError);
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+
+
+test('full session evidence refuses rounded usage counters', { skip: needsNodeSqlite }, async () => {
+  const { getSessionEvidence } = await import('./index.js');
+  const { dbPath, cleanup } = await seededDatabase();
+  try {
+    const db = new sqlite!.DatabaseSync(dbPath);
+    try {
+      db.prepare("UPDATE session_events SET token_json = ? WHERE source = 'claude' AND message_id = 'a1'")
+        .run('{"input_tokens":9007199254740992,"output_tokens":3}');
+    } finally { db.close(); }
+    const evidence = await getSessionEvidence('claude', SHARED_SESSION, { dbPath });
+    const message = evidence?.messages.find((row) => row.messageId === 'a1');
+    assert.equal(message?.usage, null);
+    assert.equal(message?.usageError, 'USAGE_COUNT_NOT_REPRESENTABLE');
+    const request = evidence?.requests.find((row) => row.messageIds.includes('a1'));
+    assert.equal(request?.usage, null);
+    assert.ok(request?.diagnostics.includes('count-not-representable'));
+    assert.equal(evidence?.usage?.usage, null);
+    assert.ok(evidence?.usage?.diagnostics.includes('count-not-representable'));
+  } finally { await cleanup(); }
 });

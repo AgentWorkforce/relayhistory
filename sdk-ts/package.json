@@ -65,6 +65,7 @@
     "dist/operations.*",
     "dist/handoff.*",
     "dist/source-contracts.*",
+    "dist/session-evidence.*",
     "dist/source-plugins.*",
     "!dist/*.test.*"
   ],

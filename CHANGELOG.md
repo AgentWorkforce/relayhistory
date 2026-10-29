@@ -4,10 +4,19 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased - Patch]
+## [Unreleased - Minor]
+
+### Breaking Changes
+
+- Native contract 30 requires matching SDK and addon versions to retain provider event types and request identities.
+
+### Added
+
+- `getSessionEvidence` reads a complete stored session snapshot with evidence-kind selection, optional transcript omission, provider identities and usage.
 
 ### Fixed
 
+- SDK, CLI and MCP event reads preserve provider-native record types, API message IDs and request spans.
 - Selected Codex SQLite sessions report an unavailable source when their backing stores disappear, and fallback diagnostics honor quiet mode.
 
 ## [0.53.0] - 2026-10-28
