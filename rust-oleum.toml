@@ -47,7 +47,7 @@ rust_roots = ["crates/ai-hist-cli/src", "crates/ai-hist-napi/src", "crates/ai-hi
 "crates/ai-hist/src/ingest.rs::sync_codex_rollouts_with_repairs_and_coverage" = 86
 "crates/ai-hist/src/ingest/opencode.rs::load_all_from_sqlite" = 43
 "crates/ai-hist/src/ingest/opencode.rs::normalize_session" = 41
-"crates/ai-hist/src/source_intake.rs::apply_normalized" = 51
+"crates/ai-hist/src/source_intake.rs::apply_normalized" = 46
 "crates/ai-hist/src/store.rs::init_db_locked" = 69
 
 [baseline.cognitive]
@@ -63,4 +63,4 @@ rust_roots = ["crates/ai-hist-cli/src", "crates/ai-hist-napi/src", "crates/ai-hi
 "crates/ai-hist/src/ingest.rs::sync_codex_rollouts_with_repairs_and_coverage" = 117
 "crates/ai-hist/src/ingest/opencode.rs::load_all_from_sqlite" = 33
 "crates/ai-hist/src/ingest/opencode.rs::normalize_session" = 52
-"crates/ai-hist/src/source_intake.rs::apply_normalized" = 46
+"crates/ai-hist/src/source_intake.rs::apply_normalized" = 33

@@ -1,5 +1,12 @@
 //! Transport-free source plugin intake. Each complete snapshot is fenced by the
 //! observation revision acquired before external I/O, then reconciled atomically.
+#[path = "source_intake/retirement.rs"]
+pub(crate) mod retirement;
+
+#[cfg(test)]
+#[path = "source_intake/retirement/tests.rs"]
+mod retirement_tests;
+
 use crate::{discover::*, *};
 use crate::{
     observations::{self, ObservationCheckpoint, ObservationKey, SessionObservation},
@@ -234,16 +241,10 @@ pub(crate) fn apply_normalized(
         // evidence, while retaining each remote snapshot separately.
         ambiguous_local |=
             observed.key.location == SessionLocation::Local && snapshot.covered_kinds.is_empty();
+        let snapshot = retirement::restore_management(&tx, &observed.key, snapshot)?;
         snapshots.insert(owner(&observed.key), snapshot);
     }
-    let mut previous_winners = BTreeMap::new();
-    for snapshot in snapshots.values() {
-        for item in &snapshot.records {
-            previous_winners
-                .entry(item.record.identity())
-                .or_insert(&item.record);
-        }
-    }
+    let previous_winners = retirement::previous_winners(&tx, &snapshots)?;
     let mut revoked = observations::protected_canonical_evidence(&tx, key)?;
     for (identity, record) in previous_winners {
         if (ambiguous_local && record.exists(&tx)?) || !record.matches_canonical(&tx)? {
@@ -278,8 +279,9 @@ pub(crate) fn apply_normalized(
     kinds.extend(evidence.covered_kinds.iter().copied());
     own.covered_kinds = kinds.into_iter().collect();
     for record in &evidence.records {
-        let managed = !revoked.contains(&record.identity())
-            && (previously_managed.contains_key(&record.identity()) || !record.exists(&tx)?);
+        let managed = retirement::management_allowed(
+            &tx, record, &prior_records, &revoked, &previously_managed,
+        )?;
         own.records.push(ManagedRecord {
             record: record.clone(),
             managed,
@@ -324,26 +326,15 @@ pub(crate) fn apply_normalized(
         .into_iter()
         .collect::<Vec<_>>();
     snapshots.insert(owner(key), own);
-    let mut union = BTreeMap::new();
-    let mut managed = BTreeSet::new();
-    for snapshot in snapshots.values() {
-        for item in &snapshot.records {
-            let identity = item.record.identity();
-            if item.managed {
-                managed.insert(identity.clone());
-            }
-            union.entry(identity).or_insert(&item.record);
-        }
-    }
+    let union = retirement::managed_union(&snapshots);
     for (identity, record) in &previously_managed {
         if !union.contains_key(identity) {
             record.remove(&tx, key.location)?;
         }
     }
-    for (identity, record) in union {
-        if managed.contains(&identity) {
-            record.write(&tx, key.location)?;
-        }
+    retirement::retain_support(&tx, key, union.keys())?;
+    for record in union.into_values() {
+        record.write(&tx, key.location)?;
     }
     crate::hydrate::save_observation_progress(
         &tx,

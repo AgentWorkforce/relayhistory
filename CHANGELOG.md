@@ -17,6 +17,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - SDK, CLI and MCP event reads preserve provider-native record types, API message IDs and request spans.
+- Retained matching remote evidence survives retirement of its direct local source, without allowing conflicting snapshots to replace local evidence.
 - Selected Codex SQLite sessions report an unavailable source when their backing stores disappear, and fallback diagnostics honor quiet mode.
 
 ## [0.53.0] - 2026-10-28

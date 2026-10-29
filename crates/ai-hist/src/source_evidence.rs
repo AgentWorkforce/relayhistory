@@ -468,6 +468,21 @@ impl EvidenceRecord {
             |row| row.get(0),
         )?)
     }
+    /// A retiring direct source disproved the other side's share of this
+    /// canonical payload. Keep remote-only rows conservative; demote only a
+    /// row whose local share is about to be retired in the same transaction.
+    pub(crate) fn revoke_unmatched_remote_share(&self, conn: &Connection) -> Result<()> {
+        let table = self.kind.spec().table;
+        if crate::store::EVIDENCE_LOCATION_TABLES.contains(&table) {
+            let (condition, values) = self.key_sql()?;
+            conn.execute(
+                &format!("UPDATE {table} SET location='local' WHERE {condition} AND location='both'"),
+                params_from_iter(values),
+            )?;
+        }
+        Ok(())
+    }
+
     /// Retire this record for the observation at `location`. In a table
     /// whose rows record which evidence backs them, only that side's share is
     /// retired: a record the other side also backs stays, as the other side's.

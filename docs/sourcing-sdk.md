@@ -325,6 +325,15 @@ A driver runs one enumerate/apply cycle per connector:
    `include_related: Some(false)` scopes coverage to the one thread, exactly
    as `HydrateOptions::include_related` does.
 
+When a direct local source is retired, the store compares retained remote
+records against the canonical payload before deleting local evidence. Only exact
+matches gain remote ownership; conflicting snapshots remain stored and protected
+from overwriting local evidence, including on replay after retirement. This
+handoff uses separate local ownership metadata, so it does not modify acquired
+connector snapshots or invalidate their revision fences. Matching connectors can
+withdraw their own shares independently. Legacy snapshots without normalized
+per-record evidence cannot prove support and remain conservative.
+
 `ObservationKey`, `SessionObservation`, `ObservationCheckpoint`,
 `ObservationState`, `NormalizedSourceEvidence`, `SourceObservation`,
 `SourceObservationBatch`, `SourceEvidenceSubmission`, `DiscoverySummary` and

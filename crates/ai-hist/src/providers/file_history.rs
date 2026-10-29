@@ -182,8 +182,10 @@ pub(crate) fn retire_local_session_with_prompts(
     sid: &str,
     reconcile: fn(&Connection, &str, &str) -> Result<()>,
 ) -> Result<()> {
+    let retained = crate::source_intake::retirement::capture(conn, source, sid)?;
     crate::ingest::retire_local_session_evidence(conn, source, sid)?;
     reconcile(conn, source, sid)?;
+    retained.restore(conn, source, sid)?;
     for table in [
         "session_observations",
         "session_hydration_checkpoints",
