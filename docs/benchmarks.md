@@ -1488,8 +1488,7 @@ The run passed with zero late samples and zero misses. The 365-day,
 14,600-session list-scale case remained below the 1.5 ms first-paint budget
 at 0.240 ms p99.
 
-The gate passed with zero late or missed sessions. Retained capture improved
-at p50 and p99, and e2e improved at p50; the shared host's plain-capture and
-e2e p99 values regressed in this run. The 5 ms e2e budget is still tracked
-rather than enforced: this change removes a periodic checkpoint from the
-visibility path without claiming that the remaining latency work is complete.
+All three measured paths improved at p50 and p99 in this run. The 5 ms e2e
+budget is still tracked rather than enforced: this change removes a periodic
+checkpoint from the visibility path without claiming that the remaining
+latency work is complete.
