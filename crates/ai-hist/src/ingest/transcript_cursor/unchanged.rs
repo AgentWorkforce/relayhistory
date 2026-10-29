@@ -88,7 +88,7 @@ fn transcript_unchanged_with_settle(
             if let Err(error) =
                 store_settled_cursor(conn, source, &locator, raw.as_deref(), &settled)
             {
-                if !super::SYNC_QUIET.load(std::sync::atomic::Ordering::Relaxed) {
+                if !super::output::quiet() {
                     eprintln!("  [sync] could not record {locator} as settled: {error:#}");
                 }
             }

@@ -293,6 +293,13 @@ narrowed by the request (no `Relationship` when `include_related` is off) —
 hook fires inside the harness's tool call, and a file that was cleaned up
 before the hook ran is an answer.
 
+Capture progress output is scoped to the current operation and thread.
+Facade sync, discovery and hydration suppress optional progress and quiet-aware
+skip diagnostics;
+explicit CLI progress calls restore the caller's prior policy when they finish,
+including on errors or unwind. Shallow-read workers inherit the operation's
+policy without changing concurrent callers.
+
 ### Source connector intake
 
 The three `*_source_*` operations are how a host composes an external source

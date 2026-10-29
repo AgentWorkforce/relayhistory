@@ -47,8 +47,16 @@ test('defaultDbPath follows native environment precedence', () => {
 test('resumeCommand preserves source and project-aware commands', () => {
   assert.equal(resumeCommand({ source: 'claude', sessionId: 's1', project: '/work/app', locations: [] }), 'cd /work/app && claude --resume s1');
   assert.equal(resumeCommand({ source: 'codex', sessionId: 's2', project: null, locations: ['local'] }), 'codex resume s2');
+  assert.equal(resumeCommand({ source: 'codex', sessionId: 's2', project: '/moved/project', locations: ['local'] }), 'codex resume s2');
   assert.equal(resumeCommand({ source: 'cursor', sessionId: 's3', project: '/work/app', locations: ['local', 'remote'] }), 'cd /work/app && cursor-agent --resume=s3');
   assert.equal(resumeCommand({ source: 'grok', sessionId: 's4', project: null, locations: ['remote'] }), null);
   assert.equal(resumeCommand({ source: 'opencode', sessionId: 's5', project: null, locations: ['local'] }), null);
   assert.equal(resumeCommand({ source: 'muse', sessionId: 's6', project: '/work/app', locations: ['local'] }), 'cd /work/app && muse resume s6');
+});
+
+test('resumeCommand uses Rust-compatible quoting for punctuation and apostrophes', () => {
+  assert.equal(
+    resumeCommand({ source: 'codex', sessionId: "a:b'c", project: '/irrelevant', locations: ['local'] }),
+    "codex resume 'a:b'\\''c'",
+  );
 });

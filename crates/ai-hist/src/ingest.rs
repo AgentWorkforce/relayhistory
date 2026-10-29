@@ -122,19 +122,15 @@ pub use tool_result_facts::{
     EVENT_SOURCE_TOOL_RESULT, STATUS_COMPLETED, STATUS_ERRORED, STATUS_UNKNOWN,
 };
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-/// When set, sync progress lines (`[claude] +N rows`, …) are suppressed. The
-/// in-process local sync API sets this to keep the embedding host's stdout
-/// available for its own output; the CLI leaves it false.
-static SYNC_QUIET: AtomicBool = AtomicBool::new(false);
+#[path = "ingest/output.rs"]
+pub(crate) mod output;
 
-/// `println!` for sync progress that honors [`SYNC_QUIET`].
+/// Progress output scoped to the current capture operation.
 macro_rules! sync_note {
     ($($arg:tt)*) => {
-        if !SYNC_QUIET.load(AtomicOrdering::Relaxed) {
-            println!($($arg)*);
-        }
+        $crate::ingest::output::note(format_args!($($arg)*))
     };
 }
 
@@ -180,7 +176,7 @@ pub(crate) use sweep_phases::SweepScope;
 /// This is the reusable engine entry point used by the N-API boundary. The
 /// command-line parser is intentionally not involved.
 pub fn sync_local_at(db_path: &Path) -> Result<bool> {
-    SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
+    let _output = output::Scope::enter(true);
     sync_exclusive(db_path)
 }
 
@@ -344,7 +340,7 @@ pub(crate) fn capture_files<T>(source: &'static str, files: Vec<T>) -> impl Iter
 #[cfg(test)]
 pub(crate) fn sync_local_at_with_home(db_path: &Path, home: &Path) -> Result<bool> {
     let roots = crate::ProviderRoots::from_env(home.to_path_buf());
-    SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
+    let _output = output::Scope::enter(true);
     sync_exclusive_with_roots(db_path, &roots, false).map(|tick| tick.attempted)
 }
 
@@ -375,10 +371,7 @@ pub fn sync_tick_at_with_roots(
     output: SyncOutput,
     force: bool,
 ) -> Result<SyncTick> {
-    SYNC_QUIET.store(
-        matches!(output, SyncOutput::Silent),
-        AtomicOrdering::Relaxed,
-    );
+    let _output = self::output::Scope::enter(matches!(output, SyncOutput::Silent));
     sync_exclusive_with_roots(db_path, roots, force)
 }
 
@@ -392,10 +385,7 @@ pub fn sync_tick_at(
     output: SyncOutput,
     force: bool,
 ) -> Result<SyncTick> {
-    SYNC_QUIET.store(
-        matches!(output, SyncOutput::Silent),
-        AtomicOrdering::Relaxed,
-    );
+    let _output = self::output::Scope::enter(matches!(output, SyncOutput::Silent));
     if scope == SessionScope::Remote {
         remote::ensure_selected_remote_connectors_configured_for_at(
             "sync",
@@ -421,7 +411,7 @@ pub fn sync_tick_at(
 /// through [`sources::SourceRegistry`] or an SDK host. Credentials alone never
 /// add a data source. Cached remote catalog reads remain available.
 pub fn sync_scoped_at(db_path: &Path, scope: SessionScope) -> Result<bool> {
-    SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
+    let _output = output::Scope::enter(true);
     sync_scope_exclusive(db_path, scope)
 }
 
@@ -436,7 +426,7 @@ pub fn sync_scoped_at_with_connectors(
     scope: SessionScope,
     connectors: &remote::SourceConnectorSelection,
 ) -> Result<bool> {
-    SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
+    let _output = output::Scope::enter(true);
     sync_scope_with_connectors(db_path, scope, connectors)
 }
 
@@ -455,10 +445,7 @@ pub fn sync_scoped_at_with_output(
     connectors: &remote::SourceConnectorSelection,
     output: SyncOutput,
 ) -> Result<bool> {
-    SYNC_QUIET.store(
-        matches!(output, SyncOutput::Silent),
-        AtomicOrdering::Relaxed,
-    );
+    let _output = self::output::Scope::enter(matches!(output, SyncOutput::Silent));
     sync_scope_with_connectors(db_path, scope, connectors)
 }
 
@@ -467,10 +454,7 @@ pub fn sync_scoped_at_with_output(
 /// `source_path` is named outright, so it is the only database read — its
 /// channel siblings are not. [`sync_opencode_with_roots`] reads them.
 pub fn sync_opencode_at(db_path: &Path, source_path: &Path, output: SyncOutput) -> Result<bool> {
-    SYNC_QUIET.store(
-        matches!(output, SyncOutput::Silent),
-        AtomicOrdering::Relaxed,
-    );
+    let _output = self::output::Scope::enter(matches!(output, SyncOutput::Silent));
     sync_opencode_exclusive(db_path, source_path, true, &default_opencode_storage_dir())
 }
 
@@ -482,10 +466,7 @@ pub fn sync_opencode_with_roots(
     roots: &crate::ProviderRoots,
     output: SyncOutput,
 ) -> Result<bool> {
-    SYNC_QUIET.store(
-        matches!(output, SyncOutput::Silent),
-        AtomicOrdering::Relaxed,
-    );
+    let _output = self::output::Scope::enter(matches!(output, SyncOutput::Silent));
     sync_opencode_exclusive(
         db_path,
         &roots.opencode_db,
@@ -519,8 +500,8 @@ fn sync_scope_with_connectors(
 
 /// Remote acquisition stub for scoped sync.
 ///
-/// Local scope never reaches this function. `all` scope skips quietly when no
-/// connector is configured; an explicit `remote` request bails
+/// Local scope never reaches this function. `all` scope skips remote acquisition;
+/// an explicit `remote` request bails
 /// `CONNECTOR_NOT_CONFIGURED` because remote acquisition requires an
 /// explicitly registered source plugin composed through the SDK host.
 fn sync_remote_connectors(
@@ -2742,10 +2723,9 @@ fn refresh_project_identity_after_sync(conn: &Connection) {
 /// Synchronize local providers, or read the current snapshot when another sync owns the lock.
 /// The boolean reports that synchronization was skipped. No destination or credentials are read.
 pub fn prepare_local_sync_snapshot(db_path: &Path) -> Result<(Connection, bool)> {
-    SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
+    let _output = output::Scope::enter(true);
     let Some(sync_lock) = try_acquire_sync_lock(db_path)? else {
-        // Pushing already-indexed rows only reads SQLite and remains useful while another
-        // process scans. A read-only connection avoids joining the writer contention.
+        // Cached reads remain useful while another process scans. A read-only connection avoids joining the writer contention.
         let conn = open_db_readonly(db_path).with_context(|| {
             format!(
                 "another sync owns the lock and no readable database is available at {}",
@@ -10752,16 +10732,6 @@ fn heal_claude_synthetic_session_summaries(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// The per-message facts a provider records on the envelope rather than in the
-/// message body, carried verbatim from the parser to the row.
-///
-/// These are the facts consumers need and normalization would otherwise read
-/// past: which API request a turn belongs to (`request_id`), why the model
-/// stopped — and, by its absence, that it has not yet (`stop_reason`), which
-/// harness build produced it (`agent_version`), whether the row is delegated or
-/// injected rather than human (`is_sidechain` / `is_meta`), and which Codex
-/// turn it falls inside (`turn_id`). Every field is optional and stored as the
-/// provider wrote it: relayhistory preserves, consumers map.
 /// The generation of raw-fact parsing the local parser stamps on every event
 /// it writes.
 ///
@@ -10784,6 +10754,16 @@ fn heal_claude_synthetic_session_summaries(conn: &Connection) -> Result<()> {
 /// finished transcript never changes on disk, so only this re-read stores it.
 const RAW_MESSAGE_FACTS_VERSION: i64 = 5;
 
+/// The per-message facts a provider records on the envelope rather than in the
+/// message body, carried verbatim from the parser to the row.
+///
+/// These are the facts consumers need and normalization would otherwise read
+/// past: which API request a turn belongs to (`request_id`), why the model
+/// stopped — and, by its absence, that it has not yet (`stop_reason`), which
+/// harness build produced it (`agent_version`), whether the row is delegated or
+/// injected rather than human (`is_sidechain` / `is_meta`), and which Codex
+/// turn it falls inside (`turn_id`). Every field is optional and stored as the
+/// provider wrote it: relayhistory preserves, consumers map.
 #[derive(Debug, Default, Clone, Copy)]
 struct RawMessageFacts<'a> {
     request_id: Option<&'a str>,
@@ -35845,7 +35825,7 @@ mod tests {
         .unwrap();
 
         let sweep = || {
-            SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
+            let _output = output::Scope::enter(true);
             let tick = sync_exclusive_with_home(&db_path, home.path(), true).unwrap();
             assert!(tick.attempted && tick.swept);
         };
@@ -38736,7 +38716,7 @@ mod post_sweep_checkpoint_tests {
         claude_transcript(home.path(), "checkpoint-a", 20..40);
         let reader = pin_reader(&db_path);
 
-        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let writer_stop = stop.clone();
         let writer_path = db_path.clone();
         let writer = std::thread::spawn(move || {

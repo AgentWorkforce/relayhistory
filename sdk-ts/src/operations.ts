@@ -1281,11 +1281,13 @@ export function resumeCommand(
     if (entry.source === 'muse') return `muse resume ${shellQuote(entry.sessionId)}`;
     return null;
   })();
-  return resume && entry.project ? `cd ${shellQuote(entry.project)} && ${resume}` : resume;
+  return resume && entry.project && entry.source !== 'codex'
+    ? `cd ${shellQuote(entry.project)} && ${resume}`
+    : resume;
 }
 
 function shellQuote(value: string): string {
-  return /^[A-Za-z0-9._:/-]+$/.test(value) ? value : `'${value.replace(/'/g, `'"'"'`)}'`;
+  return /^[A-Za-z0-9._/-]+$/.test(value) ? value : `'${value.replace(/'/g, "'\\''")}'`;
 }
 
 function preserveStorageFailure(error: unknown): void {

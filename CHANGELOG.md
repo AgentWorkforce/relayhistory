@@ -23,6 +23,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - SDK, CLI and MCP event reads preserve provider-native record types, API message IDs and request spans.
 - Retained matching remote evidence survives retirement of its direct local source, without allowing conflicting snapshots to replace local evidence.
 - Repeated DeepAgents prompts with equal text and timestamps retain separate history rows through export and remote intake, using stable native event identity.
+- Capture operations restore their output policy on return and unwind, and concurrent quiet calls no longer silence progress in other threads.
+- Codex resume commands in the TypeScript SDK no longer depend on the recorded project directory, matching Rust CLI behavior.
 - Selected Codex SQLite sessions report an unavailable source when their backing stores disappear, and fallback diagnostics honor quiet mode.
 
 ### Rust API

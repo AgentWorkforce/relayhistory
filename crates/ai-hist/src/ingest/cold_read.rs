@@ -726,7 +726,7 @@ mod tests {
             home.path().to_path_buf(),
             home.path().join(".local/share/opencode/opencode.db"),
         );
-        super::super::SYNC_QUIET.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _output = super::super::output::Scope::enter(true);
         super::super::sync_exclusive_with_roots(&db, &roots, false).unwrap();
 
         let conn = crate::open_db(&db).unwrap();

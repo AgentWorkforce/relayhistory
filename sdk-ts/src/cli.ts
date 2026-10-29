@@ -363,15 +363,15 @@ const USAGE_TEXT = `Usage:
   ai-hist sessions edits SOURCE SESSION_ID [--limit N] [--after JSON] [--db PATH] [--json]
   ai-hist sessions markers SOURCE SESSION_ID [--limit N] [--after JSON] [--db PATH] [--json]
   ai-hist sessions usage SOURCE SESSION_ID [--db PATH] [--json]
-  ai-hist search QUERY... [--local | --remote | --all] [--source SOURCE] [--project PATH] [--role all|user|assistant|prompt] [--fts] [--since-ms MS] [--until-ms MS] [--after JSON] [--limit N] [--json]
+  ai-hist search QUERY... [--local | --remote | --all] [--source SOURCE] [--project PATH] [--role all|user|assistant|prompt] [--fts] [--since-ms MS] [--until-ms MS] [--after JSON] [--limit N] [--tag TAG] [--db PATH] [--json]
   ai-hist recent [N] [--local | --remote | --all] [--source SOURCE] [--project PATH] [--since-ms MS] [--until-ms MS] [--after JSON] [--json]
   ai-hist session SESSION_ID [--source SOURCE] [--json]
   ai-hist events SESSION_ID [--source SOURCE] [--limit N] [--after JSON] [--json]
   ai-hist resume QUERY... [--local | --remote | --all] [--db PATH] [--fts] [--json]
   ai-hist pack QUERY... [--local | --remote | --all] [--source SOURCE] [--project PATH] [--tag TAG] [--limit N] [--tokens N] [--db PATH] [--fts] [--json]
-  ai-hist stats [--local | --remote | --all] [--json]
+  ai-hist stats [--local | --remote | --all] [--by-cwd] [--tag TAG] [--db PATH] [--json]
   ai-hist export --selection FILE [--out FILE] [--db PATH]
-  ai-hist sync [--local | --remote | --all] [--source-connector ID | --no-source-connectors] [--acquisition-timeout-ms N] [--db PATH] [--json]
+  ai-hist sync [--local | --remote | --all] [--config PATH] [--source-connector ID | --no-source-connectors] [--acquisition-timeout-ms N] [--db PATH] [--json]
 
 Every command that reads local history indexes it on first use; pass
 --no-bootstrap to answer from the store exactly as it stands.

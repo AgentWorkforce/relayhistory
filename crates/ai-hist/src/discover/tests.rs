@@ -4417,6 +4417,7 @@ fn captured_files_keep_zero_discovery_opens_beside_parallel_uncached_reads() {
             catalog: Option<&Connection>,
             candidate: &Candidate,
         ) -> Result<Option<ShallowSession>> {
+            assert!(crate::ingest::output::quiet(), "worker lost parent output policy");
             if std::thread::current().id() == self.caller {
                 self.owner_reads.fetch_add(1, Ordering::SeqCst);
             } else {
@@ -4425,6 +4426,7 @@ fn captured_files_keep_zero_discovery_opens_beside_parallel_uncached_reads() {
             CodexProvider::default().read_shallow(scan, catalog, candidate)
         }
     }
+    let _output = crate::ingest::output::Scope::enter(true);
     let conn = catalog();
     let home = tempfile::tempdir().unwrap();
     let _capture = crate::ingest::cold_read::begin_sweep();
