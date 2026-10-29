@@ -302,7 +302,7 @@ fn bounded_native_export_remote_intake_and_local_deletion_preserve_evidence() {
         .session(&reference, SessionQuery::default())
         .unwrap()
         .unwrap();
-    assert_eq!(imported.messages.len(), original.messages.len());
+    assert_eq!(imported.messages, original.messages);
     assert_eq!(imported.tool_calls, original.tool_calls);
     assert_eq!(imported.tool_results, original.tool_results);
     #[cfg(feature = "unstable-internal")]
@@ -327,29 +327,47 @@ fn bounded_native_export_remote_intake_and_local_deletion_preserve_evidence() {
     receiver
         .discover(DiscoveryOptions::default().sources([Source::DeepAgents]))
         .unwrap();
-    // Shared order has no durable native ordinal yet (#532); a local replay
-    // may reject it, but must leave the remote snapshot intact.
-    if let Err(error) = receiver.hydrate(&reference, HydrateOptions::default()) {
-        assert!(format!("{error:#}").contains("FILE_HISTORY_SHARED_ORDER_CONFLICT"));
-    }
+    receiver
+        .hydrate(&reference, HydrateOptions::default())
+        .unwrap();
     let db = rusqlite::Connection::open(&native).unwrap();
     db.execute("INSERT INTO writes (thread_id,checkpoint_ns,checkpoint_id,task_id,task_path,idx,channel,type,value) SELECT thread_id,checkpoint_ns,checkpoint_id,'zz-remote-append','',idx+10,channel,type,(SELECT value FROM writes WHERE thread_id LIKE '%446' AND channel='messages' ORDER BY checkpoint_id LIMIT 1) FROM writes WHERE thread_id LIKE '%443' LIMIT 1", []).unwrap();
     drop(db);
-    if let Err(error) = receiver.hydrate(&reference, HydrateOptions::default()) {
-        assert!(format!("{error:#}").contains("FILE_HISTORY_SHARED_ORDER_CONFLICT"));
-    }
+    receiver
+        .hydrate(&reference, HydrateOptions::default())
+        .unwrap();
     let before_delete = receiver
         .session(&reference, SessionQuery::default())
         .unwrap()
         .unwrap();
-    assert!(before_delete.messages.len() >= imported.messages.len());
+    assert_eq!(before_delete.messages.len(), imported.messages.len() + 1);
+    assert_eq!(
+        &before_delete.messages[..imported.messages.len()],
+        imported.messages.as_slice(),
+        "local replay preserves every imported message and its recorded order"
+    );
+    let local_append = before_delete.messages.last().unwrap();
+    assert_eq!(local_append.message_id.as_deref(), Some("graph-human-0"));
+    assert_eq!(local_append.role, Role::User);
+    assert_eq!(
+        local_append.blocks[0].text.as_deref(),
+        Some("Actual DeltaChannel prompt 0")
+    );
     std::fs::remove_file(&native).unwrap();
     receiver.sync(SyncOptions::default().force(true)).unwrap();
     let retained = receiver
         .session(&reference, SessionQuery::default())
         .unwrap()
         .unwrap();
-    assert_eq!(retained.messages.len(), before_delete.messages.len());
+    assert_eq!(
+        retained.messages, imported.messages,
+        "only remote-backed messages survive authoritative native deletion"
+    );
+    assert_eq!(retained.prompts, imported.prompts);
+    assert!(retained
+        .messages
+        .iter()
+        .all(|message| message.message_id.as_deref() != Some("graph-human-0")));
     assert_eq!(retained.tool_calls, imported.tool_calls);
     assert_eq!(retained.tool_results, imported.tool_results);
 }

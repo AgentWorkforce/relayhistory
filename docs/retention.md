@@ -36,8 +36,9 @@ space for that rewrite.
 
 The SDK uses `maintainRetention({ days, apply, allowUnuploaded, maxRows,
 dbPath })` and `compactDatabase({ dbPath })`. These operations delegate to the
-same Rust `SessionStore` APIs described below. They do not introduce a second
-retention implementation.
+same Rust maintenance and compaction engines described below. Compaction checks
+the sync lock and free space before opening a writable store or migrating it.
+They do not introduce a second retention implementation.
 
 ## Policy and desktop integration
 

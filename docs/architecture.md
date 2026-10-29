@@ -74,6 +74,13 @@ and the facade instead of adding another typed native function. The typed
 `getSessionRequestsPage` / `getSessionUsage` / `getSessionUserTurnsPage`
 exports stay for compatibility until a later major.
 
+The dispatcher also exposes `retention` and `compact` for explicit operator
+maintenance. Retention previews use the core read-only policy helpers, so they
+neither create nor migrate a database; an explicit apply uses `SessionStore`
+for one bounded maintenance batch. Compaction calls the core compaction engine
+directly to preserve its lock and disk-space checks before any writable open.
+See [retention controls](retention.md) for their CLI and SDK options.
+
 ## Session sourcing ownership
 
 RelayHistory is the single owner of acquiring, parsing and storing session

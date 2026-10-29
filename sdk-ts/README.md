@@ -150,6 +150,15 @@ JavaScript numbers may round. Invalid stored JSON remains in the optional `rawAr
 `rawStructuredPatch`, `rawPayload` and `rawUsage` strings. Usage is reported
 by the provider, with the same safe-counter checks as the paged SDK reads.
 
+## Retention and compaction
+
+`maintainRetention({ dbPath, days: 30 })` previews policy without creating or
+changing the store. Set `apply: true` to save the policy and run one bounded
+maintenance batch. Upload acknowledgement protection remains enabled unless
+`allowUnuploaded: true` is also supplied. `compactDatabase({ dbPath })` returns
+unused SQLite space to the filesystem. See the [retention guide](../docs/retention.md)
+for CLI commands, batch limits and recovery behavior.
+
 ## Session topology
 
 Sessions that delegate to subagents form a tree, and it is queryable:
