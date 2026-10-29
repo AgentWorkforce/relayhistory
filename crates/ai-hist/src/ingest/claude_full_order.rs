@@ -143,6 +143,99 @@ mod tests {
         assert!(cursor.claude.is_none());
     }
     #[test]
+    fn complete_claude_reread_reserves_surviving_local_ranks_for_valid_export() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("native-claude.jsonl");
+        fs::write(&path, text(&["a", "c", "b"])).unwrap();
+        let conn = crate::open_db(&home.path().join("ledger.db")).unwrap();
+        ingest_claude_transcript_as(&conn, &path, None).unwrap();
+        let before = rows(&conn);
+        let survivor = || {
+            conn.query_row("SELECT id,source_order,revision FROM session_events WHERE source='claude' AND event_uid='c:0'", [], |row| Ok((row.get::<_,i64>(0)?,row.get::<_,i64>(1)?,row.get::<_,i64>(2)?))).unwrap()
+        };
+        let preserved = survivor();
+        fs::write(&path, text(&["b", "a"])).unwrap();
+        ingest_claude_transcript_as(&conn, &path, None).unwrap();
+        assert_eq!(
+            rows(&conn),
+            before,
+            "the full Claude parser retains the omitted local event"
+        );
+        assert_eq!(
+            survivor(),
+            preserved,
+            "an unobserved survivor keeps its ID, rank and revision"
+        );
+        let key = crate::observations::ObservationKey {
+            source: "claude".into(),
+            session_id: "native-claude".into(),
+            location: crate::SessionLocation::Remote,
+            connector_id: "rank-roundtrip".into(),
+            connector_instance: "default".into(),
+        };
+        let kinds = [crate::EvidenceKind::SessionEvent];
+        let mut exported =
+            crate::source_evidence::read_session(&conn, "claude", "native-claude", &kinds).unwrap();
+        crate::source_evidence::validate_records(&key, &kinds, &mut exported).unwrap();
+        let remote = crate::SessionStore::open(
+            crate::StoreOptions::default().db_path(home.path().join("remote.db")),
+        )
+        .unwrap();
+        remote
+            .apply_source_observations(crate::SourceObservationBatch::new(
+                "rank-roundtrip",
+                "default",
+                crate::SessionLocation::Remote,
+                vec![crate::SourceObservation {
+                    session: crate::ShallowSession {
+                        source: "claude".into(),
+                        session_id: "native-claude".into(),
+                        source_stamp: Some("native".into()),
+                        ..Default::default()
+                    },
+                    raw_locator: Some("native-export".into()),
+                }],
+            ))
+            .unwrap();
+        let revision = remote.source_observation(&key).unwrap().revision.unwrap();
+        remote
+            .apply_source_evidence(
+                crate::SourceEvidenceSubmission::new(
+                    key,
+                    revision,
+                    crate::NormalizedSourceEvidence {
+                        source_stamp: "native".into(),
+                        source_bytes: 0,
+                        covered_kinds: kinds.to_vec(),
+                        records: exported,
+                    },
+                )
+                .include_related(false),
+            )
+            .unwrap();
+        let restored = crate::open_db(remote.db_path()).unwrap();
+        let restored_ids: Vec<String> =
+            crate::session_events(&restored, "native-claude", Some("claude"))
+                .unwrap()
+                .into_iter()
+                .map(|event| event.event_uid)
+                .collect();
+        assert_eq!(restored_ids, ["b:0", "c:0", "a:0"]);
+
+        assert_eq!(
+            order(&conn),
+            vec![
+                ("b:0".into(), Some(0)),
+                ("c:0".into(), Some(1)),
+                ("a:0".into(), Some(2))
+            ]
+        );
+        let stable = revisions(&conn);
+        ingest_claude_transcript_as(&conn, &path, None).unwrap();
+        assert_eq!(revisions(&conn), stable);
+    }
+
+    #[test]
     fn complete_grok_session_reread_enriches_legacy_order_without_row_replacement() {
         let home = tempfile::tempdir().unwrap();
         let dir = home.path().join(".grok/sessions/project/native-grok");
