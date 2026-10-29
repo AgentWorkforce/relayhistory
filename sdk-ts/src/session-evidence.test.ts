@@ -821,3 +821,20 @@ test('SDK history and evidence keep equal-time repeated native prompts distinct'
     assert.deepEqual(evidence?.prompts.filter((row) => row.eventUid !== null).map((row) => row.eventUid).sort(), ['native-prompt-1', 'native-prompt-2']);
   } finally { await cleanup(); }
 });
+
+
+test('full session evidence describes uncatalogued delegated children', { skip: needsNodeSqlite }, async () => {
+  const { getSessionEvidence } = await import('./index.js');
+  const { dbPath, cleanup } = await seededDatabase();
+  try {
+    const db = new sqlite!.DatabaseSync(dbPath);
+    try {
+      db.prepare("INSERT INTO session_events(source,session_id,event_uid,role,kind,ts_ms,text) VALUES ('claude','delegated-child','child:1','assistant','text',1,'child evidence')").run();
+      db.prepare("INSERT INTO session_relationships(source,parent_session_id,relationship_uid,child_session_id,relationship,identity_status,evidence_kind,created_ms,updated_ms) VALUES ('claude',?,'child-edge','delegated-child','delegated','observed','test',1,1)").run(SHARED_SESSION);
+    } finally { db.close(); }
+    const evidence = await getSessionEvidence('claude', 'delegated-child', { dbPath });
+    assert.equal(evidence?.session.discoveryState, 'delegated');
+    assert.equal(evidence?.messages[0]?.blocks[0]?.text, 'child evidence');
+    assert.equal(evidence?.relationships[0]?.side, 'child');
+  } finally { await cleanup(); }
+});

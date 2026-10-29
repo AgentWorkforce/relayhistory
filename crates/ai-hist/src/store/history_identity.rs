@@ -13,7 +13,7 @@ pub(super) fn migrate(conn: &Connection) -> Result<()> {
         return Ok(());
     }
     let sql: String = conn.query_row(
-        "SELECT sql FROM sqlite_master WHERE name='history'",
+        "SELECT sql FROM sqlite_master WHERE name='history' COLLATE NOCASE",
         [],
         |r| r.get(0),
     )?;
@@ -39,13 +39,14 @@ fn legacy_constraint(sql: &str) -> Option<std::ops::Range<usize>> {
         .map(|(_, c)| c.to_ascii_lowercase())
         .collect::<String>();
     let target = "unique(source,timestamp_ms,prompt)";
-    let start = normalized.find(target)?;
-    // The searched ASCII constraint has one normalized character per byte.
+    let byte_start = normalized.find(target)?;
+    let start = normalized[..byte_start].chars().count();
+    // The constraint is ASCII; preceding SQL may contain multibyte text.
     Some(positions[start].0..positions[start + target.len() - 1].0 + 1)
 }
 
 fn rebuild(conn: &Connection, sql: &str, range: std::ops::Range<usize>) -> Result<()> {
-    let objects: Vec<String> = conn.prepare("SELECT sql FROM sqlite_master WHERE tbl_name='history' AND sql IS NOT NULL AND type IN ('trigger','index') AND name NOT LIKE 'change_feed_%' ORDER BY type")?
+    let objects: Vec<String> = conn.prepare("SELECT sql FROM sqlite_master WHERE tbl_name='history' COLLATE NOCASE AND sql IS NOT NULL AND type IN ('trigger','index') AND name NOT LIKE 'change_feed_%' ORDER BY type")?
         .query_map([], |r| r.get(0))?.collect::<rusqlite::Result<_>>()?;
     let columns: Vec<String> = conn
         .prepare("PRAGMA table_info(history)")?
@@ -53,14 +54,17 @@ fn rebuild(conn: &Connection, sql: &str, range: std::ops::Range<usize>) -> Resul
         .collect::<rusqlite::Result<_>>()?;
     let columns = columns
         .iter()
-        .map(|c| format!("\"{c}\""))
+        .map(|c| format!("\"{}\"", c.replace('"', "\"\"")))
         .collect::<Vec<_>>()
         .join(",");
     let mut ddl = sql.to_owned();
     ddl.replace_range(range,"CHECK(event_uid IS NULL OR (length(event_uid)>0 AND session_id IS NOT NULL AND length(session_id)>0))");
-    let ddl = ddl.replacen("history", "history_identity_rebuild", 1);
+    let body = ddl
+        .find('(')
+        .ok_or_else(|| anyhow::anyhow!("history table has no column definition"))?;
+    let ddl = format!("CREATE TABLE history_identity_rebuild {}", &ddl[body..]);
     let sequence: i64 = conn.query_row(
-        "SELECT coalesce((SELECT seq FROM sqlite_sequence WHERE name='history'),0)",
+        "SELECT coalesce((SELECT seq FROM sqlite_sequence WHERE name='history' COLLATE NOCASE),0)",
         [],
         |r| r.get(0),
     )?;
@@ -73,7 +77,7 @@ fn rebuild(conn: &Connection, sql: &str, range: std::ops::Range<usize>) -> Resul
     conn.pragma_update(None, "legacy_alter_table", legacy)?;
     renamed?;
     conn.execute(
-        "UPDATE sqlite_sequence SET seq=max(seq,?1) WHERE name='history'",
+        "UPDATE sqlite_sequence SET seq=max(seq,?1) WHERE name='history' COLLATE NOCASE",
         [sequence],
     )?;
     for object in objects {

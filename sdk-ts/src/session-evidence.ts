@@ -26,7 +26,7 @@ export interface EvidenceSession {
   projectKeyMethod: string | null;
   rawPath: string | null;
   sourceStamp: string | null;
-  discoveryState: 'shallow' | 'full';
+  discoveryState: 'shallow' | 'full' | 'delegated';
   locations: Array<string>;
 }
 

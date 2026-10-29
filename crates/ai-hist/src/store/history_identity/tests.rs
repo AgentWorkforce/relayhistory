@@ -269,3 +269,44 @@ fn a_legacy_owned_snapshot_keeps_its_identity_and_can_withdraw_after_migration()
         0
     );
 }
+
+#[test]
+fn migration_preserves_unicode_defaults_and_quoted_extension_columns() {
+    let conn = Connection::open_in_memory().unwrap();
+    conn.execute_batch(r#"
+        CREATE TABLE schema_migrations(name TEXT PRIMARY KEY);
+        CREATE TABLE "HISTORY" (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL,
+            session_id TEXT, event_uid TEXT, timestamp_ms INTEGER NOT NULL,
+            prompt TEXT NOT NULL, "note""extra" TEXT DEFAULT 'é',
+            UNIQUE(source, timestamp_ms, prompt)
+        );
+        INSERT INTO HISTORY(source,session_id,timestamp_ms,prompt) VALUES('deepagents','s',1,'retry');
+        UPDATE sqlite_sequence SET seq=100 WHERE name='HISTORY';
+    "#).unwrap();
+    migrate(&conn).unwrap();
+    assert_eq!(
+        conn.query_row(r#"SELECT "note""extra" FROM history"#, [], |row| row
+            .get::<_, String>(0))
+            .unwrap(),
+        "é"
+    );
+    for uid in ["one", "two"] {
+        conn.execute("INSERT INTO history(source,session_id,event_uid,timestamp_ms,prompt) VALUES('deepagents','s',?1,1,'retry')", [uid]).unwrap();
+    }
+    assert_eq!(
+        conn.query_row("SELECT count(*) FROM history", [], |row| row
+            .get::<_, i64>(0))
+            .unwrap(),
+        3
+    );
+    assert_eq!(
+        conn.query_row(
+            "SELECT min(id) FROM history WHERE event_uid IS NOT NULL",
+            [],
+            |row| row.get::<_, i64>(0)
+        )
+        .unwrap(),
+        101
+    );
+}
