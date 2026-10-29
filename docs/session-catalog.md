@@ -966,6 +966,20 @@ How each adapter works:
   `SyncOptions::codex_sqlite_max_age_days`, and processes can set
   `AI_HIST_CODEX_SQLITE_MAX_AGE_DAYS` (`0` disables the cutoff).
 
+  A changed SQLite projection replaces its SQLite-owned evidence, even while a
+  shorter rollout is growing. Checking only the item-id set would miss rewritten
+  text, tool results and order under the same ids. This favors correct replacement
+  over stable SQLite row ids: consumers use native evidence identities, and should
+  expect change-feed activity when the projection changes. Selected hydration of
+  a catalogued `sqlite:` locator reports `SESSION_SOURCE_UNAVAILABLE` if its store
+  pair has disappeared.
+
+  Related restored rollouts are fully hashed once per unique child in each
+  related-thread scan. That read is needed to detect a rewrite that preserves both
+  file size and mtime; the current path has no trusted filesystem generation that
+  would make a metadata-only cache equivalent. Large child rollouts can therefore
+  make repeated parent hydration expensive.
+
   A rollout is a **delegated child thread** exactly when its `session_meta`
   carries a subagent marker (`thread_source` `subagent` or `guardian_review`,
   or the object form of `source.subagent`) *and* names a parent thread

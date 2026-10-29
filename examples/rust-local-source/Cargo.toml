@@ -1,0 +1,16 @@
+# Standalone path consumer: no release-version synchronization is needed.
+[package]
+name = "relayhistory-rust-local-source"
+version = "0.0.0"
+edition = "2021"
+publish = false
+rust-version = "1.88"
+
+[workspace]
+
+[dependencies]
+ai-hist = { path = "../../crates/ai-hist" }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tempfile = "3"

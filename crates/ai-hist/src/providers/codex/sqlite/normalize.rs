@@ -3,6 +3,11 @@ use super::*;
 use crate::ingest::{ToolResultFacts, ToolResultIndexer};
 use sha2::{Digest, Sha256};
 
+// Legacy rollouts lack native message IDs and may record the event a few seconds
+// apart from the SQLite projection. Keep the compatibility window bounded to
+// five seconds; exact text, role and one-to-one overlap markers also must match.
+const IDLESS_ROLLOUT_TIMESTAMP_TOLERANCE_MS: i64 = 5_000;
+
 fn content_hash(capture: &Capture) -> Result<String> {
     let t = &capture.thread;
     let content = json!({
@@ -171,13 +176,13 @@ fn event(
             .query_row(
                 "SELECT event_uid FROM session_events WHERE source='codex' AND session_id=?1 \
                  AND role=?2 AND kind='text' AND raw_kind IS NULL AND text=?3 \
-                 AND ABS(ts_ms - ?4) <= 5000 \
+                 AND ABS(ts_ms - ?4) <= ?5 \
                  AND NOT EXISTS (SELECT 1 FROM session_markers AS marker \
                    WHERE marker.source='codex' AND marker.session_id=?1 \
                    AND marker.marker_uid LIKE 'sqlite:overlap:%' \
                    AND json_extract(marker.payload_json, '$.rollout_event_uid')=session_events.event_uid) \
                  ORDER BY ABS(ts_ms - ?4), id LIMIT 1",
-                params![t.id, role, text, item.ts],
+                params![t.id, role, text, item.ts, IDLESS_ROLLOUT_TIMESTAMP_TOLERANCE_MS],
                 |row| row.get(0),
             )
             .optional()?;
