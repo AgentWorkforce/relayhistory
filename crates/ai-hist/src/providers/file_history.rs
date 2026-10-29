@@ -101,7 +101,9 @@ pub(crate) fn retire_with_prompts(
 // Reconcile after local shares retire: surviving remote events in this session
 // and other sessions still support prompt rows. Compare complete ordered user
 // text projections, and prefer the existing owner when its evidence survives.
-// A control row (harness-written user text) never supports a prompt.
+// Only anonymous rows may be handed to another session by text/time. An
+// identified row requires its own session/event reference; a control row
+// (harness-written user text) never supports either kind of prompt.
 pub(crate) fn reconcile_prompts(
     conn: &Connection,
     source: &str,
@@ -114,6 +116,7 @@ pub(crate) fn reconcile_prompts(
     let reference = "SELECT e.session_id FROM session_events e \
         WHERE +e.source = ?1 AND e.role = 'user' \
           AND e.kind = 'text' AND e.control_kind IS NULL AND e.ts_ms = history.timestamp_ms \
+          AND (history.event_uid IS NULL OR (e.session_id = history.session_id AND e.event_uid = history.event_uid)) \
         GROUP BY e.session_id, e.message_id \
         HAVING (SELECT group_concat(text, char(10)) FROM \
           (SELECT text FROM session_events b WHERE b.source = ?1 \
@@ -126,11 +129,11 @@ pub(crate) fn reconcile_prompts(
     // project projection even when INSERT OR IGNORE saw the same prompt again.
     conn.execute(&format!("UPDATE history SET project = ({project}) WHERE source = ?1 AND session_id = ?2 AND EXISTS ({reference}) AND project IS NOT ({project})"), [source, sid])?;
     conn.execute(&format!("UPDATE history SET project = ({project}), session_id = ({reference}) \
-        WHERE source = ?1 AND session_id = ?2 \
+        WHERE source = ?1 AND session_id = ?2 AND event_uid IS NULL \
         AND (timestamp_ms || ':' || coalesce(prompt_hash, '')) NOT IN (SELECT value FROM json_each(?3)) \
         AND EXISTS ({reference}) AND session_id IS NOT ({reference})"), rusqlite::params![source, sid, keep])?;
     conn.execute(&format!("DELETE FROM history WHERE source = ?1 AND session_id = ?2 \
-        AND (timestamp_ms || ':' || coalesce(prompt_hash, '')) NOT IN (SELECT value FROM json_each(?3)) \
+        AND (event_uid IS NOT NULL OR (timestamp_ms || ':' || coalesce(prompt_hash, '')) NOT IN (SELECT value FROM json_each(?3))) \
         AND NOT EXISTS ({reference})"), rusqlite::params![source, sid, keep])?;
     Ok(())
 }
