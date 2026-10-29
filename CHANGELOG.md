@@ -13,7 +13,6 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - `getSessionEvidence` reads a complete stored session snapshot with evidence-kind selection, optional transcript omission, provider identities and usage.
-
 - The CLI and SDK expose retention policy previews, explicitly applied bounded pruning with upload protection, and database compaction for reclaiming free space.
 
 ### Changed
@@ -28,12 +27,17 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Capture operations restore their output policy on return and unwind, and concurrent quiet calls no longer silence progress in other threads.
 - Codex resume commands in the TypeScript SDK no longer depend on the recorded project directory, matching Rust CLI behavior.
 - Session export and source intake preserve recorded same-timestamp event order through replay, rewrites and later local hydration; conflicting retained order rolls back atomically.
-- Selected Codex SQLite sessions report an unavailable source when their backing stores disappear, and fallback diagnostics honor quiet mode.
 
 ### Rust API
 
 - Added optional `HistoryEntry::event_uid` and `Prompt::event_uid`; callers constructing `HistoryEntry` literals must supply the field (`None` for anonymous prompt logs).
 - Added nullable `Block::source_order`; session evidence contract 5 orders events by recorded source position and resolves existing event cursors through stable row identity.
+
+## [0.53.1] - 2026-10-29
+
+### Fixed
+
+- Selected Codex SQLite sessions report an unavailable source when their backing stores disappear, and fallback diagnostics honor quiet mode.
 
 ## [0.53.0] - 2026-10-28
 
@@ -1225,7 +1229,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - The SDK reads provider JSONL natively and works without the Python CLI.
 
-[Unreleased]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.53.0...HEAD
+[Unreleased]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.53.1...HEAD
+[0.53.1]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.53.0...sdk-ts-v0.53.1
 [0.53.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.52.0...sdk-ts-v0.53.0
 [0.52.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.51.0...sdk-ts-v0.52.0
 [0.51.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.50.1...sdk-ts-v0.51.0
