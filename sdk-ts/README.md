@@ -92,7 +92,7 @@ explicit plugin modules/options; `--source-connector` selects their IDs and is
 repeatable. `--no-source-connectors` disables remote acquisition. MCP uses
 `AI_HIST_PLUGIN_CONFIG` and `source_connectors`. Scope defaults to local even
 with plugins configured. See [source plugins](../docs/source-plugins.md).
-Native contract 29 requires a matching addon, including current catalog and
+Native contract 30 requires a matching addon, including current catalog and
 source/delivery contracts.
 
 Catalog pages, discovery results, statistics, and sync results echo the requested `scope`,
@@ -105,7 +105,12 @@ than emitting a local CLI command; an empty `locations` array retains legacy
 local behavior for rows written before provenance tracking.
 
 The event primitive is page-based and uses `{ tsMs, id }` as a deterministic
-cursor. The `sessionEvents` async iterator walks pages without accumulating a
+cursor. Events with known `sourceOrder` follow recorded order within each
+same-timestamp bucket; null means the provider order is unknown. Cursors resolve
+through stable row identity. If an ordered cursor row is removed, restart the
+read rather than guessing its old position. Source ranks outside JavaScript's
+safe integer range fail with `SOURCE_ORDER_NOT_REPRESENTABLE`.
+The `sessionEvents` async iterator walks pages without accumulating a
 large transcript. `getSessionEvents` is an explicit collecting convenience.
 
 Tool calls and file edits follow the same page / iterator / collect trio
@@ -125,6 +130,34 @@ becomes `null` while the raw string stays available as `argsJson` and
 `parseStoredJson(raw)` is that same parse, exported for callers that hold a raw
 stored string of their own: it returns the parsed value, or `null` for anything
 that is not a parseable string.
+
+## Full session evidence
+
+`getSessionEvidence(source, sessionId, { dbPath?, kinds?, includeText? })`
+reads all stored evidence on one database snapshot through the Rust
+`SessionStore` facade and returns `SessionEvidence | null`. It does not hydrate
+provider files or create a missing database. Omit `kinds` for all evidence,
+pass an empty array for metadata only, or select kinds such as `history` and
+`session_event`. `coverage` describes the provider's capabilities; `loaded`
+identifies what this query fetched.
+
+`includeText: false` omits transcript text and catalog excerpts while retaining
+prompt hashes and byte lengths. Tool arguments, patches, marker payloads and
+raw usage remain available; this option is not a general content scrubber.
+Provider JSON keys are preserved inside `args`, `structuredPatch`, `payload`
+and `usageSnapshot`. `rawUsageSnapshot` preserves exact snapshot counters that
+JavaScript numbers may round. Invalid stored JSON remains in the optional `rawArgs`,
+`rawStructuredPatch`, `rawPayload` and `rawUsage` strings. Usage is reported
+by the provider, with the same safe-counter checks as the paged SDK reads.
+
+## Retention and compaction
+
+`maintainRetention({ dbPath, days: 30 })` previews policy without creating or
+changing the store. Set `apply: true` to save the policy and run one bounded
+maintenance batch. Upload acknowledgement protection remains enabled unless
+`allowUnuploaded: true` is also supplied. `compactDatabase({ dbPath })` returns
+unused SQLite space to the filesystem. See the [retention guide](../docs/retention.md)
+for CLI commands, batch limits and recovery behavior.
 
 ## Session topology
 

@@ -94,6 +94,7 @@ impl Sink<'_> {
             return crate::insert_history(
                 self.conn,
                 &HistoryEntry {
+                    event_uid: None,
                     id: 0,
                     source: ID.into(),
                     session_id: Some(self.session.id.clone()),

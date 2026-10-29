@@ -109,6 +109,11 @@ sessions.
 
 ## Live capture
 
+The `watch`, `ingest --hook`, and `import --watch` commands below belong to the
+repository's Rust CLI, built with `cargo build -p ai-hist-cli`; invoke
+`target/debug/ai-hist` or put that binary on `PATH`. They are not commands in
+the npm CLI installed by `npm install -g ai-hist`.
+
 Provider transcripts do not live forever. Claude Code cleans up its JSONL
 files, so the window in which a session can still be captured losslessly is
 bounded — and anything that only learns about a session from a later sweep can

@@ -23,19 +23,19 @@ rust_roots = ["crates/ai-hist-cli/src", "crates/ai-hist-napi/src", "crates/ai-hi
 [baseline]
 
 [baseline.file_loc]
-"crates/ai-hist-cli/src/lib.rs" = 2777
-"crates/ai-hist-napi/src/lib.rs" = 2115
-"crates/ai-hist/src/change_feed.rs" = 1197
+"crates/ai-hist-cli/src/lib.rs" = 2684
+"crates/ai-hist-napi/src/lib.rs" = 1959
+"crates/ai-hist/src/change_feed.rs" = 1196
 "crates/ai-hist/src/discover.rs" = 3268
-"crates/ai-hist/src/ingest.rs" = 11383
+"crates/ai-hist/src/ingest.rs" = 11323
 "crates/ai-hist/src/ingest/devin.rs" = 828
 "crates/ai-hist/src/ingest/hydrate.rs" = 3328
-"crates/ai-hist/src/ingest/opencode.rs" = 1453
-"crates/ai-hist/src/session_store.rs" = 1714
-"crates/ai-hist/src/store.rs" = 3064
+"crates/ai-hist/src/ingest/opencode.rs" = 1426
+"crates/ai-hist/src/session_store.rs" = 1688
+"crates/ai-hist/src/store.rs" = 3051
 
 [baseline.cyclomatic]
-"crates/ai-hist-cli/src/lib.rs::run" = 88
+"crates/ai-hist-cli/src/lib.rs::run" = 81
 "crates/ai-hist/src/discover.rs::discover_sessions_with_worker_limit" = 70
 "crates/ai-hist/src/ingest.rs::ingest_claude_record" = 74
 "crates/ai-hist/src/ingest.rs::ingest_codex_rollout_incremental" = 116
@@ -47,15 +47,15 @@ rust_roots = ["crates/ai-hist-cli/src", "crates/ai-hist-napi/src", "crates/ai-hi
 "crates/ai-hist/src/ingest.rs::sync_codex_rollouts_with_repairs_and_coverage" = 86
 "crates/ai-hist/src/ingest/opencode.rs::load_all_from_sqlite" = 43
 "crates/ai-hist/src/ingest/opencode.rs::normalize_session" = 41
-"crates/ai-hist/src/source_intake.rs::apply_normalized" = 51
-"crates/ai-hist/src/store.rs::init_db_locked" = 69
+"crates/ai-hist/src/source_intake.rs::apply_normalized" = 41
+"crates/ai-hist/src/store.rs::init_db_locked" = 68
 
 [baseline.cognitive]
-"crates/ai-hist-cli/src/lib.rs::run" = 82
+"crates/ai-hist-cli/src/lib.rs::run" = 78
 "crates/ai-hist/src/discover.rs::discover_sessions_with_worker_limit" = 128
 "crates/ai-hist/src/ingest.rs::ingest_claude_record" = 81
 "crates/ai-hist/src/ingest.rs::ingest_codex_rollout_incremental" = 181
-"crates/ai-hist/src/ingest.rs::ingest_cursor_transcript" = 102
+"crates/ai-hist/src/ingest.rs::ingest_cursor_transcript" = 99
 "crates/ai-hist/src/ingest.rs::ingest_grok_session" = 71
 "crates/ai-hist/src/ingest.rs::ingest_muse_session" = 56
 "crates/ai-hist/src/ingest.rs::sync_basic" = 31
@@ -63,4 +63,4 @@ rust_roots = ["crates/ai-hist-cli/src", "crates/ai-hist-napi/src", "crates/ai-hi
 "crates/ai-hist/src/ingest.rs::sync_codex_rollouts_with_repairs_and_coverage" = 117
 "crates/ai-hist/src/ingest/opencode.rs::load_all_from_sqlite" = 33
 "crates/ai-hist/src/ingest/opencode.rs::normalize_session" = 52
-"crates/ai-hist/src/source_intake.rs::apply_normalized" = 46
+"crates/ai-hist/src/source_intake.rs::apply_normalized" = 29

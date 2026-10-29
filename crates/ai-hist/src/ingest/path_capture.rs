@@ -23,7 +23,7 @@ pub(crate) fn sync_facade_tick<B, R>(
     before: impl FnOnce(&Connection) -> Result<B>,
     after: impl FnOnce(&Connection, B, SyncTick, bool) -> Result<R>,
 ) -> Result<Option<(SyncTick, R, SyncRunLock)>> {
-    SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
+    let _output = output::Scope::enter(true);
     check_capture_cancelled()?;
     let Some(sync_lock) = try_acquire_sync_lock(db_path)? else {
         return Ok(None);

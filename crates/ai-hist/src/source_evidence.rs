@@ -106,7 +106,7 @@ struct Spec {
 impl EvidenceKind {
     fn spec(self) -> Spec {
         match self {
-        Self::History=>Spec{table:"history",columns:"source,session_id,project,prompt,prompt_hash,timestamp_ms,git_branch",required:"source,session_id,prompt,timestamp_ms",key:"source,timestamp_ms,prompt",derived:""},
+        Self::History=>Spec{table:"history",columns:"source,session_id,project,prompt,prompt_hash,timestamp_ms,git_branch,event_uid",required:"source,session_id,prompt,timestamp_ms",key:"source,timestamp_ms,prompt",derived:""},
         // `project_key` travels with the event so a snapshot round-trips the
         // canonical identity the emitting side resolved, and `project_key_method`
         // with it so the receiving side can tell a key the emitter resolved for
@@ -133,7 +133,7 @@ impl EvidenceKind {
         // read every control row back as a prompt. `record_token_json` is the
         // record's own usage beside a settled `token_json`, a provider fact a
         // snapshot round-trips like the rest.
-        Self::SessionEvent=>Spec{table:"session_events",columns:"source,session_id,project,project_key,project_key_method,cwd,git_branch,message_id,parent_id,ts_ms,role,kind,text,model,token_json,provider,event_uid,tool_use_id,payload_bytes,payload_truncated,payload_hash,call_index,event_index,result_status,event_source,error_signal,subagent_session_id,agent_id,request_id,provider_message_id,stop_reason,agent_version,is_sidechain,is_meta,turn_id,request_span,raw_kind,control_kind,record_token_json",required:"source,session_id,ts_ms,role,kind,event_uid",key:"source,session_id,event_uid",derived:"project_key,project_key_method"},
+        Self::SessionEvent=>Spec{table:"session_events",columns:"source,session_id,project,project_key,project_key_method,cwd,git_branch,message_id,parent_id,ts_ms,role,kind,text,model,token_json,provider,event_uid,tool_use_id,payload_bytes,payload_truncated,payload_hash,call_index,event_index,result_status,event_source,error_signal,subagent_session_id,agent_id,request_id,provider_message_id,stop_reason,agent_version,is_sidechain,is_meta,turn_id,request_span,raw_kind,control_kind,record_token_json,source_order",required:"source,session_id,ts_ms,role,kind,event_uid",key:"source,session_id,event_uid",derived:"project_key,project_key_method"},
         Self::ToolCall=>Spec{table:"tool_calls",columns:"source,session_id,message_id,tool_use_id,name,target,args_json,is_error,ts_ms",required:"source,session_id,tool_use_id,name",key:"source,session_id,tool_use_id",derived:""},
         Self::FileEdit=>Spec{table:"file_edits",columns:"source,session_id,message_id,tool_use_id,file_path,tool_name,lines_added,lines_removed,structured_patch_json,user_modified,ts_ms,git_branch,cwd",required:"source,session_id,tool_use_id,file_path,tool_name",key:"source,session_id,tool_use_id",derived:""},
         Self::Relationship=>Spec{table:"session_relationships",columns:"source,parent_session_id,relationship_uid,child_session_id,relationship,identity_status,child_agent_type,child_agent_name,child_model,spawn_depth,evidence_kind,evidence_locator,evidence_ref,child_has_events,spawned_at_ms,created_ms,updated_ms,origin_session_id",required:"source,parent_session_id,relationship_uid,relationship,identity_status,evidence_kind,created_ms,updated_ms",key:"source,parent_session_id,relationship_uid",derived:""},
@@ -148,7 +148,8 @@ impl EvidenceKind {
 fn numeric(field: &str) -> bool {
     matches!(
         field,
-        "timestamp_ms"
+        "source_order"
+            | "timestamp_ms"
             | "ts_ms"
             | "lines_added"
             | "lines_removed"
@@ -289,7 +290,7 @@ fn column_value_has_type(field: &str, value: &Value) -> bool {
 }
 
 /// The record belongs to the observed session and names its own identity.
-fn validate_ownership(key: &ObservationKey, record: &EvidenceRecord, spec: &Spec) -> Result<()> {
+fn validate_ownership(key: &ObservationKey, record: &EvidenceRecord, _spec: &Spec) -> Result<()> {
     let session_field = if record.kind == EvidenceKind::Relationship {
         "parent_session_id"
     } else {
@@ -300,7 +301,7 @@ fn validate_ownership(key: &ObservationKey, record: &EvidenceRecord, spec: &Spec
             && record.payload.get(session_field).and_then(Value::as_str) == Some(&key.session_id),
         "INVALID_ARGUMENT: evidence belongs to another source or session"
     );
-    for field in spec.key.split(',').filter(|field| !numeric(field)) {
+    for field in record.key_fields().split(',').filter(|field| !numeric(field)) {
         ensure!(
             record
                 .payload
@@ -395,13 +396,18 @@ fn sql_value(value: &Value) -> Result<rusqlite::types::Value> {
     })
 }
 impl EvidenceRecord {
+    fn key_fields(&self) -> &str {
+        if self.kind == EvidenceKind::History && self.payload.get("event_uid").is_some_and(|v| !v.is_null()) { "source,session_id,event_uid" } else { self.kind.spec().key }
+    }
+    fn conflict_target(&self) -> String {
+        let key = self.key_fields();
+        match self.kind { EvidenceKind::History => format!("{key}) WHERE event_uid IS {}", if self.payload.get("event_uid").is_some_and(|v| !v.is_null()) { "NOT NULL" } else { "NULL" }), _ => format!("{key})") }
+    }
     pub fn identity(&self) -> String {
         // `Value`'s `Display` is its compact JSON serialization, which cannot fail.
         json!([
             self.kind,
-            self.kind
-                .spec()
-                .key
+            self.key_fields()
                 .split(',')
                 .map(|field| self.payload.get(field).cloned().unwrap_or(Value::Null))
                 .collect::<Vec<_>>()
@@ -409,13 +415,13 @@ impl EvidenceRecord {
         .to_string()
     }
     fn key_sql(&self) -> Result<(String, Vec<rusqlite::types::Value>)> {
-        let columns = self.kind.spec().key.split(',').collect::<Vec<_>>();
+        let columns = self.key_fields().split(',').collect::<Vec<_>>();
         Ok((
             columns
                 .iter()
-                .map(|column| format!("{column}=?"))
+                .map(|column| format!("{column} IS ?"))
                 .collect::<Vec<_>>()
-                .join(" AND "),
+                .join(" AND ") + if self.kind == EvidenceKind::History && self.key_fields() == self.kind.spec().key { " AND event_uid IS NULL" } else { "" },
             columns
                 .iter()
                 .map(|column| sql_value(&self.payload[*column]))
@@ -444,6 +450,11 @@ impl EvidenceRecord {
         let mut clauses = vec![];
         let mut values = vec![];
         for column in self.kind.owned_columns() {
+            // Legacy snapshots never asserted order. They cannot revoke a
+            // later known order merely by omitting the new optional field.
+            if column == "source_order" && self.payload.get(column).is_none_or(Value::is_null) {
+                continue;
+            }
             clauses.push(format!("{column} IS ?"));
             values.push(sql_value(self.payload.get(column).unwrap_or(&Value::Null))?);
         }
@@ -468,6 +479,21 @@ impl EvidenceRecord {
             |row| row.get(0),
         )?)
     }
+    /// A retiring direct source disproved the other side's share of this
+    /// canonical payload. Keep remote-only rows conservative; demote only a
+    /// row whose local share is about to be retired in the same transaction.
+    pub(crate) fn revoke_unmatched_remote_share(&self, conn: &Connection) -> Result<()> {
+        let table = self.kind.spec().table;
+        if crate::store::EVIDENCE_LOCATION_TABLES.contains(&table) {
+            let (condition, values) = self.key_sql()?;
+            conn.execute(
+                &format!("UPDATE {table} SET location='local' WHERE {condition} AND location='both'"),
+                params_from_iter(values),
+            )?;
+        }
+        Ok(())
+    }
+
     /// Retire this record for the observation at `location`. In a table
     /// whose rows record which evidence backs them, only that side's share is
     /// retired: a record the other side also backs stays, as the other side's.
@@ -501,8 +527,15 @@ impl EvidenceRecord {
             .collect::<Result<Vec<_>>>()?;
         let mut updates = columns
             .iter()
-            .filter(|column| !spec.key.split(',').any(|key| key == **column))
-            .map(|column| format!("{column}=excluded.{column}"))
+            .filter(|column| !self.key_fields().split(',').any(|key| key == **column))
+            .map(|column| {
+                if self.kind == EvidenceKind::SessionEvent && *column == "source_order" {
+                    "source_order=CASE WHEN excluded.ts_ms=session_events.ts_ms THEN COALESCE(excluded.source_order,session_events.source_order) ELSE excluded.source_order END"
+                        .to_string()
+                } else {
+                    format!("{column}=excluded.{column}")
+                }
+            })
             .collect::<Vec<_>>();
         if located {
             columns.push("location");
@@ -511,11 +544,11 @@ impl EvidenceRecord {
         }
         conn.execute(
             &format!(
-                "INSERT INTO {}({}) VALUES({}) ON CONFLICT({}) DO UPDATE SET {}",
+                "INSERT INTO {}({}) VALUES({}) ON CONFLICT({} DO UPDATE SET {}",
                 spec.table,
                 columns.join(","),
                 vec!["?"; columns.len()].join(","),
-                spec.key,
+                self.conflict_target(),
                 updates.join(",")
             ),
             params_from_iter(values),

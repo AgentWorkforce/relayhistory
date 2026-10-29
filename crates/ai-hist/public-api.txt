@@ -308,6 +308,7 @@ pub ai_hist::Block::event_uid: alloc::string::String
 pub ai_hist::Block::kind: ai_hist::BlockKind
 pub ai_hist::Block::raw_kind: core::option::Option<alloc::string::String>
 pub ai_hist::Block::role: ai_hist::Role
+pub ai_hist::Block::source_order: core::option::Option<i64>
 pub ai_hist::Block::text: core::option::Option<alloc::string::String>
 pub ai_hist::Block::text_bytes: core::option::Option<i64>
 pub ai_hist::Block::tool_use_id: core::option::Option<alloc::string::String>
@@ -471,6 +472,7 @@ pub ai_hist::ForgetReport::sessions: u64
 pub ai_hist::ForgetReport::skipped_unrecoverable: u64
 pub ai_hist::ForgetReport::tool_calls: u64
 pub struct ai_hist::HistoryEntry
+pub ai_hist::HistoryEntry::event_uid: core::option::Option<alloc::string::String>
 pub ai_hist::HistoryEntry::id: i64
 pub ai_hist::HistoryEntry::project: core::option::Option<alloc::string::String>
 pub ai_hist::HistoryEntry::prompt: alloc::string::String
@@ -603,6 +605,7 @@ pub fn ai_hist::ProgressObserver::new(impl core::ops::function::Fn(ai_hist::Capt
 impl core::fmt::Debug for ai_hist::ProgressObserver
 pub fn ai_hist::ProgressObserver::fmt(&self, &mut core::fmt::Formatter<'_>) -> core::fmt::Result
 #[non_exhaustive] pub struct ai_hist::Prompt
+pub ai_hist::Prompt::event_uid: core::option::Option<alloc::string::String>
 pub ai_hist::Prompt::project: core::option::Option<alloc::string::String>
 pub ai_hist::Prompt::prompt: core::option::Option<alloc::string::String>
 pub ai_hist::Prompt::prompt_bytes: i64
@@ -698,6 +701,7 @@ pub ai_hist::SessionEvent::result_status: core::option::Option<alloc::string::St
 pub ai_hist::SessionEvent::role: alloc::string::String
 pub ai_hist::SessionEvent::session_id: alloc::string::String
 pub ai_hist::SessionEvent::source: alloc::string::String
+pub ai_hist::SessionEvent::source_order: core::option::Option<i64>
 pub ai_hist::SessionEvent::stop_reason: core::option::Option<alloc::string::String>
 pub ai_hist::SessionEvent::subagent_session_id: core::option::Option<alloc::string::String>
 pub ai_hist::SessionEvent::text: core::option::Option<alloc::string::String>

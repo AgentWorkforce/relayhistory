@@ -3,6 +3,9 @@
 
 use super::*;
 
+#[cfg(test)]
+mod tests;
+
 /// Where `export --format sqlite` writes when no destination is given.
 pub(crate) const DEFAULT_SQLITE_EXPORT: &str = "ai-hist-export.db";
 
@@ -51,6 +54,7 @@ pub(crate) fn export_history(
         let row = json!({
             "source": entry.source,
             "session_id": entry.session_id,
+            "event_uid": entry.event_uid,
             "project": entry.project,
             "prompt": entry.prompt,
             "prompt_hash": entry.prompt_hash.clone().unwrap_or_else(|| prompt_hash(&entry.prompt)),
@@ -294,7 +298,7 @@ fn export_rows(
     since: Option<&str>,
 ) -> Result<Vec<HistoryEntry>> {
     let mut sql =
-        "SELECT id, source, session_id, project, prompt, timestamp_ms FROM history WHERE 1=1"
+        "SELECT id, source, session_id, project, prompt, timestamp_ms, event_uid FROM history WHERE 1=1"
             .to_string();
     let mut params_vec = Vec::new();
     if let Some(source) = source {

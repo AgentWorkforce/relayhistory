@@ -979,6 +979,7 @@ fn history_log_collision_does_not_claim_another_sessions_sqlite_prompt() {
     let temp = tempfile::tempdir().unwrap();
     let conn = crate::open_db(&temp.path().join("history.db")).unwrap();
     let entry = HistoryEntry {
+        event_uid: None,
         id: 0,
         source: "codex".into(),
         session_id: Some("owner".into()),

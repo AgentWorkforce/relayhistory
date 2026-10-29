@@ -261,7 +261,7 @@ pub(crate) fn sync_opencode_sources(
 
 /// A sync progress line, unless sync output is quiet.
 fn note(line: &str) {
-    if !super::SYNC_QUIET.load(std::sync::atomic::Ordering::Relaxed) {
+    if !super::output::quiet() {
         println!("{line}");
     }
 }

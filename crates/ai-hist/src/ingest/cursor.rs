@@ -582,6 +582,15 @@ pub(crate) fn record_blocks(obj: &serde_json::Map<String, Value>) -> Vec<Value> 
     content.as_array().cloned().unwrap_or_default()
 }
 
+impl super::CursorTranscriptOutcome {
+    pub(super) fn observe_activity(&mut self, emitted: bool, guessed: bool, ts_ms: i64) {
+        if emitted && !guessed {
+            self.first_ts_ms = Some(self.first_ts_ms.map_or(ts_ms, |first| first.min(ts_ms)));
+            self.last_ts_ms = Some(self.last_ts_ms.map_or(ts_ms, |last| last.max(ts_ms)));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -169,6 +169,7 @@ fn history(conn: &Connection, sid: &str, ts: i64, text: &str) -> Result<usize> {
     insert_history(
         conn,
         &HistoryEntry {
+            event_uid: None,
             id: 0,
             source: ID.into(),
             session_id: Some(sid.into()),

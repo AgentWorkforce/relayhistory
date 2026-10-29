@@ -6,6 +6,8 @@ use crate::sources::catalog::{Discovery, Fixtures, Hydration, LocalSource, Relat
 use crate::EvidenceKind;
 use serde::{Deserialize, Serialize};
 mod decode;
+#[cfg(test)]
+mod history_identity_tests;
 mod lifecycle;
 mod normalize;
 mod roots;
@@ -34,7 +36,7 @@ pub(crate) const METADATA: ProviderMetadata = ProviderMetadata {
     usage: None,
 };
 pub(crate) const ADAPTER: Option<ProviderAdapter> = Some(ProviderAdapter {
-    generation: "dcode_checkpoint_v1",
+    generation: "dcode_checkpoint_v2",
     acquire,
     sweep,
     resolve_roots: roots::resolve,

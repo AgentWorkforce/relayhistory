@@ -1262,6 +1262,7 @@ mod tests {
         token_json: Option<&str>,
     ) -> SessionEvent {
         SessionEvent {
+            source_order: None,
             id: 0,
             source: "codex".into(),
             session_id: "s1".into(),

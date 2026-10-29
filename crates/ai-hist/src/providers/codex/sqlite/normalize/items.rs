@@ -40,6 +40,7 @@ fn user(conn: &Connection, t: &Thread, item: &Item, history_ids: &mut Vec<i64>) 
     let inserted = crate::insert_history(
         conn,
         &HistoryEntry {
+            event_uid: None,
             id: 0,
             source: "codex".into(),
             session_id: Some(t.id.clone()),

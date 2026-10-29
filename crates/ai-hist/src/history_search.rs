@@ -54,6 +54,7 @@ pub const MATCH_SOURCE_SESSION_EVENT: &str = "session_event";
 
 #[derive(Debug, Clone)]
 pub struct SearchRow {
+    pub event_uid: Option<String>,
     pub id: i64,
     pub source: String,
     pub session_id: Option<String>,
@@ -275,10 +276,11 @@ const HISTORY_BRANCH: SearchBranch = SearchBranch {
     fts: "history_fts",
     ts_column: "timestamp_ms",
     ts_index: "idx_history_timestamp",
-    columns: "h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms",
+    columns: "h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms, h.event_uid",
     after_history_tie: false,
     row: |row| {
         Ok(SearchRow {
+            event_uid: row.get(6)?,
             id: row.get(0)?,
             source: row.get(1)?,
             session_id: row.get(2)?,
@@ -298,10 +300,11 @@ const EVENT_BRANCH: SearchBranch = SearchBranch {
     fts: "session_events_fts",
     ts_column: "ts_ms",
     ts_index: "idx_session_events_ts",
-    columns: "e.id, e.source, e.session_id, e.project, COALESCE(e.text, ''), e.ts_ms, e.role, e.kind",
+    columns: "e.id, e.source, e.session_id, e.project, COALESCE(e.text, ''), e.ts_ms, e.role, e.kind, e.event_uid",
     after_history_tie: true,
     row: |row| {
         Ok(SearchRow {
+            event_uid: row.get(8)?,
             id: row.get(0)?,
             source: row.get(1)?,
             session_id: row.get(2)?,
@@ -478,7 +481,7 @@ fn append_event_search_filters(
         let mut mirror = format!(
             "SELECT 1 FROM history hp WHERE hp.source = {alias}.source \
                AND hp.session_id = {alias}.session_id AND hp.timestamp_ms = {alias}.ts_ms \
-               AND hp.prompt = trim({alias}.text, {RUST_WHITESPACE})"
+               AND hp.prompt = trim({alias}.text, {RUST_WHITESPACE}) AND (hp.event_uid IS NULL OR hp.event_uid={alias}.event_uid)"
         );
         if let Some(query) = prompt_match {
             mirror.push_str(
@@ -543,6 +546,7 @@ mod tests {
             insert_history(
                 &conn,
                 &HistoryEntry {
+                    event_uid: None,
                     id: 0,
                     source: "claude".into(),
                     session_id: Some("s1".into()),
@@ -686,6 +690,7 @@ mod tests {
         insert_history(
             &conn,
             &HistoryEntry {
+                event_uid: None,
                 id: 0,
                 source: "claude".into(),
                 session_id: Some("s1".into()),
@@ -1025,6 +1030,7 @@ mod tests {
                     insert_history(
                         &conn,
                         &HistoryEntry {
+                            event_uid: None,
                             id: 0,
                             source: source.into(),
                             session_id: Some(session.into()),
@@ -1235,6 +1241,7 @@ mod tests {
             insert_history(
                 &conn,
                 &HistoryEntry {
+                    event_uid: None,
                     id: 0,
                     source: "claude".into(),
                     session_id: if index % 2 == 0 { None } else { Some(String::new()) },

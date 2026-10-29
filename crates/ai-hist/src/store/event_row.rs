@@ -49,6 +49,7 @@ pub(crate) fn row_to_session_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<
         raw_kind: envelope.raw_kind,
         control_kind: envelope.control_kind,
         record_token_json: envelope.record_token_json,
+        source_order: envelope.source_order,
     })
 }
 
@@ -134,6 +135,7 @@ struct SessionEventEnvelope {
     raw_kind: Option<String>,
     control_kind: Option<String>,
     record_token_json: Option<String>,
+    source_order: Option<i64>,
 }
 
 fn session_event_envelope(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionEventEnvelope> {
@@ -151,5 +153,6 @@ fn session_event_envelope(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionEv
         raw_kind: row.get(36)?,
         control_kind: row.get(37)?,
         record_token_json: row.get(38)?,
+        source_order: row.get(39)?,
     })
 }

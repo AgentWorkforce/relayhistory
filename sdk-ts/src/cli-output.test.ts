@@ -683,12 +683,12 @@ test('resume prints the best matching session\'s native resume command', async (
     await seedCodexSession(root, home, db);
     const env = { ...process.env, HOME: home, USERPROFILE: home, XDG_DATA_HOME: join(home, 'share') };
     const human = await run(process.execPath, [cli, 'resume', 'auth refresh', '--db', db, '--no-warning'], { env });
-    assert.equal(human.stdout.trim(), 'cd /work/demo && codex resume codex-demo-1');
+    assert.equal(human.stdout.trim(), 'codex resume codex-demo-1');
 
     const json = await run(process.execPath, [cli, 'resume', 'auth refresh', '--db', db, '--json', '--no-warning'], { env });
     const parsed = JSON.parse(json.stdout) as Record<string, unknown>;
     assert.equal(parsed.session_id, 'codex-demo-1');
-    assert.equal(parsed.resume_cmd, 'cd /work/demo && codex resume codex-demo-1');
+    assert.equal(parsed.resume_cmd, 'codex resume codex-demo-1');
     // A resumable session's JSON never carries the unavailability explanation.
     assert.equal('resume_unavailable_reason' in parsed, false);
   } finally {
@@ -732,7 +732,7 @@ test('pack formats matching entries with resume commands and respects a token bu
     const human = await run(process.execPath, [cli, 'pack', 'auth refresh', '--db', db, '--no-warning'], { env });
     assert.match(human.stdout, /^=== ai-hist pack: "auth refresh" \| .+ \| 1 entries ===/);
     assert.match(human.stdout, /\[1\/1\] #\d+ {2}.+ {2}codex {2}\/work\/demo/);
-    assert.match(human.stdout, /Resume: cd \/work\/demo && codex resume codex-demo-1/);
+    assert.match(human.stdout, /Resume: codex resume codex-demo-1/);
 
     const truncated = await run(process.execPath, [
       cli, 'pack', 'auth refresh', '--db', db, '--tokens', '2', '--no-warning',
@@ -742,7 +742,7 @@ test('pack formats matching entries with resume commands and respects a token bu
     const json = await run(process.execPath, [cli, 'pack', 'auth refresh', '--db', db, '--json', '--no-warning'], { env });
     const parsed = JSON.parse(json.stdout) as { entries: Array<Record<string, unknown>> };
     assert.equal(parsed.entries.length, 1);
-    assert.equal(parsed.entries[0]?.resume_cmd, 'cd /work/demo && codex resume codex-demo-1');
+    assert.equal(parsed.entries[0]?.resume_cmd, 'codex resume codex-demo-1');
   } finally {
     await rm(root, { recursive: true, force: true });
   }

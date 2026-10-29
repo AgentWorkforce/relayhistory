@@ -37,6 +37,7 @@ pub(super) struct UserTurnHeader {
     pub(super) key: String,
     pub(super) ts_ms: i64,
     pub(super) id: i64,
+    pub(super) order: i64,
     pub(super) message_id: Option<String>,
     pub(super) last_ts_ms: i64,
 }
@@ -50,16 +51,16 @@ type HeaderPage = (Vec<UserTurnHeader>, bool);
 /// as the block pass. `after` selects `(ts_ms, id) > cursor`.
 pub(super) fn user_turn_walk_sql(after: bool) -> String {
     let range = if after {
-        " AND (ts_ms, id) > (?, ?)"
+        " AND (ts_ms, COALESCE(source_order,id), id) > (?, ?, ?)"
     } else {
         ""
     };
     format!(
         "SELECT id, ts_ms, NULLIF(message_id, ''), \
-                CASE WHEN {USER_TURN_ROW_FILTER} THEN 1 ELSE 0 END \
+                CASE WHEN {USER_TURN_ROW_FILTER} THEN 1 ELSE 0 END, source_order \
          FROM session_events \
          WHERE source = ? AND session_id = ?{range} \
-         ORDER BY ts_ms ASC, id ASC"
+         ORDER BY ts_ms ASC, COALESCE(source_order,id) ASC, id ASC"
     )
 }
 
@@ -91,7 +92,7 @@ fn message_rows_sql_for(conn: &Connection) -> Result<String> {
 
 fn message_rows_sql(index: &str) -> String {
     format!(
-        "SELECT id, ts_ms, NULLIF(message_id, '') \
+        "SELECT id, ts_ms, NULLIF(message_id, ''), source_order \
          FROM session_events INDEXED BY {index} \
          WHERE source = ? AND session_id = ? AND message_id = ? \
            AND {USER_TURN_ROW_FILTER}"
@@ -105,7 +106,7 @@ fn message_rows_sql(index: &str) -> String {
 /// the row itself, not a scan.
 pub(super) fn user_turn_collided_row_sql() -> String {
     format!(
-        "SELECT id, ts_ms FROM session_events \
+        "SELECT id, ts_ms, source_order FROM session_events \
          WHERE id = ? AND source = ? AND session_id = ? \
            AND NULLIF(message_id, '') IS NULL AND {USER_TURN_ROW_FILTER}"
     )
@@ -123,8 +124,20 @@ pub(super) fn page_headers(
     let mut walk = conn.prepare(&user_turn_walk_sql(after.is_some()))?;
     let mut named = conn.prepare(&message_rows_sql_for(conn)?)?;
     let mut collided = conn.prepare(&user_turn_collided_row_sql())?;
+    let after_order = after
+        .map(|cursor| super::event_cursor_order(conn, session_id, Some(source), cursor))
+        .transpose()?;
+    let after_position = after
+        .zip(after_order)
+        .map(|(cursor, order)| (cursor.ts_ms, order, cursor.id));
     let mut rows = match after {
-        Some(cursor) => walk.query(params![source, session_id, cursor.ts_ms, cursor.id])?,
+        Some(cursor) => walk.query(params![
+            source,
+            session_id,
+            cursor.ts_ms,
+            after_order,
+            cursor.id
+        ])?,
         None => walk.query(params![source, session_id])?,
     };
     let mut state = PageState::new(limit as usize);
@@ -134,13 +147,14 @@ pub(super) fn page_headers(
             ts_ms: row.get(1)?,
             message_id: row.get(2)?,
             is_turn: row.get::<_, i64>(3)? == 1,
+            source_order: row.get(4)?,
         };
         if let Some(page) = state.observe(
             &mut named,
             &mut collided,
             source,
             session_id,
-            after,
+            after_position,
             scanned,
         )? {
             return Ok(page);
@@ -154,6 +168,7 @@ struct ScannedRow {
     ts_ms: i64,
     message_id: Option<String>,
     is_turn: bool,
+    source_order: Option<i64>,
 }
 
 struct PageState {
@@ -165,7 +180,7 @@ struct PageState {
     frozen: bool,
     extra: bool,
     seen: HashSet<String>,
-    candidates: BTreeMap<(i64, i64), UserTurnHeader>,
+    candidates: BTreeMap<(i64, i64, i64), UserTurnHeader>,
 }
 
 impl PageState {
@@ -186,7 +201,7 @@ impl PageState {
         collided: &mut Statement<'_>,
         source: &str,
         session_id: &str,
-        after: Option<&SessionEventCursor>,
+        after: Option<(i64, i64, i64)>,
         row: ScannedRow,
     ) -> Result<Option<HeaderPage>> {
         if self.starts_later_timestamp(row.ts_ms) {
@@ -236,7 +251,7 @@ impl PageState {
         collided: &mut Statement<'_>,
         source: &str,
         session_id: &str,
-        after: Option<&SessionEventCursor>,
+        after: Option<(i64, i64, i64)>,
         row: &ScannedRow,
     ) -> Result<()> {
         let key = turn_key(row.message_id.as_deref(), row.id);
@@ -247,7 +262,7 @@ impl PageState {
         if !past_cursor(&header, after) {
             return Ok(());
         }
-        let anchor = (header.ts_ms, header.id);
+        let anchor = (header.ts_ms, header.order, header.id);
         if self.candidates.insert(anchor, header).is_some() {
             anyhow::bail!("two user turns share an anchor");
         }
@@ -263,13 +278,8 @@ impl PageState {
     }
 }
 
-fn past_cursor(header: &UserTurnHeader, after: Option<&SessionEventCursor>) -> bool {
-    match after {
-        None => true,
-        Some(cursor) => {
-            header.ts_ms > cursor.ts_ms || (header.ts_ms == cursor.ts_ms && header.id > cursor.id)
-        }
-    }
+fn past_cursor(header: &UserTurnHeader, after: Option<(i64, i64, i64)>) -> bool {
+    after.is_none_or(|cursor| (header.ts_ms, header.order, header.id) > cursor)
 }
 
 fn turn_key(message_id: Option<&str>, id: i64) -> String {
@@ -292,6 +302,8 @@ struct Fold {
     id: i64,
     last_ts_ms: i64,
     named: bool,
+    anchor: (i64, i64, i64),
+    known: bool,
 }
 
 impl Fold {
@@ -301,21 +313,26 @@ impl Fold {
             id: row.id,
             last_ts_ms: row.ts_ms,
             named: row.message_id.is_some(),
+            anchor: (row.ts_ms, row.source_order.unwrap_or(row.id), row.id),
+            known: row.source_order.is_some(),
         }
     }
 
-    fn observe(&mut self, id: i64, ts_ms: i64, named: bool) {
+    fn observe(&mut self, id: i64, ts_ms: i64, named: bool, source_order: Option<i64>) {
         self.ts_ms = self.ts_ms.min(ts_ms);
         self.id = self.id.min(id);
         self.last_ts_ms = self.last_ts_ms.max(ts_ms);
         self.named |= named;
+        self.anchor = self.anchor.min((ts_ms, source_order.unwrap_or(id), id));
+        self.known |= source_order.is_some();
     }
 
     fn header(self, key: &str) -> UserTurnHeader {
         UserTurnHeader {
             key: key.to_owned(),
             ts_ms: self.ts_ms,
-            id: self.id,
+            id: if self.known { self.anchor.2 } else { self.id },
+            order: if self.known { self.anchor.1 } else { self.id },
             message_id: self.named.then(|| key.to_owned()),
             last_ts_ms: self.last_ts_ms,
         }
@@ -348,7 +365,7 @@ fn fold_named(
     let mut rows = stmt.query(params![source, session_id, key])?;
     while let Some(row) = rows.next()? {
         let named: Option<String> = row.get(2)?;
-        fold.observe(row.get(0)?, row.get(1)?, named.is_some());
+        fold.observe(row.get(0)?, row.get(1)?, named.is_some(), row.get(3)?);
     }
     Ok(())
 }
@@ -362,7 +379,7 @@ fn fold_collided(
 ) -> Result<()> {
     let mut rows = stmt.query(params![row_id, source, session_id])?;
     while let Some(row) = rows.next()? {
-        fold.observe(row.get(0)?, row.get(1)?, false);
+        fold.observe(row.get(0)?, row.get(1)?, false, row.get(2)?);
     }
     Ok(())
 }

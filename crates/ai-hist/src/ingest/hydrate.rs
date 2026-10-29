@@ -173,7 +173,7 @@ pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 3;
 /// hydrates restores the Codex forks and subagents without paginated history
 /// that generation 17's probe read whole as copied parent history, which
 /// sync's `codex_fork_replay_gate` generation 3 restores.
-pub(crate) const HYDRATION_PARSER_VERSION: i64 = 20;
+pub(crate) const HYDRATION_PARSER_VERSION: i64 = 21;
 
 #[derive(Debug, Clone)]
 pub struct HydrateSessionOptions {
@@ -3829,17 +3829,6 @@ fn build_local_result(
     })
 }
 
-/// The delegated threads whose evidence this hydration also acquired.
-///
-/// Delegation only, on both the seed and the recursive step. A continuation or
-/// a fork is a *different conversation* that this one carried on from, not
-/// work this session delegated: counting it here would put a separate
-/// session's events into this hydration's evidence totals and hand the caller
-/// a `relatedSessionIds` it never asked to acquire. Continuity is read through
-/// `getSessionRelationships`'s `continuity` array instead. This mirrors
-/// `RelationshipKinds::delegation()` — everything that is not a continuity
-/// kind — rather than whitelisting `delegated`, so `materialized_local` keeps
-/// being related exactly as before.
 /// The evidence kinds this hydration could actually have indexed.
 ///
 /// The provider's declared coverage, narrowed by the request: `include_related:
@@ -3968,6 +3957,17 @@ fn stored_discovery_state(conn: &Connection, source: &str, session_id: &str) -> 
         .unwrap_or_else(|| "shallow".to_string()))
 }
 
+/// The delegated threads whose evidence this hydration also acquired.
+///
+/// Delegation only, on both the seed and the recursive step. A continuation or
+/// a fork is a *different conversation* that this one carried on from, not
+/// work this session delegated: counting it here would put a separate
+/// session's events into this hydration's evidence totals and hand the caller
+/// a `relatedSessionIds` it never asked to acquire. Continuity is read through
+/// `getSessionRelationships`'s `continuity` array instead. This mirrors
+/// `RelationshipKinds::delegation()` — everything that is not a continuity
+/// kind — rather than whitelisting `delegated`, so `materialized_local` keeps
+/// being related exactly as before.
 fn related_ids(conn: &Connection, source: &str, session_id: &str) -> Result<Vec<String>> {
     Ok(conn
         .prepare(

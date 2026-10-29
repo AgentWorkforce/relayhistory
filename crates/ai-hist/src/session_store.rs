@@ -79,12 +79,16 @@ mod sync;
 pub use reconciliation::{Reconciliation, ReconciliationStep};
 mod catalog_row;
 use catalog_row::catalog_session;
+mod prompt;
+pub use prompt::Prompt;
 mod profile;
 pub use profile::{SessionAvatar, SessionProfile};
 mod options;
 use options::resolve_db_path;
+mod event_order;
 mod path_scope;
 mod source_intake;
+use event_order::block_from_event;
 mod watch_sweep;
 
 pub(crate) use options::controlled;
@@ -2050,35 +2054,6 @@ pub struct SessionEvidence {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-/// One `history` row.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct Prompt {
-    /// `None` when the query asked for no text.
-    pub prompt: Option<String>,
-    /// sha256 of the prompt, hex: the hash the ledger stored, or one computed
-    /// from the text when it was carried. `None` only for a row written
-    /// without a stored hash and read without its text.
-    pub prompt_hash: Option<String>,
-    pub prompt_bytes: i64,
-    pub project: Option<String>,
-    pub timestamp_ms: i64,
-}
-
-impl Prompt {
-    fn from_row(row: PromptRow) -> Self {
-        Self {
-            prompt_hash: row
-                .prompt_hash
-                .or_else(|| row.prompt.as_deref().map(prompt_hash)),
-            prompt_bytes: row.prompt_bytes,
-            prompt: row.prompt,
-            project: row.project,
-            timestamp_ms: row.timestamp_ms,
-        }
-    }
-}
-
 /// Who a message came from. Mirrors the `session_events.role` constraint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[non_exhaustive]
@@ -2191,6 +2166,9 @@ impl Message {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[non_exhaustive]
 pub struct Block {
+    /// Source-observed order within its timestamp bucket; absent means unknown.
+    #[serde(default)]
+    pub source_order: Option<i64>,
     pub event_uid: String,
     /// The event's own role. Usually the message's; OpenCode stores a tool
     /// result as a part of the assistant message that called the tool, so
@@ -2223,17 +2201,7 @@ fn group_messages(source: Source, events: &[(SessionEvent, Option<i64>)]) -> Vec
     let mut usage_blobs: Vec<Option<String>> = Vec::new();
     let mut index: BTreeMap<String, usize> = BTreeMap::new();
     for (event, text_bytes) in events {
-        let block = Block {
-            event_uid: event.event_uid.clone(),
-            role: Role::parse(&event.role),
-            kind: BlockKind::parse(&event.kind),
-            text: event.text.clone(),
-            text_bytes: *text_bytes,
-            tool_use_id: event.tool_use_id.clone(),
-            raw_kind: event.raw_kind.clone(),
-            control: event.control_kind.as_deref().and_then(ControlKind::parse),
-            ts_ms: event.ts_ms,
-        };
+        let block = block_from_event(event, *text_bytes);
         let slot = event
             .message_id
             .as_ref()

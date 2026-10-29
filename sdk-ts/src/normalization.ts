@@ -16,6 +16,7 @@ import {
   SessionScope,
   SessionLocation,
   NativeContractMismatchError,
+  RelayHistoryError,
   InvalidArgumentError,
   SessionSourceUnavailableError,
   SessionSourceMismatchError,
@@ -119,6 +120,7 @@ export function historyEntry(value: UnknownRecord): HistoryEntry {
     id: Number(value.id),
     source: String(value.source) as Source,
     sessionId: nullableString(value.sessionId),
+    eventUid: nullableString(value.eventUid),
     project: nullableString(value.project),
     prompt: String(value.prompt),
     timestampMs: Number(value.timestampMs),
@@ -260,6 +262,15 @@ export function tokenUsage(raw: unknown): Record<string, unknown> | null {
   }
 }
 
+/** A known source rank must cross the JavaScript boundary exactly. */
+export function sourceOrder(value: unknown): number | null {
+  if (value == null) return null;
+  if (typeof value !== 'number' || !Number.isSafeInteger(value) || value < 0) {
+    throw new RelayHistoryError('Source order cannot be represented as a nonnegative safe integer.', 'SOURCE_ORDER_NOT_REPRESENTABLE');
+  }
+  return value;
+}
+
 export function sessionEvent(value: UnknownRecord): SessionEvent {
   return {
     id: Number(value.id),
@@ -285,6 +296,10 @@ export function sessionEvent(value: UnknownRecord): SessionEvent {
         : tokenUsage(value.recordTokenJson),
     provider: nullableString(value.provider),
     eventUid: String(value.eventUid),
+    sourceOrder: sourceOrder(value.sourceOrder),
+    rawKind: nullableString(value.rawKind),
+    providerMessageId: nullableString(value.providerMessageId),
+    requestSpan: nullableString(value.requestSpan),
     toolUseId: nullableString(value.toolUseId),
     payloadBytes: nullableNumber(value.payloadBytes),
     payloadTruncated: nullableBoolean(value.payloadTruncated),

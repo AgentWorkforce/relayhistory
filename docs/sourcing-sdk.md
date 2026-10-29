@@ -293,6 +293,13 @@ narrowed by the request (no `Relationship` when `include_related` is off) —
 hook fires inside the harness's tool call, and a file that was cleaned up
 before the hook ran is an answer.
 
+Capture progress output is scoped to the current operation and thread.
+Facade sync, discovery and hydration suppress optional progress and quiet-aware
+skip diagnostics;
+explicit CLI progress calls restore the caller's prior policy when they finish,
+including on errors or unwind. Shallow-read workers inherit the operation's
+policy without changing concurrent callers.
+
 ### Source connector intake
 
 The three `*_source_*` operations are how a host composes an external source
@@ -325,10 +332,44 @@ A driver runs one enumerate/apply cycle per connector:
    `include_related: Some(false)` scopes coverage to the one thread, exactly
    as `HydrateOptions::include_related` does.
 
+When a direct local source is retired, the store compares retained remote
+records against the canonical payload before deleting local evidence. Only exact
+matches gain remote ownership; conflicting snapshots remain stored and protected
+from overwriting local evidence, including on replay after retirement. This
+handoff uses separate local ownership metadata, so it does not modify acquired
+connector snapshots or invalidate their revision fences. Matching connectors can
+withdraw their own shares independently. Legacy snapshots without normalized
+per-record evidence cannot prove support and remain conservative.
+
 `ObservationKey`, `SessionObservation`, `ObservationCheckpoint`,
 `ObservationState`, `NormalizedSourceEvidence`, `SourceObservation`,
 `SourceObservationBatch`, `SourceEvidenceSubmission`, `DiscoverySummary` and
 `HydrateSessionResult` are part of the default surface for this.
+
+Ordering is an optional source fact on session-event payloads:
+`source_order` is a nonnegative integer within `(source, session_id, ts_ms)`;
+public `Block::source_order` exposes it. Preserve it verbatim through exports,
+including paged exports; do not derive it from array position, record identity
+or destination row IDs. The record array may be shuffled without changing
+conversation order. Absent/null means unknown. Mixed known/unknown buckets
+have deterministic rendering but no claimed order for unknown events. An
+incremental append to a legacy bucket leaves new ranks unknown until a full
+source read establishes its order.
+
+Known order conflicts across retained observations fail atomically with
+`SOURCE_ORDER_CONFLICT`. A partial-kind submission does not withdraw the prior
+event snapshot. A legacy observation cannot clear known canonical order, even
+when it is the remaining support after local retirement. Native
+rewrites preserve event row IDs and change only ranks when order changes.
+Event cursors retain `{ts_ms,id}`: reads resolve the current rank through that
+stable row, reject a row belonging to another source/session or ordered
+timestamp, and
+return `STALE_EVENT_CURSOR` when a deleted row cannot be positioned safely in
+an ordered timestamp bucket. A cursor is not a snapshot across mutations;
+restart the read after an order-changing revision. Old user-turn cursors with
+composite `MIN(timestamp)`/`MIN(id)` anchors remain positional only within the
+same source/session and wholly unknown-order legacy buckets. Evidence contract 5 covers
+these ordering semantics.
 
 ### `watch`
 
@@ -598,7 +639,7 @@ replace, never a duplicate.
 | `FileEdit`            | `file_edits`            | `source, session_id, tool_use_id`                                     | `SessionFileEdit`     |
 | `SessionMarker`       | `session_markers`       | `source, session_id, marker_uid`                                      | `SessionMarker`       |
 | `Relationship`        | `session_relationships` | `source, parent_session_id, relationship_uid`                         | `SessionRelationship` |
-| `History`             | `history`               | `source, timestamp_ms, prompt`                                        | `HistoryEntry`        |
+| `History`             | `history`               | legacy: `source, timestamp_ms, prompt`; identified: `source, "event", session_id, event_uid` | `HistoryEntry`        |
 | `Presence`            | `session_presences`     | `source, session_id, location`                                        | —                     |
 | `CommitLink`          | `session_commit_links`  | `source, session_id, commit_sha, match_method`                        | —                     |
 | `SourceObservation`   | `session_observations`  | `source, session_id, location, connector_id, connector_instance`      | —                     |
@@ -1135,6 +1176,27 @@ declined.
   [Versioning](#versioning-cargo-semver-is-the-contract).
 - `examples/rust-consumer` is the same surface exercised from outside the
   workspace, against the published crate nightly.
+
+## Prompt history identity
+
+`HistoryEntry::event_uid` and `SessionEvidence::prompts[].event_uid` carry an
+optional stable session-event reference. An identified prompt is keyed by
+`(source, session_id, event_uid)`; edits to its text/time update that row.
+The change-feed/export key is `["history", source, "event", session_id,
+event_uid]`. Anonymous rows retain the exact legacy key `["history", source,
+timestamp_ms, prompt]`, including existing exported record IDs, ownership
+snapshots and tombstones. Identity is never inferred from equal text/time.
+
+Export schema version 3 advertises native history identity and source-order
+evidence. New intake accepts old snapshots with absent identity fields; older
+intake rejects unsupported new columns explicitly.
+
+The schema upgrade preserves row IDs, revisions and the autoincrement sequence.
+It does not assign event IDs retrospectively. DeepAgents' next authoritative
+local read replaces its unowned anonymous projection with identified prompts;
+a retained remote-owned anonymous prompt remains independent evidence. Old
+snapshots lacking `event_uid` continue to use the legacy identity. Other
+adapters remain anonymous until they supply a source-observed event reference.
 
 ## Appendix: who still needs `unstable-internal`, and why
 

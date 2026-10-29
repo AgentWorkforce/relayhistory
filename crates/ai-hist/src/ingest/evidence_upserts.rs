@@ -56,6 +56,10 @@ fn session_event_sql(session_key: &str, session_method: &str) -> (String, String
          WHEN session_events.project_key IS NOT NULL THEN session_events.project_key_method \
          ELSE ?17 END"
     );
+    // An incremental cursor does not re-observe a legacy bucket's prefix.
+    // Allocate a rank only when every retained row has known source order;
+    // otherwise append as unknown and preserve the bucket's row-id fallback.
+    // Existing known ranks are retained by the event-identity lookup first.
     let rewrite = format!(
         "INSERT INTO session_events \
          (source, session_id, project, project_key, project_key_method, cwd, git_branch, \
@@ -63,13 +67,16 @@ fn session_event_sql(session_key: &str, session_method: &str) -> (String, String
           tool_use_id, payload_bytes, payload_truncated, payload_hash, call_index, event_index, \
           result_status, event_source, error_signal, subagent_session_id, agent_id, \
           request_id, provider_message_id, stop_reason, agent_version, is_sidechain, is_meta, \
-          turn_id, request_span, raw_facts_version, raw_kind, control_kind, record_token_json) \
+          turn_id, request_span, raw_facts_version, raw_kind, control_kind, record_token_json, source_order) \
          VALUES (?1, ?2, ?3, \
            {insert_key}, \
            {insert_method}, \
            ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, \
            ?14, ?15, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, \
-           ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40) \
+           ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, \
+           COALESCE((SELECT source_order FROM session_events WHERE source=?1 AND session_id=?2 AND event_uid=?15 AND ts_ms=?8), \
+             (SELECT CASE WHEN COUNT(source_order)=COUNT(*) THEN COALESCE(MAX(source_order),-1)+1 END \
+              FROM session_events WHERE source=?1 AND session_id=?2 AND ts_ms=?8))) \
          ON CONFLICT(source, session_id, event_uid) DO UPDATE SET \
          project=excluded.project, \
          project_key={assigned_key}, \
@@ -90,10 +97,13 @@ fn session_event_sql(session_key: &str, session_method: &str) -> (String, String
          request_span=excluded.request_span, \
          raw_facts_version=excluded.raw_facts_version, raw_kind=excluded.raw_kind, \
          control_kind=excluded.control_kind, record_token_json=excluded.record_token_json, \
+         source_order=CASE WHEN session_events.ts_ms=excluded.ts_ms \
+           THEN COALESCE(session_events.source_order,excluded.source_order) ELSE excluded.source_order END, \
          location={LOCATION_ASSIGNED}"
     );
     let unchanged = format!(
-        "excluded.project IS NOT session_events.project \
+        "excluded.source_order IS NOT session_events.source_order \
+         OR excluded.project IS NOT session_events.project \
          OR ({assigned_key}) IS NOT session_events.project_key \
          OR ({assigned_method}) IS NOT session_events.project_key_method \
          OR excluded.cwd IS NOT session_events.cwd \
@@ -215,3 +225,6 @@ pub(crate) static FILE_EDIT_UPSERT: LazyLock<String> = LazyLock::new(|| {
 pub(crate) static FILE_EDIT_REWRITE: LazyLock<String> = LazyLock::new(|| {
     format!("{FILE_EDIT_INSERT}{FILE_EDIT_BRANCH_KEPT}, location={EDIT_LOCATION_ASSIGNED}")
 });
+
+#[cfg(test)]
+mod tests;
