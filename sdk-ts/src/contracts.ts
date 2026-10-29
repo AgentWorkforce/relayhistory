@@ -342,6 +342,8 @@ export interface SessionEvent {
   */
   provider: string | null;
   eventUid: string;
+  /** Observed order within the timestamp bucket; null when unknown. */
+  sourceOrder: number | null;
   /** Provider-native record or block type, when recorded. */
   rawKind: string | null;
   /** Upstream API message identity, distinct from the transcript record ID. */

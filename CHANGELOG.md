@@ -8,7 +8,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Breaking Changes
 
-- Native contract 30 requires matching SDK and addon versions to retain provider event types and request identities.
+- Native contract 30 and evidence contract 5 require matching SDK and addon versions for full-session evidence, prompt identities and recorded event ordering.
 
 ### Added
 

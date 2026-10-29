@@ -371,3 +371,65 @@ fn one_record_paged_export_intake_reopen_reexport_retains_durable_order() {
     submit(&receiver, "transport", replay).unwrap();
     assert_eq!(ids(&receiver), before);
 }
+
+#[test]
+fn remote_rank_cannot_collide_with_direct_local_canonical_survivor() {
+    let home = tempfile::tempdir().unwrap();
+    let store = open(home.path());
+    let conn = rusqlite::Connection::open(store.db_path()).unwrap();
+    conn.execute(
+        "INSERT INTO session_events(source,session_id,ts_ms,event_uid,role,kind,text,source_order,location) VALUES('claude',?1,100,'local-a','user','text','A',0,'local')",
+        [SID],
+    ).unwrap();
+    let revision = observe(&store, "remote");
+    let before = ids(&store);
+    let error = store
+        .apply_source_evidence(SourceEvidenceSubmission::new(
+            key("remote"),
+            revision.clone(),
+            NormalizedSourceEvidence {
+                source_stamp: "fixture".into(),
+                source_bytes: 0,
+                covered_kinds: vec![EvidenceKind::SessionEvent],
+                records: vec![record("remote-b", "assistant", Some(0), true)],
+            },
+        ))
+        .unwrap_err();
+    assert!(error.to_string().contains("SOURCE_ORDER_CONFLICT"));
+    assert_eq!(ids(&store), before);
+    assert_eq!(
+        store
+            .source_observation(&key("remote"))
+            .unwrap()
+            .revision
+            .as_deref(),
+        Some(revision.as_str())
+    );
+    submit(
+        &store,
+        "remote",
+        vec![record("remote-b", "assistant", Some(1), true)],
+    )
+    .unwrap();
+    assert_eq!(uids(&store), ["local-a", "remote-b"]);
+}
+
+#[test]
+fn unknown_remote_order_preserves_rank_only_within_the_same_timestamp() {
+    let home = tempfile::tempdir().unwrap();
+    let store = open(home.path());
+    submit(
+        &store,
+        "remote",
+        vec![record("event", "user", Some(7), true)],
+    )
+    .unwrap();
+    submit(&store, "remote", vec![record("event", "user", None, true)]).unwrap();
+    assert_eq!(evidence(&store).messages[0].blocks[0].source_order, Some(7));
+    let mut moved = record("event", "user", None, true);
+    moved.payload.insert("ts_ms".into(), json!(200));
+    submit(&store, "remote", vec![moved]).unwrap();
+    let block = &evidence(&store).messages[0].blocks[0];
+    assert_eq!(block.ts_ms, 200);
+    assert_eq!(block.source_order, None);
+}

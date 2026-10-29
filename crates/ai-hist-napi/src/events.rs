@@ -24,6 +24,8 @@ pub struct NativeSessionEvent {
     /// (OpenCode's `providerID`). Null elsewhere rather than inferred.
     pub provider: Option<String>,
     pub event_uid: String,
+    /// Observed order within a timestamp bucket; null when unknown.
+    pub source_order: Option<i64>,
     /// Provider-native record or block type, when recorded.
     pub raw_kind: Option<String>,
     /// Upstream API message identity, distinct from the transcript record ID.
@@ -87,6 +89,7 @@ impl From<CoreSessionEvent> for NativeSessionEvent {
             token_json: event.token_json,
             provider: event.provider,
             event_uid: event.event_uid,
+            source_order: event.source_order,
             raw_kind: event.raw_kind,
             provider_message_id: event.provider_message_id,
             request_span: event.request_span,

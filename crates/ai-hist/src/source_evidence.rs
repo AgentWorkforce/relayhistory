@@ -530,7 +530,7 @@ impl EvidenceRecord {
             .filter(|column| !self.key_fields().split(',').any(|key| key == **column))
             .map(|column| {
                 if self.kind == EvidenceKind::SessionEvent && *column == "source_order" {
-                    "source_order=COALESCE(excluded.source_order,session_events.source_order)"
+                    "source_order=CASE WHEN excluded.ts_ms=session_events.ts_ms THEN COALESCE(excluded.source_order,session_events.source_order) ELSE excluded.source_order END"
                         .to_string()
                 } else {
                     format!("{column}=excluded.{column}")

@@ -26,6 +26,8 @@ export interface NativeSessionEvent {
    */
   provider?: string
   eventUid: string
+  /** Observed order within a timestamp bucket; null when unknown. */
+  sourceOrder?: number
   /** Provider-native record or block type, when recorded. */
   rawKind?: string
   /** Upstream API message identity, distinct from the transcript record ID. */

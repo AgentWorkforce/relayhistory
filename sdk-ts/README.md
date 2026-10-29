@@ -105,7 +105,12 @@ than emitting a local CLI command; an empty `locations` array retains legacy
 local behavior for rows written before provenance tracking.
 
 The event primitive is page-based and uses `{ tsMs, id }` as a deterministic
-cursor. The `sessionEvents` async iterator walks pages without accumulating a
+cursor. Events with known `sourceOrder` follow recorded order within each
+same-timestamp bucket; null means the provider order is unknown. Cursors resolve
+through stable row identity. If an ordered cursor row is removed, restart the
+read rather than guessing its old position. Source ranks outside JavaScript's
+safe integer range fail with `SOURCE_ORDER_NOT_REPRESENTABLE`.
+The `sessionEvents` async iterator walks pages without accumulating a
 large transcript. `getSessionEvents` is an explicit collecting convenience.
 
 Tool calls and file edits follow the same page / iterator / collect trio

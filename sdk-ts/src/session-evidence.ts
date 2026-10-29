@@ -2,7 +2,7 @@
 import type { Source, EvidenceKind } from './sdk-common.js';
 import type { ControlKind, NormalizedUsage, SessionRequest, SessionUsage, SessionUserTurn } from './contracts.js';
 import { sessionStoreCall, SESSION_STORE_OPS } from './native.js';
-import { evidenceIdentity } from './normalization.js';
+import { evidenceIdentity, sourceOrder } from './normalization.js';
 
 export interface EvidenceSession {
   source: Source;
@@ -65,6 +65,7 @@ export interface EvidenceMessage {
 }
 
 export interface EvidenceBlock {
+  sourceOrder: number | null;
   eventUid: string;
   role: 'user' | 'assistant' | 'tool_result';
   kind: 'text' | 'thinking' | 'tool_use' | 'tool_result';
@@ -207,7 +208,9 @@ function normalizeEvidence(value: Record<string, unknown>): SessionEvidence {
     ...record(prompt), eventUid: prompt.event_uid ?? null,
   }));
   result.messages = (value.messages as Record<string, unknown>[]).map((message) => ({
-    ...record(message), blocks: (message.blocks as unknown[]).map(record),
+    ...record(message), blocks: (message.blocks as Record<string, unknown>[]).map((block) => ({
+      ...record(block), sourceOrder: sourceOrder(block.source_order),
+    })),
   }));
   // Requests, usage and user turns already use their paged camelCase wire shapes.
   return result as unknown as SessionEvidence;

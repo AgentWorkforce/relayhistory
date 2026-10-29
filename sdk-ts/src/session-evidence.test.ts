@@ -838,3 +838,37 @@ test('full session evidence describes uncatalogued delegated children', { skip: 
     assert.equal(evidence?.relationships[0]?.side, 'child');
   } finally { await cleanup(); }
 });
+
+test('SDK event pages and full evidence preserve recorded order and reject rounded ranks', { skip: needsNodeSqlite }, async () => {
+  const { getSessionEvidence, getSessionEventsPage, getSessionUserTurnsPage } = await import('./index.js');
+  const { dbPath, cleanup } = await seededDatabase();
+  try {
+    const db = new sqlite!.DatabaseSync(dbPath);
+    try {
+      db.prepare("INSERT INTO sessions(source,session_id) VALUES ('claude','ordered-sdk')").run();
+      const insert = db.prepare("INSERT INTO session_events(source,session_id,event_uid,message_id,role,kind,ts_ms,text,source_order) VALUES ('claude','ordered-sdk',?,?,?,'text',100,?,?)");
+      insert.run('C', 'C', 'user', 'third', 2);
+      insert.run('B', 'B', 'assistant', 'second', 1);
+      insert.run('A', 'A', 'user', 'first', 0);
+    } finally { db.close(); }
+    const first = await getSessionEventsPage('ordered-sdk', { dbPath, source: 'claude', limit: 1 });
+    assert.deepEqual(first.events.map((row) => [row.eventUid, row.sourceOrder]), [['A', 0]]);
+    assert.ok(first.nextCursor);
+    const second = await getSessionEventsPage('ordered-sdk', { dbPath, source: 'claude', limit: 1, after: first.nextCursor });
+    assert.equal(second.events[0]?.eventUid, 'B');
+    const evidence = await getSessionEvidence('claude', 'ordered-sdk', { dbPath });
+    assert.deepEqual(evidence?.messages.map((row) => row.messageId), ['A', 'B', 'C']);
+    assert.deepEqual(evidence?.messages.flatMap((row) => row.blocks.map((block) => block.sourceOrder)), [0, 1, 2]);
+    const turns = await getSessionUserTurnsPage('claude', 'ordered-sdk', { dbPath, limit: 1 });
+    assert.equal(turns.userTurns[0]?.messageId, 'A');
+    assert.equal(turns.userTurns[0]?.followingMessageId, 'B');
+    assert.ok(turns.nextCursor);
+    assert.equal((await getSessionUserTurnsPage('claude', 'ordered-sdk', { dbPath, limit: 1, after: turns.nextCursor })).userTurns[0]?.messageId, 'C');
+    const unsafe = new sqlite!.DatabaseSync(dbPath);
+    try { unsafe.prepare("UPDATE session_events SET source_order=? WHERE session_id='ordered-sdk' AND event_uid='C'").run(9007199254740993n); }
+    finally { unsafe.close(); }
+    const unsafeRank = (error: unknown) => (error as { code?: string }).code === 'SOURCE_ORDER_NOT_REPRESENTABLE';
+    await assert.rejects(getSessionEvents('ordered-sdk', { dbPath, source: 'claude' }), unsafeRank);
+    await assert.rejects(getSessionEvidence('claude', 'ordered-sdk', { dbPath }), unsafeRank);
+  } finally { await cleanup(); }
+});
