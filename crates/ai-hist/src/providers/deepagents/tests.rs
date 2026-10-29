@@ -491,7 +491,10 @@ fn equal_time_repeated_prompts_keep_distinct_native_events_and_export() {
         .collect();
     assert_eq!(native_ids, ["human-1", "human-2"]);
     let history_count: i64 = ledger.query_row("SELECT count(*) FROM history WHERE source='deepagents' AND session_id=?1 AND prompt='retry native prompt'", [&session.id], |r| r.get(0)).unwrap();
-    assert_eq!(history_count, 2, "stable native identities preserve both equal-time prompts");
+    assert_eq!(
+        history_count, 2,
+        "stable native identities preserve both equal-time prompts"
+    );
     drop(statement);
     drop(ledger);
     let store = crate::SessionStore::open(

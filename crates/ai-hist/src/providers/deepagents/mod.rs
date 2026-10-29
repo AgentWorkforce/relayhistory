@@ -6,14 +6,14 @@ use crate::sources::catalog::{Discovery, Fixtures, Hydration, LocalSource, Relat
 use crate::EvidenceKind;
 use serde::{Deserialize, Serialize};
 mod decode;
+#[cfg(test)]
+mod history_identity_tests;
 mod lifecycle;
 mod normalize;
 mod roots;
 mod storage;
 #[cfg(test)]
 mod tests;
-#[cfg(test)]
-mod history_identity_tests;
 const ID: &str = "deepagents";
 pub(crate) const LOCAL_SOURCE: LocalSource = LocalSource {
     id: ID,
