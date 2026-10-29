@@ -23,7 +23,9 @@ pub(super) fn refresh_catalog_codex_locator(
             Ok(current) => current,
             Err(error) if error.is::<crate::ingest::CaptureCancelled>() => return Err(error),
             Err(error) => {
-                eprintln!("ai-hist: [codex] skipping SQLite locator refresh: {error:#}");
+                crate::ingest::scoped_files::provider_diagnostic(format_args!(
+                    "[codex] skipping SQLite locator refresh: {error:#}"
+                ));
                 None
             }
         };

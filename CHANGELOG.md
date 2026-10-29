@@ -4,7 +4,11 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Patch]
+
+### Fixed
+
+- Selected Codex SQLite sessions report an unavailable source when their backing stores disappear, and fallback diagnostics honor quiet mode.
 
 ## [0.53.0] - 2026-10-28
 

@@ -35,7 +35,9 @@ pub(crate) fn incomplete_projection_owns_rollout(incoming: &str, observed: &str)
             Err(error)
         }
         Err(error) => {
-            eprintln!("ai-hist: [codex] SQLite catalog ownership unavailable: {error:#}");
+            crate::ingest::scoped_files::provider_diagnostic(format_args!(
+                "[codex] SQLite catalog ownership unavailable: {error:#}"
+            ));
             Ok(false)
         }
     }
@@ -47,7 +49,9 @@ pub(crate) fn enumerate(
 ) -> Result<(Vec<Candidate>, HashSet<PathBuf>)> {
     let selection = database_selection(root)?;
     if let Some(diagnostic) = selection.diagnostic {
-        eprintln!("ai-hist: [codex] skipping SQLite history: {diagnostic}");
+        crate::ingest::scoped_files::provider_diagnostic(format_args!(
+            "[codex] skipping SQLite history: {diagnostic}"
+        ));
     }
     let Some((state, history)) = selection.pair else {
         return Ok((Vec::new(), HashSet::new()));

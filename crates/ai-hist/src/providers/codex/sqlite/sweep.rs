@@ -499,10 +499,10 @@ pub(crate) fn sync(
                     }
                     Err(error) => {
                         failed = true;
-                        eprintln!(
-                            "ai-hist: [codex] skipping SQLite thread {}: {error:#}",
+                        crate::ingest::scoped_files::provider_diagnostic(format_args!(
+                            "[codex] skipping SQLite thread {}: {error:#}",
                             thread.id
-                        );
+                        ));
                         continue;
                     }
                 }

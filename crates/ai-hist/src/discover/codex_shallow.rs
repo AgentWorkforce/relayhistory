@@ -91,7 +91,7 @@ impl ShallowSessionProvider for CodexProvider {
         match crate::providers::codex::sqlite::fingerprint(&env.codex_home) {
             Ok(sqlite) => inputs.extend(sqlite),
             Err(error) if error.is::<crate::ingest::CaptureCancelled>() => return Err(error),
-            Err(error) => eprintln!("ai-hist: [codex] skipping SQLite history: {error:#}"),
+            Err(error) => crate::ingest::scoped_files::provider_diagnostic(format_args!("[codex] skipping SQLite history: {error:#}")),
         }
         Ok(inputs)
     }
@@ -120,7 +120,7 @@ impl ShallowSessionProvider for CodexProvider {
                 Ok(found) => found,
                 Err(error) if error.is::<crate::ingest::CaptureCancelled>() => return Err(error),
                 Err(error) => {
-                    eprintln!("ai-hist: [codex] skipping SQLite history: {error:#}");
+                    crate::ingest::scoped_files::provider_diagnostic(format_args!("[codex] skipping SQLite history: {error:#}"));
                     (Vec::new(), Default::default())
                 }
             };

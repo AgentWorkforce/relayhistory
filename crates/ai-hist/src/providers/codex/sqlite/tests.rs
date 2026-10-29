@@ -539,6 +539,31 @@ fn idless_rollout_prefix_and_rewritten_projection_do_not_leave_duplicate_evidenc
         "one rollout row and one separate repeated reply"
     );
 
+    // An unchanged item ID can carry rewritten output: ID-set retirement alone
+    // would retain the old conflict-ignored event.
+    history
+        .execute(
+            "UPDATE thread_items SET item_json=?1 WHERE item_id='repeated-answer'",
+            [
+                json!({"type":"agentMessage","id":"repeated-answer","text":"Rewritten answer"})
+                    .to_string(),
+            ],
+        )
+        .unwrap();
+    Connection::open(codex.join("state_5.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE threads SET updated_at_ms=updated_at_ms+1 WHERE id='sqlite-pruned-all-items'",
+            [],
+        )
+        .unwrap();
+    sync(&conn, &mut state, &codex, &repairs).unwrap();
+    let rewritten: String = conn.query_row(
+        "SELECT text FROM session_events WHERE session_id='sqlite-pruned-all-items' AND event_uid='repeated-answer'",
+        [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(rewritten, "Rewritten answer");
+
     history.execute("DELETE FROM thread_items WHERE thread_id='sqlite-pruned-all-items' AND item_id IN ('sqlite-sqlite-pruned-all-items-0','sqlite-sqlite-pruned-all-items-2','sqlite-sqlite-pruned-all-items-4')", []).unwrap();
     history
         .execute(
@@ -921,4 +946,57 @@ fn exact_rollout_sync_does_not_enumerate_or_hydrate_sqlite_siblings() {
             .unwrap(),
         2
     );
+}
+
+#[test]
+fn selected_sqlite_locator_reports_unavailable_after_pair_disappears() {
+    let temp = tempfile::tempdir().unwrap();
+    let codex = temp.path().join(".codex");
+    install_thread_set(&codex, &[2_000_000]);
+    let roots =
+        crate::ProviderRoots::from_home(temp.path().to_owned(), temp.path().join("opencode.db"));
+    let db = temp.path().join("history.db");
+    let conn = crate::open_db(&db).unwrap();
+    let locator = locator(&codex.join("state_5.sqlite"), "thread-000");
+    conn.execute("INSERT INTO sessions (source,session_id,raw_path,discovery_state) VALUES ('codex','thread-000',?1,'shallow')", [&locator]).unwrap();
+    conn.execute("INSERT INTO session_presences (source,session_id,location,raw_locator,source_stamp,discovery_state) VALUES ('codex','thread-000','local',?1,'v2:test','shallow')", [&locator]).unwrap();
+    drop(conn);
+    std::fs::remove_file(codex.join("state_5.sqlite")).unwrap();
+    std::fs::remove_file(codex.join("thread_history_1.sqlite")).unwrap();
+    let store =
+        crate::SessionStore::open(crate::StoreOptions::default().db_path(db).roots(roots)).unwrap();
+    let error = store
+        .hydrate(
+            &crate::SessionRef::id(crate::Source::Codex, "thread-000"),
+            crate::HydrateOptions::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), "SESSION_SOURCE_UNAVAILABLE");
+}
+
+#[test]
+fn history_log_collision_does_not_claim_another_sessions_sqlite_prompt() {
+    let temp = tempfile::tempdir().unwrap();
+    let conn = crate::open_db(&temp.path().join("history.db")).unwrap();
+    let entry = HistoryEntry {
+        id: 0,
+        source: "codex".into(),
+        session_id: Some("owner".into()),
+        project: None,
+        prompt: "same prompt".into(),
+        prompt_hash: None,
+        timestamp_ms: 1000,
+    };
+    crate::insert_history(&conn, &entry).unwrap();
+    let id = conn.last_insert_rowid();
+    conn.execute("INSERT INTO session_markers (source,session_id,marker_uid,kind,subkind,payload_json) VALUES ('codex','owner','sqlite:thread','session_metadata','sqlite',?1)", [json!({"history_ids":[id]}).to_string()]).unwrap();
+    let mut collision = entry.clone();
+    collision.session_id = Some("other".into());
+    assert_eq!(crate::insert_history(&conn, &collision).unwrap(), 0);
+    claim_history_log_prompt(&conn, &collision).unwrap();
+    let ids: String = conn.query_row("SELECT json_extract(payload_json,'$.history_ids') FROM session_markers WHERE session_id='owner'", [], |row| row.get(0)).unwrap();
+    assert_eq!(ids, json!([id]).to_string());
+    claim_history_log_prompt(&conn, &entry).unwrap();
+    let ids: String = conn.query_row("SELECT json_extract(payload_json,'$.history_ids') FROM session_markers WHERE session_id='owner'", [], |row| row.get(0)).unwrap();
+    assert_eq!(ids, "[]");
 }

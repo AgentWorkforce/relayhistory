@@ -368,8 +368,8 @@ pub(crate) fn capture(
     state: &Path,
     id: &str,
 ) -> Result<AcquiredSession> {
-    let (current_state, history) =
-        databases(&roots.codex)?.context("Codex SQLite history unavailable")?;
+    let (current_state, history) = databases(&roots.codex)?
+        .context("SESSION_SOURCE_UNAVAILABLE: Codex SQLite history unavailable")?;
     ensure!(
         std::fs::canonicalize(state)? == std::fs::canonicalize(&current_state)?,
         "SESSION_SOURCE_MISMATCH: stale Codex SQLite locator"
