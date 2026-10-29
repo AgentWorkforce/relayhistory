@@ -30,7 +30,7 @@
   "capture": [
     {
       "evidence": "Messages and tools",
-      "coverage": "SQLite schema 31 native rows, tool IDs/results and reasoning; profile identity namespaced."
+      "coverage": "SQLite schema 31 native rows, tool IDs/results and reasoning; profile identity namespaced. Complete native rereads fill unknown event order without changing known remote order."
     },
     {
       "evidence": "Usage and relationships",

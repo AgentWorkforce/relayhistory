@@ -145,6 +145,32 @@ pub(super) fn note(conn: &Connection, event: &EventRow<'_>) {
     });
 }
 
+/// Forget only a parser's explicitly retired local event share. Do not filter
+/// against database membership at finish: an unexplained disappearance or a
+/// moved timestamp must still reject the complete-read observation.
+pub(super) fn forget(conn: &Connection, source: &str, session: &str, uids: &[String]) {
+    if uids.is_empty() {
+        return;
+    }
+    FRAMES.with(|frames| {
+        for frame in frames.borrow_mut().iter_mut().filter(|frame| {
+            frame.conn == std::ptr::from_ref(conn) as usize
+                && frame.source == source
+                && frame.session.as_deref().is_none_or(|sid| sid == session)
+        }) {
+            if let Some(group) = frame.groups.get_mut(session) {
+                group.ordered.retain(|(_, uid)| !uids.contains(uid));
+                group.positions = group
+                    .ordered
+                    .iter()
+                    .enumerate()
+                    .map(|(index, (_, uid))| (uid.clone(), index))
+                    .collect();
+            }
+        }
+    });
+}
+
 impl Capture<'_> {
     fn take(&self) -> (BTreeMap<String, Events>, bool) {
         FRAMES.with(|frames| {

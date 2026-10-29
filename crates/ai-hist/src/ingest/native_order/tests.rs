@@ -156,3 +156,62 @@ fn caught_nested_unwind_invalidates_the_outer_order_proof() {
         0
     );
 }
+
+fn emitted(conn: &Connection, uid: &str) {
+    crate::ingest::insert_session_event(
+        conn,
+        &EventRow {
+            source: "claude",
+            session_id: "retired",
+            event_uid: uid,
+            message_id: uid,
+            ts_ms: 1,
+            role: "assistant",
+            kind: "text",
+            text: Some(uid),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+}
+
+#[test]
+fn explicit_retirement_updates_active_positions_and_allows_reemission() {
+    let conn = Connection::open_in_memory().unwrap();
+    crate::init_db(&conn).unwrap();
+    let outer = begin(&conn, "claude", None).unwrap();
+    let inner = begin(&conn, "claude", Some("retired")).unwrap();
+    emitted(&conn, "temporary");
+    emitted(&conn, "survivor");
+    conn.execute("DELETE FROM session_events WHERE event_uid='temporary'", [])
+        .unwrap();
+    forget(&conn, "claude", "retired", &["temporary".into()]);
+    emitted(&conn, "survivor");
+    emitted(&conn, "temporary");
+    inner.finish().unwrap();
+    outer.finish().unwrap();
+    let uids: Vec<String> = conn
+        .prepare("SELECT event_uid FROM session_events ORDER BY source_order,id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert_eq!(uids, ["survivor", "temporary"]);
+}
+
+#[test]
+fn forgetting_another_session_does_not_hide_a_moved_timestamp() {
+    let conn = Connection::open_in_memory().unwrap();
+    crate::init_db(&conn).unwrap();
+    let capture = begin(&conn, "claude", None).unwrap();
+    emitted(&conn, "moved");
+    conn.execute(
+        "UPDATE session_events SET ts_ms=2 WHERE event_uid='moved'",
+        [],
+    )
+    .unwrap();
+    forget(&conn, "claude", "other", &["moved".into()]);
+    let error = capture.finish().unwrap_err();
+    assert!(format!("{error:#}").contains("FILE_HISTORY_ORDER_OBSERVATION_CHANGED"));
+}
