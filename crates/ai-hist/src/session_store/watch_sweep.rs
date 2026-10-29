@@ -146,8 +146,9 @@ pub(super) struct TickNotes {
 /// disabled. This worker keeps that copy/fsync work off the leading tick while
 /// enforcing a 30 s PASSIVE-checkpoint deadline for a sustained burst. Full
 /// sweeps retain their separate bounded-TRUNCATE space-reclamation role. If
-/// the worker is unavailable or cannot complete a checkpoint, the next writer
-/// checkout restores SQLite's default automatic checkpoint threshold.
+/// the worker is unavailable or three consecutive attempts cannot complete,
+/// the next writer checkout restores SQLite's default automatic checkpoint
+/// threshold.
 pub(super) struct QuietCheckpoint {
     schedule: Option<std::sync::mpsc::Sender<()>>,
     available: std::sync::Arc<std::sync::atomic::AtomicBool>,
@@ -219,6 +220,7 @@ fn checkpoint_after_quiet(
     completed: Option<std::sync::mpsc::Sender<crate::ingest::SweepCheckpoint>>,
     available: &std::sync::atomic::AtomicBool,
 ) {
+    let mut incomplete_attempts = 0;
     while pending.recv().is_ok() {
         let cap = std::time::Instant::now() + max_delay;
         let mut quiet_until = std::time::Instant::now() + quiet;
@@ -235,12 +237,17 @@ fn checkpoint_after_quiet(
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                    finish_quiet_checkpoint(db_path, &completed, available);
+                    finish_quiet_checkpoint(
+                        db_path,
+                        &completed,
+                        available,
+                        &mut incomplete_attempts,
+                    );
                     return;
                 }
             }
         }
-        if !finish_quiet_checkpoint(db_path, &completed, available) {
+        if !finish_quiet_checkpoint(db_path, &completed, available, &mut incomplete_attempts) {
             return;
         }
     }
@@ -250,16 +257,64 @@ fn finish_quiet_checkpoint(
     db_path: &Path,
     completed: &Option<std::sync::mpsc::Sender<crate::ingest::SweepCheckpoint>>,
     available: &std::sync::atomic::AtomicBool,
+    incomplete_attempts: &mut u8,
 ) -> bool {
-    let outcome = checkpoint_wal(db_path);
-    let complete = outcome.is_some_and(|outcome| outcome.complete);
+    note_quiet_checkpoint(
+        checkpoint_wal(db_path),
+        completed,
+        available,
+        incomplete_attempts,
+    )
+}
+
+fn note_quiet_checkpoint(
+    outcome: Option<crate::ingest::SweepCheckpoint>,
+    completed: &Option<std::sync::mpsc::Sender<crate::ingest::SweepCheckpoint>>,
+    available: &std::sync::atomic::AtomicBool,
+    incomplete_attempts: &mut u8,
+) -> bool {
+    const MAX_CONSECUTIVE_INCOMPLETE_ATTEMPTS: u8 = 3;
     if let (Some(completed), Some(outcome)) = (completed, outcome) {
         let _ = completed.send(outcome);
     }
-    if !complete {
-        available.store(false, std::sync::atomic::Ordering::Release);
+    match outcome {
+        Some(outcome) if outcome.complete => {
+            *incomplete_attempts = 0;
+            true
+        }
+        Some(_) => {
+            *incomplete_attempts += 1;
+            if *incomplete_attempts < MAX_CONSECUTIVE_INCOMPLETE_ATTEMPTS {
+                true
+            } else {
+                available.store(false, std::sync::atomic::Ordering::Release);
+                false
+            }
+        }
+        None => {
+            available.store(false, std::sync::atomic::Ordering::Release);
+            false
+        }
     }
-    complete
+}
+
+fn checkpoint_wal(db_path: &Path) -> Option<crate::ingest::SweepCheckpoint> {
+    let flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    if let Ok(conn) = rusqlite::Connection::open_with_flags(db_path, flags) {
+        if conn
+            .is_readonly(rusqlite::DatabaseName::Main)
+            .unwrap_or(true)
+        {
+            return None;
+        }
+        return Some(crate::ingest::checkpoint_after_sweep(
+            &conn,
+            db_path,
+            u64::MAX,
+        ));
+    }
+    None
 }
 
 /// One watch loop's sweep: the same locked `sync` as [`SessionStore::sync`],
@@ -532,19 +587,6 @@ impl WatchSweep {
     }
 }
 
-fn checkpoint_wal(db_path: &Path) -> Option<crate::ingest::SweepCheckpoint> {
-    let flags =
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
-    if let Ok(conn) = rusqlite::Connection::open_with_flags(db_path, flags) {
-        return Some(crate::ingest::checkpoint_after_sweep(
-            &conn,
-            db_path,
-            u64::MAX,
-        ));
-    }
-    None
-}
-
 fn configure_auto_checkpoint(
     conn: &rusqlite::Connection,
     defer_to_worker: bool,
@@ -740,7 +782,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("missing.db");
         let available = std::sync::atomic::AtomicBool::new(true);
-        assert!(!finish_quiet_checkpoint(&db_path, &None, &available));
+        let mut incomplete_attempts = 0;
+        assert!(!finish_quiet_checkpoint(
+            &db_path,
+            &None,
+            &available,
+            &mut incomplete_attempts,
+        ));
         assert!(!available.load(std::sync::atomic::Ordering::Acquire));
         assert!(!db_path.exists());
     }
@@ -803,5 +851,53 @@ mod tests {
             .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))
             .unwrap();
         assert_eq!(current, 1_000);
+    }
+
+    #[test]
+    fn transient_incomplete_checkpoints_retry_before_fallback() {
+        let available = std::sync::atomic::AtomicBool::new(true);
+        let mut incomplete_attempts = 0;
+        let incomplete = crate::ingest::SweepCheckpoint {
+            escalated: false,
+            complete: false,
+            wal_bytes: 4096,
+        };
+        assert!(note_quiet_checkpoint(
+            Some(incomplete),
+            &None,
+            &available,
+            &mut incomplete_attempts,
+        ));
+        assert!(available.load(std::sync::atomic::Ordering::Acquire));
+        assert_eq!(incomplete_attempts, 1);
+
+        let complete = crate::ingest::SweepCheckpoint {
+            complete: true,
+            ..incomplete
+        };
+        assert!(note_quiet_checkpoint(
+            Some(complete),
+            &None,
+            &available,
+            &mut incomplete_attempts,
+        ));
+        assert_eq!(incomplete_attempts, 0);
+
+        for expected in 1..=2 {
+            assert!(note_quiet_checkpoint(
+                Some(incomplete),
+                &None,
+                &available,
+                &mut incomplete_attempts,
+            ));
+            assert_eq!(incomplete_attempts, expected);
+        }
+        assert!(!note_quiet_checkpoint(
+            Some(incomplete),
+            &None,
+            &available,
+            &mut incomplete_attempts,
+        ));
+        assert!(!available.load(std::sync::atomic::Ordering::Acquire));
     }
 }
