@@ -14,6 +14,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - `getSessionEvidence` reads a complete stored session snapshot with evidence-kind selection, optional transcript omission, provider identities and usage.
 
+- The CLI and SDK expose retention policy previews, explicitly applied bounded pruning with upload protection, and database compaction for reclaiming free space.
+
 ### Changed
 
 - Export schema version 3 carries stable prompt-event identity and source-order evidence; new readers continue accepting older snapshots.

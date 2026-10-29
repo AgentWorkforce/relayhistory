@@ -95,6 +95,7 @@ export * from './delivery.js';
 export * from './history-export.js';
 export { NATIVE_CONTRACT_VERSION, runtimePlatform, validateNativeContract } from './native.js';
 export * from './git.js';
+export * from './maintenance.js';
 
 export * from './contracts.js';
 import type {

@@ -6,6 +6,39 @@ reads do not contact a network service. Retention adds explicit maintenance;
 cleanup does not run during session capture, catalog listing, sync or hydration.
 Evidence writes still maintain the additional indexes described below.
 
+## Operator commands
+
+The npm CLI and the repository's Rust CLI both expose:
+
+```sh
+ai-hist retention --days 30 --json       # policy preview only; no creation or writes
+ai-hist retention --days 30 --apply     # save policy and run one bounded batch
+ai-hist retention --apply --max-rows 128 # another bounded batch, using saved policy
+ai-hist compact                         # reclaim SQLite free space; deletes no rows
+```
+
+Preview reports the stored and effective policy, not a count or exact plan of
+rows that would be deleted. `--apply` is required to save settings or prune.
+Without registered upload consumers and acknowledgements, the batch waits and
+removes nothing. `--apply --allow-unuploaded` explicitly permits loss before
+upload; it never follows from choosing an age limit. `--days 0` keeps evidence
+forever. Neither command reads or deletes provider originals or remote copies.
+`--db PATH` selects the store; `--json` prints the result.
+
+Each invocation removes at most `--max-rows` payload/auxiliary rows (1..1024,
+default 128), plus the existing engine's bounded catalog/presence cleanup.
+Inspect `busy`, `deferred`, `awaiting_upload_ack` and `cycle_complete` in CLI JSON
+(the SDK uses camelCase) before
+scheduling another invocation; the command never spins through an entire store.
+Freed SQLite pages can be reused immediately; `compact` rewrites the database
+to return them to the filesystem and may need a pause in writes and enough
+space for that rewrite.
+
+The SDK uses `maintainRetention({ days, apply, allowUnuploaded, maxRows,
+dbPath })` and `compactDatabase({ dbPath })`. These operations delegate to the
+same Rust `SessionStore` APIs described below. They do not introduce a second
+retention implementation.
+
 ## Policy and desktop integration
 
 The shared setting is `store_settings['history.retention_days']` in that store.

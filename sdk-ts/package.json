@@ -63,6 +63,7 @@
     "dist/pagination.*",
     "dist/git.*",
     "dist/operations.*",
+    "dist/maintenance.*",
     "dist/handoff.*",
     "dist/source-contracts.*",
     "dist/session-evidence.*",

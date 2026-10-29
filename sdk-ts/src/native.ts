@@ -140,6 +140,8 @@ async function loadNative(): Promise<NativeBinding> {
  */
 export const SESSION_STORE_OPS = Object.freeze({
   session: 'session',
+  retention: 'retention',
+  compact: 'compact',
   markers: 'markers',
   requests: 'requests',
   usageSummary: 'usage_summary',
@@ -161,6 +163,14 @@ export interface SessionEvidenceCallArgs {
   sessionId: string;
   includeText?: boolean;
   kinds?: readonly string[];
+}
+
+export interface MaintenanceCallArgs {
+  dbPath?: string;
+  days?: number;
+  apply?: boolean;
+  allowUnuploaded?: boolean;
+  maxRows?: number;
 }
 
 export interface SessionStoreCallArgs {
@@ -200,7 +210,7 @@ export interface CommitChangesCallArgs {
  */
 export async function sessionStoreCall(
   op: SessionStoreOp,
-  args: SessionStoreCallArgs | SessionEvidenceCallArgs | ChangeFeedCallArgs | CommitChangesCallArgs,
+  args: SessionStoreCallArgs | SessionEvidenceCallArgs | ChangeFeedCallArgs | CommitChangesCallArgs | MaintenanceCallArgs,
 ): Promise<UnknownRecord> {
   return nativeCall(async (native) => {
     const answer = await native.sessionStoreCall(op, JSON.stringify(args));
