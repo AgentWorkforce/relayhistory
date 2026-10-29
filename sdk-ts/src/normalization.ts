@@ -119,6 +119,7 @@ export function historyEntry(value: UnknownRecord): HistoryEntry {
     id: Number(value.id),
     source: String(value.source) as Source,
     sessionId: nullableString(value.sessionId),
+    eventUid: nullableString(value.eventUid),
     project: nullableString(value.project),
     prompt: String(value.prompt),
     timestampMs: Number(value.timestampMs),

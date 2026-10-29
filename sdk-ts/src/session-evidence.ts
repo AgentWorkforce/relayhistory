@@ -31,6 +31,7 @@ export interface EvidenceSession {
 }
 
 export interface EvidencePrompt {
+  eventUid: string | null;
   prompt: string | null;
   promptHash: string | null;
   promptBytes: number;
@@ -202,6 +203,9 @@ function normalizeEvidence(value: Record<string, unknown>): SessionEvidence {
     result[field.replace(/_([a-z])/g, (_, letter: string) => letter.toUpperCase())] =
       (value[field] as unknown[]).map(record);
   }
+  result.prompts = (value.prompts as Record<string, unknown>[]).map((prompt) => ({
+    ...record(prompt), eventUid: prompt.event_uid ?? null,
+  }));
   result.messages = (value.messages as Record<string, unknown>[]).map((message) => ({
     ...record(message), blocks: (message.blocks as unknown[]).map(record),
   }));

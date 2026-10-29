@@ -8,6 +8,7 @@ pub struct NativeHistoryEntry {
     pub id: i64,
     pub source: String,
     pub session_id: Option<String>,
+    pub event_uid: Option<String>,
     pub project: Option<String>,
     pub prompt: String,
     pub timestamp_ms: i64,
@@ -24,6 +25,7 @@ impl NativeHistoryEntry {
             id: entry.id,
             source: entry.source,
             session_id: entry.session_id,
+            event_uid: entry.event_uid,
             project: entry.project,
             prompt: entry.prompt,
             timestamp_ms: entry.timestamp_ms,
@@ -68,6 +70,7 @@ pub struct NativeSearchMatch {
     pub id: i64,
     pub source: String,
     pub session_id: Option<String>,
+    pub event_uid: Option<String>,
     pub project: Option<String>,
     /// The matched text: the prompt for a `history` match, the event text
     /// otherwise. Named `prompt` so a match is still a history entry.
@@ -92,6 +95,7 @@ impl NativeSearchMatch {
             id: row.id,
             source: row.source,
             session_id: row.session_id,
+            event_uid: row.event_uid,
             project: row.project,
             prompt: row.text,
             timestamp_ms: row.timestamp_ms,

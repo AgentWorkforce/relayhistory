@@ -801,3 +801,23 @@ test('full session evidence retains exact usage snapshot JSON', { skip: needsNod
     assert.deepEqual(marker?.usageSnapshot?.provider_extra, { snake_key: 'intact' });
   } finally { await cleanup(); }
 });
+
+
+test('SDK history and evidence keep equal-time repeated native prompts distinct', { skip: needsNodeSqlite }, async () => {
+  const { getSessionEvidence, recent, search } = await import('./index.js');
+  const { dbPath, cleanup } = await seededDatabase();
+  try {
+    const db = new sqlite!.DatabaseSync(dbPath);
+    try {
+      const insert = db.prepare("INSERT INTO history(source, session_id, event_uid, timestamp_ms, prompt) VALUES ('claude', ?, ?, 1790000000000, 'identity-test')");
+      insert.run(SHARED_SESSION, 'native-prompt-1');
+      insert.run(SHARED_SESSION, 'native-prompt-2');
+    } finally { db.close(); }
+    const rows = (await recent({ dbPath, source: 'claude' })).filter((row) => row.prompt === 'identity-test');
+    assert.deepEqual(rows.map((row) => row.eventUid).sort(), ['native-prompt-1', 'native-prompt-2']);
+    const matches = await search('identity-test', { dbPath, source: 'claude' });
+    assert.deepEqual(matches.map((row) => row.eventUid).sort(), ['native-prompt-1', 'native-prompt-2']);
+    const evidence = await getSessionEvidence('claude', SHARED_SESSION, { dbPath, kinds: ['history'], includeText: false });
+    assert.deepEqual(evidence?.prompts.filter((row) => row.eventUid !== null).map((row) => row.eventUid).sort(), ['native-prompt-1', 'native-prompt-2']);
+  } finally { await cleanup(); }
+});

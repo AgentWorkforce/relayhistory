@@ -6,6 +6,8 @@ export interface HistoryEntry {
   id: number;
   source: Source;
   sessionId: string | null;
+  /** Native prompt/event identity; null for anonymous legacy prompt logs. */
+  eventUid: string | null;
   project: string | null;
   prompt: string;
   timestampMs: number;

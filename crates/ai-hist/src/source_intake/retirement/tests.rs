@@ -169,3 +169,34 @@ fn local_retirement_schema_upgrades_without_changing_snapshot_revisions() {
     assert_eq!(observations::revision(&conn,&remote).unwrap(),revision);
     assert_eq!(conn.query_row("SELECT count(*) FROM local_retirement_support",[],|r|r.get::<_,i64>(0)).unwrap(),0);
 }
+
+#[test]
+fn identified_equal_time_prompts_survive_retirement_and_withdraw_independently() {
+    for remote_first in [false, true] {
+        let (_dir, mut conn) = setup();
+        let remote = key(SessionLocation::Remote, "remote");
+        observe(&conn, &remote);
+        let mut records = records("repeat");
+        records[1].payload.insert("event_uid".into(), serde_json::json!("prompt:1"));
+        let mut repeated = records[1].clone();
+        repeated.payload.insert("event_uid".into(), serde_json::json!("prompt:2"));
+        records.push(repeated);
+        source_evidence::validate_records(&remote,
+            &[EvidenceKind::SessionEvent, EvidenceKind::History, EvidenceKind::ToolCall],
+            &mut records).unwrap();
+        if !remote_first { local(&conn, &records); }
+        submit(&mut conn, &remote, records.clone());
+        if remote_first { local(&conn, &records); }
+        retire(&conn).unwrap();
+        for record in &records { assert!(record.matches_canonical(&conn).unwrap()); }
+        let ids: Vec<String> = conn.prepare("SELECT event_uid FROM history WHERE session_id='retained' ORDER BY event_uid").unwrap()
+            .query_map([], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(ids, ["prompt:1", "prompt:2"]);
+        records.pop();
+        submit(&mut conn, &remote, records.clone());
+        assert_eq!(conn.query_row("SELECT count(*) FROM history WHERE session_id='retained'", [], |row| row.get::<_, i64>(0)).unwrap(), 1);
+        assert!(records[1].matches_canonical(&conn).unwrap());
+        submit(&mut conn, &remote, vec![]);
+        assert_eq!(conn.query_row("SELECT count(*) FROM history WHERE session_id='retained'", [], |row| row.get::<_, i64>(0)).unwrap(), 0);
+    }
+}

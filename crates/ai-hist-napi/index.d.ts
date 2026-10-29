@@ -78,6 +78,7 @@ export interface NativeHistoryEntry {
   id: number
   source: string
   sessionId?: string
+  eventUid?: string
   project?: string
   prompt: string
   timestampMs: number
@@ -91,6 +92,7 @@ export interface NativeSearchMatch {
   id: number
   source: string
   sessionId?: string
+  eventUid?: string
   project?: string
   /**
    * The matched text: the prompt for a `history` match, the event text
