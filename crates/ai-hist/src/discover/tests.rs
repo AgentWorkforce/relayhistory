@@ -2635,6 +2635,20 @@ fn nested_relaxed_synchronous_guards_share_one_connection_policy() {
         .query_row("PRAGMA synchronous", [], |row| row.get(0))
         .unwrap();
     assert_eq!(restored, full);
+    {
+        let _next = RelaxedSynchronous::new(&conn).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "a completed guard must not make the next guard look nested"
+        );
+    }
+    assert_eq!(
+        conn.query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        full
+    );
 }
 
 #[test]

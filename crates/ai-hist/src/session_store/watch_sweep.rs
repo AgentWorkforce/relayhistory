@@ -144,7 +144,8 @@ pub(super) struct TickNotes {
 ///
 /// The retained watch writer has SQLite's commit-thread auto-checkpoint
 /// disabled. This worker keeps that copy/fsync work off the leading tick while
-/// the ordinary full sweep remains the 30 s backstop for a sustained burst.
+/// enforcing a 30 s PASSIVE-checkpoint deadline for a sustained burst. Full
+/// sweeps retain their separate bounded-TRUNCATE space-reclamation role.
 pub(super) struct QuietCheckpoint {
     schedule: Option<std::sync::mpsc::Sender<()>>,
 }
@@ -154,18 +155,24 @@ impl QuietCheckpoint {
         let quiet_ms = debounce_ms
             .saturating_mul(5)
             .clamp(1_000, DEFAULT_SLOW_POLL_MS);
-        Self::with_quiet(db_path, Duration::from_millis(quiet_ms), None)
+        Self::with_quiet(
+            db_path,
+            Duration::from_millis(quiet_ms),
+            Duration::from_millis(DEFAULT_SLOW_POLL_MS),
+            None,
+        )
     }
 
     fn with_quiet(
         db_path: PathBuf,
         quiet: Duration,
+        max_delay: Duration,
         completed: Option<std::sync::mpsc::Sender<crate::ingest::SweepCheckpoint>>,
     ) -> Self {
         let (schedule, pending) = std::sync::mpsc::channel();
         let spawned = std::thread::Builder::new()
             .name("ai-hist-wal-checkpoint".into())
-            .spawn(move || checkpoint_after_quiet(&db_path, quiet, pending, completed));
+            .spawn(move || checkpoint_after_quiet(&db_path, quiet, max_delay, pending, completed));
         Self {
             schedule: spawned.ok().map(|_| schedule),
         }
@@ -181,13 +188,24 @@ impl QuietCheckpoint {
 fn checkpoint_after_quiet(
     db_path: &Path,
     quiet: Duration,
+    max_delay: Duration,
     pending: std::sync::mpsc::Receiver<()>,
     completed: Option<std::sync::mpsc::Sender<crate::ingest::SweepCheckpoint>>,
 ) {
     while pending.recv().is_ok() {
+        let cap = std::time::Instant::now() + max_delay;
+        let mut quiet_until = std::time::Instant::now() + quiet;
         loop {
-            match pending.recv_timeout(quiet) {
-                Ok(()) => continue,
+            let now = std::time::Instant::now();
+            let wait = quiet_until.min(cap).saturating_duration_since(now);
+            match pending.recv_timeout(wait) {
+                Ok(()) => {
+                    quiet_until = std::time::Instant::now() + quiet;
+                    if std::time::Instant::now() < cap {
+                        continue;
+                    }
+                    break;
+                }
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => break,
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                     if let (Some(completed), Some(outcome)) = (&completed, checkpoint_wal(db_path))
@@ -254,10 +272,6 @@ pub(super) struct Carry {
     /// stronger statement than an empty catalog diff, which an append that
     /// adds evidence rows without moving a catalog column would also give.
     wrote_nothing: std::sync::atomic::AtomicBool,
-    /// The retained watch writer has commit-thread auto-checkpoint disabled.
-    /// Quiet-window upkeep checkpoints instead; full sweeps retain their
-    /// existing checkpoint/truncate backstop.
-    checkpoint_deferred: std::sync::atomic::AtomicBool,
 }
 
 impl WatchSweep {
@@ -412,16 +426,7 @@ impl WatchSweep {
             force,
             &plan.scope(),
             |conn| {
-                if !self
-                    .carry
-                    .checkpoint_deferred
-                    .load(std::sync::atomic::Ordering::Acquire)
-                {
-                    conn.pragma_update(None, "wal_autocheckpoint", 0)?;
-                    self.carry
-                        .checkpoint_deferred
-                        .store(true, std::sync::atomic::Ordering::Release);
-                }
+                disable_auto_checkpoint(conn)?;
                 head_before.set(head(conn));
                 let before = match previous {
                     Some(before) => before,
@@ -498,6 +503,14 @@ fn checkpoint_wal(db_path: &Path) -> Option<crate::ingest::SweepCheckpoint> {
         ));
     }
     None
+}
+
+fn disable_auto_checkpoint(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let current: i64 = conn.query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))?;
+    if current != 0 {
+        conn.pragma_update(None, "wal_autocheckpoint", 0)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -657,6 +670,7 @@ mod tests {
         let checkpoint = QuietCheckpoint::with_quiet(
             db_path.clone(),
             Duration::from_millis(10),
+            Duration::from_secs(5),
             Some(completed),
         );
         checkpoint.schedule();
@@ -678,5 +692,54 @@ mod tests {
         let db_path = dir.path().join("missing.db");
         assert!(checkpoint_wal(&db_path).is_none());
         assert!(!db_path.exists());
+    }
+
+    #[test]
+    fn sustained_capture_is_checkpointed_at_the_hard_deadline() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("history.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        conn.execute_batch(
+            "PRAGMA journal_mode=WAL;
+             PRAGMA wal_autocheckpoint=0;
+             CREATE TABLE payload (body BLOB NOT NULL);
+             INSERT INTO payload(body) VALUES (zeroblob(4096));",
+        )
+        .unwrap();
+
+        let (completed, outcome) = std::sync::mpsc::channel();
+        let checkpoint = QuietCheckpoint::with_quiet(
+            db_path,
+            Duration::from_secs(1),
+            Duration::from_millis(40),
+            Some(completed),
+        );
+        let schedule = checkpoint.schedule.as_ref().unwrap().clone();
+        let producer = std::thread::spawn(move || {
+            for _ in 0..20 {
+                schedule.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let outcome = outcome.recv_timeout(Duration::from_millis(250)).unwrap();
+        assert!(outcome.complete);
+        assert!(!outcome.escalated);
+        producer.join().unwrap();
+    }
+
+    #[test]
+    fn every_replacement_writer_disables_auto_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("history.db");
+        for _ in 0..2 {
+            let conn = rusqlite::Connection::open(&db_path).unwrap();
+            conn.pragma_update(None, "wal_autocheckpoint", 1_000)
+                .unwrap();
+            disable_auto_checkpoint(&conn).unwrap();
+            let current: i64 = conn
+                .query_row("PRAGMA wal_autocheckpoint", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(current, 0);
+        }
     }
 }

@@ -1446,11 +1446,13 @@ on roughly every eighth small-session commit. Normal captures were about
 writer. It disables that connection's commit-thread auto-checkpoint during
 the untimed startup sweep, coalesces successful exact-event captures, and
 runs a PASSIVE checkpoint after five debounce windows of quiet (at least one
-second). It never takes the WAL writer lock. A continuously busy watcher
-retains the ordinary 30-second full-sweep checkpoint as its hard backstop;
-that full sweep also keeps the existing bounded-TRUNCATE policy for physical
-space reclamation. Plain `sync`, hook hydration, and `Reconciliation` keep
-their existing connection policies.
+second). It never takes the WAL writer lock, and a fixed 30-second deadline
+forces the same PASSIVE checkpoint even if events never become quiet. Each
+retained-connection checkout verifies the connection-local setting, so a
+writer reopened after database replacement cannot silently regain automatic
+checkpoints. Full sweeps keep the existing bounded-TRUNCATE policy for
+physical space reclamation. Plain `sync`, hook hydration, and
+`Reconciliation` keep their existing connection policies.
 
 The exact path also nests discovery's `synchronous = NORMAL` scope. Nested
 guards on the same connection now share the outer policy instead of issuing
@@ -1468,11 +1470,12 @@ against `be827d1e`, 30-day/1,200-session store:
 
 | Metric | `main` p50 | head p50 | `main` p99 | head p99 |
 |---|---:|---:|---:|---:|
-| `capture_path` | 12.376 ms | 8.423 ms | 28.876 ms | 19.685 ms |
-| `capture_path_retained` | 5.492 ms | 3.672 ms | 19.008 ms | 13.212 ms |
-| `e2e_visible` | 9.633 ms | 7.760 ms | 59.754 ms | 58.265 ms |
+| `capture_path` | 12.169 ms | 12.492 ms | 24.346 ms | 40.989 ms |
+| `capture_path_retained` | 5.524 ms | 5.306 ms | 17.268 ms | 15.930 ms |
+| `e2e_visible` | 10.795 ms | 8.811 ms | 43.806 ms | 50.854 ms |
 
-The gate passed with zero late or missed sessions. The 5 ms e2e budget is
-still tracked rather than enforced: this change removes a periodic checkpoint
-from the visibility path and improves the distribution, but does not claim
-the remaining work is complete.
+The gate passed with zero late or missed sessions. Retained capture improved
+at p50 and p99, and e2e improved at p50; the shared host's plain-capture and
+e2e p99 values regressed in this run. The 5 ms e2e budget is still tracked
+rather than enforced: this change removes a periodic checkpoint from the
+visibility path without claiming that the remaining latency work is complete.

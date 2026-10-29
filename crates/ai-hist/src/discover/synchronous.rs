@@ -39,7 +39,8 @@ impl<'a> RelaxedSynchronous<'a> {
 impl Drop for RelaxedSynchronous<'_> {
     fn drop(&mut self) {
         let identity = self.conn as *const Connection as usize;
-        STACK.with(|stack| debug_assert_eq!(stack.borrow_mut().pop(), Some(identity)));
+        let popped = STACK.with(|stack| stack.borrow_mut().pop());
+        debug_assert_eq!(popped, Some(identity));
         // Best effort: a connection that cannot take the pragma any more is
         // being torn down anyway.
         if let Some(previous) = self.previous {
