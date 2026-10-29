@@ -37,7 +37,7 @@ fn retire(conn: &Connection) -> Result<()> {
 }
 #[test]
 fn local_first_retirement_keeps_matching_remote_evidence() {
-    let (_dir,mut conn)=setup();
+    let (dir,mut conn)=setup();
     let records=records("original");
     local(&conn,&records);
     let remote=key(SessionLocation::Remote,"remote");

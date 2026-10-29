@@ -5,6 +5,9 @@
 
 pub mod change_feed;
 mod events;
+mod history;
+use history::SessionLocations;
+pub use history::{NativeHistoryEntry, NativeSearchMatch};
 pub mod export;
 mod session_evidence;
 pub use events::NativeSessionEvent;
@@ -13,18 +16,18 @@ pub mod sources;
 
 use std::path::{Path, PathBuf};
 
-use ai_hist::history_search::{search_all, search_page as core_search_page, SearchRole, SearchRow};
+use ai_hist::history_search::{search_all, search_page as core_search_page, SearchRole};
 use ai_hist::{
     default_db_path, open_db, open_db_readonly, recent as core_recent, relationship_capabilities,
     schema_is_catalog_read_current, schema_is_event_read_current, schema_is_evidence_read_current,
     schema_is_read_current, schema_is_relationship_read_current, schema_is_user_turn_read_current,
     session as core_session, session_children_page as core_session_children_page,
     session_events_page as core_session_events_page,
-    session_file_edits_page as core_session_file_edits_page, session_locations,
+    session_file_edits_page as core_session_file_edits_page,
     session_relationships as core_session_relationships,
     session_tool_calls_page as core_session_tool_calls_page, session_tree as core_session_tree,
     session_user_turns_page as core_session_user_turns_page,
-    stats_scoped_by as core_stats_scoped_by, HistoryEntry, QueryFilter,
+    stats_scoped_by as core_stats_scoped_by, QueryFilter,
     RelationshipCapabilities as CoreRelationshipCapabilities,
     RelationshipCursor as CoreRelationshipCursor,
     RelationshipDiagnostic as CoreRelationshipDiagnostic,
@@ -437,103 +440,6 @@ pub struct SessionOptions {
     pub db_path: Option<String>,
     pub source: Option<String>,
     pub tag: Option<String>,
-}
-
-#[napi(object)]
-pub struct NativeHistoryEntry {
-    pub id: i64,
-    pub source: String,
-    pub session_id: Option<String>,
-    pub project: Option<String>,
-    pub prompt: String,
-    pub timestamp_ms: i64,
-    pub locations: Vec<String>,
-}
-
-impl NativeHistoryEntry {
-    fn from_entry(
-        locations: &mut SessionLocations<'_>,
-        entry: HistoryEntry,
-    ) -> anyhow::Result<Self> {
-        let locations = locations.of(&entry.source, entry.session_id.as_deref())?;
-        Ok(Self {
-            id: entry.id,
-            source: entry.source,
-            session_id: entry.session_id,
-            project: entry.project,
-            prompt: entry.prompt,
-            timestamp_ms: entry.timestamp_ms,
-            locations,
-        })
-    }
-}
-
-/// The locations of each session a result set names, read once per session
-/// with one cached statement however many rows share it.
-struct SessionLocations<'c> {
-    conn: &'c rusqlite::Connection,
-    known: std::collections::HashMap<(String, String), Vec<String>>,
-}
-
-impl<'c> SessionLocations<'c> {
-    fn new(conn: &'c rusqlite::Connection) -> Self {
-        Self {
-            conn,
-            known: std::collections::HashMap::new(),
-        }
-    }
-
-    fn of(&mut self, source: &str, session_id: Option<&str>) -> anyhow::Result<Vec<String>> {
-        let Some(session_id) = session_id else {
-            return Ok(Vec::new());
-        };
-        let key = (source.to_string(), session_id.to_string());
-        if let Some(locations) = self.known.get(&key) {
-            return Ok(locations.clone());
-        }
-        let locations = session_locations(self.conn, source, session_id)?;
-        self.known.insert(key, locations.clone());
-        Ok(locations)
-    }
-}
-
-/// One `search` match. `id` is unique only within `match_source`: a prompt
-/// is a `history` row, anything else a `session_event` row.
-#[napi(object)]
-pub struct NativeSearchMatch {
-    pub id: i64,
-    pub source: String,
-    pub session_id: Option<String>,
-    pub project: Option<String>,
-    /// The matched text: the prompt for a `history` match, the event text
-    /// otherwise. Named `prompt` so a match is still a history entry.
-    pub prompt: String,
-    pub timestamp_ms: i64,
-    pub locations: Vec<String>,
-    /// `history` or `session_event`.
-    pub match_source: String,
-    /// `user` for a `history` match; the event's role otherwise.
-    pub role: String,
-    /// `history` for a `history` match; the event's kind otherwise.
-    pub kind: String,
-}
-
-impl NativeSearchMatch {
-    fn from_row(locations: &mut SessionLocations<'_>, row: SearchRow) -> anyhow::Result<Self> {
-        let locations = locations.of(&row.source, row.session_id.as_deref())?;
-        Ok(Self {
-            id: row.id,
-            source: row.source,
-            session_id: row.session_id,
-            project: row.project,
-            prompt: row.text,
-            timestamp_ms: row.timestamp_ms,
-            locations,
-            match_source: row.match_source,
-            role: row.role,
-            kind: row.kind,
-        })
-    }
 }
 
 #[napi(object)]

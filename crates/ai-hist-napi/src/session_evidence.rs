@@ -53,6 +53,19 @@ fn wire_evidence(evidence: ai_hist::SessionEvidence) -> napi::Result<Value> {
         }
         raw["usage"] = serde_json::to_value(usage).map_err(encode)?;
     }
+    for (raw, marker) in value["markers"]
+        .as_array_mut()
+        .into_iter()
+        .flatten()
+        .zip(&evidence.markers)
+    {
+        if let Some(snapshot) = &marker.usage_snapshot {
+            // Provider counters can exceed JavaScript's exact integer range.
+            // Keep the exact JSON alongside the convenient parsed projection.
+            raw["raw_usage_snapshot"] =
+                Value::String(serde_json::to_string(snapshot).map_err(encode)?);
+        }
+    }
     value["requests"] = serde_json::to_value(
         evidence
             .requests

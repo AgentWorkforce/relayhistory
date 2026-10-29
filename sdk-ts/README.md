@@ -140,7 +140,8 @@ identifies what this query fetched.
 prompt hashes and byte lengths. Tool arguments, patches, marker payloads and
 raw usage remain available; this option is not a general content scrubber.
 Provider JSON keys are preserved inside `args`, `structuredPatch`, `payload`
-and `usageSnapshot`. Invalid stored JSON remains in the optional `rawArgs`,
+and `usageSnapshot`. `rawUsageSnapshot` preserves exact snapshot counters that
+JavaScript numbers may round. Invalid stored JSON remains in the optional `rawArgs`,
 `rawStructuredPatch`, `rawPayload` and `rawUsage` strings. Usage is reported
 by the provider, with the same safe-counter checks as the paged SDK reads.
 

@@ -784,3 +784,20 @@ test('full session evidence refuses rounded usage counters', { skip: needsNodeSq
     assert.ok(evidence?.usage?.diagnostics.includes('count-not-representable'));
   } finally { await cleanup(); }
 });
+
+
+test('full session evidence retains exact usage snapshot JSON', { skip: needsNodeSqlite }, async () => {
+  const { getSessionEvidence } = await import('./index.js');
+  const { dbPath, cleanup } = await seededDatabase();
+  try {
+    const db = new sqlite!.DatabaseSync(dbPath);
+    try {
+      db.prepare("INSERT INTO session_markers(source, session_id, marker_uid, kind, payload_json) VALUES ('codex', ?, 'large-snapshot', 'usage_snapshot', ?)")
+        .run(SHARED_SESSION, '{"total_token_usage":{"input_tokens":9007199254740993},"provider_extra":{"snake_key":"intact"}}');
+    } finally { db.close(); }
+    const evidence = await getSessionEvidence('codex', SHARED_SESSION, { dbPath, kinds: ['session_marker'] });
+    const marker = evidence?.markers.find((row) => row.markerUid === 'large-snapshot');
+    assert.ok(marker?.rawUsageSnapshot?.includes('9007199254740993'));
+    assert.deepEqual(marker?.usageSnapshot?.provider_extra, { snake_key: 'intact' });
+  } finally { await cleanup(); }
+});

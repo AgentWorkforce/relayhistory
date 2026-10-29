@@ -74,6 +74,38 @@ export interface NativeSessionEvent {
    */
   recordTokenJson?: string
 }
+export interface NativeHistoryEntry {
+  id: number
+  source: string
+  sessionId?: string
+  project?: string
+  prompt: string
+  timestampMs: number
+  locations: Array<string>
+}
+/**
+ * One `search` match. `id` is unique only within `match_source`: a prompt
+ * is a `history` row, anything else a `session_event` row.
+ */
+export interface NativeSearchMatch {
+  id: number
+  source: string
+  sessionId?: string
+  project?: string
+  /**
+   * The matched text: the prompt for a `history` match, the event text
+   * otherwise. Named `prompt` so a match is still a history entry.
+   */
+  prompt: string
+  timestampMs: number
+  locations: Array<string>
+  /** `history` or `session_event`. */
+  matchSource: string
+  /** `user` for a `history` match; the event's role otherwise. */
+  role: string
+  /** `history` for a `history` match; the event's kind otherwise. */
+  kind: string
+}
 export declare function historyExport(requestJson: string, dbPath?: string | undefined | null): Promise<string>
 /**
  * One JSON request against the `SessionStore` facade.
@@ -177,38 +209,6 @@ export interface SessionOptions {
   dbPath?: string
   source?: string
   tag?: string
-}
-export interface NativeHistoryEntry {
-  id: number
-  source: string
-  sessionId?: string
-  project?: string
-  prompt: string
-  timestampMs: number
-  locations: Array<string>
-}
-/**
- * One `search` match. `id` is unique only within `match_source`: a prompt
- * is a `history` row, anything else a `session_event` row.
- */
-export interface NativeSearchMatch {
-  id: number
-  source: string
-  sessionId?: string
-  project?: string
-  /**
-   * The matched text: the prompt for a `history` match, the event text
-   * otherwise. Named `prompt` so a match is still a history entry.
-   */
-  prompt: string
-  timestampMs: number
-  locations: Array<string>
-  /** `history` or `session_event`. */
-  matchSource: string
-  /** `user` for a `history` match; the event's role otherwise. */
-  role: string
-  /** `history` for a `history` match; the event's kind otherwise. */
-  kind: string
 }
 export interface EventCursor {
   tsMs: number

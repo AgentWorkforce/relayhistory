@@ -132,6 +132,8 @@ export interface EvidenceMarker {
   text: string | null;
   payload: unknown | null;
   usageSnapshot?: Record<string, unknown> | null;
+  /** Exact JSON, including counters outside JavaScript's safe integer range. */
+  rawUsageSnapshot?: string;
   rawPayload?: string;
 }
 
