@@ -146,6 +146,7 @@ pub(super) struct TickNotes {
     pub(super) changed: Vec<SessionRef>,
     pub(super) sources: Option<Vec<Source>>,
     pub(super) kind: WatchTick,
+    pub(super) diagnostics: Vec<SyncDiagnostic>,
 }
 
 /// Coalesce exact captures and checkpoint only after a short quiet interval.
@@ -323,7 +324,7 @@ impl WatchSweep {
             })
         });
         match result {
-            Ok((mut outcome, changed)) => {
+            Ok((mut outcome, changed, diagnostics)) => {
                 outcome.changed_nothing = !outcome.contended
                     && changed.is_empty()
                     && self
@@ -333,10 +334,9 @@ impl WatchSweep {
                 if request.force && plan.paths.is_some() && outcome.swept {
                     self.checkpoint.schedule();
                 }
-                self.notes
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .changed = changed;
+                let mut notes = self.notes.lock().unwrap_or_else(PoisonError::into_inner);
+                notes.changed = changed;
+                notes.diagnostics = diagnostics;
                 Ok(outcome)
             }
             Err(error) => {
@@ -365,6 +365,7 @@ impl WatchSweep {
             notes.kind = WatchTick::Discover;
             notes.sources = sources.clone();
             notes.changed.clear();
+            notes.diagnostics.clear();
         }
         match self.store.discover(DiscoveryOptions {
             sources,
@@ -383,7 +384,7 @@ impl WatchSweep {
         plan: &SweepPlan,
         previous: Option<CatalogFingerprint>,
         swept_from: &mut Option<CatalogFingerprint>,
-    ) -> anyhow::Result<Option<(SyncTick, CatalogFingerprint, Vec<SessionRef>)>> {
+    ) -> anyhow::Result<Option<LockedWatchSweep>> {
         let mut writer = std::mem::take(
             &mut *self
                 .carry
@@ -408,7 +409,7 @@ impl WatchSweep {
         plan: &SweepPlan,
         force: bool,
         swept_from: &mut Option<CatalogFingerprint>,
-    ) -> anyhow::Result<Option<(SyncTick, CatalogFingerprint, Vec<SessionRef>)>> {
+    ) -> anyhow::Result<Option<LockedWatchSweep>> {
         let head = |conn: &rusqlite::Connection| {
             crate::change_feed::read_head(conn)
                 .ok()
@@ -448,7 +449,11 @@ impl WatchSweep {
                 Ok((after, changed))
             },
         )?;
-        Ok(outcome.map(|(tick, (after, changed), _sync_lock)| (tick, after, changed)))
+        Ok(
+            outcome.map(|(tick, (after, changed), _sync_lock, diagnostics)| {
+                (tick, after, changed, diagnostics)
+            }),
+        )
     }
 
     /// Diff the catalog against the baseline a cancelled sweep started from,

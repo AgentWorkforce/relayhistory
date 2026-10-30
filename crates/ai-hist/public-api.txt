@@ -404,6 +404,8 @@ pub ai_hist::CompactReport::wal_truncated: bool
 pub ai_hist::Diagnostic::code: alloc::string::String
 pub ai_hist::Diagnostic::message: alloc::string::String
 pub ai_hist::Diagnostic::subject: core::option::Option<alloc::string::String>
+impl core::convert::From<ai_hist::SyncDiagnostic> for ai_hist::Diagnostic
+pub fn ai_hist::Diagnostic::from(ai_hist::SyncDiagnostic) -> Self
 #[non_exhaustive] pub struct ai_hist::DiscoveryOptions
 pub ai_hist::DiscoveryOptions::limit: core::option::Option<usize>
 pub ai_hist::DiscoveryOptions::paths: core::option::Option<alloc::vec::Vec<std::path::PathBuf>>
@@ -993,6 +995,13 @@ impl serde_core::ser::Serialize for ai_hist::StoredRow
 pub fn ai_hist::StoredRow::serialize<S: serde_core::ser::Serializer>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error>
 impl<'de> serde_core::de::Deserialize<'de> for ai_hist::StoredRow
 pub fn ai_hist::StoredRow::deserialize<D: serde_core::de::Deserializer<'de>>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
+#[non_exhaustive] pub struct ai_hist::SyncDiagnostic
+pub ai_hist::SyncDiagnostic::code: alloc::string::String
+pub ai_hist::SyncDiagnostic::message: alloc::string::String
+pub ai_hist::SyncDiagnostic::source: ai_hist::Source
+pub ai_hist::SyncDiagnostic::subject: core::option::Option<alloc::string::String>
+impl core::convert::From<ai_hist::SyncDiagnostic> for ai_hist::Diagnostic
+pub fn ai_hist::Diagnostic::from(ai_hist::SyncDiagnostic) -> Self
 #[non_exhaustive] pub struct ai_hist::SyncOptions
 pub ai_hist::SyncOptions::codex_sqlite_max_age_days: core::option::Option<u64>
 pub ai_hist::SyncOptions::force: bool
@@ -1011,12 +1020,14 @@ pub fn ai_hist::SyncOptions::sources(self, impl core::iter::traits::collect::Int
 pub fn ai_hist::SyncOptions::stop(self, ai_hist::StopToken) -> Self
 #[non_exhaustive] pub struct ai_hist::SyncReport
 pub ai_hist::SyncReport::changed: alloc::vec::Vec<ai_hist::SessionRef>
+pub ai_hist::SyncReport::diagnostics: alloc::vec::Vec<ai_hist::SyncDiagnostic>
 pub ai_hist::SyncReport::head_revision: u64
 pub ai_hist::SyncReport::swept: bool
 #[non_exhaustive] pub struct ai_hist::TickReport
 pub ai_hist::TickReport::cancelled: bool
 pub ai_hist::TickReport::changed: alloc::vec::Vec<ai_hist::SessionRef>
 pub ai_hist::TickReport::contended: bool
+pub ai_hist::TickReport::diagnostics: alloc::vec::Vec<ai_hist::SyncDiagnostic>
 pub ai_hist::TickReport::elapsed_ms: u64
 pub ai_hist::TickReport::first_event_age_ms: core::option::Option<u64>
 pub ai_hist::TickReport::forced: bool

@@ -1000,3 +1000,125 @@ fn history_log_collision_does_not_claim_another_sessions_sqlite_prompt() {
     let ids: String = conn.query_row("SELECT json_extract(payload_json,'$.history_ids') FROM session_markers WHERE session_id='owner'", [], |row| row.get(0)).unwrap();
     assert_eq!(ids, "[]");
 }
+
+/// The facade's sync is quiet, so a Codex store pair it cannot use is not
+/// on stderr; it is on the report, as the diagnostic the host asked for by
+/// embedding instead of running the CLI.
+#[test]
+fn a_quiet_sync_reports_a_missing_sqlite_store_pair_on_the_report() {
+    let temp = tempfile::tempdir().unwrap();
+    let codex = temp.path().join(".codex");
+    install_thread_set(&codex, &[2_000_000]);
+    std::fs::remove_file(codex.join("thread_history_1.sqlite")).unwrap();
+    let roots =
+        crate::ProviderRoots::from_home(temp.path().to_owned(), temp.path().join("opencode.db"));
+    let store = crate::SessionStore::open(
+        crate::StoreOptions::default()
+            .db_path(temp.path().join("history.db"))
+            .roots(roots),
+    )
+    .unwrap();
+    let report = store.sync(crate::SyncOptions::default()).unwrap();
+    assert!(report.swept);
+    let codex_skips: Vec<_> = report
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.source == crate::Source::Codex)
+        .collect();
+    assert_eq!(codex_skips.len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(codex_skips[0].code, "SESSION_SOURCE_UNAVAILABLE");
+    assert!(
+        codex_skips[0]
+            .message
+            .starts_with("skipping SQLite history: incomplete Codex SQLite history pair"),
+        "{}",
+        codex_skips[0].message
+    );
+    assert_eq!(codex_skips[0].subject, None);
+    // The report round-trips with the diagnostics on it.
+    let json = serde_json::to_string(&report).unwrap();
+    assert_eq!(
+        serde_json::from_str::<crate::SyncReport>(&json).unwrap(),
+        report
+    );
+}
+
+/// A store pair the process may not read is a skip of the same kind.
+#[cfg(unix)]
+#[test]
+fn a_quiet_sync_reports_a_withheld_sqlite_store_pair_on_the_report() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let codex = temp.path().join(".codex");
+    install_thread_set(&codex, &[2_000_000]);
+    let state = codex.join("state_5.sqlite");
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&state).is_ok() {
+        // Root reads through the mode bits; nothing is withheld here.
+        return;
+    }
+    let roots =
+        crate::ProviderRoots::from_home(temp.path().to_owned(), temp.path().join("opencode.db"));
+    let store = crate::SessionStore::open(
+        crate::StoreOptions::default()
+            .db_path(temp.path().join("history.db"))
+            .roots(roots),
+    )
+    .unwrap();
+    let report = store.sync(crate::SyncOptions::default()).unwrap();
+    let codex_skips: Vec<_> = report
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.source == crate::Source::Codex)
+        .collect();
+    assert!(!codex_skips.is_empty(), "{:?}", report.diagnostics);
+    assert!(codex_skips
+        .iter()
+        .all(|diagnostic| diagnostic.code == "SESSION_SOURCE_UNAVAILABLE"));
+    assert!(
+        codex_skips[0]
+            .message
+            .starts_with("skipping SQLite history: "),
+        "{}",
+        codex_skips[0].message
+    );
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o644)).unwrap();
+}
+
+/// A watch tick is the same quiet sweep: its report carries the skip too.
+#[test]
+fn a_watch_tick_reports_a_missing_sqlite_store_pair_on_its_report() {
+    let temp = tempfile::tempdir().unwrap();
+    let codex = temp.path().join(".codex");
+    install_thread_set(&codex, &[2_000_000]);
+    std::fs::remove_file(codex.join("thread_history_1.sqlite")).unwrap();
+    let roots =
+        crate::ProviderRoots::from_home(temp.path().to_owned(), temp.path().join("opencode.db"));
+    let store = crate::SessionStore::open(
+        crate::StoreOptions::default()
+            .db_path(temp.path().join("history.db"))
+            .roots(roots),
+    )
+    .unwrap();
+    let mut watch = store
+        .watch(crate::WatchOptions {
+            use_fs_events: false,
+            poll_interval_ms: 100,
+            immediate: true,
+            ..crate::WatchOptions::default()
+        })
+        .unwrap();
+    let first = watch
+        .next_timeout(std::time::Duration::from_secs(30))
+        .expect("startup tick")
+        .unwrap();
+    assert!(first.swept);
+    let codex_skips: Vec<_> = first
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.source == crate::Source::Codex)
+        .collect();
+    assert_eq!(codex_skips.len(), 1, "{:?}", first.diagnostics);
+    assert_eq!(codex_skips[0].code, "SESSION_SOURCE_UNAVAILABLE");
+    watch.stop();
+}

@@ -23,9 +23,15 @@ pub(super) fn refresh_catalog_codex_locator(
             Ok(current) => current,
             Err(error) if error.is::<crate::ingest::CaptureCancelled>() => return Err(error),
             Err(error) => {
-                crate::ingest::scoped_files::provider_diagnostic(format_args!(
-                    "[codex] skipping SQLite locator refresh: {error:#}"
-                ));
+                crate::ingest::provider_diagnostics::provider_diagnostic(
+                    crate::ingest::provider_diagnostics::ProviderSkip {
+                        source: crate::Source::Codex,
+                        code: "SESSION_SOURCE_UNAVAILABLE",
+                        subject: Some(&options.session_id),
+                        what: format_args!("skipping SQLite locator refresh"),
+                        detail: format_args!("{error:#}"),
+                    },
+                );
                 None
             }
         };

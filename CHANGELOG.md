@@ -10,6 +10,14 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - New sessions become visible sooner because live watch capture checkpoints its WAL after the active burst instead of on the commit thread.
 
+### Fixed
+
+- A Codex SQLite store that a quiet `sync`, `watch` or `hydrate` could not read is reported on that call's result, so an embedding host sees why Codex history is missing; the CLI still prints the skip on stderr.
+
+### Rust API
+
+- Added `SyncDiagnostic` and `SyncReport::diagnostics`, `TickReport::diagnostics`: what providers skipped during the sweep, with a stable code (`SESSION_SOURCE_UNAVAILABLE`, `EVIDENCE_PARTIAL`), the source and the session it names. A hydration's skips arrive on `HydrateReport::diagnostics`.
+
 ## [0.53.1] - 2026-10-29
 
 ### Fixed

@@ -17,7 +17,12 @@ struct PendingEntry {
 thread_local! { pub(super) static STOP_AFTER_BRACKET: std::cell::RefCell<Option<StopToken>> = const {std::cell::RefCell::new(None)}; }
 
 type PendingChanges = Vec<(SessionRef, u64)>;
-type LockedSync = (SyncTick, PendingChanges, crate::ingest::SyncRunLock);
+type LockedSync = (
+    SyncTick,
+    PendingChanges,
+    crate::ingest::SyncRunLock,
+    Vec<SyncDiagnostic>,
+);
 #[cfg(test)]
 thread_local! {pub(super) static BEFORE_REPORT:std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const {std::cell::RefCell::new(None)};}
 
@@ -116,14 +121,15 @@ impl SessionStore {
             opts.paths.as_deref(),
             opts.sources.as_deref(),
         ));
-        let (tick, pending, _sync_lock) = crate::providers::codex::sqlite::with_sweep_policy(
-            opts.codex_sqlite_max_age_days,
-            || {
-                controlled(opts.stop.as_ref(), opts.progress.as_ref(), || {
-                    self.sync_tick(opts.force, opts.lock_timeout_ms, &scope)
-                })
-            },
-        )?;
+        let (tick, pending, _sync_lock, diagnostics) =
+            crate::providers::codex::sqlite::with_sweep_policy(
+                opts.codex_sqlite_max_age_days,
+                || {
+                    controlled(opts.stop.as_ref(), opts.progress.as_ref(), || {
+                        self.sync_tick(opts.force, opts.lock_timeout_ms, &scope)
+                    })
+                },
+            )?;
         #[cfg(test)]
         if let Some(hook) = BEFORE_REPORT.with(|hook| hook.borrow_mut().take()) {
             hook();
@@ -153,6 +159,7 @@ impl SessionStore {
             swept: tick.swept,
             changed,
             head_revision,
+            diagnostics,
         })
     }
 
@@ -261,8 +268,8 @@ impl SessionStore {
                 },
             )
             .map_err(Error::sync)?;
-            if let Some((tick, changed, guard)) = outcome {
-                return Ok((tick, changed, guard));
+            if let Some((tick, changed, guard, diagnostics)) = outcome {
+                return Ok((tick, changed, guard, diagnostics));
             }
             crate::ingest::check_capture_cancelled().map_err(Error::sync)?;
             let now = Instant::now();

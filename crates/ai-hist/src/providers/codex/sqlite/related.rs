@@ -160,9 +160,7 @@ pub(crate) fn capture_related(
             Ok(rollout) => rollout,
             Err(error) if error.is::<crate::ingest::CaptureCancelled>() => return Err(error),
             Err(error) => {
-                crate::ingest::scoped_files::provider_diagnostic(format_args!(
-                    "[codex] skipping related thread {child}: {error:#}"
-                ));
+                skipping("related thread", &child, &error);
                 root.related_incomplete = true;
                 continue;
             }
@@ -176,9 +174,7 @@ pub(crate) fn capture_related(
                 }
                 Err(error) if error.is::<crate::ingest::CaptureCancelled>() => return Err(error),
                 Err(error) => {
-                    crate::ingest::scoped_files::provider_diagnostic(format_args!(
-                        "[codex] skipping related rollout {child}: {error:#}"
-                    ));
+                    skipping("related rollout", &child, &error);
                     root.related_incomplete = true;
                 }
             }
@@ -188,9 +184,7 @@ pub(crate) fn capture_related(
             Ok(acquired) => acquired,
             Err(error) if error.is::<crate::ingest::CaptureCancelled>() => return Err(error),
             Err(error) => {
-                crate::ingest::scoped_files::provider_diagnostic(format_args!(
-                    "[codex] skipping related thread {child}: {error:#}"
-                ));
+                skipping("related thread", &child, &error);
                 root.related_incomplete = true;
                 continue;
             }

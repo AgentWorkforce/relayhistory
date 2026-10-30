@@ -37,31 +37,35 @@ pub(super) fn read_files(
     let workers = worker_limit.min(fs_reads.len()).min(MAX_READ_WORKERS);
     if workers > 1 {
         let stop = crate::ingest::shared_capture_stop();
+        let diagnostics = crate::ingest::provider_diagnostics::current();
         let next = AtomicUsize::new(0);
         let results = Mutex::new(Vec::with_capacity(fs_reads.len()));
         std::thread::scope(|scope| {
             for _ in 0..workers {
-                scope.spawn(|| loop {
-                    if stop.as_ref().is_some_and(crate::StopToken::is_stopped) {
-                        break;
+                scope.spawn(|| {
+                    let _reports = crate::ingest::provider_diagnostics::install(diagnostics.clone());
+                    loop {
+                        if stop.as_ref().is_some_and(crate::StopToken::is_stopped) {
+                            break;
+                        }
+                        let slot = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(&entry_index) = fs_reads.get(slot) else {
+                            break;
+                        };
+                        let WindowEntry::Read {
+                            candidate,
+                            provider,
+                            ..
+                        } = &entries[entry_index]
+                        else {
+                            continue;
+                        };
+                        let outcome = provider.read_shallow(scan, None, candidate);
+                        results
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .push((entry_index, outcome));
                     }
-                    let slot = next.fetch_add(1, Ordering::Relaxed);
-                    let Some(&entry_index) = fs_reads.get(slot) else {
-                        break;
-                    };
-                    let WindowEntry::Read {
-                        candidate,
-                        provider,
-                        ..
-                    } = &entries[entry_index]
-                    else {
-                        continue;
-                    };
-                    let outcome = provider.read_shallow(scan, None, candidate);
-                    results
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner)
-                        .push((entry_index, outcome));
                 });
             }
         });

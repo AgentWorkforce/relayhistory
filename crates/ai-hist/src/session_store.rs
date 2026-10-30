@@ -77,6 +77,9 @@ mod discovery;
 mod reconciliation;
 mod sync;
 pub use reconciliation::{Reconciliation, ReconciliationStep};
+mod diagnostic;
+use diagnostic::hydrate_report;
+pub use diagnostic::{Diagnostic, SyncDiagnostic};
 mod catalog_row;
 use catalog_row::catalog_session;
 mod profile;
@@ -273,28 +276,13 @@ impl Error {
             return Self::Cancelled(format!("{error:#}"));
         }
         let message = format!("{error:#}");
-        let coded: &[(&str, ErrorBuilder)] = &[
-            ("SESSION_NOT_FOUND", Self::SessionNotFound),
-            ("SESSION_SOURCE_UNAVAILABLE", Self::SessionSourceUnavailable),
-            ("SESSION_SOURCE_MISMATCH", Self::SourceMismatch),
-            ("HYDRATION_UNSUPPORTED", Self::HydrationUnsupported),
-            ("CONNECTOR_NOT_CONFIGURED", Self::ConnectorNotConfigured),
-            ("AUTHENTICATION_EXPIRED", Self::AuthenticationExpired),
-            ("EVIDENCE_PARTIAL", Self::EvidencePartial),
-            ("CONNECTOR_FAILURE", Self::ConnectorFailure),
-            ("SOURCE_REVISION_CONFLICT", Self::SourceRevisionConflict),
-            ("INVALID_ARGUMENT", Self::InvalidArgument),
-            ("DISCOVERY_FAILED", Self::Discovery),
-            // A discover tick's database-open failure is reported through the
-            // same sink as a sync failure. The code has to survive that.
-            ("DATABASE_OPEN_FAILED", Self::DatabaseOpen),
-        ];
-        for (code, build) in coded {
-            if let Some(detail) = message.strip_prefix(&format!("{code}: ")) {
-                return build(detail.to_string());
-            }
+        match split_code(&message) {
+            Some((code, detail)) => CODED.iter().find(|(coded, _)| *coded == code).map_or_else(
+                || otherwise(message.clone()),
+                |(_, build)| build(detail.to_string()),
+            ),
+            None => otherwise(message),
         }
-        otherwise(message)
     }
 
     pub(crate) fn query(error: anyhow::Error) -> Self {
@@ -336,8 +324,39 @@ impl Error {
     }
 }
 
-/// One `Error` variant's constructor, for the code table above.
+/// One `Error` variant's constructor, for the code table below.
 type ErrorBuilder = fn(String) -> Error;
+
+/// The codes the engine puts on the errors it can name, as `CODE: detail`.
+const CODED: &[(&str, ErrorBuilder)] = &[
+    ("SESSION_NOT_FOUND", Error::SessionNotFound),
+    (
+        "SESSION_SOURCE_UNAVAILABLE",
+        Error::SessionSourceUnavailable,
+    ),
+    ("SESSION_SOURCE_MISMATCH", Error::SourceMismatch),
+    ("HYDRATION_UNSUPPORTED", Error::HydrationUnsupported),
+    ("CONNECTOR_NOT_CONFIGURED", Error::ConnectorNotConfigured),
+    ("AUTHENTICATION_EXPIRED", Error::AuthenticationExpired),
+    ("EVIDENCE_PARTIAL", Error::EvidencePartial),
+    ("CONNECTOR_FAILURE", Error::ConnectorFailure),
+    ("SOURCE_REVISION_CONFLICT", Error::SourceRevisionConflict),
+    ("INVALID_ARGUMENT", Error::InvalidArgument),
+    ("DISCOVERY_FAILED", Error::Discovery),
+    // A discover tick's database-open failure is reported through the
+    // same sink as a sync failure. The code has to survive that.
+    ("DATABASE_OPEN_FAILED", Error::DatabaseOpen),
+];
+
+/// The stable code a `CODE: detail` message carries, and the detail.
+pub(crate) fn split_code(message: &str) -> Option<(&'static str, &str)> {
+    CODED.iter().find_map(|(code, _)| {
+        message
+            .strip_prefix(code)
+            .and_then(|rest| rest.strip_prefix(": "))
+            .map(|detail| (*code, detail))
+    })
+}
 
 impl fmt::Display for Error {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -678,6 +697,20 @@ impl SessionStore {
     }
 
     fn hydrate_now(&self, r: &SessionRef, opts: &HydrateOptions) -> Result<HydrateReport, Error> {
+        let (report, skipped) =
+            crate::ingest::provider_diagnostics::collect(|| self.hydrate_engine(r, opts));
+        let mut report = report?;
+        report
+            .diagnostics
+            .extend(skipped.into_iter().map(Diagnostic::from));
+        Ok(report)
+    }
+
+    fn hydrate_engine(
+        &self,
+        r: &SessionRef,
+        opts: &HydrateOptions,
+    ) -> Result<HydrateReport, Error> {
         match r {
             SessionRef::Id { source, session_id } => {
                 let options = HydrateSessionOptions {
@@ -1105,18 +1138,29 @@ fn changes_under_lock(
 /// successful tick diffs against the last digest that was reported.
 fn rolling_tick(
     base: &mut Option<CatalogFingerprint>,
-    sweep: impl FnOnce(
-        Option<CatalogFingerprint>,
-    ) -> anyhow::Result<Option<(SyncTick, CatalogFingerprint, Vec<SessionRef>)>>,
-) -> anyhow::Result<(TickOutcome, Vec<SessionRef>)> {
+    sweep: impl FnOnce(Option<CatalogFingerprint>) -> anyhow::Result<Option<LockedWatchSweep>>,
+) -> anyhow::Result<(TickOutcome, Vec<SessionRef>, Vec<SyncDiagnostic>)> {
     match sweep(base.clone())? {
-        None => Ok((TickOutcome::from(SyncTick::default()), Vec::new())),
-        Some((tick, after, changed)) => {
+        None => Ok((
+            TickOutcome::from(SyncTick::default()),
+            Vec::new(),
+            Vec::new(),
+        )),
+        Some((tick, after, changed, diagnostics)) => {
             *base = Some(after);
-            Ok((TickOutcome::from(tick), changed))
+            Ok((TickOutcome::from(tick), changed, diagnostics))
         }
     }
 }
+
+/// What one locked watch sweep hands the loop: the tick, the catalog digest
+/// it ended with, the rows it changed and what its providers skipped.
+type LockedWatchSweep = (
+    SyncTick,
+    CatalogFingerprint,
+    Vec<SessionRef>,
+    Vec<SyncDiagnostic>,
+);
 
 /// Whether a [`SessionRef::Path`] can name exactly one session of `source`
 /// — the same rule for reading and for hydrating, with the same error.
@@ -1279,6 +1323,11 @@ pub struct SyncReport {
     /// the store's epoch, and [`SessionStore::changes_since`] is what judges
     /// whether a stored watermark can resume.
     pub head_revision: u64,
+    /// What providers skipped during this sweep, in the order they said so;
+    /// see [`SyncDiagnostic`]. Empty when nothing was skipped, and on an
+    /// unswept call.
+    #[serde(default)]
+    pub diagnostics: Vec<SyncDiagnostic>,
 }
 
 /// One digest per catalog row over every column [`SyncReport::changed`]
@@ -1451,76 +1500,6 @@ impl HydrateReport {
     }
 }
 
-fn hydrate_report(
-    source: Source,
-    session_id: String,
-    status: HydrateStatus,
-    result: Option<HydrateSessionResult>,
-) -> Result<HydrateReport, Error> {
-    let session = SessionRef::id(source, session_id);
-    let Some(result) = result else {
-        return Ok(HydrateReport {
-            session,
-            status,
-            capability: None,
-            coverage: Vec::new(),
-            related: Vec::new(),
-            bytes_read: 0,
-            diagnostics: Vec::new(),
-        });
-    };
-    // The engine's coverage comes from the adapter declaration, which leaves
-    // parser-derived markers out on purpose (a connector cannot supply them);
-    // the facade's contract is the capability declaration `session()` also
-    // reports. Markers are written by the same parse that writes events, so
-    // they are covered exactly when events are; everything else follows the
-    // engine's narrowing (`include_related`, incomplete Codex child search).
-    let engine = &result.coverage;
-    let coverage = source
-        .capabilities()
-        .evidence_kinds
-        .into_iter()
-        .filter(|kind| {
-            engine.contains(kind)
-                || (*kind == EvidenceKind::SessionMarker
-                    && engine.contains(&EvidenceKind::SessionEvent))
-        })
-        .collect();
-    Ok(HydrateReport {
-        session,
-        status,
-        capability: Some(Capability::parse(&result.capability)?),
-        coverage,
-        related: result
-            .related_session_ids
-            .into_iter()
-            .map(|id| SessionRef::id(source, id))
-            .collect(),
-        bytes_read: result.bytes_read,
-        diagnostics: result
-            .diagnostics
-            .into_iter()
-            .map(|diagnostic| Diagnostic {
-                code: diagnostic.code,
-                message: diagnostic.message,
-                subject: None,
-            })
-            .collect(),
-    })
-}
-
-/// Something a read or a hydration noticed that is not an error.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[non_exhaustive]
-pub struct Diagnostic {
-    /// Stable code, e.g. `RELATIONSHIP_UNLINKED_CHILD`, `EVIDENCE_PARTIAL`.
-    pub code: String,
-    pub message: String,
-    /// What the diagnostic is about, when it names one thing: a
-    /// `relationship_uid`, a locator.
-    pub subject: Option<String>,
-}
-
 // ---------------------------------------------------------------------------
 // watch
 // ---------------------------------------------------------------------------
@@ -1659,6 +1638,11 @@ pub struct TickReport {
     /// the sources whose roots fired in its debounce window.
     #[serde(default)]
     pub sources: Option<Vec<Source>>,
+    /// What providers skipped during this tick's sweep; see
+    /// [`SyncReport::diagnostics`]. Empty on a contended, unswept or
+    /// discover tick.
+    #[serde(default)]
+    pub diagnostics: Vec<SyncDiagnostic>,
 }
 
 impl TickReport {
@@ -1675,6 +1659,7 @@ impl TickReport {
             first_event_age_ms: report.first_event_at.map(|at| duration_ms(at.elapsed())),
             changed: notes.changed,
             sources: notes.sources,
+            diagnostics: notes.diagnostics,
         }
     }
 }
@@ -3845,7 +3830,7 @@ mod tests {
         );
 
         // A contended tick touches nothing either.
-        let (contended, changed) = rolling_tick(&mut base, |_| Ok(None)).unwrap();
+        let (contended, changed, _) = rolling_tick(&mut base, |_| Ok(None)).unwrap();
         assert!(contended.contended);
         assert!(changed.is_empty());
         assert_eq!(base.as_ref(), Some(&reported));
@@ -3858,10 +3843,10 @@ mod tests {
         )
         .unwrap();
         let after = catalog_fingerprint(&conn).unwrap();
-        let (outcome, changed) = rolling_tick(&mut base, |previous| {
+        let (outcome, changed, _) = rolling_tick(&mut base, |previous| {
             let before = previous.expect("baseline kept");
             let changed = catalog_changes(&before, &after);
-            Ok(Some((swept, after.clone(), changed)))
+            Ok(Some((swept, after.clone(), changed, Vec::new())))
         })
         .unwrap();
         assert!(outcome.swept);
@@ -3877,7 +3862,7 @@ mod tests {
         assert_eq!(base.as_ref(), Some(&after));
 
         // An unswept tick keeps the baseline where the last swept one left it.
-        let (_, changed) = rolling_tick(&mut base, |previous| {
+        let (_, changed, _) = rolling_tick(&mut base, |previous| {
             let before = previous.unwrap();
             let (now, changed) = changes_under_lock(&conn, &before).unwrap();
             Ok(Some((
@@ -3887,6 +3872,7 @@ mod tests {
                 },
                 now,
                 changed,
+                Vec::new(),
             )))
         })
         .unwrap();

@@ -97,8 +97,8 @@ pub use session_store::{
     Reconciliation, ReconciliationStep, Relationship, RelationshipSide, Role, SessionAvatar,
     SessionEvidence, SessionProfile, SessionQuery, SessionRef, SessionStore, Source,
     SourceCapabilities, SourceEvidenceSubmission, SourceObservationBatch, StopToken, StoreOptions,
-    SyncOptions, SyncReport, TickReport, ToolCall, ToolResult, WatchHandle, WatchOptions,
-    WatchScope, WatchStop, WatchTick, WatchedPath,
+    SyncDiagnostic, SyncOptions, SyncReport, TickReport, ToolCall, ToolResult, WatchHandle,
+    WatchOptions, WatchScope, WatchStop, WatchTick, WatchedPath,
 };
 /// The usage reads that take a raw connection. Embedders reach the same data
 /// through [`SessionStore::session`], whose `requests` and `usage` fields
