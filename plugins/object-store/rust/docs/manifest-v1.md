@@ -13,6 +13,10 @@
   - the **client**: the desktop's local delivery coordinator for that machine
   - the **server**: the storage-event handler, the normalize transform and the
     lifecycle sweeper
+
+  A one-time exporter also appends one epoch to `raw`
+  ([Backfill](#backfill)). It is a narrow exception to the `raw` ownership
+  below, not a third owner.
 - **Readers:** the server-side `storage.event` handler, the normalize transform,
   the Supabase `sessions` pointer upsert, and `fetch`.
 
@@ -42,7 +46,7 @@ through unchanged.
 | Fields | Owner | Notes |
 | ------ | ----- | ----- |
 | `session.*` | client | Only the client sees the harness metadata. |
-| `raw` (everything in it, including `raw.state`, `raw.epoch`, `raw.epochs`, `raw.owner`, `raw.updated_at`) | client | The server has no raw bytes and never writes this section. |
+| `raw` (everything in it, including `raw.state`, `raw.epoch`, `raw.epochs`, `raw.owner`, `raw.updated_at`) | client | The server has no raw bytes and never writes this section. The exporter may append exactly its own epoch ([Backfill](#backfill)). |
 | `writer.*` | client | Which client delivery instance last wrote. |
 | `server` (everything in it: `normalized`, `lifecycle`, `retention`, `updated_at`) | server | The client never writes this section. |
 | `schema_v`, `layout`, `trace_id` | first writer | Set once on creation, normally by the client, and never changed. |
@@ -105,7 +109,7 @@ Readers ignore unknown fields. Writers preserve them.
 | `content_sha256` | string (64 hex) | required | Hash chain over the ordered chunk list ([definition](#content_sha256)). |
 | `epoch` | integer ≥ 0 | required | The current source epoch: the epoch counter ([Epochs](#epochs)). |
 | `epochs` | array of [epoch records](#epoch-records) | required | One record per epoch ever opened, `epochs[i].epoch == i`, so `epochs.length == epoch + 1`. |
-| `next_offset` | integer ≥ 0 | required | `start_offset + bytes` of the last chunk in the current epoch, or `0` if the current epoch has no chunks yet. The client resumes reading the source here. |
+| `next_offset` | integer ≥ 0 | required | `start_offset + bytes` of the last chunk in the current epoch, or that epoch's base offset ([Epoch invariants](#epoch-invariants-readers-check)) if it has no chunks yet. The client resumes reading the source here, unless the current epoch is a backfill epoch; see [Backfill](#backfill). |
 | `chunks` | array of [chunk](#chunk-entries) | required | Every chunk of every epoch, ordered by `seq`. |
 | `scrub` | object | optional | `{ ruleset, version }`: the scrub rule set the stored chunks went through ([Scrubbing](#scrubbing)). `version` is the **lowest** version applied to any listed chunk. Absent means the chunks are unscrubbed, and every reader quarantines the manifest. |
 
@@ -115,9 +119,10 @@ Readers ignore unknown fields. Writers preserve them.
 | ----- | ---- | ---- | ------- |
 | `epoch` | integer ≥ 0 | required | Equal to its index in `raw.epochs`. |
 | `opened_at` | string (RFC 3339) | required | When the client opened it. |
-| `reason` | `"initial"`, `"truncated"` or `"rewritten"` | required | `"initial"` only for epoch 0. `"truncated"`: the source shrank. `"rewritten"`: bytes before `next_offset` changed. |
+| `reason` | `"initial"`, `"truncated"`, `"rewritten"`, `"backfill"` or `"resumed"` | required | `"initial"` only for epoch 0. `"truncated"`: the source shrank. `"rewritten"`: bytes before `next_offset` changed. `"backfill"`: an exporter's records from before a cutover. `"resumed"`: the raw owner continuing its source after a backfill epoch. See [Backfill](#backfill). |
 | `first_seq` | integer ≥ 0 | required | `seq` of the epoch's first chunk, which equals `raw.chunk_count` at the moment it was opened. |
-| `opened_by` | string | required | `raw.owner` at the time it was opened. |
+| `opened_by` | string | required | `raw.owner` at the time it was opened, or for a `"backfill"` epoch `migration:{grant_id}`, the exporter's identity. |
+| `resumes_epoch` | integer ≥ 0 | required on `"resumed"` | The newest live (non-backfill) epoch this one continues. Absent on every other reason. |
 
 ### `server`
 
@@ -204,19 +209,21 @@ Because the write is conditional on that exact copy, two writers can never
 commit the same number or skip one.
 
 **Who may open an epoch.** Only the client that is `raw.owner`, and only when
-it observes that the source shrank below `next_offset` (`"truncated"`) or that
-bytes before `next_offset` changed (`"rewritten"`). It detects the second case
-by re-hashing the source range of the last acknowledged chunk and comparing it
-with `chunks[-1].sha256`. **The server never opens an epoch.** It has no access
-to the source, and it never writes `raw`.
+it observes that the source shrank below its live end (`"truncated"`), that
+bytes before it changed (`"rewritten"`), or that an exporter's epoch is the
+current one (`"resumed"`). It detects the second case by re-hashing the source
+range of the last acknowledged live chunk and comparing it with that chunk's
+`sha256`. The exporter opens one `"backfill"` epoch ([Backfill](#backfill)).
+**The server never opens an epoch.** It has no access to the source, and it
+never writes `raw`.
 
 **Opening an epoch** is one manifest write that does all of the following:
 
 - sets `raw.epoch = remote.raw.epoch + 1`
 - appends an `epochs` record (`first_seq = remote.raw.chunk_count`,
   `opened_by = raw.owner`)
-- appends the new epoch's first chunks (`start_offset` starting at `0`; it may
-  be zero chunks if the source is now empty)
+- appends the new epoch's first chunks (`start_offset` starting at the epoch's
+  base offset; it may be zero chunks if the source is now empty)
 - sets `next_offset` to the new epoch's end
 
 Earlier epochs and their chunks stay listed forever, because raw is canonical.
@@ -246,11 +253,138 @@ though `start_offset` restarts at `0`.
    `epochs[0].reason == "initial"`.
 2. For every chunk, `chunk.epoch` is non-decreasing along `chunks`, and the
    first chunk of epoch `e` has `seq == epochs[e].first_seq` and
-   `start_offset == 0`.
+   `start_offset` equal to the epoch's **base offset**: `0`, or for a
+   `"resumed"` epoch the end of `resumes_epoch`.
 3. Within an epoch, offsets are contiguous:
    `chunks[i].start_offset == chunks[i-1].start_offset + chunks[i-1].bytes`.
-4. `next_offset` = end of the last chunk whose epoch is `raw.epoch`, or `0` if
-   that epoch has no chunks.
+4. `next_offset` = end of the last chunk whose epoch is `raw.epoch`, or that
+   epoch's base offset if it has no chunks.
+5. At most one epoch is `"backfill"`. It is not epoch 0, it lists at least one
+   chunk, its `opened_by` starts with `migration:`, and `raw.format` is
+   `"ndjson"`.
+6. A `"resumed"` epoch directly follows the backfill epoch, and its
+   `resumes_epoch` names the newest non-backfill epoch before it.
+
+## Backfill
+
+A cutover can leave a session with two sources: new records that the live
+client delivers, and older records that only a server-side store still holds.
+The older ones land later than the newer ones. An **exporter** adds them as one
+sealed `"backfill"` epoch, without taking the session from its client.
+
+**Exporter identity.** `opened_by` is `migration:{grant_id}`, taken from the
+exporter's verified credential. The ingest boundary, not the exporter, enforces
+everything marked "refused" below, and refuses a `"backfill"` epoch from any
+other credential.
+
+**Ownership: what the exporter may change.** One compare-and-swap write that:
+
+- appends one epoch record: `reason: "backfill"`, `first_seq = raw.chunk_count`,
+  number `raw.epoch + 1`
+- appends that epoch's chunks after every listed chunk (`seq` continues,
+  `start_offset` from `0`)
+- recomputes the derived `raw` totals: `chunk_count`, `raw_bytes`,
+  `stored_bytes`, `content_sha256`, `epoch`, `next_offset`
+- sets `extensions["client.relayhistory_export"]`, its own key
+- sets `revision` and `updated_at`
+
+Refused: changing `raw.owner` (the client's fencing token), `raw.state`,
+`raw.updated_at`, `raw.format`, `raw.scrub`, `session`, `writer`, `server`, any
+existing epoch or chunk, or any other extension. `raw.updated_at` stays put on
+purpose: lifecycle follows the client's activity, and old records landing do
+not make a session active.
+
+**Scrubbing.** Backfill chunks go through the same server-side sealing as live
+chunks and must match the session's `raw.scrub` rule set and version, because
+the exporter cannot change the marker. A session whose chunks were never
+scrubbed stays quarantined, and a backfill does not lift that.
+
+**A sealed epoch.** Everything in the epoch lands in that one write. The epoch
+never grows, so a reader sees all of a backfill or none of it. No writer
+appends to it afterwards (refused).
+
+**Compare-and-swap.** The exporter uses the ordinary protocol: read, build on
+that copy, conditional write, 8 attempts with backoff.
+
+- A lost race means a live or server write landed first. `seq` and the chunk
+  keys that embed it come from the copy being written, so the exporter re-reads
+  and re-seals under the new `seq`. Chunks sealed for the lost attempt stay as
+  harmless orphans. It never merges its epoch into a copy it did not read.
+- When attempts run out it is a delay, never data loss. The exporter re-queues
+  the session. Its source is frozen, so a retry produces the same content.
+- Neither side waits for the other, and the client never fails because of the
+  exporter: for the client it is one more lost race.
+
+**Idempotency.** The exporter compares content, not bytes of the manifest. The
+**backfill digest** is the [`content_sha256`](#content_sha256) chain over only
+the backfill epoch's chunks, with each chunk's `epoch` taken as `0`, so it
+does not depend on where the epoch landed.
+
+| Remote copy | Meaning | Action |
+| ----------- | ------- | ------- |
+| No backfill epoch | Not exported yet | Append. |
+| Backfill epoch with an equal digest | Already exported | **No-op.** No write, no new revision. |
+| Backfill epoch with a different digest | The source or the exporter changed | **Stop for a human.** Never overwrite, and never add a second epoch. |
+
+**The live client after a backfill.** The epoch usually lands after live
+chunks, so it is `raw.epoch` the next time the client reads. `raw` then moved
+without the client writing, and the client must not take it for its own
+unacknowledged write. ([Stale writers](#stale-writers) has the row.)
+
+1. It adopts the remote copy as its new `ack`.
+2. It keeps its own position: the **live end** is the end of the newest
+   non-backfill epoch. `next_offset` is now the end of the exporter's stream and
+   means nothing for this source.
+3. Its next write opens a `"resumed"` epoch and continues at the live end. Same
+   source, same offsets, nothing re-uploaded. The base offset makes this valid:
+   the first chunk starts at the live end, not `0`.
+
+`seq` still comes from the remote copy, so chunks the client had uploaded under
+the old `seq` are abandoned and re-uploaded. A client that detects a truncation
+or rewrite at that moment opens that epoch instead, from `0`.
+
+**Reading.** A reader that wants the records of the session reads **every**
+epoch, in any order:
+
+1. Key each record by its identity. For RelayHistory records it is
+   `(origin_id, record_id)`.
+2. Keep the highest `revision` of each key, then drop keys whose highest
+   revision is a delete. A delete recorded after the cutover therefore beats
+   the exported record. Equal revisions with different content are an error.
+3. Sort what is left by event time, then by identity.
+
+Arrival order, `seq` and epoch number never decide anything, so live and
+backfill commits can interleave any way. A reader that wants only the live
+source's current stream (the "current epoch" default for harness logs) reads
+the newest non-backfill epoch plus the chain of `resumes_epoch` behind it, not
+`raw.epoch`. Because a backfill changes both `raw.content_sha256` and
+`raw.epoch`, it makes normalized output stale, and the next event rebuilds it.
+
+**If the client truncates or rewrites.** Before or after the backfill, in either
+order, the outcome is the same. The client opens its epoch from `0`, re-reading
+its source. The backfill epoch stays listed, like every earlier epoch, and
+stays in the merge: it holds records the source may no longer have, and the
+client's epoch changes nothing about them. Truncating a source does not delete
+records. Only a delete record does, under the rule above. Records that appear
+in both are one key. The exporter never reads the client's epochs, so its
+digest and its no-op do not change.
+
+**Limits of this design.**
+
+- **Only one format per session.** Chunks use `raw.format`, so a backfill
+  needs a live stream in the same `ndjson` record shape. A session whose live
+  stream is a `jsonl` harness log cannot take one (refused).
+- **Clients that replace `raw` from local state.** A client must follow
+  [Ownership](#ownership) and edit the copy it read. One that rebuilds `raw`
+  drops the epoch, and the boundary refuses the write.
+- **Every reader must understand the two reasons first.** Unknown reasons fail
+  validation, so a client or reader older than this section stops at a
+  backfilled manifest. Writing a backfill is safe only after all of them are
+  upgraded.
+- **Cold exports.** When the exporter creates the manifest, `raw.owner` is
+  `migration:{grant_id}` and no client owns it. A client that later resumes that
+  session is fenced, and its records stay local. Handing such a session to a
+  client is not defined yet.
 
 ## Stale writers
 
@@ -271,6 +405,7 @@ On every read before a write, the client classifies the remote copy:
 | `revision < ack.revision`, or `raw.chunk_count < ack.chunk_count`, or `ack.content_sha256` is not on the remote hash chain at position `ack.chunk_count` | The manifest went backwards: restored from backup, or corrupted | **Stop and alert** (`ManifestRolledBack`). Do not overwrite. |
 | `raw` identical to `ack` (only `server` / `revision` moved) | The server wrote | Re-apply and continue. |
 | `raw.epoch < ack.epoch` | The manifest went backwards | **Stop and alert**, as above. |
+| `raw` extends `ack` and an epoch added since `ack` is `"backfill"` | An exporter appended ([Backfill](#backfill)) | Adopt it as the new `ack`, and continue from the live end, not `next_offset`. |
 | `raw` extends `ack` (more chunks and/or a newer epoch, even with no new chunks) and this instance is the owner | Its own earlier write that it did not see acknowledged, e.g. a crash after the PUT | Adopt it as the new `ack`, including the epoch, and append only what is missing. Never open the epoch a second time. |
 
 **Ownership transfer.** A new client instance takes over only through an
@@ -278,6 +413,8 @@ explicit takeover write: it sets `raw.owner` to itself under compare-and-swap,
 which is recorded in `writer`. It does this only when it holds the source, for
 example a reinstalled desktop re-reading the same logs. The previous owner
 detects it on its next read and fences itself.
+
+The exporter never changes `raw.owner` and never takes over.
 
 The server is never "stale" in a harmful way. Its writes only replace its own
 section, and it recomputes that section from the copy it just read.

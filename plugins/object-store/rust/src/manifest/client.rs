@@ -47,12 +47,19 @@ pub enum RemoteState {
     /// acknowledgment it never saw (e.g. a crash after the PUT). Adopt it,
     /// including the epoch, before reading the source again.
     Extended { new_chunks: u64, new_epochs: u32 },
+    /// `raw` extends the acknowledged state and includes an exporter's
+    /// backfill epoch. Adopt it as the new `ack`, then read the source from
+    /// `Raw::live_next_offset`, and call [`resume_epoch`] before appending.
+    Backfilled { new_chunks: u64, new_epochs: u32 },
 }
 
 impl RemoteState {
     /// Whether this client may write `raw` on top of the remote copy.
     pub fn may_write(&self) -> bool {
-        matches!(self, Self::Unchanged | Self::Extended { .. })
+        matches!(
+            self,
+            Self::Unchanged | Self::Extended { .. } | Self::Backfilled { .. }
+        )
     }
 }
 
@@ -94,11 +101,21 @@ pub fn classify(remote: &Manifest, owner: &str, ack: Option<&ClientAck>) -> Remo
             reason: format!("epoch {} < acknowledged {}", remote.raw.epoch, ack.epoch),
         };
     }
+    let backfilled = remote
+        .raw
+        .epochs
+        .iter()
+        .skip(ack.epoch as usize + 1)
+        .any(|e| e.reason == EpochReason::Backfill);
     match (
         remote.raw.chunk_count - ack.chunk_count,
         remote.raw.epoch - ack.epoch,
     ) {
         (0, 0) => RemoteState::Unchanged,
+        (new_chunks, new_epochs) if backfilled => RemoteState::Backfilled {
+            new_chunks,
+            new_epochs,
+        },
         (new_chunks, new_epochs) => RemoteState::Extended {
             new_chunks,
             new_epochs,
@@ -133,6 +150,11 @@ pub struct NewChunk {
 /// returned entry (`layout::SessionLocation::raw_chunk`) **before** writing
 /// the manifest. Offsets must continue from `raw.next_offset`.
 pub fn plan_chunks(raw: &Raw, chunks: Vec<NewChunk>) -> Result<Vec<ChunkEntry>> {
+    if raw.at_backfill_tail() {
+        return Err(Error::InvalidArgument(
+            "the current epoch is a sealed backfill epoch; resume_epoch first".into(),
+        ));
+    }
     let mut next_offset = raw.next_offset;
     let mut out = Vec::with_capacity(chunks.len());
     for (i, c) in chunks.into_iter().enumerate() {
@@ -204,9 +226,35 @@ pub fn apply_chunks(raw: &mut Raw, entries: &[ChunkEntry]) -> Result<()> {
 /// edited, which the compare-and-swap write then pins. Only the raw owner may
 /// call this, and only after observing the source truncated or rewritten.
 pub fn open_epoch(raw: &mut Raw, reason: EpochReason) -> Result<u32> {
-    if reason == EpochReason::Initial {
-        return Err(Error::InvalidArgument("only epoch 0 is \"initial\"".into()));
+    match reason {
+        EpochReason::Truncated | EpochReason::Rewritten => {}
+        EpochReason::Initial => {
+            return Err(Error::InvalidArgument("only epoch 0 is \"initial\"".into()))
+        }
+        EpochReason::Backfill | EpochReason::Resumed => {
+            return Err(Error::InvalidArgument(format!(
+                "{reason:?} epochs are not source changes; only the exporter opens \"backfill\", and resume_epoch opens \"resumed\""
+            )))
+        }
     }
+    Ok(push_epoch(raw, reason, None))
+}
+
+/// Continue the live stream after a backfill epoch: same source, same offsets,
+/// no re-upload. Only the raw owner calls this, once it has adopted the
+/// backfill epoch ([`RemoteState::Backfilled`]). Opening `truncated` or
+/// `rewritten` instead is also valid if the source changed.
+pub fn resume_epoch(raw: &mut Raw) -> Result<u32> {
+    if !raw.at_backfill_tail() {
+        return Err(Error::InvalidArgument(
+            "only the epoch right after a backfill epoch is \"resumed\"".into(),
+        ));
+    }
+    let live = raw.live_epoch();
+    Ok(push_epoch(raw, EpochReason::Resumed, Some(live)))
+}
+
+fn push_epoch(raw: &mut Raw, reason: EpochReason, resumes_epoch: Option<u32>) -> u32 {
     let epoch = raw.epoch + 1;
     raw.epochs.push(EpochRecord {
         epoch,
@@ -214,12 +262,13 @@ pub fn open_epoch(raw: &mut Raw, reason: EpochReason) -> Result<u32> {
         reason,
         first_seq: raw.chunk_count,
         opened_by: raw.owner.clone(),
+        resumes_epoch,
         extra: Default::default(),
     });
     raw.epoch = epoch;
-    raw.next_offset = 0;
+    raw.next_offset = raw.epoch_base(epoch);
     raw.updated_at = now_rfc3339();
-    Ok(epoch)
+    epoch
 }
 
 /// Record that chunks scrubbed with `ruleset` `version` are listed. Call it
@@ -292,12 +341,7 @@ fn recompute(raw: &mut Raw) {
         .iter()
         .fold(0u64, |a, c| a.saturating_add(c.stored_bytes));
     raw.content_sha256 = content_sha256(&raw.chunks);
-    raw.next_offset = raw
-        .chunks
-        .iter()
-        .rev()
-        .find(|c| c.epoch == raw.epoch)
-        .map_or(0, |c| c.start_offset.saturating_add(c.bytes));
+    raw.next_offset = raw.epoch_end(raw.epoch);
 }
 
 /// Everything needed for revision 1.
@@ -331,6 +375,7 @@ pub fn new_manifest(params: NewManifest) -> Manifest {
             reason: EpochReason::Initial,
             first_seq: 0,
             opened_by: owner,
+            resumes_epoch: None,
             extra: Default::default(),
         }],
         next_offset: 0,
