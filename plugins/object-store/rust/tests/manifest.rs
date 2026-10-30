@@ -968,6 +968,14 @@ fn validator_rejects_malformed_backfill_and_resumed_epochs() {
             "raw.epochs[1].opened_by",
             Box::new(|m| m.raw.epochs[1].opened_by = OWNER.into()),
         ),
+        (
+            "raw.epochs[1].opened_by",
+            Box::new(|m| m.raw.epochs[1].opened_by = "migration:".into()),
+        ),
+        (
+            "raw.epochs[1].opened_by",
+            Box::new(|m| m.raw.epochs[1].opened_by = "migration:bad id".into()),
+        ),
         ("raw.format", Box::new(|m| m.raw.format = RawFormat::Jsonl)),
         (
             "raw.epochs",

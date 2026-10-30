@@ -282,7 +282,7 @@ impl Checker {
 
     fn backfill_epoch(&mut self, raw: &Raw, at: &str, i: usize) {
         let e = &raw.epochs[i];
-        if !e.opened_by.starts_with(MIGRATION_ID_PREFIX) {
+        if !is_migration_id(&e.opened_by) {
             self.issue(
                 format!("{at}.opened_by"),
                 format!("a backfill epoch is opened by {MIGRATION_ID_PREFIX}{{grant_id}}"),
@@ -501,6 +501,16 @@ impl Checker {
             );
         }
     }
+}
+
+/// `migration:{grant_id}`, the shape the ingest boundary mints.
+fn is_migration_id(s: &str) -> bool {
+    s.strip_prefix(MIGRATION_ID_PREFIX).is_some_and(|grant| {
+        (1..=255).contains(&grant.len())
+            && grant
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b':' | b'-'))
+    })
 }
 
 fn is_uuid_v7(s: &str) -> bool {
