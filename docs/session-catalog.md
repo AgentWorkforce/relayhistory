@@ -55,13 +55,14 @@ produce; `capability` is `full` only when that list contains every kind in
 `relationship`), and `partial` otherwise, with a `HYDRATION_PARTIAL_COVERAGE`
 diagnostic naming the missing ones. A zero count for a *covered* kind means
 this session has none of it; a kind absent from `coverage` means nothing
-looked. So a completed Cursor hydration reports:
+looked. So a completed Devin hydration, whose parser reads no delegation,
+reports:
 
 ```json
 {
   "capability": "partial",
-  "coverage": ["history"],
-  "diagnostics": [{ "code": "HYDRATION_PARTIAL_COVERAGE", "message": "cursor evidence covers history; this hydration produces no session_event, tool_call, file_edit, relationship" }]
+  "coverage": ["history", "session_event", "tool_call", "file_edit"],
+  "diagnostics": [{ "code": "HYDRATION_PARTIAL_COVERAGE", "message": "devin evidence covers history, session_event, tool_call, file_edit; this hydration produces no relationship" }]
 }
 ```
 
@@ -454,8 +455,10 @@ cache-only queries over the same ledger.
 Discovery and sync are acquisition operations. Local adapters are always
 available; remote acquisition runs through provider connectors —
 `claude-web` for claude.ai/code web sessions, `codex-cloud` for Codex
-cloud tasks and `devin-cloud` for an organization's Devin cloud sessions —
-that are configured by the provider CLI's own stored sign-in
+cloud tasks, `devin-cloud` for an organization's Devin cloud sessions and
+`cursor-cloud` for Cursor Cloud Agents —
+that are configured by the provider CLI's own stored sign-in (a Cursor API key
+for `cursor-cloud`)
 (see [Remote connectors](source-plugins.md)). Explicit remote acquisition
 on a machine with no connector configured returns an error rather than
 silently doing local work. `--all` means every configured adapter: the local
@@ -496,7 +499,7 @@ mark captured is missing for every consumer, not just for `ai-hist`.
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
 | **claude** | ✓ | ✓ | ✓ | ✓ | ✓ (tail) | ✓ | ✓ (head) | – | ✓ (record `version`) | – | – | – |
 | **codex** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
-| **cursor** | ✓ (dir name) | ✓ (decoded path) | – (never) | ✓ (injected `<timestamp>`) | ✓ (injected `<timestamp>`, else mtime) | ✓ | ✓ (if a build writes `message.model`) | – | – | – | – | – |
+| **cursor** | ✓ (dir name; a subagent's file stem) | ✓ (decoded path) | – (never) | ✓ (injected `<timestamp>`) | ✓ (injected `<timestamp>`, else mtime) | ✓ | ✓ (if a build writes `message.model`) | – | – | – | – | – |
 | **grok** | ✓ | ✓ | ✓ | ✓ (`updates.jsonl`, else `summary.json`) | ✓ (`updates.jsonl`, else `summary.json`) | ✓ | ✓ | – | – | – | – | – |
 | **muse** | ✓ (metadata `stream.id`) | ✓ (`workspace_root`) | – (never) | ✓ (metadata `recorded_at`) | ✓ (tail `recorded_at`) | ✓ (first `started` prompt) | ✓ (metadata, then `model_completed`) | – | ✓ (`build.semver`) | – | – | – |
 | **opencode** | ✓ | ✓ (directory / message `path.cwd`) | – | ✓ | ✓ | ✓ | ✓ (`providerID/modelID`) | – | – | – | – | – |
@@ -771,7 +774,7 @@ follows.
 |---|---|---|---|---|---|---|
 | **claude** | ✓ | ✓ | ✓ | ✓ | ✓ | `full` |
 | **codex** | ✓ | ✓ | ✓ | ✓ | ✓ when the bounded child search is complete | `full` or `partial` |
-| **cursor** | ✓ | ✓ | ✓ | ✓ | – (never: a `Task` block names no child transcript) | `partial` |
+| **cursor** | ✓ | ✓ | ✓ | ✓ | ✓ (from `<parent>/subagents/<child>.jsonl`; a `Task` block names no child) | `full` |
 | **grok** | ✓ | ✓ | ✓ | ✓ | ✓ | `full` |
 | **muse** | ✓ | ✓ | ✓ | ✓ | ✓ | `full` |
 | **opencode** | ✓ | ✓ | ✓ | ✓ | ✓ | `full` |
@@ -853,7 +856,8 @@ Delegation is a separate capability, reported on every relationship result as
 | **claude** | sometimes | ✓ | ✓ | ✓ |
 | **grok** | sometimes | ✓ | ✓ | ✓ |
 | **muse** | always | ✓ | ✓ | ✓ |
-| **cursor**, **devin** | never | – | – | – |
+| **cursor** | always | – | – | ✓ |
+| **devin** | never | – | – | – |
 
 OpenCode is `always` because a subagent session is a session in its own right
 and its own record names the parent, in `session.parentID`. Nothing is
@@ -879,10 +883,14 @@ record names the child session. The edge is recorded with `evidence_kind =
 `task_stream_linked` (or `memory_reminder_child_session_linked`) record for
 that log. See ["muse"](#muse).
 
-Cursor is `never` for a different reason from devin: it does
-record the spawn — a `Task` / `functions.Subagent` tool call, preserved as a
-`tool_calls` row — but the block names no child transcript, so there is no
-identity to link. See ["cursor → Delegation"](#cursor).
+Cursor is `always` because every subagent writes its own transcript at
+`agent-transcripts/<parent>/subagents/<child>.jsonl`, and the top-level
+session ids that layout names are the same directory and file names the
+catalog already uses. The edge is recorded with `evidence_kind =
+"cursor_subagent_dir"` and the child's file as its locator. The spawn itself —
+a `Task` / `functions.Subagent` tool call, preserved as a `tool_calls` row —
+names no child, so a call is not matched to the transcript it started. See
+["cursor → Delegation"](#cursor).
 
 Claude is `sometimes` because a subagent transcript carries the *parent's*
 `sessionId` on every record; the child's own identity is the per-child
@@ -1203,14 +1211,20 @@ How each adapter works:
   edge says otherwise. The shallow reader takes this fact from `summary.json`
   and does not search transcript prose to guess a parent.
 
-  Cursor's `Task` / `functions.Subagent` calls are recorded as ordinary
-  `tool_calls` rows, so the spawn is visible. The block carries **no child
-  transcript id**, so there is nothing to link to and
-  `relationship_capabilities("cursor").stableChildIdentity` stays `never`;
-  targeted hydration reports `CURSOR_SUBAGENT_SPAWN_UNLINKED` when a transcript
-  contains such a call. Third-party reports describe subagent sidecars at
-  `agent-transcripts/<parent>/subagents/<child>.jsonl`, but that layout is
-  **unverified here** and no relationship row is written on the strength of it.
+  Cursor writes each subagent's transcript at
+  `agent-transcripts/<parent>/subagents/<child>.jsonl` (verified against Cursor
+  IDE transcripts from October 2026). The full walk, path-scoped ticks and
+  targeted hydration all list it as its own session under its file stem, with
+  the parent's decoded project as its `cwd`, and record a `delegated` edge
+  `<parent> → <child>` with `evidence_kind = "cursor_subagent_dir"`. A child
+  transcript opens with the delegated prompt framed as a `<user_query>`, so
+  that prompt is the child's `first_prompt` and `history` row. Hydrating a
+  parent with `include_related` records an edge for every transcript under its
+  `subagents/`. Neither file names the other: the child's records carry no
+  parent id, and the parent's `Task` / `functions.Subagent` calls — recorded as
+  ordinary `tool_calls` rows — carry **no child transcript id**, so a call is
+  not matched to the transcript it started; targeted hydration still reports
+  `CURSOR_SUBAGENT_SPAWN_UNLINKED` for those calls.
 
   ### Verification status
 

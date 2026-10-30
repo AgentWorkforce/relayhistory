@@ -4,11 +4,19 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased - Patch]
+## [Unreleased - Minor]
+
+### Added
+
+- `@relayhistory/provider-sources` gains a `cursor-cloud` connector: `--remote` / `--all` discovery lists Cursor Cloud Agents through `GET /v1/agents`, and targeted hydration returns each agent's prompts and assistant replies (from `GET /v0/agents/{id}/conversation`, timed by its v1 runs) as `cursor` evidence under the agent's `bc-…` id. It needs a Cursor API key in `RELAYHISTORY_CURSOR_API_KEY`, `CURSOR_API_KEY` or `~/.config/relayhistory/cursor-api-key`.
 
 ### Changed
 
 - New sessions become visible sooner because live watch capture checkpoints its WAL after the active burst instead of on the commit thread.
+
+### Fixed
+
+- Cursor subagent sessions are discovered and searchable: transcripts under `agent-transcripts/<parent>/subagents/` are indexed as their own sessions, by full sweeps and change-triggered scans, and linked to the session that spawned them.
 
 ## [0.53.1] - 2026-10-29
 

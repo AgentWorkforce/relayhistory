@@ -1,0 +1,12 @@
+{
+  "id": "bc-00000000-0000-0000-0000-000000000002",
+  "messages": [
+    { "id": "msg_001", "type": "user_message", "text": "Bump the iOS build number to 37 and prepare a TestFlight upload" },
+    { "id": "msg_002", "type": "assistant_message", "text": "I'll start from the Xcode project settings." },
+    { "id": "msg_003", "type": "assistant_message", "text": "Build 37 is ready; the branch is pushed." },
+    { "id": "msg_004", "type": "user_message", "text": "Also add a changelog bullet" },
+    { "id": "msg_005", "type": "tool_summary", "text": "ignored: not a conversational message type" },
+    { "id": "msg_006", "type": "assistant_message", "text": "   " },
+    { "id": "msg_007", "type": "assistant_message", "text": "Added the changelog bullet." }
+  ]
+}

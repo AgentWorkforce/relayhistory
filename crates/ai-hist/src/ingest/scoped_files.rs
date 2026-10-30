@@ -4,7 +4,6 @@
 //! to the paths that changed. Both go through here so the sync functions stay
 //! the walks they were.
 
-use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -26,6 +25,10 @@ use super::path_scope::{self, PathScope, RootWalk};
 
 #[path = "claude_scope.rs"]
 mod claude_scope;
+#[path = "cursor_scope.rs"]
+mod cursor_scope;
+
+pub(crate) use cursor_scope::{cursor_subagent_transcripts, cursor_transcripts};
 
 /// Every Claude transcript under `root` that this scope names: each `*.jsonl`
 /// except the subagent workflow journals, which are metadata and never a
@@ -243,125 +246,6 @@ fn collect_matching_files_inner(
         }
     }
     Ok(())
-}
-
-pub(crate) fn cursor_transcripts(
-    root: &Path,
-    scope: Option<&PathScope>,
-) -> Result<Vec<(PathBuf, String, String)>> {
-    match PathScope::walk_of(scope, root) {
-        RootWalk::Skip => Ok(Vec::new()),
-        RootWalk::Full => cursor_transcripts_full(root),
-        RootWalk::Partial(scope) => cursor_transcripts_partial(root, scope),
-    }
-}
-
-fn cursor_transcripts_full(root: &Path) -> Result<Vec<(PathBuf, String, String)>> {
-    let mut files = Vec::new();
-    for project_dir in super::sorted_dirs(root)? {
-        super::check_capture_cancelled()?;
-        files.extend(cursor_project_transcripts(&project_dir)?);
-    }
-    Ok(files)
-}
-
-fn cursor_project_transcripts(project_dir: &Path) -> Result<Vec<(PathBuf, String, String)>> {
-    let mut files = Vec::new();
-    let ts_root = project_dir.join("agent-transcripts");
-    if !ts_root.is_dir() {
-        return Ok(files);
-    }
-    let project_path = super::decode_cursor_project(
-        project_dir
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default(),
-    );
-    for session_dir in super::sorted_dirs(&ts_root)? {
-        super::check_capture_cancelled()?;
-        let session_id = session_dir
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default()
-            .to_string();
-        let jsonl = session_dir.join(format!("{session_id}.jsonl"));
-        if jsonl.is_file() {
-            files.push((jsonl, session_id, project_path.clone()));
-        }
-    }
-    Ok(files)
-}
-
-/// The session file a changed path names, without listing its siblings.
-///
-/// The shape is checked before the file is stat'd, so a tick that names one
-/// transcript does not stat the other sessions in the project.
-fn cursor_transcripts_partial(
-    root: &Path,
-    scope: &PathScope,
-) -> Result<Vec<(PathBuf, String, String)>> {
-    let mut files = Vec::new();
-    let mut seen = HashSet::new();
-    let mut missed = false;
-    for changed in scope.paths() {
-        super::check_capture_cancelled()?;
-        if !changed.starts_with(root) {
-            continue;
-        }
-        match cursor_changed_target(root, changed) {
-            Some(CursorTarget::File(jsonl, session_id, project)) => {
-                if seen.insert(jsonl.clone()) && jsonl.is_file() {
-                    files.push((jsonl, session_id, project));
-                }
-            }
-            Some(CursorTarget::Project(project_dir)) => {
-                for (jsonl, session_id, project) in cursor_project_transcripts(&project_dir)? {
-                    if seen.insert(jsonl.clone()) {
-                        files.push((jsonl, session_id, project));
-                    }
-                }
-            }
-            // A path under the root that is not a transcript shape. Listing
-            // the root is the walk that cannot miss it.
-            None => missed = true,
-        }
-    }
-    if missed {
-        return cursor_transcripts_full(root);
-    }
-    files.sort();
-    Ok(files)
-}
-
-enum CursorTarget {
-    File(PathBuf, String, String),
-    Project(PathBuf),
-}
-
-fn cursor_changed_target(root: &Path, changed: &Path) -> Option<CursorTarget> {
-    let rel = changed.strip_prefix(root).ok()?;
-    let parts: Vec<_> = rel.components().collect();
-    if parts.is_empty() {
-        return None;
-    }
-    let project_dir = root.join(parts[0]);
-    let project = super::decode_cursor_project(parts[0].as_os_str().to_str()?);
-    if parts.len() == 1 || (parts.len() == 2 && parts[1].as_os_str() == "agent-transcripts") {
-        return Some(CursorTarget::Project(project_dir));
-    }
-    if parts.len() >= 3 && parts[1].as_os_str() == "agent-transcripts" {
-        let session_id = parts[2].as_os_str().to_str()?.to_string();
-        let jsonl = project_dir
-            .join("agent-transcripts")
-            .join(&session_id)
-            .join(format!("{session_id}.jsonl"));
-        // A path that is not this session's transcript and is not inside its
-        // directory is not evidence. Inside the directory, the transcript is.
-        if parts.len() == 3 || changed == jsonl || changed.starts_with(jsonl.parent()?) {
-            return Some(CursorTarget::File(jsonl, session_id, project));
-        }
-    }
-    None
 }
 
 pub(crate) fn collect_muse_transcripts(root: &Path) -> Result<Vec<PathBuf>> {

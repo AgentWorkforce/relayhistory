@@ -11808,6 +11808,7 @@ fn sync_cursor_with_hooks_in(
                 raw_path: Some(&transcript.path.to_string_lossy()),
             },
         )?;
+        cursor::record_subagent_delegation(&tx, &transcript.path)?;
     }
     tx.commit().context("commit Cursor sync")?;
     state.insert(
@@ -12210,35 +12211,6 @@ fn prepare_cursor_sync(
     })
 }
 
-/// Timestamps a previous pass stored, keyed by the record's byte offset.
-///
-/// Every event derived from one record shares that record's byte offset as the
-/// prefix of its `event_uid` (`"{offset}:{block}"`), so the first event at
-/// each offset answers the question. Loaded once per incremental pass because
-/// a `substr(event_uid, …)` predicate cannot use the uid index.
-fn stored_cursor_record_timestamps(
-    conn: &Connection,
-    session_id: &str,
-) -> Result<HashMap<u64, i64>> {
-    let mut stored = HashMap::new();
-    let mut stmt = conn.prepare(
-        "SELECT event_uid, ts_ms FROM session_events \
-         WHERE source = 'cursor' AND session_id = ? ORDER BY id",
-    )?;
-    let mut rows = stmt.query([session_id])?;
-    while let Some(row) = rows.next()? {
-        let uid: String = row.get(0)?;
-        let ts: i64 = row.get(1)?;
-        if let Some(offset) = uid
-            .split_once(':')
-            .and_then(|(prefix, _)| prefix.parse::<u64>().ok())
-        {
-            stored.entry(offset).or_insert(ts);
-        }
-    }
-    Ok(stored)
-}
-
 /// Drop every row a previous read of this Cursor transcript produced.
 ///
 /// Cursor evidence is keyed on the record's byte offset, which is stable only
@@ -12341,7 +12313,7 @@ pub(crate) fn ingest_cursor_transcript(
     // sync of a long untimed transcript would otherwise scan events once per
     // old record.
     let stored_ts = if history_from_offset > 0 {
-        stored_cursor_record_timestamps(conn, session_id)?
+        cursor::stored_record_timestamps(conn, session_id)?
     } else {
         HashMap::new()
     };
@@ -21663,6 +21635,64 @@ mod tests {
                 .get::<_, i64>(0))
                 .unwrap(),
             2
+        );
+    }
+
+    /// A full sync indexes a subagent transcript as its own session, under
+    /// its file stem and its parent's project, and records the delegation.
+    ///
+    /// Positive control: before the fix the sync counted one prompt and the
+    /// child had no `sessions` row at all.
+    #[test]
+    fn cursor_sync_indexes_subagent_transcripts_and_links_their_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir
+            .path()
+            .join("home-dev-app/agent-transcripts/p1/p1.jsonl");
+        let child = dir
+            .path()
+            .join("home-dev-app/agent-transcripts/p1/subagents/c1.jsonl");
+        for (path, prompt) in [(&parent, "parent prompt"), (&child, "delegated prompt")] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(
+                path,
+                format!("{}\n", json!({"role":"user","message":{"content":prompt}})),
+            )
+            .unwrap();
+        }
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        assert_eq!(
+            super::sync_cursor(&conn, &mut state, dir.path(), &mut SweepCoverage::default())
+                .unwrap(),
+            2
+        );
+        let (cwd, raw_path): (String, String) = conn
+            .query_row(
+                "SELECT cwd, raw_path FROM sessions WHERE source='cursor' AND session_id='c1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(cwd, "/home/dev/app");
+        assert_eq!(raw_path, child.to_string_lossy());
+        let edge: (String, String, String, String) = conn
+            .query_row(
+                "SELECT parent_session_id, child_session_id, relationship, evidence_locator \
+                 FROM session_relationships WHERE source='cursor'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            edge,
+            (
+                "p1".to_string(),
+                "c1".to_string(),
+                "delegated".to_string(),
+                child.to_string_lossy().into_owned()
+            )
         );
     }
 

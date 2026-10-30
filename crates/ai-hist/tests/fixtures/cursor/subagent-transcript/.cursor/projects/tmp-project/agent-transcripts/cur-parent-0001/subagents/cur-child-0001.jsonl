@@ -1,0 +1,3 @@
+{"role":"user","message":{"content":[{"type":"text","text":"<timestamp>Thursday, Oct 29, 2026, 10:55 PM (UTC-7)</timestamp>\n<user_query>\nsearch the suite for the flaky test\n</user_query>"}]}}
+{"role":"assistant","message":{"content":[{"type":"tool_use","name":"Grep","input":{"pattern":"flaky"}}]}}
+{"role":"assistant","message":{"content":[{"type":"text","text":"retry_test is the flaky one."}]}}

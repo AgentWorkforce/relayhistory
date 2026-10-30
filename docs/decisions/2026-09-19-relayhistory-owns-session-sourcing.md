@@ -155,7 +155,7 @@ compresses it ([session catalog](../session-catalog.md)).
 | File edits (`file_edits`)                                          | ✓      | ✓     | ✓      | ✓    | ✓    | ✓        | ✓     | [#166](https://github.com/AgentWorkforce/relayhistory/issues/166) / [#167](https://github.com/AgentWorkforce/relayhistory/issues/167) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                     |
 | Compaction / summary markers                                       | ✗      | ◐     | ✗      | ✓    | ✗    | ✓        | ✓     | [#165](https://github.com/AgentWorkforce/relayhistory/issues/165) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                                                                                         |
 | Control / lifecycle rows                                           | ✓      | ✓     | ✗      | ◐    | ✓    | ✓        | ◐     | [#165](https://github.com/AgentWorkforce/relayhistory/issues/165), [#180](https://github.com/AgentWorkforce/relayhistory/issues/180)                                                                                                                                          |
-| Relationship — delegated                                           | ◐      | ✓     | —      | ◐    | ✓    | ✓        | —     | [#170](https://github.com/AgentWorkforce/relayhistory/issues/170) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                                                                                         |
+| Relationship — delegated                                           | ◐      | ✓     | ✓      | ◐    | ✓    | ✓        | —     | [#170](https://github.com/AgentWorkforce/relayhistory/issues/170) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                                                                                         |
 | Relationship — fork / resume / continuation                        | ✗      | ✓     | ✗      | ✗    | ✗    | ✗        | —     | [#170](https://github.com/AgentWorkforce/relayhistory/issues/170)                                                                                                                                                                                                             |
 | Session metadata (cwd, branch, versions)                           | ◐      | ✓     | ◐      | ◐    | ◐    | ◐        | ◐     | [#164](https://github.com/AgentWorkforce/relayhistory/issues/164), [#177](https://github.com/AgentWorkforce/relayhistory/issues/177)                                                                                                                                          |
 | Provider-native session kind (`sessions.session_kind`)             | —      | —     | —      | ✓    | —    | —        | —     | Grok `summary.json` records `session_kind: "subagent"` even without a parent id; root listings use this observed fact. |
@@ -338,8 +338,10 @@ otherwise `relationship_capture` records it as `identity_status = 'unlinked'`
 with a null child id. A linked child's edge names the session whose tool call
 started it (a nested subagent's parent is the subagent that spawned it), and
 its evidence is read by id through `SessionStore::session`. `relationship_capabilities().stable_child_identity` is
-`always` for codex, grok-bot, opencode and muse, `sometimes` for claude and grok, and
-`never` for cursor/devin. Codex fork is `✓`:
+`always` for codex, cursor, grok-bot, opencode and muse, `sometimes` for claude and grok, and
+`never` for devin. Cursor's `delegated` edge comes from where the child's
+transcript is filed (`agent-transcripts/<parent>/subagents/<child>.jsonl`,
+`evidence_kind = "cursor_subagent_dir"`): its `Task` calls name no child. Codex fork is `✓`:
 the `fork` edge is recorded from the fields Codex actually writes on
 `session_meta` — `forked_from_id` for a human fork, and
 `source.subagent.thread_spawn.parent_thread_id` for a subagent spawn — with the

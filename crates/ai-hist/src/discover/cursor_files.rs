@@ -31,16 +31,20 @@ pub(super) fn candidates(env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
                 continue;
             };
             let jsonl = session_dir.join(format!("{session_id}.jsonl"));
-            let Ok((stamp, recency_hint_ms)) = crate::file_stamp_and_modified(&jsonl) else {
-                continue;
-            };
-            out.push(Candidate {
-                source: "cursor",
-                locator: jsonl.to_string_lossy().into_owned(),
-                session_id: Some(session_id.to_string()),
-                recency_hint_ms,
-                stamp,
-            });
+            if let Ok((stamp, recency_hint_ms)) = crate::file_stamp_and_modified(&jsonl) {
+                out.push(Candidate {
+                    source: "cursor",
+                    locator: jsonl.to_string_lossy().into_owned(),
+                    session_id: Some(session_id.to_string()),
+                    recency_hint_ms,
+                    stamp,
+                });
+            }
+            // A subagent is its own session, under its own file stem. The
+            // project is decoded again by `read_shallow`, so none is passed.
+            out.extend(stamped(
+                crate::ingest::scoped_files::cursor_subagent_transcripts(&session_dir, "")?,
+            ));
         }
     }
     Ok(out)
@@ -103,5 +107,47 @@ mod tests {
             session.as_ref().map(|row| row.session_id.as_str()),
             Some("cursor-1")
         );
+    }
+
+    /// The full walk lists a subagent transcript as its own candidate, and its
+    /// shallow row takes the project from the directory under `projects`,
+    /// which for a subagent is one level further up than for its parent.
+    ///
+    /// Positive control: before the fix the walk found only `parent-1`, and
+    /// the fixed-depth cwd lookup decoded `/agent/transcripts` for the child.
+    #[test]
+    fn the_full_walk_discovers_subagent_transcripts() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let session = home.join(".cursor/projects/work-app/agent-transcripts/parent-1");
+        let parent = session.join("parent-1.jsonl");
+        let child = session.join("subagents/child-1.jsonl");
+        for path in [&parent, &child] {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(
+                path,
+                "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"<user_query>\\nfix\\n</user_query>\"}]}}\n",
+            )
+            .unwrap();
+        }
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::init_db(&conn).unwrap();
+        let env = DiscoveryEnv::with_roots(&conn, home.to_path_buf(), home.join("opencode.db"));
+        let found = candidates(&env).unwrap();
+        assert_eq!(
+            found
+                .iter()
+                .map(|candidate| candidate.session_id.as_deref().unwrap())
+                .collect::<Vec<_>>(),
+            vec!["parent-1", "child-1"]
+        );
+        assert_eq!(found[1].locator, child.to_string_lossy());
+
+        let session = super::super::CursorProvider
+            .read_shallow(&env.scan(), Some(&conn), &found[1])
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.session_id, "child-1");
+        assert_eq!(session.cwd.as_deref(), Some("/work/app"));
     }
 }

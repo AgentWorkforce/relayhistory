@@ -1115,12 +1115,17 @@ mod tests {
             relationship_capabilities("grok").stable_child_identity,
             "sometimes"
         );
-        for source in ["cursor", "not-a-provider"] {
-            let capabilities = relationship_capabilities(source);
-            assert_eq!(capabilities.stable_child_identity, "never");
-            assert!(!capabilities.records_agent_type);
-            assert!(!capabilities.records_spawn_time);
-            assert!(!capabilities.records_evidence_locator);
-        }
+        // A Cursor subagent's file names both ends of the edge, and nothing
+        // else about the spawn.
+        let cursor = relationship_capabilities("cursor");
+        assert_eq!(cursor.stable_child_identity, "always");
+        assert!(!cursor.records_agent_type);
+        assert!(!cursor.records_spawn_time);
+        assert!(cursor.records_evidence_locator);
+        let unknown = relationship_capabilities("not-a-provider");
+        assert_eq!(unknown.stable_child_identity, "never");
+        assert!(!unknown.records_agent_type);
+        assert!(!unknown.records_spawn_time);
+        assert!(!unknown.records_evidence_locator);
     }
 }
