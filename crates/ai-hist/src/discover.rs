@@ -1677,14 +1677,16 @@ impl ShallowSessionProvider for CursorProvider {
         "cursor"
     }
     /// The transcript parser writes prompts, events, tool calls and file edits.
-    /// Delegation is deliberately absent: a Cursor `Task` block names no child
-    /// transcript, so no relationship row is ever written.
+    /// A `Task` block names no child transcript, so delegation is recorded
+    /// from the other side: a subagent transcript at
+    /// `<parent>/subagents/<child>.jsonl` writes the edge to its parent.
     fn evidence_kinds(&self) -> &'static [EvidenceKind] {
         &[
             EvidenceKind::History,
             EvidenceKind::SessionEvent,
             EvidenceKind::ToolCall,
             EvidenceKind::FileEdit,
+            EvidenceKind::Relationship,
         ]
     }
 
@@ -1754,13 +1756,9 @@ impl ShallowSessionProvider for CursorProvider {
             .tail_records_rev()
             .find_map(cursor_assistant_text)
             .map(|text| excerpt(&text));
-        let cwd = path
-            .parent()
-            .and_then(Path::parent)
-            .and_then(Path::parent)
-            .and_then(|p| p.file_name())
-            .and_then(|s| s.to_str())
-            .map(crate::decode_cursor_project);
+        // Found by walking up rather than at a fixed depth: a subagent
+        // transcript sits one directory deeper than its parent's.
+        let cwd = crate::ingest::cursor::project_dir_name(&path).map(crate::decode_cursor_project);
         Ok(Some(ShallowSession {
             source: "cursor".into(),
             session_id,

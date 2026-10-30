@@ -1,7 +1,7 @@
 {
   "name": "@relayhistory/provider-sources",
   "version": "0.53.1",
-  "description": "Optional Claude web, Codex cloud and Devin cloud source adapters for local ai-hist.",
+  "description": "Optional Claude web, Codex cloud, Devin cloud and Cursor Cloud Agents source adapters for local ai-hist.",
   "repository": {
     "type": "git",
     "url": "https://github.com/AgentWorkforce/relayhistory",

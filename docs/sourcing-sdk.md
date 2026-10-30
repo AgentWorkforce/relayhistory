@@ -1025,7 +1025,7 @@ handle.
 | codex | ✓ | ✓ | ✓ | ✓ | ✓ | cumulative-delta |
 | copilot | ✓ | ✓ | ✓ | — | — | per-message |
 | cortex | ✓ | ✓ | ✓ | — | — | none |
-| cursor | ✓ | ✓ | ✓ | ✓ | — | none |
+| cursor | ✓ | ✓ | ✓ | ✓ | ✓ | none |
 | deepagents | ✓ | ✓ | ✓ | — | — | none |
 | devin | ✓ | ✓ | ✓ | ✓ | — | none |
 | goose | ✓ | ✓ | ✓ | — | — | none |

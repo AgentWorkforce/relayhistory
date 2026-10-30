@@ -3276,18 +3276,7 @@ fn ingest_cursor(
     _target: &CatalogTarget,
     path: &Path,
 ) -> Result<(Vec<HydrationDiagnostic>, u64)> {
-    let project = path
-        .ancestors()
-        .find(|ancestor| {
-            ancestor
-                .parent()
-                .and_then(Path::file_name)
-                .and_then(|s| s.to_str())
-                == Some("projects")
-        })
-        .and_then(Path::file_name)
-        .and_then(|s| s.to_str())
-        .map(decode_cursor_project);
+    let project = crate::ingest::cursor::project_dir_name(path).map(decode_cursor_project);
     let mtime_ms = file_modified_ms(path).unwrap_or(0);
     // Targeted hydration always re-reads the whole transcript, so it is a
     // rebuild: clear every row a previous read left before writing the new
@@ -3330,6 +3319,19 @@ fn ingest_cursor(
             raw_path: Some(&path.to_string_lossy()),
         },
     )?;
+    if options.include_related {
+        // Both ends: a subagent's edge to its parent, and a parent's edge to
+        // every subagent filed under it, so `relationship` coverage is what
+        // this hydration claims whichever of the two was selected.
+        crate::ingest::cursor::record_subagent_delegation(conn, path)?;
+        if let Some(session_dir) = path.parent() {
+            for (child, _, _) in
+                crate::ingest::scoped_files::cursor_subagent_transcripts(session_dir, "")?
+            {
+                crate::ingest::cursor::record_subagent_delegation(conn, &child)?;
+            }
+        }
+    }
     Ok((cursor_diagnostics(&outcome), outcome.consumed_through))
 }
 
@@ -3355,8 +3357,9 @@ fn cursor_diagnostics(outcome: &CursorTranscriptOutcome) -> Vec<HydrationDiagnos
         diagnostics.push(HydrationDiagnostic {
             code: "CURSOR_SUBAGENT_SPAWN_UNLINKED".to_string(),
             message: format!(
-                "cursor recorded {} subagent spawn call(s) but writes no child transcript id; \
-                 the delegation is visible as a tool call and the child is not addressable",
+                "cursor recorded {} subagent spawn call(s) but writes no child transcript id \
+                 into them; a call is not matched to the subagent transcript it started, \
+                 which is linked by its subagents/ location instead",
                 outcome.subagent_calls
             ),
             duration_ms: None,
@@ -10795,7 +10798,9 @@ mod tests {
             "a recorded spawn with no child id must be reported, not silently dropped: {:?}",
             result.diagnostics
         );
-        // Cursor never names the child, so no relationship row is invented.
+        // The `Task` call names no child, so no relationship row is invented
+        // from it. A child is linked only by a transcript filed under
+        // `subagents/`, which is where `stable_child_identity` comes from.
         let conn = open_db(&db).unwrap();
         let relationships: i64 = conn
             .query_row(
@@ -10805,10 +10810,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(relationships, 0);
-        assert_eq!(
-            crate::relationships::relationship_capabilities("cursor").stable_child_identity,
-            "never"
-        );
+        let capabilities = crate::relationships::relationship_capabilities("cursor");
+        assert_eq!(capabilities.stable_child_identity, "always");
+        assert!(capabilities.records_evidence_locator);
+        assert!(!capabilities.records_agent_type);
 
         // Diagnostics describe the stored evidence, not this run. Re-hydrating
         // the same file must still report them.
@@ -11001,6 +11006,71 @@ mod tests {
         path
     }
 
+    /// Hydrating either end of a Cursor delegation records the edge: the
+    /// child from its own location, the parent from the `subagents/` it holds.
+    /// The child is hydrated under its file stem, with the parent's project.
+    #[test]
+    fn hydrating_a_cursor_subagent_or_its_parent_records_the_delegation() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = cursor_transcript(dir.path(), "cur-parent", "parent prompt");
+        let child = parent.with_file_name("subagents/cur-child.jsonl");
+        fs::create_dir_all(child.parent().unwrap()).unwrap();
+        fs::copy(&parent, &child).unwrap();
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "cursor", "cur-parent", Some(&parent));
+        catalog_row(&conn, "cursor", "cur-child", Some(&child));
+        drop(conn);
+        let edges = || -> Vec<(String, String, String, String)> {
+            let conn = open_db(&db).unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT parent_session_id, child_session_id, evidence_kind, identity_status \
+                     FROM session_relationships WHERE source = 'cursor'",
+                )
+                .unwrap();
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            rows
+        };
+        let expected = vec![(
+            "cur-parent".to_string(),
+            "cur-child".to_string(),
+            "cursor_subagent_dir".to_string(),
+            "observed".to_string(),
+        )];
+
+        let mut declined = options("cursor", "cur-child");
+        declined.include_related = false;
+        hydrate_session_at_with_home(&db, &declined, dir.path()).unwrap();
+        assert!(
+            edges().is_empty(),
+            "include_related off reads no delegation"
+        );
+
+        hydrate_session_at_with_home(&db, &options("cursor", "cur-parent"), dir.path()).unwrap();
+        assert_eq!(edges(), expected, "the parent links the subagent it holds");
+
+        let hydrated =
+            hydrate_session_at_with_home(&db, &options("cursor", "cur-child"), dir.path()).unwrap();
+        assert_ne!(hydrated.status, "error");
+        assert_eq!(edges(), expected, "re-observing from the child is one edge");
+        let cwd: Option<String> = open_db(&db)
+            .unwrap()
+            .query_row(
+                "SELECT cwd FROM sessions WHERE source='cursor' AND session_id='cur-child'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cwd.as_deref(), Some("/work/app"));
+    }
+
     /// Write an OpenCode store whose one session happens to contain only a
     /// user prompt. Capability describes the parser, not which kinds this
     /// particular sparse session exercised.
@@ -11105,9 +11175,12 @@ mod tests {
         let conn = open_db(&db).unwrap();
         catalog_row(&conn, "cursor", "cursor-2", Some(&transcript));
         drop(conn);
+        // Declining related evidence leaves `relationship` uncovered, so the
+        // result is partial.
+        let mut request = options("cursor", "cursor-2");
+        request.include_related = false;
 
-        let first =
-            hydrate_session_at_with_home(&db, &options("cursor", "cursor-2"), dir.path()).unwrap();
+        let first = hydrate_session_at_with_home(&db, &request, dir.path()).unwrap();
         assert_eq!(first.capability, "partial");
         assert_eq!(first.discovery_state, "full");
         let stored: String = open_db(&db)
@@ -11122,7 +11195,7 @@ mod tests {
 
         // Same bytes, same parser: the short-circuit is reached.
         assert_eq!(
-            hydrate_session_at_with_home(&db, &options("cursor", "cursor-2"), dir.path())
+            hydrate_session_at_with_home(&db, &request, dir.path())
                 .unwrap()
                 .status,
             "unchanged"
@@ -11137,8 +11210,7 @@ mod tests {
                 params![HYDRATION_PARSER_VERSION - 1],
             )
             .unwrap();
-        let reparsed =
-            hydrate_session_at_with_home(&db, &options("cursor", "cursor-2"), dir.path()).unwrap();
+        let reparsed = hydrate_session_at_with_home(&db, &request, dir.path()).unwrap();
         assert_eq!(reparsed.status, "updated");
         assert_eq!(reparsed.discovery_state, "full");
         let parser_version: i64 = open_db(&db)
@@ -11630,20 +11702,43 @@ mod tests {
         assert_eq!(widened.capability, "full");
     }
 
-    /// The opt-out explains an absent `relationship` and nothing else. Cursor
-    /// is missing that kind because its parser never reads it — a `Task` block
-    /// names no child transcript — and blaming the request for that sends the
-    /// reader looking for an option to change instead of at the provider.
+    /// The opt-out explains an absent `relationship` and nothing else. Devin
+    /// is missing that kind because its parser never reads it, and blaming
+    /// the request for that sends the reader looking for an option to change
+    /// instead of at the provider.
     #[test]
     fn the_partial_diagnostic_blames_the_opt_out_only_for_what_it_removed() {
         let dir = tempfile::tempdir().unwrap();
-        let transcript = cursor_transcript(dir.path(), "cursor-4", "cursor prompt");
+        let cli_dir = dir.path().join(".local/share/devin/cli");
+        fs::create_dir_all(&cli_dir).unwrap();
+        let store = cli_dir.join("sessions.db");
+        Connection::open(&store)
+            .unwrap()
+            .execute_batch(
+                r#"
+                CREATE TABLE sessions (
+                  id TEXT PRIMARY KEY, last_activity_at INTEGER, hidden INTEGER DEFAULT 0
+                );
+                CREATE TABLE message_nodes (
+                  row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  session_id TEXT NOT NULL, node_id INTEGER NOT NULL,
+                  parent_node_id INTEGER, chat_message TEXT,
+                  created_at INTEGER, metadata TEXT
+                );
+                INSERT INTO sessions (id, last_activity_at) VALUES ('devin-4', 1);
+                INSERT INTO message_nodes (session_id, node_id, chat_message, created_at)
+                VALUES ('devin-4', 1,
+                  '{"message_id":"u1","role":"user","content":"devin prompt","metadata":{"is_user_input":true}}',
+                  1);
+                "#,
+            )
+            .unwrap();
         let db = dir.path().join("history.db");
         let conn = open_db(&db).unwrap();
-        catalog_row(&conn, "cursor", "cursor-4", Some(&transcript));
+        catalog_row(&conn, "devin", "devin-4", Some(&store));
         drop(conn);
 
-        let mut request = options("cursor", "cursor-4");
+        let mut request = options("devin", "devin-4");
         request.include_related = false;
         let prompt_only = hydrate_session_at_with_home(&db, &request, dir.path()).unwrap();
         let message = prompt_only
@@ -11655,7 +11750,7 @@ mod tests {
             .clone();
         assert!(
             !message.contains("include_related"),
-            "cursor has no relationship parser, so the opt-out did not remove it: {message}"
+            "devin has no relationship parser, so the opt-out did not remove it: {message}"
         );
 
         // Control: a source that does declare delegation, with the same flag
@@ -11687,7 +11782,9 @@ mod tests {
     /// and the hydration contract follows without another edit.
     #[test]
     fn declared_coverage_matches_what_each_local_parser_writes() {
-        for source in ["claude", "codex", "grok", "opencode"] {
+        // Cursor's delegation comes from where a subagent transcript is filed,
+        // not from its `Task` block, which names no child.
+        for source in ["claude", "codex", "cursor", "grok", "opencode"] {
             assert_eq!(
                 crate::discover::declared_evidence_kinds(source),
                 FULL_SESSION_KINDS,
@@ -11695,20 +11792,9 @@ mod tests {
             );
             assert!(crate::discover::missing_evidence_kinds(source).is_empty());
         }
-        // Cursor parses every kind but delegation: a `Task` block names no
-        // child transcript, so no relationship row is ever written.
+        // Devin parses every kind but delegation.
         assert_eq!(
-            crate::discover::declared_evidence_kinds("cursor"),
-            &[
-                EvidenceKind::History,
-                EvidenceKind::SessionEvent,
-                EvidenceKind::ToolCall,
-                EvidenceKind::FileEdit,
-            ],
-            "cursor parses everything except delegation"
-        );
-        assert_eq!(
-            crate::discover::missing_evidence_kinds("cursor"),
+            crate::discover::missing_evidence_kinds("devin"),
             vec![EvidenceKind::Relationship],
         );
         // An unknown source has no adapter at all, so it declares nothing.
