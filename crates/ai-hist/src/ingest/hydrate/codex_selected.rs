@@ -14,10 +14,17 @@ pub(super) fn refresh_catalog_codex_locator(
         .as_deref()
         .is_some_and(|locator| crate::providers::codex::sqlite::parse_locator(locator).is_none())
     {
-        let current = crate::providers::codex::sqlite::current_locator(
-            roots,
-            &options.session_id,
-            target.locator.as_deref().unwrap_or_default(),
+        // A pair the selection rules reject is a skipped check, not a
+        // refresh that found nothing: it is reported like a failed one.
+        let current = crate::providers::codex::sqlite::database_selection(&roots.codex).and_then(
+            |selection| match selection.diagnostic {
+                Some(diagnostic) => Err(anyhow::anyhow!(diagnostic)),
+                None => crate::providers::codex::sqlite::current_locator(
+                    roots,
+                    &options.session_id,
+                    target.locator.as_deref().unwrap_or_default(),
+                ),
+            },
         );
         let current = match current {
             Ok(current) => current,

@@ -1122,3 +1122,50 @@ fn a_watch_tick_reports_a_missing_sqlite_store_pair_on_its_report() {
     assert_eq!(codex_skips[0].code, "SESSION_SOURCE_UNAVAILABLE");
     watch.stop();
 }
+
+/// A hydration whose locator refresh finds a store pair the selection rules
+/// reject reads the saved rollout and says why SQLite was not consulted.
+#[test]
+fn a_hydration_reports_an_unsupported_sqlite_store_pair_on_its_report() {
+    let temp = tempfile::tempdir().unwrap();
+    let codex = temp.path().join(".codex");
+    let rollout = codex.join("sessions/2026/04/20/rollout-root-thread.jsonl");
+    std::fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+    let lines = [
+        json!({"timestamp":"2026-04-20T00:00:00Z","type":"session_meta","payload":{"id":"root-thread","cwd":"/work/app"}}),
+        json!({"timestamp":"2026-04-20T00:00:01Z","type":"event_msg","payload":{"type":"agent_message","message":"Done"}}),
+    ];
+    std::fs::write(
+        &rollout,
+        lines.iter().map(Value::to_string).collect::<Vec<_>>().join("\n") + "\n",
+    )
+    .unwrap();
+    std::fs::write(codex.join("state_6.sqlite"), b"").unwrap();
+    std::fs::write(codex.join("thread_history_1.sqlite"), b"").unwrap();
+    let roots =
+        crate::ProviderRoots::from_home(temp.path().to_owned(), temp.path().join("opencode.db"));
+    let store = crate::SessionStore::open(
+        crate::StoreOptions::default()
+            .db_path(temp.path().join("history.db"))
+            .roots(roots),
+    )
+    .unwrap();
+    store.sync(crate::SyncOptions::default()).unwrap();
+    let report = store
+        .hydrate(
+            &crate::SessionRef::id(crate::Source::Codex, "root-thread"),
+            crate::HydrateOptions::default(),
+        )
+        .unwrap();
+    let skips: Vec<_> = report
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "SESSION_SOURCE_UNAVAILABLE")
+        .collect();
+    assert_eq!(skips.len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(
+        skips[0].message,
+        "skipping SQLite locator refresh: unsupported Codex state_6.sqlite; supported version: 5"
+    );
+    assert_eq!(skips[0].subject.as_deref(), Some("root-thread"));
+}
