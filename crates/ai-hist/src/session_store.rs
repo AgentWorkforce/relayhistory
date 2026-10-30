@@ -698,7 +698,7 @@ impl SessionStore {
 
     fn hydrate_now(&self, r: &SessionRef, opts: &HydrateOptions) -> Result<HydrateReport, Error> {
         let (report, skipped) =
-            crate::ingest::provider_diagnostics::collect(|| self.hydrate_engine(r, opts));
+            crate::ingest::provider_diagnostics::collect_quietly(|| self.hydrate_engine(r, opts));
         let mut report = report?;
         report
             .diagnostics

@@ -89,6 +89,15 @@ pub(crate) fn collect<T>(run: impl FnOnce() -> T) -> (T, Vec<SyncDiagnostic>) {
     (outcome, diagnostics)
 }
 
+/// [`collect`] for a facade call: the embedding API is quiet, so the skips
+/// reach the report and not stderr. Latched for the process, as
+/// `sync_facade_tick` latches it; the CLI's engine entries set it back
+/// before each pass of their own.
+pub(crate) fn collect_quietly<T>(run: impl FnOnce() -> T) -> (T, Vec<SyncDiagnostic>) {
+    SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
+    collect(run)
+}
+
 /// The sink this thread reports into, for a worker thread to [`install`].
 pub(crate) fn current() -> Option<Sink> {
     SINK.with(|slot| slot.borrow().clone())
@@ -188,6 +197,23 @@ mod tests {
         );
         assert_eq!(printed().len(), 1);
         assert!(current().is_none());
+    }
+
+    #[test]
+    fn a_facade_collection_is_quiet_for_the_process() {
+        printed();
+        let ((), diagnostics) = collect_quietly(|| {
+            provider_diagnostic(ProviderSkip {
+                source: Source::Codex,
+                code: "SESSION_SOURCE_UNAVAILABLE",
+                subject: Some("root"),
+                what: format_args!("skipping SQLite locator refresh"),
+                detail: format_args!("unsupported Codex state_6.sqlite"),
+            });
+        });
+        assert!(SYNC_QUIET.load(AtomicOrdering::Relaxed));
+        assert!(printed().is_empty(), "a facade call prints no skip");
+        assert_eq!(diagnostics.len(), 1);
     }
 
     #[test]
