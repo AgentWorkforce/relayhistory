@@ -1137,7 +1137,12 @@ fn a_hydration_reports_an_unsupported_sqlite_store_pair_on_its_report() {
     ];
     std::fs::write(
         &rollout,
-        lines.iter().map(Value::to_string).collect::<Vec<_>>().join("\n") + "\n",
+        lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n",
     )
     .unwrap();
     std::fs::write(codex.join("state_6.sqlite"), b"").unwrap();
