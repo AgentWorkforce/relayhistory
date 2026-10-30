@@ -10,8 +10,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use chrono::NaiveDate;
 use relayhistory_object_store::layout::{RawFormat, SessionLocation};
 use relayhistory_object_store::manifest::client::{
-    apply_chunks, classify, new_manifest, open_epoch, plan_chunks, ClientAck, NewChunk,
-    NewManifest, RemoteState,
+    apply_chunks, classify, new_manifest, open_epoch, plan_chunks, resume_epoch, ClientAck,
+    NewChunk, NewManifest, RemoteState,
 };
 use relayhistory_object_store::manifest::server::{
     pointer_fields, with_lifecycle, with_normalized,
@@ -825,4 +825,271 @@ fn unscrubbed_manifests_are_quarantined() {
     assert!(!quarantined(&fresh));
     assert!(needs_transform(&fresh));
     assert!(pointer_fields(&fresh).scrubbed);
+}
+
+const EXPORTER: &str = "migration:mgr_export";
+
+fn ndjson_manifest(loc: &SessionLocation) -> Manifest {
+    let mut m = first_manifest(loc);
+    m.raw.format = RawFormat::Ndjson;
+    m
+}
+
+/// What the exporter's write does to `raw`: one sealed epoch after everything
+/// already listed, with `raw.owner`, `raw.state` and `raw.updated_at` untouched.
+fn with_backfill(raw: &Raw) -> Raw {
+    let mut next = raw.clone();
+    let epoch = raw.epoch + 1;
+    next.epochs.push(EpochRecord {
+        epoch,
+        opened_at: "2026-10-30T00:00:00.000Z".into(),
+        reason: EpochReason::Backfill,
+        first_seq: raw.chunk_count,
+        opened_by: EXPORTER.into(),
+        resumes_epoch: None,
+        extra: Default::default(),
+    });
+    next.epoch = epoch;
+    let planned = chunk(900, 0, 500);
+    next.chunks.push(ChunkEntry {
+        seq: raw.chunk_count,
+        epoch,
+        start_offset: 0,
+        bytes: planned.bytes,
+        stored_bytes: planned.stored_bytes,
+        sha256_8: planned.sha256[..8].to_string(),
+        sha256: planned.sha256,
+        stored_sha256: planned.stored_sha256,
+        stored_raw_bytes: planned.stored_raw_bytes,
+        raw_sha256: planned.raw_sha256,
+        compression: Compression::Zstd,
+        records: planned.records,
+        first_ts: None,
+        last_ts: None,
+        extra: Default::default(),
+    });
+    next.chunk_count += 1;
+    next.raw_bytes += 500;
+    next.stored_bytes += next.chunks.last().unwrap().stored_bytes;
+    next.content_sha256 = content_sha256(&next.chunks);
+    next.next_offset = 500;
+    next
+}
+
+fn live_with_backfill() -> Manifest {
+    let mut m = ndjson_manifest(&location("backfill"));
+    let planned = plan_chunks(&m.raw, vec![chunk(0, 0, 100), chunk(1, 100, 50)]).unwrap();
+    apply_chunks(&mut m.raw, &planned).unwrap();
+    m.raw = with_backfill(&m.raw);
+    m
+}
+
+#[test]
+fn a_live_client_resumes_its_offsets_after_a_backfill_epoch() {
+    let mut m = live_with_backfill();
+    ensure_valid(&m, None).unwrap();
+    assert_eq!(m.raw.owner, OWNER, "the exporter never takes the owner");
+    assert_eq!(m.raw.next_offset, 500, "end of the exporter's stream");
+    assert_eq!(m.raw.live_epoch(), 0);
+    assert_eq!(m.raw.live_next_offset(), 150, "the client's own position");
+
+    let err = plan_chunks(&m.raw, vec![chunk(2, 150, 10)]).unwrap_err();
+    assert!(err.to_string().contains("resume_epoch"), "{err}");
+
+    let epoch = resume_epoch(&mut m.raw).unwrap();
+    assert_eq!(epoch, 2);
+    assert_eq!(m.raw.epochs[2].resumes_epoch, Some(0));
+    assert_eq!(m.raw.next_offset, 150);
+    ensure_valid(&m, None).unwrap();
+
+    let planned = plan_chunks(&m.raw, vec![chunk(2, 150, 10)]).unwrap();
+    apply_chunks(&mut m.raw, &planned).unwrap();
+    assert_eq!(m.raw.next_offset, 160);
+    assert_eq!(m.raw.live_next_offset(), 160);
+    ensure_valid(&m, None).unwrap();
+}
+
+#[test]
+fn classify_never_mistakes_a_backfill_for_the_clients_own_write() {
+    let mut m = ndjson_manifest(&location("classify"));
+    let planned = plan_chunks(&m.raw, vec![chunk(0, 0, 100)]).unwrap();
+    apply_chunks(&mut m.raw, &planned).unwrap();
+    m.revision = 2;
+    let ack = ClientAck::of(&m);
+
+    let mut remote = m.clone();
+    remote.raw = with_backfill(&m.raw);
+    remote.revision = 3;
+    let state = classify(&remote, OWNER, Some(&ack));
+    assert_eq!(
+        state,
+        RemoteState::Backfilled {
+            new_chunks: 1,
+            new_epochs: 1
+        }
+    );
+    assert!(state.may_write());
+
+    // Once adopted, later server writes are ordinary.
+    let adopted = ClientAck::of(&remote);
+    assert_eq!(
+        classify(&remote, OWNER, Some(&adopted)),
+        RemoteState::Unchanged
+    );
+}
+
+#[test]
+fn a_truncation_after_a_backfill_starts_over_and_keeps_the_backfill() {
+    let mut m = live_with_backfill();
+    open_epoch(&mut m.raw, EpochReason::Truncated).unwrap();
+    assert_eq!(m.raw.next_offset, 0);
+    let planned = plan_chunks(&m.raw, vec![chunk(2, 0, 10)]).unwrap();
+    apply_chunks(&mut m.raw, &planned).unwrap();
+    ensure_valid(&m, None).unwrap();
+    assert_eq!(m.raw.live_epoch(), 2);
+    assert!(m.raw.chunks.iter().any(|c| c.epoch == 1));
+}
+
+#[test]
+fn only_the_exporter_opens_backfill_and_only_resume_epoch_opens_resumed() {
+    let mut m = live_with_backfill();
+    for reason in [EpochReason::Backfill, EpochReason::Resumed] {
+        assert!(open_epoch(&mut m.raw, reason).is_err());
+    }
+    let mut plain = ndjson_manifest(&location("plain"));
+    assert!(resume_epoch(&mut plain.raw).is_err());
+}
+
+#[test]
+fn validator_rejects_malformed_backfill_and_resumed_epochs() {
+    type Corrupt = Box<dyn Fn(&mut Manifest)>;
+    let cases: Vec<(&str, Corrupt)> = vec![
+        (
+            "raw.epochs[1].opened_by",
+            Box::new(|m| m.raw.epochs[1].opened_by = OWNER.into()),
+        ),
+        ("raw.format", Box::new(|m| m.raw.format = RawFormat::Jsonl)),
+        (
+            "raw.epochs",
+            Box::new(|m| {
+                m.raw = with_backfill(&m.raw);
+            }),
+        ),
+        (
+            "raw.epochs[1].resumes_epoch",
+            Box::new(|m| m.raw.epochs[1].resumes_epoch = Some(0)),
+        ),
+        (
+            "raw.epochs[0].resumes_epoch",
+            Box::new(|m| m.raw.epochs[0].resumes_epoch = Some(0)),
+        ),
+        (
+            "raw.epochs[2].resumes_epoch",
+            Box::new(|m| {
+                resume_epoch(&mut m.raw).unwrap();
+                m.raw.epochs[2].resumes_epoch = Some(1);
+            }),
+        ),
+        (
+            "raw.epochs[3].reason",
+            Box::new(|m| {
+                open_epoch(&mut m.raw, EpochReason::Rewritten).unwrap();
+                open_epoch(&mut m.raw, EpochReason::Rewritten).unwrap();
+                m.raw.epochs[3].reason = EpochReason::Resumed;
+                m.raw.epochs[3].resumes_epoch = Some(2);
+            }),
+        ),
+        (
+            "raw.chunks[3].start_offset",
+            Box::new(|m| {
+                resume_epoch(&mut m.raw).unwrap();
+                let mut c = plan_chunks(&m.raw, vec![chunk(9, 150, 10)]).unwrap();
+                c[0].start_offset = 0;
+                m.raw.chunks.extend(c);
+                m.raw.chunk_count += 1;
+                m.raw.raw_bytes += 10;
+                m.raw.stored_bytes += m.raw.chunks[3].stored_bytes;
+                m.raw.content_sha256 = content_sha256(&m.raw.chunks);
+                m.raw.next_offset = 10;
+            }),
+        ),
+    ];
+    for (path, corrupt) in cases {
+        let mut m = live_with_backfill();
+        corrupt(&mut m);
+        let issues = validate(&m, None);
+        assert!(issues.iter().any(|i| i.path == path), "{path}: {issues:?}");
+    }
+
+    // Empty: a backfill epoch lists at least one chunk.
+    let mut empty = ndjson_manifest(&location("empty"));
+    let planned = plan_chunks(&empty.raw, vec![chunk(0, 0, 10)]).unwrap();
+    apply_chunks(&mut empty.raw, &planned).unwrap();
+    let live = empty.raw.chunks.clone();
+    empty.raw = with_backfill(&empty.raw);
+    empty.raw.chunks = live;
+    assert!(validate(&empty, None)
+        .iter()
+        .any(|i| i.path == "raw.epochs[1]"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_backfill_commit_and_live_appends_race_without_loss() {
+    for (backend, store, _dir) in stores() {
+        let loc = location(backend);
+        let key = loc.manifest().unwrap();
+        let m = ndjson_manifest(&loc);
+        update_manifest(&*store, &key, &fast(), |_| {
+            Ok(Edit::Create(Box::new(m.clone())))
+        })
+        .await
+        .unwrap();
+
+        let live_store = store.clone();
+        let live_key = key.clone();
+        let live = tokio::spawn(async move {
+            for n in 0..6u64 {
+                update_manifest(&*live_store, &live_key, &fast(), |m| {
+                    let m = m.expect("manifest exists");
+                    let mut raw = m.raw.clone();
+                    if raw.at_backfill_tail() {
+                        resume_epoch(&mut raw)?;
+                    }
+                    let at = raw.next_offset;
+                    let planned = plan_chunks(&raw, vec![chunk(n, at, 10)])?;
+                    apply_chunks(&mut raw, &planned)?;
+                    Ok(Edit::client(m.session.clone(), m.writer.clone(), raw))
+                })
+                .await
+                .unwrap();
+            }
+        });
+        let export_store = store.clone();
+        let export_key = key.clone();
+        let export = tokio::spawn(async move {
+            update_manifest(&*export_store, &export_key, &fast(), |m| {
+                let m = m.expect("manifest exists");
+                Ok(Edit::client(
+                    m.session.clone(),
+                    m.writer.clone(),
+                    with_backfill(&m.raw),
+                ))
+            })
+            .await
+            .unwrap();
+        });
+        live.await.unwrap();
+        export.await.unwrap();
+
+        let done = update_manifest(&*store, &key, &fast(), |_| Ok(Edit::Unchanged))
+            .await
+            .unwrap()
+            .manifest
+            .unwrap();
+        let backfill = done.raw.chunks.iter().filter(|c| c.bytes == 500).count();
+        assert_eq!(backfill, 1, "{backend}");
+        assert_eq!(done.raw.chunk_count, 7, "{backend}: no live chunk lost");
+        assert_eq!(done.raw.live_next_offset(), 60, "{backend}");
+        assert_eq!(done.raw.owner, OWNER, "{backend}");
+    }
 }

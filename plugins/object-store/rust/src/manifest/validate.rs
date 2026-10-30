@@ -3,8 +3,10 @@
 
 use sha2::{Digest, Sha256};
 
-use super::types::{ChunkEntry, EpochReason, Manifest, Raw, MANIFEST_SCHEMA_VERSION};
-use crate::layout::LAYOUT_VERSION;
+use super::types::{
+    ChunkEntry, EpochReason, Manifest, Raw, MANIFEST_SCHEMA_VERSION, MIGRATION_ID_PREFIX,
+};
+use crate::layout::{RawFormat, LAYOUT_VERSION};
 use crate::{Error, ObjectKey, Result};
 
 /// One violated rule, with the JSON path it applies to.
@@ -77,6 +79,7 @@ pub fn validate(m: &Manifest, key: Option<&ObjectKey>) -> Vec<Issue> {
     v.session(m);
     v.raw_totals(m);
     v.epochs(m);
+    v.backfill(m);
     v.chunks(m);
     v.scrub(m);
     v.server(m);
@@ -252,6 +255,79 @@ impl Checker {
         }
     }
 
+    /// `backfill` and `resumed` epochs: who opened them and what they follow.
+    fn backfill(&mut self, m: &Manifest) {
+        let raw = &m.raw;
+        let backfills = raw
+            .epochs
+            .iter()
+            .filter(|e| e.reason == EpochReason::Backfill)
+            .count();
+        if backfills > 1 {
+            self.issue("raw.epochs", "at most one epoch is \"backfill\"");
+        }
+        for (i, e) in raw.epochs.iter().enumerate() {
+            let at = format!("raw.epochs[{i}]");
+            match e.reason {
+                EpochReason::Backfill => self.backfill_epoch(raw, &at, i),
+                EpochReason::Resumed => self.resumed_epoch(raw, &at, i),
+                _ if e.resumes_epoch.is_some() => self.issue(
+                    format!("{at}.resumes_epoch"),
+                    "is only valid on a \"resumed\" epoch",
+                ),
+                _ => {}
+            }
+        }
+    }
+
+    fn backfill_epoch(&mut self, raw: &Raw, at: &str, i: usize) {
+        let e = &raw.epochs[i];
+        if !e.opened_by.starts_with(MIGRATION_ID_PREFIX) {
+            self.issue(
+                format!("{at}.opened_by"),
+                format!("a backfill epoch is opened by {MIGRATION_ID_PREFIX}{{grant_id}}"),
+            );
+        }
+        if e.resumes_epoch.is_some() {
+            self.issue(
+                format!("{at}.resumes_epoch"),
+                "is only valid on a \"resumed\" epoch",
+            );
+        }
+        if raw.format != RawFormat::Ndjson {
+            self.issue(
+                "raw.format",
+                "a backfill epoch needs ndjson: exported records share the live stream's format",
+            );
+        }
+        if !raw.chunks.iter().any(|c| c.epoch == e.epoch) {
+            self.issue(at.to_string(), "a backfill epoch lists at least one chunk");
+        }
+    }
+
+    /// A `resumed` epoch directly follows the backfill epoch and continues
+    /// the newest live epoch before it.
+    fn resumed_epoch(&mut self, raw: &Raw, at: &str, i: usize) {
+        let before = &raw.epochs[..i];
+        if before.last().map(|e| e.reason) != Some(EpochReason::Backfill) {
+            self.issue(
+                format!("{at}.reason"),
+                "a \"resumed\" epoch directly follows the backfill epoch",
+            );
+        }
+        let live = before
+            .iter()
+            .rev()
+            .find(|e| e.reason != EpochReason::Backfill)
+            .map(|e| e.epoch);
+        if raw.epochs[i].resumes_epoch != live {
+            self.issue(
+                format!("{at}.resumes_epoch"),
+                format!("must name the newest live epoch before it ({live:?})"),
+            );
+        }
+    }
+
     fn chunks(&mut self, m: &Manifest) {
         let mut prev: Option<&ChunkEntry> = None;
         for (i, c) in m.raw.chunks.iter().enumerate() {
@@ -296,7 +372,7 @@ impl Checker {
         self.epoch_start(raw, &at, c, first_of_epoch);
         let expected = match prev {
             Some(p) if !first_of_epoch => p.start_offset.checked_add(p.bytes),
-            _ => Some(0),
+            _ => Some(raw.epoch_base(c.epoch)),
         };
         let Some(expected) = expected else {
             self.issue(
@@ -338,7 +414,9 @@ impl Checker {
             .iter()
             .rev()
             .find(|c| c.epoch == raw.epoch)
-            .map_or(Some(0), |c| c.start_offset.checked_add(c.bytes));
+            .map_or(Some(raw.epoch_base(raw.epoch)), |c| {
+                c.start_offset.checked_add(c.bytes)
+            });
         let Some(expected) = expected else {
             self.issue("raw.next_offset", "end of the current epoch overflows u64");
             return;
