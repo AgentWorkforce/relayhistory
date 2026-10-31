@@ -30,7 +30,12 @@ fn known_fields(path: &str) -> &'static [&'static str] {
             "cwd_sha256",
             "parent_session_id",
         ],
-        "writer" => &["delivery_instance_id", "plugin_version", "host_version"],
+        "writer" => &[
+            "delivery_instance_id",
+            "plugin_version",
+            "host_version",
+            "capabilities",
+        ],
         "raw" => &[
             "owner",
             "state",

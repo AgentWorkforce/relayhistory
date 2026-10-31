@@ -4,7 +4,7 @@
 
 use super::types::{
     ChunkEntry, Compression, EpochReason, EpochRecord, Manifest, Raw, RawState, ScrubMarker,
-    Session, Writer, MANIFEST_SCHEMA_VERSION,
+    Session, Writer, MANIFEST_EPOCHS_CAPABILITY, MANIFEST_SCHEMA_VERSION, MIGRATION_ID_PREFIX,
 };
 use super::update::now_rfc3339;
 use super::validate::content_sha256;
@@ -36,6 +36,9 @@ impl ClientAck {
 pub enum RemoteState {
     /// Another client instance owns `raw`: stop writing this session.
     Fenced { owner: String },
+    /// A cold export: an exporter holds `raw`, and no client does. Take it
+    /// over with [`adopt_epoch`], reading the source from offset 0.
+    Unclaimed { owner: String },
     /// The manifest went backwards (restore or corruption): stop and alert,
     /// never overwrite.
     RolledBack { reason: String },
@@ -58,7 +61,10 @@ impl RemoteState {
     pub fn may_write(&self) -> bool {
         matches!(
             self,
-            Self::Unchanged | Self::Extended { .. } | Self::Backfilled { .. }
+            Self::Unchanged
+                | Self::Extended { .. }
+                | Self::Backfilled { .. }
+                | Self::Unclaimed { .. }
         )
     }
 }
@@ -66,6 +72,11 @@ impl RemoteState {
 /// Classify `remote` for a client whose fencing token is `owner`. With no
 /// `ack` (first contact, e.g. after reinstall) only ownership is checked.
 pub fn classify(remote: &Manifest, owner: &str, ack: Option<&ClientAck>) -> RemoteState {
+    if remote.raw.owner.starts_with(MIGRATION_ID_PREFIX) {
+        return RemoteState::Unclaimed {
+            owner: remote.raw.owner.clone(),
+        };
+    }
     if remote.raw.owner != owner {
         return RemoteState::Fenced {
             owner: remote.raw.owner.clone(),
@@ -231,9 +242,9 @@ pub fn open_epoch(raw: &mut Raw, reason: EpochReason) -> Result<u32> {
         EpochReason::Initial => {
             return Err(Error::InvalidArgument("only epoch 0 is \"initial\"".into()))
         }
-        EpochReason::Backfill | EpochReason::Resumed => {
+        EpochReason::Backfill | EpochReason::Resumed | EpochReason::Adopted => {
             return Err(Error::InvalidArgument(format!(
-                "{reason:?} epochs are not source changes; only the exporter opens \"backfill\", and resume_epoch opens \"resumed\""
+                "{reason:?} epochs are not source changes; only the exporter opens \"backfill\", resume_epoch opens \"resumed\" and adopt_epoch opens \"adopted\""
             )))
         }
     }
@@ -252,6 +263,36 @@ pub fn resume_epoch(raw: &mut Raw) -> Result<u32> {
     }
     let live = raw.live_epoch();
     Ok(push_epoch(raw, EpochReason::Resumed, Some(live)))
+}
+
+/// Take over a cold export: `owner` becomes `raw.owner` and the new epoch
+/// starts at offset 0 of its source, after every exported chunk. The
+/// compare-and-swap write is the fence: a client that loses this race reads
+/// the winner as `raw.owner` and is [`RemoteState::Fenced`].
+pub fn adopt_epoch(raw: &mut Raw, owner: &str) -> Result<u32> {
+    if !raw.owner.starts_with(MIGRATION_ID_PREFIX) {
+        return Err(Error::InvalidArgument(format!(
+            "raw.owner {:?} is not a cold export",
+            raw.owner
+        )));
+    }
+    if owner.starts_with(MIGRATION_ID_PREFIX) {
+        return Err(Error::InvalidArgument(
+            "an exporter does not take over".into(),
+        ));
+    }
+    raw.owner = owner.to_string();
+    Ok(push_epoch(raw, EpochReason::Adopted, None))
+}
+
+/// `writer` advertising what this crate understands. Send it on every write:
+/// a backfill waits until the session's writer advertises the capability.
+pub fn advertise(mut writer: Writer) -> Writer {
+    let capabilities = writer.capabilities.get_or_insert_with(Vec::new);
+    if !capabilities.iter().any(|c| c == MANIFEST_EPOCHS_CAPABILITY) {
+        capabilities.push(MANIFEST_EPOCHS_CAPABILITY.to_string());
+    }
+    writer
 }
 
 fn push_epoch(raw: &mut Raw, reason: EpochReason, resumes_epoch: Option<u32>) -> u32 {
@@ -392,7 +433,7 @@ pub fn new_manifest(params: NewManifest) -> Manifest {
         created_at: now.clone(),
         updated_at: now,
         session: params.session,
-        writer: params.writer,
+        writer: advertise(params.writer),
         raw,
         server: None,
         extensions: None,

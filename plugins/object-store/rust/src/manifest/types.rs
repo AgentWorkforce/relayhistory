@@ -15,6 +15,11 @@ pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 /// with this: `migration:{grant_id}`.
 pub const MIGRATION_ID_PREFIX: &str = "migration:";
 
+/// A writer or reader that understands the `backfill`, `resumed` and `adopted`
+/// epochs. Exporters are refused until the session's writer and every reader
+/// advertise it.
+pub const MANIFEST_EPOCHS_CAPABILITY: &str = "manifest-epochs-v2";
+
 /// Unknown fields, preserved on round trip.
 pub type Extra = Map<String, Value>;
 
@@ -63,6 +68,9 @@ pub struct Writer {
     pub plugin_version: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_version: Option<String>,
+    /// What this writer understands, e.g. [`MANIFEST_EPOCHS_CAPABILITY`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<Vec<String>>,
     #[serde(flatten)]
     pub extra: Extra,
 }
@@ -127,6 +135,8 @@ pub enum EpochReason {
     Backfill,
     /// The raw owner continuing its source after a backfill epoch.
     Resumed,
+    /// A client taking over a cold export.
+    Adopted,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

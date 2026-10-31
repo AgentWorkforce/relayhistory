@@ -8,6 +8,7 @@
 //! - [`server`]: server section, lifecycle, pointer-row fields.
 
 pub mod client;
+mod epoch_rules;
 mod merge;
 pub mod server;
 pub mod types;
