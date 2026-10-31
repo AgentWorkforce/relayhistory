@@ -163,6 +163,7 @@ use subagent_cleanup::{
     cleanup_subagent_registration, codex_session_has_remote_presence, session_has_remote_presence,
 };
 // After `sync_note!`, which the repair note uses.
+pub(crate) mod provider_diagnostics;
 pub(crate) mod scoped_files;
 #[cfg(test)]
 pub(crate) use scoped_files::take_dirs_read;
@@ -373,10 +374,7 @@ pub fn sync_tick_at_with_roots(
     output: SyncOutput,
     force: bool,
 ) -> Result<SyncTick> {
-    SYNC_QUIET.store(
-        matches!(output, SyncOutput::Silent),
-        AtomicOrdering::Relaxed,
-    );
+    quiet_unless(output);
     sync_exclusive_with_roots(db_path, roots, force)
 }
 
@@ -390,10 +388,7 @@ pub fn sync_tick_at(
     output: SyncOutput,
     force: bool,
 ) -> Result<SyncTick> {
-    SYNC_QUIET.store(
-        matches!(output, SyncOutput::Silent),
-        AtomicOrdering::Relaxed,
-    );
+    quiet_unless(output);
     if scope == SessionScope::Remote {
         remote::ensure_selected_remote_connectors_configured_for_at(
             "sync",
@@ -445,6 +440,14 @@ pub enum SyncOutput {
     Progress,
 }
 
+/// Quiet unless the caller asked for progress.
+fn quiet_unless(output: SyncOutput) {
+    SYNC_QUIET.store(
+        matches!(output, SyncOutput::Silent),
+        AtomicOrdering::Relaxed,
+    );
+}
+
 /// Scoped ingestion with an explicitly chosen progress destination. Embedded
 /// callers should use `sync_scoped_at_with_connectors`, which is always silent.
 pub fn sync_scoped_at_with_output(
@@ -453,10 +456,7 @@ pub fn sync_scoped_at_with_output(
     connectors: &remote::SourceConnectorSelection,
     output: SyncOutput,
 ) -> Result<bool> {
-    SYNC_QUIET.store(
-        matches!(output, SyncOutput::Silent),
-        AtomicOrdering::Relaxed,
-    );
+    quiet_unless(output);
     sync_scope_with_connectors(db_path, scope, connectors)
 }
 
@@ -465,10 +465,7 @@ pub fn sync_scoped_at_with_output(
 /// `source_path` is named outright, so it is the only database read — its
 /// channel siblings are not. [`sync_opencode_with_roots`] reads them.
 pub fn sync_opencode_at(db_path: &Path, source_path: &Path, output: SyncOutput) -> Result<bool> {
-    SYNC_QUIET.store(
-        matches!(output, SyncOutput::Silent),
-        AtomicOrdering::Relaxed,
-    );
+    quiet_unless(output);
     sync_opencode_exclusive(db_path, source_path, true, &default_opencode_storage_dir())
 }
 
@@ -480,10 +477,7 @@ pub fn sync_opencode_with_roots(
     roots: &crate::ProviderRoots,
     output: SyncOutput,
 ) -> Result<bool> {
-    SYNC_QUIET.store(
-        matches!(output, SyncOutput::Silent),
-        AtomicOrdering::Relaxed,
-    );
+    quiet_unless(output);
     sync_opencode_exclusive(
         db_path,
         &roots.opencode_db,

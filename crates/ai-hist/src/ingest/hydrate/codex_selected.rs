@@ -14,18 +14,31 @@ pub(super) fn refresh_catalog_codex_locator(
         .as_deref()
         .is_some_and(|locator| crate::providers::codex::sqlite::parse_locator(locator).is_none())
     {
-        let current = crate::providers::codex::sqlite::current_locator(
-            roots,
-            &options.session_id,
-            target.locator.as_deref().unwrap_or_default(),
+        // A pair the selection rules reject is a skipped check, not a
+        // refresh that found nothing: it is reported like a failed one.
+        let current = crate::providers::codex::sqlite::database_selection(&roots.codex).and_then(
+            |selection| match selection.diagnostic {
+                Some(diagnostic) => Err(anyhow::anyhow!(diagnostic)),
+                None => crate::providers::codex::sqlite::current_locator(
+                    roots,
+                    &options.session_id,
+                    target.locator.as_deref().unwrap_or_default(),
+                ),
+            },
         );
         let current = match current {
             Ok(current) => current,
             Err(error) if error.is::<crate::ingest::CaptureCancelled>() => return Err(error),
             Err(error) => {
-                crate::ingest::scoped_files::provider_diagnostic(format_args!(
-                    "[codex] skipping SQLite locator refresh: {error:#}"
-                ));
+                crate::ingest::provider_diagnostics::provider_diagnostic(
+                    crate::ingest::provider_diagnostics::ProviderSkip {
+                        source: crate::Source::Codex,
+                        code: "SESSION_SOURCE_UNAVAILABLE",
+                        subject: Some(&options.session_id),
+                        what: format_args!("skipping SQLite locator refresh"),
+                        detail: format_args!("{error:#}"),
+                    },
+                );
                 None
             }
         };

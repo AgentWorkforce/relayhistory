@@ -11,13 +11,6 @@ use std::sync::atomic::Ordering as AtomicOrdering;
 
 use super::SYNC_QUIET;
 
-/// Provider skip diagnostics share the embedding API's quiet setting.
-pub(crate) fn provider_diagnostic(message: std::fmt::Arguments<'_>) {
-    if !SYNC_QUIET.load(AtomicOrdering::Relaxed) {
-        eprintln!("ai-hist: {message}");
-    }
-}
-
 use anyhow::{Context, Result};
 use rusqlite::Connection;
 

@@ -247,7 +247,7 @@ are eligible. `SyncOptions::codex_sqlite_max_age_days` overrides that window;
 `AI_HIST_CODEX_SQLITE_MAX_AGE_DAYS` is read, then the 30-day default is used.
 Threads with a complete rollout are never projected from SQLite.
 
-`SyncReport { swept, changed, head_revision }`: `swept` is false when the fingerprint matched
+`SyncReport { swept, changed, head_revision, diagnostics }`: `swept` is false when the fingerprint matched
 and nothing was opened. `changed` lists the `SessionRef`s whose catalog row was
 created or changed while the call held the lock — swept or not — derived from
 a per-row digest of the `sessions` table taken after the lock was acquired and
@@ -265,6 +265,16 @@ column takes part except the two bounded text excerpts (`first_prompt`,
 discovery state, a re-resolved or inherited `project_key`, a metadata field the
 shallow read filled in. Once every catalog write stamps a revision (the change
 feed's `revision`), the digest can become a read of that one column.
+
+`diagnostics` lists what providers skipped and carried on without, as
+`SyncDiagnostic { source, code, message, subject }`: a Codex SQLite store pair
+that is missing, unsupported or unreadable is `SESSION_SOURCE_UNAVAILABLE`
+(the rollouts are still read); one thread or related child that could not be
+captured is `EVIDENCE_PARTIAL` with the thread as `subject`. The facade is
+quiet — no progress on stdout, no skip on stderr — so the report is where a
+host learns that a pass left history out; `ai-hist sync` prints the same
+skips on stderr. A `watch` tick carries them as `TickReport::diagnostics`, and
+a hydration folds its own into `HydrateReport::diagnostics`.
 
 ### `hydrate`
 

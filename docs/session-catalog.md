@@ -966,8 +966,10 @@ How each adapter works:
   read-only with pinned transactions and retains the native item ids. Complete
   rollouts remain primary. The SQLite layout has only a cumulative
   `threads.tokens_used` total, so it supplies one snapshot marker and no
-  per-message usage. A newer store version or an incomplete pair skips SQLite
-  with a diagnostic while rollout capture continues. Recovery walks eligible
+  per-message usage. A newer store version, an incomplete pair or a store the
+  process cannot read skips SQLite while rollout capture continues; the skip is
+  a `SESSION_SOURCE_UNAVAILABLE` entry in `SyncReport::diagnostics` (and the
+  `watch` tick's), printed on stderr only by the CLI. Recovery walks eligible
   threads newest-first in batches of 50 and resumes from a persisted sweep
   cursor, allowing every other provider to run between batches. The default
   eligibility window is 30 days; embedders can set

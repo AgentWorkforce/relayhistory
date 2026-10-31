@@ -91,7 +91,7 @@ impl ShallowSessionProvider for CodexProvider {
         match crate::providers::codex::sqlite::fingerprint(&env.codex_home) {
             Ok(sqlite) => inputs.extend(sqlite),
             Err(error) if error.is::<crate::ingest::CaptureCancelled>() => return Err(error),
-            Err(error) => crate::ingest::scoped_files::provider_diagnostic(format_args!("[codex] skipping SQLite history: {error:#}")),
+            Err(error) => skipping_sqlite_history(&error),
         }
         Ok(inputs)
     }
@@ -120,7 +120,7 @@ impl ShallowSessionProvider for CodexProvider {
                 Ok(found) => found,
                 Err(error) if error.is::<crate::ingest::CaptureCancelled>() => return Err(error),
                 Err(error) => {
-                    crate::ingest::scoped_files::provider_diagnostic(format_args!("[codex] skipping SQLite history: {error:#}"));
+                    skipping_sqlite_history(&error);
                     (Vec::new(), Default::default())
                 }
             };
@@ -268,4 +268,18 @@ fn string_list(value: Option<&Value>) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// The SQLite stores could not be read: this pass has no Codex SQLite
+/// history, and the rollouts are read as usual.
+fn skipping_sqlite_history(error: &anyhow::Error) {
+    crate::ingest::provider_diagnostics::provider_diagnostic(
+        crate::ingest::provider_diagnostics::ProviderSkip {
+            source: crate::Source::Codex,
+            code: "SESSION_SOURCE_UNAVAILABLE",
+            subject: None,
+            what: format_args!("skipping SQLite history"),
+            detail: format_args!("{error:#}"),
+        },
+    );
 }

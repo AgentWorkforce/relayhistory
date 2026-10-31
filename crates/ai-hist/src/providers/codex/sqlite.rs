@@ -426,5 +426,19 @@ pub(crate) fn decode(acquired: &AcquiredSession) -> Result<Capture> {
     serde_json::from_value(acquired.payload.clone()).map_err(Into::into)
 }
 
+/// One thread of many could not be captured: the sweep or related scan goes
+/// on without it, and the pass reports the gap as `EVIDENCE_PARTIAL`.
+pub(crate) fn skipping(what: &str, id: &str, error: &anyhow::Error) {
+    crate::ingest::provider_diagnostics::provider_diagnostic(
+        crate::ingest::provider_diagnostics::ProviderSkip {
+            source: crate::Source::Codex,
+            code: "EVIDENCE_PARTIAL",
+            subject: Some(id),
+            what: format_args!("skipping {what} {id}"),
+            detail: format_args!("{error:#}"),
+        },
+    );
+}
+
 #[cfg(test)]
 mod tests;

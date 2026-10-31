@@ -499,10 +499,7 @@ pub(crate) fn sync(
                     }
                     Err(error) => {
                         failed = true;
-                        crate::ingest::scoped_files::provider_diagnostic(format_args!(
-                            "[codex] skipping SQLite thread {}: {error:#}",
-                            thread.id
-                        ));
+                        skipping("SQLite thread", &thread.id, &error);
                         continue;
                     }
                 }
