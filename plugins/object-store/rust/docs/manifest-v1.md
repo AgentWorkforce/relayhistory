@@ -406,8 +406,9 @@ mistakes, not a hostile client.
 **A refused backfill** waits, durably. A queued stage re-checks the gate with a
 growing delay, bounded (12 attempts, 1 hour cap, by default), then dead-letters.
 When the gate opens it marks the item ready, and the exporter writes again: the
-stage cannot replay the write, because manifests are not queued. A client with no
-capability is not refused anything, and keeps delivering as before.
+stage cannot replay the write, because manifests are not queued. A client on an
+unknown release keeps delivering, and its backfill waits. It still needs a machine
+claim to write at all ([Handover](#handover)).
 
 ## Handover
 
@@ -456,8 +457,9 @@ the client must not send it. It holds the session, uploads nothing and reports
 `feed_epoch_moved` until a person decides. The same applies to a takeover whose
 feed is missing from a non-empty `origin_revisions`.
 
-**A client that cannot take over yet** (it is not a known release, or the gate
-is closed) must not stall. The boundary holds its manifest at
+**A client that cannot take over yet** (it holds a matching machine claim, but
+is not a known release, or the gate is closed) must not stall. A client with no
+claim is refused before this point and writes nothing. The boundary holds its manifest at
 `parked/{machine_id}/manifest.json`, with the same compare-and-swap rules
 against that object, and acknowledges it. Readers never see a parked manifest:
 no event fires, and the session stays the export. Once a capable client writes
@@ -472,12 +474,30 @@ erases a session must also erase what is parked beside it.
 A parked client's records are invisible until a takeover, and a takeover
 re-reads the source, so an upgrade depends on the source still being there.
 
-**Machine binding.** A live write's token carries a signed `meta.machineId`. It
-must equal the key's `m=` and `writer.delivery_instance_id`, or the write is
-refused. A takeover and reading the full manifest for a compare-and-swap retry
-always need it, so a client without one cannot rebase. Other live writes may omit
-it until a boundary switch requires it. A migration assertion is bound to its
-grant instead, and never reads a parked manifest.
+**Machine binding.** Every mutating request from a live token carries a signed
+`meta.machineId`, checked before anything is stored, whatever the route. A chunk's
+claim must equal its machine. A manifest's must equal the key's `m=` and
+`writer.delivery_instance_id`, so a client whose delivery instance id is not its
+machine id cannot pass. Without a matching claim the write is refused, so a
+client cannot deliver, take over or read the full manifest for a compare-and-swap
+retry. A migration assertion is bound to its grant instead, and never reads a
+parked manifest.
+
+**The legacy window.** So that a client without a claim can reconcile while it is
+replaced, a deployment may open a read-only window: it returns the object version
+alone, never the manifest, and no write passes through it. It is shut by default,
+and upgrading never opens it. It needs an explicit start and end at most 72 hours
+apart. There is one activation for the whole database, recorded once and never
+changed: the start must equal it and the end stay within 72 hours of it, so
+restated dates and new deployment labels open nothing, and stages sharing a
+database share the one window. If the record cannot be read, the window stays
+shut. Each read is recorded by caller and client version. The client version is
+self-reported: it is a meter, and must never influence identity, authorization,
+limits or trust. A present, mismatched claim is refused whether the window is
+open or not. While it is open the system is not machine-bound.
+
+Clients must therefore change before the boundary does: a host's delivery
+stopping is not a rollout step.
 
 **Identity.** A takeover needs the same key, so the export's `m=` must be the
 client's. If they differ, the two never meet. A session filed under both a real
