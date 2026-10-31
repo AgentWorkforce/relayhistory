@@ -6,6 +6,14 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.55.0] - 2026-10-31
+
+### Fixed
+
+- The facade's hydration is quiet like its sync
+- Report a rejected Codex SQLite pair from the locator refresh
+- Carry provider skip diagnostics on the sync report
+
 ## [0.54.1] - 2026-10-30
 
 ### Added
@@ -1221,7 +1229,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - The SDK reads provider JSONL natively and works without the Python CLI.
 
-[Unreleased]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.54.1...HEAD
+[Unreleased]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.55.0...HEAD
+[0.55.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.54.1...sdk-ts-v0.55.0
 [0.54.1]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.53.1...sdk-ts-v0.54.1
 [0.53.1]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.53.0...sdk-ts-v0.53.1
 [0.53.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.52.0...sdk-ts-v0.53.0
