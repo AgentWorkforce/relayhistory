@@ -93,6 +93,7 @@ Readers ignore unknown fields. Writers preserve them.
 | `delivery_instance_id` | string | required | The client destination instance that last wrote. |
 | `plugin_version` | string | required | `relayhistory-object-store` version of that write. |
 | `host_version` | string | optional | Host application version (desktop app / CLI). |
+| `capabilities` | array of string | optional | What this writer understands. `"manifest-epochs-v2"`: the `backfill`, `resumed` and `adopted` epochs ([Activation](#activation)). |
 
 ### `raw`
 
@@ -119,7 +120,7 @@ Readers ignore unknown fields. Writers preserve them.
 | ----- | ---- | ---- | ------- |
 | `epoch` | integer ≥ 0 | required | Equal to its index in `raw.epochs`. |
 | `opened_at` | string (RFC 3339) | required | When the client opened it. |
-| `reason` | `"initial"`, `"truncated"`, `"rewritten"`, `"backfill"` or `"resumed"` | required | `"initial"` only for epoch 0. `"truncated"`: the source shrank. `"rewritten"`: bytes before `next_offset` changed. `"backfill"`: an exporter's records from before a cutover. `"resumed"`: the raw owner continuing its source after a backfill epoch. See [Backfill](#backfill). |
+| `reason` | `"initial"`, `"truncated"`, `"rewritten"`, `"backfill"`, `"resumed"` or `"adopted"` | required | `"initial"` only for epoch 0. `"truncated"`: the source shrank. `"rewritten"`: bytes before `next_offset` changed. `"backfill"`: an exporter's records from before a cutover. `"resumed"`: the raw owner continuing its source after a backfill epoch. See [Backfill](#backfill). `"adopted"`: a client taking over a cold export. See [Handover](#handover). |
 | `first_seq` | integer ≥ 0 | required | `seq` of the epoch's first chunk, which equals `raw.chunk_count` at the moment it was opened. |
 | `opened_by` | string | required | `raw.owner` at the time it was opened, or for a `"backfill"` epoch `migration:{grant_id}`, the exporter's identity. |
 | `resumes_epoch` | integer ≥ 0 | required on `"resumed"` | The newest live (non-backfill) epoch this one continues. Absent on every other reason. |
@@ -264,6 +265,8 @@ though `start_offset` restarts at `0`.
    `"ndjson"`.
 6. A `"resumed"` epoch directly follows the backfill epoch, and its
    `resumes_epoch` names the newest non-backfill epoch before it.
+7. At most one epoch is `"adopted"`. Epoch 0 was opened by an exporter, the
+   adopted epoch was not, and `raw.owner` is no longer `migration:…`.
 
 ## Backfill
 
@@ -323,8 +326,8 @@ does not depend on where the epoch landed.
 | Remote copy | Meaning | Action |
 | ----------- | ------- | ------- |
 | No backfill epoch | Not exported yet | Append. |
-| Backfill epoch with an equal digest | Already exported | **No-op.** No write, no new revision. |
-| Backfill epoch with a different digest | The source or the exporter changed | **Stop for a human.** Never overwrite, and never add a second epoch. |
+| A backfill epoch, or a cold export's epoch 0, with an equal digest | Already exported | **No-op.** No write, no new revision. |
+| Either of those with a different digest | The source or the exporter changed | **Stop for a human.** Never overwrite, and never add a second epoch. |
 
 **The live client after a backfill.** The epoch usually lands after live
 chunks, so it is `raw.epoch` the next time the client reads. `raw` then moved
@@ -377,14 +380,129 @@ digest and its no-op do not change.
 - **Clients that replace `raw` from local state.** A client must follow
   [Ownership](#ownership) and edit the copy it read. One that rebuilds `raw`
   drops the epoch, and the boundary refuses the write.
-- **Every reader must understand the two reasons first.** Unknown reasons fail
-  validation, so a client or reader older than this section stops at a
-  backfilled manifest. Writing a backfill is safe only after all of them are
-  upgraded.
-- **Cold exports.** When the exporter creates the manifest, `raw.owner` is
-  `migration:{grant_id}` and no client owns it. A client that later resumes that
-  session is fenced, and its records stay local. Handing such a session to a
-  client is not defined yet.
+
+## Activation
+
+Unknown epoch reasons fail validation, so a client or reader older than this
+document stops at a manifest that has one. The writer boundary therefore
+refuses every `"backfill"` and `"adopted"` epoch (`activation_required`, with
+`Retry-After`) until both hold:
+
+- the session's writer is a known client release: `writer.plugin_version` is on
+  the boundary's allowlist for `"manifest-epochs-v2"`
+- every reader has a valid attestation
+
+**Attestation.** At startup a reader parses fixture manifests with these epochs,
+then records its reader name, the capability, its build's commit and the time,
+signed with a server key. The commit is a constant baked in at build time, not
+configuration, so a running process cannot claim another build. Rows lapse after
+7 days, so a rollback stops counting. A missing key, a missing row, a bad
+signature or a stale row all keep the gate closed.
+
+`writer.capabilities` is what a client says of itself. It is advisory, and the
+allowlist decides. `plugin_version` is client-supplied too, so this stops
+mistakes, not a hostile client.
+
+**A refused backfill** waits, durably. A queued stage re-checks the gate with a
+growing delay, bounded (12 attempts, 1 hour cap, by default), then dead-letters.
+When the gate opens it marks the item ready, and the exporter writes again: the
+stage cannot replay the write, because manifests are not queued. A client on an
+unknown release keeps delivering, and its backfill waits. It still needs a machine
+claim to write at all ([Handover](#handover)).
+
+## Handover
+
+When the exporter creates the manifest (a **cold export**), `raw.owner` is
+`migration:{grant_id}` and no client holds the stream. A client that later
+resumes the session takes it over.
+
+**The takeover write** is one compare-and-swap write that:
+
+- sets `raw.owner` and `writer` to the client
+- appends one `"adopted"` epoch: `first_seq = raw.chunk_count`, `opened_by` the
+  client, offsets from `0`
+- appends the client's first chunks to it
+
+Refused: an exporter taking over, an owner that is not the writer, an owner that
+is not `migration:…` before the write, and any change to an existing epoch or
+chunk, `trace_id`, `created_at`, `server`, `raw.format`, `raw.scrub` or the
+exporter's extension. An upgraded client takes the `trace_id` it finds, because
+every chunk carries it.
+
+**Races.**
+
+- Two clients: compare-and-swap lets one win. The loser re-reads, finds another
+  owner and is fenced, as under [Stale writers](#stale-writers).
+- Client and exporter: the export is done once the manifest exists. A retry
+  finds epoch 0 with an equal digest and is a no-op, before or after the
+  takeover.
+
+**What the client uploads.** Everything after what the export holds. The export
+marker's `origin_revisions` maps each client feed origin to the highest revision
+exported, and the client resumes its feed there. An origin missing from the map
+resumes at `0` when the map is empty or absent, and a record sent twice folds, because it has the same
+`(origin_id, record_id)` and revision as the exported copy. Two copies of one
+revision compare without `received_at`, which only says when each path stored
+it, and the earlier copy wins so that output does not depend on arrival order.
+
+This needs rows, not log lines: an `ndjson` stream carries the client's change
+feed, with `origin_id` the feed epoch, `record_id` the SHA-256 of the feed key
+and `revision` the feed revision. Each chunk records its feed position as
+`source_end` and `source_origin`, because `start_offset` is then a position in
+the stream.
+
+A feed whose epoch moved, such as a rebuilt store, keeps its record ids under a
+new origin. One record under two origins has no order a reader can settle, so
+the client must not send it. It holds the session, uploads nothing and reports
+`feed_epoch_moved` until a person decides. The same applies to a takeover whose
+feed is missing from a non-empty `origin_revisions`.
+
+**A client that cannot take over yet** (it holds a matching machine claim, but
+is not a known release, or the gate is closed) must not stall. A client with no
+claim is refused before this point and writes nothing. The boundary holds its manifest at
+`parked/{machine_id}/manifest.json`, with the same compare-and-swap rules
+against that object, and acknowledges it. Readers never see a parked manifest:
+no event fires, and the session stays the export. Once a capable client writes
+with the gate open, it finds the cold export and takes over. A successful
+takeover deletes the parked manifest and the chunks only it lists.
+
+Parked objects expire 30 days after they were last written. There is no job: a
+later write to the session removes an expired one. An unstamped one is kept,
+because losing a client's only copy is worse than a late sweep. Anything that
+erases a session must also erase what is parked beside it.
+
+A parked client's records are invisible until a takeover, and a takeover
+re-reads the source, so an upgrade depends on the source still being there.
+
+**Machine binding.** Every mutating request from a live token carries a signed
+`meta.machineId`, checked before anything is stored, whatever the route. A chunk's
+claim must equal its machine. A manifest's must equal the key's `m=` and
+`writer.delivery_instance_id`, so a client whose delivery instance id is not its
+machine id cannot pass. Without a matching claim the write is refused, so a
+client cannot deliver, take over or read the full manifest for a compare-and-swap
+retry. A migration assertion is bound to its grant instead, and never reads a
+parked manifest.
+
+**The legacy window.** So that a client without a claim can reconcile while it is
+replaced, a deployment may open a read-only window: it returns the object version
+alone, never the manifest, and no write passes through it. It is shut by default,
+and upgrading never opens it. It needs an explicit start and end at most 72 hours
+apart. There is one activation for the whole database, recorded once and never
+changed: the start must equal it and the end stay within 72 hours of it, so
+restated dates and new deployment labels open nothing, and stages sharing a
+database share the one window. If the record cannot be read, the window stays
+shut. Each read is recorded by caller and client version. The client version is
+self-reported: it is a meter, and must never influence identity, authorization,
+limits or trust. A present, mismatched claim is refused whether the window is
+open or not. While it is open the system is not machine-bound.
+
+Clients must therefore change before the boundary does: a host's delivery
+stopping is not a rollout step.
+
+**Identity.** A takeover needs the same key, so the export's `m=` must be the
+client's. If they differ, the two never meet. A session filed under both a real
+machine and `unknown-origin-*` is a `session_machine_split`: it is reported, and
+the export does not count as complete while one exists.
 
 ## Stale writers
 

@@ -43,6 +43,7 @@ fn first_manifest(loc: &SessionLocation) -> Manifest {
             delivery_instance_id: "dest_objstore_01".into(),
             plugin_version: "test".into(),
             host_version: None,
+            capabilities: None,
             extra: Default::default(),
         },
         format: RawFormat::Jsonl,

@@ -1,0 +1,125 @@
+{
+  "key": "v1/ws=default/m=mach-1/h=claude/d=2025/10/29/s=s-resumed/manifest.json",
+  "manifest": {
+    "schema_v": 1,
+    "layout": "v1",
+    "trace_id": "01a18edb-32d0-79e1-b54f-7260cda08a0d",
+    "revision": 3,
+    "created_at": "2026-10-30T22:08:12.496Z",
+    "updated_at": "2026-10-30T22:08:12.518Z",
+    "session": {
+      "workspace_id": "default",
+      "machine_id": "mach-1",
+      "harness": "claude",
+      "session_id": "s-resumed",
+      "started_at": "2025-10-29T09:26:40.000Z",
+      "harness_version": "1.0.0"
+    },
+    "writer": {
+      "delivery_instance_id": "mach-1",
+      "plugin_version": "96bulls-courier/0.2.0",
+      "capabilities": [
+        "manifest-epochs-v2"
+      ]
+    },
+    "raw": {
+      "owner": "mach-1",
+      "state": "open",
+      "updated_at": "2026-10-30T22:08:12.518Z",
+      "format": "ndjson",
+      "compression": "zstd",
+      "chunk_count": 3,
+      "raw_bytes": 691,
+      "stored_bytes": 557,
+      "content_sha256": "6f8b39a6ab0d1e1c2978e05397eb23eb86152aabd945ac1d11893950c81e1b8e",
+      "epoch": 2,
+      "epochs": [
+        {
+          "epoch": 0,
+          "opened_at": "2025-10-29T09:26:40.000Z",
+          "reason": "initial",
+          "first_seq": 0,
+          "opened_by": "mach-1"
+        },
+        {
+          "epoch": 1,
+          "opened_at": "2026-10-30T22:08:12.503Z",
+          "reason": "backfill",
+          "first_seq": 1,
+          "opened_by": "migration:mgr_export"
+        },
+        {
+          "epoch": 2,
+          "opened_at": "2026-10-30T22:08:12.518Z",
+          "reason": "resumed",
+          "first_seq": 2,
+          "opened_by": "mach-1",
+          "resumes_epoch": 0
+        }
+      ],
+      "next_offset": 516,
+      "chunks": [
+        {
+          "seq": 0,
+          "epoch": 0,
+          "start_offset": 0,
+          "bytes": 258,
+          "stored_bytes": 207,
+          "sha256": "038c521ed39429bf6f1140c82e32df2f74a63c83a64497ca53d7598c7fa70a21",
+          "sha256_8": "038c521e",
+          "stored_sha256": "5862650508bc4849f11f84882ea30a6ffb74b22f2dbed37e673d041708762edf",
+          "compression": "zstd",
+          "stored_raw_bytes": 258,
+          "raw_sha256": "038c521ed39429bf6f1140c82e32df2f74a63c83a64497ca53d7598c7fa70a21",
+          "records": 1,
+          "source_end": 8
+        },
+        {
+          "seq": 1,
+          "epoch": 1,
+          "start_offset": 0,
+          "bytes": 175,
+          "stored_bytes": 142,
+          "sha256": "704bf902cb0c8734f7415b3a0107eaf7b9609cc58615f1f5be47c94cff4fe920",
+          "sha256_8": "704bf902",
+          "stored_sha256": "f602b90c003e4cb9cc733afdb0a9ba1577d58484d843939e125fbf16c050f99a",
+          "compression": "zstd",
+          "stored_raw_bytes": 175,
+          "raw_sha256": "704bf902cb0c8734f7415b3a0107eaf7b9609cc58615f1f5be47c94cff4fe920",
+          "records": 1
+        },
+        {
+          "seq": 2,
+          "epoch": 2,
+          "start_offset": 258,
+          "bytes": 258,
+          "stored_bytes": 208,
+          "sha256": "515de1f02a4a18dbed393c16c424d9124919e6314df37ecd3b57ec3d16a7e79f",
+          "sha256_8": "515de1f0",
+          "stored_sha256": "09e0b896fb6b06948d1eae6c7de7340a55a3bfb65459a4f1c3c9e4cad4603f6c",
+          "compression": "zstd",
+          "stored_raw_bytes": 258,
+          "raw_sha256": "515de1f02a4a18dbed393c16c424d9124919e6314df37ecd3b57ec3d16a7e79f",
+          "records": 1,
+          "source_end": 16
+        }
+      ],
+      "scrub": {
+        "ruleset": "relayhistory-scrub",
+        "version": 1
+      }
+    },
+    "extensions": {
+      "96bulls": {
+        "session_uuid": "01a18edb-32d0-728e-a371-604c9a839ca2",
+        "session_uuid_source": "minted",
+        "tenant_id": "org_test",
+        "user_id": "user"
+      },
+      "client.relayhistory_export": {
+        "version": 1,
+        "source": "neon.delivery_records"
+      }
+    }
+  }
+}

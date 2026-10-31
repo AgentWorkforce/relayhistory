@@ -9,6 +9,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - The object-store plugin's manifest v1 gains `backfill` and `resumed` epochs: a cutover exporter can add pre-cutover records to a session the live client still owns, and the client continues at its own offset. Manifests with these epochs need this version.
+- The object-store plugin's manifest v1 gains `adopted` epochs and `writer.capabilities`: a client can take over a cold export, and exporters wait until the writer is a known release and every reader has attested `manifest-epochs-v2`.
 - `@relayhistory/provider-sources` gains a `cursor-cloud` connector: `--remote` / `--all` discovery lists Cursor Cloud Agents through `GET /v1/agents`, and targeted hydration returns each agent's prompts and assistant replies (from `GET /v0/agents/{id}/conversation`, timed by its v1 runs) as `cursor` evidence under the agent's `bc-…` id. It needs a Cursor API key in `RELAYHISTORY_CURSOR_API_KEY`, `CURSOR_API_KEY` or `~/.config/relayhistory/cursor-api-key`.
 
 ### Changed

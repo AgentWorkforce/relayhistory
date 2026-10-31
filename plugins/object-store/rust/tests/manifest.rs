@@ -10,8 +10,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use chrono::NaiveDate;
 use relayhistory_object_store::layout::{RawFormat, SessionLocation};
 use relayhistory_object_store::manifest::client::{
-    apply_chunks, classify, new_manifest, open_epoch, plan_chunks, resume_epoch, ClientAck,
-    NewChunk, NewManifest, RemoteState,
+    adopt_epoch, advertise, apply_chunks, classify, new_manifest, open_epoch, plan_chunks,
+    resume_epoch, ClientAck, NewChunk, NewManifest, RemoteState,
 };
 use relayhistory_object_store::manifest::server::{
     pointer_fields, with_lifecycle, with_normalized,
@@ -106,6 +106,7 @@ fn first_manifest(loc: &SessionLocation) -> Manifest {
             delivery_instance_id: OWNER.into(),
             plugin_version: "test".into(),
             host_version: None,
+            capabilities: None,
             extra: Default::default(),
         },
         format: RawFormat::Jsonl,
@@ -1099,5 +1100,171 @@ async fn a_backfill_commit_and_live_appends_race_without_loss() {
         assert_eq!(done.raw.chunk_count, 7, "{backend}: no live chunk lost");
         assert_eq!(done.raw.live_next_offset(), 60, "{backend}");
         assert_eq!(done.raw.owner, OWNER, "{backend}");
+    }
+}
+
+fn cold_export(loc: &SessionLocation) -> Manifest {
+    let mut m = ndjson_manifest(loc);
+    m.raw.owner = EXPORTER.into();
+    m.raw.epochs[0].opened_by = EXPORTER.into();
+    m.writer.delivery_instance_id = EXPORTER.into();
+    let planned = plan_chunks(&m.raw, vec![chunk(0, 0, 100)]).unwrap();
+    apply_chunks(&mut m.raw, &planned).unwrap();
+    m
+}
+
+#[test]
+fn a_client_adopts_a_cold_export_from_offset_zero() {
+    let mut m = cold_export(&location("adopt"));
+    assert_eq!(
+        classify(&m, OWNER, None),
+        RemoteState::Unclaimed {
+            owner: EXPORTER.into()
+        }
+    );
+    assert!(classify(&m, OWNER, None).may_write());
+
+    let exported = m.raw.chunks.clone();
+    assert_eq!(adopt_epoch(&mut m.raw, OWNER).unwrap(), 1);
+    assert_eq!(m.raw.owner, OWNER);
+    assert_eq!(m.raw.epochs[1].opened_by, OWNER);
+    assert_eq!(m.raw.next_offset, 0);
+    let planned = plan_chunks(&m.raw, vec![chunk(1, 0, 50)]).unwrap();
+    apply_chunks(&mut m.raw, &planned).unwrap();
+    ensure_valid(&m, None).unwrap();
+    assert_eq!(m.raw.chunks[..1], exported[..]);
+    assert_eq!(m.raw.live_next_offset(), 50);
+    assert!(!classify(&m, "another", None).may_write());
+
+    assert!(adopt_epoch(&mut m.raw, "another").is_err(), "already held");
+    let mut cold = cold_export(&location("exporter"));
+    assert!(adopt_epoch(&mut cold.raw, "migration:other").is_err());
+    assert!(open_epoch(&mut cold.raw, EpochReason::Adopted).is_err());
+}
+
+#[test]
+fn validator_rejects_malformed_adopted_epochs() {
+    let adopted = || {
+        let mut m = cold_export(&location("bad-adopt"));
+        adopt_epoch(&mut m.raw, OWNER).unwrap();
+        m
+    };
+    let has = |m: &Manifest, path: &str| validate(m, None).iter().any(|i| i.path == path);
+
+    let mut live = ndjson_manifest(&location("not-cold"));
+    adopt_epoch(&mut live.raw, OWNER).unwrap_err();
+    open_epoch(&mut live.raw, EpochReason::Rewritten).unwrap();
+    live.raw.epochs[1].reason = EpochReason::Adopted;
+    assert!(has(&live, "raw.epochs[1].reason"));
+
+    let mut m = adopted();
+    m.raw.owner = EXPORTER.into();
+    assert!(has(&m, "raw.owner"));
+    let mut m = adopted();
+    m.raw.epochs[1].opened_by = EXPORTER.into();
+    assert!(has(&m, "raw.epochs[1].opened_by"));
+    let mut m = adopted();
+    open_epoch(&mut m.raw, EpochReason::Rewritten).unwrap();
+    m.raw.epochs[2].reason = EpochReason::Adopted;
+    assert!(has(&m, "raw.epochs"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn racing_takeovers_leave_one_owner_and_fence_the_loser() {
+    for (backend, store, _dir) in stores() {
+        let loc = location(backend);
+        let key = loc.manifest().unwrap();
+        let cold = cold_export(&loc);
+        update_manifest(&*store, &key, &fast(), |_| {
+            Ok(Edit::Create(Box::new(cold.clone())))
+        })
+        .await
+        .unwrap();
+
+        let takeover = |id: &'static str| {
+            let store = store.clone();
+            let key = key.clone();
+            tokio::spawn(async move {
+                let mut fenced = false;
+                let updated = update_manifest(&*store, &key, &fast(), |m| {
+                    let m = m.expect("manifest exists");
+                    if matches!(classify(m, id, None), RemoteState::Fenced { .. }) {
+                        fenced = true;
+                        return Ok(Edit::Unchanged);
+                    }
+                    let mut raw = m.raw.clone();
+                    if raw.owner != id {
+                        adopt_epoch(&mut raw, id)?;
+                    }
+                    let at = raw.next_offset;
+                    let planned = plan_chunks(&raw, vec![chunk(7, at, 10)])?;
+                    apply_chunks(&mut raw, &planned)?;
+                    let mut writer = m.writer.clone();
+                    writer.delivery_instance_id = id.into();
+                    Ok(Edit::client(m.session.clone(), advertise(writer), raw))
+                })
+                .await
+                .unwrap();
+                (updated.written, fenced)
+            })
+        };
+        let (a, b) = (takeover("client-a"), takeover("client-b"));
+        let (a, b) = (a.await.unwrap(), b.await.unwrap());
+        assert!(a.0 ^ b.0, "{backend}: exactly one wins: {a:?} {b:?}");
+        assert!(a.1 ^ b.1, "{backend}: exactly one fenced: {a:?} {b:?}");
+
+        let done = update_manifest(&*store, &key, &fast(), |_| Ok(Edit::Unchanged))
+            .await
+            .unwrap()
+            .manifest
+            .unwrap();
+        assert_eq!(done.raw.chunk_count, 2, "{backend}");
+        let adopted = done
+            .raw
+            .epochs
+            .iter()
+            .filter(|e| e.reason == EpochReason::Adopted);
+        assert_eq!(adopted.count(), 1, "{backend}");
+    }
+}
+
+#[test]
+fn writers_advertise_the_capability_once() {
+    let m = first_manifest(&location("capability"));
+    let expected = Some(vec![MANIFEST_EPOCHS_CAPABILITY.to_string()]);
+    assert_eq!(m.writer.capabilities, expected);
+    assert_eq!(advertise(m.writer).capabilities, expected);
+}
+
+/// Written by the 96BullSessions courier through its real manifest routes, so
+/// the Rust reader is proven against what TypeScript writes, not just the spec.
+#[test]
+fn typescript_built_manifests_parse_here() {
+    for (body, reasons) in [
+        (
+            include_str!("fixtures/ts-manifest-v1-adopted.json"),
+            vec![EpochReason::Initial, EpochReason::Adopted],
+        ),
+        (
+            include_str!("fixtures/ts-manifest-v1-resumed.json"),
+            vec![
+                EpochReason::Initial,
+                EpochReason::Backfill,
+                EpochReason::Resumed,
+            ],
+        ),
+    ] {
+        let fixture: serde_json::Value = serde_json::from_str(body).unwrap();
+        let key = ObjectKey::new(fixture["key"].as_str().unwrap()).unwrap();
+        let bytes = serde_json::to_vec(&fixture["manifest"]).unwrap();
+        let m = parse_manifest(&bytes, Some(&key)).unwrap();
+        assert_eq!(
+            m.raw.epochs.iter().map(|e| e.reason).collect::<Vec<_>>(),
+            reasons
+        );
+        assert_eq!(
+            m.writer.capabilities.as_deref(),
+            Some(&[MANIFEST_EPOCHS_CAPABILITY.to_string()][..])
+        );
     }
 }
