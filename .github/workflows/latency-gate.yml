@@ -58,7 +58,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest]
-    runs-on: ${{ matrix.os }}
+    runs-on: ${{ vars.GRAPHIDE_CI_RUNNER != 'off' && (matrix.os == 'ubuntu-latest' && 'graphide-linux-x64-4') || matrix.os }}
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
