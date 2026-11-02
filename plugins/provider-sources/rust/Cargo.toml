@@ -3,11 +3,21 @@ name = "history-provider-sources"
 version = "0.56.0"
 edition = "2021"
 license = "MIT"
+repository = "https://github.com/AgentWorkforce/relayhistory"
+rust-version = "1.88"
+description = "Optional provider-native session sources for ai-hist: Claude web, Codex cloud, Devin cloud and Cursor Cloud Agents."
+readme = "README.md"
+keywords = ["ai", "history", "claude", "codex", "session"]
+categories = ["development-tools"]
+include = ["src/**/*", "tests/fixtures/**/*", "README.md"]
 
 [workspace]
 
 [dependencies]
-ai-hist = { path = "../../../crates/ai-hist", features = ["unstable-internal"] }
+# Exact pin: `unstable-internal` is outside ai-hist's semver contract, so this
+# crate is released in lockstep with it (scripts/set-release-version.mjs
+# stamps both). The path wins in this checkout; crates.io resolves the version.
+ai-hist = { version = "=0.56.0", path = "../../../crates/ai-hist", features = ["unstable-internal"] }
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
