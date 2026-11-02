@@ -17,7 +17,7 @@
     }
   ],
   "population": {
-    "evidence": ["history", "session_event", "tool_call"],
+    "evidence": [],
     "usage_accounting": "none"
   }
 }

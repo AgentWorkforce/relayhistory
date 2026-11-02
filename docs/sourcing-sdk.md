@@ -1019,7 +1019,7 @@ handle.
 | Source | history | session_event | tool_call | file_edit | relationship | usage accounting |
 | --- | --- | --- | --- | --- | --- | --- |
 | antigravity | ✓ | ✓ | — | — | — | none |
-| capy | ✓ | ✓ | ✓ | — | — | none |
+| capy | — | — | — | — | — | none |
 | claude | ✓ | ✓ | ✓ | ✓ | ✓ | per-message |
 | cline | ✓ | ✓ | ✓ | — | — | none |
 | codebuddy | ✓ | ✓ | ✓ | — | — | per-message |
