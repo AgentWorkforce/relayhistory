@@ -359,6 +359,11 @@ mod tests {
     #[test]
     fn every_local_source_has_a_phase() {
         for source in crate::store::SOURCE_CHOICES {
+            // Capy transcripts are uploaded to hosted History. This computer
+            // has no files for a sweep to read.
+            if *source == "capy" {
+                continue;
+            }
             assert!(
                 SWEEP_PHASE_SOURCES.contains(source) || crate::providers::adapter(source).is_some(),
                 "{source} has no sweep phase, so a scoped sweep could never read it"
