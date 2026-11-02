@@ -157,7 +157,7 @@ compresses it ([session catalog](../session-catalog.md)).
 | File edits (`file_edits`)                                          | ✓      | ✓     | ✓      | ✓    | ✓    | ✓        | ✓     | [#166](https://github.com/AgentWorkforce/relayhistory/issues/166) / [#167](https://github.com/AgentWorkforce/relayhistory/issues/167) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                     |
 | Compaction / summary markers                                       | ✗      | ◐     | ✗      | ✓    | ✗    | ✓        | ✓     | [#165](https://github.com/AgentWorkforce/relayhistory/issues/165) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                                                                                         |
 | Control / lifecycle rows                                           | ✓      | ✓     | ✗      | ◐    | ✓    | ✓        | ◐     | [#165](https://github.com/AgentWorkforce/relayhistory/issues/165), [#180](https://github.com/AgentWorkforce/relayhistory/issues/180)                                                                                                                                          |
-| Relationship — delegated                                           | ◐      | ✓     | —      | ◐    | ✓    | ✓        | —     | [#170](https://github.com/AgentWorkforce/relayhistory/issues/170) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                                                                                         |
+| Relationship — delegated                                           | ◐      | ✓     | ✓      | ◐    | ✓    | ✓        | —     | [#170](https://github.com/AgentWorkforce/relayhistory/issues/170) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                                                                                         |
 | Relationship — fork / resume / continuation                        | ✗      | ✓     | ✗      | ✗    | ✗    | ✗        | —     | [#170](https://github.com/AgentWorkforce/relayhistory/issues/170)                                                                                                                                                                                                             |
 | Session metadata (cwd, branch, versions)                           | ◐      | ✓     | ◐      | ◐    | ◐    | ◐        | ◐     | [#164](https://github.com/AgentWorkforce/relayhistory/issues/164), [#177](https://github.com/AgentWorkforce/relayhistory/issues/177)                                                                                                                                          |
 | Provider-native session kind (`sessions.session_kind`)             | —      | —     | —      | ✓    | —    | —        | —     | Grok `summary.json` records `session_kind: "subagent"` even without a parent id; root listings use this observed fact. |
@@ -340,8 +340,10 @@ otherwise `relationship_capture` records it as `identity_status = 'unlinked'`
 with a null child id. A linked child's edge names the session whose tool call
 started it (a nested subagent's parent is the subagent that spawned it), and
 its evidence is read by id through `SessionStore::session`. `relationship_capabilities().stable_child_identity` is
-`always` for codex, grok-bot, opencode and muse, `sometimes` for claude and grok, and
-`never` for cursor/devin. Codex fork is `✓`:
+`always` for codex, cursor, grok-bot, opencode and muse, `sometimes` for claude and grok, and
+`never` for devin. Cursor's `delegated` edge comes from where the child's
+transcript is filed (`agent-transcripts/<parent>/subagents/<child>.jsonl`,
+`evidence_kind = "cursor_subagent_dir"`): its `Task` calls name no child. Codex fork is `✓`:
 the `fork` edge is recorded from the fields Codex actually writes on
 `session_meta` — `forked_from_id` for a human fork, and
 `source.subagent.thread_spawn.parent_thread_id` for a subagent spawn — with the
@@ -548,6 +550,8 @@ Generated from provider-owned acquisition records; these cells describe fixture-
 | grok-bot | Usage and acquisition | No local model, token or cost usage; passive local blobs only, with no host backfill, network calls or credential reads. |
 | openclaw | Messages and tools | One session per OpenClaw session key for agent databases (every window: resets, isolated cron and heartbeat runs; cron run keys fold into their job); one per transcript for the pre-2026.8 JSONL store. Agent schema 19-31 transcript rows (JSON, or zstd from schema 23) and verified cold archives (file or SQLite, from schema 21), plus the JSONL store (`sessions/*.jsonl` with its `sessions.json` index), full entry tree with native entry IDs, user/assistant/thinking/tool content, toolCallId joins and isError outcomes; session key, agent ID and channel retained as metadata; heartbeat and wake prompts are controls. A session the agent database holds is read from it, never also from JSONL. |
 | openclaw | Usage and relationships | Assistant per-message usage with reported cost, one request per provider responseId; delivery mirrors, transcript-only rows and CLI-harness rows carry no request usage. Session windows, previous session and parent/spawn keys retained as metadata; no relationship, resume or live execution advertised. Reset/delete archives, compaction checkpoints and the doctor's import archive are not read; a deleted session retires. |
+| capy | Hosted transcript | Capy keeps no transcript files on this computer. Cloud uploads a bound thread to hosted History as source capy, with the jam id as the session id. Local discovery returns nothing. |
+| capy | What this source is not | A jam id and a relay agent name (capy- plus the first 8 characters) are not sources. Passing either as the source returns invalid source. Read the hosted session with source capy, or message the relay agent. |
 <!-- END GENERATED PROVIDER CAPTURE -->
 
 ### Embedded Codex image evidence

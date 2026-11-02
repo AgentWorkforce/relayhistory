@@ -14,6 +14,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - `getSessionEvidence` reads a complete stored session snapshot with evidence-kind selection, optional transcript omission, provider identities and usage.
 - The CLI and SDK expose retention policy previews, explicitly applied bounded pruning with upload protection, and database compaction for reclaiming free space.
+- Local readers accept History source `capy`. Capy has no transcript files on disk, so discovery returns nothing; a bound thread's transcript is what Cloud uploads to hosted History, with the jam id as the session id. A jam id or a relay agent name is not a source.
 
 ### Changed
 
@@ -32,6 +33,34 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Added optional `HistoryEntry::event_uid` and `Prompt::event_uid`; callers constructing `HistoryEntry` literals must supply the field (`None` for anonymous prompt logs).
 - Added nullable `Block::source_order`; session evidence contract 5 orders events by recorded source position and resolves existing event cursors through stable row identity.
+- Added `Source::Capy`. It names the hosted History source Cloud uploads for a bound Capy thread. This computer has no Capy transcript files, so discovery returns nothing.
+
+## [0.55.0] - 2026-10-31
+
+### Fixed
+
+- The facade's hydration is quiet like its sync
+- Report a rejected Codex SQLite pair from the locator refresh
+- Carry provider skip diagnostics on the sync report
+
+## [0.54.1] - 2026-10-30
+
+### Added
+
+- `@relayhistory/provider-sources` gains a `cursor-cloud` connector: `--remote` / `--all` discovery lists Cursor Cloud Agents through `GET /v1/agents`, and targeted hydration returns each agent's prompts and assistant replies (from `GET /v0/agents/{id}/conversation`, timed by its v1 runs) as `cursor` evidence under the agent's `bc-…` id. It needs a Cursor API key in `RELAYHISTORY_CURSOR_API_KEY`, `CURSOR_API_KEY` or `~/.config/relayhistory/cursor-api-key`.
+
+### Changed
+
+- New sessions become visible sooner because live watch capture checkpoints its WAL after the active burst instead of on the commit thread.
+
+### Fixed
+
+- Cursor subagent sessions are discovered and searchable: transcripts under `agent-transcripts/<parent>/subagents/` are indexed as their own sessions, by full sweeps and change-triggered scans, and linked to the session that spawned them.
+- A Codex SQLite store that a quiet `sync`, `watch` or `hydrate` could not read is reported on that call's result, so an embedding host sees why Codex history is missing; the CLI still prints the skip on stderr.
+
+### Rust API
+
+- Added `SyncDiagnostic` and `SyncReport::diagnostics`, `TickReport::diagnostics`: what providers skipped during the sweep, with a stable code (`SESSION_SOURCE_UNAVAILABLE`, `EVIDENCE_PARTIAL`), the source and the session it names. A hydration's skips arrive on `HydrateReport::diagnostics`.
 
 ## [0.53.1] - 2026-10-29
 
@@ -1229,7 +1258,9 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - The SDK reads provider JSONL natively and works without the Python CLI.
 
-[Unreleased]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.53.1...HEAD
+[Unreleased]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.55.0...HEAD
+[0.55.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.54.1...sdk-ts-v0.55.0
+[0.54.1]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.53.1...sdk-ts-v0.54.1
 [0.53.1]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.53.0...sdk-ts-v0.53.1
 [0.53.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.52.0...sdk-ts-v0.53.0
 [0.52.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.51.0...sdk-ts-v0.52.0

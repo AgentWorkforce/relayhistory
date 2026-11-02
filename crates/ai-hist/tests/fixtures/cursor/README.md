@@ -16,6 +16,7 @@ correct them.
 |---|---|---|
 | `observed-3.13.25.jsonl` | The shape a 104-transcript corpus of Cursor IDE 3.13.25 was reported to carry: bare `{role, message:{content:[…]}}` records, `text` and **id-less** `tool_use` blocks, a `turn_ended` marker, `<timestamp>`/`<user_query>` framing on human turns, and **no** `tool_result`, `thinking`, `model` or `usage`. | Shapes corroborated by several independent third-party adapters. Not verified here against a real file. |
 | `legacy-string-content.jsonl` | The older row shape: `message.content` as a bare string with no framing at all. | Corroborated — this is the shape the pre-existing `parse_cursor_text` was written against and its tests still cover. |
+| `subagent-transcript/` | A home tree with a parent transcript at `agent-transcripts/<parent>/<parent>.jsonl` and a subagent's at `agent-transcripts/<parent>/subagents/<child>.jsonl`. The child is its own session under its file stem, opens with the delegated prompt framed as a `<user_query>`, and names its parent nowhere but in its path. | Layout verified against real Cursor IDE transcripts (October 2026); record contents authored. |
 | `extended-unverified.jsonl` | A build that also writes `message.model`, `message.usage`, `thinking` blocks, `tool_use` ids and `tool_result` blocks. | **Unverified.** No source shows Cursor writing these. The fixture exists to prove the parser records them *when present* rather than to claim Cursor writes them. |
 
 `extended-unverified.jsonl` is deliberately named so that nobody reads it as

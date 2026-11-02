@@ -72,6 +72,8 @@ use serde_json::Value;
 
 mod claude_shallow;
 use claude_shallow::read_claude_shallow;
+mod synchronous;
+pub(crate) use synchronous::RelaxedSynchronous;
 mod observed_stamps;
 mod codex_shallow;
 pub(crate) use codex_shallow::CodexProvider;
@@ -1675,14 +1677,16 @@ impl ShallowSessionProvider for CursorProvider {
         "cursor"
     }
     /// The transcript parser writes prompts, events, tool calls and file edits.
-    /// Delegation is deliberately absent: a Cursor `Task` block names no child
-    /// transcript, so no relationship row is ever written.
+    /// A `Task` block names no child transcript, so delegation is recorded
+    /// from the other side: a subagent transcript at
+    /// `<parent>/subagents/<child>.jsonl` writes the edge to its parent.
     fn evidence_kinds(&self) -> &'static [EvidenceKind] {
         &[
             EvidenceKind::History,
             EvidenceKind::SessionEvent,
             EvidenceKind::ToolCall,
             EvidenceKind::FileEdit,
+            EvidenceKind::Relationship,
         ]
     }
 
@@ -1752,13 +1756,9 @@ impl ShallowSessionProvider for CursorProvider {
             .tail_records_rev()
             .find_map(cursor_assistant_text)
             .map(|text| excerpt(&text));
-        let cwd = path
-            .parent()
-            .and_then(Path::parent)
-            .and_then(Path::parent)
-            .and_then(|p| p.file_name())
-            .and_then(|s| s.to_str())
-            .map(crate::decode_cursor_project);
+        // Found by walking up rather than at a fixed depth: a subagent
+        // transcript sits one directory deeper than its parent's.
+        let cwd = crate::ingest::cursor::project_dir_name(&path).map(crate::decode_cursor_project);
         Ok(Some(ShallowSession {
             source: "cursor".into(),
             session_id,
@@ -4828,35 +4828,6 @@ fn discover_sessions_with_worker_limit(
 const MAX_READ_WINDOW: usize = 256;
 /// Most worker threads one window's filesystem reads fan out across.
 const MAX_READ_WORKERS: usize = 16;
-
-/// Scoped `PRAGMA synchronous = NORMAL` for one discovery write transaction.
-///
-/// Constructed around each window's catalog transaction in
-/// [`discover_sessions_with_env`] and restores the connection's previous
-/// synchronous level when dropped — before the window's rows reach `on_row` —
-/// so only discovery's own commits (reconstructible catalog rows and skip
-/// markers) run at the relaxed durability, never a callback's writes through
-/// the same connection.
-pub(crate) struct RelaxedSynchronous<'a> {
-    conn: &'a Connection,
-    previous: i64,
-}
-
-impl<'a> RelaxedSynchronous<'a> {
-    pub(crate) fn new(conn: &'a Connection) -> Result<Self> {
-        let previous = conn.query_row("PRAGMA synchronous", [], |row| row.get(0))?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
-        Ok(Self { conn, previous })
-    }
-}
-
-impl Drop for RelaxedSynchronous<'_> {
-    fn drop(&mut self) {
-        // Best effort: a connection that cannot take the pragma any more is
-        // being torn down anyway.
-        let _ = self.conn.pragma_update(None, "synchronous", self.previous);
-    }
-}
 
 /// One classified candidate in a read window.
 enum WindowEntry<'c> {

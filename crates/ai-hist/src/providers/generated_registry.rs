@@ -130,6 +130,11 @@ const REGISTRATIONS: &[Registration] = &[
         metadata: openclaw::METADATA,
         adapter: openclaw::ADAPTER,
     },
+    Registration {
+        id: "capy",
+        metadata: capy::METADATA,
+        adapter: capy::ADAPTER,
+    },
     #[cfg(test)]
     Registration {
         id: "test-fixture",

@@ -1,0 +1,23 @@
+{
+  "items": [
+    {
+      "id": "run-00000000-0000-0000-0000-000000000022",
+      "agentId": "bc-00000000-0000-0000-0000-000000000002",
+      "status": "FINISHED",
+      "createdAt": "2026-10-20T18:40:00.000Z",
+      "updatedAt": "2026-10-20T18:45:00.000Z",
+      "git": {
+        "branches": [
+          { "repoUrl": "github.com/your-org/your-repo", "branch": "cursor/prepare-ios-build-37-bf6d" }
+        ]
+      }
+    },
+    {
+      "id": "run-00000000-0000-0000-0000-000000000021",
+      "agentId": "bc-00000000-0000-0000-0000-000000000002",
+      "status": "FINISHED",
+      "createdAt": "2026-10-20T18:30:00.000Z",
+      "updatedAt": "2026-10-20T18:35:00.000Z"
+    }
+  ]
+}

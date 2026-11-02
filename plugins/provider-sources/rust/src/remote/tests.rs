@@ -66,6 +66,10 @@ fn without_credentials_override() -> ClearedCredentialsOverride {
         "RELAYHISTORY_DEVIN_API_BASE_URL",
         "RELAYHISTORY_DEVIN_CREDENTIALS",
         "RELAYHISTORY_DEVIN_CONFIG",
+        "RELAYHISTORY_CURSOR_API_KEY",
+        "RELAYHISTORY_CURSOR_API_KEY_FILE",
+        "RELAYHISTORY_CURSOR_API_BASE_URL",
+        "CURSOR_API_KEY",
         "XDG_DATA_HOME",
         "XDG_CONFIG_HOME",
     ];
@@ -797,7 +801,7 @@ fn statuses_report_missing_credentials_with_the_paths_looked_at() {
     let _cleared = without_credentials_override();
     let home = tempfile::tempdir().unwrap();
     let statuses = remote_connector_statuses_at(home.path());
-    assert_eq!(statuses.len(), 3);
+    assert_eq!(statuses.len(), 4);
     assert!(statuses.iter().all(|status| !status.configured));
     let error = ensure_remote_connectors_configured_at("discovery", home.path())
         .unwrap_err()
@@ -809,6 +813,7 @@ fn statuses_report_missing_credentials_with_the_paths_looked_at() {
     assert!(error.contains("claude-web"), "{error}");
     assert!(error.contains("codex-cloud"), "{error}");
     assert!(error.contains("devin-cloud"), "{error}");
+    assert!(error.contains("cursor-cloud"), "{error}");
 
     std::fs::create_dir_all(home.path().join(".codex")).unwrap();
     std::fs::write(home.path().join(".codex/auth.json"), "{}").unwrap();
@@ -846,8 +851,15 @@ fn a_source_filter_that_excludes_every_configured_connector_is_unsupported() {
     );
     assert!(error.contains("claude-web"), "{error}");
     assert!(!error.contains("codex-cloud"), "{error}");
-    // Cursor has no selected provider connector; commercial login cannot widen selection.
+    // Cursor's connector exists but holds no API key here.
     let error = ok(&["cursor"]).unwrap_err().to_string();
+    assert!(
+        error.contains("no remote provider connectors are configured"),
+        "{error}"
+    );
+    assert!(error.contains("cursor-cloud"), "{error}");
+    // A source with no remote connector at all is a different refusal.
+    let error = ok(&["grok"]).unwrap_err().to_string();
     assert!(
         error.contains("no matching remote provider connectors exist"),
         "{error}"
@@ -856,6 +868,9 @@ fn a_source_filter_that_excludes_every_configured_connector_is_unsupported() {
     let error = ok(&["bogus"]).unwrap_err().to_string();
     assert!(error.contains("invalid source 'bogus'"), "{error}");
 }
+
+#[path = "cursor_cloud_tests.rs"]
+mod cursor_cloud_tests;
 
 // ---------------------------------------------------------------------------
 // devin-cloud

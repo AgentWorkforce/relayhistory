@@ -2,15 +2,16 @@
 
 This standalone Cargo workspace installs `history-provider-sources`. It depends
 on the public local-history engine/core; neither local package depends on it.
-It contains the Claude web-session HTTP adapter, the Codex cloud CLI adapter and
-the Devin cloud HTTP adapter, including their existing bounded pagination,
+It contains the Claude web-session HTTP adapter, the Codex cloud CLI adapter, the
+Devin cloud HTTP adapter and the Cursor Cloud Agents HTTP adapter, including their existing bounded pagination,
 redirect protection, output limits, and provider-credential behavior. It never
 loads RelayHistory commercial auth.
 
 Rust hosts explicitly call `remote::provider(home, connector_id, instance, limit)`
 and register the returned `ShallowSessionProvider`. Construction does not read
 credentials or use a transport. Supported connector IDs are `claude-web`,
-`codex-cloud` and `devin-cloud`; unknown IDs fail before any provider activity.
+`codex-cloud`, `devin-cloud` and `cursor-cloud`; unknown IDs fail before any
+provider activity.
 Instances are non-secret user configuration keys. Provider sign-in remains owned
 by the provider CLIs. `RELAYHISTORY_CLAUDE_CREDENTIALS` and
 `RELAYHISTORY_CLAUDE_API_BASE_URL` retain their original meanings. Devin reads
@@ -20,6 +21,21 @@ by the provider CLIs. `RELAYHISTORY_CLAUDE_CREDENTIALS` and
 `RELAYHISTORY_DEVIN_API_BASE_URL` override each input. Devin reads need
 `ViewOrgSessions`; `send`'s `POST .../messages` additionally needs
 `ManageOrgSessions`, and a denied send answers `PERMISSION_DENIED`.
+
+`cursor-cloud` lists the API key owner's Cursor Cloud Agents through
+`GET /v1/agents` (archived agents included) and hydrates one through the v0
+`GET /v0/agents/{id}/conversation` endpoint — the only route that returns every
+user prompt and assistant reply; v1 run streams expire. Conversation messages
+carry no timestamps, so each turn takes its v1 run's `createdAt` (the prompt)
+and `updatedAt` (the replies) from `GET /v1/agents/{id}/runs`. Evidence is
+prompt history and user/assistant text only: no tool calls, thinking, usage or
+file edits. Session ids are the agent's `bc-…` id, which never matches a local
+Cursor transcript's UUID. The Cloud Agents API takes a Cursor user or service
+account API key (Cursor Dashboard → API Keys), not the editor's sign-in:
+`RELAYHISTORY_CURSOR_API_KEY`, else `CURSOR_API_KEY`, else the first line of
+`RELAYHISTORY_CURSOR_API_KEY_FILE` (default
+`$XDG_CONFIG_HOME/relayhistory/cursor-api-key`, `~/.config/...` when unset).
+`RELAYHISTORY_CURSOR_API_BASE_URL` overrides `https://api.cursor.com`.
 
 The binary accepts one JSON stdin request and emits one JSON stdout response:
 

@@ -41,6 +41,7 @@ export const SOURCES = Object.freeze([
   'vtcode',
   'grok-bot',
   'openclaw',
+  'capy',
 ] as const);
 // END GENERATED PROVIDER SOURCES
 

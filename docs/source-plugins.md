@@ -6,7 +6,7 @@ Installing a package does not change local data sources.
 
 | Optional package | Connector IDs | Evidence |
 |---|---|---|
-| `@relayhistory/provider-sources` | `claude-web`, `codex-cloud`, `devin-cloud` | Claude teleport events; Codex supported task diff; Devin org session messages |
+| `@relayhistory/provider-sources` | `claude-web`, `codex-cloud`, `devin-cloud`, `cursor-cloud` | Claude teleport events; Codex supported task diff; Devin org session messages; Cursor Cloud Agent prompts and replies |
 
 ```json
 {"plugins":[{"module":"@relayhistory/provider-sources","options":{"connectors":["claude-web"],"instanceId":"personal"}}]}
@@ -61,6 +61,9 @@ Devin's v3 message history carries user and assistant text only — no tool
 calls, token usage or file edits — and needs only `ViewOrgSessions`. Its
 `send` operation posts a message into a remote session and needs the
 broader `ManageOrgSessions`; a denied send surfaces `PERMISSION_DENIED`.
+Cursor Cloud Agents never write a local transcript; `cursor-cloud` reads them
+with a Cursor API key (`RELAYHISTORY_CURSOR_API_KEY`, `CURSOR_API_KEY` or a key
+file — see the helper README) and captures prompts and assistant text only.
 Partial evidence is reported as partial capability.
 
 A plugin may also register destinations (`HistoryDestination`), separately from
