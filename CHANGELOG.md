@@ -4,10 +4,11 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Minor]
 
 ### Added
 
+- Claude sessions carry the client that started them as `originator`, from the transcript's `entrypoint`: `cli` for the terminal, `claude-desktop` for the Claude app, `sdk-ts` for an SDK run. Existing sessions are re-read once to pick it up.
 - Local readers accept History source `capy`. Capy has no transcript files on disk, so discovery returns nothing; a bound thread's transcript is what Cloud uploads to hosted History, with the jam id as the session id. A jam id or a relay agent name is not a source.
 
 ### Rust API

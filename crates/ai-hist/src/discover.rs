@@ -99,10 +99,12 @@ pub const SESSION_CATALOG_CONTRACT_VERSION: u32 = 7;
 /// invalidates every stored stamp, so a scanner that learns to extract a new
 /// field re-reads sources whose bytes never changed. `parser_version` keeps its
 /// existing meaning (full-ingest parser generation) and is untouched.
-pub const SHALLOW_SCANNER_VERSION: u32 = 17;
+pub const SHALLOW_SCANNER_VERSION: u32 = 18;
 
 // Version 17 reads Grok Bot names from account rosters. Cached transcripts
 // whose bytes are unchanged must still be revisited after upgrading.
+// Version 18 reads the Claude `entrypoint` as the originator, which unchanged
+// transcripts only gain by being read again.
 
 /// Version 2 shipped the classification that hid standalone guardians (see
 /// [`crate::codex_is_subagent`]). Their rollouts never change on disk, so the
@@ -276,8 +278,8 @@ pub struct ShallowSession {
     /// reason to widen a read, so an empty list means "not seen cheaply", not
     /// "no model".
     pub models: Vec<String>,
-    /// Client that originated the session (codex `session_meta.originator`).
-    /// Observed.
+    /// Client that originated the session (codex `session_meta.originator`,
+    /// claude record `entrypoint`). Observed.
     pub originator: Option<String>,
     /// Agent CLI version (codex `cli_version`, claude record `version`).
     /// Observed.

@@ -380,7 +380,7 @@ empirically, not inferred.
 The cells therefore track what the _provider_ exposes, not which internal pass
 writes it: codex is the one complete row (`session_meta` gives originator,
 `cli_version`, git remote, initial commit and workspace roots); claude gets the
-record `version` and cwd/branch; cursor gets a cwd decoded from the directory
+record `entrypoint` as originator, the record `version` and cwd/branch; cursor gets a cwd decoded from the directory
 name; grok and opencode get cwd and (for grok) branch; devin gets
 `working_directory`, `workspace_dirs` and `model`, and the CLI version only
 inside an `agent_manifest` marker when a transcript export exists. See the
