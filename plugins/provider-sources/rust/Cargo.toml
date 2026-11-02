@@ -9,7 +9,7 @@ description = "Optional provider-native session sources for ai-hist: Claude web,
 readme = "README.md"
 keywords = ["ai", "history", "claude", "codex", "session"]
 categories = ["development-tools"]
-include = ["src/**/*", "README.md"]
+include = ["src/**/*", "tests/fixtures/**/*", "README.md"]
 
 [workspace]
 

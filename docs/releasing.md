@@ -54,15 +54,23 @@ and `crates/ai-hist-napi/src/lib.rs`).
    already-published `custom_version`; the job checks out `sdk-ts-v<version>`
    and publishes the crate from that tag.
 
-   The same job then publishes `history-provider-sources`
+   `publish-plugin-crate` then publishes `history-provider-sources`
    (`plugins/provider-sources/rust`) at that version. It builds on ai-hist's
    `unstable-internal` feature, which is outside ai-hist's semver contract, so
    it pins `ai-hist = { version = "=<version>", path = ... }` and
    `scripts/set-release-version.mjs` stamps that pin with everything else. Its
    dry run, here and in CI, patches `ai-hist` to the checkout, since that
    version is not on crates.io yet. A tag whose manifest predates the pin
-   publishes `ai-hist` only. The crate's trusted publisher on crates.io must
-   name this repository and `publish.yml`, like `ai-hist`'s.
+   publishes `ai-hist` only. It runs in its own job after `publish-crate`, so
+   it never holds back `ai-hist`, and is skipped with the other plugins when
+   `plugins` is off.
+
+   OIDC cannot create a crate, so the first version of a new crate name is
+   published by hand from a maintainer's crates.io token (`cargo login`, then
+   `cargo publish --manifest-path plugins/provider-sources/rust/Cargo.toml`
+   on the released tree). Then add a trusted publisher on the crate's
+   crates.io settings naming `AgentWorkforce/relayhistory` and `publish.yml`,
+   as `ai-hist` has; every later release publishes it from this job.
 5. On a real publish, before building and again immediately before publishing,
    the workflow checks for an existing recovery tag. A tagged version must be
    resumed with `skip_core` and its `custom_version`, even if npm still
