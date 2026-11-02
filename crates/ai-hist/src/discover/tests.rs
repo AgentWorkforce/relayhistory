@@ -280,10 +280,16 @@ fn discovering_an_unknown_source_is_rejected() {
 fn claude_discovery_reads_the_entrypoint_as_the_originator() {
     let conn = catalog();
     let home = tempfile::tempdir().unwrap();
-    let app = CLAUDE_BODY.replacen(
-        r#""version":"1.2.3","#,
-        r#""version":"1.2.3","entrypoint":"claude-desktop","#,
-        1,
+    // Claude Code writes `entrypoint` on the records that carry `version`,
+    // after bookkeeping records that carry neither.
+    let app = format!(
+        "{}\n{}",
+        r#"{"type":"file-history-snapshot","messageId":"m0","snapshot":{}}"#,
+        CLAUDE_BODY.replacen(
+            r#""version":"1.2.3","#,
+            r#""version":"1.2.3","entrypoint":"claude-desktop","#,
+            1,
+        )
     );
     claude_session(home.path(), "claude-1", &app, 1_750_000_000_000);
     let terminal = CLAUDE_BODY.replace("claude-1", "claude-2");
