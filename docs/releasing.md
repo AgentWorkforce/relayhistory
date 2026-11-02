@@ -5,7 +5,7 @@ One workflow releases everything: `Publish RelayHistory release`
 trusted publishing and must not change -- see "Renaming this workflow" below). All public packages share one version:
 the `ai-hist` npm package, `ai-hist-native`, each native platform package, `ai-hist-mcp`,
 `@relayhistory/provider-sources` and its
-eight platform helper packages, and the `ai-hist` crates.io crate. The SDK checks the current native contract
+eight platform helper packages, and the `ai-hist` and `history-provider-sources` crates.io crates. The SDK checks the current native contract
 version at initialization; both halves declare it in source (`sdk-ts/src/native.ts`
 and `crates/ai-hist-napi/src/lib.rs`).
 
@@ -53,6 +53,16 @@ and `crates/ai-hist-napi/src/lib.rs`).
    publishes nothing. A crates.io-only retry uses `skip_core` with the
    already-published `custom_version`; the job checks out `sdk-ts-v<version>`
    and publishes the crate from that tag.
+
+   The same job then publishes `history-provider-sources`
+   (`plugins/provider-sources/rust`) at that version. It builds on ai-hist's
+   `unstable-internal` feature, which is outside ai-hist's semver contract, so
+   it pins `ai-hist = { version = "=<version>", path = ... }` and
+   `scripts/set-release-version.mjs` stamps that pin with everything else. Its
+   dry run, here and in CI, patches `ai-hist` to the checkout, since that
+   version is not on crates.io yet. A tag whose manifest predates the pin
+   publishes `ai-hist` only. The crate's trusted publisher on crates.io must
+   name this repository and `publish.yml`, like `ai-hist`'s.
 5. On a real publish, before building and again immediately before publishing,
    the workflow checks for an existing recovery tag. A tagged version must be
    resumed with `skip_core` and its `custom_version`, even if npm still
@@ -101,6 +111,15 @@ compiled, what was committed and what is published cannot diverge.
 The published crate is `ai-hist` on crates.io. It shares the npm version line,
 so `sdk-ts-v0.18.8` is also `ai-hist@0.18.8` on crates.io. `ai-hist-cli` and
 `ai-hist-napi` stay unpublished workspace members (`publish = false`).
+
+`history-provider-sources` is published too, for Rust hosts that compose the
+remote connectors (Agent Relay's core). Depend on both at the same exact
+version so Cargo builds one `ai-hist`:
+
+```toml
+ai-hist = { version = "=0.56.0", features = ["opencode-backup", "git-hooks", "fs-events"] }
+history-provider-sources = "=0.56.0"
+```
 
 Cargo semver is the Rust contract — there is no separate Rust contract-version
 constant. Any change to a public struct field, enum variant, or behaviour a

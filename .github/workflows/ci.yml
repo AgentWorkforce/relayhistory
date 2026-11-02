@@ -378,6 +378,13 @@ jobs:
       # crate's own test suite never runs anywhere.
       - name: Optional plugin Rust tests
         run: cargo test --manifest-path plugins/provider-sources/rust/Cargo.toml --locked
+      # The release publishes this crate to crates.io next to ai-hist; the
+      # patch stands in for the ai-hist version this tree has not released yet.
+      - name: Optional plugin crate publish dry-run
+        run: >-
+          cargo publish --dry-run --allow-dirty --locked
+          --manifest-path plugins/provider-sources/rust/Cargo.toml
+          --config "patch.crates-io.ai-hist.path=\"$GITHUB_WORKSPACE/crates/ai-hist\""
       - name: Optional plugin SDK tests
         env:
           HISTORY_PROVIDER_SOURCES_BIN: ${{ github.workspace }}/plugins/provider-sources/rust/target/debug/history-provider-sources

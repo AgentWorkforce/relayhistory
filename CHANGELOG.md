@@ -4,7 +4,11 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Patch]
+
+### Added
+
+- `history-provider-sources` is published to crates.io at the release version, so Rust hosts can depend on the remote source connectors by version instead of a git pin; it requires `ai-hist` at the same exact version.
 
 ## [0.56.0] - 2026-11-02
 
