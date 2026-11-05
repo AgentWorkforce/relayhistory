@@ -497,6 +497,12 @@ exist; the escalation triggers above are restated there.
   `crates/relayburn-sdk/src/ingest/ingest.rs`; record types in
   `crates/relayburn-sdk/src/reader/types.rs`.
 
+## Hosted Amp projection
+
+| Provider | Evidence | Coverage / limitations |
+| --- | --- | --- |
+| amp (hosted TypeScript projection) | Messages and raw evidence | `ai-hist/amp-source` retains native protocol message IDs/revisions, timestamped user/assistant text, raw message JSON and tool boundaries. A current CLI export established the field mapping. Unknown unions and tool results remain markers. No local Rust source, built-in discovery, pricing or token estimates. Cloud owns transport, selection, credential custody, injection and acknowledged upload state. |
+
 <!-- BEGIN GENERATED PROVIDER CAPTURE -->
 ## Added provider capture matrix
 
