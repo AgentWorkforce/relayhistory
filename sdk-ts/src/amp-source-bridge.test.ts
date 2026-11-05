@@ -61,3 +61,10 @@ test('provider bridge rejects missing, malformed and future operations without r
   assert.equal(malformed.calls.length, 0);
   assert.deepEqual(malformed.result, { ok: false, outcome: 'rejected', code: 'amp_invalid_operation' });
 });
+test('provider bridge normalizes supported thread URLs and rejects NUL text before spawning', () => {
+  const read = bridge({ kind: 'export', threadId: ' https://ampcode.com/threads/T-fixture-thread/ ' });
+  assert.equal(read.call.args.at(-1), 'T-fixture-thread');
+  const rejected = bridge({ kind: 'inject', threadId: 'T-fixture-thread', text: 'bad' + String.fromCharCode(0) });
+  assert.equal(rejected.calls.length, 0);
+  assert.deepEqual(rejected.result, { ok: false, outcome: 'rejected', code: 'amp_invalid_operation' });
+});

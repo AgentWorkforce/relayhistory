@@ -145,7 +145,8 @@ export type AmpOperation =
 export const AMP_CLI_VERSION = '0.0.1793857728-g655a2c';
 export const AMP_CLI_BRIDGE = `const {spawnSync}=require('node:child_process');
 let op;try{op=JSON.parse(process.env.RELAY_AMP_OPERATION)}catch{}
-if(!op||!['discover','export','inject'].includes(op.kind)||(op.kind!=='discover'&&(typeof op.threadId!=='string'||!/^T-[A-Za-z0-9-]{6,100}$/.test(op.threadId)))||(op.kind==='inject'&&(typeof op.text!=='string'||!op.text))){process.stdout.write(JSON.stringify({ok:false,outcome:'rejected',code:'amp_invalid_operation'}));process.exit(0)}
+if(op&&typeof op.threadId==='string'){op.threadId=op.threadId.trim();const prefix='https://ampcode.com/threads/';if(op.threadId.startsWith(prefix))op.threadId=op.threadId.slice(prefix.length);if(op.threadId.endsWith('/'))op.threadId=op.threadId.slice(0,-1)}
+if(!op||!['discover','export','inject'].includes(op.kind)||(op.kind!=='discover'&&(typeof op.threadId!=='string'||!/^T-[A-Za-z0-9-]{6,100}$/.test(op.threadId)))||(op.kind==='inject'&&(typeof op.text!=='string'||!op.text||op.text.includes(String.fromCharCode(0))))){process.stdout.write(JSON.stringify({ok:false,outcome:'rejected',code:'amp_invalid_operation'}));process.exit(0)}
 const args=['--log-file','/dev/null'];
 if(op.kind==='discover')args.push('threads','search','author:me','--json','--limit','100');
 else if(op.kind==='export')args.push('threads','export',op.threadId);
