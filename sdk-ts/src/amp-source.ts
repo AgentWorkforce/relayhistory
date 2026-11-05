@@ -110,12 +110,16 @@ export function ampEvidence(
           }];
         })
       : [];
-    const onlyToolResults = !prose && toolResults.length > 0;
+    const onlyToolResults = !prose.trim() && toolResults.length > 0 &&
+      Array.isArray(raw.content) && raw.content.every((block) => {
+        const part = object(block);
+        return (part.type === 'tool_result' && typeof part.toolUseID === 'string' && !!part.toolUseID) ||
+          (part.type === 'text' && typeof part.text === 'string' && !part.text.trim());
+      });
     const content = onlyToolResults
-      ? toolResults.map((result) => {
-          const value = result.output ?? result.error;
-          return typeof value === 'string' ? value : value == null ? '' : JSON.stringify(value);
-        }).filter(Boolean).join('\n')
+      ? toolResults.flatMap((result) => [result.output, result.error]
+          .map((value) => typeof value === 'string' ? value : value == null ? '' : JSON.stringify(value))
+          .filter((text) => text.trim())).join('\n')
       : prose;
     return {
       v: 1,
@@ -125,9 +129,9 @@ export function ampEvidence(
       lens: 'history',
       kind: onlyToolResults
         ? 'tool_call'
-        : role === 'user' && content
+        : role === 'user' && content.trim()
         ? 'prompt'
-        : role === 'assistant' && content
+        : role === 'assistant' && content.trim()
           ? 'assistant'
           : toolCalls.length || role === 'tool'
             ? 'tool_call'

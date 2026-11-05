@@ -128,3 +128,25 @@ test('normalizes multiple tool outputs and errors without turning them into huma
   assert.equal(unknown.kind, 'marker');
   assert.equal(unknown.record.toolResults, undefined);
 });
+
+test('blank text and empty output do not hide searchable tool errors', () => {
+  const [row] = ampEvidence(tid, [{ ...msg, role: 'user', content: [
+    { type: 'text', text: ' \n ' },
+    { type: 'tool_result', toolUseID: 'call-error', run: { status: 'error', result: '', error: { code: 'fixture_failure' } } },
+  ] }]);
+  assert.equal(row.kind, 'tool_call');
+  assert.equal(row.actorRole, 'tool');
+  assert.equal(row.content, '{"code":"fixture_failure"}');
+  assert.equal(row.record.toolResults?.[0].output, '');
+});
+
+test('mixed unknown or image blocks remain markers while known tool outcomes are retained', () => {
+  for (const extra of [{ type: 'image', source: { type: 'url', url: 'https://example.test/fixture.png' } }, { type: 'future-block' }]) {
+    const [row] = ampEvidence(tid, [{ ...msg, role: 'user', content: [
+      { type: 'text', text: ' ' },
+      { type: 'tool_result', toolUseID: 'call-1', run: { status: 'done', result: 'fixture output' } }, extra,
+    ] }]);
+    assert.equal(row.kind, 'marker');
+    assert.deepEqual(row.record.toolResults, [{ id: 'call-1', status: 'done', output: 'fixture output' }]);
+  }
+});
