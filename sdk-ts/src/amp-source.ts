@@ -17,6 +17,7 @@ export type AmpEvidence = {
     messageId: string;
     messageVersion: number | null;
     raw: AmpMessage;
+    toolResults?: Array<{ id: string; status: string | null; output?: unknown; error?: unknown }>;
     timestampInferred?: true;
   };
 };
@@ -65,7 +66,7 @@ export function ampEvidence(
     )
       throw new Error('AMP_INVALID_MESSAGE_VERSION');
     const role = typeof raw.role === 'string' ? raw.role : null;
-    const content =
+    const prose =
       typeof raw.content === 'string'
         ? raw.content
         : Array.isArray(raw.content)
@@ -96,13 +97,35 @@ export function ampEvidence(
             : [];
         })
       : [];
+    const toolResults = role === 'user' && Array.isArray(raw.content)
+      ? raw.content.flatMap((block) => {
+          const result = object(block);
+          if (result.type !== 'tool_result' || typeof result.toolUseID !== 'string' || !result.toolUseID) return [];
+          const run = object(result.run);
+          return [{
+            id: result.toolUseID,
+            status: typeof run.status === 'string' ? run.status : null,
+            ...(Object.hasOwn(run, 'result') ? { output: run.result } : {}),
+            ...(Object.hasOwn(run, 'error') ? { error: run.error } : {}),
+          }];
+        })
+      : [];
+    const onlyToolResults = !prose && toolResults.length > 0;
+    const content = onlyToolResults
+      ? toolResults.map((result) => {
+          const value = result.output ?? result.error;
+          return typeof value === 'string' ? value : value == null ? '' : JSON.stringify(value);
+        }).filter(Boolean).join('\n')
+      : prose;
     return {
       v: 1,
       source: 'amp',
       sessionId,
       eventId: `amp:${sessionId}:${messageId}`,
       lens: 'history',
-      kind: role === 'user' && content
+      kind: onlyToolResults
+        ? 'tool_call'
+        : role === 'user' && content
         ? 'prompt'
         : role === 'assistant' && content
           ? 'assistant'
@@ -111,12 +134,13 @@ export function ampEvidence(
             : 'marker',
       ts: new Date(time).toISOString(),
       content,
-      actorRole: role,
+      actorRole: onlyToolResults ? 'tool' : role,
       ...(toolCalls.length ? { toolCalls } : {}),
       record: {
         messageId,
         messageVersion: version === undefined ? null : Number(version),
         raw,
+        ...(toolResults.length ? { toolResults } : {}),
         ...(nativeDate == null ? { timestampInferred: true as const } : {}),
       },
     };

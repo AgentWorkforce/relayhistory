@@ -541,8 +541,11 @@ remain beside normalized text. Positional `messageId` and generic `id` are never
 accepted as substitutes. Each native message keeps one convergence envelope;
 mixed and multiple assistant tool calls retain typed `toolCalls` with their
 native call IDs, names and inputs. Tool-only assistant messages are tool records;
-user envelopes containing only tool results remain markers. Unknown message
-unions remain raw markers. No pricing, cost or estimated usage is inferred.
+user envelopes containing only tool results become tool records, with native
+call IDs, statuses, outputs and errors retained in `record.toolResults`. Mixed
+human prose keeps its prompt text and retains tool results separately. This
+preserves tool evidence when hosted privacy scrubbing removes raw provider JSON.
+Unknown message unions remain raw markers. No pricing, cost or estimated usage is inferred.
 Missing message times may use a recorded thread creation time, explicitly
 marked as inferred. Invalid identity, duplicate identity and malformed versions
 fail closed. A read-only check against a current Amp CLI export established the

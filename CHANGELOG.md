@@ -11,6 +11,10 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Amp cloud transcript projection is available through `ai-hist/amp-source`, retaining native message identity, revisions, raw evidence, and typed tool calls for hosted uploaders and supporting a preinstalled CLI on persistent process hosts.
 - `history-provider-sources` is published to crates.io at the release version, so Rust hosts can depend on the remote source connectors by version instead of a git pin; it requires `ai-hist` at the same exact version.
 
+### Fixed
+
+- Amp tool results retain searchable output, call identity, status and errors in hosted history instead of becoming empty user prompts after privacy scrubbing.
+
 ## [0.56.0] - 2026-11-02
 
 ### Added

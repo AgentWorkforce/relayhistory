@@ -67,8 +67,10 @@ test('native CLI exports use protocol identity and keep tool results out of huma
   });
   assert.deepEqual(
     rows.map((row) => row.kind),
-    ['prompt', 'tool_call', 'marker'],
+    ['prompt', 'tool_call', 'tool_call'],
   );
+  assert.equal(rows[2].actorRole, 'tool');
+  assert.deepEqual(rows[2].record.toolResults, [{ id: 'call-1', status: 'done' }]);
   assert.equal(rows[0].record.messageId, 'native-1');
   assert.equal(rows[0].record.messageVersion, 4);
   assert.equal(rows[0].ts, '2026-11-05T00:00:00.000Z');
@@ -103,4 +105,26 @@ test('mixed assistant text and tool content keeps readable assistant prose', () 
     { id: 'call-2', tool: 'Read', input: { path: 'b' } },
   ]);
   assert.deepEqual(ampEvidence(tid, [{ ...msg, content: (row.record.raw.content as unknown[]).slice(2) }])[0].toolCalls, row.toolCalls);
+});
+
+test('normalizes multiple tool outputs and errors without turning them into human prompts', () => {
+  const content = [
+    { type: 'tool_result', toolUseID: 'call-1', run: { status: 'done', result: 'found the file' } },
+    { type: 'tool_result', toolUseID: 'call-2', run: { status: 'error', error: { code: 'missing_file' } } },
+  ];
+  const [row] = ampEvidence(tid, [{ ...msg, role: 'user', content }]);
+  assert.equal(row.kind, 'tool_call');
+  assert.equal(row.actorRole, 'tool');
+  assert.equal(row.content, 'found the file\n{"code":"missing_file"}');
+  assert.deepEqual(row.record.toolResults, [
+    { id: 'call-1', status: 'done', output: 'found the file' },
+    { id: 'call-2', status: 'error', error: { code: 'missing_file' } },
+  ]);
+  const [mixed] = ampEvidence(tid, [{ ...msg, role: 'user', content: [{ type: 'text', text: 'human follow-up' }, ...content] }]);
+  assert.equal(mixed.kind, 'prompt');
+  assert.equal(mixed.content, 'human follow-up');
+  assert.deepEqual(mixed.record.toolResults, row.record.toolResults);
+  const [unknown] = ampEvidence(tid, [{ ...msg, role: 'future-role', content }]);
+  assert.equal(unknown.kind, 'marker');
+  assert.equal(unknown.record.toolResults, undefined);
 });
