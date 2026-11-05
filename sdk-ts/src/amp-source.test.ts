@@ -76,6 +76,7 @@ test('native CLI exports use protocol identity and keep tool results out of huma
 test('rejects ambiguous identity, malformed versions, missing timestamps and wrong exports', () => {
   for (const item of [
     { ...msg, messageID: null },
+    { ...msg, messageID: '   ' },
     { ...msg, messageID: null, id: 'generic', messageId: 1 },
     { ...msg, protocolMessageID: null, protocolMessageVersion: 1, messageId: 1 },
     { ...msg, messageID: undefined, messageId: 1 },

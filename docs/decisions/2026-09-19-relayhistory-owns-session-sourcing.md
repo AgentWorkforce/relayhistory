@@ -501,7 +501,7 @@ exist; the escalation triggers above are restated there.
 
 | Provider | Evidence | Coverage / limitations |
 | --- | --- | --- |
-| amp (hosted TypeScript projection) | Messages and raw evidence | `ai-hist/amp-source` retains native protocol message IDs/revisions, timestamped user/assistant text, raw message JSON and typed tool calls with native IDs, names and inputs, including mixed messages. One convergence envelope per native message; positional and generic IDs are rejected. A current CLI export established the field mapping. Unknown unions and tool results remain markers. No local Rust source, built-in discovery, pricing or token estimates. Cloud owns transport, selection, credential custody, injection and acknowledged upload state. |
+| amp (hosted TypeScript projection) | Messages and raw evidence | `ai-hist/amp-source` retains native protocol message IDs/revisions, timestamped user/assistant text, raw message JSON and typed tool calls with native IDs, names and inputs, including mixed messages. One convergence envelope per native message; positional and generic IDs are rejected. A current CLI export established the field mapping. Unknown unions and user envelopes containing only tool results remain markers. No local Rust source, built-in discovery, pricing or token estimates. Cloud owns transport, selection, credential custody, injection and acknowledged upload state. |
 
 <!-- BEGIN GENERATED PROVIDER CAPTURE -->
 ## Added provider capture matrix

@@ -47,7 +47,7 @@ export function ampEvidence(
     const id = native ? raw.protocolMessageID : raw.messageID;
     if (
       (typeof id !== 'string' && typeof id !== 'number') ||
-      !String(id) ||
+      !String(id).trim() ||
       String(id).length > 256
     )
       throw new Error('AMP_MISSING_MESSAGE_ID');
@@ -144,11 +144,12 @@ export type AmpOperation =
   | { kind: 'inject'; threadId: string; text: string };
 export const AMP_CLI_VERSION = '0.0.1793857728-g655a2c';
 export const AMP_CLI_BRIDGE = `const {spawnSync}=require('node:child_process');
-const op=JSON.parse(process.env.RELAY_AMP_OPERATION);
+let op;try{op=JSON.parse(process.env.RELAY_AMP_OPERATION)}catch{}
+if(!op||!['discover','export','inject'].includes(op.kind)||(op.kind!=='discover'&&(typeof op.threadId!=='string'||!/^T-[A-Za-z0-9-]{6,100}$/.test(op.threadId)))||(op.kind==='inject'&&(typeof op.text!=='string'||!op.text))){process.stdout.write(JSON.stringify({ok:false,outcome:'rejected',code:'amp_invalid_operation'}));process.exit(0)}
 const args=['--log-file','/dev/null'];
 if(op.kind==='discover')args.push('threads','search','author:me','--json','--limit','100');
 else if(op.kind==='export')args.push('threads','export',op.threadId);
-else args.push('threads','continue',op.threadId,'-ox',op.text);
+else if(op.kind==='inject')args.push('threads','continue',op.threadId,'-ox',op.text);
 const r=spawnSync('/tmp/relay-amp/node_modules/.bin/amp',args,{encoding:'utf8',timeout:45000,maxBuffer:16777216,env:{...process.env,RELAY_AMP_OPERATION:''}});
 if(r.status!==0){process.stdout.write(JSON.stringify({ok:false,outcome:op.kind==='inject'?'unknown':'rejected',code:'amp_command_failed'}));process.exit(0)}
 if(op.kind==='inject')process.stdout.write(JSON.stringify({ok:true,value:{accepted:true}}));
