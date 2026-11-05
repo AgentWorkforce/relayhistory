@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { AMP_CLI_BRIDGE, type AmpOperation } from './amp-source.js';
 
-function bridge(operation: unknown, result = { status: 0 as number | null, stdout: '[]' }, raw?: string) {
+function bridge(operation: unknown, result = { status: 0 as number | null, stdout: '[]' }, raw?: string, cliPath?: string) {
   let output = '';
   const calls: Array<{ command: string; args: string[]; options: Record<string, unknown> }> = [];
   const exited = Symbol('exit');
@@ -11,7 +11,7 @@ function bridge(operation: unknown, result = { status: 0 as number | null, stdou
     vm.runInNewContext(AMP_CLI_BRIDGE, {
       require: () => ({ spawnSync: (command: string, args: string[], options: Record<string, unknown>) => { calls.push({ command, args, options }); return result; } }),
       process: {
-        env: { RELAY_AMP_OPERATION: raw ?? JSON.stringify(operation), AMP_API_KEY: 'fixture-only' },
+        env: { RELAY_AMP_OPERATION: raw ?? JSON.stringify(operation), AMP_API_KEY: 'fixture-only', RELAY_AMP_CLI_PATH: cliPath },
         stdout: { write: (text: string) => { output += text; } },
         exit: () => { throw exited; },
       },
@@ -67,4 +67,10 @@ test('provider bridge normalizes supported thread URLs and rejects NUL text befo
   const rejected = bridge({ kind: 'inject', threadId: 'T-fixture-thread', text: 'bad' + String.fromCharCode(0) });
   assert.equal(rejected.calls.length, 0);
   assert.deepEqual(rejected.result, { ok: false, outcome: 'rejected', code: 'amp_invalid_operation' });
+});
+
+test('provider bridge accepts a host-owned preinstalled CLI path without taking commands from operations', () => {
+  const read = bridge({ kind: 'discover', executable: '/untrusted' }, undefined, undefined, '/opt/relay-amp/node_modules/.bin/amp');
+  assert.equal(read.call.command, '/opt/relay-amp/node_modules/.bin/amp');
+  assert.equal(read.calls.length, 1);
 });
