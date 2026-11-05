@@ -34,10 +34,12 @@ test('provider bridge selects read operations without starting an agent and boun
     assert.equal(read.call.command, '/tmp/relay-amp/node_modules/.bin/amp');
   }
 });
-test('provider bridge sends literal arguments to the existing orb and classifies uncertain submissions', () => {
+test('provider bridge sends private text over stdin to the existing orb and classifies uncertain submissions', () => {
   const operation: AmpOperation = { kind: 'inject', threadId: 'T-fixture-thread', text: 'literal $(text) `not a shell`' };
   const sent = bridge(operation);
-  assert.deepEqual(Array.from(sent.call.args), ['--log-file', '/dev/null', 'threads', 'continue', operation.threadId, '-ox', operation.text]);
+  assert.deepEqual(Array.from(sent.call.args), ['--log-file', '/dev/null', 'threads', 'continue', operation.threadId, '-ox']);
+  assert.equal(sent.call.options.input, operation.text);
+  assert.ok(!sent.call.args.includes(operation.text));
   assert.deepEqual(sent.result, { ok: true, value: { accepted: true } });
   assert.equal(sent.calls.length, 1);
   assert.equal(sent.call.command, '/tmp/relay-amp/node_modules/.bin/amp');

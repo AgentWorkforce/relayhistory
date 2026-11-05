@@ -13,6 +13,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Amp remote injection sends message text over stdin so private content and scoped reply capabilities stay out of CLI process arguments.
+
 - Amp tool results retain searchable output, call identity, status and errors in hosted history instead of becoming empty user prompts after privacy scrubbing.
 
 ## [0.56.0] - 2026-11-02
