@@ -527,6 +527,33 @@ to the consumer; profile reads never hydrate transcripts or request images
 from the network. A row without a usable name or avatar returns no profile.
 Missing optional profile data leaves the history readable.
 
+### Hosted Amp transcript projection
+
+`ai-hist/amp-source` projects Amp CLI JSON exports and External API message
+arrays into hosted history records. Agent Relay Cloud owns the encrypted
+personal access token, explicit thread selection, CLI transport, injection,
+scheduling and delivery; RelayHistory owns this projection. This does not add
+a local Rust `Source` or a built-in discovery connector.
+
+Native CLI exports use `protocolMessageID` and `protocolMessageVersion`;
+External API arrays use `messageID` and `messageVersion`. Raw message fields
+remain beside normalized text. Positional `messageId` and generic `id` are never
+accepted as substitutes. Each native message keeps one convergence envelope;
+mixed and multiple assistant tool calls retain typed `toolCalls` with their
+native call IDs, names and inputs. Tool-only assistant messages are tool records;
+user envelopes containing only tool results remain markers. Unknown message
+unions remain raw markers. No pricing, cost or estimated usage is inferred.
+Missing message times may use a recorded thread creation time, explicitly
+marked as inferred. Invalid identity, duplicate identity and malformed versions
+fail closed. A read-only check against a current Amp CLI export established the
+native field mapping; synthetic tests contain no customer transcript text.
+
+The CLI bridge's discovery operation is a bounded picker of 100 recent authored
+threads. It is not account-wide enumeration; the current CLI search exposes a
+limit without a continuation token. Hosts can accept another thread URL/ID and
+verify it through export. Scheduled catch-up scans selected bindings separately
+from this picker, so its limit does not cap the number of threads a host syncs.
+
 ### Session markers
 
 Not every provider record is a message. Compaction and summary boundaries,
