@@ -11,6 +11,8 @@ export type AmpEvidence = {
   ts: string;
   content: string;
   actorRole: string | null;
+  /** One envelope per native message; mixed/multiple calls retain their own native identities. */
+  toolCalls?: Array<{ id: string; tool: string; input: unknown }>;
   record: {
     messageId: string;
     messageVersion: number | null;
@@ -41,8 +43,8 @@ export function ampEvidence(
   const seen = new Set<string>();
   return messages.map((value) => {
     const raw = object(value);
-    const id =
-      raw.messageID ?? raw.protocolMessageID ?? raw.id ?? raw.messageId;
+    const native = Object.hasOwn(raw, 'protocolMessageID') || Object.hasOwn(raw, 'protocolMessageVersion');
+    const id = native ? raw.protocolMessageID : raw.messageID;
     if (
       (typeof id !== 'string' && typeof id !== 'number') ||
       !String(id) ||
@@ -54,13 +56,8 @@ export function ampEvidence(
     const messageId = String(id);
     if (seen.has(messageId)) throw new Error('AMP_DUPLICATE_MESSAGE_ID');
     seen.add(messageId);
-    const version =
-      raw.messageVersion ?? raw.protocolMessageVersion ?? raw.version;
-    if (
-      ['messageVersion', 'protocolMessageVersion', 'version'].some(
-        (key) => raw[key] === null,
-      )
-    )
+    const version = native ? raw.protocolMessageVersion : raw.messageVersion;
+    if (version === null)
       throw new Error('AMP_INVALID_MESSAGE_VERSION');
     if (
       version !== undefined &&
@@ -91,9 +88,14 @@ export function ampEvidence(
           : NaN;
     if (!Number.isFinite(time) || !Number.isFinite(new Date(time).getTime()))
       throw new Error('AMP_MISSING_MESSAGE_TIMESTAMP');
-    const hasTool =
-      Array.isArray(raw.content) &&
-      raw.content.some((block) => object(block).type === 'tool_use');
+    const toolCalls = role === 'assistant' && Array.isArray(raw.content)
+      ? raw.content.flatMap((block) => {
+          const tool = object(block);
+          return tool.type === 'tool_use' && typeof tool.id === 'string' && tool.id && typeof tool.name === 'string' && tool.name
+            ? [{ id: tool.id, tool: tool.name, input: tool.input ?? null }]
+            : [];
+        })
+      : [];
     return {
       v: 1,
       source: 'amp',
@@ -104,12 +106,13 @@ export function ampEvidence(
         ? 'prompt'
         : role === 'assistant' && content
           ? 'assistant'
-          : hasTool || role === 'tool'
+          : toolCalls.length || role === 'tool'
             ? 'tool_call'
             : 'marker',
       ts: new Date(time).toISOString(),
       content,
       actorRole: role,
+      ...(toolCalls.length ? { toolCalls } : {}),
       record: {
         messageId,
         messageVersion: version === undefined ? null : Number(version),
@@ -135,6 +138,7 @@ export function ampExport(threadId: string, value: unknown): AmpEvidence[] {
 
 /** Provider-owned CLI acquisition and remote submission contract. Hosts supply an isolated process runtime. */
 export type AmpOperation =
+  /** Bounded recent-thread picker; a host may select any other owned thread by ID and verify via export. */
   | { kind: 'discover' }
   | { kind: 'export'; threadId: string }
   | { kind: 'inject'; threadId: string; text: string };

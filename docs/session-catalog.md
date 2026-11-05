@@ -537,7 +537,10 @@ a local Rust `Source` or a built-in discovery connector.
 
 Native CLI exports use `protocolMessageID` and `protocolMessageVersion`;
 External API arrays use `messageID` and `messageVersion`. Raw message fields
-remain beside normalized text. Tool-only assistant messages are tool records;
+remain beside normalized text. Positional `messageId` and generic `id` are never
+accepted as substitutes. Each native message keeps one convergence envelope;
+mixed and multiple assistant tool calls retain typed `toolCalls` with their
+native call IDs, names and inputs. Tool-only assistant messages are tool records;
 user envelopes containing only tool results remain markers. Unknown message
 unions remain raw markers. No pricing, cost or estimated usage is inferred.
 Missing message times may use a recorded thread creation time, explicitly

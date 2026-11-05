@@ -22,12 +22,8 @@ test('retains native identity, versions and raw fields beside normalized text', 
   );
 });
 test('unknown message unions remain raw markers', () => {
-  assert.equal(
-    ampEvidence(tid, [
-      { ...msg, role: 'new-role', content: { unknown: true } },
-    ])[0].kind,
-    'marker',
-  );
+  for (const content of [{ unknown: true }, [{ type: 'tool_use', id: 'call-1', name: 'Read' }]])
+    assert.equal(ampEvidence(tid, [{ ...msg, role: 'new-role', content }])[0].kind, 'marker');
 });
 test('native CLI exports use protocol identity and keep tool results out of human prompts', () => {
   const rows = ampExport(tid, {
@@ -80,6 +76,9 @@ test('native CLI exports use protocol identity and keep tool results out of huma
 test('rejects ambiguous identity, malformed versions, missing timestamps and wrong exports', () => {
   for (const item of [
     { ...msg, messageID: null },
+    { ...msg, messageID: null, id: 'generic', messageId: 1 },
+    { ...msg, protocolMessageID: null, protocolMessageVersion: 1, messageId: 1 },
+    { ...msg, messageID: undefined, messageId: 1 },
     { ...msg, messageID: NaN },
     { ...msg, messageVersion: null },
     { ...msg, messageVersion: -1 },
@@ -94,8 +93,13 @@ test('rejects ambiguous identity, malformed versions, missing timestamps and wro
 });
 
 test('mixed assistant text and tool content keeps readable assistant prose', () => {
-  const [row] = ampEvidence(tid, [{ ...msg, content: [{ type: 'text', text: 'Checking' }, { type: 'text', text: 'now' }, { type: 'tool_use', name: 'Read' }] }]);
+  const [row] = ampEvidence(tid, [{ ...msg, content: [{ type: 'text', text: 'Checking' }, { type: 'text', text: 'now' }, { type: 'tool_use', id: 'call-1', name: 'Read', input: { path: 'a' } }, { type: 'tool_use', id: 'call-2', name: 'Read', input: { path: 'b' } }] }]);
   assert.equal(row.kind, 'assistant');
   assert.equal(row.content, 'Checking\nnow');
-  assert.equal((row.record.raw.content as unknown[]).length, 3);
+  assert.equal((row.record.raw.content as unknown[]).length, 4);
+  assert.deepEqual(row.toolCalls, [
+    { id: 'call-1', tool: 'Read', input: { path: 'a' } },
+    { id: 'call-2', tool: 'Read', input: { path: 'b' } },
+  ]);
+  assert.deepEqual(ampEvidence(tid, [{ ...msg, content: (row.record.raw.content as unknown[]).slice(2) }])[0].toolCalls, row.toolCalls);
 });
