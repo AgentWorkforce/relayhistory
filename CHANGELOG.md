@@ -13,8 +13,13 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Codex SQLite capture uses indexed message and timestamp lookups when reconciling overlapping records, reducing repeated conversation scans. It also reuses the conversation fingerprint while preserving edits to earlier items.
 - Amp remote injection sends private text over stdin and treats process or stdin failures as unconfirmed submissions, preventing false acceptance and unsafe retries.
 - Amp tool results retain searchable output, call identity, status and errors in hosted history as tool evidence after privacy scrubbing, keeping mixed human prompts separate from tool output.
+
+### Rust API
+
+- `SessionStore::retention_changes_since` returns a bounded journal of session identities affected by local retention, allowing consumers to refresh session counts incrementally. Gaps and expired cursors require a full refresh.
 
 ## [0.56.0] - 2026-11-02
 

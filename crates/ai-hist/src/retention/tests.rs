@@ -315,7 +315,14 @@ fn prune_transaction_does_not_block_local_catalog_reads() {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .unwrap();
         let mut report = RetentionReport::default();
-        maintenance::evict(&tx, &("codex".into(), "old".into()), 128, &mut report).unwrap();
+        maintenance::evict(
+            &tx,
+            &("codex".into(), "old".into()),
+            128,
+            &mut report,
+            &mut super::changes::Affected::new(),
+        )
+        .unwrap();
         holding_tx.send(()).unwrap();
         release_rx.recv().unwrap();
         tx.commit().unwrap();
@@ -437,6 +444,7 @@ fn default_cooldown_prevents_back_to_back_writer_batches() {
     assert_eq!(maintenance::run(&store, &opts, now + 1000).unwrap().rows, 1);
 }
 
+mod changes;
 mod generation;
 mod plans;
 mod progress;

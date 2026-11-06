@@ -92,12 +92,17 @@ fn user_images(conn: &Connection, t: &Thread, item: &Item) -> Result<()> {
             "SELECT event_uid FROM session_events WHERE source='codex' AND session_id=?1 \
              AND role='user' AND kind='text' AND raw_kind='input_image' AND text=?2 \
              AND ABS(ts_ms - ?3) <= ?4 \
+             AND ts_ms BETWEEN ?5 AND ?6 \
              AND NOT EXISTS (SELECT 1 FROM session_markers AS marker \
                WHERE marker.source='codex' AND marker.session_id=?1 \
                AND marker.marker_uid LIKE 'sqlite:overlap:%' \
                AND json_extract(marker.payload_json, '$.rollout_event_uid')=session_events.event_uid) \
              ORDER BY ABS(ts_ms - ?3), id LIMIT 1",
-            params![t.id, markdown, item.ts, IDLESS_ROLLOUT_TIMESTAMP_TOLERANCE_MS],
+            params![
+                t.id, markdown, item.ts, IDLESS_ROLLOUT_TIMESTAMP_TOLERANCE_MS,
+                item.ts.saturating_sub(IDLESS_ROLLOUT_TIMESTAMP_TOLERANCE_MS),
+                item.ts.saturating_add(IDLESS_ROLLOUT_TIMESTAMP_TOLERANCE_MS)
+            ],
             |row| row.get(0),
         ).optional()?;
         if let Some(rollout_uid) = rollout_uid {

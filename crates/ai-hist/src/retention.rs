@@ -4,7 +4,9 @@
 //! on its maintenance worker, publishes durable upload acknowledgements, and
 //! yields between batches. Local eviction never retracts remote copies.
 mod anonymous;
+mod changes;
 mod generation;
+pub use changes::RetentionChanges;
 mod maintenance;
 mod relationships;
 mod replay;
@@ -195,13 +197,14 @@ pub(crate) fn init_indexes(conn: &Connection) -> anyhow::Result<()> {
     schema::init_indexes(conn)
 }
 pub(crate) fn indexes_current(conn: &Connection) -> anyhow::Result<bool> {
-    schema::indexes_current(conn)
+    Ok(schema::indexes_current(conn)? && changes::present(conn)?)
 }
 pub(crate) fn init_schema(conn: &Connection) -> anyhow::Result<()> {
     conn.execute_batch("CREATE TABLE IF NOT EXISTS store_settings(key TEXT PRIMARY KEY,value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS retention_consumers(name TEXT PRIMARY KEY,epoch INTEGER NOT NULL,revision INTEGER NOT NULL CHECK(revision>=0));
         CREATE TABLE IF NOT EXISTS retention_pending(source TEXT NOT NULL,session_id TEXT NOT NULL,last_activity_ms INTEGER NOT NULL,PRIMARY KEY(source,session_id));
         CREATE TABLE IF NOT EXISTS retention_sweep(singleton INTEGER PRIMARY KEY CHECK(singleton=1),source TEXT NOT NULL,session_id TEXT NOT NULL);")?;
+    changes::init(conn)?;
     Ok(())
 }
 fn writable(store: &SessionStore, operation: &str) -> Result<Connection, Error> {

@@ -25,6 +25,9 @@ pub fn ai_hist::project_identity::project_identity(&std::path::Path) -> ai_hist:
 pub fn ai_hist::project_identity::resolve_project_identity(&str) -> ai_hist::project_identity::ProjectIdentity
 pub type ai_hist::project_identity::GitConfig = std::collections::hash::map::HashMap<alloc::string::String, std::collections::hash::map::HashMap<alloc::string::String, alloc::vec::Vec<alloc::string::String>>>
 pub mod ai_hist::retention
+#[non_exhaustive] pub struct ai_hist::retention::RetentionChanges
+pub ai_hist::retention::RetentionChanges::generation: u64
+pub ai_hist::retention::RetentionChanges::sessions: core::option::Option<alloc::vec::Vec<ai_hist::SessionIdentity>>
 pub struct ai_hist::retention::RetentionOptions
 pub ai_hist::retention::RetentionOptions::allow_unuploaded: bool
 pub ai_hist::retention::RetentionOptions::max_rows: u32
@@ -864,6 +867,8 @@ impl ai_hist::SessionStore
 pub fn ai_hist::SessionStore::reconcile(&self) -> core::result::Result<ai_hist::Reconciliation, ai_hist::Error>
 impl ai_hist::SessionStore
 pub fn ai_hist::SessionStore::resumes_from(&self, ai_hist::Watermark, &ai_hist::ChangeQuery) -> core::result::Result<bool, ai_hist::Error>
+impl ai_hist::SessionStore
+pub fn ai_hist::SessionStore::retention_changes_since(&self, u64) -> core::result::Result<ai_hist::retention::RetentionChanges, ai_hist::Error>
 impl ai_hist::SessionStore
 pub fn ai_hist::SessionStore::session_profile(&self, &ai_hist::SessionRef) -> core::result::Result<core::option::Option<ai_hist::SessionProfile>, ai_hist::Error>
 impl ai_hist::SessionStore

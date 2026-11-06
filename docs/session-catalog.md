@@ -1016,6 +1016,16 @@ How each adapter works:
   a catalogued `sqlite:` locator reports `SESSION_SOURCE_UNAVAILABLE` if its store
   pair has disappeared.
 
+  Overlap checks seek through the native-message and timestamp indexes, so a
+  lookup for each new record avoids walking every record already in the thread.
+  One conversation fingerprint is reused for retirement and normalization.
+  The opt-in `sqlite_single_append_benchmark` creates temporary source and
+  destination databases and measures capture, decoding, reconciliation and commit
+  for an initial conversation and one appended item. Run
+  `cargo test -p ai-hist --release --lib sqlite_single_append_benchmark -- --ignored --nocapture`.
+  It defaults to 10,000 items and two repetitions. Set
+  `AI_HIST_SQLITE_BENCH_ITEMS` and `AI_HIST_SQLITE_BENCH_RUNS` to vary the fixture.
+
   Related restored rollouts are fully hashed once per unique child in each
   related-thread scan. That read is needed to detect a rewrite that preserves both
   file size and mtime; the current path has no trusted filesystem generation that
