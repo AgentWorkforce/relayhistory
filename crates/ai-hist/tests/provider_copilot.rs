@@ -364,3 +364,35 @@ fn copilot_symlink_escape_is_never_read() {
         .iter()
         .any(|d| d.message.contains("SESSION_SOURCE_MISMATCH")));
 }
+
+#[test]
+fn vscode_copilot_harness_uses_native_history_without_a_second_parser() {
+    const SID: &str = "69e50b90-b873-4de0-a36d-c9152a45e772";
+    let journal = include_str!("fixtures/copilot/vscode-harness/.copilot/session-state/69e50b90-b873-4de0-a36d-c9152a45e772/events.jsonl");
+    let home = tempfile::tempdir().unwrap();
+    stage(home.path(), SID, journal);
+    let evidence = provider_support::assert_history_conformance(
+        home.path(),
+        provider_support::HistoryCase {
+            source: Source::Copilot,
+            session_id: SID,
+            messages: &[
+                (Role::User, "Relay integration fixture: read README.md using a file-reading tool, then reply with exactly RELAY_COPILOT_VSCODE_PROOF_OK. Do not modify files or run terminal commands."),
+                (Role::Assistant, "RELAY_COPILOT_VSCODE_PROOF_OK"),
+            ],
+        },
+    );
+    assert_eq!(evidence.tool_calls.len(), 2);
+    assert_eq!(evidence.tool_results.len(), 2);
+    assert!(evidence.tool_results.iter().any(|r| r.text.as_deref()
+        == Some("Disposable Relay Copilot integration test. No production data.\n")));
+    assert!(evidence
+        .markers
+        .iter()
+        .any(|m| m.kind == "session.usage_record"));
+    assert!(evidence.messages.iter().all(|m| m.raw_usage().is_none()));
+    assert_eq!(
+        evidence.session.cwd.as_deref(),
+        Some("/fixture/copilot-vscode")
+    );
+}
