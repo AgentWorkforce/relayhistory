@@ -487,8 +487,7 @@ pub(crate) fn sync(
                     let acquired = capture(&roots, &state_db, &thread.id)?;
                     let captured = decode(&acquired)?;
                     let tx = conn.unchecked_transaction()?;
-                    retire_if_changed(&tx, &captured, true)?;
-                    let count = normalize(&tx, &captured, &state_db)?;
+                    let count = reconcile(&tx, &captured, &state_db, true)?;
                     tx.commit()?;
                     Ok(count)
                 })();

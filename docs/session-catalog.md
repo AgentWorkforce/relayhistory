@@ -1016,6 +1016,22 @@ How each adapter works:
   a catalogued `sqlite:` locator reports `SESSION_SOURCE_UNAVAILABLE` if its store
   pair has disappeared.
 
+  Overlap checks use native-message and timestamp indexes. A reconciliation reads
+  its existing overlap claims once and tracks them in memory, avoiding repeated
+  marker scans. This uses memory proportional to the conversation's claims; dense
+  groups of identical messages at the same timestamp can still require many
+  candidate checks. Existing overlap claims are revalidated first; new text
+  matches check native message identities before falling back to legacy text matching.
+  Legacy overlap claims suppress an item only while their referenced rollout
+  evidence exists and remains eligible for that match.
+  One conversation fingerprint is reused for retirement and normalization.
+  The opt-in `sqlite_single_append_benchmark` creates temporary source and
+  destination databases and times the end-to-end initial sync and one appended-item
+  sync for a single conversation. Run
+  `cargo test -p ai-hist --release --lib sqlite_single_append_benchmark -- --ignored --nocapture`.
+  It defaults to 10,000 items and two repetitions. Set
+  `AI_HIST_SQLITE_BENCH_ITEMS` and `AI_HIST_SQLITE_BENCH_RUNS` to vary the fixture.
+
   Related restored rollouts are fully hashed once per unique child in each
   related-thread scan. That read is needed to detect a rewrite that preserves both
   file size and mtime; the current path has no trusted filesystem generation that

@@ -26,6 +26,7 @@ pub(super) fn advance_if_evicted(
     conn: &Connection,
     rows: u64,
     catalog_changed: bool,
+    affected: &super::changes::Affected,
 ) -> anyhow::Result<()> {
     if rows == 0 && !catalog_changed {
         return Ok(());
@@ -34,5 +35,6 @@ pub(super) fn advance_if_evicted(
         .checked_add(1)
         .ok_or_else(|| anyhow::anyhow!("retention catalog generation exhausted"))?;
     conn.execute("INSERT INTO store_settings(key,value) VALUES(?1,?2) ON CONFLICT(key) DO UPDATE SET value=excluded.value", [KEY, &next.to_string()])?;
+    super::changes::record(conn, next, affected)?;
     Ok(())
 }

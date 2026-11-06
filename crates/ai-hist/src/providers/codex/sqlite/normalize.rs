@@ -2,6 +2,7 @@
 use super::*;
 use crate::ingest::{ToolResultFacts, ToolResultIndexer};
 use sha2::{Digest, Sha256};
+use std::io::{BufWriter, Write};
 
 // Legacy rollouts lack native message IDs and may record the event a few seconds
 // apart from the SQLite projection. Keep the compatibility window bounded to
@@ -15,18 +16,33 @@ fn content_hash(capture: &Capture) -> Result<String> {
         "source": t.source, "thread_source": t.thread_source, "cwd": t.cwd,
         "branch": t.branch, "model": t.model, "tokens_used": t.tokens_used,
     });
-    Ok(format!(
-        "{:x}",
-        Sha256::digest(serde_json::to_vec(&content)?)
-    ))
+    let mut digest = Sha256::new();
+    {
+        let mut writer = BufWriter::new(&mut digest);
+        serde_json::to_writer(&mut writer, &content)?;
+        writer.flush()?;
+    }
+    Ok(format!("{:x}", digest.finalize()))
+}
+
+pub(crate) fn reconcile(
+    conn: &Connection,
+    capture: &Capture,
+    state: &Path,
+    include_related: bool,
+) -> Result<usize> {
+    let hash = content_hash(capture)?;
+    retire_if_changed(conn, capture, include_related, &hash)?;
+    normalize(conn, capture, state, include_related, &hash)
 }
 
 /// The selected stamp includes descendants. Keep this thread's row IDs when
 /// only a child changed, while still replacing a rewritten projection.
-pub(crate) fn retire_if_changed(
+fn retire_if_changed(
     conn: &Connection,
     capture: &Capture,
     include_related: bool,
+    hash: &str,
 ) -> Result<()> {
     let prior: Option<String> = conn
         .query_row(
@@ -37,7 +53,7 @@ pub(crate) fn retire_if_changed(
         )
         .optional()?
         .flatten();
-    if prior.as_deref() != Some(content_hash(capture)?.as_str()) {
+    if prior.as_deref() != Some(hash) {
         retire(conn, &capture.thread.id, include_related)?;
     } else if include_related {
         retire_relationships(conn, &capture.thread.id)?;
@@ -99,13 +115,13 @@ pub(crate) fn claim_history_log_prompt(conn: &Connection, entry: &HistoryEntry) 
     Ok(())
 }
 
-fn thread_payload(capture: &Capture, history_ids: Vec<i64>) -> Result<Value> {
+fn thread_payload(capture: &Capture, history_ids: Vec<i64>, hash: &str) -> Value {
     let t = &capture.thread;
-    let mut payload = json!({"archived":t.archived,"source":t.source,"name":t.name,"agent_nickname":t.agent_nickname,"agent_role":t.agent_role,"next_rollout_byte_offset":t.next_offset,"content_hash":content_hash(capture)?});
+    let mut payload = json!({"archived":t.archived,"source":t.source,"name":t.name,"agent_nickname":t.agent_nickname,"agent_role":t.agent_role,"next_rollout_byte_offset":t.next_offset,"content_hash":hash});
     if !history_ids.is_empty() {
         payload["history_ids"] = json!(history_ids);
     }
-    Ok(payload)
+    payload
 }
 
 fn marker(
@@ -136,96 +152,8 @@ fn marker(
     Ok(())
 }
 
-fn event(
-    conn: &Connection,
-    t: &Thread,
-    item: &Item,
-    uid: &str,
-    role_and_kind: (&str, &str),
-    text: Option<&str>,
-    result_facts: Option<&ToolResultFacts>,
-) -> Result<bool> {
-    let (role, kind) = role_and_kind;
-    let control_kind = if (role, kind) == ("user", "text") {
-        text.and_then(crate::ingest::control::codex_text_control_kind)
-            .map(crate::ingest::control::ControlKind::as_str)
-    } else {
-        None
-    };
-    let overlap_uid = format!("sqlite:overlap:{}", item.id);
-    if matches!((role, kind), ("user" | "assistant", "text")) {
-        let mapped: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM session_markers WHERE source='codex' AND session_id=?1 AND marker_uid=?2)",
-            params![t.id, overlap_uid],
-            |row| row.get(0),
-        )?;
-        if mapped {
-            return Ok(false);
-        }
-    }
-    let rollout_has_item = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM session_events WHERE source='codex' AND session_id=?1 AND event_uid<>?2 AND role=?3 AND kind=?4 AND (message_id=?5 OR provider_message_id=?5))",
-        params![t.id, uid, role, kind, item.id],
-        |r| r.get::<_, bool>(0),
-    )?;
-    if rollout_has_item {
-        return Ok(false);
-    }
-    if let Some(text) = text.filter(|_| matches!((role, kind), ("user" | "assistant", "text"))) {
-        let rollout_uid: Option<String> = conn
-            .query_row(
-                "SELECT event_uid FROM session_events WHERE source='codex' AND session_id=?1 \
-                 AND role=?2 AND kind='text' AND raw_kind IS NULL AND text=?3 \
-                 AND ABS(ts_ms - ?4) <= ?5 \
-                 AND NOT EXISTS (SELECT 1 FROM session_markers AS marker \
-                   WHERE marker.source='codex' AND marker.session_id=?1 \
-                   AND marker.marker_uid LIKE 'sqlite:overlap:%' \
-                   AND json_extract(marker.payload_json, '$.rollout_event_uid')=session_events.event_uid) \
-                 ORDER BY ABS(ts_ms - ?4), id LIMIT 1",
-                params![t.id, role, text, item.ts, IDLESS_ROLLOUT_TIMESTAMP_TOLERANCE_MS],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if let Some(rollout_uid) = rollout_uid {
-            marker(
-                conn,
-                t,
-                &overlap_uid,
-                item.ts,
-                "rollout_overlap",
-                &json!({"rollout_event_uid":rollout_uid}),
-                item.turn_id.as_deref(),
-            )?;
-            return Ok(false);
-        }
-    }
-    crate::ingest::insert_session_event(
-        conn,
-        &EventRow {
-            source: "codex",
-            session_id: &t.id,
-            project: t.cwd.as_deref(),
-            cwd: t.cwd.as_deref(),
-            git_branch: t.branch.as_deref(),
-            message_id: &item.id,
-            event_uid: uid,
-            ts_ms: item.ts,
-            role,
-            kind,
-            text,
-            model: t.model.as_deref(),
-            raw_kind: Some(&item.kind),
-            tool_result_facts: result_facts,
-            raw_facts: RawMessageFacts {
-                turn_id: item.turn_id.as_deref(),
-                control_kind,
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-    )?;
-    Ok(true)
-}
+mod events;
+use events::{event, text_event, Kind, Overlaps};
 
 /// A changed projection replaces only rows that came from the previous
 /// SQLite capture. The rollout and history.jsonl keep their own evidence.
@@ -370,15 +298,12 @@ fn normalize_relationships(
 mod items;
 use items::normalize_item;
 
-pub(crate) fn normalize(conn: &Connection, capture: &Capture, state: &Path) -> Result<usize> {
-    normalize_with_relationships(conn, capture, state, true)
-}
-
-pub(crate) fn normalize_with_relationships(
+fn normalize(
     conn: &Connection,
     capture: &Capture,
     state: &Path,
     include_related: bool,
+    hash: &str,
 ) -> Result<usize> {
     let t = &capture.thread;
     let session_locator = locator(state, &t.id);
@@ -420,6 +345,7 @@ pub(crate) fn normalize_with_relationships(
     let mut prompts = 0;
     let mut history_ids = prior_history_ids(conn, &t.id)?;
     let mut result_indexer = ToolResultIndexer::default();
+    let mut overlaps = Overlaps::load(conn, &t.id)?;
     for item in &capture.items {
         prompts += normalize_item(
             conn,
@@ -428,6 +354,7 @@ pub(crate) fn normalize_with_relationships(
             &mut result_indexer,
             include_related,
             &mut history_ids,
+            &mut overlaps,
         )?;
     }
     for turn in &capture.turns {
@@ -454,7 +381,7 @@ pub(crate) fn normalize_with_relationships(
             None,
         )?;
     }
-    let thread_payload = thread_payload(capture, history_ids)?;
+    let thread_payload = thread_payload(capture, history_ids, hash);
     marker(
         conn,
         t,
@@ -472,3 +399,6 @@ pub(crate) fn normalize_with_relationships(
     }
     Ok(prompts)
 }
+
+#[cfg(test)]
+mod tests;
