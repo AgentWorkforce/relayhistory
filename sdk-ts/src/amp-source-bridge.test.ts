@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import vm from 'node:vm';
 import { AMP_CLI_BRIDGE, type AmpOperation } from './amp-source.js';
 
-function bridge(operation: unknown, result = { status: 0 as number | null, stdout: '[]' }, raw?: string, cliPath?: string) {
+function bridge(operation: unknown, result: { status: number | null; stdout: string; error?: Error } = { status: 0, stdout: '[]' }, raw?: string, cliPath?: string) {
   let output = '';
   const calls: Array<{ command: string; args: string[]; options: Record<string, unknown> }> = [];
   const exited = Symbol('exit');
@@ -34,10 +34,12 @@ test('provider bridge selects read operations without starting an agent and boun
     assert.equal(read.call.command, '/tmp/relay-amp/node_modules/.bin/amp');
   }
 });
-test('provider bridge sends literal arguments to the existing orb and classifies uncertain submissions', () => {
+test('provider bridge sends private text over stdin to the existing orb and classifies uncertain submissions', () => {
   const operation: AmpOperation = { kind: 'inject', threadId: 'T-fixture-thread', text: 'literal $(text) `not a shell`' };
   const sent = bridge(operation);
-  assert.deepEqual(Array.from(sent.call.args), ['--log-file', '/dev/null', 'threads', 'continue', operation.threadId, '-ox', operation.text]);
+  assert.deepEqual(Array.from(sent.call.args), ['--log-file', '/dev/null', 'threads', 'continue', operation.threadId, '-ox']);
+  assert.equal(sent.call.options.input, operation.text);
+  assert.ok(!sent.call.args.includes(operation.text));
   assert.deepEqual(sent.result, { ok: true, value: { accepted: true } });
   assert.equal(sent.calls.length, 1);
   assert.equal(sent.call.command, '/tmp/relay-amp/node_modules/.bin/amp');
@@ -45,6 +47,12 @@ test('provider bridge sends literal arguments to the existing orb and classifies
     assert.deepEqual(bridge(operation, { status, stdout: 'secret output' }).result, { ok: false, outcome: 'unknown', code: 'amp_command_failed' });
     assert.deepEqual(bridge({ kind: 'discover' }, { status, stdout: 'secret output' }).result, { ok: false, outcome: 'rejected', code: 'amp_command_failed' });
   }
+});
+test('provider bridge never accepts a zero-exit process whose stdin write failed', () => {
+  const result = { status: 0, stdout: 'private output', error: Object.assign(new Error('private stdin error'), { code: 'EPIPE' }) };
+  const operation: AmpOperation = { kind: 'inject', threadId: 'T-fixture-thread', text: 'private message' };
+  assert.deepEqual(bridge(operation, result).result, { ok: false, outcome: 'unknown', code: 'amp_command_failed' });
+  assert.deepEqual(bridge({ kind: 'discover' }, result).result, { ok: false, outcome: 'rejected', code: 'amp_command_failed' });
 });
 test('provider bridge rejects malformed read output without echoing it', () => {
   assert.deepEqual(bridge({ kind: 'export', threadId: 'T-fixture-thread' }, { status: 0, stdout: 'private malformed text' }).result,

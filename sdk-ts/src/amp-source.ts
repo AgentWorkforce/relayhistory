@@ -11,12 +11,13 @@ export type AmpEvidence = {
   ts: string;
   content: string;
   actorRole: string | null;
-  /** One envelope per native message; mixed/multiple calls retain their own native identities. */
+  /** Calls retain native identities; mixed human/tool messages have separate tool evidence. */
   toolCalls?: Array<{ id: string; tool: string; input: unknown }>;
   record: {
     messageId: string;
     messageVersion: number | null;
     raw: AmpMessage;
+    toolResults?: Array<{ id: string; status: string | null; output?: unknown; error?: unknown }>;
     timestampInferred?: true;
   };
 };
@@ -41,7 +42,7 @@ export function ampEvidence(
 ): AmpEvidence[] {
   const sessionId = ampThreadId(threadId);
   const seen = new Set<string>();
-  return messages.map((value) => {
+  return messages.flatMap((value): AmpEvidence[] => {
     const raw = object(value);
     const native = Object.hasOwn(raw, 'protocolMessageID') || Object.hasOwn(raw, 'protocolMessageVersion');
     const id = native ? raw.protocolMessageID : raw.messageID;
@@ -65,7 +66,7 @@ export function ampEvidence(
     )
       throw new Error('AMP_INVALID_MESSAGE_VERSION');
     const role = typeof raw.role === 'string' ? raw.role : null;
-    const content =
+    const prose =
       typeof raw.content === 'string'
         ? raw.content
         : Array.isArray(raw.content)
@@ -96,30 +97,72 @@ export function ampEvidence(
             : [];
         })
       : [];
-    return {
+    const toolResults = role === 'user' && Array.isArray(raw.content)
+      ? raw.content.flatMap((block) => {
+          const result = object(block);
+          if (result.type !== 'tool_result' || typeof result.toolUseID !== 'string' || !result.toolUseID) return [];
+          const run = object(result.run);
+          return [{
+            id: result.toolUseID,
+            status: typeof run.status === 'string' ? run.status : null,
+            ...(Object.hasOwn(run, 'result') ? { output: run.result } : {}),
+            ...(Object.hasOwn(run, 'error') ? { error: run.error } : {}),
+          }];
+        })
+      : [];
+    const onlyToolResults = !prose.trim() && toolResults.length > 0 &&
+      Array.isArray(raw.content) && raw.content.every((block) => {
+        const part = object(block);
+        return (part.type === 'tool_result' && typeof part.toolUseID === 'string' && !!part.toolUseID) ||
+          (part.type === 'text' && typeof part.text === 'string' && !part.text.trim());
+      });
+    const resultText = toolResults.flatMap((result) => [result.output, result.error]
+      .map((value) => {
+        if (typeof value === 'string') return value;
+        if (value == null) return '';
+        try { return JSON.stringify(value) ?? ''; } catch { return ''; }
+      })
+      .filter((text) => text.trim()));
+    const humanWithResults = role === 'user' && !!prose.trim() && toolResults.length > 0;
+    const content = humanWithResults ? prose : toolResults.length
+      ? [prose, ...resultText].filter((text) => text.trim()).join('\n')
+      : prose;
+    const row: AmpEvidence = {
       v: 1,
       source: 'amp',
       sessionId,
       eventId: `amp:${sessionId}:${messageId}`,
       lens: 'history',
-      kind: role === 'user' && content
+      kind: onlyToolResults
+        ? 'tool_call'
+        : role === 'user' && prose.trim()
         ? 'prompt'
-        : role === 'assistant' && content
+        : role === 'assistant' && prose.trim()
           ? 'assistant'
           : toolCalls.length || role === 'tool'
             ? 'tool_call'
             : 'marker',
       ts: new Date(time).toISOString(),
       content,
-      actorRole: role,
+      actorRole: onlyToolResults ? 'tool' : role,
       ...(toolCalls.length ? { toolCalls } : {}),
       record: {
         messageId,
         messageVersion: version === undefined ? null : Number(version),
         raw,
+        ...(toolResults.length ? { toolResults } : {}),
         ...(nativeDate == null ? { timestampInferred: true as const } : {}),
       },
     };
+    if (!humanWithResults) return [row];
+    // A different event namespace prevents collisions with arbitrary native message IDs.
+    return [row, {
+      ...row,
+      eventId: `amp-tool-results:${sessionId}:${messageId}`,
+      kind: 'tool_call',
+      actorRole: 'tool',
+      content: resultText.join('\n'),
+    }];
   });
 }
 export function ampExport(threadId: string, value: unknown): AmpEvidence[] {
@@ -150,8 +193,8 @@ if(!op||!['discover','export','inject'].includes(op.kind)||(op.kind!=='discover'
 const args=['--log-file','/dev/null'];
 if(op.kind==='discover')args.push('threads','search','author:me','--json','--limit','100');
 else if(op.kind==='export')args.push('threads','export',op.threadId);
-else if(op.kind==='inject')args.push('threads','continue',op.threadId,'-ox',op.text);
-const r=spawnSync(process.env.RELAY_AMP_CLI_PATH||'/tmp/relay-amp/node_modules/.bin/amp',args,{encoding:'utf8',timeout:45000,maxBuffer:16777216,env:{...process.env,RELAY_AMP_OPERATION:''}});
-if(r.status!==0){process.stdout.write(JSON.stringify({ok:false,outcome:op.kind==='inject'?'unknown':'rejected',code:'amp_command_failed'}));process.exit(0)}
+else if(op.kind==='inject')args.push('threads','continue',op.threadId,'-ox');
+const r=spawnSync(process.env.RELAY_AMP_CLI_PATH||'/tmp/relay-amp/node_modules/.bin/amp',args,{encoding:'utf8',input:op.kind==='inject'?op.text:undefined,timeout:45000,maxBuffer:16777216,env:{...process.env,RELAY_AMP_OPERATION:''}});
+if(r.error||r.status!==0){process.stdout.write(JSON.stringify({ok:false,outcome:op.kind==='inject'?'unknown':'rejected',code:'amp_command_failed'}));process.exit(0)}
 if(op.kind==='inject')process.stdout.write(JSON.stringify({ok:true,value:{accepted:true}}));
 else{try{process.stdout.write(JSON.stringify({ok:true,value:JSON.parse(r.stdout)}))}catch{process.stdout.write(JSON.stringify({ok:false,outcome:'rejected',code:'amp_invalid_json'}))}}`;

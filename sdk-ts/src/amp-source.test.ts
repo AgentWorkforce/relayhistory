@@ -67,8 +67,10 @@ test('native CLI exports use protocol identity and keep tool results out of huma
   });
   assert.deepEqual(
     rows.map((row) => row.kind),
-    ['prompt', 'tool_call', 'marker'],
+    ['prompt', 'tool_call', 'tool_call'],
   );
+  assert.equal(rows[2].actorRole, 'tool');
+  assert.deepEqual(rows[2].record.toolResults, [{ id: 'call-1', status: 'done' }]);
   assert.equal(rows[0].record.messageId, 'native-1');
   assert.equal(rows[0].record.messageVersion, 4);
   assert.equal(rows[0].ts, '2026-11-05T00:00:00.000Z');
@@ -103,4 +105,81 @@ test('mixed assistant text and tool content keeps readable assistant prose', () 
     { id: 'call-2', tool: 'Read', input: { path: 'b' } },
   ]);
   assert.deepEqual(ampEvidence(tid, [{ ...msg, content: (row.record.raw.content as unknown[]).slice(2) }])[0].toolCalls, row.toolCalls);
+});
+
+test('normalizes multiple tool outputs and errors without turning them into human prompts', () => {
+  const content = [
+    { type: 'tool_result', toolUseID: 'call-1', run: { status: 'done', result: 'found the file' } },
+    { type: 'tool_result', toolUseID: 'call-2', run: { status: 'error', error: { code: 'missing_file' } } },
+  ];
+  const [row] = ampEvidence(tid, [{ ...msg, role: 'user', content }]);
+  assert.equal(row.kind, 'tool_call');
+  assert.equal(row.actorRole, 'tool');
+  assert.equal(row.content, 'found the file\n{"code":"missing_file"}');
+  assert.deepEqual(row.record.toolResults, [
+    { id: 'call-1', status: 'done', output: 'found the file' },
+    { id: 'call-2', status: 'error', error: { code: 'missing_file' } },
+  ]);
+  const [mixed] = ampEvidence(tid, [{ ...msg, role: 'user', content: [{ type: 'text', text: 'human follow-up' }, ...content] }]);
+  assert.equal(mixed.kind, 'prompt');
+  assert.equal(mixed.content, 'human follow-up');
+  assert.deepEqual(mixed.record.toolResults, row.record.toolResults);
+  const [unknown] = ampEvidence(tid, [{ ...msg, role: 'future-role', content }]);
+  assert.equal(unknown.kind, 'marker');
+  assert.equal(unknown.record.toolResults, undefined);
+});
+
+test('blank text and empty output do not hide searchable tool errors', () => {
+  const [row] = ampEvidence(tid, [{ ...msg, role: 'user', content: [
+    { type: 'text', text: ' \n ' },
+    { type: 'tool_result', toolUseID: 'call-error', run: { status: 'error', result: '', error: { code: 'fixture_failure' } } },
+  ] }]);
+  assert.equal(row.kind, 'tool_call');
+  assert.equal(row.actorRole, 'tool');
+  assert.equal(row.content, '{"code":"fixture_failure"}');
+  assert.equal(row.record.toolResults?.[0].output, '');
+});
+
+test('mixed unknown or image blocks remain markers while known tool outcomes are retained', () => {
+  for (const extra of [{ type: 'image', source: { type: 'url', url: 'https://example.test/fixture.png' } }, { type: 'future-block' }]) {
+    const [row] = ampEvidence(tid, [{ ...msg, role: 'user', content: [
+      { type: 'text', text: ' ' },
+      { type: 'tool_result', toolUseID: 'call-1', run: { status: 'done', result: 'fixture output' } }, extra,
+    ] }]);
+    assert.equal(row.kind, 'marker');
+    assert.equal(row.content, 'fixture output');
+    assert.deepEqual(row.record.toolResults, [{ id: 'call-1', status: 'done', output: 'fixture output' }]);
+  }
+});
+
+test('human prose and mixed tool output remain distinct and searchable across revisions', () => {
+  const [row, result] = ampEvidence(tid, [{ ...msg, role: 'user', content: [
+    { type: 'text', text: 'A real follow-up' },
+    { type: 'tool_result', toolUseID: 'call-1', run: { status: 'error', result: 'partial output', error: 'fixture error' } },
+    { type: 'future-block' },
+  ] }]);
+  assert.equal(row.kind, 'prompt');
+  assert.equal(row.actorRole, 'user');
+  assert.equal(row.content, 'A real follow-up');
+  assert.equal(result.kind, 'tool_call');
+  assert.equal(result.actorRole, 'tool');
+  assert.equal(result.content, 'partial output\nfixture error');
+  assert.notEqual(result.eventId, row.eventId);
+  const revised = ampEvidence(tid, [{ ...row.record.raw, messageVersion: 3 }]);
+  assert.deepEqual(revised.map((r) => r.eventId), [row.eventId, result.eventId]);
+  assert.equal(revised[1].record.messageVersion, 3);
+  assert.equal(result.record.messageId, row.record.messageId);
+});
+
+test('unserializable tool output never crashes readable projection', () => {
+  const cyclic: Record<string, unknown> = {};
+  cyclic.self = cyclic;
+  for (const output of [undefined, () => {}, Symbol('output'), 1n, cyclic]) {
+    const rows = ampEvidence(tid, [{ ...msg, role: 'user', content: [
+      { type: 'text', text: 'Human prose' },
+      { type: 'tool_result', toolUseID: 'call-1', run: { result: output, error: 'known failure' } },
+    ] }]);
+    assert.equal(rows[0].content, 'Human prose');
+    assert.equal(rows[1].content, 'known failure');
+  }
 });
