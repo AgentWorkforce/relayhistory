@@ -1020,7 +1020,8 @@ How each adapter works:
   its existing overlap claims once and tracks them in memory, avoiding repeated
   marker scans. This uses memory proportional to the conversation's claims; dense
   groups of identical messages at the same timestamp can still require many
-  candidate checks. Native message identities take precedence over text matching.
+  candidate checks. Existing overlap claims are revalidated first; new text
+  matches check native message identities before falling back to legacy text matching.
   Legacy overlap claims suppress an item only while their referenced rollout
   evidence exists and remains eligible for that match.
   One conversation fingerprint is reused for retirement and normalization.

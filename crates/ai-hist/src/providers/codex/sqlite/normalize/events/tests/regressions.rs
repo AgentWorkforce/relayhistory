@@ -93,10 +93,13 @@ fn identified_rollout_cannot_hide_a_distinct_sqlite_message(role: &str) {
     let directory = tempfile::tempdir().unwrap();
     let conn = crate::open_db(&directory.path().join("history.db")).unwrap();
     ingest_rollout(&conn, directory.path(), role, Some("first"));
-    let (message_id, event_uid, provider_id): (String, String, Option<String>) = conn.query_row(
+    let (message_id, event_uid, provider_id): (String, String, Option<String>) = conn
+        .query_row(
             "SELECT message_id,event_uid,provider_message_id FROM session_events WHERE role=?1 AND text='answer'",
-            [role], |r| Ok((r.get(0)?,r.get(1)?,r.get(2)?)),
-        ).unwrap();
+            [role],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
     if role == "user" {
         assert_eq!(message_id, "first");
         assert_ne!(message_id, event_uid);
@@ -179,21 +182,33 @@ fn stale_overlap_after_retention_cannot_hide_unchanged_sqlite_capture() {
         })
         .unwrap();
     assert_eq!(pruned.rows, 1);
-    let target_exists: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM session_events WHERE session_id='thread' AND text='answer')", [], |r|r.get(0),
-    ).unwrap();
+    let target_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_events WHERE session_id='thread' AND text='answer')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert!(!target_exists);
-    let marker_exists: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM session_markers WHERE marker_uid='sqlite:overlap:native-item')", [], |r|r.get(0),
-    ).unwrap();
+    let marker_exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_markers WHERE marker_uid='sqlite:overlap:native-item')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert!(
         marker_exists,
         "bounded retention must leave the later marker to reproduce the bug"
     );
     apply_capture(&conn, directory.path(), &capture).unwrap();
-    let restored: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM session_events WHERE session_id='thread' AND event_uid='native-item' AND text='answer')", [], |r|r.get(0),
-    ).unwrap();
+    let restored: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_events WHERE session_id='thread' AND event_uid='native-item' AND text='answer')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert!(
         restored,
         "a dangling overlap marker is not evidence that a message exists"
@@ -289,7 +304,13 @@ fn missing_image_target_is_repaired_during_an_authorized_reconciliation() {
         )
         .unwrap();
     assert!(restored);
-    let stale:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM session_markers WHERE marker_uid='sqlite:overlap:first:input_image:0')",[],|r|r.get(0)).unwrap();
+    let stale: bool = conn
+        .query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_markers WHERE marker_uid='sqlite:overlap:first:input_image:0')",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert!(!stale);
 }
 
@@ -427,7 +448,13 @@ fn an_old_claim_to_an_identified_message_is_repaired_without_rewriting_the_captu
             )
             .unwrap();
         assert_eq!(count, 2, "role={role}");
-        let bad:bool=conn.query_row("SELECT EXISTS(SELECT 1 FROM session_markers WHERE marker_uid='sqlite:overlap:second')",[],|r|r.get(0)).unwrap();
+        let bad: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM session_markers WHERE marker_uid='sqlite:overlap:second')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         assert!(!bad);
     }
 }
