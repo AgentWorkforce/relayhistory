@@ -2,6 +2,8 @@ use super::*;
 
 #[test]
 fn projection_digest_keeps_the_existing_canonical_representation() {
+    // Recorded from this fixture's pre-streaming ai-hist 0.56.0 JSON bytes.
+    const EXPECTED_HASH: &str = "1c12ae127115d9035a6b30cdfe88a0e0a75ecae17e4fa06f6d649cd4776e2020";
     let capture: Capture = serde_json::from_value(json!({
         "thread": {
             "id":"thread", "created":1, "updated":2, "archived":false,
@@ -30,5 +32,6 @@ fn projection_digest_keeps_the_existing_canonical_representation() {
         "{:x}",
         Sha256::digest(serde_json::to_vec(&previous).unwrap())
     );
-    assert_eq!(content_hash(&capture).unwrap(), previous_hash);
+    assert_eq!(previous_hash, EXPECTED_HASH);
+    assert_eq!(content_hash(&capture).unwrap(), EXPECTED_HASH);
 }

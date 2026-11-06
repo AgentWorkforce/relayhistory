@@ -1020,8 +1020,8 @@ How each adapter works:
   lookup for each new record avoids walking every record already in the thread.
   One conversation fingerprint is reused for retirement and normalization.
   The opt-in `sqlite_single_append_benchmark` creates temporary source and
-  destination databases and measures capture, decoding, reconciliation and commit
-  for an initial conversation and one appended item. Run
+  destination databases and times the end-to-end initial sync and one appended-item
+  sync for a single conversation. Run
   `cargo test -p ai-hist --release --lib sqlite_single_append_benchmark -- --ignored --nocapture`.
   It defaults to 10,000 items and two repetitions. Set
   `AI_HIST_SQLITE_BENCH_ITEMS` and `AI_HIST_SQLITE_BENCH_RUNS` to vary the fixture.
