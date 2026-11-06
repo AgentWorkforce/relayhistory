@@ -116,10 +116,11 @@ export function ampEvidence(
         return (part.type === 'tool_result' && typeof part.toolUseID === 'string' && !!part.toolUseID) ||
           (part.type === 'text' && typeof part.text === 'string' && !part.text.trim());
       });
-    const content = onlyToolResults
-      ? toolResults.flatMap((result) => [result.output, result.error]
-          .map((value) => typeof value === 'string' ? value : value == null ? '' : JSON.stringify(value))
-          .filter((text) => text.trim())).join('\n')
+    const resultText = toolResults.flatMap((result) => [result.output, result.error]
+      .map((value) => typeof value === 'string' ? value : value == null ? '' : JSON.stringify(value))
+      .filter((text) => text.trim()));
+    const content = toolResults.length
+      ? [prose, ...resultText].filter((text) => text.trim()).join('\n')
       : prose;
     return {
       v: 1,
@@ -129,9 +130,9 @@ export function ampEvidence(
       lens: 'history',
       kind: onlyToolResults
         ? 'tool_call'
-        : role === 'user' && content.trim()
+        : role === 'user' && prose.trim()
         ? 'prompt'
-        : role === 'assistant' && content.trim()
+        : role === 'assistant' && prose.trim()
           ? 'assistant'
           : toolCalls.length || role === 'tool'
             ? 'tool_call'
@@ -180,6 +181,6 @@ if(op.kind==='discover')args.push('threads','search','author:me','--json','--lim
 else if(op.kind==='export')args.push('threads','export',op.threadId);
 else if(op.kind==='inject')args.push('threads','continue',op.threadId,'-ox');
 const r=spawnSync(process.env.RELAY_AMP_CLI_PATH||'/tmp/relay-amp/node_modules/.bin/amp',args,{encoding:'utf8',input:op.kind==='inject'?op.text:undefined,timeout:45000,maxBuffer:16777216,env:{...process.env,RELAY_AMP_OPERATION:''}});
-if(r.status!==0){process.stdout.write(JSON.stringify({ok:false,outcome:op.kind==='inject'?'unknown':'rejected',code:'amp_command_failed'}));process.exit(0)}
+if(r.error||r.status!==0){process.stdout.write(JSON.stringify({ok:false,outcome:op.kind==='inject'?'unknown':'rejected',code:'amp_command_failed'}));process.exit(0)}
 if(op.kind==='inject')process.stdout.write(JSON.stringify({ok:true,value:{accepted:true}}));
 else{try{process.stdout.write(JSON.stringify({ok:true,value:JSON.parse(r.stdout)}))}catch{process.stdout.write(JSON.stringify({ok:false,outcome:'rejected',code:'amp_invalid_json'}))}}`;

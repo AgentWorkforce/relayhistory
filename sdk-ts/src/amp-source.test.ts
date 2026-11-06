@@ -122,7 +122,7 @@ test('normalizes multiple tool outputs and errors without turning them into huma
   ]);
   const [mixed] = ampEvidence(tid, [{ ...msg, role: 'user', content: [{ type: 'text', text: 'human follow-up' }, ...content] }]);
   assert.equal(mixed.kind, 'prompt');
-  assert.equal(mixed.content, 'human follow-up');
+  assert.equal(mixed.content, 'human follow-up\nfound the file\n{"code":"missing_file"}');
   assert.deepEqual(mixed.record.toolResults, row.record.toolResults);
   const [unknown] = ampEvidence(tid, [{ ...msg, role: 'future-role', content }]);
   assert.equal(unknown.kind, 'marker');
@@ -147,6 +147,18 @@ test('mixed unknown or image blocks remain markers while known tool outcomes are
       { type: 'tool_result', toolUseID: 'call-1', run: { status: 'done', result: 'fixture output' } }, extra,
     ] }]);
     assert.equal(row.kind, 'marker');
+    assert.equal(row.content, 'fixture output');
     assert.deepEqual(row.record.toolResults, [{ id: 'call-1', status: 'done', output: 'fixture output' }]);
   }
+});
+
+test('human prose and mixed tool output both remain searchable without changing the human turn', () => {
+  const [row] = ampEvidence(tid, [{ ...msg, role: 'user', content: [
+    { type: 'text', text: 'A real follow-up' },
+    { type: 'tool_result', toolUseID: 'call-1', run: { status: 'error', result: 'partial output', error: 'fixture error' } },
+    { type: 'future-block' },
+  ] }]);
+  assert.equal(row.kind, 'prompt');
+  assert.equal(row.actorRole, 'user');
+  assert.equal(row.content, 'A real follow-up\npartial output\nfixture error');
 });
