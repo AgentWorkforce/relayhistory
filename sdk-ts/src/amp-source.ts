@@ -11,7 +11,7 @@ export type AmpEvidence = {
   ts: string;
   content: string;
   actorRole: string | null;
-  /** One envelope per native message; mixed/multiple calls retain their own native identities. */
+  /** Calls retain native identities; mixed human/tool messages have separate tool evidence. */
   toolCalls?: Array<{ id: string; tool: string; input: unknown }>;
   record: {
     messageId: string;
@@ -42,7 +42,7 @@ export function ampEvidence(
 ): AmpEvidence[] {
   const sessionId = ampThreadId(threadId);
   const seen = new Set<string>();
-  return messages.map((value) => {
+  return messages.flatMap((value): AmpEvidence[] => {
     const raw = object(value);
     const native = Object.hasOwn(raw, 'protocolMessageID') || Object.hasOwn(raw, 'protocolMessageVersion');
     const id = native ? raw.protocolMessageID : raw.messageID;
@@ -117,12 +117,17 @@ export function ampEvidence(
           (part.type === 'text' && typeof part.text === 'string' && !part.text.trim());
       });
     const resultText = toolResults.flatMap((result) => [result.output, result.error]
-      .map((value) => typeof value === 'string' ? value : value == null ? '' : JSON.stringify(value))
+      .map((value) => {
+        if (typeof value === 'string') return value;
+        if (value == null) return '';
+        try { return JSON.stringify(value) ?? ''; } catch { return ''; }
+      })
       .filter((text) => text.trim()));
-    const content = toolResults.length
+    const humanWithResults = role === 'user' && !!prose.trim() && toolResults.length > 0;
+    const content = humanWithResults ? prose : toolResults.length
       ? [prose, ...resultText].filter((text) => text.trim()).join('\n')
       : prose;
-    return {
+    const row: AmpEvidence = {
       v: 1,
       source: 'amp',
       sessionId,
@@ -149,6 +154,15 @@ export function ampEvidence(
         ...(nativeDate == null ? { timestampInferred: true as const } : {}),
       },
     };
+    if (!humanWithResults) return [row];
+    // A different event namespace prevents collisions with arbitrary native message IDs.
+    return [row, {
+      ...row,
+      eventId: `amp-tool-results:${sessionId}:${messageId}`,
+      kind: 'tool_call',
+      actorRole: 'tool',
+      content: resultText.join('\n'),
+    }];
   });
 }
 export function ampExport(threadId: string, value: unknown): AmpEvidence[] {

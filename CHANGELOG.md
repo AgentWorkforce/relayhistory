@@ -14,8 +14,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - Amp remote injection sends private text over stdin and treats process or stdin failures as unconfirmed submissions, preventing false acceptance and unsafe retries.
-
-- Amp tool results retain searchable output, call identity, status and errors in hosted history instead of becoming empty user prompts after privacy scrubbing.
+- Amp tool results retain searchable output, call identity, status and errors in hosted history as tool evidence after privacy scrubbing, keeping mixed human prompts separate from tool output.
 
 ## [0.56.0] - 2026-11-02
 

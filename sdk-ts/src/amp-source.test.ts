@@ -122,7 +122,7 @@ test('normalizes multiple tool outputs and errors without turning them into huma
   ]);
   const [mixed] = ampEvidence(tid, [{ ...msg, role: 'user', content: [{ type: 'text', text: 'human follow-up' }, ...content] }]);
   assert.equal(mixed.kind, 'prompt');
-  assert.equal(mixed.content, 'human follow-up\nfound the file\n{"code":"missing_file"}');
+  assert.equal(mixed.content, 'human follow-up');
   assert.deepEqual(mixed.record.toolResults, row.record.toolResults);
   const [unknown] = ampEvidence(tid, [{ ...msg, role: 'future-role', content }]);
   assert.equal(unknown.kind, 'marker');
@@ -152,13 +152,34 @@ test('mixed unknown or image blocks remain markers while known tool outcomes are
   }
 });
 
-test('human prose and mixed tool output both remain searchable without changing the human turn', () => {
-  const [row] = ampEvidence(tid, [{ ...msg, role: 'user', content: [
+test('human prose and mixed tool output remain distinct and searchable across revisions', () => {
+  const [row, result] = ampEvidence(tid, [{ ...msg, role: 'user', content: [
     { type: 'text', text: 'A real follow-up' },
     { type: 'tool_result', toolUseID: 'call-1', run: { status: 'error', result: 'partial output', error: 'fixture error' } },
     { type: 'future-block' },
   ] }]);
   assert.equal(row.kind, 'prompt');
   assert.equal(row.actorRole, 'user');
-  assert.equal(row.content, 'A real follow-up\npartial output\nfixture error');
+  assert.equal(row.content, 'A real follow-up');
+  assert.equal(result.kind, 'tool_call');
+  assert.equal(result.actorRole, 'tool');
+  assert.equal(result.content, 'partial output\nfixture error');
+  assert.notEqual(result.eventId, row.eventId);
+  const revised = ampEvidence(tid, [{ ...row.record.raw, messageVersion: 3 }]);
+  assert.deepEqual(revised.map((r) => r.eventId), [row.eventId, result.eventId]);
+  assert.equal(revised[1].record.messageVersion, 3);
+  assert.equal(result.record.messageId, row.record.messageId);
+});
+
+test('unserializable tool output never crashes readable projection', () => {
+  const cyclic: Record<string, unknown> = {};
+  cyclic.self = cyclic;
+  for (const output of [undefined, () => {}, Symbol('output'), 1n, cyclic]) {
+    const rows = ampEvidence(tid, [{ ...msg, role: 'user', content: [
+      { type: 'text', text: 'Human prose' },
+      { type: 'tool_result', toolUseID: 'call-1', run: { result: output, error: 'known failure' } },
+    ] }]);
+    assert.equal(rows[0].content, 'Human prose');
+    assert.equal(rows[1].content, 'known failure');
+  }
 });
