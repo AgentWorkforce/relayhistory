@@ -418,9 +418,7 @@ mod related;
 pub(crate) use related::{capture_related, restored_rollout};
 
 mod normalize;
-pub(crate) use normalize::{
-    claim_history_log_prompt, normalize, normalize_with_relationships, retire, retire_if_changed,
-};
+pub(crate) use normalize::{claim_history_log_prompt, reconcile, retire};
 
 pub(crate) fn decode(acquired: &AcquiredSession) -> Result<Capture> {
     serde_json::from_value(acquired.payload.clone()).map_err(Into::into)

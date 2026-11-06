@@ -52,6 +52,16 @@ fn fold_claude_head_line(
     if let Some(version) = value.get("version").and_then(Value::as_str) {
         session.agent_version = Some(version.to_string());
     }
+    // Claude Code records the client (`cli` for the terminal,
+    // `claude-desktop` for the Claude app, `sdk-ts` for an SDK run) on the
+    // same records as `version`, so the head settles only after reading it.
+    if session.originator.is_none() {
+        session.originator = value
+            .get("entrypoint")
+            .and_then(Value::as_str)
+            .filter(|entrypoint| !entrypoint.is_empty())
+            .map(str::to_string);
+    }
     // `<synthetic>` is the placeholder on a notice Claude Code wrote
     // itself; no model by that name ran in the session.
     push_unique(

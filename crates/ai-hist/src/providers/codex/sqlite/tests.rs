@@ -1,6 +1,8 @@
 use super::*;
 
 mod control;
+mod performance;
+mod transactions;
 
 fn install_fixture(codex: &Path, stem: &str) {
     std::fs::create_dir_all(codex).unwrap();

@@ -963,6 +963,107 @@ jobs:
           # crates.io credential minted from GitHub OIDC above, not a repo secret.
           cargo publish -p ai-hist --allow-dirty --locked --no-verify
 
+  publish-plugin-crate:
+    name: Publish history-provider-sources to crates.io
+    needs: [version, publish-crate]
+    # Its own job so the optional plugin crate can never hold back ai-hist, and
+    # skipped with the other plugins when `plugins` is off. It pins ai-hist
+    # exactly, so it only runs once publish-crate has put that version out.
+    if: ${{ !cancelled() && inputs.plugins && needs.version.result == 'success' && needs.publish-crate.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    defaults:
+      run:
+        working-directory: .
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+      CRATE_URL: https://crates.io/api/v1/crates/history-provider-sources
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.skip_core && format('refs/tags/sdk-ts-v{0}', needs.version.outputs.version) || github.sha }}
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Stamp history-provider-sources at the release version
+        id: plugin-crate
+        run: |
+          set -euo pipefail
+          manifest=plugins/provider-sources/rust/Cargo.toml
+          # Tags cut before the crate gained its exact ai-hist pin cannot be
+          # published to crates.io; a skip_core retry of one publishes ai-hist only.
+          if grep -q '^ai-hist = { version = "=' "$manifest"; then
+            node scripts/set-release-version.mjs "$VERSION"
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::$manifest has no exact ai-hist pin; not publishing history-provider-sources"
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: cargo publish dry-run
+        if: ${{ steps.plugin-crate.outputs.publish == 'true' }}
+        # A dry run publishes no ai-hist, so build against this checkout's.
+        run: >-
+          cargo publish --dry-run --allow-dirty --locked
+          --manifest-path plugins/provider-sources/rust/Cargo.toml
+          --config "patch.crates-io.ai-hist.path=\"$GITHUB_WORKSPACE/crates/ai-hist\""
+      - name: Check whether this version is already on crates.io
+        id: crate-gate
+        if: ${{ !inputs.dry_run && steps.plugin-crate.outputs.publish == 'true' }}
+        run: |
+          set -euo pipefail
+          status="$(
+            curl -sS -o /dev/null -w "%{http_code}" \
+              -A "relayhistory-publish-crate (github.com/AgentWorkforce/relayhistory)" \
+              "${CRATE_URL}/${VERSION}"
+          )"
+          case "$status" in
+            200)
+              echo "exists=true" >> "$GITHUB_OUTPUT"
+              echo "history-provider-sources ${VERSION} already exists on crates.io; skip"
+              ;;
+            404)
+              echo "exists=false" >> "$GITHUB_OUTPUT"
+              ;;
+            *)
+              echo "::error::crates.io lookup returned HTTP ${status}; not publishing"
+              exit 1
+              ;;
+          esac
+      - name: Authenticate with crates.io
+        if: ${{ !inputs.dry_run && steps.plugin-crate.outputs.publish == 'true' && steps.crate-gate.outputs.exists != 'true' }}
+        id: crates-auth
+        uses: rust-lang/crates-io-auth-action@v1
+      - name: Publish to crates.io
+        if: ${{ !inputs.dry_run && steps.plugin-crate.outputs.publish == 'true' && steps.crate-gate.outputs.exists != 'true' }}
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token }}
+        run: |
+          set -euo pipefail
+          # Packaging resolves the ai-hist version publish-crate just released;
+          # retry while the crates.io index catches up. A publish whose response
+          # was lost leaves the version live, so a failed attempt checks for it.
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            if cargo publish --allow-dirty --locked --no-verify \
+              --manifest-path plugins/provider-sources/rust/Cargo.toml; then
+              exit 0
+            fi
+            status="$(
+              curl -sS -o /dev/null -w "%{http_code}" \
+                -A "relayhistory-publish-crate (github.com/AgentWorkforce/relayhistory)" \
+                "${CRATE_URL}/${VERSION}" || true
+            )"
+            if [ "$status" = 200 ]; then
+              echo "history-provider-sources ${VERSION} is on crates.io"
+              exit 0
+            fi
+            echo "attempt ${attempt} failed; waiting for the index"
+            sleep 30
+          done
+          exit 1
+
   package-plugins:
     name: Package optional history plugins
     needs: [version, helpers]

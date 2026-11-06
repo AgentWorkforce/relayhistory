@@ -177,6 +177,23 @@ changes. The token tracks retention eviction only, not ordinary mutations or
 store replacement; a generation alone is not a store identity. No query scans
 or idle cache rebuilds are needed while the token is unchanged.
 
+For session membership and delegation, `SessionStore::retention_changes_since`
+returns the current generation and the identities affected since the supplied
+generation. Each eviction transaction records its candidate session and both
+endpoints of removed relationships alongside the generation. The reader obtains
+the generation and journal from one SQLite snapshot. Recheck each returned
+identity through `has_session` and the relevant relationship queries, then save
+the returned generation with the updated view. Continue following ordinary
+changes through the change feed and verify the store epoch separately.
+
+The journal retains 1,024 eviction generations. The result is `sessions: None`
+when a cursor is too old, a writer omitted a journal batch, a supplied generation
+is ahead of the store, or more than 4,096 identities would be returned. Rebuild
+the view in those cases. An empty list means complete coverage with no named
+identity affected, such as an anonymous-prompt eviction. Read-only handles over
+older stores can report missing coverage without a schema migration. Journal
+failure rolls back the eviction transaction, including its generation change.
+
 As with `forget_evidence`, eviction deletes its own change-feed tombstones
 **in the same transaction**, before any uploader can see them. Earlier
 ordinary deletion tombstones are preserved. Local retention therefore does
