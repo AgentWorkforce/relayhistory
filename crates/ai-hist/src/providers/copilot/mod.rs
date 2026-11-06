@@ -1,4 +1,4 @@
-//! Passive GitHub Copilot CLI history: the session journals under
+//! Passive GitHub Copilot history (CLI and VS Code Copilot harness): journals under
 //! `$COPILOT_HOME/session-state/<id>/events.jsonl` (default `~/.copilot`).
 //! No agent process, configuration, authentication or model access.
 use super::*;

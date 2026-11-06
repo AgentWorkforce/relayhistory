@@ -2661,6 +2661,22 @@ as current.
 
 ---
 
+## GitHub Copilot in VS Code
+
+The **Copilot** harness in VS Code uses the native Copilot runtime and persists
+`$COPILOT_HOME/session-state/<id>/events.jsonl` (default `~/.copilot`). The
+`copilot` provider discovers and hydrates those sessions with the same stable
+native identity as Copilot CLI. No additional API key, export, or parser is
+required. Messages, tool calls/results, models and raw usage markers are
+available; only counters actually recorded per message become message usage.
+Desktop consumers retain their normal history sharing controls and upload
+schedule.
+
+The older **Local** harness stores `workspaceStorage/*/chatSessions` mutation
+logs. Those files are a different format and are not ingested by `copilot`.
+Selecting Copilot rather than Local for new editor chats uses the supported
+native journal. See [the live writer provenance](../crates/ai-hist/src/providers/copilot/vscode-provenance.json).
+
 ## Adding a provider
 
 Providers are added **here and nowhere else**. RelayHistory is the single owner
