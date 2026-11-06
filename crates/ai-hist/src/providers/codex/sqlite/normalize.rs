@@ -153,7 +153,7 @@ fn marker(
 }
 
 mod events;
-use events::event;
+use events::{event, text_event, Kind, Overlaps};
 
 /// A changed projection replaces only rows that came from the previous
 /// SQLite capture. The rollout and history.jsonl keep their own evidence.
@@ -345,6 +345,7 @@ fn normalize(
     let mut prompts = 0;
     let mut history_ids = prior_history_ids(conn, &t.id)?;
     let mut result_indexer = ToolResultIndexer::default();
+    let mut overlaps = Overlaps::load(conn, &t.id)?;
     for item in &capture.items {
         prompts += normalize_item(
             conn,
@@ -353,6 +354,7 @@ fn normalize(
             &mut result_indexer,
             include_related,
             &mut history_ids,
+            &mut overlaps,
         )?;
     }
     for turn in &capture.turns {

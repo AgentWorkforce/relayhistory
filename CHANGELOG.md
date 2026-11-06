@@ -13,10 +13,11 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- Codex SQLite sync reconciles large conversations faster without changing captured history.
+- Codex SQLite sync reconciles large conversations with fewer repeated searches.
 
 ### Fixed
 
+- Codex SQLite sync preserves distinct messages with identical text and restores missing evidence when an overlap marker outlives its referenced rollout event.
 - Amp remote injection sends private text over stdin and treats process or stdin failures as unconfirmed submissions, preventing false acceptance and unsafe retries.
 - Amp tool results retain searchable output, call identity, status and errors in hosted history as tool evidence after privacy scrubbing, keeping mixed human prompts separate from tool output.
 

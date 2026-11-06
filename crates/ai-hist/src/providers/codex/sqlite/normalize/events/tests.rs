@@ -1,6 +1,25 @@
 use super::*;
 use rusqlite::StatementStatus;
 
+mod freshness;
+mod regressions;
+mod scaling;
+
+fn record_text(
+    conn: &Connection,
+    t: &Thread,
+    item: &Item,
+    uid: &str,
+    (role, kind): (&str, &str),
+    text: Option<&str>,
+    facts: Option<&ToolResultFacts>,
+) -> Result<bool> {
+    assert_eq!(uid, item.id);
+    assert_eq!(kind, "text");
+    assert!(facts.is_none());
+    text_event(conn, t, item, role, text, &mut Overlaps::load(conn, &t.id)?)
+}
+
 fn thread() -> Thread {
     serde_json::from_value(json!({
         "id":"thread", "created":1, "updated":2, "archived":false,
@@ -28,7 +47,7 @@ fn native_overlap_checks_both_identity_columns_in_the_same_session() {
             &format!("INSERT INTO session_events(source,session_id,event_uid,role,kind,ts_ms,{column}) \
                       VALUES ('codex','other','other-event','assistant','text',10000,'native-item')"), [],
         ).unwrap();
-        assert!(event(
+        assert!(record_text(
             &conn,
             &thread(),
             &item(),
@@ -42,7 +61,7 @@ fn native_overlap_checks_both_identity_columns_in_the_same_session() {
             .unwrap();
         conn.execute("UPDATE session_events SET session_id='thread'", [])
             .unwrap();
-        assert!(!event(
+        assert!(!record_text(
             &conn,
             &thread(),
             &item(),
@@ -62,9 +81,9 @@ fn idless_overlap_keeps_inclusive_timestamp_boundaries() {
         let conn = crate::open_db(&dir.path().join("history.db")).unwrap();
         conn.execute(
             "INSERT INTO session_events(source,session_id,event_uid,message_id,role,kind,ts_ms,text) \
-             VALUES ('codex','thread','rollout','0','assistant','text',?1,'answer')", [10_000 + delta],
+             VALUES ('codex','thread','rollout','rollout','assistant','text',?1,'answer')", [10_000 + delta],
         ).unwrap();
-        let inserted = event(
+        let inserted = record_text(
             &conn,
             &thread(),
             &item(),
@@ -106,6 +125,7 @@ fn normalize_image(conn: &Connection, item: &Item) {
         &mut ToolResultIndexer::default(),
         false,
         &mut Vec::new(),
+        &mut Overlaps::load(conn, "thread").unwrap(),
     )
     .unwrap();
 }
@@ -142,13 +162,13 @@ fn text_and_image_overlap_handle_negative_and_extreme_timestamps() {
             };
             conn.execute(
                 "INSERT INTO session_events(source,session_id,event_uid,message_id,role,kind,ts_ms,text,raw_kind) \
-                 VALUES ('codex','thread','rollout','0',?1,'text',?2,?3,?4)",
-                params![if image { "user" } else { "assistant" }, rollout_ts, text, image.then_some("input_image")],
+                 VALUES ('codex','thread',?1,?2,?3,'text',?4,?5,?6)",
+                params![if image {"1:input_image:0"} else {"rollout"}, if image {"1:response_item_user_message"} else {"rollout"}, if image { "user" } else { "assistant" }, rollout_ts, text, image.then_some("input_image")],
             ).unwrap();
             if image {
                 normalize_image(&conn, &item);
             } else {
-                let inserted = event(
+                let inserted = record_text(
                     &conn,
                     &thread(),
                     &item,
@@ -178,18 +198,21 @@ fn image_overlap_keeps_one_to_one_matching_and_row_id_ties() {
     let conn = crate::open_db(&dir.path().join("history.db")).unwrap();
     let image = image_item("first", 10_000);
     let text = image_markdown(&image);
-    for (uid, ts) in [("earlier-row", 5000), ("later-row", 15_000)] {
+    for (uid, message, ts) in [
+        ("1:input_image:0", "1:response_item_user_message", 5000),
+        ("2:input_image:0", "2:response_item_user_message", 15_000),
+    ] {
         conn.execute(
             "INSERT INTO session_events(source,session_id,event_uid,message_id,role,kind,ts_ms,text,raw_kind) \
-             VALUES ('codex','thread',?1,?1,'user','text',?2,?3,'input_image')",
-            params![uid, ts, text],
+             VALUES ('codex','thread',?1,?2,'user','text',?3,?4,'input_image')",
+            params![uid, message, ts, text],
         ).unwrap();
     }
     normalize_image(&conn, &image);
     normalize_image(&conn, &image_item("second", 10_000));
     normalize_image(&conn, &image_item("third", 10_000));
     normalize_image(&conn, &image);
-    for (native, rollout) in [("first", "earlier-row"), ("second", "later-row")] {
+    for (native, rollout) in [("first", "1:input_image:0"), ("second", "2:input_image:0")] {
         let chosen: String = conn.query_row(
             "SELECT json_extract(payload_json,'$.rollout_event_uid') FROM session_markers WHERE marker_uid=?1",
             [format!("sqlite:overlap:{native}:input_image:0")], |r| r.get(0),

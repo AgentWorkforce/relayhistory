@@ -8,10 +8,11 @@ pub(super) fn normalize_item(
     result_indexer: &mut ToolResultIndexer,
     include_related: bool,
     history_ids: &mut Vec<i64>,
+    overlaps: &mut Overlaps,
 ) -> Result<usize> {
     match item.kind.as_str() {
-        "userMessage" => user(conn, t, item, history_ids),
-        "agentMessage" => agent(conn, t, item),
+        "userMessage" => user(conn, t, item, history_ids, overlaps),
+        "agentMessage" => agent(conn, t, item, overlaps),
         "reasoning" => reasoning(conn, t, item),
         "commandExecution" | "mcpToolCall" | "collabAgentToolCall" | "webSearch" => {
             tool(conn, t, item, result_indexer, include_related)
@@ -24,15 +25,21 @@ pub(super) fn normalize_item(
     }
 }
 
-fn user(conn: &Connection, t: &Thread, item: &Item, history_ids: &mut Vec<i64>) -> Result<usize> {
+fn user(
+    conn: &Connection,
+    t: &Thread,
+    item: &Item,
+    history_ids: &mut Vec<i64>,
+    overlaps: &mut Overlaps,
+) -> Result<usize> {
     let text = text_blocks(&item.value["content"]);
     let control = crate::ingest::control::codex_text_control_kind(&text);
     let recorded = if text.is_empty() {
         false
     } else {
-        event(conn, t, item, &item.id, ("user", "text"), Some(&text), None)?
+        text_event(conn, t, item, "user", Some(&text), overlaps)?
     };
-    user_images(conn, t, item)?;
+    user_images(conn, t, item, overlaps)?;
     if t.is_child() || !recorded || control.is_some() {
         return Ok(0);
     }
@@ -55,7 +62,7 @@ fn user(conn: &Connection, t: &Thread, item: &Item, history_ids: &mut Vec<i64>) 
     Ok(inserted)
 }
 
-fn user_images(conn: &Connection, t: &Thread, item: &Item) -> Result<()> {
+fn user_images(conn: &Connection, t: &Thread, item: &Item, overlaps: &mut Overlaps) -> Result<()> {
     let Some(content) = item.value["content"].as_array() else {
         return Ok(());
     };
@@ -80,41 +87,39 @@ fn user_images(conn: &Connection, t: &Thread, item: &Item) -> Result<()> {
             continue;
         }
         let overlap_uid = format!("sqlite:overlap:{}:input_image:{index}", item.id);
-        let mapped: bool = conn.query_row(
-            "SELECT EXISTS(SELECT 1 FROM session_markers WHERE source='codex' AND session_id=?1 AND marker_uid=?2)",
-            params![t.id, overlap_uid],
-            |row| row.get(0),
-        )?;
-        if mapped {
+        if overlaps.mapped(conn, t, item, &overlap_uid, Kind::Image, &markdown)? {
             continue;
         }
-        let rollout_uid: Option<String> = conn.query_row(
-            "SELECT event_uid FROM session_events WHERE source='codex' AND session_id=?1 \
+        let mut stmt = conn.prepare(
+            "SELECT event_uid,message_id,provider_message_id FROM session_events WHERE source='codex' AND session_id=?1 \
              AND role='user' AND kind='text' AND raw_kind='input_image' AND text=?2 \
-             AND ABS(ts_ms - ?3) <= ?4 \
-             AND ts_ms BETWEEN ?5 AND ?6 \
-             AND NOT EXISTS (SELECT 1 FROM session_markers AS marker \
-               WHERE marker.source='codex' AND marker.session_id=?1 \
-               AND marker.marker_uid LIKE 'sqlite:overlap:%' \
-               AND json_extract(marker.payload_json, '$.rollout_event_uid')=session_events.event_uid) \
-             ORDER BY ABS(ts_ms - ?3), id LIMIT 1",
-            params![
-                t.id, markdown, item.ts, IDLESS_ROLLOUT_TIMESTAMP_TOLERANCE_MS,
-                item.ts.saturating_sub(IDLESS_ROLLOUT_TIMESTAMP_TOLERANCE_MS),
-                item.ts.saturating_add(IDLESS_ROLLOUT_TIMESTAMP_TOLERANCE_MS)
-            ],
-            |row| row.get(0),
-        ).optional()?;
-        if let Some(rollout_uid) = rollout_uid {
-            marker(
-                conn,
-                t,
-                &overlap_uid,
-                item.ts,
-                "rollout_overlap",
-                &json!({"rollout_event_uid":rollout_uid}),
-                item.turn_id.as_deref(),
-            )?;
+             AND ABS(ts_ms - ?3) <= ?4 AND ts_ms BETWEEN ?5 AND ?6 \
+             ORDER BY ABS(ts_ms - ?3), id"
+        )?;
+        let mut rows = stmt.query(params![
+            t.id,
+            markdown,
+            item.ts,
+            IDLESS_ROLLOUT_TIMESTAMP_TOLERANCE_MS,
+            item.ts
+                .saturating_sub(IDLESS_ROLLOUT_TIMESTAMP_TOLERANCE_MS),
+            item.ts
+                .saturating_add(IDLESS_ROLLOUT_TIMESTAMP_TOLERANCE_MS)
+        ])?;
+        let mut matched = None;
+        while let Some(row) = rows.next()? {
+            let uid: String = row.get(0)?;
+            let message: String = row.get(1)?;
+            let provider: Option<String> = row.get(2)?;
+            if !overlaps.claimed(&uid)
+                && Overlaps::legacy_image(&uid, &message, provider.as_deref())
+            {
+                matched = Some(uid);
+                break;
+            }
+        }
+        if let Some(uid) = matched {
+            overlaps.claim(conn, t, item, &overlap_uid, Kind::Image, uid)?;
             continue;
         }
         crate::ingest::insert_session_event(
@@ -143,17 +148,9 @@ fn user_images(conn: &Connection, t: &Thread, item: &Item) -> Result<()> {
     Ok(())
 }
 
-fn agent(conn: &Connection, t: &Thread, item: &Item) -> Result<usize> {
+fn agent(conn: &Connection, t: &Thread, item: &Item, overlaps: &mut Overlaps) -> Result<usize> {
     let value = &item.value;
-    event(
-        conn,
-        t,
-        item,
-        &item.id,
-        ("assistant", "text"),
-        value["text"].as_str(),
-        None,
-    )?;
+    text_event(conn, t, item, "assistant", value["text"].as_str(), overlaps)?;
     if let Some(phase) = value["phase"].as_str() {
         marker(
             conn,
