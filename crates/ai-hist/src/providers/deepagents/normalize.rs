@@ -147,6 +147,7 @@ fn write(conn: &Connection, s: &Session, path: &Path) -> Result<usize> {
             message(conn, s, m, &mut replay, &mut replay_indexer, true)?;
         }
     }
+    retire_superseded_legacy_history(conn, &s.id)?;
     reconcile_history(conn, &s.id)?;
     Ok(inserted)
 }
@@ -238,6 +239,7 @@ fn message(
         inserted += crate::insert_history(
             conn,
             &HistoryEntry {
+                event_uid: Some(format!("{prefix}:text")),
                 id: 0,
                 source: ID.into(),
                 session_id: Some(s.id.clone()),
@@ -409,7 +411,7 @@ fn bounded_tool_json(
     .to_string())
 }
 fn reconcile_history(conn: &Connection, session: &str) -> Result<()> {
-    const MATCH: &str = "e.source=history.source AND e.role='user' AND e.kind='text' AND e.control_kind IS NULL AND e.ts_ms=history.timestamp_ms AND e.text=history.prompt";
+    const MATCH: &str = "(history.event_uid IS NULL OR (e.event_uid=history.event_uid AND e.session_id=history.session_id)) AND e.source=history.source AND e.role='user' AND e.kind='text' AND e.control_kind IS NULL AND e.ts_ms=history.timestamp_ms AND e.text=history.prompt";
     conn.execute(&format!("UPDATE history SET session_id=(SELECT e.session_id FROM session_events e WHERE {MATCH} ORDER BY e.session_id LIMIT 1), project=(SELECT e.cwd FROM session_events e WHERE {MATCH} ORDER BY e.session_id LIMIT 1) WHERE source=?1 AND session_id=?2 AND NOT EXISTS(SELECT 1 FROM session_events e WHERE {MATCH} AND e.session_id=?2) AND EXISTS(SELECT 1 FROM session_events e WHERE {MATCH})"),rusqlite::params![ID,session])?;
     conn.execute(&format!("DELETE FROM history WHERE source=?1 AND session_id=?2 AND NOT EXISTS(SELECT 1 FROM session_events e WHERE {MATCH})"),rusqlite::params![ID,session])?;
     Ok(())
@@ -426,5 +428,10 @@ pub(super) fn retire_deleted(conn: &Connection, path: &Path, ids: &[String]) -> 
         crate::ingest::check_capture_cancelled()?;
         crate::providers::file_history::retire_local_session(conn, ID, &id)?;
     }
+    Ok(())
+}
+
+fn retire_superseded_legacy_history(conn: &Connection, session: &str) -> Result<()> {
+    conn.execute("DELETE FROM history WHERE source=?1 AND session_id=?2 AND event_uid IS NULL AND NOT EXISTS (SELECT 1 FROM observation_evidence oe WHERE oe.source=history.source AND oe.session_id=history.session_id AND oe.location='remote' AND json_extract(oe.payload_json,'$.item.managed')=1 AND json_extract(oe.payload_json,'$.item.record.kind')='history' AND json_extract(oe.payload_json,'$.item.record.payload.event_uid') IS NULL AND json_extract(oe.payload_json,'$.item.record.payload.timestamp_ms')=history.timestamp_ms AND json_extract(oe.payload_json,'$.item.record.payload.prompt')=history.prompt)",rusqlite::params![ID,session])?;
     Ok(())
 }

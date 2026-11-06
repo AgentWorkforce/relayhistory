@@ -21,7 +21,7 @@
     },
     {
       "evidence": "Tools and control",
-      "coverage": "Persisted tool_use and tool_result IDs joined; active-leaf and last-prompt retained as markers. Same-millisecond remote ordering conflict reports retryable failure under #463. Usage objects supplied to writer are discarded, so per-request usage stays unknown. No file edits or relationships inferred. Qoder CN and IDE schemas are excluded."
+      "coverage": "Persisted tool_use and tool_result IDs joined; active-leaf and last-prompt retained as markers. Recorded same-millisecond order survives export/intake and matching local hydration; a contradictory native reorder still reports a retryable conflict. Usage objects supplied to writer are discarded, so per-request usage stays unknown. No file edits or relationships inferred. Qoder CN and IDE schemas are excluded."
     }
   ],
   "population": {

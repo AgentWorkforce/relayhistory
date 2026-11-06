@@ -4184,7 +4184,7 @@
       "repo_url": null,
       "session_id": "default:30313961303030302d303030302d373030302d383030302d303030303030303030343433",
       "source": "deepagents",
-      "source_stamp": "dcode_checkpoint_v1:sha256:880858d6069674ba0d5c0e4d6f8a825e7b30941da0238082dbad9456546acca5",
+      "source_stamp": "dcode_checkpoint_v2:sha256:880858d6069674ba0d5c0e4d6f8a825e7b30941da0238082dbad9456546acca5",
       "title": null,
       "workspace_roots_json": null
     },
@@ -4204,7 +4204,7 @@
       "repo_url": null,
       "session_id": "default:30313961303030302d303030302d373030302d383030302d303030303030303030343434",
       "source": "deepagents",
-      "source_stamp": "dcode_checkpoint_v1:sha256:6cc3cd1b74769bd2143ecc0a7377c01b4105348e31600e2657f80e2b31ba478f",
+      "source_stamp": "dcode_checkpoint_v2:sha256:6cc3cd1b74769bd2143ecc0a7377c01b4105348e31600e2657f80e2b31ba478f",
       "title": null,
       "workspace_roots_json": null
     },
@@ -4224,7 +4224,7 @@
       "repo_url": null,
       "session_id": "default:30313961303030302d303030302d373030302d383030302d303030303030303030343435",
       "source": "deepagents",
-      "source_stamp": "dcode_checkpoint_v1:sha256:7418bc563029e5292a<n>fd419f664c48bc1add269f0c4674012",
+      "source_stamp": "dcode_checkpoint_v2:sha256:7418bc563029e5292a<n>fd419f664c48bc1add269f0c4674012",
       "title": null,
       "workspace_roots_json": null
     },
@@ -4244,7 +4244,7 @@
       "repo_url": null,
       "session_id": "default:30313961303030302d303030302d373030302d383030302d303030303030303030343436",
       "source": "deepagents",
-      "source_stamp": "dcode_checkpoint_v1:sha256:7c55cd24bd05e6fbc0a8e4992eafd5e6a7ecb8aeac61848c7331aa652206208c",
+      "source_stamp": "dcode_checkpoint_v2:sha256:7c55cd24bd05e6fbc0a8e4992eafd5e6a7ecb8aeac61848c7331aa652206208c",
       "title": null,
       "workspace_roots_json": null
     }

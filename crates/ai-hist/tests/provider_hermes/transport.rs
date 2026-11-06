@@ -217,7 +217,12 @@ fn assert_location(home: &Path, location: &str) {
         assert_eq!(locations, vec![location.to_string()], "{table}");
     }
 }
-fn roundtrip(archive: &[HistoryExportRecord], expected: &SessionEvidence, local_first: bool) {
+fn roundtrip(
+    archive: &[HistoryExportRecord],
+    expected: &SessionEvidence,
+    local_first: bool,
+    native_expected: &SessionEvidence,
+) {
     let home = tempfile::tempdir().unwrap();
     let store = open(home.path());
     if local_first {
@@ -234,6 +239,36 @@ fn roundtrip(archive: &[HistoryExportRecord], expected: &SessionEvidence, local_
         stage(home.path());
         hydrate(&store);
     }
+    // A native reread can enrich previously unknown ordering. A legacy null
+    // makes no claim, but any newly supplied rank must match the independent
+    // fresh native capture, rather than a value guessed from receiver row IDs.
+    let actual = read(&store);
+    let mut after_capture = expected.clone();
+    for block in after_capture
+        .messages
+        .iter_mut()
+        .flat_map(|m| &mut m.blocks)
+    {
+        if block.source_order.is_none() {
+            let observed = actual
+                .messages
+                .iter()
+                .flat_map(|m| &m.blocks)
+                .find(|b| b.event_uid == block.event_uid)
+                .expect("retained event");
+            if observed.source_order.is_some() {
+                let native = native_expected
+                    .messages
+                    .iter()
+                    .flat_map(|m| &m.blocks)
+                    .find(|b| b.event_uid == block.event_uid)
+                    .expect("native oracle event");
+                assert_eq!(observed.source_order, native.source_order);
+                block.source_order = observed.source_order;
+            }
+        }
+    }
+    let expected = &after_capture;
     assert_location(home.path(), if local_first { "local" } else { "both" });
     assert_same(&read(&store), expected);
     let before = store.head_revision().unwrap();
@@ -273,7 +308,7 @@ fn hermes_native_export_preserves_tool_identity_in_both_acquisition_orders() {
     assert_native(&expected);
     let archive = export(origin.path());
     for local_first in [false, true] {
-        roundtrip(&archive, &expected, local_first);
+        roundtrip(&archive, &expected, local_first, &expected);
     }
 }
 #[test]
@@ -294,20 +329,50 @@ fn hermes_pre_intake_index_and_archive_work_without_reindexing() {
     let current = export(home.path());
     let old: Vec<HistoryExportRecord> =
         serde_json::from_str(include_str!("fixtures/pre-intake-export.json")).unwrap();
+    let current_records = records(&current);
+    let mut legacy_records = records(&old);
+    for record in &current_records {
+        if record.kind == EvidenceKind::SessionEvent {
+            assert_eq!(
+                record.payload.get("source_order"),
+                Some(&serde_json::Value::Null),
+                "opening a legacy index must not invent source ordering"
+            );
+        }
+    }
+    for record in &mut legacy_records {
+        if record.kind == EvidenceKind::SessionEvent {
+            assert!(
+                !record.payload.contains_key("source_order"),
+                "fixture must retain its pre-order archive shape"
+            );
+            record
+                .payload
+                .insert("source_order".into(), serde_json::Value::Null);
+        }
+    }
     assert_eq!(
-        records(&current)
+        current_records
             .iter()
             .map(|r| &r.payload)
             .collect::<Vec<_>>(),
-        records(&old).iter().map(|r| &r.payload).collect::<Vec<_>>()
+        legacy_records
+            .iter()
+            .map(|r| &r.payload)
+            .collect::<Vec<_>>()
     );
     assert_eq!(
         store.head_revision().unwrap(),
         before,
         "old index remains unchanged without force-sync"
     );
+    let native_home = tempfile::tempdir().unwrap();
+    stage(native_home.path());
+    let native = open(native_home.path());
+    hydrate(&native);
+    let native_expected = read(&native);
     for archive in [&old, &current] {
-        roundtrip(archive, &expected, false);
+        roundtrip(archive, &expected, false, &native_expected);
     }
 }
 #[test]

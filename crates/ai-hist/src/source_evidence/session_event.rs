@@ -13,6 +13,12 @@ pub(super) fn validate_session_event(payload: &Map<String, Value>) -> Result<()>
                 .contains(&payload["kind"].as_str().unwrap_or_default()),
         "INVALID_ARGUMENT: invalid event role or kind"
     );
+    if let Some(value) = payload.get("source_order").filter(|value| !value.is_null()) {
+        ensure!(
+            value.as_i64().is_some_and(|order| order >= 0),
+            "INVALID_ARGUMENT: source_order must be a nonnegative integer"
+        );
+    }
     // `control_kind` is a closed vocabulary, and every reader -- the
     // user-turn page, prompt attribution, the plugin's turn export --
     // treats any non-null value as authoritative without rechecking

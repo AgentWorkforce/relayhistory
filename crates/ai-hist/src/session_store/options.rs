@@ -114,6 +114,7 @@ pub(crate) fn controlled<T>(
     progress: Option<&ProgressObserver>,
     work: impl FnOnce() -> Result<T, Error>,
 ) -> Result<T, Error> {
+    let _output = crate::ingest::output::Scope::enter(true);
     let stop = stop.cloned();
     let stoppable = move || match stop {
         Some(token) => with_capture_token(token, || Ok(work())),

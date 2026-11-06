@@ -91,8 +91,10 @@ const MIGRATION: &str = "change_feed_v2";
 
 mod epochs;
 mod export_schema;
+mod history_identity;
 mod validate;
 use export_schema::reconcile_export_schema;
+use history_identity::{row_to_history, HISTORY_COLUMNS};
 
 /// The column a named cursor records its kind set in.
 const KINDS_COLUMN: &str = "kinds";
@@ -398,21 +400,6 @@ impl ChangeKind {
     }
 }
 
-/// The typed [`HistoryEntry`] columns, in the order [`row_to_history`] reads.
-const HISTORY_COLUMNS: &str = "id, source, session_id, project, prompt, prompt_hash, timestamp_ms";
-
-fn row_to_history(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEntry> {
-    Ok(HistoryEntry {
-        id: row.get(0)?,
-        source: row.get(1)?,
-        session_id: row.get(2)?,
-        project: row.get(3)?,
-        prompt: row.get(4)?,
-        prompt_hash: row.get(5)?,
-        timestamp_ms: row.get(6)?,
-    })
-}
-
 /// One stamped table: where a record's source, session and identity live.
 ///
 /// A record is named two ways. `key` is its identity -- the columns of the
@@ -476,6 +463,9 @@ impl FedTable {
 
     /// The `record_key` as SQL over `row`.
     fn record_key_sql(&self, row: &str) -> String {
+        if self.name == "history" {
+            return history_identity::record_key_sql(row);
+        }
         match self.record {
             [column] => format!("{row}.{column}"),
             columns => format!(
@@ -523,6 +513,9 @@ impl FedTable {
                 )
             })?,
         };
+        if kind == ChangeKind::History {
+            return Ok(history_identity::key_from_identity(source, record));
+        }
         let mut key = Vec::with_capacity(self.key.len() + 1);
         key.push(Value::String(kind.as_str().to_string()));
         for column in self.key {
@@ -539,6 +532,9 @@ impl FedTable {
 
     /// [`Change::key`] from a stored row.
     fn key_from_row(&self, kind: ChangeKind, row: &StoredRow) -> Vec<Value> {
+        if kind == ChangeKind::History {
+            return history_identity::key_from_row(row);
+        }
         let mut key = Vec::with_capacity(self.key.len() + 1);
         key.push(Value::String(kind.as_str().to_string()));
         key.extend(

@@ -27,8 +27,12 @@ use ai_hist::git_helpers::*;
 use ai_hist::history_search::{search_all, SearchRole, SearchRow};
 use ai_hist::paths::{default_opencode_db_path, home_dir};
 use ai_hist::{discover, remote, *};
+mod early_command;
 mod export;
+mod history_entries;
 mod import;
+use history_entries::{get_entry, load_sqlite_entries, query_entries, row_to_entry};
+mod retention_cli;
 use import::import_history;
 
 use export::export_history;
@@ -319,6 +323,19 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Preview retention policy; --apply saves it and runs one bounded batch.
+    Retention {
+        #[arg(long)]
+        days: Option<u32>,
+        #[arg(long)]
+        apply: bool,
+        #[arg(long, requires = "apply")]
+        allow_unuploaded: bool,
+        #[arg(long, default_value_t = 128, value_parser = clap::value_parser!(u32).range(1..=1024))]
+        max_rows: u32,
+        #[arg(long)]
+        json: bool,
+    },
     /// Build a compact context pack from matching history.
     Pack {
         #[command(flatten)]
@@ -598,67 +615,8 @@ pub fn run() -> Result<()> {
     // Sync commands must acquire their advisory lock before opening a writable connection.
     // Pre-dispatch them so the common connection setup below cannot initialize the schema or
     // wait on SQLite before contention is detected.
-    match &cli.command {
-        Command::Sync { scope } => {
-            return sync_scoped_at_with_output(
-                &db_path,
-                scope.resolve(),
-                &connectors,
-                SyncOutput::Progress,
-            )
-            .map(|_| ());
-        }
-        Command::Watch {
-            scope,
-            interval,
-            no_fsevents,
-            debounce_ms,
-            no_leading_edge,
-        } => {
-            if scope.resolve() == SessionScope::Remote {
-                remote::ensure_selected_remote_connectors_configured_for("sync", &[], &connectors)?;
-            }
-            return watch_loop_with_connectors(
-                &db_path,
-                *interval,
-                scope.resolve(),
-                &connectors,
-                WatchDrivers {
-                    use_fs_events: !*no_fsevents,
-                    debounce_ms: *debounce_ms,
-                    leading_edge: !*no_leading_edge,
-                },
-            );
-        }
-        Command::Ingest { hook, quiet, json } => {
-            return run_hook_ingest(&db_path, hook, *quiet, *json);
-        }
-        // Takes the sync lock and opens its own connection: a second handle
-        // held open here would pin the WAL the compaction is truncating.
-        Command::Compact { json } => return compact(&db_path, *json),
-        Command::Sessions {
-            action: SessionsAction::Discover { scope, source, .. },
-        } if scope.resolve() == SessionScope::Remote => {
-            remote::ensure_selected_remote_connectors_configured_for(
-                "discovery",
-                source,
-                &connectors,
-            )?;
-        }
-        Command::SyncOpencode { opencode_db } => {
-            // An explicit `--opencode-db` names one store; otherwise every
-            // channel database is read, as `sync` reads them.
-            return match opencode_db {
-                Some(source) => sync_opencode_at(&db_path, source, SyncOutput::Progress),
-                None => sync_opencode_with_roots(
-                    &db_path,
-                    &ProviderRoots::from_env(home_dir()),
-                    SyncOutput::Progress,
-                ),
-            }
-            .map(|_| ());
-        }
-        _ => {}
+    if early_command::run(&cli.command, &db_path, &connectors)?.is_some() {
+        return Ok(());
     }
     // Read-only commands get a handle that cannot take the write lock, so a
     // query never contends with the writer. Falls back to a writable open when
@@ -790,6 +748,9 @@ pub fn run() -> Result<()> {
         Command::Context { id, window } => show_context(&conn, id, window),
         Command::Doctor { json } => doctor(&db_path, json),
         Command::Compact { .. } => anyhow::bail!("compact is dispatched before a connection opens"),
+        Command::Retention { .. } => {
+            anyhow::bail!("retention is dispatched before a connection opens")
+        }
         Command::Pack {
             scope,
             query,
@@ -1796,7 +1757,7 @@ fn show_context(conn: &Connection, id: i64, window_minutes: i64) -> Result<()> {
     if let Some(session_id) = &entry.session_id {
         let rows = query_entries(
             conn,
-            "SELECT id, source, session_id, project, prompt, timestamp_ms FROM history WHERE session_id = ? ORDER BY timestamp_ms ASC",
+            "SELECT id, source, session_id, project, prompt, timestamp_ms, event_uid FROM history WHERE session_id = ? ORDER BY timestamp_ms ASC",
             &[session_id],
         )?;
         if !rows.is_empty() {
@@ -1811,7 +1772,7 @@ fn show_context(conn: &Connection, id: i64, window_minutes: i64) -> Result<()> {
     let window_ms = window_minutes * 60 * 1000;
     let sid = entry.session_id.as_deref().unwrap_or("");
     let mut stmt = conn.prepare(
-        "SELECT id, source, session_id, project, prompt, timestamp_ms FROM history \
+        "SELECT id, source, session_id, project, prompt, timestamp_ms, event_uid FROM history \
          WHERE timestamp_ms BETWEEN ? AND ? AND (session_id IS NULL OR session_id != ?) \
          ORDER BY timestamp_ms ASC",
     )?;
@@ -2916,35 +2877,6 @@ fn git_status(repo: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn get_entry(conn: &Connection, id: i64) -> Result<HistoryEntry> {
-    conn.query_row(
-        "SELECT id, source, session_id, project, prompt, timestamp_ms FROM history WHERE id = ?",
-        [id],
-        row_to_entry,
-    )
-    .with_context(|| format!("No entry with id {id}"))
-}
-
-fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEntry> {
-    Ok(HistoryEntry {
-        id: row.get(0)?,
-        source: row.get(1)?,
-        session_id: row.get(2)?,
-        project: row.get(3)?,
-        prompt: row.get(4)?,
-        prompt_hash: None,
-        timestamp_ms: row.get(5)?,
-    })
-}
-
-fn query_entries(conn: &Connection, sql: &str, params_: &[&String]) -> Result<Vec<HistoryEntry>> {
-    let mut stmt = conn.prepare(sql)?;
-    let rows = stmt
-        .query_map(rusqlite::params_from_iter(params_.iter()), row_to_entry)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
-}
-
 /// Restrict a history/event query by where its canonical session is present.
 ///
 /// Legacy rows with no session id or no classification are local so upgrading
@@ -3102,38 +3034,6 @@ fn load_jsonl_entries(path: &Path) -> Result<Vec<HistoryEntry>> {
         }
         entries.push(serde_json::from_value(value)?);
     }
-    Ok(entries)
-}
-
-fn load_sqlite_entries(path: &Path) -> Result<Vec<HistoryEntry>> {
-    let src = Connection::open(path)?;
-    let cols = src
-        .prepare("PRAGMA table_info(history)")?
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    let has_hash = cols.iter().any(|col| col == "prompt_hash");
-    let sql = if has_hash {
-        "SELECT id, source, session_id, project, prompt, prompt_hash, timestamp_ms FROM history"
-    } else {
-        "SELECT id, source, session_id, project, prompt, NULL, timestamp_ms FROM history"
-    };
-    let mut stmt = src.prepare(sql)?;
-    let entries = stmt
-        .query_map([], |row| {
-            let prompt: String = row.get(4)?;
-            Ok(HistoryEntry {
-                id: row.get(0)?,
-                source: row.get(1)?,
-                session_id: row.get(2)?,
-                project: row.get(3)?,
-                prompt_hash: row
-                    .get::<_, Option<String>>(5)?
-                    .or_else(|| Some(prompt_hash(&prompt))),
-                prompt,
-                timestamp_ms: row.get(6)?,
-            })
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(entries)
 }
 
@@ -3321,6 +3221,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         let entry = HistoryEntry {
+            event_uid: None,
             id: 1,
             source: "codex".into(),
             session_id: Some("cloud-session".into()),
@@ -3555,6 +3456,7 @@ mod tests {
             insert_history(
                 conn,
                 &HistoryEntry {
+                    event_uid: None,
                     id: 0,
                     source: source.into(),
                     session_id: Some(session.into()),
@@ -3572,7 +3474,7 @@ mod tests {
 
     fn history_rows(conn: &Connection) -> Vec<ExportedRow> {
         conn.prepare(
-            "SELECT source, session_id, project, prompt, timestamp_ms FROM history \
+            "SELECT source, session_id, project, prompt, timestamp_ms, event_uid FROM history \
              ORDER BY timestamp_ms",
         )
         .unwrap()

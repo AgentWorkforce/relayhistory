@@ -19,6 +19,7 @@ napi-derive = "2"
 rusqlite = { version = "0.32", features = ["bundled"] }
 
 [dev-dependencies]
+fs2 = "0.4"
 tempfile = "3"
 
 [build-dependencies]

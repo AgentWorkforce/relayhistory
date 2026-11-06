@@ -1038,3 +1038,6 @@ fn recency_query_aggregates_messages_once_and_bounds_selected_capture() {
         .unwrap();
     assert_eq!(latest, 2000000001.0);
 }
+
+#[path = "native_order_tests.rs"]
+mod native_order_tests;

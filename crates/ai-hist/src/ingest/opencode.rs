@@ -611,25 +611,8 @@ pub(crate) fn sqlite_store_holds_session(store: &Path, session_id: &str) -> Resu
     Ok(held)
 }
 
-/// Whether `columns` holds every one of `names`: the columns a loader reads.
-pub(crate) fn has_columns(columns: &BTreeSet<String>, names: &[&str]) -> bool {
-    names.iter().all(|name| columns.contains(*name))
-}
-
-pub(crate) fn table_columns(conn: &Connection, table: &str) -> Result<BTreeSet<String>> {
-    Ok(conn
-        .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))?
-        .query_map([], |row| row.get::<_, String>(0))?
-        .collect::<rusqlite::Result<BTreeSet<String>>>()?)
-}
-
-pub(crate) fn optional_column<'a>(columns: &BTreeSet<String>, name: &'a str) -> &'a str {
-    if columns.contains(name) {
-        name
-    } else {
-        "NULL"
-    }
-}
+mod schema;
+pub(crate) use schema::{has_columns, optional_column, table_columns};
 
 // ---------------------------------------------------------------------------
 // Loader: legacy JSON tree (`storage/`)
@@ -1325,30 +1308,8 @@ pub(crate) struct OpencodeIngestCounts {
 /// for SQLite, the session file for the JSON tree. Everything else comes from
 /// the loaded session, so the two layouts produce identical rows apart from
 /// that one field.
-pub(crate) fn normalize(
-    conn: &Connection,
-    loaded: &OpencodeSession,
-    raw_path: &str,
-) -> Result<OpencodeIngestCounts> {
-    // One session, one atomic replacement. Reading a session is a read of its
-    // *current* files, so it has to end with the database agreeing — and the
-    // half-state between "the retired rows are gone" and "the new ones are
-    // written" must never be visible to a reader.
-    //
-    // A savepoint rather than a transaction, because the callers differ:
-    // hydration already holds one (a nested `BEGIN` would fail), global sync
-    // does not. A savepoint nests either way.
-    conn.execute_batch("SAVEPOINT ai_hist_opencode_session")?;
-    let result = normalize_session(conn, loaded, raw_path);
-    if result.is_ok() {
-        conn.execute_batch("RELEASE ai_hist_opencode_session")?;
-    } else {
-        let _ = conn.execute_batch(
-            "ROLLBACK TO ai_hist_opencode_session; RELEASE ai_hist_opencode_session;",
-        );
-    }
-    result
-}
+mod acquisition;
+pub(crate) use acquisition::normalize;
 
 /// The provider-owned rows this read produced, by each table's own stable key.
 ///
@@ -1509,6 +1470,7 @@ fn normalize_session(
                     counts.prompts += insert_history(
                         conn,
                         &HistoryEntry {
+                            event_uid: None,
                             id: 0,
                             source: "opencode".into(),
                             session_id: Some(session_id.to_string()),
@@ -2177,6 +2139,35 @@ mod tests {
             r#"{"id":"prt_io","sessionID":"ses_io","messageID":"msg_io","type":"text","text":"aaa"}"#,
         );
         (root, part)
+    }
+
+    #[test]
+    fn complete_native_reread_learns_legacy_order_without_replacing_event_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let (root, part) = tree(dir.path());
+        fs::write(
+            part.parent().unwrap().join("prt_second.json"),
+            r#"{"id":"prt_second","sessionID":"ses_io","messageID":"msg_io","type":"text","text":"bbb"}"#,
+        )
+        .unwrap();
+        let path = root.join("session/global/ses_io.json");
+        let loaded = load_from_json_tree(&path).unwrap().unwrap();
+        let conn = crate::open_db(&dir.path().join("ledger.db")).unwrap();
+        normalize(&conn, &loaded, path.to_str().unwrap()).unwrap();
+        let rows = |conn: &Connection| {
+            conn.prepare("SELECT id,event_uid,text,source_order FROM session_events WHERE source='opencode' AND session_id='ses_io' ORDER BY ts_ms,COALESCE(source_order,id),id")
+                .unwrap().query_map([], |r| Ok((r.get::<_,i64>(0)?,r.get::<_,String>(1)?,r.get::<_,String>(2)?,r.get::<_,Option<i64>>(3)?)))
+                .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+        };
+        let original = rows(&conn);
+        assert_eq!(original.len(), 2);
+        assert!(original.iter().all(|row| row.3.is_some()));
+        conn.execute("UPDATE session_events SET source_order=NULL", [])
+            .unwrap();
+        normalize(&conn, &loaded, path.to_str().unwrap()).unwrap();
+        assert_eq!(rows(&conn), original);
+        normalize(&conn, &loaded, path.to_str().unwrap()).unwrap();
+        assert_eq!(rows(&conn), original);
     }
 
     /// Replace `path` with something that still enumerates and still stats but

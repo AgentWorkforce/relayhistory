@@ -1327,4 +1327,48 @@ mod tests {
             .unwrap();
         assert_eq!((kept.1, kept.2), (answer.1, answer.2));
     }
+
+    #[test]
+    fn a_complete_muse_reread_enriches_legacy_null_order_without_replacing_rows() {
+        let home = tempfile::tempdir().unwrap();
+        let lines = muse_base()
+            .into_iter()
+            .map(|line| {
+                let mut value: Value = serde_json::from_str(&line).unwrap();
+                value["recorded_at"] = json!(1_700_000_001_000_000_i64);
+                value.to_string()
+            })
+            .collect::<Vec<_>>();
+        let path = write_muse(home.path(), &lines);
+        let (_db, conn) = ingest_muse(home.path(), &path);
+        conn.execute(
+            "UPDATE session_events SET source_order=NULL WHERE source='muse'",
+            [],
+        )
+        .unwrap();
+        let before = event_rows(&conn, "muse", "muse-stable");
+        let transcript = read_muse_transcript(&path).unwrap().unwrap();
+        ingest_muse_session(
+            &conn,
+            &transcript,
+            &path.to_string_lossy(),
+            MuseRole::Session,
+        )
+        .unwrap();
+        let after = event_rows(&conn, "muse", "muse-stable");
+        assert_eq!(
+            after.iter().map(|row| (&row.0, row.1)).collect::<Vec<_>>(),
+            before.iter().map(|row| (&row.0, row.1)).collect::<Vec<_>>()
+        );
+        let ranks: Vec<(String,i64)> = conn.prepare("SELECT event_uid,source_order FROM session_events WHERE source='muse' ORDER BY ts_ms,source_order").unwrap().query_map([],|row|Ok((row.get(0)?,row.get(1)?))).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(ranks, vec![("prompt-1".into(), 0), ("answer-1".into(), 1)]);
+        ingest_muse_session(
+            &conn,
+            &transcript,
+            &path.to_string_lossy(),
+            MuseRole::Session,
+        )
+        .unwrap();
+        assert_eq!(event_rows(&conn, "muse", "muse-stable"), after);
+    }
 }

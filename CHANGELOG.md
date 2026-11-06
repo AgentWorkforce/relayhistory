@@ -6,24 +6,39 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased - Minor]
 
+### Breaking Changes
+
+- Native contract 30 and evidence contract 5 require matching SDK and addon versions for full-session evidence, prompt identities and recorded event ordering.
+
 ### Added
 
 - Amp cloud transcript projection is available through `ai-hist/amp-source`, retaining native message identity, revisions, raw evidence, and typed tool calls for hosted uploaders and supporting a preinstalled CLI on persistent process hosts.
 - `history-provider-sources` is published to crates.io at the release version, so Rust hosts can depend on the remote source connectors by version instead of a git pin; it requires `ai-hist` at the same exact version.
+- `getSessionEvidence` reads a complete stored session snapshot with evidence-kind selection, optional transcript omission, provider identities and usage.
+- The CLI and SDK expose retention policy previews, explicitly applied bounded pruning with upload protection, and database compaction for reclaiming free space.
 
 ### Changed
 
 - Codex SQLite sync reconciles large conversations with fewer repeated searches.
+- Export schema version 3 carries stable prompt-event identity and source-order evidence; new readers continue accepting older snapshots.
 
 ### Fixed
 
 - Codex SQLite sync preserves distinct messages with identical text and restores missing evidence when an overlap marker outlives its referenced rollout event.
 - Amp remote injection sends private text over stdin and treats process or stdin failures as unconfirmed submissions, preventing false acceptance and unsafe retries.
 - Amp tool results retain searchable output, call identity, status and errors in hosted history as tool evidence after privacy scrubbing, keeping mixed human prompts separate from tool output.
+- SDK, CLI and MCP event reads preserve provider-native record types, API message IDs and request spans.
+- Retained matching remote evidence survives retirement of its direct local source, without allowing conflicting snapshots to replace local evidence.
+- Repeated DeepAgents prompts with equal text and timestamps retain separate history rows through export and remote intake, using stable native event identity.
+- Capture operations restore their output policy on return and unwind, and concurrent quiet calls no longer silence progress in other threads.
+- Codex resume commands in the TypeScript SDK no longer depend on the recorded project directory, matching Rust CLI behavior.
+- Session export and source intake preserve recorded same-timestamp event order through replay, rewrites and later local hydration; conflicting retained order rolls back atomically.
 
 ### Rust API
 
 - `SessionStore::retention_changes_since` returns a bounded journal of session identities affected by local retention, including both endpoints of removed relationships, so consumers can refresh membership and delegation views incrementally. Gaps and expired cursors require a full refresh.
+- Added optional `HistoryEntry::event_uid` and `Prompt::event_uid`; callers constructing `HistoryEntry` literals must supply the field (`None` for anonymous prompt logs).
+- Added nullable `Block::source_order`; session evidence contract 5 orders events by recorded source position and resolves existing event cursors through stable row identity.
 
 ## [0.56.0] - 2026-11-02
 

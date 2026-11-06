@@ -203,6 +203,7 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
         saved_claude.clone()
     };
     let start_offset = reader.start_offset();
+    let order = native_order::optional(conn, "claude", attributed_session_id, start_offset == 0)?;
     // A rewound pass restarts at the unterminated record it saw last time, so
     // that record gets the index it had before rather than one past it.
     let line_index = if reader.start_offset() == saved_claude.resume_from.unwrap_or(u64::MAX) {
@@ -302,7 +303,19 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
     // the position, not the parser state. Its rows came from bytes that are no
     // longer there, and the next pass reads the same region again and upserts
     // over them.
-    match reader.commit(commit_offset)? {
+    let publication = reader.commit(commit_offset)?;
+    if let Some(order) = order {
+        if matches!(&publication, CommitOutcome::Published(_))
+            && pass.in_progress.is_empty()
+            && unterminated.is_none()
+            && commit_offset == reader.position()
+        {
+            order.finish()?;
+        } else {
+            order.discard()?;
+        }
+    }
+    match publication {
         CommitOutcome::Published(file) => {
             cursor.file = Some(file);
             cursor.claude = Some(claude);

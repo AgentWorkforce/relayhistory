@@ -22,7 +22,9 @@ use crate::change_feed::{self, ChangeKind};
 
 /// The record format version. `2`: `origin_id` is the store's change-feed
 /// epoch and `revision` is the row's change-feed revision.
-pub const EXPORT_SCHEMA_VERSION: u32 = 2;
+/// `3`: history may carry stable event identity; ranked session events may
+/// carry source order. Older intake must reject unsupported evidence fields.
+pub const EXPORT_SCHEMA_VERSION: u32 = 3;
 
 /// The kinds a selection may name, in the order a snapshot reads them.
 pub const SUPPORTED_KINDS: &[&str] = &[
