@@ -587,6 +587,18 @@ retained in non-activity markers, so it does not create a second conversation
 message alongside the same locally captured native block. Fixture tests compare
 API event/tool keys and measured facts against the local parser's snapshots.
 
+Canonical marker payloads follow the native intake bounds: strings and object
+keys have at most 128 characters, and containers at most 32 entries recursively.
+The API-message row's separate `raw` field retains the complete original JSON;
+hosts store it in their raw-capture artifact beside the canonical snapshot and
+do not put that unbounded value into `payload_json`. Typed text events remain
+complete. Structured tool-result measurements describe each route's stable
+serialization of its observed JSON value, rather than original wire bytes:
+JavaScript cannot recover a numeric lexeme such as `1.0` after parsing it as
+`1`. Logical canonical identity never depends on these representation-specific
+measurements. A host retains the original response bytes separately when that
+lexical distinction matters.
+
 ### Session markers
 
 Not every provider record is a message. Compaction and summary boundaries,

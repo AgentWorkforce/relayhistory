@@ -114,7 +114,10 @@ test('canonical API blocks reproduce native local event/tool keys and measured f
       const key = [kind, 'droid', 'factory-fixture', local[column]];
       assert.deepEqual(row.key, key);
       assert.equal(row.record_id, createHash('sha256').update(JSON.stringify(key)).digest('hex'));
-      for (const [field, value] of Object.entries(row.payload)) if (Object.hasOwn(local, field)) assert.deepEqual(value, local[field], `${local[column]}.${field}`);
+      // Cwd/project attribution comes from the local header and is not exposed by
+      // the API message response. Every other observed native fact must exist.
+      const localOnly = new Set(['cwd', 'project', 'git_branch', 'project_key', 'project_key_method']);
+      for (const [field, value] of Object.entries(local)) if (value !== null && !localOnly.has(field)) assert.deepEqual(row.payload[field], value, `${local[column]}.${field}`);
     }
   }
   assert.ok(records.some(row => row.kind === 'session_marker' && row.payload.marker_uid === 'block:a3:0'));
@@ -142,4 +145,73 @@ test('explicit native hook and model-only context is never projected as a human 
     assert.equal(canonical.filter(row => row.kind === 'session_event').length, 0);
     assert.deepEqual(JSON.parse(String(canonical[0].payload.payload_json)), raw);
   }
+});
+
+test('readable tool activity requires a bound result and never absorbs unbound text', () => {
+  const text = { type: 'text', text: 'Unbound output' };
+  const result = { type: 'tool_result', toolUseId: 'call-1', isError: false, content: 'Bound output' };
+  const raw = { ...message, role: 'tool', content: [text] };
+  const [marker] = factoryEvidence(sid, [raw]);
+  assert.equal(marker.kind, 'marker');
+  assert.equal(marker.content, 'Unbound output');
+  assert.equal(marker.record.toolResults, undefined);
+  for (const extra of [text, { type: 'future-block' }]) {
+    const [context, output] = factoryEvidence(sid, [{ ...raw, content: [extra, result] }]);
+    assert.equal(context.kind, 'marker');
+    assert.equal(context.record.toolResults, undefined);
+    assert.equal(output.kind, 'tool_call');
+    assert.equal(output.content, 'Bound output');
+    assert.equal(output.record.toolResults?.[0].id, 'call-1');
+    assert.notEqual(context.eventId, output.eventId);
+  }
+});
+
+test('canonical markers obey native intake bounds without truncating text events or separate raw capture', async (t) => {
+  const { factoryCanonicalEvidence } = await import('./factory-source.js');
+  const { HistoryPluginRegistry, discoverSourcePlugins, hydrateSourcePlugin, getSessionEventsPage } = await import('./index.js');
+  const { mkdtemp, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = await mkdtemp(join(tmpdir(), 'factory-canonical-intake-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const longText = '界'.repeat(300);
+  const raw = { ...message, content: [
+    { type: 'text', text: longText },
+    { type: 'future', payload: { ['k'.repeat(200)]: Array.from({ length: 40 }, () => 'long'.repeat(100)), values: Object.fromEntries(Array.from({ length: 40 }, (_, i) => [String(i), i])) } },
+  ] };
+  const records = await factoryCanonicalEvidence(sid, [raw]);
+  assert.deepEqual(records.find(row => row.raw)?.raw, raw);
+  const bounded = (value: unknown): void => {
+    if (typeof value === 'string') assert.ok(Array.from(value).length <= 128);
+    if (Array.isArray(value)) { assert.ok(value.length <= 32); value.forEach(bounded); }
+    else if (value && typeof value === 'object') {
+      assert.ok(Object.keys(value).length <= 32);
+      for (const [key, part] of Object.entries(value)) { assert.ok(Array.from(key).length <= 128); bounded(part); }
+    }
+  };
+  records.filter(row => row.kind === 'session_marker').forEach(row => bounded(JSON.parse(String(row.payload.payload_json))));
+  const source: import('./source-contracts.js').HistorySource = {
+    id: 'factory-intake-fixture', instanceId: 'owned', location: 'remote', supportedSources: ['droid'],
+    discover: async () => ({ observations: [{ source: 'droid', session_id: sid, raw_path: 'fixture:factory', source_stamp: 'fixture-v1' }] }),
+    hydrate: async () => ({ source_stamp: 'fixture-v1', source_bytes: Buffer.byteLength(JSON.stringify(raw)), covered_kinds: ['session_event', 'session_marker', 'tool_call'], records: records.map(({ kind, payload }) => ({ kind, payload })) }),
+  };
+  const registry = new HistoryPluginRegistry();
+  registry.register({ sources: [source] });
+  const dbPath = join(dir, 'history.db');
+  await discoverSourcePlugins(registry, { dbPath });
+  await hydrateSourcePlugin(source, { source: 'droid', sessionId: sid }, { dbPath });
+  const events = (await getSessionEventsPage(sid, { source: 'droid', dbPath })).events;
+  assert.equal(events.length, 1);
+  assert.equal(events[0].text, longText);
+});
+
+test('API-only tool metadata stays raw while activity text uses the shared native contract', async () => {
+  const { factoryCanonicalEvidence } = await import('./factory-source.js');
+  const block = { type: 'tool_use', id: 'call-1', name: 'Read', input: { file_path: '/fixture/a.txt' }, namespace: 'api-only', thoughtSignature: 'fixture-signature' };
+  const rows = await factoryCanonicalEvidence(sid, [{ ...message, content: [block] }]);
+  const event = rows.find(row => row.kind === 'session_event');
+  assert.ok(event);
+  assert.deepEqual(JSON.parse(String(event.payload.text)), { type: 'tool_use', id: 'call-1', name: 'Read', input: block.input });
+  assert.equal(event.payload.raw_kind, 'tool_use');
+  assert.deepEqual((rows.find(row => row.raw)?.raw?.content as unknown[])[0], block);
 });

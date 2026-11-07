@@ -416,3 +416,154 @@ fn rewriting_a_user_row_as_explicit_runtime_context_retires_its_old_prompt() {
         .iter()
         .any(|m| m.message_id.as_deref() == Some("runtime-context")));
 }
+
+#[test]
+fn native_models_links_and_non_text_tool_metadata_survive_rewrites() {
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path());
+    let store = open(home.path());
+    let mut rows: Vec<serde_json::Value> = FIXTURE
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    rows[2]["message"]["modelId"] = "fixture-model".into();
+    rows[3]["message"]["content"][0]["content"] = serde_json::json!([{"type":"image","source":{"type":"base64","data":"fixture-not-real-image-bytes"}}]);
+    rows[5]["turnId"] = "native-turn".into();
+    rows[5]["parentId"] = "u1".into();
+    std::fs::write(
+        &path,
+        rows.iter()
+            .map(|row| format!("{row}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    store
+        .discover(DiscoveryOptions::default().sources([Source::Droid]))
+        .unwrap();
+    hydrate(&store);
+    let evidence = read(&store);
+    assert_eq!(evidence.session.models, ["fixture-model"]);
+    assert!(evidence
+        .messages
+        .iter()
+        .flat_map(|message| &message.blocks)
+        .filter(|block| block.kind == ai_hist::BlockKind::ToolUse)
+        .all(|block| block.raw_kind.as_deref() == Some("tool_use")));
+    assert!(evidence
+        .markers
+        .iter()
+        .any(|marker| marker.kind == "tool_result_metadata"
+            && marker
+                .raw_payload()
+                .is_some_and(|raw| raw.contains("image"))));
+    assert!(evidence
+        .markers
+        .iter()
+        .any(|marker| marker.kind == "opaque_block" && marker.message_id.as_deref() == Some("a3")));
+    assert!(evidence
+        .markers
+        .iter()
+        .any(|marker| marker.kind == "todo_state"
+            && marker.turn_id.as_deref() == Some("native-turn")
+            && marker.parent_id.as_deref() == Some("u1")));
+    std::fs::write(&path, FIXTURE).unwrap();
+    hydrate(&store);
+    assert!(read(&store).session.models.is_empty());
+}
+
+#[test]
+fn authenticated_native_read_error_and_resumed_append_round_trip() {
+    let initial = include_str!(
+        "fixtures/droid/v2-native-read/.factory/sessions/-fixture/native-read-session.jsonl"
+    );
+    let resumed = include_str!(
+        "fixtures/droid/v2-native-resume/.factory/sessions/-fixture/native-read-session.jsonl"
+    );
+    assert!(
+        resumed.starts_with(initial),
+        "native resumed capture retains its initial records"
+    );
+    let home = tempfile::tempdir().unwrap();
+    let path = home
+        .path()
+        .join(".factory/sessions/-fixture/native-read-session.jsonl");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(&path, initial).unwrap();
+    let store = open(home.path());
+    let reference = SessionRef::id(Source::Droid, "native-read-session");
+    let mut previous = std::collections::BTreeSet::new();
+    for (turn, capture, marker) in [
+        (1, initial, "FACTORY_HISTORY_NATIVE_READ_OK"),
+        (2, resumed, "FACTORY_HISTORY_NATIVE_RESUME_OK"),
+    ] {
+        std::fs::write(&path, capture).unwrap();
+        store
+            .sync(SyncOptions::default().sources([Source::Droid]))
+            .unwrap();
+        let e = store
+            .session(&reference, SessionQuery::default())
+            .unwrap()
+            .unwrap();
+        assert_eq!(e.tool_calls.len(), turn + 1);
+        assert_eq!(e.tool_results.len(), turn + 1);
+        assert_eq!(e.prompts.len(), turn);
+        assert_eq!(
+            e.tool_results
+                .iter()
+                .filter(|r| r.result_status.as_deref() == Some("errored"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            e.tool_results
+                .iter()
+                .filter(|r| r.result_status.as_deref() == Some("completed"))
+                .count(),
+            turn
+        );
+        assert!(has(&e, marker));
+        assert!(e.tool_calls.iter().all(|call| call.name == "Read"));
+        let ids: std::collections::BTreeSet<_> = e
+            .messages
+            .iter()
+            .flat_map(|m| m.blocks.iter().map(|b| b.event_uid.clone()))
+            .collect();
+        assert!(previous.is_subset(&ids));
+        previous = ids;
+        let head = store.head_revision().unwrap();
+        store
+            .sync(SyncOptions::default().sources([Source::Droid]))
+            .unwrap();
+        assert_eq!(store.head_revision().unwrap(), head);
+    }
+}
+
+#[test]
+fn sdk_transport_provenance_is_retained_without_inferring_prompt_authorship() {
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path());
+    let store = open(home.path());
+    let mut rows: Vec<serde_json::Value> = FIXTURE
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    rows[1]["message"]["userMessageSource"] = "sdk".into();
+    std::fs::write(
+        &path,
+        rows.iter()
+            .map(|row| format!("{row}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    store
+        .sync(SyncOptions::default().sources([Source::Droid]))
+        .unwrap();
+    let e = read(&store);
+    assert!(e
+        .prompts
+        .iter()
+        .any(|p| p.prompt.as_deref() == Some("Inspect the Factory fixture.")));
+    assert!(e.markers.iter().any(|m| m.kind == "message_metadata"
+        && m.raw_payload()
+            .is_some_and(|raw| raw.contains("userMessageSource") && raw.contains("sdk"))));
+}

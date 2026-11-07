@@ -59,13 +59,13 @@
       "initial_commit": null,
       "last_activity_ms": 1776643200000,
       "last_assistant_text": null,
-      "models_json": null,
+      "models_json": "[]",
       "originator": null,
       "raw_path": "<home>/.factory/sessions/-fixture/native-startup.jsonl",
       "repo_url": null,
       "session_id": "native-startup",
       "source": "droid",
-      "source_stamp": "droid_v2_2:sha256:b7a84b07dc5e1135853ae21104d7533ac8434c60e5715721b09c1986b668aaea",
+      "source_stamp": "droid_v2_3:sha256:b7a84b07dc5e1135853ae21104d7533ac8434c60e5715721b09c1986b668aaea",
       "title": "Native startup fixture",
       "workspace_roots_json": null
     }

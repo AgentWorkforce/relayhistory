@@ -42,7 +42,7 @@ pub(super) fn parse(bytes: &[u8], shallow: bool) -> Result<Vec<Value>> {
                 kind != "session_start",
                 "DROID_INVALID_RECORD: duplicate header"
             );
-            time(&entry)?;
+            let timestamp = time(&entry)?;
             if kind == "message" {
                 let id = string(&entry, "id")?;
                 anyhow::ensure!(
@@ -50,7 +50,7 @@ pub(super) fn parse(bytes: &[u8], shallow: bool) -> Result<Vec<Value>> {
                     "DROID_INVALID_RECORD: duplicate message id"
                 );
                 anyhow::ensure!(
-                    time(&entry)?.is_some(),
+                    timestamp.is_some(),
                     "DROID_INVALID_RECORD: message timestamp missing"
                 );
                 string(&entry["message"], "role")?;
@@ -67,6 +67,26 @@ pub(super) fn parse(bytes: &[u8], shallow: bool) -> Result<Vec<Value>> {
     }
     anyhow::ensure!(!entries.is_empty(), "DROID_INCOMPLETE_HEADER");
     Ok(entries)
+}
+pub(super) fn last_activity(bytes: &[u8]) -> Result<(Option<i64>, usize)> {
+    let end = bytes.iter().rposition(|b| *b == b'\n').unwrap_or(0);
+    let mut latest = None;
+    let mut records = 0;
+    for line in bytes[..end]
+        .split(|b| *b == b'\n')
+        .filter(|line| !line.is_empty())
+    {
+        crate::ingest::check_capture_cancelled()?;
+        let row: Value = serde_json::from_slice(line)
+            .context("DROID_INVALID_RECORD: malformed complete tail record")?;
+        anyhow::ensure!(
+            row.is_object(),
+            "DROID_INVALID_RECORD: tail record must be an object"
+        );
+        latest = latest.max(time(&row)?);
+        records += 1;
+    }
+    Ok((latest, records))
 }
 pub(super) fn text(content: &Value) -> String {
     content

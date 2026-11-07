@@ -1,4 +1,6 @@
 use super::*;
+use std::io::{Seek, SeekFrom};
+pub(super) const TRANSCRIPT_LIMIT: u64 = 128 * 1024 * 1024;
 pub(super) fn is_transcript(root: &Path, path: &Path) -> bool {
     path.strip_prefix(root).ok().is_some_and(|p| {
         let parts: Vec<_> = p.components().collect();
@@ -10,18 +12,35 @@ pub(super) fn is_transcript(root: &Path, path: &Path) -> bool {
 fn sidecar(path: &Path) -> PathBuf {
     path.with_extension("settings.json")
 }
-fn read_settings(path: &Path, context: &AcquisitionContext<'_>) -> Result<Vec<u8>> {
-    const SETTINGS_LIMIT: u64 = 1024 * 1024;
+pub(super) fn read_limited(
+    path: &Path,
+    context: &AcquisitionContext<'_>,
+    limit: u64,
+    code: &str,
+) -> Result<Vec<u8>> {
     context.validate(path)?;
     let mut raw = Vec::new();
     std::fs::File::open(path)?
-        .take(SETTINGS_LIMIT + 1)
+        .take(limit + 1)
         .read_to_end(&mut raw)?;
-    anyhow::ensure!(
-        raw.len() as u64 <= SETTINGS_LIMIT,
-        "DROID_SETTINGS_TOO_LARGE"
-    );
+    anyhow::ensure!(raw.len() as u64 <= limit, "{code}");
     Ok(raw)
+}
+pub(super) fn tail(path: &Path, context: &AcquisitionContext<'_>) -> Result<Vec<u8>> {
+    context.validate(path)?;
+    let mut file = std::fs::File::open(path)?;
+    let offset = file.metadata()?.len().saturating_sub(HEAD_LIMIT);
+    file.seek(SeekFrom::Start(offset))?;
+    let mut bytes = Vec::new();
+    file.take(HEAD_LIMIT).read_to_end(&mut bytes)?;
+    if offset > 0 {
+        let start = bytes
+            .iter()
+            .position(|b| *b == b'\n')
+            .map_or(bytes.len(), |n| n + 1);
+        bytes.drain(..start);
+    }
+    Ok(bytes)
 }
 pub(super) fn stamp(
     path: &Path,
@@ -48,12 +67,21 @@ pub(super) fn stamp(
 }
 pub(super) fn snapshot(path: &Path, context: &AcquisitionContext<'_>) -> Result<AcquiredSession> {
     let (before, modified) = stamp(path, context)?;
-    let bytes = context.read(path)?;
+    let bytes = read_limited(
+        path,
+        context,
+        TRANSCRIPT_LIMIT,
+        "DROID_TRANSCRIPT_TOO_LARGE",
+    )?;
+    anyhow::ensure!(
+        stamp(path, context)?.0 == before,
+        "DROID_CAPTURE_CHANGED: retry after writer settles"
+    );
     let entries = format::parse(&bytes, false)?;
     let mut paths = vec![path.to_owned()];
     let mut size = bytes.len();
     let settings = sidecar(path);
-    let settings = match read_settings(&settings, context) {
+    let settings = match read_limited(&settings, context, 1024 * 1024, "DROID_SETTINGS_TOO_LARGE") {
         Ok(raw) => {
             size += raw.len();
             paths.push(settings);

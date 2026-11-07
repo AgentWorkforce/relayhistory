@@ -29,7 +29,7 @@ pub(crate) const METADATA: ProviderMetadata = ProviderMetadata {
     message_ids: MessageIdOrigin::Provider,
     usage: None,
 };
-const GENERATION: &str = "droid_v2_2";
+const GENERATION: &str = "droid_v2_3";
 pub(crate) const ADAPTER: Option<ProviderAdapter> = Some(ProviderAdapter {
     generation: GENERATION,
     acquire,
@@ -86,8 +86,12 @@ impl ShallowSessionProvider for Provider {
                 if !storage::is_transcript(root, &path) {
                     continue;
                 }
+                // Keep a failing locator in the work list so shallow discovery
+                // reports it individually and the sweep records unread evidence
+                // without blocking healthy sessions or retiring prior snapshots.
                 let (stamp, recency_hint_ms) =
-                    storage::stamp(&path, &AcquisitionContext::new(ID, &env.provider_roots))?;
+                    storage::stamp(&path, &AcquisitionContext::new(ID, &env.provider_roots))
+                        .unwrap_or_else(|_| ("droid_stamp_unavailable".into(), None));
                 out.push(Candidate {
                     source: ID,
                     locator: path.to_string_lossy().into_owned(),
@@ -112,14 +116,34 @@ impl ShallowSessionProvider for Provider {
         conn: Option<&Connection>,
         c: &Candidate,
     ) -> Result<Option<ShallowSession>> {
+        let (source_stamp, _) = storage::stamp(
+            Path::new(&c.locator),
+            &AcquisitionContext::new(ID, scan.provider_roots),
+        )?;
         let bytes = prefix(
             &AcquisitionContext::new(ID, scan.provider_roots),
             Path::new(&c.locator),
         )?;
         scan.note_open();
         scan.note_bytes(bytes.len() as u64);
+        let tail = storage::tail(
+            Path::new(&c.locator),
+            &AcquisitionContext::new(ID, scan.provider_roots),
+        )?;
+        scan.note_open();
+        scan.note_bytes(tail.len() as u64);
+        anyhow::ensure!(
+            storage::stamp(
+                Path::new(&c.locator),
+                &AcquisitionContext::new(ID, scan.provider_roots)
+            )?
+            .0 == source_stamp,
+            "DROID_CAPTURE_CHANGED: retry after writer settles"
+        );
         let entries = format::parse(&bytes, true)?;
         scan.note_records(entries.len() as u64);
+        let (last_activity, tail_records) = format::last_activity(&tail)?;
+        scan.note_records(tail_records as u64);
         let header = &entries[0];
         let sid = format::string(header, "id")?;
         if let Some(conn) = conn {
@@ -135,16 +159,18 @@ impl ShallowSessionProvider for Provider {
                 .iter()
                 .filter_map(|e| format::time(e).ok().flatten())
                 .min(),
-            last_activity_ms: entries
-                .iter()
-                .filter_map(|e| format::time(e).ok().flatten())
-                .max(),
+            last_activity_ms: last_activity.or(c.recency_hint_ms).max(
+                entries
+                    .iter()
+                    .filter_map(|e| format::time(e).ok().flatten())
+                    .max(),
+            ),
             title: header["sessionTitle"]
                 .as_str()
                 .or_else(|| header["title"].as_str())
                 .map(str::to_owned),
             raw_path: Some(c.locator.clone()),
-            source_stamp: Some(c.stamp.clone()),
+            source_stamp: Some(source_stamp),
             discovery_state: "shallow".into(),
             ..Default::default()
         }))
@@ -263,7 +289,15 @@ fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
             }
             Err(error) => {
                 crate::ingest::check_capture_cancelled()?;
-                eprintln!("Droid {}: {error:#}", path.display());
+                crate::ingest::provider_diagnostics::provider_diagnostic(
+                    crate::ingest::provider_diagnostics::ProviderSkip {
+                        source: crate::Source::Droid,
+                        code: "EVIDENCE_PARTIAL",
+                        subject: Some(&candidate.locator),
+                        what: format_args!("skipping Droid transcript {}", path.display()),
+                        detail: format_args!("{error:#}"),
+                    },
+                );
                 cache.remove(&candidate.locator);
                 result.unread += 1;
             }

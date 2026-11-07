@@ -85,19 +85,20 @@ export function factoryEvidence(session: string, messages: unknown[]): FactoryEv
     const resultText = toolResults.map(result => readable(result.output)).filter(text => text.trim()).join('\n');
     const onlyResults = !prose.trim() && toolResults.length > 0 && blocks.every(block => block.type === 'tool_result' || (block.type === 'text' && typeof block.text === 'string' && !block.text.trim()));
     const mixed = role === 'user' && !!prose.trim() && toolResults.length > 0;
+    const splitTool = role === 'tool' && toolResults.length > 0 && !onlyResults;
     const row: FactoryEvidence = {
       v: 1, source: 'droid', sessionId,
       eventId: `factory:${encodeURIComponent(sessionId)}:${encodeURIComponent(messageId)}`,
       lens: 'history',
-      kind: onlyResults ? 'tool_call' : role === 'user' && prose.trim() ? 'prompt' : role === 'assistant' && prose.trim() ? 'assistant' : toolCalls.length || role === 'tool' ? 'tool_call' : 'marker',
+      kind: onlyResults ? 'tool_call' : role === 'user' && prose.trim() ? 'prompt' : role === 'assistant' && prose.trim() ? 'assistant' : toolCalls.length ? 'tool_call' : 'marker',
       ts: new Date(createdAt).toISOString(),
-      content: mixed ? prose : [prose, resultText].filter(text => text.trim()).join('\n'),
+      content: mixed || splitTool ? prose : [prose, resultText].filter(text => text.trim()).join('\n'),
       actorRole: onlyResults ? 'tool' : role,
       ...(toolCalls.length ? { toolCalls } : {}),
-      record: { messageId, messageVersion: null, updatedAt, blockIds, raw, ...(toolResults.length ? { toolResults } : {}) },
+      record: { messageId, messageVersion: null, updatedAt, blockIds, raw, ...(toolResults.length && !splitTool ? { toolResults } : {}) },
     };
-    if (!mixed) return [row];
-    return [row, { ...row, eventId: `factory-tool-results:${encodeURIComponent(sessionId)}:${encodeURIComponent(messageId)}`, kind: 'tool_call', actorRole: 'tool', content: resultText }];
+    if (!mixed && !splitTool) return [row];
+    return [row, { ...row, eventId: `factory-tool-results:${encodeURIComponent(sessionId)}:${encodeURIComponent(messageId)}`, kind: 'tool_call', actorRole: 'tool', content: resultText, record: { ...row.record, toolResults } }];
   });
 }
 /** Validate one documented GET /sessions/{id}/messages envelope. A host must
@@ -125,26 +126,36 @@ export type FactoryCanonicalRecord = {
   key: string[];
   record_id: string;
   payload: Record<string, unknown>;
+  /** Full provider JSON for a host's separate raw capture, never an unbounded marker column. */
+  raw?: FactoryMessage;
 };
 export async function factoryCanonicalRecordId(key: readonly string[]): Promise<string> {
   const digest = await globalThis.crypto.subtle.digest('SHA-256', new TextEncoder().encode(JSON.stringify(key)));
   return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
 }
+function compareUnicode(a: string, b: string): number {
+  const left = Array.from(a, c => c.codePointAt(0)!);
+  const right = Array.from(b, c => c.codePointAt(0)!);
+  for (let i = 0; i < Math.min(left.length, right.length); i++) if (left[i] !== right[i]) return left[i] - right[i];
+  return left.length - right.length;
+}
 function stableJson(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`;
   if (value !== null && typeof value === 'object') {
-    // UTF-8 / Unicode scalar ordering matches serde_json's ordered Map.
-    const compare = (a: string, b: string): number => {
-      const left = Array.from(a, c => c.codePointAt(0)!);
-      const right = Array.from(b, c => c.codePointAt(0)!);
-      for (let i = 0; i < Math.min(left.length, right.length); i++) if (left[i] !== right[i]) return left[i] - right[i];
-      return left.length - right.length;
-    };
-    return `{${Object.keys(value).sort(compare).map(key => `${JSON.stringify(key)}:${stableJson((value as FactoryMessage)[key])}`).join(',')}}`;
+    return `{${Object.keys(value).sort(compareUnicode).map(key => `${JSON.stringify(key)}:${stableJson((value as FactoryMessage)[key])}`).join(',')}}`;
   }
   const encoded = JSON.stringify(value);
   if (encoded === undefined) throw new Error('FACTORY_NON_JSON_EVIDENCE');
   return encoded;
+}
+/** Same recursive bounds as ai-hist's canonical SessionMarker intake. */
+function boundedMarker(value: unknown): unknown {
+  if (typeof value === 'string') return Array.from(value).slice(0, 128).join('');
+  if (Array.isArray(value)) return value.slice(0, 32).map(boundedMarker);
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(Object.keys(value).sort(compareUnicode).slice(0, 32).map(key => [Array.from(key).slice(0, 128).join(''), boundedMarker((value as FactoryMessage)[key])]));
+  }
+  return value;
 }
 /** Per-block API projection with the SAME native message/ordinal keys as local
  * Droid v2 acquisition. API-specific raw fields stay in non-activity markers.
@@ -154,9 +165,9 @@ export async function factoryCanonicalEvidence(session: string, messages: unknow
   const sessionId = factorySessionId(session);
   const out: FactoryCanonicalRecord[] = [];
   const calls = new Map<string, FactoryCanonicalRecord>();
-  const add = async (kind: FactoryCanonicalRecord['kind'], uid: string, payload: Record<string, unknown>) => {
+  const add = async (kind: FactoryCanonicalRecord['kind'], uid: string, payload: Record<string, unknown>, raw?: FactoryMessage) => {
     const key = [kind, 'droid', sessionId, uid];
-    const row: FactoryCanonicalRecord = { kind, source: 'droid', session_id: sessionId, key, record_id: await factoryCanonicalRecordId(key), payload: { source: 'droid', session_id: sessionId, ...payload } };
+    const row: FactoryCanonicalRecord = { kind, source: 'droid', session_id: sessionId, key, record_id: await factoryCanonicalRecordId(key), payload: { source: 'droid', session_id: sessionId, ...payload }, ...(raw ? { raw } : {}) };
     out.push(row);
     return row;
   };
@@ -166,20 +177,20 @@ export async function factoryCanonicalEvidence(session: string, messages: unknow
     const mid = String(raw.id);
     const ts = Number(raw.createdAt);
     const blocks = raw.content as unknown[];
-    const marker = (uid: string, kind: string, payload: unknown) => add('session_marker', uid, { marker_uid: uid, message_id: mid, ts_ms: ts, kind, payload_json: stableJson(payload) });
-    await marker(`api-message:${mid}`, 'factory_api_message', raw);
+    const marker = (uid: string, kind: string, payload: unknown, original?: FactoryMessage) => add('session_marker', uid, { marker_uid: uid, message_id: mid, parent_id: typeof raw.parentId === 'string' ? raw.parentId : null, turn_id: typeof raw.turnId === 'string' ? raw.turnId : null, ts_ms: ts, kind, payload_json: stableJson(boundedMarker(payload)) }, original);
+    await marker(`api-message:${mid}`, 'factory_api_message', raw, raw);
     if (factoryControl(raw) || !['user', 'assistant', 'tool'].includes(String(raw.role))) continue;
-    const base = { message_id: mid, parent_id: typeof raw.parentId === 'string' ? raw.parentId : null, ts_ms: ts, model: typeof raw.modelId === 'string' ? raw.modelId : null, provider: typeof raw.apiProvider === 'string' ? raw.apiProvider : null, raw_kind: 'message' };
+    const base = { message_id: mid, parent_id: typeof raw.parentId === 'string' ? raw.parentId : null, turn_id: typeof raw.turnId === 'string' ? raw.turnId : null, ts_ms: ts, model: typeof raw.modelId === 'string' ? raw.modelId : null, provider: typeof raw.apiProvider === 'string' ? raw.apiProvider : null, raw_kind: 'message' };
     if (!blocks.length && raw.role !== 'tool') await add('session_event', `${mid}:0`, { ...base, event_uid: `${mid}:0`, role: raw.role, kind: 'text', text: null });
     for (const [index, value] of blocks.entries()) {
       const block = object(value);
       const uid = `${mid}:${index}`;
       const kind = block.type;
-      if (!['text', 'thinking', 'tool_use', 'tool_result'].includes(String(kind)) || (raw.role === 'tool' && kind !== 'tool_result')) {
-        await marker(`block:${uid}`, 'opaque_block', { type: 'opaque_block', block, messageId: mid, timestamp: new Date(ts).toISOString() });
+      if (typeof kind !== 'string' || !['text', 'thinking', 'tool_use', 'tool_result'].includes(kind) || (raw.role === 'tool' && kind !== 'tool_result')) {
+        await marker(`block:${uid}`, 'opaque_block', { type: 'opaque_block', block, id: mid, parentId: raw.parentId ?? null, turnId: raw.turnId ?? null, timestamp: new Date(ts).toISOString() });
         continue;
       }
-      const event: Record<string, unknown> = { ...base, event_uid: uid, role: kind === 'tool_result' ? 'tool_result' : raw.role, kind };
+      const event: Record<string, unknown> = { ...base, event_uid: uid, role: kind === 'tool_result' ? 'tool_result' : raw.role, kind, raw_kind: kind };
       if (kind === 'text' || kind === 'thinking') {
         const text = block[kind];
         if (typeof text !== 'string') throw new Error('FACTORY_INVALID_BLOCK_TEXT');
@@ -189,7 +200,7 @@ export async function factoryCanonicalEvidence(session: string, messages: unknow
         if (calls.has(id)) throw new Error('FACTORY_DUPLICATE_TOOL_ID');
         const name = identity(block.name, 'FACTORY_INVALID_TOOL_NAME');
         event.tool_use_id = id;
-        event.text = stableJson(block);
+        event.text = stableJson({ type: 'tool_use', id, name, input: block.input ?? null });
         calls.set(id, await add('tool_call', id, { message_id: mid, tool_use_id: id, name, target: typeof object(block.input).file_path === 'string' ? object(block.input).file_path : null, args_json: stableJson(block.input ?? null), is_error: null, ts_ms: ts }));
       } else {
         Object.assign(event, await canonicalToolResult(block));

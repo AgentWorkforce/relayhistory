@@ -129,10 +129,36 @@
       "turn_id": null
     },
     {
+      "kind": "message_metadata",
+      "marker_uid": "metadata:native-id-4",
+      "message_id": "native-id-4",
+      "parent_id": "native-id-3",
+      "payload_json": "{\"id\":\"native-id-4\",\"message\":{\"interactionMode\":\"auto\",\"role\":\"user\"},\"parentId\":\"native-id-3\",\"seq\":3,\"timestamp\":\"2026-11-07T00:00:04Z\",\"type\":\"message_metadata\"}",
+      "session_id": "native-writer",
+      "source": "droid",
+      "subkind": null,
+      "text": null,
+      "ts_ms": 1794009604000,
+      "turn_id": null
+    },
+    {
+      "kind": "message_metadata",
+      "marker_uid": "metadata:native-id-5",
+      "message_id": "native-id-5",
+      "parent_id": "native-id-4",
+      "payload_json": "{\"id\":\"native-id-5\",\"message\":{\"apiProvider\":\"azure_anthropic\",\"modelId\":\"claude-opus-4-8\",\"reasoningEffort\":\"high\",\"role\":\"assistant\"},\"parentId\":\"native-id-4\",\"seq\":4,\"timestamp\":\"2026-11-07T00:00:05Z\",\"type\":\"message_metadata\"}",
+      "session_id": "native-writer",
+      "source": "droid",
+      "subkind": null,
+      "text": null,
+      "ts_ms": 1794009605000,
+      "turn_id": null
+    },
+    {
       "kind": "message",
       "marker_uid": "message:native-id-6",
       "message_id": "native-id-6",
-      "parent_id": null,
+      "parent_id": "native-id-5",
       "payload_json": "{\"id\":\"native-id-6\",\"message\":{\"content\":[],\"hookCommands\":[{\"command\":\"fixture-command\",\"type\":\"command\"},{\"command\":\"fixture-command\",\"timeout\":10,\"type\":\"command\"}],\"hookEndTime\":1794071363054,\"hookEventName\":\"Stop\",\"hookOrder\":1794071362975000,\"hookParentId\":\"fixture-hookParentId\",\"hookResults\":[{\"exitCode\":0,\"stderr\":\"fixture-stderr\",\"stdout\":\"fixture-stdout\"},{\"exitCode\":0,\"stderr\":\"fixture-stderr\",\"stdout\":\"fixture-stdout\"}],\"hookStartTime\":1794071362975,\"hookStatus\":\"completed\",\"role\":\"user\",\"visibility\":\"user_only\"},\"parentId\":\"native-id-5\",\"seq\":5,\"timestamp\":\"2026-11-07T00:00:06Z\",\"type\":\"message\"}",
       "session_id": "native-writer",
       "source": "droid",
@@ -145,7 +171,7 @@
       "kind": "message",
       "marker_uid": "message:native-id-7",
       "message_id": "native-id-7",
-      "parent_id": null,
+      "parent_id": "native-id-5",
       "payload_json": "{\"id\":\"native-id-7\",\"message\":{\"content\":[],\"hookCommands\":[{\"command\":\"fixture-command\",\"type\":\"command\"}],\"hookEndTime\":1794071363129,\"hookEventName\":\"SessionEnd\",\"hookOrder\":1794071363084000,\"hookParentId\":\"fixture-hookParentId\",\"hookResults\":[{\"exitCode\":0,\"stderr\":\"fixture-stderr\",\"stdout\":\"fixture-stdout\"}],\"hookStartTime\":1794071363084,\"hookStatus\":\"completed\",\"role\":\"user\",\"visibility\":\"user_only\"},\"parentId\":\"native-id-5\",\"seq\":6,\"timestamp\":\"2026-11-07T00:00:08Z\",\"type\":\"message\"}",
       "session_id": "native-writer",
       "source": "droid",
@@ -178,7 +204,7 @@
       "subkind": null,
       "text": null,
       "ts_ms": null,
-      "turn_id": null
+      "turn_id": "native-id-4"
     },
     {
       "kind": "session_settings",
@@ -206,13 +232,13 @@
       "initial_commit": null,
       "last_activity_ms": 1794009608000,
       "last_assistant_text": "FACTORY_NATIVE_WRITER_OK",
-      "models_json": null,
+      "models_json": "[\"claude-opus-4-8\"]",
       "originator": null,
       "raw_path": "<home>/.factory/sessions/-fixture/native-writer.jsonl",
       "repo_url": null,
       "session_id": "native-writer",
       "source": "droid",
-      "source_stamp": "droid_v2_2:sha256:4b647093f1ae1ffb2e5265340b8bc7d4f9c69966818cd0389c7b3d4110f36d0d",
+      "source_stamp": "droid_v2_3:sha256:4b647093f1ae1ffb2e5265340b8bc7d4f9c69966818cd0389c7b3d4110f36d0d",
       "title": "Native Factory writer fixture",
       "workspace_roots_json": null
     }

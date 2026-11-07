@@ -60,15 +60,26 @@ pub(super) fn write(conn: &Connection, payload: &Value, path: &Path) -> Result<u
         },
     )?;
     if complete {
-        let title = header["sessionTitle"]
-            .as_str()
-            .or_else(|| header["title"].as_str());
-        crate::ingest::set_session_title(conn, ID, sid, title)?;
-        conn.execute("UPDATE sessions SET first_prompt=?2 WHERE source='droid' AND session_id=?1 AND first_prompt IS NOT ?2",rusqlite::params![sid,format::first_prompt(entries)])?;
-        file_history::retire_locator_sessions(conn, ID, path, Some(sid))?;
+        update_metadata(conn, sid, entries, path)?;
     }
     shared.ensure_unchanged(conn, sid)?;
     Ok(records.inserted)
+}
+fn update_metadata(conn: &Connection, sid: &str, entries: &[Value], path: &Path) -> Result<()> {
+    let header = &entries[0];
+    let title = header["sessionTitle"]
+        .as_str()
+        .or_else(|| header["title"].as_str());
+    crate::ingest::set_session_title(conn, ID, sid, title)?;
+    let models: std::collections::BTreeSet<_> = entries
+        .iter()
+        .filter(|row| row["type"] == "message" && row["message"]["role"] == "assistant")
+        .filter_map(|row| row["message"]["modelId"].as_str())
+        .filter(|model| !model.is_empty())
+        .collect();
+    conn.execute("UPDATE sessions SET first_prompt=?2, models_json=?3 WHERE source='droid' AND session_id=?1 AND (first_prompt IS NOT ?2 OR models_json IS NOT ?3)",rusqlite::params![sid,format::first_prompt(entries),serde_json::to_string(&models)?])?;
+    file_history::retire_locator_sessions(conn, ID, path, Some(sid))?;
+    Ok(())
 }
 struct Records {
     inserted: usize,
@@ -139,6 +150,8 @@ pub(super) fn marker(
             ts_ms: format::time(entry)?,
             message_id: entry["id"].as_str(),
             payload_json: Some(&payload),
+            parent_id: entry["parentId"].as_str(),
+            turn_id: entry["turnId"].as_str(),
             ..Default::default()
         },
     )?;
@@ -160,6 +173,14 @@ fn message(
         marker(conn, sid, entry, &format!("message:{mid}"), keys)?;
         return Ok(0);
     }
+    // Transport provenance (for example an SDK source) is observed metadata,
+    // not proof of who authored the prompt. Preserve it without reclassifying.
+    let mut metadata = entry.clone();
+    metadata["type"] = "message_metadata".into();
+    if let Some(message) = metadata["message"].as_object_mut() {
+        message.remove("content");
+    }
+    marker(conn, sid, &metadata, &format!("metadata:{mid}"), keys)?;
     let base = EventRow {
         source: ID,
         session_id: sid,
@@ -172,7 +193,10 @@ fn message(
         model: msg["modelId"].as_str(),
         provider: msg["apiProvider"].as_str(),
         raw_kind: Some("message"),
-        raw_facts: RawMessageFacts::default(),
+        raw_facts: RawMessageFacts {
+            turn_id: entry["turnId"].as_str(),
+            ..Default::default()
+        },
         ..Default::default()
     };
     let blocks = msg["content"].as_array().context("Droid content missing")?;
