@@ -1029,6 +1029,7 @@ handle.
 | cursor | ✓ | ✓ | ✓ | ✓ | ✓ | none |
 | deepagents | ✓ | ✓ | ✓ | — | — | none |
 | devin | ✓ | ✓ | ✓ | ✓ | — | none |
+| droid | ✓ | ✓ | ✓ | — | — | none |
 | goose | ✓ | ✓ | ✓ | — | — | none |
 | grok | ✓ | ✓ | ✓ | ✓ | ✓ | per-request |
 | grok-bot | ✓ | ✓ | — | — | ✓ | none |

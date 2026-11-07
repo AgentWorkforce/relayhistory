@@ -1,0 +1,54 @@
+{
+  "id": "droid",
+  "rust_id": "droid",
+  "variant": "Droid",
+  "order": 447,
+  "aliases": [
+    "factory"
+  ],
+  "fixtures": [
+    {
+      "source": "droid",
+      "name": "v2-synthetic",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "droid/v2-synthetic"
+      ],
+      "quirk": "Synthetic v2 JSONL and settings sidecar based on Droid 0.148.1 observed persistence shape and SDK 0.10.0 discovery; not a successful authenticated writer capture. Native IDs, thinking, tools, mixed human/tool results, unknown blocks and cumulative usage markers."
+    },
+    {
+      "source": "droid",
+      "name": "v2-native-startup",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "droid/v2-native-startup"
+      ],
+      "quirk": "Sanitized native Droid 0.148.1 session_start and settings written by an owned readonly exec on 2026-11-07. Inference failed authentication before any message or tool; metadata-only persistence is verified, authenticated message/reader round trip remains unverified."
+    }
+  ],
+  "capture": [
+    {
+      "evidence": "Messages and identity",
+      "coverage": "Native v2 session_start and settings shape verified against an owned Droid 0.148.1 startup capture; native message IDs, RFC3339 timestamps, typed user/assistant/thinking content covered by synthetic fixtures. Legacy root and project directories; coherent settings sidecar capture; unsupported versions and duplicate identities rejected. Authenticated message writer/reader round trip remains unverified (Droid inference rejected the API key)."
+    },
+    {
+      "evidence": "Tools and metadata",
+      "coverage": "Native tool_use IDs join tool_result tool_use_id, explicit is_error preserved; mixed user text remains distinct from tool output. Session settings, cumulative tokenUsage/inclusiveTokenUsage and unknown/control records retained as markers; no inferred per-message usage, credits-to-token conversion, file edits or relationships."
+    },
+    {
+      "evidence": "Lifecycle",
+      "coverage": "Passive discovery, selected hydration, full and scoped watch sweeps, resumed appends, deferred partial final records, full rewrites and sidecar-only updates; read failures preserve the previous snapshot. No agent launch or network request during acquisition."
+    }
+  ],
+  "population": {
+    "evidence": [
+      "history",
+      "session_event",
+      "tool_call",
+      "session_marker"
+    ],
+    "usage_accounting": "none"
+  }
+}

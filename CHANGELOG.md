@@ -4,7 +4,15 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Minor]
+
+### Added
+
+- Factory Droid local sessions are discovered and indexed automatically from native JSONL transcripts and settings sidecars, preserving messages, tool outcomes and resumed-session changes.
+
+### Rust API
+
+- Added `Source::Droid` with `factory` as an input alias; serialized source identity is `droid`.
 
 ## [0.57.1] - 2026-11-07
 

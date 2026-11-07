@@ -271,6 +271,8 @@ source without deciding which one fails the test.
 | cortex/native | Official Cortex Code CLI 1.2.18 native writer merged, flat, rewritten, zero-byte empty sidecar and untimed sessions; raw native restart-reader oracles for IDs, order and content. |
 | deepagents/dcode-checkpoints | Pinned dcode 0.1.88 writer and current SDK DeltaChannel: 171 checkpoints crossing snapshot frequency 50, pending writes, native tool IDs, same-ID revision/removal, and Overwrite compaction. |
 | deepagents/native-oracles | Fresh-process bundled inspector transcript exports and the fully synthetic native capture recipe. |
+| droid/v2-synthetic | Synthetic v2 JSONL and settings sidecar based on Droid 0.148.1 observed persistence shape and SDK 0.10.0 discovery; not a successful authenticated writer capture. Native IDs, thinking, tools, mixed human/tool results, unknown blocks and cumulative usage markers. |
+| droid/v2-native-startup | Sanitized native Droid 0.148.1 session_start and settings written by an owned readonly exec on 2026-11-07. Inference failed authentication before any message or tool; metadata-only persistence is verified, authenticated message/reader round trip remains unverified. |
 | goose/schema17 | Goose 1.56.0 native schema-17 writer: ordinary and tool turns, then appended turns after process restart. |
 | goose/before-resume | Same native writer before process restart; four messages including matching tool request and response IDs. |
 | goose/schema17-official-export | Independent SessionManager::get_session/export_session read in a fresh process after resume. |

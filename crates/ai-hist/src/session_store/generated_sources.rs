@@ -41,6 +41,8 @@ pub enum Source {
     Cortex,
     #[serde(rename = "deepagents")]
     DeepAgents,
+    #[serde(rename = "droid")]
+    Droid,
     #[serde(rename = "goose")]
     Goose,
     #[serde(rename = "junie")]
@@ -85,6 +87,7 @@ impl Source {
         Self::Codebuddy,
         Self::Cortex,
         Self::DeepAgents,
+        Self::Droid,
         Self::Goose,
         Self::Junie,
         Self::Kilo,
@@ -120,6 +123,7 @@ impl Source {
             "codebuddy",
             "cortex",
             "deepagents",
+            "droid",
             "goose",
             "junie",
             "kilo",
@@ -156,6 +160,8 @@ impl Source {
             ("codebuddy", Source::Codebuddy),
             ("cortex", Source::Cortex),
             ("deepagents", Source::DeepAgents),
+            ("droid", Source::Droid),
+            ("factory", Source::Droid),
             ("goose", Source::Goose),
             ("junie", Source::Junie),
             ("kilo", Source::Kilo),
@@ -198,6 +204,7 @@ impl Source {
             &crate::providers::codebuddy::METADATA,
             &crate::providers::cortex::METADATA,
             &crate::providers::deepagents::METADATA,
+            &crate::providers::droid::METADATA,
             &crate::providers::goose::METADATA,
             &crate::providers::junie::METADATA,
             &crate::providers::kilo::METADATA,
