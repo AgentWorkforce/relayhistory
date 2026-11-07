@@ -1,4 +1,4 @@
-//! Passive Hermes schema-31 acquisition. See plans/history-providers/hermes.md.
+//! Passive Hermes schema-31/32 acquisition. See plans/history-providers/hermes.md.
 use super::*;
 use crate::discover::{Candidate, DiscoveryEnv, ScanEnv, ShallowSession, ShallowSessionProvider};
 use crate::hydrate::{IngestOutcome, SelectedIngest, SelectedIngestResult};
@@ -34,6 +34,9 @@ pub(crate) const ADAPTER: Option<ProviderAdapter> = Some(ProviderAdapter {
 });
 #[derive(Debug, Serialize, Deserialize)]
 struct Session {
+    // Preserve schema-31 snapshot hashes and previously serialized captures.
+    #[serde(default = "schema31", skip_serializing_if = "is_schema31")]
+    schema_version: i64,
     native_id: String,
     id: String,
     profile: String,
@@ -47,6 +50,12 @@ struct Session {
     latest: i64,
     ended: Option<i64>,
     messages: Vec<Message>,
+}
+fn schema31() -> i64 {
+    31
+}
+fn is_schema31(version: &i64) -> bool {
+    *version == 31
 }
 #[derive(Debug, Serialize, Deserialize)]
 struct Message {

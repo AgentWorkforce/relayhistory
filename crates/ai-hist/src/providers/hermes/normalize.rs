@@ -7,6 +7,7 @@ use crate::ingest::{
 use crate::store::NewSessionMarker;
 use crate::HistoryEntry;
 use anyhow::ensure;
+use rusqlite::OptionalExtension;
 use std::collections::BTreeSet;
 #[derive(Default)]
 struct Keys {
@@ -21,7 +22,7 @@ struct HermesMarker<'a> {
     message: Option<&'a str>,
     ts: i64,
     kind: &'a str,
-    payload: &'a Value,
+    payload: String,
 }
 fn marker(conn: &Connection, s: &Session, m: HermesMarker<'_>, keys: &mut Keys) -> Result<()> {
     let HermesMarker {
@@ -44,7 +45,7 @@ fn marker(conn: &Connection, s: &Session, m: HermesMarker<'_>, keys: &mut Keys) 
             kind,
             subkind: Some("hermes"),
             text: None,
-            payload_json: Some(&payload.to_string()),
+            payload_json: Some(&payload),
         },
     )?;
     keys.markers.insert(uid.into());
@@ -72,6 +73,7 @@ fn write_session(conn: &Connection, s: &Session, path: &Path) -> Result<usize> {
     let mut keys = Keys::default();
     let mut inserted = 0;
     let mut indexer = ToolResultIndexer::default();
+    let payload = session_payload(conn, s)?;
     marker(
         conn,
         s,
@@ -80,7 +82,7 @@ fn write_session(conn: &Connection, s: &Session, path: &Path) -> Result<usize> {
             message: None,
             ts: s.started,
             kind: "session_metadata",
-            payload: &serde_json::json!({"native_session_id":s.native_id,"profile":s.profile,"parent_session_id":s.parent,"end_reason":s.end_reason,"title":s.title,"model":s.model,"schema_version":31}),
+            payload,
         },
         &mut keys,
     )?;
@@ -158,6 +160,36 @@ fn write_session(conn: &Connection, s: &Session, path: &Path) -> Result<usize> {
     reconcile_history(conn, &s.id)?;
     Ok(inserted)
 }
+// A transported marker owns its payload. Retain it when the only difference is
+// the database schema version; all substantive changes still reach the guard.
+fn session_payload(conn: &Connection, s: &Session) -> Result<String> {
+    let mut payload = serde_json::json!({"native_session_id":s.native_id,"profile":s.profile,"parent_session_id":s.parent,"end_reason":s.end_reason,"title":s.title,"model":s.model,"schema_version":s.schema_version});
+    let prior: Option<String> = conn.query_row(
+        "SELECT payload_json FROM session_markers WHERE source=?1 AND session_id=?2 AND marker_uid='session' AND location IS NOT 'local'",
+        rusqlite::params![ID, s.id], |row| row.get(0),
+    ).optional()?.flatten();
+    if let Some((raw, prior)) = prior.and_then(|text| {
+        serde_json::from_str::<Value>(&text)
+            .ok()
+            .map(|value| (text, value))
+    }) {
+        let mut comparable = prior.clone();
+        if let (Some(old), Some(new)) = (comparable.as_object_mut(), payload.as_object_mut()) {
+            let old_version = old.remove("schema_version");
+            let new_version = new.remove("schema_version");
+            let supported =
+                |v: &Option<Value>| matches!(v.as_ref().and_then(Value::as_i64), Some(31 | 32));
+            let same = old == new && supported(&old_version) && supported(&new_version);
+            if let Some(version) = new_version {
+                new.insert("schema_version".into(), version);
+            }
+            if same {
+                return Ok(raw);
+            }
+        }
+    }
+    Ok(payload.to_string())
+}
 fn message(
     conn: &Connection,
     s: &Session,
@@ -181,7 +213,7 @@ fn message(
             message: Some(&mid),
             ts: m.timestamp,
             kind: "message_metadata",
-            payload: &serde_json::json!({"active":m.active,"compacted":m.compacted,"compressed_summary":m.compressed,"observed":m.observed,"display_kind":m.display_kind,"tool_name":m.tool_name}),
+            payload: serde_json::json!({"active":m.active,"compacted":m.compacted,"compressed_summary":m.compressed,"observed":m.observed,"display_kind":m.display_kind,"tool_name":m.tool_name}).to_string(),
         },
         keys,
     )?;
@@ -194,7 +226,7 @@ fn message(
                 message: Some(&mid),
                 ts: m.timestamp,
                 kind: "system",
-                payload: &serde_json::json!({"content":m.content}),
+                payload: serde_json::json!({"content":m.content}).to_string(),
             },
             keys,
         )?;
