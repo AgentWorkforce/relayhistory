@@ -30,7 +30,10 @@ use rusqlite::Connection;
 /// commits and reopens every [`super::JSONL_CHUNK_LINES`] records, so a very
 /// large transcript holds the lock for one chunk at a time, not for its whole
 /// read. A chunk committed ahead of the transcript's cursor is what autocommit
-/// did for every statement; the re-read that follows upserts over it.
+/// did for every statement; the re-read that follows upserts over it. The
+/// exception is a Claude transcript read from byte zero: its source order is
+/// checked only after the whole read, so that walk records no boundaries and
+/// its rows commit together, or roll back together when the check fails.
 ///
 /// New `session_events` rows are copied into `session_events_fts` once, in the
 /// statement before each commit, instead of by the per-row insert trigger.

@@ -143,6 +143,39 @@ mod tests {
         assert!(cursor.claude.is_none());
     }
     #[test]
+    fn a_rejected_complete_reread_commits_no_chunk_of_a_sweep() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("native-claude.jsonl");
+        fs::write(&path, text(&["a", "z"])).unwrap();
+        let conn = crate::open_db(&home.path().join("ledger.db")).unwrap();
+        ingest_claude_transcript_as(&conn, &path, None).unwrap();
+        conn.execute(
+            "UPDATE session_events SET location='both' WHERE source='claude'",
+            [],
+        )
+        .unwrap();
+        let before = rows(&conn);
+        // More than a chunk of new events ahead of the conflicting bucket.
+        let filler: String = (0..JSONL_CHUNK_LINES + 10).map(|i| serde_json::json!({"type":"user","uuid":format!("f{i}"),"sessionId":"native-claude","timestamp":"2026-10-22T11:00:00Z","message":{"role":"user","content":[{"type":"text","text":"filler"}]}}).to_string()+"\n").collect();
+        fs::write(&path, filler + &text(&["z", "a"])).unwrap();
+        let mut cursor = transcript_cursor::TranscriptCursorState::default();
+        let error = {
+            let mut write = SweepWrite::begin(&conn).unwrap();
+            incremental::ingest_claude_transcript_incremental_batched(
+                &conn,
+                &path,
+                None,
+                &mut cursor,
+                &mut || write.record(),
+            )
+            .unwrap_err()
+        };
+        assert!(format!("{error:#}").contains("FILE_HISTORY_SHARED_ORDER_CONFLICT"));
+        assert!(conn.is_autocommit());
+        assert_eq!(rows(&conn), before, "a rejected reread left events behind");
+        assert!(cursor.file.is_none());
+    }
+    #[test]
     fn complete_claude_reread_reserves_surviving_local_ranks_for_valid_export() {
         let home = tempfile::tempdir().unwrap();
         let path = home.path().join("native-claude.jsonl");

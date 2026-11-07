@@ -204,6 +204,16 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
     };
     let start_offset = reader.start_offset();
     let order = native_order::optional(conn, "claude", attributed_session_id, start_offset == 0)?;
+    // A complete read is staged whole: its rows stay in the open chunk until
+    // `order.finish()` accepts them. A chunk committed ahead of a rejected
+    // order check would leave the rejected reread's events visible, and every
+    // later reread of the same bytes is rejected the same way.
+    let mut staged = || Ok(());
+    let between_records: &mut dyn FnMut() -> Result<()> = if order.is_some() {
+        &mut staged
+    } else {
+        between_records
+    };
     // A rewound pass restarts at the unterminated record it saw last time, so
     // that record gets the index it had before rather than one past it.
     let line_index = if reader.start_offset() == saved_claude.resume_from.unwrap_or(u64::MAX) {
