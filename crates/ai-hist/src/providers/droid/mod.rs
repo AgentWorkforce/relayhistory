@@ -29,7 +29,7 @@ pub(crate) const METADATA: ProviderMetadata = ProviderMetadata {
     message_ids: MessageIdOrigin::Provider,
     usage: None,
 };
-const GENERATION: &str = "droid_v2_1";
+const GENERATION: &str = "droid_v2_2";
 pub(crate) const ADAPTER: Option<ProviderAdapter> = Some(ProviderAdapter {
     generation: GENERATION,
     acquire,

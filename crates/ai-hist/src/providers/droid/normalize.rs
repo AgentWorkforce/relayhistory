@@ -156,7 +156,7 @@ fn message(
     let msg = &entry["message"];
     let role = format::string(msg, "role")?;
     let mid = format::string(entry, "id")?;
-    if !["user", "assistant"].contains(&role) {
+    if !["user", "assistant"].contains(&role) || format::is_control(msg) {
         marker(conn, sid, entry, &format!("message:{mid}"), keys)?;
         return Ok(0);
     }

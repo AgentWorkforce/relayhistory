@@ -360,7 +360,7 @@
       "repo_url": null,
       "session_id": "factory-fixture",
       "source": "droid",
-      "source_stamp": "droid_v2_1:sha256:d85cdeffc482acdfc18cfe542634b989e0587a07d6d5515cf9677f314007611f",
+      "source_stamp": "droid_v2_2:sha256:d85cdeffc482acdfc18cfe542634b989e0587a07d6d5515cf9677f314007611f",
       "title": "Factory fixture",
       "workspace_roots_json": null
     }

@@ -26,12 +26,22 @@
         "droid/v2-native-startup"
       ],
       "quirk": "Sanitized native Droid 0.148.1 session_start and settings written by an owned readonly exec on 2026-11-07. Inference failed authentication before any message or tool; metadata-only persistence is verified, authenticated message/reader round trip remains unverified."
+    },
+    {
+      "source": "droid",
+      "name": "v2-native-writer",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "droid/v2-native-writer"
+      ],
+      "quirk": "Sanitized owned native capture: task-private official Droid 1.6.0 resumed a 0.148.1 metadata-only session and completed an authenticated Claude Opus 4.8 turn on 2026-11-07. Native v2 messages, IDs/parent links, hook rows, llm_only startup reminders and turn outcome are preserved; paths, identities, context, commands and harmless prompt/reply text are replaced. Tool and second-turn append coverage remain synthetic."
     }
   ],
   "capture": [
     {
       "evidence": "Messages and identity",
-      "coverage": "Native v2 session_start and settings shape verified against an owned Droid 0.148.1 startup capture; native message IDs, RFC3339 timestamps, typed user/assistant/thinking content covered by synthetic fixtures. Legacy root and project directories; coherent settings sidecar capture; unsupported versions and duplicate identities rejected. Authenticated message writer/reader round trip remains unverified (Droid inference rejected the API key)."
+      "coverage": "Native v2 session_start, settings, message IDs/parent links and timestamp shape verified against an owned authenticated Droid 1.6.0 writer capture resumed from 0.148.1. Fixture round trip distinguishes real user/assistant text from explicit llm_only/user_only and hook context retained as markers. Legacy/project roots, coherent sidecars, unsupported versions and duplicate identities covered; tools and resumed appends additionally have synthetic coverage."
     },
     {
       "evidence": "Tools and metadata",

@@ -332,3 +332,87 @@ fn droid_watch_automatically_captures_append_and_settings_changes() {
     watch.stopper().stop();
     assert!(captured, "watch must capture without an explicit sync call");
 }
+
+#[test]
+fn authenticated_native_writer_keeps_hook_and_model_context_out_of_human_history() {
+    let home = tempfile::tempdir().unwrap();
+    let path = home
+        .path()
+        .join(".factory/sessions/-fixture/native-writer.jsonl");
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(
+        &path,
+        include_str!(
+            "fixtures/droid/v2-native-writer/.factory/sessions/-fixture/native-writer.jsonl"
+        ),
+    )
+    .unwrap();
+    std::fs::write(path.with_extension("settings.json"), include_str!("fixtures/droid/v2-native-writer/.factory/sessions/-fixture/native-writer.settings.json")).unwrap();
+    let evidence = provider_support::assert_history_conformance(
+        home.path(),
+        provider_support::HistoryCase {
+            source: Source::Droid,
+            session_id: "native-writer",
+            messages: &[
+                (
+                    Role::User,
+                    "Reply exactly FACTORY_NATIVE_WRITER_OK. Do not call any tools.",
+                ),
+                (Role::Assistant, "FACTORY_NATIVE_WRITER_OK"),
+            ],
+        },
+    );
+    assert_eq!(evidence.messages.len(), 2);
+    assert_eq!(evidence.prompts.len(), 1);
+    assert_eq!(
+        evidence.session.first_prompt.as_deref(),
+        Some("Reply exactly FACTORY_NATIVE_WRITER_OK. Do not call any tools.")
+    );
+    assert!(!evidence.prompts.iter().any(|p| p
+        .prompt
+        .as_deref()
+        .is_some_and(|text| text.contains("system-reminder"))));
+    assert!(evidence
+        .markers
+        .iter()
+        .any(|m| m.kind == "agent_turn_outcome"));
+    assert!(
+        evidence
+            .markers
+            .iter()
+            .filter(|m| m.kind == "message")
+            .count()
+            >= 5
+    );
+}
+
+#[test]
+fn rewriting_a_user_row_as_explicit_runtime_context_retires_its_old_prompt() {
+    let home = tempfile::tempdir().unwrap();
+    let path = stage(home.path());
+    let store = open(home.path());
+    let row = serde_json::json!({"type":"message","id":"runtime-context","timestamp":"2026-11-01T00:02:00Z","message":{"role":"user","content":[{"type":"text","text":"Runtime metadata"}],"visibility":"both"}});
+    std::fs::write(&path, format!("{FIXTURE}{row}\n")).unwrap();
+    store
+        .discover(DiscoveryOptions::default().sources([Source::Droid]))
+        .unwrap();
+    hydrate(&store);
+    assert!(read(&store)
+        .prompts
+        .iter()
+        .any(|p| p.prompt.as_deref() == Some("Runtime metadata")));
+    let mut control = row;
+    control["message"]["visibility"] = "llm_only".into();
+    std::fs::write(&path, format!("{FIXTURE}{control}\n")).unwrap();
+    hydrate(&store);
+    let evidence = read(&store);
+    assert!(!evidence
+        .prompts
+        .iter()
+        .any(|p| p.prompt.as_deref() == Some("Runtime metadata")));
+    assert!(!has(&evidence, "Runtime metadata"));
+    assert!(evidence
+        .markers
+        .iter()
+        .any(|m| m.message_id.as_deref() == Some("runtime-context")));
+}

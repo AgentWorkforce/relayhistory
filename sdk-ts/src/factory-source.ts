@@ -48,6 +48,10 @@ function readable(value: unknown): string {
   }).join('\n');
   return '';
 }
+function factoryControl(raw: FactoryMessage): boolean {
+  return raw.role === 'user' && (raw.visibility === 'llm_only' || raw.visibility === 'user_only' ||
+    (typeof raw.hookEventName === 'string' && !!raw.hookEventName));
+}
 /** Project a complete message set (all pages). Never invent IDs, timestamps or usage. */
 export function factoryEvidence(session: string, messages: unknown[]): FactoryEvidence[] {
   const sessionId = factorySessionId(session);
@@ -60,7 +64,7 @@ export function factoryEvidence(session: string, messages: unknown[]): FactoryEv
     const createdAt = timestamp(raw.createdAt, 'FACTORY_INVALID_MESSAGE_TIMESTAMP');
     const updatedAt = raw.updatedAt === undefined ? null : timestamp(raw.updatedAt, 'FACTORY_INVALID_MESSAGE_UPDATED_AT');
     if (!Array.isArray(raw.content)) throw new Error('FACTORY_INVALID_MESSAGE_CONTENT');
-    const role = typeof raw.role === 'string' ? raw.role : null;
+    const role = !factoryControl(raw) && typeof raw.role === 'string' ? raw.role : null;
     const blocks = raw.content.map(object);
     const prose = readable(raw.content);
     const blockIds = blocks.flatMap(block => typeof block.id === 'string' ? [identity(block.id, 'FACTORY_INVALID_BLOCK_ID')] : []);
@@ -164,7 +168,7 @@ export async function factoryCanonicalEvidence(session: string, messages: unknow
     const blocks = raw.content as unknown[];
     const marker = (uid: string, kind: string, payload: unknown) => add('session_marker', uid, { marker_uid: uid, message_id: mid, ts_ms: ts, kind, payload_json: stableJson(payload) });
     await marker(`api-message:${mid}`, 'factory_api_message', raw);
-    if (!['user', 'assistant', 'tool'].includes(String(raw.role))) continue;
+    if (factoryControl(raw) || !['user', 'assistant', 'tool'].includes(String(raw.role))) continue;
     const base = { message_id: mid, parent_id: typeof raw.parentId === 'string' ? raw.parentId : null, ts_ms: ts, model: typeof raw.modelId === 'string' ? raw.modelId : null, provider: typeof raw.apiProvider === 'string' ? raw.apiProvider : null, raw_kind: 'message' };
     if (!blocks.length && raw.role !== 'tool') await add('session_event', `${mid}:0`, { ...base, event_uid: `${mid}:0`, role: raw.role, kind: 'text', text: null });
     for (const [index, value] of blocks.entries()) {
@@ -219,6 +223,6 @@ async function canonicalToolResult(block: FactoryMessage): Promise<Record<string
   return facts;
 }
 async function factoryRawHash(bytes: Uint8Array): Promise<string> {
-  const digest = await globalThis.crypto.subtle.digest('SHA-256', bytes);
+  const digest = await globalThis.crypto.subtle.digest('SHA-256', new Uint8Array(bytes).buffer);
   return Array.from(new Uint8Array(digest), byte => byte.toString(16).padStart(2, '0')).join('');
 }

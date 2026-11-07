@@ -132,3 +132,14 @@ test('canonical role tool never becomes a human prompt or unbound native text ev
   assert.equal(events[0].payload.tool_use_id, 'call-1');
   assert.ok(records.some(row => row.payload.kind === 'opaque_block'));
 });
+
+test('explicit native hook and model-only context is never projected as a human turn', async () => {
+  const { factoryCanonicalEvidence } = await import('./factory-source.js');
+  for (const extra of [{ visibility: 'llm_only' }, { visibility: 'user_only' }, { hookEventName: 'UserPromptSubmit' }]) {
+    const raw = { ...message, ...extra, role: 'user', content: [{ type: 'text', text: 'Runtime context, not a human prompt' }] };
+    assert.equal(factoryEvidence(sid, [raw])[0].kind, 'marker');
+    const canonical = await factoryCanonicalEvidence(sid, [raw]);
+    assert.equal(canonical.filter(row => row.kind === 'session_event').length, 0);
+    assert.deepEqual(JSON.parse(String(canonical[0].payload.payload_json)), raw);
+  }
+});

@@ -83,8 +83,19 @@ pub(super) fn text(content: &Value) -> String {
 pub(super) fn first_prompt(entries: &[Value]) -> Option<String> {
     entries
         .iter()
-        .filter(|e| e["type"] == "message" && e["message"]["role"] == "user")
+        .filter(|e| {
+            e["type"] == "message" && e["message"]["role"] == "user" && !is_control(&e["message"])
+        })
         .map(|e| text(&e["message"]["content"]))
         .find(|v| !v.is_empty())
         .map(|v| v.chars().take(4096).collect())
+}
+pub(super) fn is_control(message: &Value) -> bool {
+    message["role"] == "user"
+        && (matches!(
+            message["visibility"].as_str(),
+            Some("llm_only" | "user_only")
+        ) || message["hookEventName"]
+            .as_str()
+            .is_some_and(|event| !event.is_empty()))
 }

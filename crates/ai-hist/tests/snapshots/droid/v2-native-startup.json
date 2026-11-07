@@ -65,7 +65,7 @@
       "repo_url": null,
       "session_id": "native-startup",
       "source": "droid",
-      "source_stamp": "droid_v2_1:sha256:b7a84b07dc5e1135853ae21104d7533ac8434c60e5715721b09c1986b668aaea",
+      "source_stamp": "droid_v2_2:sha256:b7a84b07dc5e1135853ae21104d7533ac8434c60e5715721b09c1986b668aaea",
       "title": "Native startup fixture",
       "workspace_roots_json": null
     }
