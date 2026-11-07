@@ -161,12 +161,14 @@ impl ShallowSessionProvider for Provider {
                 .iter()
                 .filter_map(|e| format::time(e).ok().flatten())
                 .min(),
-            last_activity_ms: last_activity.or(c.recency_hint_ms).max(
-                entries
-                    .iter()
-                    .filter_map(|e| format::time(e).ok().flatten())
-                    .max(),
-            ),
+            last_activity_ms: last_activity
+                .max(
+                    entries
+                        .iter()
+                        .filter_map(|e| format::time(e).ok().flatten())
+                        .max(),
+                )
+                .or(c.recency_hint_ms),
             title: header["sessionTitle"]
                 .as_str()
                 .or_else(|| header["title"].as_str())

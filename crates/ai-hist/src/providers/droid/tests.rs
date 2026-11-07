@@ -245,3 +245,40 @@ fn tail_preserves_complete_boundary_records_and_counts_only_unseen_lines() {
     assert_eq!(records, 1);
     assert_eq!(format::last_activity(rows, rows.len()).unwrap().1, 0);
 }
+
+#[test]
+fn oversized_tail_uses_known_native_time_before_file_copy_time() {
+    let (_temp, store, path) = fixture();
+    let rows = [
+        serde_json::json!({"type":"session_start","id":"factory-fixture","version":2}),
+        serde_json::json!({"type":"message","id":"head","timestamp":"2026-11-01T00:00:00Z","message":{"role":"user","content":[{"type":"text","text":"Original prompt"}]}}),
+        serde_json::json!({"type":"message","id":"large","timestamp":"2026-11-01T00:01:00Z","message":{"role":"assistant","content":[{"type":"text","text":"x".repeat(2 * HEAD_LIMIT as usize)}]}}),
+    ];
+    std::fs::write(
+        &path,
+        rows.iter()
+            .map(|row| format!("{row}\n"))
+            .collect::<String>(),
+    )
+    .unwrap();
+    let copied = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1794009600);
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(std::fs::FileTimes::new().set_modified(copied))
+        .unwrap();
+    store
+        .discover(crate::DiscoveryOptions::default().sources([crate::Source::Droid]))
+        .unwrap();
+    let evidence = store
+        .session(
+            &crate::SessionRef::id(crate::Source::Droid, "factory-fixture"),
+            crate::SessionQuery::default(),
+        )
+        .unwrap()
+        .unwrap();
+    // The oversized last record is outside bounded shallow parsing. A known
+    // native head time is an honest estimate; a file-copy time is not activity.
+    assert_eq!(evidence.session.last_activity_ms, Some(1793491200000));
+}

@@ -215,3 +215,32 @@ test('API-only tool metadata stays raw while activity text uses the shared nativ
   assert.equal(event.payload.raw_kind, 'tool_use');
   assert.deepEqual((rows.find(row => row.raw)?.raw?.content as unknown[])[0], block);
 });
+
+test('canonical Factory blocks retain numeric native order through source intake', async (t) => {
+  const { factoryCanonicalEvidence } = await import('./factory-source.js');
+  const { HistoryPluginRegistry, discoverSourcePlugins, hydrateSourcePlugin, getSessionEventsPage } = await import('./index.js');
+  const { mkdtemp, rm } = await import('node:fs/promises');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const dir = await mkdtemp(join(tmpdir(), 'factory-block-order-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
+  const expected = Array.from({ length: 12 }, (_, index) => `Block ${index}`);
+  const raw = { ...message, role: 'assistant', content: expected.map(text => ({ type: 'text', text })) };
+  const records = await factoryCanonicalEvidence(sid, [raw]);
+  const source: import('./source-contracts.js').HistorySource = {
+    id: 'factory-order-fixture', instanceId: 'owned', location: 'remote', supportedSources: ['droid'],
+    discover: async () => ({ observations: [{ source: 'droid', session_id: sid, raw_path: 'fixture:factory-order', source_stamp: 'order-v1' }] }),
+    hydrate: async () => ({ source_stamp: 'order-v1', source_bytes: Buffer.byteLength(JSON.stringify(raw)), covered_kinds: ['session_event', 'session_marker', 'tool_call'], records: records.map(({ kind, payload }) => ({ kind, payload })) }),
+  };
+  const registry = new HistoryPluginRegistry();
+  registry.register({ sources: [source] });
+  const dbPath = join(dir, 'history.db');
+  await discoverSourcePlugins(registry, { dbPath });
+  await hydrateSourcePlugin(source, { source: 'droid', sessionId: sid }, { dbPath });
+  const read = async () => (await getSessionEventsPage(sid, { source: 'droid', dbPath })).events;
+  const events = await read();
+  assert.deepEqual(events.map(event => event.text), expected);
+  assert.deepEqual(events.map(event => event.eventUid), expected.map((_, index) => `${message.id}:${index}`));
+  await hydrateSourcePlugin(source, { source: 'droid', sessionId: sid }, { dbPath });
+  assert.deepEqual(await read(), events);
+});
