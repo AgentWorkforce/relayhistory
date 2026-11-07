@@ -277,6 +277,34 @@ fn hermes_native_export_preserves_tool_identity_in_both_acquisition_orders() {
     }
 }
 #[test]
+fn imported_schema31_hydrates_after_schema32_upgrade() {
+    let origin = tempfile::tempdir().unwrap();
+    stage(origin.path());
+    let source = open(origin.path());
+    hydrate(&source);
+    let archive = export(origin.path());
+    let home = tempfile::tempdir().unwrap();
+    let store = open(home.path());
+    observe(&store);
+    apply(&store, records(&archive)).unwrap();
+    stage(home.path());
+    let db = rusqlite::Connection::open(home.path().join(".hermes/state.db")).unwrap();
+    db.execute("UPDATE schema_version SET version=32", [])
+        .unwrap();
+    hydrate(&store);
+    assert_location(home.path(), "both");
+    assert_same(&read(&store), &read(&source));
+    db.execute("UPDATE sessions SET title='changed'", [])
+        .unwrap();
+    let error = store
+        .hydrate(&reference(), HydrateOptions::default())
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("SHARED_EVIDENCE_CONFLICT"),
+        "{error}"
+    );
+}
+#[test]
 fn hermes_pre_intake_index_and_archive_work_without_reindexing() {
     let home = tempfile::tempdir().unwrap();
     let conn = rusqlite::Connection::open(home.path().join("ledger.db")).unwrap();
