@@ -263,20 +263,35 @@ fn sqlite_source_remains_read_only_and_spill_paths_are_only_text() {
 }
 #[test]
 fn schema_upgrade_preserves_shared_metadata_but_rejects_content_rewrites() {
-    let (home, roots, path, _db) = fixture();
+    let (home, roots, path, db) = fixture();
     let conn = crate::open_db(&home.path().join("ledger.db")).unwrap();
     let mut session = storage::all(&AcquisitionContext::new(ID, &roots), &path)
-        .unwrap().into_iter().find(|s| s.native_id == NATIVE).unwrap();
+        .unwrap()
+        .into_iter()
+        .find(|s| s.native_id == NATIVE)
+        .unwrap();
     normalize::session(&conn, &session, &path).unwrap();
     conn.execute("UPDATE session_markers SET location='both' WHERE source='hermes' AND session_id=? AND marker_uid='session'", [SESSION]).unwrap();
     let before: String = conn.query_row("SELECT payload_json FROM session_markers WHERE source='hermes' AND session_id=? AND marker_uid='session'", [SESSION], |r| r.get(0)).unwrap();
-    session.schema_version = 32;
-    assert_eq!(serde_json::to_value(&session).unwrap()["schema_version"], 32);
+    db.execute("UPDATE schema_version SET version=32", [])
+        .unwrap();
+    session = storage::all(&AcquisitionContext::new(ID, &roots), &path)
+        .unwrap()
+        .into_iter()
+        .find(|s| s.native_id == NATIVE)
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&session).unwrap()["schema_version"],
+        32
+    );
     normalize::session(&conn, &session, &path).unwrap();
     let after: (String, String) = conn.query_row("SELECT payload_json,location FROM session_markers WHERE source='hermes' AND session_id=? AND marker_uid='session'", [SESSION], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
     assert_eq!(after, (before.clone(), "both".into()));
     session.title = Some("changed".into());
-    assert!(normalize::session(&conn, &session, &path).unwrap_err().to_string().contains("SHARED_EVIDENCE_CONFLICT"));
+    assert!(normalize::session(&conn, &session, &path)
+        .unwrap_err()
+        .to_string()
+        .contains("SHARED_EVIDENCE_CONFLICT"));
     let retained: String = conn.query_row("SELECT payload_json FROM session_markers WHERE source='hermes' AND session_id=? AND marker_uid='session'", [SESSION], |r| r.get(0)).unwrap();
     assert_eq!(retained, before);
 }

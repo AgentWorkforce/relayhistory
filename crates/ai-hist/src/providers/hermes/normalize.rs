@@ -7,8 +7,8 @@ use crate::ingest::{
 use crate::store::NewSessionMarker;
 use crate::HistoryEntry;
 use anyhow::ensure;
-use std::collections::BTreeSet;
 use rusqlite::OptionalExtension;
+use std::collections::BTreeSet;
 #[derive(Default)]
 struct Keys {
     events: BTreeSet<String>,
@@ -166,15 +166,24 @@ fn session_payload(conn: &Connection, s: &Session) -> Result<String> {
         "SELECT payload_json FROM session_markers WHERE source=?1 AND session_id=?2 AND marker_uid='session' AND location IS NOT 'local'",
         rusqlite::params![ID, s.id], |row| row.get(0),
     ).optional()?.flatten();
-    if let Some((raw, prior)) = prior.and_then(|text| serde_json::from_str::<Value>(&text).ok().map(|value| (text, value))) {
+    if let Some((raw, prior)) = prior.and_then(|text| {
+        serde_json::from_str::<Value>(&text)
+            .ok()
+            .map(|value| (text, value))
+    }) {
         let mut comparable = prior.clone();
         if let (Some(old), Some(new)) = (comparable.as_object_mut(), payload.as_object_mut()) {
             let old_version = old.remove("schema_version");
             let new_version = new.remove("schema_version");
-            let supported = |v: &Option<Value>| matches!(v.as_ref().and_then(Value::as_i64), Some(31 | 32));
+            let supported =
+                |v: &Option<Value>| matches!(v.as_ref().and_then(Value::as_i64), Some(31 | 32));
             let same = old == new && supported(&old_version) && supported(&new_version);
-            if let Some(version) = new_version { new.insert("schema_version".into(), version); }
-            if same { return Ok(raw); }
+            if let Some(version) = new_version {
+                new.insert("schema_version".into(), version);
+            }
+            if same {
+                return Ok(raw);
+            }
         }
     }
     Ok(payload.to_string())
