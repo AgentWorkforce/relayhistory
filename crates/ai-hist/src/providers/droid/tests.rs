@@ -197,7 +197,7 @@ fn snapshot_read_limits_and_recent_shallow_activity_are_bounded() {
         let timestamp = chrono::DateTime::from_timestamp(1793491200 + index, 0)
             .unwrap()
             .to_rfc3339();
-        rows.push(serde_json::json!({"type":"message","id":format!("m{index}"),"timestamp":timestamp,"message":{"role":"user","content":[{"type":"text","text":"bounded shallow test"}]}}));
+        rows.push(serde_json::json!({"type":"message","id":format!("m{index}"),"timestamp":timestamp,"message":{"role":"user","content":[{"type":"text","text":"bounded shallow test".repeat(24)}]}}));
     }
     std::fs::write(
         &path,
@@ -217,5 +217,31 @@ fn snapshot_read_limits_and_recent_shallow_activity_are_bounded() {
         .unwrap()
         .unwrap();
     assert_eq!(evidence.session.last_activity_ms, Some(1793491399000));
-    assert!(storage::tail(&path, &ctx).unwrap().len() <= HEAD_LIMIT as usize);
+    assert!(std::fs::metadata(&path).unwrap().len() > HEAD_LIMIT);
+    assert!(storage::tail(&path, &ctx).unwrap().bytes.len() <= HEAD_LIMIT as usize);
+}
+
+#[test]
+fn tail_preserves_complete_boundary_records_and_counts_only_unseen_lines() {
+    let (_temp, store, path) = fixture();
+    let ctx = AcquisitionContext::new(ID, store.roots());
+    let mut bytes = vec![b'x'; 100];
+    bytes.push(b'\n');
+    let first = b"{\"timestamp\":\"2026-11-07T00:00:00Z\"}\n";
+    bytes.extend_from_slice(first);
+    bytes.resize(101 + HEAD_LIMIT as usize - 1, b' ');
+    bytes.push(b'\n');
+    std::fs::write(&path, bytes).unwrap();
+    let tail = storage::tail(&path, &ctx).unwrap();
+    assert_eq!(tail.offset, 101);
+    assert!(tail.bytes.starts_with(first));
+    assert_eq!(tail.bytes.len(), HEAD_LIMIT as usize);
+    let rows =
+        b"{\"timestamp\":\"2026-11-07T00:00:00Z\"}\n{\"timestamp\":\"2026-11-07T00:01:00Z\"}\n";
+    let head = format::head_extent(rows, 1);
+    assert_eq!(head, first.len());
+    let (latest, records) = format::last_activity(rows, head).unwrap();
+    assert_eq!(latest, Some(1794009660000));
+    assert_eq!(records, 1);
+    assert_eq!(format::last_activity(rows, rows.len()).unwrap().1, 0);
 }

@@ -131,7 +131,7 @@ impl ShallowSessionProvider for Provider {
             &AcquisitionContext::new(ID, scan.provider_roots),
         )?;
         scan.note_open();
-        scan.note_bytes(tail.len() as u64);
+        scan.note_bytes(tail.bytes.len() as u64);
         anyhow::ensure!(
             storage::stamp(
                 Path::new(&c.locator),
@@ -142,7 +142,9 @@ impl ShallowSessionProvider for Provider {
         );
         let entries = format::parse(&bytes, true)?;
         scan.note_records(entries.len() as u64);
-        let (last_activity, tail_records) = format::last_activity(&tail)?;
+        let overlap = (format::head_extent(&bytes, entries.len()) as u64)
+            .saturating_sub(tail.offset) as usize;
+        let (last_activity, tail_records) = format::last_activity(&tail.bytes, overlap)?;
         scan.note_records(tail_records as u64);
         let header = &entries[0];
         let sid = format::string(header, "id")?;

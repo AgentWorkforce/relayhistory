@@ -606,8 +606,8 @@
       "repo_url": null,
       "session_id": "native-read-session",
       "source": "droid",
-      "source_stamp": "droid_v2_3:sha256:a27232b9cb3f3aee4de361c5a<n>eac3c7ac<n>b36f1b945",
-      "title": "Owned finite read-only persistence test. Only use Read. Do not use MCP, network, shell, skills or modify anything. First Read the exact file /Users/kh...",
+      "source_stamp": "droid_v2_3:sha256:ed984138b0e37066efb43c3bf4ac31c987282ea1d1fc3bfb7b02f9cfe35454c2",
+      "title": "Owned finite read-only persistence test. Only use Read. Do not use MCP, network, shell, skills or modify anything. First Read the exact file /fixture/...",
       "workspace_roots_json": null
     }
   ],

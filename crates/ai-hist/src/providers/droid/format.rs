@@ -68,14 +68,31 @@ pub(super) fn parse(bytes: &[u8], shallow: bool) -> Result<Vec<Value>> {
     anyhow::ensure!(!entries.is_empty(), "DROID_INCOMPLETE_HEADER");
     Ok(entries)
 }
-pub(super) fn last_activity(bytes: &[u8]) -> Result<(Option<i64>, usize)> {
+pub(super) fn head_extent(bytes: &[u8], records: usize) -> usize {
+    let mut offset = 0;
+    let mut seen = 0;
+    for line in bytes.split_inclusive(|b| *b == b'\n') {
+        offset += line.len();
+        if line != b"\n" {
+            seen += 1;
+            if seen == records {
+                return offset;
+            }
+        }
+    }
+    offset
+}
+pub(super) fn last_activity(bytes: &[u8], counted_before: usize) -> Result<(Option<i64>, usize)> {
     let end = bytes.iter().rposition(|b| *b == b'\n').unwrap_or(0);
     let mut latest = None;
     let mut records = 0;
-    for line in bytes[..end]
-        .split(|b| *b == b'\n')
-        .filter(|line| !line.is_empty())
-    {
+    let mut offset = 0;
+    for line in bytes[..end].split(|b| *b == b'\n') {
+        let start = offset;
+        offset += line.len() + 1;
+        if line.is_empty() {
+            continue;
+        }
         crate::ingest::check_capture_cancelled()?;
         let row: Value = serde_json::from_slice(line)
             .context("DROID_INVALID_RECORD: malformed complete tail record")?;
@@ -84,7 +101,7 @@ pub(super) fn last_activity(bytes: &[u8]) -> Result<(Option<i64>, usize)> {
             "DROID_INVALID_RECORD: tail record must be an object"
         );
         latest = latest.max(time(&row)?);
-        records += 1;
+        records += usize::from(start >= counted_before);
     }
     Ok((latest, records))
 }

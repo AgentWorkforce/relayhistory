@@ -26,21 +26,33 @@ pub(super) fn read_limited(
     anyhow::ensure!(raw.len() as u64 <= limit, "{code}");
     Ok(raw)
 }
-pub(super) fn tail(path: &Path, context: &AcquisitionContext<'_>) -> Result<Vec<u8>> {
+pub(super) struct Tail {
+    pub offset: u64,
+    pub bytes: Vec<u8>,
+}
+pub(super) fn tail(path: &Path, context: &AcquisitionContext<'_>) -> Result<Tail> {
     context.validate(path)?;
     let mut file = std::fs::File::open(path)?;
     let offset = file.metadata()?.len().saturating_sub(HEAD_LIMIT);
-    file.seek(SeekFrom::Start(offset))?;
+    // Include the preceding byte so a window on a record boundary retains that record.
+    let start = offset.saturating_sub(1);
+    file.seek(SeekFrom::Start(start))?;
     let mut bytes = Vec::new();
-    file.take(HEAD_LIMIT).read_to_end(&mut bytes)?;
+    file.take(HEAD_LIMIT + u64::from(offset > 0))
+        .read_to_end(&mut bytes)?;
+    let mut actual_offset = start;
     if offset > 0 {
-        let start = bytes
+        let skipped = bytes
             .iter()
             .position(|b| *b == b'\n')
             .map_or(bytes.len(), |n| n + 1);
-        bytes.drain(..start);
+        bytes.drain(..skipped);
+        actual_offset += skipped as u64;
     }
-    Ok(bytes)
+    Ok(Tail {
+        offset: actual_offset,
+        bytes,
+    })
 }
 pub(super) fn stamp(
     path: &Path,
