@@ -282,3 +282,103 @@ fn oversized_tail_uses_known_native_time_before_file_copy_time() {
     // native head time is an honest estimate; a file-copy time is not activity.
     assert_eq!(evidence.session.last_activity_ms, Some(1793491200000));
 }
+
+#[test]
+fn unavailable_stamp_cannot_hit_cache_or_authorize_missing_session_retirement() {
+    let (_temp, store, path) = fixture();
+    let sibling = path.with_file_name("missing.jsonl");
+    std::fs::write(
+        &sibling,
+        FIXTURE.replace("factory-fixture", "unrelated-session"),
+    )
+    .unwrap();
+    let conn = crate::open_db(store.db_path()).unwrap();
+    let repairs = crate::ingest::SweepRepairs::default();
+    let mut state = serde_json::Map::new();
+    sweep(SweepContext {
+        conn: &conn,
+        state: &mut state,
+        roots: store.roots(),
+        paths: None,
+        repairs: &repairs,
+    })
+    .unwrap();
+    std::fs::remove_file(sibling).unwrap();
+    std::fs::write(&path, FIXTURE.replace("Hello Factory", "Recovered Factory")).unwrap();
+    for legacy_cache in [true, false] {
+        let locator = path.to_string_lossy().into_owned();
+        let cache = state
+            .get_mut("droid_file_stamps")
+            .unwrap()
+            .as_object_mut()
+            .unwrap();
+        cache.remove(&locator);
+        if legacy_cache {
+            cache.insert(locator.clone(),serde_json::json!({"stamp":"droid_stamp_unavailable","generation":GENERATION,"sid":"factory-fixture"}));
+        }
+        // Model the actual phase boundary deterministically: enumeration failed
+        // stamping, but snapshot acquisition can now read the recovered file.
+        let env = DiscoveryEnv::with_provider_roots(&conn, store.roots().clone());
+        let mut candidates = Provider.enumerate(&env, None).unwrap();
+        assert_eq!(candidates.len(), 1);
+        candidates[0].stamp = "droid_stamp_unavailable".into();
+        let result = sweep_candidates(
+            SweepContext {
+                conn: &conn,
+                state: &mut state,
+                roots: store.roots(),
+                paths: None,
+                repairs: &repairs,
+            },
+            candidates,
+        )
+        .unwrap();
+        assert!(
+            store
+                .session(
+                    &crate::SessionRef::id(crate::Source::Droid, "unrelated-session"),
+                    crate::SessionQuery::default()
+                )
+                .unwrap()
+                .is_some(),
+            "an incomplete stamp pass must not retire an unrelated missing session"
+        );
+        assert_eq!(result.unread, 1);
+        assert!(state["droid_file_stamps"].get(&locator).is_none());
+        let recovered = store
+            .session(
+                &crate::SessionRef::id(crate::Source::Droid, "factory-fixture"),
+                crate::SessionQuery::default(),
+            )
+            .unwrap()
+            .unwrap();
+        assert!(recovered
+            .messages
+            .iter()
+            .flat_map(|message| &message.blocks)
+            .any(|block| block
+                .text
+                .as_deref()
+                .is_some_and(|text| text.contains("Recovered Factory"))));
+    }
+    // A later genuinely complete enumeration can perform normal retirement.
+    assert_eq!(
+        sweep(SweepContext {
+            conn: &conn,
+            state: &mut state,
+            roots: store.roots(),
+            paths: None,
+            repairs: &repairs
+        })
+        .unwrap()
+        .unread,
+        0
+    );
+    assert!(store
+        .session(
+            &crate::SessionRef::id(crate::Source::Droid, "unrelated-session"),
+            crate::SessionQuery::default()
+        )
+        .unwrap()
+        .is_none());
+}

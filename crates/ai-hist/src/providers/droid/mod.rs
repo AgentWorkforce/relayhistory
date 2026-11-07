@@ -14,6 +14,7 @@ mod storage;
 mod tests;
 
 const ID: &str = "droid";
+const UNAVAILABLE_STAMP: &str = "droid_stamp_unavailable";
 const HEAD_LIMIT: u64 = 64 * 1024;
 pub(crate) const LOCAL_SOURCE: LocalSource = LocalSource {
     id: ID,
@@ -91,7 +92,7 @@ impl ShallowSessionProvider for Provider {
                 // without blocking healthy sessions or retiring prior snapshots.
                 let (stamp, recency_hint_ms) =
                     storage::stamp(&path, &AcquisitionContext::new(ID, &env.provider_roots))
-                        .unwrap_or_else(|_| ("droid_stamp_unavailable".into(), None));
+                        .unwrap_or_else(|_| (UNAVAILABLE_STAMP.into(), None));
                 out.push(Candidate {
                     source: ID,
                     locator: path.to_string_lossy().into_owned(),
@@ -231,6 +232,10 @@ fn ingest(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
 fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
     let env = DiscoveryEnv::with_provider_roots(ctx.conn, ctx.roots.clone())
         .with_path_scope(ctx.paths.cloned());
+    let candidates = Provider.enumerate(&env, None)?;
+    sweep_candidates(ctx, candidates)
+}
+fn sweep_candidates(ctx: SweepContext<'_>, candidates: Vec<Candidate>) -> Result<SweepResult> {
     let mut result = SweepResult::default();
     let cache_key = "droid_file_stamps";
     let mut cache = ctx
@@ -239,7 +244,6 @@ fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
         .and_then(Value::as_object)
         .cloned()
         .unwrap_or_default();
-    let candidates = Provider.enumerate(&env, None)?;
     if ctx.paths.is_none() {
         let visited: std::collections::BTreeSet<_> =
             candidates.iter().map(|c| c.locator.as_str()).collect();
@@ -249,10 +253,12 @@ fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
         crate::ingest::check_capture_cancelled()?;
         let path = Path::new(&candidate.locator);
         let generation = GENERATION;
+        let unavailable = candidate.stamp == UNAVAILABLE_STAMP;
         let cached_sid = cache
             .get(&candidate.locator)
             .filter(|previous| {
-                previous["stamp"].as_str() == Some(&candidate.stamp)
+                !unavailable
+                    && previous["stamp"].as_str() == Some(&candidate.stamp)
                     && previous["generation"].as_str() == Some(generation)
             })
             .and_then(|previous| previous["sid"].as_str());
@@ -283,13 +289,16 @@ fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
         };
         match ingest() {
             Ok((n, partial, sid)) => {
-                if partial {
+                // A recovered capture does not turn an incomplete enumeration
+                // into authority to cache a sentinel or retire missing sessions.
+                let incomplete = partial || unavailable;
+                if incomplete {
                     cache.remove(&candidate.locator);
                 } else {
                     cache.insert(candidate.locator.clone(), serde_json::json!({"stamp": candidate.stamp, "generation": generation, "sid": sid}));
                 }
                 result.inserted += n;
-                result.unread += u64::from(partial);
+                result.unread += u64::from(incomplete);
             }
             Err(error) => {
                 crate::ingest::check_capture_cancelled()?;
