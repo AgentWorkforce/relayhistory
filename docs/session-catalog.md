@@ -559,6 +559,34 @@ limit without a continuation token. Hosts can accept another thread URL/ID and
 verify it through export. Scheduled catch-up scans selected bindings separately
 from this picker, so its limit does not cap the number of threads a host syncs.
 
+### Hosted Factory transcript projection
+
+`ai-hist/factory-source` interprets the documented Factory Sessions API message
+shape. Hosts own API keys, selected sessions, HTTP transport, pagination,
+scheduling, injection and delivery. `factoryMessagePage` validates each messages
+page; hosts fetch every page before treating a snapshot as complete. A repeated
+cursor, failed page or exceeded acquisition bound must preserve the preceding
+snapshot rather than retire unvisited messages.
+
+`factoryEvidence` provides readable message envelopes with the canonical source
+`droid`. `factoryCanonicalEvidence` produces per-block `session_event`, native
+`tool_call` and raw `session_marker` payloads for canonical delivery. Its event
+keys match local Droid acquisition: `["session_event", "droid", sessionId,
+messageId + ":" + blockOrdinal]`; tool keys use the native tool-use ID.
+`record_id` is SHA-256 over the compact JSON key array, matching the Rust export
+contract. A host supplies its own origin and revision fences. These records do
+not by themselves configure or activate a hosted delivery pipeline.
+
+Message IDs, optional block IDs, creation/update timestamps, tool-use IDs and
+the original API JSON are preserved. The API's `toolUseId` and `isError` fields
+map to explicit tool-result identity and outcomes. Human text stays separate
+from tool output. Unknown blocks and non-human roles stay raw markers; thinking
+also retains its typed canonical block. No credits, usage or current-time
+timestamps are inferred. API-only metadata is
+retained in non-activity markers, so it does not create a second conversation
+message alongside the same locally captured native block. Fixture tests compare
+API event/tool keys and measured facts against the local parser's snapshots.
+
 ### Session markers
 
 Not every provider record is a message. Compaction and summary boundaries,

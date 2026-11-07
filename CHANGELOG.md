@@ -9,6 +9,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - Factory Droid local sessions are discovered and indexed automatically from native JSONL transcripts and settings sidecars, preserving messages, tool outcomes and resumed-session changes.
+- `ai-hist/factory-source` projects Factory API messages into readable evidence and canonical delivery records with the same native block identities as local Droid capture, preserving raw messages and explicit tool outcomes.
 
 ### Rust API
 
