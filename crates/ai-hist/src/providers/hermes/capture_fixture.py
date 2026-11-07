@@ -30,7 +30,9 @@ with patch('time.time', return_value=1780000000.0):
     oracle = [db.export_session(sid, include_inactive=True) for sid in ['chat/not-a-uuid:α','compressed-child']]
     db.close()
 conn=sqlite3.connect(root/'state.db')
-assert conn.execute('SELECT version FROM schema_version').fetchone()[0] == args.schema_version
+version = conn.execute('SELECT version FROM schema_version').fetchone()[0]
+if version != args.schema_version:
+    raise SystemExit(f'expected schema {args.schema_version}, found {version}')
 oracle_name = 'official-export.json' if args.schema_version == 31 else 'official-export-schema32.json'
 (output/oracle_name).write_text(json.dumps(oracle, indent=2, ensure_ascii=False)+'\n')
 # Preserve actual upstream table DDL/rows, omit derived indexes, triggers and other stores.
