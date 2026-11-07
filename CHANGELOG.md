@@ -4,7 +4,11 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Patch]
+
+### Fixed
+
+- Hermes history discovery and capture accept SQLite schema 32 while retaining schema 31 support, including archived messages and native tool-call identities.
 
 ## [0.57.0] - 2026-11-06
 

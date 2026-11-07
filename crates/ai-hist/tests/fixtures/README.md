@@ -226,6 +226,8 @@ source without deciding which one fails the test.
 | pi/writer-v3 | Pi 1.1.0 SessionManager v3 synthetic persistence capture: custom IDs, forkFrom parentSession, full branched history, tools/results, assistant usage, standalone usage and compaction markers; upstream getEntries oracle. |
 | hermes/schema31 | Pinned Hermes schema 31 writer, arbitrary native IDs, resumed messages, tool calls/results, compression child and archived rows; no per-request usage inferred. |
 | hermes/official-export | SessionDB.export_session(include_inactive=True) independent oracle from pinned writer. |
+| hermes/schema32 | Pinned Hermes schema 32 writer with additive runtime and transcript revision columns; same native messages, tools, archived rows and compression child as schema 31. |
+| hermes/official-export-schema32 | Schema 32 SessionDB.export_session(include_inactive=True) oracle from the pinned upstream writer. |
 | omp/title-v3 | Authored synthetic OMP18.9.2 title-slot JSONL verified against pinned official parseSessionContent; partial assistant usage, image blob reference retained as marker, actual tool IDs. |
 | omp/writer-v3 | OMP18.9.2 checksum-pinned real SessionManager writer capture: user/assistant/tool, title change, reopen/resume; independently read with getEntries and loadSessionMessagesReadOnly. Random IDs and wall clock sanitized consistently. |
 | antigravity/ordinary | Official SDK 0.1.22 native harness transcript writer and independent restart reader; ordinary synthetic conversation, complete and compact projections. SDK capture only, not an App or CLI writer capture. |

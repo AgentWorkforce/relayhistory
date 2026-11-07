@@ -78,7 +78,7 @@ fn write_session(conn: &Connection, s: &Session, path: &Path) -> Result<usize> {
             message: None,
             ts: s.started,
             kind: "session_metadata",
-            payload: &serde_json::json!({"native_session_id":s.native_id,"profile":s.profile,"parent_session_id":s.parent,"end_reason":s.end_reason,"title":s.title,"model":s.model,"schema_version":31}),
+            payload: &serde_json::json!({"native_session_id":s.native_id,"profile":s.profile,"parent_session_id":s.parent,"end_reason":s.end_reason,"title":s.title,"model":s.model,"schema_version":s.schema_version}),
         },
         &mut keys,
     )?;

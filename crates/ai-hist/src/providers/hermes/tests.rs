@@ -4,22 +4,36 @@ const SQL: &str = include_str!("../../../tests/fixtures/hermes/schema31.sql");
 const NATIVE: &str = "chat/not-a-uuid:α";
 const SESSION: &str = "default:636861742f6e6f742d612d757569643aceb1";
 fn fixture() -> (tempfile::TempDir, ProviderRoots, PathBuf, Connection) {
+    fixture_sql(SQL)
+}
+fn fixture_sql(sql: &str) -> (tempfile::TempDir, ProviderRoots, PathBuf, Connection) {
     let home = tempfile::tempdir().unwrap();
     let roots = ProviderRoots::from_home(home.path().into(), home.path().join("opencode.db"));
     let path = home.path().join(".hermes/state.db");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     let db = Connection::open(&path).unwrap();
-    db.execute_batch(SQL).unwrap();
+    db.execute_batch(sql).unwrap();
     (home, roots, path, db)
 }
 #[test]
 fn official_export_matches_captured_writer_messages() {
-    let (_home, roots, path, _db) = fixture();
+    assert_official_export(
+        SQL,
+        include_str!("../../../tests/fixtures/hermes/official-export.json"),
+    );
+}
+#[test]
+fn schema32_official_export_matches_captured_writer_messages() {
+    assert_official_export(
+        include_str!("../../../tests/fixtures/hermes/schema32.sql"),
+        include_str!("../../../tests/fixtures/hermes/official-export-schema32.json"),
+    );
+}
+fn assert_official_export(sql: &str, oracle: &str) {
+    let (_home, roots, path, _db) = fixture_sql(sql);
     let captured = storage::all(&AcquisitionContext::new(ID, &roots), &path).unwrap();
-    let oracle: Value = serde_json::from_str(include_str!(
-        "../../../tests/fixtures/hermes/official-export.json"
-    ))
-    .unwrap();
+    let oracle: Value = serde_json::from_str(oracle).unwrap();
+    assert_eq!(captured.len(), oracle.as_array().unwrap().len());
     assert_eq!(oracle[0]["input_tokens"], 1500);
     assert_eq!(oracle[0]["output_tokens"], 200);
     for s in captured {
@@ -132,12 +146,14 @@ fn missing_empty_unsupported_and_malformed_are_distinguished() {
     db.execute_batch("DELETE FROM messages; DELETE FROM sessions")
         .unwrap();
     assert!(storage::enumerate(&roots, None).unwrap().is_empty());
-    db.execute("UPDATE schema_version SET version=32", [])
-        .unwrap();
-    assert!(storage::enumerate(&roots, None)
-        .unwrap_err()
-        .to_string()
-        .contains("unsupported Hermes schema 32"));
+    for version in [30, 33] {
+        db.execute("UPDATE schema_version SET version=?", [version])
+            .unwrap();
+        assert!(storage::enumerate(&roots, None)
+            .unwrap_err()
+            .to_string()
+            .contains(&format!("unsupported Hermes schema {version}")));
+    }
     drop(db);
     std::fs::write(&path, b"not SQLite").unwrap();
     assert!(storage::enumerate(&roots, None).is_err());
@@ -532,7 +548,7 @@ fn deleted_sessions_retire_only_after_complete_selected_profile_capture() {
     assert_eq!(location, "remote");
     db.execute_batch("DELETE FROM messages; DELETE FROM sessions")
         .unwrap();
-    db.execute("UPDATE schema_version SET version=32", [])
+    db.execute("UPDATE schema_version SET version=33", [])
         .unwrap();
     run(&mut state, Some(&unrelated)).unwrap();
     assert!(run(&mut state, None).is_err());
