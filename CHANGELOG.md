@@ -4,7 +4,17 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Minor]
+
+### Added
+
+- Search matches carry a match-centered `snippet` (with `contentTruncated` and `snippetStartOffset`), echo grouping (`groupId`, `groupSize`, `echoCount`, `groupTruncated`, `isPrimary`), `origin`, `controlKind`, `eventUid` and an `eventRef`; `prompt` still holds the full text. Search accepts `sessionId`, `kinds`, `origin`, `maxContentChars` and `maxTotalContentChars` filters and budgets.
+- The MCP `search_history` tool returns an envelope `{matches, nextCursor, truncated, totalContentCharsUsed}` and rejects unknown arguments.
+
+### Changed
+
+- Search pages return group primaries only: assistant and tool rows that repeat a prompt verbatim (or are linked to it) collapse into that prompt as counted echoes. Two identical-wording user prompts at different timestamps both stay primaries.
+- The native contract is now 30.
 
 ## [0.57.1] - 2026-11-07
 

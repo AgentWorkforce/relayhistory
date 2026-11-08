@@ -129,7 +129,36 @@ test('the TypeScript CLI and MCP return the SDK search result', async () => {
       const result = await client.callTool({ name: 'search_history', arguments: { query: 'searchneedle' } });
       assert.equal(result.isError, undefined);
       const text = (result.content as Array<{ text: string }>)[0].text;
-      assert.deepEqual(JSON.parse(text), JSON.parse(JSON.stringify(expected)));
+      const envelope = JSON.parse(text) as { matches: SearchMatch[]; nextCursor: unknown; truncated: boolean; totalContentCharsUsed: number };
+      assert.deepEqual(envelope.matches, JSON.parse(JSON.stringify(expected)));
+      assert.equal(envelope.truncated, false);
+      assert.equal(
+        envelope.totalContentCharsUsed,
+        envelope.matches.reduce((sum, match) => sum + JSON.stringify(match).length, 0),
+      );
+      // Every match carries the grouping and snippet fields.
+      for (const match of envelope.matches) {
+        assert.equal(typeof match.snippet, 'string');
+        assert.equal(match.contentTruncated, false);
+        assert.equal(match.groupSize, 1);
+        assert.equal(match.echoCount, 0);
+        assert.equal(match.isPrimary, true);
+        assert.equal(match.origin, match.matchSource === 'history' ? 'human' : 'unknown');
+        assert.equal(match.eventRef.id, match.id);
+        assert.equal(match.eventRef.matchSource, match.matchSource);
+      }
+      assert.ok(tool.inputSchema.properties?.session_id, 'search_history exposes session_id');
+      assert.ok(tool.inputSchema.properties?.kinds, 'search_history exposes kinds');
+      assert.ok(tool.inputSchema.properties?.origin, 'search_history exposes origin');
+      assert.ok(tool.inputSchema.properties?.max_content_chars, 'search_history exposes max_content_chars');
+      assert.ok(tool.inputSchema.properties?.max_total_content_chars, 'search_history exposes max_total_content_chars');
+
+      // Unknown arguments are rejected by name, budget-like ones included.
+      const unknown = await client.callTool({
+        name: 'search_history', arguments: { query: 'searchneedle', max_chars: 100 },
+      });
+      assert.equal(unknown.isError, true);
+      assert.match(JSON.stringify(unknown.content), /max_chars/);
 
       assert.ok(tool.inputSchema.properties?.before_ms, 'search_history exposes before_ms');
       const newest = expected[0];
@@ -137,7 +166,7 @@ test('the TypeScript CLI and MCP return the SDK search result', async () => {
         name: 'search_history', arguments: { query: 'searchneedle', before_ms: newest.timestampMs },
       });
       assert.equal(bounded.isError, undefined);
-      const boundedRows = JSON.parse((bounded.content as Array<{ text: string }>)[0].text) as SearchMatch[];
+      const boundedRows = (JSON.parse((bounded.content as Array<{ text: string }>)[0].text) as { matches: SearchMatch[] }).matches;
       assert.deepEqual(
         boundedRows.map(identity),
         expected.filter((match) => match.timestampMs < newest.timestampMs).map(identity),

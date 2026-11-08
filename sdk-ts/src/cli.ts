@@ -328,7 +328,7 @@ export function humanLine(value: unknown): string {
   const source = row.matchSource != null && row.matchSource !== 'history'
     ? `${row.source ?? ''}:${row.role ?? ''}:${row.kind ?? ''}`
     : row.source ?? '';
-  return [row.timestampMs ?? row.lastActivityMs ?? '', source, locations, row.sessionId ?? '', row.project ?? row.cwd ?? '', row.prompt ?? row.firstPrompt ?? '']
+  return [row.timestampMs ?? row.lastActivityMs ?? '', source, locations, row.sessionId ?? '', row.project ?? row.cwd ?? '', row.snippet ?? row.prompt ?? row.firstPrompt ?? '']
     .filter((item) => item !== '' && item != null)
     .join('  ');
 }

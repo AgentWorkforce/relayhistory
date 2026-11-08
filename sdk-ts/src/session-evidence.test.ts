@@ -9,7 +9,7 @@ import {
   SESSION_EVIDENCE_CONTRACT_VERSION, SESSION_HYDRATION_CONTRACT_VERSION,
   getSessionEvents, getSessionFileEdits, getSessionFileEditsPage, getSessionToolCalls,
   getSessionToolCallsPage, getSessionUserTurns, getSessionUserTurnsPage,
-  hydrateSession, parseStoredJson, sessionFileEdits, sessionToolCalls, sync,
+  hydrateSession, parseStoredJson, search, sessionFileEdits, sessionToolCalls, sync,
   type EvidenceCursor, type SessionFileEdit, type SessionToolCall,
 } from './index.js';
 import { combineHydration, normalizeHydration, sessionEvent } from './normalization.js';
@@ -670,6 +670,21 @@ test('user turn pages group each message with its blocks and page by keyset', as
       getSessionUserTurnsPage('claude', '', { dbPath }),
       (error: unknown) => error instanceof InvalidArgumentError,
     );
+  } finally {
+    await cleanup();
+  }
+});
+
+test('search grouping never hides raw rows from getSessionEvents', async () => {
+  const { dbPath, cleanup } = await seededDatabase();
+  try {
+    const before = await getSessionEvents(SHARED_SESSION, { source: 'claude', dbPath });
+    assert.ok(before.length > 1, 'the fixture has raw events');
+    // Grouped search may collapse echoes into primaries; the raw read must not.
+    await search('auth', { dbPath, sessionId: SHARED_SESSION });
+    const after = await getSessionEvents(SHARED_SESSION, { source: 'claude', dbPath });
+    assert.deepEqual(after.map((event) => event.id), before.map((event) => event.id));
+    assert.deepEqual(after.map((event) => event.eventUid), before.map((event) => event.eventUid));
   } finally {
     await cleanup();
   }

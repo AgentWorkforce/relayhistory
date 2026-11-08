@@ -91,6 +91,20 @@ export interface SearchOptions {
   rawFts?: boolean
   /** `all` (default), `user`, `assistant` or `prompt` — the CLI's `--role`. */
   role?: string
+  /** Restrict to one session id. */
+  sessionId?: string
+  /**
+   * Restrict to these kinds (`history`, `text`, `thinking`, `tool_use`,
+   * `tool_result`); absent means every kind.
+   */
+  kinds?: Array<string>
+  /**
+   * Restrict to one origin: `human`, `peer`, `system`, `synthetic` or
+   * `unknown`.
+   */
+  origin?: string
+  /** Snippet window in codepoints, 40..=2000 (default 320). */
+  maxContentChars?: number
 }
 export interface NativeSearchPage {
   matches: Array<NativeSearchMatch>
@@ -138,6 +152,33 @@ export interface NativeSearchMatch {
   role: string
   /** `history` for a `history` match; the event's kind otherwise. */
   kind: string
+  /** Match-centered snippet of `prompt`; `prompt` keeps the full text. */
+  snippet: string
+  contentTruncated: boolean
+  /**
+   * Codepoint offset of the snippet in the full text; null only when the
+   * text is empty.
+   */
+  snippetStartOffset?: number
+  /** The echo group this primary represents; null for a singleton. */
+  groupId?: string
+  groupSize: number
+  echoCount: number
+  groupTruncated: boolean
+  isPrimary: boolean
+  /** `human`, `peer`, `system`, `synthetic` or `unknown`. */
+  origin: string
+  /** Why a user-role event is not a human prompt; null otherwise. */
+  controlKind?: string
+  eventUid?: string
+  eventRef: NativeSearchEventRef
+}
+/** The stored row a search match came from. */
+export interface NativeSearchEventRef {
+  matchSource: string
+  id: number
+  sessionId?: string
+  eventUid?: string
 }
 export interface NativeSessionEvent {
   id: number

@@ -87,7 +87,12 @@ use serde::Serialize;
 /// intake. An addon that lacks it would ignore the option and still read a
 /// protected folder.
 /// 29 adds `agentName` (Claude's `agent-name`) to catalog rows.
-pub const NATIVE_CONTRACT_VERSION: u32 = 29;
+/// 30 adds search grouping and snippets: `NativeSearchMatch` carries
+/// `snippet`, `contentTruncated`, `snippetStartOffset`, `groupId`,
+/// `groupSize`, `echoCount`, `groupTruncated`, `isPrimary`, `origin`,
+/// `controlKind`, `eventUid` and `eventRef`, and `SearchOptions` takes
+/// `sessionId`, `kinds`, `origin` and `maxContentChars`.
+pub const NATIVE_CONTRACT_VERSION: u32 = 30;
 const DEFAULT_LIMIT: i64 = 50;
 const DEFAULT_EVENT_LIMIT: i64 = 200;
 
@@ -348,6 +353,7 @@ impl HistoryQueryOptions {
             until_ms: self.until_ms,
             after: self.after.clone().map(NativeHistoryCursor::into_core),
             limit,
+            ..Default::default()
         };
         filter
             .validate()
@@ -377,6 +383,16 @@ pub struct SearchOptions {
     pub raw_fts: Option<bool>,
     /// `all` (default), `user`, `assistant` or `prompt` — the CLI's `--role`.
     pub role: Option<String>,
+    /// Restrict to one session id.
+    pub session_id: Option<String>,
+    /// Restrict to these kinds (`history`, `text`, `thinking`, `tool_use`,
+    /// `tool_result`); absent means every kind.
+    pub kinds: Option<Vec<String>>,
+    /// Restrict to one origin: `human`, `peer`, `system`, `synthetic` or
+    /// `unknown`.
+    pub origin: Option<String>,
+    /// Snippet window in codepoints, 40..=2000 (default 320).
+    pub max_content_chars: Option<i64>,
 }
 
 struct SearchRequest {
@@ -392,23 +408,31 @@ impl SearchRequest {
         let options = options.unwrap_or_default();
         let limit = validate_limit(options.limit, 20, 1_000)?;
         let role = parse_search_role(options.role.as_deref())?;
+        let mut filter = HistoryQueryOptions {
+            scope: options.scope.clone(),
+            db_path: None,
+            source: options.source.clone(),
+            project: options.project.clone(),
+            tag: options.tag.clone(),
+            before_ms: options.before_ms,
+            since_ms: options.since_ms,
+            until_ms: options.until_ms,
+            after: options.after.clone(),
+            limit: None,
+        }
+        .filter(limit)?;
+        filter.session_id = options.session_id.clone();
+        filter.kinds = options.kinds.clone().unwrap_or_default();
+        filter.origin = options.origin.clone();
+        filter.max_content_chars = options.max_content_chars;
+        filter
+            .validate()
+            .map_err(|error| native_error("INVALID_ARGUMENT", format!("{error:#}")))?;
         Ok(Self {
             path: db_path(options.db_path.clone()),
             terms: query.split_whitespace().map(str::to_string).collect(),
             raw_fts: options.raw_fts.unwrap_or(false),
-            filter: HistoryQueryOptions {
-                scope: options.scope,
-                db_path: None,
-                source: options.source,
-                project: options.project,
-                tag: options.tag,
-                before_ms: options.before_ms,
-                since_ms: options.since_ms,
-                until_ms: options.until_ms,
-                after: options.after,
-                limit: None,
-            }
-            .filter(limit)?,
+            filter,
             role,
         })
     }
@@ -512,11 +536,39 @@ pub struct NativeSearchMatch {
     pub role: String,
     /// `history` for a `history` match; the event's kind otherwise.
     pub kind: String,
+    /// Match-centered snippet of `prompt`; `prompt` keeps the full text.
+    pub snippet: String,
+    pub content_truncated: bool,
+    /// Codepoint offset of the snippet in the full text; null only when the
+    /// text is empty.
+    pub snippet_start_offset: Option<i64>,
+    /// The echo group this primary represents; null for a singleton.
+    pub group_id: Option<String>,
+    pub group_size: i64,
+    pub echo_count: i64,
+    pub group_truncated: bool,
+    pub is_primary: bool,
+    /// `human`, `peer`, `system`, `synthetic` or `unknown`.
+    pub origin: String,
+    /// Why a user-role event is not a human prompt; null otherwise.
+    pub control_kind: Option<String>,
+    pub event_uid: Option<String>,
+    pub event_ref: NativeSearchEventRef,
+}
+
+/// The stored row a search match came from.
+#[napi(object)]
+pub struct NativeSearchEventRef {
+    pub match_source: String,
+    pub id: i64,
+    pub session_id: Option<String>,
+    pub event_uid: Option<String>,
 }
 
 impl NativeSearchMatch {
     fn from_row(locations: &mut SessionLocations<'_>, row: SearchRow) -> anyhow::Result<Self> {
         let locations = locations.of(&row.source, row.session_id.as_deref())?;
+        let event_ref = row.event_ref();
         Ok(Self {
             id: row.id,
             source: row.source,
@@ -528,6 +580,23 @@ impl NativeSearchMatch {
             match_source: row.match_source,
             role: row.role,
             kind: row.kind,
+            snippet: row.snippet,
+            content_truncated: row.content_truncated,
+            snippet_start_offset: row.snippet_start_offset.map(|value| value as i64),
+            group_id: row.group_id,
+            group_size: row.group_size,
+            echo_count: row.echo_count,
+            group_truncated: row.group_truncated,
+            is_primary: row.is_primary,
+            origin: row.origin,
+            control_kind: row.control_kind,
+            event_uid: row.event_uid,
+            event_ref: NativeSearchEventRef {
+                match_source: event_ref.match_source,
+                id: event_ref.id,
+                session_id: event_ref.session_id,
+                event_uid: event_ref.event_uid,
+            },
         })
     }
 }

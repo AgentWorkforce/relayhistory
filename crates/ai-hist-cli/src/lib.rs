@@ -1493,6 +1493,23 @@ fn print_search_rows(rows: Vec<SearchRow>, as_json: bool) -> Result<()> {
                     "role": row.role,
                     "kind": row.kind,
                     "match_source": row.match_source,
+                    "snippet": row.snippet,
+                    "content_truncated": row.content_truncated,
+                    "snippet_start_offset": row.snippet_start_offset,
+                    "group_id": row.group_id,
+                    "group_size": row.group_size,
+                    "echo_count": row.echo_count,
+                    "group_truncated": row.group_truncated,
+                    "is_primary": row.is_primary,
+                    "origin": row.origin,
+                    "control_kind": row.control_kind,
+                    "event_uid": row.event_uid,
+                    "event_ref": {
+                        "match_source": row.match_source,
+                        "id": row.id,
+                        "session_id": row.session_id,
+                        "event_uid": row.event_uid,
+                    },
                 })
             })
             .collect::<Vec<_>>();
@@ -1521,12 +1538,8 @@ fn fmt_search_row(row: &SearchRow) -> String {
     } else {
         format!("{}:{}:{}", row.source, row.role, row.kind)
     };
-    let text = if row.text.chars().count() > 120 {
-        let truncated: String = row.text.chars().take(120).collect();
-        format!("{}...", truncated.replace('\n', " "))
-    } else {
-        row.text.replace('\n', " ")
-    };
+    // The match-centered snippet, already windowed by the search layer.
+    let text = row.snippet.replace('\n', " ");
     format!("  #{:<5} {}  ({}){}  {}", row.id, dt, label, project, text)
 }
 

@@ -9,7 +9,7 @@ import {
   discoverSessions, getSession, getSessionEventsPage, getSessionFileEditsPage,
   getSessionMarkersPage, getSessionRelationships, getSessionRequestsPage, getSessionToolCallsPage,
   getSessionTree, getSessionUsage, getSourceCapabilities, hydrateSession,
-  listSessionCatalogPage, recent, search, stats, sync, createHandoff, resumeHandoff,
+  listSessionCatalogPage, recent, searchPage, stats, sync, createHandoff, resumeHandoff,
   CATALOG_SOURCES, MAX_HANDOFF_INTENT_CHARS, SOURCES,
 } from './index.js';
 
@@ -63,13 +63,21 @@ async function call(operation: () => Promise<unknown>) {
   }
 }
 
-server.tool('search_history',
-  'Full-text search of already-indexed user prompts and session events (assistant text, tool calls and results), '
+server.registerTool('search_history', {
+  description: 'Full-text search of already-indexed user prompts and session events (assistant text, tool calls and results), '
   + 'newest first; the same contract as `ai-hist search`. By default each word is matched as a literal token and all '
   + 'must match; a leading - excludes a word. A query containing AND, OR, NOT, a trailing * or a "quoted phrase" is '
   + 'passed to SQLite FTS5 as written, and raw_fts: true always does so. Each match carries matchSource '
-  + '(history or session_event), role and kind; id is unique only within matchSource. To page, pass the last '
-  + 'match\'s timestampMs, id and matchSource as after.', {
+  + '(history or session_event), role and kind; id is unique only within matchSource. Matches are grouped: an '
+  + 'assistant or tool row that repeats a prompt verbatim (or is linked to it) collapses into that prompt as an '
+  + 'echo, counted by groupSize/echoCount under the primary\'s groupId; pages return primaries only. prompt keeps '
+  + 'the full text and snippet is a match-centered window of it (see snippetStartOffset and contentTruncated). '
+  + 'Each match also carries origin and eventRef for re-reading the full row. Budget arguments are '
+  + 'max_content_chars (per-match snippet window, 40..2000, default 320) and max_total_content_chars (total '
+  + 'serialized page budget, 500..200000, default 20000); legacy names such as max_content, max_chars, budget or '
+  + 'token_budget are not accepted. The result is an envelope {matches, nextCursor, truncated, '
+  + 'totalContentCharsUsed}; nextCursor is a search position only: pass it back unchanged as after to continue.',
+  inputSchema: z.strictObject({
   query: z.string(), source: SOURCE.optional(), project: z.string().optional(), tag: z.string().optional(),
   scope: SESSION_SCOPE.optional().default('local'),
   role: z.enum(['all', 'user', 'assistant', 'prompt']).optional().default('all')
@@ -79,8 +87,20 @@ server.tool('search_history',
   before_ms: z.number().int().optional().describe('Deprecated: exclusive, so it skips rows tied on the timestamp. Use after.'),
   since_ms: SINCE_MS, until_ms: UNTIL_MS, after: HISTORY_AFTER,
   limit: z.number().int().min(1).max(1000).optional().default(20),
-}, READ, ({ query, source, project, tag, scope, role, raw_fts, before_ms, since_ms, until_ms, after, limit }) => call(() => search(query, {
+  session_id: z.string().min(1).optional().describe('Restrict to one session id.'),
+  kinds: z.array(z.enum(['history', 'text', 'thinking', 'tool_use', 'tool_result'])).optional()
+    .describe('Restrict to these kinds; history names prompt rows.'),
+  origin: z.enum(['human', 'peer', 'system', 'synthetic', 'unknown']).optional()
+    .describe('Restrict to one origin, derived from the stored row.'),
+  max_content_chars: z.number().int().min(40).max(2000).optional()
+    .describe('Snippet window in codepoints (default 320).'),
+  max_total_content_chars: z.number().int().min(500).max(200000).optional()
+    .describe('Total serialized JSON budget across the page matches (default 20000).'),
+  }),
+  annotations: READ,
+}, ({ query, source, project, tag, scope, role, raw_fts, before_ms, since_ms, until_ms, after, limit, session_id, kinds, origin, max_content_chars, max_total_content_chars }) => call(() => searchPage(query, {
   source, project, tag, scope, role, rawFts: raw_fts, beforeMs: before_ms, sinceMs: since_ms, untilMs: until_ms, after, limit,
+  sessionId: session_id, kinds, origin, maxContentChars: max_content_chars, maxTotalContentChars: max_total_content_chars,
 })));
 
 server.tool('recent_history', 'List recent already-indexed prompts, newest first by (timestampMs, id). '

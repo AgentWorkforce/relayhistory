@@ -152,6 +152,8 @@ export function nativeHistoryCursor(after: HistoryCursor | undefined): object | 
   };
 }
 
+const SEARCH_ORIGINS: readonly string[] = ['human', 'peer', 'system', 'synthetic', 'unknown'];
+
 export function searchMatch(value: UnknownRecord): SearchMatch {
   const matchSource = String(value.matchSource);
   if (matchSource !== 'history' && matchSource !== 'session_event') {
@@ -160,11 +162,33 @@ export function searchMatch(value: UnknownRecord): SearchMatch {
       'NATIVE_CONTRACT_MISMATCH',
     );
   }
+  const entry = historyEntry(value);
+  const ref = (value.eventRef ?? {}) as UnknownRecord;
+  const groupSize = typeof value.groupSize === 'number' ? value.groupSize : 1;
   return {
-    ...historyEntry(value),
+    ...entry,
     matchSource,
     role: String(value.role),
     kind: String(value.kind),
+    snippet: typeof value.snippet === 'string' ? value.snippet : entry.prompt,
+    contentTruncated: value.contentTruncated === true,
+    snippetStartOffset: typeof value.snippetStartOffset === 'number' ? value.snippetStartOffset : null,
+    groupId: nullableString(value.groupId),
+    groupSize,
+    echoCount: typeof value.echoCount === 'number' ? value.echoCount : groupSize - 1,
+    groupTruncated: value.groupTruncated === true,
+    isPrimary: value.isPrimary !== false,
+    origin: (SEARCH_ORIGINS.includes(String(value.origin))
+      ? String(value.origin)
+      : 'unknown') as SearchMatch['origin'],
+    controlKind: nullableString(value.controlKind),
+    eventUid: nullableString(value.eventUid),
+    eventRef: {
+      matchSource: (ref.matchSource === 'session_event' ? 'session_event' : 'history') as SearchMatch['eventRef']['matchSource'],
+      id: typeof ref.id === 'number' ? ref.id : entry.id,
+      sessionId: nullableString(ref.sessionId),
+      eventUid: nullableString(ref.eventUid),
+    },
   };
 }
 

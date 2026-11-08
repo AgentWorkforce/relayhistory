@@ -20,10 +20,22 @@ Use these public operations:
   indexed history reads. `search()`, MCP `search_history` and `ai-hist search`
   share one contract: prompts and session events, filtered by `role`
   (`all`, `user`, `assistant`, `prompt`), with each match's `matchSource`,
-  `role` and `kind`. Page them with `searchPage()` / `recentPage()` and the
-  returned `nextCursor` (MCP: pass the last row's `timestampMs`, `id` and
-  `matchSource` as `after`), and bound them with inclusive `sinceMs` /
-  `untilMs`. `beforeMs` is deprecated: it skips rows tied on its timestamp.
+  `role` and `kind`. Search also accepts `sessionId`, `kinds` and `origin`
+  filters. Matches are grouped: an assistant or tool row that repeats a
+  prompt verbatim (or is linked to it by id) collapses into that prompt as an
+  echo, counted by `groupSize`/`echoCount`; pages return primaries only, and
+  two identical-wording prompts at different timestamps both stay primaries.
+  `prompt` keeps the full text; `snippet` is a match-centered window of it
+  (`maxContentChars`, default 320 codepoints), with `contentTruncated` and
+  `snippetStartOffset`, plus `origin` and an `eventRef` for re-reading the
+  full row. Page them with `searchPage()` / `recentPage()` and the returned
+  `nextCursor` (MCP: pass `nextCursor` back unchanged as `after`; it is a
+  search position only), and bound them with inclusive `sinceMs` / `untilMs`
+  and the serialized-size budget `maxTotalContentChars` (MCP:
+  `max_total_content_chars`, default 20000). MCP `search_history` returns an
+  envelope `{matches, nextCursor, truncated, totalContentCharsUsed}` and
+  rejects unknown arguments. `beforeMs` is deprecated: it skips rows tied on
+  its timestamp.
 - `getSessionRelationships()` / MCP `get_session_relationships` and
   `getSessionTree()` / MCP `get_session_tree` for delegation topology, plus
   the SDK-only `getSessionChildrenPage()`, `sessionDescendants()`, and

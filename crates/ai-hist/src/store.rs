@@ -93,6 +93,18 @@ pub struct QueryFilter {
     pub after: Option<HistoryCursor>,
     pub limit: i64,
     pub scope: SessionScope,
+    /// Exact session id a search is restricted to (search only; `recent`
+    /// ignores it). Composes with `source`, `project` and `tag`.
+    pub session_id: Option<String>,
+    /// Event kinds a search may return (search only; empty means every
+    /// kind). `history` names prompt rows.
+    pub kinds: Vec<String>,
+    /// Origin a search is restricted to: `human`, `peer`, `system`,
+    /// `synthetic` or `unknown` (search only).
+    pub origin: Option<String>,
+    /// Snippet window in codepoints for search matches (search only).
+    /// `None` means the 320-codepoint default.
+    pub max_content_chars: Option<i64>,
 }
 
 impl QueryFilter {
@@ -107,6 +119,30 @@ impl QueryFilter {
         }
         if let Some(cursor) = &self.after {
             cursor.validate()?;
+        }
+        for kind in &self.kinds {
+            anyhow::ensure!(
+                matches!(
+                    kind.as_str(),
+                    "history" | "text" | "thinking" | "tool_use" | "tool_result"
+                ),
+                "search kind must be one of history, text, thinking, tool_use, tool_result (got {kind})"
+            );
+        }
+        if let Some(origin) = &self.origin {
+            anyhow::ensure!(
+                matches!(
+                    origin.as_str(),
+                    "human" | "peer" | "system" | "synthetic" | "unknown"
+                ),
+                "search origin must be one of human, peer, system, synthetic, unknown (got {origin})"
+            );
+        }
+        if let Some(max_content_chars) = self.max_content_chars {
+            anyhow::ensure!(
+                (40..=2000).contains(&max_content_chars),
+                "max_content_chars must be between 40 and 2000 (got {max_content_chars})"
+            );
         }
         Ok(())
     }
