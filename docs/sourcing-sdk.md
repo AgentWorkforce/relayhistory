@@ -376,7 +376,9 @@ stable row, reject a row belonging to another source/session or ordered
 timestamp, and
 return `STALE_EVENT_CURSOR` when a deleted row cannot be positioned safely in
 an ordered timestamp bucket. A cursor is not a snapshot across mutations;
-restart the read after an order-changing revision. Old user-turn cursors with
+restart the read after an order-changing revision. New user-turn cursors use the
+first event row in the turn, keeping its timestamp and row ID together even
+when no block has recorded source order. Old user-turn cursors with
 composite `MIN(timestamp)`/`MIN(id)` anchors remain positional only within the
 same source/session and wholly unknown-order legacy buckets. Evidence contract 5 covers
 these ordering semantics.

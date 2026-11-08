@@ -9055,9 +9055,9 @@ mod scoped_project_identity_tests {
 mod user_turn_pass_tests {
     use super::*;
 
-    /// The implementation before #307, verbatim in its SQL: one header
-    /// grouping, then per turn a block read on the computed key and two
-    /// neighbour reads. Slow, and the definition the single pass must match.
+    /// Independent per-turn reference: one grouping, then actual first-row
+    /// anchors, a block read and two neighbour reads. Slow, but independent
+    /// of the paged fold and the whole-session window query.
     fn reference_page(
         conn: &Connection,
         source: &str,
@@ -9067,20 +9067,22 @@ mod user_turn_pass_tests {
     ) -> SessionUserTurnPage {
         let limit = limit.clamp(1, 1_000);
         let mut sql = format!(
-            "SELECT {USER_TURN_KEY} AS turn_key, MIN(ts_ms) AS turn_ts, MIN(id) AS turn_id, \
-             MIN(NULLIF(message_id, '')) AS turn_message_id \
-             FROM session_events \
+            "WITH grouped AS (SELECT {USER_TURN_KEY} AS turn_key, MIN(ts_ms) AS turn_ts, \
+             MIN(NULLIF(message_id, '')) AS turn_message_id FROM session_events \
+             WHERE source = ? AND session_id = ? AND {USER_TURN_ROW_FILTER} GROUP BY turn_key) \
+             SELECT turn_key, turn_ts, (SELECT id FROM session_events \
              WHERE source = ? AND session_id = ? AND {USER_TURN_ROW_FILTER} \
-             GROUP BY turn_key"
+             AND {USER_TURN_KEY} = grouped.turn_key ORDER BY ts_ms,id LIMIT 1) AS turn_id, \
+             turn_message_id FROM grouped"
         );
-        let mut params_vec: Vec<rusqlite::types::Value> =
-            vec![source.to_string().into(), session_id.to_string().into()];
+        let mut params_vec: Vec<rusqlite::types::Value> = vec![
+            source.to_string().into(),
+            session_id.to_string().into(),
+            source.to_string().into(),
+            session_id.to_string().into(),
+        ];
         if let Some(cursor) = after {
-            // Repeat the aggregates. `HAVING` does not see the alias of
-            // `MIN(id)` — `id` is the rowid — so `turn_id > ?` is never
-            // true and a later turn at the cursor's timestamp is dropped.
-            sql.push_str(" HAVING MIN(ts_ms) > ? OR (MIN(ts_ms) = ? AND MIN(id) > ?)");
-            params_vec.push(cursor.ts_ms.into());
+            sql.push_str(" WHERE (turn_ts,turn_id) > (?,?)");
             params_vec.push(cursor.ts_ms.into());
             params_vec.push(cursor.id.into());
         }
@@ -9645,9 +9647,8 @@ mod user_turn_pass_tests {
     }
 
     /// Two message ids interleaved, plus an unnamed row whose key collides
-    /// with a literal `event:<id>` message id. The anchor is `(MIN(ts_ms),
-    /// MIN(id))`, not the first row, so a key change is not the end of the
-    /// turn. Pages of one still match the whole-session grouping.
+    /// with a literal `event:<id>` message id. A key change is not the end
+    /// of the turn. Pages of one still match the whole-session grouping.
     #[test]
     fn interleaved_message_ids_stay_one_turn_across_pages() {
         let conn = Connection::open_in_memory().unwrap();
@@ -9675,8 +9676,8 @@ mod user_turn_pass_tests {
         insert(4, 40, None, "user", "text");
         insert(30, 400, Some("event:4"), "user", "text");
         insert(1, 50, Some("a0"), "assistant", "text");
-        // m1's later block has the smaller id, so the anchor is not the
-        // first row a forward scan meets. m2 sits between the two blocks.
+        // m1's later block has the smaller id, but its actual first row
+        // anchors the turn. m2 sits between the two blocks.
         insert(10, 100, Some("m1"), "user", "text");
         insert(7, 150, Some("m2"), "user", "text");
         insert(11, 160, Some("a1"), "assistant", "text");
@@ -9696,7 +9697,7 @@ mod user_turn_pass_tests {
                 .collect::<Vec<_>>(),
             vec![
                 (4, 40, Some("event:4".to_string()), 2),
-                (5, 100, Some("m1".to_string()), 2),
+                (10, 100, Some("m1".to_string()), 2),
                 (7, 150, Some("m2".to_string()), 1),
                 (20, 300, None, 1),
             ]
@@ -9710,7 +9711,7 @@ mod user_turn_pass_tests {
             "claude",
             "s",
             1,
-            Some(&SessionEventCursor { ts_ms: 100, id: 5 }),
+            Some(&SessionEventCursor { ts_ms: 100, id: 10 }),
         )
         .unwrap();
         assert_eq!(m2.user_turns.len(), 1);

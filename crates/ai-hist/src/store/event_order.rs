@@ -70,14 +70,7 @@ pub(super) fn user_turn_stream_sql() -> String {
 /// regroup the turns already returned. Per-key lookups for the whole
 /// session would be one lookup per turn instead of this single pass.
 pub(super) fn user_turn_header_sql() -> String {
-    format!(
-        "SELECT {USER_TURN_KEY} AS turn_key, MIN(ts_ms) AS turn_ts, MIN(id) AS turn_id, \
-         MIN(NULLIF(message_id, '')) AS turn_message_id, MAX(ts_ms) AS turn_last_ts, MIN(id) AS event_order \
-         FROM session_events \
-         WHERE source = ? AND session_id = ? AND {USER_TURN_ROW_FILTER} \
-         GROUP BY turn_key \
-         ORDER BY turn_ts ASC, turn_id ASC"
-    )
+    ranked_turn_header_sql()
 }
 
 pub(super) fn ranked_turn_header_sql() -> String {
@@ -88,7 +81,7 @@ pub(super) fn ranked_turn_header_sql() -> String {
             FROM session_events WHERE source=? AND session_id=? AND {USER_TURN_ROW_FILTER}
          ), grouped AS (
             SELECT turn_key,MIN(ts_ms) AS turn_ts,
-                CASE WHEN COUNT(source_order)=0 THEN MIN(id) ELSE MAX(CASE WHEN nth=1 THEN id END) END AS anchor,
+                MAX(CASE WHEN nth=1 THEN id END) AS anchor,
                 MIN(NULLIF(message_id,'')) AS named,MAX(ts_ms) AS last_ts
             FROM native GROUP BY turn_key
          )
