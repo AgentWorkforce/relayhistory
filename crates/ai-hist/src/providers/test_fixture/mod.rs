@@ -139,6 +139,7 @@ fn normalize(conn: &Connection, payload: &Value, path: &Path) -> Result<usize> {
             inserted += crate::insert_history(
                 conn,
                 &HistoryEntry {
+                    // This fixture exercises anonymous history; DeepAgents covers native identity.
                     event_uid: None,
                     id: 0,
                     source: ID.into(),

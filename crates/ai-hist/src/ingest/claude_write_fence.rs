@@ -8,10 +8,13 @@ use std::fs::{File, OpenOptions};
 use std::path::PathBuf;
 use std::rc::{Rc, Weak};
 
+mod eligibility;
+
 struct Lease {
     conn: usize,
     db: PathBuf,
     file: File,
+    eligibility: RefCell<Option<eligibility::Eligibility>>,
 }
 impl Drop for Lease {
     fn drop(&mut self) {
@@ -22,11 +25,6 @@ thread_local! {
     static HELD: RefCell<Vec<Weak<Lease>>> = const { RefCell::new(Vec::new()) };
 }
 pub(crate) struct Guard(Option<Rc<Lease>>);
-impl Guard {
-    pub(super) fn fenced(&self) -> bool {
-        self.0.is_some()
-    }
-}
 
 /// Acquire before a write transaction. Same-connection nesting is reentrant;
 /// another connection, even on this thread, cannot inherit the owner's lease.
@@ -69,6 +67,7 @@ pub(crate) fn acquire(conn: &Connection, source: &str) -> Result<Guard> {
         conn: owner,
         db,
         file,
+        eligibility: RefCell::new(None),
     });
     HELD.with(|held| held.borrow_mut().push(Rc::downgrade(&lease)));
     Ok(Guard(Some(lease)))
@@ -83,6 +82,7 @@ pub(crate) fn acquire_wait(conn: &Connection, source: &str) -> Result<Guard> {
     }
     let mut attempts = 0;
     loop {
+        super::check_capture_cancelled()?;
         match acquire(conn, source) {
             Ok(guard) => return Ok(guard),
             Err(error) => {
@@ -92,6 +92,7 @@ pub(crate) fn acquire_wait(conn: &Connection, source: &str) -> Result<Guard> {
                         if code.code == rusqlite::ErrorCode::DatabaseBusy
                 );
                 if !busy || !crate::store::busy_retry_handler(attempts) {
+                    super::check_capture_cancelled()?;
                     return Err(error);
                 }
                 attempts += 1;
@@ -112,6 +113,22 @@ fn held_by_other_connection(conn: &Connection) -> Result<bool> {
             .filter_map(Weak::upgrade)
             .any(|lease| lease.conn != owner && lease.db == db)
     }))
+}
+
+/// A rolled-back sweep may reuse clock revisions for different rows.
+/// Invalidate before the connection can start another write unit.
+pub(super) fn invalidate(conn: &Connection) {
+    let owner = std::ptr::from_ref(conn) as usize;
+    HELD.with(|held| {
+        for lease in held
+            .borrow()
+            .iter()
+            .filter_map(Weak::upgrade)
+            .filter(|lease| lease.conn == owner)
+        {
+            *lease.eligibility.borrow_mut() = None;
+        }
+    });
 }
 
 fn lock_contended(error: &std::io::Error) -> bool {
@@ -136,17 +153,21 @@ pub(super) fn stage_complete(
     session: Option<&str>,
     guard: &Guard,
 ) -> Result<bool> {
-    if !guard.fenced() {
+    let Some(lease) = &guard.0 else {
         return Ok(true);
+    };
+    if let Some(session) = session {
+        return eligibility::constrained(conn, session);
     }
-    // Without explicit attribution, records may name multiple sessions. A
-    // head/session metadata hint is not proof that every later row belongs to
-    // it, so check all sessions captured by that source-wide collector.
-    let constrained=conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM session_events WHERE source='claude' AND (?1 IS NULL OR session_id=?1) GROUP BY session_id,ts_ms HAVING COUNT(source_order)!=COUNT(*) OR SUM(location!='local')>0 OR MIN(source_order)!=0 OR MAX(source_order)>=COUNT(*) OR COUNT(DISTINCT source_order)!=COUNT(*))",
-        [session],|row|row.get(0),
-    )?;
-    Ok(constrained)
+    // No first-record/session hint is authoritative for a mixed transcript.
+    // Keep the archive-wide proof, refreshing only revision-touched sessions.
+    let mut cached = lease.eligibility.borrow_mut();
+    if let Some(cached) = cached.as_mut() {
+        cached.refresh(conn)?;
+    } else {
+        *cached = Some(eligibility::Eligibility::load(conn)?);
+    }
+    Ok(cached.as_ref().is_some_and(eligibility::Eligibility::any))
 }
 
 pub(crate) fn begin_transaction<'a>(

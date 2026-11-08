@@ -13,9 +13,9 @@ use crate::{
 };
 use anyhow::Result;
 use rusqlite::Connection;
+use walk::{walk, walk_pays, BranchSearch};
 #[cfg(test)]
 use walk::{SORT_EVERY_MATCH, WALK_OUTCOMES};
-use walk::{walk, walk_pays, BranchSearch};
 
 mod walk;
 
@@ -318,7 +318,6 @@ const EVENT_BRANCH: SearchBranch = SearchBranch {
     },
 };
 
-
 /// One branch's matches, newest first: `filter_sql` and `filter_params` are
 /// the branch's predicates on its alias, `fts_match` its MATCH expression.
 ///
@@ -386,7 +385,6 @@ fn search_branch(
     query_branch_rows(conn, branch, &sql, params_vec, raw_fts)
 }
 
-
 fn query_branch_rows(
     conn: &Connection,
     branch: &SearchBranch,
@@ -452,7 +450,8 @@ fn append_row_filters(
 /// The characters Rust's `str::trim` strips (Unicode `White_Space`), as a
 /// SQLite `trim` set, so a prompt a parser trimmed in Rust pairs with its
 /// verbatim event text.
-const RUST_WHITESPACE: &str = "char(9, 10, 11, 12, 13, 32, 133, 160, 5760, 8192, 8193, 8194, 8195, \
+const RUST_WHITESPACE: &str =
+    "char(9, 10, 11, 12, 13, 32, 133, 160, 5760, 8192, 8193, 8194, 8195, \
      8196, 8197, 8198, 8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288)";
 
 fn append_event_search_filters(
@@ -469,8 +468,10 @@ fn append_event_search_filters(
     // same timestamp. The prompt is the `history` match; the event copy would
     // only repeat it under a second id. A copy is that turn's row -- same
     // session, same timestamp, same text up to the surrounding whitespace a
-    // parser trims before writing `history` (OpenCode, with `str::trim`) --
-    // not merely equal text, so a later turn that repeats an earlier prompt
+    // parser trims before writing `history` (OpenCode, with `str::trim`).
+    // A native prompt UID must also match the event UID; legacy prompts
+    // without a UID retain the session/time/text check. It is not merely
+    // equal text, so a later turn that repeats an earlier prompt
     // still matches. It is dropped only when the prompt is itself one of this
     // search's `history` matches: it matches the same query and passes the
     // same filters. Scope, source and tag are per session and time is the
@@ -684,6 +685,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn native_prompt_only_suppresses_the_user_event_with_its_own_uid() {
+        let conn = fixture();
+        conn.execute(
+            "UPDATE history SET event_uid='native-prompt' WHERE prompt='needle prompt 1'",
+            [],
+        )
+        .unwrap();
+        for uid in ["native-prompt", "different-event"] {
+            conn.execute("INSERT INTO session_events(source,session_id,message_id,ts_ms,role,kind,text,event_uid) VALUES('claude','s1','m',1000,'user','text','needle prompt 1',?1)",[uid]).unwrap();
+        }
+        let rows = search_all(
+            &conn,
+            &["needle prompt 1".into()],
+            false,
+            &filter(100),
+            SearchRole::User,
+        )
+        .unwrap();
+        let matching: Vec<_> = rows
+            .iter()
+            .filter(|row| row.text == "needle prompt 1")
+            .collect();
+        assert_eq!(
+            matching.len(),
+            2,
+            "the history prompt and distinct native event both remain searchable"
+        );
+        let events: Vec<_> = matching
+            .iter()
+            .filter(|row| row.match_source == MATCH_SOURCE_SESSION_EVENT)
+            .map(|row| row.event_uid.as_deref())
+            .collect();
+        assert_eq!(events, [Some("different-event")]);
+    }
+
     fn prompt_and_user_event(prompt_project: &str, event_ts: i64) -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
@@ -764,9 +801,14 @@ mod tests {
         // Same turn, but only the event's project matches the query; the
         // prompt is not a match, so the event must not be dropped for it.
         let conn = prompt_and_user_event("/work/alpha", 1_000);
-        let by_text =
-            search_all(&conn, &["retry".to_string()], false, &filtered(None, None), SearchRole::All)
-                .unwrap();
+        let by_text = search_all(
+            &conn,
+            &["retry".to_string()],
+            false,
+            &filtered(None, None),
+            SearchRole::All,
+        )
+        .unwrap();
         assert_eq!(keys(&by_text), vec![("history".into(), 1)]);
         let by_project = search_all(
             &conn,
@@ -790,18 +832,25 @@ mod tests {
         )
         .unwrap();
         let role_word = ["assistant".to_string()];
-        assert!(search_all(&conn, &role_word, false, &filter(100), SearchRole::All)
-            .unwrap()
-            .is_empty());
+        assert!(
+            search_all(&conn, &role_word, false, &filter(100), SearchRole::All)
+                .unwrap()
+                .is_empty()
+        );
         // The project column is matched on both branches, as `history_fts`
         // always has; a raw query may still name the role column itself.
         let project_word = ["work".to_string()];
-        let by_project =
-            search_all(&conn, &project_word, false, &filter(100), SearchRole::Assistant).unwrap();
+        let by_project = search_all(
+            &conn,
+            &project_word,
+            false,
+            &filter(100),
+            SearchRole::Assistant,
+        )
+        .unwrap();
         assert!(by_project.iter().any(|row| row.text == "done"));
         let raw = ["role : assistant".to_string()];
-        let by_role =
-            search_all(&conn, &raw, true, &filter(100), SearchRole::Assistant).unwrap();
+        let by_role = search_all(&conn, &raw, true, &filter(100), SearchRole::Assistant).unwrap();
         assert_eq!(by_role.len(), 3);
     }
 
@@ -862,7 +911,11 @@ mod tests {
         );
         assert_eq!(full.len(), 7);
         for page_size in [1, 2, 3, 7, 50] {
-            assert_eq!(walk(&conn, page_size, SearchRole::All), full, "page size {page_size}");
+            assert_eq!(
+                walk(&conn, page_size, SearchRole::All),
+                full,
+                "page size {page_size}"
+            );
         }
         assert_eq!(walk(&conn, 1, SearchRole::Prompt).len(), 4);
 
@@ -978,7 +1031,10 @@ mod tests {
         );
         assert_eq!(SearchRole::parse("prompt").unwrap(), SearchRole::Prompt);
         let error = SearchRole::parse("tool").unwrap_err().to_string();
-        assert!(error.contains("all, user, assistant, prompt"), "got: {error}");
+        assert!(
+            error.contains("all, user, assistant, prompt"),
+            "got: {error}"
+        );
     }
 
     /// Sessions across sources and locations, prompts mirrored as user
@@ -1013,7 +1069,9 @@ mod tests {
         .unwrap();
         let mut seed = 7_u64;
         let mut next = move |bound: u64| {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (seed >> 33) % bound
         };
         for index in 0..90_i64 {
@@ -1123,7 +1181,10 @@ mod tests {
         let mut walked = 0;
         WALK_OUTCOMES.with(|outcomes| outcomes.set((0, 0)));
         for terms in term_sets {
-            let terms = terms.iter().map(|term| term.to_string()).collect::<Vec<_>>();
+            let terms = terms
+                .iter()
+                .map(|term| term.to_string())
+                .collect::<Vec<_>>();
             for role in roles {
                 for base in &filters {
                     for limit in 1..=5 {
@@ -1166,7 +1227,10 @@ mod tests {
         }
         assert!(walked > 0);
         let (served, fell_back) = WALK_OUTCOMES.with(|outcomes| outcomes.get());
-        assert!(served > 0 && fell_back > 0, "served {served}, fell back {fell_back}");
+        assert!(
+            served > 0 && fell_back > 0,
+            "served {served}, fell back {fell_back}"
+        );
     }
 
     #[test]
@@ -1181,7 +1245,10 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(error.contains("Invalid raw FTS5 MATCH expression"), "got: {error}");
+        assert!(
+            error.contains("Invalid raw FTS5 MATCH expression"),
+            "got: {error}"
+        );
     }
 
     #[test]
@@ -1230,7 +1297,10 @@ mod tests {
         }
         assert_eq!(pages, 20);
         let (served, fell_back) = WALK_OUTCOMES.with(|outcomes| outcomes.get());
-        assert!(served > 0 && fell_back > 0, "served {served}, fell back {fell_back}");
+        assert!(
+            served > 0 && fell_back > 0,
+            "served {served}, fell back {fell_back}"
+        );
     }
 
     #[test]
@@ -1244,7 +1314,11 @@ mod tests {
                     event_uid: None,
                     id: 0,
                     source: "claude".into(),
-                    session_id: if index % 2 == 0 { None } else { Some(String::new()) },
+                    session_id: if index % 2 == 0 {
+                        None
+                    } else {
+                        Some(String::new())
+                    },
                     project: Some("/work/alpha".into()),
                     prompt: format!("needle orphan {index}"),
                     prompt_hash: None,
@@ -1265,7 +1339,10 @@ mod tests {
                 .find(|row| row.session_id.as_deref().is_some_and(|id| !id.is_empty()))
                 .unwrap();
             let found = found.expect("a resumable prompt");
-            assert_eq!((found.id, found.timestamp_ms), (expected.id, expected.timestamp_ms));
+            assert_eq!(
+                (found.id, found.timestamp_ms),
+                (expected.id, expected.timestamp_ms)
+            );
         }
     }
 }

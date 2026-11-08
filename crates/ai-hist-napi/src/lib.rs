@@ -93,7 +93,9 @@ use serde::Serialize;
 /// intake. An addon that lacks it would ignore the option and still read a
 /// protected folder.
 /// 29 adds `agentName` (Claude's `agent-name`) to catalog rows.
-/// 30 adds full session evidence and preserves provider event identities.
+/// 30 adds the `session`, `retention` and `compact` sessionStoreCall operations,
+/// `eventUid` on history/search rows, and raw kind, provider message ID, request
+/// span ID and source order on session events.
 pub const NATIVE_CONTRACT_VERSION: u32 = 30;
 const DEFAULT_LIMIT: i64 = 50;
 const DEFAULT_EVENT_LIMIT: i64 = 200;

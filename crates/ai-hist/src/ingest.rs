@@ -7082,21 +7082,10 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
     coverage: &mut SweepCoverage,
     paths: Option<&path_scope::PathScope>,
 ) -> Result<()> {
-    // Load-bearing for the raw-facts generation below: an absent root returns
-    // before anything is recorded, so a run that could not see the archive
-    // does not retire the one-time backfill pass over it.
-    if !root.exists() {
-        if repairs.repairs_all()
-            && state
-                .get("claude_sessions_v3")
-                .and_then(Value::as_object)
-                .is_some_and(|known| state_names_files_under(known, root))
-        {
-            coverage.note_unread();
-        }
-        state.insert(incremental::CLAUDE_HOLDING_RECORDS_KEY.into(), false.into());
+    if !claude_full_order::root_present(state, root, repairs, coverage) {
         return Ok(());
     }
+    let _claude_write = claude_write_fence::acquire_wait(conn, "claude")?;
     // The `claude_sessions*` path -> stamp maps are retired. They recorded only
     // *that* a file had changed, which left one answer available — re-read all
     // of it — and they grew a JSON entry per transcript inside a single state
@@ -12217,8 +12206,8 @@ pub(crate) fn ingest_cursor_transcript(
     // update, rolls back and the next sync retries the same offset.
     let text = cold_read::read_string(path)
         .with_context(|| format!("read Cursor transcript {}", path.display()))?;
-    // This walk emits every complete record from byte zero through the
-    // selected boundary; history_from_offset only limits prompt insertion.
+    // This walk emits records from byte zero; history_from_offset only
+    // limits prompts. A bounded prefix or incomplete tail discards capture.
     let order = native_order::begin(conn, "cursor", Some(session_id))?;
     let mut outcome = CursorTranscriptOutcome::default();
     let mut offset: u64 = 0;
@@ -12645,7 +12634,7 @@ pub(crate) fn ingest_cursor_transcript(
         outcome.observe_activity(emitted_evidence, ts_is_guessed, ts_ms);
     }
     outcome.consumed_through = offset;
-    order.finish()?;
+    cursor::finish_native_order(order, &text, index_through)?;
     Ok(outcome)
 }
 
@@ -23685,6 +23674,63 @@ mod tests {
         let events = crate::session_events(&conn, "s-legacy", Some("cursor")).unwrap();
         assert_eq!(events.len(), 2);
         assert!(events.iter().all(|event| event.ts_ms == 4_242));
+    }
+
+    #[test]
+    fn cursor_partial_reads_do_not_certify_legacy_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bounded.jsonl");
+        let first = "{\"role\":\"user\",\"timestamp\":100,\"message\":{\"content\":\"first\"}}\n";
+        let text = format!("{first}{{\"role\":\"user\",\"timestamp\":100,\"message\":{{\"content\":\"second\"}}}}\n");
+        fs::write(&path, &text).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let read = |limit| {
+            super::ingest_cursor_transcript(&conn, &path, "bounded", None, 100, 0, limit).unwrap()
+        };
+        read(u64::MAX);
+        let original = crate::session_events(&conn, "bounded", Some("cursor")).unwrap();
+        for (contents, boundary) in [
+            (text.clone(), first.len() as u64),
+            (format!("{text}{{\"role\":\"user\""), u64::MAX),
+        ] {
+            conn.execute("UPDATE session_events SET source_order=NULL", [])
+                .unwrap();
+            conn.execute("DELETE FROM history WHERE prompt='first'", [])
+                .unwrap();
+            fs::write(&path, contents).unwrap();
+            assert!(read(boundary).records > 0);
+            let rows = crate::session_events(&conn, "bounded", Some("cursor")).unwrap();
+            assert!(
+                rows.iter().all(|event| event.source_order.is_none()),
+                "a prefix or incomplete tail cannot establish complete native order"
+            );
+            assert_eq!(
+                rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+                original.iter().map(|row| row.id).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM history", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                2,
+                "successful partial payload writes remain committed"
+            );
+        }
+        fs::write(&path, &text).unwrap();
+        read(text.len() as u64);
+        let complete = crate::session_events(&conn, "bounded", Some("cursor")).unwrap();
+        assert_eq!(
+            complete
+                .iter()
+                .map(|row| row.source_order)
+                .collect::<Vec<_>>(),
+            [Some(0), Some(1)]
+        );
+        assert_eq!(
+            complete.iter().map(|row| row.id).collect::<Vec<_>>(),
+            original.iter().map(|row| row.id).collect::<Vec<_>>()
+        );
     }
 
     #[test]

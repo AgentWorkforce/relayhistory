@@ -25,6 +25,7 @@ export interface RetentionMaintenanceResult {
   dryRun: boolean;
   /** This previews policy, never a deletion estimate. */
   preview: 'policy_only';
+  /** Persisted policy after this call; preview leaves the prior policy unchanged. */
   storedDays: number;
   effectiveDays: number;
   maxRows: number;

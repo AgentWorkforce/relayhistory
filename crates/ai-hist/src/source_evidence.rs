@@ -1,11 +1,13 @@
 //! Validated canonical evidence records accepted from installed source adapters.
 //! Foreign database row ids are retained in observations but never assigned locally.
 mod ownership;
+mod scalar;
 mod session_event;
 use crate::observations::ObservationKey;
 use crate::SessionLocation;
 use anyhow::{ensure, Context, Result};
 use rusqlite::{params_from_iter, Connection};
+use scalar::sql_value;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use session_event::validate_session_event;
@@ -301,7 +303,11 @@ fn validate_ownership(key: &ObservationKey, record: &EvidenceRecord, _spec: &Spe
             && record.payload.get(session_field).and_then(Value::as_str) == Some(&key.session_id),
         "INVALID_ARGUMENT: evidence belongs to another source or session"
     );
-    for field in record.key_fields().split(',').filter(|field| !numeric(field)) {
+    for field in record
+        .key_fields()
+        .split(',')
+        .filter(|field| !numeric(field))
+    {
         ensure!(
             record
                 .payload
@@ -383,25 +389,29 @@ fn fill_derived_columns(record: &mut EvidenceRecord, spec: &Spec) {
         });
     }
 }
-fn sql_value(value: &Value) -> Result<rusqlite::types::Value> {
-    use rusqlite::types::Value as Sql;
-    Ok(match value {
-        Value::Null => Sql::Null,
-        Value::Bool(value) => Sql::Integer(i64::from(*value)),
-        Value::Number(value) => (value.as_i64().map(Sql::Integer))
-            .or_else(|| value.as_f64().map(Sql::Real))
-            .context("evidence number is not representable as a SQLite REAL")?,
-        Value::String(value) => Sql::Text(value.clone()),
-        _ => anyhow::bail!("validated evidence contains only SQLite scalars"),
-    })
-}
 impl EvidenceRecord {
     fn key_fields(&self) -> &str {
-        if self.kind == EvidenceKind::History && self.payload.get("event_uid").is_some_and(|v| !v.is_null()) { "source,session_id,event_uid" } else { self.kind.spec().key }
+        if self.kind == EvidenceKind::History
+            && self.payload.get("event_uid").is_some_and(|v| !v.is_null())
+        {
+            "source,session_id,event_uid"
+        } else {
+            self.kind.spec().key
+        }
     }
     fn conflict_target(&self) -> String {
         let key = self.key_fields();
-        match self.kind { EvidenceKind::History => format!("{key}) WHERE event_uid IS {}", if self.payload.get("event_uid").is_some_and(|v| !v.is_null()) { "NOT NULL" } else { "NULL" }), _ => format!("{key})") }
+        match self.kind {
+            EvidenceKind::History => format!(
+                "{key}) WHERE event_uid IS {}",
+                if self.payload.get("event_uid").is_some_and(|v| !v.is_null()) {
+                    "NOT NULL"
+                } else {
+                    "NULL"
+                }
+            ),
+            _ => format!("{key})"),
+        }
     }
     pub fn identity(&self) -> String {
         // `Value`'s `Display` is its compact JSON serialization, which cannot fail.
@@ -421,7 +431,13 @@ impl EvidenceRecord {
                 .iter()
                 .map(|column| format!("{column} IS ?"))
                 .collect::<Vec<_>>()
-                .join(" AND ") + if self.kind == EvidenceKind::History && self.key_fields() == self.kind.spec().key { " AND event_uid IS NULL" } else { "" },
+                .join(" AND ")
+                + if self.kind == EvidenceKind::History && self.key_fields() == self.kind.spec().key
+                {
+                    " AND event_uid IS NULL"
+                } else {
+                    ""
+                },
             columns
                 .iter()
                 .map(|column| sql_value(&self.payload[*column]))
@@ -487,7 +503,9 @@ impl EvidenceRecord {
         if crate::store::EVIDENCE_LOCATION_TABLES.contains(&table) {
             let (condition, values) = self.key_sql()?;
             conn.execute(
-                &format!("UPDATE {table} SET location='local' WHERE {condition} AND location='both'"),
+                &format!(
+                    "UPDATE {table} SET location='local' WHERE {condition} AND location='both'"
+                ),
                 params_from_iter(values),
             )?;
         }
@@ -766,6 +784,14 @@ mod tests {
             validate(record).is_err(),
             "call identity is not legal on plain text"
         );
+    }
+
+    #[test]
+    fn invalid_source_order_is_rejected() {
+        for rank in [json!(-1), json!(1.5), json!("1")] {
+            let error = validate(with("source_order", rank)).unwrap_err();
+            assert!(error.to_string().contains("INVALID_ARGUMENT"), "{error}");
+        }
     }
 
     #[test]

@@ -147,3 +147,21 @@ fn public_retention_fence_reports_busy_without_eviction_until_release() {
     assert!(store.prune_expired(opts).unwrap().rows > 0);
     assert_eq!(event_count(&conn, "claude"), 0);
 }
+
+#[test]
+fn public_codex_only_forget_does_not_take_the_claude_fence() {
+    let (_home, store, conn) = fixture();
+    old_session(&conn);
+    conn.execute("INSERT INTO sessions(source,session_id,last_activity_ms,discovery_state) VALUES('codex','fenced',1,'full')",[]).unwrap();
+    conn.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) VALUES('codex','fenced','codex',1,'assistant','text','codex')",[]).unwrap();
+    let _guard = crate::ingest::claude_write_fence::acquire(&conn, "claude").unwrap();
+    let report = store
+        .forget_evidence(
+            ForgetScope::Sessions(vec![SessionRef::id(Source::Codex, "fenced")]),
+            ForgetOptions::default().include_unrecoverable(true),
+        )
+        .unwrap();
+    assert_eq!(report.events, 1);
+    assert_eq!(event_count(&conn, "codex"), 0);
+    assert_eq!(event_count(&conn, "claude"), 1);
+}

@@ -1,6 +1,29 @@
 //! Complete Claude transcript helpers and source-order conformance.
 use super::*;
 
+/// An absent archive must not retire a pending backfill or pretend that its
+/// previously known transcripts were read successfully.
+pub(super) fn root_present(
+    state: &mut Map<String, Value>,
+    root: &Path,
+    repairs: &SweepRepairs,
+    coverage: &mut SweepCoverage,
+) -> bool {
+    if root.exists() {
+        return true;
+    }
+    if repairs.repairs_all()
+        && state
+            .get("claude_sessions_v3")
+            .and_then(Value::as_object)
+            .is_some_and(|known| state_names_files_under(known, root))
+    {
+        coverage.note_unread();
+    }
+    state.insert(incremental::CLAUDE_HOLDING_RECORDS_KEY.into(), false.into());
+    false
+}
+
 /// The first in-log session id a transcript carries.
 ///
 /// Read ahead of the record walk, and bounded in the case that matters: the
@@ -31,8 +54,8 @@ pub(super) fn claude_file_session_id(path: &Path) -> Result<Option<String>> {
     }
 }
 
-/// Every record that names a session is a sidechain row — what a sidecar's
-/// records look like, and the half of the sidecar rule content can answer.
+/// True when every identified record is a sidechain row.
+/// A file with no identified records returns false.
 pub(crate) fn claude_records_are_all_sidechain(identified: usize, sidechain: usize) -> bool {
     identified > 0 && sidechain == identified
 }

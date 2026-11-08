@@ -36,8 +36,13 @@ pub(crate) fn dispatch(args_json: &str) -> napi::Result<String> {
 
 /// Preserve opaque provider JSON. Only usage and turn flags need the same
 /// JavaScript-safe conversions as the paged operations.
-fn wire_evidence(evidence: ai_hist::SessionEvidence) -> napi::Result<Value> {
+fn wire_evidence(mut evidence: ai_hist::SessionEvidence) -> napi::Result<Value> {
     let encode = |error| native_error("DATABASE_QUERY_FAILED", error);
+    // Move the collections that need wire conversions out before serializing
+    // the base evidence, avoiding a discarded copy of their transcript blocks.
+    let requests = std::mem::take(&mut evidence.requests);
+    let user_turns = std::mem::take(&mut evidence.user_turns);
+    let usage = evidence.usage.take();
     let mut value = serde_json::to_value(&evidence).map_err(encode)?;
     for (raw, message) in value["messages"]
         .as_array_mut()
@@ -67,22 +72,20 @@ fn wire_evidence(evidence: ai_hist::SessionEvidence) -> napi::Result<Value> {
         }
     }
     value["requests"] = serde_json::to_value(
-        evidence
-            .requests
+        requests
             .into_iter()
             .map(NativeSessionRequest::from)
             .collect::<Vec<_>>(),
     )
     .map_err(encode)?;
     value["user_turns"] = serde_json::to_value(
-        evidence
-            .user_turns
+        user_turns
             .into_iter()
             .map(NativeSessionUserTurn::from)
             .collect::<Vec<_>>(),
     )
     .map_err(encode)?;
-    value["usage"] = match evidence.usage {
+    value["usage"] = match usage {
         Some(summary) => serde_json::to_value(crate::session_usage(
             evidence.session.source.to_string(),
             evidence.session.session_id,

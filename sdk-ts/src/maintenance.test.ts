@@ -1,14 +1,15 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, access, readFile } from 'node:fs/promises';
+import { mkdtemp, access, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { maintainRetention, compactDatabase } from './maintenance.js';
 import { runCli } from './cli.js';
 
 // Native integration runs after rebuilding the addon for this checkout.
-test('retention preview does not create a store and apply is explicit', async () => {
+test('retention preview does not create a store and apply is explicit', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'retention-sdk-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
   const dbPath = join(dir, 'history.db');
   const preview = await maintainRetention({ dbPath, days: 7 });
   assert.equal(preview.dryRun, true);
@@ -18,6 +19,8 @@ test('retention preview does not create a store and apply is explicit', async ()
   await assert.rejects(access(dbPath));
   const applied = await maintainRetention({ dbPath, days: 7, apply: true });
   assert.equal(applied.dryRun, false);
+  assert.equal(applied.storedDays, 7);
+  assert.equal(applied.effectiveDays, 7);
   assert.equal(applied.report?.awaitingUploadAck, true);
   const before = await readFile(dbPath);
   const saved = await maintainRetention({ dbPath, days: 1 });
@@ -34,16 +37,18 @@ test('retention preview does not create a store and apply is explicit', async ()
   assert.ok(JSON.parse(compactOutput.join('')).db_bytes_after > 0);
 });
 
-test('malformed retention options fail before opening a store', async () => {
+test('malformed retention options fail before opening a store', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'retention-invalid-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
   const dbPath = join(dir, 'history.db');
   for (const options of [{ days: -1 }, { days: 1.5 }, { days: 0x100000000 }, { maxRows: 0 }, { maxRows: 1025 }, { allowUnuploaded: true }]) {
     await assert.rejects(maintainRetention({ ...options, dbPath }), { code: 'INVALID_ARGUMENT' });
   }
 });
 
-test('production CLI retention previews an absent store without bootstrap', async () => {
+test('production CLI retention previews an absent store without bootstrap', async (t) => {
   const dir = await mkdtemp(join(tmpdir(), 'retention-cli-'));
+  t.after(() => rm(dir, { recursive: true, force: true }));
   const dbPath = join(dir, 'history.db');
   const stdout: string[] = [], stderr: string[] = [];
   const code = await runCli(['retention', '--db', dbPath, '--days', '7', '--json', '--no-warning'], {

@@ -49,3 +49,7 @@ pub(super) fn row_to_history(row: &rusqlite::Row<'_>) -> rusqlite::Result<Histor
         timestamp_ms: row.get(6)?,
     })
 }
+
+#[cfg(test)]
+#[path = "history_identity_tests.rs"]
+mod tests;

@@ -21,14 +21,16 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- Ordinary full Claude imports and rereads release the database writer lock between chunks, while constrained evidence keeps atomic rollback and competing Claude mutations are fenced.
+- Applied retention changes report the saved policy.
+- Native prompt change feeds retain session-scoped deletion identities after upgrades.
+- Large Claude imports and rereads release the database writer between chunks; overlapping Claude writes may return `SQLITE_BUSY`.
 - User-turn pagination keeps timestamp and event ID anchored to the same row, including mixed recorded-order and legacy events.
 - SDK, CLI and MCP event reads preserve provider-native record types, API message IDs and request spans.
 - Retained matching remote evidence survives retirement of its direct local source, without allowing conflicting snapshots to replace local evidence.
 - Repeated DeepAgents prompts with equal text and timestamps retain separate history rows through export and remote intake, using stable native event identity.
 - Capture operations restore their output policy on return and unwind, and concurrent quiet calls no longer silence progress in other threads.
 - Codex resume commands in the TypeScript SDK no longer depend on the recorded project directory, matching Rust CLI behavior.
-- Session export and source intake preserve recorded same-timestamp event order through replay, rewrites and later local hydration; conflicting retained order rolls back atomically.
+- Same-timestamp event order survives export, source intake and hydration; conflicting retained order is rejected without partial writes.
 
 ### Rust API
 

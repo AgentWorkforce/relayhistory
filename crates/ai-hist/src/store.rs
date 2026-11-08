@@ -17,9 +17,7 @@ pub(crate) use busy::{busy_retry_handler, configure_busy_retry, ShortBusyBudget}
 pub(crate) mod busy_wait;
 mod event_order;
 mod event_row;
-use event_order::{
-    event_cursor_order, ranked_turn_header_sql, user_turn_header_sql, user_turn_stream_sql,
-};
+use event_order::{event_cursor_order, ranked_turn_header_sql, user_turn_stream_sql};
 mod retired_sources;
 pub(crate) mod sync_connection;
 pub use retired_sources::is_retired_source;
@@ -2863,11 +2861,11 @@ pub struct SessionFileEdit {
 /// 3: `session_events` rows carry `control_kind`, and the user-turn page
 /// leaves control rows out.
 ///
-/// 5: recorded `source_order` survives transport and determines equal-time order.
-///
 /// 4: `control_kind` may be `synthetic` (OpenCode harness-written user
 /// text), and `session_events` rows carry `record_token_json`, a Claude
 /// record's own usage beside the settled request blob.
+///
+/// 5: recorded `source_order` survives transport and determines equal-time order.
 pub const SESSION_EVIDENCE_CONTRACT_VERSION: u32 = 5;
 
 /// Stable continuation for tool calls and file edits.
@@ -3664,16 +3662,7 @@ fn grouped_turn_headers(
     source: &str,
     session_id: &str,
 ) -> Result<Vec<UserTurnHeader>> {
-    let ranked: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM session_events WHERE source=?1 AND session_id=?2 AND source_order IS NOT NULL)",
-        params![source,session_id], |row| row.get(0),
-    )?;
-    let query = if ranked {
-        ranked_turn_header_sql()
-    } else {
-        user_turn_header_sql()
-    };
-    let mut stmt = conn.prepare(&query)?;
+    let mut stmt = conn.prepare(&ranked_turn_header_sql())?;
     let rows = stmt.query_map(params![source, session_id], |row| {
         Ok(UserTurnHeader {
             key: row.get(0)?,

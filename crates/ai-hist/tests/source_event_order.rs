@@ -209,7 +209,7 @@ fn conflicting_observation_order_rolls_back_snapshot_revision_and_canonical_chan
         revision
     );
     // Failed replacement did not discard the second connector's old assertion.
-    submit(&store, "first", native()).unwrap();
+    submit(&store, "second", native()).unwrap();
 }
 #[test]
 fn legacy_unknown_order_is_not_inferred_from_snapshot_array_position_and_mixed_order_is_explicit() {
@@ -229,11 +229,18 @@ fn legacy_unknown_order_is_not_inferred_from_snapshot_array_position_and_mixed_o
     legacy.reverse();
     submit(&store, "legacy", legacy).unwrap();
     assert_eq!(uids(&store), unknown);
-    // Independent known evidence can add knowledge without inventing values for
-    // the unknown rows. Known order is never cleared by a legacy snapshot.
+    // Known evidence can add knowledge without inventing values for unknown
+    // rows. A later legacy replacement must preserve that canonical knowledge.
     let mut mixed = native();
     mixed[2].payload.insert("source_order".into(), Value::Null);
     submit(&store, "legacy", mixed).unwrap();
+    let known = evidence(&store).messages;
+    let mut replay = native();
+    for row in &mut replay {
+        row.payload.remove("source_order");
+    }
+    submit(&store, "legacy", replay).unwrap();
+    assert_eq!(evidence(&store).messages, known);
     let blocks: Vec<_> = evidence(&store)
         .messages
         .into_iter()

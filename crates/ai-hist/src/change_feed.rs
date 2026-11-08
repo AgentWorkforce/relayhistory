@@ -92,6 +92,7 @@ const MIGRATION: &str = "change_feed_v2";
 mod epochs;
 mod export_schema;
 mod history_identity;
+mod table_identity;
 mod validate;
 use export_schema::reconcile_export_schema;
 use history_identity::{row_to_history, HISTORY_COLUMNS};
@@ -442,25 +443,6 @@ impl FedTable {
         }
     }
 
-    /// Whether the session is part of the record's identity. A prompt's is
-    /// not: `history` is unique on source, time and text, and a prompt that
-    /// gains or changes its session is the same record.
-    fn session_keyed(&self) -> bool {
-        self.key.contains(&self.session)
-    }
-
-    /// The session as a tombstone stores it: the row's, when the session is
-    /// part of the identity, else `''`, so a tombstone names exactly the
-    /// record's key and a later insert of that key clears it whatever
-    /// session it carries.
-    fn tombstone_session_sql(&self, row: &str) -> String {
-        if self.session_keyed() {
-            format!("{row}.{}", self.session)
-        } else {
-            "''".to_string()
-        }
-    }
-
     /// The `record_key` as SQL over `row`.
     fn record_key_sql(&self, row: &str) -> String {
         if self.name == "history" {
@@ -477,23 +459,6 @@ impl FedTable {
                     .join(", ")
             ),
         }
-    }
-
-    /// True when a write moved the row to another identity.
-    fn identity_changed_sql(&self) -> String {
-        let mut changed = Vec::new();
-        if !self.source.starts_with('\'') {
-            changed.push(format!("OLD.{0} IS NOT NEW.{0}", self.source));
-        }
-        if self.session_keyed() {
-            changed.push(format!("OLD.{0} IS NOT NEW.{0}", self.session));
-        }
-        changed.push(format!(
-            "{} IS NOT {}",
-            self.record_key_sql("OLD"),
-            self.record_key_sql("NEW")
-        ));
-        changed.join(" OR ")
     }
 
     /// [`Change::key`] from a tombstone's identity columns.
@@ -923,9 +888,9 @@ impl ChangeQuery {
     /// tool calls, file edits, markers, relationships (under their parent
     /// session), prompts, presences, commit links and connector
     /// observations. A prompt that names no session belongs to no
-    /// session's drain, and nor does a prompt's delete: a prompt's session is
-    /// not part of its identity, so its tombstone carries none. Both still
-    /// reach the unfiltered feed.
+    /// session's drain. Native prompt deletes retain their session identity;
+    /// legacy prompt deletes carry no session because their identity is source,
+    /// time and text. Those deletes still reach the unfiltered feed.
     ///
     /// A session drain is a one-shot read -- the backfill of a session an
     /// embedder has just started following -- and cannot name a consumer

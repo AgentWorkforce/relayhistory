@@ -347,6 +347,8 @@ fn message(
     insert_history(
         conn,
         &HistoryEntry {
+            // History joins all human text blocks; a single block UID is not its identity.
+            // Keep legacy keys until a provider migration supersedes anonymous rows.
             event_uid: None,
             id: 0,
             source: ID.into(),

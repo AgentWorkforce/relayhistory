@@ -120,6 +120,8 @@ fn conflicting_snapshots_never_receive_canonical_order() {
             let revision = observations::revision(&conn, &conflicting)
                 .unwrap()
                 .unwrap();
+            let evidence_before = observations::evidence(&conn, &conflicting).unwrap();
+            let revision_before = observations::revision(&conn, &conflicting).unwrap();
             let err = apply_normalized(
                 &mut conn,
                 &conflicting,
@@ -135,6 +137,14 @@ fn conflicting_snapshots_never_receive_canonical_order() {
             )
             .unwrap_err();
             assert!(format!("{err:#}").contains("SOURCE_ORDER_CONFLICT"));
+            assert_eq!(
+                observations::evidence(&conn, &conflicting).unwrap(),
+                evidence_before
+            );
+            assert_eq!(
+                observations::revision(&conn, &conflicting).unwrap(),
+                revision_before
+            );
             // A previously retained known assertion can become stale after
             // native local order changes. Capture must prefer the matching
             // legacy proof without borrowing the conflicting assertion's rank.

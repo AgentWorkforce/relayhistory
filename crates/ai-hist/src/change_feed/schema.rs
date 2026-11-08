@@ -211,7 +211,7 @@ pub(crate) fn schema_is_current(conn: &Connection) -> Result<bool> {
     if !bound {
         return Ok(false);
     }
-    migration_applied(conn, MIGRATION)
+    Ok(migration_applied(conn, MIGRATION)? && migration_applied(conn, "history_feed_identity_v2")?)
 }
 
 /// Whether the feed's own tables exist and its identity row carries an
@@ -298,6 +298,7 @@ fn kind_feed_is_current(
 pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
     let identity_existed = feed_identity_exists(conn)?;
     create_feed_tables(conn)?;
+    migrate_history_identity(conn)?;
     let backfill = !migration_applied(conn, MIGRATION)?;
     if backfill {
         // A database from before presences were fed: its session re-stamp
@@ -317,6 +318,25 @@ pub(crate) fn init_schema(conn: &Connection) -> Result<()> {
         [MIGRATION],
     )?;
     reconcile_export_schema(conn, identity_existed)?;
+    Ok(())
+}
+
+// Identity SQL is embedded in all three triggers, not only the update guard.
+fn migrate_history_identity(conn: &Connection) -> Result<()> {
+    if migration_applied(conn, "history_feed_identity_v2")? {
+        return Ok(());
+    }
+    for trigger in trigger_names(ChangeKind::History) {
+        conn.execute_batch(&format!("DROP TRIGGER IF EXISTS {trigger};"))?;
+    }
+    // Already-recorded native deletes used the legacy empty session column.
+    // Keep their original keys/revisions while making session drains complete.
+    conn.execute_batch("INSERT INTO evidence_tombstones(kind,source,session_id,record_key,revision)
+        SELECT kind,source,json_extract(record_key,'$[1]'),record_key,revision
+        FROM evidence_tombstones WHERE kind='history' AND session_id='' AND json_extract(record_key,'$[0]')='event'
+        ON CONFLICT(kind,source,session_id,record_key) DO UPDATE SET revision=max(revision,excluded.revision);
+        DELETE FROM evidence_tombstones WHERE kind='history' AND session_id='' AND json_extract(record_key,'$[0]')='event';
+        INSERT INTO schema_migrations(name) VALUES('history_feed_identity_v2');")?;
     Ok(())
 }
 

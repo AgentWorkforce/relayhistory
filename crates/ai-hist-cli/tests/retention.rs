@@ -41,6 +41,8 @@ fn preview_is_read_only_and_apply_is_one_protected_batch() {
     assert!(guarded.status.success());
     let result: Value = serde_json::from_slice(&guarded.stdout).unwrap();
     assert_eq!(result["report"]["awaiting_upload_ack"], true);
+    assert_eq!(result["stored_days"], 1);
+    assert_eq!(result["effective_days"], 1);
     let applied = run(&path, &["--apply", "--allow-unuploaded", "--max-rows", "2"]);
     assert!(
         applied.status.success(),

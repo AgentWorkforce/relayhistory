@@ -52,6 +52,7 @@ pub(super) fn run(
             Value::Null,
         )
     };
+    let stored_days = if apply { effective_days } else { stored_days };
     if json_output {
         println!(
             "{}",

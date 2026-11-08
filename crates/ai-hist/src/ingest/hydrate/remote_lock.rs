@@ -16,6 +16,7 @@ pub(super) fn acquire_remote_hydration_lock(
     db_path: &Path,
     options: &HydrateSessionOptions,
 ) -> Result<RemoteHydrationLock> {
+    super::super::check_capture_cancelled()?;
     let absolute = if db_path.is_absolute() {
         db_path.to_path_buf()
     } else {
@@ -46,7 +47,37 @@ pub(super) fn acquire_remote_hydration_lock(
         .write(true)
         .open(&lock_path)
         .with_context(|| format!("opening hydration lock {}", lock_path.display()))?;
-    crate::file_lock::lock_exclusive(&file)
+    wait_for_lock(&file, crate::store::busy_retry_handler)
         .with_context(|| format!("locking hydration target {}", lock_path.display()))?;
     Ok(RemoteHydrationLock { file })
 }
+
+// Reuse the bounded SQLite grace window and its cancellation-aware sleeps.
+// The callback is injectable so expiry is tested without a 30-second test.
+fn wait_for_lock(file: &fs::File, mut retry: impl FnMut(i32) -> bool) -> Result<()> {
+    let mut attempts = 0;
+    loop {
+        super::super::check_capture_cancelled()?;
+        match crate::file_lock::try_lock_exclusive(file) {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || (cfg!(windows) && matches!(error.raw_os_error(), Some(32 | 33))) => {}
+            Err(error) => return Err(error.into()),
+        }
+        if !retry(attempts) {
+            super::super::check_capture_cancelled()?;
+            return Err(rusqlite::Error::SqliteFailure(
+                rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                Some(
+                    "remote hydration target is still locked after the bounded retry budget".into(),
+                ),
+            )
+            .into());
+        }
+        attempts += 1;
+    }
+}
+
+#[cfg(test)]
+mod tests;

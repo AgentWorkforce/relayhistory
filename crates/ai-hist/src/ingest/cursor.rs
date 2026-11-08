@@ -39,6 +39,20 @@
 //! and it resets exactly when Cursor rewrites the file — which is also when the
 //! byte cursor resets.
 
+/// Only an EOF read can certify native order; successful prefixes still keep
+/// their payload writes, while discarding any complete-read certification.
+pub(super) fn finish_native_order(
+    order: super::native_order::Capture<'_>,
+    text: &str,
+    index_through: u64,
+) -> anyhow::Result<()> {
+    if text.len() as u64 <= index_through && (text.is_empty() || text.ends_with('\n')) {
+        order.finish()
+    } else {
+        order.discard()
+    }
+}
+
 use std::path::Path;
 
 use serde_json::Value;

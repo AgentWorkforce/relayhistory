@@ -100,7 +100,7 @@ test('the native session-store dispatcher is named in one place', async () => {
   for (const op of ['session', 'markers', 'requests', 'usage_summary', 'user_turns', 'capabilities', 'changes', 'commit_changes']) {
     assert.match(native, new RegExp(`'${op}'`), `native.ts names the ${op} op`);
   }
-  const files = ['index.ts', 'cli.ts', 'mcp-server.ts', 'operations.ts', 'normalization.ts', 'pagination.ts', 'sdk-common.ts', 'session-evidence.ts'];
+  const files = ['index.ts', 'cli.ts', 'mcp-server.ts', 'operations.ts', 'normalization.ts', 'pagination.ts', 'sdk-common.ts', 'session-evidence.ts', 'maintenance.ts'];
   const source = (await Promise.all(files.map((file) => readFile(join(sourceDir, file), 'utf8')))).join('\n');
   assert.doesNotMatch(source, /\.sessionStoreCall\(/, 'only native.ts calls the binding directly');
   assert.doesNotMatch(source, /sessionStoreCall\(\s*'/, 'op names are not spelled outside native.ts');

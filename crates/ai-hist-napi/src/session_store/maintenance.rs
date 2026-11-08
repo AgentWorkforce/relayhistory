@@ -114,6 +114,7 @@ fn retention(
     } else {
         0
     };
+    let stored_days = if apply { effective } else { stored_days };
     Ok(
         json!({"dryRun":!apply,"preview":"policy_only","storedDays":stored_days,"effectiveDays":effective,
         "maxRows":max_rows,"allowUnuploaded":allow_unuploaded,"generation":generation,"report":report}),
@@ -152,6 +153,13 @@ mod tests {
         assert_eq!(
             read_retention_policy(&path).unwrap(),
             RetentionPolicy::default()
+        );
+        let applied = call(&path, json!({"days":7,"apply":true}));
+        assert_eq!(applied["storedDays"], 7);
+        assert_eq!(applied["effectiveDays"], 7);
+        assert_eq!(
+            read_retention_policy(&path).unwrap(),
+            RetentionPolicy::from_days(7)
         );
         drop(conn);
     }

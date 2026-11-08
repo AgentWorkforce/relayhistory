@@ -10,7 +10,7 @@ pub struct Prompt {
     pub event_uid: Option<String>,
     /// `None` when the query asked for no text.
     pub prompt: Option<String>,
-    /// sha256 of the prompt, hex: the hash the ledger stored, or one computed
+    /// First 16 hex characters of the prompt's SHA-256: the stored hash, or one computed
     /// from the text when it was carried. `None` only for a row written
     /// without a stored hash and read without its text.
     pub prompt_hash: Option<String>,

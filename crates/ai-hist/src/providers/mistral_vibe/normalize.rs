@@ -76,6 +76,8 @@ fn event(
         insert_history(
             conn,
             &HistoryEntry {
+                // Keep this adapter's legacy history keys until a provider migration
+                // supersedes anonymous rows without duplicating remote-owned evidence.
                 event_uid: None,
                 id: 0,
                 source: ID.into(),

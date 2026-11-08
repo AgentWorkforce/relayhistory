@@ -69,14 +69,10 @@ pub(super) fn user_turn_stream_sql() -> String {
 /// make SQLite aggregate every matching row first, so walking pages would
 /// regroup the turns already returned. Per-key lookups for the whole
 /// session would be one lookup per turn instead of this single pass.
-pub(super) fn user_turn_header_sql() -> String {
-    ranked_turn_header_sql()
-}
-
 pub(super) fn ranked_turn_header_sql() -> String {
     format!(
         "WITH native AS (
-            SELECT *, {USER_TURN_KEY} AS turn_key,
+            SELECT id, ts_ms, message_id, source_order, {USER_TURN_KEY} AS turn_key,
                 ROW_NUMBER() OVER(PARTITION BY {USER_TURN_KEY} ORDER BY ts_ms,COALESCE(source_order,id),id) AS nth
             FROM session_events WHERE source=? AND session_id=? AND {USER_TURN_ROW_FILTER}
          ), grouped AS (
@@ -110,4 +106,28 @@ pub(super) fn ensure_indexes(conn: &Connection) -> Result<()> {
 
 pub(super) fn stream_position(row: &rusqlite::Row<'_>) -> rusqlite::Result<(i64, i64, i64)> {
     Ok((row.get(1)?, row.get(9)?, row.get(0)?))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::hooks::{AuthAction, AuthContext, Authorization};
+
+    #[test]
+    fn whole_session_turn_headers_do_not_read_transcript_bodies() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute("INSERT INTO session_events(source,session_id,event_uid,ts_ms,message_id,role,kind,text) VALUES('claude','headers','u',100,'m','user','text',?1)", ["x".repeat(1024 * 1024)]).unwrap();
+        conn.authorizer(Some(|context: AuthContext<'_>| match context.action {
+            AuthAction::Read {
+                table_name: "session_events",
+                column_name: "text",
+                ..
+            } => Authorization::Deny,
+            _ => Authorization::Allow,
+        }));
+        let headers = grouped_turn_headers(&conn, "claude", "headers").unwrap();
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].message_id.as_deref(), Some("m"));
+    }
 }

@@ -77,7 +77,7 @@ and distinct events cannot claim the same known rank at a timestamp. Intake
 returns `SOURCE_ORDER_CONFLICT` and rolls back canonical rows, retained snapshots
 and checkpoint changes on disagreement. A legacy null does not erase known
 order. Kind-partial submissions retain prior ordering for untouched event
-snapshots. Native reorders update ranks in place; remotely backed conflicting
+snapshots. Complete native reorders update ranks in place; remotely backed conflicting
 buckets retain their prior snapshot. This contract never changes native IDs or
 fabricates timestamps. See the [ordering ADR](decisions/2026-10-29-durable-source-event-order.md).
 

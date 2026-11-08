@@ -3456,7 +3456,7 @@ mod tests {
             insert_history(
                 conn,
                 &HistoryEntry {
-                    event_uid: None,
+                    event_uid: (source == "claude").then(|| "native-prompt".into()),
                     id: 0,
                     source: source.into(),
                     session_id: Some(session.into()),
@@ -3470,7 +3470,14 @@ mod tests {
         }
     }
 
-    type ExportedRow = (String, Option<String>, Option<String>, String, i64);
+    type ExportedRow = (
+        String,
+        Option<String>,
+        Option<String>,
+        String,
+        i64,
+        Option<String>,
+    );
 
     fn history_rows(conn: &Connection) -> Vec<ExportedRow> {
         conn.prepare(
@@ -3485,6 +3492,7 @@ mod tests {
                 row.get(2)?,
                 row.get(3)?,
                 row.get(4)?,
+                row.get(5)?,
             ))
         })
         .unwrap()
@@ -3530,6 +3538,7 @@ mod tests {
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0]["source"], "claude");
         assert_eq!(lines[0]["prompt"], "tag the release");
+        assert_eq!(lines[0]["event_uid"], "native-prompt");
         assert_eq!(lines[0]["prompt_hash"], prompt_hash("tag the release"));
         assert_eq!(lines[2]["project"], Value::Null);
 

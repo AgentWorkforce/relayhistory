@@ -25,14 +25,14 @@ rust_roots = ["crates/ai-hist-cli/src", "crates/ai-hist-napi/src", "crates/ai-hi
 [baseline.file_loc]
 "crates/ai-hist-cli/src/lib.rs" = 2684
 "crates/ai-hist-napi/src/lib.rs" = 1959
-"crates/ai-hist/src/change_feed.rs" = 1196
+"crates/ai-hist/src/change_feed.rs" = 1172
 "crates/ai-hist/src/discover.rs" = 3249
-"crates/ai-hist/src/ingest.rs" = 11302
+"crates/ai-hist/src/ingest.rs" = 11294
 "crates/ai-hist/src/ingest/devin.rs" = 828
 "crates/ai-hist/src/ingest/hydrate.rs" = 3286
 "crates/ai-hist/src/ingest/opencode.rs" = 1426
 "crates/ai-hist/src/session_store.rs" = 1669
-"crates/ai-hist/src/store.rs" = 3051
+"crates/ai-hist/src/store.rs" = 3040
 
 [baseline.cyclomatic]
 "crates/ai-hist-cli/src/lib.rs::run" = 81
@@ -43,7 +43,7 @@ rust_roots = ["crates/ai-hist-cli/src", "crates/ai-hist-napi/src", "crates/ai-hi
 "crates/ai-hist/src/ingest.rs::ingest_grok_session" = 55
 "crates/ai-hist/src/ingest.rs::ingest_muse_session" = 58
 "crates/ai-hist/src/ingest.rs::sync_basic" = 29
-"crates/ai-hist/src/ingest.rs::sync_claude_session_metadata_with_repairs_and_coverage" = 87
+"crates/ai-hist/src/ingest.rs::sync_claude_session_metadata_with_repairs_and_coverage" = 86
 "crates/ai-hist/src/ingest.rs::sync_codex_rollouts_with_repairs_and_coverage" = 86
 "crates/ai-hist/src/ingest/opencode.rs::load_all_from_sqlite" = 43
 "crates/ai-hist/src/ingest/opencode.rs::normalize_session" = 41
@@ -59,7 +59,7 @@ rust_roots = ["crates/ai-hist-cli/src", "crates/ai-hist-napi/src", "crates/ai-hi
 "crates/ai-hist/src/ingest.rs::ingest_grok_session" = 71
 "crates/ai-hist/src/ingest.rs::ingest_muse_session" = 56
 "crates/ai-hist/src/ingest.rs::sync_basic" = 31
-"crates/ai-hist/src/ingest.rs::sync_claude_session_metadata_with_repairs_and_coverage" = 63
+"crates/ai-hist/src/ingest.rs::sync_claude_session_metadata_with_repairs_and_coverage" = 60
 "crates/ai-hist/src/ingest.rs::sync_codex_rollouts_with_repairs_and_coverage" = 117
 "crates/ai-hist/src/ingest/opencode.rs::load_all_from_sqlite" = 33
 "crates/ai-hist/src/ingest/opencode.rs::normalize_session" = 52
