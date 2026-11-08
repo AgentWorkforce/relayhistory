@@ -50,14 +50,17 @@ struct Group {
     position: usize,
     size: i64,
     absorbable: bool,
+    /// The primary's whitespace-collapsed text, computed once: grouping
+    /// compares every pending row against every primary, so collapsing on
+    /// each comparison would re-allocate the same strings quadratically.
+    primary_text: String,
 }
 
-/// Whether `echo` repeats `primary`'s full trimmed text verbatim.
-fn text_matches(echo: &SearchRow, primary: &SearchRow) -> bool {
-    let primary_text = collapse_whitespace(primary.text.trim());
+/// Whether `echo` repeats the primary's full trimmed text verbatim.
+fn text_matches(echo: &SearchRow, primary_text: &str) -> bool {
     !primary_text.is_empty()
         && (echo.kind == "tool_use" || echo.kind == "tool_result" || echo.role == "assistant")
-        && collapse_whitespace(&echo.text).contains(&primary_text)
+        && collapse_whitespace(&echo.text).contains(primary_text)
 }
 
 /// Among the primaries an echo could join, the closest preceding one (the
@@ -94,7 +97,7 @@ fn join_target(groups: &[Group], row: &SearchRow) -> Option<usize> {
         }
         if linked_to(row, &group.representative) {
             linked.push(index);
-        } else if text_matches(row, &group.representative) {
+        } else if text_matches(row, &group.primary_text) {
             by_text.push(index);
         }
     }
@@ -111,11 +114,13 @@ pub(super) fn group_rows(rows: Vec<SearchRow>, bound_hit: bool) -> Vec<SearchRow
     let mut pending: Vec<(usize, SearchRow)> = Vec::new();
     for (position, row) in rows.into_iter().enumerate() {
         if row.is_primary_candidate() {
+            let primary_text = collapse_whitespace(row.text.trim());
             groups.push(Group {
                 representative: row,
                 position,
                 size: 1,
                 absorbable: true,
+                primary_text,
             });
         } else {
             pending.push((position, row));
@@ -126,6 +131,7 @@ pub(super) fn group_rows(rows: Vec<SearchRow>, bound_hit: bool) -> Vec<SearchRow
         match joined {
             Some(index) => groups[index].size += 1,
             None => groups.push(Group {
+                primary_text: String::new(),
                 representative: row,
                 position,
                 size: 1,
@@ -276,10 +282,14 @@ pub(super) fn grouped_page_is_stable(
 
 /// Recount each selected primary's echoes over the whole filtered match
 /// set, ignoring the page cursor and limit, so `group_size`/`echo_count`
-/// do not depend on where the cursor fell. The recount groups every match
-/// (up to [`MAX_GROUP_FETCH`] rows per branch) with the same precedence as
-/// the page itself; when that bound cuts the recount, a primary it could
-/// not recount keeps `group_truncated` set.
+/// do not depend on where the cursor fell. An echo can only join a primary
+/// in its own session, so the recount is scoped to the sessions of the
+/// primaries actually on the page — one bounded fetch and grouping per
+/// distinct session on the page, never a regrouping of the whole match
+/// corpus per continued page. Primaries with no session id keep the
+/// unscoped recount, since their echoes are the session-less rows too.
+/// When a recount bound is hit, a primary it could not recount keeps
+/// `group_truncated` set.
 pub(super) fn recount_echoes(
     conn: &Connection,
     terms: &[String],
@@ -291,29 +301,45 @@ pub(super) fn recount_echoes(
     if primaries.is_empty() || matches!(role, SearchRole::Assistant | SearchRole::Prompt) {
         return Ok(());
     }
-    let mut universe_filter = filter.clone();
-    universe_filter.after = None;
-    let fetched = fetch_rows(conn, terms, raw_fts, &universe_filter, role, MAX_GROUP_FETCH)?;
-    let bound_hit = fetched.bound_hit;
-    let grouped = group_rows(fetched.rows, bound_hit);
-    let counts: std::collections::HashMap<(String, i64), (i64, i64, bool)> = grouped
-        .iter()
-        .map(|row| {
-            (
+    if !primaries.iter().any(|row| row.is_primary_candidate()) {
+        return Ok(());
+    }
+    // Distinct sessions among the page's primaries, in page order; `None`
+    // (a session-less primary) falls back to one unscoped recount.
+    let mut sessions: Vec<Option<String>> = Vec::new();
+    for row in primaries.iter().filter(|row| row.is_primary_candidate()) {
+        if !sessions.contains(&row.session_id) {
+            sessions.push(row.session_id.clone());
+        }
+    }
+    let mut counts: std::collections::HashMap<(String, i64), (i64, i64, bool)> =
+        std::collections::HashMap::new();
+    let mut any_bound_hit = false;
+    for session in sessions {
+        let mut universe_filter = filter.clone();
+        universe_filter.after = None;
+        if let Some(session_id) = &session {
+            universe_filter.session_id = Some(session_id.clone());
+        }
+        let fetched = fetch_rows(conn, terms, raw_fts, &universe_filter, role, MAX_GROUP_FETCH)?;
+        let bound_hit = fetched.bound_hit;
+        any_bound_hit |= bound_hit;
+        for row in group_rows(fetched.rows, bound_hit) {
+            counts.insert(
                 (row.match_source.clone(), row.id),
                 (row.group_size, row.echo_count, row.group_truncated),
-            )
-        })
-        .collect();
+            );
+        }
+    }
     for row in primaries.iter_mut() {
         match counts.get(&(row.match_source.clone(), row.id)) {
             Some(&(size, echoes, truncated)) => {
                 row.group_size = size;
                 row.echo_count = echoes;
                 row.group_id = (size > 1).then(|| format!("{}:{}", row.match_source, row.id));
-                row.group_truncated = truncated && bound_hit;
+                row.group_truncated = truncated && any_bound_hit;
             }
-            None if bound_hit => row.group_truncated = true,
+            None if any_bound_hit => row.group_truncated = true,
             None => {}
         }
     }

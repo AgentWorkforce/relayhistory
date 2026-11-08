@@ -91,6 +91,16 @@ pub fn derive_origin(match_source: &str, role: &str, control_kind: Option<&str>)
 /// silently claiming exhaustion.
 const MAX_GROUP_FETCH: i64 = 50_000;
 
+/// The per-branch bound the stability growth in [`search_all`] may reach.
+/// Past it the page is accepted as-is rather than read exhaustively: a
+/// standalone assistant/tool match can only be absorbed by a primary that
+/// also matches this search, and proving none exists anywhere in a large
+/// match set would make a one-row search cost the whole corpus. Rows that
+/// might still be such an echo are flagged `group_truncated`, and
+/// [`search_page`] still returns a cursor, so the bound is visible to the
+/// caller instead of silently wrong.
+const GROUP_FETCH_GROWTH_CAP: i64 = 2_000;
+
 /// The bounded over-fetch a grouped search reads before collapsing: enough
 /// headroom for echoes around the requested primaries, never unbounded. It
 /// also stays inside the timestamp walk's recent window, so a grouped search
@@ -169,26 +179,40 @@ pub fn search_all(
     // the page early — echoes collapsing leave fewer primaries than the
     // limit while older matches wait beyond the bound, and an echo whose
     // primary lies beyond it would stand alone — so the fetch bound grows
-    // (doubling, up to MAX_GROUP_FETCH rows per branch) and the rows are
-    // regrouped until the page is provably complete or a branch is truly
-    // exhausted.
+    // (doubling, up to GROUP_FETCH_GROWTH_CAP rows per branch) and the rows
+    // are regrouped until the page is provably complete, a branch is truly
+    // exhausted, or the growth cap accepts the page with its possibly-echo
+    // rows flagged `group_truncated`.
     let mut fetch_limit = bounded_fetch_limit(requested);
     let mut grouped: Vec<SearchRow>;
+    let mut page_stable = false;
     loop {
         let mut fetched = fetch_rows(conn, terms, raw_fts, filter, role, fetch_limit)?;
         let bound_hit = fetched.bound_hit;
         let rows = std::mem::take(&mut fetched.rows);
         grouped = group_rows(rows, bound_hit);
         if !bound_hit || grouped_page_is_stable(&grouped, requested, filter, role, &fetched) {
+            page_stable = true;
             break;
         }
-        if fetch_limit >= MAX_GROUP_FETCH {
+        if fetch_limit >= GROUP_FETCH_GROWTH_CAP {
             break;
         }
         fetch_limit = fetch_limit
             .saturating_mul(2)
-            .min(MAX_GROUP_FETCH)
+            .min(GROUP_FETCH_GROWTH_CAP)
             .max(fetch_limit + 1);
+    }
+    if !page_stable {
+        // The growth cap stopped the search before the page was provably
+        // complete: standalone rows in it may yet be echoes of a primary
+        // beyond the bound, so flag them instead of presenting them as
+        // certainly independent matches.
+        for row in grouped.iter_mut().take(requested as usize) {
+            if !row.is_primary_candidate() {
+                row.group_truncated = true;
+            }
+        }
     }
     grouped.truncate(requested as usize);
     // A page cursor must not change a primary's echo count: an echo newer
@@ -1764,6 +1788,75 @@ mod tests {
         assert_eq!(second.rows[0].text, "needle alpha prompt");
         assert_eq!(second.rows[0].echo_count, 1, "same count as the one-page read");
         assert_eq!(second.rows[0].group_size, 2);
+    }
+
+    #[test]
+    fn assistant_only_matches_page_without_a_primary() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for index in 0..30 {
+            conn.execute(
+                "INSERT INTO session_events \
+                 (source, session_id, project, message_id, ts_ms, role, kind, text, event_uid) \
+                 VALUES ('claude', 's1', '/work/needle', ?, ?, 'assistant', 'text', ?, ?)",
+                params![
+                    format!("m{index}"),
+                    1_000 + index,
+                    format!("needle assistant reply {index}"),
+                    format!("e{index}")
+                ],
+            )
+            .unwrap();
+        }
+        let terms = ["needle".to_string()];
+        let first = search_page(&conn, &terms, false, &filter(5), SearchRole::All).unwrap();
+        assert_eq!(first.rows.len(), 5);
+        assert!(first.rows.iter().all(|row| row.role == "assistant"));
+        let cursor = first.next_cursor.expect("more assistant replies follow");
+        let second = search_page(
+            &conn,
+            &terms,
+            false,
+            &QueryFilter {
+                after: Some(cursor),
+                ..filter(5)
+            },
+            SearchRole::All,
+        )
+        .unwrap();
+        assert_eq!(second.rows.len(), 5);
+        let first_ids: Vec<i64> = first.rows.iter().map(|row| row.id).collect();
+        assert!(second.rows.iter().all(|row| !first_ids.contains(&row.id)));
+    }
+
+    #[test]
+    fn assistant_only_matches_stop_at_the_growth_cap_and_flag_the_page() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut batch = String::new();
+        for index in 0..2_100 {
+            batch.push_str(&format!(
+                "INSERT INTO session_events \
+                 (source, session_id, project, message_id, ts_ms, role, kind, text, event_uid) \
+                 VALUES ('claude', 's1', '/work/needle', 'm{index}', {}, 'assistant', 'text', \
+                 'needle assistant reply {index}', 'e{index}');",
+                1_000 + index
+            ));
+        }
+        conn.execute_batch(&batch).unwrap();
+        let rows = search_all(
+            &conn,
+            &["needle".to_string()],
+            false,
+            &filter(1),
+            SearchRole::All,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].group_truncated,
+            "a page accepted at the growth cap flags its possibly-echo rows"
+        );
     }
 
     #[test]
