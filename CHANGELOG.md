@@ -21,6 +21,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Partial Claude scans preserve pending transcript retries when the source root is unavailable.
+- Remote evidence rejects oversized integers instead of rounding them into floating-point values.
 - Applied retention changes report the saved policy.
 - Native prompt change feeds retain session-scoped deletion identities after upgrades.
 - Large Claude imports and rereads release the database writer between chunks; overlapping Claude writes may return `SQLITE_BUSY`.

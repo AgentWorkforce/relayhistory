@@ -7082,7 +7082,7 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
     coverage: &mut SweepCoverage,
     paths: Option<&path_scope::PathScope>,
 ) -> Result<()> {
-    if !claude_full_order::root_present(state, root, repairs, coverage) {
+    if !claude_full_order::root_present(state, root, repairs, coverage, paths) {
         return Ok(());
     }
     let _claude_write = claude_write_fence::acquire_wait(conn, "claude")?;

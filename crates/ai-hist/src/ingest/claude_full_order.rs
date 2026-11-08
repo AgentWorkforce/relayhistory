@@ -8,6 +8,7 @@ pub(super) fn root_present(
     root: &Path,
     repairs: &SweepRepairs,
     coverage: &mut SweepCoverage,
+    paths: Option<&path_scope::PathScope>,
 ) -> bool {
     if root.exists() {
         return true;
@@ -20,7 +21,11 @@ pub(super) fn root_present(
     {
         coverage.note_unread();
     }
-    state.insert(incremental::CLAUDE_HOLDING_RECORDS_KEY.into(), false.into());
+    let holding = scoped_files::claude_holding_flag(paths, root, false, state);
+    state.insert(
+        incremental::CLAUDE_HOLDING_RECORDS_KEY.into(),
+        holding.into(),
+    );
     false
 }
 
@@ -63,6 +68,46 @@ pub(crate) fn claude_records_are_all_sidechain(identified: usize, sidechain: usi
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_root_preserves_held_records_only_for_partial_or_skipped_walks() {
+        let home = tempfile::tempdir().unwrap();
+        let root = home.path().join("missing-claude-root");
+        let conn = crate::open_db(&home.path().join("history.db")).unwrap();
+        for (scope, preserve) in [
+            (None, false),
+            (path_scope::PathScope::from_paths([root.clone()]), false),
+            (
+                path_scope::PathScope::from_paths([root.join("held.jsonl")]),
+                true,
+            ),
+            (
+                path_scope::PathScope::from_paths([home.path().join("another-root")]),
+                true,
+            ),
+        ] {
+            for already_held in [false, true] {
+                let mut state = Map::new();
+                state.insert(
+                    incremental::CLAUDE_HOLDING_RECORDS_KEY.into(),
+                    already_held.into(),
+                );
+                sync_claude_session_metadata_with_repairs_and_coverage(
+                    &conn,
+                    &mut state,
+                    &root,
+                    &SweepRepairs::default(),
+                    &mut SweepCoverage::default(),
+                    scope.as_ref(),
+                )
+                .unwrap();
+                assert_eq!(
+                    incremental::sweep_left_records_held(&state),
+                    already_held && preserve
+                );
+            }
+        }
+    }
 
     fn text(ids: &[&str]) -> String {
         ids.iter().map(|id| serde_json::json!({"type":"user","uuid":id,"sessionId":"native-claude","timestamp":"2026-10-22T12:00:00Z","message":{"role":"user","content":[{"type":"text","text":id}]}}).to_string()+"\n").collect()

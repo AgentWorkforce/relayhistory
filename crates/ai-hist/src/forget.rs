@@ -492,7 +492,8 @@ fn scope(
 }
 
 /// Forget sessions from `pending` in one write transaction until it has
-/// removed [`BATCH_ROWS`] evidence rows or run out of sessions.
+/// removed [`BATCH_ROWS`] evidence rows, exhausted [`BATCH_TIME`], reached a
+/// different source, or run out of sessions.
 fn forget_batch<'a>(
     conn: &mut Connection,
     pending: &mut std::iter::Peekable<impl Iterator<Item = &'a Target>>,
