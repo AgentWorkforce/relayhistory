@@ -144,6 +144,13 @@ pub struct SearchRow {
     pub group_truncated: bool,
     pub is_primary: bool,
     pub origin: String,
+    /// Internal: the page fetch stopped at its growth cap before the page
+    /// was provably complete, so older matches may follow even when this
+    /// page came back short. Kept separate from `group_truncated` (which
+    /// describes one group's echo count) because the echo recount may
+    /// complete a group — clearing its flag — without completing the page.
+    /// Not part of the wire contract; the napi layer does not map it.
+    pub page_incomplete: bool,
 }
 
 impl SearchRow {
@@ -207,11 +214,17 @@ pub fn search_all(
         // The growth cap stopped the search before the page was provably
         // complete: standalone rows in it may yet be echoes of a primary
         // beyond the bound, so flag them instead of presenting them as
-        // certainly independent matches.
+        // certainly independent matches. The page-level marker goes on the
+        // last returned row and lives apart from `group_truncated`, so the
+        // echo recount below — which may complete a group's count — cannot
+        // clear the signal `search_page` needs to hand back a cursor.
         for row in grouped.iter_mut().take(requested as usize) {
             if !row.is_primary_candidate() {
                 row.group_truncated = true;
             }
+        }
+        if let Some(last) = grouped.iter_mut().take(requested as usize).last() {
+            last.page_incomplete = true;
         }
     }
     grouped.truncate(requested as usize);
@@ -265,10 +278,13 @@ pub fn search_page(
             id: row.id,
             match_source: Some(row.match_source.clone()),
         })
-    } else if rows.iter().any(|row| row.group_truncated) {
-        // The grouping fetch hit its absolute bound, so this page may not
-        // be the last one even though it came back short: hand back a
-        // cursor rather than silently claiming exhaustion.
+    } else if rows.iter().any(|row| row.group_truncated || row.page_incomplete) {
+        // The grouping fetch hit its bound, so this page may not be the
+        // last one even though it came back short: hand back a cursor
+        // rather than silently claiming exhaustion. `page_incomplete` is
+        // the reliable signal here — the echo recount can complete a
+        // group's count and clear its `group_truncated`, but it cannot
+        // complete the page.
         rows.last().map(|row| HistoryCursor {
             timestamp_ms: row.timestamp_ms,
             id: row.id,
@@ -478,6 +494,7 @@ fn search_row(row: &rusqlite::Row<'_>, match_source: &str) -> rusqlite::Result<S
         group_truncated: false,
         is_primary: true,
         origin,
+        page_incomplete: false,
     })
 }
 
@@ -1857,6 +1874,91 @@ mod tests {
             rows[0].group_truncated,
             "a page accepted at the growth cap flags its possibly-echo rows"
         );
+    }
+
+    #[test]
+    fn continued_pages_reach_matches_beyond_the_grouping_cap() {
+        // Devin's scenario: a newer primary A, then 2,000 assistant echoes
+        // of an older primary B filling the whole event fetch bound, then a
+        // still older primary C in the same branch. Page two's recount
+        // completes B's echo count; that must not cost C its cursor.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for (session, ts, prompt) in [
+            ("sa", 10_000, "needle alpha prompt"),
+            ("sb", 1_500, "needle bravo prompt"),
+        ] {
+            insert_history(
+                &conn,
+                &HistoryEntry {
+                    id: 0,
+                    source: "claude".into(),
+                    session_id: Some(session.into()),
+                    project: Some("/work/needle".into()),
+                    prompt: prompt.into(),
+                    prompt_hash: Some(format!("hash-{session}")),
+                    timestamp_ms: ts,
+                },
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, project, message_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('claude', 'sc', '/work/needle', 'mc', 1000, 'user', 'text', 'needle charlie prompt', 'ec')",
+            [],
+        )
+        .unwrap();
+        let mut batch = String::new();
+        for index in 0..2_000 {
+            batch.push_str(&format!(
+                "INSERT INTO session_events \
+                 (source, session_id, project, message_id, ts_ms, role, kind, text, event_uid) \
+                 VALUES ('claude', 'sb', '/work/needle', 'm{index}', {}, 'assistant', 'text', \
+                 'quoting needle bravo prompt {index}', 'e{index}');",
+                2_000 + index
+            ));
+        }
+        conn.execute_batch(&batch).unwrap();
+
+        let terms = ["needle".to_string()];
+        let first = search_page(&conn, &terms, false, &filter(1), SearchRole::All).unwrap();
+        assert_eq!(first.rows.len(), 1);
+        assert_eq!(first.rows[0].text, "needle alpha prompt");
+        let cursor = first.next_cursor.expect("bravo follows alpha");
+
+        let second = search_page(
+            &conn,
+            &terms,
+            false,
+            &QueryFilter {
+                after: Some(cursor),
+                ..filter(1)
+            },
+            SearchRole::All,
+        )
+        .unwrap();
+        assert_eq!(second.rows.len(), 1);
+        assert_eq!(second.rows[0].text, "needle bravo prompt");
+        assert_eq!(second.rows[0].echo_count, 2_000);
+        let cursor = second
+            .next_cursor
+            .expect("charlie stays reachable past the grouping cap");
+
+        let third = search_page(
+            &conn,
+            &terms,
+            false,
+            &QueryFilter {
+                after: Some(cursor),
+                ..filter(1)
+            },
+            SearchRole::All,
+        )
+        .unwrap();
+        assert_eq!(third.rows.len(), 1);
+        assert_eq!(third.rows[0].text, "needle charlie prompt");
+        assert!(third.next_cursor.is_none());
     }
 
     #[test]
