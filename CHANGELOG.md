@@ -21,7 +21,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- Hermes history discovery and capture accept SQLite schema 32 while retaining schema 31 support, including archived messages and native tool-call identities.
+- User-turn pagination keeps timestamp and event ID anchored to the same row, including mixed recorded-order and legacy events.
 - SDK, CLI and MCP event reads preserve provider-native record types, API message IDs and request spans.
 - Retained matching remote evidence survives retirement of its direct local source, without allowing conflicting snapshots to replace local evidence.
 - Repeated DeepAgents prompts with equal text and timestamps retain separate history rows through export and remote intake, using stable native event identity.
@@ -33,6 +33,12 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Added optional `HistoryEntry::event_uid` and `Prompt::event_uid`; callers constructing `HistoryEntry` literals must supply the field (`None` for anonymous prompt logs).
 - Added nullable `Block::source_order`; session evidence contract 5 orders events by recorded source position and resolves existing event cursors through stable row identity.
+
+## [0.57.1] - 2026-11-07
+
+### Fixed
+
+- Hermes history discovery and capture accept SQLite schema 32 while retaining schema 31 support, including archived messages and native tool-call identities.
 
 ## [0.57.0] - 2026-11-06
 
@@ -1289,7 +1295,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - The SDK reads provider JSONL natively and works without the Python CLI.
 
-[Unreleased]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.57.0...HEAD
+[Unreleased]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.57.1...HEAD
+[0.57.1]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.57.0...sdk-ts-v0.57.1
 [0.57.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.56.0...sdk-ts-v0.57.0
 [0.56.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.55.0...sdk-ts-v0.56.0
 [0.55.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.54.1...sdk-ts-v0.55.0
