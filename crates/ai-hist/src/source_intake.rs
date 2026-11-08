@@ -7,6 +7,10 @@ pub(crate) mod retirement;
 #[path = "source_intake/retirement/tests.rs"]
 mod retirement_tests;
 
+#[cfg(test)]
+#[path = "source_intake/fence_tests.rs"]
+mod fence_tests;
+
 mod event_order;
 use crate::{discover::*, *};
 use crate::{
@@ -14,7 +18,7 @@ use crate::{
     source_evidence::{self, EvidenceKind, EvidenceRecord, FULL_SESSION_KINDS},
 };
 use anyhow::{ensure, Context, Result};
-use rusqlite::{Connection, TransactionBehavior};
+use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -224,7 +228,7 @@ pub(crate) fn apply_normalized(
             .records
             .retain(|record| record.kind != EvidenceKind::Relationship);
     }
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let (_claude_write, tx) = crate::ingest::claude_write_fence::begin_transaction(conn, &key.source)?;
     ensure!(
         observations::revision(&tx, key)?.as_deref() == Some(expected),
         "SOURCE_REVISION_CONFLICT: source observation changed during acquisition"

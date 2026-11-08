@@ -21,6 +21,7 @@ mod claude_full_order;
 mod claude_record_rows;
 mod session_order_scope;
 use claude_full_order::claude_file_session_id;
+pub(crate) use claude_full_order::claude_records_are_all_sidechain;
 mod claude_standalone;
 pub(crate) mod claude_title;
 pub(crate) mod codex;
@@ -44,6 +45,7 @@ pub(crate) mod hydrate;
 mod images;
 use history_prompts::retire_claude_history_row;
 pub(crate) use images::image_markdown;
+pub(crate) mod claude_write_fence;
 pub(crate) mod incremental;
 pub(crate) mod jsonl;
 pub(crate) mod muse;
@@ -7316,7 +7318,7 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
         // Everything this transcript writes from here -- the fold's cursor,
         // the catalog row, the records and their cursor, the relationship and
         // continuity rows -- is one write unit. The fold above only read.
-        let mut write = SweepWrite::begin(conn)?;
+        let (_claude_write, mut write) = claude_write_fence::begin_sweep(conn)?;
         scan_cursor.claude.get_or_insert_with(Default::default).scan = scan;
         transcript_cursor::store_cursor(conn, &scan_key, &scan_cursor)?;
         if let Some(meta) = scanned_meta {
@@ -8106,12 +8108,6 @@ pub(crate) fn is_claude_sidecar_file(path: &Path) -> bool {
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.starts_with(CLAUDE_SIDECAR_PREFIX))
-}
-
-/// Every record that names a session is a sidechain row — what a sidecar's
-/// records look like, and the half of the sidecar rule content can answer.
-pub(crate) fn claude_records_are_all_sidechain(identified: usize, sidechain: usize) -> bool {
-    identified > 0 && sidechain == identified
 }
 
 /// Walk only the records that have arrived since `state` was written.

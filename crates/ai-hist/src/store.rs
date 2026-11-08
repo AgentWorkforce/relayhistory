@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 mod busy;
-pub(crate) use busy::{configure_busy_retry, ShortBusyBudget};
+pub(crate) use busy::{busy_retry_handler, configure_busy_retry, ShortBusyBudget};
 pub(crate) mod busy_wait;
 mod event_order;
 mod event_row;

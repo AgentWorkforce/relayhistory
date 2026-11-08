@@ -21,6 +21,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Ordinary full Claude imports and rereads release the database writer lock between chunks, while constrained evidence keeps atomic rollback and competing Claude mutations are fenced.
 - User-turn pagination keeps timestamp and event ID anchored to the same row, including mixed recorded-order and legacy events.
 - SDK, CLI and MCP event reads preserve provider-native record types, API message IDs and request spans.
 - Retained matching remote evidence survives retirement of its direct local source, without allowing conflicting snapshots to replace local evidence.

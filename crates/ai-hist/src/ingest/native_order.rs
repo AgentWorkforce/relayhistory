@@ -30,6 +30,7 @@ pub(crate) struct Capture<'a> {
     session: Option<String>,
     transaction: Option<Transaction<'a>>,
     settled: bool,
+    _claude_write: super::claude_write_fence::Guard,
 }
 
 /// Arm only for complete source reads, before any payload is normalized.
@@ -39,6 +40,7 @@ pub(crate) fn begin<'a>(
     source: &str,
     session: Option<&str>,
 ) -> Result<Capture<'a>> {
+    let claude_write = super::claude_write_fence::acquire(conn, source)?;
     let transaction = conn
         .is_autocommit()
         .then(|| conn.unchecked_transaction())
@@ -61,6 +63,7 @@ pub(crate) fn begin<'a>(
         session: session.map(str::to_owned),
         transaction,
         settled: false,
+        _claude_write: claude_write,
     })
 }
 

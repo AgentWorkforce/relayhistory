@@ -384,6 +384,16 @@ they return `STALE_EVENT_CURSOR` because translating them to the new ordering
 could silently repeat or skip turns. Old cursors that identify an actual row
 continue to work. Evidence contract 5 covers these ordering semantics.
 
+Full Claude sweeps release SQLite's writer lock between chunks when the
+captured scope contains only local evidence with dense, known ranks. A
+source-wide file lock protects Claude evidence across those commits;
+competing Claude acquisition, forget and retention operations yield or
+report busy, while unrelated database writes can proceed. Reads that may
+reconcile legacy, shared or sparse ranks retain a single transaction so an
+ordering conflict rolls back the whole read. Unattributed transcripts can
+contain multiple session IDs, so their eligibility check covers all Claude
+sessions. In-memory databases also retain single-transaction staging.
+
 ### `watch`
 
 The `ai-hist watch` loop on its own thread, as an iterator of `TickReport`s.

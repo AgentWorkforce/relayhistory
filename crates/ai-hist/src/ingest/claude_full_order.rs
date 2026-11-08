@@ -31,6 +31,12 @@ pub(super) fn claude_file_session_id(path: &Path) -> Result<Option<String>> {
     }
 }
 
+/// Every record that names a session is a sidechain row — what a sidecar's
+/// records look like, and the half of the sidecar rule content can answer.
+pub(crate) fn claude_records_are_all_sidechain(identified: usize, sidechain: usize) -> bool {
+    identified > 0 && sidechain == identified
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -314,3 +320,7 @@ mod tests {
         assert_eq!(versions(), after);
     }
 }
+
+#[cfg(test)]
+#[path = "claude_chunk_tests.rs"]
+mod chunk_tests;

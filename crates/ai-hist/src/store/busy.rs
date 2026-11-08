@@ -43,7 +43,7 @@ fn retry_delay(prior_attempts: i32) -> Option<Duration> {
             .map(Duration::from_millis)
     }
 }
-fn busy_retry_handler(prior_attempts: i32) -> bool {
+pub(crate) fn busy_retry_handler(prior_attempts: i32) -> bool {
     if crate::ingest::shared_capture_stop().is_some_and(|stop| stop.is_stopped()) {
         return false;
     }

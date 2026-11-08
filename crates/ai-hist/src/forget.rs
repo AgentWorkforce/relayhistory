@@ -497,6 +497,7 @@ fn forget_batch<'a>(
     report: &mut ForgetReport,
 ) -> anyhow::Result<()> {
     let started = Instant::now();
+    let _claude_write = crate::ingest::claude_write_fence::acquire_wait(conn, "claude")?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let clock: i64 = tx
         .query_row(
