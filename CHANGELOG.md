@@ -6,15 +6,19 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased - Minor]
 
+### Breaking Changes
+
+- The native contract is now 30: the TypeScript SDK and the `ai-hist-native` addon must be upgraded together, and an older addon is rejected.
+- The MCP `search_history` tool returns an envelope `{matches, nextCursor, truncated, totalContentCharsUsed}` instead of a bare array of matches.
+
 ### Added
 
 - Search matches carry a match-centered `snippet` (with `contentTruncated` and `snippetStartOffset`), echo grouping (`groupId`, `groupSize`, `echoCount`, `groupTruncated`, `isPrimary`), `origin`, `controlKind`, `eventUid` and an `eventRef`; `prompt` still holds the full text. Search accepts `sessionId`, `kinds`, `origin`, `maxContentChars` and `maxTotalContentChars` filters and budgets.
-- The MCP `search_history` tool returns an envelope `{matches, nextCursor, truncated, totalContentCharsUsed}` and rejects unknown arguments.
+- The MCP `search_history` tool rejects unknown arguments instead of silently dropping them.
 
 ### Changed
 
 - Search pages return group primaries only: assistant and tool rows that repeat a prompt verbatim (or are linked to it) collapse into that prompt as counted echoes. Two identical-wording user prompts at different timestamps both stay primaries.
-- The native contract is now 30.
 
 ### Fixed
 

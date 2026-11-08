@@ -13,16 +13,15 @@ fn collapse_whitespace(text: &str) -> String {
 
 /// Whether `candidate` is linked to `primary` by the transcript's own ids:
 /// its `parent_id` or `tool_use_id` names the primary's message or event.
+/// Only transcript ids compare — never the primary's SQLite row id, which a
+/// provider id could collide with by chance.
 fn linked_to(candidate: &SearchRow, primary: &SearchRow) -> bool {
     let primary_ids = [
         primary.message_id.as_deref(),
         primary.event_uid.as_deref(),
         primary.tool_use_id.as_deref(),
     ];
-    let names_primary = |value: &str| {
-        value == primary.id.to_string()
-            || primary_ids.iter().flatten().any(|id| *id == value)
-    };
+    let names_primary = |value: &str| primary_ids.iter().flatten().any(|id| *id == value);
     candidate.parent_id.as_deref().is_some_and(names_primary)
         || candidate.tool_use_id.as_deref().is_some_and(names_primary)
 }
@@ -31,20 +30,22 @@ fn linked_to(candidate: &SearchRow, primary: &SearchRow) -> bool {
 ///
 /// A primary is a `history` row or a `role = user`/`kind = text` event. Any
 /// other row joins a primary only in the same source and session when it is
-/// linked to the primary by id, or when it is a tool call/result or an
-/// assistant row whose whitespace-collapsed text contains the primary's full
-/// trimmed text verbatim (case-sensitive). An explicit id link always wins
-/// over a text match, whatever the rows' order; a text-only echo joins the
-/// closest preceding primary in its session (the prompt that most recently
-/// preceded it, not a later re-utterance of the same words), falling back to
-/// the closest following primary when none precedes it. A user or history
-/// row never joins another as an echo, so two identical-wording approvals
-/// at different timestamps both stay primaries. There is no fuzzy
-/// similarity. A row that joins nothing stays as its own singleton group.
-/// Only group representatives are returned, with
-/// `group_size`/`echo_count` counting the echoes; `bound_hit` marks the
-/// oldest group `group_truncated` because the bounded over-fetch may have
-/// cut its remaining echoes.
+/// a tool call/result or an assistant row whose whitespace-collapsed text
+/// contains the primary's full trimmed text verbatim (case-sensitive):
+/// verbatim repetition is the echo evidence, and conversation ancestry
+/// alone never suppresses a substantive reply. Among the primaries a
+/// repeating row could join, an explicit id link wins over a text-only
+/// match, whatever the rows' order; a text-only echo joins the closest
+/// preceding primary in its session (the prompt that most recently
+/// preceded it, not a later re-utterance of the same words), falling back
+/// to the closest following primary when none precedes it. A user or
+/// history row never joins another as an echo, so two identical-wording
+/// approvals at different timestamps both stay primaries. There is no
+/// fuzzy similarity. A row that joins nothing stays as its own singleton
+/// group. Only group representatives are returned, with
+/// `group_size`/`echo_count` counting the echoes; `bound_hit` marks every
+/// primary `group_truncated` because a bound-cut fetch may have omitted
+/// some of its echoes.
 struct Group {
     representative: SearchRow,
     position: usize,
@@ -56,11 +57,13 @@ struct Group {
     primary_text: String,
 }
 
-/// Whether `echo` repeats the primary's full trimmed text verbatim.
-fn text_matches(echo: &SearchRow, primary_text: &str) -> bool {
+/// Whether an echo candidate (by kind/role) repeats the primary's full
+/// trimmed text verbatim. Both texts arrive whitespace-collapsed, each
+/// collapsed once per search rather than once per comparison.
+fn text_matches(echo: &SearchRow, echo_text: &str, primary_text: &str) -> bool {
     !primary_text.is_empty()
         && (echo.kind == "tool_use" || echo.kind == "tool_result" || echo.role == "assistant")
-        && collapse_whitespace(&echo.text).contains(primary_text)
+        && echo_text.contains(primary_text)
 }
 
 /// Among the primaries an echo could join, the closest preceding one (the
@@ -83,21 +86,27 @@ fn pick_closest_preceding(
         .or_else(|| candidates.iter().copied().min_by_key(key))
 }
 
-/// The group an echo joins, if any: an explicit id link beats every text
-/// match, regardless of the rows' order.
-fn join_target(groups: &[Group], row: &SearchRow) -> Option<usize> {
+/// The group an echo joins, if any. A row joins only with evidence that it
+/// actually repeats the primary: its text must contain the primary's full
+/// text verbatim. Conversation ancestry alone is not echo evidence — an
+/// ordinary assistant reply is parented to its prompt without repeating
+/// it, and suppressing it would hide a substantive match. Among the
+/// primaries a repeating row could join, an explicit id link beats a
+/// text-only match, regardless of the rows' order.
+fn join_target(groups: &[Group], row: &SearchRow, row_text: &str) -> Option<usize> {
     let mut linked: Vec<usize> = Vec::new();
     let mut by_text: Vec<usize> = Vec::new();
     for (index, group) in groups.iter().enumerate() {
         if !group.absorbable
             || group.representative.source != row.source
             || group.representative.session_id != row.session_id
+            || !text_matches(row, row_text, &group.primary_text)
         {
             continue;
         }
         if linked_to(row, &group.representative) {
             linked.push(index);
-        } else if text_matches(row, &group.primary_text) {
+        } else {
             by_text.push(index);
         }
     }
@@ -111,7 +120,7 @@ pub(super) fn group_rows(rows: Vec<SearchRow>, bound_hit: bool) -> Vec<SearchRow
     // newest-first order it precedes its primary and a single pass would
     // miss the join.
     let mut groups: Vec<Group> = Vec::new();
-    let mut pending: Vec<(usize, SearchRow)> = Vec::new();
+    let mut pending: Vec<(usize, SearchRow, String)> = Vec::new();
     for (position, row) in rows.into_iter().enumerate() {
         if row.is_primary_candidate() {
             let primary_text = collapse_whitespace(row.text.trim());
@@ -123,11 +132,12 @@ pub(super) fn group_rows(rows: Vec<SearchRow>, bound_hit: bool) -> Vec<SearchRow
                 primary_text,
             });
         } else {
-            pending.push((position, row));
+            let row_text = collapse_whitespace(&row.text);
+            pending.push((position, row, row_text));
         }
     }
-    for (position, row) in pending {
-        let joined = join_target(&groups, &row);
+    for (position, row, row_text) in pending {
+        let joined = join_target(&groups, &row, &row_text);
         match joined {
             Some(index) => groups[index].size += 1,
             None => groups.push(Group {
@@ -140,17 +150,19 @@ pub(super) fn group_rows(rows: Vec<SearchRow>, bound_hit: bool) -> Vec<SearchRow
         }
     }
     groups.sort_by_key(|group| group.position);
-    let last = groups.len().saturating_sub(1);
     groups
         .into_iter()
-        .enumerate()
-        .map(|(index, group)| {
+        .map(|group| {
             let mut row = group.representative;
             row.group_size = group.size;
             row.echo_count = group.size - 1;
             row.group_id = (group.size > 1)
                 .then(|| format!("{}:{}", row.match_source, row.id));
-            row.group_truncated = bound_hit && index == last;
+            // A bound-cut fetch can omit echoes of any primary in it —
+            // the other branch's bound cuts independently — so every
+            // primary's count is only a lower bound, not just the
+            // oldest group's.
+            row.group_truncated = bound_hit && group.absorbable;
             row.is_primary = true;
             row
         })
@@ -290,29 +302,40 @@ pub(super) fn grouped_page_is_stable(
 /// unscoped recount, since their echoes are the session-less rows too.
 /// When a recount bound is hit, a primary it could not recount keeps
 /// `group_truncated` set.
+///
+/// The same un-cursored grouping also settles membership across the
+/// cursor: a standalone row on this page that the recount shows joined a
+/// primary before the cursor (an echo older than its prompt, surfacing
+/// only now) is dropped rather than returned a second time as its own
+/// match. When anything is dropped, the last kept row is marked
+/// `page_incomplete` so the caller still gets a cursor.
 pub(super) fn recount_echoes(
     conn: &Connection,
     terms: &[String],
     raw_fts: bool,
     filter: &QueryFilter,
     role: SearchRole,
-    primaries: &mut [SearchRow],
-) -> Result<()> {
+    primaries: Vec<SearchRow>,
+) -> Result<Vec<SearchRow>> {
     if primaries.is_empty() || matches!(role, SearchRole::Assistant | SearchRole::Prompt) {
-        return Ok(());
+        return Ok(primaries);
     }
     if !primaries.iter().any(|row| row.is_primary_candidate()) {
-        return Ok(());
+        return Ok(primaries);
     }
-    // Distinct sessions among the page's primaries, in page order; `None`
-    // (a session-less primary) falls back to one unscoped recount.
+    // Distinct sessions among the page's rows, in page order — standalone
+    // rows included, since resolving whether one is an absorbed echo needs
+    // its session's grouping too. `None` (a session-less row) falls back
+    // to one unscoped recount.
     let mut sessions: Vec<Option<String>> = Vec::new();
-    for row in primaries.iter().filter(|row| row.is_primary_candidate()) {
+    for row in primaries.iter() {
         if !sessions.contains(&row.session_id) {
             sessions.push(row.session_id.clone());
         }
     }
     let mut counts: std::collections::HashMap<(String, i64), (i64, i64, bool)> =
+        std::collections::HashMap::new();
+    let mut session_bound_hit: std::collections::HashMap<Option<String>, bool> =
         std::collections::HashMap::new();
     let mut any_bound_hit = false;
     for session in sessions {
@@ -324,6 +347,7 @@ pub(super) fn recount_echoes(
         let fetched = fetch_rows(conn, terms, raw_fts, &universe_filter, role, MAX_GROUP_FETCH)?;
         let bound_hit = fetched.bound_hit;
         any_bound_hit |= bound_hit;
+        session_bound_hit.insert(session, bound_hit);
         for row in group_rows(fetched.rows, bound_hit) {
             counts.insert(
                 (row.match_source.clone(), row.id),
@@ -331,6 +355,7 @@ pub(super) fn recount_echoes(
             );
         }
     }
+    let mut primaries = primaries;
     for row in primaries.iter_mut() {
         match counts.get(&(row.match_source.clone(), row.id)) {
             Some(&(size, echoes, truncated)) => {
@@ -343,5 +368,23 @@ pub(super) fn recount_echoes(
             None => {}
         }
     }
-    Ok(())
+    // Drop standalone rows the un-cursored grouping proves are echoes of a
+    // primary before the cursor: they were already counted on that
+    // primary's page and must not reappear as their own match. A row whose
+    // session recount hit its bound is kept — its membership is unproven.
+    let before = primaries.len();
+    primaries.retain(|row| {
+        row.is_primary_candidate()
+            || counts.contains_key(&(row.match_source.clone(), row.id))
+            || session_bound_hit
+                .get(&row.session_id)
+                .copied()
+                .unwrap_or(false)
+    });
+    if primaries.len() < before {
+        if let Some(last) = primaries.last_mut() {
+            last.page_incomplete = true;
+        }
+    }
+    Ok(primaries)
 }

@@ -69,7 +69,7 @@ server.registerTool('search_history', {
   + 'must match; a leading - excludes a word. A query containing AND, OR, NOT, a trailing * or a "quoted phrase" is '
   + 'passed to SQLite FTS5 as written, and raw_fts: true always does so. Each match carries matchSource '
   + '(history or session_event), role and kind; id is unique only within matchSource. Matches are grouped: an '
-  + 'assistant or tool row that repeats a prompt verbatim (or is linked to it) collapses into that prompt as an '
+  + 'assistant or tool row that repeats a prompt verbatim collapses into that prompt as an '
   + 'echo, counted by groupSize/echoCount under the primary\'s groupId; pages return primaries only. prompt keeps '
   + 'the full text and snippet is a match-centered window of it (see snippetStartOffset and contentTruncated). '
   + 'Each match also carries origin and eventRef for re-reading the full row. Budget arguments are '

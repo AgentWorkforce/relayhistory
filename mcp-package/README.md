@@ -15,7 +15,8 @@ both source and session ID and use bounded deterministic cursors.
 `search_history` returns an envelope `{matches, nextCursor, truncated,
 totalContentCharsUsed}`. Matches are grouped primaries (echoes of a prompt
 collapse into it and are counted, not returned), carry a match-centered
-`snippet` beside the full `prompt`, and accept `session_id`, `kinds`,
+`snippet` beside the full `prompt` (counts are a lower bound when
+`groupTruncated` is set), and accept `session_id`, `kinds`,
 `origin`, `max_content_chars` and `max_total_content_chars`; unknown
 arguments are rejected.
 

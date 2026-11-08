@@ -20,21 +20,26 @@ Use these public operations:
   indexed history reads. `search()`, MCP `search_history` and `ai-hist search`
   share one contract: prompts and session events, filtered by `role`
   (`all`, `user`, `assistant`, `prompt`), with each match's `matchSource`,
-  `role` and `kind`. Search also accepts `sessionId`, `kinds` and `origin`
-  filters. Matches are grouped: an assistant or tool row that repeats a
-  prompt verbatim (or is linked to it by id) collapses into that prompt as an
-  echo, counted by `groupSize`/`echoCount`; pages return primaries only, and
-  two identical-wording prompts at different timestamps both stay primaries.
+  `role` and `kind`. The SDK and MCP surfaces also accept `sessionId`,
+  `kinds` and `origin` filters (`ai-hist search` shares the result contract
+  but exposes no such flags). Matches are grouped: an assistant or tool row
+  that repeats a prompt verbatim collapses into that prompt as an echo,
+  counted by `groupSize`/`echoCount` (a lower bound when `groupTruncated`
+  is set); pages return primaries only, and two identical-wording prompts
+  at different timestamps both stay primaries.
   `prompt` keeps the full text; `snippet` is a match-centered window of it
   (`maxContentChars`, default 320 codepoints), with `contentTruncated` and
   `snippetStartOffset`, plus `origin` and an `eventRef` for re-reading the
   full row. Page them with `searchPage()` / `recentPage()` and the returned
   `nextCursor` (MCP: pass `nextCursor` back unchanged as `after`; it is a
-  search position only), and bound them with inclusive `sinceMs` / `untilMs`
-  and the serialized-size budget `maxTotalContentChars` (MCP:
-  `max_total_content_chars`). The budget bounds `searchPage()` and MCP
-  `search_history` (default 20000); `search()` returns every match up to
-  `limit` unless a budget is explicitly given. MCP `search_history` returns an
+  search position only), and bound them with inclusive `sinceMs` / `untilMs`.
+  The serialized-size budget `maxTotalContentChars` (MCP:
+  `max_total_content_chars`) bounds search pages only — `searchPage()` and
+  MCP `search_history` (default 20000); `recentPage()` does not accept it,
+  and `search()` returns every match up to `limit` unless a budget is
+  explicitly given. For a `session_event` match, `eventRef` names the event
+  `getSessionEvents` can re-read; for a `history` match it identifies the
+  history row itself, which may have no session id. MCP `search_history` returns an
   envelope `{matches, nextCursor, truncated, totalContentCharsUsed}` and
   rejects unknown arguments. `beforeMs` is deprecated: it skips rows tied on
   its timestamp.

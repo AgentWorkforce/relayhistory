@@ -162,8 +162,27 @@ export function searchMatch(value: UnknownRecord): SearchMatch {
       'NATIVE_CONTRACT_MISMATCH',
     );
   }
+  const origin = String(value.origin);
+  if (!SEARCH_ORIGINS.includes(origin)) {
+    throw new NativeContractMismatchError(
+      `ai-hist-native returned an unknown search origin '${origin}'. Reinstall matching ai-hist packages.`,
+      'NATIVE_CONTRACT_MISMATCH',
+    );
+  }
   const entry = historyEntry(value);
   const ref = (value.eventRef ?? {}) as UnknownRecord;
+  if (ref.matchSource !== 'history' && ref.matchSource !== 'session_event') {
+    throw new NativeContractMismatchError(
+      `ai-hist-native returned an unknown eventRef matchSource '${String(ref.matchSource)}'. Reinstall matching ai-hist packages.`,
+      'NATIVE_CONTRACT_MISMATCH',
+    );
+  }
+  if (ref.matchSource !== matchSource) {
+    throw new NativeContractMismatchError(
+      `ai-hist-native returned an eventRef matchSource '${ref.matchSource}' that disagrees with the match's '${matchSource}'. Reinstall matching ai-hist packages.`,
+      'NATIVE_CONTRACT_MISMATCH',
+    );
+  }
   const groupSize = typeof value.groupSize === 'number' ? value.groupSize : 1;
   return {
     ...entry,
@@ -178,13 +197,11 @@ export function searchMatch(value: UnknownRecord): SearchMatch {
     echoCount: typeof value.echoCount === 'number' ? value.echoCount : groupSize - 1,
     groupTruncated: value.groupTruncated === true,
     isPrimary: value.isPrimary !== false,
-    origin: (SEARCH_ORIGINS.includes(String(value.origin))
-      ? String(value.origin)
-      : 'unknown') as SearchMatch['origin'],
+    origin: origin as SearchMatch['origin'],
     controlKind: nullableString(value.controlKind),
     eventUid: nullableString(value.eventUid),
     eventRef: {
-      matchSource: (ref.matchSource === 'session_event' ? 'session_event' : 'history') as SearchMatch['eventRef']['matchSource'],
+      matchSource: ref.matchSource as SearchMatch['eventRef']['matchSource'],
       id: typeof ref.id === 'number' ? ref.id : entry.id,
       sessionId: nullableString(ref.sessionId),
       eventUid: nullableString(ref.eventUid),

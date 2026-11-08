@@ -690,6 +690,32 @@ test('search grouping never hides raw rows from getSessionEvents', async () => {
   }
 });
 
+test('grouped search collapses an echo while getSessionEvents keeps every raw row', { skip: needsNodeSqlite }, async () => {
+  const { dbPath, cleanup } = await seededDatabase();
+  try {
+    const database = new sqlite!.DatabaseSync(dbPath);
+    try {
+      database.exec(`
+        INSERT INTO session_events (source, session_id, project, message_id, ts_ms, role, kind, text, event_uid)
+        VALUES ('claude', 'echo-raw', '/work/app', 'mu1', 1000, 'user', 'text', 'update auth', 'eu1'),
+               ('claude', 'echo-raw', '/work/app', 'ma1', 1001, 'assistant', 'text', 'update auth, done', 'ea1');
+      `);
+    } finally {
+      database.close();
+    }
+
+    const matches = await search('update auth', { dbPath, sessionId: 'echo-raw' });
+    assert.equal(matches.length, 1, 'the repeating assistant row collapses into the prompt');
+    assert.equal(matches[0].groupSize, 2);
+    assert.equal(matches[0].echoCount, 1);
+
+    const events = await getSessionEvents('echo-raw', { source: 'claude', dbPath });
+    assert.deepEqual(events.map((event) => event.eventUid), ['eu1', 'ea1'], 'raw rows survive grouping');
+  } finally {
+    await cleanup();
+  }
+});
+
 test('recordTokenUsage is the usage of the event\'s own record', () => {
   const base = { id: 1, source: 'claude', sessionId: 's', tsMs: 0, role: 'assistant', kind: 'text', eventUid: 'e' };
   const settled = '{"input_tokens":10,"output_tokens":7}';

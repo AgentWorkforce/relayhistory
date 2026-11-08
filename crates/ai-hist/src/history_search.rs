@@ -54,8 +54,11 @@ impl SearchRole {
     }
 }
 
-/// Reference to the stored row a match came from: enough for a caller to
-/// re-read the full evidence with `get_session_events`.
+/// Reference to the stored row a match came from. For a `session_event`
+/// match it names the event `get_session_events` can re-read (by session,
+/// around the event's position). For a `history` match, `id` identifies a
+/// history row, not a session event — re-read it through the prompt/search
+/// surfaces, and note a history match may carry no session id at all.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SearchEventRef {
     pub match_source: String,
@@ -232,7 +235,7 @@ pub fn search_all(
     // than the cursor is filtered out of this page's fetch, so recount the
     // page's primaries against the un-cursored match set.
     if filter.after.is_some() {
-        recount_echoes(conn, terms, raw_fts, filter, role, &mut grouped)?;
+        grouped = recount_echoes(conn, terms, raw_fts, filter, role, grouped)?;
     }
     let max_chars = filter
         .max_content_chars
@@ -2035,6 +2038,145 @@ mod tests {
         let newer = rows.iter().find(|row| row.timestamp_ms == 2_000).unwrap();
         assert_eq!(older.echo_count, 1);
         assert_eq!(newer.echo_count, 0);
+    }
+
+    #[test]
+    fn a_parented_reply_that_does_not_repeat_the_prompt_stays_a_match() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, project, message_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('claude', 's1', '/work/needle', 'm-user', 1000, 'user', 'text', 'ship it', 'e-user')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, project, message_id, parent_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('claude', 's1', '/work/needle', 'm-reply', 'm-user', 1001, 'assistant', 'text', 'we will ship tomorrow after tests', 'e-reply')",
+            [],
+        )
+        .unwrap();
+        let rows = search_all(
+            &conn,
+            &["ship".to_string()],
+            false,
+            &filter(100),
+            SearchRole::All,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 2, "ancestry alone must not suppress the reply");
+        let prompt = rows.iter().find(|row| row.text == "ship it").unwrap();
+        assert_eq!(prompt.echo_count, 0);
+    }
+
+    #[test]
+    fn a_provider_id_colliding_with_a_row_id_does_not_link() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for (index, ts) in [(1, 1_000), (2, 2_000)] {
+            insert_history(
+                &conn,
+                &HistoryEntry {
+                    id: 0,
+                    source: "claude".into(),
+                    session_id: Some("s1".into()),
+                    project: Some("/work/needle".into()),
+                    prompt: "ship it".into(),
+                    prompt_hash: Some(format!("hash-collide-{index}")),
+                    timestamp_ms: ts,
+                },
+            )
+            .unwrap();
+        }
+        // The first inserted history row has SQLite id 1; a provider
+        // parent_id of "1" names no transcript id of either prompt, so the
+        // echo (which repeats the prompt) joins by text: the closest
+        // preceding primary, at ts 2000.
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, project, message_id, parent_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('claude', 's1', '/work/needle', 'm-echo', '1', 2001, 'assistant', 'text', 'assistant: ship it', 'e-collide')",
+            [],
+        )
+        .unwrap();
+        let rows = search_all(
+            &conn,
+            &["ship".to_string()],
+            false,
+            &filter(100),
+            SearchRole::All,
+        )
+        .unwrap();
+        let older = rows.iter().find(|row| row.timestamp_ms == 1_000).unwrap();
+        let newer = rows.iter().find(|row| row.timestamp_ms == 2_000).unwrap();
+        assert_eq!(older.echo_count, 0);
+        assert_eq!(newer.echo_count, 1);
+    }
+
+    #[test]
+    fn an_echo_older_than_its_primary_is_not_returned_again_after_the_cursor() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        insert_history(
+            &conn,
+            &HistoryEntry {
+                id: 0,
+                source: "claude".into(),
+                session_id: Some("s1".into()),
+                project: Some("/work/needle".into()),
+                prompt: "needle prompt".into(),
+                prompt_hash: Some("hash-older-echo".into()),
+                timestamp_ms: 2_000,
+            },
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, project, message_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('claude', 's1', '/work/needle', 'm-echo', 1000, 'assistant', 'text', 'earlier copy: needle prompt', 'e-old')",
+            [],
+        )
+        .unwrap();
+        insert_history(
+            &conn,
+            &HistoryEntry {
+                id: 0,
+                source: "claude".into(),
+                session_id: Some("s1".into()),
+                project: Some("/work/needle".into()),
+                prompt: "needle tail prompt".into(),
+                prompt_hash: Some("hash-tail".into()),
+                timestamp_ms: 500,
+            },
+        )
+        .unwrap();
+        let terms = ["needle".to_string()];
+        let first = search_page(&conn, &terms, false, &filter(1), SearchRole::All).unwrap();
+        assert_eq!(first.rows[0].text, "needle prompt");
+        assert_eq!(first.rows[0].echo_count, 1);
+        let second = search_page(
+            &conn,
+            &terms,
+            false,
+            &QueryFilter {
+                after: first.next_cursor,
+                ..filter(1)
+            },
+            SearchRole::All,
+        )
+        .unwrap();
+        assert_eq!(second.rows.len(), 1);
+        assert_eq!(second.rows[0].text, "needle tail prompt");
+    }
+
+    #[test]
+    fn a_snippet_with_a_one_codepoint_window_centers_without_panicking() {
+        let (snippet, truncated, offset) = compute_snippet("abc", &["b".to_string()], 1);
+        assert!(truncated);
+        assert_eq!(snippet, "b");
+        assert_eq!(offset, Some(1));
     }
 
     #[test]

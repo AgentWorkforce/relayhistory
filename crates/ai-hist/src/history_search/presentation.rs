@@ -101,6 +101,12 @@ pub fn compute_snippet(
     let end = start + max;
     let head_truncated = start > 0;
     let tail_truncated = end < total;
+    if head_truncated && tail_truncated && max < 3 {
+        // Too narrow for an ellipsis on both sides: return the raw window
+        // at the match instead of slicing a reversed range.
+        let snippet: String = chars[start..end].iter().collect();
+        return (snippet, true, Some(start));
+    }
     let mut snippet = String::new();
     match (head_truncated, tail_truncated) {
         (true, true) => {
