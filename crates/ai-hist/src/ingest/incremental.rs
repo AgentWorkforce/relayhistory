@@ -241,7 +241,7 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
         let file_session_id = claude
             .scan
             .as_ref()
-            .and_then(|scan| scan.fold.session_id.clone());
+            .and_then(|scan| scan.fold.file_session_id());
         let mut walk = ClaudeIncrementalWalk {
             conn,
             path,

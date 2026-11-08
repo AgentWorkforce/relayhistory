@@ -947,7 +947,14 @@ How each adapter works:
   `isSidechain` rows — inline Task traffic from Claude Code versions that wrote
   it there — is that session's transcript: catalogued under the records'
   `sessionId`, with its sidechain assistant turns, `is_sidechain` and usage
-  kept as evidence of it. A transcript whose complete records
+  kept as evidence of it. A resumed or forked conversation is a new
+  `<sessionId>.jsonl` that opens with a copy of its origin's records under the
+  origin's `sessionId`: the session the file is named after owns it, its
+  catalog row and metadata come from its own records, the copied records stay
+  the origin's, and a `fork` edge with `evidence_ref = "inheritedSessionId"`
+  names the origin. Two `sessionId`s in a primary transcript, neither of them
+  its file name, are an identity conflict and fail that transcript. A
+  transcript whose complete records
   parse as nothing is reported as a diagnostic rather than published under its
   file name; an empty one is simply not a session yet. The subagent workflow
   journal, `<session>/subagents/**/journal.jsonl`, is excluded by name before

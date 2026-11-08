@@ -1216,12 +1216,15 @@ Retain the round between calls: restarting discovery with a row limit repeatedly
 visits the same newest prefix and is not reconciliation. Each provider rotates
 after every slice, including errors. Failed enumeration items remain pending in
 a fair retry queue, so an unreadable directory or entry does not monopolize the
-healthy work behind it. Errors still return through `Err`; unresolved failures
-keep `complete` false.
+healthy work behind it. An acquisition that fails for its paths, rather than
+for the run (cancellation, lock contention, the store), is retried one path at a
+time, and a path that fails alone joins the same retry queue: one malformed
+transcript never holds the paths batched with it or behind it. Errors still
+return through `Err`; unresolved failures keep `complete` false.
 
 `healthy_pass_exhausted()` is a level query that remains usable after `Err`. It
 means ready enumeration and pending acquisition have drained, not that all
-coverage succeeded. At an existing periodic backstop or loss-recovery boundary,
+coverage succeeded: failed enumeration items and failed paths remain owed. At an existing periodic backstop or loss-recovery boundary,
 `refresh_healthy_pass()` can revisit the retained validated roots without dropping
 failed obligations. It returns `false` without mutation while ready work or
 pending acquisitions remain. It also refreshes providers that already completed,
