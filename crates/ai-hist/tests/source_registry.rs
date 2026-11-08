@@ -69,6 +69,7 @@ impl Fixture {
 }
 fn event(uid: &str, text: &str) -> SessionEvent {
     SessionEvent {
+        source_order: None,
         id: 0,
         source: "claude".into(),
         session_id: "session".into(),

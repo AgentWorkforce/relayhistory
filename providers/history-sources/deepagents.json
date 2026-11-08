@@ -36,7 +36,7 @@
   "capture": [
     {
       "evidence": "Messages and tools",
-      "coverage": "Pinned DeepAgents Code SQLite MsgPack root checkpoints v2 and v4 plus ordered messages writes; text-only message projection with native IDs and tool call/result IDs."
+      "coverage": "Pinned DeepAgents Code SQLite MsgPack root checkpoints v2 and v4 plus ordered messages writes; text-only message projection with native IDs and tool call/result IDs. Prompt history retains stable event UIDs, preserving repeated equal-time text through export/intake."
     },
     {
       "evidence": "Usage and relationships",

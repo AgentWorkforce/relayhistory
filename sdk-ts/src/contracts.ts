@@ -6,6 +6,8 @@ export interface HistoryEntry {
   id: number;
   source: Source;
   sessionId: string | null;
+  /** Native prompt/event identity; null for anonymous legacy prompt logs. */
+  eventUid: string | null;
   project: string | null;
   prompt: string;
   timestampMs: number;
@@ -340,6 +342,14 @@ export interface SessionEvent {
   */
   provider: string | null;
   eventUid: string;
+  /** Observed order within the timestamp bucket; null when unknown. */
+  sourceOrder: number | null;
+  /** Provider-native record or block type, when recorded. */
+  rawKind: string | null;
+  /** Upstream API message identity, distinct from the transcript record ID. */
+  providerMessageId: string | null;
+  /** Recorded request grouping when the provider does not name requests. */
+  requestSpan: string | null;
   /**
    * Per-tool-result fidelity. Null on every row that is not a tool result,
    * and on a tool-result row whose provider does not record that fact — the

@@ -41,6 +41,8 @@
 
 mod cursors;
 mod recovery;
+#[cfg(test)]
+mod tests;
 
 use crate::diagnostics::{self, CompactRefused};
 use crate::ingest::{check_capture_cancelled, try_acquire_sync_lock, SyncRunLock};
@@ -490,13 +492,17 @@ fn scope(
 }
 
 /// Forget sessions from `pending` in one write transaction until it has
-/// removed [`BATCH_ROWS`] evidence rows or run out of sessions.
+/// removed [`BATCH_ROWS`] evidence rows, exhausted [`BATCH_TIME`], reached a
+/// different source, or run out of sessions.
 fn forget_batch<'a>(
     conn: &mut Connection,
     pending: &mut std::iter::Peekable<impl Iterator<Item = &'a Target>>,
     report: &mut ForgetReport,
 ) -> anyhow::Result<()> {
-    let started = Instant::now();
+    let Some(source) = pending.peek().map(|target| target.key.0.clone()) else {
+        return Ok(());
+    };
+    let _claude_write = crate::ingest::claude_write_fence::acquire_wait(conn, &source)?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let clock: i64 = tx
         .query_row(
@@ -510,8 +516,13 @@ fn forget_batch<'a>(
         .prepare("SELECT DISTINCT source FROM transcript_cursors")?
         .query_map([], |row| row.get(0))?
         .collect::<rusqlite::Result<_>>()?;
+    let started = Instant::now();
     let mut rows = 0;
-    while rows < BATCH_ROWS && started.elapsed() < BATCH_TIME {
+    // A new source needs its own fence, acquired before the next transaction.
+    while rows < BATCH_ROWS
+        && started.elapsed() < BATCH_TIME
+        && pending.peek().is_some_and(|target| target.key.0 == source)
+    {
         let Some(target) = pending.next() else {
             break;
         };

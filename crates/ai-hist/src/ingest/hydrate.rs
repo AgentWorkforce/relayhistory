@@ -6,6 +6,7 @@ use crate::observations::{self, ObservationCheckpoint, ObservationKey, SessionOb
 use crate::source_evidence::EvidenceKind;
 use rusqlite::{params, OptionalExtension, TransactionBehavior};
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
 use std::fs::OpenOptions;
 use std::time::Instant;
 
@@ -24,6 +25,8 @@ pub(super) use exact::{
     needs_validation as exact_capture_needs_validation,
 };
 mod probe;
+mod remote_lock;
+use remote_lock::acquire_remote_hydration_lock;
 mod snapshot;
 mod unified_diff;
 
@@ -173,7 +176,7 @@ pub const SESSION_HYDRATION_CONTRACT_VERSION: u32 = 3;
 /// hydrates restores the Codex forks and subagents without paginated history
 /// that generation 17's probe read whole as copied parent history, which
 /// sync's `codex_fork_replay_gate` generation 3 restores.
-pub(crate) const HYDRATION_PARSER_VERSION: i64 = 20;
+pub(crate) const HYDRATION_PARSER_VERSION: i64 = 21;
 
 #[derive(Debug, Clone)]
 pub struct HydrateSessionOptions {
@@ -407,6 +410,7 @@ fn hydrate_local(
     claude_snapshot: Option<ClaudeTranscriptSnapshot>,
     started: Instant,
 ) -> Result<HydrateSessionResult> {
+    let _claude_write = super::claude_write_fence::acquire_wait(conn, &options.source)?;
     let local_key = ObservationKey {
         source: options.source.clone(),
         session_id: options.session_id.clone(),
@@ -872,55 +876,6 @@ fn fresh_local_observation(
     }
 }
 
-struct RemoteHydrationLock {
-    file: fs::File,
-}
-
-impl Drop for RemoteHydrationLock {
-    fn drop(&mut self) {
-        let _ = crate::file_lock::unlock(&self.file);
-    }
-}
-
-fn acquire_remote_hydration_lock(
-    db_path: &Path,
-    options: &HydrateSessionOptions,
-) -> Result<RemoteHydrationLock> {
-    let absolute = if db_path.is_absolute() {
-        db_path.to_path_buf()
-    } else {
-        std::env::current_dir()?.join(db_path)
-    };
-    let canonical_db = fs::canonicalize(&absolute).or_else(|_| {
-        let parent = absolute.parent().unwrap_or_else(|| Path::new("."));
-        let parent = fs::canonicalize(parent)?;
-        Ok::<_, std::io::Error>(
-            parent.join(
-                absolute
-                    .file_name()
-                    .unwrap_or_else(|| std::ffi::OsStr::new("history.db")),
-            ),
-        )
-    })?;
-    let lock_dir = canonical_db
-        .parent()
-        .unwrap_or_else(|| Path::new("."))
-        .join(".relayhistory-hydration-locks");
-    fs::create_dir_all(&lock_dir)?;
-    let key = format!("{}\0{}", options.source, options.session_id);
-    let lock_path = lock_dir.join(format!("{:x}.lock", Sha256::digest(key.as_bytes())));
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(&lock_path)
-        .with_context(|| format!("opening hydration lock {}", lock_path.display()))?;
-    crate::file_lock::lock_exclusive(&file)
-        .with_context(|| format!("locking hydration target {}", lock_path.display()))?;
-    Ok(RemoteHydrationLock { file })
-}
-
 fn hydrate_remote_session(
     _conn: &mut Connection,
     _options: &HydrateSessionOptions,
@@ -1158,7 +1113,7 @@ fn hydrate_remote_claude_observed(
         );
     }
     let transcript = crate::jsonl_temp::JsonlTemp::write(records.iter())?;
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let (_claude_write, tx) = super::claude_write_fence::begin_transaction(conn, &options.source)?;
     let had_local_presence: bool = tx.query_row(
         "SELECT EXISTS(SELECT 1 FROM session_presences WHERE source = ? AND session_id = ? AND location = 'local')",
         params![options.source, options.session_id],
@@ -3832,17 +3787,6 @@ fn build_local_result(
     })
 }
 
-/// The delegated threads whose evidence this hydration also acquired.
-///
-/// Delegation only, on both the seed and the recursive step. A continuation or
-/// a fork is a *different conversation* that this one carried on from, not
-/// work this session delegated: counting it here would put a separate
-/// session's events into this hydration's evidence totals and hand the caller
-/// a `relatedSessionIds` it never asked to acquire. Continuity is read through
-/// `getSessionRelationships`'s `continuity` array instead. This mirrors
-/// `RelationshipKinds::delegation()` — everything that is not a continuity
-/// kind — rather than whitelisting `delegated`, so `materialized_local` keeps
-/// being related exactly as before.
 /// The evidence kinds this hydration could actually have indexed.
 ///
 /// The provider's declared coverage, narrowed by the request: `include_related:
@@ -3971,6 +3915,17 @@ fn stored_discovery_state(conn: &Connection, source: &str, session_id: &str) -> 
         .unwrap_or_else(|| "shallow".to_string()))
 }
 
+/// The delegated threads whose evidence this hydration also acquired.
+///
+/// Delegation only, on both the seed and the recursive step. A continuation or
+/// a fork is a *different conversation* that this one carried on from, not
+/// work this session delegated: counting it here would put a separate
+/// session's events into this hydration's evidence totals and hand the caller
+/// a `relatedSessionIds` it never asked to acquire. Continuity is read through
+/// `getSessionRelationships`'s `continuity` array instead. This mirrors
+/// `RelationshipKinds::delegation()` — everything that is not a continuity
+/// kind — rather than whitelisting `delegated`, so `materialized_local` keeps
+/// being related exactly as before.
 fn related_ids(conn: &Connection, source: &str, session_id: &str) -> Result<Vec<String>> {
     Ok(conn
         .prepare(

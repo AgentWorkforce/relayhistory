@@ -6,10 +6,6 @@ pub fn try_lock_exclusive(file: &File) -> io::Result<()> {
     imp::try_lock_exclusive(file)
 }
 
-pub fn lock_exclusive(file: &File) -> io::Result<()> {
-    imp::lock_exclusive(file)
-}
-
 pub fn unlock(file: &File) -> io::Result<()> {
     imp::unlock(file)
 }
@@ -32,10 +28,6 @@ mod imp {
         }
     }
 
-    pub fn lock_exclusive(file: &File) -> io::Result<()> {
-        flock(file, FlockOperation::LockExclusive)
-    }
-
     pub fn unlock(file: &File) -> io::Result<()> {
         flock(file, FlockOperation::Unlock)
     }
@@ -48,10 +40,6 @@ mod imp {
 
     pub fn try_lock_exclusive(file: &File) -> io::Result<()> {
         FileExt::try_lock_exclusive(file)
-    }
-
-    pub fn lock_exclusive(file: &File) -> io::Result<()> {
-        FileExt::lock_exclusive(file)
     }
 
     pub fn unlock(file: &File) -> io::Result<()> {

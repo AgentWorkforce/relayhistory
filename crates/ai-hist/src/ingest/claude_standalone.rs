@@ -134,16 +134,20 @@ fn retire_standalone_events(
     const STANDALONE: &str = "source = 'claude' AND session_id = ?1 AND provider_message_id = ?2 \
            AND role = 'assistant' AND kind = 'thinking' \
            AND text = ''";
-    let deleted = conn
+    let mut retired = conn
         .prepare_cached(&format!(
-            "DELETE FROM session_events WHERE {STANDALONE} AND location = 'local'"
+            "DELETE FROM session_events WHERE {STANDALONE} AND location = 'local' RETURNING event_uid"
         ))?
-        .execute(rusqlite::params![session_id, provider_message_id])?;
-    super::evidence_probe::note_deleted(conn, "session_events", deleted);
-    conn.prepare_cached(&format!(
-        "UPDATE session_events SET location = 'remote' WHERE {STANDALONE} AND location = 'both'"
+        .query_map(rusqlite::params![session_id, provider_message_id], |row| row.get::<_,String>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    super::evidence_probe::note_deleted(conn, "session_events", retired.len());
+    let demoted = conn.prepare_cached(&format!(
+        "UPDATE session_events SET location = 'remote' WHERE {STANDALONE} AND location = 'both' RETURNING event_uid"
     ))?
-    .execute(rusqlite::params![session_id, provider_message_id])?;
+    .query_map(rusqlite::params![session_id, provider_message_id], |row| row.get::<_,String>(0))?
+    .collect::<rusqlite::Result<Vec<_>>>()?;
+    retired.extend(demoted);
+    super::native_order::forget(conn, "claude", session_id, &retired);
     Ok(())
 }
 

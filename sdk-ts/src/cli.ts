@@ -9,7 +9,7 @@ import { pathToFileURL } from 'node:url';
 import {
   discoverSessions, ensureLocalStore, formatSessionRow, onStoreMigration, getSession, getSessionEventsPage, getSessionFileEditsPage,
   getSessionMarkersPage, getSessionRelationships, getSessionToolCallsPage, getSessionTree, getSessionUsage,
-  hydrateSession, listSessionCatalogPage, recent, resumeCommand, search, stats, sync,
+  hydrateSession, listSessionCatalogPage, recent, resumeCommand, search, stats, sync, maintainRetention, compactDatabase,
   type CatalogCursor, type EvidenceCursor, type HistoryEntry, type LocalStoreReadiness,
   type SessionFileEditsPage, type SessionMarkersPage, type SessionRelationship, type SessionScope,
   type SessionToolCallsPage, type SessionUsage, type SearchRole, type HistoryCursor,
@@ -49,8 +49,9 @@ class CliExit extends Error {
 
 type PackageMetadata = { version?: string };
 
-export const BOOLEAN_FLAGS = new Set(['all', 'by-cwd', 'fts', 'help', 'json', 'local', 'no-bootstrap', 'no-related', 'no-source-connectors', 'no-warning', 'pretty', 'remote', 'version']);
+export const BOOLEAN_FLAGS = new Set(['apply', 'allow-unuploaded', 'all', 'by-cwd', 'fts', 'help', 'json', 'local', 'no-bootstrap', 'no-related', 'no-source-connectors', 'no-warning', 'pretty', 'remote', 'version']);
 export const VALUE_FLAGS = new Set([
+  'days', 'max-rows',
   'config', 'selection', 'out', 'after', 'after-ms', 'after-session-id', 'after-source', 'before-ms', 'db', 'limit',
   'max-depth', 'max-nodes', 'source-connector', 'project', 'role', 'since-ms', 'source', 'tag', 'tokens', 'until-ms',
   // Documented in the usage text and read by `sessions discover`, `sessions
@@ -363,15 +364,17 @@ const USAGE_TEXT = `Usage:
   ai-hist sessions edits SOURCE SESSION_ID [--limit N] [--after JSON] [--db PATH] [--json]
   ai-hist sessions markers SOURCE SESSION_ID [--limit N] [--after JSON] [--db PATH] [--json]
   ai-hist sessions usage SOURCE SESSION_ID [--db PATH] [--json]
-  ai-hist search QUERY... [--local | --remote | --all] [--source SOURCE] [--project PATH] [--role all|user|assistant|prompt] [--fts] [--since-ms MS] [--until-ms MS] [--after JSON] [--limit N] [--json]
+  ai-hist search QUERY... [--local | --remote | --all] [--source SOURCE] [--project PATH] [--role all|user|assistant|prompt] [--fts] [--since-ms MS] [--until-ms MS] [--after JSON] [--limit N] [--tag TAG] [--db PATH] [--json]
   ai-hist recent [N] [--local | --remote | --all] [--source SOURCE] [--project PATH] [--since-ms MS] [--until-ms MS] [--after JSON] [--json]
   ai-hist session SESSION_ID [--source SOURCE] [--json]
   ai-hist events SESSION_ID [--source SOURCE] [--limit N] [--after JSON] [--json]
   ai-hist resume QUERY... [--local | --remote | --all] [--db PATH] [--fts] [--json]
   ai-hist pack QUERY... [--local | --remote | --all] [--source SOURCE] [--project PATH] [--tag TAG] [--limit N] [--tokens N] [--db PATH] [--fts] [--json]
-  ai-hist stats [--local | --remote | --all] [--json]
+  ai-hist stats [--local | --remote | --all] [--by-cwd] [--tag TAG] [--db PATH] [--json]
   ai-hist export --selection FILE [--out FILE] [--db PATH]
-  ai-hist sync [--local | --remote | --all] [--source-connector ID | --no-source-connectors] [--acquisition-timeout-ms N] [--db PATH] [--json]
+  ai-hist retention [--days N] [--apply] [--allow-unuploaded] [--max-rows N] [--db PATH] [--json]
+  ai-hist compact [--db PATH] [--json]
+  ai-hist sync [--local | --remote | --all] [--config PATH] [--source-connector ID | --no-source-connectors] [--acquisition-timeout-ms N] [--db PATH] [--json]
 
 Every command that reads local history indexes it on first use; pass
 --no-bootstrap to answer from the store exactly as it stands.
@@ -819,6 +822,10 @@ export interface CommandSpec {
  * cannot accept can never reach the mounted help.
  */
 export const FLAG_SPECS: Record<string, { flags: string; description: string }> = {
+  apply: { flags: '--apply', description: 'Explicitly save retention policy and run one bounded batch.' },
+  'allow-unuploaded': { flags: '--allow-unuploaded', description: 'Permit pruning unuploaded evidence; requires --apply.' },
+  days: { flags: '--days <days>', description: 'Days since last activity; zero keeps evidence forever.' },
+  'max-rows': { flags: '--max-rows <rows>', description: 'Maximum rows in one retention batch, 1..1024.' },
   'acquisition-timeout-ms': { flags: '--acquisition-timeout-ms <ms>', description: 'Budget for remote acquisition, in milliseconds.' },
   after: { flags: '--after <json>', description: 'Continue from a printed cursor.' },
   'after-ms': { flags: '--after-ms <ms>', description: 'Cursor timestamp, with --after-source and --after-session-id.' },
@@ -942,6 +949,10 @@ export const COMMANDS = new Map<string, CommandSpec>([
     allowed: ['all', 'by-cwd', 'db', 'json', 'local', 'remote', 'tag'] }],
   // sync and `sessions discover` build the store rather than read it, so they
   // do not bootstrap first; running them is itself the remedy for an empty one.
+  ['retention', { name: 'retention', description: 'Preview retention policy; --apply runs one bounded batch.', surface: ['retention'],
+    positionals: [0, 0], allowed: ['apply', 'allow-unuploaded', 'days', 'max-rows', 'db', 'json'] }],
+  ['compact', { name: 'compact', description: 'Reclaim SQLite free space without deleting evidence.', surface: ['compact'],
+    positionals: [0, 0], allowed: ['db', 'json'] }],
   ['sync', { name: 'sync', description: 'Index new sessions from every configured source.', surface: ['sync'],
     positionals: [0, 0], validate: (args) => { sourceConnectorFlags(args); },
     allowed: ['all', 'db', 'json', 'local', 'remote', 'config', 'source-connector', 'no-source-connectors', 'acquisition-timeout-ms'] }],
@@ -1070,6 +1081,20 @@ async function dispatch(argv: readonly string[], io: CliIo, options: RunCliOptio
     if (!selectionPath) usage('export requires --selection FILE');
     await runHistoryExportCommand({ dbPath: textFlag(args, 'db'), selectionPath, outputPath: textFlag(args, 'out') },
       options.stdoutStream);
+    return 0;
+  }
+  if (command === 'retention') {
+    const result = await maintainRetention({ dbPath: textFlag(args, 'db'), days: numberFlag(args, 'days'),
+      apply: args.flags.has('apply'), allowUnuploaded: args.flags.has('allow-unuploaded'), maxRows: numberFlag(args, 'max-rows') });
+    if (json) output(io, result, true);
+    else if (result.dryRun) io.stdout(`Policy preview only: ${result.effectiveDays === 0 ? 'keep forever' : `${result.effectiveDays} days`}. No changes made. Use --apply to save policy and run one bounded batch.\n`);
+    else io.stdout(`Retention batch: ${result.report?.rows ?? 0} rows removed; ${result.report?.awaitingUploadAck ? 'waiting for upload acknowledgement' : result.report?.busy ? 'store busy' : result.report?.deferred ? 'maintenance deferred' : result.report?.cycleComplete ? 'cycle complete' : 'batch finished; more work may remain'}.\n`);
+    return 0;
+  }
+  if (command === 'compact') {
+    const result = await compactDatabase({ dbPath: textFlag(args, 'db') });
+    if (json) output(io, result, true);
+    else io.stdout(`Compacted database: ${result.dbBytesBefore} -> ${result.dbBytesAfter} bytes.\n`);
     return 0;
   }
   const acquisitionPlugins = ['sync','sessions'].includes(command ?? '') && textFlag(args,'config') ? (await loadHistoryApplicationConfig(textFlag(args,'config')!)).registry : undefined;

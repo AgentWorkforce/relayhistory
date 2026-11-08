@@ -8,12 +8,9 @@
 //! silenced stderr still learns what the pass left out.
 use std::cell::RefCell;
 use std::fmt::Arguments;
-use std::sync::atomic::Ordering as AtomicOrdering;
 use std::sync::{Arc, Mutex, PoisonError};
 
 use crate::session_store::{split_code, Source, SyncDiagnostic};
-
-use super::SYNC_QUIET;
 
 /// One thing a provider left out of a pass.
 pub(crate) struct ProviderSkip<'a> {
@@ -45,7 +42,7 @@ thread_local! {
 /// Report a skip: to stderr unless the pass is quiet, and to the collecting
 /// facade call's report whenever one is collecting.
 pub(crate) fn provider_diagnostic(skip: ProviderSkip<'_>) {
-    route(SYNC_QUIET.load(AtomicOrdering::Relaxed), skip);
+    route(super::output::quiet(), skip);
 }
 
 fn route(quiet: bool, skip: ProviderSkip<'_>) {
@@ -90,11 +87,10 @@ pub(crate) fn collect<T>(run: impl FnOnce() -> T) -> (T, Vec<SyncDiagnostic>) {
 }
 
 /// [`collect`] for a facade call: the embedding API is quiet, so the skips
-/// reach the report and not stderr. Latched for the process, as
-/// `sync_facade_tick` latches it; the CLI's engine entries set it back
-/// before each pass of their own.
+/// reach the report and not stderr. Quiet only for this call; the caller's
+/// output policy is back once it returns.
 pub(crate) fn collect_quietly<T>(run: impl FnOnce() -> T) -> (T, Vec<SyncDiagnostic>) {
-    SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
+    let _output = super::output::Scope::enter(true);
     collect(run)
 }
 
@@ -200,7 +196,7 @@ mod tests {
     }
 
     #[test]
-    fn a_facade_collection_is_quiet_for_the_process() {
+    fn a_facade_collection_is_quiet_only_for_its_call() {
         printed();
         let ((), diagnostics) = collect_quietly(|| {
             provider_diagnostic(ProviderSkip {
@@ -211,7 +207,10 @@ mod tests {
                 detail: format_args!("unsupported Codex state_6.sqlite"),
             });
         });
-        assert!(SYNC_QUIET.load(AtomicOrdering::Relaxed));
+        assert!(
+            !super::super::output::quiet(),
+            "facade call leaked quiet state"
+        );
         assert!(printed().is_empty(), "a facade call prints no skip");
         assert_eq!(diagnostics.len(), 1);
     }

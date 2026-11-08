@@ -166,7 +166,9 @@ pub(super) fn write_event(conn: &Connection, row: &super::EventRow<'_>) -> Resul
         CatalogBind::Subquery => None,
         CatalogBind::Cached(project) => Some(project),
     };
-    execute_event(conn, row, resolved_key, resolved_method, catalog)
+    execute_event(conn, row, resolved_key, resolved_method, catalog)?;
+    super::native_order::note(conn, row);
+    Ok(())
 }
 
 fn touch(conn: &Connection, source: &str, session_id: &str) -> Result<CatalogBind> {

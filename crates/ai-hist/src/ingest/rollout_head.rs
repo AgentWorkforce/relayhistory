@@ -6,14 +6,13 @@ use serde_json::Value;
 use std::cell::Cell;
 use std::io::{self, BufRead, BufReader};
 use std::path::Path;
-use std::sync::atomic::Ordering as AtomicOrdering;
 
 use super::codex;
 use super::cold_read;
 use super::transcript_cursor::{TranscriptCursorState, TranscriptReader};
 use super::{
     codex_is_subagent, codex_parent_session_id, codex_parent_thread_id, parse_iso_ms,
-    CodexSessionMeta, SYNC_QUIET,
+    CodexSessionMeta,
 };
 
 /// How far into a file a bounded head read will look, however few records it

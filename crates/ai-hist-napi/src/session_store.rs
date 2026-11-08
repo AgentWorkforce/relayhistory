@@ -20,6 +20,9 @@
 //! `(ts_ms, id)` keyset — the cursor every other native page hands back.
 //! Capabilities are answered from the crate's pure capability tables, with no
 //! database at all.
+#[path = "session_store/maintenance.rs"]
+mod maintenance;
+
 use std::path::{Path, PathBuf};
 
 use ai_hist::{
@@ -42,6 +45,9 @@ use crate::{
 
 /// Every op the dispatcher answers, in the spelling the SDK sends.
 pub const SESSION_STORE_OPS: &[&str] = &[
+    OP_SESSION,
+    maintenance::OP_RETENTION,
+    maintenance::OP_COMPACT,
     OP_MARKERS,
     OP_REQUESTS,
     OP_USAGE_SUMMARY,
@@ -50,6 +56,7 @@ pub const SESSION_STORE_OPS: &[&str] = &[
     crate::change_feed::OP_CHANGES,
     crate::change_feed::OP_COMMIT_CHANGES,
 ];
+const OP_SESSION: &str = "session";
 const OP_MARKERS: &str = "markers";
 const OP_REQUESTS: &str = "requests";
 const OP_USAGE_SUMMARY: &str = "usage_summary";
@@ -265,10 +272,16 @@ fn evidence_cursor(cursor: Option<CursorArgs>) -> Option<SessionEvidenceCursor> 
 /// Answer one op. Synchronous so it can be unit-tested without a runtime; the
 /// `#[napi]` wrapper moves it onto a blocking worker.
 pub(crate) fn dispatch(op: &str, args_json: &str) -> napi::Result<String> {
+    if op == maintenance::OP_RETENTION || op == maintenance::OP_COMPACT {
+        return maintenance::dispatch(op, args_json);
+    }
     // The change feed is store-wide, not one source's, so it reads its own
     // argument shape rather than the per-session one below.
     if op == crate::change_feed::OP_CHANGES || op == crate::change_feed::OP_COMMIT_CHANGES {
         return crate::change_feed::dispatch(op, args_json);
+    }
+    if op == OP_SESSION {
+        return super::session_evidence::dispatch(args_json);
     }
     let mut args = parse_args(args_json)?;
     let source_name = validate_identity(std::mem::take(&mut args.source), "source")?;
@@ -292,7 +305,7 @@ pub(crate) fn dispatch(op: &str, args_json: &str) -> napi::Result<String> {
 /// Run `read` against the database at `path`, or answer `None` when there is
 /// no database there — a missing database is an empty answer, and a read
 /// never creates it.
-fn read_existing<T>(
+pub(crate) fn read_existing<T>(
     path: PathBuf,
     read: impl Fn(&SessionStore) -> Result<T, ai_hist::Error>,
 ) -> napi::Result<Option<T>> {

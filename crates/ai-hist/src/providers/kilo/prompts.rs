@@ -12,7 +12,7 @@ struct PromptSupport {
 type PromptParts = BTreeMap<(String, i64, String), Vec<(String, Option<String>)>>;
 fn supported_prompts(conn: &Connection, times: &BTreeSet<i64>) -> Result<Vec<PromptSupport>> {
     let times = serde_json::to_string(times)?;
-    let mut stmt = conn.prepare("SELECT session_id,ts_ms,message_id,event_uid,text,COALESCE(project,cwd) FROM session_events WHERE source=?1 AND role='user' AND kind='text' AND text IS NOT NULL AND control_kind IS NULL AND ts_ms IN (SELECT value FROM json_each(?2)) ORDER BY ts_ms,id")?;
+    let mut stmt = conn.prepare("SELECT session_id,ts_ms,message_id,event_uid,text,COALESCE(project,cwd) FROM session_events WHERE source=?1 AND role='user' AND kind='text' AND text IS NOT NULL AND control_kind IS NULL AND ts_ms IN (SELECT value FROM json_each(?2)) ORDER BY ts_ms,COALESCE(source_order,id),id")?;
     let mut groups = PromptParts::new();
     let rows = stmt.query_map(rusqlite::params![ID, times], |row| {
         Ok((

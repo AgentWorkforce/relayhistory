@@ -303,6 +303,13 @@ narrowed by the request (no `Relationship` when `include_related` is off) —
 hook fires inside the harness's tool call, and a file that was cleaned up
 before the hook ran is an answer.
 
+Capture progress output is scoped to the current operation and thread.
+Facade sync, discovery and hydration suppress optional progress and quiet-aware
+skip diagnostics;
+explicit CLI progress calls restore the caller's prior policy when they finish,
+including on errors or unwind. Shallow-read workers inherit the operation's
+policy without changing concurrent callers.
+
 ### Source connector intake
 
 The three `*_source_*` operations are how a host composes an external source
@@ -335,10 +342,57 @@ A driver runs one enumerate/apply cycle per connector:
    `include_related: Some(false)` scopes coverage to the one thread, exactly
    as `HydrateOptions::include_related` does.
 
+When a direct local source is retired, the store compares retained remote
+records against the canonical payload before deleting local evidence. Only exact
+matches gain remote ownership; conflicting snapshots remain stored and protected
+from overwriting local evidence, including on replay after retirement. This
+handoff uses separate local ownership metadata, so it does not modify acquired
+connector snapshots or invalidate their revision fences. Matching connectors can
+withdraw their own shares independently. Legacy snapshots without normalized
+per-record evidence cannot prove support and remain conservative.
+
 `ObservationKey`, `SessionObservation`, `ObservationCheckpoint`,
 `ObservationState`, `NormalizedSourceEvidence`, `SourceObservation`,
 `SourceObservationBatch`, `SourceEvidenceSubmission`, `DiscoverySummary` and
 `HydrateSessionResult` are part of the default surface for this.
+
+Ordering is an optional source fact on session-event payloads:
+`source_order` is a nonnegative integer within `(source, session_id, ts_ms)`;
+public `Block::source_order` exposes it. Preserve it verbatim through exports,
+including paged exports; do not derive it from array position, record identity
+or destination row IDs. The record array may be shuffled without changing
+conversation order. Absent/null means unknown. Mixed known/unknown buckets
+have deterministic rendering but no claimed order for unknown events. An
+incremental append to a legacy bucket leaves new ranks unknown until a full
+source read establishes its order.
+
+Known order conflicts across retained observations fail atomically with
+`SOURCE_ORDER_CONFLICT`. A partial-kind submission does not withdraw the prior
+event snapshot. A legacy observation cannot clear known canonical order, even
+when it is the remaining support after local retirement. Native
+rewrites preserve event row IDs and change only ranks when order changes.
+Event cursors retain `{ts_ms,id}`: reads resolve the current rank through that
+stable row, reject a row belonging to another source/session or ordered
+timestamp, and
+return `STALE_EVENT_CURSOR` when a deleted row cannot be positioned safely in
+an ordered timestamp bucket. A cursor is not a snapshot across mutations;
+restart the read after an order-changing revision. New user-turn cursors use the
+first event row in the turn, keeping its timestamp and row ID together even
+when no block has recorded source order. Old user-turn cursors whose
+`MIN(timestamp)` and `MIN(id)` came from different rows require a fresh read:
+they return `STALE_EVENT_CURSOR` because translating them to the new ordering
+could silently repeat or skip turns. Old cursors that identify an actual row
+continue to work. Evidence contract 5 covers these ordering semantics.
+
+Full Claude sweeps release SQLite's writer lock between chunks when the
+captured scope contains only local evidence with dense, known ranks. A
+source-wide file lock protects Claude evidence across those commits;
+competing Claude acquisition, forget and retention operations yield or
+report busy, while unrelated database writes can proceed. Reads that may
+reconcile legacy, shared or sparse ranks retain a single transaction so an
+ordering conflict rolls back the whole read. Unattributed transcripts can
+contain multiple session IDs, so their eligibility check covers all Claude
+sessions. In-memory databases also retain single-transaction staging.
 
 ### `watch`
 
@@ -608,7 +662,7 @@ replace, never a duplicate.
 | `FileEdit`            | `file_edits`            | `source, session_id, tool_use_id`                                     | `SessionFileEdit`     |
 | `SessionMarker`       | `session_markers`       | `source, session_id, marker_uid`                                      | `SessionMarker`       |
 | `Relationship`        | `session_relationships` | `source, parent_session_id, relationship_uid`                         | `SessionRelationship` |
-| `History`             | `history`               | `source, timestamp_ms, prompt`                                        | `HistoryEntry`        |
+| `History`             | `history`               | legacy: `source, timestamp_ms, prompt`; identified: `source, "event", session_id, event_uid` | `HistoryEntry`        |
 | `Presence`            | `session_presences`     | `source, session_id, location`                                        | —                     |
 | `CommitLink`          | `session_commit_links`  | `source, session_id, commit_sha, match_method`                        | —                     |
 | `SourceObservation`   | `session_observations`  | `source, session_id, location, connector_id, connector_instance`      | —                     |
@@ -626,9 +680,11 @@ upsert and on the delete that retracts it — `["history", "claude",
 1756634400000, "ship the feed"]`. `record_key` is
 the part of `key` inside a session: the one identity column's text, or a JSON
 array of several (`[1756634400000,"ship the feed"]` for a prompt).
-`session_id` is the parent session for a relationship and empty for a prompt that names no session; a prompt's session is not part of
-its key, so its delete carries it empty and a prompt gaining a session is an
-upsert, never a delete. `source` is `None` for a source
+`session_id` is the parent session for a relationship. Native prompt keys
+include their source, session and `event_uid`, so their tombstones retain the
+session and a session move produces a delete for the old identity plus an
+upsert for the new one. Legacy anonymous prompts use timestamp/text identity:
+their tombstones carry no session, and gaining a session is only an upsert. `source` is `None` for a source
 this build does not know — a row written by a newer release — and
 `source_name` is the stored name either way, so such a row is carried rather
 than failing the drain. The feed applies no consent or exclusion rule: an
@@ -639,9 +695,10 @@ exactly the changes whose `source_name` and `session_id` are those, with the
 same rows, keys, revisions and tombstones the unfiltered drain reports for it,
 bounded to the head at open. `source` is the stored name, so a source this
 build does not know works. It covers every kind that stores a session,
-and relationships under their parent. A prompt that names no session is in no session's drain, and
-nor is a prompt's delete, whose tombstone carries no session because a
-prompt's session is not part of its key. A session drain is a one-shot read,
+and relationships under their parent. Native prompt deletions and moves out
+of that session appear in its drain. Anonymous prompts without a session and
+legacy prompt tombstones are absent because those tombstones carry no session.
+A session drain is a one-shot read,
 such as the backfill of a session an embedder has just started following. It
 cannot name a consumer, and it has nothing to commit; either is
 `Error::InvalidArgument`, as is an empty source or session id. Keep the named
@@ -1146,6 +1203,27 @@ declined.
   [Versioning](#versioning-cargo-semver-is-the-contract).
 - `examples/rust-consumer` is the same surface exercised from outside the
   workspace, against the published crate nightly.
+
+## Prompt history identity
+
+`HistoryEntry::event_uid` and `SessionEvidence::prompts[].event_uid` carry an
+optional stable session-event reference. An identified prompt is keyed by
+`(source, session_id, event_uid)`; edits to its text/time update that row.
+The change-feed/export key is `["history", source, "event", session_id,
+event_uid]`. Anonymous rows retain the exact legacy key `["history", source,
+timestamp_ms, prompt]`, including existing exported record IDs, ownership
+snapshots and tombstones. Identity is never inferred from equal text/time.
+
+Export schema version 3 advertises native history identity and source-order
+evidence. New intake accepts old snapshots with absent identity fields; older
+intake rejects unsupported new columns explicitly.
+
+The schema upgrade preserves row IDs, revisions and the autoincrement sequence.
+It does not assign event IDs retrospectively. DeepAgents' next authoritative
+local read replaces its unowned anonymous projection with identified prompts;
+a retained remote-owned anonymous prompt remains independent evidence. Old
+snapshots lacking `event_uid` continue to use the legacy identity. Other
+adapters remain anonymous until they supply a source-observed event reference.
 
 ## Appendix: who still needs `unstable-internal`, and why
 

@@ -39,6 +39,20 @@
 //! and it resets exactly when Cursor rewrites the file — which is also when the
 //! byte cursor resets.
 
+/// Only an EOF read can certify native order; successful prefixes still keep
+/// their payload writes, while discarding any complete-read certification.
+pub(super) fn finish_native_order(
+    order: super::native_order::Capture<'_>,
+    text: &str,
+    index_through: u64,
+) -> anyhow::Result<()> {
+    if text.len() as u64 <= index_through && (text.is_empty() || text.ends_with('\n')) {
+        order.finish()
+    } else {
+        order.discard()
+    }
+}
+
 use std::path::Path;
 
 use serde_json::Value;
@@ -684,6 +698,15 @@ pub(crate) fn record_blocks(obj: &serde_json::Map<String, Value>) -> Vec<Value> 
         return vec![serde_json::json!({"type": "text", "text": text})];
     }
     content.as_array().cloned().unwrap_or_default()
+}
+
+impl super::CursorTranscriptOutcome {
+    pub(super) fn observe_activity(&mut self, emitted: bool, guessed: bool, ts_ms: i64) {
+        if emitted && !guessed {
+            self.first_ts_ms = Some(self.first_ts_ms.map_or(ts_ms, |first| first.min(ts_ms)));
+            self.last_ts_ms = Some(self.last_ts_ms.map_or(ts_ms, |last| last.max(ts_ms)));
+        }
+    }
 }
 
 #[cfg(test)]

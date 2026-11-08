@@ -32,9 +32,9 @@ Rust owns provider discovery/parsing, schema creation and migration, direct
 SQLite connections, catalog queries, history/event queries, search,
 statistics, and sync. Blocking filesystem and SQLite work is dispatched away
 from Node's event loop. TypeScript validates inputs, validates native contract
-version 29, catalog contract version 7, hydration contract version 3,
+version 30, catalog contract version 7, hydration contract version 3,
 session-relationship contract version 2, and session evidence contract version
-4 and session usage contract version 3, normalizes nullable fields, maps native
+5 and session usage contract version 3, normalizes nullable fields, maps native
 errors, and supplies pagination
 helpers.
 
@@ -62,12 +62,24 @@ crosses as `{epoch, revision}` with the epoch as 16 hex digits, because it is a
 random 64-bit store identity a JavaScript number cannot hold. `sdk-ts/src/native.ts` (`SESSION_STORE_OPS`) is the only place
 in the SDK that spells them, and the SDK's request, usage and user-turn reads
 use the dispatcher. The dispatcher validates and opens through `SessionStore`;
-capabilities come from pure tables, while paged evidence reads still open a
+`session` reads the full `SessionStore::session` snapshot with
+`{dbPath?, source, sessionId, kinds?, includeText?}` and returns
+`{evidence: SessionEvidence | null}`. The SDK exposes this as
+`getSessionEvidence`, converting facade field names to camelCase while retaining
+opaque provider JSON unchanged. Missing sessions return null; this read does
+not acquire provider files. Capabilities come from pure tables, while paged evidence reads still open a
 read connection and call connection-level page helpers. Changes and cursor
 commits go through the facade. New operations should extend this dispatcher
 and the facade instead of adding another typed native function. The typed
 `getSessionRequestsPage` / `getSessionUsage` / `getSessionUserTurnsPage`
 exports stay for compatibility until a later major.
+
+The dispatcher also exposes `retention` and `compact` for explicit operator
+maintenance. Retention previews use the core read-only policy helpers, so they
+neither create nor migrate a database; an explicit apply uses `SessionStore`
+for one bounded maintenance batch. Compaction calls the core compaction engine
+directly to preserve its lock and disk-space checks before any writable open.
+See [retention controls](retention.md) for their CLI and SDK options.
 
 ## Session sourcing ownership
 
@@ -534,7 +546,9 @@ the typed row, `ShallowSession`, `SessionEvent`, `SessionToolCall`,
 `SessionFileEdit`, `SessionMarker` or `SessionRelationship` — or `Delete`.
 `record_key` is the record's provider-native identity within its session and
 kind: `event_uid`, `tool_use_id`, `marker_uid`, `relationship_uid`, or the
-session id for a catalog row. The drain is bounded to the head revision at
+session id for a catalog row. History retains its legacy `[timestamp_ms, prompt]`
+record key when anonymous; identified history uses `["event", session_id, event_uid]`
+so timestamp/text edits do not change its identity. The drain is bounded to the head revision at
 open and pages in `batch`-sized reads, at most 10,000. `ChangeKind` is not
 `EvidenceKind`: the catalog row is fed and is not adapter evidence.
 

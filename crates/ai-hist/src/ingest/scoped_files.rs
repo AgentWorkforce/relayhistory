@@ -7,9 +7,6 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering as AtomicOrdering;
-
-use super::SYNC_QUIET;
 
 use anyhow::{Context, Result};
 use rusqlite::Connection;

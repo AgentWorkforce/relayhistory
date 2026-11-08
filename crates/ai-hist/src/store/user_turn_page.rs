@@ -3,10 +3,9 @@
 //! `GROUP BY` the turn key aggregates every user-turn row of the session
 //! before `HAVING` and `LIMIT`, so each page of an N-turn session regroups
 //! all N. This walk does not. It also cannot close a turn when the key
-//! changes: blocks that share a message id are not a contiguous span, and
-//! the anchor is `(MIN(ts_ms), MIN(id))`, which can pair two different rows.
-//! A later row of an earlier turn would be dropped or reported as a second
-//! anchor.
+//! changes: blocks that share a message id are not a contiguous span.
+//! Each anchor is the first actual row in `(ts_ms, COALESCE(source_order,id),
+//! id)` order; combining independent minima can create an invalid cursor.
 //!
 //! Each newly seen key is aggregated from its own rows. Named rows are
 //! found through `idx_session_events_session_message` (the message id is
@@ -37,6 +36,7 @@ pub(super) struct UserTurnHeader {
     pub(super) key: String,
     pub(super) ts_ms: i64,
     pub(super) id: i64,
+    pub(super) order: i64,
     pub(super) message_id: Option<String>,
     pub(super) last_ts_ms: i64,
 }
@@ -50,16 +50,16 @@ type HeaderPage = (Vec<UserTurnHeader>, bool);
 /// as the block pass. `after` selects `(ts_ms, id) > cursor`.
 pub(super) fn user_turn_walk_sql(after: bool) -> String {
     let range = if after {
-        " AND (ts_ms, id) > (?, ?)"
+        " AND (ts_ms, COALESCE(source_order,id), id) > (?, ?, ?)"
     } else {
         ""
     };
     format!(
         "SELECT id, ts_ms, NULLIF(message_id, ''), \
-                CASE WHEN {USER_TURN_ROW_FILTER} THEN 1 ELSE 0 END \
+                CASE WHEN {USER_TURN_ROW_FILTER} THEN 1 ELSE 0 END, source_order \
          FROM session_events \
          WHERE source = ? AND session_id = ?{range} \
-         ORDER BY ts_ms ASC, id ASC"
+         ORDER BY ts_ms ASC, COALESCE(source_order,id) ASC, id ASC"
     )
 }
 
@@ -91,7 +91,7 @@ fn message_rows_sql_for(conn: &Connection) -> Result<String> {
 
 fn message_rows_sql(index: &str) -> String {
     format!(
-        "SELECT id, ts_ms, NULLIF(message_id, '') \
+        "SELECT id, ts_ms, NULLIF(message_id, ''), source_order \
          FROM session_events INDEXED BY {index} \
          WHERE source = ? AND session_id = ? AND message_id = ? \
            AND {USER_TURN_ROW_FILTER}"
@@ -105,7 +105,7 @@ fn message_rows_sql(index: &str) -> String {
 /// the row itself, not a scan.
 pub(super) fn user_turn_collided_row_sql() -> String {
     format!(
-        "SELECT id, ts_ms FROM session_events \
+        "SELECT id, ts_ms, source_order FROM session_events \
          WHERE id = ? AND source = ? AND session_id = ? \
            AND NULLIF(message_id, '') IS NULL AND {USER_TURN_ROW_FILTER}"
     )
@@ -123,8 +123,11 @@ pub(super) fn page_headers(
     let mut walk = conn.prepare(&user_turn_walk_sql(after.is_some()))?;
     let mut named = conn.prepare(&message_rows_sql_for(conn)?)?;
     let mut collided = conn.prepare(&user_turn_collided_row_sql())?;
-    let mut rows = match after {
-        Some(cursor) => walk.query(params![source, session_id, cursor.ts_ms, cursor.id])?,
+    let after_position = after
+        .map(|cursor| turn_cursor_position(conn, source, session_id, cursor))
+        .transpose()?;
+    let mut rows = match after_position {
+        Some((ts, order, id)) => walk.query(params![source, session_id, ts, order, id])?,
         None => walk.query(params![source, session_id])?,
     };
     let mut state = PageState::new(limit as usize);
@@ -134,13 +137,14 @@ pub(super) fn page_headers(
             ts_ms: row.get(1)?,
             message_id: row.get(2)?,
             is_turn: row.get::<_, i64>(3)? == 1,
+            source_order: row.get(4)?,
         };
         if let Some(page) = state.observe(
             &mut named,
             &mut collided,
             source,
             session_id,
-            after,
+            after_position,
             scanned,
         )? {
             return Ok(page);
@@ -149,11 +153,34 @@ pub(super) fn page_headers(
     Ok(state.finish())
 }
 
+/// Old synthetic turn anchors cannot safely continue after the anchor policy
+/// changes: remapping them can skip unseen turns or repeat earlier ones.
+/// Actual row cursors retain the generic event cursor policy unchanged.
+fn turn_cursor_position(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+    cursor: &SessionEventCursor,
+) -> Result<(i64, i64, i64)> {
+    let order = super::event_cursor_order(conn, session_id, Some(source), cursor)?;
+    let synthetic: bool = conn.query_row(
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM session_events WHERE id=?1 AND source=?2 \
+         AND session_id=?3 AND ts_ms<>?4 AND {USER_TURN_ROW_FILTER})"
+        ),
+        params![cursor.id, source, session_id, cursor.ts_ms],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(!synthetic, "STALE_EVENT_CURSOR: legacy user-turn anchor combines different rows; restart user-turn pagination");
+    Ok((cursor.ts_ms, order, cursor.id))
+}
+
 struct ScannedRow {
     id: i64,
     ts_ms: i64,
     message_id: Option<String>,
     is_turn: bool,
+    source_order: Option<i64>,
 }
 
 struct PageState {
@@ -165,7 +192,7 @@ struct PageState {
     frozen: bool,
     extra: bool,
     seen: HashSet<String>,
-    candidates: BTreeMap<(i64, i64), UserTurnHeader>,
+    candidates: BTreeMap<(i64, i64, i64), UserTurnHeader>,
 }
 
 impl PageState {
@@ -186,7 +213,7 @@ impl PageState {
         collided: &mut Statement<'_>,
         source: &str,
         session_id: &str,
-        after: Option<&SessionEventCursor>,
+        after: Option<(i64, i64, i64)>,
         row: ScannedRow,
     ) -> Result<Option<HeaderPage>> {
         if self.starts_later_timestamp(row.ts_ms) {
@@ -236,7 +263,7 @@ impl PageState {
         collided: &mut Statement<'_>,
         source: &str,
         session_id: &str,
-        after: Option<&SessionEventCursor>,
+        after: Option<(i64, i64, i64)>,
         row: &ScannedRow,
     ) -> Result<()> {
         let key = turn_key(row.message_id.as_deref(), row.id);
@@ -247,7 +274,7 @@ impl PageState {
         if !past_cursor(&header, after) {
             return Ok(());
         }
-        let anchor = (header.ts_ms, header.id);
+        let anchor = (header.ts_ms, header.order, header.id);
         if self.candidates.insert(anchor, header).is_some() {
             anyhow::bail!("two user turns share an anchor");
         }
@@ -263,13 +290,8 @@ impl PageState {
     }
 }
 
-fn past_cursor(header: &UserTurnHeader, after: Option<&SessionEventCursor>) -> bool {
-    match after {
-        None => true,
-        Some(cursor) => {
-            header.ts_ms > cursor.ts_ms || (header.ts_ms == cursor.ts_ms && header.id > cursor.id)
-        }
-    }
+fn past_cursor(header: &UserTurnHeader, after: Option<(i64, i64, i64)>) -> bool {
+    after.is_none_or(|cursor| (header.ts_ms, header.order, header.id) > cursor)
 }
 
 fn turn_key(message_id: Option<&str>, id: i64) -> String {
@@ -288,34 +310,32 @@ fn colliding_event_id(key: &str) -> Option<i64> {
 }
 
 struct Fold {
-    ts_ms: i64,
-    id: i64,
     last_ts_ms: i64,
     named: bool,
+    anchor: (i64, i64, i64),
 }
 
 impl Fold {
     fn seed(row: &ScannedRow) -> Self {
         Self {
-            ts_ms: row.ts_ms,
-            id: row.id,
             last_ts_ms: row.ts_ms,
             named: row.message_id.is_some(),
+            anchor: (row.ts_ms, row.source_order.unwrap_or(row.id), row.id),
         }
     }
 
-    fn observe(&mut self, id: i64, ts_ms: i64, named: bool) {
-        self.ts_ms = self.ts_ms.min(ts_ms);
-        self.id = self.id.min(id);
+    fn observe(&mut self, id: i64, ts_ms: i64, named: bool, source_order: Option<i64>) {
         self.last_ts_ms = self.last_ts_ms.max(ts_ms);
         self.named |= named;
+        self.anchor = self.anchor.min((ts_ms, source_order.unwrap_or(id), id));
     }
 
     fn header(self, key: &str) -> UserTurnHeader {
         UserTurnHeader {
             key: key.to_owned(),
-            ts_ms: self.ts_ms,
-            id: self.id,
+            ts_ms: self.anchor.0,
+            id: self.anchor.2,
+            order: self.anchor.1,
             message_id: self.named.then(|| key.to_owned()),
             last_ts_ms: self.last_ts_ms,
         }
@@ -348,7 +368,7 @@ fn fold_named(
     let mut rows = stmt.query(params![source, session_id, key])?;
     while let Some(row) = rows.next()? {
         let named: Option<String> = row.get(2)?;
-        fold.observe(row.get(0)?, row.get(1)?, named.is_some());
+        fold.observe(row.get(0)?, row.get(1)?, named.is_some(), row.get(3)?);
     }
     Ok(())
 }
@@ -362,7 +382,94 @@ fn fold_collided(
 ) -> Result<()> {
     let mut rows = stmt.query(params![row_id, source, session_id])?;
     while let Some(row) = rows.next()? {
-        fold.observe(row.get(0)?, row.get(1)?, false);
+        fold.observe(row.get(0)?, row.get(1)?, false, row.get(2)?);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::*;
+
+    fn seed(conn: &Connection, ranked: bool) {
+        init_db(conn).unwrap();
+        for (id, ts, message, role, rank) in [
+            (1, 200, "split", "user", None),
+            (2, 100, "split", "user", None),
+            (3, 100, "assistant", "assistant", ranked.then_some(0)),
+            (4, 100, "second", "user", ranked.then_some(1)),
+            (5, 300, "last", "user", None),
+        ] {
+            conn.execute("INSERT INTO session_events(id,source,session_id,event_uid,ts_ms,message_id,role,kind,text,source_order) VALUES(?1,'claude','s',?2,?3,?4,?5,'text',?4,?6)",params![id,format!("e{id}"),ts,message,role,rank]).unwrap();
+        }
+    }
+
+    #[test]
+    fn mixed_order_turn_pages_use_real_row_anchors_and_preserve_neighbours() {
+        let conn = Connection::open_in_memory().unwrap();
+        seed(&conn, true);
+        let mut turns = Vec::new();
+        let mut cursor = None;
+        for _ in 0..4 {
+            let page = session_user_turns_page(&conn, "claude", "s", 1, cursor.as_ref()).unwrap();
+            turns.extend(page.user_turns);
+            cursor = page.next_cursor;
+            if cursor.is_none() {
+                break;
+            }
+        }
+        assert!(cursor.is_none(), "pagination must terminate");
+        assert_eq!(
+            turns.iter().map(|turn| turn.id).collect::<Vec<_>>(),
+            [4, 2, 5]
+        );
+        assert_eq!(turns, session_user_turns_all(&conn, "claude", "s").unwrap());
+        assert_eq!(turns[0].preceding_message_id.as_deref(), Some("assistant"));
+        assert_eq!(turns[0].following_message_id.as_deref(), Some("split"));
+        assert_eq!(turns[1].blocks.len(), 2);
+        assert_eq!(turns[1].preceding_message_id.as_deref(), Some("second"));
+        assert_eq!(turns[1].following_message_id.as_deref(), Some("last"));
+        assert_eq!(turns[2].preceding_message_id.as_deref(), Some("split"));
+    }
+
+    #[test]
+    fn legacy_composite_turn_cursor_requires_restart_but_actual_rows_continue() {
+        let conn = Connection::open_in_memory().unwrap();
+        seed(&conn, false);
+        let all = session_user_turns_all(&conn, "claude", "s").unwrap();
+        assert_eq!(
+            all.iter().map(|turn| turn.id).collect::<Vec<_>>(),
+            [2, 4, 5]
+        );
+        let first = session_user_turns_page(&conn, "claude", "s", 1, None).unwrap();
+        assert_eq!(first.user_turns, all[..1]);
+        assert_eq!(
+            first.next_cursor,
+            Some(SessionEventCursor { ts_ms: 100, id: 2 })
+        );
+        let old = SessionEventCursor { ts_ms: 100, id: 1 };
+        let stale = session_user_turns_page(&conn, "claude", "s", 1, Some(&old))
+            .unwrap_err()
+            .to_string();
+        assert!(stale.contains("STALE_EVENT_CURSOR"));
+        assert!(stale.contains("restart user-turn pagination"));
+        let resumed =
+            session_user_turns_page(&conn, "claude", "s", 1, first.next_cursor.as_ref()).unwrap();
+        assert_eq!(resumed.user_turns, all[1..2]);
+        assert_eq!(resumed.user_turns[0].id, 4);
+        let tail =
+            session_user_turns_page(&conn, "claude", "s", 1, resumed.next_cursor.as_ref()).unwrap();
+        assert_eq!(tail.user_turns, all[2..]);
+        assert_eq!(
+            super::super::event_cursor_order(&conn, "s", Some("claude"), &old).unwrap(),
+            1,
+            "generic event cursors retain positional legacy semantics"
+        );
+        conn.execute("UPDATE session_events SET source_order=0 WHERE id=3", [])
+            .unwrap();
+        assert!(session_user_turns_page(&conn, "claude", "s", 1, Some(&old))
+            .unwrap_err()
+            .to_string()
+            .contains("INVALID_EVENT_CURSOR"));
+    }
 }

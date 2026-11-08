@@ -47,6 +47,7 @@ fn user(
     let inserted = crate::insert_history(
         conn,
         &HistoryEntry {
+            event_uid: None,
             id: 0,
             source: "codex".into(),
             session_id: Some(t.id.clone()),
