@@ -84,14 +84,12 @@ pub fn derive_origin(match_source: &str, role: &str, control_kind: Option<&str>)
 
 
 
-/// The absolute per-branch row bound a grouped search may read while
-/// looking for its page of primaries. The fetch starts at
-/// [`bounded_fetch_limit`] and doubles until the page is provably complete
-/// or a branch is exhausted; this cap is the bounded-work policy that stops
-/// the growth. When the cap stops the search first, the page may be
-/// incomplete: the oldest returned group is marked `group_truncated` (and
-/// [`search_page`] still hands back a cursor) instead of the search
-/// silently claiming exhaustion.
+/// The per-branch row bound for the echo recount's un-cursored universe
+/// fetch. It is deliberately larger than [`GROUP_FETCH_GROWTH_CAP`]: the
+/// page fetch itself grows only to that cap, and this bound applies to the
+/// recount's session-scoped refetch. When it stops a recount, the affected
+/// primaries keep `group_truncated` instead of silently claiming complete
+/// counts.
 const MAX_GROUP_FETCH: i64 = 50_000;
 
 /// The per-branch bound the stability growth in [`search_all`] may reach.
@@ -230,13 +228,16 @@ pub fn search_all(
             last.page_incomplete = true;
         }
     }
-    grouped.truncate(requested as usize);
-    // A page cursor must not change a primary's echo count: an echo newer
-    // than the cursor is filtered out of this page's fetch, so recount the
-    // page's primaries against the un-cursored match set.
+    // A page cursor must not change a primary's echo count, and an echo
+    // older than its primary must not resurface as its own match: resolve
+    // counts and membership against the un-cursored match set BEFORE the
+    // limit selects the page, so a dropped echo never consumes a page slot
+    // and a short page still signals continuation through the recount's
+    // `page_incomplete` marking.
     if filter.after.is_some() {
         grouped = recount_echoes(conn, terms, raw_fts, filter, role, grouped)?;
     }
+    grouped.truncate(requested as usize);
     let max_chars = filter
         .max_content_chars
         .map(|value| value as usize)
@@ -448,7 +449,28 @@ const HISTORY_BRANCH: SearchBranch = SearchBranch {
     fts: "history_fts",
     ts_column: "timestamp_ms",
     ts_index: "idx_history_timestamp",
-    columns: "h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms, 'user', 'history', NULL, NULL, NULL, NULL, NULL, NULL",
+    // A history row carries no transcript ids of its own, but its prompt is
+    // usually mirrored by a user text event (the same provider record).
+    // That mirror is suppressed from the event branch as a duplicate, so
+    // borrow its message/event ids here: an echo linked to the mirror's id
+    // can then be attributed to this prompt instead of whichever identical
+    // prompt the text alone would pick. The trim set inlined below mirrors
+    // `filters::RUST_WHITESPACE` (concat! takes literals only).
+    columns: concat!(
+        "h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms, 'user', 'history', ",
+        "(SELECT e.message_id FROM session_events e WHERE e.source = h.source ",
+        "AND e.session_id = h.session_id AND e.ts_ms = h.timestamp_ms ",
+        "AND e.role = 'user' AND e.kind = 'text' AND trim(e.text, ",
+        "char(9, 10, 11, 12, 13, 32, 133, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, ",
+        "8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288)",
+        ") = h.prompt LIMIT 1), NULL, ",
+        "(SELECT e.event_uid FROM session_events e WHERE e.source = h.source ",
+        "AND e.session_id = h.session_id AND e.ts_ms = h.timestamp_ms ",
+        "AND e.role = 'user' AND e.kind = 'text' AND trim(e.text, ",
+        "char(9, 10, 11, 12, 13, 32, 133, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, ",
+        "8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288)",
+        ") = h.prompt LIMIT 1), NULL, NULL, NULL"
+    ),
     after_history_tie: false,
     row: |row| search_row(row, MATCH_SOURCE_HISTORY),
 };
@@ -2169,6 +2191,174 @@ mod tests {
         .unwrap();
         assert_eq!(second.rows.len(), 1);
         assert_eq!(second.rows[0].text, "needle tail prompt");
+    }
+
+    #[test]
+    fn echoes_do_not_consume_a_continued_page() {
+        // The prompt's echoes sort between it and the next primary. They
+        // were already counted on the prompt's page, so the continued page
+        // must reach the next primary instead of returning (or stalling
+        // on) the echoes again.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        insert_history(
+            &conn,
+            &HistoryEntry {
+                id: 0,
+                source: "claude".into(),
+                session_id: Some("s1".into()),
+                project: Some("/work/needle".into()),
+                prompt: "needle prompt".into(),
+                prompt_hash: Some("hash-echoes-alone".into()),
+                timestamp_ms: 2_000,
+            },
+        )
+        .unwrap();
+        for (index, ts) in [(1, 1_000), (2, 1_001)] {
+            conn.execute(
+                "INSERT INTO session_events \
+                 (source, session_id, project, message_id, ts_ms, role, kind, text, event_uid) \
+                 VALUES ('claude', 's1', '/work/needle', ?, ?, 'assistant', 'text', ?, ?)",
+                params![
+                    format!("m-echo-{index}"),
+                    ts,
+                    format!("needle prompt (copy {index})"),
+                    format!("e-echo-{index}")
+                ],
+            )
+            .unwrap();
+        }
+        insert_history(
+            &conn,
+            &HistoryEntry {
+                id: 0,
+                source: "claude".into(),
+                session_id: Some("s1".into()),
+                project: Some("/work/needle".into()),
+                prompt: "needle tail prompt".into(),
+                prompt_hash: Some("hash-echoes-tail".into()),
+                timestamp_ms: 500,
+            },
+        )
+        .unwrap();
+        let terms = ["needle".to_string()];
+        let first = search_page(&conn, &terms, false, &filter(1), SearchRole::All).unwrap();
+        assert_eq!(first.rows[0].text, "needle prompt");
+        assert_eq!(first.rows[0].echo_count, 2);
+        let second = search_page(
+            &conn,
+            &terms,
+            false,
+            &QueryFilter {
+                after: first.next_cursor,
+                ..filter(1)
+            },
+            SearchRole::All,
+        )
+        .unwrap();
+        assert_eq!(second.rows.len(), 1);
+        assert_eq!(second.rows[0].text, "needle tail prompt");
+        assert!(second.next_cursor.is_none());
+    }
+
+    #[test]
+    fn an_echo_linked_to_a_mirrored_prompt_uses_that_prompts_id() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for (index, ts) in [(1, 1_000), (2, 2_000)] {
+            insert_history(
+                &conn,
+                &HistoryEntry {
+                    id: 0,
+                    source: "claude".into(),
+                    session_id: Some("s1".into()),
+                    project: Some("/work/needle".into()),
+                    prompt: "ship it".into(),
+                    prompt_hash: Some(format!("hash-mirror-{index}")),
+                    timestamp_ms: ts,
+                },
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO session_events \
+                 (source, session_id, project, message_id, ts_ms, role, kind, text, event_uid) \
+                 VALUES ('claude', 's1', '/work/needle', ?, ?, 'user', 'text', 'ship it', ?)",
+                params![format!("u{index}"), ts, format!("eu{index}")],
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, project, message_id, parent_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('claude', 's1', '/work/needle', 'm-echo', 'u1', 2001, 'assistant', 'text', 'assistant: ship it', 'e-mirror-echo')",
+            [],
+        )
+        .unwrap();
+        let rows = search_all(
+            &conn,
+            &["ship".to_string()],
+            false,
+            &filter(100),
+            SearchRole::All,
+        )
+        .unwrap();
+        let older = rows.iter().find(|row| row.timestamp_ms == 1_000).unwrap();
+        let newer = rows.iter().find(|row| row.timestamp_ms == 2_000).unwrap();
+        assert_eq!(older.echo_count, 1, "the linked mirror id attributes the echo");
+        assert_eq!(newer.echo_count, 0);
+    }
+
+    #[test]
+    fn a_reply_quoting_the_prompt_mid_sentence_stays_a_match() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, project, message_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('claude', 's1', '/work/needle', 'm-user', 1000, 'user', 'text', 'ship it', 'e-user')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, project, message_id, parent_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('claude', 's1', '/work/needle', 'm-reply', 'm-user', 1001, 'assistant', 'text', 'Do not ship it: the tests failed', 'e-reply')",
+            [],
+        )
+        .unwrap();
+        let rows = search_all(
+            &conn,
+            &["ship".to_string()],
+            false,
+            &filter(100),
+            SearchRole::All,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 2, "a mid-sentence quote is a substantive match");
+    }
+
+    #[test]
+    fn a_snippet_centers_on_a_column_filter_operand_and_folds_diacritics() {
+        let (snippet, _, _) = compute_snippet(
+            "café opening times and the tailneedle location",
+            &["text:tailneedle".to_string()],
+            20,
+        );
+        assert!(snippet.contains("tailneedle"), "snippet: {snippet}");
+        let (snippet, _, _) = compute_snippet(
+            "meet at the café at noon, bring the needle thread",
+            &["cafe".to_string()],
+            20,
+        );
+        assert!(snippet.contains("café"), "snippet: {snippet}");
+    }
+
+    #[test]
+    fn a_snippet_with_a_one_codepoint_window_at_the_match_end_keeps_the_match() {
+        let (snippet, truncated, offset) = compute_snippet("abc", &["c".to_string()], 1);
+        assert!(truncated);
+        assert_eq!(snippet, "c");
+        assert_eq!(offset, Some(2));
     }
 
     #[test]

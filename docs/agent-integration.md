@@ -20,10 +20,11 @@ Use these public operations:
   indexed history reads. `search()`, MCP `search_history` and `ai-hist search`
   share one contract: prompts and session events, filtered by `role`
   (`all`, `user`, `assistant`, `prompt`), with each match's `matchSource`,
-  `role` and `kind`. The SDK and MCP surfaces also accept `sessionId`,
-  `kinds` and `origin` filters (`ai-hist search` shares the result contract
+  `role` and `kind`. The SDK (`sessionId`) and MCP (`session_id`) surfaces also accept
+  session, `kinds` and `origin` filters (`ai-hist search` shares the result contract
   but exposes no such flags). Matches are grouped: an assistant or tool row
-  that repeats a prompt verbatim collapses into that prompt as an echo,
+  that repeats a prompt verbatim collapses into that prompt as an echo
+  (a reply that merely quotes the prompt in passing stays its own match),
   counted by `groupSize`/`echoCount` (a lower bound when `groupTruncated`
   is set); pages return primaries only, and two identical-wording prompts
   at different timestamps both stay primaries.

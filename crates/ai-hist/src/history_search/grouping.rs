@@ -31,7 +31,7 @@ fn linked_to(candidate: &SearchRow, primary: &SearchRow) -> bool {
 /// A primary is a `history` row or a `role = user`/`kind = text` event. Any
 /// other row joins a primary only in the same source and session when it is
 /// a tool call/result or an assistant row whose whitespace-collapsed text
-/// contains the primary's full trimmed text verbatim (case-sensitive):
+/// starts or ends with the primary's full trimmed text (case-sensitive):
 /// verbatim repetition is the echo evidence, and conversation ancestry
 /// alone never suppresses a substantive reply. Among the primaries a
 /// repeating row could join, an explicit id link wins over a text-only
@@ -57,13 +57,25 @@ struct Group {
     primary_text: String,
 }
 
-/// Whether an echo candidate (by kind/role) repeats the primary's full
-/// trimmed text verbatim. Both texts arrive whitespace-collapsed, each
-/// collapsed once per search rather than once per comparison.
+/// Whether an echo candidate (by kind/role) mirrors the primary's full
+/// trimmed text: the collapsed echo text contains the primary's whole
+/// text, and that text makes up at least a third of the echo. Mere
+/// containment is not enough — a substantive reply that quotes the prompt
+/// in passing ("Do not ship it: the tests failed") is a match in its own
+/// right, while a wrapper that mostly is the prompt ("quoting <prompt>
+/// 1999", "assistant: <prompt>") is an echo. Both texts arrive
+/// whitespace-collapsed, each collapsed once per search rather than once
+/// per comparison.
 fn text_matches(echo: &SearchRow, echo_text: &str, primary_text: &str) -> bool {
-    !primary_text.is_empty()
-        && (echo.kind == "tool_use" || echo.kind == "tool_result" || echo.role == "assistant")
-        && echo_text.contains(primary_text)
+    if primary_text.is_empty()
+        || !(echo.kind == "tool_use" || echo.kind == "tool_result" || echo.role == "assistant")
+        || !echo_text.contains(primary_text)
+    {
+        return false;
+    }
+    echo_text.starts_with(primary_text)
+        || echo_text.ends_with(primary_text)
+        || primary_text.chars().count() * 3 >= echo_text.chars().count()
 }
 
 /// Among the primaries an echo could join, the closest preceding one (the
@@ -136,11 +148,14 @@ pub(super) fn group_rows(rows: Vec<SearchRow>, bound_hit: bool) -> Vec<SearchRow
             pending.push((position, row, row_text));
         }
     }
+    // Singleton groups stay out of the matching set: echo matching scans
+    // only absorbable primaries, never the accumulated singletons.
+    let mut singletons: Vec<Group> = Vec::new();
     for (position, row, row_text) in pending {
         let joined = join_target(&groups, &row, &row_text);
         match joined {
             Some(index) => groups[index].size += 1,
-            None => groups.push(Group {
+            None => singletons.push(Group {
                 primary_text: String::new(),
                 representative: row,
                 position,
@@ -149,6 +164,7 @@ pub(super) fn group_rows(rows: Vec<SearchRow>, bound_hit: bool) -> Vec<SearchRow
             }),
         }
     }
+    groups.extend(singletons);
     groups.sort_by_key(|group| group.position);
     groups
         .into_iter()
@@ -320,9 +336,10 @@ pub(super) fn recount_echoes(
     if primaries.is_empty() || matches!(role, SearchRole::Assistant | SearchRole::Prompt) {
         return Ok(primaries);
     }
-    if !primaries.iter().any(|row| row.is_primary_candidate()) {
-        return Ok(primaries);
-    }
+    // No primary candidate on the page does not skip resolution: a page of
+    // echoes alone (their prompt already returned) must still be resolved
+    // against the un-cursored grouping, or the echoes would be returned a
+    // second time as their own matches.
     // Distinct sessions among the page's rows, in page order — standalone
     // rows included, since resolving whether one is an absorbed echo needs
     // its session's grouping too. `None` (a session-less row) falls back
@@ -381,7 +398,11 @@ pub(super) fn recount_echoes(
                 .copied()
                 .unwrap_or(false)
     });
-    if primaries.len() < before {
+    if primaries.len() < before && any_bound_hit {
+        // Rows dropped while a recount bound was hit somewhere: the page
+        // may not be the last, so keep a continuation signal. With every
+        // recount complete, the grouped set was the whole window and a
+        // drop implies nothing about older matches.
         if let Some(last) = primaries.last_mut() {
             last.page_incomplete = true;
         }

@@ -5,14 +5,22 @@
 pub const DEFAULT_SNIPPET_CHARS: usize = 320;
 
 /// The literal terms a snippet centers on: the query split on whitespace,
-/// stripped of FTS operators, quotes and a trailing `*`. Negated terms and
-/// column filters name no literal text, so they never center a snippet.
+/// stripped of FTS operators, quotes and a trailing `*`. Negated terms
+/// name no literal text; a column filter contributes its operand.
 fn snippet_terms(terms: &[String]) -> Vec<String> {
     let mut out = Vec::new();
     for raw in terms.iter().flat_map(|term| term.split_whitespace()) {
         let mut token = raw.trim().trim_matches(|c| c == '"' || c == '\'' || c == '(' || c == ')');
-        if token.is_empty() || token.starts_with('-') || token.contains(':') {
+        if token.is_empty() || token.starts_with('-') {
             continue;
+        }
+        // A column filter (`text:tailneedle`) names its literal operand
+        // after the colon; that operand is what the snippet centers on.
+        if token.contains(':') {
+            token = token.rsplit(':').next().unwrap_or("");
+            if token.is_empty() {
+                continue;
+            }
         }
         if let Some(stripped) = token.strip_suffix('*') {
             token = stripped;
@@ -25,6 +33,36 @@ fn snippet_terms(terms: &[String]) -> Vec<String> {
             continue;
         }
         out.push(token.to_string());
+    }
+    out
+}
+
+/// Fold one char for snippet matching: lowercase it, strip Latin
+/// diacritics (`é` -> `e`), and drop combining marks. Expansions (`ß` ->
+/// `ss`) yield several chars; the caller maps every yielded char back to
+/// the original codepoint.
+fn fold_char(ch: char) -> Vec<char> {
+    let mut out = Vec::new();
+    for lowered in ch.to_lowercase() {
+        match lowered {
+            'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'ă' | 'ą' => out.push('a'),
+            'ç' | 'ć' | 'ĉ' | 'ċ' | 'č' => out.push('c'),
+            'ď' | 'đ' | 'ð' => out.push('d'),
+            'è' | 'é' | 'ê' | 'ë' | 'ē' | 'ĕ' | 'ė' | 'ę' | 'ě' => out.push('e'),
+            'ì' | 'í' | 'î' | 'ï' | 'ĩ' | 'ī' | 'ĭ' | 'į' | 'ı' => out.push('i'),
+            'ł' => out.push('l'),
+            'ñ' | 'ń' | 'ņ' | 'ň' => out.push('n'),
+            'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ō' | 'ŏ' | 'ő' => out.push('o'),
+            'ù' | 'ú' | 'û' | 'ü' | 'ũ' | 'ū' | 'ŭ' | 'ů' | 'ű' | 'ų' => out.push('u'),
+            'ý' | 'ÿ' | 'ŷ' => out.push('y'),
+            'ß' => out.extend(['s', 's']),
+            'æ' => out.extend(['a', 'e']),
+            'œ' => out.extend(['o', 'e']),
+            'ø' => out.push('o'),
+            'þ' => out.extend(['t', 'h']),
+            '\u{300}'..='\u{36f}' => {}
+            other => out.push(other),
+        }
     }
     out
 }
@@ -56,19 +94,21 @@ pub fn compute_snippet(
     }
     // Lowercasing can expand a char (`İ` becomes `i̇`, two codepoints), so a
     // match position counted in the lowered text is not an offset in the
-    // original. Build the lowered text char by char and remember which
-    // original codepoint each lowered codepoint came from.
+    // original. Build the folded text char by char and remember which
+    // original codepoint each folded codepoint came from. Folding also
+    // strips Latin diacritics, matching the FTS tokenizer: `cafe` finds
+    // `café`.
     let mut text_lower = String::new();
     let mut lowered_to_original: Vec<usize> = Vec::new();
     for (original_index, ch) in text.chars().enumerate() {
-        for lowered in ch.to_lowercase() {
+        for lowered in fold_char(ch) {
             text_lower.push(lowered);
             lowered_to_original.push(original_index);
         }
     }
     let mut best: Option<(usize, usize)> = None;
     for term in snippet_terms(terms) {
-        let term_lower = term.to_lowercase();
+        let term_lower: String = term.chars().flat_map(fold_char).collect();
         if term_lower.is_empty() {
             continue;
         }
@@ -101,9 +141,9 @@ pub fn compute_snippet(
     let end = start + max;
     let head_truncated = start > 0;
     let tail_truncated = end < total;
-    if head_truncated && tail_truncated && max < 3 {
-        // Too narrow for an ellipsis on both sides: return the raw window
-        // at the match instead of slicing a reversed range.
+    if max < 3 {
+        // Too narrow for ellipses: return the raw window at the match
+        // instead of slicing a reversed or match-less range.
         let snippet: String = chars[start..end].iter().collect();
         return (snippet, true, Some(start));
     }
