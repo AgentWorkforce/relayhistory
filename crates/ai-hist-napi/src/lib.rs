@@ -10,7 +10,7 @@ pub mod sources;
 
 use std::path::{Path, PathBuf};
 
-use ai_hist::history_search::{search_all, search_page as core_search_page, SearchRole, SearchRow};
+use ai_hist::history_search::{search_all, search_page as core_search_page, SearchRole};
 use ai_hist::{
     default_db_path, open_db, open_db_readonly, recent as core_recent, relationship_capabilities,
     schema_is_catalog_read_current, schema_is_event_read_current, schema_is_evidence_read_current,
@@ -490,20 +490,24 @@ impl NativeHistoryEntry {
 
 /// The locations of each session a result set names, read once per session
 /// with one cached statement however many rows share it.
-struct SessionLocations<'c> {
+pub(crate) struct SessionLocations<'c> {
     conn: &'c rusqlite::Connection,
     known: std::collections::HashMap<(String, String), Vec<String>>,
 }
 
 impl<'c> SessionLocations<'c> {
-    fn new(conn: &'c rusqlite::Connection) -> Self {
+    pub(crate) fn new(conn: &'c rusqlite::Connection) -> Self {
         Self {
             conn,
             known: std::collections::HashMap::new(),
         }
     }
 
-    fn of(&mut self, source: &str, session_id: Option<&str>) -> anyhow::Result<Vec<String>> {
+    pub(crate) fn of(
+        &mut self,
+        source: &str,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<String>> {
         let Some(session_id) = session_id else {
             return Ok(Vec::new());
         };
@@ -514,90 +518,6 @@ impl<'c> SessionLocations<'c> {
         let locations = session_locations(self.conn, source, session_id)?;
         self.known.insert(key, locations.clone());
         Ok(locations)
-    }
-}
-
-/// One `search` match. `id` is unique only within `match_source`: a prompt
-/// is a `history` row, anything else a `session_event` row.
-#[napi(object)]
-pub struct NativeSearchMatch {
-    pub id: i64,
-    pub source: String,
-    pub session_id: Option<String>,
-    pub project: Option<String>,
-    /// The matched text: the prompt for a `history` match, the event text
-    /// otherwise. Named `prompt` so a match is still a history entry.
-    pub prompt: String,
-    pub timestamp_ms: i64,
-    pub locations: Vec<String>,
-    /// `history` or `session_event`.
-    pub match_source: String,
-    /// `user` for a `history` match; the event's role otherwise.
-    pub role: String,
-    /// `history` for a `history` match; the event's kind otherwise.
-    pub kind: String,
-    /// Match-centered snippet of `prompt`; `prompt` keeps the full text.
-    pub snippet: String,
-    pub content_truncated: bool,
-    /// Codepoint offset of the snippet in the full text; null only when the
-    /// text is empty.
-    pub snippet_start_offset: Option<i64>,
-    /// The echo group this primary represents; null for a singleton.
-    pub group_id: Option<String>,
-    pub group_size: i64,
-    pub echo_count: i64,
-    pub group_truncated: bool,
-    pub is_primary: bool,
-    /// `human`, `peer`, `system`, `synthetic` or `unknown`.
-    pub origin: String,
-    /// Why a user-role event is not a human prompt; null otherwise.
-    pub control_kind: Option<String>,
-    pub event_uid: Option<String>,
-    pub event_ref: NativeSearchEventRef,
-}
-
-/// The stored row a search match came from.
-#[napi(object)]
-pub struct NativeSearchEventRef {
-    pub match_source: String,
-    pub id: i64,
-    pub session_id: Option<String>,
-    pub event_uid: Option<String>,
-}
-
-impl NativeSearchMatch {
-    fn from_row(locations: &mut SessionLocations<'_>, row: SearchRow) -> anyhow::Result<Self> {
-        let locations = locations.of(&row.source, row.session_id.as_deref())?;
-        let event_ref = row.event_ref();
-        Ok(Self {
-            id: row.id,
-            source: row.source,
-            session_id: row.session_id,
-            project: row.project,
-            prompt: row.text,
-            timestamp_ms: row.timestamp_ms,
-            locations,
-            match_source: row.match_source,
-            role: row.role,
-            kind: row.kind,
-            snippet: row.snippet,
-            content_truncated: row.content_truncated,
-            snippet_start_offset: row.snippet_start_offset.map(|value| value as i64),
-            group_id: row.group_id,
-            group_size: row.group_size,
-            echo_count: row.echo_count,
-            group_truncated: row.group_truncated,
-            is_primary: row.is_primary,
-            origin: row.origin,
-            control_kind: row.control_kind,
-            event_uid: row.event_uid,
-            event_ref: NativeSearchEventRef {
-                match_source: event_ref.match_source,
-                id: event_ref.id,
-                session_id: event_ref.session_id,
-                event_uid: event_ref.event_uid,
-            },
-        })
     }
 }
 
@@ -1689,6 +1609,8 @@ pub async fn stats(options: Option<StatsOptions>) -> napi::Result<NativeStats> {
 
 mod catalog_session;
 pub use catalog_session::CatalogSession;
+mod search;
+pub use search::{NativeSearchEventRef, NativeSearchMatch};
 
 #[napi(object)]
 pub struct CatalogCursor {

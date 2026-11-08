@@ -107,7 +107,9 @@ export interface SearchOptions extends ListOptions {
   maxContentChars?: number;
   /**
    * Total budget in serialized JSON characters across the page's matches,
-   * 500..200000 (default 20000). At least one match is always returned.
+   * 500..200000. `searchPage` (and MCP `search_history` through it) applies
+   * a 20000 default; `search` applies no budget unless this is explicitly
+   * provided. At least one match is always returned.
    */
   maxTotalContentChars?: number;
 }

@@ -16,6 +16,14 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Search pages return group primaries only: assistant and tool rows that repeat a prompt verbatim (or are linked to it) collapse into that prompt as counted echoes. Two identical-wording user prompts at different timestamps both stay primaries.
 - The native contract is now 30.
 
+### Fixed
+
+- `origin: 'unknown'` search now returns ordinary assistant and tool rows (a NULL `control_kind` no longer drops them), and every origin filter returns only rows whose reported origin matches it.
+- Grouped search pages no longer end early when echoes collapse or an echo's prompt sits past the first fetch bound: the search reads on until the page is complete, and a prompt's `echoCount` is the same whatever the page size.
+- An echo now counts under the prompt it is linked to by id, or for a text-only echo the closest preceding identical prompt, instead of the newest matching prompt.
+- Snippets center on the match and report `snippetStartOffset` in original codepoints even when lowercasing expands a character (for example `İ`).
+- SDK `search()` returns all matches up to `limit` unless `maxTotalContentChars` is explicitly given; only `searchPage()` and MCP `search_history` apply the 20000 default budget.
+
 ## [0.57.1] - 2026-11-07
 
 ### Fixed

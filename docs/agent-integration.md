@@ -32,7 +32,9 @@ Use these public operations:
   `nextCursor` (MCP: pass `nextCursor` back unchanged as `after`; it is a
   search position only), and bound them with inclusive `sinceMs` / `untilMs`
   and the serialized-size budget `maxTotalContentChars` (MCP:
-  `max_total_content_chars`, default 20000). MCP `search_history` returns an
+  `max_total_content_chars`). The budget bounds `searchPage()` and MCP
+  `search_history` (default 20000); `search()` returns every match up to
+  `limit` unless a budget is explicitly given. MCP `search_history` returns an
   envelope `{matches, nextCursor, truncated, totalContentCharsUsed}` and
   rejects unknown arguments. `beforeMs` is deprecated: it skips rows tied on
   its timestamp.

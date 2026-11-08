@@ -287,14 +287,22 @@ function applySearchBudget(
   return { matches: kept, nextCursor: cursor, truncated, totalContentCharsUsed: used };
 }
 
+/**
+ * Every match for `query`, up to `options.limit` rows. The total budget
+ * applies only when `maxTotalContentChars` is explicitly provided: with no
+ * budget given, all `limit` matches are returned and no truncation signal
+ * is lost, matching the Rust CLI. Use `searchPage` for the budgeted,
+ * enveloped read.
+ */
 export async function search(query: string, options: SearchOptions = {}): Promise<SearchMatch[]> {
   validateSearchBudget(options);
-  const budget = options.maxTotalContentChars ?? DEFAULT_MAX_TOTAL_CONTENT_CHARS;
   const scope = options.scope ?? 'local';
   return nativeCall(async (native) => {
     const { maxTotalContentChars: _budget, ...nativeOptions } = options;
     const rows = await native.search(query, { ...nativeOptions, scope, after: nativeHistoryCursor(options.after) });
-    return applySearchBudget(rows.map(searchMatch), budget, null).matches;
+    const matches = rows.map(searchMatch);
+    if (options.maxTotalContentChars === undefined) return matches;
+    return applySearchBudget(matches, options.maxTotalContentChars, null).matches;
   });
 }
 
@@ -302,7 +310,10 @@ export async function search(query: string, options: SearchOptions = {}): Promis
  * One page of `search`. Pass the returned `nextCursor` back as `after` to
  * continue; it is `null` once no further match exists. Pages never skip or
  * repeat a match among rows present for the whole walk; rows committed
- * meanwhile appear wherever their `(timestampMs, id)` places them.
+ * meanwhile appear wherever their `(timestampMs, id)` places them. Unlike
+ * `search`, a page is always bounded by the total budget
+ * (`maxTotalContentChars`, default 20000) and reports it in the envelope;
+ * this is the read MCP `search_history` passes through.
  */
 export async function searchPage(query: string, options: SearchOptions = {}): Promise<SearchPage> {
   validateSearchBudget(options);

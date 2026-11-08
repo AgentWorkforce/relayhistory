@@ -147,9 +147,54 @@ test('local discovery, hydration and cached evidence survive malformed commercia
       .filter((match) => match.matchSource === 'history');
     assert.equal(prompts.length, 1);
     assert.deepEqual(prompts[0].locations, ['local']);
+    // The prompt match carries the full search shape beside the entry
+    // fields: snippet, grouping, origin and provenance.
+    assert.deepEqual(
+      {
+        snippet: prompts[0].snippet,
+        contentTruncated: prompts[0].contentTruncated,
+        snippetStartOffset: prompts[0].snippetStartOffset,
+        groupId: prompts[0].groupId,
+        groupSize: prompts[0].groupSize,
+        echoCount: prompts[0].echoCount,
+        groupTruncated: prompts[0].groupTruncated,
+        isPrimary: prompts[0].isPrimary,
+        origin: prompts[0].origin,
+        controlKind: prompts[0].controlKind,
+        eventUid: prompts[0].eventUid,
+        eventRef: prompts[0].eventRef,
+      },
+      {
+        snippet: 'contractneedle contract-session',
+        contentTruncated: false,
+        snippetStartOffset: 0,
+        groupId: null,
+        groupSize: 1,
+        echoCount: 0,
+        groupTruncated: false,
+        isPrimary: true,
+        origin: 'human',
+        controlKind: null,
+        eventUid: null,
+        eventRef: {
+          matchSource: 'history',
+          id: prompts[0].id,
+          sessionId: 'contract-session',
+          eventUid: null,
+        },
+      },
+    );
     assert.deepEqual(
       await recent({ dbPath, scope: 'local' }),
-      prompts.map(({ matchSource: _source, role: _role, kind: _kind, ...entry }) => entry),
+      prompts.map(({
+        matchSource: _source, role: _role, kind: _kind,
+        snippet: _snippet, contentTruncated: _contentTruncated,
+        snippetStartOffset: _snippetStartOffset, groupId: _groupId,
+        groupSize: _groupSize, echoCount: _echoCount,
+        groupTruncated: _groupTruncated, isPrimary: _isPrimary,
+        origin: _origin, controlKind: _controlKind, eventUid: _eventUid,
+        eventRef: _eventRef, ...entry
+      }) => entry),
     );
     assert.equal((await stats({ dbPath, scope: 'local' })).total, 1);
   });

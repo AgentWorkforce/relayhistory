@@ -130,56 +130,6 @@ export interface NativeHistoryEntry {
   timestampMs: number
   locations: Array<string>
 }
-/**
- * One `search` match. `id` is unique only within `match_source`: a prompt
- * is a `history` row, anything else a `session_event` row.
- */
-export interface NativeSearchMatch {
-  id: number
-  source: string
-  sessionId?: string
-  project?: string
-  /**
-   * The matched text: the prompt for a `history` match, the event text
-   * otherwise. Named `prompt` so a match is still a history entry.
-   */
-  prompt: string
-  timestampMs: number
-  locations: Array<string>
-  /** `history` or `session_event`. */
-  matchSource: string
-  /** `user` for a `history` match; the event's role otherwise. */
-  role: string
-  /** `history` for a `history` match; the event's kind otherwise. */
-  kind: string
-  /** Match-centered snippet of `prompt`; `prompt` keeps the full text. */
-  snippet: string
-  contentTruncated: boolean
-  /**
-   * Codepoint offset of the snippet in the full text; null only when the
-   * text is empty.
-   */
-  snippetStartOffset?: number
-  /** The echo group this primary represents; null for a singleton. */
-  groupId?: string
-  groupSize: number
-  echoCount: number
-  groupTruncated: boolean
-  isPrimary: boolean
-  /** `human`, `peer`, `system`, `synthetic` or `unknown`. */
-  origin: string
-  /** Why a user-role event is not a human prompt; null otherwise. */
-  controlKind?: string
-  eventUid?: string
-  eventRef: NativeSearchEventRef
-}
-/** The stored row a search match came from. */
-export interface NativeSearchEventRef {
-  matchSource: string
-  id: number
-  sessionId?: string
-  eventUid?: string
-}
 export interface NativeSessionEvent {
   id: number
   source: string
@@ -576,6 +526,56 @@ export interface CatalogSession {
   projectKeyMethod?: string
   locations: Array<string>
   fromCache: boolean
+}
+/**
+ * One `search` match. `id` is unique only within `match_source`: a prompt
+ * is a `history` row, anything else a `session_event` row.
+ */
+export interface NativeSearchMatch {
+  id: number
+  source: string
+  sessionId?: string
+  project?: string
+  /**
+   * The matched text: the prompt for a `history` match, the event text
+   * otherwise. Named `prompt` so a match is still a history entry.
+   */
+  prompt: string
+  timestampMs: number
+  locations: Array<string>
+  /** `history` or `session_event`. */
+  matchSource: string
+  /** `user` for a `history` match; the event's role otherwise. */
+  role: string
+  /** `history` for a `history` match; the event's kind otherwise. */
+  kind: string
+  /** Match-centered snippet of `prompt`; `prompt` keeps the full text. */
+  snippet: string
+  contentTruncated: boolean
+  /**
+   * Codepoint offset of the snippet in the full text; null only when the
+   * text is empty.
+   */
+  snippetStartOffset?: number
+  /** The echo group this primary represents; null for a singleton. */
+  groupId?: string
+  groupSize: number
+  echoCount: number
+  groupTruncated: boolean
+  isPrimary: boolean
+  /** `human`, `peer`, `system`, `synthetic` or `unknown`. */
+  origin: string
+  /** Why a user-role event is not a human prompt; null otherwise. */
+  controlKind?: string
+  eventUid?: string
+  eventRef: NativeSearchEventRef
+}
+/** The stored row a search match came from. */
+export interface NativeSearchEventRef {
+  matchSource: string
+  id: number
+  sessionId?: string
+  eventUid?: string
 }
 export interface CatalogCursor {
   lastActivityMs?: number
