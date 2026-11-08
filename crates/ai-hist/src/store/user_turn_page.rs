@@ -123,20 +123,11 @@ pub(super) fn page_headers(
     let mut walk = conn.prepare(&user_turn_walk_sql(after.is_some()))?;
     let mut named = conn.prepare(&message_rows_sql_for(conn)?)?;
     let mut collided = conn.prepare(&user_turn_collided_row_sql())?;
-    let after_order = after
-        .map(|cursor| super::event_cursor_order(conn, session_id, Some(source), cursor))
-        .transpose()?;
     let after_position = after
-        .zip(after_order)
-        .map(|(cursor, order)| (cursor.ts_ms, order, cursor.id));
-    let mut rows = match after {
-        Some(cursor) => walk.query(params![
-            source,
-            session_id,
-            cursor.ts_ms,
-            after_order,
-            cursor.id
-        ])?,
+        .map(|cursor| turn_cursor_position(conn, source, session_id, cursor))
+        .transpose()?;
+    let mut rows = match after_position {
+        Some((ts, order, id)) => walk.query(params![source, session_id, ts, order, id])?,
         None => walk.query(params![source, session_id])?,
     };
     let mut state = PageState::new(limit as usize);
@@ -160,6 +151,28 @@ pub(super) fn page_headers(
         }
     }
     Ok(state.finish())
+}
+
+/// Old synthetic turn anchors cannot safely continue after the anchor policy
+/// changes: remapping them can skip unseen turns or repeat earlier ones.
+/// Actual row cursors retain the generic event cursor policy unchanged.
+fn turn_cursor_position(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+    cursor: &SessionEventCursor,
+) -> Result<(i64, i64, i64)> {
+    let order = super::event_cursor_order(conn, session_id, Some(source), cursor)?;
+    let synthetic: bool = conn.query_row(
+        &format!(
+            "SELECT EXISTS(SELECT 1 FROM session_events WHERE id=?1 AND source=?2 \
+         AND session_id=?3 AND ts_ms<>?4 AND {USER_TURN_ROW_FILTER})"
+        ),
+        params![cursor.id, source, session_id, cursor.ts_ms],
+        |row| row.get(0),
+    )?;
+    anyhow::ensure!(!synthetic, "STALE_EVENT_CURSOR: legacy user-turn anchor combines different rows; restart user-turn pagination");
+    Ok((cursor.ts_ms, order, cursor.id))
 }
 
 struct ScannedRow {
@@ -420,7 +433,7 @@ mod tests {
     }
 
     #[test]
-    fn legacy_composite_cursor_is_only_accepted_in_an_unknown_order_bucket() {
+    fn legacy_composite_turn_cursor_requires_restart_but_actual_rows_continue() {
         let conn = Connection::open_in_memory().unwrap();
         seed(&conn, false);
         let all = session_user_turns_all(&conn, "claude", "s").unwrap();
@@ -435,7 +448,23 @@ mod tests {
             Some(SessionEventCursor { ts_ms: 100, id: 2 })
         );
         let old = SessionEventCursor { ts_ms: 100, id: 1 };
-        assert!(session_user_turns_page(&conn, "claude", "s", 1, Some(&old)).is_ok());
+        let stale = session_user_turns_page(&conn, "claude", "s", 1, Some(&old))
+            .unwrap_err()
+            .to_string();
+        assert!(stale.contains("STALE_EVENT_CURSOR"));
+        assert!(stale.contains("restart user-turn pagination"));
+        let resumed =
+            session_user_turns_page(&conn, "claude", "s", 1, first.next_cursor.as_ref()).unwrap();
+        assert_eq!(resumed.user_turns, all[1..2]);
+        assert_eq!(resumed.user_turns[0].id, 4);
+        let tail =
+            session_user_turns_page(&conn, "claude", "s", 1, resumed.next_cursor.as_ref()).unwrap();
+        assert_eq!(tail.user_turns, all[2..]);
+        assert_eq!(
+            super::super::event_cursor_order(&conn, "s", Some("claude"), &old).unwrap(),
+            1,
+            "generic event cursors retain positional legacy semantics"
+        );
         conn.execute("UPDATE session_events SET source_order=0 WHERE id=3", [])
             .unwrap();
         assert!(session_user_turns_page(&conn, "claude", "s", 1, Some(&old))

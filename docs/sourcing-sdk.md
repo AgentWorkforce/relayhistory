@@ -378,10 +378,11 @@ return `STALE_EVENT_CURSOR` when a deleted row cannot be positioned safely in
 an ordered timestamp bucket. A cursor is not a snapshot across mutations;
 restart the read after an order-changing revision. New user-turn cursors use the
 first event row in the turn, keeping its timestamp and row ID together even
-when no block has recorded source order. Old user-turn cursors with
-composite `MIN(timestamp)`/`MIN(id)` anchors remain positional only within the
-same source/session and wholly unknown-order legacy buckets. Evidence contract 5 covers
-these ordering semantics.
+when no block has recorded source order. Old user-turn cursors whose
+`MIN(timestamp)` and `MIN(id)` came from different rows require a fresh read:
+they return `STALE_EVENT_CURSOR` because translating them to the new ordering
+could silently repeat or skip turns. Old cursors that identify an actual row
+continue to work. Evidence contract 5 covers these ordering semantics.
 
 ### `watch`
 
