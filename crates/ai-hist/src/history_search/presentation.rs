@@ -16,6 +16,14 @@ fn snippet_terms(terms: &[String]) -> Vec<(String, bool)> {
         if token.is_empty() || token.starts_with('-') {
             continue;
         }
+        // The prefix marker comes off first: for `text:"cat"*` the operand
+        // is quoted, and unquoting it before stripping `*` would leave a
+        // stray quote in the term.
+        let mut prefix = false;
+        if let Some(stripped) = token.strip_suffix('*') {
+            token = stripped;
+            prefix = true;
+        }
         // A column filter (`text:tailneedle`) names its literal operand
         // after the colon; that operand is what the snippet centers on.
         if token.contains(':') {
@@ -27,11 +35,6 @@ fn snippet_terms(terms: &[String]) -> Vec<(String, bool)> {
             if token.is_empty() {
                 continue;
             }
-        }
-        let mut prefix = false;
-        if let Some(stripped) = token.strip_suffix('*') {
-            token = stripped;
-            prefix = true;
         }
         if token.is_empty() {
             continue;
@@ -91,17 +94,17 @@ fn fold_latin_extended_additional(ch: char) -> Option<char> {
         'ġ' => 'g',
         'ḥ' => 'h',
         'ḳ' => 'k',
-        'ḷ' | 'ḹ' => 'l',
+        'ḷ' => 'l',
         'ṁ' | 'ṃ' => 'm',
         'ṇ' => 'n',
         'ṗ' => 'p',
-        'ṛ' | 'ṝ' => 'r',
-        'ṣ' => 's',
+        'ṛ' => 'r',
+        'ṣ' | 'ṡ' => 's',
         'ṭ' => 't',
         'ṿ' => 'v',
         'ẇ' | 'ẁ' | 'ẅ' => 'w',
         'ẋ' => 'x',
-        'ỳ' => 'y',
+        'ỳ' | 'ẏ' => 'y',
         _ => return None,
     })
 }

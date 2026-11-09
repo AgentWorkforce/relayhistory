@@ -2757,6 +2757,86 @@ mod tests {
     }
 
     #[test]
+    fn a_short_rejection_after_the_prompt_is_not_an_echo() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for (uid, role, text, ts) in [
+            ("e-user", "user", "ship it", 1_000),
+            ("e-asst", "assistant", "ship it? No.", 1_001),
+        ] {
+            conn.execute(
+                "INSERT INTO session_events \
+                 (source, session_id, project, message_id, ts_ms, role, kind, text, event_uid) \
+                 VALUES ('claude', 's1', '/work/needle', ?1, ?2, ?3, 'text', ?4, ?1)",
+                rusqlite::params![uid, ts, role, text],
+            )
+            .unwrap();
+        }
+        let rows = search_all(
+            &conn,
+            &["ship".to_string()],
+            false,
+            &filter(100),
+            SearchRole::All,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 2, "rows: {rows:?}");
+    }
+
+    #[test]
+    fn a_prompt_containing_escaped_quotes_still_collapses_its_verbatim_echo() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for (uid, role, kind, text, ts) in [
+            ("e-user", "user", "text", "run \\\"ship it\\\" now", 1_000),
+            (
+                "e-tool",
+                "assistant",
+                "tool_use",
+                "{\"cmd\": \"run \\\"ship it\\\" now\"}",
+                1_001,
+            ),
+        ] {
+            conn.execute(
+                "INSERT INTO session_events \
+                 (source, session_id, project, message_id, ts_ms, role, kind, text, event_uid) \
+                 VALUES ('claude', 's1', '/work/needle', ?1, ?2, ?3, ?4, ?5, ?1)",
+                rusqlite::params![uid, ts, role, kind, text],
+            )
+            .unwrap();
+        }
+        let rows = search_all(
+            &conn,
+            &["ship".to_string()],
+            false,
+            &filter(100),
+            SearchRole::All,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1, "rows: {rows:?}");
+        assert_eq!(rows[0].echo_count, 1);
+    }
+
+    #[test]
+    fn a_snippet_centers_on_a_quoted_prefix_column_operand() {
+        let text = format!("concatenate {} catapult done", "filler ".repeat(20));
+        let (snippet, _, _) = compute_snippet(&text, &["text:\"cat\"*".to_string()], 30);
+        assert!(snippet.contains("catapult"), "snippet: {snippet}");
+    }
+
+    #[test]
+    fn a_snippet_folds_dotted_s_and_keeps_multi_diacritic_letters_distinct() {
+        let text = format!("{} ṡample end", "filler ".repeat(30));
+        let (snippet, _, _) = compute_snippet(&text, &["sample".to_string()], 30);
+        assert!(snippet.contains("ṡample"), "snippet: {snippet}");
+        // ḹ carries two diacritics; the tokenizer keeps it distinct from
+        // `l`, so a search for `l` centers on the standalone tail `l`.
+        let text = format!("ḹ{} tail l here", "x".repeat(60));
+        let (snippet, _, _) = compute_snippet(&text, &["l".to_string()], 20);
+        assert!(snippet.contains("tail l"), "snippet: {snippet}");
+    }
+
+    #[test]
     fn session_less_rows_never_group_with_each_other() {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();

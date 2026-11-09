@@ -72,36 +72,52 @@ struct Group {
 /// an echo. Both texts arrive whitespace-collapsed, each collapsed once
 /// per search rather than once per comparison; lengths are codepoints,
 /// cached by the caller where compared repeatedly.
-fn text_matches(echo: &SearchRow, echo_text: &str, primary_text: &str) -> bool {
+fn is_negation(word: &str) -> bool {
+    matches!(
+        word.to_ascii_lowercase().as_str(),
+        "no" | "not" | "never" | "cannot" | "can't" | "dont" | "don't" | "won't" | "n't"
+    )
+}
+
+fn words(text: &str) -> impl Iterator<Item = &str> {
+    text.split(|c: char| !c.is_alphanumeric() && c != '\'')
+        .filter(|word| !word.is_empty())
+}
+
+/// Whether one form of the echo text repeats the primary: the whole
+/// primary text appears, it makes up at least a third of the echo, and
+/// no negation flanks it. A negation changes the meaning ("Do not ship
+/// it" before, "ship it? No." after the prompt "ship it" is a substantive
+/// reply, not a repetition), however short the reply is.
+fn variant_matches(echo_text: &str, primary_text: &str) -> bool {
+    let Some(start) = echo_text.find(primary_text) else {
+        return false;
+    };
+    let negated = words(&echo_text[..start]).any(is_negation)
+        || words(&echo_text[start + primary_text.len()..])
+            .take(2)
+            .any(is_negation);
+    !negated && primary_text.chars().count() * 3 >= echo_text.chars().count()
+}
+
+fn text_matches(
+    echo: &SearchRow,
+    echo_text: &str,
+    echo_unescaped: Option<&str>,
+    primary_text: &str,
+) -> bool {
     if primary_text.is_empty()
         || !(echo.kind == "tool_use" || echo.kind == "tool_result" || echo.role == "assistant")
     {
         return false;
     }
-    // A tool payload may serialize the prompt with escaped quotes; that
-    // serialization is still the same verbatim text.
-    let unescaped;
-    let echo_text = if echo_text.contains("\\\"") {
-        unescaped = echo_text.replace("\\\"", "\"");
-        &unescaped
-    } else {
-        echo_text
-    };
-    let Some(start) = echo_text.find(primary_text) else {
-        return false;
-    };
-    // A negation in front of the quoted text changes its meaning ("Do not
-    // ship it" answering the prompt "ship it" is a substantive reply, not
-    // a repetition), however short the reply is.
-    let negated = echo_text[..start]
-        .split(|c: char| !c.is_alphanumeric() && c != '\'')
-        .any(|word| {
-            matches!(
-                word.to_ascii_lowercase().as_str(),
-                "no" | "not" | "never" | "cannot" | "can't" | "dont" | "don't" | "won't" | "n't"
-            )
-        });
-    !negated && primary_text.chars().count() * 3 >= echo_text.chars().count()
+    // The original text is tried first (a prompt that itself contains
+    // `\"` must still match its verbatim echo); a tool payload that
+    // serializes the prompt with escaped quotes is the fallback form.
+    // The caller builds the unescaped form once per candidate row, not
+    // once per primary it is compared against.
+    variant_matches(echo_text, primary_text)
+        || echo_unescaped.is_some_and(|text| variant_matches(text, primary_text))
 }
 
 /// Among the primaries an echo could join, the closest preceding one (the
@@ -131,12 +147,18 @@ fn pick_closest_preceding(
 /// it, and suppressing it would hide a substantive match. Among the
 /// primaries a repeating row could join, an explicit id link beats a
 /// text-only match, regardless of the rows' order.
-fn join_target(groups: &[Group], candidates: &[usize], row: &SearchRow, row_text: &str) -> Option<usize> {
+fn join_target(
+    groups: &[Group],
+    candidates: &[usize],
+    row: &SearchRow,
+    row_text: &str,
+    row_unescaped: Option<&str>,
+) -> Option<usize> {
     let mut linked: Vec<usize> = Vec::new();
     let mut by_text: Vec<usize> = Vec::new();
     for &index in candidates {
         let group = &groups[index];
-        if !text_matches(row, row_text, &group.primary_text) {
+        if !text_matches(row, row_text, row_unescaped, &group.primary_text) {
             continue;
         }
         if linked_to(row, &group.representative) {
@@ -198,7 +220,11 @@ pub(super) fn group_rows(rows: Vec<SearchRow>, bound_hit: bool) -> Vec<SearchRow
                 .unwrap_or(&[]),
             _ => &[],
         };
-        let joined = join_target(&groups, candidates, &row, &row_text);
+        // Built once per candidate row, not once per primary compared.
+        let row_unescaped = row_text
+            .contains("\\\"")
+            .then(|| row_text.replace("\\\"", "\""));
+        let joined = join_target(&groups, candidates, &row, &row_text, row_unescaped.as_deref());
         match joined {
             Some(index) => groups[index].size += 1,
             None => singletons.push(Group {

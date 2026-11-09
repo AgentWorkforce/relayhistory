@@ -311,9 +311,11 @@ export async function search(query: string, options: SearchOptions = {}): Promis
  * continue; it is `null` once no further match exists. Pages never skip or
  * repeat a match among rows present for the whole walk; rows committed
  * meanwhile appear wherever their `(timestampMs, id)` places them. Unlike
- * `search`, a page is always bounded by the total budget
- * (`maxTotalContentChars`, default 20000) and reports it in the envelope;
- * this is the read MCP `search_history` passes through.
+ * `search`, a page is bounded by the total budget
+ * (`maxTotalContentChars`, default 20000) and reports it in the envelope.
+ * The first match is the exception: it is returned in full even when it
+ * alone exceeds the budget, and `truncated` is then `true`. This is the
+ * read MCP `search_history` passes through.
  */
 export async function searchPage(query: string, options: SearchOptions = {}): Promise<SearchPage> {
   validateSearchBudget(options);
