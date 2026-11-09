@@ -441,13 +441,13 @@ const HISTORY_BRANCH: SearchBranch = SearchBranch {
     // `filters::RUST_WHITESPACE` (concat! takes literals only).
     columns: concat!(
         "h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms, 'user', 'history', ",
-        "(SELECT group_concat(e.message_id) FROM session_events e WHERE e.source = h.source ",
+        "(SELECT group_concat(e.message_id, char(31)) FROM session_events e WHERE e.source = h.source ",
         "AND e.session_id = h.session_id AND e.ts_ms = h.timestamp_ms ",
         "AND e.role = 'user' AND e.kind = 'text' AND trim(e.text, ",
         "char(9, 10, 11, 12, 13, 32, 133, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, ",
         "8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288)",
         ") = h.prompt), NULL, ",
-        "(SELECT group_concat(e.event_uid) FROM session_events e WHERE e.source = h.source ",
+        "(SELECT group_concat(e.event_uid, char(31)) FROM session_events e WHERE e.source = h.source ",
         "AND e.session_id = h.session_id AND e.ts_ms = h.timestamp_ms ",
         "AND e.role = 'user' AND e.kind = 'text' AND trim(e.text, ",
         "char(9, 10, 11, 12, 13, 32, 133, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, ",
@@ -477,8 +477,9 @@ fn search_row(row: &rusqlite::Row<'_>, match_source: &str) -> rusqlite::Result<S
     let role: String = row.get(6)?;
     let control_kind: Option<String> = row.get(12)?;
     let origin = derive_origin(match_source, &role, control_kind.as_deref());
-    // The history branch concatenates every mirrored event's ids; the
-    // first of each list stays the row's own id field and the rest are
+    // The history branch concatenates every mirrored event's ids with a
+    // unit-separator delimiter (an id containing a comma survives intact);
+    // the first of each list stays the row's own id field and the rest are
     // alternates echo linkage may name.
     let mut message_id: Option<String> = row.get(8)?;
     let mut event_uid: Option<String> = row.get(10)?;
@@ -486,7 +487,7 @@ fn search_row(row: &rusqlite::Row<'_>, match_source: &str) -> rusqlite::Result<S
     if match_source == MATCH_SOURCE_HISTORY {
         let split = |value: Option<String>, alt_ids: &mut Vec<String>| {
             let mut parts = value
-                .map(|v| v.split(',').map(str::to_string).collect::<Vec<_>>())
+                .map(|v| v.split('\u{1f}').map(str::to_string).collect::<Vec<_>>())
                 .unwrap_or_default();
             if parts.is_empty() {
                 None
@@ -2524,6 +2525,74 @@ mod tests {
         assert!(offset.unwrap() > 100, "offset past the substring hit: {offset:?}");
         let (snippet, _, _) = compute_snippet("the Škoda needle thread", &["skoda".to_string()], 40);
         assert!(snippet.contains("Škoda"), "snippet: {snippet}");
+    }
+
+    #[test]
+    fn a_snippet_skips_an_embedded_unicode_occurrence_without_panicking() {
+        let mut text = "котик ".to_string();
+        text.push_str(&"filler ".repeat(80));
+        text.push_str("кот");
+        let (snippet, _, offset) = compute_snippet(&text, &["кот".to_string()], 40);
+        assert!(snippet.ends_with("кот") || snippet.contains(" кот"), "snippet: {snippet}");
+        assert!(offset.unwrap() > 100, "offset past the embedded hit: {offset:?}");
+    }
+
+    #[test]
+    fn a_mirror_id_containing_a_comma_still_links() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        insert_history(
+            &conn,
+            &HistoryEntry {
+                id: 0,
+                source: "claude".into(),
+                session_id: Some("s1".into()),
+                project: Some("/work/needle".into()),
+                prompt: "ship it".into(),
+                prompt_hash: Some("hash-comma-mirror".into()),
+                timestamp_ms: 1_000,
+            },
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, project, message_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('claude', 's1', '/work/needle', 'id,with,commas', 1000, 'user', 'text', 'ship it', 'e-comma')",
+            [],
+        )
+        .unwrap();
+        insert_history(
+            &conn,
+            &HistoryEntry {
+                id: 0,
+                source: "claude".into(),
+                session_id: Some("s1".into()),
+                project: Some("/work/needle".into()),
+                prompt: "ship it".into(),
+                prompt_hash: Some("hash-comma-new".into()),
+                timestamp_ms: 2_000,
+            },
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, project, message_id, parent_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('claude', 's1', '/work/needle', 'm-echo', 'id,with,commas', 2001, 'assistant', 'text', 'assistant: ship it', 'e-echo')",
+            [],
+        )
+        .unwrap();
+        let rows = search_all(
+            &conn,
+            &["ship".to_string()],
+            false,
+            &filter(100),
+            SearchRole::All,
+        )
+        .unwrap();
+        let older = rows.iter().find(|row| row.timestamp_ms == 1_000).unwrap();
+        let newer = rows.iter().find(|row| row.timestamp_ms == 2_000).unwrap();
+        assert_eq!(older.echo_count, 1);
+        assert_eq!(newer.echo_count, 0);
     }
 
     #[test]

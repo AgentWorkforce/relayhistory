@@ -139,7 +139,15 @@ fn choose_occurrence(
         if chosen.is_none() {
             chosen = Some(lowered_start);
         }
-        search_from = byte_idx + 1;
+        // Advance past this occurrence's first char, in bytes: one byte
+        // forward can land inside a multibyte character, and the next
+        // slice would panic instead of searching on.
+        search_from = byte_idx
+            + text_lower[byte_idx..]
+                .chars()
+                .next()
+                .map(char::len_utf8)
+                .unwrap_or(1);
     }
     chosen
 }
