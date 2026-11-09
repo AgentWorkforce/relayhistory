@@ -15,7 +15,6 @@ use rusqlite::Connection;
 #[cfg(test)]
 use walk::{SORT_EVERY_MATCH, WALK_OUTCOMES};
 use filters::{append_event_search_filters, append_history_search_filters};
-use grouping::{fetch_rows, group_rows, grouped_page_is_stable, recount_echoes};
 use walk::{walk, walk_pays, BranchSearch};
 
 pub use presentation::{compute_snippet, DEFAULT_SNIPPET_CHARS};
