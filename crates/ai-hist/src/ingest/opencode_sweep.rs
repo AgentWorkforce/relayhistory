@@ -507,14 +507,18 @@ fn changed_sessions(
 
 /// Read the changed sessions. Session-keyed queries are bounded only when
 /// the provider indexes the column they seek on; without that index each one
-/// scans `part`, so the store is read whole once instead.
+/// scans `part`, so the store is read whole once instead. A store with no V1
+/// tables (one OpenCode 2 created) has nothing to scan, and `session_message`
+/// is keyed by session, so its sessions are always read one at a time.
 fn read_changed(
     src: &Connection,
     changed: Vec<Changed>,
     read: &mut StoreRead<'_>,
     sweep: &mut OpencodeSweep<'_>,
 ) -> Result<()> {
-    if opencode::sync_plan(src)? == OpencodeSyncPlan::PerSession {
+    if opencode::sync_plan(src)? == OpencodeSyncPlan::PerSession
+        || !opencode::v2::Layout::detect(src)?.has_v1()
+    {
         for session in changed {
             check_capture_cancelled()?;
             let loaded = opencode::load_from_sqlite(src, &session.session_id);
