@@ -22,8 +22,11 @@ pub use presentation::{compute_snippet, DEFAULT_SNIPPET_CHARS};
 
 mod filters;
 mod grouping;
+mod page;
 mod presentation;
 mod walk;
+
+use page::{fetch_grouped_window, present_rows, resolve_echoes};
 
 /// Which rows a search may match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -152,6 +155,11 @@ pub struct SearchRow {
     /// complete a group — clearing its flag — without completing the page.
     /// Not part of the wire contract; the napi layer does not map it.
     pub page_incomplete: bool,
+    /// Internal: further transcript ids this row is known by (every
+    /// mirrored event's ids for a history prompt). Echo linkage checks
+    /// them alongside `message_id`/`event_uid`/`tool_use_id`. Not part of
+    /// the wire contract; the napi layer does not map it.
+    pub alt_ids: Vec<String>,
 }
 
 impl SearchRow {
@@ -213,7 +221,7 @@ pub fn search_all(
             resolve_echoes(conn, terms, raw_fts, &window, role, rows, page_stable)?;
         grouped = rows;
         match continuation {
-            Some(cursor) if continuations < 8 => {
+            Some(cursor) if continuations < 64 => {
                 continuations += 1;
                 window.after = Some(cursor);
                 continue 'pages;
@@ -224,92 +232,6 @@ pub fn search_all(
     grouped.truncate(requested as usize);
     present_rows(&mut grouped, terms, filter);
     Ok(grouped)
-}
-
-/// Fetch and group one window, growing the per-branch bound until the page
-/// is provably complete or the growth cap accepts it. Returns the grouped
-/// rows and whether the page was proven complete; when it was not, the
-/// possibly-echo rows are flagged and the last row carries the
-/// `page_incomplete` marker `search_page` turns into a cursor.
-fn fetch_grouped_window(
-    conn: &Connection,
-    terms: &[String],
-    raw_fts: bool,
-    window: &QueryFilter,
-    role: SearchRole,
-    requested: i64,
-) -> Result<(Vec<SearchRow>, bool)> {
-    let mut fetch_limit = bounded_fetch_limit(requested);
-    loop {
-        let mut fetched = fetch_rows(conn, terms, raw_fts, window, role, fetch_limit)?;
-        let bound_hit = fetched.bound_hit;
-        let rows = std::mem::take(&mut fetched.rows);
-        let mut grouped = group_rows(rows, bound_hit);
-        if !bound_hit || grouped_page_is_stable(&grouped, requested, window, role, &fetched) {
-            return Ok((grouped, true));
-        }
-        if fetch_limit >= GROUP_FETCH_GROWTH_CAP {
-            for row in grouped.iter_mut().take(requested as usize) {
-                if !row.is_primary_candidate() {
-                    row.group_truncated = true;
-                }
-            }
-            if let Some(last) = grouped.iter_mut().take(requested as usize).last() {
-                last.page_incomplete = true;
-            }
-            return Ok((grouped, false));
-        }
-        fetch_limit = fetch_limit
-            .saturating_mul(2)
-            .min(GROUP_FETCH_GROWTH_CAP)
-            .max(fetch_limit + 1);
-    }
-}
-
-/// Resolve one window's echo counts and membership against the un-cursored
-/// match set. When the window was left incomplete by the growth cap and
-/// resolution dropped every row, returns the cursor past the oldest dropped
-/// row so the caller can continue instead of reporting an empty last page.
-fn resolve_echoes(
-    conn: &Connection,
-    terms: &[String],
-    raw_fts: bool,
-    window: &QueryFilter,
-    role: SearchRole,
-    rows: Vec<SearchRow>,
-    page_stable: bool,
-) -> Result<(Vec<SearchRow>, Option<HistoryCursor>)> {
-    let last_fetched = rows.last().map(|row| HistoryCursor {
-        timestamp_ms: row.timestamp_ms,
-        id: row.id,
-        match_source: Some(row.match_source.clone()),
-    });
-    let mut rows = recount_echoes(conn, terms, raw_fts, window, role, rows)?;
-    if page_stable {
-        return Ok((rows, None));
-    }
-    match rows.last_mut() {
-        Some(last) => {
-            last.page_incomplete = true;
-            Ok((rows, None))
-        }
-        None => Ok((rows, last_fetched)),
-    }
-}
-
-/// Fill each returned row's origin and match-centered snippet.
-fn present_rows(grouped: &mut [SearchRow], terms: &[String], filter: &QueryFilter) {
-    let max_chars = filter
-        .max_content_chars
-        .map(|value| value as usize)
-        .unwrap_or(DEFAULT_SNIPPET_CHARS);
-    for row in grouped {
-        row.origin = derive_origin(&row.match_source, &row.role, row.control_kind.as_deref());
-        let (snippet, truncated, offset) = compute_snippet(&row.text, terms, max_chars);
-        row.snippet = snippet;
-        row.content_truncated = truncated;
-        row.snippet_start_offset = offset;
-    }
 }
 
 /// One page of [`search_all`], with a cursor to the next page when a further
@@ -514,22 +436,24 @@ const HISTORY_BRANCH: SearchBranch = SearchBranch {
     // That mirror is suppressed from the event branch as a duplicate, so
     // borrow its message/event ids here: an echo linked to the mirror's id
     // can then be attributed to this prompt instead of whichever identical
-    // prompt the text alone would pick. The trim set inlined below mirrors
+    // prompt the text alone would pick. Every matching mirror contributes
+    // its ids (group_concat), not just the first, in case a prompt was
+    // recorded by more than one event. The trim set inlined below mirrors
     // `filters::RUST_WHITESPACE` (concat! takes literals only).
     columns: concat!(
         "h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms, 'user', 'history', ",
-        "(SELECT e.message_id FROM session_events e WHERE e.source = h.source ",
+        "(SELECT group_concat(e.message_id) FROM session_events e WHERE e.source = h.source ",
         "AND e.session_id = h.session_id AND e.ts_ms = h.timestamp_ms ",
         "AND e.role = 'user' AND e.kind = 'text' AND trim(e.text, ",
         "char(9, 10, 11, 12, 13, 32, 133, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, ",
         "8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288)",
-        ") = h.prompt LIMIT 1), NULL, ",
-        "(SELECT e.event_uid FROM session_events e WHERE e.source = h.source ",
+        ") = h.prompt), NULL, ",
+        "(SELECT group_concat(e.event_uid) FROM session_events e WHERE e.source = h.source ",
         "AND e.session_id = h.session_id AND e.ts_ms = h.timestamp_ms ",
         "AND e.role = 'user' AND e.kind = 'text' AND trim(e.text, ",
         "char(9, 10, 11, 12, 13, 32, 133, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, ",
         "8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288)",
-        ") = h.prompt LIMIT 1), NULL, NULL, NULL"
+        ") = h.prompt), NULL, NULL, NULL"
     ),
     after_history_tie: false,
     row: |row| search_row(row, MATCH_SOURCE_HISTORY),
@@ -554,6 +478,28 @@ fn search_row(row: &rusqlite::Row<'_>, match_source: &str) -> rusqlite::Result<S
     let role: String = row.get(6)?;
     let control_kind: Option<String> = row.get(12)?;
     let origin = derive_origin(match_source, &role, control_kind.as_deref());
+    // The history branch concatenates every mirrored event's ids; the
+    // first of each list stays the row's own id field and the rest are
+    // alternates echo linkage may name.
+    let mut message_id: Option<String> = row.get(8)?;
+    let mut event_uid: Option<String> = row.get(10)?;
+    let mut alt_ids: Vec<String> = Vec::new();
+    if match_source == MATCH_SOURCE_HISTORY {
+        let split = |value: Option<String>, alt_ids: &mut Vec<String>| {
+            let mut parts = value
+                .map(|v| v.split(',').map(str::to_string).collect::<Vec<_>>())
+                .unwrap_or_default();
+            if parts.is_empty() {
+                None
+            } else {
+                alt_ids.append(&mut parts.split_off(1.min(parts.len())));
+                parts.into_iter().next()
+            }
+        };
+        // split_off(1) when len==1 yields empty; guard above via min.
+        message_id = split(message_id, &mut alt_ids);
+        event_uid = split(event_uid, &mut alt_ids);
+    }
     Ok(SearchRow {
         id: row.get(0)?,
         source: row.get(1)?,
@@ -564,9 +510,9 @@ fn search_row(row: &rusqlite::Row<'_>, match_source: &str) -> rusqlite::Result<S
         role,
         kind: row.get(7)?,
         match_source: match_source.to_string(),
-        message_id: row.get(8)?,
+        message_id,
         parent_id: row.get(9)?,
-        event_uid: row.get(10)?,
+        event_uid,
         tool_use_id: row.get(11)?,
         control_kind,
         agent_id: row.get(13)?,
@@ -580,6 +526,7 @@ fn search_row(row: &rusqlite::Row<'_>, match_source: &str) -> rusqlite::Result<S
         is_primary: true,
         origin,
         page_incomplete: false,
+        alt_ids,
     })
 }
 
@@ -2477,6 +2424,107 @@ mod tests {
             20,
         );
         assert!(snippet.contains("café"), "snippet: {snippet}");
+    }
+
+    #[test]
+    fn a_reply_starting_with_the_prompt_but_adding_substance_stays_a_match() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, project, message_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('claude', 's1', '/work/needle', 'm-user', 1000, 'user', 'text', 'ship it', 'e-user')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, project, message_id, parent_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('claude', 's1', '/work/needle', 'm-reply', 'm-user', 1001, 'assistant', 'text', 'ship it only after fixing these failures in the importer and rerunning the whole suite', 'e-reply')",
+            [],
+        )
+        .unwrap();
+        let rows = search_all(
+            &conn,
+            &["ship".to_string()],
+            false,
+            &filter(100),
+            SearchRole::All,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 2, "a prefix alone must not make a long reply an echo");
+    }
+
+    #[test]
+    fn an_echo_linked_to_any_mirrored_event_id_uses_the_history_prompt() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        insert_history(
+            &conn,
+            &HistoryEntry {
+                id: 0,
+                source: "claude".into(),
+                session_id: Some("s1".into()),
+                project: Some("/work/needle".into()),
+                prompt: "ship it".into(),
+                prompt_hash: Some("hash-two-mirrors".into()),
+                timestamp_ms: 1_000,
+            },
+        )
+        .unwrap();
+        for (index, ts) in [(1, 1_000), (2, 1_000)] {
+            conn.execute(
+                "INSERT INTO session_events \
+                 (source, session_id, project, message_id, ts_ms, role, kind, text, event_uid) \
+                 VALUES ('claude', 's1', '/work/needle', ?, ?, 'user', 'text', 'ship it', ?)",
+                params![format!("mirror{index}"), ts, format!("em{index}")],
+            )
+            .unwrap();
+        }
+        insert_history(
+            &conn,
+            &HistoryEntry {
+                id: 0,
+                source: "claude".into(),
+                session_id: Some("s1".into()),
+                project: Some("/work/needle".into()),
+                prompt: "ship it".into(),
+                prompt_hash: Some("hash-two-mirrors-new".into()),
+                timestamp_ms: 2_000,
+            },
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, project, message_id, parent_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('claude', 's1', '/work/needle', 'm-echo', 'mirror2', 2001, 'assistant', 'text', 'assistant: ship it', 'e-echo')",
+            [],
+        )
+        .unwrap();
+        let rows = search_all(
+            &conn,
+            &["ship".to_string()],
+            false,
+            &filter(100),
+            SearchRole::All,
+        )
+        .unwrap();
+        let older = rows.iter().find(|row| row.timestamp_ms == 1_000).unwrap();
+        let newer = rows.iter().find(|row| row.timestamp_ms == 2_000).unwrap();
+        assert_eq!(older.echo_count, 1);
+        assert_eq!(newer.echo_count, 0);
+    }
+
+    #[test]
+    fn a_snippet_centers_on_the_standalone_token_not_an_earlier_substring() {
+        let mut text = "needlepoint ".to_string();
+        text.push_str(&"filler ".repeat(80));
+        text.push_str("needle");
+        let (snippet, _, offset) = compute_snippet(&text, &["needle".to_string()], 40);
+        assert!(snippet.contains(" needle") || snippet.ends_with("needle"), "snippet: {snippet}");
+        assert!(offset.unwrap() > 100, "offset past the substring hit: {offset:?}");
+        let (snippet, _, _) = compute_snippet("the Škoda needle thread", &["skoda".to_string()], 40);
+        assert!(snippet.contains("Škoda"), "snippet: {snippet}");
     }
 
     #[test]

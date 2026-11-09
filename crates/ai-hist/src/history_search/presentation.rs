@@ -7,7 +7,9 @@ pub const DEFAULT_SNIPPET_CHARS: usize = 320;
 /// The literal terms a snippet centers on: the query split on whitespace,
 /// stripped of FTS operators, quotes and a trailing `*`. Negated terms
 /// name no literal text; a column filter contributes its operand.
-fn snippet_terms(terms: &[String]) -> Vec<String> {
+/// Each term with whether it was a prefix (`*`) query: a plain term
+/// centers on a token-boundary occurrence, a prefix term on any substring.
+fn snippet_terms(terms: &[String]) -> Vec<(String, bool)> {
     let mut out = Vec::new();
     for raw in terms.iter().flat_map(|term| term.split_whitespace()) {
         let mut token = raw.trim().trim_matches(|c| c == '"' || c == '\'' || c == '(' || c == ')');
@@ -22,8 +24,10 @@ fn snippet_terms(terms: &[String]) -> Vec<String> {
                 continue;
             }
         }
+        let mut prefix = false;
         if let Some(stripped) = token.strip_suffix('*') {
             token = stripped;
+            prefix = true;
         }
         if token.is_empty() {
             continue;
@@ -32,7 +36,7 @@ fn snippet_terms(terms: &[String]) -> Vec<String> {
         if upper == "AND" || upper == "OR" || upper == "NOT" {
             continue;
         }
-        out.push(token.to_string());
+        out.push((token.to_string(), prefix));
     }
     out
 }
@@ -57,11 +61,87 @@ fn fold_char(ch: char) -> Vec<char> {
             'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ō' | 'ŏ' | 'ő' => out.push('o'),
             'ù' | 'ú' | 'û' | 'ü' | 'ũ' | 'ū' | 'ŭ' | 'ů' | 'ű' | 'ų' => out.push('u'),
             'ý' | 'ÿ' | 'ŷ' => out.push('y'),
+            'ğ' => out.push('g'),
+            'ĺ' | 'ľ' => out.push('l'),
+            'ŕ' | 'ř' => out.push('r'),
+            'ś' | 'š' | 'ş' => out.push('s'),
+            'ť' | 'ţ' => out.push('t'),
+            'ź' | 'ż' | 'ž' => out.push('z'),
             '\u{300}'..='\u{36f}' => {}
             other => out.push(other),
         }
     }
     out
+}
+
+/// Locate the earliest match of any term in the folded text, returned as
+/// (start, length) in original codepoints. FTS matches whole tokens, so
+/// a plain term prefers the first occurrence that is a whole token
+/// (neither neighbor alphanumeric or `_`) — `needle` centers on the
+/// standalone word rather than an earlier `needlepoint`. Prefix queries
+/// keep plain substring matching, and a substring occurrence remains the
+/// fallback when no whole-token occurrence exists.
+fn find_match(
+    text_lower: &str,
+    folded_chars: &[char],
+    lowered_to_original: &[usize],
+    terms: &[String],
+) -> Option<(usize, usize)> {
+    let mut best: Option<(usize, usize)> = None;
+    for (term, prefix) in snippet_terms(terms) {
+        let term_lower: String = term.chars().flat_map(fold_char).collect();
+        if term_lower.is_empty() {
+            continue;
+        }
+        let term_len = term_lower.chars().count();
+        if let Some(lowered_start) = choose_occurrence(text_lower, folded_chars, &term_lower, prefix)
+        {
+            let start = lowered_to_original[lowered_start];
+            let len = lowered_to_original[lowered_start + term_len - 1] + 1 - start;
+            let better = match best {
+                None => true,
+                Some((best_start, best_len)) => {
+                    start < best_start || (start == best_start && len > best_len)
+                }
+            };
+            if better {
+                best = Some((start, len));
+            }
+        }
+    }
+    best
+}
+
+/// The folded-codepoint offset of one term's chosen occurrence: the
+/// first whole-token occurrence for a plain term, the first substring
+/// occurrence for a prefix term or as a fallback.
+fn choose_occurrence(
+    text_lower: &str,
+    folded_chars: &[char],
+    term_lower: &str,
+    prefix: bool,
+) -> Option<usize> {
+    let term_len = term_lower.chars().count();
+    let mut search_from = 0;
+    let mut chosen: Option<usize> = None;
+    while let Some(rel) = text_lower[search_from..].find(term_lower) {
+        let byte_idx = search_from + rel;
+        let lowered_start = text_lower[..byte_idx].chars().count();
+        let starts_token = lowered_start == 0
+            || !folded_chars[lowered_start - 1].is_alphanumeric()
+                && folded_chars[lowered_start - 1] != '_';
+        let ends_token = lowered_start + term_len >= folded_chars.len()
+            || !folded_chars[lowered_start + term_len].is_alphanumeric()
+                && folded_chars[lowered_start + term_len] != '_';
+        if prefix || starts_token && ends_token {
+            return Some(lowered_start);
+        }
+        if chosen.is_none() {
+            chosen = Some(lowered_start);
+        }
+        search_from = byte_idx + 1;
+    }
+    chosen
 }
 
 /// A match-centered window of `text`, at most `max_content_chars` codepoints
@@ -103,28 +183,8 @@ pub fn compute_snippet(
             lowered_to_original.push(original_index);
         }
     }
-    let mut best: Option<(usize, usize)> = None;
-    for term in snippet_terms(terms) {
-        let term_lower: String = term.chars().flat_map(fold_char).collect();
-        if term_lower.is_empty() {
-            continue;
-        }
-        if let Some(byte_idx) = text_lower.find(&term_lower) {
-            let lowered_start = text_lower[..byte_idx].chars().count();
-            let lowered_len = term_lower.chars().count();
-            let start = lowered_to_original[lowered_start];
-            let len = lowered_to_original[lowered_start + lowered_len - 1] + 1 - start;
-            let better = match best {
-                None => true,
-                Some((best_start, best_len)) => {
-                    start < best_start || (start == best_start && len > best_len)
-                }
-            };
-            if better {
-                best = Some((start, len));
-            }
-        }
-    }
+    let folded_chars: Vec<char> = text_lower.chars().collect();
+    let best = find_match(&text_lower, &folded_chars, &lowered_to_original, terms);
     let Some((match_start, _)) = best else {
         let mut snippet: String = chars[..max - 1].iter().collect();
         snippet.push('\u{2026}');

@@ -25,7 +25,7 @@ Use these public operations:
   but exposes no such flags). Matches are grouped: an assistant or tool row
   that repeats a prompt verbatim collapses into that prompt as an echo
   (a reply that merely quotes the prompt in passing stays its own match),
-  counted by `groupSize`/`echoCount` (a lower bound when `groupTruncated`
+  counted by `groupSize`/`echoCount` (provisional when `groupTruncated`
   is set); pages return primaries only, and two identical-wording prompts
   at different timestamps both stay primaries.
   `prompt` keeps the full text; `snippet` is a match-centered window of it
