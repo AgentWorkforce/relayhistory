@@ -1489,26 +1489,6 @@ fn bounded_jsonl_from_bytes(bytes: &[u8]) -> BoundedJsonl {
     BoundedJsonl { head, tail }
 }
 
-fn claude_session_id_from_bounded(bounded: &BoundedJsonl) -> Result<Option<String>> {
-    let session_ids = bounded
-        .head_records()
-        .chain(bounded.tail_records_rev())
-        .filter_map(parse_record)
-        .filter_map(|value| {
-            value
-                .get("sessionId")
-                .and_then(Value::as_str)
-                .filter(|id| !id.is_empty())
-                .map(str::to_string)
-        })
-        .collect::<BTreeSet<_>>();
-    anyhow::ensure!(
-        session_ids.len() <= 1,
-        "conflicting sessionId values in Claude transcript"
-    );
-    Ok(session_ids.into_iter().next())
-}
-
 pub(crate) fn excerpt(text: &str) -> String {
     text.trim().chars().take(EXCERPT_MAX_CHARS).collect()
 }

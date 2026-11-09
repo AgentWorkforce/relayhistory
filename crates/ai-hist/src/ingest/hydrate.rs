@@ -2443,14 +2443,12 @@ fn ingest_claude(
         // than claiming bytes nobody parsed.
         Some(snapshot) => ingest_claude_hook_snapshot(conn, path, snapshot, cursor)?,
         None => {
+            // The record walk reads the file's session from this pass's fold
+            // and keeps it on the `cursor.claude` it rewrites.
+            cursor.claude.get_or_insert_with(Default::default).scan = scan;
             outcome.absorb(incremental::ingest_claude_transcript_incremental(
                 conn, path, None, cursor,
             )?);
-            // The record walk rewrites `cursor.claude`; put the metadata
-            // walk's own position back on it so both survive the same store.
-            if let Some(claude) = cursor.claude.as_mut() {
-                claude.scan = scan;
-            }
         }
     }
     continuity::capture_claude(
