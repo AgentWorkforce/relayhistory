@@ -195,38 +195,60 @@ pub fn search_all(
     // growth cap left incomplete: the dropped echoes were already counted,
     // and older matches beyond them must stay reachable.
     let mut window = filter.clone();
-    let mut grouped: Vec<SearchRow>;
     let mut continuations = 0;
+    let mut grouped: Vec<SearchRow>;
     'pages: loop {
-        let mut fetch_limit = bounded_fetch_limit(requested);
-        let mut page_stable = false;
-        loop {
-            let mut fetched = fetch_rows(conn, terms, raw_fts, &window, role, fetch_limit)?;
-            let bound_hit = fetched.bound_hit;
-            let rows = std::mem::take(&mut fetched.rows);
-            grouped = group_rows(rows, bound_hit);
-            if !bound_hit || grouped_page_is_stable(&grouped, requested, &window, role, &fetched)
-            {
-                page_stable = true;
-                break;
-            }
-            if fetch_limit >= GROUP_FETCH_GROWTH_CAP {
-                break;
-            }
-            fetch_limit = fetch_limit
-                .saturating_mul(2)
-                .min(GROUP_FETCH_GROWTH_CAP)
-                .max(fetch_limit + 1);
+        let (rows, page_stable) =
+            fetch_grouped_window(conn, terms, raw_fts, &window, role, requested)?;
+        if window.after.is_none() {
+            grouped = rows;
+            break;
         }
-        if !page_stable {
-            // The growth cap stopped the search before the page was provably
-            // complete: standalone rows in it may yet be echoes of a primary
-            // beyond the bound, so flag them instead of presenting them as
-            // certainly independent matches. The page-level marker goes on
-            // the last returned row and lives apart from `group_truncated`,
-            // so the echo recount below — which may complete a group's
-            // count — cannot clear the signal `search_page` needs to hand
-            // back a cursor.
+        // A page cursor must not change a primary's echo count, and an echo
+        // older than its primary must not resurface as its own match:
+        // resolve counts and membership against the un-cursored match set
+        // BEFORE the limit selects the page, so a dropped echo never
+        // consumes a page slot.
+        let (rows, continuation) =
+            resolve_echoes(conn, terms, raw_fts, &window, role, rows, page_stable)?;
+        grouped = rows;
+        match continuation {
+            Some(cursor) if continuations < 8 => {
+                continuations += 1;
+                window.after = Some(cursor);
+                continue 'pages;
+            }
+            _ => break,
+        }
+    }
+    grouped.truncate(requested as usize);
+    present_rows(&mut grouped, terms, filter);
+    Ok(grouped)
+}
+
+/// Fetch and group one window, growing the per-branch bound until the page
+/// is provably complete or the growth cap accepts it. Returns the grouped
+/// rows and whether the page was proven complete; when it was not, the
+/// possibly-echo rows are flagged and the last row carries the
+/// `page_incomplete` marker `search_page` turns into a cursor.
+fn fetch_grouped_window(
+    conn: &Connection,
+    terms: &[String],
+    raw_fts: bool,
+    window: &QueryFilter,
+    role: SearchRole,
+    requested: i64,
+) -> Result<(Vec<SearchRow>, bool)> {
+    let mut fetch_limit = bounded_fetch_limit(requested);
+    loop {
+        let mut fetched = fetch_rows(conn, terms, raw_fts, window, role, fetch_limit)?;
+        let bound_hit = fetched.bound_hit;
+        let rows = std::mem::take(&mut fetched.rows);
+        let mut grouped = group_rows(rows, bound_hit);
+        if !bound_hit || grouped_page_is_stable(&grouped, requested, window, role, &fetched) {
+            return Ok((grouped, true));
+        }
+        if fetch_limit >= GROUP_FETCH_GROWTH_CAP {
             for row in grouped.iter_mut().take(requested as usize) {
                 if !row.is_primary_candidate() {
                     row.group_truncated = true;
@@ -235,50 +257,59 @@ pub fn search_all(
             if let Some(last) = grouped.iter_mut().take(requested as usize).last() {
                 last.page_incomplete = true;
             }
+            return Ok((grouped, false));
         }
-        // A page cursor must not change a primary's echo count, and an echo
-        // older than its primary must not resurface as its own match:
-        // resolve counts and membership against the un-cursored match set
-        // BEFORE the limit selects the page, so a dropped echo never
-        // consumes a page slot.
-        if window.after.is_some() {
-            let last_fetched = grouped.last().map(|row| HistoryCursor {
-                timestamp_ms: row.timestamp_ms,
-                id: row.id,
-                match_source: Some(row.match_source.clone()),
-            });
-            grouped = recount_echoes(conn, terms, raw_fts, &window, role, grouped)?;
-            if !page_stable {
-                if let Some(last) = grouped.last_mut() {
-                    last.page_incomplete = true;
-                } else if let Some(cursor) = last_fetched {
-                    // Resolution dropped every fetched row: they were all
-                    // echoes of an earlier primary, and the cap had hidden
-                    // whatever follows them. Continue past the oldest
-                    // dropped row instead of reporting an empty last page.
-                    continuations += 1;
-                    if continuations <= 8 {
-                        window.after = Some(cursor);
-                        continue 'pages;
-                    }
-                }
-            }
-        }
-        break;
+        fetch_limit = fetch_limit
+            .saturating_mul(2)
+            .min(GROUP_FETCH_GROWTH_CAP)
+            .max(fetch_limit + 1);
     }
-    grouped.truncate(requested as usize);
+}
+
+/// Resolve one window's echo counts and membership against the un-cursored
+/// match set. When the window was left incomplete by the growth cap and
+/// resolution dropped every row, returns the cursor past the oldest dropped
+/// row so the caller can continue instead of reporting an empty last page.
+fn resolve_echoes(
+    conn: &Connection,
+    terms: &[String],
+    raw_fts: bool,
+    window: &QueryFilter,
+    role: SearchRole,
+    rows: Vec<SearchRow>,
+    page_stable: bool,
+) -> Result<(Vec<SearchRow>, Option<HistoryCursor>)> {
+    let last_fetched = rows.last().map(|row| HistoryCursor {
+        timestamp_ms: row.timestamp_ms,
+        id: row.id,
+        match_source: Some(row.match_source.clone()),
+    });
+    let mut rows = recount_echoes(conn, terms, raw_fts, window, role, rows)?;
+    if page_stable {
+        return Ok((rows, None));
+    }
+    match rows.last_mut() {
+        Some(last) => {
+            last.page_incomplete = true;
+            Ok((rows, None))
+        }
+        None => Ok((rows, last_fetched)),
+    }
+}
+
+/// Fill each returned row's origin and match-centered snippet.
+fn present_rows(grouped: &mut [SearchRow], terms: &[String], filter: &QueryFilter) {
     let max_chars = filter
         .max_content_chars
         .map(|value| value as usize)
         .unwrap_or(DEFAULT_SNIPPET_CHARS);
-    for row in &mut grouped {
+    for row in grouped {
         row.origin = derive_origin(&row.match_source, &row.role, row.control_kind.as_deref());
         let (snippet, truncated, offset) = compute_snippet(&row.text, terms, max_chars);
         row.snippet = snippet;
         row.content_truncated = truncated;
         row.snippet_start_offset = offset;
     }
-    Ok(grouped)
 }
 
 /// One page of [`search_all`], with a cursor to the next page when a further

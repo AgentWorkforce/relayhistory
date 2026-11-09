@@ -175,12 +175,13 @@ test('local discovery, hydration and cached evidence survive malformed commercia
         isPrimary: true,
         origin: 'human',
         controlKind: null,
-        eventUid: null,
+        // A history prompt borrows its mirrored user event's uid.
+        eventUid: 'contract-session-user:0',
         eventRef: {
           matchSource: 'history',
           id: prompts[0].id,
           sessionId: 'contract-session',
-          eventUid: null,
+          eventUid: 'contract-session-user:0',
         },
       },
     );
