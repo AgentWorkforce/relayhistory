@@ -10,7 +10,7 @@ pub mod sources;
 
 use std::path::{Path, PathBuf};
 
-use ai_hist::history_search::{search_all, search_page as core_search_page, SearchRole, SearchRow};
+use ai_hist::history_search::{search_all, search_page as core_search_page, SearchRole};
 use ai_hist::{
     default_db_path, open_db, open_db_readonly, recent as core_recent, relationship_capabilities,
     schema_is_catalog_read_current, schema_is_event_read_current, schema_is_evidence_read_current,
@@ -87,7 +87,12 @@ use serde::Serialize;
 /// intake. An addon that lacks it would ignore the option and still read a
 /// protected folder.
 /// 29 adds `agentName` (Claude's `agent-name`) to catalog rows.
-pub const NATIVE_CONTRACT_VERSION: u32 = 29;
+/// 30 adds search grouping and snippets: `NativeSearchMatch` carries
+/// `snippet`, `contentTruncated`, `snippetStartOffset`, `groupId`,
+/// `groupSize`, `echoCount`, `groupTruncated`, `isPrimary`, `origin`,
+/// `controlKind`, `eventUid` and `eventRef`, and `SearchOptions` takes
+/// `sessionId`, `kinds`, `origin` and `maxContentChars`.
+pub const NATIVE_CONTRACT_VERSION: u32 = 30;
 const DEFAULT_LIMIT: i64 = 50;
 const DEFAULT_EVENT_LIMIT: i64 = 200;
 
@@ -348,6 +353,7 @@ impl HistoryQueryOptions {
             until_ms: self.until_ms,
             after: self.after.clone().map(NativeHistoryCursor::into_core),
             limit,
+            ..Default::default()
         };
         filter
             .validate()
@@ -377,6 +383,16 @@ pub struct SearchOptions {
     pub raw_fts: Option<bool>,
     /// `all` (default), `user`, `assistant` or `prompt` — the CLI's `--role`.
     pub role: Option<String>,
+    /// Restrict to one session id.
+    pub session_id: Option<String>,
+    /// Restrict to these kinds (`history`, `text`, `thinking`, `tool_use`,
+    /// `tool_result`); absent means every kind.
+    pub kinds: Option<Vec<String>>,
+    /// Restrict to one origin: `human`, `peer`, `system`, `synthetic` or
+    /// `unknown`.
+    pub origin: Option<String>,
+    /// Snippet window in codepoints, 40..=2000 (default 320).
+    pub max_content_chars: Option<i64>,
 }
 
 struct SearchRequest {
@@ -392,23 +408,31 @@ impl SearchRequest {
         let options = options.unwrap_or_default();
         let limit = validate_limit(options.limit, 20, 1_000)?;
         let role = parse_search_role(options.role.as_deref())?;
+        let mut filter = HistoryQueryOptions {
+            scope: options.scope.clone(),
+            db_path: None,
+            source: options.source.clone(),
+            project: options.project.clone(),
+            tag: options.tag.clone(),
+            before_ms: options.before_ms,
+            since_ms: options.since_ms,
+            until_ms: options.until_ms,
+            after: options.after.clone(),
+            limit: None,
+        }
+        .filter(limit)?;
+        filter.session_id = options.session_id.clone();
+        filter.kinds = options.kinds.clone().unwrap_or_default();
+        filter.origin = options.origin.clone();
+        filter.max_content_chars = options.max_content_chars;
+        filter
+            .validate()
+            .map_err(|error| native_error("INVALID_ARGUMENT", format!("{error:#}")))?;
         Ok(Self {
             path: db_path(options.db_path.clone()),
             terms: query.split_whitespace().map(str::to_string).collect(),
             raw_fts: options.raw_fts.unwrap_or(false),
-            filter: HistoryQueryOptions {
-                scope: options.scope,
-                db_path: None,
-                source: options.source,
-                project: options.project,
-                tag: options.tag,
-                before_ms: options.before_ms,
-                since_ms: options.since_ms,
-                until_ms: options.until_ms,
-                after: options.after,
-                limit: None,
-            }
-            .filter(limit)?,
+            filter,
             role,
         })
     }
@@ -466,20 +490,24 @@ impl NativeHistoryEntry {
 
 /// The locations of each session a result set names, read once per session
 /// with one cached statement however many rows share it.
-struct SessionLocations<'c> {
+pub(crate) struct SessionLocations<'c> {
     conn: &'c rusqlite::Connection,
     known: std::collections::HashMap<(String, String), Vec<String>>,
 }
 
 impl<'c> SessionLocations<'c> {
-    fn new(conn: &'c rusqlite::Connection) -> Self {
+    pub(crate) fn new(conn: &'c rusqlite::Connection) -> Self {
         Self {
             conn,
             known: std::collections::HashMap::new(),
         }
     }
 
-    fn of(&mut self, source: &str, session_id: Option<&str>) -> anyhow::Result<Vec<String>> {
+    pub(crate) fn of(
+        &mut self,
+        source: &str,
+        session_id: Option<&str>,
+    ) -> anyhow::Result<Vec<String>> {
         let Some(session_id) = session_id else {
             return Ok(Vec::new());
         };
@@ -490,45 +518,6 @@ impl<'c> SessionLocations<'c> {
         let locations = session_locations(self.conn, source, session_id)?;
         self.known.insert(key, locations.clone());
         Ok(locations)
-    }
-}
-
-/// One `search` match. `id` is unique only within `match_source`: a prompt
-/// is a `history` row, anything else a `session_event` row.
-#[napi(object)]
-pub struct NativeSearchMatch {
-    pub id: i64,
-    pub source: String,
-    pub session_id: Option<String>,
-    pub project: Option<String>,
-    /// The matched text: the prompt for a `history` match, the event text
-    /// otherwise. Named `prompt` so a match is still a history entry.
-    pub prompt: String,
-    pub timestamp_ms: i64,
-    pub locations: Vec<String>,
-    /// `history` or `session_event`.
-    pub match_source: String,
-    /// `user` for a `history` match; the event's role otherwise.
-    pub role: String,
-    /// `history` for a `history` match; the event's kind otherwise.
-    pub kind: String,
-}
-
-impl NativeSearchMatch {
-    fn from_row(locations: &mut SessionLocations<'_>, row: SearchRow) -> anyhow::Result<Self> {
-        let locations = locations.of(&row.source, row.session_id.as_deref())?;
-        Ok(Self {
-            id: row.id,
-            source: row.source,
-            session_id: row.session_id,
-            project: row.project,
-            prompt: row.text,
-            timestamp_ms: row.timestamp_ms,
-            locations,
-            match_source: row.match_source,
-            role: row.role,
-            kind: row.kind,
-        })
     }
 }
 
@@ -1620,6 +1609,8 @@ pub async fn stats(options: Option<StatsOptions>) -> napi::Result<NativeStats> {
 
 mod catalog_session;
 pub use catalog_session::CatalogSession;
+mod search;
+pub use search::{NativeSearchEventRef, NativeSearchMatch};
 
 #[napi(object)]
 pub struct CatalogCursor {

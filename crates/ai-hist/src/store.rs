@@ -20,6 +20,8 @@ pub(crate) mod sync_connection;
 pub use retired_sources::is_retired_source;
 mod schema_check;
 use schema_check::REQUIRED_SESSIONS_COLUMNS;
+mod query_filter;
+pub use query_filter::QueryFilter;
 mod user_turn_page;
 use crate::ingest::evidence_reconcile::{record_history_presence, record_marker_presence};
 pub(crate) use event_row::row_to_session_event;
@@ -73,43 +75,6 @@ pub struct TaggedSession {
     pub project: Option<String>,
     pub entry_count: i64,
     pub last_activity_ms: Option<i64>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct QueryFilter {
-    pub source: Option<String>,
-    pub project: Option<String>,
-    pub tag: Option<String>,
-    /// Deprecated exclusive timestamp bound. Rows sharing the boundary
-    /// timestamp are skipped, so it is not a pagination cursor; use `after`.
-    pub before_ms: Option<i64>,
-    /// Inclusive lower bound on the row timestamp.
-    pub since_ms: Option<i64>,
-    /// Inclusive upper bound on the row timestamp.
-    pub until_ms: Option<i64>,
-    /// Keyset continuation: only rows strictly after this one in the read's
-    /// `(timestamp DESC, id DESC, match source)` order. Applied in addition
-    /// to the time window.
-    pub after: Option<HistoryCursor>,
-    pub limit: i64,
-    pub scope: SessionScope,
-}
-
-impl QueryFilter {
-    /// The checks every surface applies before a history read, so an invalid
-    /// window is the same error from the CLI, the SDK and MCP.
-    pub fn validate(&self) -> Result<()> {
-        if let (Some(since), Some(until)) = (self.since_ms, self.until_ms) {
-            anyhow::ensure!(
-                since <= until,
-                "since_ms ({since}) must not be later than until_ms ({until})"
-            );
-        }
-        if let Some(cursor) = &self.after {
-            cursor.validate()?;
-        }
-        Ok(())
-    }
 }
 
 /// Where a newest-first history read stopped: the last row it returned.

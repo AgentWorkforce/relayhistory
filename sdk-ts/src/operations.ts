@@ -98,6 +98,7 @@ export * from './git.js';
 
 export * from './contracts.js';
 import type {
+  HistoryCursor,
   HistoryEntry,
   HistoryPage,
   SearchMatch,
@@ -236,27 +237,95 @@ export async function nativeBuildProfile(): Promise<string> {
  * match says where it was found (`matchSource`) and, for an event, its `role`
  * and `kind`.
  */
+const DEFAULT_MAX_TOTAL_CONTENT_CHARS = 20_000;
+
+/** Validate the snippet and budget arguments every search surface shares. */
+function validateSearchBudget(options: SearchOptions): void {
+  if (options.maxContentChars !== undefined
+    && (!Number.isInteger(options.maxContentChars) || options.maxContentChars < 40 || options.maxContentChars > 2000)) {
+    throw new InvalidArgumentError(
+      `maxContentChars must be an integer between 40 and 2000 (got ${options.maxContentChars})`,
+      'INVALID_ARGUMENT',
+    );
+  }
+  if (options.maxTotalContentChars !== undefined
+    && (!Number.isInteger(options.maxTotalContentChars)
+      || options.maxTotalContentChars < 500 || options.maxTotalContentChars > 200_000)) {
+    throw new InvalidArgumentError(
+      `maxTotalContentChars must be an integer between 500 and 200000 (got ${options.maxTotalContentChars})`,
+      'INVALID_ARGUMENT',
+    );
+  }
+}
+
+/**
+ * Apply the total budget to normalized matches: account each match's final
+ * serialized JSON length in order and stop before exceeding the budget,
+ * always keeping at least one match. This lives here, not in the native
+ * layer, because the accounted length is the JSON a caller receives.
+ */
+function applySearchBudget(
+  matches: SearchMatch[],
+  budget: number,
+  nextCursor: HistoryCursor | null,
+): SearchPage {
+  const kept: SearchMatch[] = [];
+  let used = 0;
+  for (const match of matches) {
+    const length = JSON.stringify(match).length;
+    if (kept.length > 0 && used + length > budget) break;
+    kept.push(match);
+    used += length;
+  }
+  const truncated = kept.length < matches.length
+    || (kept.length === 1 && used > budget);
+  let cursor = nextCursor;
+  if (kept.length < matches.length && kept.length > 0) {
+    const last = kept[kept.length - 1];
+    cursor = { timestampMs: last.timestampMs, id: last.id, matchSource: last.matchSource };
+  }
+  return { matches: kept, nextCursor: cursor, truncated, totalContentCharsUsed: used };
+}
+
+/**
+ * Every match for `query`, up to `options.limit` rows. The total budget
+ * applies only when `maxTotalContentChars` is explicitly provided: with no
+ * budget given, all `limit` matches are returned and no truncation signal
+ * is lost, matching the Rust CLI. Use `searchPage` for the budgeted,
+ * enveloped read.
+ */
 export async function search(query: string, options: SearchOptions = {}): Promise<SearchMatch[]> {
+  validateSearchBudget(options);
   const scope = options.scope ?? 'local';
-  return nativeCall(async (native) =>
-    (await native.search(query, { ...options, scope, after: nativeHistoryCursor(options.after) })).map(searchMatch),
-  );
+  return nativeCall(async (native) => {
+    const { maxTotalContentChars: _budget, ...nativeOptions } = options;
+    const rows = await native.search(query, { ...nativeOptions, scope, after: nativeHistoryCursor(options.after) });
+    const matches = rows.map(searchMatch);
+    if (options.maxTotalContentChars === undefined) return matches;
+    return applySearchBudget(matches, options.maxTotalContentChars, null).matches;
+  });
 }
 
 /**
  * One page of `search`. Pass the returned `nextCursor` back as `after` to
  * continue; it is `null` once no further match exists. Pages never skip or
  * repeat a match among rows present for the whole walk; rows committed
- * meanwhile appear wherever their `(timestampMs, id)` places them.
+ * meanwhile appear wherever their `(timestampMs, id)` places them. Unlike
+ * `search`, a page is bounded by the total budget
+ * (`maxTotalContentChars`, default 20000) and reports it in the envelope.
+ * The first match is the exception: it is returned in full even when it
+ * alone exceeds the budget, and `truncated` is then `true`. This is the
+ * read MCP `search_history` passes through.
  */
 export async function searchPage(query: string, options: SearchOptions = {}): Promise<SearchPage> {
+  validateSearchBudget(options);
+  const budget = options.maxTotalContentChars ?? DEFAULT_MAX_TOTAL_CONTENT_CHARS;
   const scope = options.scope ?? 'local';
   return nativeCall(async (native) => {
-    const page = await native.searchPage(query, { ...options, scope, after: nativeHistoryCursor(options.after) });
-    return {
-      matches: Array.isArray(page.matches) ? page.matches.map(searchMatch) : [],
-      nextCursor: historyCursor(page.nextCursor),
-    };
+    const { maxTotalContentChars: _budget, ...nativeOptions } = options;
+    const page = await native.searchPage(query, { ...nativeOptions, scope, after: nativeHistoryCursor(options.after) });
+    const matches = Array.isArray(page.matches) ? page.matches.map(searchMatch) : [];
+    return applySearchBudget(matches, budget, historyCursor(page.nextCursor));
   });
 }
 

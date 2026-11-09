@@ -199,3 +199,44 @@ test('the TypeScript CLI and MCP page with the same cursor and window', async ()
     }
   });
 });
+
+test('a small total budget pages the remainder without skips or repeats', async () => {
+  await withTiedSession(async (dbPath) => {
+    const all = await search('pageneedle', { dbPath, limit: 1000 });
+    assert.equal(all.length, 10);
+
+    const walked: string[] = [];
+    let after: HistoryCursor | undefined;
+    let pages = 0;
+    for (;;) {
+      const page = await searchPage('pageneedle', { dbPath, limit: 1000, after, maxTotalContentChars: 500 });
+      pages += 1;
+      assert.ok(page.matches.length >= 1, 'a page always returns at least one match');
+      assert.ok(page.totalContentCharsUsed > 0);
+      assert.equal(
+        page.totalContentCharsUsed,
+        page.matches.reduce((sum, match) => sum + JSON.stringify(match).length, 0),
+      );
+      walked.push(...page.matches.map(key));
+      if (!page.nextCursor) break;
+      assert.equal(page.truncated, true, 'a budget-stopped page says so');
+      after = page.nextCursor;
+      assert.ok(pages < 30, 'the budget walk terminates');
+    }
+    assert.ok(pages > 1, 'the small budget split the result');
+    assert.deepEqual(walked, all.map(key), 'no match is skipped or repeated');
+
+    await assert.rejects(
+      () => searchPage('pageneedle', { dbPath, maxTotalContentChars: 100 }),
+      (error: unknown) => error instanceof InvalidArgumentError && /maxTotalContentChars must be an integer between 500 and 200000/.test(error.message),
+    );
+    await assert.rejects(
+      () => search('pageneedle', { dbPath, maxTotalContentChars: 200_001 }),
+      (error: unknown) => error instanceof InvalidArgumentError && /maxTotalContentChars/.test(error.message),
+    );
+    await assert.rejects(
+      () => searchPage('pageneedle', { dbPath, maxContentChars: 10 }),
+      (error: unknown) => error instanceof InvalidArgumentError && /maxContentChars must be an integer between 40 and 2000/.test(error.message),
+    );
+  });
+});

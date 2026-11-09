@@ -20,10 +20,30 @@ Use these public operations:
   indexed history reads. `search()`, MCP `search_history` and `ai-hist search`
   share one contract: prompts and session events, filtered by `role`
   (`all`, `user`, `assistant`, `prompt`), with each match's `matchSource`,
-  `role` and `kind`. Page them with `searchPage()` / `recentPage()` and the
-  returned `nextCursor` (MCP: pass the last row's `timestampMs`, `id` and
-  `matchSource` as `after`), and bound them with inclusive `sinceMs` /
-  `untilMs`. `beforeMs` is deprecated: it skips rows tied on its timestamp.
+  `role` and `kind`. The SDK (`sessionId`) and MCP (`session_id`) surfaces also accept
+  session, `kinds` and `origin` filters (`ai-hist search` shares the result contract
+  but exposes no such flags). Matches are grouped: an assistant or tool row
+  that repeats a prompt verbatim collapses into that prompt as an echo
+  (a reply that merely quotes the prompt in passing stays its own match),
+  counted by `groupSize`/`echoCount` (provisional when `groupTruncated`
+  is set); pages return primaries only, and two identical-wording prompts
+  at different timestamps both stay primaries.
+  `prompt` keeps the full text; `snippet` is a match-centered window of it
+  (`maxContentChars`, default 320 codepoints), with `contentTruncated` and
+  `snippetStartOffset`, plus `origin` and an `eventRef` for re-reading the
+  full row. Page them with `searchPage()` / `recentPage()` and the returned
+  `nextCursor` (MCP: pass `nextCursor` back unchanged as `after`; it is a
+  search position only), and bound them with inclusive `sinceMs` / `untilMs`.
+  The serialized-size budget `maxTotalContentChars` (MCP:
+  `max_total_content_chars`) bounds search pages only — `searchPage()` and
+  MCP `search_history` (default 20000); `recentPage()` does not accept it,
+  and `search()` returns every match up to `limit` unless a budget is
+  explicitly given. For a `session_event` match, `eventRef` names the event
+  `getSessionEvents` can re-read; for a `history` match it identifies the
+  history row itself, which may have no session id. MCP `search_history` returns an
+  envelope `{matches, nextCursor, truncated, totalContentCharsUsed}` and
+  rejects unknown arguments. `beforeMs` is deprecated: it skips rows tied on
+  its timestamp.
 - `getSessionRelationships()` / MCP `get_session_relationships` and
   `getSessionTree()` / MCP `get_session_tree` for delegation topology, plus
   the SDK-only `getSessionChildrenPage()`, `sessionDescendants()`, and
