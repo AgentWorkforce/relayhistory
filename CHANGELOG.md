@@ -27,6 +27,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - An echo now counts under the prompt it is linked to by id, or for a text-only echo the closest preceding identical prompt, instead of the newest matching prompt.
 - Snippets center on the match and report `snippetStartOffset` in original codepoints even when lowercasing expands a character (for example `İ`).
 - SDK `search()` returns all matches up to `limit` unless `maxTotalContentChars` is explicitly given; only `searchPage()` and MCP `search_history` apply the 20000 default budget.
+- Reconciliation retries a failing acquisition batch one path at a time and queues a path that fails alone for retry, so one unreadable transcript no longer blocks every path after it or keeps the pass from draining.
+- Resumed and forked Claude transcripts, which open with a copy of the origin session's records, are captured under the session they are named after, with a `fork` edge to the origin, instead of failing with conflicting `sessionId` values.
 
 ## [0.57.1] - 2026-11-07
 
