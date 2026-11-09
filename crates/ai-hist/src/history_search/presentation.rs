@@ -71,28 +71,39 @@ fn fold_char(ch: char) -> Vec<char> {
             'ś' | 'š' | 'ş' => out.push('s'),
             'ť' | 'ţ' => out.push('t'),
             'ź' | 'ż' | 'ž' => out.push('z'),
-            'ḃ' | 'ḅ' => out.push('b'),
-            'ḋ' | 'ḍ' => out.push('d'),
-            'ḟ' => out.push('f'),
-            'ġ' => out.push('g'),
-            'ḥ' => out.push('h'),
-            'ḳ' => out.push('k'),
-            'ḷ' | 'ḹ' => out.push('l'),
-            'ṁ' | 'ṃ' => out.push('m'),
-            'ṇ' => out.push('n'),
-            'ṗ' => out.push('p'),
-            'ṛ' | 'ṝ' => out.push('r'),
-            'ṣ' => out.push('s'),
-            'ṭ' => out.push('t'),
-            'ṿ' => out.push('v'),
-            'ẇ' | 'ẁ' | 'ẅ' => out.push('w'),
-            'ẋ' => out.push('x'),
-            'ỳ' => out.push('y'),
             '\u{300}'..='\u{36f}' => {}
-            other => out.push(other),
+            other => match fold_latin_extended_additional(other) {
+                Some(base) => out.push(base),
+                None => out.push(other),
+            },
         }
     }
     out
+}
+
+/// Fold the Latin Extended Additional dotted letters (`ḍ` -> `d`) the
+/// same way; split out of `fold_char` to keep each match small.
+fn fold_latin_extended_additional(ch: char) -> Option<char> {
+    Some(match ch {
+        'ḃ' | 'ḅ' => 'b',
+        'ḋ' | 'ḍ' => 'd',
+        'ḟ' => 'f',
+        'ġ' => 'g',
+        'ḥ' => 'h',
+        'ḳ' => 'k',
+        'ḷ' | 'ḹ' => 'l',
+        'ṁ' | 'ṃ' => 'm',
+        'ṇ' => 'n',
+        'ṗ' => 'p',
+        'ṛ' | 'ṝ' => 'r',
+        'ṣ' => 's',
+        'ṭ' => 't',
+        'ṿ' => 'v',
+        'ẇ' | 'ẁ' | 'ẅ' => 'w',
+        'ẋ' => 'x',
+        'ỳ' => 'y',
+        _ => return None,
+    })
 }
 
 /// Locate the earliest match of any term in the folded text, returned as
