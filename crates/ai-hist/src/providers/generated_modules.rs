@@ -10,6 +10,7 @@ pub(crate) mod cortex;
 pub(crate) mod cursor;
 pub(crate) mod deepagents;
 pub(crate) mod devin;
+pub(crate) mod droid;
 pub(crate) mod goose;
 pub(crate) mod grok;
 pub(crate) mod grok_bot;

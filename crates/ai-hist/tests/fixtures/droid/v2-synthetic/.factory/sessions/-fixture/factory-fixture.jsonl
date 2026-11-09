@@ -1,0 +1,9 @@
+{"type":"session_start","id":"factory-fixture","title":"Factory fixture","sessionTitle":"Factory fixture","owner":"fixture-owner","version":2,"cwd":"/fixture","hostId":"fixture-host"}
+{"type":"message","id":"u1","timestamp":"2026-11-01T00:00:00Z","message":{"role":"user","content":[{"type":"text","text":"Inspect the Factory fixture."}],"visibility":"both"}}
+{"type":"message","id":"a1","timestamp":"2026-11-01T00:00:01Z","message":{"role":"assistant","content":[{"type":"thinking","thinking":"Inspect the greeting.","signature":"fixture-not-a-signature"},{"type":"tool_use","id":"read1","name":"Read","input":{"file_path":"/fixture/greeting.txt"}}],"visibility":"both"}}
+{"type":"message","id":"r1","timestamp":"2026-11-01T00:00:02Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"read1","is_error":false,"content":"Hello Factory fixture."}],"visibility":"both"}}
+{"type":"message","id":"a2","timestamp":"2026-11-01T00:00:03Z","message":{"role":"assistant","content":[{"type":"text","text":"The greeting says Hello Factory fixture."}],"visibility":"both"}}
+{"type":"todo_state","id":"todo1","timestamp":"2026-11-01T00:00:04Z","todos":{"items":[]},"messageIndex":4}
+{"type":"message","id":"u2","timestamp":"2026-11-01T00:00:05Z","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"missing1","is_error":true,"content":[{"type":"text","text":"Fixture file missing."}]},{"type":"text","text":"Try the next fixture."}],"visibility":"both"}}
+{"type":"message","id":"a3","timestamp":"2026-11-01T00:00:06Z","message":{"role":"assistant","content":[{"type":"future_block","text":"Do not promote unknown blocks."},{"type":"text","text":"Ready for the next fixture."}],"visibility":"both"}}
+{"type":"session_end","timestamp":"2026-11-01T00:00:07Z","durationMs":7000,"toolCount":1,"finalText":"Ready for the next fixture."}

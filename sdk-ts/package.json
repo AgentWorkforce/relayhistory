@@ -28,6 +28,10 @@
     "./amp-source": {
       "types": "./dist/amp-source.d.ts",
       "default": "./dist/amp-source.js"
+    },
+    "./factory-source": {
+      "types": "./dist/factory-source.d.ts",
+      "default": "./dist/factory-source.js"
     }
   },
   "keywords": [
@@ -71,6 +75,7 @@
     "dist/source-contracts.*",
     "dist/source-plugins.*",
     "dist/amp-source.*",
+    "dist/factory-source.*",
     "!dist/*.test.*"
   ],
   "repository": {
