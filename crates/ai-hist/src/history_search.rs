@@ -191,51 +191,80 @@ pub fn search_all(
     // are regrouped until the page is provably complete, a branch is truly
     // exhausted, or the growth cap accepts the page with its possibly-echo
     // rows flagged `group_truncated`.
-    let mut fetch_limit = bounded_fetch_limit(requested);
+    // The window advances only when echo resolution empties a page the
+    // growth cap left incomplete: the dropped echoes were already counted,
+    // and older matches beyond them must stay reachable.
+    let mut window = filter.clone();
     let mut grouped: Vec<SearchRow>;
-    let mut page_stable = false;
-    loop {
-        let mut fetched = fetch_rows(conn, terms, raw_fts, filter, role, fetch_limit)?;
-        let bound_hit = fetched.bound_hit;
-        let rows = std::mem::take(&mut fetched.rows);
-        grouped = group_rows(rows, bound_hit);
-        if !bound_hit || grouped_page_is_stable(&grouped, requested, filter, role, &fetched) {
-            page_stable = true;
-            break;
+    let mut continuations = 0;
+    'pages: loop {
+        let mut fetch_limit = bounded_fetch_limit(requested);
+        let mut page_stable = false;
+        loop {
+            let mut fetched = fetch_rows(conn, terms, raw_fts, &window, role, fetch_limit)?;
+            let bound_hit = fetched.bound_hit;
+            let rows = std::mem::take(&mut fetched.rows);
+            grouped = group_rows(rows, bound_hit);
+            if !bound_hit || grouped_page_is_stable(&grouped, requested, &window, role, &fetched)
+            {
+                page_stable = true;
+                break;
+            }
+            if fetch_limit >= GROUP_FETCH_GROWTH_CAP {
+                break;
+            }
+            fetch_limit = fetch_limit
+                .saturating_mul(2)
+                .min(GROUP_FETCH_GROWTH_CAP)
+                .max(fetch_limit + 1);
         }
-        if fetch_limit >= GROUP_FETCH_GROWTH_CAP {
-            break;
-        }
-        fetch_limit = fetch_limit
-            .saturating_mul(2)
-            .min(GROUP_FETCH_GROWTH_CAP)
-            .max(fetch_limit + 1);
-    }
-    if !page_stable {
-        // The growth cap stopped the search before the page was provably
-        // complete: standalone rows in it may yet be echoes of a primary
-        // beyond the bound, so flag them instead of presenting them as
-        // certainly independent matches. The page-level marker goes on the
-        // last returned row and lives apart from `group_truncated`, so the
-        // echo recount below — which may complete a group's count — cannot
-        // clear the signal `search_page` needs to hand back a cursor.
-        for row in grouped.iter_mut().take(requested as usize) {
-            if !row.is_primary_candidate() {
-                row.group_truncated = true;
+        if !page_stable {
+            // The growth cap stopped the search before the page was provably
+            // complete: standalone rows in it may yet be echoes of a primary
+            // beyond the bound, so flag them instead of presenting them as
+            // certainly independent matches. The page-level marker goes on
+            // the last returned row and lives apart from `group_truncated`,
+            // so the echo recount below — which may complete a group's
+            // count — cannot clear the signal `search_page` needs to hand
+            // back a cursor.
+            for row in grouped.iter_mut().take(requested as usize) {
+                if !row.is_primary_candidate() {
+                    row.group_truncated = true;
+                }
+            }
+            if let Some(last) = grouped.iter_mut().take(requested as usize).last() {
+                last.page_incomplete = true;
             }
         }
-        if let Some(last) = grouped.iter_mut().take(requested as usize).last() {
-            last.page_incomplete = true;
+        // A page cursor must not change a primary's echo count, and an echo
+        // older than its primary must not resurface as its own match:
+        // resolve counts and membership against the un-cursored match set
+        // BEFORE the limit selects the page, so a dropped echo never
+        // consumes a page slot.
+        if window.after.is_some() {
+            let last_fetched = grouped.last().map(|row| HistoryCursor {
+                timestamp_ms: row.timestamp_ms,
+                id: row.id,
+                match_source: Some(row.match_source.clone()),
+            });
+            grouped = recount_echoes(conn, terms, raw_fts, &window, role, grouped)?;
+            if !page_stable {
+                if let Some(last) = grouped.last_mut() {
+                    last.page_incomplete = true;
+                } else if let Some(cursor) = last_fetched {
+                    // Resolution dropped every fetched row: they were all
+                    // echoes of an earlier primary, and the cap had hidden
+                    // whatever follows them. Continue past the oldest
+                    // dropped row instead of reporting an empty last page.
+                    continuations += 1;
+                    if continuations <= 8 {
+                        window.after = Some(cursor);
+                        continue 'pages;
+                    }
+                }
+            }
         }
-    }
-    // A page cursor must not change a primary's echo count, and an echo
-    // older than its primary must not resurface as its own match: resolve
-    // counts and membership against the un-cursored match set BEFORE the
-    // limit selects the page, so a dropped echo never consumes a page slot
-    // and a short page still signals continuation through the recount's
-    // `page_incomplete` marking.
-    if filter.after.is_some() {
-        grouped = recount_echoes(conn, terms, raw_fts, filter, role, grouped)?;
+        break;
     }
     grouped.truncate(requested as usize);
     let max_chars = filter
@@ -2259,6 +2288,72 @@ mod tests {
         assert_eq!(second.rows.len(), 1);
         assert_eq!(second.rows[0].text, "needle tail prompt");
         assert!(second.next_cursor.is_none());
+    }
+
+    #[test]
+    fn an_echo_only_capped_page_continues_to_older_matches() {
+        // Devin's scenario: a prompt, then more echoes than the grouping
+        // fetch cap, then an older prompt. The capped continued page holds
+        // only echoes; resolving them must not strand the older prompt.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for (session, ts, prompt) in [
+            ("sa", 5_000, "needle cap prompt"),
+            ("sb", 100, "needle older prompt"),
+        ] {
+            insert_history(
+                &conn,
+                &HistoryEntry {
+                    id: 0,
+                    source: "claude".into(),
+                    session_id: Some(session.into()),
+                    project: Some("/work/needle".into()),
+                    prompt: prompt.into(),
+                    prompt_hash: Some(format!("hash-cap-{session}")),
+                    timestamp_ms: ts,
+                },
+            )
+            .unwrap();
+        }
+        let mut batch = String::new();
+        for index in 0..2_001 {
+            batch.push_str(&format!(
+                "INSERT INTO session_events \
+                 (source, session_id, project, message_id, ts_ms, role, kind, text, event_uid) \
+                 VALUES ('claude', 'sa', '/work/needle', 'm{index}', {}, 'assistant', 'text', \
+                 'needle cap prompt (echo {index})', 'e{index}');",
+                1_000 + index
+            ));
+        }
+        conn.execute_batch(&batch).unwrap();
+        let terms = ["needle".to_string()];
+        let first = search_page(&conn, &terms, false, &filter(1), SearchRole::All).unwrap();
+        assert_eq!(first.rows[0].text, "needle cap prompt");
+        let second = search_page(
+            &conn,
+            &terms,
+            false,
+            &QueryFilter {
+                after: first.next_cursor,
+                ..filter(1)
+            },
+            SearchRole::All,
+        )
+        .unwrap();
+        assert_eq!(second.rows.len(), 1);
+        assert_eq!(second.rows[0].text, "needle older prompt");
+    }
+
+    #[test]
+    fn a_snippet_does_not_center_on_a_sharp_s_fold_the_search_did_not_match() {
+        let mut text = "Strasse ".to_string();
+        text.push_str(&"filler ".repeat(80));
+        text.push_str("Straße");
+        let (snippet, _, offset) = compute_snippet(&text, &["strasse".to_string()], 40);
+        assert!(snippet.contains("Strasse"), "snippet: {snippet}");
+        assert_eq!(offset, Some(0));
+        let (snippet, _, _) = compute_snippet(&text, &["straße".to_string()], 40);
+        assert!(snippet.contains("Straße"), "snippet: {snippet}");
     }
 
     #[test]

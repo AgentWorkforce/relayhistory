@@ -37,29 +37,26 @@ fn snippet_terms(terms: &[String]) -> Vec<String> {
     out
 }
 
-/// Fold one char for snippet matching: lowercase it, strip Latin
-/// diacritics (`é` -> `e`), and drop combining marks. Expansions (`ß` ->
-/// `ss`) yield several chars; the caller maps every yielded char back to
-/// the original codepoint.
+/// Fold one char for snippet matching the way the FTS5 unicode61
+/// tokenizer indexes text: lowercase, strip diacritic marks (`é` -> `e`),
+/// and drop combining marks. Letters the tokenizer keeps distinct stay
+/// distinct — `ß` does not become `ss`, `æ` does not become `ae` — or the
+/// snippet could center on a word the search never matched. Expansions
+/// from lowercasing (`İ` -> `i̇`) yield several chars; the caller maps
+/// every yielded char back to the original codepoint.
 fn fold_char(ch: char) -> Vec<char> {
     let mut out = Vec::new();
     for lowered in ch.to_lowercase() {
         match lowered {
             'à' | 'á' | 'â' | 'ã' | 'ä' | 'å' | 'ā' | 'ă' | 'ą' => out.push('a'),
             'ç' | 'ć' | 'ĉ' | 'ċ' | 'č' => out.push('c'),
-            'ď' | 'đ' | 'ð' => out.push('d'),
+            'ď' => out.push('d'),
             'è' | 'é' | 'ê' | 'ë' | 'ē' | 'ĕ' | 'ė' | 'ę' | 'ě' => out.push('e'),
-            'ì' | 'í' | 'î' | 'ï' | 'ĩ' | 'ī' | 'ĭ' | 'į' | 'ı' => out.push('i'),
-            'ł' => out.push('l'),
+            'ì' | 'í' | 'î' | 'ï' | 'ĩ' | 'ī' | 'ĭ' | 'į' => out.push('i'),
             'ñ' | 'ń' | 'ņ' | 'ň' => out.push('n'),
             'ò' | 'ó' | 'ô' | 'õ' | 'ö' | 'ō' | 'ŏ' | 'ő' => out.push('o'),
             'ù' | 'ú' | 'û' | 'ü' | 'ũ' | 'ū' | 'ŭ' | 'ů' | 'ű' | 'ų' => out.push('u'),
             'ý' | 'ÿ' | 'ŷ' => out.push('y'),
-            'ß' => out.extend(['s', 's']),
-            'æ' => out.extend(['a', 'e']),
-            'œ' => out.extend(['o', 'e']),
-            'ø' => out.push('o'),
-            'þ' => out.extend(['t', 'h']),
             '\u{300}'..='\u{36f}' => {}
             other => out.push(other),
         }
