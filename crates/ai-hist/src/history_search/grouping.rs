@@ -87,8 +87,21 @@ fn text_matches(echo: &SearchRow, echo_text: &str, primary_text: &str) -> bool {
     } else {
         echo_text
     };
-    echo_text.contains(primary_text)
-        && primary_text.chars().count() * 3 >= echo_text.chars().count()
+    let Some(start) = echo_text.find(primary_text) else {
+        return false;
+    };
+    // A negation in front of the quoted text changes its meaning ("Do not
+    // ship it" answering the prompt "ship it" is a substantive reply, not
+    // a repetition), however short the reply is.
+    let negated = echo_text[..start]
+        .split(|c: char| !c.is_alphanumeric() && c != '\'')
+        .any(|word| {
+            matches!(
+                word.to_ascii_lowercase().as_str(),
+                "no" | "not" | "never" | "cannot" | "can't" | "dont" | "don't" | "won't" | "n't"
+            )
+        });
+    !negated && primary_text.chars().count() * 3 >= echo_text.chars().count()
 }
 
 /// Among the primaries an echo could join, the closest preceding one (the

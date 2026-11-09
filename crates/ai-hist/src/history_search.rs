@@ -2730,6 +2730,33 @@ mod tests {
     }
 
     #[test]
+    fn a_short_negating_reply_is_not_an_echo() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for (uid, role, text, ts) in [
+            ("e-user", "user", "ship it", 1_000),
+            ("e-asst", "assistant", "Do not ship it", 1_001),
+        ] {
+            conn.execute(
+                "INSERT INTO session_events \
+                 (source, session_id, project, message_id, ts_ms, role, kind, text, event_uid) \
+                 VALUES ('claude', 's1', '/work/needle', ?1, ?2, ?3, 'text', ?4, ?1)",
+                rusqlite::params![uid, ts, role, text],
+            )
+            .unwrap();
+        }
+        let rows = search_all(
+            &conn,
+            &["ship".to_string()],
+            false,
+            &filter(100),
+            SearchRole::All,
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 2, "rows: {rows:?}");
+    }
+
+    #[test]
     fn session_less_rows_never_group_with_each_other() {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
