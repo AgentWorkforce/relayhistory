@@ -669,11 +669,12 @@ mod tests {
         );
 
         let cursor = call("capabilities", json!({ "source": "cursor" })).unwrap();
-        assert_eq!(cursor["fullCoverage"], json!(false));
-        assert!(!cursor["missingEvidenceKinds"]
-            .as_array()
-            .unwrap()
-            .is_empty());
-        assert_eq!(cursor["relationships"]["stableChildIdentity"], "never");
+        assert_eq!(cursor["fullCoverage"], json!(true));
+        assert_eq!(cursor["relationships"]["stableChildIdentity"], "always");
+
+        let devin = call("capabilities", json!({ "source": "devin" })).unwrap();
+        assert_eq!(devin["fullCoverage"], json!(false));
+        assert!(!devin["missingEvidenceKinds"].as_array().unwrap().is_empty());
+        assert_eq!(devin["relationships"]["stableChildIdentity"], "never");
     }
 }

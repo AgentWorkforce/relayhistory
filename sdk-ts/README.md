@@ -92,7 +92,8 @@ explicit plugin modules/options; `--source-connector` selects their IDs and is
 repeatable. `--no-source-connectors` disables remote acquisition. MCP uses
 `AI_HIST_PLUGIN_CONFIG` and `source_connectors`. Scope defaults to local even
 with plugins configured. See [source plugins](../docs/source-plugins.md).
-Native contract 28 rejects old addons that lack the source/delivery boundary.
+Native contract 29 requires a matching addon, including current catalog and
+source/delivery contracts.
 
 Catalog pages, discovery results, statistics, and sync results echo the requested `scope`,
 and discovery results additionally report `locationsRun` — the connector

@@ -87,8 +87,36 @@ async function setCrateVersion(directory, version) {
     );
     if (!written.includes(path)) written.push(path);
   }
+  // A plugin crate published to crates.io (`history-provider-sources`) needs
+  // a registry requirement on the core crate beside its path. It builds on
+  // `unstable-internal`, which is outside ai-hist's semver contract, so the
+  // requirement is an exact pin on the same release.
+  const manifest = await readFile(manifestPath, "utf8");
+  if (coreDependencyLinePattern.test(manifest)) {
+    assert.match(
+      manifest,
+      coreDependencyVersionPattern,
+      `${manifestPath} must pin ${coreCrate} as { version = "=<version>", path = ... }`,
+    );
+    await writeFile(
+      manifestPath,
+      manifest.replace(
+        coreDependencyVersionPattern,
+        (_, prefix, suffix) => prefix + version + suffix,
+      ),
+    );
+    if (!written.includes(manifestPath)) written.push(manifestPath);
+  }
   return written;
 }
+
+/** A plugin crate's dependency line on the core crate. */
+const coreDependencyLinePattern = new RegExp(`^${coreCrate} = `, "m");
+/** Its exact registry requirement, which the release stamps. */
+const coreDependencyVersionPattern = new RegExp(
+  `(^${coreCrate} = \\{ version = "=)[^"]+(")`,
+  "m",
+);
 
 /** The out-of-tree consumer that builds against the crates.io core crate. */
 export const consumerExample = "examples/rust-consumer";
@@ -184,6 +212,12 @@ async function setCoreCrateVersion(root, version) {
       ),
     ],
     [resolve(root, "Cargo.lock"), lockVersionPattern(coreCrate)],
+    // This standalone path consumer has its own lock, so --locked CI must
+    // follow the core version even though its dependency has no version pin.
+    [
+      resolve(root, "examples/rust-local-source/Cargo.lock"),
+      lockVersionPattern(coreCrate),
+    ],
   ];
   for (const [path, pattern] of files) {
     const contents = await readFile(path, "utf8");

@@ -99,9 +99,7 @@ pub fn scan_claude_transcript(path: &Path) -> Result<Option<ContinuityEvidence>>
         .with_context(|| format!("reading Claude transcript {}", path.display()))?;
     let mut reader = std::io::BufReader::new(file);
     let mut raw = Vec::new();
-    let mut evidence = ContinuityEvidence::default();
-    let mut first_user_seen = false;
-    let mut any = false;
+    let mut fold = crate::ingest::ClaudeMetaFold::for_path(path);
     while next_record(&mut reader, &mut raw)
         .with_context(|| format!("reading Claude transcript {}", path.display()))?
         .is_some()
@@ -113,22 +111,17 @@ pub fn scan_claude_transcript(path: &Path) -> Result<Option<ContinuityEvidence>>
         let Ok(line) = std::str::from_utf8(&raw) else {
             continue;
         };
-        any |= fold_claude_line(&mut evidence, &mut first_user_seen, line);
+        fold_claude_line(&mut fold, line);
     }
-    Ok(finish_claude_fold(evidence, any, path))
+    Ok(fold.finish_continuity(path))
 }
 
-/// Fold one transcript line that is a JSON object; whether it was one.
-pub(super) fn fold_claude_line(
-    evidence: &mut ContinuityEvidence,
-    first_user_seen: &mut bool,
-    line: &str,
-) -> bool {
-    let Ok(Value::Object(object)) = serde_json::from_str::<Value>(line) else {
-        return false;
-    };
-    fold_claude_record(evidence, first_user_seen, &object);
-    true
+/// Fold one transcript line that is a JSON object through the metadata fold,
+/// which owns continuity's fold and the file's session ownership.
+pub(super) fn fold_claude_line(fold: &mut crate::ingest::ClaudeMetaFold, line: &str) {
+    if let Ok(value @ Value::Object(_)) = serde_json::from_str::<Value>(line) {
+        fold.observe(&value);
+    }
 }
 
 /// Settle a folded evidence set into the row it should record, or `None`.

@@ -25,6 +25,9 @@ pub fn ai_hist::project_identity::project_identity(&std::path::Path) -> ai_hist:
 pub fn ai_hist::project_identity::resolve_project_identity(&str) -> ai_hist::project_identity::ProjectIdentity
 pub type ai_hist::project_identity::GitConfig = std::collections::hash::map::HashMap<alloc::string::String, std::collections::hash::map::HashMap<alloc::string::String, alloc::vec::Vec<alloc::string::String>>>
 pub mod ai_hist::retention
+#[non_exhaustive] pub struct ai_hist::retention::RetentionChanges
+pub ai_hist::retention::RetentionChanges::generation: u64
+pub ai_hist::retention::RetentionChanges::sessions: core::option::Option<alloc::vec::Vec<ai_hist::SessionIdentity>>
 pub struct ai_hist::retention::RetentionOptions
 pub ai_hist::retention::RetentionOptions::allow_unuploaded: bool
 pub ai_hist::retention::RetentionOptions::max_rows: u32
@@ -203,6 +206,7 @@ pub ai_hist::SessionScope::Local
 pub ai_hist::SessionScope::Remote
 #[non_exhaustive] pub enum ai_hist::Source
 pub ai_hist::Source::Antigravity
+pub ai_hist::Source::Capy
 pub ai_hist::Source::Claude
 pub ai_hist::Source::Cline
 pub ai_hist::Source::Codebuddy
@@ -404,6 +408,8 @@ pub ai_hist::CompactReport::wal_truncated: bool
 pub ai_hist::Diagnostic::code: alloc::string::String
 pub ai_hist::Diagnostic::message: alloc::string::String
 pub ai_hist::Diagnostic::subject: core::option::Option<alloc::string::String>
+impl core::convert::From<ai_hist::SyncDiagnostic> for ai_hist::Diagnostic
+pub fn ai_hist::Diagnostic::from(ai_hist::SyncDiagnostic) -> Self
 #[non_exhaustive] pub struct ai_hist::DiscoveryOptions
 pub ai_hist::DiscoveryOptions::limit: core::option::Option<usize>
 pub ai_hist::DiscoveryOptions::paths: core::option::Option<alloc::vec::Vec<std::path::PathBuf>>
@@ -862,6 +868,8 @@ pub fn ai_hist::SessionStore::reconcile(&self) -> core::result::Result<ai_hist::
 impl ai_hist::SessionStore
 pub fn ai_hist::SessionStore::resumes_from(&self, ai_hist::Watermark, &ai_hist::ChangeQuery) -> core::result::Result<bool, ai_hist::Error>
 impl ai_hist::SessionStore
+pub fn ai_hist::SessionStore::retention_changes_since(&self, u64) -> core::result::Result<ai_hist::retention::RetentionChanges, ai_hist::Error>
+impl ai_hist::SessionStore
 pub fn ai_hist::SessionStore::session_profile(&self, &ai_hist::SessionRef) -> core::result::Result<core::option::Option<ai_hist::SessionProfile>, ai_hist::Error>
 impl ai_hist::SessionStore
 pub fn ai_hist::SessionStore::sync(&self, ai_hist::SyncOptions) -> core::result::Result<ai_hist::SyncReport, ai_hist::Error>
@@ -993,6 +1001,13 @@ impl serde_core::ser::Serialize for ai_hist::StoredRow
 pub fn ai_hist::StoredRow::serialize<S: serde_core::ser::Serializer>(&self, S) -> core::result::Result<<S as serde_core::ser::Serializer>::Ok, <S as serde_core::ser::Serializer>::Error>
 impl<'de> serde_core::de::Deserialize<'de> for ai_hist::StoredRow
 pub fn ai_hist::StoredRow::deserialize<D: serde_core::de::Deserializer<'de>>(D) -> core::result::Result<Self, <D as serde_core::de::Deserializer>::Error>
+#[non_exhaustive] pub struct ai_hist::SyncDiagnostic
+pub ai_hist::SyncDiagnostic::code: alloc::string::String
+pub ai_hist::SyncDiagnostic::message: alloc::string::String
+pub ai_hist::SyncDiagnostic::source: ai_hist::Source
+pub ai_hist::SyncDiagnostic::subject: core::option::Option<alloc::string::String>
+impl core::convert::From<ai_hist::SyncDiagnostic> for ai_hist::Diagnostic
+pub fn ai_hist::Diagnostic::from(ai_hist::SyncDiagnostic) -> Self
 #[non_exhaustive] pub struct ai_hist::SyncOptions
 pub ai_hist::SyncOptions::codex_sqlite_max_age_days: core::option::Option<u64>
 pub ai_hist::SyncOptions::force: bool
@@ -1011,12 +1026,14 @@ pub fn ai_hist::SyncOptions::sources(self, impl core::iter::traits::collect::Int
 pub fn ai_hist::SyncOptions::stop(self, ai_hist::StopToken) -> Self
 #[non_exhaustive] pub struct ai_hist::SyncReport
 pub ai_hist::SyncReport::changed: alloc::vec::Vec<ai_hist::SessionRef>
+pub ai_hist::SyncReport::diagnostics: alloc::vec::Vec<ai_hist::SyncDiagnostic>
 pub ai_hist::SyncReport::head_revision: u64
 pub ai_hist::SyncReport::swept: bool
 #[non_exhaustive] pub struct ai_hist::TickReport
 pub ai_hist::TickReport::cancelled: bool
 pub ai_hist::TickReport::changed: alloc::vec::Vec<ai_hist::SessionRef>
 pub ai_hist::TickReport::contended: bool
+pub ai_hist::TickReport::diagnostics: alloc::vec::Vec<ai_hist::SyncDiagnostic>
 pub ai_hist::TickReport::elapsed_ms: u64
 pub ai_hist::TickReport::first_event_age_ms: core::option::Option<u64>
 pub ai_hist::TickReport::forced: bool

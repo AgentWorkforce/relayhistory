@@ -18,6 +18,8 @@ pub const CLAUDE_WEB_CONNECTOR: &str = "claude-web";
 pub const CODEX_CLOUD_CONNECTOR: &str = "codex-cloud";
 /// Connector name for the api.devin.ai organization session lister.
 pub const DEVIN_CLOUD_CONNECTOR: &str = "devin-cloud";
+/// Connector name for the api.cursor.com Cloud Agents lister.
+pub const CURSOR_CLOUD_CONNECTOR: &str = "cursor-cloud";
 
 /// Most listing pages one enumeration may fetch, whatever the caller asked.
 const MAX_LIST_PAGES: usize = 100;
@@ -34,6 +36,8 @@ pub const MAX_REMOTE_MESSAGE_BYTES: usize = 64 * 1024;
 
 mod claude_web;
 mod codex_diff;
+mod cursor_cloud;
+mod cursor_hydrate;
 mod devin_auth;
 mod devin_cloud;
 
@@ -51,6 +55,8 @@ use claude_web::{
 use claude_web::{claude_api_base_url, excerpt_one_line, UreqClaudeTransport};
 pub use claude_web::{ClaudeHttpResponse, ClaudeSessionsTransport, ClaudeWebProvider};
 
+use cursor_cloud::{cursor_provider_at, cursor_status};
+pub use cursor_cloud::{CursorCloudProvider, CursorHttpResponse, CursorTransport};
 use devin_auth::{devin_provider_at, devin_status};
 pub use devin_cloud::DevinCloudProvider;
 
@@ -64,7 +70,7 @@ pub use send::{send_remote_message_at, send_remote_message_with, RemoteCredentia
 /// cannot.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoteConnectorStatus {
-    /// Connector name (`claude-web`, `codex-cloud`, `cloud`).
+    /// Connector name (`claude-web`, `codex-cloud`, `devin-cloud`, `cursor-cloud`).
     pub connector: &'static str,
     /// The upstream source, or `"*"` for a cross-source connector.
     pub source: &'static str,
@@ -103,6 +109,7 @@ impl Default for SourceConnectorSelection {
                 CLAUDE_WEB_CONNECTOR.into(),
                 CODEX_CLOUD_CONNECTOR.into(),
                 DEVIN_CLOUD_CONNECTOR.into(),
+                CURSOR_CLOUD_CONNECTOR.into(),
             ],
         }
     }
@@ -116,6 +123,7 @@ impl SourceConnectorSelection {
                     CLAUDE_WEB_CONNECTOR,
                     CODEX_CLOUD_CONNECTOR,
                     DEVIN_CLOUD_CONNECTOR,
+                    CURSOR_CLOUD_CONNECTOR,
                 ]
                 .contains(&id.as_str()),
                 "invalid source connector '{id}'"
@@ -153,6 +161,7 @@ pub fn selected_remote_connector_statuses_at(
         (CLAUDE_WEB_CONNECTOR, "claude"),
         (CODEX_CLOUD_CONNECTOR, "codex"),
         (DEVIN_CLOUD_CONNECTOR, "devin"),
+        (CURSOR_CLOUD_CONNECTOR, "cursor"),
     ] {
         if !selection.contains(connector)
             || (!sources.is_empty() && !sources.iter().any(|s| s == source))
@@ -162,6 +171,7 @@ pub fn selected_remote_connector_statuses_at(
         let (configured, detail) = match connector {
             CLAUDE_WEB_CONNECTOR => cli_credential_status(claude_credentials_path(home)),
             CODEX_CLOUD_CONNECTOR => cli_credential_status(codex_auth_path(home)),
+            CURSOR_CLOUD_CONNECTOR => cursor_status(home),
             _ => devin_status(home),
         };
         statuses.push(RemoteConnectorStatus {
@@ -286,7 +296,10 @@ pub fn ensure_selected_remote_connectors_configured_for_at(
                 "hydration" | "hydrate" => {
                     matches!(
                         id.as_str(),
-                        CLAUDE_WEB_CONNECTOR | CODEX_CLOUD_CONNECTOR | DEVIN_CLOUD_CONNECTOR
+                        CLAUDE_WEB_CONNECTOR
+                            | CODEX_CLOUD_CONNECTOR
+                            | DEVIN_CLOUD_CONNECTOR
+                            | CURSOR_CLOUD_CONNECTOR
                     )
                 }
                 _ => true,
@@ -335,6 +348,11 @@ pub fn selected_remote_providers(
     if selection.contains(DEVIN_CLOUD_CONNECTOR) && applicable("devin") {
         providers.extend(
             devin_provider_at(home, limit).map(|p| Box::new(p) as Box<dyn ShallowSessionProvider>),
+        );
+    }
+    if selection.contains(CURSOR_CLOUD_CONNECTOR) && applicable("cursor") {
+        providers.extend(
+            cursor_provider_at(home, limit).map(|p| Box::new(p) as Box<dyn ShallowSessionProvider>),
         );
     }
     providers

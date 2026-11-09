@@ -52,8 +52,9 @@ pub(super) fn run(
         });
     }
     let head = crate::change_feed::read_head(&tx).map_err(Error::query)?;
-    let (report, catalog_changed) = apply_batch(&tx, &plan, opts, now)?;
-    super::generation::advance_if_evicted(&tx, report.rows, catalog_changed)
+    let mut affected = super::changes::Affected::new();
+    let (report, catalog_changed) = apply_batch(&tx, &plan, opts, now, &mut affected)?;
+    super::generation::advance_if_evicted(&tx, report.rows, catalog_changed, &affected)
         .map_err(Error::query)?;
     // This IMMEDIATE transaction is the sole writer since head was read.
     // Exactly its eviction tombstones are removed; older real deletions stay.
@@ -156,6 +157,7 @@ fn process_session(
     floor: i64,
     opts: &RetentionOptions,
     report: &mut RetentionReport,
+    affected: &mut super::changes::Affected,
 ) -> Result<(bool, bool), Error> {
     if !targets::expired(conn, key, cutoff).map_err(Error::query)? {
         return Ok((true, false));
@@ -164,7 +166,7 @@ fn process_session(
         report.protected_sessions += 1;
         return Ok((true, false));
     }
-    evict(conn, key, opts.max_rows as u64, report).map_err(Error::query)
+    evict(conn, key, opts.max_rows as u64, report, affected).map_err(Error::query)
 }
 
 fn apply_batch(
@@ -172,6 +174,7 @@ fn apply_batch(
     plan: &Plan,
     opts: &RetentionOptions,
     now: i64,
+    affected: &mut super::changes::Affected,
 ) -> Result<(RetentionReport, bool), Error> {
     let head = crate::change_feed::read_head(conn).map_err(Error::query)?;
     let floor = upload_floor(conn, head.epoch).map_err(Error::query)?;
@@ -188,8 +191,16 @@ fn apply_batch(
     let mut report = RetentionReport::default();
     let mut catalog_changed = false;
     if let Some(key) = &plan.candidate {
-        let (complete, changed) =
-            process_session(conn, key, cutoff, floor.unwrap_or(0), opts, &mut report)?;
+        affected.insert(key.clone());
+        let (complete, changed) = process_session(
+            conn,
+            key,
+            cutoff,
+            floor.unwrap_or(0),
+            opts,
+            &mut report,
+            affected,
+        )?;
         catalog_changed = changed;
         if !complete {
             return Ok((report, catalog_changed));
@@ -245,18 +256,27 @@ pub(super) fn evict(
     key: &targets::Key,
     budget: u64,
     report: &mut RetentionReport,
+    affected: &mut super::changes::Affected,
 ) -> anyhow::Result<(bool, bool)> {
     if let Some(activity) = targets::activity(conn, key)? {
         conn.execute("INSERT INTO retention_pending VALUES (?1,?2,?3) ON CONFLICT(source,session_id) DO UPDATE SET last_activity_ms=MAX(last_activity_ms,excluded.last_activity_ms)", params![key.0,key.1,activity])?;
     }
     let mut remaining = budget;
     for (table, _) in targets::PAYLOADS {
-        if !delete_part(conn, table, "session_id", key, &mut remaining, report)? {
+        if !delete_part(
+            conn,
+            table,
+            "session_id",
+            key,
+            &mut remaining,
+            report,
+            affected,
+        )? {
             return Ok((false, false));
         }
     }
     for (table, column) in AUXILIARY {
-        if !delete_part(conn, table, column, key, &mut remaining, report)? {
+        if !delete_part(conn, table, column, key, &mut remaining, report, affected)? {
             return Ok((false, false));
         }
     }
@@ -328,10 +348,11 @@ fn delete_part(
     key: &targets::Key,
     remaining: &mut u64,
     report: &mut RetentionReport,
+    affected: &mut super::changes::Affected,
 ) -> anyhow::Result<bool> {
     let limit = (*remaining).min(32);
     let removed = if table == "session_relationships" {
-        super::relationships::delete(conn, column, key, limit)?
+        super::relationships::delete(conn, column, key, limit, affected)?
     } else {
         conn.prepare_cached(&delete_sql(table, column))?
             .execute(params![key.0, key.1, limit])? as u64

@@ -11,6 +11,7 @@ const CONNECTOR_SOURCES = {
   'claude-web': 'claude',
   'codex-cloud': 'codex',
   'devin-cloud': 'devin',
+  'cursor-cloud': 'cursor',
 } as const;
 type ProviderConnectorId = keyof typeof CONNECTOR_SOURCES;
 export interface ProviderSourceOptions extends HelperOptions {
@@ -26,7 +27,7 @@ export function createHistoryPlugin(options: ProviderSourceOptions = {}): Histor
     new Set(connectors).size !== connectors.length
   )
     throw new InvalidArgumentError(
-      'Provider connectors must be unique claude-web, codex-cloud or devin-cloud IDs',
+      'Provider connectors must be unique claude-web, codex-cloud, devin-cloud or cursor-cloud IDs',
       'INVALID_ARGUMENT',
     );
   const sources: HistorySource[] = connectors.map((connectorId) => {

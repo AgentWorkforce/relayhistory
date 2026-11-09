@@ -4,7 +4,83 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Patch]
+
+### Fixed
+
+- Reconciliation retries a failing acquisition batch one path at a time and queues a path that fails alone for retry, so one unreadable transcript no longer blocks every path after it or keeps the pass from draining.
+- Resumed and forked Claude transcripts, which open with a copy of the origin session's records, are captured under the session they are named after, with a `fork` edge to the origin, instead of failing with conflicting `sessionId` values.
+
+## [0.57.1] - 2026-11-07
+
+### Fixed
+
+- Hermes history discovery and capture accept SQLite schema 32 while retaining schema 31 support, including archived messages and native tool-call identities.
+
+## [0.57.0] - 2026-11-06
+
+### Added
+
+- Amp cloud transcript projection is available through `ai-hist/amp-source`, retaining native message identity, revisions, raw evidence, and typed tool calls for hosted uploaders and supporting a preinstalled CLI on persistent process hosts.
+- `history-provider-sources` is published to crates.io at the release version, so Rust hosts can depend on the remote source connectors by version instead of a git pin; it requires `ai-hist` at the same exact version.
+
+### Changed
+
+- Codex SQLite sync reconciles large conversations with fewer repeated searches.
+
+### Fixed
+
+- Codex SQLite sync preserves distinct messages with identical text and restores missing evidence when an overlap marker outlives its referenced rollout event.
+- Amp remote injection sends private text over stdin and treats process or stdin failures as unconfirmed submissions, preventing false acceptance and unsafe retries.
+- Amp tool results retain searchable output, call identity, status and errors in hosted history as tool evidence after privacy scrubbing, keeping mixed human prompts separate from tool output.
+
+### Rust API
+
+- `SessionStore::retention_changes_since` returns a bounded journal of session identities affected by local retention, including both endpoints of removed relationships, so consumers can refresh membership and delegation views incrementally. Gaps and expired cursors require a full refresh.
+
+## [0.56.0] - 2026-11-02
+
+### Added
+
+- Claude sessions carry the client that started them as `originator`, from the transcript's `entrypoint`: `cli` for the terminal, `claude-desktop` for the Claude app, `sdk-ts` for an SDK run. Existing sessions are re-read once to pick it up.
+- Local readers accept History source `capy`. Capy has no transcript files on disk, so discovery returns nothing; a bound thread's transcript is what Cloud uploads to hosted History, with the jam id as the session id. A jam id or a relay agent name is not a source.
+
+### Rust API
+
+- Added `Source::Capy`. It names the hosted History source Cloud uploads for a bound Capy thread. This computer has no Capy transcript files, so discovery returns nothing.
+
+## [0.55.0] - 2026-10-31
+
+### Fixed
+
+- The facade's hydration is quiet like its sync
+- Report a rejected Codex SQLite pair from the locator refresh
+- Carry provider skip diagnostics on the sync report
+
+## [0.54.1] - 2026-10-30
+
+### Added
+
+- `@relayhistory/provider-sources` gains a `cursor-cloud` connector: `--remote` / `--all` discovery lists Cursor Cloud Agents through `GET /v1/agents`, and targeted hydration returns each agent's prompts and assistant replies (from `GET /v0/agents/{id}/conversation`, timed by its v1 runs) as `cursor` evidence under the agent's `bc-…` id. It needs a Cursor API key in `RELAYHISTORY_CURSOR_API_KEY`, `CURSOR_API_KEY` or `~/.config/relayhistory/cursor-api-key`.
+
+### Changed
+
+- New sessions become visible sooner because live watch capture checkpoints its WAL after the active burst instead of on the commit thread.
+
+### Fixed
+
+- Cursor subagent sessions are discovered and searchable: transcripts under `agent-transcripts/<parent>/subagents/` are indexed as their own sessions, by full sweeps and change-triggered scans, and linked to the session that spawned them.
+- A Codex SQLite store that a quiet `sync`, `watch` or `hydrate` could not read is reported on that call's result, so an embedding host sees why Codex history is missing; the CLI still prints the skip on stderr.
+
+### Rust API
+
+- Added `SyncDiagnostic` and `SyncReport::diagnostics`, `TickReport::diagnostics`: what providers skipped during the sweep, with a stable code (`SESSION_SOURCE_UNAVAILABLE`, `EVIDENCE_PARTIAL`), the source and the session it names. A hydration's skips arrive on `HydrateReport::diagnostics`.
+
+## [0.53.1] - 2026-10-29
+
+### Fixed
+
+- Selected Codex SQLite sessions report an unavailable source when their backing stores disappear, and fallback diagnostics honor quiet mode.
 
 ## [0.53.0] - 2026-10-28
 
@@ -1197,7 +1273,13 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - The SDK reads provider JSONL natively and works without the Python CLI.
 
-[Unreleased]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.53.0...HEAD
+[Unreleased]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.57.1...HEAD
+[0.57.1]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.57.0...sdk-ts-v0.57.1
+[0.57.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.56.0...sdk-ts-v0.57.0
+[0.56.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.55.0...sdk-ts-v0.56.0
+[0.55.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.54.1...sdk-ts-v0.55.0
+[0.54.1]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.53.1...sdk-ts-v0.54.1
+[0.53.1]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.53.0...sdk-ts-v0.53.1
 [0.53.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.52.0...sdk-ts-v0.53.0
 [0.52.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.51.0...sdk-ts-v0.52.0
 [0.51.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.50.1...sdk-ts-v0.51.0

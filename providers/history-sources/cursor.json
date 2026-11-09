@@ -18,6 +18,16 @@
     },
     {
       "source": "cursor",
+      "name": "subagent-transcript",
+      "quirk": "a subagent transcript at `agent-transcripts/<parent>/subagents/<child>.jsonl` beside its parent's; the child is its own session under its file stem, linked to the parent by its location because neither file names the other",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "cursor/subagent-transcript"
+      ]
+    },
+    {
+      "source": "cursor",
       "name": "observed-3-13-25",
       "quirk": "the reported Cursor IDE 3.13.25 record shape: id-less `tool_use`, a `turn_ended` marker and `<timestamp>`/`<user_query>` framing; staged by the ai-hist cursor parser tests rather than by this harness",
       "layout": "Reference",
@@ -52,7 +62,8 @@
       "history",
       "session_event",
       "tool_call",
-      "file_edit"
+      "file_edit",
+      "relationship"
     ],
     "usage_accounting": "none"
   }

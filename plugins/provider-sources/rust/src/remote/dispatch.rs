@@ -9,10 +9,11 @@ use rusqlite::Connection;
 use crate::discover::{Candidate, DiscoveryEnv, ScanEnv, ShallowSession, ShallowSessionProvider};
 
 use super::claude_web::{claude_api_base_url, ClaudeWebProvider, UreqClaudeTransport};
+use super::cursor_cloud::cursor_provider;
 use super::devin_auth::devin_provider;
 use super::{
     claude_credentials_path, CodexCloudProvider, ExecCodexCli, RemoteSessionEvidence,
-    CLAUDE_WEB_CONNECTOR, CODEX_CLOUD_CONNECTOR, DEVIN_CLOUD_CONNECTOR,
+    CLAUDE_WEB_CONNECTOR, CODEX_CLOUD_CONNECTOR, CURSOR_CLOUD_CONNECTOR, DEVIN_CLOUD_CONNECTOR,
 };
 
 /// Select exactly one adapter. Construction does not read credentials or invoke a transport.
@@ -39,6 +40,7 @@ pub fn provider(
         )),
         CODEX_CLOUD_CONNECTOR => Box::new(CodexCloudProvider::new(ExecCodexCli, limit)),
         DEVIN_CLOUD_CONNECTOR => Box::new(devin_provider(home, limit)),
+        CURSOR_CLOUD_CONNECTOR => Box::new(cursor_provider(home, limit)),
         _ => anyhow::bail!("INVALID_ARGUMENT: unknown provider source connector"),
     };
     Ok(Box::new(InstanceProvider {

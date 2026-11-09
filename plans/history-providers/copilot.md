@@ -1,8 +1,8 @@
-# GitHub Copilot CLI historical acquisition (#432)
+# GitHub Copilot native historical acquisition (#432)
 
-Source `copilot` reads GitHub Copilot CLI's native session journals. It covers
-the CLI only: VS Code Copilot Chat and hosted coding-agent history are separate
-products with separate stores.
+Source `copilot` reads native session journals from Copilot CLI and the newer
+**Copilot harness** in VS Code. The legacy VS Code **Local harness** mutation
+logs and hosted coding-agent history use separate stores and are not acquired.
 
 ## Pinned product and evidence
 
@@ -26,7 +26,13 @@ products with separate stores.
   resume.
 - Schema reference: [`github/copilot-sdk@6be623b0`](https://github.com/github/copilot-sdk/blob/6be623b01b194a61466385e3f708639ec98ce8ac/nodejs/src/generated/session-events.ts).
 
-No private history, authentication, model request or tool execution was used.
+The CLI importer fixture used no authentication, model requests or tools. A
+separate disposable VS Code 1.144.0 chat, under the owner’s existing GitHub
+sign-in, read a synthetic README and returned a known proof string. Its
+[vscode-harness fixture](../../crates/ai-hist/tests/fixtures/copilot/vscode-harness)
+and [versioned provenance](../../crates/ai-hist/src/providers/copilot/vscode-provenance.json)
+prove that the current editor harness writes the same native v1 journal. No
+private project history was copied. Passive discovery never starts a model.
 
 ## Acquisition
 
@@ -53,7 +59,7 @@ and a 16 KiB tail (last activity).
 
 | Journal record | Stored as |
 | --- | --- |
-| `user.message` | user `text` event; a history prompt only when `data.source` is absent (a person typed it); otherwise (`agent-<id>`, `skill-<name>`) `control_kind: synthetic`, outside prompts and user turns |
+| `user.message` | user `text` event; a history prompt only when `data.source` is absent (the runtime also uses this shape for queued hook follow-ups); otherwise (`agent-<id>`, `skill-<name>`) `control_kind: synthetic`, outside prompts and user turns |
 | `assistant.message` | assistant `thinking` (`reasoningText`), `text` (`content`) and `tool_use` (`toolRequests`) events; `model`, `messageId` as provider message ID, `requestId`, `turnId`; `parentToolCallId` marks a subagent message as sidechain |
 | `tool.execution_complete` | `tool_result` event joined by `toolCallId`; `success: false` is `errored` with `error.message` as its text |
 | `tool.execution_start` | marker; also the tool call when no assistant message requested it |

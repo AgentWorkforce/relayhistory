@@ -18,7 +18,7 @@ dead_code_max = 0
 redundant_code_max = 0
 
 [sources]
-rust_roots = ["crates/ai-hist-cli/src", "crates/ai-hist-napi/src", "crates/ai-hist/src", "examples/rust-consumer/src", "plugins/provider-sources/rust/src", "plugins/object-store/rust/src"]
+rust_roots = ["crates/ai-hist-cli/src", "crates/ai-hist-napi/src", "crates/ai-hist/src", "examples/rust-consumer/src", "examples/rust-local-source/src", "plugins/provider-sources/rust/src", "plugins/object-store/rust/src"]
 
 [baseline]
 
@@ -26,12 +26,12 @@ rust_roots = ["crates/ai-hist-cli/src", "crates/ai-hist-napi/src", "crates/ai-hi
 "crates/ai-hist-cli/src/lib.rs" = 2777
 "crates/ai-hist-napi/src/lib.rs" = 2115
 "crates/ai-hist/src/change_feed.rs" = 1197
-"crates/ai-hist/src/discover.rs" = 3258
-"crates/ai-hist/src/ingest.rs" = 11383
+"crates/ai-hist/src/discover.rs" = 3220
+"crates/ai-hist/src/ingest.rs" = 11342
 "crates/ai-hist/src/ingest/devin.rs" = 828
-"crates/ai-hist/src/ingest/hydrate.rs" = 3328
+"crates/ai-hist/src/ingest/hydrate.rs" = 3326
 "crates/ai-hist/src/ingest/opencode.rs" = 1437
-"crates/ai-hist/src/session_store.rs" = 1714
+"crates/ai-hist/src/session_store.rs" = 1695
 "crates/ai-hist/src/store.rs" = 3064
 
 [baseline.cyclomatic]

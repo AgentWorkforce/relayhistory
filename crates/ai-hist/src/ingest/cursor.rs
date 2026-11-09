@@ -1,8 +1,10 @@
 //! Cursor agent-transcript record parsing.
 //!
 //! One place for the interpretation of
-//! `~/.cursor/projects/<encoded-path>/agent-transcripts/<id>/<id>.jsonl`, so
-//! shallow discovery, full sync and targeted hydration cannot drift apart.
+//! `~/.cursor/projects/<encoded-path>/agent-transcripts/<id>/<id>.jsonl`, and
+//! of the subagent transcripts Cursor writes beside one at
+//! `agent-transcripts/<id>/subagents/<child>.jsonl`, so shallow discovery,
+//! full sync and targeted hydration cannot drift apart.
 //!
 //! ## What Cursor actually writes
 //!
@@ -37,7 +39,109 @@
 //! and it resets exactly when Cursor rewrites the file — which is also when the
 //! byte cursor resets.
 
+use std::path::Path;
+
 use serde_json::Value;
+
+/// The directory beside a top-level transcript that holds the subagent
+/// transcripts it spawned: `agent-transcripts/<parent>/subagents/<child>.jsonl`.
+pub(crate) const SUBAGENTS_DIR: &str = "subagents";
+
+/// The parent session a subagent transcript was written under, and the
+/// subagent's own session id (its file stem).
+///
+/// The layout is the only evidence: Cursor writes no child id into the
+/// parent's `Task` block and no parent id into the child's records. A path
+/// that is not exactly `agent-transcripts/<parent>/subagents/<child>.jsonl`
+/// is not a subagent transcript.
+pub(crate) fn subagent_identity(path: &Path) -> Option<(&str, &str)> {
+    if path.extension()? != "jsonl" {
+        return None;
+    }
+    let child = path.file_stem()?.to_str().filter(|stem| !stem.is_empty())?;
+    let subagents = path.parent()?;
+    if subagents.file_name()? != SUBAGENTS_DIR {
+        return None;
+    }
+    let session_dir = subagents.parent()?;
+    if session_dir.parent()?.file_name()? != "agent-transcripts" {
+        return None;
+    }
+    let parent = session_dir.file_name()?.to_str()?;
+    Some((parent, child))
+}
+
+/// Record a subagent transcript as a delegation of the session whose
+/// directory it was written in. A top-level transcript records nothing.
+///
+/// The location is the evidence (see [`subagent_identity`]), and the session
+/// ids it names are the same directory and file names discovery uses.
+pub(crate) fn record_subagent_delegation(
+    conn: &rusqlite::Connection,
+    path: &Path,
+) -> anyhow::Result<()> {
+    let Some((parent, child)) = subagent_identity(path) else {
+        return Ok(());
+    };
+    let locator = path.to_string_lossy();
+    crate::relationship_capture::record_relationship(
+        conn,
+        &crate::relationship_capture::ObservedRelationship {
+            source: "cursor",
+            parent_session_id: parent,
+            child_session_id: Some(child),
+            relationship: "delegated",
+            evidence_kind: "cursor_subagent_dir",
+            evidence_locator: Some(&locator),
+            child_has_events: super::session_events_exist(conn, "cursor", child)?,
+            ..Default::default()
+        },
+    )
+}
+
+/// Timestamps a previous pass stored, keyed by the record's byte offset.
+///
+/// Every event derived from one record shares that record's byte offset as the
+/// prefix of its `event_uid` (`"{offset}:{block}"`), so the first event at
+/// each offset answers the question. Loaded once per incremental pass because
+/// a `substr(event_uid, …)` predicate cannot use the uid index.
+pub(crate) fn stored_record_timestamps(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> anyhow::Result<std::collections::HashMap<u64, i64>> {
+    let mut stored = std::collections::HashMap::new();
+    let mut stmt = conn.prepare(
+        "SELECT event_uid, ts_ms FROM session_events \
+         WHERE source = 'cursor' AND session_id = ? ORDER BY id",
+    )?;
+    let mut rows = stmt.query([session_id])?;
+    while let Some(row) = rows.next()? {
+        let uid: String = row.get(0)?;
+        let ts: i64 = row.get(1)?;
+        if let Some(offset) = uid
+            .split_once(':')
+            .and_then(|(prefix, _)| prefix.parse::<u64>().ok())
+        {
+            stored.entry(offset).or_insert(ts);
+        }
+    }
+    Ok(stored)
+}
+
+/// The encoded project directory a transcript sits under: the component
+/// directly below `.cursor/projects`, at whatever depth the transcript is.
+pub(crate) fn project_dir_name(path: &Path) -> Option<&str> {
+    path.ancestors()
+        .find(|ancestor| {
+            ancestor
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+                == Some("projects")
+        })
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+}
 
 /// A Cursor tool-call argument payload that names a file the agent wrote.
 ///

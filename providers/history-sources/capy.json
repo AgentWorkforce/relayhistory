@@ -1,0 +1,23 @@
+{
+  "id": "capy",
+  "rust_id": "capy",
+  "variant": "Capy",
+  "order": 512,
+  "aliases": [],
+  "ingested_only": true,
+  "fixtures": [],
+  "capture": [
+    {
+      "evidence": "Hosted transcript",
+      "coverage": "Capy keeps no transcript files on this computer. Cloud uploads a bound thread to hosted History as source capy, with the jam id as the session id. Local discovery returns nothing."
+    },
+    {
+      "evidence": "What this source is not",
+      "coverage": "A jam id and a relay agent name (capy- plus the first 8 characters) are not sources. Passing either as the source returns invalid source. Read the hosted session with source capy, or message the relay agent."
+    }
+  ],
+  "population": {
+    "evidence": [],
+    "usage_accounting": "none"
+  }
+}

@@ -57,6 +57,8 @@ pub enum Source {
     GrokBot,
     #[serde(rename = "openclaw")]
     OpenClaw,
+    #[serde(rename = "capy")]
+    Capy,
     #[cfg(test)]
     #[serde(rename = "test-fixture")]
     TestFixture,
@@ -91,6 +93,7 @@ impl Source {
         Self::Vtcode,
         Self::GrokBot,
         Self::OpenClaw,
+        Self::Capy,
         #[cfg(test)]
         Self::TestFixture,
     ];
@@ -125,6 +128,7 @@ impl Source {
             "vtcode",
             "grok-bot",
             "openclaw",
+            "capy",
             #[cfg(test)]
             "test-fixture",
         ];
@@ -162,6 +166,7 @@ impl Source {
             ("vt-code", Source::Vtcode),
             ("grok-bot", Source::GrokBot),
             ("openclaw", Source::OpenClaw),
+            ("capy", Source::Capy),
             #[cfg(test)]
             ("test-fixture", Source::TestFixture),
             #[cfg(test)]
@@ -201,6 +206,7 @@ impl Source {
             &crate::providers::vtcode::METADATA,
             &crate::providers::grok_bot::METADATA,
             &crate::providers::openclaw::METADATA,
+            &crate::providers::capy::METADATA,
             #[cfg(test)]
             &crate::providers::test_fixture::METADATA,
         ];

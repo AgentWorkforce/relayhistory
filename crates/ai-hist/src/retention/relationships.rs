@@ -5,7 +5,7 @@ use rusqlite::{params, Connection};
 const REOPEN: &str = "UPDATE session_continuity_evidence SET pending_reason='unreconciled' WHERE source=?1 AND locator=?2";
 const DELETE: &str = "DELETE FROM session_relationships WHERE rowid=?1";
 fn select(column: &str) -> String {
-    format!("SELECT rowid,evidence_locator,relationship FROM session_relationships WHERE source=?1 AND {column}=?2 LIMIT ?3")
+    format!("SELECT rowid,evidence_locator,relationship,parent_session_id,child_session_id FROM session_relationships WHERE source=?1 AND {column}=?2 LIMIT ?3")
 }
 
 pub(super) fn warm(conn: &Connection) -> anyhow::Result<()> {
@@ -22,6 +22,7 @@ pub(super) fn delete(
     column: &str,
     key: &Key,
     limit: u64,
+    affected: &mut super::changes::Affected,
 ) -> anyhow::Result<u64> {
     let rows = conn
         .prepare_cached(&select(column))?
@@ -30,12 +31,19 @@ pub(super) fn delete(
                 row.get::<_, i64>(0)?,
                 row.get::<_, Option<String>>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+                row.get::<_, Option<String>>(4)?,
             ))
         })?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     let mut reopen = conn.prepare_cached(REOPEN)?;
     let mut delete = conn.prepare_cached(DELETE)?;
-    for (rowid, locator, kind) in &rows {
+    for (rowid, locator, kind, parent, child) in &rows {
+        for id in Some(parent).into_iter().chain(child.as_ref()) {
+            if !key.0.is_empty() && !id.is_empty() {
+                affected.insert((key.0.clone(), id.clone()));
+            }
+        }
         if matches!(kind.as_str(), "continuation" | "fork" | "resume") {
             // (source, locator) is the evidence primary key: at most one update
             // per removed edge, even if the survivor has many transcript files.

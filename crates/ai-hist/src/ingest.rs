@@ -17,6 +17,7 @@ use std::io::{self, BufRead, BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+mod claude_owner;
 mod claude_record_rows;
 mod claude_standalone;
 pub(crate) mod claude_title;
@@ -52,6 +53,8 @@ pub(crate) mod tool_result_facts;
 pub(crate) mod transcript_cursor;
 pub(crate) mod transcript_file;
 
+use claude_owner::claude_file_session_id;
+pub(crate) use claude_owner::{claude_primary_stem, claude_sessionless_owner};
 use event_insert::insert_session_event;
 pub(crate) use evidence_probe::note_deleted;
 use evidence_probe::{
@@ -163,6 +166,7 @@ use subagent_cleanup::{
     cleanup_subagent_registration, codex_session_has_remote_presence, session_has_remote_presence,
 };
 // After `sync_note!`, which the repair note uses.
+pub(crate) mod provider_diagnostics;
 pub(crate) mod scoped_files;
 #[cfg(test)]
 pub(crate) use scoped_files::take_dirs_read;
@@ -373,10 +377,7 @@ pub fn sync_tick_at_with_roots(
     output: SyncOutput,
     force: bool,
 ) -> Result<SyncTick> {
-    SYNC_QUIET.store(
-        matches!(output, SyncOutput::Silent),
-        AtomicOrdering::Relaxed,
-    );
+    quiet_unless(output);
     sync_exclusive_with_roots(db_path, roots, force)
 }
 
@@ -390,10 +391,7 @@ pub fn sync_tick_at(
     output: SyncOutput,
     force: bool,
 ) -> Result<SyncTick> {
-    SYNC_QUIET.store(
-        matches!(output, SyncOutput::Silent),
-        AtomicOrdering::Relaxed,
-    );
+    quiet_unless(output);
     if scope == SessionScope::Remote {
         remote::ensure_selected_remote_connectors_configured_for_at(
             "sync",
@@ -445,6 +443,14 @@ pub enum SyncOutput {
     Progress,
 }
 
+/// Quiet unless the caller asked for progress.
+fn quiet_unless(output: SyncOutput) {
+    SYNC_QUIET.store(
+        matches!(output, SyncOutput::Silent),
+        AtomicOrdering::Relaxed,
+    );
+}
+
 /// Scoped ingestion with an explicitly chosen progress destination. Embedded
 /// callers should use `sync_scoped_at_with_connectors`, which is always silent.
 pub fn sync_scoped_at_with_output(
@@ -453,10 +459,7 @@ pub fn sync_scoped_at_with_output(
     connectors: &remote::SourceConnectorSelection,
     output: SyncOutput,
 ) -> Result<bool> {
-    SYNC_QUIET.store(
-        matches!(output, SyncOutput::Silent),
-        AtomicOrdering::Relaxed,
-    );
+    quiet_unless(output);
     sync_scope_with_connectors(db_path, scope, connectors)
 }
 
@@ -465,10 +468,7 @@ pub fn sync_scoped_at_with_output(
 /// `source_path` is named outright, so it is the only database read — its
 /// channel siblings are not. [`sync_opencode_with_roots`] reads them.
 pub fn sync_opencode_at(db_path: &Path, source_path: &Path, output: SyncOutput) -> Result<bool> {
-    SYNC_QUIET.store(
-        matches!(output, SyncOutput::Silent),
-        AtomicOrdering::Relaxed,
-    );
+    quiet_unless(output);
     sync_opencode_exclusive(db_path, source_path, true, &default_opencode_storage_dir())
 }
 
@@ -480,10 +480,7 @@ pub fn sync_opencode_with_roots(
     roots: &crate::ProviderRoots,
     output: SyncOutput,
 ) -> Result<bool> {
-    SYNC_QUIET.store(
-        matches!(output, SyncOutput::Silent),
-        AtomicOrdering::Relaxed,
-    );
+    quiet_unless(output);
     sync_opencode_exclusive(
         db_path,
         &roots.opencode_db,
@@ -7946,11 +7943,21 @@ pub(crate) struct ClaudeMetaFold {
     /// Two different `sessionId` values were seen in one transcript.
     #[serde(default)]
     pub conflicting_session_ids: bool,
+    /// The session that owns the file: its stem, for a primary transcript.
+    /// A resumed or forked conversation starts by copying its origin's
+    /// records, so a primary transcript can name two sessions; the one it is
+    /// named after owns it, and the other's records are inherited history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// The owner's records alone, split off at the first record naming
+    /// another session. `None` while every identified record is the owner's,
+    /// when this fold already is the owner's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owned: Option<Box<ClaudeMetaFold>>,
 }
 
 impl ClaudeMetaFold {
-    /// Fold one record in. Must be called in file order, once per record.
-    pub(crate) fn observe(&mut self, value: &Value) {
+    pub(super) fn observe_record(&mut self, value: &Value) {
         if let Some(object) = value.as_object() {
             self.continuity_any = true;
             crate::continuity::fold_claude_record(
@@ -8061,9 +8068,7 @@ impl ClaudeMetaFold {
         }
     }
 
-    /// The session the transcript at `path` describes, or `None` when no
-    /// record named one.
-    pub(crate) fn finish(&self, path: &Path) -> Option<ClaudeSessionMeta> {
+    pub(super) fn finish_own(&self, path: &Path) -> Option<ClaudeSessionMeta> {
         let session_id = self.session_id.clone()?;
         let first = self.first_ts.unwrap_or(0);
         Some(ClaudeSessionMeta {
@@ -8218,7 +8223,7 @@ fn retire_claude_history_row(
 /// position to keep. It folds through `ClaudeMetaFold` like every other
 /// reader, so what a record means cannot differ between the two.
 fn scan_claude_session_text(path: &Path, text: &str) -> Result<Option<ClaudeSessionMeta>> {
-    let mut fold = ClaudeMetaFold::default();
+    let mut fold = ClaudeMetaFold::for_path(path);
     for line in text.lines() {
         check_capture_cancelled()?;
         let Ok(value) = serde_json::from_str::<Value>(line) else {
@@ -8227,7 +8232,7 @@ fn scan_claude_session_text(path: &Path, text: &str) -> Result<Option<ClaudeSess
         fold.observe(&value);
     }
     anyhow::ensure!(
-        !fold.conflicting_session_ids,
+        !fold.has_conflicting_identity(),
         "conflicting sessionId values in Claude transcript {}",
         path.display()
     );
@@ -8241,14 +8246,17 @@ fn ingest_claude_transcript_text_as(
     text: &str,
     attributed_session_id: Option<&str>,
 ) -> Result<()> {
-    let file_session_id = text.lines().find_map(|line| {
-        serde_json::from_str::<Value>(line)
-            .ok()?
-            .get("sessionId")?
-            .as_str()
-            .filter(|id| !id.is_empty())
-            .map(str::to_string)
-    });
+    let file_session_id = claude_sessionless_owner(
+        path,
+        text.lines().filter_map(|line| {
+            serde_json::from_str::<Value>(line)
+                .ok()?
+                .get("sessionId")?
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+        }),
+    );
     let mut walk = ClaudeRecordWalk::new(
         conn,
         path,
@@ -8270,10 +8278,15 @@ pub(crate) fn scan_claude_session_file_resumed(
     let mut reader =
         transcript_cursor::TranscriptReader::open(path, saved.file.as_ref(), saved.resume_from)?;
     let mut fold = if reader.start_offset() == 0 {
-        ClaudeMetaFold::default()
+        ClaudeMetaFold::for_path(path)
     } else {
         saved.fold.clone()
     };
+    // A fold saved before ownership was recorded resumes owned by the stem;
+    // `observe` splits the owner's records off only from the next foreign one.
+    if fold.owner.is_none() {
+        fold.owner = claude_primary_stem(path);
+    }
     let start_offset = reader.start_offset();
     let mut resume_from = None;
     let mut line = String::new();
@@ -8333,12 +8346,11 @@ pub(crate) fn scan_claude_session_file_resumed(
         .saturating_add(reader.tail_bytes())
         .saturating_add(validation_bytes);
     anyhow::ensure!(
-        !fold.conflicting_session_ids,
+        !fold.has_conflicting_identity(),
         "conflicting sessionId values in Claude transcript {}",
         path.display()
     );
-    let continuity =
-        crate::continuity::finish_claude_fold(fold.continuity.clone(), fold.continuity_any, path);
+    let continuity = fold.finish_continuity(path);
     Ok(ClaudeScanPass {
         meta: fold.finish(path),
         bytes_read,
@@ -8820,36 +8832,6 @@ fn ingest_claude_transcript_as(
         walk.feed(line.trim_end_matches(['\n', '\r']))?;
     }
     walk.finish()
-}
-
-/// The first in-log session id a transcript carries.
-///
-/// Read ahead of the record walk, and bounded in the case that matters: the
-/// id is normally on the first record, and this stops at the first one that
-/// has it.
-fn claude_file_session_id(path: &Path) -> Result<Option<String>> {
-    let file = fs::File::open(path)
-        .with_context(|| format!("reading claude transcript {}", path.display()))?;
-    let mut reader = BufReader::new(file);
-    let mut raw = Vec::new();
-    loop {
-        raw.clear();
-        if reader.read_until(b'\n', &mut raw)? == 0 {
-            return Ok(None);
-        }
-        let Ok(line) = std::str::from_utf8(&raw) else {
-            continue;
-        };
-        if let Some(id) = serde_json::from_str::<Value>(line.trim_end_matches(['\n', '\r']))
-            .ok()
-            .as_ref()
-            .and_then(|value| value.get("sessionId"))
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())
-        {
-            return Ok(Some(id.to_string()));
-        }
-    }
 }
 
 /// What one Claude transcript threads through its records, whichever reader
@@ -11808,6 +11790,7 @@ fn sync_cursor_with_hooks_in(
                 raw_path: Some(&transcript.path.to_string_lossy()),
             },
         )?;
+        cursor::record_subagent_delegation(&tx, &transcript.path)?;
     }
     tx.commit().context("commit Cursor sync")?;
     state.insert(
@@ -12210,35 +12193,6 @@ fn prepare_cursor_sync(
     })
 }
 
-/// Timestamps a previous pass stored, keyed by the record's byte offset.
-///
-/// Every event derived from one record shares that record's byte offset as the
-/// prefix of its `event_uid` (`"{offset}:{block}"`), so the first event at
-/// each offset answers the question. Loaded once per incremental pass because
-/// a `substr(event_uid, …)` predicate cannot use the uid index.
-fn stored_cursor_record_timestamps(
-    conn: &Connection,
-    session_id: &str,
-) -> Result<HashMap<u64, i64>> {
-    let mut stored = HashMap::new();
-    let mut stmt = conn.prepare(
-        "SELECT event_uid, ts_ms FROM session_events \
-         WHERE source = 'cursor' AND session_id = ? ORDER BY id",
-    )?;
-    let mut rows = stmt.query([session_id])?;
-    while let Some(row) = rows.next()? {
-        let uid: String = row.get(0)?;
-        let ts: i64 = row.get(1)?;
-        if let Some(offset) = uid
-            .split_once(':')
-            .and_then(|(prefix, _)| prefix.parse::<u64>().ok())
-        {
-            stored.entry(offset).or_insert(ts);
-        }
-    }
-    Ok(stored)
-}
-
 /// Drop every row a previous read of this Cursor transcript produced.
 ///
 /// Cursor evidence is keyed on the record's byte offset, which is stable only
@@ -12341,7 +12295,7 @@ pub(crate) fn ingest_cursor_transcript(
     // sync of a long untimed transcript would otherwise scan events once per
     // old record.
     let stored_ts = if history_from_offset > 0 {
-        stored_cursor_record_timestamps(conn, session_id)?
+        cursor::stored_record_timestamps(conn, session_id)?
     } else {
         HashMap::new()
     };
@@ -21663,6 +21617,64 @@ mod tests {
                 .get::<_, i64>(0))
                 .unwrap(),
             2
+        );
+    }
+
+    /// A full sync indexes a subagent transcript as its own session, under
+    /// its file stem and its parent's project, and records the delegation.
+    ///
+    /// Positive control: before the fix the sync counted one prompt and the
+    /// child had no `sessions` row at all.
+    #[test]
+    fn cursor_sync_indexes_subagent_transcripts_and_links_their_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir
+            .path()
+            .join("home-dev-app/agent-transcripts/p1/p1.jsonl");
+        let child = dir
+            .path()
+            .join("home-dev-app/agent-transcripts/p1/subagents/c1.jsonl");
+        for (path, prompt) in [(&parent, "parent prompt"), (&child, "delegated prompt")] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(
+                path,
+                format!("{}\n", json!({"role":"user","message":{"content":prompt}})),
+            )
+            .unwrap();
+        }
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        assert_eq!(
+            super::sync_cursor(&conn, &mut state, dir.path(), &mut SweepCoverage::default())
+                .unwrap(),
+            2
+        );
+        let (cwd, raw_path): (String, String) = conn
+            .query_row(
+                "SELECT cwd, raw_path FROM sessions WHERE source='cursor' AND session_id='c1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(cwd, "/home/dev/app");
+        assert_eq!(raw_path, child.to_string_lossy());
+        let edge: (String, String, String, String) = conn
+            .query_row(
+                "SELECT parent_session_id, child_session_id, relationship, evidence_locator \
+                 FROM session_relationships WHERE source='cursor'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            edge,
+            (
+                "p1".to_string(),
+                "c1".to_string(),
+                "delegated".to_string(),
+                child.to_string_lossy().into_owned()
+            )
         );
     }
 

@@ -247,7 +247,7 @@ are eligible. `SyncOptions::codex_sqlite_max_age_days` overrides that window;
 `AI_HIST_CODEX_SQLITE_MAX_AGE_DAYS` is read, then the 30-day default is used.
 Threads with a complete rollout are never projected from SQLite.
 
-`SyncReport { swept, changed, head_revision }`: `swept` is false when the fingerprint matched
+`SyncReport { swept, changed, head_revision, diagnostics }`: `swept` is false when the fingerprint matched
 and nothing was opened. `changed` lists the `SessionRef`s whose catalog row was
 created or changed while the call held the lock — swept or not — derived from
 a per-row digest of the `sessions` table taken after the lock was acquired and
@@ -265,6 +265,16 @@ column takes part except the two bounded text excerpts (`first_prompt`,
 discovery state, a re-resolved or inherited `project_key`, a metadata field the
 shallow read filled in. Once every catalog write stamps a revision (the change
 feed's `revision`), the digest can become a read of that one column.
+
+`diagnostics` lists what providers skipped and carried on without, as
+`SyncDiagnostic { source, code, message, subject }`: a Codex SQLite store pair
+that is missing, unsupported or unreadable is `SESSION_SOURCE_UNAVAILABLE`
+(the rollouts are still read); one thread or related child that could not be
+captured is `EVIDENCE_PARTIAL` with the thread as `subject`. The facade is
+quiet — no progress on stdout, no skip on stderr — so the report is where a
+host learns that a pass left history out; `ai-hist sync` prints the same
+skips on stderr. A `watch` tick carries them as `TickReport::diagnostics`, and
+a hydration folds its own into `HydrateReport::diagnostics`.
 
 ### `hydrate`
 
@@ -1009,13 +1019,14 @@ handle.
 | Source | history | session_event | tool_call | file_edit | relationship | usage accounting |
 | --- | --- | --- | --- | --- | --- | --- |
 | antigravity | ✓ | ✓ | — | — | — | none |
+| capy | — | — | — | — | — | none |
 | claude | ✓ | ✓ | ✓ | ✓ | ✓ | per-message |
 | cline | ✓ | ✓ | ✓ | — | — | none |
 | codebuddy | ✓ | ✓ | ✓ | — | — | per-message |
 | codex | ✓ | ✓ | ✓ | ✓ | ✓ | cumulative-delta |
 | copilot | ✓ | ✓ | ✓ | — | — | per-message |
 | cortex | ✓ | ✓ | ✓ | — | — | none |
-| cursor | ✓ | ✓ | ✓ | ✓ | — | none |
+| cursor | ✓ | ✓ | ✓ | ✓ | ✓ | none |
 | deepagents | ✓ | ✓ | ✓ | — | — | none |
 | devin | ✓ | ✓ | ✓ | ✓ | — | none |
 | goose | ✓ | ✓ | ✓ | — | — | none |
@@ -1148,9 +1159,9 @@ repository should — each entry is a facade gap or a deliberate non-goal.
 | `crates/ai-hist-cli` | `open_db`, `open_db_readonly`, `init_db` | Every subcommand holds a raw connection; the CLI predates the facade |
 | | `search`, `search_all`, `history_search::*`, `recent`, `sessions`, `session`, `session_events`, `session_tool_calls`, `session_file_edits`, `QueryFilter`, `ProjectGrouping`, statistics | Search, catalog grouping and statistics are product surface, not sourcing surface; unbounded reads are not offered to embedders |
 | | `insert_history`, `prompt_hash`, `HistoryEntry`, `import_json` | The hook fast path and `ai-hist import` *write* prompt rows; the facade is read-side plus `sync`/`hydrate` |
-| | `sync_local_at_cancellable`, `prepare_local_sync_snapshot`, `watch::*` | Cancellation and progress output around the same engine paths `sync` and `watch` wrap |
+| | `sync_scoped_at_with_output`, `watch::WatchLoop`, `watch::TickFn` | CLI sync dispatch and watch scheduling with cancellation/progress around the shared capture engine |
 | | `discover`, `diagnostics::doctor_report`, `paths::*`, `git_helpers::*`, tags, `resume_command` | Operator tooling: doctor, discovery diagnostics, resume commands, tagging |
-| `crates/ai-hist-napi` | `open_db*`, `schema_is_*_read_current`, `default_db_path` | Node holds one long-lived connection per addon and answers a schema mismatch by reopening writable |
+| `crates/ai-hist-napi` | `open_db*`, `schema_is_*_read_current`, `default_db_path` | Native reads open connections as needed and answer a stale schema by reopening writable |
 | | connection-taking `session_*_page`, `session_relationships`, `session_tree`, `session_children_page`, `stats_scoped_by`, `search`, `recent`, `session_locations` | The TypeScript SDK exposes relationships, trees, statistics and search the Rust facade does not; moving these reads onto `SessionStore` facade methods (markers, requests, usage, user turns and the full `SessionEvidence` op), and then dropping `rusqlite` from `ai-hist-napi`, is a follow-up to [#181](https://github.com/AgentWorkforce/relayhistory/issues/181) |
 | | `SESSION_*_CONTRACT_VERSION` constants, `export` | The native contract is versioned separately from Cargo semver; `export` backs the SDK's local `exportHistory` |
 | `plugins/provider-sources/rust` | `discover::DiscoveryEnv`, `ShallowSessionProvider`, `sources::normalize_source_evidence`, `EvidenceKind`, `SOURCE_CHOICES` | Provider adapters enumerate and acquire through engine types (`DiscoveryEnv` borrows a connection); hosts land the results through the facade's `source_observation` / `apply_source_observations` / `apply_source_evidence` |
@@ -1205,12 +1216,15 @@ Retain the round between calls: restarting discovery with a row limit repeatedly
 visits the same newest prefix and is not reconciliation. Each provider rotates
 after every slice, including errors. Failed enumeration items remain pending in
 a fair retry queue, so an unreadable directory or entry does not monopolize the
-healthy work behind it. Errors still return through `Err`; unresolved failures
-keep `complete` false.
+healthy work behind it. An acquisition that fails for its paths, rather than
+for the run (cancellation, lock contention, the store), is retried one path at a
+time, and a path that fails alone joins the same retry queue: one malformed
+transcript never holds the paths batched with it or behind it. Errors still
+return through `Err`; unresolved failures keep `complete` false.
 
 `healthy_pass_exhausted()` is a level query that remains usable after `Err`. It
 means ready enumeration and pending acquisition have drained, not that all
-coverage succeeded. At an existing periodic backstop or loss-recovery boundary,
+coverage succeeded: failed enumeration items and failed paths remain owed. At an existing periodic backstop or loss-recovery boundary,
 `refresh_healthy_pass()` can revisit the retained validated roots without dropping
 failed obligations. It returns `false` without mutation while ready work or
 pending acquisitions remain. It also refreshes providers that already completed,

@@ -1,8 +1,11 @@
 # Run with pinned upstream checkout on PYTHONPATH and isolated HERMES_HOME.
-import json, os, sqlite3
+import argparse, json, os, sqlite3
 from pathlib import Path
 from unittest.mock import patch
 from hermes_state import SessionDB
+parser = argparse.ArgumentParser()
+parser.add_argument('--schema-version', type=int, choices=[31, 32], default=31)
+args = parser.parse_args()
 root = Path(os.environ['HERMES_HOME'])
 root.mkdir(parents=True, exist_ok=True)
 output = Path(__file__).resolve().parents[3] / 'tests/fixtures/hermes'
@@ -25,9 +28,13 @@ with patch('time.time', return_value=1780000000.0):
     db.append_message('compressed-child', 'user', 'A fresh human question.', timestamp=1780000008, message_uid='msg-child-user')
     db.append_message('compressed-child', 'assistant', 'A fresh answer.', timestamp=1780000009, message_uid='msg-child-answer')
     oracle = [db.export_session(sid, include_inactive=True) for sid in ['chat/not-a-uuid:α','compressed-child']]
-    (output/'official-export.json').write_text(json.dumps(oracle, indent=2, ensure_ascii=False)+'\n')
     db.close()
 conn=sqlite3.connect(root/'state.db')
+version = conn.execute('SELECT version FROM schema_version').fetchone()[0]
+if version != args.schema_version:
+    raise SystemExit(f'expected schema {args.schema_version}, found {version}')
+oracle_name = 'official-export.json' if args.schema_version == 31 else 'official-export-schema32.json'
+(output/oracle_name).write_text(json.dumps(oracle, indent=2, ensure_ascii=False)+'\n')
 # Preserve actual upstream table DDL/rows, omit derived indexes, triggers and other stores.
 tables=['schema_version','system_prompts','sessions','messages','session_model_usage']
 lines=['BEGIN TRANSACTION;']
@@ -37,4 +44,4 @@ for table in tables:
 for table in tables:
     lines.extend(line for line in conn.iterdump() if line.startswith(f'INSERT INTO "{table}"'))
 lines.append('COMMIT;')
-(output/'schema31.sql').write_text('\n'.join(lines)+'\n')
+(output/f'schema{args.schema_version}.sql').write_text('\n'.join(lines)+'\n')

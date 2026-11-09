@@ -34,12 +34,22 @@
         "copilot/cli-usage"
       ],
       "quirk": "authored from the persisted shape of Copilot CLI 1.0.86 journals with synthetic values: per-message model, reasoningText and outputTokens, a failed bash tool, a mid-session model change, an explore subagent whose messages carry parentToolCallId and reuse the main agent's bash_1 call ID, a usage checkpoint, and two cumulative session.shutdown modelMetrics totals across a resume."
+    },
+    {
+      "source": "copilot",
+      "name": "vscode-harness",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "copilot/vscode-harness"
+      ],
+      "quirk": "VS Code 1.144.0 Copilot harness / bundled Copilot Chat 0.72.0 runtime 1.0.103 native v1 journal excerpt from a disposable live editor chat: native message IDs, rename_chat and view tools/results, auto-selected model and raw session.usage_record/checkpoint markers; no per-message outputTokens. Paths and session ID sanitized; host prompts, hook envelopes and telemetry omitted."
     }
   ],
   "capture": [
     {
       "evidence": "Messages and identity",
-      "coverage": "Journal version 1 session.start header identity, native event UUIDs, user/assistant text, reasoningText, per-message model, provider messageId and requestId, turnId, cwd and branch from the header context, copilotVersion, every model the journal names; an event's parent is its nearest parentId ancestor stored as an event (markers between them are skipped); agent- and skill-delivered user messages are synthetic, not prompts or user turns; other journal versions rejected with diagnostic; duplicate native IDs at distinct live paths rejected and a journal declaring a new identity retires the old one."
+      "coverage": "Journal version 1 session.start header identity, native event UUIDs, user/assistant text, reasoningText, per-message model, provider messageId and requestId, turnId, cwd and branch from the header context, copilotVersion, every model the journal names; an event's parent is its nearest parentId ancestor stored as an event (markers between them are skipped); user messages explicitly tagged by data.source as agent- or skill-delivered are synthetic, not prompts or user turns; source-less queued hook follow-ups remain provider user messages; other journal versions rejected with diagnostic; duplicate native IDs at distinct live paths rejected and a journal declaring a new identity retires the old one. VS Code Copilot harness sessions using the same native journal are covered by a live editor fixture; legacy Local workspaceStorage chatSessions mutation logs are not captured."
     },
     {
       "evidence": "Tools and usage",

@@ -1,0 +1,22 @@
+{
+  "items": [
+    {
+      "id": "bc-00000000-0000-0000-0000-000000000002",
+      "name": "Prepare iOS build 37 for TestFlight",
+      "status": "IDLE",
+      "env": { "type": "cloud" },
+      "url": "https://cursor.com/agents/bc-00000000-0000-0000-0000-000000000002",
+      "createdAt": "2026-10-20T18:30:00.000Z",
+      "updatedAt": "2026-10-20T18:45:00.000Z",
+      "latestRunId": "run-00000000-0000-0000-0000-000000000022"
+    },
+    {
+      "id": "not-a-cloud-agent",
+      "name": "skipped: not a bc- id",
+      "status": "IDLE",
+      "createdAt": "2026-10-20T18:00:00.000Z",
+      "updatedAt": "2026-10-20T18:00:00.000Z"
+    }
+  ],
+  "nextCursor": "bc-00000000-0000-0000-0000-000000000001"
+}

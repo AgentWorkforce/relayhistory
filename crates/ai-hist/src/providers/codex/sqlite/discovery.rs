@@ -1,5 +1,6 @@
 //! Shallow Codex SQLite discovery and change fingerprints.
 use super::*;
+use crate::ingest::provider_diagnostics::{provider_diagnostic, ProviderSkip};
 
 /// A cataloged rollout yields to SQLite only when that same thread's
 /// projection extends beyond the rollout. A sibling with the same id retains
@@ -35,7 +36,13 @@ pub(crate) fn incomplete_projection_owns_rollout(incoming: &str, observed: &str)
             Err(error)
         }
         Err(error) => {
-            eprintln!("ai-hist: [codex] SQLite catalog ownership unavailable: {error:#}");
+            provider_diagnostic(ProviderSkip {
+                source: crate::Source::Codex,
+                code: "SESSION_SOURCE_UNAVAILABLE",
+                subject: Some(id),
+                what: format_args!("SQLite catalog ownership unavailable"),
+                detail: format_args!("{error:#}"),
+            });
             Ok(false)
         }
     }
@@ -47,7 +54,13 @@ pub(crate) fn enumerate(
 ) -> Result<(Vec<Candidate>, HashSet<PathBuf>)> {
     let selection = database_selection(root)?;
     if let Some(diagnostic) = selection.diagnostic {
-        eprintln!("ai-hist: [codex] skipping SQLite history: {diagnostic}");
+        provider_diagnostic(ProviderSkip {
+            source: crate::Source::Codex,
+            code: "SESSION_SOURCE_UNAVAILABLE",
+            subject: None,
+            what: format_args!("skipping SQLite history"),
+            detail: format_args!("{diagnostic}"),
+        });
     }
     let Some((state, history)) = selection.pair else {
         return Ok((Vec::new(), HashSet::new()));

@@ -368,8 +368,8 @@ pub(crate) fn capture(
     state: &Path,
     id: &str,
 ) -> Result<AcquiredSession> {
-    let (current_state, history) =
-        databases(&roots.codex)?.context("Codex SQLite history unavailable")?;
+    let (current_state, history) = databases(&roots.codex)?
+        .context("SESSION_SOURCE_UNAVAILABLE: Codex SQLite history unavailable")?;
     ensure!(
         std::fs::canonicalize(state)? == std::fs::canonicalize(&current_state)?,
         "SESSION_SOURCE_MISMATCH: stale Codex SQLite locator"
@@ -418,12 +418,24 @@ mod related;
 pub(crate) use related::{capture_related, restored_rollout};
 
 mod normalize;
-pub(crate) use normalize::{
-    claim_history_log_prompt, normalize, normalize_with_relationships, retire, retire_if_changed,
-};
+pub(crate) use normalize::{claim_history_log_prompt, reconcile, retire};
 
 pub(crate) fn decode(acquired: &AcquiredSession) -> Result<Capture> {
     serde_json::from_value(acquired.payload.clone()).map_err(Into::into)
+}
+
+/// One thread of many could not be captured: the sweep or related scan goes
+/// on without it, and the pass reports the gap as `EVIDENCE_PARTIAL`.
+pub(crate) fn skipping(what: &str, id: &str, error: &anyhow::Error) {
+    crate::ingest::provider_diagnostics::provider_diagnostic(
+        crate::ingest::provider_diagnostics::ProviderSkip {
+            source: crate::Source::Codex,
+            code: "EVIDENCE_PARTIAL",
+            subject: Some(id),
+            what: format_args!("skipping {what} {id}"),
+            detail: format_args!("{error:#}"),
+        },
+    );
 }
 
 #[cfg(test)]

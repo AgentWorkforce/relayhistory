@@ -15,7 +15,9 @@ function readDescriptors(root, directory, testOnly) {
     const item = JSON.parse(fs.readFileSync(path.join(dir, name), 'utf8'));
     if (name !== `${item.id}.json` || !/^[a-z][a-z0-9-]*$/.test(item.id)) throw new Error(`Invalid provider id: ${name}`);
     if (!/^[a-z][a-z0-9_]*$/.test(item.rust_id) || !/^[A-Z][A-Za-z0-9]*$/.test(item.variant)) throw new Error(`Invalid Rust identifiers: ${name}`);
-    if (!Number.isSafeInteger(item.order) || !Array.isArray(item.aliases) || !Array.isArray(item.fixtures) || !item.fixtures.length) throw new Error(`Incomplete descriptor: ${name}`);
+    const ingestedOnly = item.ingested_only === true;
+    if (!Number.isSafeInteger(item.order) || !Array.isArray(item.aliases) || !Array.isArray(item.fixtures) || (!ingestedOnly && !item.fixtures.length)) throw new Error(`Incomplete descriptor: ${name}`);
+    if (ingestedOnly && item.fixtures.length) throw new Error(`An ingested-only source has no local fixtures: ${name}`);
     if (!fs.existsSync(path.join(root, `crates/ai-hist/src/providers/${item.rust_id}/mod.rs`))) throw new Error(`Missing provider module: ${name}`);
     for (const fixture of item.fixtures) {
       if (fixture.source !== item.id || !/^[a-z0-9-]+$/.test(fixture.name) || !fixture.quirk || !fixture.files?.length) throw new Error(`Invalid fixture for ${item.id}`);
