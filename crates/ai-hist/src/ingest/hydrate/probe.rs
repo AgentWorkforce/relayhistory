@@ -198,9 +198,8 @@ impl HydrationProbe {
                 .ok()
             })
             .as_ref()?;
-        conn.prepare_cached("SELECT 1 FROM session WHERE id = ?")
-            .and_then(|mut statement| statement.exists([session_id]))
-            .ok()
+        let layout = crate::ingest::opencode::v2::Layout::detect(conn).ok()?;
+        Some(layout.envelope(conn, session_id).ok()?.is_some())
     }
 }
 

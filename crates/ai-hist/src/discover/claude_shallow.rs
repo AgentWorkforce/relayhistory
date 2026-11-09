@@ -1,10 +1,11 @@
 //! A Claude shallow read: the head and tail folds over a bounded transcript.
 
 use super::{
-    claude_session_id_from_bounded, claude_substantive_prompt, claude_timestamp, parse_record,
-    push_unique, records, BoundedJsonl, Candidate, ShallowSession,
+    claude_substantive_prompt, claude_timestamp, parse_record, push_unique, records, BoundedJsonl,
+    Candidate, ShallowSession,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
+use std::collections::BTreeSet;
 use std::path::Path;
 use crate::ingest::claude_title::ClaudeTitles;
 use serde_json::Value;
@@ -25,12 +26,16 @@ fn fold_claude_head_line(
     fold: &mut ClaudeHeadFold,
     line: &[u8],
     sidecar_layout: bool,
+    owner: Option<&str>,
 ) -> bool {
     fold.head_records_seen += 1;
     let Some(value) = parse_record(line) else {
         return true;
     };
     fold.parsed_records += 1;
+    if is_inherited(&value, owner) {
+        return true;
+    }
     if value
         .get("sessionId")
         .and_then(Value::as_str)
@@ -93,7 +98,22 @@ fn fold_claude_head_line(
     !settled
 }
 
-fn fold_claude_shallow_tail(session: &mut ShallowSession, bounded: &BoundedJsonl) {
+/// A record of the session a resumed or forked transcript inherited its
+/// history from, when `owner` is the session the file belongs to.
+fn is_inherited(value: &Value, owner: Option<&str>) -> bool {
+    owner.is_some_and(|owner| {
+        value
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .is_some_and(|id| !id.is_empty() && id != owner)
+    })
+}
+
+fn fold_claude_shallow_tail(
+    session: &mut ShallowSession,
+    bounded: &BoundedJsonl,
+    owner: Option<&str>,
+) {
     let mut need_last_activity = true;
     let mut need_branch = true;
     for line in bounded.tail_records_rev() {
@@ -103,6 +123,9 @@ fn fold_claude_shallow_tail(session: &mut ShallowSession, bounded: &BoundedJsonl
         let Some(value) = parse_record(line) else {
             continue;
         };
+        if is_inherited(&value, owner) {
+            continue;
+        }
         if need_last_activity {
             if let Some(ts) = claude_timestamp(&value) {
                 session.last_activity_ms = Some(ts);
@@ -133,12 +156,17 @@ fn may_hold_title(line: &[u8]) -> bool {
 /// [`ClaudeTitles`]). For a file inside the head budget the tail walk is the
 /// whole file. For a larger one, a rename recorded only between the two
 /// regions is missed here and filled in by the full ingest.
-fn fold_claude_shallow_title(session: &mut ShallowSession, bounded: &BoundedJsonl) {
+fn fold_claude_shallow_title(
+    session: &mut ShallowSession,
+    bounded: &BoundedJsonl,
+    owner: Option<&str>,
+) {
     let mut titles = ClaudeTitles::default();
     if !bounded.tail.is_empty() {
         for value in records(&bounded.head)
             .filter(|line| may_hold_title(line))
             .filter_map(parse_record)
+            .filter(|value| !is_inherited(value, owner))
         {
             titles.observe(&value);
         }
@@ -147,7 +175,12 @@ fn fold_claude_shallow_title(session: &mut ShallowSession, bounded: &BoundedJson
         .tail_records_rev()
         .filter(|line| may_hold_title(line))
         .collect();
-    for value in tail.into_iter().rev().filter_map(parse_record) {
+    for value in tail
+        .into_iter()
+        .rev()
+        .filter_map(parse_record)
+        .filter(|value| !is_inherited(value, owner))
+    {
         titles.observe(&value);
     }
     session.title = titles.best();
@@ -165,7 +198,8 @@ pub(super) fn read_claude_shallow(
         ..Default::default()
     };
     let mut models = Vec::new();
-    let session_id = claude_session_id_from_bounded(bounded)?;
+    let (session_id, inherits) = claude_session_id_from_bounded(bounded, path)?;
+    let owner = session_id.as_deref().filter(|_| inherits);
     // A subagent sidecar transcript is its own file whose records carry the
     // *parent's* sessionId (see `ingest_claude_transcript`). Enumerating it
     // as a session would emit the parent twice per run and let the two
@@ -180,12 +214,19 @@ pub(super) fn read_claude_shallow(
         head_records_seen: 0,
     };
     for line in bounded.head_records() {
-        if !fold_claude_head_line(&mut session, &mut models, &mut head, line, sidecar_layout) {
+        if !fold_claude_head_line(
+            &mut session,
+            &mut models,
+            &mut head,
+            line,
+            sidecar_layout,
+            owner,
+        ) {
             break;
         }
     }
-    fold_claude_shallow_tail(&mut session, bounded);
-    fold_claude_shallow_title(&mut session, bounded);
+    fold_claude_shallow_tail(&mut session, bounded, owner);
+    fold_claude_shallow_title(&mut session, bounded, owner);
     // A file laid out as a sidecar whose every identified head record is a
     // sidechain row is a subagent's transcript, for a session whose own
     // transcript is enumerated separately. A primary transcript of only
@@ -223,4 +264,35 @@ pub(super) fn read_claude_shallow(
         session.session_id = session_id;
         session.models = models;
         Ok(Some(session))
+}
+
+/// The session a bounded Claude transcript belongs to, and whether its
+/// records also name another session.
+///
+/// One id is the session. Several are accepted only when one is the file's
+/// stem: a resumed or forked conversation copies its origin's records into a
+/// new file named after itself, and those records are inherited history.
+fn claude_session_id_from_bounded(
+    bounded: &BoundedJsonl,
+    path: &Path,
+) -> Result<(Option<String>, bool)> {
+    let session_ids = bounded
+        .head_records()
+        .chain(bounded.tail_records_rev())
+        .filter_map(parse_record)
+        .filter_map(|value| {
+            value
+                .get("sessionId")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+        })
+        .collect::<BTreeSet<_>>();
+    if session_ids.len() <= 1 {
+        return Ok((session_ids.into_iter().next(), false));
+    }
+    let owner = crate::ingest::claude_primary_stem(path)
+        .filter(|stem| session_ids.contains(stem))
+        .context("conflicting sessionId values in Claude transcript")?;
+    Ok((Some(owner), true))
 }

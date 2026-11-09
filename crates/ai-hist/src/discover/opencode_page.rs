@@ -142,6 +142,67 @@ pub(super) fn opencode_sqlite_model(
     Ok(model)
 }
 
+/// The shallow read's prompt, title and model, from the tables the OpenCode
+/// reader picks for the session.
+pub(super) fn opencode_shallow_fields(
+    scan: &ScanEnv<'_>,
+    snapshot: &OpencodeReadSnapshot,
+    locator: &str,
+) -> Result<(Option<String>, Option<String>, Option<String>)> {
+    use crate::ingest::opencode::v2;
+    let conn = &snapshot.conn;
+    if snapshot.layout.envelope(conn, locator)? != Some(v2::Envelope::V2) {
+        return Ok((
+            opencode_sqlite_prompt(scan, snapshot, locator)?,
+            opencode_sqlite_title(snapshot, locator)?,
+            opencode_sqlite_model(scan, snapshot, locator)?,
+        ));
+    }
+    scan.note_query();
+    let prompt = v2::first_prompt(conn, locator, EXCERPT_MAX_CHARS, EXCERPT_TRIM_WHITESPACE)?
+        .map(|text| excerpt(&text))
+        .filter(|text| !text.is_empty());
+    scan.note_query();
+    let model = v2::first_model(conn, locator)?;
+    scan.note_records(u64::from(prompt.is_some()) + u64::from(model.is_some()));
+    Ok((prompt, v2::title(conn, locator)?, model))
+}
+
+/// The session enumeration: the V1 `session` rows, or on a store with
+/// OpenCode 2 the V1 sessions it has not copied and then its own, in
+/// one order. Sorting that union reads every session row, which the V1-only
+/// query avoids when the provider indexes `time_updated`; session rows are
+/// small.
+pub(super) fn opencode_enumeration_sql(
+    snapshot: &OpencodeReadSnapshot,
+    [directory, created, updated]: [&str; 3],
+    recency_order: &str,
+    limit_sql: &str,
+) -> Result<String> {
+    use crate::ingest::opencode::v2;
+    let v1 = format!(
+        "SELECT id, {directory}, {created}, {updated} FROM session \
+         WHERE id IS NOT NULL AND id <> ''"
+    );
+    if !snapshot.layout.has_v2() {
+        return Ok(format!("{v1} ORDER BY {recency_order}{limit_sql}"));
+    }
+    let order = match recency_order {
+        "time_updated DESC, id ASC" => "updated_ms DESC, id ASC",
+        _ => "id ASC",
+    };
+    let owned = v2::sessions_sql("v.id, v.directory, v.time_created, v.time_updated");
+    let v1 = match snapshot.session_columns.contains("id") {
+        true => format!("{v1}{} UNION ALL ", snapshot.layout.v1_filter()),
+        false => String::new(),
+    };
+    Ok(format!(
+        "SELECT id, directory, created_ms, updated_ms FROM \
+         (SELECT NULL AS id, NULL AS directory, NULL AS created_ms, NULL AS updated_ms \
+          WHERE 0 UNION ALL {v1}{owned}) ORDER BY {order}{limit_sql}"
+    ))
+}
+
 pub(super) type OpencodeSessionRow = (String, Option<String>, Option<i64>, Option<i64>);
 
 fn opencode_session_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OpencodeSessionRow> {

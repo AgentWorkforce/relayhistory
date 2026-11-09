@@ -2443,14 +2443,12 @@ fn ingest_claude(
         // than claiming bytes nobody parsed.
         Some(snapshot) => ingest_claude_hook_snapshot(conn, path, snapshot, cursor)?,
         None => {
+            // The record walk reads the file's session from this pass's fold
+            // and keeps it on the `cursor.claude` it rewrites.
+            cursor.claude.get_or_insert_with(Default::default).scan = scan;
             outcome.absorb(incremental::ingest_claude_transcript_incremental(
                 conn, path, None, cursor,
             )?);
-            // The record walk rewrites `cursor.claude`; put the metadata
-            // walk's own position back on it so both survive the same store.
-            if let Some(claude) = cursor.claude.as_mut() {
-                claude.scan = scan;
-            }
         }
     }
     continuity::capture_claude(
@@ -4479,6 +4477,35 @@ mod tests {
             .recv_timeout(std::time::Duration::from_secs(2))
             .unwrap();
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn an_opencode_2_session_that_is_gone_is_source_unavailable() {
+        let home = tempfile::tempdir().unwrap();
+        let store = home.path().join("opencode.db");
+        Connection::open(&store)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT NOT NULL,
+                                          time_created INTEGER NOT NULL,
+                                          time_updated INTEGER NOT NULL);
+                 CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                                               type TEXT NOT NULL, seq INTEGER NOT NULL,
+                                               time_created INTEGER NOT NULL, data TEXT NOT NULL);",
+            )
+            .unwrap();
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let roots = crate::ProviderRoots::from_home(home.path().to_path_buf(), store.clone());
+        let target = CatalogTarget {
+            locator: Some(store.to_string_lossy().into_owned()),
+            discovery_state: Some("shallow".into()),
+        };
+        let error = source_snapshot(&conn, &options("opencode", "gone"), &target, &roots, None)
+            .unwrap_err();
+        assert!(
+            error.to_string().starts_with("SESSION_SOURCE_UNAVAILABLE"),
+            "{error:#}"
+        );
     }
 
     #[test]

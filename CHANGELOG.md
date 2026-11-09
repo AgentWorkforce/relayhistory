@@ -11,6 +11,11 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Factory Droid local sessions are discovered and indexed automatically from native JSONL transcripts and settings sidecars, preserving messages, tool outcomes and resumed-session changes.
 - `ai-hist/factory-source` projects Factory API messages into readable evidence and canonical delivery records with the same native block identities as local Droid capture, preserving raw messages and explicit tool outcomes.
 
+### Fixed
+
+- Reconciliation retries a failing acquisition batch one path at a time and queues a path that fails alone for retry, so one unreadable transcript no longer blocks every path after it or keeps the pass from draining.
+- Resumed and forked Claude transcripts, which open with a copy of the origin session's records, are captured under the session they are named after, with a `fork` edge to the origin, instead of failing with conflicting `sessionId` values.
+
 ### Rust API
 
 - Added `Source::Droid` with `factory` as an input alias; serialized source identity is `droid`.
@@ -90,6 +95,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- OpenCode 2 sessions are discovered, synced and hydrated from its `session_v2` and `session_message` tables: every session with a `session_v2` row reads from there, V1 sessions OpenCode 2 has not migrated yet keep reading from the V1 tables. Migrated sessions re-sync once, and can carry less than their V1 originals (attachments and part kinds OpenCode 2 drops).
 - Session manifests record raw-chunk scrub status and stored digests; readers quarantine unscrubbed sessions.
 - The object-storage plugin can scrub PII and secrets, including PGP private keys, card numbers and phone numbers, from raw session chunks before upload (`scrub::scrub_chunk`, uploaded only through `scrub::seal::put_raw_chunk`), using the same rules as the hosted service.
 - The object-storage plugin's `scrub::Dropped` implements `Display` and `std::error::Error`, so callers can propagate it with `?`.

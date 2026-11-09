@@ -63,6 +63,10 @@ const REF_FORK_SESSION: &str = "forkSessionId";
 const REF_RESUME_MARKER: &str = "resume-marker";
 const REF_SHARED_SESSION_ID: &str = "sharedSessionId";
 const REF_SOURCE_SESSION: &str = "sourceSessionId";
+/// A session whose records a transcript carries ahead of its own: a resumed
+/// or forked Claude conversation copies its origin's history into the new
+/// file, which is named after the new session.
+const REF_INHERITED_SESSION: &str = "inheritedSessionId";
 /// Codex's own fork field: a human "fork conversation" names its parent here.
 const REF_FORKED_FROM_ID: &str = "forked_from_id";
 /// A Codex subagent spawn, which starts from the parent thread's context.
@@ -111,6 +115,22 @@ pub struct ContinuityEvidence {
     /// An explicit `sourceSessionId`, which names the origin directly.
     pub explicit_source_session_id: Option<String>,
     pub source_version: Option<String>,
+}
+
+/// Record `parent` as the session this transcript's history was inherited
+/// from: a fork target, dated by the transcript's own first record.
+pub(crate) fn note_inherited_session(evidence: &mut ContinuityEvidence, parent: String) {
+    if parent.is_empty() || parent == evidence.session_id {
+        return;
+    }
+    if let Some(ts) = evidence.first_ts_ms {
+        evidence.explicit_fork_ts_ms.entry(parent.clone()).or_insert(ts);
+    }
+    evidence
+        .explicit_fork_refs
+        .entry(parent.clone())
+        .or_insert_with(|| REF_INHERITED_SESSION.to_string());
+    push_unique(&mut evidence.explicit_fork_targets, parent);
 }
 
 impl ContinuityEvidence {
@@ -444,14 +464,12 @@ pub(crate) fn scan_claude_transcript_text(
     path: &Path,
     text: &str,
 ) -> Result<Option<ContinuityEvidence>> {
-    let mut evidence = ContinuityEvidence::default();
-    let mut first_user_seen = false;
-    let mut any = false;
+    let mut fold = crate::ingest::ClaudeMetaFold::for_path(path);
     for line in text.lines() {
         crate::ingest::check_capture_cancelled()?;
-        any |= fold_claude_line(&mut evidence, &mut first_user_seen, line);
+        fold_claude_line(&mut fold, line);
     }
-    Ok(finish_claude_fold(evidence, any, path))
+    Ok(fold.finish_continuity(path))
 }
 
 /// Store the evidence in bytes the hook captured, in one call.

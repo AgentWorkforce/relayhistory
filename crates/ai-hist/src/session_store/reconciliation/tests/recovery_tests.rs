@@ -292,3 +292,94 @@ fn recovery_v44_many_repaired_directories_bound_handles_and_keep_all_tails() {
     assert!(done);
     assert_eq!(ids(&store).len(), 9);
 }
+
+/// A transcript whose acquisition fails on its own: two sessions, neither the
+/// one it is named after.
+fn conflicting(path: &std::path::Path) {
+    write(path, "first-owner", "c1");
+    write(path, "second-owner", "c2");
+}
+
+#[test]
+fn one_failing_transcript_is_isolated_and_the_pass_drains_past_it() {
+    let (_temp, store, project) = fixture();
+    let broken = project.join("broken.jsonl");
+    conflicting(&broken);
+    for n in 0..20 {
+        write(
+            &project.join(format!("main-{n:02}.jsonl")),
+            &format!("main-{n:02}"),
+            "u1",
+        );
+    }
+    let mut round = store.reconcile().unwrap().sources([Source::Claude]);
+    let mut errors = 0;
+    let mut steps = 0;
+    while !round.healthy_pass_exhausted() {
+        steps += 1;
+        assert!(steps < 64, "the walk must advance past the failing path");
+        match round.step(64, 8, SyncOptions::default()) {
+            Ok(step) => assert!(!step.complete, "a failing path stays owed"),
+            Err(Error::SyncFailed(_)) => errors += 1,
+            Err(error) => panic!("unexpected {error:?}"),
+        }
+    }
+    let captured = ids(&store);
+    for n in 0..20 {
+        assert!(
+            captured.contains(&format!("main-{n:02}")),
+            "main-{n:02} missing"
+        );
+    }
+    // The failing batch, the path alone, then fair deferred retries between
+    // healthy batches: bounded by the walk, never one error per step forever.
+    assert!(errors <= 4, "{errors} errors in {steps} steps");
+    let walk = &round.sources[0];
+    assert!(walk.pending.is_empty());
+    assert_eq!(
+        walk.deferred.iter().collect::<Vec<_>>(),
+        [&DeferredWork::Acquisition(broken.clone())],
+        "the failing transcript stays owed"
+    );
+
+    // Still owed: each retry fails and keeps it, and the round never completes.
+    assert!(round.step(64, 8, SyncOptions::default()).is_err());
+    assert!(round.healthy_pass_exhausted());
+    assert_eq!(round.sources[0].deferred.len(), 1);
+
+    // Repaired, the next retry captures it and the round completes.
+    fs::remove_file(&broken).unwrap();
+    write(&broken, "broken", "fixed");
+    let mut completed = false;
+    for _ in 0..8 {
+        if round.step(64, 8, SyncOptions::default()).unwrap().complete {
+            completed = true;
+            break;
+        }
+    }
+    assert!(completed);
+    assert!(ids(&store).contains("broken"));
+}
+
+#[test]
+fn a_run_failure_keeps_the_batch_whole() {
+    let (_temp, store, project) = fixture();
+    for n in 0..3 {
+        write(
+            &project.join(format!("main-{n}.jsonl")),
+            &format!("main-{n}"),
+            "u1",
+        );
+    }
+    let mut round = store.reconcile().unwrap().sources([Source::Claude]);
+    let stop = crate::StopToken::new();
+    stop.stop();
+    assert!(matches!(
+        round.step(64, 8, SyncOptions::default().stop(stop)),
+        Err(Error::Cancelled(_))
+    ));
+    let walk = &round.sources[0];
+    assert_eq!(walk.pending.len(), 3);
+    assert_eq!(walk.isolating, 0);
+    assert!(walk.deferred.is_empty());
+}

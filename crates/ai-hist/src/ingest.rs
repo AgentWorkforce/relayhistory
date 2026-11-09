@@ -17,6 +17,7 @@ use std::io::{self, BufRead, BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+mod claude_owner;
 mod claude_record_rows;
 mod claude_standalone;
 pub(crate) mod claude_title;
@@ -52,6 +53,8 @@ pub(crate) mod tool_result_facts;
 pub(crate) mod transcript_cursor;
 pub(crate) mod transcript_file;
 
+use claude_owner::claude_file_session_id;
+pub(crate) use claude_owner::{claude_primary_stem, claude_sessionless_owner};
 use event_insert::insert_session_event;
 pub(crate) use evidence_probe::note_deleted;
 use evidence_probe::{
@@ -781,8 +784,8 @@ const SWEEP_PARSER_GENERATIONS: &[&str] = &[
 /// that output changes, so the first sweep after an upgrade re-reads stores
 /// the source fingerprint would otherwise call unchanged. `v2` makes every
 /// assistant message evidence (step-only and reasoning-only messages, thinking
-/// blocks, `synthetic` control rows).
-const OPENCODE_NORMALIZER_GENERATION: &str = "opencode_normalizer_v2";
+/// blocks, `synthetic` control rows). `v3` reads OpenCode 2's own tables.
+const OPENCODE_NORMALIZER_GENERATION: &str = "opencode_normalizer_v3";
 
 /// The generation half of a stored fingerprint: what this build of the sweep
 /// would produce from a given tree, independent of the tree itself.
@@ -7940,11 +7943,21 @@ pub(crate) struct ClaudeMetaFold {
     /// Two different `sessionId` values were seen in one transcript.
     #[serde(default)]
     pub conflicting_session_ids: bool,
+    /// The session that owns the file: its stem, for a primary transcript.
+    /// A resumed or forked conversation starts by copying its origin's
+    /// records, so a primary transcript can name two sessions; the one it is
+    /// named after owns it, and the other's records are inherited history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// The owner's records alone, split off at the first record naming
+    /// another session. `None` while every identified record is the owner's,
+    /// when this fold already is the owner's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owned: Option<Box<ClaudeMetaFold>>,
 }
 
 impl ClaudeMetaFold {
-    /// Fold one record in. Must be called in file order, once per record.
-    pub(crate) fn observe(&mut self, value: &Value) {
+    pub(super) fn observe_record(&mut self, value: &Value) {
         if let Some(object) = value.as_object() {
             self.continuity_any = true;
             crate::continuity::fold_claude_record(
@@ -8055,9 +8068,7 @@ impl ClaudeMetaFold {
         }
     }
 
-    /// The session the transcript at `path` describes, or `None` when no
-    /// record named one.
-    pub(crate) fn finish(&self, path: &Path) -> Option<ClaudeSessionMeta> {
+    pub(super) fn finish_own(&self, path: &Path) -> Option<ClaudeSessionMeta> {
         let session_id = self.session_id.clone()?;
         let first = self.first_ts.unwrap_or(0);
         Some(ClaudeSessionMeta {
@@ -8212,7 +8223,7 @@ fn retire_claude_history_row(
 /// position to keep. It folds through `ClaudeMetaFold` like every other
 /// reader, so what a record means cannot differ between the two.
 fn scan_claude_session_text(path: &Path, text: &str) -> Result<Option<ClaudeSessionMeta>> {
-    let mut fold = ClaudeMetaFold::default();
+    let mut fold = ClaudeMetaFold::for_path(path);
     for line in text.lines() {
         check_capture_cancelled()?;
         let Ok(value) = serde_json::from_str::<Value>(line) else {
@@ -8221,7 +8232,7 @@ fn scan_claude_session_text(path: &Path, text: &str) -> Result<Option<ClaudeSess
         fold.observe(&value);
     }
     anyhow::ensure!(
-        !fold.conflicting_session_ids,
+        !fold.has_conflicting_identity(),
         "conflicting sessionId values in Claude transcript {}",
         path.display()
     );
@@ -8235,14 +8246,17 @@ fn ingest_claude_transcript_text_as(
     text: &str,
     attributed_session_id: Option<&str>,
 ) -> Result<()> {
-    let file_session_id = text.lines().find_map(|line| {
-        serde_json::from_str::<Value>(line)
-            .ok()?
-            .get("sessionId")?
-            .as_str()
-            .filter(|id| !id.is_empty())
-            .map(str::to_string)
-    });
+    let file_session_id = claude_sessionless_owner(
+        path,
+        text.lines().filter_map(|line| {
+            serde_json::from_str::<Value>(line)
+                .ok()?
+                .get("sessionId")?
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+        }),
+    );
     let mut walk = ClaudeRecordWalk::new(
         conn,
         path,
@@ -8264,10 +8278,15 @@ pub(crate) fn scan_claude_session_file_resumed(
     let mut reader =
         transcript_cursor::TranscriptReader::open(path, saved.file.as_ref(), saved.resume_from)?;
     let mut fold = if reader.start_offset() == 0 {
-        ClaudeMetaFold::default()
+        ClaudeMetaFold::for_path(path)
     } else {
         saved.fold.clone()
     };
+    // A fold saved before ownership was recorded resumes owned by the stem;
+    // `observe` splits the owner's records off only from the next foreign one.
+    if fold.owner.is_none() {
+        fold.owner = claude_primary_stem(path);
+    }
     let start_offset = reader.start_offset();
     let mut resume_from = None;
     let mut line = String::new();
@@ -8327,12 +8346,11 @@ pub(crate) fn scan_claude_session_file_resumed(
         .saturating_add(reader.tail_bytes())
         .saturating_add(validation_bytes);
     anyhow::ensure!(
-        !fold.conflicting_session_ids,
+        !fold.has_conflicting_identity(),
         "conflicting sessionId values in Claude transcript {}",
         path.display()
     );
-    let continuity =
-        crate::continuity::finish_claude_fold(fold.continuity.clone(), fold.continuity_any, path);
+    let continuity = fold.finish_continuity(path);
     Ok(ClaudeScanPass {
         meta: fold.finish(path),
         bytes_read,
@@ -8814,36 +8832,6 @@ fn ingest_claude_transcript_as(
         walk.feed(line.trim_end_matches(['\n', '\r']))?;
     }
     walk.finish()
-}
-
-/// The first in-log session id a transcript carries.
-///
-/// Read ahead of the record walk, and bounded in the case that matters: the
-/// id is normally on the first record, and this stops at the first one that
-/// has it.
-fn claude_file_session_id(path: &Path) -> Result<Option<String>> {
-    let file = fs::File::open(path)
-        .with_context(|| format!("reading claude transcript {}", path.display()))?;
-    let mut reader = BufReader::new(file);
-    let mut raw = Vec::new();
-    loop {
-        raw.clear();
-        if reader.read_until(b'\n', &mut raw)? == 0 {
-            return Ok(None);
-        }
-        let Ok(line) = std::str::from_utf8(&raw) else {
-            continue;
-        };
-        if let Some(id) = serde_json::from_str::<Value>(line.trim_end_matches(['\n', '\r']))
-            .ok()
-            .as_ref()
-            .and_then(|value| value.get("sessionId"))
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())
-        {
-            return Ok(Some(id.to_string()));
-        }
-    }
 }
 
 /// What one Claude transcript threads through its records, whichever reader
