@@ -75,11 +75,20 @@ struct Group {
 fn text_matches(echo: &SearchRow, echo_text: &str, primary_text: &str) -> bool {
     if primary_text.is_empty()
         || !(echo.kind == "tool_use" || echo.kind == "tool_result" || echo.role == "assistant")
-        || !echo_text.contains(primary_text)
     {
         return false;
     }
-    primary_text.chars().count() * 3 >= echo_text.chars().count()
+    // A tool payload may serialize the prompt with escaped quotes; that
+    // serialization is still the same verbatim text.
+    let unescaped;
+    let echo_text = if echo_text.contains("\\\"") {
+        unescaped = echo_text.replace("\\\"", "\"");
+        &unescaped
+    } else {
+        echo_text
+    };
+    echo_text.contains(primary_text)
+        && primary_text.chars().count() * 3 >= echo_text.chars().count()
 }
 
 /// Among the primaries an echo could join, the closest preceding one (the
@@ -166,10 +175,16 @@ pub(super) fn group_rows(rows: Vec<SearchRow>, bound_hit: bool) -> Vec<SearchRow
     }
     let mut singletons: Vec<Group> = Vec::new();
     for (position, row, row_text) in pending {
-        let candidates = buckets
-            .get(&(row.source.clone(), row.session_id.clone()))
-            .map(Vec::as_slice)
-            .unwrap_or(&[]);
+        // Rows with no (or an empty) session id have no proven session to
+        // group within: unrelated session-less rows must not hide each
+        // other as echoes.
+        let candidates: &[usize] = match row.session_id.as_deref() {
+            Some(session) if !session.is_empty() => buckets
+                .get(&(row.source.clone(), row.session_id.clone()))
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+            _ => &[],
+        };
         let joined = join_target(&groups, candidates, &row, &row_text);
         match joined {
             Some(index) => groups[index].size += 1,
@@ -383,8 +398,16 @@ pub(super) fn recount_echoes(
         let fetched = fetch_rows(conn, terms, raw_fts, &universe_filter, role, MAX_GROUP_FETCH)?;
         let bound_hit = fetched.bound_hit;
         any_bound_hit |= bound_hit;
+        let unscoped = session.is_none() && filter.session_id.is_none();
         session_bound_hit.insert(session, bound_hit);
         for row in group_rows(fetched.rows, bound_hit) {
+            // The session-less recount fetches without a session filter,
+            // so it sees every session's rows; only its own session-less
+            // results may be recorded, or a bound-cut unscoped grouping
+            // could overwrite a complete session recount's membership.
+            if unscoped && row.session_id.is_some() {
+                continue;
+            }
             counts.insert(
                 (row.match_source.clone(), row.id),
                 (row.group_size, row.echo_count, row.group_truncated),

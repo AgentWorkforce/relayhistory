@@ -18,7 +18,10 @@ collapse into it and are counted, not returned), carry a match-centered
 `snippet` beside the full `prompt` (counts are provisional when
 `groupTruncated` is set), and accept `session_id`, `kinds`,
 `origin`, `max_content_chars` and `max_total_content_chars`; unknown
-arguments are rejected.
+arguments are rejected. The first match on a page is always returned in
+full even when its snippet alone would exceed
+`max_total_content_chars`, with `truncated: true`; later matches wait
+for the next cursor.
 
 A Relaycast handoff is a pointer, never an inlined transcript. `create_handoff`
 turns the caller's continuation request into the pointer's single,

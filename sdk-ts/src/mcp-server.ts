@@ -75,7 +75,9 @@ server.registerTool('search_history', {
   + 'Each match also carries origin and eventRef for re-reading the full row. Budget arguments are '
   + 'max_content_chars (per-match snippet window, 40..2000, default 320) and max_total_content_chars (total '
   + 'serialized page budget, 500..200000, default 20000); legacy names such as max_content, max_chars, budget or '
-  + 'token_budget are not accepted. The result is an envelope {matches, nextCursor, truncated, '
+  + 'token_budget are not accepted. The first match on a page is always returned in full even when its snippet '
+  + 'alone would exceed max_total_content_chars, with truncated: true; later matches wait for the next page. '
+  + 'The result is an envelope {matches, nextCursor, truncated, '
   + 'totalContentCharsUsed}; nextCursor is a search position only: pass it back unchanged as after to continue.',
   inputSchema: z.strictObject({
   query: z.string(), source: SOURCE.optional(), project: z.string().optional(), tag: z.string().optional(),

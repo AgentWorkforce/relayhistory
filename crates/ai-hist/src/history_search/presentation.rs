@@ -19,7 +19,11 @@ fn snippet_terms(terms: &[String]) -> Vec<(String, bool)> {
         // A column filter (`text:tailneedle`) names its literal operand
         // after the colon; that operand is what the snippet centers on.
         if token.contains(':') {
-            token = token.rsplit(':').next().unwrap_or("");
+            token = token
+                .rsplit(':')
+                .next()
+                .unwrap_or("")
+                .trim_matches(|c| c == '"' || c == '\'');
             if token.is_empty() {
                 continue;
             }
@@ -67,6 +71,23 @@ fn fold_char(ch: char) -> Vec<char> {
             'ś' | 'š' | 'ş' => out.push('s'),
             'ť' | 'ţ' => out.push('t'),
             'ź' | 'ż' | 'ž' => out.push('z'),
+            'ḃ' | 'ḅ' => out.push('b'),
+            'ḋ' | 'ḍ' => out.push('d'),
+            'ḟ' => out.push('f'),
+            'ġ' => out.push('g'),
+            'ḥ' => out.push('h'),
+            'ḳ' => out.push('k'),
+            'ḷ' | 'ḹ' => out.push('l'),
+            'ṁ' | 'ṃ' => out.push('m'),
+            'ṇ' => out.push('n'),
+            'ṗ' => out.push('p'),
+            'ṛ' | 'ṝ' => out.push('r'),
+            'ṣ' => out.push('s'),
+            'ṭ' => out.push('t'),
+            'ṿ' => out.push('v'),
+            'ẇ' | 'ẁ' | 'ẅ' => out.push('w'),
+            'ẋ' => out.push('x'),
+            'ỳ' => out.push('y'),
             '\u{300}'..='\u{36f}' => {}
             other => out.push(other),
         }
@@ -87,54 +108,71 @@ fn find_match(
     lowered_to_original: &[usize],
     terms: &[String],
 ) -> Option<(usize, usize)> {
-    let mut best: Option<(usize, usize)> = None;
+    // A whole-token match from any term beats a substring fallback from
+    // another (`alpha OR beta` must not center on `alphabet` when a real
+    // `beta` token occurs later), so the two classes compete separately.
+    let mut best_token: Option<(usize, usize)> = None;
+    let mut best_fallback: Option<(usize, usize)> = None;
     for (term, prefix) in snippet_terms(terms) {
         let term_lower: String = term.chars().flat_map(fold_char).collect();
         if term_lower.is_empty() {
             continue;
         }
         let term_len = term_lower.chars().count();
-        if let Some(lowered_start) = choose_occurrence(text_lower, folded_chars, &term_lower, prefix)
+        if let Some((lowered_start, is_token)) =
+            choose_occurrence(text_lower, folded_chars, &term_lower, prefix)
         {
             let start = lowered_to_original[lowered_start];
             let len = lowered_to_original[lowered_start + term_len - 1] + 1 - start;
-            let better = match best {
+            let slot = if is_token {
+                &mut best_token
+            } else {
+                &mut best_fallback
+            };
+            let better = match *slot {
                 None => true,
                 Some((best_start, best_len)) => {
                     start < best_start || (start == best_start && len > best_len)
                 }
             };
             if better {
-                best = Some((start, len));
+                *slot = Some((start, len));
             }
         }
     }
-    best
+    best_token.or(best_fallback)
 }
 
-/// The folded-codepoint offset of one term's chosen occurrence: the
-/// first whole-token occurrence for a plain term, the first substring
-/// occurrence for a prefix term or as a fallback.
+/// The folded-codepoint offset of one term's chosen occurrence, and
+/// whether it is a whole-token match. A plain term prefers the first
+/// whole-token occurrence and falls back to the first substring
+/// occurrence; a prefix term prefers the first occurrence at a token
+/// start. Token boundaries follow the FTS tokenizer: a neighbor that is
+/// not alphanumeric separates tokens (underscore included). The
+/// codepoint offset is tracked incrementally as the search advances, so
+/// many embedded occurrences do not recount the whole prefix each time.
 fn choose_occurrence(
     text_lower: &str,
     folded_chars: &[char],
     term_lower: &str,
     prefix: bool,
-) -> Option<usize> {
+) -> Option<(usize, bool)> {
     let term_len = term_lower.chars().count();
     let mut search_from = 0;
+    let mut counted_to = 0usize;
+    let mut counted_chars = 0usize;
     let mut chosen: Option<usize> = None;
     while let Some(rel) = text_lower[search_from..].find(term_lower) {
         let byte_idx = search_from + rel;
-        let lowered_start = text_lower[..byte_idx].chars().count();
-        let starts_token = lowered_start == 0
-            || !folded_chars[lowered_start - 1].is_alphanumeric()
-                && folded_chars[lowered_start - 1] != '_';
+        counted_chars += text_lower[counted_to..byte_idx].chars().count();
+        counted_to = byte_idx;
+        let lowered_start = counted_chars;
+        let starts_token =
+            lowered_start == 0 || !folded_chars[lowered_start - 1].is_alphanumeric();
         let ends_token = lowered_start + term_len >= folded_chars.len()
-            || !folded_chars[lowered_start + term_len].is_alphanumeric()
-                && folded_chars[lowered_start + term_len] != '_';
-        if prefix || starts_token && ends_token {
-            return Some(lowered_start);
+            || !folded_chars[lowered_start + term_len].is_alphanumeric();
+        if prefix && starts_token || !prefix && starts_token && ends_token {
+            return Some((lowered_start, prefix || ends_token));
         }
         if chosen.is_none() {
             chosen = Some(lowered_start);
@@ -149,7 +187,7 @@ fn choose_occurrence(
                 .map(char::len_utf8)
                 .unwrap_or(1);
     }
-    chosen
+    chosen.map(|start| (start, false))
 }
 
 /// A match-centered window of `text`, at most `max_content_chars` codepoints
