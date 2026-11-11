@@ -838,6 +838,7 @@ pub fn ai_hist::SessionStore::remove_retention_consumer(&self, &str) -> core::re
 pub fn ai_hist::SessionStore::retention_generation(&self) -> core::result::Result<u64, ai_hist::Error>
 pub fn ai_hist::SessionStore::retention_policy(&self) -> core::result::Result<ai_hist::retention::RetentionPolicy, ai_hist::Error>
 pub fn ai_hist::SessionStore::set_retention_policy(&self, ai_hist::retention::RetentionPolicy) -> core::result::Result<(), ai_hist::Error>
+pub fn ai_hist::SessionStore::set_registered_agent_name(&self, ai_hist::Source, &str, core::option::Option<&str>) -> core::result::Result<bool, ai_hist::Error>
 impl ai_hist::SessionStore
 pub fn ai_hist::SessionStore::apply_source_evidence(&self, ai_hist::SourceEvidenceSubmission) -> core::result::Result<ai_hist::HydrateSessionResult, ai_hist::Error>
 pub fn ai_hist::SessionStore::apply_source_observations(&self, ai_hist::SourceObservationBatch) -> core::result::Result<ai_hist::DiscoverySummary, ai_hist::Error>

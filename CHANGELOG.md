@@ -6,6 +6,14 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- A session can carry the name its agent was registered under (for example an Agent Relay worker's spawn name), so the change feed reports it as the session's `agent_name` and agent-name search can find it. A name the provider recorded itself is never replaced.
+
+### Rust API
+
+- Added `SessionStore::set_registered_agent_name(source, session_id, name)`. It returns whether the effective `agent_name` changed; a real change is stamped at a new revision and re-exported by the change feed. `None` clears only a name this method set. Errors: `InvalidArgument` (empty, over 128 characters, or a control character), `SessionNotFound`, and `UnsupportedOperation` on a read-only store.
+
 ## [0.58.0] - 2026-11-09
 
 ### Added

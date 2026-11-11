@@ -6,6 +6,8 @@ use crate::discover;
 use rusqlite::Connection;
 use std::path::PathBuf;
 
+mod registered_agent_name;
+
 impl CatalogSession {
     /// A delegated child's catalog-shaped description from one row of
     /// `DELEGATED_CHILD_SQL` (see `delegated_child_session`). `models` is left
