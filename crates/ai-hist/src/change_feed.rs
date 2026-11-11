@@ -1748,6 +1748,128 @@ mod tests {
         )
     }
 
+    /// The session's change-feed rows since `from`, with the agent name each reports.
+    fn session_names(store: &SessionStore, from: Watermark) -> Vec<(u64, Option<String>)> {
+        drain(
+            store
+                .changes_since(from, ChangeQuery::default().kinds([ChangeKind::Session]))
+                .unwrap(),
+        )
+        .into_iter()
+        .map(|change| match upsert(&change.op) {
+            Some(EvidenceRow::Session(session)) => (change.revision, session.agent_name.clone()),
+            other => panic!("a session upsert: {other:?}"),
+        })
+        .collect()
+    }
+
+    #[test]
+    fn a_registered_agent_name_is_a_stamped_metadata_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, conn) = store(dir.path());
+        conn.execute(
+            "INSERT INTO sessions (session_id, source) VALUES ('c1', 'codex')",
+            [],
+        )
+        .unwrap();
+        let head = store.head_revision().unwrap();
+
+        // Setting a name on an unnamed session re-reports the row at a new revision.
+        assert!(store
+            .set_registered_agent_name(Source::Codex, "c1", Some(" yo-1 "))
+            .unwrap());
+        let after = session_names(&store, head);
+        assert_eq!(after.len(), 1, "{after:?}");
+        assert!(after[0].0 > head.revision);
+        assert_eq!(after[0].1.as_deref(), Some("yo-1"));
+
+        // The same name again is a no-op: no new revision.
+        let head = store.head_revision().unwrap();
+        assert!(!store
+            .set_registered_agent_name(Source::Codex, "c1", Some("yo-1"))
+            .unwrap());
+        assert_eq!(store.head_revision().unwrap(), head);
+        assert!(session_names(&store, head).is_empty());
+
+        // A rename replaces the name this method set.
+        assert!(store
+            .set_registered_agent_name(Source::Codex, "c1", Some("yo-2"))
+            .unwrap());
+        assert_eq!(
+            session_names(&store, head).last().unwrap().1.as_deref(),
+            Some("yo-2")
+        );
+
+        // A clear removes it.
+        let head = store.head_revision().unwrap();
+        assert!(store
+            .set_registered_agent_name(Source::Codex, "c1", None)
+            .unwrap());
+        assert_eq!(session_names(&store, head).last().unwrap().1, None);
+    }
+
+    #[test]
+    fn a_provider_agent_name_wins_over_a_registered_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, conn) = store(dir.path());
+        conn.execute(
+            "INSERT INTO sessions (session_id, source, agent_name) \
+             VALUES ('s1', 'claude', 'native-worker')",
+            [],
+        )
+        .unwrap();
+        let head = store.head_revision().unwrap();
+        assert!(!store
+            .set_registered_agent_name(Source::Claude, "s1", Some("registered"))
+            .unwrap());
+        assert!(!store
+            .set_registered_agent_name(Source::Claude, "s1", None)
+            .unwrap());
+        assert_eq!(store.head_revision().unwrap(), head);
+        let name: Option<String> = conn
+            .query_row(
+                "SELECT agent_name FROM sessions WHERE source = 'claude' AND session_id = 's1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(name.as_deref(), Some("native-worker"));
+    }
+
+    #[test]
+    fn a_registered_agent_name_refuses_bad_input_and_unknown_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, conn) = store(dir.path());
+        conn.execute(
+            "INSERT INTO sessions (session_id, source) VALUES ('c1', 'codex')",
+            [],
+        )
+        .unwrap();
+        for bad in ["", "   ", "tab\tname", &"x".repeat(129)] {
+            assert!(
+                matches!(
+                    store.set_registered_agent_name(Source::Codex, "c1", Some(bad)),
+                    Err(Error::InvalidArgument(_))
+                ),
+                "{bad:?}"
+            );
+        }
+        assert!(matches!(
+            store.set_registered_agent_name(Source::Codex, "missing", Some("yo")),
+            Err(Error::SessionNotFound(_))
+        ));
+        let read_only = SessionStore::open(StoreOptions {
+            db_path: Some(dir.path().join("ai-history.db")),
+            read_only: true,
+            ..StoreOptions::default()
+        })
+        .unwrap();
+        assert!(matches!(
+            read_only.set_registered_agent_name(Source::Codex, "c1", Some("yo")),
+            Err(Error::UnsupportedOperation(_))
+        ));
+    }
+
     #[test]
     fn every_write_takes_a_new_revision_and_replays_in_order() {
         let dir = tempfile::tempdir().unwrap();

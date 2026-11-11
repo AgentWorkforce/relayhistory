@@ -47,6 +47,7 @@ pub const SESSION_STORE_OPS: &[&str] = &[
     OP_USAGE_SUMMARY,
     OP_USER_TURNS,
     OP_CAPABILITIES,
+    OP_SET_REGISTERED_AGENT_NAME,
     crate::change_feed::OP_CHANGES,
     crate::change_feed::OP_COMMIT_CHANGES,
 ];
@@ -55,6 +56,7 @@ const OP_REQUESTS: &str = "requests";
 const OP_USAGE_SUMMARY: &str = "usage_summary";
 const OP_USER_TURNS: &str = "user_turns";
 const OP_CAPABILITIES: &str = "capabilities";
+const OP_SET_REGISTERED_AGENT_NAME: &str = "set_registered_agent_name";
 
 /// The one argument shape every op reads. Unknown keys are rejected rather
 /// than ignored: the SDK is the only caller, and an argument it spells wrong
@@ -67,6 +69,19 @@ struct CallArgs {
     session_id: Option<String>,
     limit: Option<i64>,
     after: Option<CursorArgs>,
+    /// `set_registered_agent_name` only: the name, or `null` to clear one.
+    /// Required for that op, so a caller cannot clear a name by omission.
+    #[serde(default, deserialize_with = "present")]
+    agent_name: Option<Option<String>>,
+}
+
+/// A field that is present, even as `null`, is `Some`; an absent one stays
+/// `None` through `#[serde(default)]`.
+fn present<'de, D>(deserializer: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 /// A continuation as JSON. `tsMs` is optional because marker cursors may sit
@@ -279,6 +294,7 @@ pub(crate) fn dispatch(op: &str, args_json: &str) -> napi::Result<String> {
         OP_REQUESTS => requests(args, &source, source_name),
         OP_USAGE_SUMMARY => usage_summary(args, &source, source_name),
         OP_USER_TURNS => user_turns(args, &source, source_name),
+        OP_SET_REGISTERED_AGENT_NAME => set_registered_agent_name(args, source),
         other => Err(native_error(
             "INVALID_ARGUMENT",
             format!(
@@ -301,6 +317,31 @@ fn read_existing<T>(
     } else {
         Ok(None)
     }
+}
+
+/// The answer to `set_registered_agent_name`.
+#[derive(Debug, Serialize)]
+struct RegisteredAgentNameResult {
+    changed: bool,
+}
+
+/// Record a registered agent name on a catalogued session; see
+/// `SessionStore::set_registered_agent_name`. A write, so it opens writable.
+fn set_registered_agent_name(mut args: CallArgs, source: Source) -> napi::Result<String> {
+    let session_id = required_session_id(&mut args)?;
+    let Some(name) = args.agent_name.take() else {
+        return Err(native_error(
+            "INVALID_ARGUMENT",
+            "agentName is required (a string, or null to clear)",
+        ));
+    };
+    let path = db_path(args.db_path);
+    let store =
+        open_store(&path, false).map_err(|error| database_error(&path, format!("{error:#}")))?;
+    let changed = store
+        .set_registered_agent_name(source, &session_id, name.as_deref())
+        .map_err(query_error)?;
+    serialize(&RegisteredAgentNameResult { changed })
 }
 
 fn capabilities(source: &Source, source_name: String) -> napi::Result<String> {
@@ -465,6 +506,40 @@ mod tests {
         dispatch(op, &args.to_string())
             .map(|answer| serde_json::from_str(&answer).expect("dispatcher answers JSON"))
             .map_err(|error| error.reason.clone())
+    }
+
+    #[test]
+    fn set_registered_agent_name_writes_and_requires_an_explicit_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("history.db");
+        open_db(&db)
+            .unwrap()
+            .execute(
+                "INSERT INTO sessions (session_id, source) VALUES ('c1', 'codex')",
+                [],
+            )
+            .unwrap();
+        let db = db.to_str().unwrap();
+        let args = |name: Value| json!({"dbPath": db, "source": "codex", "sessionId": "c1", "agentName": name});
+        assert_eq!(
+            call("set_registered_agent_name", args(json!("yo-1"))).unwrap(),
+            json!({"changed": true})
+        );
+        assert_eq!(
+            call("set_registered_agent_name", args(json!("yo-1"))).unwrap(),
+            json!({"changed": false})
+        );
+        assert_eq!(
+            call("set_registered_agent_name", args(Value::Null)).unwrap(),
+            json!({"changed": true})
+        );
+        // Omitting agentName is refused, so a caller cannot clear by omission.
+        let refused = call(
+            "set_registered_agent_name",
+            json!({"dbPath": db, "source": "codex", "sessionId": "c1"}),
+        )
+        .unwrap_err();
+        assert!(refused.contains("agentName is required"), "{refused}");
     }
 
     fn seeded_markers() -> tempfile::TempDir {
