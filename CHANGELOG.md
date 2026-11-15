@@ -4,7 +4,11 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Patch]
+
+### Fixed
+
+- Claude records written without a `timestamp`, such as `api-request-blob` request copies, are no longer stored at 1970-01-01. They take the time of the preceding record in their session. With no earlier time to inherit, they keep a marker with no time, and the pass reports them as `EVIDENCE_PARTIAL`. Claude and Codex `history.jsonl` lines without a usable time are skipped instead of stored at 0.
 
 ## [0.59.0] - 2026-11-11
 
