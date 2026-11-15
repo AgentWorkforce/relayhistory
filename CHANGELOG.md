@@ -6,6 +6,14 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased - Patch]
 
+### Added
+
+- Claude messages keep who sent them: `session_events.origin_kind` stores each record's `origin.kind` verbatim (`human`, `peer`, `task-notification`, ...), and the change feed exports it with the row, so an uploaded session can tell human-typed messages from agent-to-agent traffic. Rows indexed before the column stay null and are not re-exported for it.
+
+### Rust API
+
+- Added `SessionEvent::origin_kind`.
+
 ### Fixed
 
 - Claude records written without a `timestamp`, such as `api-request-blob` request copies, are no longer stored at 1970-01-01. They take the time of the preceding record in their session. With no earlier time to inherit, they keep a marker with no time, and the pass reports them as `EVIDENCE_PARTIAL`. Claude and Codex `history.jsonl` lines without a usable time are skipped instead of stored at 0.

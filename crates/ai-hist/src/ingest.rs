@@ -8977,6 +8977,11 @@ fn ingest_claude_record(
         control_kind: None,
         // Set below, once the request's usage is settled.
         record_token_json: None,
+        // Who wrote the message: a person at the prompt, a peer agent, or a
+        // background task's notification. Kept verbatim so a reader can tell
+        // human-typed messages from agent-to-agent traffic without the
+        // transcript.
+        origin_kind: control::origin_kind(obj),
     };
     // A notice Claude Code wrote itself, not model output; see
     // `is_claude_synthetic_placeholder_model`.
@@ -10780,6 +10785,10 @@ struct RawMessageFacts<'a> {
     /// `token_json` -- JSON `null` for a copy that carried none. `None` where
     /// `token_json` already is the record's own, and for every other source.
     record_token_json: Option<&'a str>,
+    /// Claude: the record's `origin.kind` verbatim (`human`, `peer`,
+    /// `task-notification`, ...), who put the message in the transcript.
+    /// `None` where the record names no origin, and for every other source.
+    origin_kind: Option<&'a str>,
 }
 
 /// The provider's own identities for the request a record belongs to, read

@@ -1301,6 +1301,7 @@ mod tests {
             control_kind: None,
             raw_kind: None,
             record_token_json: None,
+            origin_kind: None,
         }
     }
 

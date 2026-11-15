@@ -343,6 +343,10 @@ CREATE TABLE IF NOT EXISTS session_events (
     -- request's copies settle into -- and JSON `null` for a copy that carried
     -- none. Null wherever `token_json` already is the record's own.
     record_token_json TEXT,
+    -- Who put a message in the transcript, as the harness recorded it:
+    -- Claude's `origin.kind` verbatim (`human`, `peer`, `task-notification`,
+    -- ...). Null where the record names no origin and for other sources.
+    origin_kind TEXT,
     -- Which evidence backs this row: 'local' (a local parser read it from
     -- the provider's own files), 'remote' (a remote observation supplied
     -- it) or 'both'. See `EVIDENCE_LOCATION_TABLES`.
@@ -727,6 +731,11 @@ const REQUIRED_SESSION_EVENT_COLUMNS: &[(&str, &str)] = &[
     // by the same parser generation as the facts above, so the raw-facts
     // backfill fills it on rows indexed before it existed.
     ("record_token_json", "TEXT"),
+    // Who put the message in the transcript, verbatim from the harness
+    // (Claude's `origin.kind`). Appended, so the change feed restamps only
+    // rows holding a value: rows indexed before it stay NULL and are not
+    // re-exported. New and re-parsed rows carry it.
+    ("origin_kind", "TEXT"),
 ];
 /// Columns the v2 `session_relationships` shape adds. A v1 row set cannot
 /// represent related evidence whose child has no provider-recorded identity,
@@ -2761,6 +2770,13 @@ pub struct SessionEvent {
     /// wherever `token_json` already is the record's own: every row of other
     /// sources, and a Claude row whose usage settlement did not change.
     pub record_token_json: Option<String>,
+    /// Who put the message in the transcript, as the harness recorded it:
+    /// Claude's `origin.kind` verbatim (`human` for a person at the prompt,
+    /// `peer` for another agent session, `task-notification` for a background
+    /// task's notice). `None` where the record names none, for other sources,
+    /// and on rows indexed before the column existed.
+    #[serde(default)]
+    pub origin_kind: Option<String>,
 }
 
 /// Stable continuation for normalized session events.
@@ -2900,7 +2916,7 @@ pub(crate) const SESSION_EVENT_COLUMNS: &str =
      payload_truncated, payload_hash, call_index, event_index, result_status, event_source, \
      error_signal, subagent_session_id, agent_id, request_id, provider_message_id, \
      stop_reason, agent_version, is_sidechain, is_meta, turn_id, request_span, raw_kind, \
-     control_kind, record_token_json";
+     control_kind, record_token_json, origin_kind";
 
 /// The order every whole-session event read uses: oldest first, rows sharing
 /// a timestamp in insertion order.
