@@ -15,6 +15,8 @@ mod busy;
 pub(crate) use busy::{configure_busy_retry, ShortBusyBudget};
 pub(crate) mod busy_wait;
 mod event_row;
+mod history_lines;
+pub use history_lines::{parse_claude, parse_codex};
 mod retired_sources;
 pub(crate) mod sync_connection;
 pub use retired_sources::is_retired_source;
@@ -2210,58 +2212,6 @@ pub fn prompt_hash(prompt: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(prompt.as_bytes());
     format!("{:x}", hasher.finalize())[..16].to_string()
-}
-
-pub fn parse_claude(line: &str) -> Result<Option<HistoryEntry>> {
-    let obj: serde_json::Value = serde_json::from_str(line)?;
-    let display = obj
-        .get("display")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim();
-    if display.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(HistoryEntry {
-        id: 0,
-        source: "claude".into(),
-        session_id: obj
-            .get("sessionId")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-        project: obj
-            .get("project")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-        prompt: display.to_string(),
-        prompt_hash: Some(prompt_hash(display)),
-        timestamp_ms: obj.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0),
-    }))
-}
-
-pub fn parse_codex(line: &str) -> Result<Option<HistoryEntry>> {
-    let obj: serde_json::Value = serde_json::from_str(line)?;
-    let text = obj
-        .get("text")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim();
-    if text.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(HistoryEntry {
-        id: 0,
-        source: "codex".into(),
-        session_id: obj
-            .get("session_id")
-            .or_else(|| obj.get("sessionId"))
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-        project: None,
-        prompt: text.to_string(),
-        prompt_hash: Some(prompt_hash(text)),
-        timestamp_ms: ((obj.get("ts").and_then(|v| v.as_f64()).unwrap_or(0.0)) * 1000.0) as i64,
-    }))
 }
 
 pub fn parse_cursor_text(line: &str) -> Result<Option<String>> {
@@ -5987,6 +5937,32 @@ mod tests {
                 .unwrap()
                 .timestamp_ms,
             2000
+        );
+    }
+
+    /// A history line with no usable time is left out, never dated 0.
+    #[test]
+    fn a_history_line_without_a_time_is_never_stored_at_zero() {
+        for line in [
+            r#"{"display":"hello","sessionId":"s"}"#,
+            r#"{"display":"hello","timestamp":"not a number","sessionId":"s"}"#,
+            r#"{"display":"hello","timestamp":0,"sessionId":"s"}"#,
+        ] {
+            assert!(parse_claude(line).unwrap().is_none(), "{line}");
+        }
+        for line in [
+            r#"{"text":"fix","session_id":"c"}"#,
+            r#"{"text":"fix","ts":"soon","session_id":"c"}"#,
+            r#"{"text":"fix","ts":0,"session_id":"c"}"#,
+        ] {
+            assert!(parse_codex(line).unwrap().is_none(), "{line}");
+        }
+        assert_eq!(
+            parse_claude(r#"{"display":"hello","timestamp":7,"sessionId":"s"}"#)
+                .unwrap()
+                .unwrap()
+                .timestamp_ms,
+            7
         );
     }
 

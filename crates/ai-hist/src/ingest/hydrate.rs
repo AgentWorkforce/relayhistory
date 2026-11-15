@@ -4934,7 +4934,7 @@ mod tests {
         fs::write(
             &transcript,
             concat!(
-                r#"{"sessionId":"vanishing","uuid":"1","type":"assistant","message":{"role":"assistant","content":"captured"}}"#,
+                r#"{"sessionId":"vanishing","uuid":"1","timestamp":"2026-01-01T00:00:00Z","type":"assistant","message":{"role":"assistant","content":"captured"}}"#,
                 "\n",
             ),
         )

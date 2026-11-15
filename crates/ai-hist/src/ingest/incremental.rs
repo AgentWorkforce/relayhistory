@@ -336,6 +336,7 @@ impl ClaudeCursorState {
             file_session_id,
             indexer: &mut self.tool_results,
             last_assistant_cache_read: &mut self.cache_reads,
+            last_record_ts: &mut self.record_ts,
             triads: &mut self.slash_commands,
         }
     }
