@@ -231,6 +231,12 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
     // being written then is not going to be finished. Holding it back again
     // would hold it back forever.
     let defer_unfinished = !reader.quiesced();
+    let prefix_bytes = super::claude_untimed::fold_prefix_times(
+        &mut reader,
+        start_offset,
+        attributed_session_id,
+        &mut claude,
+    )?;
     let (
         line_index,
         reread_bytes,
@@ -318,6 +324,7 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
         .saturating_sub(start_offset)
         .saturating_add(reader.tail_bytes())
         .saturating_add(reread_bytes)
+        .saturating_add(prefix_bytes)
         .saturating_add(pass.validation_bytes);
     Ok(pass)
 }
@@ -337,10 +344,7 @@ impl ClaudeCursorState {
             file_session_id,
             indexer: &mut self.tool_results,
             last_assistant_cache_read: &mut self.cache_reads,
-            record_times: super::claude_untimed::RecordTimes {
-                last: &mut self.record_ts,
-                from_start: self.record_ts_from_start,
-            },
+            last_record_ts: &mut self.record_ts,
             triads: &mut self.slash_commands,
         }
     }

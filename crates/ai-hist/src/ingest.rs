@@ -8797,7 +8797,7 @@ struct ClaudeFileParse<'a> {
     /// The time of the latest record that reported one, per session; see
     /// [`claude_untimed::ClaudeRecordTime`] for why a record without one
     /// inherits it.
-    record_times: claude_untimed::RecordTimes<'a>,
+    last_record_ts: &'a mut HashMap<String, i64>,
     triads: &'a mut control::SlashCommandTriads,
 }
 
@@ -8848,7 +8848,7 @@ fn ingest_claude_record(
         file_session_id,
         ref mut indexer,
         ref mut last_assistant_cache_read,
-        ref mut record_times,
+        ref mut last_record_ts,
         ref mut triads,
     } = *file;
     let stem = path
@@ -8936,7 +8936,7 @@ fn ingest_claude_record(
     // A record that reports no time of its own inherits the time of the
     // nearest preceding record of its session that did, and is never stored
     // at 0; see `ClaudeRecordTime`.
-    let time = claude_untimed::ClaudeRecordTime::resolve(conn, obj, session_id, record_times)?;
+    let time = claude_untimed::ClaudeRecordTime::resolve(obj, session_id, last_record_ts);
     let ts_ms = time.ts_ms;
     let message_role = message
         .and_then(|m| m.get("role"))
@@ -28436,17 +28436,28 @@ mod tests {
     }
 
     /// A cursor an earlier build committed has no per-session times, yet
-    /// resumes past the timed record an appended untimed one follows. The
-    /// record takes the session's latest stored time, as a read from zero
-    /// gives it, rather than losing its content.
+    /// resumes past the timed records an appended untimed one follows. The
+    /// pass folds them from the bytes already read, a marker-only record's
+    /// time included, so the record gets the time a read from zero gives it
+    /// rather than losing its content.
     #[test]
-    fn an_untimed_record_after_a_cursor_from_an_earlier_build_inherits_the_stored_time() {
+    fn an_untimed_record_after_a_cursor_from_an_earlier_build_inherits_the_prefix_time() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("s-legacy.jsonl");
         let first = "2026-11-04T07:00:00.000Z";
+        // A timed record that stores only a marker: its time is the latest
+        // before the blob, and no event of its own carries it.
+        let boundary = "2026-11-04T07:05:00.000Z";
+        let compact = json!({
+            "type": "system", "subtype": "compact_boundary", "uuid": "c1",
+            "sessionId": "s-legacy", "timestamp": boundary,
+        });
         fs::write(
             &path,
-            timed_claude_user("s-legacy", "u1", first, "first prompt") + "\n",
+            format!(
+                "{}\n{compact}\n",
+                timed_claude_user("s-legacy", "u1", first, "first prompt")
+            ),
         )
         .unwrap();
         let conn = Connection::open_in_memory().unwrap();
@@ -28472,6 +28483,14 @@ mod tests {
 
         assert!(diagnostics.is_empty(), "{diagnostics:?}");
         assert_no_epoch_rows(&conn, "s-legacy");
+        let tool_ts: i64 = conn
+            .query_row(
+                "SELECT ts_ms FROM tool_calls WHERE session_id='s-legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tool_ts, iso_ms(boundary));
         let fresh = Connection::open_in_memory().unwrap();
         init_db(&fresh).unwrap();
         ingest_claude_transcript(&fresh, &path).unwrap();

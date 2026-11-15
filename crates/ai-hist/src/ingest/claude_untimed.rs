@@ -18,6 +18,7 @@
 //! A record with nothing to inherit keeps only its marker (see
 //! [`keep_untimed_record`]).
 
+use super::transcript_cursor::{ClaudeCursorState, TranscriptReader};
 use super::*;
 
 /// A record's own time, and the time it is stored at.
@@ -32,46 +33,22 @@ pub(super) struct ClaudeRecordTime {
     pub ts_ms: Option<i64>,
 }
 
-/// The walk's latest reported time per session, and whether it saw the
-/// transcript from its first byte.
-pub(super) struct RecordTimes<'a> {
-    pub last: &'a mut HashMap<String, i64>,
-    /// `false` for a cursor an earlier build committed: it resumes past timed
-    /// records whose times it never folded into `last`.
-    pub from_start: bool,
-}
-
 impl ClaudeRecordTime {
-    /// Resolve `obj`'s time against the walk's times, and fold its own time
-    /// into them.
-    ///
-    /// A walk that did not start at the first byte can be missing the time of
-    /// a session whose timed records an earlier build read. That build stored
-    /// them, and everything it stored came from bytes before this position,
-    /// so the session's latest stored time is the nearest preceding one. It is
-    /// looked up once per session and then kept in the walk's times.
+    /// Resolve `obj`'s time against `last`, the latest reported time per
+    /// session in this transcript, and fold its own time into `last`.
     pub(super) fn resolve(
-        conn: &Connection,
         obj: &Map<String, Value>,
         session_id: &str,
-        times: &mut RecordTimes<'_>,
-    ) -> Result<Self> {
-        let own_ts_ms = obj
-            .get("timestamp")
-            .and_then(|v| v.as_str().and_then(parse_iso_ms).or_else(|| v.as_i64()))
-            .filter(|ts| *ts > 0);
-        let RecordTimes { last, from_start } = times;
+        last: &mut HashMap<String, i64>,
+    ) -> Self {
+        let own_ts_ms = own_ts_ms(obj);
         if let Some(ts) = own_ts_ms {
             last.insert(session_id.to_string(), ts);
-        } else if !*from_start && !last.contains_key(session_id) {
-            if let Some(stored) = latest_stored_ts_ms(conn, session_id)? {
-                last.insert(session_id.to_string(), stored);
-            }
         }
-        Ok(Self {
+        Self {
             own_ts_ms,
             ts_ms: own_ts_ms.or_else(|| last.get(session_id).copied()),
-        })
+        }
     }
 
     /// What a parser before this rule stored the record at, for matching the
@@ -81,14 +58,46 @@ impl ClaudeRecordTime {
     }
 }
 
-/// The latest real time stored for a Claude session's events.
-fn latest_stored_ts_ms(conn: &Connection, session_id: &str) -> Result<Option<i64>> {
-    Ok(conn
-        .prepare_cached(
-            "SELECT MAX(ts_ms) FROM session_events \
-             WHERE source = 'claude' AND session_id = ?1 AND ts_ms > 0",
-        )?
-        .query_row(params![session_id], |row| row.get::<_, Option<i64>>(0))?)
+fn own_ts_ms(obj: &Map<String, Value>) -> Option<i64> {
+    obj.get("timestamp")
+        .and_then(|v| v.as_str().and_then(parse_iso_ms).or_else(|| v.as_i64()))
+        .filter(|ts| *ts > 0)
+}
+
+/// Fold the record times of `[0, upto)` into `claude`, once, for a cursor an
+/// earlier build committed, and return the bytes read.
+///
+/// Such a cursor carries no record times, yet resumes past the timed records
+/// an appended untimed record follows. Every record that reports a time takes
+/// part, including those that store only a marker (a `compact_boundary`, say),
+/// under the session `ingest_claude_record` would give it, so the walk
+/// resumes holding exactly the times a read from byte zero holds at that
+/// point.
+pub(super) fn fold_prefix_times(
+    reader: &mut TranscriptReader,
+    upto: u64,
+    attributed_session_id: Option<&str>,
+    claude: &mut ClaudeCursorState,
+) -> Result<u64> {
+    if claude.record_ts_from_start {
+        return Ok(0);
+    }
+    let last = &mut claude.record_ts;
+    let read = reader.replay(0, upto, |line| {
+        let Ok(Value::Object(obj)) = serde_json::from_str::<Value>(line) else {
+            return Ok(());
+        };
+        let record_session = obj
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty());
+        if let (Some(session), Some(ts)) = (record_session, own_ts_ms(&obj)) {
+            last.insert(attributed_session_id.unwrap_or(session).to_string(), ts);
+        }
+        Ok(())
+    })?;
+    claude.record_ts_from_start = true;
+    Ok(read)
 }
 
 /// A Claude record with no time of its own and none to inherit; see

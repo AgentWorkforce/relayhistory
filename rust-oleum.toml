@@ -37,7 +37,7 @@ rust_roots = ["crates/ai-hist-cli/src", "crates/ai-hist-napi/src", "crates/ai-hi
 [baseline.cyclomatic]
 "crates/ai-hist-cli/src/lib.rs::run" = 88
 "crates/ai-hist/src/discover.rs::discover_sessions_with_worker_limit" = 70
-"crates/ai-hist/src/ingest.rs::ingest_claude_record" = 73
+"crates/ai-hist/src/ingest.rs::ingest_claude_record" = 72
 "crates/ai-hist/src/ingest.rs::ingest_codex_rollout_incremental" = 116
 "crates/ai-hist/src/ingest.rs::ingest_cursor_transcript" = 49
 "crates/ai-hist/src/ingest.rs::ingest_grok_session" = 55
