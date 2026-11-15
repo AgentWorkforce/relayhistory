@@ -30,7 +30,7 @@ on:
 permissions:
   contents: read
 concurrency:
-  group: fast-path-${{ inputs.ref }}
+  group: fast-path-${{ inputs.ref }}-${{ github.run_id }}
   cancel-in-progress: false
 jobs:
   gate:
@@ -59,13 +59,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ci-verify
+          save-if: false
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-          cache: npm
-          cache-dependency-path: |
-            crates/ai-hist-napi/package-lock.json
-            sdk-ts/package-lock.json
       - name: Physically remove the optional provider-sources plugin
         run: rm -rf plugins
       - name: Rust formatting
@@ -111,7 +108,7 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@v4
         id: cargo-public-api-cache
         with:
           path: ~/.cargo/bin/cargo-public-api
@@ -131,7 +128,7 @@ jobs:
           ref: ${{ needs.gate.outputs.sha }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@v4
         id: rust-oleum-cache
         with:
           path: ~/.cargo/bin/rust-oleum
@@ -194,10 +191,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-          cache: npm
-          cache-dependency-path: |
-            crates/ai-hist-napi/package-lock.json
-            sdk-ts/package-lock.json
       - name: Build native addon
         working-directory: crates/ai-hist-napi
         run: npm ci && npm run build:debug
@@ -222,6 +215,7 @@ jobs:
         with:
           workspaces: plugins/object-store/rust -> target
           key: ci-object-store-plugin
+          save-if: false
       - name: The local hot path never links an object-storage client
         run: |
           for crate in ai-hist ai-hist-cli ai-hist-napi; do
@@ -257,17 +251,13 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: "20"
-          cache: npm
-          cache-dependency-path: |
-            crates/ai-hist-napi/package-lock.json
-            sdk-ts/package-lock.json
-            plugins/provider-sources/sdk/package-lock.json
       - uses: Swatinem/rust-cache@v2
         with:
           workspaces: |
             . -> target
             plugins/provider-sources/rust -> target
           key: ci-optional-history-plugins
+          save-if: false
       - name: Optional helper packaging contracts
         run: node --test scripts/history-helper-packaging.composed.mjs
       - name: Build composed distribution
@@ -389,10 +379,12 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ai-hist-napi-${{ matrix.target }}
+          save-if: false
       - name: Setup zig
         if: matrix.cross
         uses: mlugg/setup-zig@v1
         with:
+          use-cache: false
           version: 0.13.0
       - name: Install deps
         run: npm ci
