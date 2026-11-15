@@ -1,0 +1,551 @@
+# Fast path: run the CI checks and build the native release artifacts on
+# Blacksmith runners, outside the shared GitHub-hosted queue. Anyone with
+# write access (people or agents) may start it; nothing runs until Khaliq
+# approves the fast-path environment.
+#
+# It publishes nothing. npm and crates.io use trusted publishing bound to
+# publish.yml, so the fast path builds the Node-API addons, assembles the npm
+# packages (ai-hist-native and its platform packages, ai-hist, ai-hist-mcp)
+# at the checked-in version with `npm pack`, packages the ai-hist crate, and
+# uploads everything as workflow artifacts. No dist-tag, git tag or GitHub
+# release is created or moved.
+#
+# Blacksmith has no Intel macOS and no Windows arm64 runners: x86_64-apple-darwin
+# is cross-built on Apple Silicon without its native smoke test, and
+# aarch64-pc-windows-msvc (and its CI job) is left to publish.yml. The optional
+# provider-sources helper binaries are not built here.
+name: fast-path
+run-name: fast-path ${{ inputs.ref }} (${{ inputs.reason }})
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch, tag or commit to build (a PR branch is fine)
+        required: true
+        default: main
+      reason:
+        description: Why this needs the fast path
+        required: true
+permissions:
+  contents: read
+concurrency:
+  group: fast-path-${{ inputs.ref }}
+  cancel-in-progress: false
+jobs:
+  gate:
+    name: Approve and resolve ref
+    environment: fast-path
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    outputs:
+      sha: ${{ steps.sha.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - id: sha
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  verify:
+    needs: gate
+    runs-on: blacksmith-8vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ci-verify
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: |
+            crates/ai-hist-napi/package-lock.json
+            sdk-ts/package-lock.json
+      - name: Physically remove the optional provider-sources plugin
+        run: rm -rf plugins
+      - name: Rust formatting
+        run: cargo fmt --all -- --check
+      - name: Release workflow tests
+        run: node --test scripts/*.test.mjs
+      - name: Rust lint
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Rust tests
+        run: cargo test --workspace --all-features
+      - name: Sync and hydration throughput gate
+        run: node scripts/benchmark-sync.mjs --gate
+      - name: Published crate builds and tests without optional features
+        run: cargo test -p ai-hist --no-default-features
+      - name: Crate publish dry-run
+        run: cargo publish --dry-run -p ai-hist --allow-dirty
+      - name: Native binding contract
+        working-directory: crates/ai-hist-napi
+        run: |
+          npm ci
+          npm run build:debug
+          node ../../scripts/verify-native-contract.mjs ./index.js
+          git diff --exit-code -- index.d.ts
+      - name: TypeScript tests
+        working-directory: sdk-ts
+        run: |
+          npm ci
+          npm run lint
+          npm test
+      - name: Installed local SDK and CLI smoke test
+        run: node scripts/smoke-history-packages.mjs
+
+  public-api:
+    needs: gate
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - uses: actions/cache@v4
+        id: cargo-public-api-cache
+        with:
+          path: ~/.cargo/bin/cargo-public-api
+          key: cargo-public-api-${{ runner.os }}-0.52.0
+      - name: Install cargo-public-api
+        if: steps.cargo-public-api-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-public-api --version 0.52.0 --locked
+      - name: Public API matches the checked-in snapshot
+        run: node scripts/check-public-api.mjs
+
+  code-quality:
+    needs: gate
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        id: rust-oleum-cache
+        with:
+          path: ~/.cargo/bin/rust-oleum
+          key: rust-oleum-${{ runner.os }}-0.4.0
+      - name: Install rust-oleum
+        if: steps.rust-oleum-cache.outputs.cache-hit != 'true'
+        run: cargo install rust-oleum --version 0.4.0 --locked
+      - name: Quality ratchet
+        run: rust-oleum --github-summary "$GITHUB_STEP_SUMMARY"
+
+  rust-examples:
+    name: Rust consumer, local source and MSRV
+    needs: gate
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@1.88.0
+      - name: MSRV check
+        run: cargo +1.88.0 check -p ai-hist --all-features --locked
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Redirect the example's crates.io dependency at this checkout
+        working-directory: examples/rust-consumer
+        run: |
+          mkdir -p .cargo
+          cat > .cargo/config.toml <<EOF
+          [patch.crates-io]
+          ai-hist = { path = "$GITHUB_WORKSPACE/crates/ai-hist" }
+          EOF
+      - name: Build and run the consumer against the workspace crate
+        working-directory: examples/rust-consumer
+        run: cargo run
+      - name: The workspace crate was the one built
+        working-directory: examples/rust-consumer
+        run: |
+          cargo tree --prefix none --depth 1 -e normal | tee /dev/stderr \
+            | grep -qE '^ai-hist v[0-9.]+ \(.*/crates/ai-hist\)$'
+      - name: Check the standalone local connector example
+        working-directory: examples/rust-local-source
+        run: |
+          cargo fmt -- --check
+          cargo run --locked
+      - name: Verify the example resolved this checkout
+        working-directory: examples/rust-local-source
+        run: |
+          cargo tree --locked --prefix none --depth 1 -e normal | tee /dev/stderr \
+            | grep -qE "^ai-hist v[0-9.]+ \($GITHUB_WORKSPACE/crates/ai-hist\)$"
+
+  node-22-sdk:
+    needs: gate
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: |
+            crates/ai-hist-napi/package-lock.json
+            sdk-ts/package-lock.json
+      - name: Build native addon
+        working-directory: crates/ai-hist-napi
+        run: npm ci && npm run build:debug
+      - name: Test SDK on Node 22
+        working-directory: sdk-ts
+        run: npm ci && npm test
+
+  object-store-plugin:
+    needs: gate
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    env:
+      MANIFEST: plugins/object-store/rust/Cargo.toml
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: plugins/object-store/rust -> target
+          key: ci-object-store-plugin
+      - name: The local hot path never links an object-storage client
+        run: |
+          for crate in ai-hist ai-hist-cli ai-hist-napi; do
+            if cargo tree -p "$crate" -e normal,build --all-features -i object_store >/dev/null 2>&1; then
+              echo "::error::$crate depends on object_store; cloud SDKs must stay in plugins/object-store"
+              exit 1
+            fi
+          done
+      - name: Format
+        run: cargo fmt --manifest-path "$MANIFEST" -- --check
+      - name: Lint (every feature combination)
+        run: |
+          for features in s3 gcs azure conformance scrub "s3,gcs,azure,conformance,scrub"; do
+            cargo clippy --manifest-path "$MANIFEST" --locked --all-targets --no-default-features --features "$features" -- -D warnings
+          done
+          cargo clippy --manifest-path "$MANIFEST" --locked --all-targets --no-default-features -- -D warnings
+      - name: Start MinIO, fake-gcs-server and Azurite
+        run: plugins/object-store/rust/scripts/emulators.sh up > "$RUNNER_TEMP/emulators.env"
+      - name: Conformance suite on every adapter
+        run: |
+          . "$RUNNER_TEMP/emulators.env"
+          cargo test --manifest-path "$MANIFEST" --locked --all-features -- --nocapture
+
+  optional-history-plugins:
+    needs: gate
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: |
+            crates/ai-hist-napi/package-lock.json
+            sdk-ts/package-lock.json
+            plugins/provider-sources/sdk/package-lock.json
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            plugins/provider-sources/rust -> target
+          key: ci-optional-history-plugins
+      - name: Optional helper packaging contracts
+        run: node --test scripts/history-helper-packaging.composed.mjs
+      - name: Build composed distribution
+        run: |
+          cargo build --manifest-path plugins/provider-sources/rust/Cargo.toml --locked
+          npm --prefix crates/ai-hist-napi ci
+          npm --prefix crates/ai-hist-napi run build:debug
+          npm --prefix sdk-ts ci
+          npm --prefix plugins/provider-sources/sdk ci --ignore-scripts
+          npm --prefix plugins/provider-sources/sdk run build
+      - name: Optional plugin Rust tests
+        run: cargo test --manifest-path plugins/provider-sources/rust/Cargo.toml --locked
+      - name: Optional plugin crate publish dry-run
+        run: >-
+          cargo publish --dry-run --allow-dirty --locked
+          --manifest-path plugins/provider-sources/rust/Cargo.toml
+          --config "patch.crates-io.ai-hist.path=\"$GITHUB_WORKSPACE/crates/ai-hist\""
+      - name: Optional plugin SDK tests
+        env:
+          HISTORY_PROVIDER_SOURCES_BIN: ${{ github.workspace }}/plugins/provider-sources/rust/target/debug/history-provider-sources
+        run: npm --prefix plugins/provider-sources/sdk test
+      - name: Installed composed tarballs
+        run: |
+          mkdir -p helper-packs
+          version=$(node -p "require('./plugins/provider-sources/sdk/package.json').version")
+          node scripts/package-history-helper.mjs provider-sources linux-x64-gnu "$version" plugins/provider-sources/rust/target/debug/history-provider-sources helper-stage/provider-sources
+          (cd helper-stage/provider-sources && npm pack --ignore-scripts --pack-destination ../../helper-packs)
+          node scripts/smoke-history-packages.mjs --helpers helper-packs
+
+  windows-helper-cancellation:
+    needs: gate
+    runs-on: blacksmith-4vcpu-windows-2025
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: Build local native addon and optional SDK runtimes
+        run: |
+          set -euo pipefail
+          npm --prefix crates/ai-hist-napi ci
+          npm --prefix crates/ai-hist-napi run build:debug
+          npm --prefix sdk-ts ci
+          npm --prefix plugins/provider-sources/sdk ci --ignore-scripts
+          npm --prefix plugins/provider-sources/sdk run build
+      - name: Verify actual Windows descendant cleanup and missing executable errors
+        run: node --test plugins/provider-sources/sdk/dist/helper-runtime.test.js
+      - name: Verify shell-free packaging contracts
+        run: node --test scripts/history-helper-packaging.composed.mjs
+      - name: Verify installed local SDK on Windows
+        run: node scripts/smoke-history-packages.mjs
+
+  # The addon matrix from publish.yml, on Blacksmith runners.
+  build:
+    name: Build ${{ matrix.target }}
+    needs: gate
+    runs-on: ${{ matrix.os }}
+    env:
+      MACOSX_DEPLOYMENT_TARGET: '12.0'
+    defaults:
+      run:
+        working-directory: crates/ai-hist-napi
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: blacksmith-6vcpu-macos-15
+            target: aarch64-apple-darwin
+            test_native: true
+          # No Intel macOS on Blacksmith: cross-built on Apple Silicon, no native smoke test.
+          - os: blacksmith-6vcpu-macos-15
+            target: x86_64-apple-darwin
+            test_native: false
+          - os: blacksmith-4vcpu-ubuntu-2404
+            target: x86_64-unknown-linux-gnu
+            cross: true
+            glibc: '2.28'
+            test_native: true
+            test_glibc: true
+          - os: blacksmith-4vcpu-ubuntu-2404-arm
+            target: aarch64-unknown-linux-gnu
+            cross: true
+            glibc: '2.28'
+            test_native: true
+            test_glibc: true
+            # Zig 0.13 cannot link the Cortex-A53 flag emitted by Rust 1.98.
+            rust: 1.97.0
+          - os: blacksmith-4vcpu-ubuntu-2404
+            target: x86_64-unknown-linux-musl
+            cross: true
+            test_musl: true
+          - os: blacksmith-4vcpu-ubuntu-2404-arm
+            target: aarch64-unknown-linux-musl
+            cross: true
+            rust: 1.97.0
+            test_musl: true
+          - os: blacksmith-4vcpu-windows-2025
+            target: x86_64-pc-windows-msvc
+            test_native: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22.14.0'
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: ${{ matrix.rust || 'stable' }}
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ai-hist-napi-${{ matrix.target }}
+      - name: Setup zig
+        if: matrix.cross
+        uses: mlugg/setup-zig@v1
+        with:
+          version: 0.13.0
+      - name: Install deps
+        run: npm ci
+      - name: Build addon
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+          GLIBC: ${{ matrix.glibc }}
+          CROSS: ${{ matrix.cross }}
+        run: |
+          set -euo pipefail
+          if [ -n "$GLIBC" ]; then
+            npx napi build --platform --release --target "$TARGET" --zig --zig-abi-suffix "$GLIBC"
+          elif [ "$CROSS" = "true" ]; then
+            npx napi build --platform --release --target "$TARGET" --zig
+          else
+            npx napi build --platform --release --target "$TARGET"
+          fi
+      - name: Enforce GNU artifact glibc ceiling
+        if: matrix.test_glibc
+        shell: bash
+        env:
+          GLIBC_FLOOR: ${{ matrix.glibc }}
+        run: |
+          set -euo pipefail
+          readelf --version-info ./*.node > /tmp/addon-versions.txt
+          python3 - <<'PY'
+          import os, re
+          from pathlib import Path
+          versions = {tuple(map(int, v.split('.'))) for v in re.findall(r'GLIBC_(\d+\.\d+(?:\.\d+)?)', Path('/tmp/addon-versions.txt').read_text())}
+          floor = tuple(map(int, os.environ['GLIBC_FLOOR'].split('.')))
+          if not versions or max(versions) > floor:
+              raise SystemExit(f'Invalid glibc requirements: {sorted(versions)}; ceiling={floor}')
+          print(f'Maximum required glibc: {".".join(map(str, max(versions)))}')
+          PY
+      - name: Execute native contract smoke test
+        if: matrix.test_native
+        shell: bash
+        run: node ../../scripts/verify-native-contract.mjs ./index.js
+      - name: Execute musl native contract smoke test
+        if: matrix.test_musl
+        shell: bash
+        run: docker run --rm -v "$GITHUB_WORKSPACE:/work" -w /work/crates/ai-hist-napi node:22-alpine node ../../scripts/verify-native-contract.mjs ./index.js
+      - name: Build CLI for Linux runtime smoke tests
+        if: matrix.test_glibc || matrix.test_musl
+        working-directory: sdk-ts
+        run: npm ci --ignore-scripts && npm run build
+      - name: Execute GNU CLI smoke tests on supported Linux runtimes
+        if: matrix.test_glibc
+        working-directory: .
+        shell: bash
+        run: |
+          set -euo pipefail
+          for image in node:22-slim node:22 node:22-bookworm-slim ubuntu:22.04 ubuntu:24.04 node:22-trixie-slim; do
+            bash scripts/smoke-linux-native.sh "$image" local
+          done
+      - name: Execute musl CLI smoke test
+        if: matrix.test_musl
+        working-directory: .
+        run: bash scripts/smoke-linux-native.sh node:22-alpine local
+      - uses: actions/upload-artifact@v4
+        with:
+          name: napi-${{ matrix.target }}-${{ needs.gate.outputs.sha }}
+          path: crates/ai-hist-napi/*.node
+          if-no-files-found: error
+
+  package:
+    name: Pack npm packages and crate
+    needs: [gate, verify, public-api, code-quality, rust-examples, node-22-sdk, object-store-plugin, optional-history-plugins, windows-helper-cancellation, build]
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    defaults:
+      run:
+        working-directory: crates/ai-hist-napi
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.gate.outputs.sha }}
+          persist-credentials: false
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '22.14.0'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install deps
+        run: npm ci
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: napi-*-${{ needs.gate.outputs.sha }}
+          path: crates/ai-hist-napi/artifacts
+      - name: Assemble per-platform packages
+        run: npx napi create-npm-dir -t . && npx napi artifacts --dir artifacts
+      - name: Pack native packages
+        run: |
+          set -euo pipefail
+          out="$GITHUB_WORKSPACE/fast-path-packs"
+          mkdir -p "$out"
+          # Point the root package at the platform packages, as `napi prepublish` does.
+          node -e '
+            const fs = require("node:fs");
+            const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            pkg.optionalDependencies = {};
+            for (const dir of fs.readdirSync("npm")) {
+              const platform = JSON.parse(fs.readFileSync("npm/" + dir + "/package.json", "utf8"));
+              pkg.optionalDependencies[platform.name] = pkg.version;
+            }
+            fs.writeFileSync("package.json", JSON.stringify(pkg, null, 2) + "\n");
+          '
+          for dir in npm/*; do
+            if ls "$dir"/*.node >/dev/null 2>&1; then
+              (cd "$dir" && npm pack --ignore-scripts --pack-destination "$out")
+            else
+              echo "::notice::no addon for $dir (not built on Blacksmith); not packed"
+            fi
+          done
+          npm pack --ignore-scripts --pack-destination "$out"
+      - name: Pack SDK/CLI and MCP wrapper
+        working-directory: .
+        run: |
+          set -euo pipefail
+          out="$GITHUB_WORKSPACE/fast-path-packs"
+          VERSION=$(node -p 'require("./crates/ai-hist-napi/package.json").version')
+          (
+            cd sdk-ts
+            npm install --ignore-scripts
+            npm run build
+            npm pkg set dependencies.ai-hist-native="$VERSION"
+            npm pack --ignore-scripts --pack-destination "$out"
+          )
+          (cd mcp-package && npm pack --ignore-scripts --pack-destination "$out")
+      - name: Package the ai-hist crate
+        working-directory: .
+        run: cargo package -p ai-hist --allow-dirty --locked --no-verify
+      - uses: actions/upload-artifact@v4
+        with:
+          name: npm-packages-${{ needs.gate.outputs.sha }}
+          path: fast-path-packs/*.tgz
+          if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        with:
+          name: crate-${{ needs.gate.outputs.sha }}
+          path: target/package/*.crate
+          if-no-files-found: error
+      - name: Summary
+        working-directory: .
+        env:
+          REF: ${{ inputs.ref }}
+          SHA: ${{ needs.gate.outputs.sha }}
+          REASON: ${{ inputs.reason }}
+        run: |
+          {
+            echo "### relayhistory fast path"
+            echo "- ref: \`$REF\` at \`$SHA\`"
+            echo "- reason: $REASON"
+            echo "- artifact: \`npm-packages-$SHA\` (not published; npm trusted publishing is bound to publish.yml)"
+            for f in fast-path-packs/*.tgz; do echo "  - \`$(basename "$f")\`"; done
+            echo "- artifact: \`crate-$SHA\` (not published to crates.io)"
+            echo "- artifacts: \`napi-<target>-$SHA\` (aarch64-pc-windows-msvc not built)"
+          } >> "$GITHUB_STEP_SUMMARY"
