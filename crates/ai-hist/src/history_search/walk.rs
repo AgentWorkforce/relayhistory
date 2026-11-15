@@ -47,11 +47,13 @@ fn record_walk(served: bool) {
 #[cfg(not(test))]
 fn record_walk(_served: bool) {}
 
+#[cfg(test)]
 fn walk_allowed() -> bool {
-    #[cfg(test)]
-    if SORT_EVERY_MATCH.with(|sort| sort.get()) {
-        return false;
-    }
+    !SORT_EVERY_MATCH.with(|sort| sort.get())
+}
+
+#[cfg(not(test))]
+fn walk_allowed() -> bool {
     true
 }
 

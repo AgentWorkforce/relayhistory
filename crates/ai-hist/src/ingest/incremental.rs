@@ -543,16 +543,13 @@ pub(crate) fn claude_transcript_unchanged(conn: &Connection, path: &Path) -> Res
         super::CLAUDE_SUBAGENT_META_SOURCE,
         &metadata,
     )?;
-    if (metadata.is_file() || indexed_metadata)
-        && !transcript_cursor::transcript_unchanged(
+    let sidecar_known = metadata.is_file() || indexed_metadata;
+    Ok(!sidecar_known
+        || transcript_cursor::transcript_unchanged(
             conn,
             super::CLAUDE_SUBAGENT_META_SOURCE,
             &metadata,
-        )?
-    {
-        return Ok(false);
-    }
-    Ok(true)
+        )?)
 }
 
 /// Read a Claude transcript through a locator-keyed cursor, loading and
