@@ -6,7 +6,8 @@
 # It publishes nothing. npm and crates.io use trusted publishing bound to
 # publish.yml, so the fast path builds the Node-API addons, assembles the npm
 # packages (ai-hist-native and its platform packages, ai-hist, ai-hist-mcp)
-# at the checked-in version with `npm pack`, packages the ai-hist crate, and
+# at a <version>-fast.<sha7> prerelease version with `npm pack`, packages
+# the ai-hist crate (checked-in version), and
 # uploads everything as workflow artifacts. No dist-tag, git tag or GitHub
 # release is created or moved.
 #
@@ -480,6 +481,15 @@ jobs:
         with:
           pattern: napi-*-${{ needs.gate.outputs.sha }}
           path: crates/ai-hist-napi/artifacts
+      # A version npm has never served, so a partial install fails loudly
+      # instead of resolving the published release for the missing pieces.
+      - name: Stamp a fast-path prerelease version
+        env:
+          SHA: ${{ needs.gate.outputs.sha }}
+        run: |
+          set -euo pipefail
+          base=$(node -p 'require("./package.json").version')
+          npm version "${base}-fast.${SHA::7}" --no-git-tag-version --allow-same-version
       - name: Assemble per-platform packages
         run: npx napi create-npm-dir -t . && npx napi artifacts --dir artifacts
       - name: Pack native packages
@@ -514,12 +524,18 @@ jobs:
           VERSION=$(node -p 'require("./crates/ai-hist-napi/package.json").version')
           (
             cd sdk-ts
+            npm version "$VERSION" --no-git-tag-version --allow-same-version
             npm install --ignore-scripts
             npm run build
             npm pkg set dependencies.ai-hist-native="$VERSION"
             npm pack --ignore-scripts --pack-destination "$out"
           )
-          (cd mcp-package && npm pack --ignore-scripts --pack-destination "$out")
+          (
+            cd mcp-package
+            npm version "$VERSION" --no-git-tag-version --allow-same-version
+            npm pkg set dependencies.ai-hist="$VERSION"
+            npm pack --ignore-scripts --pack-destination "$out"
+          )
       - name: Package the ai-hist crate
         working-directory: .
         run: cargo package -p ai-hist --allow-dirty --locked --no-verify
@@ -545,6 +561,7 @@ jobs:
             echo "- ref: \`$REF\` at \`$SHA\`"
             echo "- reason: $REASON"
             echo "- artifact: \`npm-packages-$SHA\` (not published; npm trusted publishing is bound to publish.yml)"
+            echo "  - version \`$(node -p 'require("./crates/ai-hist-napi/package.json").version')\`; install the native, platform, SDK and MCP tarballs together"
             for f in fast-path-packs/*.tgz; do echo "  - \`$(basename "$f")\`"; done
             echo "- artifact: \`crate-$SHA\` (not published to crates.io)"
             echo "- artifacts: \`napi-<target>-$SHA\` (aarch64-pc-windows-msvc not built)"
