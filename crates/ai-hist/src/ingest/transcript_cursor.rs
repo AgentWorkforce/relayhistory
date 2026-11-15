@@ -254,6 +254,12 @@ pub(crate) struct ClaudeCursorState {
     /// that reads such a record can resume after the record that stated it.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub record_ts: std::collections::HashMap<String, i64>,
+    /// Whether `record_ts` was folded from byte zero. A cursor an earlier
+    /// build committed has no map at all and resumes past timed records it
+    /// never folded, so an untimed record it meets takes its session's latest
+    /// stored time instead; see `ClaudeRecordTime::resolve`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub record_ts_from_start: bool,
     /// The slash-command triad still being chained, per session.
     ///
     /// A command's caveat, invocation and output are three records, and a

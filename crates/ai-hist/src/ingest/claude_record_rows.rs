@@ -174,6 +174,25 @@ pub(super) fn insert_unknown_record_marker(
     Ok(())
 }
 
+/// Heal what an earlier parser left under the parent for a sidecar record:
+/// every row it produced there, and, for a record with no identity of its own
+/// (`legacy_ts_ms` is the time that parser stored it at), the positional
+/// leftovers of a pre-upgrade parse.
+pub(super) fn heal_record_under_parent(
+    conn: &Connection,
+    record_session_id: &str,
+    message_uuid: &str,
+    stem: &str,
+    legacy_ts_ms: Option<i64>,
+    parts: ClaudeRecordParts<'_>,
+) -> Result<()> {
+    heal_claude_record_rows(conn, record_session_id, message_uuid, HealedRows::All)?;
+    if let Some(ts_ms) = legacy_ts_ms {
+        heal_legacy_positional_record(conn, record_session_id, stem, ts_ms, parts)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 thread_local! {
     /// Retirements run on this thread, so a test can say a sweep issued none.

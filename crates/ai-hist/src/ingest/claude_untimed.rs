@@ -32,25 +32,46 @@ pub(super) struct ClaudeRecordTime {
     pub ts_ms: Option<i64>,
 }
 
+/// The walk's latest reported time per session, and whether it saw the
+/// transcript from its first byte.
+pub(super) struct RecordTimes<'a> {
+    pub last: &'a mut HashMap<String, i64>,
+    /// `false` for a cursor an earlier build committed: it resumes past timed
+    /// records whose times it never folded into `last`.
+    pub from_start: bool,
+}
+
 impl ClaudeRecordTime {
-    /// Resolve `obj`'s time against `last`, the latest reported time per
-    /// session in this transcript, and fold its own time into `last`.
+    /// Resolve `obj`'s time against the walk's times, and fold its own time
+    /// into them.
+    ///
+    /// A walk that did not start at the first byte can be missing the time of
+    /// a session whose timed records an earlier build read. That build stored
+    /// them, and everything it stored came from bytes before this position,
+    /// so the session's latest stored time is the nearest preceding one. It is
+    /// looked up once per session and then kept in the walk's times.
     pub(super) fn resolve(
+        conn: &Connection,
         obj: &Map<String, Value>,
         session_id: &str,
-        last: &mut HashMap<String, i64>,
-    ) -> Self {
+        times: &mut RecordTimes<'_>,
+    ) -> Result<Self> {
         let own_ts_ms = obj
             .get("timestamp")
             .and_then(|v| v.as_str().and_then(parse_iso_ms).or_else(|| v.as_i64()))
             .filter(|ts| *ts > 0);
+        let RecordTimes { last, from_start } = times;
         if let Some(ts) = own_ts_ms {
             last.insert(session_id.to_string(), ts);
+        } else if !*from_start && !last.contains_key(session_id) {
+            if let Some(stored) = latest_stored_ts_ms(conn, session_id)? {
+                last.insert(session_id.to_string(), stored);
+            }
         }
-        Self {
+        Ok(Self {
             own_ts_ms,
             ts_ms: own_ts_ms.or_else(|| last.get(session_id).copied()),
-        }
+        })
     }
 
     /// What a parser before this rule stored the record at, for matching the
@@ -58,6 +79,16 @@ impl ClaudeRecordTime {
     pub(super) fn stored_before(&self) -> i64 {
         self.own_ts_ms.unwrap_or(0)
     }
+}
+
+/// The latest real time stored for a Claude session's events.
+fn latest_stored_ts_ms(conn: &Connection, session_id: &str) -> Result<Option<i64>> {
+    Ok(conn
+        .prepare_cached(
+            "SELECT MAX(ts_ms) FROM session_events \
+             WHERE source = 'claude' AND session_id = ?1 AND ts_ms > 0",
+        )?
+        .query_row(params![session_id], |row| row.get::<_, Option<i64>>(0))?)
 }
 
 /// A Claude record with no time of its own and none to inherit; see
@@ -82,7 +113,9 @@ pub(super) struct UntimedRecord<'a> {
 ///
 /// Such a record keeps only its marker, whose time is nullable, so it still
 /// leaves a row behind. Rows an earlier parser wrote for it at 0 are retired,
-/// so a re-read heals them. When this leaves out content (a message body, or
+/// so a re-read heals them, and only those: a row stored with a real time
+/// stays even when a rewrite dropped the record it inherited that time from,
+/// and the marker, whose time is never 0, is never among them. When this leaves out content (a message body, or
 /// a subagent completion), the pass reports it as `EVIDENCE_PARTIAL`. The
 /// report names the record type, never the content, so the gap is counted
 /// rather than silent. If that report ever fires in practice, the follow-up is
@@ -99,12 +132,7 @@ pub(super) fn keep_untimed_record(conn: &Connection, record: UntimedRecord<'_>) 
         has_marker,
     } = record;
     let record_type = obj.get("type").and_then(Value::as_str).unwrap_or("");
-    heal_claude_record_rows(
-        conn,
-        session_id,
-        message_uuid,
-        HealedRows::ExceptNoticeMarker,
-    )?;
+    retire_record_rows_at_zero(conn, session_id, message_uuid)?;
     let content = message.and_then(|m| m.get("content"));
     if let Some(content) = content.filter(|_| human_role && !sidechain) {
         let raw = claude_user_text(content);
@@ -119,6 +147,28 @@ pub(super) fn keep_untimed_record(conn: &Connection, record: UntimedRecord<'_>) 
             && tool_result_facts::claude_subagent_notification_facts(obj).is_some());
     if left_out {
         report_left_out(session_id, record_type);
+    }
+    Ok(())
+}
+
+/// Retire `message_uuid`'s rows that an earlier parser stored at 0. A marker
+/// stores no time as `NULL`, never 0, so markers are untouched.
+fn retire_record_rows_at_zero(
+    conn: &Connection,
+    session_id: &str,
+    message_uuid: &str,
+) -> Result<()> {
+    for (table, condition) in super::claude_record_rows::CLAUDE_RECORD_ROWS {
+        if table == "session_markers" {
+            continue;
+        }
+        crate::store::retire_evidence_share(
+            conn,
+            table,
+            &format!("({condition}) AND ts_ms = 0"),
+            params![session_id, message_uuid],
+            SessionLocation::Local,
+        )?;
     }
     Ok(())
 }

@@ -8797,7 +8797,7 @@ struct ClaudeFileParse<'a> {
     /// The time of the latest record that reported one, per session; see
     /// [`claude_untimed::ClaudeRecordTime`] for why a record without one
     /// inherits it.
-    last_record_ts: &'a mut HashMap<String, i64>,
+    record_times: claude_untimed::RecordTimes<'a>,
     triads: &'a mut control::SlashCommandTriads,
 }
 
@@ -8848,7 +8848,7 @@ fn ingest_claude_record(
         file_session_id,
         ref mut indexer,
         ref mut last_assistant_cache_read,
-        ref mut last_record_ts,
+        ref mut record_times,
         ref mut triads,
     } = *file;
     let stem = path
@@ -8936,7 +8936,7 @@ fn ingest_claude_record(
     // A record that reports no time of its own inherits the time of the
     // nearest preceding record of its session that did, and is never stored
     // at 0; see `ClaudeRecordTime`.
-    let time = claude_untimed::ClaudeRecordTime::resolve(obj, session_id, last_record_ts);
+    let time = claude_untimed::ClaudeRecordTime::resolve(conn, obj, session_id, record_times)?;
     let ts_ms = time.ts_ms;
     let message_role = message
         .and_then(|m| m.get("role"))
@@ -8998,21 +8998,19 @@ fn ingest_claude_record(
     // unique or preserved: the live index cannot identify them after a
     // rewrite.
     if session_id != record_session_id {
-        heal_claude_record_rows(conn, record_session_id, message_uuid, HealedRows::All)?;
-        if id_less {
-            heal_legacy_positional_record(
-                conn,
-                record_session_id,
-                stem,
-                time.stored_before(),
-                ClaudeRecordParts {
-                    message,
-                    message_role,
-                    model,
-                    token_json: token_json.as_deref(),
-                },
-            )?;
-        }
+        claude_record_rows::heal_record_under_parent(
+            conn,
+            record_session_id,
+            message_uuid,
+            stem,
+            id_less.then_some(time.stored_before()),
+            ClaudeRecordParts {
+                message,
+                message_role,
+                model,
+                token_json: token_json.as_deref(),
+            },
+        )?;
     }
     if synthetic {
         // An earlier parser stored the notice as assistant output under this
@@ -28435,6 +28433,131 @@ mod tests {
             assert!(diagnostic.message.contains("`api-request-blob`"));
             assert!(!diagnostic.message.contains("copied into the blob"));
         }
+    }
+
+    /// A cursor an earlier build committed has no per-session times, yet
+    /// resumes past the timed record an appended untimed one follows. The
+    /// record takes the session's latest stored time, as a read from zero
+    /// gives it, rather than losing its content.
+    #[test]
+    fn an_untimed_record_after_a_cursor_from_an_earlier_build_inherits_the_stored_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s-legacy.jsonl");
+        let first = "2026-11-04T07:00:00.000Z";
+        fs::write(
+            &path,
+            timed_claude_user("s-legacy", "u1", first, "first prompt") + "\n",
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = transcript_cursor::TranscriptCursorState::default();
+        incremental::ingest_claude_transcript_incremental(&conn, &path, None, &mut state).unwrap();
+        // What an earlier build saved: neither field exists in its cursor.
+        let mut saved = serde_json::to_value(&state).unwrap();
+        let claude = saved["claude"].as_object_mut().unwrap();
+        assert!(claude.remove("record_ts").is_some());
+        assert!(claude.remove("record_ts_from_start").is_some());
+        let mut state: transcript_cursor::TranscriptCursorState =
+            serde_json::from_value(saved).unwrap();
+
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        use std::io::Write as _;
+        writeln!(file, "{}", untimed_claude_request_blob("s-legacy", "h1")).unwrap();
+        drop(file);
+        let (outcome, diagnostics) = provider_diagnostics::collect(|| {
+            incremental::ingest_claude_transcript_incremental(&conn, &path, None, &mut state)
+        });
+        outcome.unwrap();
+
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_no_epoch_rows(&conn, "s-legacy");
+        let fresh = Connection::open_in_memory().unwrap();
+        init_db(&fresh).unwrap();
+        ingest_claude_transcript(&fresh, &path).unwrap();
+        assert_eq!(
+            claude_stored_times(&conn, "s-legacy"),
+            claude_stored_times(&fresh, "s-legacy")
+        );
+    }
+
+    /// The marker-only fallback retires only what an earlier parser stored
+    /// at 0: the record keeps its marker, and rows it was already stored with
+    /// at a real time survive a rewrite that dropped the record before it.
+    #[test]
+    fn an_untimed_record_with_nothing_to_inherit_retires_only_rows_at_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s-heal.jsonl");
+        let first = "2026-11-05T06:00:00.000Z";
+        let timed = timed_claude_user("s-heal", "u1", first, "first prompt");
+        let blob = untimed_claude_request_blob("s-heal", "h1");
+        fs::write(&path, format!("{timed}\n{blob}\n")).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        let before = claude_stored_times(&conn, "s-heal");
+
+        // A compaction drops the timed record; the blob survives alone.
+        fs::write(&path, format!("{blob}\n")).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        let tool_ts: i64 = conn
+            .query_row(
+                "SELECT ts_ms FROM tool_calls WHERE session_id='s-heal'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tool_ts, iso_ms(first), "a timed row was retired");
+        let events_before = before
+            .iter()
+            .filter(|(table, _)| table == "session_events")
+            .count();
+        let events_after = claude_stored_times(&conn, "s-heal")
+            .iter()
+            .filter(|(table, _)| table == "session_events")
+            .count();
+        assert_eq!(events_after, events_before);
+
+        // An earlier parser's rows at 0 for the same record are retired, and
+        // the record's marker is still there afterwards.
+        let message_id: String = conn
+            .query_row(
+                "SELECT message_id FROM tool_calls WHERE session_id='s-heal'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE session_events SET ts_ms = 0 WHERE session_id='s-heal' AND message_id=?1",
+            [&message_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tool_calls SET ts_ms = 0 WHERE session_id='s-heal'",
+            [],
+        )
+        .unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        assert_no_epoch_rows(&conn, "s-heal");
+        let blob_rows: i64 = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM session_events \
+                         WHERE session_id='s-heal' AND message_id=?1) \
+                      + (SELECT COUNT(*) FROM tool_calls WHERE session_id='s-heal')",
+                [&message_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(blob_rows, 0);
+        let markers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_markers \
+                 WHERE session_id='s-heal' AND marker_uid = ?1 || ':marker' AND ts_ms IS NULL",
+                [&message_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(markers, 1, "the record's marker was retired with its rows");
     }
 
     /// A record that writes only a marker, like `permission-mode`, loses no

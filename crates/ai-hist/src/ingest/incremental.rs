@@ -197,6 +197,7 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
         ClaudeCursorState {
             scan: saved_claude.scan.clone(),
             records_parser: super::hydrate::HYDRATION_PARSER_VERSION,
+            record_ts_from_start: true,
             ..Default::default()
         }
     } else {
@@ -336,7 +337,10 @@ impl ClaudeCursorState {
             file_session_id,
             indexer: &mut self.tool_results,
             last_assistant_cache_read: &mut self.cache_reads,
-            last_record_ts: &mut self.record_ts,
+            record_times: super::claude_untimed::RecordTimes {
+                last: &mut self.record_ts,
+                from_start: self.record_ts_from_start,
+            },
             triads: &mut self.slash_commands,
         }
     }

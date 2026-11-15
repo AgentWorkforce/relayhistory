@@ -254,7 +254,11 @@ impl<'a> ClaudeRecordWalk<'a> {
                 file_session_id: self.file_session_id,
                 indexer: &mut self.indexer,
                 last_assistant_cache_read: &mut self.cache_reads,
-                last_record_ts: &mut self.record_ts,
+                // These readers always read the transcript from the start.
+                record_times: super::claude_untimed::RecordTimes {
+                    last: &mut self.record_ts,
+                    from_start: true,
+                },
                 triads: &mut self.triads,
             },
             line,
