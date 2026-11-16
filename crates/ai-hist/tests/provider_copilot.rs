@@ -70,7 +70,29 @@ fn has(e: &SessionEvidence, text: &str) -> bool {
         .any(|b| b.text.as_deref() == Some(text))
 }
 
+fn assert_native_marker_ids(evidence: &SessionEvidence, journal: &str) {
+    let expected: std::collections::BTreeSet<String> = journal
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| {
+            !matches!(
+                event["type"].as_str(),
+                Some("user.message" | "assistant.message" | "tool.execution_complete")
+            )
+        })
+        .map(|event| event["id"].as_str().unwrap().to_owned())
+        .collect();
+    let actual: std::collections::BTreeSet<String> = evidence
+        .markers
+        .iter()
+        .map(|marker| marker.marker_uid.clone())
+        .collect();
+    assert_eq!(evidence.markers.len(), expected.len());
+    assert_eq!(actual, expected);
+}
+
 fn assert_vscode_capture(evidence: &SessionEvidence) {
+    assert_native_marker_ids(evidence, VSCODE_JOURNAL);
     assert!(has(evidence, "RELAY_COPILOT_VSCODE_PROOF_OK"));
     // Two text messages and the four native tool call/result records.
     assert_eq!(evidence.messages.len(), 6);
@@ -93,6 +115,7 @@ fn assert_vscode_capture(evidence: &SessionEvidence) {
 }
 
 fn assert_desktop_capture(evidence: &SessionEvidence) {
+    assert_native_marker_ids(evidence, DESKTOP_JOURNAL);
     assert!(has(evidence, "RELAY_COPILOT_DESKTOP_CAPTURE_OK"));
     assert_eq!(evidence.tool_calls.len(), 1);
     assert_eq!(evidence.tool_results.len(), 1);
