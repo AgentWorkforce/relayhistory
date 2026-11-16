@@ -167,6 +167,7 @@ impl DevinNormalize<'_> {
                 control_kind: None,
                 // Devin's usage is stored once per message; `token_json` is it.
                 record_token_json: None,
+                origin_kind: None,
             };
 
             let ctx = NodeCtx {

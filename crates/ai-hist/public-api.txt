@@ -689,6 +689,7 @@ pub ai_hist::SessionEvent::is_sidechain: core::option::Option<i64>
 pub ai_hist::SessionEvent::kind: alloc::string::String
 pub ai_hist::SessionEvent::message_id: core::option::Option<alloc::string::String>
 pub ai_hist::SessionEvent::model: core::option::Option<alloc::string::String>
+pub ai_hist::SessionEvent::origin_kind: core::option::Option<alloc::string::String>
 pub ai_hist::SessionEvent::parent_id: core::option::Option<alloc::string::String>
 pub ai_hist::SessionEvent::payload_bytes: core::option::Option<i64>
 pub ai_hist::SessionEvent::payload_hash: core::option::Option<alloc::string::String>
