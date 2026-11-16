@@ -7,6 +7,7 @@ use crate::{
     sync_opencode_storage_dir, HistoryEntry, NewSessionMarker, SessionLocation, SessionScope,
 };
 use anyhow::{Context, Result};
+use raw_facts::RawMessageFacts;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -40,6 +41,7 @@ mod grok_unified;
 pub(crate) mod hook;
 pub(crate) mod hydrate;
 mod images;
+mod raw_facts;
 pub(crate) use images::image_markdown;
 pub(crate) mod incremental;
 pub(crate) mod jsonl;
@@ -10763,33 +10765,6 @@ fn heal_claude_synthetic_session_summaries(conn: &Connection) -> Result<()> {
 /// stamped below it predates evidence that release's parsers store, and a
 /// finished transcript never changes on disk, so only this re-read stores it.
 const RAW_MESSAGE_FACTS_VERSION: i64 = 5;
-
-#[derive(Debug, Default, Clone, Copy)]
-struct RawMessageFacts<'a> {
-    request_id: Option<&'a str>,
-    stop_reason: Option<&'a str>,
-    agent_version: Option<&'a str>,
-    is_sidechain: Option<bool>,
-    is_meta: Option<bool>,
-    turn_id: Option<&'a str>,
-    /// Which API request this row belongs to, for a provider that delimits
-    /// its requests with usage snapshots instead of naming them. Numbered per
-    /// session by the parser; see `codex_request_span` at its call site.
-    request_span: Option<&'a str>,
-    /// Why this user-role row is not a human prompt, from
-    /// [`control::ControlKind`]; `None` for a prompt and for model output.
-    /// The one derived fact carried here, because every insert already
-    /// threads this struct and the column is stamped per row like the rest.
-    control_kind: Option<&'a str>,
-    /// Claude: the record's own usage blob where settlement replaced it in
-    /// `token_json` -- JSON `null` for a copy that carried none. `None` where
-    /// `token_json` already is the record's own, and for every other source.
-    record_token_json: Option<&'a str>,
-    /// Claude: the record's `origin.kind` verbatim (`human`, `peer`,
-    /// `task-notification`, ...), who put the message in the transcript.
-    /// `None` where the record names no origin, and for every other source.
-    origin_kind: Option<&'a str>,
-}
 
 /// The provider's own identities for the request a record belongs to, read
 /// once per record and stored verbatim.
