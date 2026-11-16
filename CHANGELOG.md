@@ -15,6 +15,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Fixed
 
 - Claude records written without a `timestamp`, such as `api-request-blob` request copies, are no longer stored at 1970-01-01. They take the time of the preceding record in their session. With no earlier time to inherit, they keep a marker with no time, and the pass reports them as `EVIDENCE_PARTIAL`. Claude and Codex `history.jsonl` lines without a usable time are skipped instead of stored at 0.
+- Codex, Devin and Grok evidence with a missing or unparseable time is no longer stored at 1970-01-01. A Codex rollout line without one takes the time of the line before it, including across resumed passes; a Devin message with no time takes the session's or the preceding message's; a Grok unified-log usage row with no time and no session time waits unattached. With nothing to inherit, the evidence keeps a marker with no time and the pass reports `EVIDENCE_PARTIAL`. Session activity times, and markers, that are not known are stored as null, and a 0 stored earlier gives way to the first real time.
 
 ### Rust API
 

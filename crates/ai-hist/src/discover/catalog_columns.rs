@@ -42,15 +42,15 @@ pub(super) static UPSERT_SESSION_SQL: LazyLock<String> = LazyLock::new(|| {
          cwd = COALESCE(excluded.cwd, sessions.cwd), \
          git_branch = COALESCE(excluded.git_branch, sessions.git_branch), \
          first_activity_ms = CASE \
-             WHEN excluded.source = 'grok' THEN COALESCE(excluded.first_activity_ms, sessions.first_activity_ms) \
-             WHEN excluded.first_activity_ms IS NULL THEN sessions.first_activity_ms \
-             WHEN sessions.first_activity_ms IS NULL THEN excluded.first_activity_ms \
-             ELSE MIN(sessions.first_activity_ms, excluded.first_activity_ms) END, \
+             WHEN excluded.source = 'grok' THEN COALESCE(excluded.first_activity_ms, NULLIF(sessions.first_activity_ms, 0)) \
+             WHEN excluded.first_activity_ms IS NULL THEN NULLIF(sessions.first_activity_ms, 0) \
+             WHEN NULLIF(sessions.first_activity_ms, 0) IS NULL THEN excluded.first_activity_ms \
+             ELSE MIN(NULLIF(sessions.first_activity_ms, 0), excluded.first_activity_ms) END, \
          last_activity_ms = CASE \
-             WHEN excluded.source = 'grok' THEN COALESCE(excluded.last_activity_ms, sessions.last_activity_ms) \
-             WHEN excluded.last_activity_ms IS NULL THEN sessions.last_activity_ms \
-             WHEN sessions.last_activity_ms IS NULL THEN excluded.last_activity_ms \
-             ELSE MAX(sessions.last_activity_ms, excluded.last_activity_ms) END, \
+             WHEN excluded.source = 'grok' THEN COALESCE(excluded.last_activity_ms, NULLIF(sessions.last_activity_ms, 0)) \
+             WHEN excluded.last_activity_ms IS NULL THEN NULLIF(sessions.last_activity_ms, 0) \
+             WHEN NULLIF(sessions.last_activity_ms, 0) IS NULL THEN excluded.last_activity_ms \
+             ELSE MAX(NULLIF(sessions.last_activity_ms, 0), excluded.last_activity_ms) END, \
          last_assistant_text = COALESCE(excluded.last_assistant_text, sessions.last_assistant_text), \
          raw_path = CASE WHEN ?17 = 'remote' AND EXISTS ( \
              SELECT 1 FROM session_presences p WHERE p.source = sessions.source \
