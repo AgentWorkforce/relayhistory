@@ -14,6 +14,8 @@ const USAGE: &str = "5f0c2a8e-1d4b-4c6e-9a7f-3b2d1e0c9a81";
 const USAGE_JOURNAL: &str = include_str!(
     "fixtures/copilot/cli-usage/.copilot/session-state/5f0c2a8e-1d4b-4c6e-9a7f-3b2d1e0c9a81/events.jsonl"
 );
+const VSCODE: &str = "69e50b90-b873-4de0-a36d-c9152a45e772";
+const VSCODE_JOURNAL: &str = include_str!("fixtures/copilot/vscode-harness/.copilot/session-state/69e50b90-b873-4de0-a36d-c9152a45e772/events.jsonl");
 
 fn stage(home: &Path, sid: &str, journal: &str) -> PathBuf {
     let path = home.join(format!(".copilot/session-state/{sid}/events.jsonl"));
@@ -66,23 +68,40 @@ fn has(e: &SessionEvidence, text: &str) -> bool {
         .any(|b| b.text.as_deref() == Some(text))
 }
 
+fn assert_vscode_capture(evidence: &SessionEvidence) {
+    assert!(has(evidence, "RELAY_COPILOT_VSCODE_PROOF_OK"));
+    // Two text messages and the four native tool call/result records.
+    assert_eq!(evidence.messages.len(), 6);
+    assert_eq!(evidence.tool_calls.len(), 2);
+    assert_eq!(evidence.tool_results.len(), 2);
+    assert!(evidence.tool_results.iter().any(|r| r.text.as_deref()
+        == Some("Disposable Relay Copilot integration test. No production data.\n")));
+    for kind in [
+        "assistant.turn_start",
+        "assistant.turn_end",
+        "session.usage_record",
+    ] {
+        assert!(evidence.markers.iter().any(|m| m.kind == kind));
+    }
+    assert!(evidence.messages.iter().all(|m| m.raw_usage().is_none()));
+    assert_eq!(
+        evidence.session.cwd.as_deref(),
+        Some("/fixture/copilot-vscode")
+    );
+}
+
 #[test]
 fn copilot_desktop_and_vscode_sessions_sync_together_without_a_live_process() {
     let home = tempfile::tempdir().unwrap();
     let desktop = "6a5dde8d-2cf2-448d-a2b4-1f73db2cabf0";
-    let vscode = "f5c99c7f-2092-46bf-8960-bc7b33229214";
-    for (sid, version) in [
-        (desktop, "1.0.106-8.unstable.r43566476370.g869eef3"),
-        (vscode, "1.0.103-unstable.r41379698026.g3219c66"),
-    ] {
-        stage(
-            home.path(),
-            sid,
-            &IMPORTED_JOURNAL
-                .replace(IMPORTED, sid)
-                .replace("1.0.95", version),
-        );
-    }
+    stage(
+        home.path(),
+        desktop,
+        &IMPORTED_JOURNAL
+            .replace(IMPORTED, desktop)
+            .replace("1.0.95", "1.0.106-8.unstable.r43566476370.g869eef3"),
+    );
+    stage(home.path(), VSCODE, VSCODE_JOURNAL);
     let store = open(home.path());
     assert_eq!(discover(&store).discovered, 2);
     hydrate(&store, desktop);
@@ -105,16 +124,18 @@ fn copilot_desktop_and_vscode_sessions_sync_together_without_a_live_process() {
     drop(store);
     let store = open(home.path());
     let desktop_evidence = read(&store, desktop);
-    let vscode_evidence = read(&store, vscode);
+    let vscode_evidence = read(&store, VSCODE);
     assert_eq!(desktop_evidence.messages.len(), initial.messages.len() + 1);
-    assert_eq!(vscode_evidence.messages.len(), initial.messages.len());
+    assert_vscode_capture(&vscode_evidence);
     assert!(has(&desktop_evidence, "Continue this desktop thread."));
     assert!(!has(&vscode_evidence, "Continue this desktop thread."));
-    for evidence in [&desktop_evidence, &vscode_evidence] {
-        assert_eq!(evidence.tool_calls.len(), 1);
-        assert_eq!(evidence.tool_results.len(), 1);
-        assert!(evidence.markers.iter().any(|m| m.kind == "session.start"));
-    }
+    assert!(!has(&desktop_evidence, "RELAY_COPILOT_VSCODE_PROOF_OK"));
+    assert_eq!(desktop_evidence.tool_calls.len(), 1);
+    assert_eq!(desktop_evidence.tool_results.len(), 1);
+    assert!(desktop_evidence
+        .markers
+        .iter()
+        .any(|m| m.kind == "session.start"));
 }
 
 #[test]
@@ -418,32 +439,18 @@ fn copilot_symlink_escape_is_never_read() {
 
 #[test]
 fn vscode_copilot_harness_uses_native_history_without_a_second_parser() {
-    const SID: &str = "69e50b90-b873-4de0-a36d-c9152a45e772";
-    let journal = include_str!("fixtures/copilot/vscode-harness/.copilot/session-state/69e50b90-b873-4de0-a36d-c9152a45e772/events.jsonl");
     let home = tempfile::tempdir().unwrap();
-    stage(home.path(), SID, journal);
+    stage(home.path(), VSCODE, VSCODE_JOURNAL);
     let evidence = provider_support::assert_history_conformance(
         home.path(),
         provider_support::HistoryCase {
             source: Source::Copilot,
-            session_id: SID,
+            session_id: VSCODE,
             messages: &[
                 (Role::User, "Relay integration fixture: read README.md using a file-reading tool, then reply with exactly RELAY_COPILOT_VSCODE_PROOF_OK. Do not modify files or run terminal commands."),
                 (Role::Assistant, "RELAY_COPILOT_VSCODE_PROOF_OK"),
             ],
         },
     );
-    assert_eq!(evidence.tool_calls.len(), 2);
-    assert_eq!(evidence.tool_results.len(), 2);
-    assert!(evidence.tool_results.iter().any(|r| r.text.as_deref()
-        == Some("Disposable Relay Copilot integration test. No production data.\n")));
-    assert!(evidence
-        .markers
-        .iter()
-        .any(|m| m.kind == "session.usage_record"));
-    assert!(evidence.messages.iter().all(|m| m.raw_usage().is_none()));
-    assert_eq!(
-        evidence.session.cwd.as_deref(),
-        Some("/fixture/copilot-vscode")
-    );
+    assert_vscode_capture(&evidence);
 }
