@@ -1928,3 +1928,79 @@ fn devin_retirement_rolls_back_on_catalog_failure() {
     sync_scoped_at(&db, SessionScope::Local).unwrap();
     assert_eq!(holdings(), [0; 6], "the next sweep retries retirement");
 }
+
+/// A Devin time of 0 is no time. A node with none takes the time of the
+/// node before it; with nothing before it, it keeps a marker with no time.
+/// No row, and no session activity time, is stored at 0.
+#[test]
+fn devin_rows_without_a_time_are_never_stored_at_zero() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    stage_devin_db(
+        home,
+        r#"
+INSERT INTO sessions
+  (id, working_directory, backend_type, model, agent_mode, created_at,
+   last_activity_at, title, workspace_dirs, hidden, metadata)
+VALUES
+  ('devin-untimed', '/work/repo', 'devin', 'test-model', 'normal',
+   0, 0, NULL, '[]', 0, NULL);
+INSERT INTO message_nodes
+  (session_id, node_id, parent_node_id, chat_message, created_at, metadata)
+VALUES
+  ('devin-untimed', 0, NULL,
+   '{"message_id":"u0","role":"user","content":"leading prompt","metadata":{"is_user_input":true},"tool_calls":null,"thinking":null,"tool_call_id":null,"phase":null}',
+   0, NULL),
+  ('devin-untimed', 1, 0,
+   '{"message_id":"u1","role":"user","content":"timed prompt","metadata":{"is_user_input":true},"tool_calls":null,"thinking":null,"tool_call_id":null,"phase":null}',
+   1776643201, NULL),
+  ('devin-untimed', 2, 1,
+   '{"message_id":"a2","role":"assistant","content":"untimed answer","thinking":null,"metadata":{"num_tokens":8,"generation_model":"test-model"},"tool_calls":null,"tool_call_id":null,"phase":null}',
+   0, NULL);
+"#,
+    );
+    let _env = EnvGuard::set(home);
+    let db = home.join("history.db");
+
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+    let conn = open_db(&db).unwrap();
+    let at_zero = count(
+        &conn,
+        "SELECT (SELECT COUNT(*) FROM session_events WHERE source='devin' AND ts_ms = 0) \
+           + (SELECT COUNT(*) FROM history WHERE source='devin' AND timestamp_ms = 0) \
+           + (SELECT COUNT(*) FROM session_markers WHERE source='devin' AND ts_ms = 0) \
+           + (SELECT COUNT(*) FROM sessions WHERE source='devin' \
+                AND (first_activity_ms = 0 OR last_activity_ms = 0))",
+    );
+    assert_eq!(at_zero, 0, "a row was stored at 0");
+    let events = session_events(&conn, "devin-untimed", Some("devin")).unwrap();
+    let texts: Vec<_> = events
+        .iter()
+        .map(|e| (e.text.clone().unwrap_or_default(), e.ts_ms))
+        .collect();
+    assert_eq!(
+        texts,
+        vec![
+            ("timed prompt".to_string(), 1_776_643_201_000),
+            ("untimed answer".to_string(), 1_776_643_201_000),
+        ]
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM session_markers WHERE source='devin' \
+               AND marker_uid = 'n0:untimed' AND ts_ms IS NULL"
+        ),
+        1,
+        "the leading node keeps a marker with no time"
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT first_activity_ms FROM sessions WHERE source='devin' \
+               AND session_id='devin-untimed'"
+        ),
+        1_776_643_201_000
+    );
+}

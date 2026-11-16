@@ -3921,8 +3921,10 @@ fn upsert_shallow_session_in_transaction(
             session.source,
             session.cwd,
             session.git_branch,
-            session.first_activity_ms,
-            session.last_activity_ms,
+            // Not positive is not known: NULL, never 0, which a reader takes
+            // for 1970-01-01. A 0 already stored gives way above.
+            session.first_activity_ms.filter(|ts| *ts > 0),
+            session.last_activity_ms.filter(|ts| *ts > 0),
             session.last_assistant_text,
             session.raw_path,
             session.first_prompt,

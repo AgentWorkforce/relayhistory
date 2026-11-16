@@ -27,6 +27,7 @@ pub(crate) mod codex;
 mod codex_capture;
 mod codex_subagent;
 pub(crate) mod codex_thread_names;
+mod codex_untimed;
 mod codex_usage;
 pub(crate) mod cold_read;
 pub(crate) mod control;
@@ -152,6 +153,8 @@ pub(crate) use path_capture::{reconcile_pending, sync_facade_tick};
 // After `sync_note!`, which it uses.
 mod codex_history;
 // After `sync_note!`, which an unreadable rollout reports through.
+#[cfg(test)]
+mod catalog_time_tests;
 mod fork_replay;
 #[cfg(test)]
 mod idle_sweep_tests;
@@ -5764,13 +5767,12 @@ fn ingest_codex_rollout_incremental(
         rotated: reader.rotated,
         ..Default::default()
     };
-    let resume = if reader.start_offset() == 0 {
-        transcript_cursor::CodexCursorState::default()
-    } else {
-        cursor.codex.clone().unwrap_or_default()
-    };
     let start_offset = reader.start_offset();
     outcome.from_start = start_offset == 0;
+    // The state the pass resumes with, and the time an untimed line inherits,
+    // carried across passes.
+    let (resume, mut clock, prefix_bytes) =
+        codex_untimed::LineClock::resume(&mut reader, cursor.codex.as_ref())?;
     let mut model: Option<String> = resume.model.clone();
     // The baseline the next delta is measured against, and the span and
     // generation counters, continue across passes. The rest of the usage
@@ -5913,15 +5915,7 @@ fn ingest_codex_rollout_incremental(
             continue;
         };
         let line_type = value.get("type").and_then(Value::as_str).unwrap_or("");
-        let ts_ms = value
-            .get("timestamp")
-            .and_then(Value::as_str)
-            .and_then(parse_iso_ms)
-            .unwrap_or(0);
-        if ts_ms > 0 {
-            outcome.first_ts.get_or_insert(ts_ms);
-            outcome.last_ts = Some(outcome.last_ts.map_or(ts_ms, |last| last.max(ts_ms)));
-        }
+        let (own_ts, line_ts) = clock.observe(&value, &mut outcome);
         let payload_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
         let payload_str = |key: &str| payload.get(key).and_then(Value::as_str);
         // Settle the previous line before starting this one. `total_changes`
@@ -5941,7 +5935,9 @@ fn ingest_codex_rollout_incremental(
             codex::ReplayStep::Outside => {}
             codex::ReplayStep::Replay => {
                 fork_replay
-                    .get_or_insert_with(|| ForkReplaySpan::new(index, ts_ms, replay_gate.opening()))
+                    .get_or_insert_with(|| {
+                        ForkReplaySpan::new(index, line_ts, replay_gate.opening())
+                    })
                     .absorb(index, &value, payload);
                 continue;
             }
@@ -5970,23 +5966,16 @@ fn ingest_codex_rollout_incremental(
                 }
             }
         }
+        // Nothing to inherit: see `codex_untimed::keep_untimed_line`.
+        let Some(ts_ms) = line_ts else {
+            unwritten_line =
+                codex_untimed::keep_untimed_line(conn, session_id, index, &value, &mut model)?;
+            changes_before_line = conn.total_changes();
+            continue;
+        };
         // A state-only line is never registered: it writes no row by design,
         // and the allocation would land on the highest-volume lines in the file.
-        unwritten_line = (!codex_line_is_state_only(line_type, payload_type, payload)).then(|| {
-            UnwrittenCodexLine {
-                index,
-                ts_ms,
-                subkind: if payload_type.is_empty() {
-                    line_type.to_string()
-                } else {
-                    payload_type.to_string()
-                },
-                turn_id: payload
-                    .get("turn_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-            }
-        });
+        unwritten_line = UnwrittenCodexLine::unless_state_only(index, Some(ts_ms), &value);
         // Lifecycle, compaction, streaming-failure and begin-side tool lines
         // are not messages, so none of the arms below can hold them. Classify
         // every line once, here, and keep whatever the event model drops.
@@ -6081,6 +6070,7 @@ fn ingest_codex_rollout_incremental(
                 outcome
                     .first_prompt
                     .get_or_insert_with(|| message.text.chars().take(4096).collect());
+                codex_untimed::retire_history_at_zero(conn, session_id, own_ts, &message.text)?;
                 outcome.prompts += insert_history(
                     conn,
                     &HistoryEntry {
@@ -6461,6 +6451,8 @@ fn ingest_codex_rollout_incremental(
                                 inherited_baseline_marker: inherited_baseline_marker.clone(),
                                 state_markers: CODEX_STATE_MARKER_GENERATION,
                                 fork_replay: CODEX_FORK_REPLAY_GENERATION,
+                                record_ts: clock.last,
+                                record_ts_from_start: true,
                             },
                         );
                     }
@@ -6800,14 +6792,15 @@ fn ingest_codex_rollout_incremental(
         .saturating_sub(start_offset)
         .saturating_add(reader.tail_bytes())
         .saturating_add(pass.validation_bytes)
-        .saturating_add(probe_bytes);
+        .saturating_add(probe_bytes)
+        .saturating_add(prefix_bytes);
     Ok((outcome, pass))
 }
 
 /// One Codex rollout line that has not yet been shown to write anything.
 struct UnwrittenCodexLine {
     index: usize,
-    ts_ms: i64,
+    ts_ms: Option<i64>,
     subkind: String,
     turn_id: Option<String>,
 }
@@ -6838,7 +6831,7 @@ fn flush_unwritten_codex_line(
         session_id,
         &NewSessionMarker {
             marker_uid: &marker_uid,
-            ts_ms: (line.ts_ms != 0).then_some(line.ts_ms),
+            ts_ms: line.ts_ms,
             message_id: None,
             parent_id: None,
             turn_id: line.turn_id.as_deref(),
@@ -11113,6 +11106,8 @@ pub(crate) struct SessionCatalogRow<'a> {
     pub(crate) source: &'a str,
     pub(crate) cwd: Option<&'a str>,
     pub(crate) git_branch: Option<&'a str>,
+    /// The activity window. A time that is not positive is not known and is
+    /// stored as `NULL`, never as 0.
     pub(crate) first_ts: i64,
     pub(crate) last_ts: i64,
     pub(crate) last_assistant_text: Option<&'a str>,
@@ -11167,9 +11162,12 @@ fn upsert_session_inner(
     // prose in it any more, keeping the old value would leave the catalog
     // quoting a reply the transcript no longer contains.
     let (first_activity, last_activity, assistant_text) = match window {
+        // A time that is not positive is no time: a reader takes 0 for
+        // 1970-01-01, so it is stored as NULL, and a 0 an earlier rule stored
+        // gives way to the first real time instead of pinning MIN() forever.
         ActivityWindow::Expand => (
-            "first_activity_ms = MIN(COALESCE(sessions.first_activity_ms, excluded.first_activity_ms), excluded.first_activity_ms)",
-            "last_activity_ms = MAX(COALESCE(sessions.last_activity_ms, excluded.last_activity_ms), excluded.last_activity_ms)",
+            "first_activity_ms = MIN(COALESCE(NULLIF(sessions.first_activity_ms, 0), excluded.first_activity_ms), COALESCE(excluded.first_activity_ms, NULLIF(sessions.first_activity_ms, 0)))",
+            "last_activity_ms = MAX(COALESCE(NULLIF(sessions.last_activity_ms, 0), excluded.last_activity_ms), COALESCE(excluded.last_activity_ms, NULLIF(sessions.last_activity_ms, 0)))",
             "last_assistant_text = COALESCE(excluded.last_assistant_text, sessions.last_assistant_text)",
         ),
         ActivityWindow::Replace => (
@@ -11216,8 +11214,8 @@ fn upsert_session_inner(
             source,
             cwd,
             git_branch,
-            first_ts,
-            last_ts,
+            (first_ts > 0).then_some(first_ts),
+            (last_ts > 0).then_some(last_ts),
             last_assistant_text,
             raw_path,
             project_key,
@@ -14731,8 +14729,9 @@ fn ingest_grok_session(
          last_assistant_text = ?, models_json = ?, first_prompt = ?, session_kind = ? \
          WHERE source = 'grok' AND session_id = ?",
         params![
-            session.first_ts,
-            session.last_ts,
+            // Not positive is not known: NULL, never 0.
+            (session.first_ts > 0).then_some(session.first_ts),
+            (session.last_ts > 0).then_some(session.last_ts),
             session.last_assistant_text.as_deref(),
             (!session.models.is_empty())
                 .then(|| serde_json::to_string(&session.models).unwrap_or_default()),
