@@ -154,7 +154,9 @@ and `history` carry only the human's text.
 harness recorded it: Claude's `origin.kind`, verbatim (`human` for a person at
 the prompt, `peer` for another agent session, `task-notification` for a
 background task's notice, and whatever further kinds Claude Code writes). It is
-`null` where the record names no origin, for every other source, and on rows
+`null` where the record names no origin, or names an empty kind (the same
+reading `control_kind` classification and the slash-command marker's
+`origin_kind` already apply), for every other source, and on rows
 indexed before the column existed (they are not re-exported for it; a re-parse
 of the record fills it). It is stored beside `control_kind`, not in place of
 it: `control_kind` says whether a row is a prompt, `origin_kind` says who sent
