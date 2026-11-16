@@ -67,6 +67,57 @@ fn has(e: &SessionEvidence, text: &str) -> bool {
 }
 
 #[test]
+fn copilot_desktop_and_vscode_sessions_sync_together_without_a_live_process() {
+    let home = tempfile::tempdir().unwrap();
+    let desktop = "6a5dde8d-2cf2-448d-a2b4-1f73db2cabf0";
+    let vscode = "f5c99c7f-2092-46bf-8960-bc7b33229214";
+    for (sid, version) in [
+        (desktop, "1.0.106-8.unstable.r43566476370.g869eef3"),
+        (vscode, "1.0.103-unstable.r41379698026.g3219c66"),
+    ] {
+        stage(
+            home.path(),
+            sid,
+            &IMPORTED_JOURNAL
+                .replace(IMPORTED, sid)
+                .replace("1.0.95", version),
+        );
+    }
+    let store = open(home.path());
+    assert_eq!(discover(&store).discovered, 2);
+    hydrate(&store, desktop);
+    let initial = read(&store, desktop);
+    let path = home
+        .path()
+        .join(format!(".copilot/session-state/{desktop}/events.jsonl"));
+    let append = serde_json::json!({"type":"user.message","id":"desktop-followup",
+        "parentId":null,"timestamp":"2026-11-16T00:00:00Z","data":{"content":"Continue this desktop thread."}});
+    use std::io::Write;
+    writeln!(
+        std::fs::OpenOptions::new().append(true).open(path).unwrap(),
+        "{append}"
+    )
+    .unwrap();
+    let report = store
+        .sync(SyncOptions::default().sources([Source::Copilot]))
+        .unwrap();
+    assert!(report.diagnostics.is_empty());
+    drop(store);
+    let store = open(home.path());
+    let desktop_evidence = read(&store, desktop);
+    let vscode_evidence = read(&store, vscode);
+    assert_eq!(desktop_evidence.messages.len(), initial.messages.len() + 1);
+    assert_eq!(vscode_evidence.messages.len(), initial.messages.len());
+    assert!(has(&desktop_evidence, "Continue this desktop thread."));
+    assert!(!has(&vscode_evidence, "Continue this desktop thread."));
+    for evidence in [&desktop_evidence, &vscode_evidence] {
+        assert_eq!(evidence.tool_calls.len(), 1);
+        assert_eq!(evidence.tool_results.len(), 1);
+        assert!(evidence.markers.iter().any(|m| m.kind == "session.start"));
+    }
+}
+
+#[test]
 fn copilot_imported_journal_discover_hydrate_read_reopen_changes_export_fullsync() {
     let home = tempfile::tempdir().unwrap();
     stage(home.path(), IMPORTED, IMPORTED_JOURNAL);
