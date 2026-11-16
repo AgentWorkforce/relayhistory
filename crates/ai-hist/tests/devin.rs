@@ -2004,3 +2004,56 @@ VALUES
         1_776_643_201_000
     );
 }
+
+/// The tool calls of a node that is kept as an untimed marker stay with it:
+/// they are not re-indexed as orphan calls at a later node's time.
+#[test]
+fn devin_tool_calls_of_an_untimed_node_are_not_orphans() {
+    let _lock = ENV_LOCK.lock().unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    stage_devin_db(
+        home,
+        r#"
+INSERT INTO sessions
+  (id, working_directory, backend_type, model, agent_mode, created_at,
+   last_activity_at, title, workspace_dirs, hidden, metadata)
+VALUES
+  ('devin-untimed-call', '/work/repo', 'devin', 'test-model', 'normal',
+   0, 0, NULL, '[]', 0, NULL);
+INSERT INTO message_nodes
+  (session_id, node_id, parent_node_id, chat_message, created_at, metadata)
+VALUES
+  ('devin-untimed-call', 0, NULL,
+   '{"message_id":"a0","role":"assistant","content":"","thinking":null,"metadata":{},"tool_calls":[{"id":"c1","name":"read","arguments":{}}],"tool_call_id":null,"phase":null}',
+   0, NULL),
+  ('devin-untimed-call', 1, 0,
+   '{"message_id":"u1","role":"user","content":"timed prompt","metadata":{"is_user_input":true},"tool_calls":null,"thinking":null,"tool_call_id":null,"phase":null}',
+   1776643201, NULL);
+INSERT INTO tool_call_state (session_id, tool_call_id, tool_call_json, tool_call_update_json)
+VALUES ('devin-untimed-call', 'c1', '{"title":"read","rawInput":{}}', NULL);
+"#,
+    );
+    let _env = EnvGuard::set(home);
+    let db = home.join("history.db");
+
+    sync_scoped_at(&db, SessionScope::Local).unwrap();
+    let conn = open_db(&db).unwrap();
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM session_events WHERE source='devin' \
+               AND session_id='devin-untimed-call' AND message_id LIKE 'tcs:%'"
+        ),
+        0,
+        "a known call became an orphan"
+    );
+    assert_eq!(
+        count(
+            &conn,
+            "SELECT COUNT(*) FROM tool_calls WHERE source='devin' \
+               AND session_id='devin-untimed-call'"
+        ),
+        0
+    );
+}

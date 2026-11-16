@@ -75,6 +75,25 @@ fn report(session_id: &str, detail: std::fmt::Arguments<'_>) {
 }
 
 impl DevinNormalize<'_> {
+    /// The tool calls an untimed node names, as the role arms collect them,
+    /// so they stay with the node rather than turning into orphans stored at
+    /// a later node's time.
+    fn note_tool_references(&mut self, node: &DevinNode) {
+        let Some(message) = node.message.as_ref() else {
+            return;
+        };
+        let calls = message.get("tool_calls").and_then(Value::as_array);
+        for (index, call) in calls.into_iter().flatten().enumerate() {
+            let call_id = str_field(call.into(), "id")
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("n{}:{}", node.node_id, index));
+            self.referenced_tool_calls.insert(call_id);
+        }
+        if let Some(id) = str_field(message.into(), "tool_call_id").filter(|id| !id.is_empty()) {
+            self.referenced_tool_calls.insert(id.to_string());
+        }
+    }
+
     /// Keep a node with no time and none to take as a marker with no time,
     /// under its own message id, so children that name it as their parent
     /// still anchor to an addressable row.
@@ -102,6 +121,7 @@ impl DevinNormalize<'_> {
                 payload_json: None,
             },
         )?;
+        self.note_tool_references(node);
         if node.message.is_some() {
             report(
                 self.session_id,

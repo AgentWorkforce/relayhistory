@@ -416,7 +416,9 @@ pub(super) fn materialize_grok_unified_usage(
     // either it has no time to be stored at, and 0 would date it 1970-01-01:
     // it stays in `grok_unified_usage`, unattached, and is attached by the
     // first pass that has a time for it.
-    let fallback_ts = fallback_ts.or(first_activity).filter(|ts| *ts > 0);
+    let fallback_ts = fallback_ts
+        .filter(|ts| *ts > 0)
+        .or(first_activity.filter(|ts| *ts > 0));
     let mut untimed = 0usize;
     let mut models: Vec<String> = models_json
         .as_deref()
@@ -543,7 +545,8 @@ WHERE source = 'grok' AND session_id = ?2 AND event_uid = ?3 \
           AND token_json = json_set(json_remove(?1, '$.usage'), \
                '$.turn_usage', json(json_extract(?1, '$.usage'))) \
           AND (EXISTS (SELECT 1 FROM grok_unified_usage u \
-                       WHERE u.session_id = ?2 AND u.ts_ms IS NULL) \
+                       WHERE u.session_id = ?2 AND u.ts_ms IS NULL AND EXISTS (SELECT 1 FROM session_events e WHERE e.source = 'grok' \
+                       AND e.session_id = u.session_id AND e.event_uid = 'unified:' || u.row_key)) \
             OR EXISTS (SELECT 1 FROM grok_unified_usage u \
                        WHERE u.session_id = ?2 \
                          AND u.ts_ms BETWEEN json_extract(?1, '$.turn_start_ms') \
@@ -582,6 +585,9 @@ fn settle_grok_unified_session(
     // A turn with no recorded window cannot be placed, so a timed row never
     // covers it; only a timeless row (which covers every turn) does. Otherwise
     // it keeps its own `usage`, and `classify_grok_turn_coverage` counts it so.
+    // A timeless row counts only once it is attached as an event: one left
+    // unattached for want of any time (see `materialize_grok_unified_usage`)
+    // replaces no usage, so it must not demote any.
     conn.execute(
         "UPDATE session_events SET token_json = json_set(json_remove(token_json, '$.usage'), \
          '$.turn_usage', json(json_extract(token_json, '$.usage'))) \
@@ -590,7 +596,8 @@ fn settle_grok_unified_session(
          AND json_extract(token_json, '$.source') = 'updates.jsonl' \
          AND json_type(token_json, '$.usage') IS NOT NULL \
          AND (EXISTS (SELECT 1 FROM grok_unified_usage u WHERE u.session_id = ?1 \
-                AND u.ts_ms IS NULL) \
+                AND u.ts_ms IS NULL AND EXISTS (SELECT 1 FROM session_events e WHERE e.source = 'grok' \
+                       AND e.session_id = u.session_id AND e.event_uid = 'unified:' || u.row_key)) \
            OR EXISTS (SELECT 1 FROM grok_unified_usage u WHERE u.session_id = ?1 \
                 AND u.ts_ms BETWEEN json_extract(token_json, '$.turn_start_ms') \
                                 AND json_extract(token_json, '$.turn_end_ms')))",
@@ -635,7 +642,11 @@ pub(super) fn grok_turn_coverage(
         .filter_map(|raw| serde_json::from_str::<Value>(raw).ok())
         .collect::<Vec<_>>();
     let unified_timestamps = conn
-        .prepare("SELECT ts_ms FROM grok_unified_usage WHERE session_id = ?")?
+        .prepare(
+            "SELECT ts_ms FROM grok_unified_usage u WHERE session_id = ? \
+             AND (ts_ms IS NOT NULL OR EXISTS (SELECT 1 FROM session_events e WHERE e.source = 'grok' \
+                       AND e.session_id = u.session_id AND e.event_uid = 'unified:' || u.row_key))",
+        )?
         .query_map(params![session_id], |row| row.get::<_, Option<i64>>(0))?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(classify_grok_turn_coverage(
@@ -774,7 +785,7 @@ mod tests {
         );
 
         insert_row("timeless", None);
-        let coverage = materialize_grok_unified_usage(&conn, "g", None).unwrap();
+        let coverage = materialize_grok_unified_usage(&conn, "g", Some(15)).unwrap();
         assert!(token("t2").get("usage").is_none());
         assert_eq!(token("t2")["turn_usage"]["inputTokens"], 7);
         assert_eq!(
@@ -806,6 +817,14 @@ mod tests {
             [],
         )
         .unwrap();
+        // A turn's own usage, which only an attached log row may replace.
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, ts_ms, role, kind, event_uid, token_json) \
+             VALUES ('grok', 'g', 15, 'assistant', 'text', 'turn', ?)",
+            [json!({"source": "updates.jsonl", "usage": {"inputTokens": 7}}).to_string()],
+        )
+        .unwrap();
         // What the earlier rule stored for it.
         conn.execute(
             "INSERT INTO session_events (source, session_id, ts_ms, role, kind, event_uid) \
@@ -828,12 +847,32 @@ mod tests {
             provider_diagnostics::collect(|| materialize_grok_unified_usage(&conn, "g", None));
         assert_eq!(coverage.unwrap().inserted, 0);
         assert_eq!(event_ts(), None, "no time to store it at, and never 0");
+        let kept: Value = serde_json::from_str(
+            &conn
+                .query_row(
+                    "SELECT token_json FROM session_events WHERE event_uid = 'turn'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            kept["usage"]["inputTokens"], 7,
+            "an unattached row replaces no usage, so it demotes none"
+        );
         let reported = format!("{diagnostics:?}");
         assert!(reported.contains("EVIDENCE_PARTIAL"), "{reported}");
 
-        let coverage = materialize_grok_unified_usage(&conn, "g", Some(1_000)).unwrap();
+        // A creation time of 0 is none: the session's activity time serves.
+        conn.execute(
+            "UPDATE sessions SET first_activity_ms = 500 WHERE session_id = 'g'",
+            [],
+        )
+        .unwrap();
+        let coverage = materialize_grok_unified_usage(&conn, "g", Some(0)).unwrap();
         assert_eq!(coverage.inserted, 1);
-        assert_eq!(event_ts(), Some(1_000));
+        assert_eq!(event_ts(), Some(500));
     }
 
     #[test]

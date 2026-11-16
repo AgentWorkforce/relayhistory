@@ -69,8 +69,12 @@ impl LineClock {
         if !resume.record_ts_from_start {
             let last = &mut resume.record_ts;
             read = reader.replay(0, start_offset, |line| {
+                // The walk observes a line's time only once it has an
+                // object payload; the fold takes part on the same terms.
                 if let Ok(value) = serde_json::from_str::<Value>(line.trim()) {
-                    *last = own_ts_ms(&value).or(*last);
+                    if value.get("payload").is_some_and(Value::is_object) {
+                        *last = own_ts_ms(&value).or(*last);
+                    }
                 }
                 Ok(())
             })?;
@@ -101,6 +105,15 @@ impl LineClock {
     }
 }
 
+/// One Codex rollout line that has not yet been shown to write anything.
+pub(super) struct UnwrittenCodexLine {
+    pub(super) index: usize,
+    /// `None` when the line has no time and none to inherit; never 0.
+    pub(super) ts_ms: Option<i64>,
+    pub(super) subkind: String,
+    pub(super) turn_id: Option<String>,
+}
+
 impl UnwrittenCodexLine {
     /// The line to record as an `unknown` marker if it writes nothing, or
     /// `None` for a state-only line, which writes no row by design.
@@ -118,7 +131,7 @@ impl UnwrittenCodexLine {
         }
         Some(Self {
             index,
-            ts_ms,
+            ts_ms: ts_ms.filter(|ts| *ts > 0),
             subkind: if payload_type.is_empty() {
                 line_type.to_string()
             } else {
@@ -132,40 +145,69 @@ impl UnwrittenCodexLine {
     }
 }
 
-/// Index a line that reports no time when nothing before it in its rollout
-/// reported one either, and return the marker to record for it. Its event,
-/// tool and history rows have no time to take, and 0 would date them
-/// 1970-01-01.
+/// The time a line with no time and none to inherit is read at when it
+/// carries walk state (see [`resolve_line_ts`]). Every arm such a line
+/// reaches stores only markers, and a marker stores 0 as `NULL`, so nothing is
+/// stored at it.
+pub(super) const STATE_ONLY_TS: i64 = 0;
+
+/// Lines whose arms carry state a later line needs (the usage baseline and
+/// request boundary of `token_count`, the turn of `turn_context` and the
+/// task lifecycle, the model of `thread_settings_applied`) and write only
+/// markers. Skipping one would lose that state: an untimed opening
+/// `token_count` left out would charge its whole cumulative total to the
+/// next request.
+fn carries_state_only(value: &Value) -> bool {
+    let line_type = value.get("type").and_then(Value::as_str);
+    let payload_type = value.pointer("/payload/type").and_then(Value::as_str);
+    match (line_type, payload_type) {
+        (Some("turn_context" | "session_meta"), _) => true,
+        (Some("event_msg"), Some(kind)) => {
+            matches!(
+                kind,
+                "token_count"
+                    | "task_started"
+                    | "task_complete"
+                    | "turn_aborted"
+                    | "thread_settings_applied"
+            ) || kind.ends_with("_delta")
+        }
+        (Some("response_item"), Some(kind)) => kind.ends_with("_delta"),
+        _ => false,
+    }
+}
+
+/// The time the walk reads `value` at, given `line_ts`, its own time else the
+/// nearest preceding one, or `None` when the line is left out.
 ///
-/// The line is recorded as an `unknown` marker, whose time is nullable, so it
-/// still leaves a row behind. Rows an earlier parser wrote for it at 0 are
-/// retired, so a re-read heals them, and only those: a row stored with a real
-/// time stays, and markers, whose time is never 0, are never among them. The
-/// pass reports the line as `EVIDENCE_PARTIAL`, naming its type and never its
-/// content, so the gap is counted rather than silent. A state-only line
-/// writes no row anyway and is not reported; the one state it carries that a
-/// later line needs is the model of a `thread_settings_applied`.
-pub(super) fn keep_untimed_line(
+/// A line with nothing to inherit that carries only state is read at
+/// [`STATE_ONLY_TS`]. Any other such line has event, tool and history rows
+/// that have no time to take, and 0 would date them 1970-01-01. It is
+/// recorded as an `unknown` marker, whose time is nullable, through
+/// `unwritten`, so it still leaves a row behind. Rows an earlier parser wrote
+/// for it at 0 are retired, so a re-read heals them, and only those: a row
+/// stored with a real time stays, and markers, whose time is never 0, are
+/// never among them. The pass reports the line as `EVIDENCE_PARTIAL`, naming
+/// its type and never its content, so the gap is counted rather than silent.
+pub(super) fn resolve_line_ts(
     conn: &Connection,
     session_id: &str,
-    index: usize,
-    value: &Value,
-    model: &mut Option<String>,
-) -> Result<Option<UnwrittenCodexLine>> {
-    if value.pointer("/payload/type").and_then(Value::as_str) == Some("thread_settings_applied") {
-        if let Some(m) = value
-            .pointer("/payload/thread_settings/model")
-            .and_then(Value::as_str)
-        {
-            *model = Some(m.to_string());
-        }
+    (index, value, line_ts): (usize, &Value, Option<i64>),
+    unwritten: &mut Option<UnwrittenCodexLine>,
+) -> Result<Option<i64>> {
+    if line_ts.is_some() {
+        return Ok(line_ts);
     }
-    let Some(line) = UnwrittenCodexLine::unless_state_only(index, None, value) else {
-        return Ok(None);
-    };
-    retire_line_rows_at_zero(conn, session_id, index, value)?;
-    report_left_out(session_id, &line.subkind);
-    Ok(Some(line))
+    if carries_state_only(value) {
+        return Ok(Some(STATE_ONLY_TS));
+    }
+    let line = UnwrittenCodexLine::unless_state_only(index, None, value);
+    if let Some(line) = &line {
+        retire_line_rows_at_zero(conn, session_id, index, value)?;
+        report_left_out(session_id, &line.subkind);
+    }
+    *unwritten = line;
+    Ok(None)
 }
 
 fn retire_line_rows_at_zero(

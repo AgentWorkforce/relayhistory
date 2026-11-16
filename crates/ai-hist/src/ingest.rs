@@ -28,6 +28,7 @@ mod codex_capture;
 mod codex_subagent;
 pub(crate) mod codex_thread_names;
 mod codex_untimed;
+use codex_untimed::UnwrittenCodexLine;
 mod codex_usage;
 pub(crate) mod cold_read;
 pub(crate) mod control;
@@ -5966,10 +5967,14 @@ fn ingest_codex_rollout_incremental(
                 }
             }
         }
-        // Nothing to inherit: see `codex_untimed::keep_untimed_line`.
-        let Some(ts_ms) = line_ts else {
-            unwritten_line =
-                codex_untimed::keep_untimed_line(conn, session_id, index, &value, &mut model)?;
+        // Nothing to inherit: see `codex_untimed::resolve_line_ts`.
+        let Some(ts_ms) = codex_untimed::resolve_line_ts(
+            conn,
+            session_id,
+            (index, &value, line_ts),
+            &mut unwritten_line,
+        )?
+        else {
             changes_before_line = conn.total_changes();
             continue;
         };
@@ -6795,14 +6800,6 @@ fn ingest_codex_rollout_incremental(
         .saturating_add(probe_bytes)
         .saturating_add(prefix_bytes);
     Ok((outcome, pass))
-}
-
-/// One Codex rollout line that has not yet been shown to write anything.
-struct UnwrittenCodexLine {
-    index: usize,
-    ts_ms: Option<i64>,
-    subkind: String,
-    turn_id: Option<String>,
 }
 
 /// Record a line that claimed to be modeled and then stored nothing.

@@ -369,3 +369,96 @@ fn an_untimed_replayed_fork_prompt_retires_the_row_stored_at_zero() {
         .unwrap();
     assert_eq!(marker_ts, Some(iso("2026-04-20T00:01:00.000Z")));
 }
+
+fn usage(total: u64) -> Value {
+    json!({"type": "token_count", "info": {"total_token_usage": {
+        "input_tokens": total, "cached_input_tokens": 0, "output_tokens": 0,
+        "reasoning_output_tokens": 0, "total_tokens": total}}})
+}
+
+/// An untimed line that carries walk state still carries it: an opening
+/// cumulative snapshot with no time is the baseline the next delta is
+/// measured from, so the reply is charged its own request, not the total.
+#[test]
+fn an_untimed_opening_snapshot_still_seeds_the_usage_baseline() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rollout-baseline.jsonl");
+    let body = [
+        session_meta(None),
+        line(
+            None,
+            "turn_context",
+            json!({"turn_id": "t1", "cwd": "/tmp/project", "model": "gpt-5.4"}),
+        ),
+        line(None, "event_msg", usage(100)),
+        agent(Some(T1), "timed answer"),
+        line(Some(T2), "event_msg", usage(110)),
+    ]
+    .concat();
+    fs::write(&path, body).unwrap();
+    let (conn, meta) = open(&path);
+
+    ingest_codex_rollout(&conn, &path, &meta).unwrap();
+
+    assert_no_epoch_rows(&conn, SESSION);
+    let total: i64 = conn
+        .query_row(
+            "SELECT json_extract(token_json, '$.total_tokens') FROM session_events \
+             WHERE source = 'codex' AND text = 'timed answer'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(total, 10, "the reply is charged its own request");
+    let (turn, model): (Option<String>, Option<String>) = conn
+        .query_row(
+            "SELECT turn_id, model FROM session_events \
+             WHERE source = 'codex' AND text = 'timed answer'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        (turn.as_deref(), model.as_deref()),
+        (Some("t1"), Some("gpt-5.4")),
+        "the untimed turn_context still opens the turn"
+    );
+}
+
+/// The prefix fold for a cursor from an earlier build takes a line's time on
+/// the walk's terms: a line without an object payload is not observed by
+/// either.
+#[test]
+fn the_legacy_prefix_fold_observes_times_as_the_walk_does() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("rollout-legacy-payload.jsonl");
+    let head = [
+        session_meta(Some(T0)),
+        user(Some(T1), "first prompt"),
+        format!(
+            "{}\n",
+            json!({"timestamp": T2, "type": "event_msg", "payload": null})
+        ),
+        complete(None, "t1"),
+    ]
+    .concat();
+    fs::write(&path, head).unwrap();
+    let (conn, meta) = open(&path);
+    let mut cursor = transcript_cursor::TranscriptCursorState::default();
+    ingest_codex_rollout_incremental(&conn, &path, &meta, &mut cursor).unwrap();
+    let mut saved = serde_json::to_value(&cursor).unwrap();
+    let codex = saved["codex"].as_object_mut().unwrap();
+    codex.remove("record_ts");
+    codex.remove("record_ts_from_start");
+    let mut cursor: transcript_cursor::TranscriptCursorState =
+        serde_json::from_value(saved).unwrap();
+    assert!(cursor.file.as_ref().is_some_and(|file| file.offset > 0));
+
+    append(&path, &user(None, "appended prompt"));
+    ingest_codex_rollout_incremental(&conn, &path, &meta, &mut cursor).unwrap();
+
+    assert_eq!(event_ts(&conn, "appended prompt"), iso(T1));
+    let (fresh, _) = open(&path);
+    ingest_codex_rollout(&fresh, &path, &meta).unwrap();
+    assert_eq!(stored_times(&conn, SESSION), stored_times(&fresh, SESSION));
+}
