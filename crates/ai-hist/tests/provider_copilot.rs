@@ -14,6 +14,8 @@ const USAGE: &str = "5f0c2a8e-1d4b-4c6e-9a7f-3b2d1e0c9a81";
 const USAGE_JOURNAL: &str = include_str!(
     "fixtures/copilot/cli-usage/.copilot/session-state/5f0c2a8e-1d4b-4c6e-9a7f-3b2d1e0c9a81/events.jsonl"
 );
+const DESKTOP: &str = "6a5dde8d-2cf2-448d-a2b4-1f73db2cabf0";
+const DESKTOP_JOURNAL: &str = include_str!("fixtures/copilot/desktop-harness/.copilot/session-state/6a5dde8d-2cf2-448d-a2b4-1f73db2cabf0/events.jsonl");
 const VSCODE: &str = "69e50b90-b873-4de0-a36d-c9152a45e772";
 const VSCODE_JOURNAL: &str = include_str!("fixtures/copilot/vscode-harness/.copilot/session-state/69e50b90-b873-4de0-a36d-c9152a45e772/events.jsonl");
 
@@ -90,17 +92,56 @@ fn assert_vscode_capture(evidence: &SessionEvidence) {
     );
 }
 
+fn assert_desktop_capture(evidence: &SessionEvidence) {
+    assert!(has(evidence, "RELAY_COPILOT_DESKTOP_CAPTURE_OK"));
+    assert_eq!(evidence.tool_calls.len(), 1);
+    assert_eq!(evidence.tool_results.len(), 1);
+    let result = &evidence.tool_results[0];
+    assert_eq!(result.result_status.as_deref(), Some("errored"));
+    assert_eq!(
+        result.error_signal.as_deref(),
+        Some("tool.execution_complete.success")
+    );
+    assert_eq!(
+        result.text.as_deref(),
+        Some("Fixture MCP initialization failed.")
+    );
+    assert_eq!(
+        evidence.session.cwd.as_deref(),
+        Some("/fixture/copilot-desktop")
+    );
+    for kind in [
+        "session.start",
+        "assistant.turn_start",
+        "assistant.turn_end",
+    ] {
+        assert!(evidence.markers.iter().any(|marker| marker.kind == kind));
+    }
+}
+
+#[test]
+fn recorded_desktop_harness_preserves_failed_tool_outcomes() {
+    let home = tempfile::tempdir().unwrap();
+    stage(home.path(), DESKTOP, DESKTOP_JOURNAL);
+    let evidence = provider_support::assert_history_conformance(
+        home.path(),
+        provider_support::HistoryCase {
+            source: Source::Copilot,
+            session_id: DESKTOP,
+            messages: &[
+                (Role::User, "Check the Relay connection once."),
+                (Role::Assistant, "RELAY_COPILOT_DESKTOP_CAPTURE_OK"),
+            ],
+        },
+    );
+    assert_desktop_capture(&evidence);
+}
+
 #[test]
 fn copilot_desktop_and_vscode_sessions_sync_together_without_a_live_process() {
     let home = tempfile::tempdir().unwrap();
-    let desktop = "6a5dde8d-2cf2-448d-a2b4-1f73db2cabf0";
-    stage(
-        home.path(),
-        desktop,
-        &IMPORTED_JOURNAL
-            .replace(IMPORTED, desktop)
-            .replace("1.0.95", "1.0.106-8.unstable.r43566476370.g869eef3"),
-    );
+    let desktop = DESKTOP;
+    stage(home.path(), desktop, DESKTOP_JOURNAL);
     stage(home.path(), VSCODE, VSCODE_JOURNAL);
     let store = open(home.path());
     assert_eq!(discover(&store).discovered, 2);
@@ -130,12 +171,8 @@ fn copilot_desktop_and_vscode_sessions_sync_together_without_a_live_process() {
     assert!(has(&desktop_evidence, "Continue this desktop thread."));
     assert!(!has(&vscode_evidence, "Continue this desktop thread."));
     assert!(!has(&desktop_evidence, "RELAY_COPILOT_VSCODE_PROOF_OK"));
-    assert_eq!(desktop_evidence.tool_calls.len(), 1);
-    assert_eq!(desktop_evidence.tool_results.len(), 1);
-    assert!(desktop_evidence
-        .markers
-        .iter()
-        .any(|m| m.kind == "session.start"));
+    assert_desktop_capture(&desktop_evidence);
+    assert!(!has(&vscode_evidence, "RELAY_COPILOT_DESKTOP_CAPTURE_OK"));
 }
 
 #[test]
