@@ -1,0 +1,187 @@
+# Deploys layered-relayhistory (agent/) through layered-agents' deploy
+# action. Bootstrap-only changes (prompt, lane scripts) hot-update the
+# running host over SSM, so the lead keeps its context. Any other template
+# change stops/starts or replaces the instance, and runs only from a manual
+# dispatch with allow_restart.
+name: Agent Deploy
+
+# A landing on main that changes agent/ or its workflows deploys it once
+# Agent CI has passed on that commit (a bootstrap-only change hot-updates the
+# host; anything else waits for a manual dispatch with allow_restart).
+# The first deploy creates the host, which is a full deploy: the automatic
+# run after the landing refuses it, and a human dispatches with allow_restart.
+# This deploys only the agent's own host. relayhistory's releases and
+# publishes stay separate workflows that Khaliq gates.
+#
+# Not live yet. Before the first deploy, Khaliq: reviews and merges the
+# layered-agents infra/agents.ts entry and deploys the platform (this repo's
+# deploy role and host boundary), enables immutable OIDC subjects on this
+# repo, creates its agent-deploy Environment restricted to main, sets the
+# LAYERED_AGENT_DEPLOY_ROLE_ARN variable and the GH_APP_PUSHER_ID /
+# GH_APP_PUSHER_PRIVATE_KEY secrets, then dispatches this workflow with
+# allow_restart (creating the host is a full deploy). Until the variable is
+# set, the deploy job is skipped.
+on:
+  workflow_run:
+    workflows: [Agent CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      allow_restart:
+        description: Allow a deploy that stops/starts or replaces the host
+        type: boolean
+        default: false
+
+jobs:
+  # Decides whether an automatic run deploys: only when the landing changed
+  # what the deploy reads since the last successful deploy, as recorded by
+  # the record job's agent-deployed artifact. A dispatch always deploys. The
+  # path list is everything the deploy reads: agent/ and these two workflows.
+  changed:
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      deploy: ${{ steps.check.outputs.deploy }}
+    steps:
+      - name: Check out the CI run's commit
+        if: github.event_name == 'workflow_run'
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Compare with the last successful deploy
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" != workflow_run ]; then
+            echo "$EVENT: deploying without a path check"
+            echo deploy=true >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # The baseline is the head of the run that uploaded the newest
+          # agent-deployed artifact, which the record job leaves after each
+          # successful deploy (a dispatch with allow_restart that deployed
+          # leaves one too, so its head becomes the baseline). One API call;
+          # artifacts are listed newest first. The artifact expires after 90
+          # days, after which the run deploys anyway, which the kit makes a
+          # no-op. A failed gh api call fails the step.
+          last=$(gh api "repos/$REPO/actions/artifacts?name=agent-deployed&per_page=1" \
+            --jq '.artifacts[0].workflow_run.head_sha // empty')
+          paths=(agent/ .github/workflows/agent-ci.yml .github/workflows/agent-deploy.yml)
+          if [ -z "$last" ]; then
+            echo "No record of a deploy (no agent-deployed artifact, or it expired): deploying $HEAD_SHA"
+            deploy=true
+          elif ! git cat-file -e "$last^{commit}" 2>/dev/null || ! git merge-base --is-ancestor "$last" "$HEAD_SHA"; then
+            echo "Last deployed $last is not an ancestor of $HEAD_SHA: deploying"
+            deploy=true
+          elif [ -n "$(git diff --name-only "$last" "$HEAD_SHA" -- "${paths[@]}")" ]; then
+            echo "Changed since last deployed $last under ${paths[*]}:"
+            git diff --name-only "$last" "$HEAD_SHA" -- "${paths[@]}"
+            deploy=true
+          else
+            echo "Nothing under ${paths[*]} changed between last deployed $last and $HEAD_SHA: not deploying"
+            deploy=false
+          fi
+          echo "deploy=$deploy" >> "$GITHUB_OUTPUT"
+
+  deploy:
+    needs: changed
+    # Only main's copy of agent/ may reach the host: a dispatch from any
+    # other ref (anyone with write access can start one) is a no-op.
+    # Agent CI runs on every push to main, so main's head always gets its
+    # own run, and an automatic deploy follows only a green run on main
+    # whose commit is still main's head: the kit checks out github.sha, so
+    # a run that finished after main moved on is skipped and the newer
+    # head's own run deploys instead, and only when the changed job found
+    # agent/ or its workflows changed since the last successful deploy.
+    if: >-
+      github.ref == 'refs/heads/main'
+      && vars.LAYERED_AGENT_DEPLOY_ROLE_ARN != ''
+      && needs.changed.outputs.deploy == 'true'
+      && (github.event_name == 'workflow_dispatch'
+          || (github.event.workflow_run.conclusion == 'success'
+              && github.event.workflow_run.head_branch == 'main'
+              && github.event.workflow_run.head_sha == github.sha))
+    # One deploy at a time against the one stack and host, taken only by a job
+    # that runs (a skipped job never enters the group). An automatic run
+    # enters the group only when agent/ or its workflows changed since the
+    # last successful deploy, so a queued allow_restart dispatch is displaced
+    # only by a landing under agent/ itself: GitHub keeps one pending run per
+    # group, and a newer one cancels the pending one. A displaced dispatch
+    # shows as cancelled and must be re-dispatched.
+    concurrency:
+      group: agent-deploy-relayhistory-dev
+      cancel-in-progress: false
+    # This repo is public, and GitHub refuses a public repo's call to the
+    # private layered-agents reusable workflow before any job starts. So the
+    # job runs the same steps as layered-agents' composite action, from a
+    # read-only checkout fetched with a short-lived token from the org pusher
+    # App (contents:read on layered-agents only), as relay-desktop does. The
+    # environment is part of the deploy role's exact OIDC subject; the
+    # reusable workflow ran in the same one.
+    runs-on: ${{ vars.DEPLOY_LINUX_RUNNER || 'ubuntu-24.04' }}
+    environment: agent-deploy
+    timeout-minutes: 60
+    permissions:
+      id-token: write
+      contents: read
+      packages: read
+    steps:
+      - name: Token for the layered-agents kit (contents:read)
+        id: kit-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          app-id: ${{ secrets.GH_APP_PUSHER_ID }}
+          private-key: ${{ secrets.GH_APP_PUSHER_PRIVATE_KEY }}
+          owner: AgentWorkforce
+          repositories: layered-agents
+          permission-contents: read
+      # github.sha, as the reusable workflow's checkout did.
+      - name: Check out this repo
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check out the layered-agents kit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: AgentWorkforce/layered-agents
+          ref: main
+          token: ${{ steps.kit-token.outputs.token }}
+          path: .layered-agents
+          persist-credentials: false
+      - name: Deploy
+        uses: ./.layered-agents/.github/actions/layered-agent-deploy
+        with:
+          role-arn: ${{ vars.LAYERED_AGENT_DEPLOY_ROLE_ARN }}
+          agent-dir: agent
+          stage: dev
+          allow-restart: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_restart }}
+
+  # Leaves a record of what was deployed: the next run reads the head sha of
+  # this artifact's run to know what was last deployed.
+  record:
+    needs: deploy
+    if: needs.deploy.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+      contents: read
+    steps:
+      - name: Write the deployed sha
+        run: echo "${{ github.sha }}" > deployed-sha
+      - name: Upload the deploy record
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: agent-deployed
+          path: deployed-sha
+          retention-days: 90
+          if-no-files-found: error
