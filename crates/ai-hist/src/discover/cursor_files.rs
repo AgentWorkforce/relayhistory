@@ -6,6 +6,33 @@ use anyhow::Result;
 use super::{Candidate, DiscoveryEnv};
 
 pub(super) fn candidates(env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
+    let mut out = transcript_candidates(env)?;
+    out.extend(chat_store_candidates(env)?);
+    Ok(out)
+}
+
+/// The chats Cursor kept only in its own chat store: those with no
+/// transcript, so no chat is offered twice.
+fn chat_store_candidates(env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
+    let mut out = Vec::new();
+    for (store, session_id) in crate::ingest::cursor_store::chat_stores(&env.home, env.path_scope())? {
+        let Ok((stamp, recency_hint_ms)) =
+            crate::ingest::cursor_store::chat_store_stamp_and_modified(&store)
+        else {
+            continue;
+        };
+        out.push(Candidate {
+            source: "cursor",
+            locator: store.to_string_lossy().into_owned(),
+            session_id: Some(session_id),
+            recency_hint_ms,
+            stamp,
+        });
+    }
+    Ok(out)
+}
+
+fn transcript_candidates(env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
     let root = env.home.join(".cursor/projects");
     match crate::ingest::path_scope::PathScope::walk_of(env.path_scope(), &root) {
         crate::ingest::path_scope::RootWalk::Partial(scope) => {

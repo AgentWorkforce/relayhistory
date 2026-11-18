@@ -213,6 +213,16 @@ different reason — a `Task` block is captured as an ordinary `tool_calls` row,
 so the spawn is visible, but it names no child transcript, so there is nothing
 to write a relationship to.
 
+**Cursor chats with no transcript.** Cursor keeps every agent chat in its own
+store, `~/.cursor/chats/<workspace>/<id>/store.db`, and not every chat also
+gets an `agent-transcripts` file. A chat with no transcript is read from that
+store (`src/ingest/cursor_store.rs`): its messages are rendered as the records
+the transcript would hold and go through `ingest_cursor_transcript_text`, so
+the cells above are the same for it, except that the store keeps what the
+transcript drops — `tool_result` blocks, `tool_use` ids and `reasoning` — and
+those are captured too. A chat that has a transcript is read only from the
+transcript.
+
 **Muse Code.** `ingest_muse_session` (`src/ingest.rs`, record interpretation
 in `src/ingest/muse.rs`) reads `session.jsonl`, an event-sourced log whose
 every record carries its own `recorded_at` in microseconds, so no timestamp is

@@ -1672,7 +1672,11 @@ impl ShallowSessionProvider for CursorProvider {
     }
 
     fn watch_roots(&self, roots: &ProviderRoots<'_>) -> Vec<WatchRoot> {
-        vec![WatchRoot::tree(roots.home.join(".cursor/projects"))]
+        vec![
+            WatchRoot::tree(roots.home.join(".cursor/projects")),
+            // Cursor's own chat store, for the chats it wrote no transcript for.
+            WatchRoot::tree(roots.home.join(crate::ingest::cursor_store::CHATS_DIR)),
+        ]
     }
 
     fn enumerate(
@@ -1693,7 +1697,20 @@ impl ShallowSessionProvider for CursorProvider {
         let Some(session_id) = candidate.session_id.clone() else {
             return Ok(None);
         };
-        let bounded = read_bounded_jsonl(scan, &path)?;
+        // A chat Cursor kept only in its chat store is read as the transcript
+        // records it renders to, so both kinds of chat catalog alike.
+        let chat_store = if crate::ingest::cursor_store::is_chat_store(&path) {
+            match crate::ingest::cursor_store::read_chat_store(&path)? {
+                Some(store) => Some(store),
+                None => return Ok(None),
+            }
+        } else {
+            None
+        };
+        let bounded = match &chat_store {
+            Some(store) => bounded_jsonl_from_bytes(store.transcript.as_bytes()),
+            None => read_bounded_jsonl(scan, &path)?,
+        };
         let first_prompt = bounded
             .head_records()
             .filter_map(|line| {
@@ -1726,6 +1743,7 @@ impl ShallowSessionProvider for CursorProvider {
             .tail_records_rev()
             .find_map(cursor_record_time)
             .or(last_head_ms)
+            .or_else(|| chat_store.as_ref().and_then(|store| store.updated_ms))
             .or_else(|| crate::file_modified_ms(&path));
         let mut models = Vec::new();
         for model in bounded.head_records().filter_map(cursor_record_model) {
@@ -1739,7 +1757,12 @@ impl ShallowSessionProvider for CursorProvider {
             .map(|text| excerpt(&text));
         // Found by walking up rather than at a fixed depth: a subagent
         // transcript sits one directory deeper than its parent's.
-        let cwd = crate::ingest::cursor::project_dir_name(&path).map(crate::decode_cursor_project);
+        let cwd = match &chat_store {
+            Some(store) => store.cwd.clone(),
+            None => crate::ingest::cursor::project_dir_name(&path).map(crate::decode_cursor_project),
+        };
+        let first_activity_ms =
+            first_activity_ms.or_else(|| chat_store.as_ref().and_then(|store| store.created_ms));
         Ok(Some(ShallowSession {
             source: "cursor".into(),
             session_id,

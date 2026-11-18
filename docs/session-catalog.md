@@ -1112,6 +1112,44 @@ How each adapter works:
   cheaply", never "no model". Full details, and what Cursor does **not** write,
   are below.
 
+  A chat with **no** transcript is read from Cursor's own chat store instead,
+  `~/.cursor/chats/<workspace-hash>/<id>/store.db`, with the same source and
+  the same session id (the chat's directory name). A chat that has a
+  transcript is never offered from its store, so no chat is cataloged twice.
+
+  ### Cursor chat store
+
+  Characterized from real `cursor-agent` 2026.11.11 and 2026.11.17 stores
+  (November 2026); Cursor publishes no schema. The fixture
+  `tests/fixtures/cursor/chat-store/store-only.sql` is synthetic.
+
+  * SQLite in WAL mode, `meta(key, value)` and `blobs(id, data)`. Meta key `0`
+    is hex-encoded JSON: `agentId`, `latestRootBlobId`, `name`, `mode`,
+    `createdAt` and a `blobEncryptionKey` no observed store used.
+  * Blobs are content-addressed (`id` is the SHA-256 of `data`). The root
+    blob is protobuf: repeated field 1 lists the message blob ids in order;
+    field 9 is the workspace `file://` URI, field 21 a message whose field 1
+    is the cwd, field 22 the client (`cli`), field 26 the update time in ms.
+  * Messages are JSON in the AI SDK shape: `role` `system`, `user`,
+    `assistant` or `tool`, with `text`, `tool-call`, `tool-result` and
+    `reasoning` blocks.
+  * Newer builds write `meta.json` beside it with `cwd`, `createdAtMs`,
+    `updatedAtMs` and `hasConversation`; `hasConversation: false` is no chat.
+
+  Each message is rendered as the transcript record Cursor writes for it and
+  parsed by the transcript parser. The system prompt and the leading
+  `<user_info>` environment preamble are dropped, as the transcript drops them;
+  `tool-call` becomes `tool_use` with its real id, a `tool` message becomes a
+  user-role `tool_result`, `reasoning` becomes `thinking`. Each record's
+  `message.id` is `cursor-blob:<blob id>`. A chat store is re-read whole when
+  its stamp (store, `-wal` and `meta.json`) changes, and its session is
+  rebuilt; there is no byte checkpoint. A closed chat has no `-wal`, and a
+  read-only open would create one beside it, so such a store is opened
+  `immutable=1`; a store with a `-wal` is opened read-only. A store that
+  changes while it is read is dropped for that pass. A blob that is missing or
+  not JSON (an encrypted one would read that way) is skipped and reported as
+  `CURSOR_CHAT_STORE_BLOB_UNREADABLE`.
+
   ### Cursor record shapes
 
   Cursor publishes no schema for this file, so the shapes below were

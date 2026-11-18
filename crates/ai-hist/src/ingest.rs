@@ -176,6 +176,8 @@ use subagent_cleanup::{
 // After `sync_note!`, which the repair note uses.
 pub(crate) mod provider_diagnostics;
 pub(crate) mod scoped_files;
+// After `sync_note!`, which it uses.
+pub(crate) mod cursor_store;
 #[cfg(test)]
 pub(crate) use scoped_files::take_dirs_read;
 pub(crate) use scoped_files::{
@@ -12205,6 +12207,29 @@ pub(crate) fn ingest_cursor_transcript(
     // update, rolls back and the next sync retries the same offset.
     let text = cold_read::read_string(path)
         .with_context(|| format!("read Cursor transcript {}", path.display()))?;
+    ingest_cursor_transcript_text(
+        conn,
+        &text,
+        session_id,
+        project,
+        mtime_ms,
+        history_from_offset,
+        index_through,
+    )
+}
+
+/// [`ingest_cursor_transcript`] over records already in memory: a transcript
+/// file's text, or the transcript-shaped records rendered from Cursor's own
+/// chat store (`cursor_store`). Offsets are positions in `text`.
+pub(crate) fn ingest_cursor_transcript_text(
+    conn: &Connection,
+    text: &str,
+    session_id: &str,
+    project: Option<&str>,
+    mtime_ms: i64,
+    history_from_offset: u64,
+    index_through: u64,
+) -> Result<CursorTranscriptOutcome> {
     let mut outcome = CursorTranscriptOutcome::default();
     let mut offset: u64 = 0;
     // One query for the session, keyed by record offset. The per-record

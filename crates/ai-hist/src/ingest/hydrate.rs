@@ -2282,7 +2282,20 @@ pub(crate) fn ingest_selected_claude(ctx: SelectedIngest<'_>) -> Result<Selected
 }
 
 pub(crate) fn ingest_selected_cursor(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
-    let (diagnostics, consumed) = ingest_cursor(ctx.conn, ctx.options, ctx.target, ctx.file()?)?;
+    let path = ctx.file()?;
+    if crate::ingest::cursor_store::is_chat_store(path) {
+        // A chat store is re-read whole and has no byte checkpoint.
+        let diagnostics = ingest_cursor_chat_store(ctx.conn, ctx.options, path)?;
+        return Ok((
+            IngestOutcome {
+                records: ctx.records,
+                ..Default::default()
+            },
+            diagnostics,
+            None,
+        ));
+    }
+    let (diagnostics, consumed) = ingest_cursor(ctx.conn, ctx.options, ctx.target, path)?;
     Ok((ctx.whole_file(), diagnostics, Some(consumed)))
 }
 
@@ -3331,6 +3344,66 @@ fn ingest_cursor(
         }
     }
     Ok((cursor_diagnostics(&outcome), outcome.consumed_through))
+}
+
+/// Targeted hydration of a chat Cursor kept only in its chat store: the whole
+/// chat, rebuilt, as the sync pass does.
+fn ingest_cursor_chat_store(
+    conn: &Connection,
+    options: &HydrateSessionOptions,
+    path: &Path,
+) -> Result<Vec<HydrationDiagnostic>> {
+    let store = crate::ingest::cursor_store::read_chat_store(path)?.ok_or_else(|| {
+        hydration_error(
+            "SESSION_SOURCE_UNAVAILABLE",
+            "Cursor chat store holds no conversation",
+        )
+    })?;
+    if store.session_id != options.session_id {
+        return Err(hydration_error(
+            "SESSION_SOURCE_MISMATCH",
+            "Cursor chat store identity does not match the catalog row",
+        ));
+    }
+    let fallback_ms = store.updated_ms.or(store.created_ms).unwrap_or(0);
+    clear_cursor_session_evidence(conn, &options.session_id)?;
+    let outcome = crate::ingest::ingest_cursor_transcript_text(
+        conn,
+        &store.transcript,
+        &options.session_id,
+        store.cwd.as_deref(),
+        fallback_ms,
+        0,
+        u64::MAX,
+    )?;
+    upsert_session_rebuilt(
+        conn,
+        &SessionCatalogRow {
+            session_id: &options.session_id,
+            source: "cursor",
+            cwd: store.cwd.as_deref(),
+            git_branch: None,
+            first_ts: outcome.first_ts_ms.unwrap_or(fallback_ms),
+            last_ts: outcome.last_ts_ms.unwrap_or(fallback_ms),
+            last_assistant_text: outcome.last_assistant_text.as_deref(),
+            raw_path: Some(&path.to_string_lossy()),
+        },
+    )?;
+    let mut diagnostics = cursor_diagnostics(&outcome);
+    if store.skipped_blobs > 0 {
+        diagnostics.push(HydrationDiagnostic {
+            code: "CURSOR_CHAT_STORE_BLOB_UNREADABLE".to_string(),
+            message: format!(
+                "{} message blob(s) in the Cursor chat store were missing or not readable JSON \
+                 (possibly encrypted) and were skipped",
+                store.skipped_blobs
+            ),
+            duration_ms: None,
+            source_bytes: None,
+            records_parsed: None,
+        });
+    }
+    Ok(diagnostics)
 }
 
 /// What a Cursor transcript could not establish on its own.
@@ -10734,6 +10807,62 @@ mod tests {
         )
         .unwrap();
         transcript
+    }
+
+    #[test]
+    fn a_cursor_chat_with_no_transcript_hydrates_from_its_chat_store() {
+        use crate::ingest::cursor_store::test_support::{tool_chat, write_store};
+        let dir = tempfile::tempdir().unwrap();
+        let store = write_store(
+            dir.path(),
+            "ws",
+            "cur-store",
+            "/work/app",
+            &tool_chat("read note.txt"),
+            1_795_042_344_825,
+        );
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "cursor", "cur-store", Some(&store));
+        drop(conn);
+
+        let result =
+            hydrate_session_at_with_home(&db, &options("cursor", "cur-store"), dir.path()).unwrap();
+        assert_eq!(result.status, "hydrated", "{:?}", result.diagnostics);
+        assert!(result.evidence.events > 0, "{:?}", result.evidence);
+        assert_eq!(result.evidence.tool_calls, 1, "{:?}", result.evidence);
+        let conn = open_db(&db).unwrap();
+        let (cwd, last): (Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT cwd, last_assistant_text FROM sessions \
+                 WHERE source = 'cursor' AND session_id = 'cur-store'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(cwd.as_deref(), Some("/work/app"));
+        assert_eq!(last.as_deref(), Some("note.txt says hello"));
+        let prompts: Vec<String> = conn
+            .prepare(
+                "SELECT prompt FROM history WHERE source = 'cursor' AND session_id = 'cur-store'",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        assert_eq!(prompts, vec!["read note.txt".to_string()]);
+        let results = crate::session_events(&conn, "cur-store", Some("cursor"))
+            .unwrap()
+            .into_iter()
+            .filter(|event| event.kind == "tool_result")
+            .count();
+        assert_eq!(results, 1);
+
+        // Unchanged store: nothing to do, nothing duplicated.
+        let again =
+            hydrate_session_at_with_home(&db, &options("cursor", "cur-store"), dir.path()).unwrap();
+        assert_eq!(again.status, "unchanged");
     }
 
     #[test]

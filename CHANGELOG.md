@@ -4,7 +4,11 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Minor]
+
+### Added
+
+- Cursor chats that have no `agent-transcripts` transcript are now cataloged and indexed from Cursor's own chat store, `~/.cursor/chats/<workspace>/<id>/store.db`, under the `cursor` source with the chat's id. Until now such a chat was invisible. Prompts, replies, reasoning, tool calls with their ids, tool results and file edits are captured. A chat that has a transcript is still read only from the transcript, so nothing is cataloged twice.
 
 ## [0.60.0] - 2026-11-16
 
