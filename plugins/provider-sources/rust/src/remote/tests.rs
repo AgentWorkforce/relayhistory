@@ -534,21 +534,43 @@ fn real_claude_transport_never_follows_a_redirect_with_credentials() {
     );
 }
 
+/// Writes an executable script without this process ever holding a write
+/// handle to it. Tests run on parallel threads: if another test forks a child
+/// while this one has the script open for writing, the child inherits the
+/// handle until it execs, and running the script in that window fails with
+/// ETXTBSY ("Text file busy"), seen as "could not run `codex cloud diff`".
+/// Writing from a child process keeps the handle out of this process.
+#[cfg(unix)]
+fn write_script(path: &Path, body: &str) {
+    use std::io::Write;
+
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+        .arg(path)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(body.as_bytes())
+        .unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success(), "writing {}: {status}", path.display());
+}
+
 #[cfg(unix)]
 #[test]
 fn codex_targeted_evidence_uses_the_cli_diff_and_reports_an_empty_diff_honestly() {
-    use std::os::unix::fs::PermissionsExt;
-
     let dir = tempfile::tempdir().unwrap();
     let command = dir.path().join("codex-fixture");
-    std::fs::write(
+    write_script(
         &command,
         "#!/bin/sh\n\
          test \"$1\" = cloud && test \"$2\" = diff && test \"$3\" = task_fixture || exit 2\n\
          printf 'diff --git a/src/lib.rs b/src/lib.rs\\n--- a/src/lib.rs\\n+++ b/src/lib.rs\\n@@ -1 +1,2 @@\\n old\\n+new\\n'\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let evidence =
         acquire_codex_remote_session_with_command("task_fixture", command.as_os_str()).unwrap();
@@ -561,11 +583,10 @@ fn codex_targeted_evidence_uses_the_cli_diff_and_reports_an_empty_diff_honestly(
     assert!(diff.contains("diff --git a/src/lib.rs b/src/lib.rs"));
     assert_eq!(source_bytes, diff.len() as i64);
 
-    std::fs::write(
+    write_script(
         &command,
         "#!/bin/sh\ntest \"$1\" = cloud && test \"$2\" = diff && test \"$3\" = task_fixture\n",
-    )
-    .unwrap();
+    );
     let evidence =
         acquire_codex_remote_session_with_command("task_fixture", command.as_os_str()).unwrap();
     assert!(matches!(
@@ -593,12 +614,9 @@ fn codex_targeted_evidence_requires_the_supplied_homes_login() {
 #[cfg(unix)]
 #[test]
 fn codex_output_limit_drains_the_pipe_and_reports_size_not_timeout() {
-    use std::os::unix::fs::PermissionsExt;
-
     let dir = tempfile::tempdir().unwrap();
     let command = dir.path().join("codex-oversized");
-    std::fs::write(&command, "#!/bin/sh\nhead -c 16777217 /dev/zero\n").unwrap();
-    std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_script(&command, "#!/bin/sh\nhead -c 16777217 /dev/zero\n");
     let error = acquire_codex_remote_session_with_command_timeout(
         "task_fixture",
         command.as_os_str(),
@@ -612,12 +630,9 @@ fn codex_output_limit_drains_the_pipe_and_reports_size_not_timeout() {
 #[cfg(unix)]
 #[test]
 fn codex_inherited_pipe_is_bounded_after_the_direct_child_exits() {
-    use std::os::unix::fs::PermissionsExt;
-
     let dir = tempfile::tempdir().unwrap();
     let command = dir.path().join("codex-inherited-pipe");
-    std::fs::write(&command, "#!/bin/sh\nsleep 2 &\nexit 0\n").unwrap();
-    std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_script(&command, "#!/bin/sh\nsleep 2 &\nexit 0\n");
     let started = Instant::now();
     let error = acquire_codex_remote_session_with_command_timeout(
         "task_fixture",
