@@ -155,20 +155,24 @@ fn selected(len: usize, ends: Option<usize>) -> Vec<usize> {
     }
 }
 
-/// The id a rendered message carries: its blob id, with the occurrence
-/// number when the root lists the same blob more than once, so repeated
-/// identical messages stay separate messages.
-fn occurrence_id(messages: &[String], position: usize) -> String {
-    let id = &messages[position];
-    let earlier = messages[..position]
+/// The id each message carries: its blob id, with the occurrence number when
+/// the root lists the same blob more than once, so repeated identical
+/// messages stay separate messages. One pass over the whole list, so a
+/// preview numbers occurrences exactly as a full read does.
+fn occurrence_ids(messages: &[String]) -> Vec<String> {
+    let mut seen = std::collections::HashMap::<&str, usize>::new();
+    messages
         .iter()
-        .filter(|seen| *seen == id)
-        .count();
-    if earlier == 0 {
-        id.clone()
-    } else {
-        format!("{id}#{}", earlier + 1)
-    }
+        .map(|id| {
+            let count = seen.entry(id.as_str()).or_insert(0);
+            *count += 1;
+            if *count == 1 {
+                id.clone()
+            } else {
+                format!("{id}#{count}")
+            }
+        })
+        .collect()
 }
 
 fn render_messages(
@@ -178,6 +182,7 @@ fn render_messages(
     store: &mut ChatStore,
 ) -> Result<()> {
     let mut preamble_open = true;
+    let ids = occurrence_ids(messages);
     for &position in positions {
         let Some(data) = read_blob(conn, &messages[position])? else {
             store.skipped_blobs += 1;
@@ -187,8 +192,7 @@ fn render_messages(
             store.skipped_blobs += 1;
             continue;
         };
-        let id = occurrence_id(messages, position);
-        let Some(record) = transcript_record(&id, &message, &mut preamble_open) else {
+        let Some(record) = transcript_record(&ids[position], &message, &mut preamble_open) else {
             continue;
         };
         store.transcript.push_str(&record.to_string());

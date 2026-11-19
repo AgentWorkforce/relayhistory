@@ -15,6 +15,9 @@ use super::{
     CHAT_STORE_STATE_KEY,
 };
 
+/// Marks a saved stamp whose chat rendered no evidence.
+const NO_EVIDENCE: &str = "|no-evidence";
+
 /// One chat read before the destination writer lock is taken.
 struct Prepared {
     path: PathBuf,
@@ -139,7 +142,13 @@ fn unchanged(
     session_id: &str,
 ) -> Result<bool> {
     let key = path.to_string_lossy();
-    if seen.get(key.as_ref()).and_then(Value::as_str) != Some(stamp) {
+    let saved = seen.get(key.as_ref()).and_then(Value::as_str);
+    // A chat that produced no evidence is remembered as such, so it is not
+    // rebuilt on every pass for want of rows it never had.
+    if saved == Some(&format!("{stamp}{NO_EVIDENCE}")) {
+        return Ok(true);
+    }
+    if saved != Some(stamp) {
         return Ok(false);
     }
     Ok(conn.query_row(
@@ -192,16 +201,33 @@ fn index(conn: &Connection, prepared: &[Prepared], seen: &mut Map<String, Value>
                     store.created_ms,
                     fallback_ms,
                 ),
-                last_ts: outcome.last_ts_ms.unwrap_or(fallback_ms),
+                last_ts: crate::ingest::cursor_store::chat_end(
+                    &outcome,
+                    store.updated_ms,
+                    fallback_ms,
+                ),
                 last_assistant_text: outcome.last_assistant_text.as_deref(),
                 raw_path: Some(&path.to_string_lossy()),
             },
         )?;
-        seen.insert(
-            path.to_string_lossy().into_owned(),
-            Value::String(stamp.clone()),
-        );
+        let saved = if outcome.records == 0 {
+            format!("{stamp}{NO_EVIDENCE}")
+        } else {
+            stamp.clone()
+        };
+        seen.insert(path.to_string_lossy().into_owned(), Value::String(saved));
     }
     tx.commit().context("commit Cursor chat store sync")?;
     Ok(inserted)
+}
+
+#[cfg(test)]
+pub(super) fn is_unchanged_for_test(
+    conn: &Connection,
+    seen: &Map<String, Value>,
+    path: &Path,
+    stamp: &str,
+    session_id: &str,
+) -> bool {
+    matches!(unchanged(conn, seen, path, stamp, session_id), Ok(true))
 }

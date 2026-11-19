@@ -158,7 +158,7 @@ pub(super) fn ingest_chat_store(
                 store.created_ms,
                 fallback_ms,
             ),
-            last_ts: outcome.last_ts_ms.unwrap_or(fallback_ms),
+            last_ts: crate::ingest::cursor_store::chat_end(&outcome, store.updated_ms, fallback_ms),
             last_assistant_text: outcome.last_assistant_text.as_deref(),
             raw_path: Some(&path.to_string_lossy()),
         },

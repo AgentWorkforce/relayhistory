@@ -433,3 +433,45 @@ fn an_untimed_chat_keeps_its_creation_time_as_its_start() {
         .unwrap();
     assert_eq!((first, last), (49_000, 50_000));
 }
+
+#[test]
+fn a_chat_with_no_evidence_is_not_rebuilt_on_every_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let only_system = vec![json!({"role": "system", "content": "You are an AI coding assistant."})];
+    write_store(home, "ws", "chat-1", "/w", &only_system, 5).unwrap();
+    let conn = crate::open_db(&home.join("history.db")).unwrap();
+    let mut state = Map::new();
+    let mut coverage = crate::ingest::SweepCoverage::default();
+    sync_chat_stores_in(&conn, &mut state, home, &mut coverage, None).unwrap();
+    let saved = state[CHAT_STORE_STATE_KEY].as_object().unwrap().clone();
+    let (stores, _) = (chat_stores(home, None).unwrap(), ());
+    let (path, session_id) = &stores[0];
+    let (stamp, _) = chat_store_stamp_and_modified(path).unwrap();
+    assert!(super::sync::is_unchanged_for_test(
+        &conn, &saved, path, &stamp, session_id
+    ));
+}
+
+#[test]
+fn a_dated_first_turn_keeps_its_start_and_the_store_update_bounds_the_end() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let mut messages = tool_chat("dated first");
+    messages.push(json!({"role": "user", "content": "undated follow-up"}));
+    write_store(home, "ws", "chat-1", "/w", &messages, 1_795_042_344_825).unwrap();
+    let conn = crate::open_db(&home.join("history.db")).unwrap();
+    let mut state = Map::new();
+    let mut coverage = crate::ingest::SweepCoverage::default();
+    sync_chat_stores_in(&conn, &mut state, home, &mut coverage, None).unwrap();
+    let (first, last): (i64, i64) = conn
+        .query_row(
+            "SELECT first_activity_ms, last_activity_ms FROM sessions WHERE session_id = 'chat-1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    // 2026-11-18 23:52 UTC+1, from the first turn's <timestamp>.
+    assert_eq!(first, 1_795_042_320_000);
+    assert_eq!(last, 1_795_042_344_825);
+}
