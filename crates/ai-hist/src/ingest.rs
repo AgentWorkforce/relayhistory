@@ -12189,9 +12189,9 @@ pub(crate) struct CursorTranscriptOutcome {
 /// leave one copy per sync. Callers that resume mid-file therefore pass the
 /// offset they had already committed, and only records at or after it become
 /// history. Callers that rebuild the session's history first pass `0`.
-pub(crate) fn ingest_cursor_transcript(
+pub(crate) fn ingest_cursor_transcript<'a>(
     conn: &Connection,
-    path: &Path,
+    records: impl Into<cursor_store::Records<'a>>,
     session_id: &str,
     project: Option<&str>,
     mtime_ms: i64,
@@ -12204,7 +12204,7 @@ pub(crate) fn ingest_cursor_transcript(
     // then let the byte checkpoint advance over content nobody read. The
     // error propagates so the whole transaction, including the checkpoint
     // update, rolls back and the next sync retries the same offset.
-    let text = cursor_store::read_records(path)?;
+    let text = records.into().text()?;
     let mut outcome = CursorTranscriptOutcome::default();
     let mut offset: u64 = 0;
     // One query for the session, keyed by record offset. The per-record

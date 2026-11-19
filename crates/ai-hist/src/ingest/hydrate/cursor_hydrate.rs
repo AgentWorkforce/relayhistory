@@ -111,6 +111,18 @@ pub(super) fn ingest_chat_store(
     path: &Path,
     records: i64,
 ) -> Result<SelectedIngestResult> {
+    // A chat that has gained a transcript is the transcript's now; this row
+    // still names the store until discovery runs again.
+    if crate::ingest::cursor_store::superseded_by_transcript(path)? {
+        return Err(hydration_error(
+            "SESSION_SOURCE_MISMATCH",
+            format!(
+                "Cursor catalog row points at the chat store {}, but the chat now has a \
+                 transcript; run discoverSessions() again to re-establish its provenance",
+                path.display()
+            ),
+        ));
+    }
     let store = crate::ingest::cursor_store::read_chat_store(path)?.ok_or_else(|| {
         hydration_error(
             "SESSION_SOURCE_UNAVAILABLE",
@@ -127,7 +139,7 @@ pub(super) fn ingest_chat_store(
     clear_cursor_session_evidence(conn, &options.session_id)?;
     let outcome = ingest_cursor_transcript(
         conn,
-        path,
+        crate::ingest::cursor_store::Records::Rendered(&store.transcript),
         &options.session_id,
         store.cwd.as_deref(),
         fallback_ms,
@@ -162,7 +174,8 @@ pub(super) fn ingest_chat_store(
         });
     }
     let outcome = IngestOutcome {
-        records,
+        records: records.max(i64::try_from(store.records).unwrap_or(i64::MAX)),
+        bytes_read: path.metadata().map_or(0, |metadata| metadata.len() as i64),
         ..Default::default()
     };
     Ok((outcome, diagnostics, None))
@@ -251,5 +264,24 @@ mod tests {
         // Unchanged store: nothing to do, nothing duplicated.
         let again = hydrate_session_at_with_home(&db, &options("cur-store"), dir.path()).unwrap();
         assert_eq!(again.status, "unchanged");
+    }
+
+    #[test]
+    fn a_store_whose_chat_gained_a_transcript_is_not_hydrated_from_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = write_store(dir.path(), "ws", "cur-store", "/w", &tool_chat("a"), 5).unwrap();
+        let transcript = dir
+            .path()
+            .join(".cursor/projects/w/agent-transcripts/cur-store/cur-store.jsonl");
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(&transcript, "{}\n").unwrap();
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_store(&conn, "cur-store", &store);
+        drop(conn);
+        let error = hydrate_session_at_with_home(&db, &options("cur-store"), dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("SESSION_SOURCE_MISMATCH"), "{error}");
     }
 }

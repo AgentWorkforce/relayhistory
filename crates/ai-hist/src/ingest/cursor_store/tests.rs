@@ -3,7 +3,7 @@ use std::path::Path;
 use rusqlite::Connection;
 use serde_json::{json, Map, Value};
 
-use super::read::RootFields;
+use super::read::{file_uri_path, RootFields};
 use super::test_support::*;
 use super::*;
 
@@ -276,4 +276,137 @@ fn a_truncated_root_keeps_what_decoded() {
     root.extend_from_slice(&[0x0a, 0x20, 1, 2]);
     let fields = RootFields::decode(&root);
     assert_eq!(fields.messages.len(), 1);
+}
+
+#[test]
+fn a_store_under_a_non_ascii_home_opens() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().join("Jos\u{e9} 中 %#?");
+    let path = write_store(&home, "ws", "chat-1", "/w", &tool_chat("hi"), 5).unwrap();
+    assert!(!sidecar(&path, "-wal").exists());
+    let store = read_chat_store(&path).unwrap().unwrap();
+    assert_eq!(store.records, 4);
+}
+
+#[test]
+fn a_workspace_uri_decodes_without_slicing_through_a_character() {
+    assert_eq!(
+        file_uri_path("file:///work/%中").as_deref(),
+        Some("/work/%中")
+    );
+    assert_eq!(
+        file_uri_path("file:///Jos%C3%A9/app").as_deref(),
+        Some("/José/app")
+    );
+    assert_eq!(file_uri_path("file:///w/%4").as_deref(), Some("/w/%4"));
+}
+
+#[test]
+fn a_blob_listed_twice_is_two_messages() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut messages = tool_chat("hi");
+    let again = json!({"role": "assistant", "content": [{"type": "text", "text": "same"}]});
+    messages.push(again.clone());
+    messages.push(json!({"role": "user", "content": [{"type": "text", "text": "<user_query>\nmore\n</user_query>"}]}));
+    messages.push(again);
+    let path = write_store(dir.path(), "ws", "chat-1", "/w", &messages, 5).unwrap();
+    let store = read_chat_store(&path).unwrap().unwrap();
+    let ids: Vec<String> = store
+        .transcript
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<Value>(line).unwrap()["message"]["id"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect();
+    let mut unique = ids.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), ids.len(), "{ids:?}");
+}
+
+#[test]
+fn a_preview_renders_only_both_ends_of_a_long_chat() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut messages = tool_chat("first");
+    for n in 0..40 {
+        messages.push(json!({"role": "assistant", "content": [{"type": "text", "text": format!("reply {n}")}]}));
+    }
+    let path = write_store(dir.path(), "ws", "chat-1", "/w", &messages, 5).unwrap();
+    let preview = read_chat_store_preview(&path).unwrap().unwrap();
+    let full = read_chat_store(&path).unwrap().unwrap();
+    assert!(preview.records < full.records);
+    assert!(preview.transcript.contains("<user_query>\\nfirst"));
+    assert!(preview.transcript.contains("reply 39"));
+    assert!(!preview.transcript.contains("reply 10\""));
+}
+
+#[test]
+fn an_unchanged_store_is_indexed_again_into_a_rebuilt_database() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    write_store(home, "ws", "chat-1", "/w", &tool_chat("first prompt"), 5).unwrap();
+    let mut state = Map::new();
+    let mut coverage = crate::ingest::SweepCoverage::default();
+    let first = crate::open_db(&home.join("first.db")).unwrap();
+    sync_chat_stores_in(&first, &mut state, home, &mut coverage, None).unwrap();
+    // Same sync state, fresh database: the stamp alone must not skip it.
+    let rebuilt = crate::open_db(&home.join("rebuilt.db")).unwrap();
+    sync_chat_stores_in(&rebuilt, &mut state, home, &mut coverage, None).unwrap();
+    assert_eq!(
+        prompts(&rebuilt, "chat-1"),
+        vec!["first prompt".to_string()]
+    );
+}
+
+#[test]
+fn a_chat_with_a_subagent_transcript_is_not_offered_from_its_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    write_store(home, "ws", "child-1", "/w", &tool_chat("a"), 5).unwrap();
+    let subagents = home.join(".cursor/projects/w/agent-transcripts/parent-1/subagents");
+    std::fs::create_dir_all(&subagents).unwrap();
+    std::fs::write(subagents.join("child-1.jsonl"), "{}\n").unwrap();
+    assert!(chat_stores(home, None).unwrap().is_empty());
+}
+
+#[test]
+fn a_transcript_takes_the_catalog_row_over_from_its_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let store = write_store(home, "ws", "chat-1", "/w", &tool_chat("a"), 5).unwrap();
+    let transcript = home.join(".cursor/projects/w/agent-transcripts/chat-1/chat-1.jsonl");
+    std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+    std::fs::write(&transcript, "{}\n").unwrap();
+    let conn = crate::open_db(&home.join("history.db")).unwrap();
+    conn.execute(
+        "INSERT INTO sessions (source, session_id, raw_path, discovery_state) \
+         VALUES ('cursor', 'chat-1', ?1, 'shallow')",
+        [store.to_string_lossy()],
+    )
+    .unwrap();
+    let transcript = transcript.to_string_lossy();
+    assert!(!crate::catalog_owner::incoming_must_not_replace(
+        &conn,
+        "cursor",
+        "chat-1",
+        Some(&transcript)
+    )
+    .unwrap());
+    // The reverse never happens: a store does not take a transcript's row.
+    conn.execute(
+        "UPDATE sessions SET raw_path = ?1 WHERE session_id = 'chat-1'",
+        [&*transcript],
+    )
+    .unwrap();
+    assert!(crate::catalog_owner::incoming_must_not_replace(
+        &conn,
+        "cursor",
+        "chat-1",
+        Some(&store.to_string_lossy())
+    )
+    .unwrap());
+    assert!(superseded_by_transcript(&store).unwrap());
 }

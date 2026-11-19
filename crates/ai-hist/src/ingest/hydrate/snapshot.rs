@@ -413,11 +413,11 @@ fn file_source_inventory(
             snapshot.stamp.clone(),
         )
     } else if options.source == "cursor" && crate::ingest::cursor_store::is_chat_store(path) {
-        // The store is SQLite, not JSONL; its records are counted by the read.
-        let store = crate::ingest::cursor_store::read_chat_store(path)?;
+        // The store is SQLite, not JSONL; its records are counted by the
+        // pass that parses it, not by a read here.
         (
             path.metadata()?.len() as i64,
-            SnapshotRecords::Counted(store.map_or(0, |store| store.records as i64)),
+            SnapshotRecords::Counted(0),
             crate::ingest::cursor_store::chat_store_stamp_and_modified(path)?.0,
         )
     } else if matches!(options.source.as_str(), "claude" | "codex") {

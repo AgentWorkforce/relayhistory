@@ -1148,7 +1148,13 @@ How each adapter works:
   `immutable=1`; a store with a `-wal` is opened read-only. A store that
   changes while it is read is dropped for that pass. A blob that is missing or
   not JSON (an encrypted one would read that way) is skipped and reported as
-  `CURSOR_CHAT_STORE_BLOB_UNREADABLE`.
+  `CURSOR_CHAT_STORE_BLOB_UNREADABLE` by hydration and in the sync output.
+  A blob the root lists more than once is one message per occurrence. A
+  shallow catalog read renders only the first and last 16 messages. An
+  unchanged store is skipped on its stamp only while the destination still
+  holds its evidence. When a chat gains a transcript, the transcript takes
+  over the catalog row, and a hydration that still names the store is refused
+  until discovery runs again.
 
   ### Cursor record shapes
 

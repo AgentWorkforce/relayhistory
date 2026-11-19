@@ -53,7 +53,7 @@ pub(crate) mod test_support;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use read::read_chat_store;
+pub(crate) use read::{read_chat_store, read_chat_store_preview};
 pub(in crate::ingest) use sync::sync_chat_stores_in;
 
 /// Where Cursor keeps its chat stores, relative to the home directory.
@@ -134,7 +134,8 @@ pub(crate) fn chat_store_stamp_and_modified(path: &Path) -> Result<(String, Opti
 }
 
 /// The chat ids that have an `agent-transcripts` transcript under
-/// `projects`. Those chats are read from the transcript, never the store.
+/// `projects`, a subagent's own transcript included. Those chats are read
+/// from the transcript, never the store.
 pub(crate) fn transcript_session_ids(projects: &Path) -> Result<HashSet<String>> {
     let mut ids = HashSet::new();
     for project in crate::sorted_dirs(projects)? {
@@ -149,9 +150,19 @@ pub(crate) fn transcript_session_ids(projects: &Path) -> Result<HashSet<String>>
             if session.join(format!("{id}.jsonl")).is_file() {
                 ids.insert(id.to_string());
             }
+            let children = crate::ingest::scoped_files::cursor_subagent_transcripts(&session, "")?;
+            ids.extend(children.into_iter().map(|(_, child, _)| child));
         }
     }
     Ok(ids)
+}
+
+/// Whether the chat a store holds has a transcript, which then owns it.
+pub(crate) fn superseded_by_transcript(store: &Path) -> Result<bool> {
+    let (Some(id), Some(cursor_dir)) = (store_session_id(store), store.ancestors().nth(4)) else {
+        return Ok(false);
+    };
+    Ok(transcript_session_ids(&cursor_dir.join("projects"))?.contains(id))
 }
 
 /// Every chat store under `chats` (or under the changed paths in `scope`)
@@ -195,15 +206,42 @@ pub(crate) fn chat_stores(
     Ok(out)
 }
 
-/// The text of a Cursor record file for the transcript parser: a
-/// transcript's own text, or the transcript records a chat store renders to.
-/// An unreadable source is an error, never an empty one.
-pub(crate) fn read_records(path: &Path) -> Result<String> {
-    if !is_chat_store(path) {
-        return super::cold_read::read_string(path)
-            .with_context(|| format!("read Cursor transcript {}", path.display()));
+/// The records the transcript parser reads: a transcript file, or a chat
+/// store's records already rendered by the caller, so a pass parses exactly
+/// the copy it read and never opens the store a second time.
+pub(crate) enum Records<'a> {
+    File(&'a Path),
+    Rendered(&'a str),
+}
+
+impl<'a> From<&'a Path> for Records<'a> {
+    fn from(path: &'a Path) -> Self {
+        Self::File(path)
     }
-    Ok(read_chat_store(path)?
-        .map(|store| store.transcript)
-        .unwrap_or_default())
+}
+
+impl<'a> From<&'a PathBuf> for Records<'a> {
+    fn from(path: &'a PathBuf) -> Self {
+        Self::File(path)
+    }
+}
+
+impl<'a> Records<'a> {
+    /// The records' text. A chat store is only ever handed over rendered; a
+    /// file that is unreadable is an error, never an empty transcript.
+    pub(crate) fn text(self) -> Result<std::borrow::Cow<'a, str>> {
+        match self {
+            Self::Rendered(text) => Ok(std::borrow::Cow::Borrowed(text)),
+            Self::File(path) => {
+                anyhow::ensure!(
+                    !is_chat_store(path),
+                    "Cursor chat store {} must be read by its caller and passed rendered",
+                    path.display()
+                );
+                super::cold_read::read_string(path)
+                    .map(std::borrow::Cow::Owned)
+                    .with_context(|| format!("read Cursor transcript {}", path.display()))
+            }
+        }
+    }
 }

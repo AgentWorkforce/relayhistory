@@ -31,40 +31,103 @@ fn open_store(path: &Path) -> Result<Connection> {
     conn.with_context(|| format!("open Cursor chat store {}", path.display()))
 }
 
-/// `path` percent-encoded for a SQLite `file:` URI.
+/// `path` as a SQLite `file:` URI path: every byte outside the unreserved
+/// set is percent-encoded, so a non-ASCII path names the same file.
 fn uri_path(path: &Path) -> String {
-    let mut out = String::new();
-    for byte in path.to_string_lossy().bytes() {
-        match byte {
-            b'%' | b'?' | b'#' | b' ' => out.push_str(&format!("%{byte:02X}")),
-            _ => out.push(byte as char),
+    let text = path.to_string_lossy();
+    // SQLite expects forward slashes and a leading `/` before a drive letter.
+    let text = if cfg!(windows) {
+        let slashed = text.replace('\\', "/");
+        if slashed.starts_with('/') {
+            slashed
+        } else {
+            format!("/{slashed}")
+        }
+    } else {
+        text.into_owned()
+    };
+    let mut out = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~/:".contains(&byte) {
+            out.push(char::from(byte));
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
         }
     }
     out
 }
 
-/// Read one chat. `Ok(None)` when the store holds no conversation yet.
+/// How many messages a shallow read renders from each end of a chat.
+pub(crate) const PREVIEW_MESSAGES: usize = 16;
+
+/// Read one chat whole. `Ok(None)` when the store holds no conversation yet.
 pub(crate) fn read_chat_store(path: &Path) -> Result<Option<ChatStore>> {
+    read_chat_store_bounded(path, None)
+}
+
+/// Read only the first and last [`PREVIEW_MESSAGES`] messages, for a shallow
+/// catalog read: its head and tail are all a preview looks at.
+pub(crate) fn read_chat_store_preview(path: &Path) -> Result<Option<ChatStore>> {
+    read_chat_store_bounded(path, Some(PREVIEW_MESSAGES))
+}
+
+fn read_sidecar_meta(path: &Path) -> Option<Value> {
+    meta_json_path(path)
+        .and_then(|meta| std::fs::read(meta).ok())
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+}
+
+fn read_chat_store_bounded(path: &Path, ends: Option<usize>) -> Result<Option<ChatStore>> {
     let session_id = store_session_id(path)
         .with_context(|| format!("Cursor chat store {} has no chat id", path.display()))?
         .to_string();
-    let sidecar_meta = meta_json_path(path)
-        .and_then(|meta| std::fs::read(meta).ok())
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok());
-    if sidecar_meta
+    // Stamped before anything is read, `meta.json` included, so a sidecar
+    // replaced during the read fails the closing comparison.
+    let (before, _) = chat_store_stamp_and_modified(path)?;
+    let sidecar_meta = read_sidecar_meta(path);
+    let no_conversation = sidecar_meta
         .as_ref()
         .and_then(|meta| meta.get("hasConversation"))
         .and_then(Value::as_bool)
-        == Some(false)
-    {
+        == Some(false);
+    if no_conversation {
         return Ok(None);
     }
-    let (before, _) = chat_store_stamp_and_modified(path)?;
     let mut conn = open_store(path)?;
     conn.busy_timeout(std::time::Duration::from_secs(2))?;
     let tx = conn.transaction_with_behavior(TransactionBehavior::Deferred)?;
-    let meta = read_meta(&tx)?;
-    let Some(meta) = meta else {
+    let Some((meta, root_fields)) = read_root(&tx, path, &session_id)? else {
+        return Ok(None);
+    };
+    let mut store = ChatStore {
+        session_id,
+        origin: root_fields.origin.clone(),
+        ..ChatStore::default()
+    };
+    let positions = selected(root_fields.messages.len(), ends);
+    render_messages(&tx, &root_fields.messages, &positions, &mut store)?;
+    tx.commit()?;
+    drop(conn);
+    // A writer that started while the store was read can have moved it on;
+    // a mixture of two versions is not a chat. The next pass reads it again.
+    let (after, _) = chat_store_stamp_and_modified(path)?;
+    anyhow::ensure!(
+        before == after,
+        "Cursor chat store {} changed while it was read",
+        path.display()
+    );
+    apply_context(&mut store, sidecar_meta.as_ref(), &meta, root_fields);
+    Ok(Some(store))
+}
+
+/// The meta row and the decoded root blob it names, checked against the
+/// directory the store is filed under.
+fn read_root(
+    conn: &Connection,
+    path: &Path,
+    session_id: &str,
+) -> Result<Option<(Value, RootFields)>> {
+    let Some(meta) = read_meta(conn)? else {
         return Ok(None);
     };
     if let Some(agent) = meta.get("agentId").and_then(Value::as_str) {
@@ -77,18 +140,46 @@ pub(crate) fn read_chat_store(path: &Path) -> Result<Option<ChatStore>> {
     let Some(root_id) = meta.get("latestRootBlobId").and_then(Value::as_str) else {
         return Ok(None);
     };
-    let Some(root) = read_blob(&tx, root_id)? else {
+    let Some(root) = read_blob(conn, root_id)? else {
         return Ok(None);
     };
-    let root_fields = RootFields::decode(&root);
-    let mut store = ChatStore {
-        session_id,
-        origin: root_fields.origin.clone(),
-        ..ChatStore::default()
-    };
+    let fields = RootFields::decode(&root);
+    Ok(Some((meta, fields)))
+}
+
+/// The message positions to render: all of them, or each end of the chat.
+fn selected(len: usize, ends: Option<usize>) -> Vec<usize> {
+    match ends {
+        Some(ends) if len > ends * 2 => (0..ends).chain(len - ends..len).collect(),
+        _ => (0..len).collect(),
+    }
+}
+
+/// The id a rendered message carries: its blob id, with the occurrence
+/// number when the root lists the same blob more than once, so repeated
+/// identical messages stay separate messages.
+fn occurrence_id(messages: &[String], position: usize) -> String {
+    let id = &messages[position];
+    let earlier = messages[..position]
+        .iter()
+        .filter(|seen| *seen == id)
+        .count();
+    if earlier == 0 {
+        id.clone()
+    } else {
+        format!("{id}#{}", earlier + 1)
+    }
+}
+
+fn render_messages(
+    conn: &Connection,
+    messages: &[String],
+    positions: &[usize],
+    store: &mut ChatStore,
+) -> Result<()> {
     let mut preamble_open = true;
-    for id in &root_fields.messages {
-        let Some(data) = read_blob(&tx, id)? else {
+    for &position in positions {
+        let Some(data) = read_blob(conn, &messages[position])? else {
             store.skipped_blobs += 1;
             continue;
         };
@@ -96,43 +187,38 @@ pub(crate) fn read_chat_store(path: &Path) -> Result<Option<ChatStore>> {
             store.skipped_blobs += 1;
             continue;
         };
-        let Some(record) = transcript_record(id, &message, &mut preamble_open) else {
+        let id = occurrence_id(messages, position);
+        let Some(record) = transcript_record(&id, &message, &mut preamble_open) else {
             continue;
         };
         store.transcript.push_str(&record.to_string());
         store.transcript.push('\n');
         store.records += 1;
     }
-    tx.commit()?;
-    drop(conn);
-    // A writer that started while the store was read can have moved it on;
-    // a mixture of two versions is not a chat. The next pass reads it again.
-    let (after, _) = chat_store_stamp_and_modified(path)?;
-    anyhow::ensure!(
-        before == after,
-        "Cursor chat store {} changed while it was read",
-        path.display()
-    );
-    store.cwd = sidecar_meta
-        .as_ref()
-        .and_then(|meta| meta.get("cwd"))
+    Ok(())
+}
+
+/// The chat's cwd and times: `meta.json` first, then the root and the meta row.
+fn apply_context(
+    store: &mut ChatStore,
+    sidecar_meta: Option<&Value>,
+    meta: &Value,
+    root: RootFields,
+) {
+    let sidecar = |key: &str| sidecar_meta.and_then(|meta| meta.get(key));
+    store.cwd = sidecar("cwd")
         .and_then(Value::as_str)
         .filter(|cwd| !cwd.is_empty())
         .map(str::to_string)
-        .or(root_fields.cwd)
-        .or_else(|| root_fields.workspace_uri.as_deref().and_then(file_uri_path));
-    store.created_ms = sidecar_meta
-        .as_ref()
-        .and_then(|meta| meta.get("createdAtMs"))
+        .or(root.cwd)
+        .or_else(|| root.workspace_uri.as_deref().and_then(file_uri_path));
+    store.created_ms = sidecar("createdAtMs")
         .and_then(Value::as_i64)
         .or_else(|| meta.get("createdAt").and_then(Value::as_i64));
-    store.updated_ms = sidecar_meta
-        .as_ref()
-        .and_then(|meta| meta.get("updatedAtMs"))
+    store.updated_ms = sidecar("updatedAtMs")
         .and_then(Value::as_i64)
-        .or(root_fields.updated_ms)
+        .or(root.updated_ms)
         .or(store.created_ms);
-    Ok(Some(store))
 }
 
 fn read_meta(conn: &Connection) -> Result<Option<Value>> {
@@ -173,21 +259,32 @@ pub(super) fn encode_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|byte| format!("{byte:02x}")).collect()
 }
 
-fn file_uri_path(uri: &str) -> Option<String> {
-    let rest = uri.strip_prefix("file://")?;
-    let bytes = rest.as_bytes();
+fn hex_digit(byte: u8) -> Option<u8> {
+    char::from(byte)
+        .to_digit(16)
+        .and_then(|digit| u8::try_from(digit).ok())
+}
+
+/// The path a `file://` URI names, percent escapes decoded; a malformed
+/// escape is kept as written.
+pub(super) fn file_uri_path(uri: &str) -> Option<String> {
+    let bytes = uri.strip_prefix("file://")?.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut at = 0;
     while at < bytes.len() {
-        if bytes[at] == b'%' && at + 2 < bytes.len() {
-            if let Some(byte) = decode_hex(&rest[at + 1..at + 3]).and_then(|b| b.first().copied()) {
+        let escaped = (bytes[at] == b'%')
+            .then(|| Some(hex_digit(*bytes.get(at + 1)?)? << 4 | hex_digit(*bytes.get(at + 2)?)?))
+            .flatten();
+        match escaped {
+            Some(byte) => {
                 out.push(byte);
                 at += 3;
-                continue;
+            }
+            None => {
+                out.push(bytes[at]);
+                at += 1;
             }
         }
-        out.push(bytes[at]);
-        at += 1;
     }
     String::from_utf8(out).ok().filter(|path| !path.is_empty())
 }

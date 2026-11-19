@@ -151,9 +151,10 @@ impl ShallowSessionProvider for CursorProvider {
             return Ok(None);
         };
         // A chat Cursor kept only in its chat store is read as the transcript
-        // records it renders to, so both kinds of chat catalog alike.
+        // records its two ends render to, so both kinds of chat catalog alike
+        // and a shallow read stays bounded.
         let chat_store = if crate::ingest::cursor_store::is_chat_store(&path) {
-            match crate::ingest::cursor_store::read_chat_store(&path)? {
+            match crate::ingest::cursor_store::read_chat_store_preview(&path)? {
                 Some(store) => Some(store),
                 None => return Ok(None),
             }
