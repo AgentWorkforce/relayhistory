@@ -20,6 +20,12 @@ and `~/src/relayhistory-cloud`, with clean reference clones in `~/build/`.
   --all-targets --all-features -- -D warnings`, `cargo test --workspace
   --all-features`, plus plugin suites when touched, the public API file and
   changelog for API changes, and never raising rust-oleum ceilings.
+  **Where the gates run:** this host is a small coordinator (2 vCPU, 8 GiB).
+  Run only scoped checks here (`cargo fmt --all -- --check`,
+  `cargo check -p <crate>`). Send the full workspace clippy and test gates to
+  a worker: `spawn_relay_agent` on an allowed desktop with the branch, the
+  exact commands and "report pass/fail with the failing output". Never run
+  `cargo test --workspace` on this host.
 - **relayhistory-cloud** (private): the hosted service. **It is slated for
   deprecation in favour of AgentWorkforce/relayhistory-pipeline**, which
   layered-sessions-pipeline owns. Keep relayhistory-cloud working (fixes,

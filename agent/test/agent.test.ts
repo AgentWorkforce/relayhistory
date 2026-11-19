@@ -22,7 +22,7 @@ test("definition: the names, repos and limits infra/agents.ts must match", () =>
   assert.equal(i.name, "relayhistory");
   assert.equal(i.repo, "AgentWorkforce/relayhistory");
   assert.equal(i.arch, "x64");
-  assert.equal(i.instanceType, "m7i.xlarge");
+  assert.equal(i.instanceType, "t3.large");
   assert.equal(i.rootVolumeGiB, 150);
   assert.equal(i.ami, "ami-08cf17e3856f70154");
   assert.deepEqual(i.laneFiles, ["lead-prompt.md", "setup-lane.sh"]);
