@@ -78,15 +78,20 @@ jobs:
           # that changes nothing under the paths then never enters the
           # deploy queue, so it cannot displace a pending allow_restart
           # dispatch.
+          # Each lookup and diff is its own assignment, so set -e fails the
+          # step when one fails (inside a for list or a test it would read
+          # as an empty, successful result and could wrongly skip).
           for status in queued in_progress waiting pending requested; do
-            for other in $(gh api "repos/$REPO/actions/workflows/agent-deploy.yml/runs?status=$status&per_page=100" \
-              --jq ".workflow_runs[] | select(.id != $RUN_ID) | .head_sha"); do
+            heads=$(gh api "repos/$REPO/actions/workflows/agent-deploy.yml/runs?status=$status&per_page=100" \
+              --jq ".workflow_runs[] | select(.id != $RUN_ID) | .head_sha")
+            for other in $heads; do
               if ! git cat-file -e "$other^{commit}" 2>/dev/null; then
                 echo "An unfinished ($status) run's $other is not in this checkout: deploying"
                 echo deploy=true >> "$GITHUB_OUTPUT"
                 exit 0
               fi
-              if [ -n "$(git diff --name-only "$other" "$HEAD_SHA" -- "${paths[@]}")" ]; then
+              differs=$(git diff --name-only "$other" "$HEAD_SHA" -- "${paths[@]}")
+              if [ -n "$differs" ]; then
                 echo "An unfinished ($status) run may still deploy $other, which differs under ${paths[*]}: deploying"
                 echo deploy=true >> "$GITHUB_OUTPUT"
                 exit 0
@@ -108,13 +113,16 @@ jobs:
           elif ! git cat-file -e "$last^{commit}" 2>/dev/null || ! git merge-base --is-ancestor "$last" "$HEAD_SHA"; then
             echo "Last deployed $last is not an ancestor of $HEAD_SHA: deploying"
             deploy=true
-          elif [ -n "$(git diff --name-only "$last" "$HEAD_SHA" -- "${paths[@]}")" ]; then
-            echo "Changed since last deployed $last under ${paths[*]}:"
-            git diff --name-only "$last" "$HEAD_SHA" -- "${paths[@]}"
-            deploy=true
           else
-            echo "Nothing under ${paths[*]} changed between last deployed $last and $HEAD_SHA: not deploying"
-            deploy=false
+            changed=$(git diff --name-only "$last" "$HEAD_SHA" -- "${paths[@]}")
+            if [ -n "$changed" ]; then
+              echo "Changed since last deployed $last under ${paths[*]}:"
+              echo "$changed"
+              deploy=true
+            else
+              echo "Nothing under ${paths[*]} changed between last deployed $last and $HEAD_SHA: not deploying"
+              deploy=false
+            fi
           fi
           echo "deploy=$deploy" >> "$GITHUB_OUTPUT"
 

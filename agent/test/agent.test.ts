@@ -111,7 +111,11 @@ test("agent-deploy.yml: the deploy record is written inside the serialized deplo
   // nothing under the paths still skips, so it cannot displace a pending
   // allow_restart dispatch from the deploy queue.
   assert.match(deploy, /select\(\.id != \$RUN_ID\) \| \.head_sha/);
-  assert.match(deploy, /git diff --name-only "\$other" "\$HEAD_SHA" -- "\$\{paths\[@\]\}"/);
+  assert.match(deploy, /differs=\$\(git diff --name-only "\$other" "\$HEAD_SHA" -- "\$\{paths\[@\]\}"\)/);
+  // Lookups are standalone assignments so set -e sees a failure; inside a
+  // for list or a test it would read as an empty, successful result.
+  assert.match(deploy, /heads=\$\(gh api "repos\/\$REPO\/actions\/workflows\/agent-deploy\.yml\/runs/);
+  assert.doesNotMatch(deploy, /for \w+ in \$\(gh api|\[ -n "\$\(git diff/);
   assert.doesNotMatch(deploy, /deploying rather than trusting the last record/, "no unconditional deploy while another run is unfinished");
 });
 
