@@ -33,7 +33,7 @@ export default defineLayeredAgent({
   ami: "ami-08cf17e3856f70154",
   // 4 vCPU / 16 GiB, 150 GiB: cargo builds and tests of a Rust workspace
   // (target/ is large) plus relayhistory-cloud's TypeScript monorepo.
-  instanceType: "m7i.xlarge",
+  instanceType: "t3.large",
   rootVolumeGiB: 150,
   laneFiles: ["lead-prompt.md", "setup-lane.sh"],
   // The first repo is the lead's working directory and the ledger's repository.
