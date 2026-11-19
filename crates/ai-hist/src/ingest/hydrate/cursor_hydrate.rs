@@ -153,7 +153,11 @@ pub(super) fn ingest_chat_store(
             source: "cursor",
             cwd: store.cwd.as_deref(),
             git_branch: None,
-            first_ts: outcome.first_ts_ms.unwrap_or(fallback_ms),
+            first_ts: crate::ingest::cursor_store::chat_start(
+                &outcome,
+                store.created_ms,
+                fallback_ms,
+            ),
             last_ts: outcome.last_ts_ms.unwrap_or(fallback_ms),
             last_assistant_text: outcome.last_assistant_text.as_deref(),
             raw_path: Some(&path.to_string_lossy()),

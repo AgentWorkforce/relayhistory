@@ -245,3 +245,17 @@ impl<'a> Records<'a> {
         }
     }
 }
+
+/// A rebuilt chat's start. Records with no `<timestamp>` were stamped with
+/// the store's update time, which is not when the chat began: then the
+/// creation time is the earlier, better bound.
+pub(crate) fn chat_start(
+    outcome: &crate::ingest::CursorTranscriptOutcome,
+    created_ms: Option<i64>,
+    fallback_ms: i64,
+) -> i64 {
+    match (outcome.used_mtime_fallback, created_ms) {
+        (true, Some(created)) => outcome.first_ts_ms.map_or(created, |ts| ts.min(created)),
+        _ => outcome.first_ts_ms.unwrap_or(fallback_ms),
+    }
+}

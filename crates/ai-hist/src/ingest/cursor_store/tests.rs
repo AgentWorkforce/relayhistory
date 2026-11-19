@@ -410,3 +410,26 @@ fn a_transcript_takes_the_catalog_row_over_from_its_store() {
     .unwrap());
     assert!(superseded_by_transcript(&store).unwrap());
 }
+
+#[test]
+fn an_untimed_chat_keeps_its_creation_time_as_its_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let messages = vec![
+        json!({"role": "user", "content": "no timestamp here"}),
+        json!({"role": "assistant", "content": "ok"}),
+    ];
+    write_store(home, "ws", "chat-1", "/w", &messages, 50_000).unwrap();
+    let conn = crate::open_db(&home.join("history.db")).unwrap();
+    let mut state = Map::new();
+    let mut coverage = crate::ingest::SweepCoverage::default();
+    sync_chat_stores_in(&conn, &mut state, home, &mut coverage, None).unwrap();
+    let (first, last): (i64, i64) = conn
+        .query_row(
+            "SELECT first_activity_ms, last_activity_ms FROM sessions WHERE session_id = 'chat-1'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!((first, last), (49_000, 50_000));
+}
