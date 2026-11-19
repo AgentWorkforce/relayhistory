@@ -191,7 +191,7 @@ let op;try{op=JSON.parse(process.env.RELAY_AMP_OPERATION)}catch{}
 if(op&&typeof op.threadId==='string'){op.threadId=op.threadId.trim();const prefix='https://ampcode.com/threads/';if(op.threadId.startsWith(prefix))op.threadId=op.threadId.slice(prefix.length);if(op.threadId.endsWith('/'))op.threadId=op.threadId.slice(0,-1)}
 if(!op||!['discover','export','inject'].includes(op.kind)||(op.kind!=='discover'&&(typeof op.threadId!=='string'||!/^T-[A-Za-z0-9-]{6,100}$/.test(op.threadId)))||(op.kind==='inject'&&(typeof op.text!=='string'||!op.text||op.text.includes(String.fromCharCode(0))))){process.stdout.write(JSON.stringify({ok:false,outcome:'rejected',code:'amp_invalid_operation'}));process.exit(0)}
 const args=['--log-file','/dev/null'];
-if(op.kind==='discover')args.push('threads','search','author:me','--json','--limit','100');
+if(op.kind==='discover')args.push('threads','search','author:me','--json','--limit','101');
 else if(op.kind==='export')args.push('threads','export',op.threadId);
 else if(op.kind==='inject')args.push('threads','continue',op.threadId,'-ox');
 const r=spawnSync(process.env.RELAY_AMP_CLI_PATH||'/tmp/relay-amp/node_modules/.bin/amp',args,{encoding:'utf8',input:op.kind==='inject'?op.text:undefined,timeout:45000,maxBuffer:16777216,env:{...process.env,RELAY_AMP_OPERATION:''}});

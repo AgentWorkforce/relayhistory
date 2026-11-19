@@ -553,11 +553,13 @@ marked as inferred. Invalid identity, duplicate identity and malformed versions
 fail closed. A read-only check against a current Amp CLI export established the
 native field mapping; synthetic tests contain no customer transcript text.
 
-The CLI bridge's discovery operation is a bounded picker of 100 recent authored
-threads. It is not account-wide enumeration; the current CLI search exposes a
-limit without a continuation token. Hosts can accept another thread URL/ID and
-verify it through export. Scheduled catch-up scans selected bindings separately
-from this picker, so its limit does not cap the number of threads a host syncs.
+The CLI bridge's discovery operation requests at most 101 recent authored
+threads. Hosts present the first 100 as the bounded picker page and use the
+extra row only to report that the page was truncated. It is not account-wide
+enumeration; the current CLI search exposes a limit without a continuation
+token. Hosts can accept another thread URL/ID and verify it through export.
+Scheduled catch-up scans selected bindings separately from this picker, so its
+limit does not cap the number of threads a host syncs.
 
 ### Hosted Factory transcript projection
 
