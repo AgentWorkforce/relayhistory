@@ -157,16 +157,28 @@ pub(crate) fn transcript_session_ids(projects: &Path) -> Result<HashSet<String>>
     Ok(ids)
 }
 
-/// Whether the chat a store holds has a transcript, which then owns it.
-pub(crate) fn superseded_by_transcript(store: &Path) -> Result<bool> {
+/// Whether a store no longer owns its chat: the chat has a transcript, or
+/// another workspace holds a more recently written copy.
+pub(crate) fn superseded(store: &Path) -> Result<bool> {
     let (Some(id), Some(cursor_dir)) = (store_session_id(store), store.ancestors().nth(4)) else {
         return Ok(false);
     };
-    Ok(transcript_session_ids(&cursor_dir.join("projects"))?.contains(id))
+    if transcript_session_ids(&cursor_dir.join("projects"))?.contains(id) {
+        return Ok(true);
+    }
+    let copies: Vec<(PathBuf, String)> = all_stores(&cursor_dir.join("chats"))?
+        .into_iter()
+        .filter(|(_, copy)| copy == id)
+        .collect();
+    Ok(one_owner_per_chat(copies)
+        .first()
+        .is_some_and(|(owner, _)| owner != store))
 }
 
-/// Every chat store under `chats` (or under the changed paths in `scope`)
-/// whose chat has no transcript, with its chat id.
+/// Every chat store under `chats` whose chat has no transcript, with its
+/// chat id, one store per chat (see [`one_owner_per_chat`]), then narrowed
+/// to the changed paths in `scope`. Ownership is decided over every copy
+/// first, so a scoped tick can never pick a copy a full walk would not.
 pub(crate) fn chat_stores(
     home: &Path,
     scope: Option<&crate::ingest::path_scope::PathScope>,
@@ -175,35 +187,34 @@ pub(crate) fn chat_stores(
     if !chats.is_dir() {
         return Ok(Vec::new());
     }
-    let walk = crate::ingest::path_scope::PathScope::walk_of(scope, &chats);
-    let partial = match walk {
+    let partial = match crate::ingest::path_scope::PathScope::walk_of(scope, &chats) {
         crate::ingest::path_scope::RootWalk::Skip => return Ok(Vec::new()),
         crate::ingest::path_scope::RootWalk::Partial(scope) => Some(scope),
         crate::ingest::path_scope::RootWalk::Full => None,
     };
     let transcripts = transcript_session_ids(&home.join(".cursor/projects"))?;
+    let owners = one_owner_per_chat(all_stores(&chats)?)
+        .into_iter()
+        .filter(|(_, id)| !transcripts.contains(id))
+        .filter(|(path, _)| partial.is_none_or(|scope| scope.mentions(path)));
+    Ok(owners.collect())
+}
+
+/// Every `<workspace>/<id>/store.db` under `chats`.
+fn all_stores(chats: &Path) -> Result<Vec<(PathBuf, String)>> {
     let mut out = Vec::new();
-    for workspace in crate::sorted_dirs(&chats)? {
-        if partial.is_some_and(|scope| !scope.mentions(&workspace)) {
-            continue;
-        }
+    for workspace in crate::sorted_dirs(chats)? {
         for chat in crate::sorted_dirs(&workspace)? {
-            if partial.is_some_and(|scope| !scope.mentions(&chat)) {
-                continue;
-            }
             let Some(id) = chat.file_name().and_then(|name| name.to_str()) else {
                 continue;
             };
-            if transcripts.contains(id) {
-                continue;
-            }
             let store = chat.join(STORE_FILE);
             if store.is_file() {
                 out.push((store, id.to_string()));
             }
         }
     }
-    Ok(one_owner_per_chat(out))
+    Ok(out)
 }
 
 /// A chat id filed under more than one workspace is read from one store:

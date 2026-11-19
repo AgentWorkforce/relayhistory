@@ -99,12 +99,11 @@ pub(crate) fn incoming_must_not_replace(
     if stored == incoming || shared_sqlite_store(source, &stored) {
         return Ok(false);
     }
-    // A Cursor transcript takes the row over from the chat store it
-    // supersedes; the store stays on disk, so its presence decides nothing.
-    if source == "cursor"
-        && crate::ingest::cursor_store::is_chat_store(Path::new(&stored))
-        && !crate::ingest::cursor_store::is_chat_store(Path::new(incoming))
-    {
+    // A stored Cursor chat store gives way to whatever claims the row after
+    // it: a transcript, which supersedes every store, or the store
+    // `cursor_store::chat_stores` chose as the chat's owner. A superseded
+    // store stays on disk, so its presence decides nothing.
+    if source == "cursor" && crate::ingest::cursor_store::is_chat_store(Path::new(&stored)) {
         return Ok(false);
     }
     // The bounded Codex selection already joined each thread to its

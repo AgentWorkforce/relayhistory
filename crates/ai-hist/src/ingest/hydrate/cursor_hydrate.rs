@@ -111,14 +111,16 @@ pub(super) fn ingest_chat_store(
     path: &Path,
     records: i64,
 ) -> Result<SelectedIngestResult> {
-    // A chat that has gained a transcript is the transcript's now; this row
-    // still names the store until discovery runs again.
-    if crate::ingest::cursor_store::superseded_by_transcript(path)? {
+    // A chat that has gained a transcript, or a newer copy in another
+    // workspace, is no longer this store's; the row still names it until
+    // discovery runs again.
+    if crate::ingest::cursor_store::superseded(path)? {
         return Err(hydration_error(
             "SESSION_SOURCE_MISMATCH",
             format!(
-                "Cursor catalog row points at the chat store {}, but the chat now has a \
-                 transcript; run discoverSessions() again to re-establish its provenance",
+                "Cursor catalog row points at the chat store {}, which no longer owns the \
+                 chat (it has a transcript or a newer copy); run discoverSessions() again to \
+                 re-establish its provenance",
                 path.display()
             ),
         ));
@@ -291,6 +293,22 @@ mod tests {
         let db = dir.path().join("history.db");
         let conn = open_db(&db).unwrap();
         catalog_store(&conn, "cur-store", &store);
+        drop(conn);
+        let error = hydrate_session_at_with_home(&db, &options("cur-store"), dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("SESSION_SOURCE_MISMATCH"), "{error}");
+    }
+
+    #[test]
+    fn an_older_copy_of_a_chat_is_not_hydrated() {
+        let dir = tempfile::tempdir().unwrap();
+        let older = write_store(dir.path(), "ws-a", "cur-store", "/w", &tool_chat("a"), 5).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        write_store(dir.path(), "ws-b", "cur-store", "/w", &tool_chat("b"), 6).unwrap();
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_store(&conn, "cur-store", &older);
         drop(conn);
         let error = hydrate_session_at_with_home(&db, &options("cur-store"), dir.path())
             .unwrap_err()

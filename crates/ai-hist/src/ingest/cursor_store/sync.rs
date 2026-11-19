@@ -49,7 +49,9 @@ pub(in crate::ingest) fn sync_chat_stores_in(
     if prepared.is_empty() {
         return Ok(0);
     }
-    let inserted = index(conn, &prepared, &mut seen, coverage)?;
+    // Listed once for the whole batch, not per chat.
+    let transcripts = super::transcript_session_ids(&home.join(".cursor/projects"))?;
+    let inserted = index(conn, &prepared, &transcripts, &mut seen, coverage)?;
     state.insert(CHAT_STORE_STATE_KEY.to_string(), Value::Object(seen));
     let suffix = if errors > 0 {
         format!(" ({errors} errors)")
@@ -151,9 +153,12 @@ fn unchanged(
     if saved != Some(stamp) {
         return Ok(false);
     }
+    // The evidence must be this store's own: the catalog row names it.
     Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM session_events WHERE source = 'cursor' AND session_id = ?1)",
-        [session_id],
+        "SELECT EXISTS(SELECT 1 FROM sessions WHERE source = 'cursor' AND session_id = ?1 \
+             AND raw_path = ?2) \
+         AND EXISTS(SELECT 1 FROM session_events WHERE source = 'cursor' AND session_id = ?1)",
+        rusqlite::params![session_id, key.as_ref()],
         |row| row.get(0),
     )?)
 }
@@ -174,6 +179,7 @@ fn note_skipped_blobs(path: &Path, store: &ChatStore) {
 fn index(
     conn: &Connection,
     prepared: &[Prepared],
+    transcripts: &HashSet<String>,
     seen: &mut Map<String, Value>,
     coverage: &mut crate::ingest::SweepCoverage,
 ) -> Result<usize> {
@@ -184,7 +190,7 @@ fn index(
         crate::ingest::check_capture_cancelled()?;
         // A transcript that appeared since `prepare` owns the chat now;
         // its pass has, or will have, written it. Never overwrite it here.
-        if super::superseded_by_transcript(path)? {
+        if transcripts.contains(&store.session_id) {
             seen.remove(path.to_string_lossy().as_ref());
             continue;
         }

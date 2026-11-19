@@ -413,7 +413,7 @@ fn a_transcript_takes_the_catalog_row_over_from_its_store() {
         Some(&store.to_string_lossy())
     )
     .unwrap());
-    assert!(superseded_by_transcript(&store).unwrap());
+    assert!(superseded(&store).unwrap());
 }
 
 #[test]
@@ -522,4 +522,50 @@ fn a_chat_filed_under_two_workspaces_is_read_from_one_store() {
         chat_stores(home, None).unwrap(),
         vec![(newer, "chat-1".to_string())]
     );
+}
+
+#[test]
+fn a_scoped_tick_on_an_older_copy_never_rebuilds_from_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let older = write_store(home, "ws-a", "chat-1", "/w", &tool_chat("old"), 5).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let mut newer_chat = tool_chat("old");
+    newer_chat.push(json!({"role": "user", "content": [{"type": "text", "text":
+        "<timestamp>Thursday, Nov 19, 2026, 12:10 AM (UTC+1)</timestamp>\n<user_query>\nnewer prompt\n</user_query>"}]}));
+    write_store(home, "ws-b", "chat-1", "/w", &newer_chat, 6).unwrap();
+    let conn = crate::open_db(&home.join("history.db")).unwrap();
+    let mut state = Map::new();
+    let mut coverage = crate::ingest::SweepCoverage::default();
+    sync_chat_stores_in(&conn, &mut state, home, &mut coverage, None).unwrap();
+    let scope =
+        crate::ingest::path_scope::PathScope::from_paths([older.parent().unwrap().to_path_buf()])
+            .unwrap();
+    assert!(chat_stores(home, Some(&scope)).unwrap().is_empty());
+    sync_chat_stores_in(&conn, &mut state, home, &mut coverage, Some(&scope)).unwrap();
+    sync_chat_stores_in(&conn, &mut state, home, &mut coverage, None).unwrap();
+    assert!(prompts(&conn, "chat-1").contains(&"newer prompt".to_string()));
+    assert!(superseded(&older).unwrap());
+}
+
+#[test]
+fn the_owning_store_takes_the_catalog_row_over_from_an_older_copy() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let older = write_store(home, "ws-a", "chat-1", "/w", &tool_chat("a"), 5).unwrap();
+    let newer = write_store(home, "ws-b", "chat-1", "/w", &tool_chat("b"), 6).unwrap();
+    let conn = crate::open_db(&home.join("history.db")).unwrap();
+    conn.execute(
+        "INSERT INTO sessions (source, session_id, raw_path, discovery_state) \
+         VALUES ('cursor', 'chat-1', ?1, 'shallow')",
+        [older.to_string_lossy()],
+    )
+    .unwrap();
+    assert!(!crate::catalog_owner::incoming_must_not_replace(
+        &conn,
+        "cursor",
+        "chat-1",
+        Some(&newer.to_string_lossy())
+    )
+    .unwrap());
 }
