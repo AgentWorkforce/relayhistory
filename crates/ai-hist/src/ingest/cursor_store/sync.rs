@@ -49,9 +49,13 @@ pub(in crate::ingest) fn sync_chat_stores_in(
     if prepared.is_empty() {
         return Ok(0);
     }
-    // Listed once for the whole batch, not per chat.
-    let transcripts = super::transcript_session_ids(&home.join(".cursor/projects"))?;
-    let inserted = index(conn, &prepared, &transcripts, &mut seen, coverage)?;
+    // The current owner of every chat, resolved once for the whole batch:
+    // a store a transcript or a newer copy overtook since `prepare` is not one.
+    let owners: HashSet<PathBuf> = chat_stores(home, None)?
+        .into_iter()
+        .map(|(path, _)| path)
+        .collect();
+    let inserted = index(conn, &prepared, &owners, &mut seen, coverage)?;
     state.insert(CHAT_STORE_STATE_KEY.to_string(), Value::Object(seen));
     let suffix = if errors > 0 {
         format!(" ({errors} errors)")
@@ -179,7 +183,7 @@ fn note_skipped_blobs(path: &Path, store: &ChatStore) {
 fn index(
     conn: &Connection,
     prepared: &[Prepared],
-    transcripts: &HashSet<String>,
+    owners: &HashSet<PathBuf>,
     seen: &mut Map<String, Value>,
     coverage: &mut crate::ingest::SweepCoverage,
 ) -> Result<usize> {
@@ -190,7 +194,7 @@ fn index(
         crate::ingest::check_capture_cancelled()?;
         // A transcript, or a newer copy, that appeared since `prepare` owns
         // the chat now; its own pass writes it. Never overwrite it here.
-        if transcripts.contains(&store.session_id) || super::newer_copy_exists(path)? {
+        if !owners.contains(path) {
             seen.remove(path.to_string_lossy().as_ref());
             continue;
         }
