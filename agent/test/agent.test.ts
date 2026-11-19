@@ -90,9 +90,23 @@ test("lead prompt: relayhistory-cloud is being deprecated for relayhistory-pipel
 
 test("setup-lane.sh: Rust for the agent user, idempotent, no secrets", () => {
   const s = readFileSync(new URL("../setup-lane.sh", import.meta.url), "utf8");
-  assert.match(s, /\[ -x ~\/\.cargo\/bin\/cargo \]/);
-  assert.match(s, /sudo -H -u agent bash -c 'curl --proto =https --tlsv1\.2 -fsSL https:\/\/sh\.rustup\.rs/);
+  assert.match(s, /\[ -x ~\/\.cargo\/bin\/rustup \]/);
+  // A failed download must fail the lane: the installer goes to a file first,
+  // never piped into sh (an empty pipe would run as a successful no-op).
+  assert.match(s, /set -euo pipefail\n\s+installer=\$\(mktemp\)/);
+  assert.match(s, /curl --proto =https --tlsv1\.2 -fsSL https:\/\/sh\.rustup\.rs -o "\$installer"/);
+  assert.doesNotMatch(s, /sh\.rustup\.rs \| sh/);
+  assert.match(s, /rustup component add rustfmt clippy/, "components even where Rust already existed");
   assert.doesNotMatch(s, /systemctl (enable|start|restart)|OPENAI|secrets\.env/);
+});
+
+test("agent-deploy.yml: the deploy record is written inside the serialized deploy job", () => {
+  const deploy = repoFile(".github/workflows/agent-deploy.yml");
+  assert.doesNotMatch(deploy, /^  record:/m, "no separate record job outside the deploy lock");
+  const job = deploy.slice(deploy.indexOf("\n  deploy:"));
+  assert.match(job, /concurrency:\n\s+group: agent-deploy-relayhistory-dev/);
+  assert.ok(job.indexOf("Upload the deploy record") > job.indexOf("uses: ./.layered-agents/.github/actions/layered-agent-deploy"), "record after the deploy step");
+  assert.match(deploy, /select\(\.id != \$RUN_ID\)/, "never skips while another run is unfinished");
 });
 
 test("workflows: CI checks agent/; deploy only from main through the kit's action in the agent-deploy environment", () => {

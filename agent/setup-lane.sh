@@ -10,9 +10,19 @@ set -euo pipefail
 # shellcheck source=/dev/null
 . /opt/agent-host/env
 
-if ! sudo -H -u agent bash -c '[ -x ~/.cargo/bin/cargo ]'; then
-  sudo -H -u agent bash -c 'curl --proto =https --tlsv1.2 -fsSL https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain stable --component rustfmt,clippy'
+# A Rust install failure fails the lane (the lead's checks need cargo), unlike
+# a clone failure, which load-secrets.sh retries. The installer is downloaded
+# to a file first, so a failed download is an error rather than an empty
+# script that sh runs successfully.
+if ! sudo -H -u agent bash -c '[ -x ~/.cargo/bin/rustup ]'; then
+  sudo -H -u agent bash -c 'set -euo pipefail
+    installer=$(mktemp)
+    trap "rm -f \"$installer\"" EXIT
+    curl --proto =https --tlsv1.2 -fsSL https://sh.rustup.rs -o "$installer"
+    sh "$installer" -y --profile minimal --default-toolchain stable --component rustfmt,clippy'
 fi
+# Also on a host where Rust was already installed without them.
+sudo -H -u agent bash -c 'set -euo pipefail; ~/.cargo/bin/rustup component add rustfmt clippy'
 
 for repo in ${AGENT_REPOS:-}; do
   name=${repo##*/}

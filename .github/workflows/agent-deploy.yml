@@ -36,7 +36,7 @@ on:
 jobs:
   # Decides whether an automatic run deploys: only when the landing changed
   # what the deploy reads since the last successful deploy, as recorded by
-  # the record job's agent-deployed artifact. A dispatch always deploys. The
+  # the deploy job's agent-deployed artifact. A dispatch always deploys. The
   # path list is everything the deploy reads: agent/ and these two workflows.
   changed:
     runs-on: ubuntu-latest
@@ -60,6 +60,7 @@ jobs:
           EVENT: ${{ github.event_name }}
           HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
           REPO: ${{ github.repository }}
+          RUN_ID: ${{ github.run_id }}
         run: |
           set -euo pipefail
           if [ "$EVENT" != workflow_run ]; then
@@ -67,8 +68,23 @@ jobs:
             echo deploy=true >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # The deploy job writes its record before it leaves the deploy
+          # lock, so the newest record is the last deploy that finished. A
+          # run of this workflow that has not finished may still deploy and
+          # record a newer commit than that record says, so while any other
+          # run is unfinished this one never skips: it deploys under the
+          # lock, and an unchanged deploy is a no-op in the kit.
+          for status in queued in_progress waiting pending requested; do
+            others=$(gh api "repos/$REPO/actions/workflows/agent-deploy.yml/runs?status=$status&per_page=100" \
+              --jq "[.workflow_runs[] | select(.id != $RUN_ID)] | length")
+            if [ "$others" != 0 ]; then
+              echo "Another Agent Deploy run is $status: deploying rather than trusting the last record"
+              echo deploy=true >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+          done
           # The baseline is the head of the run that uploaded the newest
-          # agent-deployed artifact, which the record job leaves after each
+          # agent-deployed artifact, which the deploy job leaves after each
           # successful deploy (a dispatch with allow_restart that deployed
           # leaves one too, so its head becomes the baseline). One API call;
           # artifacts are listed newest first. The artifact expires after 90
@@ -165,23 +181,17 @@ jobs:
           agent-dir: agent
           stage: dev
           allow-restart: ${{ github.event_name == 'workflow_dispatch' && inputs.allow_restart }}
-
-  # Leaves a record of what was deployed: the next run reads the head sha of
-  # this artifact's run to know what was last deployed.
-  record:
-    needs: deploy
-    if: needs.deploy.result == 'success'
-    runs-on: ubuntu-latest
-    permissions:
-      actions: write
-      contents: read
-    steps:
+      # The record of what was deployed: the next run reads the head sha of
+      # this artifact's run. Written in this job, inside the deploy lock and
+      # only after a successful deploy, so records land in deploy order.
       - name: Write the deployed sha
-        run: echo "${{ github.sha }}" > deployed-sha
+        env:
+          DEPLOYED_SHA: ${{ github.sha }}
+        run: echo "$DEPLOYED_SHA" > "$RUNNER_TEMP/deployed-sha"
       - name: Upload the deploy record
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: agent-deployed
-          path: deployed-sha
+          path: ${{ runner.temp }}/deployed-sha
           retention-days: 90
           if-no-files-found: error
