@@ -412,6 +412,21 @@ fn file_source_inventory(
             SnapshotRecords::Counted(snapshot.records()),
             snapshot.stamp.clone(),
         )
+    } else if options.source == "cursor" && crate::ingest::cursor_store::is_chat_store(path) {
+        // The store is SQLite, not JSONL; its records are counted by the
+        // pass that parses it, not by a read here.
+        (
+            path.metadata()?.len() as i64,
+            SnapshotRecords::Counted(0),
+            // A transcript or a newer copy appearing changes no file of this
+            // store, so whether it still owns the chat is part of the stamp: a
+            // superseded row is never reported unchanged.
+            format!(
+                "{}|superseded:{}",
+                crate::ingest::cursor_store::chat_store_stamp_and_modified(path)?.0,
+                crate::ingest::cursor_store::superseded(path)?
+            ),
+        )
     } else if matches!(options.source.as_str(), "claude" | "codex") {
         // Counted by the pass that parses, not by a walk over the whole file
         // before it: that walk is exactly the cost cursors remove.

@@ -174,6 +174,7 @@ use subagent_cleanup::{
     cleanup_subagent_registration, codex_session_has_remote_presence, session_has_remote_presence,
 };
 // After `sync_note!`, which the repair note uses.
+pub(crate) mod cursor_store;
 pub(crate) mod provider_diagnostics;
 pub(crate) mod scoped_files;
 #[cfg(test)]
@@ -12188,9 +12189,9 @@ pub(crate) struct CursorTranscriptOutcome {
 /// leave one copy per sync. Callers that resume mid-file therefore pass the
 /// offset they had already committed, and only records at or after it become
 /// history. Callers that rebuild the session's history first pass `0`.
-pub(crate) fn ingest_cursor_transcript(
+pub(crate) fn ingest_cursor_transcript<'a>(
     conn: &Connection,
-    path: &Path,
+    records: impl Into<cursor_store::Records<'a>>,
     session_id: &str,
     project: Option<&str>,
     mtime_ms: i64,
@@ -12203,8 +12204,7 @@ pub(crate) fn ingest_cursor_transcript(
     // then let the byte checkpoint advance over content nobody read. The
     // error propagates so the whole transaction, including the checkpoint
     // update, rolls back and the next sync retries the same offset.
-    let text = cold_read::read_string(path)
-        .with_context(|| format!("read Cursor transcript {}", path.display()))?;
+    let text = records.into().text()?;
     let mut outcome = CursorTranscriptOutcome::default();
     let mut offset: u64 = 0;
     // One query for the session, keyed by record offset. The per-record
