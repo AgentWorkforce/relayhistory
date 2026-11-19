@@ -166,10 +166,14 @@ pub(crate) fn superseded(store: &Path) -> Result<bool> {
     if transcript_session_ids(&cursor_dir.join("projects"))?.contains(id) {
         return Ok(true);
     }
-    let copies: Vec<(PathBuf, String)> = all_stores(&cursor_dir.join("chats"))?
-        .into_iter()
-        .filter(|(_, copy)| copy == id)
-        .collect();
+    // Only this chat's copies: `<workspace>/<id>/store.db`, no other chat.
+    let mut copies = Vec::new();
+    for workspace in crate::sorted_dirs(&cursor_dir.join("chats"))? {
+        let copy = workspace.join(id).join(STORE_FILE);
+        if copy.is_file() {
+            copies.push((copy, id.to_string()));
+        }
+    }
     Ok(one_owner_per_chat(copies)
         .first()
         .is_some_and(|(owner, _)| owner != store))
@@ -196,7 +200,11 @@ pub(crate) fn chat_stores(
     let owners = one_owner_per_chat(all_stores(&chats)?)
         .into_iter()
         .filter(|(_, id)| !transcripts.contains(id))
-        .filter(|(path, _)| partial.is_none_or(|scope| scope.mentions(path)));
+        .filter(|(path, _)| {
+            // The chat's directory: a change to its `-wal` or `meta.json`
+            // is a change to the store.
+            partial.is_none_or(|scope| scope.mentions(path.parent().unwrap_or(path)))
+        });
     Ok(owners.collect())
 }
 

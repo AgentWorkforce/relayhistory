@@ -569,3 +569,19 @@ fn the_owning_store_takes_the_catalog_row_over_from_an_older_copy() {
     )
     .unwrap());
 }
+
+#[test]
+fn a_tick_scoped_to_a_wal_or_meta_change_reads_its_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let store = write_store(home, "ws", "chat-1", "/w", &tool_chat("a"), 5).unwrap();
+    for sibling in ["store.db-wal", "meta.json"] {
+        let changed = store.parent().unwrap().join(sibling);
+        let scope = crate::ingest::path_scope::PathScope::from_paths([changed]).unwrap();
+        assert_eq!(
+            chat_stores(home, Some(&scope)).unwrap(),
+            vec![(store.clone(), "chat-1".to_string())],
+            "{sibling}"
+        );
+    }
+}
