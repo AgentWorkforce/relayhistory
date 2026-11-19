@@ -38,7 +38,10 @@ fn uri_path(path: &Path) -> String {
     // SQLite expects forward slashes and a leading `/` before a drive letter.
     let text = if cfg!(windows) {
         let slashed = text.replace('\\', "/");
-        if slashed.starts_with('/') {
+        if slashed.starts_with("//") {
+            // UNC: a blank authority, so the share stays in the path.
+            format!("//{slashed}")
+        } else if slashed.starts_with('/') {
             slashed
         } else {
             format!("/{slashed}")

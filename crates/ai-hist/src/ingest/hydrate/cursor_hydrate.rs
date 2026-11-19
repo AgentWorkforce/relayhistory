@@ -164,6 +164,15 @@ pub(super) fn ingest_chat_store(
         },
     )?;
     let mut diagnostics = cursor_diagnostics(&outcome);
+    for diagnostic in &mut diagnostics {
+        if diagnostic.code == "CURSOR_TIMESTAMP_FROM_MTIME" {
+            diagnostic.code = "CURSOR_TIMESTAMP_FROM_STORE".to_string();
+            diagnostic.message = "cursor records carry no timestamp field; events in turns with \
+                                  no readable <timestamp> tag are stamped with the chat store's \
+                                  recorded update time"
+                .to_string();
+        }
+    }
     if store.skipped_blobs > 0 {
         diagnostics.push(HydrationDiagnostic {
             code: "CURSOR_CHAT_STORE_BLOB_UNREADABLE".to_string(),

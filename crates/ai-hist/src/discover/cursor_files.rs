@@ -197,14 +197,16 @@ impl ShallowSessionProvider for CursorProvider {
             .tail_records_rev()
             .find_map(cursor_record_time)
             .or(last_head_ms)
+            // A chat store records when it was last written, and a preview may
+            // not reach the last dated turn: the later of the two is the end,
+            // as ingestion reports it. The file mtime, which a copy moves, is
+            // the last resort.
+            .map(|last| match chat_store.as_ref().and_then(|store| store.updated_ms) {
+                Some(updated) => last.max(updated),
+                None => last,
+            })
+            .or_else(|| chat_store.as_ref().and_then(|store| store.updated_ms))
             .or_else(|| crate::file_modified_ms(&path));
-        // A chat store records when it was last written, and a preview may
-        // not reach the last dated turn; the later of the two is the end, as
-        // ingestion reports it.
-        let last_activity_ms = match chat_store.as_ref().and_then(|store| store.updated_ms) {
-            Some(updated) => Some(last_activity_ms.map_or(updated, |last| last.max(updated))),
-            None => last_activity_ms,
-        };
         let mut models = Vec::new();
         for model in bounded.head_records().filter_map(cursor_record_model) {
             if !models.contains(&model) {

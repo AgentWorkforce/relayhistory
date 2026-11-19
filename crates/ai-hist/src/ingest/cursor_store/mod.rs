@@ -203,7 +203,30 @@ pub(crate) fn chat_stores(
             }
         }
     }
-    Ok(out)
+    Ok(one_owner_per_chat(out))
+}
+
+/// A chat id filed under more than one workspace is read from one store:
+/// the most recently written, ties broken by path. Discovery and sync
+/// both take it from here, so both name the same store.
+fn one_owner_per_chat(stores: Vec<(PathBuf, String)>) -> Vec<(PathBuf, String)> {
+    let mut owners: std::collections::BTreeMap<String, (Option<i64>, PathBuf)> =
+        std::collections::BTreeMap::new();
+    for (path, id) in stores {
+        let modified = chat_store_stamp_and_modified(&path)
+            .ok()
+            .and_then(|(_, at)| at);
+        let newer = owners
+            .get(&id)
+            .is_none_or(|(at, held)| (modified, &path) > (*at, held));
+        if newer {
+            owners.insert(id, (modified, path));
+        }
+    }
+    owners
+        .into_iter()
+        .map(|(id, (_, path))| (path, id))
+        .collect()
 }
 
 /// The records the transcript parser reads: a transcript file, or a chat

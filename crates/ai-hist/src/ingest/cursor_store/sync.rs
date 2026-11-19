@@ -49,7 +49,7 @@ pub(in crate::ingest) fn sync_chat_stores_in(
     if prepared.is_empty() {
         return Ok(0);
     }
-    let inserted = index(conn, &prepared, &mut seen)?;
+    let inserted = index(conn, &prepared, &mut seen, coverage)?;
     state.insert(CHAT_STORE_STATE_KEY.to_string(), Value::Object(seen));
     let suffix = if errors > 0 {
         format!(" ({errors} errors)")
@@ -171,11 +171,23 @@ fn note_skipped_blobs(path: &Path, store: &ChatStore) {
 
 /// Rebuild each prepared chat in one transaction, from the copy read above,
 /// so the batch never reopens a store a live chat may be writing to.
-fn index(conn: &Connection, prepared: &[Prepared], seen: &mut Map<String, Value>) -> Result<usize> {
+fn index(
+    conn: &Connection,
+    prepared: &[Prepared],
+    seen: &mut Map<String, Value>,
+    coverage: &mut crate::ingest::SweepCoverage,
+) -> Result<usize> {
     let tx = conn.unchecked_transaction()?;
     let mut inserted = 0;
+    let mut rebuilt = Vec::new();
     for Prepared { path, stamp, store } in prepared {
         crate::ingest::check_capture_cancelled()?;
+        // A transcript that appeared since `prepare` owns the chat now;
+        // its pass has, or will have, written it. Never overwrite it here.
+        if super::superseded_by_transcript(path)? {
+            seen.remove(path.to_string_lossy().as_ref());
+            continue;
+        }
         let fallback_ms = store.updated_ms.or(store.created_ms).unwrap_or(0);
         crate::ingest::clear_cursor_session_evidence(&tx, &store.session_id)?;
         let outcome = crate::ingest::ingest_cursor_transcript(
@@ -216,8 +228,14 @@ fn index(conn: &Connection, prepared: &[Prepared], seen: &mut Map<String, Value>
             stamp.clone()
         };
         seen.insert(path.to_string_lossy().into_owned(), Value::String(saved));
+        rebuilt.push(store.session_id.as_str());
     }
     tx.commit().context("commit Cursor chat store sync")?;
+    // Re-derived from the start of their own source, recorded only once that
+    // is committed.
+    for session_id in rebuilt {
+        coverage.note_read("cursor", session_id, true);
+    }
     Ok(inserted)
 }
 

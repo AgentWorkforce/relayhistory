@@ -418,7 +418,14 @@ fn file_source_inventory(
         (
             path.metadata()?.len() as i64,
             SnapshotRecords::Counted(0),
-            crate::ingest::cursor_store::chat_store_stamp_and_modified(path)?.0,
+            // A transcript appearing changes no store file, so whether one
+            // owns the chat is part of the stamp: a superseded row is never
+            // reported unchanged.
+            format!(
+                "{}|transcript:{}",
+                crate::ingest::cursor_store::chat_store_stamp_and_modified(path)?.0,
+                crate::ingest::cursor_store::superseded_by_transcript(path)?
+            ),
         )
     } else if matches!(options.source.as_str(), "claude" | "codex") {
         // Counted by the pass that parses, not by a walk over the whole file

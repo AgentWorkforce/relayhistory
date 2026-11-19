@@ -281,7 +281,12 @@ fn a_truncated_root_keeps_what_decoded() {
 #[test]
 fn a_store_under_a_non_ascii_home_opens() {
     let dir = tempfile::tempdir().unwrap();
-    let home = dir.path().join("Jos\u{e9} 中 %#?");
+    let name = if cfg!(windows) {
+        "Jos\u{e9} 中 %#"
+    } else {
+        "Jos\u{e9} 中 %#?"
+    };
+    let home = dir.path().join(name);
     let path = write_store(&home, "ws", "chat-1", "/w", &tool_chat("hi"), 5).unwrap();
     assert!(!sidecar(&path, "-wal").exists());
     let store = read_chat_store(&path).unwrap().unwrap();
@@ -474,4 +479,47 @@ fn a_dated_first_turn_keeps_its_start_and_the_store_update_bounds_the_end() {
     // 2026-11-18 23:52 UTC+1, from the first turn's <timestamp>.
     assert_eq!(first, 1_795_042_320_000);
     assert_eq!(last, 1_795_042_344_825);
+}
+
+#[test]
+fn a_transcript_that_appears_replaces_the_store_evidence_in_a_full_sweep() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    write_store(home, "ws", "chat-1", "/w", &tool_chat("store prompt"), 5).unwrap();
+    let conn = crate::open_db(&home.join("history.db")).unwrap();
+    let mut state = Map::new();
+    let mut coverage = crate::ingest::SweepCoverage::default();
+    let projects = home.join(".cursor/projects");
+    sync_chat_stores_in(&conn, &mut state, home, &mut coverage, None).unwrap();
+    assert_eq!(prompts(&conn, "chat-1"), vec!["store prompt".to_string()]);
+    let transcript = projects.join("w/agent-transcripts/chat-1");
+    std::fs::create_dir_all(&transcript).unwrap();
+    std::fs::write(
+        transcript.join("chat-1.jsonl"),
+        "{\"role\":\"user\",\"message\":{\"content\":\"transcript prompt\"}}\n",
+    )
+    .unwrap();
+    // The sweep's order: transcripts, then stores.
+    crate::ingest::sync_cursor_in(&conn, &mut state, &projects, &mut coverage, None).unwrap();
+    sync_chat_stores_in(&conn, &mut state, home, &mut coverage, None).unwrap();
+    assert_eq!(
+        prompts(&conn, "chat-1"),
+        vec!["transcript prompt".to_string()]
+    );
+    assert!(crate::session_tool_calls(&conn, "chat-1", Some("cursor"))
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+fn a_chat_filed_under_two_workspaces_is_read_from_one_store() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    write_store(home, "ws-a", "chat-1", "/w", &tool_chat("old"), 5).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let newer = write_store(home, "ws-b", "chat-1", "/w", &tool_chat("new"), 6).unwrap();
+    assert_eq!(
+        chat_stores(home, None).unwrap(),
+        vec![(newer, "chat-1".to_string())]
+    );
 }

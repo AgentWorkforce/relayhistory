@@ -1152,7 +1152,10 @@ How each adapter works:
   A blob the root lists more than once is one message per occurrence. A
   shallow catalog read renders only the first and last 16 messages. An
   unchanged store is skipped on its stamp only while the destination still
-  holds its evidence. When a chat gains a transcript, the transcript takes
+  holds its evidence, except a store that rendered no records, which is saved
+  as `<stamp>|no-evidence` and skipped until its stamp changes; any change to
+  the stamp makes sync read the store again. A chat id filed under several
+  workspaces is read from its most recently written store. When a chat gains a transcript, the transcript takes
   over the catalog row, and a hydration that still names the store is refused
   until discovery runs again.
 

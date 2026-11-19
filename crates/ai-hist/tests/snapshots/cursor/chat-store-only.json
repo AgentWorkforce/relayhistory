@@ -340,7 +340,7 @@
       "repo_url": null,
       "session_id": "cur-store-00000001",
       "source": "cursor",
-      "source_stamp": "cursor-store:<n>:20480",
+      "source_stamp": "cursor-store:<n>:20480|transcript:false",
       "title": null,
       "workspace_roots_json": null
     }
