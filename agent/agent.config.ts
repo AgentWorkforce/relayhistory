@@ -31,8 +31,9 @@ export default defineLayeredAgent({
   // Pinned to the AMI the live fresh hosts run, so a new Canonical "current"
   // AMI never turns a deploy into a host replacement. Move it deliberately.
   ami: "ami-08cf17e3856f70154",
-  // 4 vCPU / 16 GiB, 150 GiB: cargo builds and tests of a Rust workspace
-  // (target/ is large) plus relayhistory-cloud's TypeScript monorepo.
+  // 2 vCPU / 8 GiB (burstable), 150 GiB: a coordinator host. The lead runs
+  // only scoped checks (cargo fmt, cargo check -p <crate>); the full workspace
+  // clippy and test gates run on spawned workers (lead-prompt.md).
   instanceType: "t3.large",
   rootVolumeGiB: 150,
   laneFiles: ["lead-prompt.md", "setup-lane.sh"],
