@@ -1,0 +1,5 @@
+node_modules/
+.alchemy/
+# No lockfile: Agent Deploy runs npm ci when one exists, and GitHub Packages
+# refuses local installs, so one cannot be generated here. CI runs npm install.
+package-lock.json

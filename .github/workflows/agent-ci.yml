@@ -1,0 +1,53 @@
+# Checks the layered agent's own stack (agent/): the names it shares with
+# layered-agents infra, the Codex lead and its key parameter, the user-data
+# size and the deploy workflow's shape, against the published
+# @agentworkforce/layered-agent kit, which this job installs from GitHub
+# Packages with its own token. Separate from ci, which builds and tests the
+# Rust workspace and never installs that package.
+name: Agent CI
+
+# Every push to main: Agent Deploy follows a green run of main's head (the
+# kit makes a deploy of unchanged agent/ a no-op). Pull requests only when
+# they touch agent/ or these workflows.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths: ["agent/**", ".github/workflows/agent-*.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  agent:
+    name: Agent stack checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: read
+    defaults:
+      run:
+        working-directory: agent
+    steps:
+      - name: Check out
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+          registry-url: https://npm.pkg.github.com
+          scope: "@agentworkforce"
+      # No lockfile: GitHub Packages refuses local installs, so one cannot be
+      # generated here (agent/.gitignore). CI runs npm install.
+      - name: Install, typecheck and test
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          npm install --no-audit --no-fund --ignore-scripts
+          npm run typecheck
+          npm test
+      - run: shellcheck setup-lane.sh
