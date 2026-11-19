@@ -163,12 +163,20 @@ pub(crate) fn superseded(store: &Path) -> Result<bool> {
     let (Some(id), Some(cursor_dir)) = (store_session_id(store), store.ancestors().nth(4)) else {
         return Ok(false);
     };
-    if transcript_session_ids(&cursor_dir.join("projects"))?.contains(id) {
-        return Ok(true);
-    }
-    // Only this chat's copies: `<workspace>/<id>/store.db`, no other chat.
+    Ok(
+        transcript_session_ids(&cursor_dir.join("projects"))?.contains(id)
+            || newer_copy_exists(store)?,
+    )
+}
+
+/// Whether another workspace holds a more recently written copy of this
+/// store's chat. Looks only at `<workspace>/<id>/store.db`, no other chat.
+pub(crate) fn newer_copy_exists(store: &Path) -> Result<bool> {
+    let (Some(id), Some(chats)) = (store_session_id(store), store.ancestors().nth(3)) else {
+        return Ok(false);
+    };
     let mut copies = Vec::new();
-    for workspace in crate::sorted_dirs(&cursor_dir.join("chats"))? {
+    for workspace in crate::sorted_dirs(chats)? {
         let copy = workspace.join(id).join(STORE_FILE);
         if copy.is_file() {
             copies.push((copy, id.to_string()));

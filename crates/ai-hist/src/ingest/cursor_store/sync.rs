@@ -188,9 +188,9 @@ fn index(
     let mut rebuilt = Vec::new();
     for Prepared { path, stamp, store } in prepared {
         crate::ingest::check_capture_cancelled()?;
-        // A transcript that appeared since `prepare` owns the chat now;
-        // its pass has, or will have, written it. Never overwrite it here.
-        if transcripts.contains(&store.session_id) {
+        // A transcript, or a newer copy, that appeared since `prepare` owns
+        // the chat now; its own pass writes it. Never overwrite it here.
+        if transcripts.contains(&store.session_id) || super::newer_copy_exists(path)? {
             seen.remove(path.to_string_lossy().as_ref());
             continue;
         }

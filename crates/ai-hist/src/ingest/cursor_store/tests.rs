@@ -585,3 +585,14 @@ fn a_tick_scoped_to_a_wal_or_meta_change_reads_its_store() {
         );
     }
 }
+
+#[test]
+fn a_store_overtaken_by_a_newer_copy_after_prepare_is_not_indexed() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let older = write_store(home, "ws-a", "chat-1", "/w", &tool_chat("a"), 5).unwrap();
+    assert!(!newer_copy_exists(&older).unwrap());
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    write_store(home, "ws-b", "chat-1", "/w", &tool_chat("b"), 6).unwrap();
+    assert!(newer_copy_exists(&older).unwrap());
+}
