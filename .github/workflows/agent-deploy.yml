@@ -68,20 +68,30 @@ jobs:
             echo deploy=true >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          paths=(agent/ .github/workflows/agent-ci.yml .github/workflows/agent-deploy.yml)
           # The deploy job writes its record before it leaves the deploy
           # lock, so the newest record is the last deploy that finished. A
-          # run of this workflow that has not finished may still deploy and
-          # record a newer commit than that record says, so while any other
-          # run is unfinished this one never skips: it deploys under the
-          # lock, and an unchanged deploy is a no-op in the kit.
+          # run of this workflow that has not finished may still deploy its
+          # own commit after that record. So this run also compares with the
+          # head of every other unfinished run: it skips only when its
+          # deployed inputs match all of them and the last record. A landing
+          # that changes nothing under the paths then never enters the
+          # deploy queue, so it cannot displace a pending allow_restart
+          # dispatch.
           for status in queued in_progress waiting pending requested; do
-            others=$(gh api "repos/$REPO/actions/workflows/agent-deploy.yml/runs?status=$status&per_page=100" \
-              --jq "[.workflow_runs[] | select(.id != $RUN_ID)] | length")
-            if [ "$others" != 0 ]; then
-              echo "Another Agent Deploy run is $status: deploying rather than trusting the last record"
-              echo deploy=true >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
+            for other in $(gh api "repos/$REPO/actions/workflows/agent-deploy.yml/runs?status=$status&per_page=100" \
+              --jq ".workflow_runs[] | select(.id != $RUN_ID) | .head_sha"); do
+              if ! git cat-file -e "$other^{commit}" 2>/dev/null; then
+                echo "An unfinished ($status) run's $other is not in this checkout: deploying"
+                echo deploy=true >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+              if [ -n "$(git diff --name-only "$other" "$HEAD_SHA" -- "${paths[@]}")" ]; then
+                echo "An unfinished ($status) run may still deploy $other, which differs under ${paths[*]}: deploying"
+                echo deploy=true >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+            done
           done
           # The baseline is the head of the run that uploaded the newest
           # agent-deployed artifact, which the deploy job leaves after each
@@ -92,7 +102,6 @@ jobs:
           # no-op. A failed gh api call fails the step.
           last=$(gh api "repos/$REPO/actions/artifacts?name=agent-deployed&per_page=1" \
             --jq '.artifacts[0].workflow_run.head_sha // empty')
-          paths=(agent/ .github/workflows/agent-ci.yml .github/workflows/agent-deploy.yml)
           if [ -z "$last" ]; then
             echo "No record of a deploy (no agent-deployed artifact, or it expired): deploying $HEAD_SHA"
             deploy=true

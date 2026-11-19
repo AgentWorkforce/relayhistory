@@ -106,7 +106,13 @@ test("agent-deploy.yml: the deploy record is written inside the serialized deplo
   const job = deploy.slice(deploy.indexOf("\n  deploy:"));
   assert.match(job, /concurrency:\n\s+group: agent-deploy-relayhistory-dev/);
   assert.ok(job.indexOf("Upload the deploy record") > job.indexOf("uses: ./.layered-agents/.github/actions/layered-agent-deploy"), "record after the deploy step");
-  assert.match(deploy, /select\(\.id != \$RUN_ID\)/, "never skips while another run is unfinished");
+  // An unfinished run may still deploy its own commit, so the skip also
+  // requires matching every unfinished run's head; a landing that changes
+  // nothing under the paths still skips, so it cannot displace a pending
+  // allow_restart dispatch from the deploy queue.
+  assert.match(deploy, /select\(\.id != \$RUN_ID\) \| \.head_sha/);
+  assert.match(deploy, /git diff --name-only "\$other" "\$HEAD_SHA" -- "\$\{paths\[@\]\}"/);
+  assert.doesNotMatch(deploy, /deploying rather than trusting the last record/, "no unconditional deploy while another run is unfinished");
 });
 
 test("workflows: CI checks agent/; deploy only from main through the kit's action in the agent-deploy environment", () => {
