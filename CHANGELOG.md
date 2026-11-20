@@ -8,6 +8,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Antigravity subagents are no longer listed as separate root sessions. The subagents a conversation spawns, recorded in its `.system_generated/subagents/<child>.json`, are now stored as `delegated` children of that conversation, with their agent type, role and spawn time.
+- Antigravity session titles no longer show the raw `<USER_REQUEST>` envelope when Antigravity appends further blocks, such as `<USER_SETTINGS_CHANGE>`, after the request's metadata.
 - Amp thread discovery requests one lookahead row so bounded clients can report when more than 100 threads exist.
 
 ## [0.61.0] - 2026-11-19
