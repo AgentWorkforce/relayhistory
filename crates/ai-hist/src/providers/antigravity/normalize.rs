@@ -103,7 +103,59 @@ pub(super) fn write(conn: &Connection, payload: &Value) -> Result<usize> {
         },
     )?;
     write_preview(conn, sid, preview, complete)?;
+    write_subagents(conn, sid, payload, rows)?;
     Ok(inserted)
+}
+
+/// Record each subagent the conversation spawned as a delegated child, so a
+/// root listing shows one conversation rather than the parent and every
+/// child beside it. Either side can be indexed first, so the child also
+/// refreshes the `child_has_events` of the edge that points at it.
+fn write_subagents(conn: &Connection, sid: &str, payload: &Value, rows: &[Value]) -> Result<()> {
+    use crate::relationship_capture::{now_ms, record_relationship, ObservedRelationship};
+    let has_events = |child: &str| -> Result<bool> {
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM session_events WHERE source=?1 AND session_id=?2)",
+            [ID, child],
+            |r| r.get(0),
+        )?)
+    };
+    for subagent in payload["subagents"].as_array().into_iter().flatten() {
+        let Some(child) = subagent["childSid"].as_str() else {
+            continue;
+        };
+        if child == sid {
+            continue;
+        }
+        let spawned_at_ms = subagent["spawnStepIndex"].as_u64().and_then(|step| {
+            rows.iter()
+                .find(|r| format::index(r).ok() == Some(step))
+                .and_then(|r| format::time(r).ok())
+        });
+        record_relationship(
+            conn,
+            &ObservedRelationship {
+                source: ID,
+                parent_session_id: sid,
+                child_session_id: Some(child),
+                child_agent_type: subagent["agentType"].as_str(),
+                child_agent_name: subagent["agentName"].as_str(),
+                spawn_depth: Some(1),
+                evidence_kind: "antigravity_subagent_file",
+                evidence_locator: subagent["locator"].as_str(),
+                child_has_events: has_events(child)?,
+                spawned_at_ms,
+                ..Default::default()
+            },
+        )?;
+    }
+    let mine = has_events(sid)?;
+    conn.execute(
+        "UPDATE session_relationships SET child_has_events=?3, updated_ms=?4 \
+         WHERE source=?1 AND child_session_id=?2 AND child_has_events<>?3",
+        rusqlite::params![ID, sid, mine, now_ms()],
+    )?;
+    Ok(())
 }
 
 fn step<'a>(

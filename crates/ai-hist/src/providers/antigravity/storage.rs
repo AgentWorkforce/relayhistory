@@ -99,20 +99,91 @@ pub(super) fn capture(path: &Path, context: &AcquisitionContext<'_>) -> Result<A
             .iter()
             .any(|r| r["status"] != "DONE" && r["status"] != "ERROR");
     let bytes_hash = format!("{:x}", Sha256::digest(&bytes));
+    let (subagents, subagent_paths, subagent_hashes) = subagents(&path, context)?;
     // The absolute locator is needed by normalization, but a temporary HOME
     // relocation is not an evidence revision. Identity, projection selection
     // and exact source bytes still distinguish every meaningful capture.
-    let revision = serde_json::to_vec(&(&sid, name, &bytes_hash))?;
+    // Subagent entries join the revision only when present, so a conversation
+    // without any keeps its stamp, and one with them is captured again.
+    let revision = if subagent_hashes.is_empty() {
+        serde_json::to_vec(&(&sid, name, &bytes_hash))?
+    } else {
+        serde_json::to_vec(&(&sid, name, &bytes_hash, &subagent_hashes))?
+    };
     let stamp = format!("sha256:{:x}", Sha256::digest(revision));
     let records = rows.len() as i64;
-    let payload = serde_json::json!({"sid":sid,"path":path,"rows":rows,"partial":incomplete,"bytesSha256":bytes_hash});
+    let payload = serde_json::json!({"sid":sid,"path":path,"rows":rows,"partial":incomplete,"bytesSha256":bytes_hash,"subagents":subagents});
+    let mut read_paths = vec![path];
+    read_paths.extend(subagent_paths);
     Ok(AcquiredSession {
         stamp,
         payload,
         bytes: bytes.len() as i64,
         records,
-        read_paths: vec![path],
+        read_paths,
     })
+}
+
+/// The delegations a conversation recorded: one
+/// `<conversation>/.system_generated/subagents/<child>.json` per spawned
+/// subagent, naming the child's own conversation (a sibling under the same
+/// brain root). The child id is taken from `conversationId`, never from the
+/// file name; an entry without a usable one is not evidence of a link.
+type Subagents = (Vec<Value>, Vec<PathBuf>, Vec<(String, String)>);
+fn subagents(path: &Path, context: &AcquisitionContext<'_>) -> Result<Subagents> {
+    let mut out = (Vec::new(), Vec::new(), Vec::new());
+    // path = <root>/<conversation>/.system_generated/logs/<transcript>
+    let Some(conversation) = path.ancestors().nth(3) else {
+        return Ok(out);
+    };
+    let Some(root) = conversation.parent() else {
+        return Ok(out);
+    };
+    let dir = conversation.join(".system_generated/subagents");
+    let entries = match std::fs::read_dir(&dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(e.into()),
+    };
+    let mut files = entries
+        .map(|e| e.map(|e| e.path()))
+        .collect::<std::io::Result<Vec<_>>>()?;
+    files.retain(|p| p.extension().is_some_and(|e| e == "json") && p.is_file());
+    files.sort();
+    for file in files {
+        crate::ingest::check_capture_cancelled()?;
+        context.validate(&file)?;
+        let bytes = context.read(&file)?;
+        let Ok(entry) = serde_json::from_slice::<Value>(&bytes) else {
+            continue;
+        };
+        let Some(child) = entry["conversationId"]
+            .as_str()
+            .filter(|c| !c.is_empty() && Path::new(c).components().count() == 1)
+            .filter(|c| !matches!(*c, "." | ".."))
+        else {
+            continue;
+        };
+        let child_path = root.join(child).join(".system_generated/logs/transcript.jsonl");
+        let Ok(child_sid) = roots::identity(context.roots, &child_path) else {
+            continue;
+        };
+        let locator = file.to_string_lossy().into_owned();
+        // Hashed by name, not locator: HOME relocation is not a revision.
+        out.2.push((
+            child.to_owned(),
+            format!("{:x}", Sha256::digest(&bytes)),
+        ));
+        out.0.push(serde_json::json!({
+            "childSid": child_sid,
+            "agentType": entry["subagentDescriptor"]["typeName"].as_str(),
+            "agentName": entry["subagentDescriptor"]["role"].as_str(),
+            "spawnStepIndex": entry["spawnStepIndex"].as_u64(),
+            "locator": locator,
+        }));
+        out.1.push(file);
+    }
+    Ok(out)
 }
 
 pub(super) fn shallow_rows(scan: &ScanEnv<'_>, path: &Path) -> Result<(Vec<Value>, Option<i64>)> {
