@@ -285,6 +285,20 @@ fn spawned_subagents_are_delegated_children_of_their_parent() {
     assert!(inputs
         .iter()
         .any(|c| c.locator.ends_with("subagents/child.json")));
+    let count = |conn: &Connection| -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM session_relationships WHERE source='antigravity'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap()
+    };
+    // A sidecar caught mid-rewrite is not an absence: the capture still
+    // succeeds, and the link it evidenced stays.
+    std::fs::write(subagents.join("child.json"), b"{\"conversationId\":").unwrap();
+    let p = storage::capture(&parent, &context).unwrap();
+    normalize::write(&conn, &p.payload).unwrap();
+    assert_eq!(count(&conn), 1);
     // A recapture without the sidecar retires the edge it evidenced.
     std::fs::remove_file(subagents.join("child.json")).unwrap();
     let p = storage::capture(&parent, &context).unwrap();

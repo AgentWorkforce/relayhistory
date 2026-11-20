@@ -133,16 +133,33 @@ fn write_subagents(conn: &Connection, sid: &str, payload: &Value, rows: &[Value]
         .filter(|child| *child != sid)
         .map(|child| format!("child:{child}"))
         .collect();
-    let stale: Vec<String> = conn
-        .prepare_cached(
-            "SELECT relationship_uid FROM session_relationships \
+    // Only an established absence retires a link: the directory was listed,
+    // and the sidecar behind the edge is gone or now names another child. One
+    // that exists but could not be read keeps its link until it can be.
+    let unreadable: std::collections::BTreeSet<&str> = payload["subagentsUnreadable"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .collect();
+    let stale: Vec<String> = if payload["subagentsListed"] == true {
+        conn.prepare_cached(
+            "SELECT relationship_uid, evidence_locator FROM session_relationships \
              WHERE source=?1 AND parent_session_id=?2 AND evidence_kind=?3",
         )?
-        .query_map([ID, sid, EVIDENCE_KIND], |r| r.get(0))?
-        .collect::<rusqlite::Result<Vec<String>>>()?
+        .query_map([ID, sid, EVIDENCE_KIND], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })?
+        .collect::<rusqlite::Result<Vec<_>>>()?
         .into_iter()
-        .filter(|uid| !current.contains(uid))
-        .collect();
+        .filter(|(uid, locator)| {
+            !current.contains(uid) && !locator.as_deref().is_some_and(|l| unreadable.contains(l))
+        })
+        .map(|(uid, _)| uid)
+        .collect()
+    } else {
+        Vec::new()
+    };
     for uid in stale {
         conn.execute(
             "DELETE FROM session_relationships \
