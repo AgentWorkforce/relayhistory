@@ -64,7 +64,14 @@ fn known_fields(path: &str) -> &'static [&'static str] {
             "first_ts",
             "last_ts",
         ],
-        "raw.epochs[]" => &["epoch", "opened_at", "reason", "first_seq", "opened_by"],
+        "raw.epochs[]" => &[
+            "epoch",
+            "opened_at",
+            "reason",
+            "first_seq",
+            "opened_by",
+            "resumes_epoch",
+        ],
         "server" => &[
             "updated_at",
             "normalized",

@@ -11,6 +11,10 @@ use crate::layout::RawFormat;
 
 pub const MANIFEST_SCHEMA_VERSION: u32 = 1;
 
+/// `opened_by` of a backfill epoch, and `raw.owner` of a cold export, start
+/// with this: `migration:{grant_id}`.
+pub const MIGRATION_ID_PREFIX: &str = "migration:";
+
 /// Unknown fields, preserved on round trip.
 pub type Extra = Map<String, Value>;
 
@@ -119,6 +123,10 @@ pub enum EpochReason {
     Initial,
     Truncated,
     Rewritten,
+    /// Pre-cutover records appended by a server-side exporter.
+    Backfill,
+    /// The raw owner continuing its source after a backfill epoch.
+    Resumed,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -128,6 +136,10 @@ pub struct EpochRecord {
     pub reason: EpochReason,
     pub first_seq: u64,
     pub opened_by: String,
+    /// The live epoch a `resumed` epoch continues. Absent on every other
+    /// reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resumes_epoch: Option<u32>,
     #[serde(flatten)]
     pub extra: Extra,
 }
@@ -218,6 +230,55 @@ pub enum EffectiveState {
     Idle,
     Abandoned,
     Archived,
+}
+
+impl Raw {
+    /// The newest epoch the client's source wrote: `raw.epoch`, unless that
+    /// is a backfill epoch.
+    pub fn live_epoch(&self) -> u32 {
+        self.epochs
+            .iter()
+            .rev()
+            .find(|e| e.reason != EpochReason::Backfill)
+            .map_or(0, |e| e.epoch)
+    }
+
+    /// `start_offset` of epoch `epoch`'s first chunk: `0`, or for a `resumed`
+    /// epoch the end of the live epoch it continues.
+    pub fn epoch_base(&self, epoch: u32) -> u64 {
+        self.epochs
+            .get(epoch as usize)
+            .and_then(|e| e.resumes_epoch)
+            .filter(|&resumed| resumed < epoch)
+            .map_or(0, |resumed| self.epoch_end(resumed))
+    }
+
+    /// The source offset just past epoch `epoch`.
+    pub fn epoch_end(&self, epoch: u32) -> u64 {
+        self.chunks
+            .iter()
+            .rev()
+            .find(|c| c.epoch == epoch)
+            .map_or_else(
+                || self.epoch_base(epoch),
+                |c| c.start_offset.saturating_add(c.bytes),
+            )
+    }
+
+    /// Where the client resumes reading its source. Use this, not
+    /// `next_offset`: after a backfill `next_offset` is the end of the
+    /// exporter's stream.
+    pub fn live_next_offset(&self) -> u64 {
+        self.epoch_end(self.live_epoch())
+    }
+
+    /// The current epoch is a backfill epoch, which is sealed: the client
+    /// must call `client::resume_epoch` (or open a new epoch) to append.
+    pub fn at_backfill_tail(&self) -> bool {
+        self.epochs
+            .last()
+            .is_some_and(|e| e.reason == EpochReason::Backfill)
+    }
 }
 
 impl Manifest {
