@@ -197,7 +197,9 @@ fn user_request_unwraps_with_trailing_settings_change_block() {
         "source": "USER_EXPLICIT", "type": "USER_INPUT", "status": "DONE",
         "content": "<USER_REQUEST>\nhi\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-19T21:00:34-08:00.\n</ADDITIONAL_METADATA>\ntrailing prose"
     });
-    assert!(format::text(&unknown).unwrap().starts_with("<USER_REQUEST>"));
+    assert!(format::text(&unknown)
+        .unwrap()
+        .starts_with("<USER_REQUEST>"));
 }
 
 #[test]
@@ -265,4 +267,34 @@ fn spawned_subagents_are_delegated_children_of_their_parent() {
         )]
     );
     assert!(p.read_paths.iter().any(|p| p.ends_with("child.json")));
+    // Session reads expose the edge, since the provider declares it.
+    let evidence = store
+        .session(
+            &crate::SessionRef::id(
+                crate::Source::Antigravity,
+                p.payload["sid"].as_str().unwrap(),
+            ),
+            crate::SessionQuery::default(),
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(evidence.relationships.len(), 1);
+    // A sync fingerprint sees the sidecars, not only the transcripts.
+    let env = crate::discover::DiscoveryEnv::with_provider_roots(&conn, roots.clone());
+    let inputs = <Provider as ShallowSessionProvider>::fingerprint_inputs(&Provider, &env).unwrap();
+    assert!(inputs
+        .iter()
+        .any(|c| c.locator.ends_with("subagents/child.json")));
+    // A recapture without the sidecar retires the edge it evidenced.
+    std::fs::remove_file(subagents.join("child.json")).unwrap();
+    let p = storage::capture(&parent, &context).unwrap();
+    normalize::write(&conn, &p.payload).unwrap();
+    let remaining: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM session_relationships WHERE source='antigravity'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining, 0);
 }

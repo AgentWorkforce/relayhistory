@@ -111,6 +111,8 @@ pub(super) fn write(conn: &Connection, payload: &Value) -> Result<usize> {
 /// root listing shows one conversation rather than the parent and every
 /// child beside it. Either side can be indexed first, so the child also
 /// refreshes the `child_has_events` of the edge that points at it.
+const EVIDENCE_KIND: &str = "antigravity_subagent_file";
+
 fn write_subagents(conn: &Connection, sid: &str, payload: &Value, rows: &[Value]) -> Result<()> {
     use crate::relationship_capture::{now_ms, record_relationship, ObservedRelationship};
     let has_events = |child: &str| -> Result<bool> {
@@ -120,6 +122,34 @@ fn write_subagents(conn: &Connection, sid: &str, payload: &Value, rows: &[Value]
             |r| r.get(0),
         )?)
     };
+    // The sidecar directory is read whole on every capture, so an edge this
+    // parent recorded earlier that the current snapshot no longer names is
+    // gone: its file was removed or now names another child.
+    let current: std::collections::BTreeSet<String> = payload["subagents"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|s| s["childSid"].as_str())
+        .filter(|child| *child != sid)
+        .map(|child| format!("child:{child}"))
+        .collect();
+    let stale: Vec<String> = conn
+        .prepare_cached(
+            "SELECT relationship_uid FROM session_relationships \
+             WHERE source=?1 AND parent_session_id=?2 AND evidence_kind=?3",
+        )?
+        .query_map([ID, sid, EVIDENCE_KIND], |r| r.get(0))?
+        .collect::<rusqlite::Result<Vec<String>>>()?
+        .into_iter()
+        .filter(|uid| !current.contains(uid))
+        .collect();
+    for uid in stale {
+        conn.execute(
+            "DELETE FROM session_relationships \
+             WHERE source=?1 AND parent_session_id=?2 AND relationship_uid=?3",
+            [ID, sid, uid.as_str()],
+        )?;
+    }
     for subagent in payload["subagents"].as_array().into_iter().flatten() {
         let Some(child) = subagent["childSid"].as_str() else {
             continue;
@@ -141,7 +171,7 @@ fn write_subagents(conn: &Connection, sid: &str, payload: &Value, rows: &[Value]
                 child_agent_type: subagent["agentType"].as_str(),
                 child_agent_name: subagent["agentName"].as_str(),
                 spawn_depth: Some(1),
-                evidence_kind: "antigravity_subagent_file",
+                evidence_kind: EVIDENCE_KIND,
                 evidence_locator: subagent["locator"].as_str(),
                 child_has_events: has_events(child)?,
                 spawned_at_ms,

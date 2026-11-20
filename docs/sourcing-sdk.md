@@ -1018,7 +1018,7 @@ handle.
 <!-- sourcing-sdk-population-table:start -->
 | Source | history | session_event | tool_call | file_edit | relationship | usage accounting |
 | --- | --- | --- | --- | --- | --- | --- |
-| antigravity | ✓ | ✓ | — | — | — | none |
+| antigravity | ✓ | ✓ | — | — | ✓ | none |
 | capy | — | — | — | — | — | none |
 | claude | ✓ | ✓ | ✓ | ✓ | ✓ | per-message |
 | cline | ✓ | ✓ | ✓ | — | — | none |

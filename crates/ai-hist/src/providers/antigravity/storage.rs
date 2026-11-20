@@ -164,16 +164,16 @@ fn subagents(path: &Path, context: &AcquisitionContext<'_>) -> Result<Subagents>
         else {
             continue;
         };
-        let child_path = root.join(child).join(".system_generated/logs/transcript.jsonl");
+        let child_path = root
+            .join(child)
+            .join(".system_generated/logs/transcript.jsonl");
         let Ok(child_sid) = roots::identity(context.roots, &child_path) else {
             continue;
         };
         let locator = file.to_string_lossy().into_owned();
         // Hashed by name, not locator: HOME relocation is not a revision.
-        out.2.push((
-            child.to_owned(),
-            format!("{:x}", Sha256::digest(&bytes)),
-        ));
+        out.2
+            .push((child.to_owned(), format!("{:x}", Sha256::digest(&bytes))));
         out.0.push(serde_json::json!({
             "childSid": child_sid,
             "agentType": entry["subagentDescriptor"]["typeName"].as_str(),
@@ -234,4 +234,41 @@ pub(super) fn shallow_rows(scan: &ScanEnv<'_>, path: &Path) -> Result<(Vec<Value
     // conversation identity discoverable without inventing activity or text;
     // explicit hydration validates and reads the complete record.
     Ok((rows, latest))
+}
+
+/// Each enumerated conversation's subagent sidecars, stamped like the
+/// transcripts so a sync fingerprint sees one appear, change or vanish.
+pub(super) fn subagent_candidates(transcripts: &[Candidate]) -> Result<Vec<Candidate>> {
+    let mut out = Vec::new();
+    for transcript in transcripts {
+        let Some(conversation) = Path::new(&transcript.locator).ancestors().nth(3) else {
+            continue;
+        };
+        let dir = conversation.join(".system_generated/subagents");
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(e) => return Err(e.into()),
+        };
+        let mut files = entries
+            .map(|e| e.map(|e| e.path()))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        files.retain(|p| p.extension().is_some_and(|e| e == "json"));
+        files.sort();
+        for file in files {
+            // A sidecar that vanished between the listing and the stat is
+            // simply absent from this fingerprint.
+            let Ok((stamp, recency_hint_ms)) = crate::file_stamp_and_modified(&file) else {
+                continue;
+            };
+            out.push(Candidate {
+                source: ID,
+                locator: file.to_string_lossy().into_owned(),
+                session_id: None,
+                recency_hint_ms,
+                stamp,
+            });
+        }
+    }
+    Ok(out)
 }

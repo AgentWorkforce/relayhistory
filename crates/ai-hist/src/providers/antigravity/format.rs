@@ -88,8 +88,8 @@ pub(super) fn text(row: &Value) -> Option<&str> {
     let Some(wrapped) = text.strip_prefix("<USER_REQUEST>\n") else {
         return Some(text);
     };
-    let Some((request, metadata)) = strip_trailing_blocks(wrapped)
-        .rsplit_once("\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\n")
+    let Some((request, metadata)) =
+        strip_trailing_blocks(wrapped).rsplit_once("\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\n")
     else {
         return Some(text);
     };
