@@ -21,7 +21,7 @@ permissions:
 
 jobs:
   verify:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.GRAPHIDE_CI_RUNNER == 'off' && 'ubuntu-latest' || 'graphide-linux-x64-8' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -101,7 +101,7 @@ jobs:
   # fails on any `rusqlite` type in the listing: an embedder never holds a
   # raw connection. See docs/sourcing-sdk.md.
   public-api:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.GRAPHIDE_CI_RUNNER == 'off' && 'ubuntu-latest' || 'graphide-linux-x64-4' }}
     steps:
       - uses: actions/checkout@v4
       # rustdoc's JSON output, which cargo-public-api reads, is nightly-only;
@@ -130,7 +130,7 @@ jobs:
   # `rust-oleum --write-baseline`. Separate from `verify`, which deletes
   # plugins/, one of the scanned source roots.
   code-quality:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.GRAPHIDE_CI_RUNNER == 'off' && 'ubuntu-latest' || 'graphide-linux-x64-4' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -153,7 +153,7 @@ jobs:
   # published-crate-consumer workflow builds the same example against the
   # crate crates.io actually serves.
   rust-consumer:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.GRAPHIDE_CI_RUNNER == 'off' && 'ubuntu-latest' || 'graphide-linux-x64-4' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -179,7 +179,7 @@ jobs:
             | grep -qE '^ai-hist v[0-9.]+ \(.*/crates/ai-hist\)$'
 
   rust-local-source:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.GRAPHIDE_CI_RUNNER == 'off' && 'ubuntu-latest' || 'graphide-linux-x64-4' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -225,7 +225,7 @@ jobs:
   # tell a regression here from breakage in burn. Making the job a required
   # check is a branch-protection setting.
   burn-contract-drift:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.GRAPHIDE_CI_RUNNER == 'off' && 'ubuntu-latest' || 'graphide-linux-x64-4' }}
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
@@ -271,7 +271,7 @@ jobs:
         run: node scripts/burn-guardrails.mjs run-parity --burn-dir burn
 
   msrv:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.GRAPHIDE_CI_RUNNER == 'off' && 'ubuntu-latest' || 'graphide-linux-x64-4' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88.0
@@ -279,7 +279,7 @@ jobs:
         run: cargo check -p ai-hist --all-features --locked
 
   node-22-sdk:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.GRAPHIDE_CI_RUNNER == 'off' && 'ubuntu-latest' || 'graphide-linux-x64-4' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -301,7 +301,7 @@ jobs:
   # directory). Not a workspace member, so nothing above builds or tests it;
   # the shared conformance suite runs against every adapter on local emulators.
   object-store-plugin:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.GRAPHIDE_CI_RUNNER == 'off' && 'ubuntu-latest' || 'graphide-linux-x64-4' }}
     env:
       MANIFEST: plugins/object-store/rust/Cargo.toml
     steps:
@@ -343,7 +343,7 @@ jobs:
           done
 
   optional-history-plugins:
-    runs-on: ubuntu-latest
+    runs-on: ${{ vars.GRAPHIDE_CI_RUNNER == 'off' && 'ubuntu-latest' || 'graphide-linux-x64-4' }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
