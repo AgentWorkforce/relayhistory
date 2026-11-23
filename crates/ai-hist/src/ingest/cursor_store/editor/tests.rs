@@ -200,16 +200,14 @@ fn the_header_chunks_decide_the_order_and_unlisted_bubbles_are_left_out() {
         &reply_bubble("stray", "abandoned", START),
     )
     .unwrap();
-    // A second chunk continues the first.
-    put(
-        &conn,
-        "composerConvHeaders:c:000001",
-        &json!([{"bubbleId": "missing", "type": 2}]),
-    )
-    .unwrap();
     close_idle(&db, conn).unwrap();
     let composer = read_composer(&db, "c").unwrap().unwrap();
-    let texts: Vec<String> = records(&composer)
+    assert_eq!(texts(&composer), vec!["first", "answer", "second"]);
+    assert!(!composer.incomplete);
+}
+
+fn texts(composer: &Composer) -> Vec<String> {
+    records(composer)
         .iter()
         .map(|r| {
             r["message"]["content"][0]["text"]
@@ -217,12 +215,294 @@ fn the_header_chunks_decide_the_order_and_unlisted_bubbles_are_left_out() {
                 .unwrap()
                 .to_string()
         })
-        .collect();
-    assert_eq!(texts, vec!["first", "answer", "second"]);
+        .collect()
+}
+
+/// Two chunks declared, three present: the third is an older generation's,
+/// holding a valid bubble the conversation no longer has. It is never read.
+#[test]
+fn a_chunk_beyond_the_declared_header_log_is_not_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, conn) = open_state_db(dir.path()).unwrap();
+    let bubbles = [
+        user_bubble("u1", "first", START),
+        reply_bubble("a1", "answer", START + 1),
+    ];
+    write_composer(&conn, "c", "", "/w", &bubbles, START).unwrap();
+    put(
+        &conn,
+        "bubbleId:c:u2",
+        &user_bubble("u2", "second", START + 2),
+    )
+    .unwrap();
+    put(
+        &conn,
+        "composerConvHeaders:c:000001",
+        &json!([{"bubbleId": "u2", "type": 1}]),
+    )
+    .unwrap();
+    put(
+        &conn,
+        "bubbleId:c:old",
+        &user_bubble("old", "abandoned turn", START + 3),
+    )
+    .unwrap();
+    put(
+        &conn,
+        "composerConvHeaders:c:000002",
+        &json!([{"bubbleId": "old", "type": 1}]),
+    )
+    .unwrap();
+    set_header_log(&conn, "c", 2, 3);
+    close_idle(&db, conn).unwrap();
+    let composer = read_composer(&db, "c").unwrap().unwrap();
+    assert_eq!(texts(&composer), vec!["first", "answer", "second"]);
+    assert!(!composer.incomplete);
+    // The declared count bounds the headers too: a longer chunk is cut to it.
+    let (_, conn) = open_state_db(dir.path()).unwrap();
+    set_header_log(&conn, "c", 2, 2);
+    close_idle(&db, conn).unwrap();
     assert_eq!(
-        composer.skipped_bubbles, 1,
-        "the listed bubble that is gone"
+        texts(&read_composer(&db, "c").unwrap().unwrap()),
+        vec!["first", "answer"]
     );
+}
+
+/// Rewrites the composer's `headerLog` to declare `chunks` chunks and `count`
+/// headers.
+fn set_header_log(conn: &Connection, id: &str, chunks: u64, count: u64) {
+    let key = format!("composerData:{id}");
+    let value: String = conn
+        .query_row(
+            "SELECT value FROM cursorDiskKV WHERE key = ?1",
+            [&key],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut data: Value = serde_json::from_str(&value).unwrap();
+    data["headerLog"] = json!({"chunkSize": 256, "chunkCount": chunks, "count": count});
+    put(conn, &key, &data).unwrap();
+}
+
+#[test]
+fn a_missing_or_malformed_declared_chunk_makes_the_read_incomplete() {
+    for damage in ["missing", "malformed", "short"] {
+        let dir = tempfile::tempdir().unwrap();
+        let (db, conn) = open_state_db(dir.path()).unwrap();
+        let bubbles = [
+            user_bubble("u1", "first", START),
+            reply_bubble("a1", "answer", START + 1),
+        ];
+        write_composer(&conn, "c", "", "/w", &bubbles, START).unwrap();
+        match damage {
+            // Two chunks declared, the second never written.
+            "missing" => set_header_log(&conn, "c", 2, 3),
+            "malformed" => {
+                put(
+                    &conn,
+                    "composerConvHeaders:c:000001",
+                    &json!({"not": "headers"}),
+                )
+                .unwrap();
+                set_header_log(&conn, "c", 2, 3);
+            }
+            // One chunk, but fewer headers in it than the log counts.
+            _ => set_header_log(&conn, "c", 1, 5),
+        }
+        close_idle(&db, conn).unwrap();
+        let composer = read_composer(&db, "c").unwrap().unwrap();
+        assert!(composer.incomplete, "{damage}");
+        assert_eq!(texts(&composer), vec!["first", "answer"], "{damage}");
+    }
+}
+
+#[test]
+fn a_listed_bubble_that_is_gone_makes_the_read_incomplete() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, conn) = open_state_db(dir.path()).unwrap();
+    write_composer(
+        &conn,
+        "c",
+        "",
+        "/w",
+        &[user_bubble("u1", "first", START)],
+        START,
+    )
+    .unwrap();
+    put(
+        &conn,
+        "composerConvHeaders:c:000000",
+        &json!([{"bubbleId": "u1"}, {"bubbleId": "gone"}]),
+    )
+    .unwrap();
+    set_header_log(&conn, "c", 1, 2);
+    close_idle(&db, conn).unwrap();
+    let composer = read_composer(&db, "c").unwrap().unwrap();
+    assert_eq!(composer.skipped_bubbles, 1);
+    assert!(composer.incomplete);
+}
+
+/// An incomplete read is indexed as far as it goes, but is not recorded as
+/// read: no stamp is saved, the sweep is told, and the next pass reads it
+/// again. A complete one beside it is unaffected.
+#[test]
+fn sync_does_not_mark_an_incomplete_conversation_read() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let (db, conn) = open_state_db(home).unwrap();
+    write_composer(
+        &conn,
+        "whole",
+        "",
+        "/w",
+        &tool_conversation("a", START),
+        START,
+    )
+    .unwrap();
+    write_composer(
+        &conn,
+        "short",
+        "",
+        "/w",
+        &tool_conversation("b", START),
+        START,
+    )
+    .unwrap();
+    set_header_log(&conn, "short", 2, 10);
+    close_idle(&db, conn).unwrap();
+    let history = crate::open_db(&home.join("history.db")).unwrap();
+    let mut state = Map::new();
+    let mut coverage = crate::ingest::SweepCoverage::default();
+    sync_editor_composers_in(&history, &mut state, home, &mut coverage, None).unwrap();
+    assert!(!coverage.complete());
+    assert!(state[EDITOR_STATE_KEY].get(locator(&db, "whole")).is_some());
+    assert!(state[EDITOR_STATE_KEY].get(locator(&db, "short")).is_none());
+    assert_eq!(
+        count(&history, "history", "short"),
+        1,
+        "what was readable is indexed"
+    );
+    // Read again on the next pass, not skipped on a stamp.
+    let mut again = crate::ingest::SweepCoverage::default();
+    assert_eq!(
+        sync_editor_composers_in(&history, &mut state, home, &mut again, None).unwrap(),
+        1
+    );
+    assert!(!again.complete());
+}
+
+/// A pass interrupted after one composer keeps that one and leaves the rest
+/// unread, with no stamp; the retry reads only what is left.
+#[test]
+fn an_interrupted_sync_keeps_what_it_committed_and_retries_the_rest() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path();
+    let (db, conn) = open_state_db(home).unwrap();
+    for id in ["a", "b", "c"] {
+        write_composer(&conn, id, "", "/w", &tool_conversation(id, START), START).unwrap();
+    }
+    close_idle(&db, conn).unwrap();
+    let path = home.join("history.db");
+    let history = crate::open_db(&path).unwrap();
+    let mut state = Map::new();
+    // Stop as soon as one conversation is committed.
+    let probe = path.clone();
+    let stop = move || {
+        let reader = Connection::open(&probe).unwrap();
+        reader
+            .query_row(
+                "SELECT count(DISTINCT session_id) FROM sessions WHERE source = 'cursor'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+            >= 1
+    };
+    let mut coverage = crate::ingest::SweepCoverage::default();
+    let error = crate::ingest::with_capture_stop(stop, || {
+        sync_editor_composers_in(&history, &mut state, home, &mut coverage, None)
+    })
+    .unwrap_err();
+    assert!(error.is::<crate::ingest::CaptureCancelled>(), "{error:#}");
+    let saved = |state: &Map<String, Value>, id: &str| {
+        state
+            .get(EDITOR_STATE_KEY)
+            .and_then(|seen| seen.get(locator(&db, id)))
+            .is_some()
+    };
+    assert!(saved(&state, "a"));
+    assert!(!saved(&state, "b") && !saved(&state, "c"));
+    assert_eq!(count(&history, "history", "b"), 0);
+    // The retry reads only the two left.
+    let mut coverage = crate::ingest::SweepCoverage::default();
+    assert_eq!(
+        sync_editor_composers_in(&history, &mut state, home, &mut coverage, None).unwrap(),
+        2
+    );
+    assert!(coverage.complete());
+    for id in ["a", "b", "c"] {
+        assert!(saved(&state, id));
+        assert_eq!(count(&history, "history", id), 1);
+    }
+}
+
+/// A headerless composer (the oldest layout) is ordered by SQLite: a full
+/// read brings each payload into memory once, as it renders it, and a
+/// preview brings in none.
+#[test]
+fn a_headerless_composer_is_ordered_without_materializing_its_payloads() {
+    let dir = tempfile::tempdir().unwrap();
+    let (db, conn) = open_state_db(dir.path()).unwrap();
+    // Inserted newest first, so key and rowid order both disagree with time.
+    for i in (0..500).rev() {
+        let id = format!("b{i:03}");
+        let bubble = if i % 2 == 0 {
+            user_bubble(&id, &format!("turn {i}"), START + i * 1_000)
+        } else {
+            // Older builds wrote a number.
+            json!({"type": 2, "bubbleId": id, "text": format!("turn {i}"), "createdAt": START + i * 1_000})
+        };
+        put(&conn, &format!("bubbleId:c:{id}"), &bubble).unwrap();
+    }
+    put(
+        &conn,
+        "bubbleId:c:undated",
+        &json!({"type": 1, "bubbleId": "undated", "text": "undated"}),
+    )
+    .unwrap();
+    put(&conn, "bubbleId:c:junk", &json!("not a bubble")).unwrap();
+    put(
+        &conn,
+        "composerData:c",
+        &json!({"_v": 14, "createdAt": START}),
+    )
+    .unwrap();
+    close_idle(&db, conn).unwrap();
+
+    let materialized = || read::MATERIALIZED.with(std::cell::Cell::get);
+    let before = materialized();
+    let preview = read_composer_preview(&db, "c").unwrap().unwrap();
+    assert_eq!(
+        materialized() - before,
+        0,
+        "a preview defers the headerless layout"
+    );
+    assert_eq!(preview.records, 0);
+    assert!(!preview.incomplete);
+
+    let before = materialized();
+    let full = read_composer(&db, "c").unwrap().unwrap();
+    assert_eq!(
+        materialized() - before,
+        502,
+        "each payload once, while rendering"
+    );
+    assert_eq!(full.skipped_bubbles, 1, "the row that is not a bubble");
+    let texts = texts(&full);
+    assert_eq!(texts.len(), 501);
+    assert_eq!(texts[0], "turn 0");
+    assert_eq!(texts[499], "turn 499");
+    assert_eq!(texts[500], "undated");
 }
 
 #[test]

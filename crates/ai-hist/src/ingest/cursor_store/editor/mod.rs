@@ -49,6 +49,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
+mod order;
 mod read;
 mod render;
 mod sync;
@@ -112,6 +113,11 @@ pub(crate) struct Composer {
     pub records: usize,
     /// Bubbles the conversation names that were missing or not readable JSON.
     pub skipped_bubbles: usize,
+    /// The conversation could not be read to the extent it declares: a
+    /// declared header chunk missing or malformed, fewer headers than its
+    /// header log counts, or a listed bubble unreadable. What was read is
+    /// indexed, but the read is not reported complete.
+    pub incomplete: bool,
 }
 
 /// A composer found by enumeration: its id, change stamp and recency.

@@ -1201,7 +1201,20 @@ How each adapter works:
     multi-root workspace names no folder and gets no cwd.
 
   The conversation's order is the header chunks, else the inline headers,
-  else the inline bubbles, else every bubble row by creation time. Each bubble
+  else the inline bubbles, else every bubble row by creation time. A
+  `headerLog` with `chunkCount` and `count` declares the extent: exactly
+  chunks `000000` up to `chunkCount` are read (a chunk past it is an older
+  generation and is ignored) and the first `count` headers in them. A
+  declared chunk that is missing or not a header array, fewer headers than
+  `count`, or a listed bubble that is missing or unreadable makes the read
+  **incomplete**: what was readable is indexed, but sync saves no stamp for
+  it and tells the sweep it did not read everything (so it is read again next
+  pass), and hydration reports `CURSOR_EDITOR_CONVERSATION_INCOMPLETE`. A
+  composer with no header log reads every chunk it has. The headerless layout
+  is ordered by SQLite from each payload's `createdAt`, so only rowids leave
+  SQLite and each payload is brought into memory once as it is rendered; a
+  shallow preview of that layout renders nothing and leaves it to the full
+  read. Each bubble
   is rendered as a transcript record and parsed by the transcript parser:
   person text as a user `text` block, thinking as `thinking`, a tool call as
   `tool_use` with its real id followed by a user-role `tool_result` when the
@@ -1219,7 +1232,9 @@ How each adapter works:
   and rowid total of its `bubbleId:` and `composerConvHeaders:` rows. Sync
   (state key `cursor_editor_composers_v1`) and discovery re-read a composer
   only when its stamp moves, then rebuild its session whole; a composer with
-  no bubbles is not a session. The database is opened read-only with a 2 s
+  no bubbles is not a session. Sync reads, rebuilds and commits one composer
+  at a time, so a first import holds one conversation in memory, and an
+  interrupted pass keeps what it committed and leaves the rest unstamped. The database is opened read-only with a 2 s
   busy timeout, inside one read transaction; with Cursor closed (no `-wal`)
   it is opened `immutable=1` so nothing is created beside it, and a read that
   raced a writer is dropped for that pass. The watcher follows

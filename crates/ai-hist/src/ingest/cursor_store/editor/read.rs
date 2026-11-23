@@ -7,6 +7,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
+use super::order::{conversation, Bubble};
 use super::render::bubble_records;
 use super::{file_stamp, Composer, ComposerHead};
 
@@ -15,7 +16,7 @@ pub(crate) const PREVIEW_BUBBLES: usize = 16;
 
 /// The half-open key range `[prefix, prefix with its last `:` bumped to `;`)`:
 /// every key that starts with `prefix`, through the key index.
-fn key_range(prefix: &str) -> (String, String) {
+pub(super) fn key_range(prefix: &str) -> (String, String) {
     let upper = match prefix.strip_suffix(':') {
         Some(stem) => format!("{stem};"),
         None => format!("{prefix}\u{10FFFF}"),
@@ -81,7 +82,7 @@ fn stamp_of(conn: &Connection, id: &str, rowid: i64, value: &[u8]) -> Result<(St
     Ok((stamp, bubbles.0 > 0 || inline > 0))
 }
 
-fn millis(value: Option<&Value>) -> Option<i64> {
+pub(super) fn millis(value: Option<&Value>) -> Option<i64> {
     let value = value?;
     value
         .as_i64()
@@ -194,17 +195,21 @@ fn read_bounded(db: &Path, id: &str, ends: Option<usize>) -> Result<Option<Compo
             ..Composer::default()
         };
         composer.updated_ms = millis(data.get("lastUpdatedAt")).or(composer.created_ms);
-        let conversation = conversation(conn, id, &data)?;
-        if conversation.is_empty() {
+        let conversation = conversation(conn, id, &data, ends.is_some())?;
+        if conversation.bubbles.is_empty() {
             return Ok(None);
         }
-        for position in selected(conversation.len(), ends) {
-            let bubble = match &conversation[position] {
+        composer.incomplete = conversation.incomplete;
+        for position in selected(conversation.bubbles.len(), ends) {
+            let bubble = match &conversation.bubbles[position] {
                 Bubble::Inline(bubble) => Some(bubble.clone()),
                 Bubble::Row(bubble_id) => bubble_row(conn, id, bubble_id)?,
+                Bubble::Rowid(rowid) => bubble_at(conn, *rowid)?,
+                Bubble::Deferred => continue,
             };
             let Some(bubble) = bubble.filter(Value::is_object) else {
                 composer.skipped_bubbles += 1;
+                composer.incomplete = true;
                 continue;
             };
             for record in bubble_records(&bubble) {
@@ -219,92 +224,6 @@ fn read_bounded(db: &Path, id: &str, ends: Option<usize>) -> Result<Option<Compo
     Ok(composer)
 }
 
-/// One message of the conversation: a bubble row by id, or a whole bubble
-/// the oldest builds keep inline in `composerData.conversation`.
-enum Bubble {
-    Row(String),
-    Inline(Value),
-}
-
-/// The conversation in order. The header chunks are the order Cursor shows;
-/// without them the inline header list, then inline bubbles, and last every
-/// bubble row the composer has, by creation time.
-fn conversation(conn: &Connection, id: &str, data: &Value) -> Result<Vec<Bubble>> {
-    let headers = header_chunks(conn, id)?;
-    if !headers.is_empty() {
-        return Ok(headers.into_iter().map(Bubble::Row).collect());
-    }
-    let inline_headers = header_ids(data.get("fullConversationHeadersOnly"));
-    if !inline_headers.is_empty() {
-        return Ok(inline_headers.into_iter().map(Bubble::Row).collect());
-    }
-    if let Some(inline) = data.get("conversation").and_then(Value::as_array) {
-        if !inline.is_empty() {
-            return Ok(inline.iter().cloned().map(Bubble::Inline).collect());
-        }
-    }
-    all_bubbles(conn, id)
-}
-
-fn header_ids(headers: Option<&Value>) -> Vec<String> {
-    headers
-        .and_then(Value::as_array)
-        .map(|headers| {
-            headers
-                .iter()
-                .filter_map(|header| header.get("bubbleId")?.as_str())
-                .filter(|id| !id.is_empty())
-                .map(str::to_string)
-                .collect()
-        })
-        .unwrap_or_default()
-}
-
-/// The bubble ids in `composerConvHeaders:<id>:<chunk>`, chunks in key order.
-fn header_chunks(conn: &Connection, id: &str) -> Result<Vec<String>> {
-    let (low, high) = key_range(&format!("composerConvHeaders:{id}:"));
-    let mut stmt = conn.prepare_cached(
-        "SELECT CAST(value AS BLOB) FROM cursorDiskKV WHERE key >= ?1 AND key < ?2 ORDER BY key",
-    )?;
-    let chunks = stmt
-        .query_map([low, high], |row| row.get::<_, Option<Vec<u8>>>(0))?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(chunks
-        .into_iter()
-        .flatten()
-        .filter_map(|chunk| serde_json::from_slice::<Value>(&chunk).ok())
-        .flat_map(|chunk| header_ids(Some(&chunk)))
-        .collect())
-}
-
-/// Every bubble row of the composer, oldest first; rowid breaks a tie.
-fn all_bubbles(conn: &Connection, id: &str) -> Result<Vec<Bubble>> {
-    let (low, high) = key_range(&format!("bubbleId:{id}:"));
-    let mut stmt = conn.prepare_cached(
-        "SELECT rowid, CAST(value AS BLOB) FROM cursorDiskKV WHERE key >= ?1 AND key < ?2",
-    )?;
-    let mut rows = stmt
-        .query_map([low, high], |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                row.get::<_, Option<Vec<u8>>>(1)?.unwrap_or_default(),
-            ))
-        })?
-        .collect::<rusqlite::Result<Vec<_>>>()?
-        .into_iter()
-        .map(|(rowid, value)| {
-            let bubble = serde_json::from_slice::<Value>(&value).unwrap_or(Value::Null);
-            let at = millis(bubble.get("createdAt")).unwrap_or(i64::MAX);
-            (at, rowid, bubble)
-        })
-        .collect::<Vec<_>>();
-    rows.sort_by_key(|(at, rowid, _)| (*at, *rowid));
-    Ok(rows
-        .into_iter()
-        .map(|(_, _, bubble)| Bubble::Inline(bubble))
-        .collect())
-}
-
 fn bubble_row(conn: &Connection, id: &str, bubble_id: &str) -> Result<Option<Value>> {
     let value = conn
         .prepare_cached("SELECT CAST(value AS BLOB) FROM cursorDiskKV WHERE key = ?1")?
@@ -313,7 +232,30 @@ fn bubble_row(conn: &Connection, id: &str, bubble_id: &str) -> Result<Option<Val
         })
         .optional()?
         .flatten();
-    Ok(value.and_then(|value| serde_json::from_slice::<Value>(&value).ok()))
+    Ok(parse_bubble(value))
+}
+
+/// A bubble row by the rowid the headerless ordering chose.
+fn bubble_at(conn: &Connection, rowid: i64) -> Result<Option<Value>> {
+    let value = conn
+        .prepare_cached("SELECT CAST(value AS BLOB) FROM cursorDiskKV WHERE rowid = ?1")?
+        .query_row([rowid], |row| row.get::<_, Option<Vec<u8>>>(0))
+        .optional()?
+        .flatten();
+    Ok(parse_bubble(value))
+}
+
+/// A bubble payload brought into memory and parsed. Every bubble a read
+/// renders passes through here, so tests can count the payloads it touched.
+fn parse_bubble(value: Option<Vec<u8>>) -> Option<Value> {
+    #[cfg(test)]
+    MATERIALIZED.with(|count| count.set(count.get() + 1));
+    serde_json::from_slice::<Value>(&value?).ok()
+}
+
+#[cfg(test)]
+thread_local! {
+    pub(super) static MATERIALIZED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 /// The positions to render: all of them, or each end of the conversation.

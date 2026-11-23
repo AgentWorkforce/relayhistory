@@ -333,6 +333,18 @@ pub(super) fn ingest_editor_composer(
             records_parsed: None,
         });
     }
+    if composer.incomplete {
+        diagnostics.push(HydrationDiagnostic {
+            code: "CURSOR_EDITOR_CONVERSATION_INCOMPLETE".to_string(),
+            message: "the Cursor editor conversation could not be read to the extent its header \
+                      log declares (a declared chunk missing or malformed, or fewer headers than \
+                      it counts); what was readable was indexed"
+                .to_string(),
+            duration_ms: None,
+            source_bytes: None,
+            records_parsed: None,
+        });
+    }
     let outcome = IngestOutcome {
         records,
         bytes_read: i64::try_from(composer.transcript.len()).unwrap_or(i64::MAX),
