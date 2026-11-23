@@ -4,7 +4,11 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased - Patch]
+## [Unreleased - Minor]
+
+### Added
+
+- Cursor editor (desktop app) Agent conversations that have no `agent-transcripts` transcript and no `cursor-agent` chat store are now cataloged and indexed from the editor's own database, `globalStorage/state.vscdb` in Cursor's user directory (`~/Library/Application Support/Cursor/User` on macOS, `~/.config/Cursor/User` on Linux, `%APPDATA%\Cursor\User` on Windows), under the `cursor` source with the composer id as the session id. Until now these conversations were never imported. Prompts, replies, thinking, tool calls with their ids, tool results, file edits, per-message times, the conversation's title and its workspace folder are captured; the database is opened read-only and only conversations whose rows changed are re-read.
 
 ### Fixed
 

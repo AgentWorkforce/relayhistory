@@ -149,7 +149,9 @@ pub(crate) fn project_dir_name(path: &Path) -> Option<&str> {
 /// `Write`/`StrReplace`/`ApplyPatch` set used by Claude- and Grok-served
 /// models, the `functions.*` namespaced set used by GPT-served models, and an
 /// older snake_case `edit_file`/`write_file` set. All three are recognized
-/// here; a name Cursor does not write simply never matches.
+/// here; a name Cursor does not write simply never matches. The editor's own
+/// store versions the snake_case names (`edit_file_v2`), and the version is
+/// not part of what the tool does.
 pub(crate) fn is_file_edit_tool(name: &str) -> bool {
     matches!(
         normalize_tool_name(name),
@@ -172,6 +174,7 @@ pub(crate) fn is_file_edit_tool(name: &str) -> bool {
 /// `functions.ApplyPatch`, `ApplyPatch` and `apply_patch` classify alike.
 fn normalize_tool_name(name: &str) -> &str {
     let bare = name.rsplit('.').next().unwrap_or(name);
+    let bare = bare.strip_suffix("_v2").unwrap_or(bare);
     // `str::to_lowercase` would allocate; these names are ASCII, and the
     // matcher above lists both the lowered CamelCase and the snake_case forms.
     LOWERED
@@ -229,15 +232,22 @@ pub(crate) fn pick_tool_target(name: &str, input: &Value) -> Option<String> {
         }
     }
     match normalize_tool_name(name) {
-        "shell" | "awaitshell" => get("command").or_else(|| get("cmd")),
-        "grep" | "glob" => get("pattern")
-            .or_else(|| get("query"))
-            .or_else(|| get("path")),
+        "shell" | "awaitshell" | "run_terminal_command" | "run_terminal_cmd" => {
+            get("command").or_else(|| get("cmd"))
+        }
+        "grep" | "glob" | "ripgrep_raw_search" | "grep_search" | "glob_file_search" => {
+            get("pattern")
+                .or_else(|| get("globPattern"))
+                .or_else(|| get("query"))
+                .or_else(|| get("path"))
+        }
         _ => get("path")
             .or_else(|| get("file_path"))
             .or_else(|| get("filePath"))
             .or_else(|| get("target_file"))
             .or_else(|| get("relative_workspace_path"))
+            .or_else(|| get("targetFile"))
+            .or_else(|| get("relativeWorkspacePath"))
             .or_else(|| get("notebook_path"))
             .or_else(|| get("uri"))
             .or_else(|| get("url"))
@@ -689,6 +699,41 @@ pub(crate) fn record_blocks(obj: &serde_json::Map<String, Value>) -> Vec<Value> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The editor's versioned tool names classify and target like the
+    /// transcript's.
+    #[test]
+    fn editor_tool_names_are_recognized() {
+        use serde_json::json;
+        assert!(is_file_edit_tool("edit_file_v2"));
+        assert!(!is_file_edit_tool("read_file_v2"));
+        assert!(is_subagent_tool("task_v2"));
+        assert_eq!(
+            pick_tool_target("edit_file_v2", &json!({"relativeWorkspacePath": "/w/a.rs"}))
+                .as_deref(),
+            Some("/w/a.rs")
+        );
+        assert_eq!(
+            pick_tool_target("read_file_v2", &json!({"targetFile": "/w/b.rs"})).as_deref(),
+            Some("/w/b.rs")
+        );
+        assert_eq!(
+            pick_tool_target(
+                "run_terminal_command_v2",
+                &json!({"command": "ls", "cwd": ""})
+            )
+            .as_deref(),
+            Some("ls")
+        );
+        assert_eq!(
+            pick_tool_target(
+                "glob_file_search",
+                &json!({"targetDirectory": "/w", "globPattern": "**/*.rs"})
+            )
+            .as_deref(),
+            Some("**/*.rs")
+        );
+    }
 
     /// A zone that is not a zone must be unreadable, not re-signed.
     ///

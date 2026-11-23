@@ -18,7 +18,7 @@ use super::{chat_store_stamp_and_modified, meta_json_path, sidecar, store_sessio
 /// directory, so that store is read as immutable instead, which touches
 /// nothing and sees exactly what a normal reader would. The caller re-stamps
 /// after the read and drops it if a writer appeared meanwhile.
-fn open_store(path: &Path) -> Result<Connection> {
+pub(crate) fn open_store(path: &Path) -> Result<Connection> {
     let conn = if sidecar(path, "-wal").exists() {
         Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
     } else {
@@ -28,7 +28,7 @@ fn open_store(path: &Path) -> Result<Connection> {
             OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
         )
     };
-    conn.with_context(|| format!("open Cursor chat store {}", path.display()))
+    conn.with_context(|| format!("open Cursor store {}", path.display()))
 }
 
 /// `path` as a SQLite `file:` URI path: every byte outside the unreserved
@@ -274,7 +274,7 @@ fn hex_digit(byte: u8) -> Option<u8> {
 
 /// The path a `file://` URI names, percent escapes decoded; a malformed
 /// escape is kept as written.
-pub(super) fn file_uri_path(uri: &str) -> Option<String> {
+pub(crate) fn file_uri_path(uri: &str) -> Option<String> {
     let bytes = uri.strip_prefix("file://")?.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut at = 0;

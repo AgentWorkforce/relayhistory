@@ -36,6 +36,9 @@
 //! transcript, the store keeps tool results and tool-call ids, so those are
 //! kept. Every rendered record carries its blob id as `message.id`.
 //!
+//! The Cursor editor's own database, read the same way for the editor's
+//! conversations, is [`editor`].
+//!
 //! The meta also names a `blobEncryptionKey`. No store seen so far encrypted
 //! its blobs; a blob that is not readable JSON is skipped and counted, never a
 //! failure of the chat.
@@ -45,6 +48,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 
+pub(crate) mod editor;
 mod read;
 mod render;
 mod sync;
@@ -53,7 +57,7 @@ pub(crate) mod test_support;
 #[cfg(test)]
 mod tests;
 
-pub(crate) use read::{read_chat_store, read_chat_store_preview};
+pub(crate) use read::{file_uri_path, open_store, read_chat_store, read_chat_store_preview};
 pub(in crate::ingest) use sync::sync_chat_stores_in;
 
 /// Where Cursor keeps its chat stores, relative to the home directory.
@@ -105,7 +109,7 @@ pub(crate) fn store_session_id(path: &Path) -> Option<&str> {
     path.parent()?.file_name()?.to_str()
 }
 
-pub(super) fn sidecar(path: &Path, suffix: &str) -> PathBuf {
+pub(crate) fn sidecar(path: &Path, suffix: &str) -> PathBuf {
     let mut name = path.as_os_str().to_owned();
     name.push(suffix);
     PathBuf::from(name)
@@ -214,6 +218,15 @@ pub(crate) fn chat_stores(
             partial.is_none_or(|scope| scope.mentions(path.parent().unwrap_or(path)))
         });
     Ok(owners.collect())
+}
+
+/// The chat id of every chat store under `home`, whichever copy owns it.
+pub(crate) fn chat_store_ids(home: &Path) -> Result<HashSet<String>> {
+    let chats = home.join(CHATS_DIR);
+    if !chats.is_dir() {
+        return Ok(HashSet::new());
+    }
+    Ok(all_stores(&chats)?.into_iter().map(|(_, id)| id).collect())
 }
 
 /// Every `<workspace>/<id>/store.db` under `chats`.
