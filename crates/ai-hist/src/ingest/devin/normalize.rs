@@ -44,6 +44,7 @@ struct NodeCtx<'a> {
 }
 
 mod roles;
+mod untimed;
 
 impl DevinNormalize<'_> {
     fn note_ts(&mut self, ts: i64) {
@@ -57,14 +58,13 @@ impl DevinNormalize<'_> {
         &mut self,
         loaded: &DevinSession,
         node_message_ids: &BTreeMap<i64, String>,
-        base_ts: i64,
+        base_ts: Option<i64>,
     ) -> Result<()> {
         let conn = self.conn;
         let session_id = self.session_id;
+        let mut inherited: Option<i64> = None;
 
         for node in &loaded.nodes {
-            let ts = node.created_ms.unwrap_or(base_ts);
-            self.note_ts(ts);
             let message_id = node_message_ids
                 .get(&node.node_id)
                 .cloned()
@@ -73,6 +73,12 @@ impl DevinNormalize<'_> {
                 .parent_node_id
                 .and_then(|parent| node_message_ids.get(&parent))
                 .cloned();
+            // See `untimed`: never 0.
+            let Some(ts) = untimed::node_ts(node, base_ts, &mut inherited) else {
+                self.keep_untimed_node(node, &message_id, parent_id.as_deref())?;
+                continue;
+            };
+            self.note_ts(ts);
             // Node metadata survives even when the message document is malformed
             // or the user turn is synthetic. Record the boundary before either
             // branch can continue past the role-specific normalization below.
@@ -167,6 +173,7 @@ impl DevinNormalize<'_> {
                 control_kind: None,
                 // Devin's usage is stored once per message; `token_json` is it.
                 record_token_json: None,
+                origin_kind: None,
             };
 
             let ctx = NodeCtx {
@@ -192,7 +199,11 @@ impl DevinNormalize<'_> {
         Ok(())
     }
 
-    pub(super) fn index_orphans(&mut self, loaded: &DevinSession, base_ts: i64) -> Result<()> {
+    pub(super) fn index_orphans(
+        &mut self,
+        loaded: &DevinSession,
+        base_ts: Option<i64>,
+    ) -> Result<()> {
         let conn = self.conn;
         let session_id = self.session_id;
         let project = self.project;
@@ -205,7 +216,10 @@ impl DevinNormalize<'_> {
 
         // Tool calls the provider persisted without a referencing message node —
         // they are still evidence, keyed by the call's own id.
-        let orphan_ts = loaded.info.last_activity_ms.unwrap_or(base_ts);
+        let Some(orphan_ts) = untimed::orphan_ts(loaded, base_ts, *self.last_ts) else {
+            untimed::report_untimed_orphans(self.session_id, loaded, self.referenced_tool_calls);
+            return Ok(());
+        };
         for (call_id, state) in &loaded.tools {
             if referenced_tool_calls.contains(call_id) {
                 continue;
@@ -302,7 +316,7 @@ impl DevinNormalize<'_> {
                 session_id,
                 &NewSessionMarker {
                     marker_uid: &uid,
-                    ts_ms: loaded.info.created_ms,
+                    ts_ms: untimed::positive(loaded.info.created_ms),
                     message_id: None,
                     parent_id: None,
                     turn_id: None,
@@ -377,7 +391,7 @@ impl DevinNormalize<'_> {
                     session_id,
                     &NewSessionMarker {
                         marker_uid: &uid,
-                        ts_ms: loaded.info.created_ms,
+                        ts_ms: untimed::positive(loaded.info.created_ms),
                         message_id: None,
                         parent_id: None,
                         turn_id: None,
@@ -437,7 +451,8 @@ impl DevinNormalize<'_> {
                     session_id,
                     &NewSessionMarker {
                         marker_uid: &uid,
-                        ts_ms: loaded.info.last_activity_ms.or(loaded.info.created_ms),
+                        ts_ms: untimed::positive(loaded.info.last_activity_ms)
+                            .or(untimed::positive(loaded.info.created_ms)),
                         message_id: None,
                         parent_id: None,
                         turn_id: None,

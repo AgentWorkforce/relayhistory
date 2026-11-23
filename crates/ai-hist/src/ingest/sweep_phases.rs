@@ -254,7 +254,19 @@ impl SweepPhases<'_, '_> {
             &projects,
             self.coverage,
             scope.paths(),
-        );
+        )
+        .and_then(|transcripts| {
+            // Chats Cursor kept only in its own chat store, after the
+            // transcripts so a chat that has both is read from its transcript.
+            super::cursor_store::sync_chat_stores_in(
+                self.conn,
+                self.state,
+                &self.roots.home,
+                self.coverage,
+                scope.paths(),
+            )
+            .map(|stores| transcripts + stores)
+        });
         self.counted("cursor", result);
         Ok(())
     }

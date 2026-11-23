@@ -216,6 +216,7 @@ pub ai_hist::Source::Cortex
 pub ai_hist::Source::Cursor
 pub ai_hist::Source::DeepAgents
 pub ai_hist::Source::Devin
+pub ai_hist::Source::Droid
 pub ai_hist::Source::Goose
 pub ai_hist::Source::Grok
 pub ai_hist::Source::GrokBot
@@ -688,6 +689,7 @@ pub ai_hist::SessionEvent::is_sidechain: core::option::Option<i64>
 pub ai_hist::SessionEvent::kind: alloc::string::String
 pub ai_hist::SessionEvent::message_id: core::option::Option<alloc::string::String>
 pub ai_hist::SessionEvent::model: core::option::Option<alloc::string::String>
+pub ai_hist::SessionEvent::origin_kind: core::option::Option<alloc::string::String>
 pub ai_hist::SessionEvent::parent_id: core::option::Option<alloc::string::String>
 pub ai_hist::SessionEvent::payload_bytes: core::option::Option<i64>
 pub ai_hist::SessionEvent::payload_hash: core::option::Option<alloc::string::String>
@@ -837,6 +839,7 @@ pub fn ai_hist::SessionStore::remove_retention_consumer(&self, &str) -> core::re
 pub fn ai_hist::SessionStore::retention_generation(&self) -> core::result::Result<u64, ai_hist::Error>
 pub fn ai_hist::SessionStore::retention_policy(&self) -> core::result::Result<ai_hist::retention::RetentionPolicy, ai_hist::Error>
 pub fn ai_hist::SessionStore::set_retention_policy(&self, ai_hist::retention::RetentionPolicy) -> core::result::Result<(), ai_hist::Error>
+pub fn ai_hist::SessionStore::set_registered_agent_name(&self, ai_hist::Source, &str, core::option::Option<&str>) -> core::result::Result<bool, ai_hist::Error>
 impl ai_hist::SessionStore
 pub fn ai_hist::SessionStore::apply_source_evidence(&self, ai_hist::SourceEvidenceSubmission) -> core::result::Result<ai_hist::HydrateSessionResult, ai_hist::Error>
 pub fn ai_hist::SessionStore::apply_source_observations(&self, ai_hist::SourceObservationBatch) -> core::result::Result<ai_hist::DiscoverySummary, ai_hist::Error>

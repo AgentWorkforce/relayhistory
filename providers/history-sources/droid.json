@@ -1,0 +1,84 @@
+{
+  "id": "droid",
+  "rust_id": "droid",
+  "variant": "Droid",
+  "order": 447,
+  "aliases": [
+    "factory"
+  ],
+  "fixtures": [
+    {
+      "source": "droid",
+      "name": "v2-synthetic",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "droid/v2-synthetic"
+      ],
+      "quirk": "Synthetic v2 JSONL and settings sidecar based on Droid 0.148.1 observed persistence shape and SDK 0.10.0 discovery; not a successful authenticated writer capture. Native IDs, thinking, tools, mixed human/tool results, unknown blocks and cumulative usage markers."
+    },
+    {
+      "source": "droid",
+      "name": "v2-native-startup",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "droid/v2-native-startup"
+      ],
+      "quirk": "Sanitized native Droid 0.148.1 session_start and settings written by an owned readonly exec on 2026-11-07. Inference failed authentication before any message or tool; metadata-only persistence is verified, authenticated message/reader round trip remains unverified."
+    },
+    {
+      "source": "droid",
+      "name": "v2-native-writer",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "droid/v2-native-writer"
+      ],
+      "quirk": "Sanitized owned native capture: task-private official Droid 1.6.0 resumed a 0.148.1 metadata-only session and completed an authenticated Claude Opus 4.8 turn on 2026-11-07. Native v2 messages, IDs/parent links, hook rows, llm_only startup reminders and turn outcome are preserved; paths, identities, context, commands and harmless prompt/reply text are replaced. Tool and second-turn append coverage remain synthetic."
+    },
+    {
+      "source": "droid",
+      "name": "v2-native-read",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "droid/v2-native-read"
+      ],
+      "quirk": "Owned authenticated Droid 1.6.0 capture from 2026-11-07, first completed turn: real Read success and an explicit missing-file error. Native message/tool identities are mapped consistently and owned verification paths are replaced; harmless prompt, reply and tool-result text are retained. Unrelated provider startup context and hook execution records are omitted (covered separately by v2-native-writer). No synthetic tool outcome and no MCP or hosted-upload claim."
+    },
+    {
+      "source": "droid",
+      "name": "v2-native-resume",
+      "layout": "HomeTree",
+      "origin": "RelayHistory",
+      "files": [
+        "droid/v2-native-resume"
+      ],
+      "quirk": "Owned authenticated Droid 1.6.0 capture from 2026-11-07, second same-session turn: a distinct Read call, retained first-turn records and a resumed assistant reply. Native message/tool identities are mapped consistently and owned verification paths are replaced; harmless prompt, reply and tool-result text are retained. Unrelated provider startup context and hook execution records are omitted (covered separately by v2-native-writer). No synthetic tool outcome and no MCP or hosted-upload claim."
+    }
+  ],
+  "capture": [
+    {
+      "evidence": "Messages and identity",
+      "coverage": "Native v2 session_start, message IDs/parent links, timestamps and tool outcomes verified against owned authenticated Droid 1.6.0 initial and resumed writer captures. Public SessionStore imports after each turn retain previous IDs and remain idempotent on repeat capture. Explicit llm_only/user_only and hook context stays metadata. Legacy/project roots, coherent sidecars, unsupported versions and duplicate identities are covered."
+    },
+    {
+      "evidence": "Tools and metadata",
+      "coverage": "Authenticated Droid 1.6.0 Read success/error and a second same-session Read verify native tool_use IDs joining tool_result tool_use_id and explicit is_error fidelity. Native marker links, envelope provenance and bounded tool/block metadata are retained, including non-text shapes covered synthetically; mixed human text stays distinct from tool output. Session settings and cumulative counters stay metadata; no inferred per-message usage, credits-to-token conversion, file edits or relationships."
+    },
+    {
+      "evidence": "Lifecycle",
+      "coverage": "Passive bounded head/tail discovery, selected hydration, full and scoped watch sweeps, resumed appends, deferred partial final records, full rewrites and sidecar-only updates; per-file read failures preserve the previous snapshot without blocking healthy sessions. Full transcript snapshots are limited to 128 MiB and settings to 1 MiB, with diagnostics and no retirement on failure. No agent launch or network request during acquisition."
+    }
+  ],
+  "population": {
+    "evidence": [
+      "history",
+      "session_event",
+      "tool_call",
+      "session_marker"
+    ],
+    "usage_accounting": "none"
+  }
+}

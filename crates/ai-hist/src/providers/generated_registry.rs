@@ -91,6 +91,11 @@ const REGISTRATIONS: &[Registration] = &[
         adapter: deepagents::ADAPTER,
     },
     Registration {
+        id: "droid",
+        metadata: droid::METADATA,
+        adapter: droid::ADAPTER,
+    },
+    Registration {
         id: "goose",
         metadata: goose::METADATA,
         adapter: goose::ADAPTER,

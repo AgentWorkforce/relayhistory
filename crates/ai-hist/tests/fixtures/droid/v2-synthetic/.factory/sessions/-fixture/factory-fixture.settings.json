@@ -1,0 +1,1 @@
+{"model": "fixture-model", "tokenUsage": {"inputTokens": 12, "outputTokens": 4, "cacheCreationTokens": 3, "cacheReadTokens": 5, "thinkingTokens": 2, "factoryCredits": 1}, "inclusiveTokenUsage": {"inputTokens": 999}, "interactionMode": "auto"}

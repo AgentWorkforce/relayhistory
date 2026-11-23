@@ -150,6 +150,19 @@ prompt is split out into a `system_reminder` row sharing the prompt's
 `message_id` (`event_uid` = `<prompt uid>:reminder:<n>`), and the prompt row
 and `history` carry only the human's text.
 
+`session_events.origin_kind` is who put a message in the transcript, as the
+harness recorded it: Claude's `origin.kind`, verbatim (`human` for a person at
+the prompt, `peer` for another agent session, `task-notification` for a
+background task's notice, and whatever further kinds Claude Code writes). It is
+`null` where the record names no origin, or names an empty kind (the same
+reading `control_kind` classification and the slash-command marker's
+`origin_kind` already apply), for every other source, and on rows
+indexed before the column existed (they are not re-exported for it; a re-parse
+of the record fills it). It is stored beside `control_kind`, not in place of
+it: `control_kind` says whether a row is a prompt, `origin_kind` says who sent
+it, and a downstream reader telling human-typed messages from agent-to-agent
+traffic reads both. An uploader carries it like any other stored column.
+
 A slash-command triad — caveat → invocation → output, chained by `parentUuid` —
 is additionally grouped into one `session_markers` row of
 `kind = "slash_command"`, `message_id` = the invocation's uuid, `parent_id` =

@@ -78,10 +78,10 @@ mod observed_stamps;
 mod codex_shallow;
 pub(crate) use codex_shallow::CodexProvider;
 mod cursor_files;
+pub(crate) use cursor_files::CursorProvider;
 mod opencode_page;
 use opencode_page::{
-    opencode_rows_unpaged, opencode_sqlite_model, opencode_sqlite_prompt, opencode_sqlite_title,
-    page_limited_opencode_rows,
+    opencode_rows_unpaged, opencode_enumeration_sql, opencode_shallow_fields, page_limited_opencode_rows,
 };
 
 /// Version of the machine-readable session-catalog contract.
@@ -1642,167 +1642,6 @@ pub(crate) fn claude_shallow_session_from_bytes(
 }
 
 // ---------------------------------------------------------------------------
-// cursor
-// ---------------------------------------------------------------------------
-
-pub(crate) struct CursorProvider;
-
-impl ShallowSessionProvider for CursorProvider {
-    fn acquire(
-        &self,
-        _home: &Path,
-        _observation: &crate::observations::SessionObservation,
-    ) -> Result<crate::sources::AcquiredEvidence> {
-        Ok(crate::sources::AcquiredEvidence::LocalFiles)
-    }
-    fn source(&self) -> &'static str {
-        "cursor"
-    }
-    /// The transcript parser writes prompts, events, tool calls and file edits.
-    /// A `Task` block names no child transcript, so delegation is recorded
-    /// from the other side: a subagent transcript at
-    /// `<parent>/subagents/<child>.jsonl` writes the edge to its parent.
-    fn evidence_kinds(&self) -> &'static [EvidenceKind] {
-        &[
-            EvidenceKind::History,
-            EvidenceKind::SessionEvent,
-            EvidenceKind::ToolCall,
-            EvidenceKind::FileEdit,
-            EvidenceKind::Relationship,
-        ]
-    }
-
-    fn watch_roots(&self, roots: &ProviderRoots<'_>) -> Vec<WatchRoot> {
-        vec![WatchRoot::tree(roots.home.join(".cursor/projects"))]
-    }
-
-    fn enumerate(
-        &self,
-        env: &DiscoveryEnv<'_>,
-        _requested_limit: Option<usize>,
-    ) -> Result<Vec<Candidate>> {
-        cursor_files::candidates(env)
-    }
-
-    fn read_shallow(
-        &self,
-        scan: &ScanEnv<'_>,
-        _catalog: Option<&Connection>,
-        candidate: &Candidate,
-    ) -> Result<Option<ShallowSession>> {
-        let path = PathBuf::from(&candidate.locator);
-        let Some(session_id) = candidate.session_id.clone() else {
-            return Ok(None);
-        };
-        let bounded = read_bounded_jsonl(scan, &path)?;
-        let first_prompt = bounded
-            .head_records()
-            .filter_map(|line| {
-                let line = String::from_utf8_lossy(line);
-                crate::parse_cursor_text(&line).ok().flatten()
-            })
-            .map(|prompt| excerpt(&prompt))
-            .find(|prompt| !prompt.is_empty());
-        // Cursor writes no timestamp field and no model on its records. The
-        // only time signal in the file is the localized `<timestamp>` tag its
-        // client injects into a human turn, so the head read looks for that
-        // and reports nothing when the build did not write one. `models` is
-        // read from `message.model` for the builds that write it; an empty
-        // list means "not seen", never "no model".
-        let mut head_times = bounded.head_records().filter_map(cursor_record_time);
-        let first_activity_ms = head_times.next();
-        // For a transcript past the head budget the tail is a separate region,
-        // so a turn time that only appears in the head is unreachable from the
-        // tail scan. A long run of assistant and tool records after one dated
-        // human turn is the ordinary shape of that: the tail finds no tag,
-        // because only a human turn carries one, and falling straight to the
-        // mtime reported a session as having last spoken "now". Full ingestion
-        // disagrees — those records inherit the open turn's time — and because
-        // the discovery upsert merges `last_activity_ms` with `MAX`, the mtime
-        // would also re-expand a window a rebuild had just retracted. The last
-        // time the head could read is the best recorded evidence there is; the
-        // mtime stays for a transcript with no readable turn time at all.
-        let last_head_ms = head_times.last().or(first_activity_ms);
-        let last_activity_ms = bounded
-            .tail_records_rev()
-            .find_map(cursor_record_time)
-            .or(last_head_ms)
-            .or_else(|| crate::file_modified_ms(&path));
-        let mut models = Vec::new();
-        for model in bounded.head_records().filter_map(cursor_record_model) {
-            if !models.contains(&model) {
-                models.push(model);
-            }
-        }
-        let last_assistant_text = bounded
-            .tail_records_rev()
-            .find_map(cursor_assistant_text)
-            .map(|text| excerpt(&text));
-        // Found by walking up rather than at a fixed depth: a subagent
-        // transcript sits one directory deeper than its parent's.
-        let cwd = crate::ingest::cursor::project_dir_name(&path).map(crate::decode_cursor_project);
-        Ok(Some(ShallowSession {
-            source: "cursor".into(),
-            session_id,
-            cwd,
-            first_activity_ms,
-            last_activity_ms,
-            first_prompt,
-            last_assistant_text,
-            models,
-            raw_path: Some(candidate.locator.clone()),
-            ..Default::default()
-        }))
-    }
-}
-
-/// Epoch milliseconds for one Cursor record, from the injected `<timestamp>`
-/// tag or from a record `timestamp` field if a build writes one.
-fn cursor_record_time(line: &[u8]) -> Option<i64> {
-    let value = parse_record(line)?;
-    let obj = value.as_object()?;
-    if let Some(ts) = obj.get("timestamp").and_then(|v| {
-        v.as_str()
-            .and_then(crate::parse_iso_ms)
-            .or_else(|| v.as_i64())
-    }) {
-        return Some(ts);
-    }
-    crate::ingest::cursor::injected_turn_time(
-        crate::ingest::cursor::record_role(obj),
-        &crate::ingest::cursor::record_blocks(obj),
-    )
-}
-
-/// `message.model` for the Cursor builds that record one.
-fn cursor_record_model(line: &[u8]) -> Option<String> {
-    let value = parse_record(line)?;
-    let model = value.get("message")?.get("model")?.as_str()?.trim();
-    (!model.is_empty()).then(|| model.to_string())
-}
-
-/// The assistant prose in one Cursor record, ignoring tool and marker blocks.
-fn cursor_assistant_text(line: &[u8]) -> Option<String> {
-    let value = parse_record(line)?;
-    let obj = value.as_object()?;
-    if crate::ingest::cursor::record_role(obj) != Some("assistant") {
-        return None;
-    }
-    // One assistant record can hold several text blocks — prose, a tool call,
-    // then more prose. Full ingestion walks them in order and keeps the last
-    // non-empty one, so the summary is the reply's closing line. Taking the
-    // first here instead would make the catalog advertise the opening line and
-    // hydration silently rewrite it.
-    crate::ingest::cursor::record_blocks(obj)
-        .iter()
-        .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
-        .filter_map(|block| block.get("text").and_then(Value::as_str))
-        .map(str::trim)
-        .rfind(|text| !text.is_empty())
-        .map(str::to_string)
-}
-
-// ---------------------------------------------------------------------------
 // grok
 // ---------------------------------------------------------------------------
 
@@ -2187,6 +2026,7 @@ struct OpencodeReadSnapshot {
     message_by_session: bool,
     part_by_session: bool,
     part_by_message: bool,
+    layout: crate::ingest::opencode::v2::Layout,
     sessions: BTreeMap<String, OpencodeSessionSeed>,
 }
 
@@ -2273,6 +2113,7 @@ fn open_opencode_snapshot(scan: &ScanEnv<'_>, store: &Path) -> Result<OpencodeRe
         }
         return Ok(OpencodeReadSnapshot {
             path: store.to_path_buf(),
+            layout: crate::ingest::opencode::v2::Layout::detect(&conn)?,
             conn,
             store_identity: format!("{generation_before}:{schema_version}"),
             session_columns,
@@ -2547,13 +2388,9 @@ impl ShallowSessionProvider for OpencodeProvider {
         // hold a whole pasted file, and materializing it just to take the
         // first 4096 characters would break the bounded-read promise for a
         // catalog entry.
-        let first_prompt = opencode_sqlite_prompt(scan, snapshot, &candidate.locator)?;
-        let title = opencode_sqlite_title(snapshot, &candidate.locator)?;
+        let (first_prompt, title, model) = opencode_shallow_fields(scan, snapshot, &candidate.locator)?;
         let mut models = Vec::new();
-        push_unique(
-            &mut models,
-            opencode_sqlite_model(scan, snapshot, &candidate.locator)?.as_deref(),
-        );
+        push_unique(&mut models, model.as_deref());
         Ok(Some(ShallowSession {
             source: "opencode".into(),
             session_id: candidate.locator.clone(),
@@ -2598,13 +2435,7 @@ fn unreadable_opencode_candidate(locator: &str) -> Candidate {
 
 /// Whether an earlier OpenCode store holds `session_id`, and so owns it.
 fn opencode_store_holds(snapshot: &OpencodeReadSnapshot, session_id: &str) -> Result<bool> {
-    if !snapshot.session_columns.contains("id") {
-        return Ok(false);
-    }
-    Ok(snapshot
-        .conn
-        .prepare_cached("SELECT 1 FROM session WHERE id = ?")?
-        .exists([session_id])?)
+    Ok(snapshot.layout.envelope(&snapshot.conn, session_id)?.is_some())
 }
 
 /// The newest sessions this OpenCode store *owns*, and the seeds the shallow
@@ -2628,7 +2459,7 @@ fn enumerate_opencode_snapshot(
 ) -> Result<Vec<Candidate>> {
     snapshot.sessions.clear();
     let columns = &snapshot.session_columns;
-    if !columns.contains("id") {
+    if !columns.contains("id") && !snapshot.layout.has_v2() {
         return Ok(Vec::new());
     }
     let updated = if columns.contains("time_updated") {
@@ -2669,10 +2500,8 @@ fn enumerate_opencode_snapshot(
     let limit_sql = sqlite_limit
         .map(|_| " LIMIT ? OFFSET ?")
         .unwrap_or_default();
-    let sql = format!(
-        "SELECT id, {directory}, {created}, {updated} FROM session \
-         WHERE id IS NOT NULL AND id <> '' ORDER BY {recency_order}{limit_sql}"
-    );
+    let sql =
+        opencode_enumeration_sql(snapshot, [directory, created, updated], recency_order, limit_sql)?;
     let mut stmt = snapshot.conn.prepare(&sql)?;
     let rows = match sqlite_limit {
         None => opencode_rows_unpaged(scan, &mut stmt, claimed)?,
@@ -3932,8 +3761,10 @@ fn upsert_shallow_session_in_transaction(
             session.source,
             session.cwd,
             session.git_branch,
-            session.first_activity_ms,
-            session.last_activity_ms,
+            // Not positive is not known: NULL, never 0, which a reader takes
+            // for 1970-01-01. A 0 already stored gives way above.
+            session.first_activity_ms.filter(|ts| *ts > 0),
+            session.last_activity_ms.filter(|ts| *ts > 0),
             session.last_assistant_text,
             session.raw_path,
             session.first_prompt,

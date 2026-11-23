@@ -249,6 +249,16 @@ pub(crate) struct ClaudeCursorState {
     /// reads it can resume after the message that stated one.
     #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
     pub cache_reads: std::collections::HashMap<String, i64>,
+    /// The time of the latest record that reported one, per session. A
+    /// record Claude writes without a `timestamp` inherits it, and the pass
+    /// that reads such a record can resume after the record that stated it.
+    #[serde(default, skip_serializing_if = "std::collections::HashMap::is_empty")]
+    pub record_ts: std::collections::HashMap<String, i64>,
+    /// Whether `record_ts` holds every time from byte zero. A cursor an
+    /// earlier build committed has neither field, so the next pass folds the
+    /// bytes it already read once; see `claude_untimed::fold_prefix_times`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub record_ts_from_start: bool,
     /// The slash-command triad still being chained, per session.
     ///
     /// A command's caveat, invocation and output are three records, and a
@@ -386,6 +396,16 @@ pub(crate) struct CodexCursorState {
     /// child's own, so it is not resumed from either.
     #[serde(default)]
     pub fork_replay: i64,
+    /// The time of the latest line that reported one. A line Codex writes
+    /// without a usable `timestamp` inherits it, and the pass that reads such
+    /// a line can resume after the line that stated it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub record_ts: Option<i64>,
+    /// Whether `record_ts` covers every line from byte zero. A cursor an
+    /// earlier build committed has neither field, so the next pass folds the
+    /// bytes it already read once; see `codex_untimed::LineClock::resume`.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub record_ts_from_start: bool,
 }
 
 /// A stat under which a cursor's positions were proven by their digests.

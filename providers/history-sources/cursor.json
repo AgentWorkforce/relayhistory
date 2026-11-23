@@ -28,6 +28,17 @@
     },
     {
       "source": "cursor",
+      "name": "chat-store-only",
+      "layout": "Sqlite",
+      "target": ".cursor/chats/0123456789abcdef0123456789abcdef/cur-store-00000001/store.db",
+      "origin": "RelayHistory",
+      "files": [
+        "cursor/chat-store/store-only.sql"
+      ],
+      "quirk": "a chat Cursor kept only in its own chat store, `~/.cursor/chats/<workspace>/<id>/store.db`, with no agent transcript: content-addressed message blobs listed by a protobuf root, a system prompt and `<user_info>` preamble the transcript would omit, `reasoning`, tool calls with ids and their tool results"
+    },
+    {
+      "source": "cursor",
       "name": "observed-3-13-25",
       "quirk": "the reported Cursor IDE 3.13.25 record shape: id-less `tool_use`, a `turn_ended` marker and `<timestamp>`/`<user_query>` framing; staged by the ai-hist cursor parser tests rather than by this harness",
       "layout": "Reference",

@@ -135,8 +135,17 @@ fn opencode_store_snapshot(
         &path,
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
     )?;
+    // The row the OpenCode reader reads the session from carries both times.
+    // OpenCode 2 keeps them when it copies a V1 session, so its stamps are
+    // marked: a session that moves to OpenCode 2 is read again once.
+    use crate::ingest::opencode::v2::{Envelope, Layout};
+    let (table, mark) = match Layout::detect(&src)?.envelope(&src, &options.session_id)? {
+        Some(Envelope::V2) => ("session_v2", "v2:"),
+        Some(Envelope::V1) => ("session", ""),
+        None => return Err(opencode_session_gone(&options.session_id)),
+    };
     let columns = src
-        .prepare("SELECT name FROM pragma_table_info('session')")?
+        .prepare(&format!("SELECT name FROM pragma_table_info('{table}')"))?
         .query_map([], |row| row.get::<_, String>(0))?
         .collect::<rusqlite::Result<std::collections::BTreeSet<_>>>()?;
     let created = if columns.contains("time_created") {
@@ -150,20 +159,15 @@ fn opencode_store_snapshot(
         "NULL"
     };
     let stamp_sql = format!(
-        "SELECT printf('%lld:%lld', COALESCE({created}, 0), \
-            COALESCE({updated}, {created}, 0)) FROM session WHERE id = ?"
+        "SELECT printf('{mark}%lld:%lld', COALESCE({created}, 0), \
+            COALESCE({updated}, {created}, 0)) FROM {table} WHERE id = ?"
     );
     let stamp = src
         .query_row(&stamp_sql, [&options.session_id], |row| {
             row.get::<_, String>(0)
         })
         .optional()?
-        .ok_or_else(|| {
-            hydration_error(
-                "SESSION_SOURCE_UNAVAILABLE",
-                format!("OpenCode session '{}' no longer exists", options.session_id),
-            )
-        })?;
+        .ok_or_else(|| opencode_session_gone(&options.session_id))?;
     Ok(SourceSnapshot {
         stamp,
         bytes: 0,
@@ -182,6 +186,13 @@ fn opencode_store_snapshot(
         opencode_layout: Some(OpencodeIngestLayout::Sqlite),
         codex_relationship_complete: true,
     })
+}
+
+fn opencode_session_gone(session_id: &str) -> anyhow::Error {
+    hydration_error(
+        "SESSION_SOURCE_UNAVAILABLE",
+        format!("OpenCode session '{session_id}' no longer exists"),
+    )
 }
 
 fn devin_store_snapshot(
@@ -400,6 +411,21 @@ fn file_source_inventory(
             snapshot.text.len() as i64,
             SnapshotRecords::Counted(snapshot.records()),
             snapshot.stamp.clone(),
+        )
+    } else if options.source == "cursor" && crate::ingest::cursor_store::is_chat_store(path) {
+        // The store is SQLite, not JSONL; its records are counted by the
+        // pass that parses it, not by a read here.
+        (
+            path.metadata()?.len() as i64,
+            SnapshotRecords::Counted(0),
+            // A transcript or a newer copy appearing changes no file of this
+            // store, so whether it still owns the chat is part of the stamp: a
+            // superseded row is never reported unchanged.
+            format!(
+                "{}|superseded:{}",
+                crate::ingest::cursor_store::chat_store_stamp_and_modified(path)?.0,
+                crate::ingest::cursor_store::superseded(path)?
+            ),
         )
     } else if matches!(options.source.as_str(), "claude" | "codex") {
         // Counted by the pass that parses, not by a walk over the whole file

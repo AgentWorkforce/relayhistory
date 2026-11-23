@@ -1,0 +1,26 @@
+{
+  "name": "@agentworkforce/relayhistory-agent",
+  "version": "0.0.0",
+  "private": true,
+  "description": "layered-relayhistory: this repo's layered agent (lane files + its Alchemy stack).",
+  "type": "module",
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "test": "node --test 'test/**/*.test.ts'",
+    "typecheck": "tsc --noEmit",
+    "plan": "alchemy plan alchemy.run.ts",
+    "shellcheck": "shellcheck *.sh"
+  },
+  "dependencies": {
+    "@agentworkforce/layered-agent": "0.1.30",
+    "@alchemy.run/aws": "2.0.0-beta.84",
+    "@effect/platform-node": "4.0.7",
+    "@effect/platform-node-shared": "4.0.7",
+    "alchemy": "2.0.0-beta.84",
+    "effect": "4.0.7"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "5.9.3"
+  }
+}

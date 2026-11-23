@@ -22,7 +22,7 @@ function bridge(operation: unknown, result: { status: number | null; stdout: str
 
 test('provider bridge selects read operations without starting an agent and bounds its process', () => {
   const discovery = bridge({ kind: 'discover' });
-  assert.deepEqual(Array.from(discovery.call.args), ['--log-file', '/dev/null', 'threads', 'search', 'author:me', '--json', '--limit', '100']);
+  assert.deepEqual(Array.from(discovery.call.args), ['--log-file', '/dev/null', 'threads', 'search', 'author:me', '--json', '--limit', '101']);
   assert.deepEqual(discovery.result, { ok: true, value: [] });
   const exported = bridge({ kind: 'export', threadId: 'T-fixture-thread' }, { status: 0, stdout: '{"messages":[]}' });
   assert.deepEqual(Array.from(exported.call.args), ['--log-file', '/dev/null', 'threads', 'export', 'T-fixture-thread']);
