@@ -103,6 +103,21 @@ fn cursor_diagnostics(outcome: &CursorTranscriptOutcome) -> Vec<HydrationDiagnos
     diagnostics
 }
 
+/// Targeted hydration of a session Cursor kept only in one of its own stores
+/// (the editor database or a chat store), or `None` for a transcript.
+pub(super) fn store_only(
+    conn: &Connection,
+    options: &HydrateSessionOptions,
+    path: &Path,
+    records: i64,
+) -> Option<Result<SelectedIngestResult>> {
+    if crate::ingest::cursor_store::editor::is_locator(path) {
+        return Some(ingest_editor_composer(conn, options, path));
+    }
+    crate::ingest::cursor_store::is_chat_store(path)
+        .then(|| ingest_chat_store(conn, options, path, records))
+}
+
 /// Targeted hydration of a chat Cursor kept only in its chat store: the whole
 /// chat, rebuilt, as the sync pass does. A store has no byte checkpoint.
 pub(super) fn ingest_chat_store(
@@ -191,6 +206,136 @@ pub(super) fn ingest_chat_store(
     let outcome = IngestOutcome {
         records: records.max(i64::try_from(store.records).unwrap_or(i64::MAX)),
         bytes_read: path.metadata().map_or(0, |metadata| metadata.len() as i64),
+        ..Default::default()
+    };
+    Ok((outcome, diagnostics, None))
+}
+
+/// The snapshot of a composer the Cursor editor kept only in its database,
+/// or `None` when the row names something else. The locator must name the
+/// editor database under this home: anything else is provenance a
+/// rediscovery has to re-establish, never a path to open.
+pub(super) fn editor_snapshot(
+    options: &HydrateSessionOptions,
+    target: &CatalogTarget,
+    roots: &crate::ProviderRoots,
+) -> Result<Option<SourceSnapshot>> {
+    let Some(locator) = target.locator.as_deref() else {
+        return Ok(None);
+    };
+    let Some((db, id)) = crate::ingest::cursor_store::editor::parse_locator(locator) else {
+        return Ok(None);
+    };
+    if id != options.session_id
+        || db != crate::ingest::cursor_store::editor::state_db_path(&roots.home)
+    {
+        return Err(hydration_error(
+            "SESSION_SOURCE_MISMATCH",
+            format!(
+                "Cursor catalog row names {locator}, not this session in the editor database; \
+                 run discoverSessions() again to re-establish its provenance"
+            ),
+        ));
+    }
+    let gone = || {
+        hydration_error(
+            "SESSION_SOURCE_UNAVAILABLE",
+            format!(
+                "Cursor editor conversation '{id}' is no longer in {}",
+                db.display()
+            ),
+        )
+    };
+    if !db.is_file() {
+        return Err(gone());
+    }
+    let stamp = crate::ingest::cursor_store::editor::composer_stamp(&db, id)?.ok_or_else(gone)?;
+    Ok(Some(SourceSnapshot {
+        // A transcript or chat store appearing changes no row of the
+        // database, so whether it still owns the composer is in the stamp.
+        stamp: format!(
+            "{stamp}|superseded:{}",
+            crate::ingest::cursor_store::editor::superseded(&roots.home, id)?
+        ),
+        bytes: 0,
+        records: SnapshotRecords::Counted(0),
+        path: Some(PathBuf::from(locator)),
+        claude_transcript: None,
+        devin_session: None,
+        provider_session: None,
+        claude_subagents: Vec::new(),
+        scanned_bytes: 0,
+        scanned_superseded: false,
+        stamped_cursors: Vec::new(),
+        opencode_layout: None,
+        codex_relationship_complete: true,
+    }))
+}
+
+/// Targeted hydration of a composer the Cursor editor kept only in its
+/// database: the whole conversation, rebuilt, as the sync pass does.
+pub(super) fn ingest_editor_composer(
+    conn: &Connection,
+    options: &HydrateSessionOptions,
+    locator: &Path,
+) -> Result<SelectedIngestResult> {
+    let text = locator.to_string_lossy();
+    let (db, id) = crate::ingest::cursor_store::editor::parse_locator(&text)
+        .context("a Cursor editor locator that does not parse")?;
+    let home = db
+        .ancestors()
+        .find(|dir| crate::ingest::cursor_store::editor::state_db_path(dir) == db)
+        .map(Path::to_path_buf);
+    if let Some(home) = home {
+        if crate::ingest::cursor_store::editor::superseded(&home, id)? {
+            return Err(hydration_error(
+                "SESSION_SOURCE_MISMATCH",
+                format!(
+                    "Cursor catalog row points at the editor conversation {text}, which now has \
+                     a transcript or chat store; run discoverSessions() again to re-establish \
+                     its provenance"
+                ),
+            ));
+        }
+    }
+    let composer =
+        crate::ingest::cursor_store::editor::read_composer(&db, id)?.ok_or_else(|| {
+            hydration_error(
+                "SESSION_SOURCE_UNAVAILABLE",
+                "Cursor editor conversation holds no messages",
+            )
+        })?;
+    anyhow::ensure!(
+        composer.session_id == options.session_id,
+        "SESSION_SOURCE_MISMATCH: Cursor editor conversation identity does not match the catalog row"
+    );
+    let (_, records, outcome) =
+        crate::ingest::cursor_store::editor::rebuild(conn, &text, &composer)?;
+    let mut diagnostics = cursor_diagnostics(&outcome);
+    for diagnostic in &mut diagnostics {
+        if diagnostic.code == "CURSOR_TIMESTAMP_FROM_MTIME" {
+            diagnostic.code = "CURSOR_TIMESTAMP_FROM_STORE".to_string();
+            diagnostic.message = "some Cursor editor messages carry no creation time; they are \
+                                  stamped with the conversation's recorded update time"
+                .to_string();
+        }
+    }
+    if composer.skipped_bubbles > 0 {
+        diagnostics.push(HydrationDiagnostic {
+            code: "CURSOR_EDITOR_BUBBLE_UNREADABLE".to_string(),
+            message: format!(
+                "{} message(s) the Cursor editor conversation lists were missing or not readable \
+                 JSON and were skipped",
+                composer.skipped_bubbles
+            ),
+            duration_ms: None,
+            source_bytes: None,
+            records_parsed: None,
+        });
+    }
+    let outcome = IngestOutcome {
+        records,
+        bytes_read: i64::try_from(composer.transcript.len()).unwrap_or(i64::MAX),
         ..Default::default()
     };
     Ok((outcome, diagnostics, None))
@@ -295,6 +440,90 @@ mod tests {
         catalog_store(&conn, "cur-store", &store);
         drop(conn);
         let error = hydrate_session_at_with_home(&db, &options("cur-store"), dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("SESSION_SOURCE_MISMATCH"), "{error}");
+    }
+
+    fn catalog_editor(conn: &Connection, session_id: &str, locator: &str) {
+        conn.execute(
+            "INSERT INTO sessions (source, session_id, raw_path, discovery_state) \
+             VALUES ('cursor', ?, ?, 'shallow')",
+            params![session_id, locator],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO session_presences \
+             (source, session_id, location, raw_locator, source_stamp, discovery_state) \
+             VALUES ('cursor', ?, 'local', ?, 'v2:test-discovery-stamp', 'shallow')",
+            params![session_id, locator],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn a_cursor_editor_conversation_hydrates_from_the_editor_database() {
+        use crate::ingest::cursor_store::editor::test_support::*;
+        let dir = tempfile::tempdir().unwrap();
+        let (path, writer) = open_state_db(dir.path()).unwrap();
+        write_composer(
+            &writer,
+            "ed-1",
+            "Read the note",
+            "/work/app",
+            &tool_conversation("read note.txt", 1_795_042_000_000),
+            1_795_041_000_000,
+        )
+        .unwrap();
+        close_idle(&path, writer).unwrap();
+        let locator = crate::ingest::cursor_store::editor::locator(&path, "ed-1");
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_editor(&conn, "ed-1", &locator);
+        drop(conn);
+
+        let result = hydrate_session_at_with_home(&db, &options("ed-1"), dir.path()).unwrap();
+        assert_eq!(result.status, "hydrated", "{:?}", result.diagnostics);
+        assert_eq!(result.evidence.tool_calls, 2, "{:?}", result.evidence);
+        let conn = open_db(&db).unwrap();
+        let (cwd, title, last): (Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT cwd, title, last_assistant_text FROM sessions \
+                 WHERE source = 'cursor' AND session_id = 'ed-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(cwd.as_deref(), Some("/work/app"));
+        assert_eq!(title.as_deref(), Some("Read the note"));
+        assert_eq!(last.as_deref(), Some("note.txt says hello"));
+        drop(conn);
+
+        let again = hydrate_session_at_with_home(&db, &options("ed-1"), dir.path()).unwrap();
+        assert_eq!(again.status, "unchanged");
+
+        // A transcript appears: the row no longer names the composer's source.
+        let transcript = dir
+            .path()
+            .join(".cursor/projects/w/agent-transcripts/ed-1/ed-1.jsonl");
+        fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        fs::write(&transcript, "{}\n").unwrap();
+        let error = hydrate_session_at_with_home(&db, &options("ed-1"), dir.path())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("SESSION_SOURCE_MISMATCH"), "{error}");
+    }
+
+    #[test]
+    fn an_editor_locator_for_another_database_is_not_opened() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("elsewhere/state.vscdb");
+        let locator = crate::ingest::cursor_store::editor::locator(&elsewhere, "ed-1");
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_editor(&conn, "ed-1", &locator);
+        drop(conn);
+        let error = hydrate_session_at_with_home(&db, &options("ed-1"), dir.path())
             .unwrap_err()
             .to_string();
         assert!(error.contains("SESSION_SOURCE_MISMATCH"), "{error}");

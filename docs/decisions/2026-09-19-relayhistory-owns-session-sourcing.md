@@ -160,7 +160,7 @@ compresses it ([session catalog](../session-catalog.md)).
 | Relationship — fork / resume / continuation                        | ✗      | ✓     | ✗      | ✗    | ✗    | ✗        | —     | [#170](https://github.com/AgentWorkforce/relayhistory/issues/170)                                                                                                                                                                                                             |
 | Session metadata (cwd, branch, versions)                           | ◐      | ✓     | ◐      | ◐    | ◐    | ◐        | ◐     | [#164](https://github.com/AgentWorkforce/relayhistory/issues/164), [#177](https://github.com/AgentWorkforce/relayhistory/issues/177)                                                                                                                                          |
 | Provider-native session kind (`sessions.session_kind`)             | —      | —     | —      | ✓    | —    | —        | —     | Grok `summary.json` records `session_kind: "subagent"` even without a parent id; root listings use this observed fact. |
-| Session title (`sessions.title`)                                  | ✓      | ✓     | ✗      | ✓    | ✗    | ✓        | ✓     | grok: observed CLI `summary.json` `generated_title`, then `session_summary`, then legacy/export `title`; cursor and muse keep the name in the harness's own app store, which is not read |
+| Session title (`sessions.title`)                                  | ✓      | ✓     | ◐      | ✓    | ✗    | ✓        | ✓     | grok: observed CLI `summary.json` `generated_title`, then `session_summary`, then legacy/export `title`; cursor: the composer `name` for a conversation read from the editor's `state.vscdb`, none for a transcript or chat store; muse keeps the name in its own app store, which is not read |
 | Agent name (`sessions.agent_name`)                                | ✓      | —     | —      | ✗    | —    | —        | ✗     | claude: the latest `agent-name` record (the name Agent Relay and other sessions address it by), kept apart from `title`; the shallow scan sees the transcript head and tail, the full ingest every rename. grok and devin parse an agent name but do not catalog it yet. Like `title`, omitted from content-off reads |
 | Canonical `project_key`                                            | ✗      | ✗     | ✗      | ✗    | ✗    | ✗        | ✗     | [#175](https://github.com/AgentWorkforce/relayhistory/issues/175)                                                                                                                                                                                                             |
 | Declared hydration `capability`                                    | ◐      | ◐     | ◐      | ◐    | ◐    | ◐        | ◐     | [#169](https://github.com/AgentWorkforce/relayhistory/issues/169)                                                                                                                                                                                                             |
@@ -222,6 +222,15 @@ the cells above are the same for it, except that the store keeps what the
 transcript drops — `tool_result` blocks, `tool_use` ids and `reasoning` — and
 those are captured too. A chat that has a transcript is read only from the
 transcript.
+
+**Cursor editor conversations.** The Cursor app keeps every Agent
+conversation ("composer") in its global `state.vscdb`, and often writes no
+transcript for it. A composer with neither a transcript nor a chat store is
+read from that database (`src/ingest/cursor_store/editor/`), rendered the same way
+and through the same parser, so the cells above hold for it as for the chat
+store. Its bubbles also carry their own creation time and the composer its
+name and workspace folder, so those conversations are timed per message,
+titled (`sessions.title`) and placed in their folder.
 
 **Muse Code.** `ingest_muse_session` (`src/ingest.rs`, record interpretation
 in `src/ingest/muse.rs`) reads `session.jsonl`, an event-sourced log whose

@@ -1161,6 +1161,70 @@ How each adapter works:
   over the catalog row, and a hydration that still names the store is refused
   until discovery runs again.
 
+  ### Cursor editor database
+
+  The Cursor app (the editor, not the `cursor-agent` CLI) keeps every Agent
+  conversation, a "composer", in its global state database,
+  `<user dir>/globalStorage/state.vscdb`, where the user directory is
+  `~/Library/Application Support/Cursor/User` on macOS, `~/.config/Cursor/User`
+  on Linux and `%APPDATA%\Cursor\User` on Windows (resolved under the home
+  RelayHistory is given). It often creates `agent-transcripts/<id>/` and never
+  writes the `.jsonl`. A composer with no transcript and no chat store is read
+  from this database, under the `cursor` source with the composer id as the
+  session id and `cursor-editor:<db path>#<composer id>` as its locator and
+  `raw_path`. A transcript, then a chat store, always comes first, so no
+  conversation is cataloged twice; when one appears it takes the catalog row
+  over, the editor stamp is dropped, and a hydration that still names the
+  editor locator is refused until discovery runs again.
+
+  Characterized from Cursor 2.x editor builds (November 2026; composer `_v` 14
+  and 18, bubble `_v` 3); Cursor publishes no schema. The tests build
+  synthetic databases (`src/ingest/cursor_store/editor/test_support.rs`).
+
+  * SQLite in WAL mode. `cursorDiskKV(key TEXT UNIQUE ON CONFLICT REPLACE,
+    value BLOB)` holds the conversations beside VS Code's `ItemTable`; a
+    rewritten key is a replace and gets a new rowid.
+  * `composerData:<id>` is JSON: `name`, `createdAt` and `lastUpdatedAt`
+    (epoch ms), `workspaceIdentifier` (`id`, and `uri.fsPath` for a folder),
+    `headerLog`, `fullConversationHeadersOnly` (often empty) and, on the
+    oldest builds, whole bubbles in `conversation`.
+  * `composerConvHeaders:<id>:<chunk>` holds the ordered headers
+    (`bubbleId`, `type`, `createdAt`) in chunks of 256.
+  * `bubbleId:<id>:<bubbleId>` is one message: `type` 1 the person, 2 the
+    assistant; `text`, `createdAt` (ISO 8601), `thinking.text`, and
+    `toolFormerData` for a tool call (`name` such as `run_terminal_command_v2`,
+    `read_file_v2` or `edit_file_v2`, `toolCallId`, `params` and `result` as
+    JSON strings, `status`). Cursor stores more bubbles than the conversation
+    lists (abandoned branches); only listed ones are read.
+  * `workspaceStorage/<workspaceIdentifier.id>/workspace.json` names the
+    folder (`folder`, a `file://` URI) when the composer records none; a
+    multi-root workspace names no folder and gets no cwd.
+
+  The conversation's order is the header chunks, else the inline headers,
+  else the inline bubbles, else every bubble row by creation time. Each bubble
+  is rendered as a transcript record and parsed by the transcript parser:
+  person text as a user `text` block, thinking as `thinking`, a tool call as
+  `tool_use` with its real id followed by a user-role `tool_result` when the
+  bubble holds a result (`is_error` when `status` is `error`). Each record
+  carries the bubble's creation time as its `timestamp` and
+  `message.id = cursor-bubble:<bubbleId>`. A bubble the conversation lists
+  that is missing or not JSON is skipped and reported as
+  `CURSOR_EDITOR_BUBBLE_UNREADABLE` by hydration. The composer `name` is the
+  session title.
+
+  The database is shared by every composer and written constantly while
+  Cursor runs, so its file stamp says nothing about one conversation. Each
+  composer is stamped from its own rows, through the key index alone: the
+  `composerData` rowid and a hash of its value, and the count, highest rowid
+  and rowid total of its `bubbleId:` and `composerConvHeaders:` rows. Sync
+  (state key `cursor_editor_composers_v1`) and discovery re-read a composer
+  only when its stamp moves, then rebuild its session whole; a composer with
+  no bubbles is not a session. The database is opened read-only with a 2 s
+  busy timeout, inside one read transaction; with Cursor closed (no `-wal`)
+  it is opened `immutable=1` so nothing is created beside it, and a read that
+  raced a writer is dropped for that pass. The watcher follows
+  `state.vscdb` and its sidecars only, not the rest of `globalStorage`.
+
   ### Cursor record shapes
 
   Cursor publishes no schema for this file, so the shapes below were

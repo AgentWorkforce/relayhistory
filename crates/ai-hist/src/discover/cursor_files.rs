@@ -7,7 +7,29 @@ use super::*;
 pub(super) fn candidates(env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
     let mut out = transcript_candidates(env)?;
     out.extend(chat_store_candidates(env)?);
+    out.extend(editor_candidates(env)?);
     Ok(out)
+}
+
+/// The conversations the Cursor editor kept only in its own database: those
+/// with no transcript and no chat store. Each composer is its own candidate,
+/// stamped from its own rows, so a write to another composer (or to the
+/// editor's other state in the same file) changes none of them.
+fn editor_candidates(env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
+    let db = crate::ingest::cursor_store::editor::state_db_path(&env.home);
+    // An unreadable database fails the walk rather than listing no
+    // composers, which would read as every one of them having gone.
+    let heads = crate::ingest::cursor_store::editor::composers(&env.home, env.path_scope())?;
+    Ok(heads
+        .into_iter()
+        .map(|head| Candidate {
+            source: "cursor",
+            locator: crate::ingest::cursor_store::editor::locator(&db, &head.session_id),
+            session_id: Some(head.session_id),
+            recency_hint_ms: head.recency_ms,
+            stamp: head.stamp,
+        })
+        .collect())
 }
 
 /// The chats Cursor kept only in its own chat store: those with no
@@ -129,6 +151,15 @@ impl ShallowSessionProvider for CursorProvider {
             WatchRoot::tree(roots.home.join(".cursor/projects")),
             // Cursor's own chat store, for the chats it wrote no transcript for.
             WatchRoot::tree(roots.home.join(crate::ingest::cursor_store::CHATS_DIR)),
+            // The editor's database and its sidecars, not the rest of its
+            // directory. The filter is the one OpenCode's single store uses.
+            WatchRoot::directory_of(
+                crate::ingest::cursor_store::editor::user_dir(roots.home).join("globalStorage"),
+                crate::discover::WatchEntries::OpencodeStores {
+                    primary: "state.vscdb".into(),
+                    channels: false,
+                },
+            ),
         ]
     }
 
@@ -150,6 +181,9 @@ impl ShallowSessionProvider for CursorProvider {
         let Some(session_id) = candidate.session_id.clone() else {
             return Ok(None);
         };
+        if let Some((db, id)) = crate::ingest::cursor_store::editor::parse_locator(&candidate.locator) {
+            return read_editor_shallow(&db, id, candidate);
+        }
         // A chat Cursor kept only in its chat store is read as the transcript
         // records its two ends render to, so both kinds of chat catalog alike
         // and a shallow read stays bounded.
@@ -240,6 +274,52 @@ impl ShallowSessionProvider for CursorProvider {
     }
 }
 
+/// A composer the editor kept only in its database, read as the transcript
+/// records its two ends render to. Bubbles carry their own times, so the
+/// window comes from them and the composer's recorded times.
+fn read_editor_shallow(
+    db: &Path,
+    composer_id: &str,
+    candidate: &Candidate,
+) -> Result<Option<ShallowSession>> {
+    let Some(composer) = crate::ingest::cursor_store::editor::read_composer_preview(db, composer_id)?
+    else {
+        return Ok(None);
+    };
+    let bounded = bounded_jsonl_from_bytes(composer.transcript.as_bytes());
+    let first_prompt = bounded
+        .head_records()
+        .filter_map(|line| crate::parse_cursor_text(&String::from_utf8_lossy(line)).ok().flatten())
+        .map(|prompt| excerpt(&prompt))
+        .find(|prompt| !prompt.is_empty());
+    let first_seen = bounded.head_records().find_map(cursor_record_time);
+    let last_seen = bounded.tail_records_rev().find_map(cursor_record_time);
+    let first_activity_ms = match (first_seen, composer.created_ms) {
+        (Some(first), Some(created)) => Some(first.min(created)),
+        (first, created) => first.or(created),
+    };
+    let last_activity_ms = match (last_seen, composer.updated_ms) {
+        (Some(last), Some(updated)) => Some(last.max(updated)),
+        (last, updated) => last.or(updated),
+    };
+    let last_assistant_text = bounded
+        .tail_records_rev()
+        .find_map(cursor_assistant_text)
+        .map(|text| excerpt(&text));
+    Ok(Some(ShallowSession {
+        source: "cursor".into(),
+        session_id: composer.session_id,
+        cwd: composer.cwd,
+        first_activity_ms,
+        last_activity_ms,
+        first_prompt,
+        last_assistant_text,
+        title: composer.title,
+        raw_path: Some(candidate.locator.clone()),
+        ..Default::default()
+    }))
+}
+
 /// Epoch milliseconds for one Cursor record, from the injected `<timestamp>`
 /// tag or from a record `timestamp` field if a build writes one.
 fn cursor_record_time(line: &[u8]) -> Option<i64> {
@@ -326,6 +406,48 @@ mod tests {
             session.as_ref().map(|row| row.session_id.as_str()),
             Some("cursor-1")
         );
+    }
+
+    /// A composer the editor kept only in its database is a candidate of its
+    /// own, and its shallow row carries the title, folder, prompt and times
+    /// the database records. One that has a transcript is not offered twice.
+    #[test]
+    fn the_full_walk_offers_an_editor_only_conversation() {
+        use crate::ingest::cursor_store::editor::test_support::*;
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let (db, writer) = open_state_db(home).unwrap();
+        let start = 1_795_042_000_000;
+        for id in ["editor-only", "has-transcript"] {
+            write_composer(&writer, id, "Read the note", "/work/app", &tool_conversation("read note.txt", start), start - 1_000).unwrap();
+        }
+        close_idle(&db, writer).unwrap();
+        let transcript = home.join(".cursor/projects/work-app/agent-transcripts/has-transcript/has-transcript.jsonl");
+        std::fs::create_dir_all(transcript.parent().unwrap()).unwrap();
+        std::fs::write(
+            &transcript,
+            "{\"role\":\"user\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"<user_query>\\nfix\\n</user_query>\"}]}}\n",
+        )
+        .unwrap();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::init_db(&conn).unwrap();
+        let env = DiscoveryEnv::with_roots(&conn, home.to_path_buf(), home.join("opencode.db"));
+        let found = candidates(&env).unwrap();
+        let ids: Vec<&str> = found.iter().map(|c| c.session_id.as_deref().unwrap()).collect();
+        assert_eq!(ids, vec!["has-transcript", "editor-only"]);
+        let editor = &found[1];
+        assert_eq!(editor.locator, crate::ingest::cursor_store::editor::locator(&db, "editor-only"));
+        let session = super::super::CursorProvider
+            .read_shallow(&env.scan(), Some(&conn), editor)
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.title.as_deref(), Some("Read the note"));
+        assert_eq!(session.cwd.as_deref(), Some("/work/app"));
+        assert_eq!(session.first_prompt.as_deref(), Some("read note.txt"));
+        assert_eq!(session.first_activity_ms, Some(start - 1_000));
+        assert_eq!(session.last_activity_ms, Some(start + 4_000));
+        assert_eq!(session.last_assistant_text.as_deref(), Some("note.txt says hello"));
+        assert_eq!(session.raw_path.as_deref(), Some(editor.locator.as_str()));
     }
 
     /// The full walk lists a subagent transcript as its own candidate, and its
