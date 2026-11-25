@@ -43,7 +43,7 @@ try {
     await client.connect(transport);
     const result=await client.callTool({name:'search_history',arguments:{query:'needle',source:'hermes'}});
     assert.equal(result.isError,undefined);
-    assert.ok(JSON.parse(result.content[0].text).some(r=>r.role==='assistant'&&r.source==='hermes'));
+    assert.ok(JSON.parse(result.content[0].text).matches.some(r=>r.role==='assistant'&&r.source==='hermes'));
     const cap=await client.callTool({name:'get_source_capabilities',arguments:{source:'hermes'}});
     assert.equal(cap.isError,undefined);assert.equal(JSON.parse(cap.content[0].text).source,'hermes');
   } finally {await client.close();await transport.close();}

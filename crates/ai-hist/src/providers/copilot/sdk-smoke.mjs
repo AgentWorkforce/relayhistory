@@ -40,7 +40,7 @@ try {
   try {
     await client.connect(transport);
     const result = await client.callTool({ name: 'search_history', arguments: { query: 'assertion', source: 'copilot', role: 'assistant' } });
-    assert.ok(!result.isError); const matches = JSON.parse(result.content[0].text); assert.ok(matches.some(m => m.source === 'copilot'));
+    assert.ok(!result.isError); const matches = JSON.parse(result.content[0].text).matches; assert.ok(matches.some(m => m.source === 'copilot'));
   } finally { await client.close(); await transport.close(); }
   console.log('Copilot SDK/CLI/MCP source filtering, user/assistant search, events and honest capability assertions passed');
 } finally { fs.rmSync(root, { recursive: true, force: true }); }

@@ -43,7 +43,7 @@ try {
     await client.connect(transport);
     const result = await client.callTool({ name: 'search_history', arguments: { query: 'needle', source: 'deepagents', role: 'user' } });
     assert.ok(!result.isError);
-    assert.ok(JSON.parse(result.content[0].text).some(match => (match.sessionId ?? match.session_id) === sessionId));
+    assert.ok(JSON.parse(result.content[0].text).matches.some(match => (match.sessionId ?? match.session_id) === sessionId));
   } finally { await client.close(); await transport.close(); }
   console.log('DeepAgents compiled native SDK/CLI/MCP discovery, hydration, user/assistant/tool search and events passed');
 } finally { fs.rmSync(root, { recursive: true, force: true }); }

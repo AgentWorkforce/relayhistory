@@ -27,15 +27,11 @@ fn snippet_terms(terms: &[String]) -> Vec<(String, bool)> {
         // A column filter (`text:tailneedle`) names its literal operand
         // after the colon; that operand is what the snippet centers on.
         if token.contains(':') {
-            token = token
-                .rsplit(':')
-                .next()
-                .unwrap_or("")
-                .trim_matches(|c| c == '"' || c == '\'');
-            if token.is_empty() {
-                continue;
-            }
+            token = token.rsplit(':').next().unwrap_or("");
         }
+        // Unquote after stripping `*` and any column prefix so both `"cat"*`
+        // and `text:"cat"*` yield `cat`.
+        token = token.trim_matches(|c| c == '"' || c == '\'' || c == '(' || c == ')');
         if token.is_empty() {
             continue;
         }

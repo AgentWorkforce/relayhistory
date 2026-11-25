@@ -61,9 +61,9 @@ if (!process.env.RH_ANTIGRAVITY_SURFACE_CHILD) {
     assert.equal(JSON.parse(capability.content[0].text).source, 'antigravity');
     const result = await client.callTool({ name: 'search_history', arguments: { query: 'synthetic fixture', source: 'antigravity' } });
     assert.ok(!result.isError);
-    assert.ok(JSON.parse(result.content[0].text).length > 0);
+    assert.ok(JSON.parse(result.content[0].text).matches.length > 0);
     const filtered = await client.callTool({ name: 'search_history', arguments: { query: 'synthetic fixture', source: 'pi' } });
-    assert.deepEqual(JSON.parse(filtered.content[0].text), []);
+    assert.deepEqual(JSON.parse(filtered.content[0].text).matches, []);
   } finally { await client.close(); }
   console.log('Antigravity native SDK discover/catalog/hydrate/read/search + CLI search + MCP descriptors/capabilities/search/source filtering passed (SDK-native fixture).');
 }

@@ -2825,6 +2825,18 @@ mod tests {
     }
 
     #[test]
+    fn a_snippet_centers_on_a_bare_quoted_prefix_term() {
+        let text = format!("{} catapult", "filler ".repeat(30));
+        let (snippet, truncated, offset) = compute_snippet(&text, &["\"cat\"*".to_string()], 30);
+        assert!(truncated);
+        assert!(offset.unwrap() > 0, "expected tail snippet, got offset {offset:?}: {snippet}");
+        assert!(snippet.contains("catapult"), "snippet: {snippet}");
+
+        let (grouped, _, _) = compute_snippet(&text, &["(\"cat\"*)".to_string()], 30);
+        assert!(grouped.contains("catapult"), "snippet: {grouped}");
+    }
+
+    #[test]
     fn a_snippet_folds_dotted_s_and_keeps_multi_diacritic_letters_distinct() {
         let text = format!("{} ṡample end", "filler ".repeat(30));
         let (snippet, _, _) = compute_snippet(&text, &["sample".to_string()], 30);
