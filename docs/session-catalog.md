@@ -553,11 +553,53 @@ marked as inferred. Invalid identity, duplicate identity and malformed versions
 fail closed. A read-only check against a current Amp CLI export established the
 native field mapping; synthetic tests contain no customer transcript text.
 
-The CLI bridge's discovery operation is a bounded picker of 100 recent authored
-threads. It is not account-wide enumeration; the current CLI search exposes a
-limit without a continuation token. Hosts can accept another thread URL/ID and
-verify it through export. Scheduled catch-up scans selected bindings separately
-from this picker, so its limit does not cap the number of threads a host syncs.
+The CLI bridge's discovery operation requests at most 101 recent authored
+threads. Hosts present the first 100 as the bounded picker page and use the
+extra row only to report that the page was truncated. It is not account-wide
+enumeration; the current CLI search exposes a limit without a continuation
+token. Hosts can accept another thread URL/ID and verify it through export.
+Scheduled catch-up scans selected bindings separately from this picker, so its
+limit does not cap the number of threads a host syncs.
+
+### Hosted Factory transcript projection
+
+`ai-hist/factory-source` interprets the documented Factory Sessions API message
+shape. Hosts own API keys, selected sessions, HTTP transport, pagination,
+scheduling, injection and delivery. `factoryMessagePage` validates each messages
+page; hosts fetch every page before treating a snapshot as complete. A repeated
+cursor, failed page or exceeded acquisition bound must preserve the preceding
+snapshot rather than retire unvisited messages.
+
+`factoryEvidence` provides readable message envelopes with the canonical source
+`droid`. `factoryCanonicalEvidence` produces per-block `session_event`, native
+`tool_call` and raw `session_marker` payloads for canonical delivery. Its event
+keys match local Droid acquisition: `["session_event", "droid", sessionId,
+messageId + ":" + blockOrdinal]`; tool keys use the native tool-use ID.
+`record_id` is SHA-256 over the compact JSON key array, matching the Rust export
+contract. A host supplies its own origin and revision fences. These records do
+not by themselves configure or activate a hosted delivery pipeline.
+
+Message IDs, optional block IDs, creation/update timestamps, tool-use IDs and
+the original API JSON are preserved. The API's `toolUseId` and `isError` fields
+map to explicit tool-result identity and outcomes. Human text stays separate
+from tool output. Unknown blocks and non-human roles stay raw markers; thinking
+also retains its typed canonical block. No credits, usage or current-time
+timestamps are inferred. API-only metadata is
+retained in non-activity markers, so it does not create a second conversation
+message alongside the same locally captured native block. Fixture tests compare
+API event/tool keys and measured facts against the local parser's snapshots.
+
+Canonical marker payloads follow the native intake bounds: strings and object
+keys have at most 128 characters, and containers at most 32 entries recursively.
+The API-message row's separate `raw` field retains the complete original JSON;
+hosts store it in their raw-capture artifact beside the canonical snapshot and
+do not put that unbounded value into `payload_json`. Typed text events remain
+complete. Structured tool-result measurements describe each route's stable
+serialization of its observed JSON value, rather than original wire bytes:
+JavaScript cannot recover a numeric lexeme such as `1.0` after parsing it as
+`1`. Logical canonical identity never depends on these representation-specific
+measurements. A host retains the original response bytes separately when that
+lexical distinction matters.
 
 ### Session markers
 
@@ -947,7 +989,14 @@ How each adapter works:
   `isSidechain` rows — inline Task traffic from Claude Code versions that wrote
   it there — is that session's transcript: catalogued under the records'
   `sessionId`, with its sidechain assistant turns, `is_sidechain` and usage
-  kept as evidence of it. A transcript whose complete records
+  kept as evidence of it. A resumed or forked conversation is a new
+  `<sessionId>.jsonl` that opens with a copy of its origin's records under the
+  origin's `sessionId`: the session the file is named after owns it, its
+  catalog row and metadata come from its own records, the copied records stay
+  the origin's, and a `fork` edge with `evidence_ref = "inheritedSessionId"`
+  names the origin. Two `sessionId`s in a primary transcript, neither of them
+  its file name, are an identity conflict and fail that transcript. A
+  transcript whose complete records
   parse as nothing is reported as a diagnostic rather than published under its
   file name; an empty one is simply not a session yet. The subagent workflow
   journal, `<session>/subagents/**/journal.jsonl`, is excluded by name before
@@ -1064,6 +1113,132 @@ How each adapter works:
   `message.model` for the builds that write one — an empty list means "not seen
   cheaply", never "no model". Full details, and what Cursor does **not** write,
   are below.
+
+  A chat with **no** transcript is read from Cursor's own chat store instead,
+  `~/.cursor/chats/<workspace-hash>/<id>/store.db`, with the same source and
+  the same session id (the chat's directory name). A chat that has a
+  transcript is never offered from its store, so no chat is cataloged twice.
+
+  ### Cursor chat store
+
+  Characterized from real `cursor-agent` 2026.11.11 and 2026.11.17 stores
+  (November 2026); Cursor publishes no schema. The fixture
+  `tests/fixtures/cursor/chat-store/store-only.sql` is synthetic.
+
+  * SQLite in WAL mode, `meta(key, value)` and `blobs(id, data)`. Meta key `0`
+    is hex-encoded JSON: `agentId`, `latestRootBlobId`, `name`, `mode`,
+    `createdAt` and a `blobEncryptionKey` no observed store used.
+  * Blobs are content-addressed (`id` is the SHA-256 of `data`). The root
+    blob is protobuf: repeated field 1 lists the message blob ids in order;
+    field 9 is the workspace `file://` URI, field 21 a message whose field 1
+    is the cwd, field 22 the client (`cli`), field 26 the update time in ms.
+  * Messages are JSON in the AI SDK shape: `role` `system`, `user`,
+    `assistant` or `tool`, with `text`, `tool-call`, `tool-result` and
+    `reasoning` blocks.
+  * Newer builds write `meta.json` beside it with `cwd`, `createdAtMs`,
+    `updatedAtMs` and `hasConversation`; `hasConversation: false` is no chat.
+
+  Each message is rendered as the transcript record Cursor writes for it and
+  parsed by the transcript parser. The system prompt and the leading
+  `<user_info>` environment preamble are dropped, as the transcript drops them;
+  `tool-call` becomes `tool_use` with its real id, a `tool` message becomes a
+  user-role `tool_result`, `reasoning` becomes `thinking`. Each record's
+  `message.id` is `cursor-blob:<blob id>`. A chat store is re-read whole when
+  its stamp (store, `-wal` and `meta.json`) changes, and its session is
+  rebuilt; there is no byte checkpoint. A closed chat has no `-wal`, and a
+  read-only open would create one beside it, so such a store is opened
+  `immutable=1`; a store with a `-wal` is opened read-only. A store that
+  changes while it is read is dropped for that pass. A blob that is missing or
+  not JSON (an encrypted one would read that way) is skipped and reported as
+  `CURSOR_CHAT_STORE_BLOB_UNREADABLE` by hydration and in the sync output.
+  A blob the root lists more than once is one message per occurrence. A
+  shallow catalog read renders only the first and last 16 messages. An
+  unchanged store is skipped on its stamp only while the destination still
+  holds its evidence, except a store that rendered no records, which is saved
+  as `<stamp>|no-evidence` and skipped until its stamp changes; any change to
+  the stamp makes sync read the store again. A chat id filed under several
+  workspaces is read from its most recently written store. When a chat gains a transcript, the transcript takes
+  over the catalog row, and a hydration that still names the store is refused
+  until discovery runs again.
+
+  ### Cursor editor database
+
+  The Cursor app (the editor, not the `cursor-agent` CLI) keeps every Agent
+  conversation, a "composer", in its global state database,
+  `<user dir>/globalStorage/state.vscdb`, where the user directory is
+  `~/Library/Application Support/Cursor/User` on macOS, `~/.config/Cursor/User`
+  on Linux and `%APPDATA%\Cursor\User` on Windows (resolved under the home
+  RelayHistory is given). It often creates `agent-transcripts/<id>/` and never
+  writes the `.jsonl`. A composer with no transcript and no chat store is read
+  from this database, under the `cursor` source with the composer id as the
+  session id and `cursor-editor:<db path>#<composer id>` as its locator and
+  `raw_path`. A transcript, then a chat store, always comes first, so no
+  conversation is cataloged twice; when one appears it takes the catalog row
+  over, the editor stamp is dropped, and a hydration that still names the
+  editor locator is refused until discovery runs again.
+
+  Characterized from Cursor 2.x editor builds (November 2026; composer `_v` 14
+  and 18, bubble `_v` 3); Cursor publishes no schema. The tests build
+  synthetic databases (`src/ingest/cursor_store/editor/test_support.rs`).
+
+  * SQLite in WAL mode. `cursorDiskKV(key TEXT UNIQUE ON CONFLICT REPLACE,
+    value BLOB)` holds the conversations beside VS Code's `ItemTable`; a
+    rewritten key is a replace and gets a new rowid.
+  * `composerData:<id>` is JSON: `name`, `createdAt` and `lastUpdatedAt`
+    (epoch ms), `workspaceIdentifier` (`id`, and `uri.fsPath` for a folder),
+    `headerLog`, `fullConversationHeadersOnly` (often empty) and, on the
+    oldest builds, whole bubbles in `conversation`.
+  * `composerConvHeaders:<id>:<chunk>` holds the ordered headers
+    (`bubbleId`, `type`, `createdAt`) in chunks of 256.
+  * `bubbleId:<id>:<bubbleId>` is one message: `type` 1 the person, 2 the
+    assistant; `text`, `createdAt` (ISO 8601), `thinking.text`, and
+    `toolFormerData` for a tool call (`name` such as `run_terminal_command_v2`,
+    `read_file_v2` or `edit_file_v2`, `toolCallId`, `params` and `result` as
+    JSON strings, `status`). Cursor stores more bubbles than the conversation
+    lists (abandoned branches); only listed ones are read.
+  * `workspaceStorage/<workspaceIdentifier.id>/workspace.json` names the
+    folder (`folder`, a `file://` URI) when the composer records none; a
+    multi-root workspace names no folder and gets no cwd.
+
+  The conversation's order is the header chunks, else the inline headers,
+  else the inline bubbles, else every bubble row by creation time. A
+  `headerLog` with `chunkCount` and `count` declares the extent: exactly
+  chunks `000000` up to `chunkCount` are read (a chunk past it is an older
+  generation and is ignored) and the first `count` headers in them. A
+  declared chunk that is missing or not a header array, fewer headers than
+  `count`, or a listed bubble that is missing or unreadable makes the read
+  **incomplete**: what was readable is indexed, but sync saves no stamp for
+  it and tells the sweep it did not read everything (so it is read again next
+  pass), and hydration reports `CURSOR_EDITOR_CONVERSATION_INCOMPLETE`. A
+  composer with no header log reads every chunk it has. The headerless layout
+  is ordered by SQLite from each payload's `createdAt`, so only rowids leave
+  SQLite and each payload is brought into memory once as it is rendered; a
+  shallow preview of that layout renders nothing and leaves it to the full
+  read. Each bubble
+  is rendered as a transcript record and parsed by the transcript parser:
+  person text as a user `text` block, thinking as `thinking`, a tool call as
+  `tool_use` with its real id followed by a user-role `tool_result` when the
+  bubble holds a result (`is_error` when `status` is `error`). Each record
+  carries the bubble's creation time as its `timestamp` and
+  `message.id = cursor-bubble:<bubbleId>`. A bubble the conversation lists
+  that is missing or not JSON is skipped and reported as
+  `CURSOR_EDITOR_BUBBLE_UNREADABLE` by hydration. The composer `name` is the
+  session title.
+
+  The database is shared by every composer and written constantly while
+  Cursor runs, so its file stamp says nothing about one conversation. Each
+  composer is stamped from its own rows, through the key index alone: the
+  `composerData` rowid and a hash of its value, and the count, highest rowid
+  and rowid total of its `bubbleId:` and `composerConvHeaders:` rows. Sync
+  (state key `cursor_editor_composers_v1`) and discovery re-read a composer
+  only when its stamp moves, then rebuild its session whole; a composer with
+  no bubbles is not a session. Sync reads, rebuilds and commits one composer
+  at a time, so a first import holds one conversation in memory, and an
+  interrupted pass keeps what it committed and leaves the rest unstamped. The database is opened read-only with a 2 s
+  busy timeout, inside one read transaction; with Cursor closed (no `-wal`)
+  it is opened `immutable=1` so nothing is created beside it, and a read that
+  raced a writer is dropped for that pass. The watcher follows
+  `state.vscdb` and its sidecars only, not the rest of `globalStorage`.
 
   ### Cursor record shapes
 
@@ -2009,6 +2184,28 @@ How each adapter works:
   session is read again. A session or store written within two seconds of the
   read is not stamped, and is read again by the next sweep. `ai-hist
   sync-opencode` reads every session.
+
+  OpenCode 2 keeps the same `opencode.db` and adds its own tables,
+  `session_v2` and `session_message`. The first OpenCode 2 start copies every
+  session into them, messages and parts included, and from then on writes
+  only there; `session`, `message` and `part` are left as they were. A
+  session with a `session_v2` row is enumerated, stamped (row fields plus one
+  `session_message` aggregate), synced and hydrated from the OpenCode 2
+  tables; a session without one (a store whose migration has not finished) is
+  still read from `session`. The OpenCode reader makes that choice once per
+  session, so discovery, hydration and the sweep never decide it themselves.
+  Each `session_message` row is rewritten into the V1 message and part
+  payloads, so the one normalizer parses it: a `user` row's `text`, an
+  `assistant` row's `content` items (`text`, `reasoning`, and `tool` with its
+  result text as `state.output`), `synthetic` rows as synthetic text and
+  `compaction` rows as the compaction marker. `system` and `idle` rows are not
+  transcript. OpenCode 2's `shell` and `subagent` tools take the targets of
+  `bash` and `task`.
+
+  An OpenCode 2 session can carry less than its V1 original: OpenCode's
+  migration replaces attachments with "Attachment unavailable after
+  migration", and only `text`, `reasoning` and `tool` content items are read,
+  so V1 part kinds with no OpenCode 2 counterpart are not in the evidence.
 
   The JSON tree is laid out as `session/<scope>/<sessionId>.json`,
   `message/<sessionId>/<messageId>.json` and `part/<messageId>/<partId>.json`.

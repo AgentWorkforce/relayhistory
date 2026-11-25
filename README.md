@@ -1,6 +1,6 @@
 # RelayHistory (`ai-hist`)
 
-**Search, resume, and hand off every coding-agent session — across every harness on your machine.**
+Search, resume and hand off coding-agent sessions across the tools on your machine. RelayHistory keeps the history local and gives agents a common way to retrieve it.
 
 Local memory for **Claude Code**, **Codex**, **Cursor**, **Grok**, **Muse Code**, **OpenCode**, and **Devin CLI**. Your agent sessions are indexed into one local SQLite database. Search them all at once, jump back into a session with its harness's native resume command, and hand a compact context pack to another agent — or to a teammate's agent — to continue the work.
 

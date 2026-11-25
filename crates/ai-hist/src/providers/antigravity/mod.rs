@@ -19,7 +19,15 @@ pub(crate) const LOCAL_SOURCE: LocalSource = LocalSource {
     discovery: Discovery::Provider(|| Box::new(Provider)),
     hydration: Hydration::Parser(ingest),
     transcript_roots: |r| r.for_provider(ID).to_vec(),
-    relationships: Relationships::NONE,
+    // A parent conversation writes `.system_generated/subagents/<child>.json`
+    // per spawned subagent; its `conversationId` names the child's own
+    // conversation under the same brain root.
+    relationships: Relationships {
+        stable_child_identity: "always",
+        records_agent_type: true,
+        records_spawn_time: true,
+        records_evidence_locator: true,
+    },
     resume: None,
     fixtures: Fixtures::Dir(ID),
 };
@@ -29,7 +37,7 @@ pub(crate) const METADATA: ProviderMetadata = ProviderMetadata {
     usage: None,
 };
 pub(crate) const ADAPTER: Option<ProviderAdapter> = Some(ProviderAdapter {
-    generation: "antigravity_transcript_v2",
+    generation: "antigravity_transcript_v3",
     acquire,
     sweep,
     resolve_roots: roots::resolve,
@@ -51,7 +59,15 @@ impl ShallowSessionProvider for Provider {
             EvidenceKind::History,
             EvidenceKind::SessionEvent,
             EvidenceKind::SessionMarker,
+            EvidenceKind::Relationship,
         ]
+    }
+    // A subagent sidecar can arrive or change while every transcript stays
+    // byte-identical; fold the sidecars in so such a tick is not skipped.
+    fn fingerprint_inputs(&self, env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
+        let mut inputs = storage::enumerate(env)?;
+        inputs.extend(storage::subagent_candidates(&inputs)?);
+        Ok(inputs)
     }
     fn enumerate(&self, env: &DiscoveryEnv<'_>, _: Option<usize>) -> Result<Vec<Candidate>> {
         storage::enumerate(env)

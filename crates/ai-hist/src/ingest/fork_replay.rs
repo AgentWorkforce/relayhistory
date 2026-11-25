@@ -37,13 +37,16 @@ pub(super) struct ForkReplaySpan {
     /// Line index of the last replayed line read so far.
     last_line: usize,
     /// The envelope timestamp of the replayed `session_meta`: when the fork
-    /// wrote the copy.
-    ts_ms: i64,
+    /// wrote the copy, else the nearest preceding line's (see
+    /// `codex_untimed`). `None` when no line up to it reported one.
+    ts_ms: Option<i64>,
     /// Tool call ids the replay carried, so rows an earlier parser indexed
     /// under the child for them can be retired.
     call_ids: Vec<String>,
     /// `(timestamp, prompt)` of each replayed human turn, for the same reason
-    /// on `history`.
+    /// on `history`. The timestamp is a match key, never stored: it is what
+    /// the earlier parser stored the prompt at, which for a line with no
+    /// time that parses was 0 (`codex_untimed::stored_before`).
     prompts: Vec<(i64, String)>,
     /// The last readable cumulative snapshot inside the replay.
     pub(super) inherited: Option<CodexTokenTotals>,
@@ -55,7 +58,11 @@ pub(super) struct ForkReplaySpan {
 }
 
 impl ForkReplaySpan {
-    pub(super) fn new(first_line: usize, ts_ms: i64, opening: codex::ReplayOpening) -> Self {
+    pub(super) fn new(
+        first_line: usize,
+        ts_ms: Option<i64>,
+        opening: codex::ReplayOpening,
+    ) -> Self {
         Self {
             opening,
             first_line,
@@ -86,12 +93,8 @@ impl ForkReplaySpan {
             }
         }
         if let Some(message) = codex::human_message(value) {
-            let ts_ms = value
-                .get("timestamp")
-                .and_then(Value::as_str)
-                .and_then(parse_iso_ms)
-                .unwrap_or(0);
-            self.prompts.push((ts_ms, message.text));
+            self.prompts
+                .push((super::codex_untimed::stored_before(value), message.text));
         }
         if payload.get("type").and_then(Value::as_str) == Some("token_count") {
             let info = payload.get("info");
@@ -185,7 +188,7 @@ pub(super) fn record_codex_fork_replay(
         session_id,
         &NewSessionMarker {
             marker_uid: &marker_uid,
-            ts_ms: (span.ts_ms != 0).then_some(span.ts_ms),
+            ts_ms: span.ts_ms,
             message_id: None,
             parent_id: meta.fork_parent_id.as_deref(),
             turn_id: closed_by.and_then(|(turn, _)| turn),

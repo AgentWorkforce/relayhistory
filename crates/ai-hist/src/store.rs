@@ -18,11 +18,17 @@ pub(crate) mod busy_wait;
 mod event_order;
 mod event_row;
 use event_order::{event_cursor_order, ranked_turn_header_sql, user_turn_stream_sql};
+mod session_event_columns;
+use session_event_columns::REQUIRED_SESSION_EVENT_COLUMNS;
+mod history_lines;
+pub use history_lines::{parse_claude, parse_codex};
 mod retired_sources;
 pub(crate) mod sync_connection;
 pub use retired_sources::is_retired_source;
 mod schema_check;
 use schema_check::REQUIRED_SESSIONS_COLUMNS;
+mod query_filter;
+pub use query_filter::QueryFilter;
 mod user_turn_page;
 use crate::ingest::evidence_reconcile::{record_history_presence, record_marker_presence};
 pub(crate) use event_row::row_to_session_event;
@@ -79,43 +85,6 @@ pub struct TaggedSession {
     pub project: Option<String>,
     pub entry_count: i64,
     pub last_activity_ms: Option<i64>,
-}
-
-#[derive(Debug, Clone, Default)]
-pub struct QueryFilter {
-    pub source: Option<String>,
-    pub project: Option<String>,
-    pub tag: Option<String>,
-    /// Deprecated exclusive timestamp bound. Rows sharing the boundary
-    /// timestamp are skipped, so it is not a pagination cursor; use `after`.
-    pub before_ms: Option<i64>,
-    /// Inclusive lower bound on the row timestamp.
-    pub since_ms: Option<i64>,
-    /// Inclusive upper bound on the row timestamp.
-    pub until_ms: Option<i64>,
-    /// Keyset continuation: only rows strictly after this one in the read's
-    /// `(timestamp DESC, id DESC, match source)` order. Applied in addition
-    /// to the time window.
-    pub after: Option<HistoryCursor>,
-    pub limit: i64,
-    pub scope: SessionScope,
-}
-
-impl QueryFilter {
-    /// The checks every surface applies before a history read, so an invalid
-    /// window is the same error from the CLI, the SDK and MCP.
-    pub fn validate(&self) -> Result<()> {
-        if let (Some(since), Some(until)) = (self.since_ms, self.until_ms) {
-            anyhow::ensure!(
-                since <= until,
-                "since_ms ({since}) must not be later than until_ms ({until})"
-            );
-        }
-        if let Some(cursor) = &self.after {
-            cursor.validate()?;
-        }
-        Ok(())
-    }
 }
 
 /// Where a newest-first history read stopped: the last row it returned.
@@ -347,6 +316,10 @@ CREATE TABLE IF NOT EXISTS session_events (
     -- request's copies settle into -- and JSON `null` for a copy that carried
     -- none. Null wherever `token_json` already is the record's own.
     record_token_json TEXT,
+    -- Who put a message in the transcript, as the harness recorded it:
+    -- Claude's `origin.kind` verbatim (`human`, `peer`, `task-notification`,
+    -- ...). Null where the record names no origin and for other sources.
+    origin_kind TEXT,
     -- Which evidence backs this row: 'local' (a local parser read it from
     -- the provider's own files), 'remote' (a remote observation supplied
     -- it) or 'both'. See `EVIDENCE_LOCATION_TABLES`.
@@ -662,77 +635,6 @@ const REQUIRED_HYDRATION_CURSOR_COLUMNS: &[(&str, &str)] = &[
 /// database created by either implementation must gain the other column.
 const REQUIRED_SESSION_MARKER_COLUMNS: &[(&str, &str)] =
     &[("message_id", "TEXT"), ("text", "TEXT")];
-/// Columns [`init_db`] adds to `session_events` after the original DDL, with
-/// the SQL type each one is added as.
-///
-/// Canonical project identity (issue #175): `project_key` is denormalized onto
-/// the event so a grouping query does not have to join `sessions` for every
-/// row, and `project_key_method` says what kind of key it is. The method is
-/// storage, not surface: nothing selects it into [`crate::SessionEvent`]. It
-/// exists so the denormalizing pass can rank what it is about to write against
-/// what the row already holds, which is the only way to tell a key a delegated
-/// child resolved for itself from one it was lent. Without it that pass
-/// overwrote the former with the latter.
-///
-/// Then the per-message raw provider facts: the envelope facts a harness
-/// records once per API request or per message and that normalization used to
-/// read past. burn groups turns into API requests by `request_id`, detects an
-/// in-progress turn by the *absence* of `stop_reason`, attributes sidechain
-/// output, and bounds a Codex turn by `turn_id`. Every one is nullable, and
-/// the wire value is stored verbatim -- relayhistory preserves, consumers map.
-///
-/// As with the catalog columns above, this list is both the migration list and
-/// the read-only guard list, so the two cannot drift.
-const REQUIRED_SESSION_EVENT_COLUMNS: &[(&str, &str)] = &[
-    ("source_order", "INTEGER CHECK(source_order IS NULL OR (typeof(source_order) = 'integer' AND source_order >= 0))"),
-    ("project_key", "TEXT"),
-    ("project_key_method", "TEXT"),
-    ("provider", "TEXT"),
-    ("request_id", "TEXT"),
-    ("provider_message_id", "TEXT"),
-    ("stop_reason", "TEXT"),
-    ("agent_version", "TEXT"),
-    ("is_sidechain", "INTEGER"),
-    ("is_meta", "INTEGER"),
-    ("turn_id", "TEXT"),
-    // Which API request a row belongs to, for a provider that delimits its
-    // requests without naming them. Codex reports cumulative `token_count`
-    // snapshots; one snapshot ends one request, and every assistant row since
-    // the previous snapshot belongs to it. The parser numbers those spans per
-    // session, because the boundary is knowable only while reading the
-    // rollout in order -- a reader cannot recover it from the stored rows
-    // without scanning the session. Null for providers that name their
-    // requests, which group on `request_id` instead.
-    ("request_span", "TEXT"),
-    // Not a provider fact: the generation of raw-fact parsing the local parser
-    // wrote the row with. It is the only field stamped on every event the
-    // parser writes, whatever the provider recorded, which is what lets a
-    // plain `sync` tell a row indexed before the facts existed from one whose
-    // facts the provider genuinely never recorded. Adapter-supplied rows do
-    // not carry it (it is absent from the session-event evidence spec), so the
-    // probes that read it exclude sessions with remote provenance.
-    ("raw_facts_version", "INTEGER"),
-    // The provider-native record or block type an event was derived from,
-    // so a `tool_result` that came from a Claude `tool_result` content
-    // block stays distinguishable from one synthesized out of a
-    // `type: "system"` subagent notification. Both land in the same `kind`;
-    // the normalized `kind` vocabulary is deliberately not widened for it.
-    ("raw_kind", "TEXT"),
-    // Why a user-role row is not a human prompt, from the vocabulary in
-    // `ingest::control::ControlKind`. Null on every prompt and every
-    // model-output row. Derived by the parser, not copied off the envelope,
-    // so it is re-stamped by the same raw-facts backfill that repairs the
-    // columns above: a row without it is a row the classifier never saw.
-    ("control_kind", "TEXT"),
-    // Claude: the usage blob as this one record carried it, verbatim. Claude
-    // writes one streamed response as several records whose usage snapshots
-    // `token_json` settles into one blob; this keeps a record's own where it
-    // differs (JSON `null` for a copy that carried none), and is null wherever
-    // `token_json` already is the record's own. Written
-    // by the same parser generation as the facts above, so the raw-facts
-    // backfill fills it on rows indexed before it existed.
-    ("record_token_json", "TEXT"),
-];
 /// Columns the v2 `session_relationships` shape adds. A v1 row set cannot
 /// represent related evidence whose child has no provider-recorded identity,
 /// so a database still carrying the v1 table is not current for any read.
@@ -2213,60 +2115,6 @@ pub fn prompt_hash(prompt: &str) -> String {
     format!("{:x}", hasher.finalize())[..16].to_string()
 }
 
-pub fn parse_claude(line: &str) -> Result<Option<HistoryEntry>> {
-    let obj: serde_json::Value = serde_json::from_str(line)?;
-    let display = obj
-        .get("display")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim();
-    if display.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(HistoryEntry {
-        event_uid: None,
-        id: 0,
-        source: "claude".into(),
-        session_id: obj
-            .get("sessionId")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-        project: obj
-            .get("project")
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-        prompt: display.to_string(),
-        prompt_hash: Some(prompt_hash(display)),
-        timestamp_ms: obj.get("timestamp").and_then(|v| v.as_i64()).unwrap_or(0),
-    }))
-}
-
-pub fn parse_codex(line: &str) -> Result<Option<HistoryEntry>> {
-    let obj: serde_json::Value = serde_json::from_str(line)?;
-    let text = obj
-        .get("text")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim();
-    if text.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(HistoryEntry {
-        event_uid: None,
-        id: 0,
-        source: "codex".into(),
-        session_id: obj
-            .get("session_id")
-            .or_else(|| obj.get("sessionId"))
-            .and_then(|v| v.as_str())
-            .map(str::to_string),
-        project: None,
-        prompt: text.to_string(),
-        prompt_hash: Some(prompt_hash(text)),
-        timestamp_ms: ((obj.get("ts").and_then(|v| v.as_f64()).unwrap_or(0.0)) * 1000.0) as i64,
-    }))
-}
-
 pub fn parse_cursor_text(line: &str) -> Result<Option<String>> {
     let obj: serde_json::Value = serde_json::from_str(line)?;
     if obj.get("role").and_then(|v| v.as_str()) != Some("user") {
@@ -2797,6 +2645,13 @@ pub struct SessionEvent {
     /// wherever `token_json` already is the record's own: every row of other
     /// sources, and a Claude row whose usage settlement did not change.
     pub record_token_json: Option<String>,
+    /// Who put the message in the transcript, as the harness recorded it:
+    /// Claude's `origin.kind` verbatim (`human` for a person at the prompt,
+    /// `peer` for another agent session, `task-notification` for a background
+    /// task's notice). `None` where the record names none, for other sources,
+    /// and on rows indexed before the column existed.
+    #[serde(default)]
+    pub origin_kind: Option<String>,
     /// Source-observed ordinal within a timestamp bucket; absent means unknown.
     /// Independent of event identity and destination database row IDs.
     #[serde(default)]
@@ -2942,7 +2797,7 @@ pub(crate) const SESSION_EVENT_COLUMNS: &str =
      payload_truncated, payload_hash, call_index, event_index, result_status, event_source, \
      error_signal, subagent_session_id, agent_id, request_id, provider_message_id, \
      stop_reason, agent_version, is_sidechain, is_meta, turn_id, request_span, raw_kind, \
-     control_kind, record_token_json, source_order";
+     control_kind, record_token_json, origin_kind, source_order";
 
 /// The order every whole-session event read uses: oldest first, rows sharing
 /// a timestamp by recorded source order, with row-ID fallback only for unknown order.
@@ -5948,6 +5803,32 @@ mod tests {
                 .unwrap()
                 .timestamp_ms,
             2000
+        );
+    }
+
+    /// A history line with no usable time is left out, never dated 0.
+    #[test]
+    fn a_history_line_without_a_time_is_never_stored_at_zero() {
+        for line in [
+            r#"{"display":"hello","sessionId":"s"}"#,
+            r#"{"display":"hello","timestamp":"not a number","sessionId":"s"}"#,
+            r#"{"display":"hello","timestamp":0,"sessionId":"s"}"#,
+        ] {
+            assert!(parse_claude(line).unwrap().is_none(), "{line}");
+        }
+        for line in [
+            r#"{"text":"fix","session_id":"c"}"#,
+            r#"{"text":"fix","ts":"soon","session_id":"c"}"#,
+            r#"{"text":"fix","ts":0,"session_id":"c"}"#,
+        ] {
+            assert!(parse_codex(line).unwrap().is_none(), "{line}");
+        }
+        assert_eq!(
+            parse_claude(r#"{"display":"hello","timestamp":7,"sessionId":"s"}"#)
+                .unwrap()
+                .unwrap()
+                .timestamp_ms,
+            7
         );
     }
 

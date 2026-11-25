@@ -66,9 +66,9 @@ if (!process.env.RH_QWEN_SURFACE_CHILD) {
     assert.equal(JSON.parse(capability.content[0].text).source, 'qwen-code');
     const result = await client.callTool({ name: 'search_history', arguments: { query: 'synthetic Qwen', source: 'qwen-code' } });
     assert.ok(!result.isError);
-    assert.ok(JSON.parse(result.content[0].text).length > 0);
+    assert.ok(JSON.parse(result.content[0].text).matches.length > 0);
     const filtered = await client.callTool({ name: 'search_history', arguments: { query: 'synthetic Qwen', source: 'pi' } });
-    assert.deepEqual(JSON.parse(filtered.content[0].text), []);
+    assert.deepEqual(JSON.parse(filtered.content[0].text).matches, []);
   } finally { await client.close(); }
   console.log('Qwen Code native recorder discover/catalog/hydrate/read/search + CLI search + MCP descriptors/capabilities/search/source filtering passed (pinned recorder fixture).');
 }

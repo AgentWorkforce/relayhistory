@@ -29,40 +29,43 @@ pub(super) fn root_present(
     false
 }
 
-/// The first in-log session id a transcript carries.
-///
-/// Read ahead of the record walk, and bounded in the case that matters: the
-/// id is normally on the first record, and this stops at the first one that
-/// has it.
-pub(super) fn claude_file_session_id(path: &Path) -> Result<Option<String>> {
-    let file = fs::File::open(path)
-        .with_context(|| format!("reading claude transcript {}", path.display()))?;
-    let mut reader = BufReader::new(file);
-    let mut raw = Vec::new();
-    loop {
-        raw.clear();
-        if reader.read_until(b'\n', &mut raw)? == 0 {
-            return Ok(None);
-        }
-        let Ok(line) = std::str::from_utf8(&raw) else {
-            continue;
-        };
-        if let Some(id) = serde_json::from_str::<Value>(line.trim_end_matches(['\n', '\r']))
-            .ok()
-            .as_ref()
-            .and_then(|value| value.get("sessionId"))
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())
-        {
-            return Ok(Some(id.to_string()));
-        }
-    }
-}
-
 /// True when every identified record is a sidechain row.
 /// A file with no identified records returns false.
 pub(crate) fn claude_records_are_all_sidechain(identified: usize, sidechain: usize) -> bool {
     identified > 0 && sidechain == identified
+}
+
+/// Index the records in bytes the hook captured.
+pub(super) fn ingest_claude_transcript_text_as(
+    conn: &Connection,
+    path: &Path,
+    text: &str,
+    attributed_session_id: Option<&str>,
+) -> Result<()> {
+    let order = native_order::begin(conn, "claude", attributed_session_id)?;
+    let file_session_id = claude_sessionless_owner(
+        path,
+        text.lines().filter_map(|line| {
+            serde_json::from_str::<Value>(line)
+                .ok()?
+                .get("sessionId")?
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+        }),
+    );
+    let mut walk = ClaudeRecordWalk::new(
+        conn,
+        path,
+        attributed_session_id,
+        file_session_id.as_deref(),
+    );
+    for line in text.lines() {
+        check_capture_cancelled()?;
+        walk.feed(line)?;
+    }
+    walk.finish()?;
+    order.finish()
 }
 
 #[cfg(test)]

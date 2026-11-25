@@ -89,7 +89,7 @@ pub(super) fn text(row: &Value) -> Option<&str> {
         return Some(text);
     };
     let Some((request, metadata)) =
-        wrapped.rsplit_once("\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\n")
+        strip_trailing_blocks(wrapped).rsplit_once("\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\n")
     else {
         return Some(text);
     };
@@ -104,4 +104,26 @@ pub(super) fn text(row: &Value) -> Option<&str> {
     } else {
         Some(text)
     }
+}
+
+/// Drop system blocks Antigravity appends after `<ADDITIONAL_METADATA>`,
+/// such as `<USER_SETTINGS_CHANGE>`: each a `\n<TAG>\n...\n</TAG>` suffix
+/// with an upper-case tag name.
+fn strip_trailing_blocks(mut text: &str) -> &str {
+    while let Some(close) = text.rfind("\n</") {
+        let Some(tag) = text[close + 3..].strip_suffix('>') else {
+            break;
+        };
+        if tag.is_empty()
+            || tag == "ADDITIONAL_METADATA"
+            || !tag.bytes().all(|b| b.is_ascii_uppercase() || b == b'_')
+        {
+            break;
+        }
+        let Some(open) = text[..close].rfind(&format!("\n<{tag}>\n")) else {
+            break;
+        };
+        text = &text[..open];
+    }
+    text
 }

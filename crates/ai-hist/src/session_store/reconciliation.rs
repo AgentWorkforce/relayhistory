@@ -51,6 +51,9 @@ struct SourceWalk {
     deferred_turn: bool,
     visited: HashSet<PathBuf>,
     pending: Vec<PathBuf>,
+    /// Leading `pending` paths to attempt one at a time, because the batch
+    /// that held them failed: one path's failure must not hold the rest.
+    isolating: usize,
     finalized: bool,
 }
 
@@ -58,19 +61,13 @@ struct SourceWalk {
 // ReadDir per repaired location; ordinary traversal still holds one iterator.
 const MAX_OPEN_DIRECTORIES: usize = 2;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum DeferredWork {
     Directory(PathBuf, WatchedPath),
     Entry(PathBuf, WatchedPath),
-}
-
-impl DeferredWork {
-    fn key(&self) -> (&PathBuf, &WatchedPath, bool) {
-        match self {
-            Self::Directory(path, root) => (path, root, true),
-            Self::Entry(path, root) => (path, root, false),
-        }
-    }
+    /// An exact path whose acquisition failed on its own. It stays owed and
+    /// is retried alone; the walk goes on past it.
+    Acquisition(PathBuf),
 }
 
 #[derive(Debug)]
@@ -128,6 +125,7 @@ impl SessionStore {
                     deferred_turn: false,
                     visited: HashSet::new(),
                     pending: Vec::new(),
+                    isolating: 0,
                     finalized: false,
                 })
             })
@@ -327,15 +325,12 @@ impl Reconciliation {
             if source.pending.is_empty() {
                 source.collect(max_entries.max(1), max_paths.max(1), &mut step.entries)?;
             }
-            step.paths = source.pending.len().min(max_paths.max(1));
+            step.paths = source.batch_len(max_paths.max(1));
             if step.paths > 0 {
                 options.sources = Some(vec![source.source]);
                 options.paths = Some(source.pending[..step.paths].to_vec());
-                step.discovery = Some(self.store.discover(options)?);
-                source.pending.drain(..step.paths);
-                if retained_pending {
-                    source.deferred_turn = !source.deferred.is_empty();
-                }
+                let discovered = self.store.discover(options);
+                step.discovery = Some(source.settle(step.paths, retained_pending, discovered)?);
             }
             Ok(step)
         })();
@@ -363,18 +358,14 @@ impl Reconciliation {
         if source.pending.is_empty() {
             source.collect(max_entries, max_paths, &mut step.entries)?;
         }
-        step.paths = source.pending.len().min(max_paths);
+        step.paths = source.batch_len(max_paths);
         if source.pending.is_empty() {
             return Ok(step);
         }
         options.sources = Some(vec![source.source]);
         options.paths = Some(source.pending[..step.paths].to_vec());
-        let report = self.store.sync(options)?;
-        source.pending.drain(..step.paths);
-        if retained_pending {
-            source.deferred_turn = !source.deferred.is_empty();
-        }
-        step.report = Some(report);
+        let synced = self.store.sync(options);
+        step.report = Some(source.settle(step.paths, retained_pending, synced)?);
         Ok(step)
     }
 }

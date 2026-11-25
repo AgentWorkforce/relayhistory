@@ -12,6 +12,7 @@ mod retirement_tests;
 mod fence_tests;
 
 mod event_order;
+mod order;
 use crate::{discover::*, *};
 use crate::{
     observations::{self, ObservationCheckpoint, ObservationKey, SessionObservation},

@@ -1,141 +1,35 @@
-# AGENTS.md — RelayHistory (`ai-hist`)
-
-Entry point for agents and humans working in this repository. Read this, then
-the document your change touches.
-
-## What this repository is
-
-RelayHistory indexes coding-agent sessions from every harness on a machine into
-one local SQLite database (`ai-history.db`) and exposes them through a Rust
-crate, a Node native addon, a TypeScript SDK, a CLI and an MCP server. See
-[`README.md`](README.md) for the product surface and
-[`docs/architecture.md`](docs/architecture.md) for the call graph.
-
-## Ownership boundary — read before adding or changing a parser
-
-**RelayHistory is the single owner of acquiring, parsing and storing session
-evidence for every harness.** Providers are added here and nowhere else.
-Downstream consumers — including
-[`AgentWorkforce/burn`](https://github.com/AgentWorkforce/burn), which owns
-pricing, cost, activity classification and analytics — read that evidence
-through the `ai-hist` crate's `SessionStore` facade instead of writing a second
-parser or a second schema.
-
-`ai-hist` is an **in-process** crate, so this is one writer _implementation_,
-not one writer process: a consumer that calls `sync`, `hydrate` or `watch`
-opens `ai-history.db` read-write in its own process, and only a handle opened
-with `StoreOptions::default().read_only(true)` truly adds no writer. Every mutation
-still goes through the crate's own schema, migrations, `SyncRunLock`, hydration
-locks and WAL busy handler. See the ADR's [store-shape
-section](docs/decisions/2026-09-19-relayhistory-owns-session-sourcing.md#store-shape-one-writer-implementation-not-one-writer-process).
-
-- [ADR: relayhistory owns session sourcing; burn consumes evidence through a
-  Rust SDK](docs/decisions/2026-09-19-relayhistory-owns-session-sourcing.md) —
-  the decision, the rejected alternatives, and the per-source **capture
-  matrix**. A change that adds or extends provider capture must move its cell
-  in that matrix in the same PR.
-- [`docs/sourcing-contract.md`](docs/sourcing-contract.md) — the record types
-  the Rust SDK must expose, mapped onto burn's reader types.
-- [`docs/session-catalog.md` → Adding a
-  provider](docs/session-catalog.md#adding-a-provider) — the only place a
-  harness is added; the ADR's per-source matrix is the contract of record.
-- burn is becoming a consumer rather than a second parser: it prices and
-  analyzes the evidence this crate captures, and drops its own harness readers
-  in burn 5.0.0 ([burn #562](https://github.com/AgentWorkforce/burn/issues/562)).
-  Two CI checks arm as burn gets there — the `burn-contract-drift` job (burn
-  built against your change, once burn depends on `ai-hist`) and the weekly
-  `burn-reader-tripwire.yml` (burn's parsers must stay gone after its cutover
-  tag); see `scripts/burn-guardrails.mjs`.
-
-RelayHistory will never own pricing, cost, token estimation, activity
-classification, or similarity-based session linking.
-
-## Document map
-
-| Document                                                 | What it covers                                                       |
-| -------------------------------------------------------- | -------------------------------------------------------------------- |
-| [`docs/architecture.md`](docs/architecture.md)           | Production call graph, package boundaries, ledger and scope          |
-| [`docs/session-catalog.md`](docs/session-catalog.md)     | Shallow discovery, per-provider capability matrix, adding a provider |
-| [`docs/sourcing-contract.md`](docs/sourcing-contract.md) | Record types the Rust SDK must expose                                |
-| [`docs/sourcing-sdk.md`](docs/sourcing-sdk.md)           | Embedder guide: the `SessionStore` facade, its structs and errors, lifecycle and locks, evidence model, semver |
-| [`docs/decisions/`](docs/decisions/)                     | Architecture decision records                                        |
-| [`docs/getting-started.md`](docs/getting-started.md)     | Install and first run                                                |
-| [`docs/releasing.md`](docs/releasing.md)                 | npm and crates.io release pipelines, semver policy, changelog cut    |
-| [`docs/agent-integration.md`](docs/agent-integration.md) | Wiring RelayHistory into an agent                                    |
-| [`crates/ai-hist/README.md`](crates/ai-hist/README.md)   | Embedding from Rust                                                  |
-| [`examples/rust-consumer`](examples/rust-consumer)       | Out-of-tree consumer of the published crate; CI smoke test          |
-
-## Decision records
-
-Durable architecture choices go in `docs/decisions/` as
-`YYYY-MM-DD-short-slug.md`, with a status, date, context, decision, the
-alternatives that were rejected and why, and the consequences. Record the
-choice, not the reasoning transcript.
-
-## Changelog
-
-`CHANGELOG.md` is the one changelog for every package; they all release at one
-version.
-
-- Curate the pending section of `CHANGELOG.md` in the same PR as any
-  user-visible change.
-- An empty post-release changelog starts at `[Unreleased]`. The first pending
-  user-visible change sets the heading to `[Unreleased - Patch]`,
-  `[Unreleased - Minor]`, or `[Unreleased - Major]` according to its SemVer
-  impact. Before 1.0, a breaking change (including a native contract bump or a
-  `### Rust API` break) is `Minor`.
-- The pending level is monotonic: `Patch < Minor < Major`. Raise the heading
-  when a higher-impact change arrives; never lower it, and leave it unchanged
-  for another change at the same level.
-- Sections, in this order: `### Breaking Changes`, `### Added`, `### Changed`,
-  `### Deprecated`, `### Removed`, `### Fixed`, `### Security`, `### Rust API`.
-- Do not hand-cut a release. The publish workflow refuses a release smaller
-  than the pending level (`scripts/check-release-changelog.mjs`), then
-  `scripts/cut-changelog.mjs` moves the pending entries under the released
-  version, restores a bare `[Unreleased]`, and updates the comparison links.
-  Entries merged while a release runs stay pending.
-- Keep entries concise and impact-first: one short, unwrapped bullet per
-  user-visible change, no nested bullets.
-- Omit PR links, internal review notes, test-only or CI-only work, and
-  implementation backstory unless they explain shipped impact.
-
-## Before opening a PR
-
-CI (`.github/workflows/ci.yml`) runs, at minimum:
+# Working in relayhistory
 
 ```sh
 cargo fmt --all -- --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
-cargo build -p ai-hist --no-default-features
-cargo publish --dry-run -p ai-hist --allow-dirty
+npm install
 ```
 
-plus the TypeScript SDK tests, the native binding contract check, the
-optional-plugin jobs, the out-of-tree consumer build (`examples/rust-consumer`
-with `[patch.crates-io]` at this checkout) and the public-API snapshot diff
-(`node scripts/check-public-api.mjs`; a change to the crate's default surface
-updates `crates/ai-hist/public-api.txt` with `--update` and adds a `### Rust
-API` changelog entry in the same PR). The plugin crates are not workspace members, so
-`cargo test --workspace` does not reach them — run them directly when you touch
-`plugins/`.
+- This repo owns all harness acquisition/parsing/storage. Burn consumes SessionStore and owns pricing/analytics; never add those product policies here.
+- SessionStore is an in-process writer implementation, not a single writer process; preserve its schema/migration/locking/WAL boundaries. Update the capture matrix with provider changes.
+- Plugin crates are outside the workspace; cargo test --workspace does not cover them. Run their direct suites when touched.
+- Public API changes update crates/ai-hist/public-api.txt via scripts/check-public-api.mjs and add a Rust API changelog entry. All packages share one version; pending release severity only rises.
+- Never raise rust-oleum ceilings. A burn-contract-drift failure may be ledger identity drift: investigate against base and consumer evidence rather than bypassing it.
+- Read docs/sourcing-contract.md and the ownership ADR for sourcing changes; docs/releasing.md plus `docs/agent-reference.md` for release rules.
 
-The `code-quality` job runs [rust-oleum](https://github.com/AgentWorkforce/rust-oleum)
-against `rust-oleum.toml`: per-function cyclomatic/cognitive complexity,
-Halstead difficulty and lines per file. Existing violations are grandfathered
-at their current ceiling in `[baseline]`; a new violation, or growing past a
-ceiling, fails. Run `rust-oleum` locally before pushing. When a refactor brings
-an entry down, lower or delete its baseline line (`rust-oleum --write-baseline`
-prints the regenerated section) — never raise one.
+## Agency and guidance
 
-For a change under `crates/ai-hist/`, the `burn-contract-drift` job checks out
-`AgentWorkforce/burn` (main, or the commit in the `BURN_REF` repository
-variable), rewrites burn's `ai-hist` requirement to a path dependency on this
-checkout — so the question is "does burn pass against this code", whatever
-version burn pins — proves burn resolved it, and runs burn's relayhistory
-parity suite. A failure there means your change moves burn's ledger identity
-(message ids, timestamps, usage dedup): fix it here or document the difference
-as intended — do not work around it in burn. If burn itself is broken, re-run
-the base branch to confirm, and a maintainer can pin `BURN_REF` to a
-known-good burn commit until it is fixed. Until burn depends on `ai-hist`
-(burn #557) the job passes with a notice.
+- Act autonomously on routine assigned work; ask forgiveness rather than permission. Preserve explicit production, release and credential gates.
+- For guidance, ask the engineering leads, the agent that spawned you, or the layered owner on Agent Relay.
+- Only a truly pressing or blocking question goes to `khaliq-gant` or `will-washburn` (CODEOWNERS) on Agent Relay.
+
+## Cross-repo context
+
+- Before and during changes, understand how this repo fits the wider system; consult its repo map and related-repo docs where available.
+- Check relevant agents’ summaries on Agent Relay and proactively contact owning agents about dependencies, adjacent changes and work in flight.
+
+## Pull requests (when used)
+
+- Open PRs as ready for review by default. If merging requires Khaliq’s OK, use `merge-train:hold` instead of draft status.
+- If you open a PR, immediately subscribe to its feedback through Agent Relay using [this skill](https://github.com/AgentWorkforce/skills/blob/main/skills/subscribing-relay-webhooks-and-writebacks/SKILL.md), and verify subscription readiness.
+- Evaluate each review finding. Address applicable feedback and explain declined changes in the thread.
+- A PR is not ready while feedback remains unaddressed or merge conflicts remain.
+- When ready, alert the CODEOWNERS and the agent that spawned you on Agent Relay.
+- Keep related open PRs from going stale: find their authoring agent on Agent Relay and coordinate; if that agent is no longer on the relay, escalate to the CODEOWNERS or the layered owner.

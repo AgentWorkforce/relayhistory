@@ -185,24 +185,7 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
     // A cursor that was rejected, or one that never existed, means this pass
     // re-reads from zero; the per-source state that went with the old position
     // describes bytes that are no longer there.
-    let mut claude = if reader.start_offset() == 0 {
-        // The metadata walk keeps its own position and its own fold, and
-        // rotation is something it detects for itself. Dropping its state here
-        // because *this* walk restarted left the global sync re-deriving a
-        // transcript's identity from byte zero on every append: it stored the
-        // scan, then this reloaded the same row and wrote a default over it.
-        //
-        // A walk from byte zero is this parser's own, so it names this
-        // generation; a resumed walk keeps the generation that committed the
-        // position it resumes from.
-        ClaudeCursorState {
-            scan: saved_claude.scan.clone(),
-            records_parser: super::hydrate::HYDRATION_PARSER_VERSION,
-            ..Default::default()
-        }
-    } else {
-        saved_claude.clone()
-    };
+    let mut claude = saved_claude.pass_start(reader.start_offset());
     let start_offset = reader.start_offset();
     let order = native_order::optional(conn, "claude", attributed_session_id, start_offset == 0)?;
     // The source fence excludes concurrent Claude mutations across chunk
@@ -244,6 +227,12 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
     // being written then is not going to be finished. Holding it back again
     // would hold it back forever.
     let defer_unfinished = !reader.quiesced();
+    let prefix_bytes = super::claude_untimed::fold_prefix_times(
+        &mut reader,
+        start_offset,
+        attributed_session_id,
+        &mut claude,
+    )?;
     let (
         line_index,
         reread_bytes,
@@ -255,7 +244,7 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
         let file_session_id = claude
             .scan
             .as_ref()
-            .and_then(|scan| scan.fold.session_id.clone());
+            .and_then(|scan| scan.fold.file_session_id());
         let mut walk = ClaudeIncrementalWalk {
             conn,
             path,
@@ -343,11 +332,35 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
         .saturating_sub(start_offset)
         .saturating_add(reader.tail_bytes())
         .saturating_add(reread_bytes)
+        .saturating_add(prefix_bytes)
         .saturating_add(pass.validation_bytes);
     Ok(pass)
 }
 
 impl ClaudeCursorState {
+    /// The state a pass starting at `start_offset` walks with.
+    ///
+    /// The metadata walk keeps its own position and its own fold, and
+    /// rotation is something it detects for itself. Dropping its state here
+    /// because *this* walk restarted left the global sync re-deriving a
+    /// transcript's identity from byte zero on every append: it stored the
+    /// scan, then this reloaded the same row and wrote a default over it.
+    ///
+    /// A walk from byte zero is this parser's own, so it names this
+    /// generation; a resumed walk keeps the generation that committed the
+    /// position it resumes from.
+    fn pass_start(&self, start_offset: u64) -> Self {
+        if start_offset != 0 {
+            return self.clone();
+        }
+        Self {
+            scan: self.scan.clone(),
+            records_parser: super::hydrate::HYDRATION_PARSER_VERSION,
+            record_ts_from_start: true,
+            ..Default::default()
+        }
+    }
+
     /// The transcript state this cursor carries, lent to the record indexer
     /// for one file.
     fn file_parse<'a>(
@@ -362,6 +375,7 @@ impl ClaudeCursorState {
             file_session_id,
             indexer: &mut self.tool_results,
             last_assistant_cache_read: &mut self.cache_reads,
+            last_record_ts: &mut self.record_ts,
             triads: &mut self.slash_commands,
         }
     }
@@ -560,16 +574,13 @@ pub(crate) fn claude_transcript_unchanged(conn: &Connection, path: &Path) -> Res
         super::CLAUDE_SUBAGENT_META_SOURCE,
         &metadata,
     )?;
-    if (metadata.is_file() || indexed_metadata)
-        && !transcript_cursor::transcript_unchanged(
+    let sidecar_known = metadata.is_file() || indexed_metadata;
+    Ok(!sidecar_known
+        || transcript_cursor::transcript_unchanged(
             conn,
             super::CLAUDE_SUBAGENT_META_SOURCE,
             &metadata,
-        )?
-    {
-        return Ok(false);
-    }
-    Ok(true)
+        )?)
 }
 
 /// Read a Claude transcript through a locator-keyed cursor, loading and

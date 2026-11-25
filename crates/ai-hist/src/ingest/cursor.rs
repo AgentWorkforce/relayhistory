@@ -163,7 +163,9 @@ pub(crate) fn project_dir_name(path: &Path) -> Option<&str> {
 /// `Write`/`StrReplace`/`ApplyPatch` set used by Claude- and Grok-served
 /// models, the `functions.*` namespaced set used by GPT-served models, and an
 /// older snake_case `edit_file`/`write_file` set. All three are recognized
-/// here; a name Cursor does not write simply never matches.
+/// here; a name Cursor does not write simply never matches. The editor's own
+/// store versions the snake_case names (`edit_file_v2`), and the version is
+/// not part of what the tool does.
 pub(crate) fn is_file_edit_tool(name: &str) -> bool {
     matches!(
         normalize_tool_name(name),
@@ -186,6 +188,7 @@ pub(crate) fn is_file_edit_tool(name: &str) -> bool {
 /// `functions.ApplyPatch`, `ApplyPatch` and `apply_patch` classify alike.
 fn normalize_tool_name(name: &str) -> &str {
     let bare = name.rsplit('.').next().unwrap_or(name);
+    let bare = bare.strip_suffix("_v2").unwrap_or(bare);
     // `str::to_lowercase` would allocate; these names are ASCII, and the
     // matcher above lists both the lowered CamelCase and the snake_case forms.
     LOWERED
@@ -243,15 +246,22 @@ pub(crate) fn pick_tool_target(name: &str, input: &Value) -> Option<String> {
         }
     }
     match normalize_tool_name(name) {
-        "shell" | "awaitshell" => get("command").or_else(|| get("cmd")),
-        "grep" | "glob" => get("pattern")
-            .or_else(|| get("query"))
-            .or_else(|| get("path")),
+        "shell" | "awaitshell" | "run_terminal_command" | "run_terminal_cmd" => {
+            get("command").or_else(|| get("cmd"))
+        }
+        "grep" | "glob" | "ripgrep_raw_search" | "grep_search" | "glob_file_search" => {
+            get("pattern")
+                .or_else(|| get("globPattern"))
+                .or_else(|| get("query"))
+                .or_else(|| get("path"))
+        }
         _ => get("path")
             .or_else(|| get("file_path"))
             .or_else(|| get("filePath"))
             .or_else(|| get("target_file"))
             .or_else(|| get("relative_workspace_path"))
+            .or_else(|| get("targetFile"))
+            .or_else(|| get("relativeWorkspacePath"))
             .or_else(|| get("notebook_path"))
             .or_else(|| get("uri"))
             .or_else(|| get("url"))
@@ -712,6 +722,99 @@ impl super::CursorTranscriptOutcome {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_partial_reads_do_not_certify_legacy_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bounded.jsonl");
+        let first = "{\"role\":\"user\",\"timestamp\":100,\"message\":{\"content\":\"first\"}}\n";
+        let text = format!("{first}{{\"role\":\"user\",\"timestamp\":100,\"message\":{{\"content\":\"second\"}}}}\n");
+        std::fs::write(&path, &text).unwrap();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::init_db(&conn).unwrap();
+        let read = |limit| {
+            crate::ingest::ingest_cursor_transcript(&conn, &path, "bounded", None, 100, 0, limit)
+                .unwrap()
+        };
+        read(u64::MAX);
+        let original = crate::session_events(&conn, "bounded", Some("cursor")).unwrap();
+        for (contents, boundary) in [
+            (text.clone(), first.len() as u64),
+            (format!("{text}{{\"role\":\"user\""), u64::MAX),
+        ] {
+            conn.execute("UPDATE session_events SET source_order=NULL", [])
+                .unwrap();
+            conn.execute("DELETE FROM history WHERE prompt='first'", [])
+                .unwrap();
+            std::fs::write(&path, contents).unwrap();
+            assert!(read(boundary).records > 0);
+            let rows = crate::session_events(&conn, "bounded", Some("cursor")).unwrap();
+            assert!(
+                rows.iter().all(|event| event.source_order.is_none()),
+                "a prefix or incomplete tail cannot establish complete native order"
+            );
+            assert_eq!(
+                rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+                original.iter().map(|row| row.id).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM history", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                2,
+                "successful partial payload writes remain committed"
+            );
+        }
+        std::fs::write(&path, &text).unwrap();
+        read(text.len() as u64);
+        let complete = crate::session_events(&conn, "bounded", Some("cursor")).unwrap();
+        assert_eq!(
+            complete
+                .iter()
+                .map(|row| row.source_order)
+                .collect::<Vec<_>>(),
+            [Some(0), Some(1)]
+        );
+        assert_eq!(
+            complete.iter().map(|row| row.id).collect::<Vec<_>>(),
+            original.iter().map(|row| row.id).collect::<Vec<_>>()
+        );
+    }
+
+    /// The editor's versioned tool names classify and target like the
+    /// transcript's.
+    #[test]
+    fn editor_tool_names_are_recognized() {
+        use serde_json::json;
+        assert!(is_file_edit_tool("edit_file_v2"));
+        assert!(!is_file_edit_tool("read_file_v2"));
+        assert!(is_subagent_tool("task_v2"));
+        assert_eq!(
+            pick_tool_target("edit_file_v2", &json!({"relativeWorkspacePath": "/w/a.rs"}))
+                .as_deref(),
+            Some("/w/a.rs")
+        );
+        assert_eq!(
+            pick_tool_target("read_file_v2", &json!({"targetFile": "/w/b.rs"})).as_deref(),
+            Some("/w/b.rs")
+        );
+        assert_eq!(
+            pick_tool_target(
+                "run_terminal_command_v2",
+                &json!({"command": "ls", "cwd": ""})
+            )
+            .as_deref(),
+            Some("ls")
+        );
+        assert_eq!(
+            pick_tool_target(
+                "glob_file_search",
+                &json!({"targetDirectory": "/w", "globPattern": "**/*.rs"})
+            )
+            .as_deref(),
+            Some("**/*.rs")
+        );
+    }
 
     /// A zone that is not a zone must be unreadable, not re-signed.
     ///

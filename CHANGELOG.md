@@ -8,19 +8,29 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Breaking Changes
 
-- Native contract 30 and evidence contract 5 require matching SDK and addon versions for full-session evidence, prompt identities and recorded event ordering.
+- The native contract is now 30: the TypeScript SDK and the `ai-hist-native` addon must be upgraded together, and an older addon is rejected. Evidence contract 5 adds full-session evidence, prompt identities and recorded event ordering.
+- The MCP `search_history` tool returns an envelope `{matches, nextCursor, truncated, totalContentCharsUsed}` instead of a bare array of matches.
 
 ### Added
 
+- Search matches carry a match-centered `snippet` (with `contentTruncated` and `snippetStartOffset`), echo grouping (`groupId`, `groupSize`, `echoCount`, `groupTruncated`, `isPrimary`), `origin`, `controlKind`, `eventUid` and an `eventRef`; `prompt` still holds the full text. Search accepts `sessionId`, `kinds`, `origin`, `maxContentChars` and `maxTotalContentChars` filters and budgets.
+- The MCP `search_history` tool rejects unknown arguments instead of silently dropping them.
 - `getSessionEvidence` reads a complete stored session snapshot with evidence-kind selection, optional transcript omission, provider identities and usage.
 - The CLI and SDK expose retention policy previews, explicitly applied bounded pruning with upload protection, and database compaction for reclaiming free space.
 
 ### Changed
 
+- Search pages return group primaries only: assistant and tool rows that repeat a prompt verbatim (or are linked to it) collapse into that prompt as counted echoes. Two identical-wording user prompts at different timestamps both stay primaries.
 - Export schema version 3 carries stable prompt-event identity and source-order evidence; new readers continue accepting older snapshots.
 
 ### Fixed
 
+- `origin: 'unknown'` search now returns ordinary assistant and tool rows (a NULL `control_kind` no longer drops them), and every origin filter returns only rows whose reported origin matches it.
+- Grouped search pages no longer end early when echoes collapse or an echo's prompt sits past the first fetch bound: the search reads on until the page is complete, and a prompt's `echoCount` is the same whatever the page size; `groupTruncated` marks potentially incomplete group counts (not page completeness), so follow `nextCursor` when present even if no returned group is flagged.
+- An echo now counts under the prompt it is linked to by id, or for a text-only echo the closest preceding identical prompt, instead of the newest matching prompt.
+- Snippets center on the match and report `snippetStartOffset` in original codepoints even when lowercasing expands a character (for example `İ`).
+- SDK `search()` returns all matches up to `limit` unless `maxTotalContentChars` is explicitly given; only `searchPage()` and MCP `search_history` apply the 20000 default budget.
+- Snippets prefer a whole-token match from any query term over an earlier substring, prefix terms center at a token start, and tool payloads that serialize a prompt with escaped quotes still collapse as echoes of it; session-less rows no longer group with unrelated rows.
 - Partial Claude scans preserve pending transcript retries when the source root is unavailable.
 - Remote evidence rejects oversized integers instead of rounding them into floating-point values.
 - Applied retention changes report the saved policy.
@@ -38,6 +48,65 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Added optional `HistoryEntry::event_uid` and `Prompt::event_uid`; callers constructing `HistoryEntry` literals must supply the field (`None` for anonymous prompt logs).
 - Added nullable `Block::source_order`; session evidence contract 5 orders events by recorded source position and resolves existing event cursors through stable row identity.
+
+## [0.62.0] - 2026-11-23
+
+### Added
+
+- Cursor editor (desktop app) Agent conversations that have no `agent-transcripts` transcript and no `cursor-agent` chat store are now cataloged and indexed from the editor's own database, `globalStorage/state.vscdb` in Cursor's user directory (`~/Library/Application Support/Cursor/User` on macOS, `~/.config/Cursor/User` on Linux, `%APPDATA%\Cursor\User` on Windows), under the `cursor` source with the composer id as the session id. Until now these conversations were never imported. Prompts, replies, thinking, tool calls with their ids, tool results, file edits, per-message times, the conversation's title and its workspace folder are captured; the database is opened read-only and only conversations whose rows changed are re-read.
+
+### Fixed
+
+- Antigravity subagents are no longer listed as separate root sessions. The subagents a conversation spawns, recorded in its `.system_generated/subagents/<child>.json`, are now stored as `delegated` children of that conversation, with their agent type, role and spawn time.
+- Antigravity session titles no longer show the raw `<USER_REQUEST>` envelope when Antigravity appends further blocks, such as `<USER_SETTINGS_CHANGE>`, after the request's metadata.
+- Amp thread discovery requests one lookahead row so bounded clients can report when more than 100 threads exist.
+
+## [0.61.0] - 2026-11-19
+
+### Added
+
+- Cursor chats that have no `agent-transcripts` transcript are now cataloged and indexed from Cursor's own chat store, `~/.cursor/chats/<workspace>/<id>/store.db`, under the `cursor` source with the chat's id. Until now such a chat was invisible. Prompts, replies, reasoning, tool calls with their ids, tool results and file edits are captured. A chat that has a transcript is still read only from the transcript, so nothing is cataloged twice.
+
+## [0.60.0] - 2026-11-16
+
+### Added
+
+- Claude messages keep who sent them: `session_events.origin_kind` stores each record's `origin.kind` verbatim (`human`, `peer`, `task-notification`, ...), and the change feed exports it with the row, so an uploaded session can tell human-typed messages from agent-to-agent traffic. Rows indexed before the column stay null and are not re-exported for it.
+
+### Fixed
+
+- Claude records written without a `timestamp`, such as `api-request-blob` request copies, are no longer stored at 1970-01-01. They take the time of the preceding record in their session. With no earlier time to inherit, they keep a marker with no time, and the pass reports them as `EVIDENCE_PARTIAL`. Claude and Codex `history.jsonl` lines without a usable time are skipped instead of stored at 0.
+- Codex, Devin and Grok evidence with a missing or unparseable time is no longer stored at 1970-01-01. A Codex rollout line without one takes the time of the line before it, including across resumed passes; a Devin message with no time takes the session's or the preceding message's; a Grok unified-log usage row with no time and no session time waits unattached. With nothing to inherit, the evidence keeps a marker with no time and the pass reports `EVIDENCE_PARTIAL`. Session activity times, and markers, that are not known are stored as null, and a 0 stored earlier gives way to the first real time.
+
+### Rust API
+
+- Breaking: `SessionEvent` has a new public field, `origin_kind: Option<String>`; a struct literal must now set it (`origin_kind: None` where there is no origin).
+
+## [0.59.0] - 2026-11-11
+
+### Added
+
+- A session can carry the name its agent was registered under (for example an Agent Relay worker's spawn name), so the change feed reports it as the session's `agent_name` and agent-name search can find it. A name the provider recorded itself is never replaced.
+
+### Rust API
+
+- Added `SessionStore::set_registered_agent_name(source, session_id, name)`. It returns whether the effective `agent_name` changed; a real change is stamped at a new revision and re-exported by the change feed. `None` clears only a name this method set. Errors: `InvalidArgument` (empty, over 128 characters, or a control character), `SessionNotFound`, and `UnsupportedOperation` on a read-only store.
+
+## [0.58.0] - 2026-11-09
+
+### Added
+
+- Factory Droid local sessions are discovered and indexed automatically from native JSONL transcripts and settings sidecars, preserving messages, tool outcomes and resumed-session changes.
+- `ai-hist/factory-source` projects Factory API messages into readable evidence and canonical delivery records with the same native block identities as local Droid capture, preserving raw messages and explicit tool outcomes.
+
+### Fixed
+
+- Reconciliation retries a failing acquisition batch one path at a time and queues a path that fails alone for retry, so one unreadable transcript no longer blocks every path after it or keeps the pass from draining.
+- Resumed and forked Claude transcripts, which open with a copy of the origin session's records, are captured under the session they are named after, with a `fork` edge to the origin, instead of failing with conflicting `sessionId` values.
+
+### Rust API
+
+- Added `Source::Droid` with `factory` as an input alias; serialized source identity is `droid`.
 
 ## [0.57.1] - 2026-11-07
 
@@ -114,6 +183,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- OpenCode 2 sessions are discovered, synced and hydrated from its `session_v2` and `session_message` tables: every session with a `session_v2` row reads from there, V1 sessions OpenCode 2 has not migrated yet keep reading from the V1 tables. Migrated sessions re-sync once, and can carry less than their V1 originals (attachments and part kinds OpenCode 2 drops).
 - Session manifests record raw-chunk scrub status and stored digests; readers quarantine unscrubbed sessions.
 - The object-storage plugin can scrub PII and secrets, including PGP private keys, card numbers and phone numbers, from raw session chunks before upload (`scrub::scrub_chunk`, uploaded only through `scrub::seal::put_raw_chunk`), using the same rules as the hosted service.
 - The object-storage plugin's `scrub::Dropped` implements `Display` and `std::error::Error`, so callers can propagate it with `?`.
@@ -1300,7 +1370,12 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - The SDK reads provider JSONL natively and works without the Python CLI.
 
-[Unreleased]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.57.1...HEAD
+[Unreleased]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.62.0...HEAD
+[0.62.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.61.0...sdk-ts-v0.62.0
+[0.61.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.60.0...sdk-ts-v0.61.0
+[0.60.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.59.0...sdk-ts-v0.60.0
+[0.59.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.58.0...sdk-ts-v0.59.0
+[0.58.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.57.1...sdk-ts-v0.58.0
 [0.57.1]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.57.0...sdk-ts-v0.57.1
 [0.57.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.56.0...sdk-ts-v0.57.0
 [0.56.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.55.0...sdk-ts-v0.56.0

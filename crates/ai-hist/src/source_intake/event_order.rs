@@ -171,7 +171,10 @@ pub(super) fn apply_union(
     }
     validate_canonical_survivors(conn, key, &union)?;
     retirement::retain_support(conn, key, union.keys())?;
-    for record in union.into_values() {
+    // Identity-keyed, but inserted in native block order where a source has one.
+    let mut writes: Vec<_> = union.into_values().collect();
+    writes.sort_by_cached_key(super::order::write_key);
+    for record in writes {
         record.write(conn, key.location)?;
     }
     Ok(())

@@ -114,6 +114,7 @@ fn event(uid: &str, text: &str) -> SessionEvent {
         request_span: None,
         control_kind: None,
         record_token_json: None,
+        origin_kind: None,
     }
 }
 impl ShallowSessionProvider for Fixture {

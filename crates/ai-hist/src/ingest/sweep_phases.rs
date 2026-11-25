@@ -254,7 +254,31 @@ impl SweepPhases<'_, '_> {
             &projects,
             self.coverage,
             scope.paths(),
-        );
+        )
+        .and_then(|transcripts| {
+            // Chats Cursor kept only in its own chat store, after the
+            // transcripts so a chat that has both is read from its transcript.
+            super::cursor_store::sync_chat_stores_in(
+                self.conn,
+                self.state,
+                &self.roots.home,
+                self.coverage,
+                scope.paths(),
+            )
+            .map(|stores| transcripts + stores)
+        })
+        .and_then(|read| {
+            // Conversations the Cursor editor kept only in its own database,
+            // last: a transcript or a chat store reads a composer first.
+            super::cursor_store::editor::sync_editor_composers_in(
+                self.conn,
+                self.state,
+                &self.roots.home,
+                self.coverage,
+                scope.paths(),
+            )
+            .map(|composers| read + composers)
+        });
         self.counted("cursor", result);
         Ok(())
     }

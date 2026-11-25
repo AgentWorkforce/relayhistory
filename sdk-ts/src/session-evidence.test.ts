@@ -9,7 +9,7 @@ import {
   SESSION_EVIDENCE_CONTRACT_VERSION, SESSION_HYDRATION_CONTRACT_VERSION,
   getSessionEvents, getSessionFileEdits, getSessionFileEditsPage, getSessionToolCalls,
   getSessionToolCallsPage, getSessionUserTurns, getSessionUserTurnsPage,
-  hydrateSession, parseStoredJson, sessionFileEdits, sessionToolCalls, sync,
+  hydrateSession, parseStoredJson, search, sessionFileEdits, sessionToolCalls, sync,
   type EvidenceCursor, type SessionFileEdit, type SessionToolCall,
 } from './index.js';
 import { combineHydration, normalizeHydration, sessionEvent } from './normalization.js';
@@ -670,6 +670,47 @@ test('user turn pages group each message with its blocks and page by keyset', as
       getSessionUserTurnsPage('claude', '', { dbPath }),
       (error: unknown) => error instanceof InvalidArgumentError,
     );
+  } finally {
+    await cleanup();
+  }
+});
+
+test('search grouping never hides raw rows from getSessionEvents', async () => {
+  const { dbPath, cleanup } = await seededDatabase();
+  try {
+    const before = await getSessionEvents(SHARED_SESSION, { source: 'claude', dbPath });
+    assert.ok(before.length > 1, 'the fixture has raw events');
+    // Grouped search may collapse echoes into primaries; the raw read must not.
+    await search('auth', { dbPath, sessionId: SHARED_SESSION });
+    const after = await getSessionEvents(SHARED_SESSION, { source: 'claude', dbPath });
+    assert.deepEqual(after.map((event) => event.id), before.map((event) => event.id));
+    assert.deepEqual(after.map((event) => event.eventUid), before.map((event) => event.eventUid));
+  } finally {
+    await cleanup();
+  }
+});
+
+test('grouped search collapses an echo while getSessionEvents keeps every raw row', { skip: needsNodeSqlite }, async () => {
+  const { dbPath, cleanup } = await seededDatabase();
+  try {
+    const database = new sqlite!.DatabaseSync(dbPath);
+    try {
+      database.exec(`
+        INSERT INTO session_events (source, session_id, project, message_id, ts_ms, role, kind, text, event_uid)
+        VALUES ('claude', 'echo-raw', '/work/app', 'mu1', 1000, 'user', 'text', 'update auth', 'eu1'),
+               ('claude', 'echo-raw', '/work/app', 'ma1', 1001, 'assistant', 'text', 'update auth, done', 'ea1');
+      `);
+    } finally {
+      database.close();
+    }
+
+    const matches = await search('update auth', { dbPath, sessionId: 'echo-raw' });
+    assert.equal(matches.length, 1, 'the repeating assistant row collapses into the prompt');
+    assert.equal(matches[0].groupSize, 2);
+    assert.equal(matches[0].echoCount, 1);
+
+    const events = await getSessionEvents('echo-raw', { source: 'claude', dbPath });
+    assert.deepEqual(events.map((event) => event.eventUid), ['eu1', 'ea1'], 'raw rows survive grouping');
   } finally {
     await cleanup();
   }

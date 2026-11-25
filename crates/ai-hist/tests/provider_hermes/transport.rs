@@ -357,9 +357,7 @@ fn hermes_pre_intake_index_and_archive_work_without_reindexing() {
     let current = export(home.path());
     let old: Vec<HistoryExportRecord> =
         serde_json::from_str(include_str!("fixtures/pre-intake-export.json")).unwrap();
-    let current_records = records(&current);
-    let mut legacy_records = records(&old);
-    for record in &current_records {
+    for record in &records(&current) {
         if record.kind == EvidenceKind::SessionEvent {
             assert_eq!(
                 record.payload.get("source_order"),
@@ -368,25 +366,29 @@ fn hermes_pre_intake_index_and_archive_work_without_reindexing() {
             );
         }
     }
-    for record in &mut legacy_records {
+    for record in &records(&old) {
         if record.kind == EvidenceKind::SessionEvent {
             assert!(
                 !record.payload.contains_key("source_order"),
                 "fixture must retain its pre-order archive shape"
             );
-            record
-                .payload
-                .insert("source_order".into(), serde_json::Value::Null);
         }
     }
+    // A column the table gained since the archive was cut (`origin_kind`, `source_order`) is
+    // exported as null on these rows and nothing else differs: the change-feed
+    // contract for an appended column (`RestampScope::Valued`), which also
+    // leaves the revision head where it was (asserted below).
+    let current_payloads: Vec<serde_json::Map<String, serde_json::Value>> = records(&current)
+        .iter()
+        .zip(records(&old).iter())
+        .map(|(now, then)| without_appended_nulls(&now.payload, &then.payload))
+        .collect();
+    assert_eq!(records(&current).len(), records(&old).len());
     assert_eq!(
-        current_records
+        current_payloads,
+        records(&old)
             .iter()
-            .map(|r| &r.payload)
-            .collect::<Vec<_>>(),
-        legacy_records
-            .iter()
-            .map(|r| &r.payload)
+            .map(|r| r.payload.clone())
             .collect::<Vec<_>>()
     );
     assert_eq!(
@@ -645,4 +647,16 @@ fn hermes_local_only_history_rewrite_remains_allowed() {
     drop(native);
     hydrate(&store);
     assert_ne!(read(&store).prompts, original.prompts);
+}
+
+/// `now` without the keys `then` lacks whose value is null: columns appended
+/// after `then` was exported, holding nothing on this row.
+fn without_appended_nulls(
+    now: &serde_json::Map<String, serde_json::Value>,
+    then: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    now.iter()
+        .filter(|(key, value)| then.contains_key(*key) || !value.is_null())
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
 }

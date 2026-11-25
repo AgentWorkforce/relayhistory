@@ -28,12 +28,27 @@ test('CLI and MCP import only the public SDK for history operations', async () =
   assert.doesNotMatch(cli + mcp, /ai-hist-native|node:sqlite|sql\.js|child_process/);
 });
 
+test('search_history is strict and exposes the grouping, snippet and budget arguments', async () => {
+  const mcp = await readFile(join(sourceDir, 'mcp-server.ts'), 'utf8');
+  const start = mcp.indexOf("registerTool('search_history'");
+  assert.notEqual(start, -1, 'search_history is registered');
+  const end = mcp.indexOf("server.tool('", start + 13);
+  const registration = mcp.slice(start, end === -1 ? undefined : end);
+  assert.match(registration, /z\.strictObject\(/, 'search_history rejects unknown arguments');
+  for (const arg of ['session_id', 'kinds', 'origin', 'max_content_chars', 'max_total_content_chars']) {
+    assert.match(registration, new RegExp(`${arg}:`), `search_history exposes ${arg}`);
+  }
+  assert.match(registration, /searchPage\(/, 'search_history returns the searchPage envelope');
+});
+
 test('MCP session operations expose scope and acquisition is declared open-world', async () => {
   const mcp = await readFile(join(sourceDir, 'mcp-server.ts'), 'utf8');
   assert.match(mcp, /const SESSION_SCOPE = z\.enum\(\['local', 'remote', 'all'\]\)/);
   assert.match(mcp, /const ACQUIRE = \{ readOnlyHint: false, idempotentHint: true, openWorldHint: true \}/);
   for (const tool of ['search_history', 'recent_history', 'list_sessions', 'discover_sessions', 'hydrate_session', 'history_stats', 'sync']) {
-    const start = mcp.indexOf(`server.tool('${tool}'`);
+    // search_history registers through registerTool so its schema can be strict.
+    let start = mcp.indexOf(`server.tool('${tool}'`);
+    if (start === -1) start = mcp.indexOf(`registerTool('${tool}'`);
     assert.notEqual(start, -1, `${tool} is registered`);
     const end = mcp.indexOf("server.tool('", start + 13);
     const registration = mcp.slice(start, end === -1 ? undefined : end);

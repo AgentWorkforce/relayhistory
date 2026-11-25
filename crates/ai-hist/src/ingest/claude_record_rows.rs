@@ -78,6 +78,62 @@ pub(super) fn delete_claude_record_rows(
     Ok(())
 }
 
+/// Called only when a record produced no event and no other marker, so it
+/// never competes with a classified marker for the same `marker_uid`. The
+/// provider's own record type goes in `subkind`; a record that does not even
+/// name its type is recorded as `record`, because "something was here" is
+/// still worth more than silence.
+pub(super) fn insert_unknown_record_marker(
+    conn: &Connection,
+    session_id: &str,
+    message_uuid: &str,
+    ts_ms: Option<i64>,
+    parent_id: Option<&str>,
+    record_type: &str,
+) -> Result<()> {
+    let marker_uid = format!("{message_uuid}:marker");
+    insert_session_marker(
+        conn,
+        "claude",
+        session_id,
+        &NewSessionMarker {
+            marker_uid: &marker_uid,
+            ts_ms,
+            message_id: Some(message_uuid),
+            parent_id,
+            turn_id: None,
+            kind: "unknown",
+            subkind: Some(if record_type.is_empty() {
+                "record"
+            } else {
+                record_type
+            }),
+            text: None,
+            payload_json: None,
+        },
+    )?;
+    Ok(())
+}
+
+/// Heal what an earlier parser left under the parent for a sidecar record:
+/// every row it produced there, and, for a record with no identity of its own
+/// (`legacy_ts_ms` is the time that parser stored it at), the positional
+/// leftovers of a pre-upgrade parse.
+pub(super) fn heal_record_under_parent(
+    conn: &Connection,
+    record_session_id: &str,
+    message_uuid: &str,
+    stem: &str,
+    legacy_ts_ms: Option<i64>,
+    parts: ClaudeRecordParts<'_>,
+) -> Result<()> {
+    heal_claude_record_rows(conn, record_session_id, message_uuid, HealedRows::All)?;
+    if let Some(ts_ms) = legacy_ts_ms {
+        heal_legacy_positional_record(conn, record_session_id, stem, ts_ms, parts)?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 thread_local! {
     /// Retirements run on this thread, so a test can say a sweep issued none.
