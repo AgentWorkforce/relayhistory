@@ -51,6 +51,37 @@ async function withIndexedSession(body: (dbPath: string) => Promise<void>): Prom
   }
 }
 
+async function withLargePrompts(body: (dbPath: string) => Promise<void>): Promise<void> {
+  const home = await mkdtemp(join(tmpdir(), 'relayhistory-search-large-'));
+  const restoreEnv = scrubHistoryEnv();
+  process.env.HOME = home;
+  process.env.USERPROFILE = home;
+  process.env.RELAYHISTORY_HOME = join(home, 'commercial');
+  process.env.RELAYHISTORY_NO_UPDATE_CHECK = '1';
+  process.env.AI_HIST_DB = join(home, 'history.db');
+  try {
+    const directory = join(home, '.claude', 'projects', '-work-search-large');
+    await mkdir(directory, { recursive: true });
+    const sessionId = 'search-large-session';
+    const records: unknown[] = [];
+    for (let turn = 0; turn < 4; turn += 1) {
+      records.push({ sessionId, cwd: '/work/search', type: 'user', uuid: `u${turn}`, timestamp: '2026-09-01T10:00:00.000Z',
+        message: { role: 'user', content: `searchneedle ${'x'.repeat(7000)} turn${turn}` } });
+      records.push({ sessionId, cwd: '/work/search', type: 'assistant', uuid: `a${turn}`, parentUuid: `u${turn}`, timestamp: '2026-09-01T10:00:05.000Z',
+        requestId: `req-${turn}`, message: { id: `msg-${turn}`, role: 'assistant', model: 'claude-test',
+          content: [{ type: 'text', text: 'searchneedle short reply' }] } });
+    }
+    await writeFile(join(directory, `${sessionId}.jsonl`), records.map((record) => JSON.stringify(record)).join('\n') + '\n');
+    const dbPath = process.env.AI_HIST_DB;
+    await sync({ dbPath, scope: 'local', sourceConnectors: [] });
+    await hydrateSession({ source: 'claude', sessionId, dbPath });
+    await body(dbPath);
+  } finally {
+    restoreEnv();
+    await rm(home, { recursive: true, force: true });
+  }
+}
+
 const identity = (match: Pick<SearchMatch, 'matchSource' | 'id'>) => `${match.matchSource}:${match.id}`;
 
 test('search spans prompts and session events and says where each match came from', async () => {
@@ -129,7 +160,36 @@ test('the TypeScript CLI and MCP return the SDK search result', async () => {
       const result = await client.callTool({ name: 'search_history', arguments: { query: 'searchneedle' } });
       assert.equal(result.isError, undefined);
       const text = (result.content as Array<{ text: string }>)[0].text;
-      assert.deepEqual(JSON.parse(text), JSON.parse(JSON.stringify(expected)));
+      const envelope = JSON.parse(text) as { matches: SearchMatch[]; nextCursor: unknown; truncated: boolean; totalContentCharsUsed: number };
+      assert.deepEqual(envelope.matches, JSON.parse(JSON.stringify(expected)));
+      assert.equal(envelope.truncated, false);
+      assert.equal(
+        envelope.totalContentCharsUsed,
+        envelope.matches.reduce((sum, match) => sum + JSON.stringify(match).length, 0),
+      );
+      // Every match carries the grouping and snippet fields.
+      for (const match of envelope.matches) {
+        assert.equal(typeof match.snippet, 'string');
+        assert.equal(match.contentTruncated, false);
+        assert.equal(match.groupSize, 1);
+        assert.equal(match.echoCount, 0);
+        assert.equal(match.isPrimary, true);
+        assert.equal(match.origin, match.matchSource === 'history' ? 'human' : 'unknown');
+        assert.equal(match.eventRef.id, match.id);
+        assert.equal(match.eventRef.matchSource, match.matchSource);
+      }
+      assert.ok(tool.inputSchema.properties?.session_id, 'search_history exposes session_id');
+      assert.ok(tool.inputSchema.properties?.kinds, 'search_history exposes kinds');
+      assert.ok(tool.inputSchema.properties?.origin, 'search_history exposes origin');
+      assert.ok(tool.inputSchema.properties?.max_content_chars, 'search_history exposes max_content_chars');
+      assert.ok(tool.inputSchema.properties?.max_total_content_chars, 'search_history exposes max_total_content_chars');
+
+      // Unknown arguments are rejected by name, budget-like ones included.
+      const unknown = await client.callTool({
+        name: 'search_history', arguments: { query: 'searchneedle', max_chars: 100 },
+      });
+      assert.equal(unknown.isError, true);
+      assert.match(JSON.stringify(unknown.content), /max_chars/);
 
       assert.ok(tool.inputSchema.properties?.before_ms, 'search_history exposes before_ms');
       const newest = expected[0];
@@ -137,7 +197,7 @@ test('the TypeScript CLI and MCP return the SDK search result', async () => {
         name: 'search_history', arguments: { query: 'searchneedle', before_ms: newest.timestampMs },
       });
       assert.equal(bounded.isError, undefined);
-      const boundedRows = JSON.parse((bounded.content as Array<{ text: string }>)[0].text) as SearchMatch[];
+      const boundedRows = (JSON.parse((bounded.content as Array<{ text: string }>)[0].text) as { matches: SearchMatch[] }).matches;
       assert.deepEqual(
         boundedRows.map(identity),
         expected.filter((match) => match.timestampMs < newest.timestampMs).map(identity),
@@ -153,5 +213,17 @@ test('the TypeScript CLI and MCP return the SDK search result', async () => {
       await client.close();
       await transport.close();
     }
+  });
+});
+
+test('search returns every limit match without a budget and honors an explicit one', async () => {
+  await withLargePrompts(async (dbPath) => {
+    const all = await search('searchneedle', { dbPath, role: 'prompt', limit: 100 });
+    assert.equal(all.length, 4, 'no default total budget cuts the array read');
+    const total = all.reduce((sum, match) => sum + JSON.stringify(match).length, 0);
+    assert.ok(total > 20_000, `the fixture must exceed the old default budget (got ${total})`);
+
+    const budgeted = await search('searchneedle', { dbPath, role: 'prompt', limit: 100, maxTotalContentChars: 500 });
+    assert.equal(budgeted.length, 1, 'an explicit budget still applies, keeping at least one match');
   });
 });

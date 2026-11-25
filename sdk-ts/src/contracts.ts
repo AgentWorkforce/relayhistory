@@ -63,10 +63,25 @@ export interface SearchPage {
   matches: SearchMatch[];
   /** Present only when a further match exists. */
   nextCursor: HistoryCursor | null;
+  /** True when the `maxTotalContentChars` budget stopped the page early. */
+  truncated: boolean;
+  /** Sum of `JSON.stringify(match).length` over the returned matches. */
+  totalContentCharsUsed: number;
 }
 
 /** Which rows a search matches. See `SearchOptions.role`. */
 export type SearchRole = 'all' | 'user' | 'assistant' | 'prompt';
+
+/** The origin of a search match, derived from the stored row. */
+export type SearchOrigin = 'human' | 'peer' | 'system' | 'synthetic' | 'unknown';
+
+/** The stored row a search match came from. */
+export interface SearchEventRef {
+  matchSource: SearchMatchSource;
+  id: number;
+  sessionId: string | null;
+  eventUid: string | null;
+}
 
 export interface SearchOptions extends ListOptions {
   /**
@@ -82,6 +97,21 @@ export interface SearchOptions extends ListOptions {
    * only prompts. Same as `ai-hist search --role`.
    */
   role?: SearchRole;
+  /** Restrict to one session id; composes with `source`, `project`, `tag` and `role`. */
+  sessionId?: string;
+  /** Restrict to these kinds (`history`, `text`, `thinking`, `tool_use`, `tool_result`). */
+  kinds?: string[];
+  /** Restrict to one origin. */
+  origin?: SearchOrigin;
+  /** Snippet window in codepoints, 40..2000 (default 320). */
+  maxContentChars?: number;
+  /**
+   * Total budget in serialized JSON characters across the page's matches,
+   * 500..200000. `searchPage` (and MCP `search_history` through it) applies
+   * a 20000 default; `search` applies no budget unless this is explicitly
+   * provided. At least one match is always returned.
+   */
+  maxTotalContentChars?: number;
 }
 
 /** Where a search match was found. */
@@ -97,6 +127,26 @@ export interface SearchMatch extends HistoryEntry {
   role: string;
   /** `history` for a prompt; the event's kind (for example `text`, `tool_result`) otherwise. */
   kind: string;
+  /** Match-centered snippet of `prompt`; `prompt` keeps the full text. */
+  snippet: string;
+  /** True when `snippet` is a window of a longer text. */
+  contentTruncated: boolean;
+  /** Codepoint offset of the snippet in the full text; null only when empty. */
+  snippetStartOffset: number | null;
+  /** The echo group this primary represents; null for a singleton. */
+  groupId: string | null;
+  /** Rows in the group, this primary included (at least 1). */
+  groupSize: number;
+  /** Echoes collapsed into this primary (`groupSize - 1`). */
+  echoCount: number;
+  /** True when the bounded over-fetch may have cut this group's echoes. */
+  groupTruncated: boolean;
+  /** True for every returned match: pages return group primaries only. */
+  isPrimary: boolean;
+  origin: SearchOrigin;
+  controlKind: string | null;
+  eventUid: string | null;
+  eventRef: SearchEventRef;
 }
 
 export interface SessionOptions {

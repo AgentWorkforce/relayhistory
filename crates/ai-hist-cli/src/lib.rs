@@ -24,12 +24,14 @@ use ai_hist::diagnostics::{
     compact_database, doctor_report, human_bytes, CompactReport, DoctorReport,
 };
 use ai_hist::git_helpers::*;
-use ai_hist::history_search::{search_all, SearchRole, SearchRow};
+use ai_hist::history_search::{search_all, SearchRole};
 use ai_hist::paths::{default_opencode_db_path, home_dir};
 use ai_hist::{discover, remote, *};
 mod export;
 mod import;
+mod search_output;
 use import::import_history;
+use search_output::print_search_rows;
 
 use export::export_history;
 #[cfg(test)]
@@ -1473,61 +1475,6 @@ fn resolve_search_role(raw: &str, agent: bool, human: bool) -> Result<SearchRole
         return Ok(SearchRole::User);
     }
     SearchRole::parse(raw).map_err(|error| anyhow::anyhow!("ai-hist search: --role: {error}"))
-}
-
-fn print_search_rows(rows: Vec<SearchRow>, as_json: bool) -> Result<()> {
-    if as_json {
-        let out = rows
-            .iter()
-            .map(|row| {
-                // Provenance is always present: `id` is only unique within
-                // its `match_source` table, so a consumer comparing results
-                // across surfaces needs the pair.
-                json!({
-                    "id": row.id,
-                    "source": row.source,
-                    "session_id": row.session_id,
-                    "project": row.project,
-                    "prompt": row.text,
-                    "timestamp_ms": row.timestamp_ms,
-                    "role": row.role,
-                    "kind": row.kind,
-                    "match_source": row.match_source,
-                })
-            })
-            .collect::<Vec<_>>();
-        println!("{}", serde_json::to_string(&out)?);
-        return Ok(());
-    }
-    for row in rows {
-        println!("{}", fmt_search_row(&row));
-    }
-    Ok(())
-}
-
-fn fmt_search_row(row: &SearchRow) -> String {
-    let dt = Local
-        .timestamp_millis_opt(row.timestamp_ms)
-        .single()
-        .map(|dt| dt.format("%Y-%m-%d %H:%M").to_string())
-        .unwrap_or_else(|| "1970-01-01 00:00".to_string());
-    let project = row
-        .project
-        .as_ref()
-        .map(|p| format!(" [{p}]"))
-        .unwrap_or_default();
-    let label = if row.match_source == "history" {
-        row.source.clone()
-    } else {
-        format!("{}:{}:{}", row.source, row.role, row.kind)
-    };
-    let text = if row.text.chars().count() > 120 {
-        let truncated: String = row.text.chars().take(120).collect();
-        format!("{}...", truncated.replace('\n', " "))
-    } else {
-        row.text.replace('\n', " ")
-    };
-    format!("  #{:<5} {}  ({}){}  {}", row.id, dt, label, project, text)
 }
 
 /// One record of a session's JSON replay stream.

@@ -51,7 +51,7 @@ try {
     await client.connect(transport);
     const response = await client.callTool({ name: 'search_history', arguments: { query: 'README', source: 'cline', role: 'assistant' } });
     assert.ok(!response.isError);
-    assert.ok(JSON.parse(response.content[0].text).some(m => m.source === 'cline'));
+    assert.ok(JSON.parse(response.content[0].text).matches.some(m => m.source === 'cline'));
   } finally {
     await client.close();
     await transport.close();

@@ -31,8 +31,8 @@ if(!process.env.RH_OMP_SURFACE_CHILD){
  try{
   const tools=await client.listTools();assert.ok(tools.tools.find(t=>t.name==='search_history').inputSchema.properties.source.enum.includes('omp'));
   const caps=await client.callTool({name:'get_source_capabilities',arguments:{source:'omp'}});assert.ok(!caps.isError);assert.equal(JSON.parse(caps.content[0].text).source,'omp');
-  const result=await client.callTool({name:'search_history',arguments:{query:'writer fixture',source:'omp'}});assert.ok(!result.isError);assert.ok(JSON.parse(result.content[0].text).length>0);
-  const filtered=await client.callTool({name:'search_history',arguments:{query:'writer fixture',source:'pi'}});assert.deepEqual(JSON.parse(filtered.content[0].text),[]);
+  const result=await client.callTool({name:'search_history',arguments:{query:'writer fixture',source:'omp'}});assert.ok(!result.isError);assert.ok(JSON.parse(result.content[0].text).matches.length>0);
+  const filtered=await client.callTool({name:'search_history',arguments:{query:'writer fixture',source:'pi'}});assert.deepEqual(JSON.parse(filtered.content[0].text).matches,[]);
  }finally{await client.close();}
  const nativeFile=path.join(process.env.HOME,'.omp/agent/sessions/synthetic/session.jsonl');
  const replacement='replacement-native-sdk';

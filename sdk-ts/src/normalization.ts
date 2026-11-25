@@ -152,6 +152,8 @@ export function nativeHistoryCursor(after: HistoryCursor | undefined): object | 
   };
 }
 
+const SEARCH_ORIGINS: readonly string[] = ['human', 'peer', 'system', 'synthetic', 'unknown'];
+
 export function searchMatch(value: UnknownRecord): SearchMatch {
   const matchSource = String(value.matchSource);
   if (matchSource !== 'history' && matchSource !== 'session_event') {
@@ -160,11 +162,50 @@ export function searchMatch(value: UnknownRecord): SearchMatch {
       'NATIVE_CONTRACT_MISMATCH',
     );
   }
+  const origin = String(value.origin);
+  if (!SEARCH_ORIGINS.includes(origin)) {
+    throw new NativeContractMismatchError(
+      `ai-hist-native returned an unknown search origin '${origin}'. Reinstall matching ai-hist packages.`,
+      'NATIVE_CONTRACT_MISMATCH',
+    );
+  }
+  const entry = historyEntry(value);
+  const ref = (value.eventRef ?? {}) as UnknownRecord;
+  if (ref.matchSource !== 'history' && ref.matchSource !== 'session_event') {
+    throw new NativeContractMismatchError(
+      `ai-hist-native returned an unknown eventRef matchSource '${String(ref.matchSource)}'. Reinstall matching ai-hist packages.`,
+      'NATIVE_CONTRACT_MISMATCH',
+    );
+  }
+  if (ref.matchSource !== matchSource) {
+    throw new NativeContractMismatchError(
+      `ai-hist-native returned an eventRef matchSource '${ref.matchSource}' that disagrees with the match's '${matchSource}'. Reinstall matching ai-hist packages.`,
+      'NATIVE_CONTRACT_MISMATCH',
+    );
+  }
+  const groupSize = typeof value.groupSize === 'number' ? value.groupSize : 1;
   return {
-    ...historyEntry(value),
+    ...entry,
     matchSource,
     role: String(value.role),
     kind: String(value.kind),
+    snippet: typeof value.snippet === 'string' ? value.snippet : entry.prompt,
+    contentTruncated: value.contentTruncated === true,
+    snippetStartOffset: typeof value.snippetStartOffset === 'number' ? value.snippetStartOffset : null,
+    groupId: nullableString(value.groupId),
+    groupSize,
+    echoCount: typeof value.echoCount === 'number' ? value.echoCount : groupSize - 1,
+    groupTruncated: value.groupTruncated === true,
+    isPrimary: value.isPrimary !== false,
+    origin: origin as SearchMatch['origin'],
+    controlKind: nullableString(value.controlKind),
+    eventUid: nullableString(value.eventUid),
+    eventRef: {
+      matchSource: ref.matchSource as SearchMatch['eventRef']['matchSource'],
+      id: typeof ref.id === 'number' ? ref.id : entry.id,
+      sessionId: nullableString(ref.sessionId),
+      eventUid: nullableString(ref.eventUid),
+    },
   };
 }
 

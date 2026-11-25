@@ -36,7 +36,7 @@ try {
  try {
   await client.connect(transport);
   const result=await client.callTool({name:'search_history',arguments:{query:'Reading',source:'qoder',role:'assistant'}});
-  assert.ok(!result.isError);const matches=JSON.parse(result.content[0].text);assert.ok(matches.some(m=>m.source==='qoder'));
+  assert.ok(!result.isError);const matches=JSON.parse(result.content[0].text).matches;assert.ok(matches.some(m=>m.source==='qoder'));
  } finally {await client.close();await transport.close();}
  console.log('Qoder SDK/CLI/MCP source filtering, user/assistant search, events and honest capability assertions passed');
 } finally {fs.rmSync(root,{recursive:true,force:true});}
