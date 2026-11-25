@@ -25,7 +25,7 @@ mod page;
 mod presentation;
 mod walk;
 
-use page::{fetch_grouped_window, present_rows, resolve_echoes};
+use page::{row_cursor, search_window_with_cursor};
 
 /// Which rows a search may match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -178,6 +178,8 @@ impl SearchRow {
 }
 
 
+const MAX_SEARCH_CONTINUATIONS: usize = 64;
+
 pub fn search_all(
     conn: &Connection,
     terms: &[String],
@@ -185,8 +187,6 @@ pub fn search_all(
     filter: &QueryFilter,
     role: SearchRole,
 ) -> Result<Vec<SearchRow>> {
-    filter.validate()?;
-    let requested = filter.limit.max(1);
     // Grouping happens before the limit: echoes collapse into their primary
     // and only primaries count toward the page, in the primary's position in
     // the global (timestamp_ms DESC, id DESC, match_source ASC) order, so
@@ -196,41 +196,61 @@ pub fn search_all(
     // primary lies beyond it would stand alone — so the fetch bound grows
     // (doubling, up to GROUP_FETCH_GROWTH_CAP rows per branch) and the rows
     // are regrouped until the page is provably complete, a branch is truly
-    // exhausted, or the growth cap accepts the page with its possibly-echo
-    // rows flagged `group_truncated`.
-    // The window advances only when echo resolution empties a page the
-    // growth cap left incomplete: the dropped echoes were already counted,
-    // and older matches beyond them must stay reachable.
-    let mut window = filter.clone();
-    let mut continuations = 0;
-    let mut grouped: Vec<SearchRow>;
-    'pages: loop {
-        let (rows, page_stable) =
-            fetch_grouped_window(conn, terms, raw_fts, &window, role, requested)?;
-        if window.after.is_none() {
-            grouped = rows;
-            break;
-        }
-        // A page cursor must not change a primary's echo count, and an echo
-        // older than its primary must not resurface as its own match:
-        // resolve counts and membership against the un-cursored match set
-        // BEFORE the limit selects the page, so a dropped echo never
-        // consumes a page slot.
-        let (rows, continuation) =
-            resolve_echoes(conn, terms, raw_fts, &window, role, rows, page_stable)?;
-        grouped = rows;
-        match continuation {
-            Some(cursor) if continuations < 64 => {
-                continuations += 1;
-                window.after = Some(cursor);
-                continue 'pages;
-            }
-            _ => break,
-        }
-    }
-    grouped.truncate(requested as usize);
-    present_rows(&mut grouped, terms, filter);
-    Ok(grouped)
+    // exhausted, or the growth cap accepts the frontier-covered prefix.
+    Ok(search_window_with_cursor(
+        conn,
+        terms,
+        raw_fts,
+        filter,
+        role,
+        MAX_SEARCH_CONTINUATIONS,
+    )?
+    .0)
+}
+
+fn search_page_with_cap(
+    conn: &Connection,
+    terms: &[String],
+    raw_fts: bool,
+    filter: &QueryFilter,
+    role: SearchRole,
+    max_continuations: usize,
+) -> Result<HistoryPage<SearchRow>> {
+    // One row past the page shows whether another follows; a limit no table
+    // can reach is clamped so that over-fetch cannot overflow.
+    let limit = filter.limit.clamp(1, i64::MAX - 1);
+    let (mut rows, pending_cursor) = search_window_with_cursor(
+        conn,
+        terms,
+        raw_fts,
+        &QueryFilter {
+            limit: limit + 1,
+            ..filter.clone()
+        },
+        role,
+        max_continuations,
+    )?;
+    let next_cursor = if rows.len() as i64 > limit {
+        rows.truncate(limit as usize);
+        rows.last().map(row_cursor)
+    } else if rows
+        .iter()
+        .any(|row| row.group_truncated || row.page_incomplete)
+    {
+        // The grouping fetch hit its bound, so this page may not be the
+        // last one even though it came back short: hand back a cursor
+        // rather than silently claiming exhaustion. `page_incomplete` is
+        // the reliable signal here — the echo recount can complete a
+        // group's count and clear its `group_truncated`, but it cannot
+        // complete the page.
+        rows.last().map(row_cursor)
+    } else {
+        // When the continuation cap was hit on empty echo-only windows,
+        // preserve the pending cursor so the caller can keep advancing
+        // rather than treating the search as exhausted.
+        pending_cursor
+    };
+    Ok(HistoryPage { rows, next_cursor })
 }
 
 /// One page of [`search_all`], with a cursor to the next page when a further
@@ -243,42 +263,7 @@ pub fn search_page(
     filter: &QueryFilter,
     role: SearchRole,
 ) -> Result<HistoryPage<SearchRow>> {
-    // One row past the page shows whether another follows; a limit no table
-    // can reach is clamped so that over-fetch cannot overflow.
-    let limit = filter.limit.clamp(1, i64::MAX - 1);
-    let mut rows = search_all(
-        conn,
-        terms,
-        raw_fts,
-        &QueryFilter {
-            limit: limit + 1,
-            ..filter.clone()
-        },
-        role,
-    )?;
-    let next_cursor = if rows.len() as i64 > limit {
-        rows.truncate(limit as usize);
-        rows.last().map(|row| HistoryCursor {
-            timestamp_ms: row.timestamp_ms,
-            id: row.id,
-            match_source: Some(row.match_source.clone()),
-        })
-    } else if rows.iter().any(|row| row.group_truncated || row.page_incomplete) {
-        // The grouping fetch hit its bound, so this page may not be the
-        // last one even though it came back short: hand back a cursor
-        // rather than silently claiming exhaustion. `page_incomplete` is
-        // the reliable signal here — the echo recount can complete a
-        // group's count and clear its `group_truncated`, but it cannot
-        // complete the page.
-        rows.last().map(|row| HistoryCursor {
-            timestamp_ms: row.timestamp_ms,
-            id: row.id,
-            match_source: Some(row.match_source.clone()),
-        })
-    } else {
-        None
-    };
-    Ok(HistoryPage { rows, next_cursor })
+    search_page_with_cap(conn, terms, raw_fts, filter, role, MAX_SEARCH_CONTINUATIONS)
 }
 
 /// The newest prompt matching a search that names a session (non-empty
@@ -2919,5 +2904,236 @@ mod tests {
             .find(|row| row.match_source == MATCH_SOURCE_HISTORY)
             .expect("the history prompt");
         assert_eq!(prompt_row.echo_count, 1, "rows: {rows:?}");
+    }
+
+    #[test]
+    fn capped_fetch_does_not_skip_unfetched_matches_in_the_capped_branch() {
+        // Graphide finding on #580: history has A (10_000), B (1_500) and 25
+        // older prompts (100..900); events have 2,000 echoes of B
+        // (2_000..3_999) plus a user text event C (1_000) beyond the event
+        // growth cap. Page 1 must not accept older history rows past the
+        // capped event frontier and advance next_cursor past C.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for (session, ts, prompt) in [
+            ("sa", 10_000, "needle alpha prompt"),
+            ("sb", 1_500, "needle bravo prompt"),
+        ] {
+            insert_history(
+                &conn,
+                &HistoryEntry {
+                    id: 0,
+                    source: "claude".into(),
+                    session_id: Some(session.into()),
+                    project: Some("/work/needle".into()),
+                    prompt: prompt.into(),
+                    prompt_hash: Some(format!("hash-cap-frontier-{session}")),
+                    timestamp_ms: ts,
+                },
+            )
+            .unwrap();
+        }
+        for index in 0..25 {
+            insert_history(
+                &conn,
+                &HistoryEntry {
+                    id: 0,
+                    source: "claude".into(),
+                    session_id: Some(format!("sd-{index}")),
+                    project: Some("/work/needle".into()),
+                    prompt: format!("needle delta prompt {index}"),
+                    prompt_hash: Some(format!("hash-cap-frontier-d-{index}")),
+                    timestamp_ms: 100 + index * 30,
+                },
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, project, message_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('claude', 'sc', '/work/needle', 'mc', 1000, 'user', 'text', 'needle charlie prompt', 'ec')",
+            [],
+        )
+        .unwrap();
+        let mut batch = String::new();
+        for index in 0..2_000 {
+            batch.push_str(&format!(
+                "INSERT INTO session_events \
+                 (source, session_id, project, message_id, ts_ms, role, kind, text, event_uid) \
+                 VALUES ('claude', 'sb', '/work/needle', 'm{index}', {}, 'assistant', 'text', \
+                 'quoting needle bravo prompt {index}', 'e{index}');",
+                2_000 + index
+            ));
+        }
+        conn.execute_batch(&batch).unwrap();
+
+        let terms = ["needle".to_string()];
+        let mut seen = Vec::new();
+        let mut after = None;
+        for _ in 0..10 {
+            let page = search_page(
+                &conn,
+                &terms,
+                false,
+                &QueryFilter {
+                    after,
+                    ..filter(20)
+                },
+                SearchRole::All,
+            )
+            .unwrap();
+            seen.extend(page.rows);
+            match page.next_cursor {
+                Some(cursor) => after = Some(cursor),
+                None => break,
+            }
+        }
+        assert_eq!(seen.len(), 28, "expected A + B + C + 25 Ds");
+        assert_eq!(seen[0].text, "needle alpha prompt");
+        assert_eq!(seen[1].text, "needle bravo prompt");
+        assert_eq!(seen[1].echo_count, 2_000);
+        assert_eq!(seen[2].text, "needle charlie prompt");
+        for pair in seen.windows(2) {
+            assert!(
+                pair[0].timestamp_ms > pair[1].timestamp_ms,
+                "results stayed strictly ordered: {} vs {}",
+                pair[0].timestamp_ms,
+                pair[1].timestamp_ms
+            );
+        }
+    }
+
+    #[test]
+    fn capped_first_page_with_only_echoes_above_frontier_continues_and_preserves_counts() {
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for (session, ts, prompt) in [
+            ("sb", 1_500, "needle bravo prompt"),
+            ("sd", 500, "needle delta prompt"),
+        ] {
+            insert_history(
+                &conn,
+                &HistoryEntry {
+                    id: 0,
+                    source: "claude".into(),
+                    session_id: Some(session.into()),
+                    project: Some("/work/needle".into()),
+                    prompt: prompt.into(),
+                    prompt_hash: Some(format!("hash-cap-first-{session}")),
+                    timestamp_ms: ts,
+                },
+            )
+            .unwrap();
+        }
+        conn.execute(
+            "INSERT INTO session_events \
+             (source, session_id, project, message_id, ts_ms, role, kind, text, event_uid) \
+             VALUES ('claude', 'sc', '/work/needle', 'mc', 1000, 'user', 'text', 'needle charlie prompt', 'ec')",
+            [],
+        )
+        .unwrap();
+        let mut batch = String::new();
+        for index in 0..2_000 {
+            batch.push_str(&format!(
+                "INSERT INTO session_events \
+                 (source, session_id, project, message_id, ts_ms, role, kind, text, event_uid) \
+                 VALUES ('claude', 'sb', '/work/needle', 'm{index}', {}, 'assistant', 'text', \
+                 'quoting needle bravo prompt {index}', 'e{index}');",
+                2_000 + index
+            ));
+        }
+        conn.execute_batch(&batch).unwrap();
+
+        let page = search_page(&conn, &["needle".to_string()], false, &filter(20), SearchRole::All)
+            .unwrap();
+        let texts: Vec<&str> = page.rows.iter().map(|row| row.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            vec![
+                "needle bravo prompt",
+                "needle charlie prompt",
+                "needle delta prompt"
+            ]
+        );
+        assert_eq!(page.rows[0].echo_count, 2_000);
+        assert!(page.next_cursor.is_none());
+    }
+
+    #[test]
+    fn continuation_cap_returns_pending_cursor_instead_of_ending_search() {
+        // Graphide finding on #580: when empty echo-only windows exhaust the
+        // continuation cap, search_page must still return the pending cursor
+        // rather than reporting next_cursor: None while older matches remain.
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        for (session, ts, prompt) in [
+            ("sa", 10_000, "needle cap prompt"),
+            ("sb", 100, "needle older prompt"),
+        ] {
+            insert_history(
+                &conn,
+                &HistoryEntry {
+                    id: 0,
+                    source: "claude".into(),
+                    session_id: Some(session.into()),
+                    project: Some("/work/needle".into()),
+                    prompt: prompt.into(),
+                    prompt_hash: Some(format!("hash-cont-cap-{session}")),
+                    timestamp_ms: ts,
+                },
+            )
+            .unwrap();
+        }
+        let mut batch = String::new();
+        for index in 0..4_001 {
+            batch.push_str(&format!(
+                "INSERT INTO session_events \
+                 (source, session_id, project, message_id, ts_ms, role, kind, text, event_uid) \
+                 VALUES ('claude', 'sa', '/work/needle', 'm{index}', {}, 'assistant', 'text', \
+                 'needle cap prompt (echo {index})', 'e{index}');",
+                1_000 + index
+            ));
+        }
+        conn.execute_batch(&batch).unwrap();
+
+        let terms = ["needle".to_string()];
+        let first = search_page(&conn, &terms, false, &filter(1), SearchRole::All).unwrap();
+        assert_eq!(first.rows.len(), 1);
+        assert_eq!(first.rows[0].text, "needle cap prompt");
+        let after_first = first.next_cursor.expect("echoes and older prompt follow");
+
+        // With max_continuations = 1, two capped 2,000-echo windows consume
+        // the initial fetch + 1 continuation while echo_0 and sb still remain.
+        let capped = search_page_with_cap(
+            &conn,
+            &terms,
+            false,
+            &QueryFilter {
+                after: Some(after_first),
+                ..filter(1)
+            },
+            SearchRole::All,
+            1,
+        )
+        .unwrap();
+        assert!(capped.rows.is_empty(), "rows: {:?}", capped.rows);
+        let resumed_cursor = capped
+            .next_cursor
+            .expect("hitting the continuation cap must preserve the pending cursor");
+
+        let resumed = search_page(
+            &conn,
+            &terms,
+            false,
+            &QueryFilter {
+                after: Some(resumed_cursor),
+                ..filter(1)
+            },
+            SearchRole::All,
+        )
+        .unwrap();
+        assert_eq!(resumed.rows.len(), 1);
+        assert_eq!(resumed.rows[0].text, "needle older prompt");
+        assert!(resumed.next_cursor.is_none());
     }
 }

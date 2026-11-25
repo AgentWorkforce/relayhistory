@@ -273,13 +273,33 @@ pub(super)     event_bound_hit: bool,
 pub(super)     event_oldest: Option<(i64, i64, String)>,
 }
 
-fn order_key(row: &SearchRow) -> (i64, i64, String) {
+pub(super) fn order_key(row: &SearchRow) -> (i64, i64, String) {
     (row.timestamp_ms, row.id, row.match_source.clone())
 }
 
 /// Whether key `a` sorts after (is older than) key `b` in the global order.
-fn key_is_after(a: &(i64, i64, String), b: &(i64, i64, String)) -> bool {
+pub(super) fn key_is_after(a: &(i64, i64, String), b: &(i64, i64, String)) -> bool {
     a.0 < b.0 || (a.0 == b.0 && (a.1 < b.1 || (a.1 == b.1 && a.2 > b.2)))
+}
+
+impl FetchedRows {
+    /// The newest `oldest` key among active branches that hit their fetch
+    /// bound. Every active branch fetched every matching row down to this
+    /// key inclusive; any grouped row older than it may sit past unfetched
+    /// matches in a capped branch.
+    pub(super) fn cap_frontier(&self) -> Option<(i64, i64, String)> {
+        let history = (self.history_active && self.history_bound_hit)
+            .then_some(self.history_oldest.as_ref())
+            .flatten();
+        let event = (self.event_active && self.event_bound_hit)
+            .then_some(self.event_oldest.as_ref())
+            .flatten();
+        match (history, event) {
+            (Some(h), Some(e)) => Some(if key_is_after(h, e) { e } else { h }.clone()),
+            (Some(key), None) | (None, Some(key)) => Some(key.clone()),
+            (None, None) => None,
+        }
+    }
 }
 
 pub(super) fn fetch_rows(
