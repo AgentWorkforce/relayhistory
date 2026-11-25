@@ -2285,8 +2285,8 @@ pub(crate) fn ingest_selected_claude(ctx: SelectedIngest<'_>) -> Result<Selected
 
 pub(crate) fn ingest_selected_cursor(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
     let path = ctx.file()?;
-    if crate::ingest::cursor_store::is_chat_store(path) {
-        return cursor_hydrate::ingest_chat_store(ctx.conn, ctx.options, path, ctx.records);
+    if let Some(result) = cursor_hydrate::store_only(ctx.conn, ctx.options, path, ctx.records) {
+        return result;
     }
     let (diagnostics, consumed) = ingest_cursor(ctx.conn, ctx.options, ctx.target, path)?;
     Ok((ctx.whole_file(), diagnostics, Some(consumed)))

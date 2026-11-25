@@ -45,6 +45,11 @@ pub(super) fn source_snapshot(
             });
         }
     }
+    if options.source == "cursor" {
+        if let Some(snapshot) = super::cursor_hydrate::editor_snapshot(options, target, roots)? {
+            return Ok(snapshot);
+        }
+    }
     if let Some(adapter) = crate::providers::adapter(&options.source) {
         let locator = target.locator.as_deref().ok_or_else(|| {
             hydration_error(

@@ -28,6 +28,15 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Snippets center on the match and report `snippetStartOffset` in original codepoints even when lowercasing expands a character (for example `İ`).
 - SDK `search()` returns all matches up to `limit` unless `maxTotalContentChars` is explicitly given; only `searchPage()` and MCP `search_history` apply the 20000 default budget.
 - Snippets prefer a whole-token match from any query term over an earlier substring, prefix terms center at a token start, and tool payloads that serialize a prompt with escaped quotes still collapse as echoes of it; session-less rows no longer group with unrelated rows.
+
+## [0.62.0] - 2026-11-23
+
+### Added
+
+- Cursor editor (desktop app) Agent conversations that have no `agent-transcripts` transcript and no `cursor-agent` chat store are now cataloged and indexed from the editor's own database, `globalStorage/state.vscdb` in Cursor's user directory (`~/Library/Application Support/Cursor/User` on macOS, `~/.config/Cursor/User` on Linux, `%APPDATA%\Cursor\User` on Windows), under the `cursor` source with the composer id as the session id. Until now these conversations were never imported. Prompts, replies, thinking, tool calls with their ids, tool results, file edits, per-message times, the conversation's title and its workspace folder are captured; the database is opened read-only and only conversations whose rows changed are re-read.
+
+### Fixed
+
 - Antigravity subagents are no longer listed as separate root sessions. The subagents a conversation spawns, recorded in its `.system_generated/subagents/<child>.json`, are now stored as `delegated` children of that conversation, with their agent type, role and spawn time.
 - Antigravity session titles no longer show the raw `<USER_REQUEST>` envelope when Antigravity appends further blocks, such as `<USER_SETTINGS_CHANGE>`, after the request's metadata.
 - Amp thread discovery requests one lookahead row so bounded clients can report when more than 100 threads exist.
@@ -1341,7 +1350,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - The SDK reads provider JSONL natively and works without the Python CLI.
 
-[Unreleased]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.61.0...HEAD
+[Unreleased]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.62.0...HEAD
+[0.62.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.61.0...sdk-ts-v0.62.0
 [0.61.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.60.0...sdk-ts-v0.61.0
 [0.60.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.59.0...sdk-ts-v0.60.0
 [0.59.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.58.0...sdk-ts-v0.59.0

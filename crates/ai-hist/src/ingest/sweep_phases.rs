@@ -266,6 +266,18 @@ impl SweepPhases<'_, '_> {
                 scope.paths(),
             )
             .map(|stores| transcripts + stores)
+        })
+        .and_then(|read| {
+            // Conversations the Cursor editor kept only in its own database,
+            // last: a transcript or a chat store reads a composer first.
+            super::cursor_store::editor::sync_editor_composers_in(
+                self.conn,
+                self.state,
+                &self.roots.home,
+                self.coverage,
+                scope.paths(),
+            )
+            .map(|composers| read + composers)
         });
         self.counted("cursor", result);
         Ok(())
