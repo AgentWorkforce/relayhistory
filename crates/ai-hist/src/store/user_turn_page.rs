@@ -171,7 +171,7 @@ fn turn_cursor_position(
         params![cursor.id, source, session_id, cursor.ts_ms],
         |row| row.get(0),
     )?;
-    anyhow::ensure!(!synthetic, "STALE_EVENT_CURSOR: legacy user-turn anchor combines different rows; restart user-turn pagination");
+    anyhow::ensure!(!synthetic, "STALE_EVENT_CURSOR: user-turn anchor no longer names its row at that timestamp (a legacy combined anchor or a re-timestamped row); restart user-turn pagination");
     Ok((cursor.ts_ms, order, cursor.id))
 }
 

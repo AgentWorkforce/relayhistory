@@ -27,7 +27,7 @@ pub(super) fn run(
     };
     let stored_days = stored.days.map_or(0, std::num::NonZeroU32::get);
     let effective_days = days.unwrap_or(stored_days);
-    let (generation, report) = if apply {
+    let (generation, report, stored_days) = if apply {
         let store = SessionStore::open(StoreOptions::default().db_path(path))?;
         if days.is_some() {
             store.set_retention_policy(RetentionPolicy::from_days(effective_days))?;
@@ -37,10 +37,14 @@ pub(super) fn run(
             allow_unuploaded,
             ..Default::default()
         })?;
+        // Report the policy this batch ran under, not the one read before the
+        // store opened: another writer may have saved one in between.
+        let saved = store.retention_policy()?.days;
         (
             store.retention_generation()?,
             json!({"rows":report.rows,"sessions":report.sessions,"protected_sessions":report.protected_sessions,
             "awaiting_upload_ack":report.awaiting_upload_ack,"busy":report.busy,"deferred":report.deferred,"cycle_complete":report.cycle_complete}),
+            saved.map_or(0, std::num::NonZeroU32::get),
         )
     } else {
         (
@@ -50,9 +54,9 @@ pub(super) fn run(
                 0
             },
             Value::Null,
+            stored_days,
         )
     };
-    let stored_days = if apply { effective_days } else { stored_days };
     if json_output {
         println!(
             "{}",

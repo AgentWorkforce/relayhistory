@@ -89,7 +89,7 @@ fn retention(
     } else {
         RetentionPolicy::default()
     };
-    let stored_days = stored.days.map_or(0, std::num::NonZeroU32::get);
+    let mut stored_days = stored.days.map_or(0, std::num::NonZeroU32::get);
     let effective = days.unwrap_or(stored_days);
     let mut report = Value::Null;
     let generation = if apply {
@@ -108,13 +108,16 @@ fn retention(
             .map_err(error)?;
         report = json!({"rows":result.rows,"sessions":result.sessions,"protectedSessions":result.protected_sessions,
             "awaitingUploadAck":result.awaiting_upload_ack,"busy":result.busy,"deferred":result.deferred,"cycleComplete":result.cycle_complete});
+        // Report the policy this batch ran under, not the one read before the
+        // store opened: another writer may have saved one in between.
+        let saved = store.retention_policy().map_err(error)?.days;
+        stored_days = saved.map_or(0, std::num::NonZeroU32::get);
         store.retention_generation().map_err(error)?
     } else if path.exists() {
         read_retention_generation(path).map_err(error)?
     } else {
         0
     };
-    let stored_days = if apply { effective } else { stored_days };
     Ok(
         json!({"dryRun":!apply,"preview":"policy_only","storedDays":stored_days,"effectiveDays":effective,
         "maxRows":max_rows,"allowUnuploaded":allow_unuploaded,"generation":generation,"report":report}),

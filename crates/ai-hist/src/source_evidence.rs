@@ -790,10 +790,12 @@ mod tests {
 
     #[test]
     fn invalid_source_order_is_rejected() {
-        for rank in [json!(-1), json!(1.5), json!("1")] {
+        for rank in [json!(-1), json!(1.5), json!("1"), json!(1_i64 << 53)] {
             let error = validate(with("source_order", rank)).unwrap_err();
             assert!(error.to_string().contains("INVALID_ARGUMENT"), "{error}");
         }
+        // The largest rank the TypeScript SDK reads exactly is still accepted.
+        validate(with("source_order", json!((1_i64 << 53) - 1))).unwrap();
     }
 
     #[test]
