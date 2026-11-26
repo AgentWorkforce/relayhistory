@@ -6,6 +6,199 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased - Minor]
 
+### Breaking Changes
+
+- The native contract is now 30: the TypeScript SDK and the `ai-hist-native` addon must be upgraded together, and an older addon is rejected.
+- The MCP `search_history` tool returns an envelope `{matches, nextCursor, truncated, totalContentCharsUsed}` instead of a bare array of matches.
+
+### Added
+
+- Search matches carry a match-centered `snippet` (with `contentTruncated` and `snippetStartOffset`), echo grouping (`groupId`, `groupSize`, `echoCount`, `groupTruncated`, `isPrimary`), `origin`, `controlKind`, `eventUid` and an `eventRef`; `prompt` still holds the full text. Search accepts `sessionId`, `kinds`, `origin`, `maxContentChars` and `maxTotalContentChars` filters and budgets.
+- The MCP `search_history` tool rejects unknown arguments instead of silently dropping them.
+- Object-storage session manifests can carry repository evidence (`session.repo`: canonical remote and root commit, never credentials), so sessions keep one repository identity across renames, transfers and remote URL changes.
+
+### Changed
+
+- Search pages return group primaries only: assistant and tool rows that repeat a prompt verbatim (or are linked to it) collapse into that prompt as counted echoes. Two identical-wording user prompts at different timestamps both stay primaries.
+
+### Fixed
+
+- `origin: 'unknown'` search now returns ordinary assistant and tool rows (a NULL `control_kind` no longer drops them), and every origin filter returns only rows whose reported origin matches it.
+- Grouped search pages no longer end early when echoes collapse or an echo's prompt sits past the first fetch bound: the search reads on until the page is complete, and a prompt's `echoCount` is the same whatever the page size; `groupTruncated` marks potentially incomplete group counts (not page completeness), so follow `nextCursor` when present even if no returned group is flagged.
+- An echo now counts under the prompt it is linked to by id, or for a text-only echo the closest preceding identical prompt, instead of the newest matching prompt.
+- Snippets center on the match and report `snippetStartOffset` in original codepoints even when lowercasing expands a character (for example `İ`).
+- SDK `search()` returns all matches up to `limit` unless `maxTotalContentChars` is explicitly given; only `searchPage()` and MCP `search_history` apply the 20000 default budget.
+- Snippets prefer a whole-token match from any query term over an earlier substring, prefix terms center at a token start, and tool payloads that serialize a prompt with escaped quotes still collapse as echoes of it; session-less rows no longer group with unrelated rows.
+- Grouped search pages that hit the per-branch fetch growth cap trim results to the frontier covered by every capped branch instead of advancing `nextCursor` past unfetched matches, and hitting the empty-page continuation cap returns the pending `nextCursor` instead of ending pagination early.
+
+## [0.62.0] - 2026-11-23
+
+### Added
+
+- Cursor editor (desktop app) Agent conversations that have no `agent-transcripts` transcript and no `cursor-agent` chat store are now cataloged and indexed from the editor's own database, `globalStorage/state.vscdb` in Cursor's user directory (`~/Library/Application Support/Cursor/User` on macOS, `~/.config/Cursor/User` on Linux, `%APPDATA%\Cursor\User` on Windows), under the `cursor` source with the composer id as the session id. Until now these conversations were never imported. Prompts, replies, thinking, tool calls with their ids, tool results, file edits, per-message times, the conversation's title and its workspace folder are captured; the database is opened read-only and only conversations whose rows changed are re-read.
+
+### Fixed
+
+- Antigravity subagents are no longer listed as separate root sessions. The subagents a conversation spawns, recorded in its `.system_generated/subagents/<child>.json`, are now stored as `delegated` children of that conversation, with their agent type, role and spawn time.
+- Antigravity session titles no longer show the raw `<USER_REQUEST>` envelope when Antigravity appends further blocks, such as `<USER_SETTINGS_CHANGE>`, after the request's metadata.
+- Amp thread discovery requests one lookahead row so bounded clients can report when more than 100 threads exist.
+
+## [0.61.0] - 2026-11-19
+
+### Added
+
+- Cursor chats that have no `agent-transcripts` transcript are now cataloged and indexed from Cursor's own chat store, `~/.cursor/chats/<workspace>/<id>/store.db`, under the `cursor` source with the chat's id. Until now such a chat was invisible. Prompts, replies, reasoning, tool calls with their ids, tool results and file edits are captured. A chat that has a transcript is still read only from the transcript, so nothing is cataloged twice.
+
+## [0.60.0] - 2026-11-16
+
+### Added
+
+- Claude messages keep who sent them: `session_events.origin_kind` stores each record's `origin.kind` verbatim (`human`, `peer`, `task-notification`, ...), and the change feed exports it with the row, so an uploaded session can tell human-typed messages from agent-to-agent traffic. Rows indexed before the column stay null and are not re-exported for it.
+
+### Fixed
+
+- Claude records written without a `timestamp`, such as `api-request-blob` request copies, are no longer stored at 1970-01-01. They take the time of the preceding record in their session. With no earlier time to inherit, they keep a marker with no time, and the pass reports them as `EVIDENCE_PARTIAL`. Claude and Codex `history.jsonl` lines without a usable time are skipped instead of stored at 0.
+- Codex, Devin and Grok evidence with a missing or unparseable time is no longer stored at 1970-01-01. A Codex rollout line without one takes the time of the line before it, including across resumed passes; a Devin message with no time takes the session's or the preceding message's; a Grok unified-log usage row with no time and no session time waits unattached. With nothing to inherit, the evidence keeps a marker with no time and the pass reports `EVIDENCE_PARTIAL`. Session activity times, and markers, that are not known are stored as null, and a 0 stored earlier gives way to the first real time.
+
+### Rust API
+
+- Breaking: `SessionEvent` has a new public field, `origin_kind: Option<String>`; a struct literal must now set it (`origin_kind: None` where there is no origin).
+
+## [0.59.0] - 2026-11-11
+
+### Added
+
+- A session can carry the name its agent was registered under (for example an Agent Relay worker's spawn name), so the change feed reports it as the session's `agent_name` and agent-name search can find it. A name the provider recorded itself is never replaced.
+
+### Rust API
+
+- Added `SessionStore::set_registered_agent_name(source, session_id, name)`. It returns whether the effective `agent_name` changed; a real change is stamped at a new revision and re-exported by the change feed. `None` clears only a name this method set. Errors: `InvalidArgument` (empty, over 128 characters, or a control character), `SessionNotFound`, and `UnsupportedOperation` on a read-only store.
+
+## [0.58.0] - 2026-11-09
+
+### Added
+
+- Factory Droid local sessions are discovered and indexed automatically from native JSONL transcripts and settings sidecars, preserving messages, tool outcomes and resumed-session changes.
+- `ai-hist/factory-source` projects Factory API messages into readable evidence and canonical delivery records with the same native block identities as local Droid capture, preserving raw messages and explicit tool outcomes.
+
+### Fixed
+
+- Reconciliation retries a failing acquisition batch one path at a time and queues a path that fails alone for retry, so one unreadable transcript no longer blocks every path after it or keeps the pass from draining.
+- Resumed and forked Claude transcripts, which open with a copy of the origin session's records, are captured under the session they are named after, with a `fork` edge to the origin, instead of failing with conflicting `sessionId` values.
+
+### Rust API
+
+- Added `Source::Droid` with `factory` as an input alias; serialized source identity is `droid`.
+
+## [0.57.1] - 2026-11-07
+
+### Fixed
+
+- Hermes history discovery and capture accept SQLite schema 32 while retaining schema 31 support, including archived messages and native tool-call identities.
+
+## [0.57.0] - 2026-11-06
+
+### Added
+
+- Amp cloud transcript projection is available through `ai-hist/amp-source`, retaining native message identity, revisions, raw evidence, and typed tool calls for hosted uploaders and supporting a preinstalled CLI on persistent process hosts.
+- `history-provider-sources` is published to crates.io at the release version, so Rust hosts can depend on the remote source connectors by version instead of a git pin; it requires `ai-hist` at the same exact version.
+
+### Changed
+
+- Codex SQLite sync reconciles large conversations with fewer repeated searches.
+
+### Fixed
+
+- Codex SQLite sync preserves distinct messages with identical text and restores missing evidence when an overlap marker outlives its referenced rollout event.
+- Amp remote injection sends private text over stdin and treats process or stdin failures as unconfirmed submissions, preventing false acceptance and unsafe retries.
+- Amp tool results retain searchable output, call identity, status and errors in hosted history as tool evidence after privacy scrubbing, keeping mixed human prompts separate from tool output.
+
+### Rust API
+
+- `SessionStore::retention_changes_since` returns a bounded journal of session identities affected by local retention, including both endpoints of removed relationships, so consumers can refresh membership and delegation views incrementally. Gaps and expired cursors require a full refresh.
+
+## [0.56.0] - 2026-11-02
+
+### Added
+
+- Claude sessions carry the client that started them as `originator`, from the transcript's `entrypoint`: `cli` for the terminal, `claude-desktop` for the Claude app, `sdk-ts` for an SDK run. Existing sessions are re-read once to pick it up.
+- Local readers accept History source `capy`. Capy has no transcript files on disk, so discovery returns nothing; a bound thread's transcript is what Cloud uploads to hosted History, with the jam id as the session id. A jam id or a relay agent name is not a source.
+
+### Rust API
+
+- Added `Source::Capy`. It names the hosted History source Cloud uploads for a bound Capy thread. This computer has no Capy transcript files, so discovery returns nothing.
+
+## [0.55.0] - 2026-10-31
+
+### Fixed
+
+- The facade's hydration is quiet like its sync
+- Report a rejected Codex SQLite pair from the locator refresh
+- Carry provider skip diagnostics on the sync report
+
+## [0.54.1] - 2026-10-30
+
+### Added
+
+- `@relayhistory/provider-sources` gains a `cursor-cloud` connector: `--remote` / `--all` discovery lists Cursor Cloud Agents through `GET /v1/agents`, and targeted hydration returns each agent's prompts and assistant replies (from `GET /v0/agents/{id}/conversation`, timed by its v1 runs) as `cursor` evidence under the agent's `bc-…` id. It needs a Cursor API key in `RELAYHISTORY_CURSOR_API_KEY`, `CURSOR_API_KEY` or `~/.config/relayhistory/cursor-api-key`.
+
+### Changed
+
+- New sessions become visible sooner because live watch capture checkpoints its WAL after the active burst instead of on the commit thread.
+
+### Fixed
+
+- Cursor subagent sessions are discovered and searchable: transcripts under `agent-transcripts/<parent>/subagents/` are indexed as their own sessions, by full sweeps and change-triggered scans, and linked to the session that spawned them.
+- A Codex SQLite store that a quiet `sync`, `watch` or `hydrate` could not read is reported on that call's result, so an embedding host sees why Codex history is missing; the CLI still prints the skip on stderr.
+
+### Rust API
+
+- Added `SyncDiagnostic` and `SyncReport::diagnostics`, `TickReport::diagnostics`: what providers skipped during the sweep, with a stable code (`SESSION_SOURCE_UNAVAILABLE`, `EVIDENCE_PARTIAL`), the source and the session it names. A hydration's skips arrive on `HydrateReport::diagnostics`.
+
+## [0.53.1] - 2026-10-29
+
+### Fixed
+
+- Selected Codex SQLite sessions report an unavailable source when their backing stores disappear, and fallback diagnostics honor quiet mode.
+
+## [0.53.0] - 2026-10-28
+
+### Added
+
+- OpenCode 2 sessions are discovered, synced and hydrated from its `session_v2` and `session_message` tables: every session with a `session_v2` row reads from there, V1 sessions OpenCode 2 has not migrated yet keep reading from the V1 tables. Migrated sessions re-sync once, and can carry less than their V1 originals (attachments and part kinds OpenCode 2 drops).
+- Session manifests record raw-chunk scrub status and stored digests; readers quarantine unscrubbed sessions.
+- The object-storage plugin can scrub PII and secrets, including PGP private keys, card numbers and phone numbers, from raw session chunks before upload (`scrub::scrub_chunk`, uploaded only through `scrub::seal::put_raw_chunk`), using the same rules as the hosted service.
+- The object-storage plugin's `scrub::Dropped` implements `Display` and `std::error::Error`, so callers can propagate it with `?`.
+- Claude sessions catalog their `agent-name` (the name Agent Relay and other sessions address them by) as `agent_name`, apart from the title, and session change records carry it so destinations can look sessions up by agent name. The session catalog contract is now 7. Sessions already catalogued are not re-scanned to fill it: a session gets its agent name when it is first catalogued or when its transcript next changes.
+
+### Changed
+
+- A full `sync` that finds nothing new is much cheaper on large Codex stores.
+
+### Rust API
+
+- Added `ShallowSession::agent_name` and `CatalogSession::agent_name`.
+
+## [0.52.0] - 2026-10-26
+
+### Added
+
+- Local history retention defaults to 30 days, supports configurable limits or forever, and evicts in maintenance batches while protecting unuploaded logs and preserving cloud copies.
+- Added `SessionStore::retention_generation` and `retention::read_retention_generation` so retained catalogs can invalidate after committed local eviction without uploading deletion records.
+- Added `SessionStore::session_profile`, `SessionProfile`, and `SessionAvatar` for locally observed Grok Bot names, avatar shapes, colors, and inline raster images without transcript hydration or network access.
+- Added local `retention` policy read/write APIs and `SessionStore` maintenance and upload-acknowledgement methods; maintenance must be scheduled by the host.
+
+### Changed
+
+- A new session reaches the catalog sooner through `watch` and exact-path capture: one validated writer per capture and across watch ticks, no per-commit fsync for exact capture, and a 2 ms leading-edge settle instead of 10 ms.
+
+### Fixed
+
+- Grok Bot shows each bot's normalized profile name consistently across discovery and full capture, including cached chats and later renames. Invalid optional names preserve the last title; an explicitly blank name clears it.
+- Grok Bot discovery reads each account roster once per pass and counts its I/O even when a bot is absent from the roster.
+
+## [0.51.0] - 2026-10-26
+
 ### Added
 
 - Kilo CLI history is discoverable and searchable from its native session database, preserving recorded messages, tool results and session rewrites.
@@ -18,9 +211,15 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - VT Code history is discoverable and searchable from canonical workspace journals under explicitly configured workspace roots, preserving recorded turns, tool identities, usage and control events.
 - Junie CLI history is discoverable and searchable from native session journals, including recorded prompts, assistant text, tool output and event markers.
 - The optional object-storage plugin (`plugins/object-store`) validates session `manifest.json` v1 and lets the desktop and server update it concurrently with compare-and-swap, without losing either side's changes.
-- Object-storage session manifests can carry repository evidence (`session.repo`: canonical remote and root commit, never credentials), so sessions keep one repository identity across renames, transfers and remote URL changes.
+
+### Changed
+
+- The object-storage plugin rejects metadata values that start or end with a space (`Error::InvalidArgument`), because HTTP stores strip them.
 
 ### Fixed
+
+- The object-storage plugin's filesystem store refuses keys that traverse a symbolic link under its root and never lists entries reached through one.
+- Object-storage presigned URLs require a lifetime of at least one second.
 
 - Reconciliation advances healthy roots past persistent enumeration errors while retaining failed locations for retry.
 - Exact-path capture avoids materializing unused cached transcript metadata and locations.
@@ -1153,7 +1352,21 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - The SDK reads provider JSONL natively and works without the Python CLI.
 
-[Unreleased - Minor]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.50.1...HEAD
+[Unreleased]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.62.0...HEAD
+[0.62.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.61.0...sdk-ts-v0.62.0
+[0.61.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.60.0...sdk-ts-v0.61.0
+[0.60.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.59.0...sdk-ts-v0.60.0
+[0.59.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.58.0...sdk-ts-v0.59.0
+[0.58.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.57.1...sdk-ts-v0.58.0
+[0.57.1]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.57.0...sdk-ts-v0.57.1
+[0.57.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.56.0...sdk-ts-v0.57.0
+[0.56.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.55.0...sdk-ts-v0.56.0
+[0.55.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.54.1...sdk-ts-v0.55.0
+[0.54.1]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.53.1...sdk-ts-v0.54.1
+[0.53.1]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.53.0...sdk-ts-v0.53.1
+[0.53.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.52.0...sdk-ts-v0.53.0
+[0.52.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.51.0...sdk-ts-v0.52.0
+[0.51.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.50.1...sdk-ts-v0.51.0
 [0.50.1]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.49.0...sdk-ts-v0.50.1
 [0.49.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.48.0...sdk-ts-v0.49.0
 [0.48.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.47.0...sdk-ts-v0.48.0

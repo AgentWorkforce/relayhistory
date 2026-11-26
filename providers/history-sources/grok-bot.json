@@ -17,7 +17,7 @@
   "capture": [
     {
       "evidence": "Messages and identity",
-      "coverage": "Base32 transcript keys, native agent and entry IDs, roster titles, complete and truncated tails across account slots; bounded local window accumulates across captures."
+      "coverage": "Base32 transcript keys, native agent and entry IDs, normalized roster titles during shallow discovery and full capture, local avatar shape/color and inline raster profiles through `SessionStore::session_profile`, complete and truncated tails across account slots; bounded local window accumulates across captures."
     },
     {
       "evidence": "Control and lineage",

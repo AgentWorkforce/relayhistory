@@ -53,6 +53,13 @@ pub(crate) fn validate_metadata(metadata: Metadata) -> Result<Metadata> {
                 "metadata value for {k:?} must be printable ASCII"
             )));
         }
+        // HTTP strips leading/trailing whitespace from header values, so such
+        // a value would differ between the cloud stores and FsStore.
+        if v.starts_with(' ') || v.ends_with(' ') {
+            return Err(Error::InvalidArgument(format!(
+                "metadata value for {k:?} must not start or end with a space"
+            )));
+        }
         total += k.len() + v.len();
     }
     if total > MAX_USER_METADATA_BYTES {
@@ -111,5 +118,14 @@ mod tests {
             "digest fills the reserve exactly"
         );
         assert!(with_digest(sized(MAX_USER_METADATA_BYTES + 1), &sha).is_err());
+    }
+
+    #[test]
+    fn values_with_edge_spaces_are_rejected() {
+        let sha = "a".repeat(64);
+        for v in [" draft", "draft ", " draft "] {
+            assert!(with_digest([("label".to_string(), v.to_string())].into(), &sha).is_err());
+        }
+        assert!(with_digest([("label".to_string(), "two words".into())].into(), &sha).is_ok());
     }
 }

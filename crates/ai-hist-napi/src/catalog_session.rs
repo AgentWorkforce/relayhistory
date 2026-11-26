@@ -17,6 +17,9 @@ pub struct CatalogSession {
     pub title: Option<String>,
     /// Provider-native kind, such as Grok's `subagent`.
     pub session_kind: Option<String>,
+    /// The name other sessions address this one by (Claude's `agent-name`,
+    /// e.g. an Agent Relay worker's name).
+    pub agent_name: Option<String>,
     pub models: Vec<String>,
     pub originator: Option<String>,
     pub agent_version: Option<String>,
@@ -48,6 +51,7 @@ impl From<ai_hist::ShallowSession> for CatalogSession {
             last_assistant_text: session.last_assistant_text,
             title: session.title,
             session_kind: session.session_kind,
+            agent_name: session.agent_name,
             models: session.models,
             originator: session.originator,
             agent_version: session.agent_version,

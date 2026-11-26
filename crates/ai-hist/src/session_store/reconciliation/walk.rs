@@ -19,8 +19,51 @@ impl SourceWalk {
     }
 
     fn defer(&mut self, work: DeferredWork) {
-        if !self.deferred.iter().any(|old| old.key() == work.key()) {
+        if !self.deferred.contains(&work) {
             self.deferred.push_back(work);
+        }
+    }
+
+    /// How many leading pending paths the next acquisition attempts.
+    pub(super) fn batch_len(&self, max_paths: usize) -> usize {
+        let bound = if self.isolating > 0 { 1 } else { max_paths };
+        self.pending.len().min(bound)
+    }
+
+    /// Account for an acquisition of the leading `attempted` pending paths.
+    ///
+    /// Success drains them. A failure that names no one path (cancellation,
+    /// lock contention, the store itself) keeps the batch for an identical
+    /// retry. Any other failure is isolated: a batch is retried one path at a
+    /// time, and a path that fails alone moves to the deferred retry queue so
+    /// the paths after it are reached. It stays owed, so the round is never
+    /// complete while it fails.
+    pub(super) fn settle<T>(
+        &mut self,
+        attempted: usize,
+        retained_pending: bool,
+        result: Result<T, Error>,
+    ) -> Result<T, Error> {
+        match result {
+            Ok(value) => {
+                self.pending.drain(..attempted);
+                self.isolating = self.isolating.saturating_sub(attempted);
+                if retained_pending {
+                    self.deferred_turn = !self.deferred.is_empty();
+                }
+                Ok(value)
+            }
+            Err(error) if !isolates_to_a_path(&error) => Err(error),
+            Err(error) if attempted > 1 => {
+                self.isolating = attempted;
+                Err(error)
+            }
+            Err(error) => {
+                let path = self.pending.remove(0);
+                self.isolating = self.isolating.saturating_sub(1);
+                self.defer(DeferredWork::Acquisition(path));
+                Err(error)
+            }
         }
     }
 
@@ -101,6 +144,11 @@ impl SourceWalk {
                     self.current = current;
                 }
                 result
+            }
+            DeferredWork::Acquisition(path) => {
+                self.pending.insert(0, path);
+                self.isolating += 1;
+                Ok(())
             }
             DeferredWork::Entry(path, root) => match deferred_entry_type(&path) {
                 Ok(kind) => {
@@ -208,6 +256,21 @@ impl SourceWalk {
             }
         }
     }
+}
+
+/// Whether a failed acquisition can be the fault of the paths it was given,
+/// rather than of the run (cancellation, lock contention) or the store.
+fn isolates_to_a_path(error: &Error) -> bool {
+    !matches!(
+        error,
+        Error::Cancelled(_)
+            | Error::SyncLocked { .. }
+            | Error::InsufficientSpace(_)
+            | Error::DatabaseOpen(_)
+            | Error::StaleSchema(_)
+            | Error::InvalidArgument(_)
+            | Error::UnsupportedOperation(_)
+    )
 }
 
 fn deferred_entry_type(path: &std::path::Path) -> std::io::Result<std::fs::FileType> {

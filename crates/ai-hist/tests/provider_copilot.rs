@@ -14,6 +14,10 @@ const USAGE: &str = "5f0c2a8e-1d4b-4c6e-9a7f-3b2d1e0c9a81";
 const USAGE_JOURNAL: &str = include_str!(
     "fixtures/copilot/cli-usage/.copilot/session-state/5f0c2a8e-1d4b-4c6e-9a7f-3b2d1e0c9a81/events.jsonl"
 );
+const DESKTOP: &str = "6a5dde8d-2cf2-448d-a2b4-1f73db2cabf0";
+const DESKTOP_JOURNAL: &str = include_str!("fixtures/copilot/desktop-harness/.copilot/session-state/6a5dde8d-2cf2-448d-a2b4-1f73db2cabf0/events.jsonl");
+const VSCODE: &str = "69e50b90-b873-4de0-a36d-c9152a45e772";
+const VSCODE_JOURNAL: &str = include_str!("fixtures/copilot/vscode-harness/.copilot/session-state/69e50b90-b873-4de0-a36d-c9152a45e772/events.jsonl");
 
 fn stage(home: &Path, sid: &str, journal: &str) -> PathBuf {
     let path = home.join(format!(".copilot/session-state/{sid}/events.jsonl"));
@@ -64,6 +68,134 @@ fn has(e: &SessionEvidence, text: &str) -> bool {
         .iter()
         .flat_map(|m| &m.blocks)
         .any(|b| b.text.as_deref() == Some(text))
+}
+
+fn assert_native_marker_ids(evidence: &SessionEvidence, journal: &str) {
+    let expected: std::collections::BTreeSet<String> = journal
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| {
+            !matches!(
+                event["type"].as_str(),
+                Some("user.message" | "assistant.message" | "tool.execution_complete")
+            )
+        })
+        .map(|event| event["id"].as_str().unwrap().to_owned())
+        .collect();
+    let actual: std::collections::BTreeSet<String> = evidence
+        .markers
+        .iter()
+        .map(|marker| marker.marker_uid.clone())
+        .collect();
+    assert_eq!(evidence.markers.len(), expected.len());
+    assert_eq!(actual, expected);
+}
+
+fn assert_vscode_capture(evidence: &SessionEvidence) {
+    assert_native_marker_ids(evidence, VSCODE_JOURNAL);
+    assert!(has(evidence, "RELAY_COPILOT_VSCODE_PROOF_OK"));
+    // Two text messages and the four native tool call/result records.
+    assert_eq!(evidence.messages.len(), 6);
+    assert_eq!(evidence.tool_calls.len(), 2);
+    assert_eq!(evidence.tool_results.len(), 2);
+    assert!(evidence.tool_results.iter().any(|r| r.text.as_deref()
+        == Some("Disposable Relay Copilot integration test. No production data.\n")));
+    for kind in [
+        "assistant.turn_start",
+        "assistant.turn_end",
+        "session.usage_record",
+    ] {
+        assert!(evidence.markers.iter().any(|m| m.kind == kind));
+    }
+    assert!(evidence.messages.iter().all(|m| m.raw_usage().is_none()));
+    assert_eq!(
+        evidence.session.cwd.as_deref(),
+        Some("/fixture/copilot-vscode")
+    );
+}
+
+fn assert_desktop_capture(evidence: &SessionEvidence) {
+    assert_native_marker_ids(evidence, DESKTOP_JOURNAL);
+    assert!(has(evidence, "RELAY_COPILOT_DESKTOP_CAPTURE_OK"));
+    assert_eq!(evidence.tool_calls.len(), 1);
+    assert_eq!(evidence.tool_results.len(), 1);
+    let result = &evidence.tool_results[0];
+    assert_eq!(result.result_status.as_deref(), Some("errored"));
+    assert_eq!(
+        result.error_signal.as_deref(),
+        Some("tool.execution_complete.success")
+    );
+    assert_eq!(
+        result.text.as_deref(),
+        Some("Fixture MCP initialization failed.")
+    );
+    assert_eq!(
+        evidence.session.cwd.as_deref(),
+        Some("/fixture/copilot-desktop")
+    );
+    for kind in [
+        "session.start",
+        "assistant.turn_start",
+        "assistant.turn_end",
+    ] {
+        assert!(evidence.markers.iter().any(|marker| marker.kind == kind));
+    }
+}
+
+#[test]
+fn recorded_desktop_harness_preserves_failed_tool_outcomes() {
+    let home = tempfile::tempdir().unwrap();
+    stage(home.path(), DESKTOP, DESKTOP_JOURNAL);
+    let evidence = provider_support::assert_history_conformance(
+        home.path(),
+        provider_support::HistoryCase {
+            source: Source::Copilot,
+            session_id: DESKTOP,
+            messages: &[
+                (Role::User, "Check the Relay connection once."),
+                (Role::Assistant, "RELAY_COPILOT_DESKTOP_CAPTURE_OK"),
+            ],
+        },
+    );
+    assert_desktop_capture(&evidence);
+}
+
+#[test]
+fn copilot_desktop_and_vscode_sessions_sync_together_without_a_live_process() {
+    let home = tempfile::tempdir().unwrap();
+    let desktop = DESKTOP;
+    stage(home.path(), desktop, DESKTOP_JOURNAL);
+    stage(home.path(), VSCODE, VSCODE_JOURNAL);
+    let store = open(home.path());
+    assert_eq!(discover(&store).discovered, 2);
+    hydrate(&store, desktop);
+    let initial = read(&store, desktop);
+    let path = home
+        .path()
+        .join(format!(".copilot/session-state/{desktop}/events.jsonl"));
+    let append = serde_json::json!({"type":"user.message","id":"desktop-followup",
+        "parentId":null,"timestamp":"2026-11-16T00:00:00Z","data":{"content":"Continue this desktop thread."}});
+    use std::io::Write;
+    writeln!(
+        std::fs::OpenOptions::new().append(true).open(path).unwrap(),
+        "{append}"
+    )
+    .unwrap();
+    let report = store
+        .sync(SyncOptions::default().sources([Source::Copilot]))
+        .unwrap();
+    assert!(report.diagnostics.is_empty());
+    drop(store);
+    let store = open(home.path());
+    let desktop_evidence = read(&store, desktop);
+    let vscode_evidence = read(&store, VSCODE);
+    assert_eq!(desktop_evidence.messages.len(), initial.messages.len() + 1);
+    assert_vscode_capture(&vscode_evidence);
+    assert!(has(&desktop_evidence, "Continue this desktop thread."));
+    assert!(!has(&vscode_evidence, "Continue this desktop thread."));
+    assert!(!has(&desktop_evidence, "RELAY_COPILOT_VSCODE_PROOF_OK"));
+    assert_desktop_capture(&desktop_evidence);
+    assert!(!has(&vscode_evidence, "RELAY_COPILOT_DESKTOP_CAPTURE_OK"));
 }
 
 #[test]
@@ -363,4 +495,22 @@ fn copilot_symlink_escape_is_never_read() {
         .diagnostics
         .iter()
         .any(|d| d.message.contains("SESSION_SOURCE_MISMATCH")));
+}
+
+#[test]
+fn vscode_copilot_harness_uses_native_history_without_a_second_parser() {
+    let home = tempfile::tempdir().unwrap();
+    stage(home.path(), VSCODE, VSCODE_JOURNAL);
+    let evidence = provider_support::assert_history_conformance(
+        home.path(),
+        provider_support::HistoryCase {
+            source: Source::Copilot,
+            session_id: VSCODE,
+            messages: &[
+                (Role::User, "Relay integration fixture: read README.md using a file-reading tool, then reply with exactly RELAY_COPILOT_VSCODE_PROOF_OK. Do not modify files or run terminal commands."),
+                (Role::Assistant, "RELAY_COPILOT_VSCODE_PROOF_OK"),
+            ],
+        },
+    );
+    assert_vscode_capture(&evidence);
 }

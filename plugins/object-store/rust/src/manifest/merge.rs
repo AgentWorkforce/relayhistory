@@ -47,7 +47,9 @@ fn known_fields(path: &str) -> &'static [&'static str] {
             "epochs",
             "next_offset",
             "chunks",
+            "scrub",
         ],
+        "raw.scrub" => &["ruleset", "version"],
         "raw.chunks[]" => &[
             "seq",
             "epoch",
@@ -57,6 +59,8 @@ fn known_fields(path: &str) -> &'static [&'static str] {
             "sha256",
             "sha256_8",
             "stored_sha256",
+            "stored_raw_bytes",
+            "raw_sha256",
             "compression",
             "records",
             "first_ts",
@@ -87,7 +91,11 @@ fn known_fields(path: &str) -> &'static [&'static str] {
 /// are merged recursively under `path`.
 fn nested(path: &str) -> &'static [(&'static str, Option<&'static str>)] {
     match path {
-        "raw" => &[("chunks", Some("seq")), ("epochs", Some("epoch"))],
+        "raw" => &[
+            ("chunks", Some("seq")),
+            ("epochs", Some("epoch")),
+            ("scrub", None),
+        ],
         "session" => &[("repo", None)],
         "server" => &[("normalized", None), ("retention", None)],
         _ => &[],

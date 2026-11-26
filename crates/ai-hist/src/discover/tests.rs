@@ -277,6 +277,30 @@ fn discovering_an_unknown_source_is_rejected() {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn claude_discovery_reads_the_entrypoint_as_the_originator() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    // Claude Code writes `entrypoint` on the records that carry `version`,
+    // after bookkeeping records that carry neither.
+    let app = format!(
+        "{}\n{}",
+        r#"{"type":"file-history-snapshot","messageId":"m0","snapshot":{}}"#,
+        CLAUDE_BODY.replacen(
+            r#""version":"1.2.3","#,
+            r#""version":"1.2.3","entrypoint":"claude-desktop","#,
+            1,
+        )
+    );
+    claude_session(home.path(), "claude-1", &app, 1_750_000_000_000);
+    let terminal = CLAUDE_BODY.replace("claude-1", "claude-2");
+    claude_session(home.path(), "claude-2", &terminal, 1_750_000_000_000);
+
+    let found = discover(&conn, home.path(), &only(&["claude"]));
+    assert_eq!(found.row("claude-1").originator.as_deref(), Some("claude-desktop"));
+    assert_eq!(found.row("claude-2").originator, None);
+}
+
+#[test]
 fn claude_cold_discovery_extracts_identity_and_skips_non_human_turns() {
     let conn = catalog();
     let home = tempfile::tempdir().unwrap();
@@ -2604,6 +2628,78 @@ fn on_row_callbacks_run_at_the_configured_durability_not_discoverys() {
         .query_row("PRAGMA synchronous", [], |row| row.get(0))
         .unwrap();
     assert_eq!(after, full);
+}
+
+#[test]
+fn nested_relaxed_synchronous_guards_share_one_connection_policy() {
+    let conn = catalog();
+    conn.pragma_update(None, "synchronous", "FULL").unwrap();
+    let full: i64 = conn
+        .query_row("PRAGMA synchronous", [], |row| row.get(0))
+        .unwrap();
+    {
+        let _outer = RelaxedSynchronous::new(&conn).unwrap();
+        let normal: i64 = conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(normal, 1);
+        {
+            let _inner = RelaxedSynchronous::new(&conn).unwrap();
+            let nested: i64 = conn
+                .query_row("PRAGMA synchronous", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(nested, normal);
+        }
+        let after_inner: i64 = conn
+            .query_row("PRAGMA synchronous", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(after_inner, normal);
+    }
+    let restored: i64 = conn
+        .query_row("PRAGMA synchronous", [], |row| row.get(0))
+        .unwrap();
+    assert_eq!(restored, full);
+    {
+        let _next = RelaxedSynchronous::new(&conn).unwrap();
+        assert_eq!(
+            conn.query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
+                .unwrap(),
+            1,
+            "a completed guard must not make the next guard look nested"
+        );
+    }
+    assert_eq!(
+        conn.query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
+            .unwrap(),
+        full
+    );
+}
+
+#[test]
+fn nested_relaxed_synchronous_guards_keep_connections_independent() {
+    let first = catalog();
+    let second = catalog();
+    for conn in [&first, &second] {
+        conn.pragma_update(None, "synchronous", "FULL").unwrap();
+    }
+    let full = |conn: &Connection| {
+        conn.query_row("PRAGMA synchronous", [], |row| row.get::<_, i64>(0))
+            .unwrap()
+    };
+    let first_full = full(&first);
+    let second_full = full(&second);
+    {
+        let _first = RelaxedSynchronous::new(&first).unwrap();
+        {
+            let _second = RelaxedSynchronous::new(&second).unwrap();
+            assert_eq!(full(&first), 1);
+            assert_eq!(full(&second), 1);
+        }
+        assert_eq!(full(&first), 1);
+        assert_eq!(full(&second), second_full);
+    }
+    assert_eq!(full(&first), first_full);
+    assert_eq!(full(&second), second_full);
 }
 
 #[test]

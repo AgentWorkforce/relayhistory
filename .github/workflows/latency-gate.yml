@@ -81,6 +81,13 @@ jobs:
       - name: Build the latency harness
         run: cargo test --release -p ai-hist-cli --test latency_bench --no-run
 
+      # ci.yml has no macOS job, and the watch loop's timing depends on the
+      # backend (FSEvents here, inotify on Linux): this is where it is tested
+      # on macOS.
+      - name: Watch-loop tests (macOS)
+        if: runner.os == 'macOS'
+        run: cargo test --release -p ai-hist --all-features --lib watch
+
       # On a pull request the regression rule compares against the base
       # commit, measured interleaved on this same runner; runners of one
       # class differ by more than the 10% allowance. Without a base (a push

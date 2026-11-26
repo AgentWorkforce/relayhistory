@@ -1,5 +1,6 @@
 //! Transport-free source plugin intake. Each complete snapshot is fenced by the
 //! observation revision acquired before external I/O, then reconciled atomically.
+mod order;
 use crate::{discover::*, *};
 use crate::{
     observations::{self, ObservationCheckpoint, ObservationKey, SessionObservation},
@@ -340,7 +341,9 @@ pub(crate) fn apply_normalized(
             record.remove(&tx, key.location)?;
         }
     }
-    for (identity, record) in union {
+    let mut writes: Vec<_> = union.into_iter().collect();
+    writes.sort_by_cached_key(|(_, record)| order::write_key(record));
+    for (identity, record) in writes {
         if managed.contains(&identity) {
             record.write(&tx, key.location)?;
         }

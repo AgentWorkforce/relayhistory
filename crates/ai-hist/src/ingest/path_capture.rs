@@ -2,7 +2,10 @@
 use super::*;
 pub(crate) mod cold_proof;
 use crate::observations;
-use crate::remote::SourceConnectorSelection;
+
+/// What one locked sweep returns: the tick, the `after` read, the lock it
+/// ran under, and what its providers skipped.
+pub(crate) type LockedTick<R> = (SyncTick, R, SyncRunLock, Vec<crate::SyncDiagnostic>);
 
 /// One local sweep for [`crate::SessionStore`]: silent, against the store's
 /// resolved provider roots, forcing past the source fingerprint when asked,
@@ -16,6 +19,10 @@ use crate::remote::SourceConnectorSelection;
 /// was held elsewhere and nothing ran — the facade turns that into an error
 /// rather than a silent no-op. `scope` names the sources the sweep reads;
 /// see [`SweepScope`] for what a scoped sweep leaves alone.
+///
+/// Quiet: no progress on stdout and no provider skip on stderr. What the
+/// providers skipped comes back with the tick instead, so the host that
+/// asked for silence is still told what the sweep left out.
 pub(crate) fn sync_facade_tick<B, R>(
     db_path: &Path,
     roots: &crate::ProviderRoots,
@@ -23,40 +30,44 @@ pub(crate) fn sync_facade_tick<B, R>(
     scope: &SweepScope,
     before: impl FnOnce(&Connection) -> Result<B>,
     after: impl FnOnce(&Connection, B, SyncTick, bool) -> Result<R>,
-) -> Result<Option<(SyncTick, R, SyncRunLock)>> {
+) -> Result<Option<LockedTick<R>>> {
     SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
     check_capture_cancelled()?;
     let Some(sync_lock) = try_acquire_sync_lock(db_path)? else {
         return Ok(None);
     };
     let _reads = cold_read::begin_read_scope();
-    crate::store::sync_connection::with_connection(db_path, |conn| {
-        // Keep setup diagnostics separate from provider errors: legacy full
-        // sync already enriches its own contention, and probing twice would
-        // add waits without changing the failed acquisition.
-        Ok((|| {
-            let baseline = before(conn)?;
-            let captured = try_capture_paths(conn, db_path, roots, scope, force).and_then(
-                |scoped| match scoped {
-                    Some(swept) => Ok(swept),
-                    None => sync_basic(conn, db_path, roots, force, scope)
-                        .map_err(|error| enrich_sync_error(db_path, error)),
-                },
-            );
-            let tick = SyncTick {
-                attempted: true,
-                swept: captured.as_ref().copied().unwrap_or(false),
-            };
-            // A cancelled/failed acquisition can already have committed earlier
-            // files. Capture that bracket before unlocking, retaining its delta for
-            // the next successful report instead of swallowing it as an outside write.
-            let outcome = after(conn, baseline, tick, captured.is_ok());
-            captured?;
-            let outcome = outcome?;
-            Ok(Some((tick, outcome, sync_lock)))
-        })())
-    })
-    .map_err(|error| enrich_sync_error(db_path, error))?
+    let (locked, diagnostics) = provider_diagnostics::collect(|| {
+        crate::store::sync_connection::with_connection(db_path, |conn| {
+            // Keep setup diagnostics separate from provider errors: legacy full
+            // sync already enriches its own contention, and probing twice would
+            // add waits without changing the failed acquisition.
+            Ok((|| -> Result<Option<(SyncTick, R, SyncRunLock)>> {
+                let baseline = before(conn)?;
+                let captured =
+                    try_capture_paths(conn, db_path, roots, scope, force).and_then(|scoped| {
+                        match scoped {
+                            Some(swept) => Ok(swept),
+                            None => sync_basic(conn, db_path, roots, force, scope)
+                                .map_err(|error| enrich_sync_error(db_path, error)),
+                        }
+                    });
+                let tick = SyncTick {
+                    attempted: true,
+                    swept: captured.as_ref().copied().unwrap_or(false),
+                };
+                // A cancelled/failed acquisition can already have committed earlier
+                // files. Capture that bracket before unlocking, retaining its delta for
+                // the next successful report instead of swallowing it as an outside write.
+                let outcome = after(conn, baseline, tick, captured.is_ok());
+                captured?;
+                let outcome = outcome?;
+                Ok(Some((tick, outcome, sync_lock)))
+            })())
+        })
+    });
+    let locked = locked.map_err(|error| enrich_sync_error(db_path, error))??;
+    Ok(locked.map(|(tick, outcome, sync_lock)| (tick, outcome, sync_lock, diagnostics)))
 }
 
 pub(crate) fn reconcile_pending(db: &Path, source: &str) -> Result<bool> {
@@ -114,6 +125,20 @@ fn capture_paths(
         .iter()
         .filter_map(|path| transcript_source(roots, scope, path))
         .collect();
+    // `synchronous = NORMAL` for the whole capture -- discovery, hydration
+    // and the capture marker -- rather than an fsync per commit. That is the
+    // durability the sweep deliberately does *not* take (docs/benchmarks.md):
+    // there a power loss can drop the last commits while `.sync-state.json`
+    // stamps survive and vouch for them. Exact capture writes no sidecar
+    // state -- it only reads `.sync-state.json` through the cold proof, and
+    // the one out-of-database checkpoint, the Cursor transcript cursor, is for
+    // a source `transcript_source` never admits here -- so every checkpoint it
+    // writes is in the same database and a lost commit loses its checkpoint
+    // with it; the next capture of the path, or the next reconciliation round,
+    // reads it again. In WAL mode NORMAL still keeps the database consistent.
+    // The guard restores the connection's level on drop, so a retained writer
+    // goes back to full durability for whatever uses it next.
+    let _relaxed = crate::discover::RelaxedSynchronous::new(conn)?;
     let mut env =
         DiscoveryEnv::with_provider_roots(conn, roots.clone()).with_path_scope(Some(paths.clone()));
     env.fresh_paths = fresh;
@@ -153,7 +178,10 @@ fn capture_paths(
         let observed_metadata = transcript_file::metadata(&path)?;
         let observed_change_time = super::transcript_cursor::change_time_ns(&observed_metadata);
         with_content_validation(validate, || {
-            hydrate::hydrate_session_at_with_roots_and_connectors(
+            // On the capture's own connection: one validated writer for
+            // the whole capture, see `hydrate_local_session_on`.
+            hydrate::hydrate_local_session_on(
+                conn,
                 db,
                 &hydrate::HydrateSessionOptions {
                     source: source.clone(),
@@ -162,7 +190,7 @@ fn capture_paths(
                     include_related: false,
                 },
                 roots,
-                &SourceConnectorSelection::default(),
+                None,
             )
         })?;
         hydrate::mark_exact_capture(conn, &source, &session_id, &path, observed_change_time)?;

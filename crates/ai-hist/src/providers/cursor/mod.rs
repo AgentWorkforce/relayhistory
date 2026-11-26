@@ -1,4 +1,5 @@
-//! Existing cursor registration; parser behavior is unchanged.
+//! Existing cursor registration. Chats with no transcript are also read from
+//! Cursor's own chat store (`ingest::cursor_store`).
 use crate::discover::CursorProvider;
 use crate::hydrate;
 use crate::sources::catalog::*;
@@ -7,8 +8,20 @@ pub(crate) const LOCAL_SOURCE: LocalSource = LocalSource {
     id: "cursor",
     discovery: Discovery::Provider(|| Box::new(CursorProvider)),
     hydration: Hydration::Parser(hydrate::ingest_selected_cursor),
-    transcript_roots: |roots| vec![roots.home.join(".cursor/projects")],
-    relationships: Relationships::NONE,
+    transcript_roots: |roots| {
+        vec![
+            roots.home.join(".cursor/projects"),
+            roots.home.join(crate::ingest::cursor_store::CHATS_DIR),
+        ]
+    },
+    // A subagent transcript is filed at `<parent>/subagents/<child>.jsonl`,
+    // which names both ends; nothing in it records the agent type or spawn.
+    relationships: Relationships {
+        stable_child_identity: "always",
+        records_agent_type: false,
+        records_spawn_time: false,
+        records_evidence_locator: true,
+    },
     resume: Some(Resume {
         command: |sid| format!("cursor-agent --resume={sid}"),
         in_project: true,

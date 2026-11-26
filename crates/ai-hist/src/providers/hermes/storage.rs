@@ -106,7 +106,7 @@ pub(super) fn watch_roots(roots: &ProviderRoots) -> Vec<WatchRoot> {
 fn read<T>(
     context: &AcquisitionContext<'_>,
     path: &Path,
-    f: impl FnOnce(&Connection) -> Result<T>,
+    f: impl FnOnce(&Connection, i64) -> Result<T>,
 ) -> Result<T> {
     check_capture_cancelled()?;
     context.validate(path)?;
@@ -122,10 +122,10 @@ fn read<T>(
             .query_row("SELECT version FROM schema_version", [], |r| r.get(0))
             .context("unsupported Hermes schema: missing schema_version")?;
         ensure!(
-            version == 31,
-            "unsupported Hermes schema {version}; supported: 31"
+            matches!(version, 31 | 32),
+            "unsupported Hermes schema {version}; supported: 31, 32"
         );
-        f(conn)
+        f(conn, version)
     })
 }
 fn timestamp(value: f64) -> Result<i64> {
@@ -143,6 +143,7 @@ pub(super) fn session_query(selected: bool) -> String {
 }
 fn sessions(
     conn: &Connection,
+    schema_version: i64,
     roots: &ProviderRoots,
     path: &Path,
     limit: usize,
@@ -175,6 +176,7 @@ fn sessions(
             "empty Hermes session identity"
         );
         result.push(Session {
+            schema_version,
             id: identity(&profile, &native_id),
             native_id,
             profile: profile.clone(),
@@ -249,9 +251,10 @@ pub(super) fn enumerate(roots: &ProviderRoots, limit: Option<usize>) -> Result<V
             }
         }
         let stamp = stamps.join("|");
-        for s in read(&context, &path, |c| {
+        for s in read(&context, &path, |c, version| {
             sessions(
                 c,
+                version,
                 roots,
                 &path,
                 limit.unwrap_or(MAX_SESSIONS).min(MAX_SESSIONS) + 1,
@@ -283,9 +286,10 @@ pub(super) fn shallow(scan: &ScanEnv<'_>, c: &Candidate) -> Result<Option<Shallo
     let context = AcquisitionContext::new(ID, scan.provider_roots);
     scan.note_open();
     scan.note_query();
-    read(&context, Path::new(&c.locator), |conn| {
+    read(&context, Path::new(&c.locator), |conn, version| {
         let found = sessions(
             conn,
+            version,
             scan.provider_roots,
             Path::new(&c.locator),
             1,
@@ -318,8 +322,8 @@ pub(super) fn shallow(scan: &ScanEnv<'_>, c: &Candidate) -> Result<Option<Shallo
 }
 use rusqlite::OptionalExtension;
 pub(super) fn all(context: &AcquisitionContext<'_>, path: &Path) -> Result<Vec<Session>> {
-    read(context, path, |conn| {
-        let mut rows = sessions(conn, context.roots, path, MAX_SESSIONS + 1, None)?;
+    read(context, path, |conn, version| {
+        let mut rows = sessions(conn, version, context.roots, path, MAX_SESSIONS + 1, None)?;
         ensure!(
             rows.len() <= MAX_SESSIONS,
             "Hermes session capture exceeds safety limit"
@@ -336,8 +340,8 @@ pub(super) fn capture(
     path: &Path,
     id: &str,
 ) -> Result<AcquiredSession> {
-    let session = read(context, path, |conn| {
-        let mut s = sessions(conn, context.roots, path, 1, Some(&native_id(id)?))?
+    let session = read(context, path, |conn, version| {
+        let mut s = sessions(conn, version, context.roots, path, 1, Some(&native_id(id)?))?
             .into_iter()
             .find(|s| s.id == id)
             .ok_or_else(|| {

@@ -1,0 +1,14 @@
+{
+  "product": "Visual Studio Code Copilot harness",
+  "vscodeVersion": "1.144.0",
+  "vscodeCommit": "2c33b50b16c472efe58357d1d2a8a5414bc23fbf",
+  "copilotChatVersion": "0.72.0",
+  "runtimeVersion": "1.0.103-unstable.r40031404408.gba6c003",
+  "platform": "darwin-arm64",
+  "capture": "A live disposable editor chat read its synthetic README with the view tool and returned RELAY_COPILOT_VSCODE_PROOF_OK. The UI confirmed the reply and both completed tools. Native v1 journal was copied as an excerpt.",
+  "sanitization": "Replaced session ID and home/workspace paths; omitted host/system prompts, transformedContent, hook/permission envelopes and toolTelemetry. Native event/message/call IDs, timestamps and remaining values retained.",
+  "privateHistory": false,
+  "fixtureRecords": 19,
+  "legacyLocalHarness": "not captured; workspaceStorage/chatSessions uses a separate mutation-log format",
+  "historyReadOnly": true
+}

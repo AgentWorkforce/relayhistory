@@ -631,11 +631,9 @@ fn normalize_inner(
     let session_id = loaded.info.id.as_str();
     let cwd = loaded.info.working_directory.as_deref();
     let project = cwd;
-    let base_ts = loaded
-        .info
-        .created_ms
-        .or(loaded.info.last_activity_ms)
-        .unwrap_or(0);
+    // A time that is not positive is no time (see `normalize::untimed`).
+    let positive = |ts: Option<i64>| ts.filter(|ts| *ts > 0);
+    let base_ts = positive(loaded.info.created_ms).or(positive(loaded.info.last_activity_ms));
 
     // node_id → stored message_id, so parent links point at event rows.
     let mut node_message_ids: BTreeMap<i64, String> = BTreeMap::new();
@@ -681,7 +679,7 @@ fn normalize_inner(
 
     // The session's own `created_at` can precede every node timestamp;
     // earliest activity is the minimum of the two, not the first node.
-    let first_ts = [first_ts, loaded.info.created_ms]
+    let first_ts = [first_ts, positive(loaded.info.created_ms)]
         .into_iter()
         .flatten()
         .min()

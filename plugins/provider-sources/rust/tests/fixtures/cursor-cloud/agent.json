@@ -1,0 +1,15 @@
+{
+  "id": "bc-00000000-0000-0000-0000-000000000002",
+  "name": "Prepare iOS build 37 for TestFlight",
+  "status": "IDLE",
+  "env": { "type": "cloud" },
+  "repos": [
+    { "url": "https://github.com/your-org/your-repo", "startingRef": "main" }
+  ],
+  "workOnCurrentBranch": false,
+  "autoCreatePR": true,
+  "url": "https://cursor.com/agents/bc-00000000-0000-0000-0000-000000000002",
+  "createdAt": "2026-10-20T18:30:00.000Z",
+  "updatedAt": "2026-10-20T18:45:00.000Z",
+  "latestRunId": "run-00000000-0000-0000-0000-000000000022"
+}

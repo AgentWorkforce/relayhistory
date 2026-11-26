@@ -159,9 +159,12 @@ test('source capabilities answer from the provider tables, before any database e
   assert.deepEqual(claude.relationships, relationships.capabilities);
 
   const cursor = await getSourceCapabilities('cursor');
-  assert.equal(cursor.fullCoverage, false);
-  assert.ok(cursor.missingEvidenceKinds.length > 0);
-  assert.equal(cursor.relationships.stableChildIdentity, 'never');
+  assert.equal(cursor.fullCoverage, true);
+  assert.equal(cursor.relationships.stableChildIdentity, 'always');
+  const devin = await getSourceCapabilities('devin');
+  assert.equal(devin.fullCoverage, false);
+  assert.ok(devin.missingEvidenceKinds.length > 0);
+  assert.equal(devin.relationships.stableChildIdentity, 'never');
   for (const source of CATALOG_SOURCES) {
     const capabilities = await getSourceCapabilities(source);
     assert.equal(capabilities.fullCoverage, capabilities.missingEvidenceKinds.length === 0, source);

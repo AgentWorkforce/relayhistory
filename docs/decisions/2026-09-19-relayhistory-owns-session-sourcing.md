@@ -145,6 +145,7 @@ compresses it ([session catalog](../session-catalog.md)).
 | Model, per event                                                   | ✓      | ✓     | —      | ✓    | ✓    | ✓        | ✓     | [#166](https://github.com/AgentWorkforce/relayhistory/issues/166) / [#167](https://github.com/AgentWorkforce/relayhistory/issues/167) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                     |
 | Token usage                                                        | ✓      | ◐     | —      | ✓    | ✓    | ✓        | ◐     | [#172](https://github.com/AgentWorkforce/relayhistory/issues/172) (supersedes #99) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168) / grok: [#212](https://github.com/AgentWorkforce/relayhistory/issues/212)                                              |
 | Token usage — each streamed record verbatim                        | ✓      | —     | —      | —    | —    | —        | —     | `session_events.record_token_json`; other sources store usage once per record                                                                                                                                                                                                 | 
+| Message origin (who sent a user message)                           | ✓      | —     | —      | —    | —    | —        | —     | `session_events.origin_kind`: Claude `origin.kind` verbatim (`human`, `peer`, `task-notification`, ...); an empty kind is stored as null, like no origin; other sources record none                                                                                                                                            | 
 | `request_id`                                                       | ✗      | —     | —      | —    | ✓    | —        | ✓     | [#164](https://github.com/AgentWorkforce/relayhistory/issues/164)                                                                                                                                                                                                             |
 | `stop_reason`                                                      | ✗      | —     | —      | —    | ✓    | ✓        | ✓     | [#164](https://github.com/AgentWorkforce/relayhistory/issues/164) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                                                                                         |
 | Codex `turn_id`                                                    | —      | ◐     | —      | —    | —    | —        | —     | [#164](https://github.com/AgentWorkforce/relayhistory/issues/164)                                                                                                                                                                                                             |
@@ -155,11 +156,12 @@ compresses it ([session catalog](../session-catalog.md)).
 | File edits (`file_edits`)                                          | ✓      | ✓     | ✓      | ✓    | ✓    | ✓        | ✓     | [#166](https://github.com/AgentWorkforce/relayhistory/issues/166) / [#167](https://github.com/AgentWorkforce/relayhistory/issues/167) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                     |
 | Compaction / summary markers                                       | ✗      | ◐     | ✗      | ✓    | ✗    | ✓        | ✓     | [#165](https://github.com/AgentWorkforce/relayhistory/issues/165) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                                                                                         |
 | Control / lifecycle rows                                           | ✓      | ✓     | ✗      | ◐    | ✓    | ✓        | ◐     | [#165](https://github.com/AgentWorkforce/relayhistory/issues/165), [#180](https://github.com/AgentWorkforce/relayhistory/issues/180)                                                                                                                                          |
-| Relationship — delegated                                           | ◐      | ✓     | —      | ◐    | ✓    | ✓        | —     | [#170](https://github.com/AgentWorkforce/relayhistory/issues/170) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                                                                                         |
+| Relationship — delegated                                           | ◐      | ✓     | ✓      | ◐    | ✓    | ✓        | —     | [#170](https://github.com/AgentWorkforce/relayhistory/issues/170) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                                                                                         |
 | Relationship — fork / resume / continuation                        | ✗      | ✓     | ✗      | ✗    | ✗    | ✗        | —     | [#170](https://github.com/AgentWorkforce/relayhistory/issues/170)                                                                                                                                                                                                             |
 | Session metadata (cwd, branch, versions)                           | ◐      | ✓     | ◐      | ◐    | ◐    | ◐        | ◐     | [#164](https://github.com/AgentWorkforce/relayhistory/issues/164), [#177](https://github.com/AgentWorkforce/relayhistory/issues/177)                                                                                                                                          |
 | Provider-native session kind (`sessions.session_kind`)             | —      | —     | —      | ✓    | —    | —        | —     | Grok `summary.json` records `session_kind: "subagent"` even without a parent id; root listings use this observed fact. |
-| Session title (`sessions.title`)                                  | ✓      | ✓     | ✗      | ✓    | ✗    | ✓        | ✓     | grok: observed CLI `summary.json` `generated_title`, then `session_summary`, then legacy/export `title`; cursor and muse keep the name in the harness's own app store, which is not read |
+| Session title (`sessions.title`)                                  | ✓      | ✓     | ◐      | ✓    | ✗    | ✓        | ✓     | grok: observed CLI `summary.json` `generated_title`, then `session_summary`, then legacy/export `title`; cursor: the composer `name` for a conversation read from the editor's `state.vscdb`, none for a transcript or chat store; muse keeps the name in its own app store, which is not read |
+| Agent name (`sessions.agent_name`)                                | ✓      | —     | —      | ✗    | —    | —        | ✗     | claude: the latest `agent-name` record (the name Agent Relay and other sessions address it by), kept apart from `title`; the shallow scan sees the transcript head and tail, the full ingest every rename. grok and devin parse an agent name but do not catalog it yet. Like `title`, omitted from content-off reads |
 | Canonical `project_key`                                            | ✗      | ✗     | ✗      | ✗    | ✗    | ✗        | ✗     | [#175](https://github.com/AgentWorkforce/relayhistory/issues/175)                                                                                                                                                                                                             |
 | Declared hydration `capability`                                    | ◐      | ◐     | ◐      | ◐    | ◐    | ◐        | ◐     | [#169](https://github.com/AgentWorkforce/relayhistory/issues/169)                                                                                                                                                                                                             |
 
@@ -192,7 +194,9 @@ unlinked evidence). Control rows are `◐`: the system preamble and Grok-injecte
 turns are kept as `system` and `synthetic_turn` markers, but no other lifecycle
 record is. OpenCode's cells are
 `✓`: one normalizer (`src/ingest/opencode.rs`) writes every assistant message
-as evidence from both of its storage layouts.
+as evidence from all three of its storage layouts: the JSON tree, the SQLite
+`session` / `message` / `part` tables, and OpenCode 2's `session_v2` /
+`session_message` tables.
 
 **Cursor, since [#166](https://github.com/AgentWorkforce/relayhistory/issues/166).**
 `ingest_cursor_transcript` replaced the prompt-only `ingest_cursor_line`, so
@@ -208,6 +212,25 @@ here moves if that checklist comes back different. Delegation stays `—` for a
 different reason — a `Task` block is captured as an ordinary `tool_calls` row,
 so the spawn is visible, but it names no child transcript, so there is nothing
 to write a relationship to.
+
+**Cursor chats with no transcript.** Cursor keeps every agent chat in its own
+store, `~/.cursor/chats/<workspace>/<id>/store.db`, and not every chat also
+gets an `agent-transcripts` file. A chat with no transcript is read from that
+store (`src/ingest/cursor_store/`): its messages are rendered as the records
+the transcript would hold and go through `ingest_cursor_transcript`, so
+the cells above are the same for it, except that the store keeps what the
+transcript drops — `tool_result` blocks, `tool_use` ids and `reasoning` — and
+those are captured too. A chat that has a transcript is read only from the
+transcript.
+
+**Cursor editor conversations.** The Cursor app keeps every Agent
+conversation ("composer") in its global `state.vscdb`, and often writes no
+transcript for it. A composer with neither a transcript nor a chat store is
+read from that database (`src/ingest/cursor_store/editor/`), rendered the same way
+and through the same parser, so the cells above hold for it as for the chat
+store. Its bubbles also carry their own creation time and the composer its
+name and workspace folder, so those conversations are timed per message,
+titled (`sessions.title`) and placed in their folder.
 
 **Muse Code.** `ingest_muse_session` (`src/ingest.rs`, record interpretation
 in `src/ingest/muse.rs`) reads `session.jsonl`, an event-sourced log whose
@@ -337,8 +360,10 @@ otherwise `relationship_capture` records it as `identity_status = 'unlinked'`
 with a null child id. A linked child's edge names the session whose tool call
 started it (a nested subagent's parent is the subagent that spawned it), and
 its evidence is read by id through `SessionStore::session`. `relationship_capabilities().stable_child_identity` is
-`always` for codex, grok-bot, opencode and muse, `sometimes` for claude and grok, and
-`never` for cursor/devin. Codex fork is `✓`:
+`always` for codex, cursor, grok-bot, opencode and muse, `sometimes` for claude and grok, and
+`never` for devin. Cursor's `delegated` edge comes from where the child's
+transcript is filed (`agent-transcripts/<parent>/subagents/<child>.jsonl`,
+`evidence_kind = "cursor_subagent_dir"`): its `Task` calls name no child. Codex fork is `✓`:
 the `fork` edge is recorded from the fields Codex actually writes on
 `session_meta` — `forked_from_id` for a human fork, and
 `source.subagent.thread_spawn.parent_thread_id` for a subagent spawn — with the
@@ -377,7 +402,7 @@ empirically, not inferred.
 The cells therefore track what the _provider_ exposes, not which internal pass
 writes it: codex is the one complete row (`session_meta` gives originator,
 `cli_version`, git remote, initial commit and workspace roots); claude gets the
-record `version` and cwd/branch; cursor gets a cwd decoded from the directory
+record `entrypoint` as originator, the record `version` and cwd/branch; cursor gets a cwd decoded from the directory
 name; grok and opencode get cwd and (for grok) branch; devin gets
 `working_directory`, `workspace_dirs` and `model`, and the CLI version only
 inside an `agent_manifest` marker when a transcript export exists. See the
@@ -494,6 +519,12 @@ exist; the escalation triggers above are restated there.
   `crates/relayburn-sdk/src/ingest/ingest.rs`; record types in
   `crates/relayburn-sdk/src/reader/types.rs`.
 
+## Hosted Amp projection
+
+| Provider | Evidence | Coverage / limitations |
+| --- | --- | --- |
+| amp (hosted TypeScript projection) | Messages and raw evidence | `ai-hist/amp-source` retains native protocol message IDs/revisions, timestamped user/assistant text, raw message JSON, typed tool calls with native IDs/names/inputs, and normalized tool results with call IDs/statuses/outputs/errors, including mixed messages. Each native message keeps an `amp:<session>:<message>` convergence envelope; mixed user prose and tool results also emit a searchable `amp-tool-results:<session>:<message>` tool envelope with the same native ID/revision, preserving exact human prompt text. Other messages emit one envelope. Positional and generic IDs are rejected. A current CLI export established the field mapping. Unknown unions remain markers; user envelopes containing only tool results become tool records. No local Rust source, built-in discovery, pricing or token estimates. Cloud owns transport, selection, credential custody, injection and acknowledged upload state. |
+
 <!-- BEGIN GENERATED PROVIDER CAPTURE -->
 ## Added provider capture matrix
 
@@ -504,14 +535,14 @@ Generated from provider-owned acquisition records; these cells describe fixture-
 | pi | Messages and identity | v3 full persisted tree, native custom session and entry IDs, user/assistant/thinking/tool content, parentId and observed timestamps; v1/v2 rejected with diagnostic; duplicate native IDs at distinct live paths rejected. |
 | pi | Tools and usage | Actual toolCallId joins and isError outcomes; assistant per-message usage with reported cost; standalone usage and summary usage retained in markers only, excluded from request totals; no inferred file edits. |
 | pi | Control and lineage | Compaction, branch summaries, labels, metadata and parentSession retained as markers; no active-context projection, inferred relationship, resume command or live execution. |
-| hermes | Messages and tools | SQLite schema 31 native rows, tool IDs/results and reasoning; profile identity namespaced. |
+| hermes | Messages and tools | SQLite schemas 31 and 32 native rows, tool IDs/results and reasoning; profile identity namespaced. |
 | hermes | Usage and relationships | Session totals are not request usage. Parent native identity retained as metadata; no delegation or native resume advertised. Legacy JSONL unsupported. |
 | omp | Messages and identity | Title-slot v3 native session/entry IDs and complete persisted history; ambiguous legacy direct headers rejected to prevent double admission with Pi. |
 | omp | Tools and usage | Actual toolCallId joins, isError results and observed partial assistant usage; image references retained as opaque markers without reading blobs; no inferred edits or usage. |
 | omp | Control and lifecycle | Title overlay and raw header/control metadata; complete rewrite retirement and partial tail preservation. No active-context projection, resume or inferred delegation. |
 | antigravity | Messages and identity | Official SDK native harness JSONL steps with recorded timestamps and user/assistant text, safe user-envelope projection, frozen App/CLI/IDE brain roots and root-namespaced conversation IDs. Full transcript preferred; message IDs derived from step positions. |
-| antigravity | Control and limits | Every native step retained as a marker, including tool arguments/results, reasoning, opaque media and compact truncation. No tool-call joins, measured usage, model, cwd, parent relationships, native resume or live execution inferred. SDK-native fixtures establish parsing; actual App/CLI writer captures remain unverified. New same-timestamp message suffixes behind truncated/nonterminal steps are deferred until complete; native step-index order is preserved without changing recorded timestamps. |
-| copilot | Messages and identity | Journal version 1 session.start header identity, native event UUIDs, user/assistant text, reasoningText, per-message model, provider messageId and requestId, turnId, cwd and branch from the header context, copilotVersion, every model the journal names; an event's parent is its nearest parentId ancestor stored as an event (markers between them are skipped); agent- and skill-delivered user messages are synthetic, not prompts or user turns; other journal versions rejected with diagnostic; duplicate native IDs at distinct live paths rejected and a journal declaring a new identity retires the old one. |
+| antigravity | Control and limits | Every native step retained as a marker, including tool arguments/results, reasoning, opaque media and compact truncation. Subagents are delegated children: each `.system_generated/subagents/<child>.json` the parent writes links it to the child conversation its `conversationId` names (agent type, role and spawn-step time kept; an entry without a usable id is skipped). No tool-call joins, measured usage, model, cwd, native resume or live execution inferred. SDK-native fixtures establish parsing; actual App/CLI writer captures remain unverified. New same-timestamp message suffixes behind truncated/nonterminal steps are deferred until complete; native step-index order is preserved without changing recorded timestamps. |
+| copilot | Messages and identity | Journal version 1 session.start header identity, native event UUIDs, user/assistant text, reasoningText, per-message model, provider messageId and requestId, turnId, cwd and branch from the header context, copilotVersion, every model the journal names; an event's parent is its nearest parentId ancestor stored as an event (markers between them are skipped); user messages explicitly tagged by data.source as agent- or skill-delivered are synthetic, not prompts or user turns; source-less queued hook follow-ups remain provider user messages; other journal versions rejected with diagnostic; duplicate native IDs at distinct live paths rejected and a journal declaring a new identity retires the old one. GitHub Copilot desktop 1.4.2 (SDK runtime 1.0.106) and VS Code Copilot harness sessions use the same native journal and share discovery, hydration and full sync; separate recorded desktop and VS Code fixtures verify mixed-host thread identities, tool outcomes and appended-message isolation, and a private desktop verification retained every native message ID across 15 local sessions; legacy Local workspaceStorage chatSessions mutation logs are not captured. |
 | copilot | Tools and usage | Assistant toolRequests and tool.execution_complete join by native toolCallId, scoped as <parentToolCallId>/<toolCallId> under a delegating call because subagents number calls independently; success/error outcomes; assistant.message outputTokens kept verbatim as per-message usage (output only); session.shutdown modelMetrics and session.usage_checkpoint kept raw in markers as session-wide cumulative totals, excluded from request usage; no inferred file edits. |
 | copilot | Control and lineage | Turn boundaries, model changes, resume, permissions, system messages, subagent lifecycle and unknown event types retained as markers with their raw parentId; subagent messages flagged sidechain by parentToolCallId and never the session preview; no child session, relationship, resume command or live execution. |
 | qwen-code | Messages and identity | Ordinary native JSONL UUID parent-chain replay, native fragment aggregation, recorded timestamps/cwd/model, runtime-root and project namespaces; native tool-call/result IDs and typed arguments/results; raw branch/control/reasoning parts retained as markers. |
@@ -527,6 +558,9 @@ Generated from provider-owned acquisition records; these cells describe fixture-
 | cortex | Tools and control | Nested tool-use and tool-result records joined by persisted tool_use_id and status; unsupported blocks remain markers. Per-message billable usage, file edits and child relationships are not claimed. |
 | deepagents | Messages and tools | Pinned DeepAgents Code SQLite MsgPack root checkpoints v2 and v4 plus ordered messages writes; text-only message projection with native IDs and tool call/result IDs. |
 | deepagents | Usage and relationships | No measured usage, file edits, child namespace relationships, offloaded history, or native resume claimed. |
+| droid | Messages and identity | Native v2 session_start, message IDs/parent links, timestamps and tool outcomes verified against owned authenticated Droid 1.6.0 initial and resumed writer captures. Public SessionStore imports after each turn retain previous IDs and remain idempotent on repeat capture. Explicit llm_only/user_only and hook context stays metadata. Legacy/project roots, coherent sidecars, unsupported versions and duplicate identities are covered. |
+| droid | Tools and metadata | Authenticated Droid 1.6.0 Read success/error and a second same-session Read verify native tool_use IDs joining tool_result tool_use_id and explicit is_error fidelity. Native marker links, envelope provenance and bounded tool/block metadata are retained, including non-text shapes covered synthetically; mixed human text stays distinct from tool output. Session settings and cumulative counters stay metadata; no inferred per-message usage, credits-to-token conversion, file edits or relationships. |
+| droid | Lifecycle | Passive bounded head/tail discovery, selected hydration, full and scoped watch sweeps, resumed appends, deferred partial final records, full rewrites and sidecar-only updates; per-file read failures preserve the previous snapshot without blocking healthy sessions. Full transcript snapshots are limited to 128 MiB and settings to 1 MiB, with diagnostics and no retirement on failure. No agent launch or network request during acquisition. |
 | goose | Messages and tools | Schema-17 SQLite text blocks and native tool request/response IDs; WAL-visible coherent snapshot. |
 | goose | Usage and relationships | Session totals are not per-request usage; parent ID remains metadata; no file edits, delegation, or native resume advertised. |
 | junie | Messages and tool blocks | Junie CLI 3110.7 native event journal: UserPromptEvent request IDs, A2UX Markdown/Result step IDs, latest native ToolBlockUpdatedEvent step status and output; raw journal rows retained as markers. |
@@ -540,11 +574,13 @@ Generated from provider-owned acquisition records; these cells describe fixture-
 | vtcode | Messages and identity | Workspace-scoped canonical events preserve native turn/item IDs and exact user-origin prompts; multi-workspace identities are namespaced to prevent same-ID collapse. |
 | vtcode | Tools and usage | Native tool_call_id and call_id join; turn.completed usage recorded once on the final assistant item, thread aggregate remains a marker; no model or file-edit inference. |
 | vtcode | Control and lifecycle | Compaction, completion and unrecognized records remain markers; no native resume or delegation claim. Partial tails defer replacement and complete rewrites retire removed records. |
-| grok-bot | Messages and identity | Base32 transcript keys, native agent and entry IDs, roster titles, complete and truncated tails across account slots; bounded local window accumulates across captures. |
+| grok-bot | Messages and identity | Base32 transcript keys, native agent and entry IDs, normalized roster titles during shallow discovery and full capture, local avatar shape/color and inline raster profiles through `SessionStore::session_profile`, complete and truncated tails across account slots; bounded local window accumulates across captures. |
 | grok-bot | Control and lineage | Widget responses, voice turns, approvals, attachments and app events retained; Cursor cloud-agent IDs recorded as observed delegation without a local child transcript. |
 | grok-bot | Usage and acquisition | No local model, token or cost usage; passive local blobs only, with no host backfill, network calls or credential reads. |
 | openclaw | Messages and tools | One session per OpenClaw session key for agent databases (every window: resets, isolated cron and heartbeat runs; cron run keys fold into their job); one per transcript for the pre-2026.8 JSONL store. Agent schema 19-31 transcript rows (JSON, or zstd from schema 23) and verified cold archives (file or SQLite, from schema 21), plus the JSONL store (`sessions/*.jsonl` with its `sessions.json` index), full entry tree with native entry IDs, user/assistant/thinking/tool content, toolCallId joins and isError outcomes; session key, agent ID and channel retained as metadata; heartbeat and wake prompts are controls. A session the agent database holds is read from it, never also from JSONL. |
 | openclaw | Usage and relationships | Assistant per-message usage with reported cost, one request per provider responseId; delivery mirrors, transcript-only rows and CLI-harness rows carry no request usage. Session windows, previous session and parent/spawn keys retained as metadata; no relationship, resume or live execution advertised. Reset/delete archives, compaction checkpoints and the doctor's import archive are not read; a deleted session retires. |
+| capy | Hosted transcript | Capy keeps no transcript files on this computer. Cloud uploads a bound thread to hosted History as source capy, with the jam id as the session id. Local discovery returns nothing. |
+| capy | What this source is not | A jam id and a relay agent name (capy- plus the first 8 characters) are not sources. Passing either as the source returns invalid source. Read the hosted session with source capy, or message the relay agent. |
 <!-- END GENERATED PROVIDER CAPTURE -->
 
 ### Embedded Codex image evidence

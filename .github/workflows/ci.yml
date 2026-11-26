@@ -138,10 +138,10 @@ jobs:
         id: rust-oleum-cache
         with:
           path: ~/.cargo/bin/rust-oleum
-          key: rust-oleum-${{ runner.os }}-0.1.3
+          key: rust-oleum-${{ runner.os }}-0.4.0
       - name: Install rust-oleum
         if: steps.rust-oleum-cache.outputs.cache-hit != 'true'
-        run: cargo install rust-oleum --version 0.1.3 --locked
+        run: cargo install rust-oleum --version 0.4.0 --locked
       - name: Quality ratchet
         run: rust-oleum --github-summary "$GITHUB_STEP_SUMMARY"
 
@@ -177,6 +177,24 @@ jobs:
         run: |
           cargo tree --prefix none --depth 1 -e normal | tee /dev/stderr \
             | grep -qE '^ai-hist v[0-9.]+ \(.*/crates/ai-hist\)$'
+
+  rust-local-source:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Check the standalone local connector example
+        working-directory: examples/rust-local-source
+        run: |
+          cargo fmt -- --check
+          cargo run --locked
+      - name: Verify the example resolved this checkout
+        working-directory: examples/rust-local-source
+        run: |
+          cargo tree --locked --prefix none --depth 1 -e normal | tee /dev/stderr \
+            | grep -qE "^ai-hist v[0-9.]+ \($GITHUB_WORKSPACE/crates/ai-hist\)$"
 
   # burn (AgentWorkforce/burn) is moving to reading session evidence through
   # this crate (burn #557; the cutover is burn 5.0.0, burn #562) and derives
@@ -307,7 +325,7 @@ jobs:
         run: cargo fmt --manifest-path "$MANIFEST" -- --check
       - name: Lint (every feature combination)
         run: |
-          for features in s3 gcs azure conformance "s3,gcs,azure,conformance"; do
+          for features in s3 gcs azure conformance scrub "s3,gcs,azure,conformance,scrub"; do
             cargo clippy --manifest-path "$MANIFEST" --locked --all-targets --no-default-features --features "$features" -- -D warnings
           done
           cargo clippy --manifest-path "$MANIFEST" --locked --all-targets --no-default-features -- -D warnings
@@ -360,6 +378,13 @@ jobs:
       # crate's own test suite never runs anywhere.
       - name: Optional plugin Rust tests
         run: cargo test --manifest-path plugins/provider-sources/rust/Cargo.toml --locked
+      # The release publishes this crate to crates.io next to ai-hist; the
+      # patch stands in for the ai-hist version this tree has not released yet.
+      - name: Optional plugin crate publish dry-run
+        run: >-
+          cargo publish --dry-run --allow-dirty --locked
+          --manifest-path plugins/provider-sources/rust/Cargo.toml
+          --config "patch.crates-io.ai-hist.path=\"$GITHUB_WORKSPACE/crates/ai-hist\""
       - name: Optional plugin SDK tests
         env:
           HISTORY_PROVIDER_SOURCES_BIN: ${{ github.workspace }}/plugins/provider-sources/rust/target/debug/history-provider-sources

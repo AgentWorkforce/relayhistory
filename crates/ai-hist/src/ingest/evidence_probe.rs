@@ -14,10 +14,21 @@
 //! sweep makes is dropped the same way. A missing snapshot is not "present":
 //! the probe asks the database, and a file with no evidence is still opened.
 //! The guard pops on drop, including a panic.
+//!
+//! A loaded set also outlives its walk. Every table the sets read is stamped
+//! by the change feed's row triggers, whichever connection writes it, so the
+//! feed head (with the store's epoch, schema version and file) names the
+//! evidence a set was read from exactly. A set loaded outside a transaction is
+//! kept, per thread and per database file, under the head it was read at;
+//! the next walk that finds the same head adopts it instead of reading every
+//! key again. A sweep that wrote nothing leaves the head where it was, so a quiet
+//! loop of sweeps reads each set once. Any write moves the head, and the next
+//! walk reads again.
 
 use std::cell::RefCell;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use anyhow::Result;
 use rusqlite::Connection;
@@ -27,18 +38,43 @@ use std::cell::Cell;
 
 thread_local! {
     static STACK: RefCell<Vec<Memo>> = const { RefCell::new(Vec::new()) };
+    static CARRIED: RefCell<Vec<Carried>> = const { RefCell::new(Vec::new()) };
 }
 
 #[cfg(test)]
 thread_local! {
     static LOADS: Cell<u64> = const { Cell::new(0) };
+    static ADOPTIONS: Cell<u64> = const { Cell::new(0) };
     static FALLBACKS: Cell<u64> = const { Cell::new(0) };
 }
+
+/// Sets kept across walks: a few database files' worth, one per kind each.
+const CARRIED_LIMIT: usize = 12;
 
 struct Slot {
     /// `PRAGMA data_version` when these keys were read.
     version: i64,
-    keys: HashSet<String>,
+    keys: Arc<HashSet<String>>,
+}
+
+/// The store state a carried set is exact for. `file` is the database
+/// file's device and inode, so a file replaced by a copy of an earlier
+/// state of itself -- same epoch, revisions counted again -- is not taken for
+/// the one the set was read from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Head {
+    file: Option<(u64, u64)>,
+    epoch: i64,
+    revision: i64,
+    schema: i64,
+}
+
+/// One kind's keys as of `head`, in the database file at `db`.
+struct Carried {
+    db: String,
+    kind: Kind,
+    head: Head,
+    keys: Arc<HashSet<String>>,
 }
 
 struct Memo {
@@ -48,7 +84,7 @@ struct Memo {
     codex_sessions: Option<Slot>,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Kind {
     ClaudeTranscript,
     ClaudeSidecar,
@@ -152,6 +188,11 @@ fn conn_id(conn: &Connection) -> usize {
 fn count_load() {
     #[cfg(test)]
     LOADS.with(|loads| loads.set(loads.get() + 1));
+}
+
+fn count_adoption() {
+    #[cfg(test)]
+    ADOPTIONS.with(|adoptions| adoptions.set(adoptions.get() + 1));
 }
 
 fn count_fallback() {
@@ -325,7 +366,9 @@ fn memo(conn: &Connection, kind: Kind, key: &str) -> Result<Option<bool>> {
         Read::Unarmed => Ok(None),
         Read::Hit(present) => Ok(Some(present)),
         Read::Pending => {
-            load(conn, id, kind)?;
+            if !adopt(conn, id, kind)? {
+                load(conn, id, kind)?;
+            }
             let version = data_version(conn)?;
             Ok(STACK.with(|stack| {
                 let stack = stack.borrow();
@@ -352,15 +395,21 @@ fn load(conn: &Connection, id: usize, kind: Kind) -> Result<()> {
     #[cfg(test)]
     on_load();
     let version = data_version(conn)?;
-    let keys = match kind {
+    let head = carry_head(conn);
+    let keys = Arc::new(match kind {
         Kind::ClaudeTranscript => load_set(conn, CLAUDE_TRANSCRIPT_KEYS_SQL)?,
         Kind::ClaudeSidecar => load_set(conn, CLAUDE_SIDECAR_KEYS_SQL)?,
         Kind::Codex => load_set(conn, CODEX_EVIDENCE_KEYS_SQL)?,
-    };
+    });
     if data_version(conn)? != version {
         return Ok(());
     }
     count_load();
+    // Kept for a later walk only when nothing moved the head while the set
+    // was read: the set is then exactly the evidence at that head.
+    if let Some((db, head)) = head.filter(|head| carry_head(conn).as_ref() == Some(head)) {
+        carry(db, kind, head, Arc::clone(&keys));
+    }
     STACK.with(|stack| {
         let mut stack = stack.borrow_mut();
         if let Some(memo) = stack.iter_mut().rev().find(|memo| memo.conn == id) {
@@ -368,6 +417,91 @@ fn load(conn: &Connection, id: usize, kind: Kind) -> Result<()> {
         }
     });
     Ok(())
+}
+
+/// This connection's database file and its change-feed head, when a set read
+/// now could be carried to a later walk.
+///
+/// `None` inside a transaction -- a head that counts uncommitted rows can be
+/// rolled back to and then reached again by different ones -- for a database
+/// with no file, and for a store without the change feed.
+fn carry_head(conn: &Connection) -> Option<(String, Head)> {
+    if !conn.is_autocommit() {
+        return None;
+    }
+    let db = conn.path().filter(|path| !path.is_empty())?.to_string();
+    let (revision, epoch): (Option<i64>, Option<i64>) = conn
+        .prepare_cached(
+            "SELECT (SELECT version FROM observation_clock WHERE singleton = 1), \
+                    (SELECT epoch FROM change_feed_store WHERE singleton = 1)",
+        )
+        .and_then(|mut stmt| stmt.query_row([], |row| Ok((row.get(0)?, row.get(1)?))))
+        .ok()?;
+    let schema = conn
+        .pragma_query_value(None, "schema_version", |row| row.get(0))
+        .ok()?;
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(&db).ok()?;
+        Some((metadata.dev(), metadata.ino()))
+    };
+    #[cfg(not(unix))]
+    let file = None;
+    Some((
+        db,
+        Head {
+            file,
+            epoch: epoch?,
+            revision: revision.unwrap_or(0),
+            schema,
+        },
+    ))
+}
+
+fn carry(db: String, kind: Kind, head: Head, keys: Arc<HashSet<String>>) {
+    CARRIED.with(|carried| {
+        let mut carried = carried.borrow_mut();
+        carried.retain(|entry| !(entry.db == db && entry.kind == kind));
+        if carried.len() >= CARRIED_LIMIT {
+            carried.remove(0);
+        }
+        carried.push(Carried {
+            db,
+            kind,
+            head,
+            keys,
+        });
+    });
+}
+
+/// Serve this walk's `kind` from a set an earlier walk read at the head the
+/// store is at now. `false` when there is none, and the caller reads it.
+fn adopt(conn: &Connection, id: usize, kind: Kind) -> Result<bool> {
+    let version = data_version(conn)?;
+    let Some((db, head)) = carry_head(conn) else {
+        return Ok(false);
+    };
+    let keys = CARRIED.with(|carried| {
+        carried
+            .borrow()
+            .iter()
+            .find(|entry| entry.db == db && entry.kind == kind && entry.head == head)
+            .map(|entry| Arc::clone(&entry.keys))
+    });
+    // Another connection's commit between the two version reads could have
+    // moved the head after it was read.
+    let Some(keys) = keys.filter(|_| data_version(conn).ok() == Some(version)) else {
+        return Ok(false);
+    };
+    count_adoption();
+    STACK.with(|stack| {
+        let mut stack = stack.borrow_mut();
+        if let Some(memo) = stack.iter_mut().rev().find(|memo| memo.conn == id) {
+            memo.store(kind, keys, version);
+        }
+    });
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -414,7 +548,7 @@ impl Memo {
         (slot.version == version).then(|| slot.keys.contains(key))
     }
 
-    fn store(&mut self, kind: Kind, keys: HashSet<String>, version: i64) {
+    fn store(&mut self, kind: Kind, keys: Arc<HashSet<String>>, version: i64) {
         *self.slot_mut(kind) = Some(Slot { version, keys });
     }
 
@@ -436,8 +570,13 @@ impl Memo {
 }
 
 #[cfg(test)]
-fn load_count() -> u64 {
+pub(super) fn load_count() -> u64 {
     LOADS.with(Cell::get)
+}
+
+#[cfg(test)]
+pub(super) fn adoption_count() -> u64 {
+    ADOPTIONS.with(Cell::get)
 }
 
 #[cfg(test)]
@@ -446,8 +585,9 @@ fn fallback_count() -> u64 {
 }
 
 #[cfg(test)]
-fn reset_counts() {
+pub(super) fn reset_counts() {
     LOADS.with(|loads| loads.set(0));
+    ADOPTIONS.with(|adoptions| adoptions.set(0));
     FALLBACKS.with(|falls| falls.set(0));
 }
 
@@ -736,8 +876,8 @@ mod tests {
             claude_sidecars: None,
             codex_sessions: None,
         };
-        memo.store(Kind::ClaudeTranscript, transcripts, 1);
-        memo.store(Kind::Codex, codex, 2);
+        memo.store(Kind::ClaudeTranscript, Arc::new(transcripts), 1);
+        memo.store(Kind::Codex, Arc::new(codex), 2);
         assert_eq!(
             memo.answer(Kind::ClaudeTranscript, "/t/a.jsonl", 2),
             None,

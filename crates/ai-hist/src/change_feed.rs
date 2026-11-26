@@ -1748,6 +1748,128 @@ mod tests {
         )
     }
 
+    /// The session's change-feed rows since `from`, with the agent name each reports.
+    fn session_names(store: &SessionStore, from: Watermark) -> Vec<(u64, Option<String>)> {
+        drain(
+            store
+                .changes_since(from, ChangeQuery::default().kinds([ChangeKind::Session]))
+                .unwrap(),
+        )
+        .into_iter()
+        .map(|change| match upsert(&change.op) {
+            Some(EvidenceRow::Session(session)) => (change.revision, session.agent_name.clone()),
+            other => panic!("a session upsert: {other:?}"),
+        })
+        .collect()
+    }
+
+    #[test]
+    fn a_registered_agent_name_is_a_stamped_metadata_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, conn) = store(dir.path());
+        conn.execute(
+            "INSERT INTO sessions (session_id, source) VALUES ('c1', 'codex')",
+            [],
+        )
+        .unwrap();
+        let head = store.head_revision().unwrap();
+
+        // Setting a name on an unnamed session re-reports the row at a new revision.
+        assert!(store
+            .set_registered_agent_name(Source::Codex, "c1", Some(" yo-1 "))
+            .unwrap());
+        let after = session_names(&store, head);
+        assert_eq!(after.len(), 1, "{after:?}");
+        assert!(after[0].0 > head.revision);
+        assert_eq!(after[0].1.as_deref(), Some("yo-1"));
+
+        // The same name again is a no-op: no new revision.
+        let head = store.head_revision().unwrap();
+        assert!(!store
+            .set_registered_agent_name(Source::Codex, "c1", Some("yo-1"))
+            .unwrap());
+        assert_eq!(store.head_revision().unwrap(), head);
+        assert!(session_names(&store, head).is_empty());
+
+        // A rename replaces the name this method set.
+        assert!(store
+            .set_registered_agent_name(Source::Codex, "c1", Some("yo-2"))
+            .unwrap());
+        assert_eq!(
+            session_names(&store, head).last().unwrap().1.as_deref(),
+            Some("yo-2")
+        );
+
+        // A clear removes it.
+        let head = store.head_revision().unwrap();
+        assert!(store
+            .set_registered_agent_name(Source::Codex, "c1", None)
+            .unwrap());
+        assert_eq!(session_names(&store, head).last().unwrap().1, None);
+    }
+
+    #[test]
+    fn a_provider_agent_name_wins_over_a_registered_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, conn) = store(dir.path());
+        conn.execute(
+            "INSERT INTO sessions (session_id, source, agent_name) \
+             VALUES ('s1', 'claude', 'native-worker')",
+            [],
+        )
+        .unwrap();
+        let head = store.head_revision().unwrap();
+        assert!(!store
+            .set_registered_agent_name(Source::Claude, "s1", Some("registered"))
+            .unwrap());
+        assert!(!store
+            .set_registered_agent_name(Source::Claude, "s1", None)
+            .unwrap());
+        assert_eq!(store.head_revision().unwrap(), head);
+        let name: Option<String> = conn
+            .query_row(
+                "SELECT agent_name FROM sessions WHERE source = 'claude' AND session_id = 's1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(name.as_deref(), Some("native-worker"));
+    }
+
+    #[test]
+    fn a_registered_agent_name_refuses_bad_input_and_unknown_sessions() {
+        let dir = tempfile::tempdir().unwrap();
+        let (store, conn) = store(dir.path());
+        conn.execute(
+            "INSERT INTO sessions (session_id, source) VALUES ('c1', 'codex')",
+            [],
+        )
+        .unwrap();
+        for bad in ["", "   ", "tab\tname", &"x".repeat(129)] {
+            assert!(
+                matches!(
+                    store.set_registered_agent_name(Source::Codex, "c1", Some(bad)),
+                    Err(Error::InvalidArgument(_))
+                ),
+                "{bad:?}"
+            );
+        }
+        assert!(matches!(
+            store.set_registered_agent_name(Source::Codex, "missing", Some("yo")),
+            Err(Error::SessionNotFound(_))
+        ));
+        let read_only = SessionStore::open(StoreOptions {
+            db_path: Some(dir.path().join("ai-history.db")),
+            read_only: true,
+            ..StoreOptions::default()
+        })
+        .unwrap();
+        assert!(matches!(
+            read_only.set_registered_agent_name(Source::Codex, "c1", Some("yo")),
+            Err(Error::UnsupportedOperation(_))
+        ));
+    }
+
     #[test]
     fn every_write_takes_a_new_revision_and_replays_in_order() {
         let dir = tempfile::tempdir().unwrap();
@@ -3511,8 +3633,8 @@ INSERT INTO observation_evidence (source, session_id, location, connector_id,
     }
 
     /// Restricted to one session, every page read seeks that session through
-    /// its table's session index -- never the revision index, never a scan of
-    /// the table -- and sorts only that session's rows.
+    /// a session-prefixed index, including a covering session/revision index.
+    /// Never walk the global revision index or scan other sessions' rows.
     #[test]
     fn a_session_page_reads_the_session_index() {
         let dir = tempfile::tempdir().unwrap();
@@ -3552,7 +3674,10 @@ INSERT INTO observation_evidence (source, session_id, location, connector_id,
                 "{table}: {plan}"
             );
             assert!(!plan.contains(&format!("SCAN {table}")), "{table}: {plan}");
-            assert!(!plan.contains("_revision"), "{table}: {plan}");
+            assert!(
+                !plan.contains(&format!("INDEX idx_{table}_revision ")),
+                "global revision walk for {table}: {plan}"
+            );
             // Every table's seek binds both the source and the session.
             assert!(
                 plan.contains("source=?") && plan.contains("session_id=?"),
@@ -3986,6 +4111,21 @@ INSERT INTO observation_evidence (source, session_id, location, connector_id,
         assert!(writable.head_revision().unwrap().revision >= 42);
     }
 
+    /// Strip every dependent index when constructing a pre-feed fixture;
+    /// newer consumers can add composite indexes containing the feed column.
+    fn remove_revision_column(conn: &Connection, table: &str) {
+        let indexes = conn.prepare("SELECT l.name FROM pragma_index_list(?1) l WHERE EXISTS(SELECT 1 FROM pragma_index_info(l.name) WHERE name=?2)")
+            .unwrap().query_map(params![table,REVISION_COLUMN], |r|r.get::<_,String>(0))
+            .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+        for index in indexes {
+            conn.execute_batch(&format!("DROP INDEX {index};")).unwrap();
+        }
+        conn.execute_batch(&format!(
+            "ALTER TABLE {table} DROP COLUMN {REVISION_COLUMN};"
+        ))
+        .unwrap();
+    }
+
     /// A database from before the feed existed is stamped once on migration,
     /// so a replay from START reports what it already held, and the head
     /// moves past every backfilled row.
@@ -4004,10 +4144,9 @@ INSERT INTO observation_evidence (source, session_id, location, connector_id,
                 conn.execute_batch(&format!("DROP TRIGGER {trigger};"))
                     .unwrap();
             }
+            remove_revision_column(&conn, "session_events");
             conn.execute_batch(
-                "DROP INDEX idx_session_events_revision; \
-                 ALTER TABLE session_events DROP COLUMN revision; \
-                 DELETE FROM schema_migrations WHERE name = 'change_feed_v2'; \
+                "DELETE FROM schema_migrations WHERE name = 'change_feed_v2'; \
                  UPDATE observation_clock SET version = 0;",
             )
             .unwrap();
@@ -4064,12 +4203,7 @@ INSERT INTO observation_evidence (source, session_id, location, connector_id,
                 .unwrap();
         }
         let history = ChangeKind::History.table();
-        conn.execute_batch(&format!(
-            "DROP INDEX {index}; ALTER TABLE {name} DROP COLUMN {REVISION_COLUMN};",
-            index = history.revision_index(),
-            name = history.name
-        ))
-        .unwrap();
+        remove_revision_column(&conn, history.name);
         conn.execute(
             "INSERT INTO history (source, session_id, prompt, timestamp_ms) \
              VALUES ('claude', 's1', 'after', 1000)",
@@ -4144,12 +4278,7 @@ INSERT INTO observation_evidence (source, session_id, location, connector_id,
                         .unwrap();
                 }
                 let table = kind.table();
-                conn.execute_batch(&format!(
-                    "DROP INDEX {index}; ALTER TABLE {name} DROP COLUMN {REVISION_COLUMN};",
-                    index = table.revision_index(),
-                    name = table.name
-                ))
-                .unwrap();
+                remove_revision_column(&conn, table.name);
             }
             let stamp = |row: &str| {
                 format!(

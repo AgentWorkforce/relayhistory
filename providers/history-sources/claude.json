@@ -322,6 +322,17 @@
     },
     {
       "source": "claude",
+      "name": "inherited-history-fork",
+      "quirk": "a forked transcript named after its own session opens with a copy of its origin's records under the origin's `sessionId`",
+      "layout": "ClaudeTranscript",
+      "origin": "RelayHistory",
+      "files": [
+        "claude/aaaaaaaa-0000-4000-8000-00000000000a.jsonl",
+        "claude/cccccccc-0000-4000-8000-00000000000c.jsonl"
+      ]
+    },
+    {
+      "source": "claude",
       "name": "settings-reference",
       "quirk": "burn's Claude settings input that sets the Bash output cap; relayhistory reads no settings file, so it is kept for provenance only",
       "layout": "Reference",

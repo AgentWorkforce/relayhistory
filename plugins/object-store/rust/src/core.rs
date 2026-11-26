@@ -145,6 +145,12 @@ pub(crate) trait Backend: Send + Sync + std::fmt::Debug + 'static {
     ) -> Result<()> {
         Ok(())
     }
+
+    /// Refuse a key the backend cannot address safely. `FsStore` rejects any
+    /// path that traverses a symbolic link under its root.
+    async fn check_key(&self, _key: &ObjectKey) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Debug)]
@@ -159,6 +165,11 @@ impl<B: Backend> Core<B> {
             backend: Arc::new(backend),
             page_size: DEFAULT_PAGE_SIZE,
         }
+    }
+
+    /// Run the backend's key check (see `Backend::check_key`).
+    pub(crate) async fn guard(&self, key: &ObjectKey) -> Result<()> {
+        self.backend.check_key(key).await
     }
 
     pub(crate) fn name(&self) -> &'static str {
@@ -412,11 +423,13 @@ impl<B: Backend> Core<B> {
     }
 
     pub(crate) async fn presign_get(&self, key: &ObjectKey, ttl: Duration) -> Result<Url> {
-        if ttl.is_zero() || ttl > MAX_PRESIGN_TTL {
+        // Every signature scheme expresses expiry in whole seconds; anything
+        // shorter would sign an already-expired URL.
+        if ttl < Duration::from_secs(1) || ttl > MAX_PRESIGN_TTL {
             return Err(Error::InvalidArgument(format!(
-                "presign ttl must be in (0, {}s], got {}s",
+                "presign ttl must be in [1s, {}s], got {:?}",
                 MAX_PRESIGN_TTL.as_secs(),
-                ttl.as_secs()
+                ttl
             )));
         }
         let span = tracing::info_span!("fetch", backend = B::NAME, key = %key, presign = true);

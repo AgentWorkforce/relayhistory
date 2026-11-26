@@ -1,7 +1,8 @@
 //! Row mapper for [`super::SessionEvent`].
 //!
 //! Column order is the `SELECT` list, not struct-field order. Index 36 is
-//! `raw_kind`, 37 is `control_kind`, and 38 is `record_token_json`.
+//! `raw_kind`, 37 is `control_kind`, 38 is `record_token_json`, and 39 is
+//! `origin_kind`.
 
 use super::SessionEvent;
 
@@ -49,6 +50,7 @@ pub(crate) fn row_to_session_event(row: &rusqlite::Row<'_>) -> rusqlite::Result<
         raw_kind: envelope.raw_kind,
         control_kind: envelope.control_kind,
         record_token_json: envelope.record_token_json,
+        origin_kind: envelope.origin_kind,
     })
 }
 
@@ -134,6 +136,7 @@ struct SessionEventEnvelope {
     raw_kind: Option<String>,
     control_kind: Option<String>,
     record_token_json: Option<String>,
+    origin_kind: Option<String>,
 }
 
 fn session_event_envelope(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionEventEnvelope> {
@@ -151,5 +154,6 @@ fn session_event_envelope(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionEv
         raw_kind: row.get(36)?,
         control_kind: row.get(37)?,
         record_token_json: row.get(38)?,
+        origin_kind: row.get(39)?,
     })
 }

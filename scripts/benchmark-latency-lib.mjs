@@ -322,7 +322,8 @@ export function renderMarkdown(report, gate, thresholds) {
   for (const run of report.runs) {
     const { metrics: _m, store, ...rest } = run.result;
     const keep = Object.entries(rest).filter(
-      ([key]) => !["phase", "samples", "turns", "release", "phaseWallMs", "watchDefaults"].includes(key),
+      ([key]) =>
+        !["phase", "samples", "turns", "release", "phaseWallMs", "watchDefaults", "lateExamples"].includes(key),
     );
     const storeText = store
       ? `${store.sessions} sessions, ${(store.dbBytes / 1048576).toFixed(1)} MiB db`

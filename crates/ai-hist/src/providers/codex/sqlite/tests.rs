@@ -1,6 +1,8 @@
 use super::*;
 
 mod control;
+mod performance;
+mod transactions;
 
 fn install_fixture(codex: &Path, stem: &str) {
     std::fs::create_dir_all(codex).unwrap();
@@ -539,6 +541,31 @@ fn idless_rollout_prefix_and_rewritten_projection_do_not_leave_duplicate_evidenc
         "one rollout row and one separate repeated reply"
     );
 
+    // An unchanged item ID can carry rewritten output: ID-set retirement alone
+    // would retain the old conflict-ignored event.
+    history
+        .execute(
+            "UPDATE thread_items SET item_json=?1 WHERE item_id='repeated-answer'",
+            [
+                json!({"type":"agentMessage","id":"repeated-answer","text":"Rewritten answer"})
+                    .to_string(),
+            ],
+        )
+        .unwrap();
+    Connection::open(codex.join("state_5.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE threads SET updated_at_ms=updated_at_ms+1 WHERE id='sqlite-pruned-all-items'",
+            [],
+        )
+        .unwrap();
+    sync(&conn, &mut state, &codex, &repairs).unwrap();
+    let rewritten: String = conn.query_row(
+        "SELECT text FROM session_events WHERE session_id='sqlite-pruned-all-items' AND event_uid='repeated-answer'",
+        [], |row| row.get(0),
+    ).unwrap();
+    assert_eq!(rewritten, "Rewritten answer");
+
     history.execute("DELETE FROM thread_items WHERE thread_id='sqlite-pruned-all-items' AND item_id IN ('sqlite-sqlite-pruned-all-items-0','sqlite-sqlite-pruned-all-items-2','sqlite-sqlite-pruned-all-items-4')", []).unwrap();
     history
         .execute(
@@ -921,4 +948,231 @@ fn exact_rollout_sync_does_not_enumerate_or_hydrate_sqlite_siblings() {
             .unwrap(),
         2
     );
+}
+
+#[test]
+fn selected_sqlite_locator_reports_unavailable_after_pair_disappears() {
+    let temp = tempfile::tempdir().unwrap();
+    let codex = temp.path().join(".codex");
+    install_thread_set(&codex, &[2_000_000]);
+    let roots =
+        crate::ProviderRoots::from_home(temp.path().to_owned(), temp.path().join("opencode.db"));
+    let db = temp.path().join("history.db");
+    let conn = crate::open_db(&db).unwrap();
+    let locator = locator(&codex.join("state_5.sqlite"), "thread-000");
+    conn.execute("INSERT INTO sessions (source,session_id,raw_path,discovery_state) VALUES ('codex','thread-000',?1,'shallow')", [&locator]).unwrap();
+    conn.execute("INSERT INTO session_presences (source,session_id,location,raw_locator,source_stamp,discovery_state) VALUES ('codex','thread-000','local',?1,'v2:test','shallow')", [&locator]).unwrap();
+    drop(conn);
+    std::fs::remove_file(codex.join("state_5.sqlite")).unwrap();
+    std::fs::remove_file(codex.join("thread_history_1.sqlite")).unwrap();
+    let store =
+        crate::SessionStore::open(crate::StoreOptions::default().db_path(db).roots(roots)).unwrap();
+    let error = store
+        .hydrate(
+            &crate::SessionRef::id(crate::Source::Codex, "thread-000"),
+            crate::HydrateOptions::default(),
+        )
+        .unwrap_err();
+    assert_eq!(error.code(), "SESSION_SOURCE_UNAVAILABLE");
+}
+
+#[test]
+fn history_log_collision_does_not_claim_another_sessions_sqlite_prompt() {
+    let temp = tempfile::tempdir().unwrap();
+    let conn = crate::open_db(&temp.path().join("history.db")).unwrap();
+    let entry = HistoryEntry {
+        id: 0,
+        source: "codex".into(),
+        session_id: Some("owner".into()),
+        project: None,
+        prompt: "same prompt".into(),
+        prompt_hash: None,
+        timestamp_ms: 1000,
+    };
+    crate::insert_history(&conn, &entry).unwrap();
+    let id = conn.last_insert_rowid();
+    conn.execute("INSERT INTO session_markers (source,session_id,marker_uid,kind,subkind,payload_json) VALUES ('codex','owner','sqlite:thread','session_metadata','sqlite',?1)", [json!({"history_ids":[id]}).to_string()]).unwrap();
+    let mut collision = entry.clone();
+    collision.session_id = Some("other".into());
+    assert_eq!(crate::insert_history(&conn, &collision).unwrap(), 0);
+    claim_history_log_prompt(&conn, &collision).unwrap();
+    let ids: String = conn.query_row("SELECT json_extract(payload_json,'$.history_ids') FROM session_markers WHERE session_id='owner'", [], |row| row.get(0)).unwrap();
+    assert_eq!(ids, json!([id]).to_string());
+    claim_history_log_prompt(&conn, &entry).unwrap();
+    let ids: String = conn.query_row("SELECT json_extract(payload_json,'$.history_ids') FROM session_markers WHERE session_id='owner'", [], |row| row.get(0)).unwrap();
+    assert_eq!(ids, "[]");
+}
+
+/// The facade's sync is quiet, so a Codex store pair it cannot use is not
+/// on stderr; it is on the report, as the diagnostic the host asked for by
+/// embedding instead of running the CLI.
+#[test]
+fn a_quiet_sync_reports_a_missing_sqlite_store_pair_on_the_report() {
+    let temp = tempfile::tempdir().unwrap();
+    let codex = temp.path().join(".codex");
+    install_thread_set(&codex, &[2_000_000]);
+    std::fs::remove_file(codex.join("thread_history_1.sqlite")).unwrap();
+    let roots =
+        crate::ProviderRoots::from_home(temp.path().to_owned(), temp.path().join("opencode.db"));
+    let store = crate::SessionStore::open(
+        crate::StoreOptions::default()
+            .db_path(temp.path().join("history.db"))
+            .roots(roots),
+    )
+    .unwrap();
+    let report = store.sync(crate::SyncOptions::default()).unwrap();
+    assert!(report.swept);
+    let codex_skips: Vec<_> = report
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.source == crate::Source::Codex)
+        .collect();
+    assert_eq!(codex_skips.len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(codex_skips[0].code, "SESSION_SOURCE_UNAVAILABLE");
+    assert!(
+        codex_skips[0]
+            .message
+            .starts_with("skipping SQLite history: incomplete Codex SQLite history pair"),
+        "{}",
+        codex_skips[0].message
+    );
+    assert_eq!(codex_skips[0].subject, None);
+    // The report round-trips with the diagnostics on it.
+    let json = serde_json::to_string(&report).unwrap();
+    assert_eq!(
+        serde_json::from_str::<crate::SyncReport>(&json).unwrap(),
+        report
+    );
+}
+
+/// A store pair the process may not read is a skip of the same kind.
+#[cfg(unix)]
+#[test]
+fn a_quiet_sync_reports_a_withheld_sqlite_store_pair_on_the_report() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().unwrap();
+    let codex = temp.path().join(".codex");
+    install_thread_set(&codex, &[2_000_000]);
+    let state = codex.join("state_5.sqlite");
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if std::fs::File::open(&state).is_ok() {
+        // Root reads through the mode bits; nothing is withheld here.
+        return;
+    }
+    let roots =
+        crate::ProviderRoots::from_home(temp.path().to_owned(), temp.path().join("opencode.db"));
+    let store = crate::SessionStore::open(
+        crate::StoreOptions::default()
+            .db_path(temp.path().join("history.db"))
+            .roots(roots),
+    )
+    .unwrap();
+    let report = store.sync(crate::SyncOptions::default()).unwrap();
+    let codex_skips: Vec<_> = report
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.source == crate::Source::Codex)
+        .collect();
+    assert!(!codex_skips.is_empty(), "{:?}", report.diagnostics);
+    assert!(codex_skips
+        .iter()
+        .all(|diagnostic| diagnostic.code == "SESSION_SOURCE_UNAVAILABLE"));
+    assert!(
+        codex_skips[0]
+            .message
+            .starts_with("skipping SQLite history: "),
+        "{}",
+        codex_skips[0].message
+    );
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o644)).unwrap();
+}
+
+/// A watch tick is the same quiet sweep: its report carries the skip too.
+#[test]
+fn a_watch_tick_reports_a_missing_sqlite_store_pair_on_its_report() {
+    let temp = tempfile::tempdir().unwrap();
+    let codex = temp.path().join(".codex");
+    install_thread_set(&codex, &[2_000_000]);
+    std::fs::remove_file(codex.join("thread_history_1.sqlite")).unwrap();
+    let roots =
+        crate::ProviderRoots::from_home(temp.path().to_owned(), temp.path().join("opencode.db"));
+    let store = crate::SessionStore::open(
+        crate::StoreOptions::default()
+            .db_path(temp.path().join("history.db"))
+            .roots(roots),
+    )
+    .unwrap();
+    let mut watch = store
+        .watch(crate::WatchOptions {
+            use_fs_events: false,
+            poll_interval_ms: 100,
+            immediate: true,
+            ..crate::WatchOptions::default()
+        })
+        .unwrap();
+    let first = watch
+        .next_timeout(std::time::Duration::from_secs(30))
+        .expect("startup tick")
+        .unwrap();
+    assert!(first.swept);
+    let codex_skips: Vec<_> = first
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.source == crate::Source::Codex)
+        .collect();
+    assert_eq!(codex_skips.len(), 1, "{:?}", first.diagnostics);
+    assert_eq!(codex_skips[0].code, "SESSION_SOURCE_UNAVAILABLE");
+    watch.stop();
+}
+
+/// A hydration whose locator refresh finds a store pair the selection rules
+/// reject reads the saved rollout and says why SQLite was not consulted.
+#[test]
+fn a_hydration_reports_an_unsupported_sqlite_store_pair_on_its_report() {
+    let temp = tempfile::tempdir().unwrap();
+    let codex = temp.path().join(".codex");
+    let rollout = codex.join("sessions/2026/04/20/rollout-root-thread.jsonl");
+    std::fs::create_dir_all(rollout.parent().unwrap()).unwrap();
+    let lines = [
+        json!({"timestamp":"2026-04-20T00:00:00Z","type":"session_meta","payload":{"id":"root-thread","cwd":"/work/app"}}),
+        json!({"timestamp":"2026-04-20T00:00:01Z","type":"event_msg","payload":{"type":"agent_message","message":"Done"}}),
+    ];
+    std::fs::write(
+        &rollout,
+        lines
+            .iter()
+            .map(Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n",
+    )
+    .unwrap();
+    std::fs::write(codex.join("state_6.sqlite"), b"").unwrap();
+    std::fs::write(codex.join("thread_history_1.sqlite"), b"").unwrap();
+    let roots =
+        crate::ProviderRoots::from_home(temp.path().to_owned(), temp.path().join("opencode.db"));
+    let store = crate::SessionStore::open(
+        crate::StoreOptions::default()
+            .db_path(temp.path().join("history.db"))
+            .roots(roots),
+    )
+    .unwrap();
+    store.sync(crate::SyncOptions::default()).unwrap();
+    let report = store
+        .hydrate(
+            &crate::SessionRef::id(crate::Source::Codex, "root-thread"),
+            crate::HydrateOptions::default(),
+        )
+        .unwrap();
+    let skips: Vec<_> = report
+        .diagnostics
+        .iter()
+        .filter(|diagnostic| diagnostic.code == "SESSION_SOURCE_UNAVAILABLE")
+        .collect();
+    assert_eq!(skips.len(), 1, "{:?}", report.diagnostics);
+    assert_eq!(
+        skips[0].message,
+        "skipping SQLite locator refresh: unsupported Codex state_6.sqlite; supported version: 5"
+    );
+    assert_eq!(skips[0].subject.as_deref(), Some("root-thread"));
 }

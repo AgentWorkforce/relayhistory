@@ -19,7 +19,7 @@ const TOKEN_JSON_ASSIGNED: &str = "CASE \
      ELSE excluded.token_json END";
 
 /// The catalog lookup a one-off insert still runs. A sweep unit binds the same
-/// value as `?41` / `?42` after reading it once.
+/// value as `?42` / `?43` after reading it once.
 const SESSION_KEY_LOOKUP: &str = "(SELECT s.project_key FROM sessions s \
      WHERE s.source = ?1 AND s.session_id = ?2)";
 
@@ -36,12 +36,12 @@ pub(crate) static SESSION_EVENT_REWRITE: LazyLock<String> =
     LazyLock::new(|| session_event_sql(SESSION_KEY_LOOKUP, SESSION_METHOD_LOOKUP).0);
 
 /// Same assignment as [`SESSION_EVENT_UPSERT`], with the catalog key already
-/// bound. `?41` is null when the session row has no key.
+/// bound. `?42` is null when the session row has no key.
 pub(crate) static SESSION_EVENT_UPSERT_CACHED: LazyLock<String> =
-    LazyLock::new(|| session_event_sql("?41", "?42").1);
+    LazyLock::new(|| session_event_sql("?42", "?43").1);
 
 pub(crate) static SESSION_EVENT_REWRITE_CACHED: LazyLock<String> =
-    LazyLock::new(|| session_event_sql("?41", "?42").0);
+    LazyLock::new(|| session_event_sql("?42", "?43").0);
 
 /// `(rewrite, upsert)`. The upsert adds the unchanged-row guard. The key
 /// expression prefers the catalog row, then the stored event key, then the
@@ -63,13 +63,14 @@ fn session_event_sql(session_key: &str, session_method: &str) -> (String, String
           tool_use_id, payload_bytes, payload_truncated, payload_hash, call_index, event_index, \
           result_status, event_source, error_signal, subagent_session_id, agent_id, \
           request_id, provider_message_id, stop_reason, agent_version, is_sidechain, is_meta, \
-          turn_id, request_span, raw_facts_version, raw_kind, control_kind, record_token_json) \
+          turn_id, request_span, raw_facts_version, raw_kind, control_kind, record_token_json, \
+          origin_kind) \
          VALUES (?1, ?2, ?3, \
            {insert_key}, \
            {insert_method}, \
            ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, \
            ?14, ?15, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, \
-           ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40) \
+           ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41) \
          ON CONFLICT(source, session_id, event_uid) DO UPDATE SET \
          project=excluded.project, \
          project_key={assigned_key}, \
@@ -90,6 +91,7 @@ fn session_event_sql(session_key: &str, session_method: &str) -> (String, String
          request_span=excluded.request_span, \
          raw_facts_version=excluded.raw_facts_version, raw_kind=excluded.raw_kind, \
          control_kind=excluded.control_kind, record_token_json=excluded.record_token_json, \
+         origin_kind=excluded.origin_kind, \
          location={LOCATION_ASSIGNED}"
     );
     let unchanged = format!(
@@ -130,6 +132,7 @@ fn session_event_sql(session_key: &str, session_method: &str) -> (String, String
          OR excluded.raw_kind IS NOT session_events.raw_kind \
          OR excluded.control_kind IS NOT session_events.control_kind \
          OR excluded.record_token_json IS NOT session_events.record_token_json \
+         OR excluded.origin_kind IS NOT session_events.origin_kind \
          OR ({LOCATION_ASSIGNED}) IS NOT session_events.location"
     );
     let upsert = format!("{rewrite} WHERE {unchanged}");

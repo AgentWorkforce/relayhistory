@@ -9,6 +9,7 @@ use std::path::Path;
 pub const CLAUDE_WEB_CONNECTOR: &str = "claude-web";
 pub const CODEX_CLOUD_CONNECTOR: &str = "codex-cloud";
 pub const DEVIN_CLOUD_CONNECTOR: &str = "devin-cloud";
+pub const CURSOR_CLOUD_CONNECTOR: &str = "cursor-cloud";
 pub const CLOUD_CONNECTOR: &str = "cloud";
 
 /// Legacy names remain accepted to provide a useful installed-plugin error.
@@ -21,7 +22,7 @@ impl SourceConnectorSelection {
     pub fn new(ids: Vec<String>) -> Result<Self> {
         let mut seen = std::collections::BTreeSet::new();
         for id in &ids {
-            anyhow::ensure!([CLAUDE_WEB_CONNECTOR,CODEX_CLOUD_CONNECTOR,DEVIN_CLOUD_CONNECTOR,CLOUD_CONNECTOR].contains(&id.as_str()),"INVALID_ARGUMENT: invalid source connector '{id}'; install and select it through the source registry");
+            anyhow::ensure!([CLAUDE_WEB_CONNECTOR,CODEX_CLOUD_CONNECTOR,DEVIN_CLOUD_CONNECTOR,CURSOR_CLOUD_CONNECTOR,CLOUD_CONNECTOR].contains(&id.as_str()),"INVALID_ARGUMENT: invalid source connector '{id}'; install and select it through the source registry");
             anyhow::ensure!(
                 seen.insert(id),
                 "INVALID_ARGUMENT: duplicate source connector '{id}'"
@@ -52,6 +53,7 @@ pub fn selected_remote_connector_statuses_at(
         (CLAUDE_WEB_CONNECTOR, "claude"),
         (CODEX_CLOUD_CONNECTOR, "codex"),
         (DEVIN_CLOUD_CONNECTOR, "devin"),
+        (CURSOR_CLOUD_CONNECTOR, "cursor"),
         (CLOUD_CONNECTOR, "*"),
     ]
     .into_iter()

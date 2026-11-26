@@ -42,6 +42,7 @@ mod file_lock;
 mod forget;
 mod jsonl_temp;
 mod read_pool;
+pub mod retention;
 mod session_identities;
 mod session_store;
 mod session_usage;
@@ -93,10 +94,11 @@ pub use session_store::{
     Block, BlockKind, Capability, CatalogIter, CatalogQuery, CatalogSession, ControlKind,
     Diagnostic, DiscoveryOptions, DiscoveryReport, DiscoveryState, Error, FileEdit, HydrateOptions,
     HydrateReport, HydrateStatus, Marker, Message, MessageIdOrigin, ProgressObserver, Prompt,
-    Reconciliation, ReconciliationStep, Relationship, RelationshipSide, Role, SessionEvidence,
-    SessionQuery, SessionRef, SessionStore, Source, SourceCapabilities, SourceEvidenceSubmission,
-    SourceObservationBatch, StopToken, StoreOptions, SyncOptions, SyncReport, TickReport, ToolCall,
-    ToolResult, WatchHandle, WatchOptions, WatchScope, WatchStop, WatchTick, WatchedPath,
+    Reconciliation, ReconciliationStep, Relationship, RelationshipSide, Role, SessionAvatar,
+    SessionEvidence, SessionProfile, SessionQuery, SessionRef, SessionStore, Source,
+    SourceCapabilities, SourceEvidenceSubmission, SourceObservationBatch, StopToken, StoreOptions,
+    SyncDiagnostic, SyncOptions, SyncReport, TickReport, ToolCall, ToolResult, WatchHandle,
+    WatchOptions, WatchScope, WatchStop, WatchTick, WatchedPath,
 };
 /// The usage reads that take a raw connection. Embedders reach the same data
 /// through [`SessionStore::session`], whose `requests` and `usage` fields

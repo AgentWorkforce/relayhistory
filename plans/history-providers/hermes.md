@@ -1,6 +1,6 @@
 # Hermes historical acquisition (#429)
 
-Pinned variant: NousResearch/hermes-agent, commit
+Original schema-31 variant: NousResearch/hermes-agent, commit
 `97a9ae8ee55d31bebce49f1fb6b5ef775323976a`, SQLite schema **31**, captured on
 macOS arm64. Primary writer: `hermes_state.py`, `hermes_state_sessions.py`,
 `hermes_state_messages.py`, `hermes_state_common.py`; official comparison
@@ -48,11 +48,11 @@ bytes-read is unknown (zero), never confused with file size. Discovery reads
 bounded metadata/first-prompt queries; no transcript allocation occurs there.
 An unsupported schema (including older schemas), invalid role/type/timestamp,
 malformed tool-call container, denied path or escaped symlink is an actionable
-error. Absence of a root means no sessions; an actual empty schema-31 database
+error. Absence of a root means no sessions; an actual empty supported database
 is valid empty history. No migration, journal-mode change or provider write
 occurs. Full sweep uses the same normalizer and an atomic transaction per session.
 
-Evidence limits: schema 31 only; legacy per-session JSONL is not supported.
+Evidence limits: schemas 31 and 32 only; legacy per-session JSONL is not supported.
 Session model/title/parent/end-reason are metadata, not per-turn inferences.
 Native integer message-row IDs retain archived generations as separate records.
 Active/compacted/observed/compressed-summary/display-kind flags remain in markers;
@@ -335,3 +335,39 @@ a local-first/unmanaged control. The query drives from session-scoped observatio
 evidence and uses the unique history key; EXPLAIN on the restored fixture confirms
 indexed lookups for both tables. The dump reproducer explicitly writes UTF-8/LF,
 including the native non-ASCII session identifier.
+
+## Schema 32 compatibility
+
+The additional writer fixture is pinned to NousResearch/hermes-agent commit
+[`a9ff9799e273f525b82718cdc69fdec71b1dca5a`](https://github.com/NousResearch/hermes-agent/tree/a9ff9799e273f525b82718cdc69fdec71b1dca5a) (schema 32). Upstream
+`hermes_state_common.py` documents the version bump as additive, with no data
+migration; `hermes_state_schema.py` advances the version after declarative
+table/column reconciliation. The reader's named session and message columns
+retain their existing meanings. New runtime ownership tables and counters are
+not transcript evidence and are not imported.
+
+`schema32.sql` contains actual upstream DDL and synthetic rows generated with
+`capture_fixture.py --schema-version 32`; `official-export-schema32.json` is
+the corresponding `SessionDB.export_session(include_inactive=True)` oracle.
+Use the pinned checkout on PYTHONPATH, its Python dependencies, and a new
+isolated HOME/HERMES_HOME to regenerate. The generator keeps the schema-31
+fixture and oracle unchanged. As for schema 31, derived indexes, triggers, and
+unrelated runtime stores are omitted from the fixture.
+
+Only 31 and 32 are accepted. Unknown future versions and older versions remain
+errors, and no provider migration or write is attempted. The existing parser
+generation is retained because schema-31 normalized evidence, snapshot hashes,
+and ledger identities are unchanged; previously rejected schema-32 reads have
+no successful capture to invalidate. Schema-32 captures carry their observed
+version into session metadata. Schema 31 is omitted from the serialized
+capture and defaults to 31 when reading older captures, preserving existing
+checkpoint hashes and transported schema-31 evidence.
+
+Two regression checks fail with the original schema-31-only gate:
+`hermes_schema32_public_history_conformance` fails during discovery, and
+`schema32_official_export_matches_captured_writer_messages` fails with
+`unsupported Hermes schema 32; supported: 31`. With schema 32 admitted, the
+public check covers discovery, hydration, restart, repeated sync, export, native
+tool-call/result identity, and byte-for-byte preservation of the provider DB.
+The captured rows also match the upstream export oracle. Schema 31 retains its
+existing fixture, while versions 30 and 33 remain explicit rejection cases.

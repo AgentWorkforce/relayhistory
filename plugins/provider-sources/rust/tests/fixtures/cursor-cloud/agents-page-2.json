@@ -1,0 +1,14 @@
+{
+  "items": [
+    {
+      "id": "bc-00000000-0000-0000-0000-000000000001",
+      "name": "Cloud sessions relayhistory sync",
+      "status": "ARCHIVED",
+      "env": { "type": "cloud" },
+      "url": "https://cursor.com/agents/bc-00000000-0000-0000-0000-000000000001",
+      "createdAt": "2026-10-19T09:00:00.000Z",
+      "updatedAt": "2026-10-19T09:20:00.000Z",
+      "latestRunId": "run-00000000-0000-0000-0000-000000000011"
+    }
+  ]
+}

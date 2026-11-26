@@ -43,6 +43,8 @@ mod key;
 pub mod layout;
 pub mod manifest;
 mod metadata;
+#[cfg(feature = "scrub")]
+pub mod scrub;
 mod upload;
 
 #[cfg(feature = "azure")]

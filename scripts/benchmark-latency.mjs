@@ -159,6 +159,7 @@ function runOnce(executable, run, profile, workDir) {
     AI_HIST_LATENCY_SWEEP_SAMPLES: String(profile.sweepSamples ?? 20),
     AI_HIST_LATENCY_FS_SAMPLES: String(profile.fsSamples ?? 1000),
     AI_HIST_LATENCY_RETAIN_DAYS: String(profile.retainDays),
+    AI_HIST_LATENCY_PRUNE_WINDOW_MS: String(profile.pruneWindowMs ?? 10000),
     AI_HIST_LATENCY_DIR: workDir,
     AI_HIST_LATENCY_REPORT: reportPath,
   };

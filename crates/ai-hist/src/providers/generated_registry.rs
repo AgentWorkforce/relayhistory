@@ -91,6 +91,11 @@ const REGISTRATIONS: &[Registration] = &[
         adapter: deepagents::ADAPTER,
     },
     Registration {
+        id: "droid",
+        metadata: droid::METADATA,
+        adapter: droid::ADAPTER,
+    },
+    Registration {
         id: "goose",
         metadata: goose::METADATA,
         adapter: goose::ADAPTER,
@@ -129,6 +134,11 @@ const REGISTRATIONS: &[Registration] = &[
         id: "openclaw",
         metadata: openclaw::METADATA,
         adapter: openclaw::ADAPTER,
+    },
+    Registration {
+        id: "capy",
+        metadata: capy::METADATA,
+        adapter: capy::ADAPTER,
     },
     #[cfg(test)]
     Registration {

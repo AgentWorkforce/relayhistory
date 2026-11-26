@@ -1195,7 +1195,8 @@ node scripts/benchmark-latency.mjs --report-only latency.json   # re-render or r
 | `e2e` | 30 days | write a new transcript → `TickReport` naming it → list query returns it. Samples are spaced past the debounce window, so each is a leading-edge tick: the new-session case |
 | `list_scale` | 30 days, 1 year | the list query alone: first page, the desktop's 500-row page, and a page halfway back through history |
 | `ingest_upload` | 30 days | hook-path ingest of N new sessions alone, then again while an uploader on its own `SessionStore` drains the change feed from a named cursor, serializes each row and commits the cursor. The uploader drains its backlog before the measured batch starts |
-| `prune` | 1 year | a reader thread running the list query back to back, first alone, then while `forget_evidence` keeps only the last 30 days; plus a writer ingesting a new session every 20 ms during the prune |
+| `prune` | 1 year | a reader thread running the list query back to back, first alone, then while retention maintenance runs as a host would drive it -- `set_retention_policy` to 30 days, an upload consumer registered and acknowledged at the head (nothing is evicted without one), then `prune_expired` with its default batch and cooldown, repeated for `pruneWindowMs` (10 s in the gate) or until the cycle completes -- plus a writer ingesting a new session every 20 ms during that window. Until 2026-10-26 this phase timed `forget_evidence` instead |
+| `codex_idle` | 3,000 Codex rollouts | a full `sync` over a settled Codex store with nothing new, forced (`idle_sync_forced`) and unforced (`idle_sync_unforced`): every 2nd rollout zstd-compressed, every 5th a delegated subagent of the one before, all named by a Codex thread index (`state_5.sqlite`). Not in a profile; run it by hand with `AI_HIST_LATENCY_PHASE=codex_idle` (sizes: `AI_HIST_LATENCY_CODEX_ROLLOUTS`, `_COMPRESSED_EVERY`, `_SUBAGENT_EVERY`; samples: `AI_HIST_LATENCY_SWEEP_SAMPLES`) |
 
 The store is a fake HOME of Claude transcripts, 40 sessions a day, two turns
 each, read through `ProviderRoots::from_home` so the process environment cannot
@@ -1370,3 +1371,124 @@ What the numbers say:
   the whole run and deletes in batches, so a new session's ingest waited up
   to ~10 s (p99) during a year-scale prune. Linux readers were barely
   touched; on macOS the read p99 quadrupled, to just under budget.
+### 2026-10-25 the new-session path, profiled and cut
+
+A per-step profile of the exact-path capture a watch tick runs for one new
+six-record Claude session, taken with temporary timing marks (thread CPU time
+beside wall time, so a contended machine still separates CPU from waiting).
+About 13 ms in all, and almost none of it parsing:
+
+| Step | Wall | What it was |
+|---|---:|---|
+| validating the retained writer | ~1.5 ms | hydration committed through a *second* connection, which moved the retained one's `data_version`, so every call re-ran the schema check |
+| `open_db` for hydration | ~2.3 ms | that second connection's own schema check (SQLite's open is 0.02 ms of it) |
+| discovery pass + identity refresh | ~2.4 ms | one candidate; ~1 ms of it an fsync |
+| evidence rows (`ingest_selected`) | ~2.1 ms | six records and their triggers |
+| hydration commit | ~1.3 ms | ~0.9 ms of it an fsync |
+| parsing | < 0.1 ms | |
+
+What changed, and why each is safe:
+
+* **One connection per capture.** `hydrate_local_session_on` runs the local
+  pass on the connection that just did discovery, in its own `IMMEDIATE`
+  transaction as before. Exact capture and the hook fast path use it.
+* **`watch` keeps its validated writer** between ticks, through the same
+  `sync_connection` cache a `Reconciliation` round uses, and only inside
+  `sync_facade_tick`, which holds the `SyncRunLock`.
+* **Exact capture commits at `synchronous = NORMAL`.** The sweep deliberately
+  does not (see "2026-09-28 sweep profile" above): there a power loss can drop
+  commits while `.sync-state.json` stamps survive and vouch for them. Exact
+  capture writes no sidecar state -- it only reads `.sync-state.json` through
+  the cold proof, and the one out-of-database checkpoint, the Cursor
+  transcript cursor, is for a source exact capture never admits -- so a lost
+  commit loses its checkpoint with it and the path is read again. The guard
+  restores the connection's level afterwards.
+* **The leading-edge settle is 1 ms**, down from 10. It only gathers one
+  write's callbacks; a straggler lands in the window's trailing tick, which
+  finds the transcript unchanged.
+* **A tick that wrote nothing closes the window it opened.** The debounce
+  window folds a burst of writes into one trailing tick; a tick whose sweep
+  left the store's change-feed head where it was is not a burst, and leaving
+  the window armed would make the next new session wait it out.
+
+Local A/B against `main` on one machine, interleaved, release build, 30-day
+store (a shared, busy machine, so treat the absolute numbers loosely and the
+ratios with more confidence; CI's labelled run is the published number):
+
+| Metric | `main` p50 | this change p50 |
+|---|---:|---:|
+| `capture_path_retained` (what a watch tick runs) | 13.0 ms | 3.5 ms |
+| `capture_path` (plain `sync` with `paths`) | 13.8 ms | 8.2 ms |
+| `ingest_hook` | 16.9 ms | 12.7 ms |
+| `e2e_visible`, Linux, inotify | 36.3 ms | 13.3 ms |
+
+Still over budget, in order of size: discovery's pass for one candidate
+(~2 ms), evidence rows and their triggers (~1.5-2 ms), the plain `sync`
+path's own validation, and on macOS FSEvents itself (14-19 ms before the
+loop hears of the file). A kqueue directory watcher beside FSEvents reports
+the event in under a millisecond, but on the macOS CI runner it doubled the
+end-to-end p99 (165 -> 345 ms) while halving the p50: a tick it triggers can
+miss the session and leave the debounce window armed for the write that
+follows. It is held back on its own branch until that interaction is
+understood on real hardware. The
+`synchronous` change is scoped to exact capture; extending it to the hook
+path needs the same proof for its Cursor checkpoint first.
+
+### 2026-10-29 checkpoint work leaves the visibility path
+
+Profiling the retained exact-capture writer exposed a periodic tail rather
+than a parser regression: SQLite's default 1000-page WAL auto-checkpoint ran
+on roughly every eighth small-session commit. Normal captures were about
+3-4 ms on the profiling host; the commit that copied the ~4 MiB backlog was
+8-12 ms.
+
+`SessionStore::watch` now owns checkpoint timing for its dedicated retained
+writer. It disables that connection's commit-thread auto-checkpoint during
+the untimed startup sweep, coalesces successful exact-event captures, and
+runs a PASSIVE checkpoint after five debounce windows of quiet (at least one
+second). It never takes the WAL writer lock, and a fixed 30-second deadline
+forces the same PASSIVE checkpoint even if events never become quiet. Each
+retained-connection checkout verifies the connection-local setting, so a
+writer reopened after database replacement cannot silently regain automatic
+checkpoints. Full sweeps keep the existing bounded-TRUNCATE policy for
+physical space reclamation. Plain `sync`, hook hydration, and
+`Reconciliation` keep their existing connection policies.
+
+The optimization is fail-safe: if the worker thread cannot start, its channel
+disconnects, the database opens read-only, or three consecutive PASSIVE
+attempts cannot catch up, the next retained-writer checkout restores SQLite's
+default 1,000-page automatic checkpoint threshold before writing. A transient
+busy or reader-pinned attempt schedules its own bounded retry after another
+quiet interval without requiring a new capture; new signals are coalesced into
+that wait, and a later complete pass resets the failure count. The fallback may
+put checkpoint latency back on a commit, but it cannot leave the WAL unbounded
+merely because background upkeep failed.
+
+The exact path also nests discovery's `synchronous = NORMAL` scope. Nested
+guards on the same connection now share the outer policy instead of issuing
+another query, update, and restore. A nested guard on a different connection
+still installs and restores its own policy.
+
+The safety tests grow a WAL past the production 4 MiB truncate threshold,
+schedule quiet upkeep, and require every frame to be caught up without
+escalating beyond PASSIVE. The latency gate remains the acceptance test for
+the timing side; no budget is enabled merely because the mechanism is
+bounded.
+
+Final local A/B, official `gate` profile, three interleaved release rounds
+against `be827d1e`, 30-day/1,200-session store:
+
+| Metric | `main` p50 | head p50 | `main` p99 | head p99 |
+|---|---:|---:|---:|---:|
+| `capture_path` | 12.603 ms | 12.329 ms | 58.825 ms | 22.169 ms |
+| `capture_path_retained` | 5.647 ms | 5.504 ms | 16.678 ms | 16.638 ms |
+| `e2e_visible` | 9.646 ms | 8.085 ms | 337.816 ms | 73.641 ms |
+
+The run passed with zero late samples and zero misses. The 365-day,
+14,600-session list-scale case remained below the 1.5 ms first-paint budget
+at 0.240 ms p99.
+
+All three measured paths improved at p50 and p99 in this run. The 5 ms e2e
+budget is still tracked rather than enforced: this change removes a periodic
+checkpoint from the visibility path without claiming that the remaining
+latency work is complete.

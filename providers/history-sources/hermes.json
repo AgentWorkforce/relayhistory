@@ -25,12 +25,33 @@
         "hermes/official-export.json"
       ],
       "quirk": "SessionDB.export_session(include_inactive=True) independent oracle from pinned writer."
+    },
+    {
+      "source": "hermes",
+      "name": "schema32",
+      "layout": "Sqlite",
+      "target": ".hermes/state.db",
+      "origin": "RelayHistory",
+      "files": [
+        "hermes/schema32.sql"
+      ],
+      "quirk": "Pinned Hermes schema 32 writer with additive runtime and transcript revision columns; same native messages, tools, archived rows and compression child as schema 31."
+    },
+    {
+      "source": "hermes",
+      "name": "official-export-schema32",
+      "layout": "Reference",
+      "origin": "RelayHistory",
+      "files": [
+        "hermes/official-export-schema32.json"
+      ],
+      "quirk": "Schema 32 SessionDB.export_session(include_inactive=True) oracle from the pinned upstream writer."
     }
   ],
   "capture": [
     {
       "evidence": "Messages and tools",
-      "coverage": "SQLite schema 31 native rows, tool IDs/results and reasoning; profile identity namespaced."
+      "coverage": "SQLite schemas 31 and 32 native rows, tool IDs/results and reasoning; profile identity namespaced."
     },
     {
       "evidence": "Usage and relationships",

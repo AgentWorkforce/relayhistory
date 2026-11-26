@@ -153,7 +153,7 @@ pub(super) fn note_presence(conn: &Connection, source: &str, session_id: &str) -
 /// thread's own repository with its delegator's, on every sync, forever.
 ///
 /// Inside a sweep guard the catalog arm is the cached lookup, bound as
-/// `?41` / `?42`, instead of a `sessions` subquery on every row.
+/// `?42` / `?43`, instead of a `sessions` subquery on every row.
 pub(super) fn write_event(conn: &Connection, row: &super::EventRow<'_>) -> Result<()> {
     let bound = touch(conn, row.source, row.session_id)?;
     let resolved = row
@@ -331,8 +331,8 @@ fn execute_event(
         )
     };
     let mut stmt = conn.prepare_cached(sql)?;
-    // The fixed binds are the statement's `?1`..=`?40`. A cached catalog key
-    // is `?41` / `?42` on that statement only.
+    // The fixed binds are the statement's `?1`..=`?41`. A cached catalog key
+    // is `?42` / `?43` on that statement only.
     macro_rules! event_params {
         ($($extra:expr),*) => {
             rusqlite::params![
@@ -376,6 +376,7 @@ fn execute_event(
                 raw_kind,
                 raw_facts.control_kind,
                 raw_facts.record_token_json,
+                raw_facts.origin_kind,
                 $($extra),*
             ]
         };

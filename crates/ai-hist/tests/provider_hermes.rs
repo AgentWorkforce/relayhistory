@@ -3,12 +3,25 @@ use ai_hist::{Role, Source};
 use provider_support::{assert_history_conformance, HistoryCase};
 #[test]
 fn hermes_public_history_conformance() {
+    history_conformance(include_str!("fixtures/hermes/schema31.sql"));
+}
+
+#[test]
+fn hermes_schema32_public_history_conformance() {
+    history_conformance(include_str!("fixtures/hermes/schema32.sql"));
+}
+
+fn history_conformance(sql: &str) {
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(home.path().join(".hermes")).unwrap();
     let db = rusqlite::Connection::open(home.path().join(".hermes/state.db")).unwrap();
-    db.execute_batch(include_str!("fixtures/hermes/schema31.sql"))
+    db.execute_batch(sql).unwrap();
+    let schema_version: i64 = db
+        .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
         .unwrap();
     drop(db);
+    let provider_path = home.path().join(".hermes/state.db");
+    let provider_before = std::fs::read(&provider_path).unwrap();
     let evidence = assert_history_conformance(
         home.path(),
         HistoryCase {
@@ -40,6 +53,16 @@ fn hermes_public_history_conformance() {
     assert_eq!(blocks.len(), 2);
     assert!(blocks.iter().all(|b| b.tool_use_id.as_ref() == Some(id)));
     assert!(evidence.requests.iter().all(|r| r.usage.is_none()));
+    let metadata = evidence
+        .markers
+        .iter()
+        .find(|m| m.kind == "session_metadata")
+        .unwrap();
+    assert_eq!(
+        metadata.payload.as_ref().unwrap()["schema_version"],
+        schema_version
+    );
+    assert_eq!(std::fs::read(provider_path).unwrap(), provider_before);
 }
 
 #[cfg(all(feature = "unstable-internal", feature = "export"))]

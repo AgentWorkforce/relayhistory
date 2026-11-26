@@ -167,6 +167,7 @@ pub(super) struct ClaudeRecordWalk<'a> {
     // instead of advancing them.
     indexer: ToolResultIndexer,
     cache_reads: HashMap<String, i64>,
+    record_ts: HashMap<String, i64>,
     triads: SlashCommandTriads,
     held_message_id: String,
     held: Vec<String>,
@@ -187,6 +188,7 @@ impl<'a> ClaudeRecordWalk<'a> {
             file_session_id,
             indexer: ToolResultIndexer::default(),
             cache_reads: HashMap::new(),
+            record_ts: HashMap::new(),
             triads: SlashCommandTriads::default(),
             held_message_id: String::new(),
             held: Vec::new(),
@@ -252,6 +254,7 @@ impl<'a> ClaudeRecordWalk<'a> {
                 file_session_id: self.file_session_id,
                 indexer: &mut self.indexer,
                 last_assistant_cache_read: &mut self.cache_reads,
+                last_record_ts: &mut self.record_ts,
                 triads: &mut self.triads,
             },
             line,

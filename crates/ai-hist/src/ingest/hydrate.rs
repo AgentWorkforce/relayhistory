@@ -10,7 +10,14 @@ use std::fs::OpenOptions;
 use std::time::Instant;
 
 mod codex_selected;
+mod entry;
+#[cfg(test)]
+use entry::hydrate_session_at_with_roots_connectors_and_claude_snapshot;
+pub(crate) use entry::{hydrate_local_session_on, hydrate_session_at_with_roots_and_connectors};
 mod continuity;
+mod cursor_hydrate;
+mod grok_log;
+use grok_log::read_grok_unified_log_for_hydration;
 mod exact;
 use exact::checkpoint_covers;
 pub(super) use exact::{
@@ -22,6 +29,7 @@ mod snapshot;
 mod unified_diff;
 
 pub(crate) use codex_selected::ingest_selected_codex;
+use cursor_hydrate::ingest_cursor;
 use probe::requires_local_pass;
 pub(crate) use probe::HydrationProbe;
 use snapshot::source_snapshot;
@@ -391,39 +399,16 @@ fn test_load_sync_state(db_path: &Path) -> Map<String, Value> {
     .unwrap()
 }
 
-pub(crate) fn hydrate_session_at_with_roots_and_connectors(
+/// Everything after the catalog lookup of a local hydration.
+fn hydrate_local(
+    conn: &Connection,
     db_path: &Path,
     options: &HydrateSessionOptions,
     roots: &crate::ProviderRoots,
-    connectors: &crate::remote::SourceConnectorSelection,
-) -> Result<HydrateSessionResult> {
-    hydrate_session_at_with_roots_connectors_and_claude_snapshot(
-        db_path, options, roots, connectors, None,
-    )
-}
-
-pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
-    db_path: &Path,
-    options: &HydrateSessionOptions,
-    roots: &crate::ProviderRoots,
-    connectors: &crate::remote::SourceConnectorSelection,
+    mut target: CatalogTarget,
     claude_snapshot: Option<ClaudeTranscriptSnapshot>,
+    started: Instant,
 ) -> Result<HydrateSessionResult> {
-    let home = &roots.home;
-    let _reads = begin_hydration(options, home, connectors)?;
-    let started = Instant::now();
-    // Acquisition and replacement are one per-session critical section. The
-    // provider call has to be inside it: otherwise an older response can wait
-    // behind a newer writer and then replace that newer evidence. A file lock
-    // covers both threads and independent RelayHistory processes.
-    let _remote_lock = (options.scope == SessionScope::Remote)
-        .then(|| acquire_remote_hydration_lock(db_path, options))
-        .transpose()?;
-    let mut conn = open_db(db_path)?;
-    let mut target = catalog_target(&conn, options)?;
-    if options.scope == SessionScope::Remote {
-        return hydrate_remote_session(&mut conn, options, home, connectors, started);
-    }
     let local_key = ObservationKey {
         source: options.source.clone(),
         session_id: options.session_id.clone(),
@@ -431,17 +416,17 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
         connector_id: options.source.clone(),
         connector_instance: "default".into(),
     };
-    let local_observation = observe_local_target(&conn, options, roots, &mut target, &local_key)?;
+    let local_observation = observe_local_target(conn, options, roots, &mut target, &local_key)?;
     // Before the stamp short-circuit: see `read_grok_unified_log_for_hydration`.
-    let log_diagnostics = read_grok_unified_log_for_hydration(&conn, options, &roots.grok)?;
-    let mut snapshot = source_snapshot(&conn, options, &target, roots, claude_snapshot)?;
-    let previous = observations::checkpoint(&conn, &local_key)?;
+    let log_diagnostics = read_grok_unified_log_for_hydration(conn, options, &roots.grok)?;
+    let mut snapshot = source_snapshot(conn, options, &target, roots, claude_snapshot)?;
+    let previous = observations::checkpoint(conn, &local_key)?;
     // A session whose last pass held records back is not finished with, even
     // though its bytes have not moved. The stamp short-circuit is what decides
     // whether a pass runs at all, so leaving it to fire here would mean the
     // held records were never looked at again and the message was lost rather
     // than deferred.
-    let parse_required = requires_local_pass(&conn, options, &snapshot)?;
+    let parse_required = requires_local_pass(conn, options, &snapshot)?;
     let stamp_matches = !parse_required
         && checkpoint_covers(previous.as_ref(), &snapshot.stamp, options.include_related)
         && target.discovery_state.as_deref() == Some("full");
@@ -456,7 +441,7 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
     // `TranscriptReader::open`, and charging it a second window here would
     // make a 1 KiB append cost 129 KiB.
     let validated = if stamp_matches {
-        unchanged_cursor_check(&conn, options, &snapshot)?
+        unchanged_cursor_check(conn, options, &snapshot)?
     } else {
         UnchangedCursorCheck::default()
     };
@@ -466,7 +451,7 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
 
     if stamp_matches && validated.valid {
         return unchanged_result(
-            &conn,
+            conn,
             options,
             snapshot,
             provider_bytes,
@@ -493,7 +478,7 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
     let records_parsed = snapshot.records.count()?;
 
     let (indexed, source_diagnostics, cursor_consumed_through, records_parsed) = commit_local_pass(
-        &mut conn,
+        conn,
         LocalPass {
             options,
             target: &target,
@@ -519,7 +504,7 @@ pub(crate) fn hydrate_session_at_with_roots_connectors_and_claude_snapshot(
     // checkpointed.
     source_diagnostics.extend(log_diagnostics);
     build_local_result(
-        &conn,
+        conn,
         options,
         HydrationPass {
             status,
@@ -562,29 +547,6 @@ fn prefer_restored_codex_rollout(
         }
     }
     Ok(())
-}
-
-/// Refuse a cancelled or invalid request, and a remote one whose connector is
-/// not configured, before any acquisition starts.
-fn begin_hydration(
-    options: &HydrateSessionOptions,
-    home: &Path,
-    connectors: &crate::remote::SourceConnectorSelection,
-) -> Result<cold_read::ReadScope> {
-    super::check_capture_cancelled()?;
-    validate_options(options)?;
-    // One hydration is one acquisition pass; see `begin_acquisition_pass`.
-    crate::project_identity::begin_acquisition_pass();
-    if options.scope == SessionScope::Remote {
-        crate::remote::ensure_selected_remote_connectors_configured_for_at(
-            "hydration",
-            home,
-            std::slice::from_ref(&options.source),
-            connectors,
-        )
-        .map_err(|error| hydration_error("CONNECTOR_NOT_CONFIGURED", error))?;
-    }
-    Ok(cold_read::begin_read_scope())
 }
 
 /// A changed pass over a session with a stamped checkpoint updated it; any
@@ -634,7 +596,7 @@ struct LocalPass<'a> {
 /// table has a provider-native uniqueness key, so interruption followed by
 /// retry is safe for both new and growing sessions.
 fn commit_local_pass(
-    conn: &mut Connection,
+    conn: &Connection,
     pass: LocalPass<'_>,
 ) -> Result<(IngestOutcome, Vec<HydrationDiagnostic>, Option<u64>, i64)> {
     let LocalPass {
@@ -649,7 +611,10 @@ fn commit_local_pass(
         local_observation,
     } = pass;
     super::check_capture_cancelled()?;
-    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // Unchecked because the connection may be shared with the caller (see
+    // `hydrate_local_session_on`); it is in autocommit, so this is the same
+    // IMMEDIATE transaction an owned connection would open.
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     let cursor_key = CursorKey::Session {
         source: &options.source,
         session_id: &options.session_id,
@@ -2319,7 +2284,11 @@ pub(crate) fn ingest_selected_claude(ctx: SelectedIngest<'_>) -> Result<Selected
 }
 
 pub(crate) fn ingest_selected_cursor(ctx: SelectedIngest<'_>) -> Result<SelectedIngestResult> {
-    let (diagnostics, consumed) = ingest_cursor(ctx.conn, ctx.options, ctx.target, ctx.file()?)?;
+    let path = ctx.file()?;
+    if let Some(result) = cursor_hydrate::store_only(ctx.conn, ctx.options, path, ctx.records) {
+        return result;
+    }
+    let (diagnostics, consumed) = ingest_cursor(ctx.conn, ctx.options, ctx.target, path)?;
     Ok((ctx.whole_file(), diagnostics, Some(consumed)))
 }
 
@@ -2480,14 +2449,12 @@ fn ingest_claude(
         // than claiming bytes nobody parsed.
         Some(snapshot) => ingest_claude_hook_snapshot(conn, path, snapshot, cursor)?,
         None => {
+            // The record walk reads the file's session from this pass's fold
+            // and keeps it on the `cursor.claude` it rewrites.
+            cursor.claude.get_or_insert_with(Default::default).scan = scan;
             outcome.absorb(incremental::ingest_claude_transcript_incremental(
                 conn, path, None, cursor,
             )?);
-            // The record walk rewrites `cursor.claude`; put the metadata
-            // walk's own position back on it so both survive the same store.
-            if let Some(claude) = cursor.claude.as_mut() {
-                claude.scan = scan;
-            }
         }
     }
     continuity::capture_claude(
@@ -3307,103 +3274,6 @@ fn recorded_codex_child_rollouts(
         .collect())
 }
 
-fn ingest_cursor(
-    conn: &Connection,
-    options: &HydrateSessionOptions,
-    _target: &CatalogTarget,
-    path: &Path,
-) -> Result<(Vec<HydrationDiagnostic>, u64)> {
-    let project = path
-        .ancestors()
-        .find(|ancestor| {
-            ancestor
-                .parent()
-                .and_then(Path::file_name)
-                .and_then(|s| s.to_str())
-                == Some("projects")
-        })
-        .and_then(Path::file_name)
-        .and_then(|s| s.to_str())
-        .map(decode_cursor_project);
-    let mtime_ms = file_modified_ms(path).unwrap_or(0);
-    // Targeted hydration always re-reads the whole transcript, so it is a
-    // rebuild: clear every row a previous read left before writing the new
-    // one. Upserting on top is not enough. Cursor evidence is keyed on the
-    // record's byte offset, and a rewritten transcript reuses those offsets
-    // for different records, so the rows an earlier generation wrote past the
-    // new end of the file would survive as tool calls and edits this session
-    // never made. `history` cannot be upserted at all, because a prompt's
-    // identity includes a timestamp an earlier parser took from the mtime.
-    //
-    // The read happens inside the caller's transaction, and it propagates its
-    // error, so a transcript that has vanished or turned unreadable since the
-    // snapshot rolls this delete back rather than committing an empty session.
-    clear_cursor_session_evidence(conn, &options.session_id)?;
-    let outcome = ingest_cursor_transcript(
-        conn,
-        path,
-        &options.session_id,
-        project.as_deref(),
-        mtime_ms,
-        0,
-        // Hydration re-reads the whole file. The Cursor byte checkpoint is
-        // advanced after this transaction commits, so a later incremental
-        // sync does not re-insert the untimed prompts this pass just wrote.
-        u64::MAX,
-    )?;
-    // Authoritative about both ends of the window, having just read the whole
-    // file: an expanding merge would keep a mtime endpoint an earlier parser
-    // wrote, which MAX() can never retract.
-    upsert_session_rebuilt(
-        conn,
-        &SessionCatalogRow {
-            session_id: &options.session_id,
-            source: "cursor",
-            cwd: project.as_deref(),
-            git_branch: None,
-            first_ts: outcome.first_ts_ms.unwrap_or(mtime_ms),
-            last_ts: outcome.last_ts_ms.unwrap_or(mtime_ms),
-            last_assistant_text: outcome.last_assistant_text.as_deref(),
-            raw_path: Some(&path.to_string_lossy()),
-        },
-    )?;
-    Ok((cursor_diagnostics(&outcome), outcome.consumed_through))
-}
-
-/// What a Cursor transcript could not establish on its own.
-///
-/// Both codes describe an absence in the provider's records, not a failure of
-/// this run: reporting them is the difference between "Cursor does not write
-/// this" and "RelayHistory did not read it".
-fn cursor_diagnostics(outcome: &CursorTranscriptOutcome) -> Vec<HydrationDiagnostic> {
-    let mut diagnostics = Vec::new();
-    if outcome.used_mtime_fallback {
-        diagnostics.push(HydrationDiagnostic {
-            code: "CURSOR_TIMESTAMP_FROM_MTIME".to_string(),
-            message: "cursor records carry no timestamp field; events in turns with no readable \
-                      <timestamp> tag are stamped with the transcript file mtime"
-                .to_string(),
-            duration_ms: None,
-            source_bytes: None,
-            records_parsed: None,
-        });
-    }
-    if outcome.subagent_calls > 0 {
-        diagnostics.push(HydrationDiagnostic {
-            code: "CURSOR_SUBAGENT_SPAWN_UNLINKED".to_string(),
-            message: format!(
-                "cursor recorded {} subagent spawn call(s) but writes no child transcript id; \
-                 the delegation is visible as a tool call and the child is not addressable",
-                outcome.subagent_calls
-            ),
-            duration_ms: None,
-            source_bytes: None,
-            records_parsed: None,
-        });
-    }
-    diagnostics
-}
-
 fn ingest_grok(
     conn: &Connection,
     options: &HydrateSessionOptions,
@@ -3423,47 +3293,6 @@ fn ingest_grok(
     }
     let outcome = ingest_grok_session(conn, &session, &path.to_string_lossy())?;
     Ok(grok_diagnostics(&outcome))
-}
-
-/// Read what the Grok home's `logs/unified.jsonl` gained, before a Grok
-/// hydration decides whether its session changed.
-///
-/// The log lives outside the session directory, so the session's stamp never
-/// moves when it grows: reading it only on the parse path meant an
-/// `unchanged` hydration never attached an inference appended after the
-/// session's last write. It runs in its own transaction, before the
-/// hydration's, and whatever it attaches clears the touched sessions' cached
-/// diagnostics so an `unchanged` result is rebuilt from the stored rows.
-///
-/// The log is every session's, so failing to read it — unreadable, replaced
-/// mid-read — is not a reason to fail this session's hydration. It is
-/// reported as `GROK_UNIFIED_LOG_UNREADABLE` and the hydration goes on with
-/// whatever the log had already given; the cursor has not moved, so the next
-/// pass tries again.
-///
-/// Any other provider's hydration has no such log and reads nothing.
-fn read_grok_unified_log_for_hydration(
-    conn: &Connection,
-    options: &HydrateSessionOptions,
-    grok_home: &Path,
-) -> Result<Vec<HydrationDiagnostic>> {
-    if options.source != "grok" {
-        return Ok(Vec::new());
-    }
-    match super::sync_grok_unified_log(conn, grok_home) {
-        Ok(_) => Ok(Vec::new()),
-        Err(error) if error.is::<super::CaptureCancelled>() => Err(error),
-        Err(error) => Ok(vec![HydrationDiagnostic {
-            code: "GROK_UNIFIED_LOG_UNREADABLE".to_string(),
-            message: format!(
-                "grok's logs/unified.jsonl could not be read, so any usage it gained since the \
-                 last pass is not attached yet: {error:#}"
-            ),
-            duration_ms: None,
-            source_bytes: None,
-            records_parsed: None,
-        }]),
-    }
 }
 
 fn ingest_muse(
@@ -4557,6 +4386,35 @@ mod tests {
     }
 
     #[test]
+    fn an_opencode_2_session_that_is_gone_is_source_unavailable() {
+        let home = tempfile::tempdir().unwrap();
+        let store = home.path().join("opencode.db");
+        Connection::open(&store)
+            .unwrap()
+            .execute_batch(
+                "CREATE TABLE session_v2 (id TEXT PRIMARY KEY, directory TEXT NOT NULL,
+                                          time_created INTEGER NOT NULL,
+                                          time_updated INTEGER NOT NULL);
+                 CREATE TABLE session_message (id TEXT PRIMARY KEY, session_id TEXT NOT NULL,
+                                               type TEXT NOT NULL, seq INTEGER NOT NULL,
+                                               time_created INTEGER NOT NULL, data TEXT NOT NULL);",
+            )
+            .unwrap();
+        let conn = open_db(&home.path().join("history.db")).unwrap();
+        let roots = crate::ProviderRoots::from_home(home.path().to_path_buf(), store.clone());
+        let target = CatalogTarget {
+            locator: Some(store.to_string_lossy().into_owned()),
+            discovery_state: Some("shallow".into()),
+        };
+        let error = source_snapshot(&conn, &options("opencode", "gone"), &target, &roots, None)
+            .unwrap_err();
+        assert!(
+            error.to_string().starts_with("SESSION_SOURCE_UNAVAILABLE"),
+            "{error:#}"
+        );
+    }
+
+    #[test]
     fn devin_changed_after_the_probe_refreshes_stamp_and_rows_together() {
         let home = tempfile::tempdir().unwrap();
         let cli_dir = home.path().join(".local/share/devin/cli");
@@ -4982,7 +4840,7 @@ mod tests {
         fs::write(
             &transcript,
             concat!(
-                r#"{"sessionId":"vanishing","uuid":"1","type":"assistant","message":{"role":"assistant","content":"captured"}}"#,
+                r#"{"sessionId":"vanishing","uuid":"1","timestamp":"2026-01-01T00:00:00Z","type":"assistant","message":{"role":"assistant","content":"captured"}}"#,
                 "\n",
             ),
         )
@@ -10873,7 +10731,9 @@ mod tests {
             "a recorded spawn with no child id must be reported, not silently dropped: {:?}",
             result.diagnostics
         );
-        // Cursor never names the child, so no relationship row is invented.
+        // The `Task` call names no child, so no relationship row is invented
+        // from it. A child is linked only by a transcript filed under
+        // `subagents/`, which is where `stable_child_identity` comes from.
         let conn = open_db(&db).unwrap();
         let relationships: i64 = conn
             .query_row(
@@ -10883,10 +10743,10 @@ mod tests {
             )
             .unwrap();
         assert_eq!(relationships, 0);
-        assert_eq!(
-            crate::relationships::relationship_capabilities("cursor").stable_child_identity,
-            "never"
-        );
+        let capabilities = crate::relationships::relationship_capabilities("cursor");
+        assert_eq!(capabilities.stable_child_identity, "always");
+        assert!(capabilities.records_evidence_locator);
+        assert!(!capabilities.records_agent_type);
 
         // Diagnostics describe the stored evidence, not this run. Re-hydrating
         // the same file must still report them.
@@ -11079,6 +10939,71 @@ mod tests {
         path
     }
 
+    /// Hydrating either end of a Cursor delegation records the edge: the
+    /// child from its own location, the parent from the `subagents/` it holds.
+    /// The child is hydrated under its file stem, with the parent's project.
+    #[test]
+    fn hydrating_a_cursor_subagent_or_its_parent_records_the_delegation() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = cursor_transcript(dir.path(), "cur-parent", "parent prompt");
+        let child = parent.with_file_name("subagents/cur-child.jsonl");
+        fs::create_dir_all(child.parent().unwrap()).unwrap();
+        fs::copy(&parent, &child).unwrap();
+        let db = dir.path().join("history.db");
+        let conn = open_db(&db).unwrap();
+        catalog_row(&conn, "cursor", "cur-parent", Some(&parent));
+        catalog_row(&conn, "cursor", "cur-child", Some(&child));
+        drop(conn);
+        let edges = || -> Vec<(String, String, String, String)> {
+            let conn = open_db(&db).unwrap();
+            let mut stmt = conn
+                .prepare(
+                    "SELECT parent_session_id, child_session_id, evidence_kind, identity_status \
+                     FROM session_relationships WHERE source = 'cursor'",
+                )
+                .unwrap();
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            rows
+        };
+        let expected = vec![(
+            "cur-parent".to_string(),
+            "cur-child".to_string(),
+            "cursor_subagent_dir".to_string(),
+            "observed".to_string(),
+        )];
+
+        let mut declined = options("cursor", "cur-child");
+        declined.include_related = false;
+        hydrate_session_at_with_home(&db, &declined, dir.path()).unwrap();
+        assert!(
+            edges().is_empty(),
+            "include_related off reads no delegation"
+        );
+
+        hydrate_session_at_with_home(&db, &options("cursor", "cur-parent"), dir.path()).unwrap();
+        assert_eq!(edges(), expected, "the parent links the subagent it holds");
+
+        let hydrated =
+            hydrate_session_at_with_home(&db, &options("cursor", "cur-child"), dir.path()).unwrap();
+        assert_ne!(hydrated.status, "error");
+        assert_eq!(edges(), expected, "re-observing from the child is one edge");
+        let cwd: Option<String> = open_db(&db)
+            .unwrap()
+            .query_row(
+                "SELECT cwd FROM sessions WHERE source='cursor' AND session_id='cur-child'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(cwd.as_deref(), Some("/work/app"));
+    }
+
     /// Write an OpenCode store whose one session happens to contain only a
     /// user prompt. Capability describes the parser, not which kinds this
     /// particular sparse session exercised.
@@ -11183,9 +11108,12 @@ mod tests {
         let conn = open_db(&db).unwrap();
         catalog_row(&conn, "cursor", "cursor-2", Some(&transcript));
         drop(conn);
+        // Declining related evidence leaves `relationship` uncovered, so the
+        // result is partial.
+        let mut request = options("cursor", "cursor-2");
+        request.include_related = false;
 
-        let first =
-            hydrate_session_at_with_home(&db, &options("cursor", "cursor-2"), dir.path()).unwrap();
+        let first = hydrate_session_at_with_home(&db, &request, dir.path()).unwrap();
         assert_eq!(first.capability, "partial");
         assert_eq!(first.discovery_state, "full");
         let stored: String = open_db(&db)
@@ -11200,7 +11128,7 @@ mod tests {
 
         // Same bytes, same parser: the short-circuit is reached.
         assert_eq!(
-            hydrate_session_at_with_home(&db, &options("cursor", "cursor-2"), dir.path())
+            hydrate_session_at_with_home(&db, &request, dir.path())
                 .unwrap()
                 .status,
             "unchanged"
@@ -11215,8 +11143,7 @@ mod tests {
                 params![HYDRATION_PARSER_VERSION - 1],
             )
             .unwrap();
-        let reparsed =
-            hydrate_session_at_with_home(&db, &options("cursor", "cursor-2"), dir.path()).unwrap();
+        let reparsed = hydrate_session_at_with_home(&db, &request, dir.path()).unwrap();
         assert_eq!(reparsed.status, "updated");
         assert_eq!(reparsed.discovery_state, "full");
         let parser_version: i64 = open_db(&db)
@@ -11708,20 +11635,43 @@ mod tests {
         assert_eq!(widened.capability, "full");
     }
 
-    /// The opt-out explains an absent `relationship` and nothing else. Cursor
-    /// is missing that kind because its parser never reads it — a `Task` block
-    /// names no child transcript — and blaming the request for that sends the
-    /// reader looking for an option to change instead of at the provider.
+    /// The opt-out explains an absent `relationship` and nothing else. Devin
+    /// is missing that kind because its parser never reads it, and blaming
+    /// the request for that sends the reader looking for an option to change
+    /// instead of at the provider.
     #[test]
     fn the_partial_diagnostic_blames_the_opt_out_only_for_what_it_removed() {
         let dir = tempfile::tempdir().unwrap();
-        let transcript = cursor_transcript(dir.path(), "cursor-4", "cursor prompt");
+        let cli_dir = dir.path().join(".local/share/devin/cli");
+        fs::create_dir_all(&cli_dir).unwrap();
+        let store = cli_dir.join("sessions.db");
+        Connection::open(&store)
+            .unwrap()
+            .execute_batch(
+                r#"
+                CREATE TABLE sessions (
+                  id TEXT PRIMARY KEY, last_activity_at INTEGER, hidden INTEGER DEFAULT 0
+                );
+                CREATE TABLE message_nodes (
+                  row_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  session_id TEXT NOT NULL, node_id INTEGER NOT NULL,
+                  parent_node_id INTEGER, chat_message TEXT,
+                  created_at INTEGER, metadata TEXT
+                );
+                INSERT INTO sessions (id, last_activity_at) VALUES ('devin-4', 1);
+                INSERT INTO message_nodes (session_id, node_id, chat_message, created_at)
+                VALUES ('devin-4', 1,
+                  '{"message_id":"u1","role":"user","content":"devin prompt","metadata":{"is_user_input":true}}',
+                  1);
+                "#,
+            )
+            .unwrap();
         let db = dir.path().join("history.db");
         let conn = open_db(&db).unwrap();
-        catalog_row(&conn, "cursor", "cursor-4", Some(&transcript));
+        catalog_row(&conn, "devin", "devin-4", Some(&store));
         drop(conn);
 
-        let mut request = options("cursor", "cursor-4");
+        let mut request = options("devin", "devin-4");
         request.include_related = false;
         let prompt_only = hydrate_session_at_with_home(&db, &request, dir.path()).unwrap();
         let message = prompt_only
@@ -11733,7 +11683,7 @@ mod tests {
             .clone();
         assert!(
             !message.contains("include_related"),
-            "cursor has no relationship parser, so the opt-out did not remove it: {message}"
+            "devin has no relationship parser, so the opt-out did not remove it: {message}"
         );
 
         // Control: a source that does declare delegation, with the same flag
@@ -11765,7 +11715,9 @@ mod tests {
     /// and the hydration contract follows without another edit.
     #[test]
     fn declared_coverage_matches_what_each_local_parser_writes() {
-        for source in ["claude", "codex", "grok", "opencode"] {
+        // Cursor's delegation comes from where a subagent transcript is filed,
+        // not from its `Task` block, which names no child.
+        for source in ["claude", "codex", "cursor", "grok", "opencode"] {
             assert_eq!(
                 crate::discover::declared_evidence_kinds(source),
                 FULL_SESSION_KINDS,
@@ -11773,20 +11725,9 @@ mod tests {
             );
             assert!(crate::discover::missing_evidence_kinds(source).is_empty());
         }
-        // Cursor parses every kind but delegation: a `Task` block names no
-        // child transcript, so no relationship row is ever written.
+        // Devin parses every kind but delegation.
         assert_eq!(
-            crate::discover::declared_evidence_kinds("cursor"),
-            &[
-                EvidenceKind::History,
-                EvidenceKind::SessionEvent,
-                EvidenceKind::ToolCall,
-                EvidenceKind::FileEdit,
-            ],
-            "cursor parses everything except delegation"
-        );
-        assert_eq!(
-            crate::discover::missing_evidence_kinds("cursor"),
+            crate::discover::missing_evidence_kinds("devin"),
             vec![EvidenceKind::Relationship],
         );
         // An unknown source has no adapter at all, so it declares nothing.

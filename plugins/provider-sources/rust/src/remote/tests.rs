@@ -66,6 +66,10 @@ fn without_credentials_override() -> ClearedCredentialsOverride {
         "RELAYHISTORY_DEVIN_API_BASE_URL",
         "RELAYHISTORY_DEVIN_CREDENTIALS",
         "RELAYHISTORY_DEVIN_CONFIG",
+        "RELAYHISTORY_CURSOR_API_KEY",
+        "RELAYHISTORY_CURSOR_API_KEY_FILE",
+        "RELAYHISTORY_CURSOR_API_BASE_URL",
+        "CURSOR_API_KEY",
         "XDG_DATA_HOME",
         "XDG_CONFIG_HOME",
     ];
@@ -181,7 +185,7 @@ fn claude_provider(
     ClaudeWebProvider::new(
         write_claude_credentials(home, FAR_FUTURE_MS),
         "https://api.example.test".to_string(),
-        Box::new(Arc::clone(transport)),
+        Arc::clone(transport),
         limit,
     )
 }
@@ -312,7 +316,7 @@ fn claude_enumeration_reports_an_expired_token_without_a_request() {
     let provider = ClaudeWebProvider::new(
         write_claude_credentials(home.path(), 1_000),
         "https://api.example.test".to_string(),
-        Box::new(Arc::clone(&transport)),
+        Arc::clone(&transport),
         None,
     );
     let conn = catalog();
@@ -530,21 +534,43 @@ fn real_claude_transport_never_follows_a_redirect_with_credentials() {
     );
 }
 
+/// Writes an executable script without this process ever holding a write
+/// handle to it. Tests run on parallel threads: if another test forks a child
+/// while this one has the script open for writing, the child inherits the
+/// handle until it execs, and running the script in that window fails with
+/// ETXTBSY ("Text file busy"), seen as "could not run `codex cloud diff`".
+/// Writing from a child process keeps the handle out of this process.
+#[cfg(unix)]
+fn write_script(path: &Path, body: &str) {
+    use std::io::Write;
+
+    let mut child = std::process::Command::new("sh")
+        .args(["-c", "cat > \"$1\" && chmod 755 \"$1\"", "sh"])
+        .arg(path)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(body.as_bytes())
+        .unwrap();
+    let status = child.wait().unwrap();
+    assert!(status.success(), "writing {}: {status}", path.display());
+}
+
 #[cfg(unix)]
 #[test]
 fn codex_targeted_evidence_uses_the_cli_diff_and_reports_an_empty_diff_honestly() {
-    use std::os::unix::fs::PermissionsExt;
-
     let dir = tempfile::tempdir().unwrap();
     let command = dir.path().join("codex-fixture");
-    std::fs::write(
+    write_script(
         &command,
         "#!/bin/sh\n\
          test \"$1\" = cloud && test \"$2\" = diff && test \"$3\" = task_fixture || exit 2\n\
          printf 'diff --git a/src/lib.rs b/src/lib.rs\\n--- a/src/lib.rs\\n+++ b/src/lib.rs\\n@@ -1 +1,2 @@\\n old\\n+new\\n'\n",
-    )
-    .unwrap();
-    std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+    );
 
     let evidence =
         acquire_codex_remote_session_with_command("task_fixture", command.as_os_str()).unwrap();
@@ -557,11 +583,10 @@ fn codex_targeted_evidence_uses_the_cli_diff_and_reports_an_empty_diff_honestly(
     assert!(diff.contains("diff --git a/src/lib.rs b/src/lib.rs"));
     assert_eq!(source_bytes, diff.len() as i64);
 
-    std::fs::write(
+    write_script(
         &command,
         "#!/bin/sh\ntest \"$1\" = cloud && test \"$2\" = diff && test \"$3\" = task_fixture\n",
-    )
-    .unwrap();
+    );
     let evidence =
         acquire_codex_remote_session_with_command("task_fixture", command.as_os_str()).unwrap();
     assert!(matches!(
@@ -589,12 +614,9 @@ fn codex_targeted_evidence_requires_the_supplied_homes_login() {
 #[cfg(unix)]
 #[test]
 fn codex_output_limit_drains_the_pipe_and_reports_size_not_timeout() {
-    use std::os::unix::fs::PermissionsExt;
-
     let dir = tempfile::tempdir().unwrap();
     let command = dir.path().join("codex-oversized");
-    std::fs::write(&command, "#!/bin/sh\nhead -c 16777217 /dev/zero\n").unwrap();
-    std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_script(&command, "#!/bin/sh\nhead -c 16777217 /dev/zero\n");
     let error = acquire_codex_remote_session_with_command_timeout(
         "task_fixture",
         command.as_os_str(),
@@ -608,12 +630,9 @@ fn codex_output_limit_drains_the_pipe_and_reports_size_not_timeout() {
 #[cfg(unix)]
 #[test]
 fn codex_inherited_pipe_is_bounded_after_the_direct_child_exits() {
-    use std::os::unix::fs::PermissionsExt;
-
     let dir = tempfile::tempdir().unwrap();
     let command = dir.path().join("codex-inherited-pipe");
-    std::fs::write(&command, "#!/bin/sh\nsleep 2 &\nexit 0\n").unwrap();
-    std::fs::set_permissions(&command, std::fs::Permissions::from_mode(0o755)).unwrap();
+    write_script(&command, "#!/bin/sh\nsleep 2 &\nexit 0\n");
     let started = Instant::now();
     let error = acquire_codex_remote_session_with_command_timeout(
         "task_fixture",
@@ -738,7 +757,7 @@ fn codex_mapping_carries_the_task_listing_and_stamps_on_status() {
 #[test]
 fn codex_provider_forwards_a_bounded_page_limit_to_the_cli() {
     let lister = Arc::new(ScriptedLister::new(vec![CODEX_LISTING.to_string()]));
-    let provider = CodexCloudProvider::new(Box::new(Arc::clone(&lister)), Some(7));
+    let provider = CodexCloudProvider::new(Arc::clone(&lister), Some(7));
     let home = tempfile::tempdir().unwrap();
     let conn = catalog();
     let env = env_at(&conn, home.path());
@@ -749,7 +768,7 @@ fn codex_provider_forwards_a_bounded_page_limit_to_the_cli() {
     // A global limit above the CLI's window is clamped per page, never
     // forwarded verbatim (the CLI rejects --limit values over 20).
     let lister = Arc::new(ScriptedLister::new(vec![CODEX_LISTING.to_string()]));
-    let provider = CodexCloudProvider::new(Box::new(Arc::clone(&lister)), Some(500));
+    let provider = CodexCloudProvider::new(Arc::clone(&lister), Some(500));
     let env = env_at(&conn, home.path());
     provider.enumerate(&env, None).unwrap();
     assert_eq!(*lister.calls.lock().unwrap(), vec![(20, None)]);
@@ -763,7 +782,7 @@ fn codex_provider_follows_the_cursor_across_pages() {
         page_one.to_string(),
         page_two.to_string(),
     ]));
-    let provider = CodexCloudProvider::new(Box::new(Arc::clone(&lister)), None);
+    let provider = CodexCloudProvider::new(Arc::clone(&lister), None);
     let home = tempfile::tempdir().unwrap();
     let conn = catalog();
     let env = env_at(&conn, home.path());
@@ -779,7 +798,7 @@ fn codex_provider_follows_the_cursor_across_pages() {
         page_one.to_string(),
         page_two.to_string(),
     ]));
-    let provider = CodexCloudProvider::new(Box::new(Arc::clone(&lister)), Some(1));
+    let provider = CodexCloudProvider::new(Arc::clone(&lister), Some(1));
     let env = env_at(&conn, home.path());
     let candidates = provider.enumerate(&env, None).unwrap();
     assert_eq!(candidates.len(), 1);
@@ -797,7 +816,7 @@ fn statuses_report_missing_credentials_with_the_paths_looked_at() {
     let _cleared = without_credentials_override();
     let home = tempfile::tempdir().unwrap();
     let statuses = remote_connector_statuses_at(home.path());
-    assert_eq!(statuses.len(), 3);
+    assert_eq!(statuses.len(), 4);
     assert!(statuses.iter().all(|status| !status.configured));
     let error = ensure_remote_connectors_configured_at("discovery", home.path())
         .unwrap_err()
@@ -809,6 +828,7 @@ fn statuses_report_missing_credentials_with_the_paths_looked_at() {
     assert!(error.contains("claude-web"), "{error}");
     assert!(error.contains("codex-cloud"), "{error}");
     assert!(error.contains("devin-cloud"), "{error}");
+    assert!(error.contains("cursor-cloud"), "{error}");
 
     std::fs::create_dir_all(home.path().join(".codex")).unwrap();
     std::fs::write(home.path().join(".codex/auth.json"), "{}").unwrap();
@@ -846,8 +866,15 @@ fn a_source_filter_that_excludes_every_configured_connector_is_unsupported() {
     );
     assert!(error.contains("claude-web"), "{error}");
     assert!(!error.contains("codex-cloud"), "{error}");
-    // Cursor has no selected provider connector; commercial login cannot widen selection.
+    // Cursor's connector exists but holds no API key here.
     let error = ok(&["cursor"]).unwrap_err().to_string();
+    assert!(
+        error.contains("no remote provider connectors are configured"),
+        "{error}"
+    );
+    assert!(error.contains("cursor-cloud"), "{error}");
+    // A source with no remote connector at all is a different refusal.
+    let error = ok(&["grok"]).unwrap_err().to_string();
     assert!(
         error.contains("no matching remote provider connectors exist"),
         "{error}"
@@ -856,6 +883,9 @@ fn a_source_filter_that_excludes_every_configured_connector_is_unsupported() {
     let error = ok(&["bogus"]).unwrap_err().to_string();
     assert!(error.contains("invalid source 'bogus'"), "{error}");
 }
+
+#[path = "cursor_cloud_tests.rs"]
+mod cursor_cloud_tests;
 
 // ---------------------------------------------------------------------------
 // devin-cloud
@@ -945,7 +975,7 @@ fn devin_provider(
     limit: Option<usize>,
 ) -> DevinCloudProvider {
     let (credentials, config) = write_devin_cli_files(home);
-    DevinCloudProvider::new(credentials, config, Box::new(Arc::clone(transport)), limit)
+    DevinCloudProvider::new(credentials, config, Arc::clone(transport), limit)
 }
 
 fn devin_session(id: &str, title: &str) -> Value {
@@ -1240,7 +1270,7 @@ fn devin_enumeration_requires_configuration_and_reports_auth() {
     let provider = DevinCloudProvider::new(
         credentials.clone(),
         config.clone(),
-        Box::new(Arc::clone(&transport)),
+        Arc::clone(&transport),
         None,
     );
     let conn = catalog();
@@ -1260,8 +1290,7 @@ fn devin_enumeration_requires_configuration_and_reports_auth() {
         401,
         "key-secret-must-not-escape".into(),
     )]));
-    let provider =
-        DevinCloudProvider::new(credentials, config, Box::new(Arc::clone(&transport)), None);
+    let provider = DevinCloudProvider::new(credentials, config, Arc::clone(&transport), None);
     let error = provider.enumerate(&env, None).unwrap_err().to_string();
     assert!(error.starts_with("AUTHENTICATION_EXPIRED:"), "{error}");
     assert!(!error.contains("key-secret"), "{error}");
@@ -1457,8 +1486,7 @@ fn devin_organization_id_cannot_alter_the_request_route() {
     let config = home.path().join("config.json");
     std::fs::write(&config, r#"{"devin":{"org_id":"org/x/../../admin"}}"#).unwrap();
     let transport = Arc::new(ScriptedDevinTransport::new(vec![]));
-    let provider =
-        DevinCloudProvider::new(credentials, config, Box::new(Arc::clone(&transport)), None);
+    let provider = DevinCloudProvider::new(credentials, config, Arc::clone(&transport), None);
     let conn = catalog();
     let env = env_at(&conn, home.path());
     let error = provider.enumerate(&env, None).unwrap_err().to_string();
@@ -1571,7 +1599,7 @@ fn real_devin_transport_never_follows_a_redirect_with_credentials() {
         .unwrap();
     });
     std::env::set_var("RELAYHISTORY_DEVIN_API_BASE_URL", &origin_url);
-    let provider = DevinCloudProvider::new(credentials, config, Box::new(UreqDevinTransport), None);
+    let provider = DevinCloudProvider::new(credentials, config, UreqDevinTransport, None);
     let conn = catalog();
     let env = env_at(&conn, home.path());
     let error = provider.enumerate(&env, None).unwrap_err().to_string();
@@ -1857,7 +1885,7 @@ fn send_remote_message_with_dispatches_on_the_connector() {
 
 fn remote_codex_provider(payload: &str, limit: Option<usize>) -> Box<dyn ShallowSessionProvider> {
     Box::new(CodexCloudProvider::new(
-        Box::new(Arc::new(ScriptedLister::new(vec![payload.to_string()]))),
+        Arc::new(ScriptedLister::new(vec![payload.to_string()])),
         limit,
     ))
 }

@@ -25,18 +25,63 @@
 //! discards up to the target; a backward one restarts the stream. Each handle
 //! reads the shared file positionally, so two handles over one open never
 //! move each other's place.
+//!
+//! A compressed transcript's length is measured once per version of the
+//! stored file. It is a pure function of the file's bytes, so it is kept,
+//! process-wide, under the stored path and the stat that names those bytes:
+//! length, mtime and, where the platform has them, device, inode and change
+//! time. A stat that still matches is the same bytes, and the kept length is
+//! exact. Only a measurement succeeds is kept: a frame running past the end of
+//! a file still being written is an error on every look until the file is
+//! whole.
 
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, BufReader, Read, Seek, SeekFrom};
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
+use std::time::SystemTime;
 
 /// The extension a zstd-compressed transcript adds to its locator.
 const ZSTD_EXTENSION: &str = "zst";
 
 /// zstd frame magic, little-endian on disk.
 const ZSTD_MAGIC: u32 = 0xFD2F_B528;
+
+/// How many measured lengths are kept before the table starts over. One entry
+/// per compressed rollout; a store several times larger than the biggest seen
+/// still fits, and one that outgrows it measures again rather than growing.
+const MEASURED_LIMIT: usize = 262_144;
+
+/// Measured decompressed lengths, by stored path.
+static MEASURED: Mutex<Option<HashMap<PathBuf, (StatKey, u64)>>> = Mutex::new(None);
+
+/// What names one version of a stored file's bytes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct StatKey {
+    len: u64,
+    modified: Option<SystemTime>,
+    #[cfg(unix)]
+    identity: (u64, u64),
+    #[cfg(unix)]
+    changed: (i64, i64),
+}
+
+impl StatKey {
+    fn of(metadata: &fs::Metadata) -> Self {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Self {
+            len: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            identity: (metadata.dev(), metadata.ino()),
+            #[cfg(unix)]
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
+}
 
 /// Skippable frames carry metadata and no records.
 const SKIPPABLE_MAGIC_MASK: u32 = 0xFFFF_FFF0;
@@ -139,8 +184,18 @@ pub(crate) fn metadata(path: &Path) -> io::Result<TranscriptMetadata> {
             compressed: false,
         });
     }
+    if let Some(len) = measured(&stored, &metadata) {
+        return Ok(TranscriptMetadata {
+            metadata,
+            len,
+            compressed: true,
+        });
+    }
+    // Measured through the open file and keyed by its own stat, so a file
+    // replaced between the two stats is not kept under the other's.
     let file = fs::File::open(&stored)?;
-    let len = decompressed_len(&file, metadata.len())?;
+    let metadata = file.metadata()?;
+    let len = measure(&stored, &file, &metadata)?;
     Ok(TranscriptMetadata {
         metadata,
         len,
@@ -155,8 +210,11 @@ pub(crate) fn open(path: &Path) -> io::Result<TranscriptFile> {
     if !is_compressed_name(&stored) {
         return Ok(TranscriptFile::Plain(file));
     }
-    let stored_len = file.metadata()?.len();
-    let len = decompressed_len(&file, stored_len)?;
+    let metadata = file.metadata()?;
+    let len = match measured(&stored, &metadata) {
+        Some(len) => len,
+        None => measure(&stored, &file, &metadata)?,
+    };
     Ok(TranscriptFile::Zstd(ZstdFile {
         file: Arc::new(file),
         len,
@@ -224,6 +282,17 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn take_read_bytes() -> u64 {
     READ_BYTES.with(|bytes| bytes.replace(0))
+}
+
+#[cfg(test)]
+thread_local! {
+    static MEASUREMENTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// How many compressed files this thread measured since the last call.
+#[cfg(test)]
+pub(crate) fn take_measurements() -> u64 {
+    MEASUREMENTS.with(|count| count.replace(0))
 }
 
 impl Read for TranscriptFile {
@@ -377,12 +446,40 @@ fn read_exact_at(file: &fs::File, buf: &mut [u8], mut offset: u64) -> io::Result
     Ok(())
 }
 
+/// The length kept for `stored` when `metadata` still names the bytes it was
+/// measured from.
+fn measured(stored: &Path, metadata: &fs::Metadata) -> Option<u64> {
+    let key = StatKey::of(metadata);
+    MEASURED
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .as_ref()?
+        .get(stored)
+        .filter(|(kept, _)| *kept == key)
+        .map(|(_, len)| *len)
+}
+
+/// Measure the open `file` stored at `stored`, whose stat is `metadata`, and
+/// keep the length when the measurement succeeds.
+fn measure(stored: &Path, file: &fs::File, metadata: &fs::Metadata) -> io::Result<u64> {
+    let len = decompressed_len(file, metadata.len())?;
+    let mut table = MEASURED.lock().unwrap_or_else(PoisonError::into_inner);
+    let table = table.get_or_insert_with(HashMap::new);
+    if table.len() >= MEASURED_LIMIT && !table.contains_key(stored) {
+        table.clear();
+    }
+    table.insert(stored.to_path_buf(), (StatKey::of(metadata), len));
+    Ok(len)
+}
+
 /// The decompressed length of a zstd file.
 ///
 /// Read from the frame headers: each frame states its content size, and its
 /// end is found by walking block headers, three bytes per block. A frame that
 /// does not state its size is counted by decompressing the file once.
 fn decompressed_len(file: &fs::File, stored_len: u64) -> io::Result<u64> {
+    #[cfg(test)]
+    MEASUREMENTS.with(|count| count.set(count.get() + 1));
     match declared_len(file, stored_len)? {
         Some(len) => Ok(len),
         None => {
@@ -646,6 +743,47 @@ mod tests {
             metadata(&path).unwrap_err().kind(),
             io::ErrorKind::InvalidData
         );
+    }
+
+    #[test]
+    fn an_unchanged_archive_is_measured_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-a.jsonl.zst");
+        let first = records(2_000);
+        fs::write(&path, compress(&first)).unwrap();
+        take_measurements();
+        assert_eq!(metadata(&path).unwrap().len(), first.len() as u64);
+        assert_eq!(take_measurements(), 1);
+        assert_eq!(metadata(&path).unwrap().len(), first.len() as u64);
+        assert_eq!(
+            open(&path).unwrap().metadata().unwrap().len(),
+            first.len() as u64
+        );
+        assert_eq!(
+            take_measurements(),
+            0,
+            "an unchanged archive was measured again"
+        );
+
+        // New bytes are a new stat, and a new measurement.
+        let second = records(3_000);
+        fs::write(&path, compress(&second)).unwrap();
+        assert_eq!(metadata(&path).unwrap().len(), second.len() as u64);
+        assert_eq!(take_measurements(), 1);
+    }
+
+    #[test]
+    fn a_frame_still_being_written_is_measured_on_every_look() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout-a.jsonl.zst");
+        let whole = compress(&records(2_000));
+        fs::write(&path, &whole[..whole.len() - 5]).unwrap();
+        take_measurements();
+        assert!(metadata(&path).is_err());
+        assert!(metadata(&path).is_err());
+        assert_eq!(take_measurements(), 2, "a failed measurement was kept");
+        fs::write(&path, &whole).unwrap();
+        assert_eq!(metadata(&path).unwrap().len(), records(2_000).len() as u64);
     }
 
     #[test]

@@ -1,6 +1,6 @@
 {
   "name": "ai-hist",
-  "version": "0.50.1",
+  "version": "0.62.0",
   "description": "Local history ingestion, storage, evidence, SDK, CLI and MCP server.",
   "license": "MIT",
   "private": false,
@@ -24,7 +24,15 @@
       "types": "./dist/relay-cli.d.ts",
       "default": "./dist/relay-cli.js"
     },
-    "./package.json": "./package.json"
+    "./package.json": "./package.json",
+    "./amp-source": {
+      "types": "./dist/amp-source.d.ts",
+      "default": "./dist/amp-source.js"
+    },
+    "./factory-source": {
+      "types": "./dist/factory-source.d.ts",
+      "default": "./dist/factory-source.js"
+    }
   },
   "keywords": [
     "mcp",
@@ -66,6 +74,8 @@
     "dist/handoff.*",
     "dist/source-contracts.*",
     "dist/source-plugins.*",
+    "dist/amp-source.*",
+    "dist/factory-source.*",
     "!dist/*.test.*"
   ],
   "repository": {

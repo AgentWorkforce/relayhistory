@@ -529,9 +529,7 @@ mod tests {
                 .unwrap();
             let plan = plan.join(" | ");
             assert!(
-                plan.contains(
-                    "idx_session_relationships_parent (source=? AND parent_session_id=?)"
-                ),
+                plan.contains("(source=? AND parent_session_id=?)"),
                 "the step does not seek by parent (analyze={analyze}): {plan}"
             );
             let plan: Vec<String> = conn
@@ -545,7 +543,7 @@ mod tests {
                 .unwrap();
             let plan = plan.join(" | ");
             assert!(
-                plan.contains("idx_session_relationships_child (source=? AND child_session_id=?)"),
+                plan.contains("(source=? AND child_session_id=?)"),
                 "the parent lookup does not seek by child (analyze={analyze}): {plan}"
             );
         }

@@ -72,6 +72,58 @@ pub trait ObjectStore: Send + Sync + Debug {
 are stored as `application/zstd` without `Content-Encoding`, so a presigned
 download returns the exact `.zst` object.
 
+## Scrubbing raw chunks
+
+`scrub` (feature `scrub`, on by default) removes PII and secrets from raw
+chunks **before** they are compressed and uploaded:
+
+- **Rules:** a byte-for-byte port of relayhistory-cloud's `scrubText`. It
+  catches private keys (PEM and PGP), home-directory usernames, bearer tokens,
+  provider and cloud keys, JWTs, OAuth query values, secret assignments, URL
+  credentials, email addresses, payment card numbers (issuer prefix, length
+  and Luhn) and phone numbers (`+` E.164, or North American with separators).
+  Matches become `[REDACTED]`; a card number held as a JSON integer becomes the
+  string `[REDACTED]`. Strings over 256 KiB (in UTF-16 units) are truncated
+  with an in-band marker, cut only after whitespace and never between digit
+  groups, so a secret is kept whole (and scrubbed) or dropped whole.
+- **Limit:** each string is scrubbed on its own. A secret split across two
+  strings, JSON values or records (a token streamed as separate deltas) is not
+  recognized, because neither part matches a rule.
+- **Spec:** the golden vectors in `tests/fixtures/scrub-golden-v2.json`. They
+  are generated from the TypeScript reference by relayhistory-cloud's
+  `test/scrub-golden.test.ts`, and both CIs check them. Refresh the fixture by
+  copying it from there; never edit it here. Bump `RULESET_VERSION` when it
+  changes.
+- **`scrub_chunk`:** works record by record. Each JSON record is parsed, every
+  string value and key is scrubbed, and the record is re-serialized with key
+  order and numbers preserved. A record that can't be parsed, or whose keys
+  collide after scrubbing, is replaced by a typed placeholder and is never
+  stored unscrubbed.
+- **Uploading:** raw chunks go through `scrub::seal`, the only sanctioned
+  path. `scrub_chunk` returns an opaque `ScrubbedChunk`;
+  `SealedChunk::seal` compresses and hashes it, giving the manifest entry's
+  **source** fields (`source_bytes`/`source_sha256` → `bytes`/`sha256`, the
+  unscrubbed range that drives offsets and epochs) and its **stored** fields
+  (`stored_bytes`, `stored_sha256`, `stored_raw_bytes`, `raw_sha256`), plus
+  `records` and the `raw.scrub` pair. `SealedChunk::new_chunk(start_offset)`
+  turns it into the manifest's `NewChunk`, and `record_sealed_scrub` sets
+  `raw.scrub` before the first chunk it covers; `put_raw_chunk` uploads it create-only
+  with `scrub-ruleset`, `scrub-version`, `raw-sha256` and `raw-bytes`
+  metadata. Neither type can be built from unscrubbed bytes, so a raw chunk
+  uploaded this way has always been scrubbed. The generic `ObjectStore::put`
+  still uploads anything; the delivery worker must not use it for raw chunks.
+  Scrubbing and sealing belong in that background worker, never on the local
+  ingest or read path.
+
+| Benchmark (release, `cargo bench --bench scrub`) | Result |
+| --- | --- |
+| 4 MiB realistic JSONL chunk | ~126 ms (~32 MiB/s, one core) |
+| 128 KiB `AAAA…` (the reference's past O(n²) case) | ~0.08 ms |
+
+Lookaround-free rules run on the linear-time `regex` engine. The four rules
+that need lookarounds use `fancy-regex` with a bounded backtrack budget; if a
+string exceeds it, the whole string is withheld (fail closed).
+
 ## Conformance suite
 
 `conformance::run_suite` (feature `conformance`) is the contract every adapter
@@ -106,6 +158,11 @@ runs all twelve against a real bucket with ambient credentials when
 
 - `FsStore`'s compare-and-swap lock is a host-local `flock`; do not share one
   directory between hosts over NFS.
+- `FsStore` refuses keys that traverse a symbolic link, checked when each
+  operation starts (and again at multipart commit). A concurrent writer
+  inside the root could still swap a directory for a link between the check
+  and the open, so the root must not be shared with untrusted writers.
+- Metadata values may not start or end with a space (HTTP strips them).
 - `FsStore::presign_get` returns a `file://` URL and cannot enforce the TTL.
 - GCS presigning needs a service-account key or ambient credentials with
   `iam.serviceAccounts.signBlob`; a vended bearer token alone returns

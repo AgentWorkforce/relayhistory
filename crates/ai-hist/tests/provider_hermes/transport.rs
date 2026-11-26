@@ -277,6 +277,34 @@ fn hermes_native_export_preserves_tool_identity_in_both_acquisition_orders() {
     }
 }
 #[test]
+fn imported_schema31_hydrates_after_schema32_upgrade() {
+    let origin = tempfile::tempdir().unwrap();
+    stage(origin.path());
+    let source = open(origin.path());
+    hydrate(&source);
+    let archive = export(origin.path());
+    let home = tempfile::tempdir().unwrap();
+    let store = open(home.path());
+    observe(&store);
+    apply(&store, records(&archive)).unwrap();
+    stage(home.path());
+    let db = rusqlite::Connection::open(home.path().join(".hermes/state.db")).unwrap();
+    db.execute("UPDATE schema_version SET version=32", [])
+        .unwrap();
+    hydrate(&store);
+    assert_location(home.path(), "both");
+    assert_same(&read(&store), &read(&source));
+    db.execute("UPDATE sessions SET title='changed'", [])
+        .unwrap();
+    let error = store
+        .hydrate(&reference(), HydrateOptions::default())
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("SHARED_EVIDENCE_CONFLICT"),
+        "{error}"
+    );
+}
+#[test]
 fn hermes_pre_intake_index_and_archive_work_without_reindexing() {
     let home = tempfile::tempdir().unwrap();
     let conn = rusqlite::Connection::open(home.path().join("ledger.db")).unwrap();
@@ -294,12 +322,22 @@ fn hermes_pre_intake_index_and_archive_work_without_reindexing() {
     let current = export(home.path());
     let old: Vec<HistoryExportRecord> =
         serde_json::from_str(include_str!("fixtures/pre-intake-export.json")).unwrap();
+    // A column the table gained since the archive was cut (`origin_kind`) is
+    // exported as null on these rows and nothing else differs: the change-feed
+    // contract for an appended column (`RestampScope::Valued`), which also
+    // leaves the revision head where it was (asserted below).
+    let current_payloads: Vec<serde_json::Map<String, serde_json::Value>> = records(&current)
+        .iter()
+        .zip(records(&old).iter())
+        .map(|(now, then)| without_appended_nulls(&now.payload, &then.payload))
+        .collect();
+    assert_eq!(records(&current).len(), records(&old).len());
     assert_eq!(
-        records(&current)
+        current_payloads,
+        records(&old)
             .iter()
-            .map(|r| &r.payload)
-            .collect::<Vec<_>>(),
-        records(&old).iter().map(|r| &r.payload).collect::<Vec<_>>()
+            .map(|r| r.payload.clone())
+            .collect::<Vec<_>>()
     );
     assert_eq!(
         store.head_revision().unwrap(),
@@ -552,4 +590,16 @@ fn hermes_local_only_history_rewrite_remains_allowed() {
     drop(native);
     hydrate(&store);
     assert_ne!(read(&store).prompts, original.prompts);
+}
+
+/// `now` without the keys `then` lacks whose value is null: columns appended
+/// after `then` was exported, holding nothing on this row.
+fn without_appended_nulls(
+    now: &serde_json::Map<String, serde_json::Value>,
+    then: &serde_json::Map<String, serde_json::Value>,
+) -> serde_json::Map<String, serde_json::Value> {
+    now.iter()
+        .filter(|(key, value)| then.contains_key(*key) || !value.is_null())
+        .map(|(key, value)| (key.clone(), value.clone()))
+        .collect()
 }

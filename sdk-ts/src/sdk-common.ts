@@ -2,7 +2,7 @@
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 
-export const SESSION_CATALOG_CONTRACT_VERSION = 6;
+export const SESSION_CATALOG_CONTRACT_VERSION = 7;
 export const SESSION_HYDRATION_CONTRACT_VERSION = 3;
 export const SESSION_RELATIONSHIP_CONTRACT_VERSION = 2;
 export const SESSION_EVIDENCE_CONTRACT_VERSION = 4;
@@ -33,6 +33,7 @@ export const SOURCES = Object.freeze([
   'codebuddy',
   'cortex',
   'deepagents',
+  'droid',
   'goose',
   'junie',
   'kilo',
@@ -41,6 +42,7 @@ export const SOURCES = Object.freeze([
   'vtcode',
   'grok-bot',
   'openclaw',
+  'capy',
 ] as const);
 // END GENERATED PROVIDER SOURCES
 

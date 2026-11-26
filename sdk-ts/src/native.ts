@@ -19,7 +19,7 @@ import {
   ConnectorFailureError,
 } from './sdk-common.js';
 
-export const NATIVE_CONTRACT_VERSION = 28;
+export const NATIVE_CONTRACT_VERSION = 30;
 type UnknownRecord = Record<string, unknown>;
 
 interface NativeBinding {
@@ -144,6 +144,7 @@ export const SESSION_STORE_OPS = Object.freeze({
   usageSummary: 'usage_summary',
   userTurns: 'user_turns',
   capabilities: 'capabilities',
+  setRegisteredAgentName: 'set_registered_agent_name',
   changes: 'changes',
   commitChanges: 'commit_changes',
 } as const);
@@ -158,6 +159,8 @@ export interface SessionStoreCallArgs {
   dbPath?: string;
   source: string;
   sessionId?: string;
+  /** `set_registered_agent_name` only: the name, or `null` to clear one. */
+  agentName?: string | null;
   limit?: number;
   /** `tsMs` may be null only for the ops whose keyset has an undated tail. */
   after?: { tsMs?: number | null; id: number };

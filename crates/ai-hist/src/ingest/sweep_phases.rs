@@ -254,7 +254,31 @@ impl SweepPhases<'_, '_> {
             &projects,
             self.coverage,
             scope.paths(),
-        );
+        )
+        .and_then(|transcripts| {
+            // Chats Cursor kept only in its own chat store, after the
+            // transcripts so a chat that has both is read from its transcript.
+            super::cursor_store::sync_chat_stores_in(
+                self.conn,
+                self.state,
+                &self.roots.home,
+                self.coverage,
+                scope.paths(),
+            )
+            .map(|stores| transcripts + stores)
+        })
+        .and_then(|read| {
+            // Conversations the Cursor editor kept only in its own database,
+            // last: a transcript or a chat store reads a composer first.
+            super::cursor_store::editor::sync_editor_composers_in(
+                self.conn,
+                self.state,
+                &self.roots.home,
+                self.coverage,
+                scope.paths(),
+            )
+            .map(|composers| read + composers)
+        });
         self.counted("cursor", result);
         Ok(())
     }
@@ -359,6 +383,11 @@ mod tests {
     #[test]
     fn every_local_source_has_a_phase() {
         for source in crate::store::SOURCE_CHOICES {
+            // Capy transcripts are uploaded to hosted History. This computer
+            // has no files for a sweep to read.
+            if *source == "capy" {
+                continue;
+            }
             assert!(
                 SWEEP_PHASE_SOURCES.contains(source) || crate::providers::adapter(source).is_some(),
                 "{source} has no sweep phase, so a scoped sweep could never read it"

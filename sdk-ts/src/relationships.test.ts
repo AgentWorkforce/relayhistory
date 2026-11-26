@@ -122,8 +122,8 @@ test('missing databases answer relationship queries with provider capabilities',
       children: [], nextCursor: null,
     });
     const cursor = await getSessionRelationships({ source: 'cursor', sessionId: 'root', dbPath });
-    assert.equal(cursor.capabilities.stableChildIdentity, 'never');
-    assert.equal(cursor.capabilities.recordsEvidenceLocator, false);
+    assert.equal(cursor.capabilities.stableChildIdentity, 'always');
+    assert.equal(cursor.capabilities.recordsEvidenceLocator, true);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

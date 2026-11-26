@@ -4,22 +4,36 @@ const SQL: &str = include_str!("../../../tests/fixtures/hermes/schema31.sql");
 const NATIVE: &str = "chat/not-a-uuid:α";
 const SESSION: &str = "default:636861742f6e6f742d612d757569643aceb1";
 fn fixture() -> (tempfile::TempDir, ProviderRoots, PathBuf, Connection) {
+    fixture_sql(SQL)
+}
+fn fixture_sql(sql: &str) -> (tempfile::TempDir, ProviderRoots, PathBuf, Connection) {
     let home = tempfile::tempdir().unwrap();
     let roots = ProviderRoots::from_home(home.path().into(), home.path().join("opencode.db"));
     let path = home.path().join(".hermes/state.db");
     std::fs::create_dir_all(path.parent().unwrap()).unwrap();
     let db = Connection::open(&path).unwrap();
-    db.execute_batch(SQL).unwrap();
+    db.execute_batch(sql).unwrap();
     (home, roots, path, db)
 }
 #[test]
 fn official_export_matches_captured_writer_messages() {
-    let (_home, roots, path, _db) = fixture();
+    assert_official_export(
+        SQL,
+        include_str!("../../../tests/fixtures/hermes/official-export.json"),
+    );
+}
+#[test]
+fn schema32_official_export_matches_captured_writer_messages() {
+    assert_official_export(
+        include_str!("../../../tests/fixtures/hermes/schema32.sql"),
+        include_str!("../../../tests/fixtures/hermes/official-export-schema32.json"),
+    );
+}
+fn assert_official_export(sql: &str, oracle: &str) {
+    let (_home, roots, path, _db) = fixture_sql(sql);
     let captured = storage::all(&AcquisitionContext::new(ID, &roots), &path).unwrap();
-    let oracle: Value = serde_json::from_str(include_str!(
-        "../../../tests/fixtures/hermes/official-export.json"
-    ))
-    .unwrap();
+    let oracle: Value = serde_json::from_str(oracle).unwrap();
+    assert_eq!(captured.len(), oracle.as_array().unwrap().len());
     assert_eq!(oracle[0]["input_tokens"], 1500);
     assert_eq!(oracle[0]["output_tokens"], 200);
     for s in captured {
@@ -132,12 +146,14 @@ fn missing_empty_unsupported_and_malformed_are_distinguished() {
     db.execute_batch("DELETE FROM messages; DELETE FROM sessions")
         .unwrap();
     assert!(storage::enumerate(&roots, None).unwrap().is_empty());
-    db.execute("UPDATE schema_version SET version=32", [])
-        .unwrap();
-    assert!(storage::enumerate(&roots, None)
-        .unwrap_err()
-        .to_string()
-        .contains("unsupported Hermes schema 32"));
+    for version in [30, 33] {
+        db.execute("UPDATE schema_version SET version=?", [version])
+            .unwrap();
+        assert!(storage::enumerate(&roots, None)
+            .unwrap_err()
+            .to_string()
+            .contains(&format!("unsupported Hermes schema {version}")));
+    }
     drop(db);
     std::fs::write(&path, b"not SQLite").unwrap();
     assert!(storage::enumerate(&roots, None).is_err());
@@ -244,6 +260,40 @@ fn sqlite_source_remains_read_only_and_spill_paths_are_only_text() {
         .query_row("PRAGMA journal_mode", [], |r| r.get(0))
         .unwrap();
     assert_eq!(before, after);
+}
+#[test]
+fn schema_upgrade_preserves_shared_metadata_but_rejects_content_rewrites() {
+    let (home, roots, path, db) = fixture();
+    let conn = crate::open_db(&home.path().join("ledger.db")).unwrap();
+    let mut session = storage::all(&AcquisitionContext::new(ID, &roots), &path)
+        .unwrap()
+        .into_iter()
+        .find(|s| s.native_id == NATIVE)
+        .unwrap();
+    normalize::session(&conn, &session, &path).unwrap();
+    conn.execute("UPDATE session_markers SET location='both' WHERE source='hermes' AND session_id=? AND marker_uid='session'", [SESSION]).unwrap();
+    let before: String = conn.query_row("SELECT payload_json FROM session_markers WHERE source='hermes' AND session_id=? AND marker_uid='session'", [SESSION], |r| r.get(0)).unwrap();
+    db.execute("UPDATE schema_version SET version=32", [])
+        .unwrap();
+    session = storage::all(&AcquisitionContext::new(ID, &roots), &path)
+        .unwrap()
+        .into_iter()
+        .find(|s| s.native_id == NATIVE)
+        .unwrap();
+    assert_eq!(
+        serde_json::to_value(&session).unwrap()["schema_version"],
+        32
+    );
+    normalize::session(&conn, &session, &path).unwrap();
+    let after: (String, String) = conn.query_row("SELECT payload_json,location FROM session_markers WHERE source='hermes' AND session_id=? AND marker_uid='session'", [SESSION], |r| Ok((r.get(0)?, r.get(1)?))).unwrap();
+    assert_eq!(after, (before.clone(), "both".into()));
+    session.title = Some("changed".into());
+    assert!(normalize::session(&conn, &session, &path)
+        .unwrap_err()
+        .to_string()
+        .contains("SHARED_EVIDENCE_CONFLICT"));
+    let retained: String = conn.query_row("SELECT payload_json FROM session_markers WHERE source='hermes' AND session_id=? AND marker_uid='session'", [SESSION], |r| r.get(0)).unwrap();
+    assert_eq!(retained, before);
 }
 #[test]
 fn rewritten_metadata_and_retired_events_preserve_remote_shares() {
@@ -532,7 +582,7 @@ fn deleted_sessions_retire_only_after_complete_selected_profile_capture() {
     assert_eq!(location, "remote");
     db.execute_batch("DELETE FROM messages; DELETE FROM sessions")
         .unwrap();
-    db.execute("UPDATE schema_version SET version=32", [])
+    db.execute("UPDATE schema_version SET version=33", [])
         .unwrap();
     run(&mut state, Some(&unrelated)).unwrap();
     assert!(run(&mut state, None).is_err());

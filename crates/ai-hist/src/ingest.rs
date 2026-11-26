@@ -7,6 +7,7 @@ use crate::{
     sync_opencode_storage_dir, HistoryEntry, NewSessionMarker, SessionLocation, SessionScope,
 };
 use anyhow::{Context, Result};
+use raw_facts::RawMessageFacts;
 use rusqlite::{params, Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
@@ -17,13 +18,17 @@ use std::io::{self, BufRead, BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+mod claude_owner;
 mod claude_record_rows;
 mod claude_standalone;
 pub(crate) mod claude_title;
+mod claude_untimed;
 pub(crate) mod codex;
 mod codex_capture;
 mod codex_subagent;
 pub(crate) mod codex_thread_names;
+mod codex_untimed;
+use codex_untimed::UnwrittenCodexLine;
 mod codex_usage;
 pub(crate) mod cold_read;
 pub(crate) mod control;
@@ -38,6 +43,7 @@ mod grok_unified;
 pub(crate) mod hook;
 pub(crate) mod hydrate;
 mod images;
+mod raw_facts;
 pub(crate) use images::image_markdown;
 pub(crate) mod incremental;
 pub(crate) mod jsonl;
@@ -52,6 +58,8 @@ pub(crate) mod tool_result_facts;
 pub(crate) mod transcript_cursor;
 pub(crate) mod transcript_file;
 
+use claude_owner::claude_file_session_id;
+pub(crate) use claude_owner::{claude_primary_stem, claude_sessionless_owner};
 use event_insert::insert_session_event;
 pub(crate) use evidence_probe::note_deleted;
 use evidence_probe::{
@@ -61,11 +69,13 @@ use evidence_probe::{
 use evidence_probe::{CLAUDE_SIDECAR_EVIDENCE_SQL, CLAUDE_TRANSCRIPT_EVENTS_SQL};
 pub(crate) use sweep_write::SweepWrite;
 
+pub(crate) use titles::set_claude_first_prompt;
 use titles::set_session_title;
 
 #[cfg(test)]
 use claude_record_rows::{delete_claude_record_rows, CLAUDE_RECORD_ROWS};
 use claude_record_rows::{heal_claude_record_rows, HealedRows};
+use claude_record_rows::{insert_unknown_record_marker, retire_claude_history_row};
 use claude_standalone::{
     claude_record_stores_no_event, claude_thinking_event_text, ClaudeRecordWalk,
     CLAUDE_STANDALONE_RECORDS_GENERATION,
@@ -144,17 +154,28 @@ pub(crate) use path_capture::{reconcile_pending, sync_facade_tick};
 // After `sync_note!`, which it uses.
 mod codex_history;
 // After `sync_note!`, which an unreadable rollout reports through.
+#[cfg(test)]
+mod catalog_time_tests;
 mod fork_replay;
+#[cfg(test)]
+mod idle_sweep_tests;
 mod jsonl_sync_steps;
 mod rederived;
 mod rollout_head;
+mod subagent_cleanup;
 use fork_replay::{inherited_baseline_verdict, record_codex_fork_replay, ForkReplaySpan};
 use jsonl_sync_steps::{cursor_scan_checkpoint, insert_history_line, settle_unchanged_jsonl};
 pub(crate) use rollout_head::read_codex_session_meta;
 #[cfg(test)]
 use rollout_head::LEADING_BYTE_LIMIT;
 use rollout_head::{read_codex_session_meta_counted, read_leading_records};
+use subagent_cleanup::{
+    cleanup_codex_subagent_history, cleanup_codex_subagent_registration,
+    cleanup_subagent_registration, codex_session_has_remote_presence, session_has_remote_presence,
+};
 // After `sync_note!`, which the repair note uses.
+pub(crate) mod cursor_store;
+pub(crate) mod provider_diagnostics;
 pub(crate) mod scoped_files;
 #[cfg(test)]
 pub(crate) use scoped_files::take_dirs_read;
@@ -365,10 +386,7 @@ pub fn sync_tick_at_with_roots(
     output: SyncOutput,
     force: bool,
 ) -> Result<SyncTick> {
-    SYNC_QUIET.store(
-        matches!(output, SyncOutput::Silent),
-        AtomicOrdering::Relaxed,
-    );
+    quiet_unless(output);
     sync_exclusive_with_roots(db_path, roots, force)
 }
 
@@ -382,10 +400,7 @@ pub fn sync_tick_at(
     output: SyncOutput,
     force: bool,
 ) -> Result<SyncTick> {
-    SYNC_QUIET.store(
-        matches!(output, SyncOutput::Silent),
-        AtomicOrdering::Relaxed,
-    );
+    quiet_unless(output);
     if scope == SessionScope::Remote {
         remote::ensure_selected_remote_connectors_configured_for_at(
             "sync",
@@ -437,6 +452,14 @@ pub enum SyncOutput {
     Progress,
 }
 
+/// Quiet unless the caller asked for progress.
+fn quiet_unless(output: SyncOutput) {
+    SYNC_QUIET.store(
+        matches!(output, SyncOutput::Silent),
+        AtomicOrdering::Relaxed,
+    );
+}
+
 /// Scoped ingestion with an explicitly chosen progress destination. Embedded
 /// callers should use `sync_scoped_at_with_connectors`, which is always silent.
 pub fn sync_scoped_at_with_output(
@@ -445,10 +468,7 @@ pub fn sync_scoped_at_with_output(
     connectors: &remote::SourceConnectorSelection,
     output: SyncOutput,
 ) -> Result<bool> {
-    SYNC_QUIET.store(
-        matches!(output, SyncOutput::Silent),
-        AtomicOrdering::Relaxed,
-    );
+    quiet_unless(output);
     sync_scope_with_connectors(db_path, scope, connectors)
 }
 
@@ -457,10 +477,7 @@ pub fn sync_scoped_at_with_output(
 /// `source_path` is named outright, so it is the only database read — its
 /// channel siblings are not. [`sync_opencode_with_roots`] reads them.
 pub fn sync_opencode_at(db_path: &Path, source_path: &Path, output: SyncOutput) -> Result<bool> {
-    SYNC_QUIET.store(
-        matches!(output, SyncOutput::Silent),
-        AtomicOrdering::Relaxed,
-    );
+    quiet_unless(output);
     sync_opencode_exclusive(db_path, source_path, true, &default_opencode_storage_dir())
 }
 
@@ -472,10 +489,7 @@ pub fn sync_opencode_with_roots(
     roots: &crate::ProviderRoots,
     output: SyncOutput,
 ) -> Result<bool> {
-    SYNC_QUIET.store(
-        matches!(output, SyncOutput::Silent),
-        AtomicOrdering::Relaxed,
-    );
+    quiet_unless(output);
     sync_opencode_exclusive(
         db_path,
         &roots.opencode_db,
@@ -779,8 +793,8 @@ const SWEEP_PARSER_GENERATIONS: &[&str] = &[
 /// that output changes, so the first sweep after an upgrade re-reads stores
 /// the source fingerprint would otherwise call unchanged. `v2` makes every
 /// assistant message evidence (step-only and reasoning-only messages, thinking
-/// blocks, `synthetic` control rows).
-const OPENCODE_NORMALIZER_GENERATION: &str = "opencode_normalizer_v2";
+/// blocks, `synthetic` control rows). `v3` reads OpenCode 2's own tables.
+const OPENCODE_NORMALIZER_GENERATION: &str = "opencode_normalizer_v3";
 
 /// The generation half of a stored fingerprint: what this build of the sweep
 /// would produce from a given tree, independent of the tree itself.
@@ -2598,21 +2612,6 @@ impl SyncTick {
     /// The sweep was skipped because no provider source had moved.
     pub fn skipped_unchanged(&self) -> bool {
         self.attempted && !self.swept
-    }
-}
-
-/// How the watch loop reads a sweep's result.
-///
-/// One conversion rather than one per caller: a tick that never took the lock
-/// looked at nothing, and a caller that folded that into `skipped_unchanged`
-/// would be telling the loop the change had been considered and dismissed.
-impl From<SyncTick> for crate::watch::TickOutcome {
-    fn from(tick: SyncTick) -> Self {
-        Self {
-            swept: tick.swept,
-            skipped_unchanged: tick.skipped_unchanged(),
-            contended: !tick.attempted,
-        }
     }
 }
 
@@ -4480,99 +4479,6 @@ fn sync_codex_with_repairs_and_coverage(
 /// database or an older guardian classification also forces re-ingestion.
 type CodexRolloutWalk = (HashMap<String, String>, HashMap<String, String>, usize);
 
-/// Reconcile the catalog registration for a locally observed subagent.
-///
-/// A local-only subagent stays out of the catalog. If the same canonical
-/// session was separately discovered remotely, its retained local events are
-/// also local evidence, so both presences and the canonical row must survive.
-///
-/// Deleting a `sessions` row fires `delete_session_hydration_state`, which
-/// cascades away every relationship the row takes part in — as parent as well
-/// as child. Undoing a subagent's registration is not that session going away,
-/// so the observed delegation evidence, including the thread's own outgoing
-/// edges, is carried across the delete. The trigger itself cannot be narrowed
-/// instead: `CREATE TRIGGER IF NOT EXISTS` never replaces the one an existing
-/// database already has.
-fn cleanup_subagent_registration(conn: &Connection, source: &str, session_id: &str) -> Result<()> {
-    conn.execute(
-        "DELETE FROM session_presences \
-         WHERE source = ? AND session_id = ? AND location = 'local' \
-           AND NOT EXISTS (\
-             SELECT 1 FROM session_presences \
-             WHERE source = ? AND session_id = ? AND location = 'remote'\
-           )",
-        params![source, session_id, source, session_id],
-    )?;
-    conn.execute_batch(
-        "CREATE TEMP TABLE IF NOT EXISTS retained_relationships \
-           AS SELECT * FROM session_relationships WHERE 0; \
-         DELETE FROM retained_relationships;",
-    )?;
-    // One seek per end of the edge; see `session_continuity_edges`.
-    conn.execute(
-        "INSERT INTO retained_relationships \
-         SELECT * FROM session_relationships WHERE source = ?1 AND parent_session_id = ?2 \
-         UNION ALL \
-         SELECT * FROM session_relationships \
-         WHERE source = ?1 AND child_session_id = ?2 AND parent_session_id <> ?2",
-        params![source, session_id],
-    )?;
-    let sessions = conn.execute(
-        "DELETE FROM sessions \
-         WHERE source = ? AND session_id = ? \
-           AND NOT EXISTS (\
-             SELECT 1 FROM session_presences \
-             WHERE source = ? AND session_id = ?\
-           )",
-        params![source, session_id, source, session_id],
-    )?;
-    conn.execute_batch(
-        "INSERT OR IGNORE INTO session_relationships SELECT * FROM retained_relationships; \
-         DELETE FROM retained_relationships;",
-    )?;
-    // Only the session delete drops evidence the probes join; a presence is
-    // not. Releasing on every changed delegated-thread rollout re-read every
-    // evidence key once per thread.
-    evidence_probe::note_deleted(conn, "sessions", sessions);
-    Ok(())
-}
-
-fn cleanup_codex_subagent_registration(conn: &Connection, session_id: &str) -> Result<()> {
-    cleanup_subagent_registration(conn, "codex", session_id)
-}
-
-fn codex_session_has_remote_presence(conn: &Connection, session_id: &str) -> Result<bool> {
-    session_has_remote_presence(conn, "codex", session_id)
-}
-
-/// Whether a session is also known remotely. Local and remote evidence share
-/// one `(source, session_id)` identity, so a local re-read must not delete
-/// rows a remote observation put there.
-fn session_has_remote_presence(conn: &Connection, source: &str, session_id: &str) -> Result<bool> {
-    conn.query_row(
-        "SELECT EXISTS(\
-           SELECT 1 FROM session_presences \
-           WHERE source = ? AND session_id = ? AND location = 'remote'\
-         )",
-        params![source, session_id],
-        |row| row.get(0),
-    )
-    .map_err(Into::into)
-}
-
-/// Remove prompt history that an older local sync incorrectly attributed to a
-/// subagent. A remote presence makes the history canonical shared evidence, so
-/// it must not be destroyed by a later local scan.
-fn cleanup_codex_subagent_history(conn: &Connection, session_id: &str) -> Result<()> {
-    if !codex_session_has_remote_presence(conn, session_id)? {
-        conn.execute(
-            "DELETE FROM history WHERE source = 'codex' AND session_id = ?",
-            [session_id],
-        )?;
-    }
-    Ok(())
-}
-
 #[cfg(test)]
 fn sync_codex_rollouts(
     conn: &Connection,
@@ -5863,13 +5769,12 @@ fn ingest_codex_rollout_incremental(
         rotated: reader.rotated,
         ..Default::default()
     };
-    let resume = if reader.start_offset() == 0 {
-        transcript_cursor::CodexCursorState::default()
-    } else {
-        cursor.codex.clone().unwrap_or_default()
-    };
     let start_offset = reader.start_offset();
     outcome.from_start = start_offset == 0;
+    // The state the pass resumes with, and the time an untimed line inherits,
+    // carried across passes.
+    let (resume, mut clock, prefix_bytes) =
+        codex_untimed::LineClock::resume(&mut reader, cursor.codex.as_ref())?;
     let mut model: Option<String> = resume.model.clone();
     // The baseline the next delta is measured against, and the span and
     // generation counters, continue across passes. The rest of the usage
@@ -6012,15 +5917,7 @@ fn ingest_codex_rollout_incremental(
             continue;
         };
         let line_type = value.get("type").and_then(Value::as_str).unwrap_or("");
-        let ts_ms = value
-            .get("timestamp")
-            .and_then(Value::as_str)
-            .and_then(parse_iso_ms)
-            .unwrap_or(0);
-        if ts_ms > 0 {
-            outcome.first_ts.get_or_insert(ts_ms);
-            outcome.last_ts = Some(outcome.last_ts.map_or(ts_ms, |last| last.max(ts_ms)));
-        }
+        let (own_ts, line_ts) = clock.observe(&value, &mut outcome);
         let payload_type = payload.get("type").and_then(Value::as_str).unwrap_or("");
         let payload_str = |key: &str| payload.get(key).and_then(Value::as_str);
         // Settle the previous line before starting this one. `total_changes`
@@ -6040,7 +5937,9 @@ fn ingest_codex_rollout_incremental(
             codex::ReplayStep::Outside => {}
             codex::ReplayStep::Replay => {
                 fork_replay
-                    .get_or_insert_with(|| ForkReplaySpan::new(index, ts_ms, replay_gate.opening()))
+                    .get_or_insert_with(|| {
+                        ForkReplaySpan::new(index, line_ts, replay_gate.opening())
+                    })
                     .absorb(index, &value, payload);
                 continue;
             }
@@ -6069,23 +5968,20 @@ fn ingest_codex_rollout_incremental(
                 }
             }
         }
+        // Nothing to inherit: see `codex_untimed::resolve_line_ts`.
+        let Some(ts_ms) = codex_untimed::resolve_line_ts(
+            conn,
+            session_id,
+            (index, &value, line_ts),
+            &mut unwritten_line,
+        )?
+        else {
+            changes_before_line = conn.total_changes();
+            continue;
+        };
         // A state-only line is never registered: it writes no row by design,
         // and the allocation would land on the highest-volume lines in the file.
-        unwritten_line = (!codex_line_is_state_only(line_type, payload_type, payload)).then(|| {
-            UnwrittenCodexLine {
-                index,
-                ts_ms,
-                subkind: if payload_type.is_empty() {
-                    line_type.to_string()
-                } else {
-                    payload_type.to_string()
-                },
-                turn_id: payload
-                    .get("turn_id")
-                    .and_then(Value::as_str)
-                    .map(str::to_string),
-            }
-        });
+        unwritten_line = UnwrittenCodexLine::unless_state_only(index, Some(ts_ms), &value);
         // Lifecycle, compaction, streaming-failure and begin-side tool lines
         // are not messages, so none of the arms below can hold them. Classify
         // every line once, here, and keep whatever the event model drops.
@@ -6180,6 +6076,7 @@ fn ingest_codex_rollout_incremental(
                 outcome
                     .first_prompt
                     .get_or_insert_with(|| message.text.chars().take(4096).collect());
+                codex_untimed::retire_history_at_zero(conn, session_id, own_ts, &message.text)?;
                 outcome.prompts += insert_history(
                     conn,
                     &HistoryEntry {
@@ -6560,6 +6457,8 @@ fn ingest_codex_rollout_incremental(
                                 inherited_baseline_marker: inherited_baseline_marker.clone(),
                                 state_markers: CODEX_STATE_MARKER_GENERATION,
                                 fork_replay: CODEX_FORK_REPLAY_GENERATION,
+                                record_ts: clock.last,
+                                record_ts_from_start: true,
                             },
                         );
                     }
@@ -6899,16 +6798,9 @@ fn ingest_codex_rollout_incremental(
         .saturating_sub(start_offset)
         .saturating_add(reader.tail_bytes())
         .saturating_add(pass.validation_bytes)
-        .saturating_add(probe_bytes);
+        .saturating_add(probe_bytes)
+        .saturating_add(prefix_bytes);
     Ok((outcome, pass))
-}
-
-/// One Codex rollout line that has not yet been shown to write anything.
-struct UnwrittenCodexLine {
-    index: usize,
-    ts_ms: i64,
-    subkind: String,
-    turn_id: Option<String>,
 }
 
 /// Record a line that claimed to be modeled and then stored nothing.
@@ -6937,7 +6829,7 @@ fn flush_unwritten_codex_line(
         session_id,
         &NewSessionMarker {
             marker_uid: &marker_uid,
-            ts_ms: (line.ts_ms != 0).then_some(line.ts_ms),
+            ts_ms: line.ts_ms,
             message_id: None,
             parent_id: None,
             turn_id: line.turn_id.as_deref(),
@@ -7973,6 +7865,8 @@ pub(crate) struct ClaudeSessionMeta {
     first_prompt: Option<String>,
     /// The name Claude Code gave the session; see [`claude_title`].
     title: Option<String>,
+    /// The latest `agent-name` record, kept apart from the title.
+    agent_name: Option<String>,
     /// This file is a delegated sidecar rather than a session of its own: it
     /// is named as one ([`is_claude_sidecar_file`]) and every identified
     /// record is a sidechain row — the same rule discovery uses to keep
@@ -8044,11 +7938,21 @@ pub(crate) struct ClaudeMetaFold {
     /// Two different `sessionId` values were seen in one transcript.
     #[serde(default)]
     pub conflicting_session_ids: bool,
+    /// The session that owns the file: its stem, for a primary transcript.
+    /// A resumed or forked conversation starts by copying its origin's
+    /// records, so a primary transcript can name two sessions; the one it is
+    /// named after owns it, and the other's records are inherited history.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    /// The owner's records alone, split off at the first record naming
+    /// another session. `None` while every identified record is the owner's,
+    /// when this fold already is the owner's.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owned: Option<Box<ClaudeMetaFold>>,
 }
 
 impl ClaudeMetaFold {
-    /// Fold one record in. Must be called in file order, once per record.
-    pub(crate) fn observe(&mut self, value: &Value) {
+    pub(super) fn observe_record(&mut self, value: &Value) {
         if let Some(object) = value.as_object() {
             self.continuity_any = true;
             crate::continuity::fold_claude_record(
@@ -8159,9 +8063,7 @@ impl ClaudeMetaFold {
         }
     }
 
-    /// The session the transcript at `path` describes, or `None` when no
-    /// record named one.
-    pub(crate) fn finish(&self, path: &Path) -> Option<ClaudeSessionMeta> {
+    pub(super) fn finish_own(&self, path: &Path) -> Option<ClaudeSessionMeta> {
         let session_id = self.session_id.clone()?;
         let first = self.first_ts.unwrap_or(0);
         Some(ClaudeSessionMeta {
@@ -8174,6 +8076,7 @@ impl ClaudeMetaFold {
             last_assistant_text: self.last_assistant_text.clone(),
             first_prompt: self.first_prompt.clone(),
             title: self.titles.best(),
+            agent_name: self.titles.agent_name.clone(),
             subagent: is_claude_sidecar_file(path)
                 && claude_records_are_all_sidechain(
                     self.identified_records,
@@ -8250,102 +8153,13 @@ impl ClaudeScanPass {
     }
 }
 
-/// Retire the history row the previous parser wrote for a record this
-/// session now stores differently, without erasing another session's prompt.
-///
-/// `history` is unique on `(source, timestamp_ms, prompt)` with no session in
-/// the key, so a task notification in one session and a human prompt with the
-/// same text at the same millisecond in another are one row, owned by
-/// whichever transcript was read first. Deleting that row outright when the
-/// owner turns out to be control would erase the other session's prompt --
-/// its own re-read had already been ignored by the unique key -- so before
-/// the delete, the row is handed to a session that has a substantive user
-/// text event at that instant with that text. Only when no such session
-/// exists is it deleted. The lookup runs only when this session actually owns
-/// such a row, which outside the one-time re-read is never.
-fn retire_claude_history_row(
-    conn: &Connection,
-    session_id: &str,
-    ts_ms: i64,
-    raw: &str,
-) -> Result<()> {
-    let owned: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM history \
-         WHERE source = 'claude' AND session_id = ?1 AND timestamp_ms = ?2 AND prompt = ?3)",
-        params![session_id, ts_ms, raw],
-        |row| row.get(0),
-    )?;
-    if !owned {
-        return Ok(());
-    }
-    let handed_over = conn.execute(
-        "UPDATE history SET session_id = ( \
-             SELECT e.session_id FROM session_events e \
-             WHERE e.source = 'claude' AND e.session_id <> ?1 AND e.ts_ms = ?2 \
-               AND e.role = 'user' AND e.kind = 'text' AND e.control_kind IS NULL \
-               AND TRIM(e.text) = ?3 \
-             ORDER BY e.session_id LIMIT 1), \
-           project = COALESCE(( \
-             SELECT e.project FROM session_events e \
-             WHERE e.source = 'claude' AND e.session_id <> ?1 AND e.ts_ms = ?2 \
-               AND e.role = 'user' AND e.kind = 'text' AND e.control_kind IS NULL \
-               AND TRIM(e.text) = ?3 \
-             ORDER BY e.session_id LIMIT 1), project) \
-         WHERE source = 'claude' AND session_id = ?1 AND timestamp_ms = ?2 AND prompt = ?3 \
-           AND EXISTS( \
-             SELECT 1 FROM session_events e \
-             WHERE e.source = 'claude' AND e.session_id <> ?1 AND e.ts_ms = ?2 \
-               AND e.role = 'user' AND e.kind = 'text' AND e.control_kind IS NULL \
-               AND TRIM(e.text) = ?3)",
-        params![session_id, ts_ms, raw],
-    )?;
-    if handed_over == 0 {
-        conn.execute(
-            "DELETE FROM history \
-             WHERE source = 'claude' AND session_id = ?1 AND timestamp_ms = ?2 AND prompt = ?3",
-            params![session_id, ts_ms, raw],
-        )?;
-    }
-    Ok(())
-}
-
-/// Record what the whole-transcript fold found as the session's first prompt.
-///
-/// The shallow catalog upsert coalesces a null `first_prompt` into whatever
-/// the row already holds, because a shallow or remote read may simply not
-/// have seen the prompt. The metadata fold has seen every record, so its
-/// answer replaces the row's -- including with null. Without that, a session
-/// whose stored title was a row the classifier now types as control (a bare
-/// `/resume <id>`, a task notification) would keep it for good on an upgraded
-/// install, while a fresh database stores nothing.
-pub(crate) fn set_claude_first_prompt(
-    conn: &Connection,
-    meta: &ClaudeSessionMeta,
-    path: &Path,
-) -> Result<()> {
-    // Every sibling transcript is folded. The prompt and title stay with the
-    // file the catalog row names; `upsert_session` has already kept or claimed
-    // that file, so this compares the path and does not stat again.
-    let recorded = path.to_string_lossy();
-    if !crate::catalog_owner::recorded_path_is(conn, "claude", &meta.session_id, recorded.as_ref())?
-    {
-        return Ok(());
-    }
-    conn.execute(
-        "UPDATE sessions SET first_prompt = ?1 WHERE source = 'claude' AND session_id = ?2",
-        params![meta.first_prompt, meta.session_id],
-    )?;
-    set_session_title(conn, "claude", &meta.session_id, meta.title.as_deref())?;
-    Ok(())
-}
-
 /// The same metadata fold, over bytes the lifecycle hook already captured.
 ///
 /// The hook hands over what it read, so there is no file to walk and no
 /// position to keep. It folds through `ClaudeMetaFold` like every other
 /// reader, so what a record means cannot differ between the two.
 fn scan_claude_session_text(path: &Path, text: &str) -> Result<Option<ClaudeSessionMeta>> {
-    let mut fold = ClaudeMetaFold::default();
+    let mut fold = ClaudeMetaFold::for_path(path);
     for line in text.lines() {
         check_capture_cancelled()?;
         let Ok(value) = serde_json::from_str::<Value>(line) else {
@@ -8354,7 +8168,7 @@ fn scan_claude_session_text(path: &Path, text: &str) -> Result<Option<ClaudeSess
         fold.observe(&value);
     }
     anyhow::ensure!(
-        !fold.conflicting_session_ids,
+        !fold.has_conflicting_identity(),
         "conflicting sessionId values in Claude transcript {}",
         path.display()
     );
@@ -8368,14 +8182,17 @@ fn ingest_claude_transcript_text_as(
     text: &str,
     attributed_session_id: Option<&str>,
 ) -> Result<()> {
-    let file_session_id = text.lines().find_map(|line| {
-        serde_json::from_str::<Value>(line)
-            .ok()?
-            .get("sessionId")?
-            .as_str()
-            .filter(|id| !id.is_empty())
-            .map(str::to_string)
-    });
+    let file_session_id = claude_sessionless_owner(
+        path,
+        text.lines().filter_map(|line| {
+            serde_json::from_str::<Value>(line)
+                .ok()?
+                .get("sessionId")?
+                .as_str()
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+        }),
+    );
     let mut walk = ClaudeRecordWalk::new(
         conn,
         path,
@@ -8397,10 +8214,15 @@ pub(crate) fn scan_claude_session_file_resumed(
     let mut reader =
         transcript_cursor::TranscriptReader::open(path, saved.file.as_ref(), saved.resume_from)?;
     let mut fold = if reader.start_offset() == 0 {
-        ClaudeMetaFold::default()
+        ClaudeMetaFold::for_path(path)
     } else {
         saved.fold.clone()
     };
+    // A fold saved before ownership was recorded resumes owned by the stem;
+    // `observe` splits the owner's records off only from the next foreign one.
+    if fold.owner.is_none() {
+        fold.owner = claude_primary_stem(path);
+    }
     let start_offset = reader.start_offset();
     let mut resume_from = None;
     let mut line = String::new();
@@ -8460,12 +8282,11 @@ pub(crate) fn scan_claude_session_file_resumed(
         .saturating_add(reader.tail_bytes())
         .saturating_add(validation_bytes);
     anyhow::ensure!(
-        !fold.conflicting_session_ids,
+        !fold.has_conflicting_identity(),
         "conflicting sessionId values in Claude transcript {}",
         path.display()
     );
-    let continuity =
-        crate::continuity::finish_claude_fold(fold.continuity.clone(), fold.continuity_any, path);
+    let continuity = fold.finish_continuity(path);
     Ok(ClaudeScanPass {
         meta: fold.finish(path),
         bytes_read,
@@ -8949,36 +8770,6 @@ fn ingest_claude_transcript_as(
     walk.finish()
 }
 
-/// The first in-log session id a transcript carries.
-///
-/// Read ahead of the record walk, and bounded in the case that matters: the
-/// id is normally on the first record, and this stops at the first one that
-/// has it.
-fn claude_file_session_id(path: &Path) -> Result<Option<String>> {
-    let file = fs::File::open(path)
-        .with_context(|| format!("reading claude transcript {}", path.display()))?;
-    let mut reader = BufReader::new(file);
-    let mut raw = Vec::new();
-    loop {
-        raw.clear();
-        if reader.read_until(b'\n', &mut raw)? == 0 {
-            return Ok(None);
-        }
-        let Ok(line) = std::str::from_utf8(&raw) else {
-            continue;
-        };
-        if let Some(id) = serde_json::from_str::<Value>(line.trim_end_matches(['\n', '\r']))
-            .ok()
-            .as_ref()
-            .and_then(|value| value.get("sessionId"))
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())
-        {
-            return Ok(Some(id.to_string()));
-        }
-    }
-}
-
 /// What one Claude transcript threads through its records, whichever reader
 /// walks it.
 ///
@@ -8996,7 +8787,33 @@ struct ClaudeFileParse<'a> {
     file_session_id: Option<&'a str>,
     indexer: &'a mut tool_result_facts::ToolResultIndexer,
     last_assistant_cache_read: &'a mut HashMap<String, i64>,
+    /// The time of the latest record that reported one, per session; see
+    /// [`claude_untimed::ClaudeRecordTime`] for why a record without one
+    /// inherits it.
+    last_record_ts: &'a mut HashMap<String, i64>,
     triads: &'a mut control::SlashCommandTriads,
+}
+
+/// Record the cache read an assistant message reported, the size a later
+/// compaction boundary is measured against, or forget it when it reported
+/// none.
+fn note_assistant_cache_read(
+    last_assistant_cache_read: &mut HashMap<String, i64>,
+    session_id: &str,
+    message: Option<&Map<String, Value>>,
+) {
+    match message
+        .and_then(|m| m.get("usage"))
+        .and_then(|usage| usage.get("cache_read_input_tokens"))
+        .and_then(Value::as_i64)
+    {
+        Some(cache_read) => {
+            last_assistant_cache_read.insert(session_id.to_string(), cache_read);
+        }
+        None => {
+            last_assistant_cache_read.remove(session_id);
+        }
+    }
 }
 
 /// Index one Claude transcript record.
@@ -9024,6 +8841,7 @@ fn ingest_claude_record(
         file_session_id,
         ref mut indexer,
         ref mut last_assistant_cache_read,
+        ref mut last_record_ts,
         ref mut triads,
     } = *file;
     let stem = path
@@ -9107,10 +8925,12 @@ fn ingest_claude_record(
             .is_none();
     // ts_ms, role, model and token spend feed the legacy heal below;
     // they only read the record.
-    let ts_ms = obj
-        .get("timestamp")
-        .and_then(|v| v.as_str().and_then(parse_iso_ms).or_else(|| v.as_i64()))
-        .unwrap_or(0);
+    //
+    // A record that reports no time of its own inherits the time of the
+    // nearest preceding record of its session that did, and is never stored
+    // at 0; see `ClaudeRecordTime`.
+    let time = claude_untimed::ClaudeRecordTime::resolve(obj, session_id, last_record_ts);
+    let ts_ms = time.ts_ms;
     let message_role = message
         .and_then(|m| m.get("role"))
         .and_then(Value::as_str)
@@ -9150,6 +8970,11 @@ fn ingest_claude_record(
         control_kind: None,
         // Set below, once the request's usage is settled.
         record_token_json: None,
+        // Who wrote the message: a person at the prompt, a peer agent, or a
+        // background task's notification. Kept verbatim so a reader can tell
+        // human-typed messages from agent-to-agent traffic without the
+        // transcript.
+        origin_kind: control::origin_kind(obj),
     };
     // A notice Claude Code wrote itself, not model output; see
     // `is_claude_synthetic_placeholder_model`.
@@ -9158,18 +8983,7 @@ fn ingest_claude_record(
     // A notice's zeroed usage is not the context the last real response
     // reported, so it neither sets nor clears the compaction size.
     if message_role == "assistant" && !sidechain && !synthetic {
-        match message
-            .and_then(|m| m.get("usage"))
-            .and_then(|usage| usage.get("cache_read_input_tokens"))
-            .and_then(Value::as_i64)
-        {
-            Some(cache_read) => {
-                last_assistant_cache_read.insert(session_id.to_string(), cache_read);
-            }
-            None => {
-                last_assistant_cache_read.remove(session_id);
-            }
-        }
+        note_assistant_cache_read(last_assistant_cache_read, session_id, message);
     }
     // Heal what an earlier parser version wrote for this record: it
     // attributed every sidechain row to the parent. Re-reading the file
@@ -9182,21 +8996,19 @@ fn ingest_claude_record(
     // unique or preserved: the live index cannot identify them after a
     // rewrite.
     if session_id != record_session_id {
-        heal_claude_record_rows(conn, record_session_id, message_uuid, HealedRows::All)?;
-        if id_less {
-            heal_legacy_positional_record(
-                conn,
-                record_session_id,
-                stem,
-                ts_ms,
-                ClaudeRecordParts {
-                    message,
-                    message_role,
-                    model,
-                    token_json: token_json.as_deref(),
-                },
-            )?;
-        }
+        claude_record_rows::heal_record_under_parent(
+            conn,
+            record_session_id,
+            message_uuid,
+            stem,
+            id_less.then_some(time.stored_before()),
+            ClaudeRecordParts {
+                message,
+                message_role,
+                model,
+                token_json: token_json.as_deref(),
+            },
+        )?;
     }
     if synthetic {
         // An earlier parser stored the notice as assistant output under this
@@ -9229,7 +9041,7 @@ fn ingest_claude_record(
             session_id,
             &NewSessionMarker {
                 marker_uid: &marker_uid,
-                ts_ms: (ts_ms != 0).then_some(ts_ms),
+                ts_ms,
                 message_id: Some(message_uuid),
                 parent_id,
                 turn_id: None,
@@ -9296,7 +9108,7 @@ fn ingest_claude_record(
             session_id,
             &NewSessionMarker {
                 marker_uid: &marker_uid,
-                ts_ms: (ts_ms != 0).then_some(ts_ms),
+                ts_ms,
                 message_id: Some(message_uuid),
                 parent_id: draft.parent_id.as_deref().or(parent_id),
                 turn_id: draft.turn_id.as_deref(),
@@ -9315,6 +9127,21 @@ fn ingest_claude_record(
     // sidecar, where every record is a sidechain, and it is read the same
     // way there.
     let system_record = obj.get("type").and_then(Value::as_str) == Some("system");
+    let Some(ts_ms) = ts_ms else {
+        return claude_untimed::keep_untimed_record(
+            conn,
+            claude_untimed::UntimedRecord {
+                session_id,
+                message_uuid,
+                parent_id,
+                obj,
+                message,
+                human_role: message_role == "user",
+                sidechain,
+                has_marker: record_rows > 0,
+            },
+        );
+    };
     if system_record {
         if let Some(tool_facts) = tool_result_facts::claude_subagent_notification_facts(obj) {
             let tool_use_id = tool_facts.tool_use_id.clone().unwrap_or_default();
@@ -9390,7 +9217,7 @@ fn ingest_claude_record(
                 conn,
                 session_id,
                 message_uuid,
-                ts_ms,
+                Some(ts_ms),
                 parent_id,
                 obj.get("type").and_then(Value::as_str).unwrap_or(""),
             )?;
@@ -9433,6 +9260,9 @@ fn ingest_claude_record(
         if !raw.is_empty() && current != Some(raw) {
             retire_claude_history_row(conn, session_id, ts_ms, raw)?;
         }
+        // A row an earlier parser stored at 0 for a record with no time of
+        // its own is retired rather than kept beside the one written below.
+        claude_untimed::retire_history_stored_at_zero(conn, &time, session_id, raw, current)?;
         if let Some(prompt) = current {
             insert_history(
                 conn,
@@ -9742,7 +9572,7 @@ fn ingest_claude_record(
             conn,
             session_id,
             message_uuid,
-            ts_ms,
+            Some(ts_ms),
             parent_id,
             obj.get("type").and_then(Value::as_str).unwrap_or(""),
         )?;
@@ -9988,45 +9818,6 @@ fn insert_sessionless_record_marker(
             subkind: draft.subkind.as_deref(),
             text: None,
             payload_json: draft.payload_json.as_deref(),
-        },
-    )?;
-    Ok(())
-}
-
-/// Record that a provider record existed when nothing else did.
-///
-/// Called only when a record produced no event and no other marker, so it
-/// never competes with a classified marker for the same `marker_uid`. The
-/// provider's own record type goes in `subkind`; a record that does not even
-/// name its type is recorded as `record`, because "something was here" is
-/// still worth more than silence.
-fn insert_unknown_record_marker(
-    conn: &Connection,
-    session_id: &str,
-    message_uuid: &str,
-    ts_ms: i64,
-    parent_id: Option<&str>,
-    record_type: &str,
-) -> Result<()> {
-    let marker_uid = format!("{message_uuid}:marker");
-    insert_session_marker(
-        conn,
-        "claude",
-        session_id,
-        &NewSessionMarker {
-            marker_uid: &marker_uid,
-            ts_ms: (ts_ms != 0).then_some(ts_ms),
-            message_id: Some(message_uuid),
-            parent_id,
-            turn_id: None,
-            kind: "unknown",
-            subkind: Some(if record_type.is_empty() {
-                "record"
-            } else {
-                record_type
-            }),
-            text: None,
-            payload_json: None,
         },
     )?;
     Ok(())
@@ -10966,29 +10757,6 @@ fn heal_claude_synthetic_session_summaries(conn: &Connection) -> Result<()> {
 /// finished transcript never changes on disk, so only this re-read stores it.
 const RAW_MESSAGE_FACTS_VERSION: i64 = 5;
 
-#[derive(Debug, Default, Clone, Copy)]
-struct RawMessageFacts<'a> {
-    request_id: Option<&'a str>,
-    stop_reason: Option<&'a str>,
-    agent_version: Option<&'a str>,
-    is_sidechain: Option<bool>,
-    is_meta: Option<bool>,
-    turn_id: Option<&'a str>,
-    /// Which API request this row belongs to, for a provider that delimits
-    /// its requests with usage snapshots instead of naming them. Numbered per
-    /// session by the parser; see `codex_request_span` at its call site.
-    request_span: Option<&'a str>,
-    /// Why this user-role row is not a human prompt, from
-    /// [`control::ControlKind`]; `None` for a prompt and for model output.
-    /// The one derived fact carried here, because every insert already
-    /// threads this struct and the column is stamped per row like the rest.
-    control_kind: Option<&'a str>,
-    /// Claude: the record's own usage blob where settlement replaced it in
-    /// `token_json` -- JSON `null` for a copy that carried none. `None` where
-    /// `token_json` already is the record's own, and for every other source.
-    record_token_json: Option<&'a str>,
-}
-
 /// The provider's own identities for the request a record belongs to, read
 /// once per record and stored verbatim.
 ///
@@ -11336,6 +11104,8 @@ pub(crate) struct SessionCatalogRow<'a> {
     pub(crate) source: &'a str,
     pub(crate) cwd: Option<&'a str>,
     pub(crate) git_branch: Option<&'a str>,
+    /// The activity window. A time that is not positive is not known and is
+    /// stored as `NULL`, never as 0.
     pub(crate) first_ts: i64,
     pub(crate) last_ts: i64,
     pub(crate) last_assistant_text: Option<&'a str>,
@@ -11390,9 +11160,12 @@ fn upsert_session_inner(
     // prose in it any more, keeping the old value would leave the catalog
     // quoting a reply the transcript no longer contains.
     let (first_activity, last_activity, assistant_text) = match window {
+        // A time that is not positive is no time: a reader takes 0 for
+        // 1970-01-01, so it is stored as NULL, and a 0 an earlier rule stored
+        // gives way to the first real time instead of pinning MIN() forever.
         ActivityWindow::Expand => (
-            "first_activity_ms = MIN(COALESCE(sessions.first_activity_ms, excluded.first_activity_ms), excluded.first_activity_ms)",
-            "last_activity_ms = MAX(COALESCE(sessions.last_activity_ms, excluded.last_activity_ms), excluded.last_activity_ms)",
+            "first_activity_ms = MIN(COALESCE(NULLIF(sessions.first_activity_ms, 0), excluded.first_activity_ms), COALESCE(excluded.first_activity_ms, NULLIF(sessions.first_activity_ms, 0)))",
+            "last_activity_ms = MAX(COALESCE(NULLIF(sessions.last_activity_ms, 0), excluded.last_activity_ms), COALESCE(excluded.last_activity_ms, NULLIF(sessions.last_activity_ms, 0)))",
             "last_assistant_text = COALESCE(excluded.last_assistant_text, sessions.last_assistant_text)",
         ),
         ActivityWindow::Replace => (
@@ -11439,8 +11212,8 @@ fn upsert_session_inner(
             source,
             cwd,
             git_branch,
-            first_ts,
-            last_ts,
+            (first_ts > 0).then_some(first_ts),
+            (last_ts > 0).then_some(last_ts),
             last_assistant_text,
             raw_path,
             project_key,
@@ -11935,6 +11708,7 @@ fn sync_cursor_with_hooks_in(
                 raw_path: Some(&transcript.path.to_string_lossy()),
             },
         )?;
+        cursor::record_subagent_delegation(&tx, &transcript.path)?;
     }
     tx.commit().context("commit Cursor sync")?;
     state.insert(
@@ -12337,35 +12111,6 @@ fn prepare_cursor_sync(
     })
 }
 
-/// Timestamps a previous pass stored, keyed by the record's byte offset.
-///
-/// Every event derived from one record shares that record's byte offset as the
-/// prefix of its `event_uid` (`"{offset}:{block}"`), so the first event at
-/// each offset answers the question. Loaded once per incremental pass because
-/// a `substr(event_uid, …)` predicate cannot use the uid index.
-fn stored_cursor_record_timestamps(
-    conn: &Connection,
-    session_id: &str,
-) -> Result<HashMap<u64, i64>> {
-    let mut stored = HashMap::new();
-    let mut stmt = conn.prepare(
-        "SELECT event_uid, ts_ms FROM session_events \
-         WHERE source = 'cursor' AND session_id = ? ORDER BY id",
-    )?;
-    let mut rows = stmt.query([session_id])?;
-    while let Some(row) = rows.next()? {
-        let uid: String = row.get(0)?;
-        let ts: i64 = row.get(1)?;
-        if let Some(offset) = uid
-            .split_once(':')
-            .and_then(|(prefix, _)| prefix.parse::<u64>().ok())
-        {
-            stored.entry(offset).or_insert(ts);
-        }
-    }
-    Ok(stored)
-}
-
 /// Drop every row a previous read of this Cursor transcript produced.
 ///
 /// Cursor evidence is keyed on the record's byte offset, which is stable only
@@ -12444,9 +12189,9 @@ pub(crate) struct CursorTranscriptOutcome {
 /// leave one copy per sync. Callers that resume mid-file therefore pass the
 /// offset they had already committed, and only records at or after it become
 /// history. Callers that rebuild the session's history first pass `0`.
-pub(crate) fn ingest_cursor_transcript(
+pub(crate) fn ingest_cursor_transcript<'a>(
     conn: &Connection,
-    path: &Path,
+    records: impl Into<cursor_store::Records<'a>>,
     session_id: &str,
     project: Option<&str>,
     mtime_ms: i64,
@@ -12459,8 +12204,7 @@ pub(crate) fn ingest_cursor_transcript(
     // then let the byte checkpoint advance over content nobody read. The
     // error propagates so the whole transaction, including the checkpoint
     // update, rolls back and the next sync retries the same offset.
-    let text = cold_read::read_string(path)
-        .with_context(|| format!("read Cursor transcript {}", path.display()))?;
+    let text = records.into().text()?;
     let mut outcome = CursorTranscriptOutcome::default();
     let mut offset: u64 = 0;
     // One query for the session, keyed by record offset. The per-record
@@ -12468,7 +12212,7 @@ pub(crate) fn ingest_cursor_transcript(
     // sync of a long untimed transcript would otherwise scan events once per
     // old record.
     let stored_ts = if history_from_offset > 0 {
-        stored_cursor_record_timestamps(conn, session_id)?
+        cursor::stored_record_timestamps(conn, session_id)?
     } else {
         HashMap::new()
     };
@@ -14337,7 +14081,7 @@ fn sync_grok_in(
         };
         let recorded = grok_state.get(&key);
         if recorded.and_then(grok_state_stamp) == Some(stamp.as_str())
-            && grok_recorded_still_indexed(conn, recorded)?
+            && grok_unified::recorded_still_indexed(conn, recorded)?
         {
             walk.accounted += 1;
             continue;
@@ -14394,44 +14138,6 @@ fn sync_grok_in(
     walk.finish("grok", "Grok session(s)", "directories")
 }
 
-/// Whether a Grok session whose stamp says unchanged is still indexed.
-///
-/// The stamp says the file has not changed. That is only half the question:
-/// `.sync-state.json` lives beside the database, so a deleted or rebuilt
-/// `history.db` keeps this file, and a stamp read on its own would answer
-/// "already indexed" for a session whose rows are gone -- until some file in
-/// the directory changes, which for a finished session is never. The Codex and
-/// Claude walks check the database for the same reason.
-///
-/// The other half of that is knowing what "its rows" means for *this* session.
-/// Not every Grok session produces `session_events` -- one made only of
-/// `system` lines, synthetic turns or encrypted reasoning is stored entirely as
-/// markers, and one with an empty transcript and a `subagents/` entry only a
-/// relationship -- so asking only about events would find nothing and re-read
-/// such a session on every run, forever. The answer is not to guess from the
-/// tables but to record what the indexing run actually produced, and then to
-/// ask about that. Unchanged, and what it did write is missing: re-index it.
-fn grok_recorded_still_indexed(conn: &Connection, recorded: Option<&Value>) -> Result<bool> {
-    match (
-        recorded.and_then(grok_state_session),
-        recorded.and_then(grok_state_had_evidence),
-    ) {
-        // Written by an older build that saved the stamp alone, so there is no
-        // session id to look the evidence up by. Trust the stamp, as that
-        // build did.
-        (None, _) => Ok(true),
-        // The run that indexed it wrote no evidence rows at all. It still
-        // wrote a catalog row -- every ingestion does -- so that is what there
-        // is to check, and it is enough: a session with no evidence *is* its
-        // catalog row. Skipping without asking anything is what let an empty
-        // session disappear for good when the database was rebuilt.
-        (Some(id), Some(false)) => grok_catalog_row_exists(conn, id),
-        (Some(id), Some(true) | None) => {
-            grok_indexed_evidence_remains(conn, id, recorded.and_then(grok_state_transcript_events))
-        }
-    }
-}
-
 /// What indexing one Grok session directory produced, and what its own records
 /// could not establish.
 ///
@@ -14481,19 +14187,6 @@ pub(crate) struct GrokIngestOutcome {
     pub unified_coverage: GrokUnifiedCoverage,
 }
 
-/// The request span of a Grok assistant row: the `updates.jsonl` turn it
-/// belongs to.
-///
-/// Grok names none of its API calls, and the only usage it reports is one
-/// `turn_completed.usage` per turn, so the turn is the finest unit a request
-/// can be measured at. Without a shared span each assistant row of a turn —
-/// its thinking, every tool call, its prose — grouped as a request of its
-/// own, and a turn that called a tool read as several requests, all but one
-/// unmeasured.
-fn grok_turn_span(turn: Option<usize>) -> Option<String> {
-    turn.map(|turn| turn.to_string())
-}
-
 /// Index one Grok session directory: prompts, events, tools, edits, markers
 /// and subagent delegations.
 fn ingest_grok_session(
@@ -14505,7 +14198,7 @@ fn ingest_grok_session(
     let sid = session.session_id.as_str();
     let project = session.cwd.as_deref();
     let branch = session.git_branch.as_deref();
-    let mut reconcile = evidence_reconcile::begin_grok(conn, sid)?;
+    let mut reconcile = grok_unified::begin_session(conn, sid, raw_path)?;
     let mut outcome = GrokIngestOutcome {
         missing_updates: !session.updates_present,
         updates_yielded_no_timing: session.updates_present && session.updates.is_empty(),
@@ -14733,7 +14426,7 @@ fn ingest_grok_session(
                         text: Some(summary),
                         event_uid: &uid,
                         raw_facts: RawMessageFacts {
-                            request_span: grok_turn_span(turn).as_deref(),
+                            request_span: grok_unified::grok_turn_span(turn).as_deref(),
                             ..RawMessageFacts::default()
                         },
                         ..EventRow::default()
@@ -14778,7 +14471,7 @@ fn ingest_grok_session(
                             model: model.as_deref(),
                             event_uid: &uid,
                             raw_facts: RawMessageFacts {
-                                request_span: grok_turn_span(turn).as_deref(),
+                                request_span: grok_unified::grok_turn_span(turn).as_deref(),
                                 ..RawMessageFacts::default()
                             },
                             ..EventRow::default()
@@ -14827,7 +14520,7 @@ fn ingest_grok_session(
                             model: model.as_deref(),
                             event_uid: &uid,
                             raw_facts: RawMessageFacts {
-                                request_span: grok_turn_span(call_turn).as_deref(),
+                                request_span: grok_unified::grok_turn_span(call_turn).as_deref(),
                                 ..RawMessageFacts::default()
                             },
                             ..EventRow::default()
@@ -15033,8 +14726,9 @@ fn ingest_grok_session(
          last_assistant_text = ?, models_json = ?, first_prompt = ?, session_kind = ? \
          WHERE source = 'grok' AND session_id = ?",
         params![
-            session.first_ts,
-            session.last_ts,
+            // Not positive is not known: NULL, never 0.
+            (session.first_ts > 0).then_some(session.first_ts),
+            (session.last_ts > 0).then_some(session.last_ts),
             session.last_assistant_text.as_deref(),
             (!session.models.is_empty())
                 .then(|| serde_json::to_string(&session.models).unwrap_or_default()),
@@ -16907,14 +16601,14 @@ mod tests {
         let path = dir.path().join("session.jsonl");
         fs::write(
             &path,
-            r#"{"sessionId":"opened","uuid":"1","type":"assistant","message":{"role":"assistant","content":"kept"}}"#.to_string()
+            r#"{"sessionId":"opened","uuid":"1","timestamp":"2026-01-01T00:00:00Z","type":"assistant","message":{"role":"assistant","content":"kept"}}"#.to_string()
                 + "\n",
         )
         .unwrap();
         let snapshot = ClaudeTranscriptSnapshot::open(&path).unwrap();
         fs::write(
             &path,
-            r#"{"sessionId":"replacement","uuid":"2","type":"assistant","message":{"role":"assistant","content":"wrong"}}"#.to_string()
+            r#"{"sessionId":"replacement","uuid":"2","timestamp":"2026-01-01T00:00:00Z","type":"assistant","message":{"role":"assistant","content":"wrong"}}"#.to_string()
                 + "\n",
         )
         .unwrap();
@@ -17141,6 +16835,7 @@ mod tests {
                 swept: false,
                 skipped_unchanged: false,
                 contended: true,
+                changed_nothing: false,
             },
             "the lock was held elsewhere: nothing was read and nothing compared"
         );
@@ -17153,6 +16848,7 @@ mod tests {
                 swept: false,
                 skipped_unchanged: true,
                 contended: false,
+                changed_nothing: false,
             },
             "the sweep ran and no source had moved"
         );
@@ -17165,6 +16861,7 @@ mod tests {
                 swept: true,
                 skipped_unchanged: false,
                 contended: false,
+                changed_nothing: false,
             },
             "the sweep ran and walked"
         );
@@ -21714,7 +21411,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("history.jsonl");
         let initial: String = (0..super::JSONL_CHUNK_LINES)
-            .map(|i| format!(r#"{{"display":"prompt {i}","timestamp":{i}}}"#) + "\n")
+            .map(|i| format!(r#"{{"display":"prompt {i}","timestamp":{}}}"#, i + 1) + "\n")
             .collect();
         fs::write(&path, initial).unwrap();
         let conn = Connection::open_in_memory().unwrap();
@@ -21838,6 +21535,64 @@ mod tests {
                 .get::<_, i64>(0))
                 .unwrap(),
             2
+        );
+    }
+
+    /// A full sync indexes a subagent transcript as its own session, under
+    /// its file stem and its parent's project, and records the delegation.
+    ///
+    /// Positive control: before the fix the sync counted one prompt and the
+    /// child had no `sessions` row at all.
+    #[test]
+    fn cursor_sync_indexes_subagent_transcripts_and_links_their_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir
+            .path()
+            .join("home-dev-app/agent-transcripts/p1/p1.jsonl");
+        let child = dir
+            .path()
+            .join("home-dev-app/agent-transcripts/p1/subagents/c1.jsonl");
+        for (path, prompt) in [(&parent, "parent prompt"), (&child, "delegated prompt")] {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(
+                path,
+                format!("{}\n", json!({"role":"user","message":{"content":prompt}})),
+            )
+            .unwrap();
+        }
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = Map::new();
+        assert_eq!(
+            super::sync_cursor(&conn, &mut state, dir.path(), &mut SweepCoverage::default())
+                .unwrap(),
+            2
+        );
+        let (cwd, raw_path): (String, String) = conn
+            .query_row(
+                "SELECT cwd, raw_path FROM sessions WHERE source='cursor' AND session_id='c1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(cwd, "/home/dev/app");
+        assert_eq!(raw_path, child.to_string_lossy());
+        let edge: (String, String, String, String) = conn
+            .query_row(
+                "SELECT parent_session_id, child_session_id, relationship, evidence_locator \
+                 FROM session_relationships WHERE source='cursor'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            edge,
+            (
+                "p1".to_string(),
+                "c1".to_string(),
+                "delegated".to_string(),
+                child.to_string_lossy().into_owned()
+            )
         );
     }
 
@@ -28330,7 +28085,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("indexless.jsonl");
         // No `uuid` and no `message.id`: identity comes from the line index.
-        let first = "{\"sessionId\":\"s-idx\",\"cwd\":\"/w\",\"type\":\"user\",\
+        let first = "{\"sessionId\":\"s-idx\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"cwd\":\"/w\",\"type\":\"user\",\
                      \"message\":{\"role\":\"user\",\"content\":\"one\"}}\n";
         fs::write(&path, first).unwrap();
         let conn = Connection::open_in_memory().unwrap();
@@ -28343,7 +28098,11 @@ mod tests {
         // Half of the next record arrives.
         let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
         use std::io::Write as _;
-        write!(file, "{{\"sessionId\":\"s-idx\",\"cw").unwrap();
+        write!(
+            file,
+            "{{\"sessionId\":\"s-idx\",\"timestamp\":\"2026-01-01T00:00:01Z\",\"cw"
+        )
+        .unwrap();
         drop(file);
         incremental::ingest_claude_transcript_incremental(&conn, &path, None, &mut state).unwrap();
         assert_eq!(
@@ -28386,6 +28145,438 @@ mod tests {
         .unwrap()
         .collect::<rusqlite::Result<Vec<_>>>()
         .unwrap()
+    }
+
+    /// A timed Claude user record.
+    fn timed_claude_user(session: &str, uuid: &str, ts: &str, text: &str) -> String {
+        json!({
+            "type": "user", "uuid": uuid, "sessionId": session, "cwd": "/w",
+            "timestamp": ts,
+            "message": {"role": "user", "content": text},
+        })
+        .to_string()
+    }
+
+    /// Claude's content-addressed copy of a request: a message body with no
+    /// `timestamp` and no `uuid`.
+    fn untimed_claude_request_blob(session: &str, hash: &str) -> String {
+        json!({
+            "type": "api-request-blob", "hash": hash, "sessionId": session,
+            "message": {"role": "assistant", "content": [
+                {"type": "text", "text": "reading the file"},
+                {"type": "tool_use", "id": format!("toolu_{hash}"), "name": "Read",
+                 "input": {"file_path": "/w/a.rs"}},
+            ]},
+        })
+        .to_string()
+    }
+
+    fn untimed_claude_user_blob(session: &str, text: &str) -> String {
+        json!({
+            "type": "api-request-blob", "hash": "h-user", "sessionId": session,
+            "message": {"role": "user", "content": text},
+        })
+        .to_string()
+    }
+
+    /// Every stored time of `session`, across the tables a record writes, as
+    /// `(table, ts)`; `None` for a nullable time left empty.
+    fn claude_stored_times(conn: &Connection, session: &str) -> Vec<(String, Option<i64>)> {
+        let mut times = Vec::new();
+        for (table, column) in [
+            ("session_events", "ts_ms"),
+            ("history", "timestamp_ms"),
+            ("tool_calls", "ts_ms"),
+            ("session_markers", "ts_ms"),
+        ] {
+            let mut statement = conn
+                .prepare(&format!(
+                    "SELECT {column} FROM {table} WHERE source='claude' AND session_id=?"
+                ))
+                .unwrap();
+            let rows = statement
+                .query_map([session], |row| row.get::<_, Option<i64>>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            times.extend(rows.into_iter().map(|ts| (table.to_string(), ts)));
+        }
+        times
+    }
+
+    fn assert_no_epoch_rows(conn: &Connection, session: &str) {
+        let times = claude_stored_times(conn, session);
+        assert!(
+            times.iter().all(|(_, ts)| *ts != Some(0)),
+            "a record without a timestamp was stored at 0: {times:?}"
+        );
+    }
+
+    /// Times are ISO strings in Claude transcripts; this is the parsed value.
+    fn iso_ms(raw: &str) -> i64 {
+        parse_iso_ms(raw).unwrap()
+    }
+
+    /// A record without `timestamp` inherits the time of the record before it
+    /// in its session, in every table, and the timed records keep their own.
+    #[test]
+    fn a_claude_record_without_a_timestamp_inherits_the_preceding_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s-untimed.jsonl");
+        let first = "2026-11-01T10:00:00.000Z";
+        let second = "2026-11-01T10:05:00.000Z";
+        let body = [
+            timed_claude_user("s-untimed", "u1", first, "first prompt"),
+            untimed_claude_request_blob("s-untimed", "h1"),
+            untimed_claude_user_blob("s-untimed", "a prompt copied into the blob"),
+            timed_claude_user("s-untimed", "u2", second, "second prompt"),
+            untimed_claude_request_blob("s-untimed", "h2"),
+        ]
+        .join("\n")
+            + "\n";
+        fs::write(&path, body).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+
+        assert_no_epoch_rows(&conn, "s-untimed");
+        let event_ts = |text: &str| -> i64 {
+            conn.query_row(
+                "SELECT ts_ms FROM session_events WHERE session_id='s-untimed' AND text=?",
+                [text],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        // The timed records are unchanged.
+        assert_eq!(event_ts("first prompt"), iso_ms(first));
+        assert_eq!(event_ts("second prompt"), iso_ms(second));
+        assert_eq!(event_ts("a prompt copied into the blob"), iso_ms(first));
+        let tool_times: Vec<(String, i64)> = conn
+            .prepare(
+                "SELECT tool_use_id, ts_ms FROM tool_calls WHERE session_id='s-untimed' \
+                 ORDER BY tool_use_id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            tool_times,
+            [
+                ("toolu_h1".to_string(), iso_ms(first)),
+                ("toolu_h2".to_string(), iso_ms(second)),
+            ]
+        );
+        let history: Vec<(String, i64)> = conn
+            .prepare(
+                "SELECT prompt, timestamp_ms FROM history WHERE session_id='s-untimed' \
+                 ORDER BY timestamp_ms, prompt",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            history,
+            [
+                ("a prompt copied into the blob".to_string(), iso_ms(first)),
+                ("first prompt".to_string(), iso_ms(first)),
+                ("second prompt".to_string(), iso_ms(second)),
+            ]
+        );
+    }
+
+    /// The inherited time survives a pass boundary: the incremental reader
+    /// resumes after the record that stated it, so the cursor carries it.
+    #[test]
+    fn an_untimed_claude_record_read_on_a_later_pass_inherits_through_the_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s-resume.jsonl");
+        let first = "2026-11-02T08:00:00.000Z";
+        fs::write(
+            &path,
+            timed_claude_user("s-resume", "u1", first, "first prompt") + "\n",
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = transcript_cursor::TranscriptCursorState::default();
+        incremental::ingest_claude_transcript_incremental(&conn, &path, None, &mut state).unwrap();
+
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        use std::io::Write as _;
+        writeln!(file, "{}", untimed_claude_request_blob("s-resume", "h1")).unwrap();
+        drop(file);
+        incremental::ingest_claude_transcript_incremental(&conn, &path, None, &mut state).unwrap();
+
+        assert_no_epoch_rows(&conn, "s-resume");
+        let tool_ts: i64 = conn
+            .query_row(
+                "SELECT ts_ms FROM tool_calls WHERE session_id='s-resume'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tool_ts, iso_ms(first));
+
+        // Positive control: a read from zero gives the same time.
+        let fresh = Connection::open_in_memory().unwrap();
+        init_db(&fresh).unwrap();
+        ingest_claude_transcript(&fresh, &path).unwrap();
+        assert_eq!(
+            claude_stored_times(&conn, "s-resume"),
+            claude_stored_times(&fresh, "s-resume")
+        );
+    }
+
+    /// With no earlier time in its session, an untimed record keeps only a
+    /// marker with no time, never a row at 0, and the pass reports the
+    /// content it left out by record type.
+    #[test]
+    fn an_untimed_claude_record_with_nothing_to_inherit_is_a_counted_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s-first.jsonl");
+        let later = "2026-11-03T09:00:00.000Z";
+        let body = [
+            untimed_claude_request_blob("s-first", "h1"),
+            untimed_claude_user_blob("s-first", "a prompt copied into the blob"),
+            timed_claude_user("s-first", "u1", later, "first timed prompt"),
+        ]
+        .join("\n")
+            + "\n";
+        fs::write(&path, body).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        // An earlier parser stored the copied prompt at 0; the re-read heals it.
+        conn.execute(
+            "INSERT INTO history (source, session_id, prompt, timestamp_ms) \
+             VALUES ('claude', 's-first', 'a prompt copied into the blob', 0)",
+            [],
+        )
+        .unwrap();
+        let (outcome, diagnostics) =
+            provider_diagnostics::collect(|| ingest_claude_transcript(&conn, &path));
+        outcome.unwrap();
+
+        assert_no_epoch_rows(&conn, "s-first");
+        let markers: Vec<(String, Option<String>, Option<i64>)> = conn
+            .prepare(
+                "SELECT kind, subkind, ts_ms FROM session_markers WHERE session_id='s-first' \
+                 ORDER BY id",
+            )
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            markers,
+            [
+                (
+                    "unknown".to_string(),
+                    Some("api-request-blob".to_string()),
+                    None
+                ),
+                (
+                    "unknown".to_string(),
+                    Some("api-request-blob".to_string()),
+                    None
+                ),
+            ]
+        );
+        let events: Vec<(String, i64)> = conn
+            .prepare("SELECT text, ts_ms FROM session_events WHERE session_id='s-first'")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(events, [("first timed prompt".to_string(), iso_ms(later))]);
+        let tool_calls: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM tool_calls WHERE session_id='s-first'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tool_calls, 0);
+        let untimed: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == "EVIDENCE_PARTIAL")
+            .collect();
+        assert_eq!(untimed.len(), 2, "{diagnostics:?}");
+        for diagnostic in untimed {
+            assert_eq!(diagnostic.subject.as_deref(), Some("s-first"));
+            assert!(diagnostic.message.contains("`api-request-blob`"));
+            assert!(!diagnostic.message.contains("copied into the blob"));
+        }
+    }
+
+    /// A cursor an earlier build committed has no per-session times, yet
+    /// resumes past the timed records an appended untimed one follows. The
+    /// pass folds them from the bytes already read, a marker-only record's
+    /// time included, so the record gets the time a read from zero gives it
+    /// rather than losing its content.
+    #[test]
+    fn an_untimed_record_after_a_cursor_from_an_earlier_build_inherits_the_prefix_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s-legacy.jsonl");
+        let first = "2026-11-04T07:00:00.000Z";
+        // A timed record that stores only a marker: its time is the latest
+        // before the blob, and no event of its own carries it.
+        let boundary = "2026-11-04T07:05:00.000Z";
+        let compact = json!({
+            "type": "system", "subtype": "compact_boundary", "uuid": "c1",
+            "sessionId": "s-legacy", "timestamp": boundary,
+        });
+        fs::write(
+            &path,
+            format!(
+                "{}\n{compact}\n",
+                timed_claude_user("s-legacy", "u1", first, "first prompt")
+            ),
+        )
+        .unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let mut state = transcript_cursor::TranscriptCursorState::default();
+        incremental::ingest_claude_transcript_incremental(&conn, &path, None, &mut state).unwrap();
+        // What an earlier build saved: neither field exists in its cursor.
+        let mut saved = serde_json::to_value(&state).unwrap();
+        let claude = saved["claude"].as_object_mut().unwrap();
+        assert!(claude.remove("record_ts").is_some());
+        assert!(claude.remove("record_ts_from_start").is_some());
+        let mut state: transcript_cursor::TranscriptCursorState =
+            serde_json::from_value(saved).unwrap();
+
+        let mut file = fs::OpenOptions::new().append(true).open(&path).unwrap();
+        use std::io::Write as _;
+        writeln!(file, "{}", untimed_claude_request_blob("s-legacy", "h1")).unwrap();
+        drop(file);
+        let (outcome, diagnostics) = provider_diagnostics::collect(|| {
+            incremental::ingest_claude_transcript_incremental(&conn, &path, None, &mut state)
+        });
+        outcome.unwrap();
+
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_no_epoch_rows(&conn, "s-legacy");
+        let tool_ts: i64 = conn
+            .query_row(
+                "SELECT ts_ms FROM tool_calls WHERE session_id='s-legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tool_ts, iso_ms(boundary));
+        let fresh = Connection::open_in_memory().unwrap();
+        init_db(&fresh).unwrap();
+        ingest_claude_transcript(&fresh, &path).unwrap();
+        assert_eq!(
+            claude_stored_times(&conn, "s-legacy"),
+            claude_stored_times(&fresh, "s-legacy")
+        );
+    }
+
+    /// The marker-only fallback retires only what an earlier parser stored
+    /// at 0: the record keeps its marker, and rows it was already stored with
+    /// at a real time survive a rewrite that dropped the record before it.
+    #[test]
+    fn an_untimed_record_with_nothing_to_inherit_retires_only_rows_at_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s-heal.jsonl");
+        let first = "2026-11-05T06:00:00.000Z";
+        let timed = timed_claude_user("s-heal", "u1", first, "first prompt");
+        let blob = untimed_claude_request_blob("s-heal", "h1");
+        fs::write(&path, format!("{timed}\n{blob}\n")).unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        let before = claude_stored_times(&conn, "s-heal");
+
+        // A compaction drops the timed record; the blob survives alone.
+        fs::write(&path, format!("{blob}\n")).unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        let tool_ts: i64 = conn
+            .query_row(
+                "SELECT ts_ms FROM tool_calls WHERE session_id='s-heal'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tool_ts, iso_ms(first), "a timed row was retired");
+        let events_before = before
+            .iter()
+            .filter(|(table, _)| table == "session_events")
+            .count();
+        let events_after = claude_stored_times(&conn, "s-heal")
+            .iter()
+            .filter(|(table, _)| table == "session_events")
+            .count();
+        assert_eq!(events_after, events_before);
+
+        // An earlier parser's rows at 0 for the same record are retired, and
+        // the record's marker is still there afterwards.
+        let message_id: String = conn
+            .query_row(
+                "SELECT message_id FROM tool_calls WHERE session_id='s-heal'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        conn.execute(
+            "UPDATE session_events SET ts_ms = 0 WHERE session_id='s-heal' AND message_id=?1",
+            [&message_id],
+        )
+        .unwrap();
+        conn.execute(
+            "UPDATE tool_calls SET ts_ms = 0 WHERE session_id='s-heal'",
+            [],
+        )
+        .unwrap();
+        ingest_claude_transcript(&conn, &path).unwrap();
+        assert_no_epoch_rows(&conn, "s-heal");
+        let blob_rows: i64 = conn
+            .query_row(
+                "SELECT (SELECT COUNT(*) FROM session_events \
+                         WHERE session_id='s-heal' AND message_id=?1) \
+                      + (SELECT COUNT(*) FROM tool_calls WHERE session_id='s-heal')",
+                [&message_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(blob_rows, 0);
+        let markers: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM session_markers \
+                 WHERE session_id='s-heal' AND marker_uid = ?1 || ':marker' AND ts_ms IS NULL",
+                [&message_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(markers, 1, "the record's marker was retired with its rows");
+    }
+
+    /// A record that writes only a marker, like `permission-mode`, loses no
+    /// content without a time, so it is not reported.
+    #[test]
+    fn an_untimed_marker_only_claude_record_is_not_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("s-mode.jsonl");
+        let line = json!({"type": "permission-mode", "permissionMode": "default",
+                          "sessionId": "s-mode"})
+        .to_string();
+        fs::write(&path, line + "\n").unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let (outcome, diagnostics) =
+            provider_diagnostics::collect(|| ingest_claude_transcript(&conn, &path));
+        outcome.unwrap();
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_no_epoch_rows(&conn, "s-mode");
+        assert!(!claude_stored_times(&conn, "s-mode").is_empty());
     }
 
     #[test]
@@ -28625,8 +28816,8 @@ mod tests {
         fs::write(
             &path,
             concat!(
-                "{\"sessionId\":\"s-control\",\"uuid\":\"control\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"<command-message>generated wrapper\"}}\n",
-                "{\"sessionId\":\"s-control\",\"uuid\":\"human\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"real prompt\"}}\n",
+                "{\"sessionId\":\"s-control\",\"uuid\":\"control\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"<command-message>generated wrapper\"}}\n",
+                "{\"sessionId\":\"s-control\",\"uuid\":\"human\",\"timestamp\":\"2026-01-01T00:00:00Z\",\"type\":\"user\",\"message\":{\"role\":\"user\",\"content\":\"real prompt\"}}\n",
             ),
         )
         .unwrap();
