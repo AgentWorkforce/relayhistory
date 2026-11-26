@@ -52,10 +52,16 @@ pub(crate) fn register_catalog_project_key(conn: &rusqlite::Connection) -> rusql
         4,
         FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
         |ctx| {
-            let source: String = ctx.get(0)?;
-            let method: Option<String> = ctx.get(1)?;
-            let repo_url: Option<String> = ctx.get(2)?;
-            let key: Option<String> = ctx.get(3)?;
+            // A malformed scalar is a catalog cache miss. Keep projection
+            // out of the index without rejecting the underlying SQLite write.
+            let (Ok(source), Ok(method), Ok(repo_url), Ok(key)) = (
+                ctx.get::<String>(0),
+                ctx.get::<Option<String>>(1),
+                ctx.get::<Option<String>>(2),
+                ctx.get::<Option<String>>(3),
+            ) else {
+                return Ok(None);
+            };
             Ok(catalog_identity_projection(
                 &source, method.as_deref(), repo_url.as_deref(), key.as_deref(),
             ).0)

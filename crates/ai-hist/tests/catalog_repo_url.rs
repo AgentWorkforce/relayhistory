@@ -485,3 +485,89 @@ fn reopened_history_only_codex_sync_refreshes_checkout_keys_and_preserves_record
         "recorded.test/Org/Newer",
     );
 }
+
+#[test]
+fn history_only_sync_uses_the_checkout_seen_by_discovery_after_a_rollout_rewrite() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path();
+    let old_checkout = home.join("checkout");
+    let new_checkout = home.join("checkout-new");
+    for (cwd, project) in [(&old_checkout, "Old"), (&new_checkout, "New")] {
+        fs::create_dir_all(cwd.join(".git")).unwrap();
+        fs::write(
+            cwd.join(".git/config"),
+            format!("[remote \"origin\"]\nurl = https://checkout.test/Org/{project}.git\n"),
+        )
+        .unwrap();
+    }
+
+    let id = "moved";
+    write_codex_rollout(home, id, &old_checkout, None);
+    let history = home.join(".codex/history.jsonl");
+    fs::write(&history, "").unwrap();
+    let db = home.join("catalog.db");
+    let store = open(home, &db);
+    store
+        .sync(SyncOptions::default().sources([Source::Codex]))
+        .unwrap();
+    assert_eq!(
+        row(&store, id).project_key.as_deref(),
+        Some("checkout.test/Org/Old")
+    );
+
+    write_codex_rollout(home, id, &new_checkout, None);
+    store
+        .discover(DiscoveryOptions::default().sources([Source::Codex]))
+        .unwrap();
+    assert_eq!(row(&store, id).cwd.as_deref(), new_checkout.to_str());
+    assert_eq!(
+        row(&store, id).project_key.as_deref(),
+        Some("checkout.test/Org/New")
+    );
+    drop(store);
+
+    fs::write(
+        &history,
+        format!(
+            "{}\n",
+            serde_json::json!({
+                "session_id": id, "ts": 1791810000, "text": "after checkout move"
+            })
+        ),
+    )
+    .unwrap();
+    let store = open(home, &db);
+    store
+        .sync(
+            SyncOptions::default()
+                .sources([Source::Codex])
+                .paths([history]),
+        )
+        .unwrap();
+    let session = row(&store, id);
+    assert_eq!(session.cwd.as_deref(), new_checkout.to_str());
+    assert_eq!(
+        session.project_key.as_deref(),
+        Some("checkout.test/Org/New")
+    );
+    let prompt_cwd: String = Connection::open(&db)
+        .unwrap()
+        .query_row(
+            "SELECT project FROM history WHERE session_id = ?1 AND prompt = 'after checkout move'",
+            [id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(Some(prompt_cwd.as_str()), new_checkout.to_str());
+    let list = |key: &str| {
+        let mut query = CatalogQuery::default();
+        query.project_key = Some(key.into());
+        query.page_size = 1;
+        store
+            .sessions(query)
+            .map(|row| row.unwrap().session_id)
+            .collect::<Vec<_>>()
+    };
+    assert!(list("checkout.test/Org/Old").is_empty());
+    assert_eq!(list("checkout.test/Org/New"), [id]);
+}

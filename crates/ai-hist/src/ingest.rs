@@ -7005,42 +7005,7 @@ fn backfill_codex_metadata_scoped(
     backfill_codex_metadata(conn, &scoped, branches)
 }
 
-fn backfill_codex_metadata(
-    conn: &Connection,
-    cwds: &HashMap<String, String>,
-    branches: &HashMap<String, String>,
-) -> Result<usize> {
-    let mut updated = 0;
-    for (session_id, cwd) in cwds {
-        check_capture_cancelled()?;
-        let branch = branches.get(session_id);
-        updated += conn.execute(
-            "UPDATE history SET project = COALESCE(project, ?), git_branch = COALESCE(git_branch, ?) WHERE source = 'codex' AND session_id = ? AND (project IS NULL OR git_branch IS NULL)",
-            params![cwd, branch, session_id],
-        )?;
-        let (first, last): (Option<i64>, Option<i64>) = conn.query_row(
-            "SELECT MIN(timestamp_ms), MAX(timestamp_ms) FROM history WHERE source = 'codex' AND session_id = ?",
-            [session_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        if let Some(first) = first {
-            upsert_session(
-                conn,
-                &SessionCatalogRow {
-                    session_id,
-                    source: "codex",
-                    cwd: Some(cwd),
-                    git_branch: branch.map(String::as_str),
-                    first_ts: first,
-                    last_ts: last.unwrap_or(first),
-                    last_assistant_text: None,
-                    raw_path: None,
-                },
-            )?;
-        }
-    }
-    Ok(updated)
-}
+use codex_history::backfill_codex_metadata;
 
 #[cfg(test)]
 fn sync_claude_session_metadata(
