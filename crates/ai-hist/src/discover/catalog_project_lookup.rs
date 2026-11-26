@@ -157,7 +157,9 @@ mod tests {
         let legacy_steps = [None, Some("codex")].map(|source| probe(&reader, source, false).1);
         assert!(legacy_steps.into_iter().all(|steps| steps > 100_000));
 
+        let started = std::time::Instant::now();
         let writer = crate::store::open_db(&path).unwrap();
+        eprintln!("catalog-project writable migration elapsed={:?}", started.elapsed());
         writer.execute_batch("ANALYZE;").unwrap();
         for source in [None, Some("codex")] {
             let (plan, steps) = probe(&reader, source, true);
@@ -184,6 +186,78 @@ mod tests {
             [],
         ).unwrap();
         assert_eq!(dirty_count(&reader), 1);
-        assert!(probe(&reader, Some("codex"), true).1 < 1_000);
+        for source in [None, Some("codex")] {
+            assert!(probe(&reader, source, true).1 < 1_000);
+        }
     }
+
+    #[test]
+    fn raw_identity_changes_are_visible_after_commit_across_catalog_pages() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("catalog.db");
+        let writer = crate::store::open_db(&path).unwrap();
+        let reader = crate::store::open_db_readonly(&path).unwrap();
+        let mut raw = Connection::open(&path).unwrap();
+        writer.execute(
+            "INSERT INTO sessions (source, session_id, last_activity_ms, project_key, project_key_method)
+             VALUES ('codex', 'anchor', 20, 'example.test/Org/New', 'remote')",
+            [],
+        ).unwrap();
+
+        let list = |key: &str| {
+            let mut options = CatalogListOptions {
+                project_key: Some(format!("example.test/Org/{key}")),
+                limit: Some(1),
+                ..Default::default()
+            };
+            let mut ids = Vec::new();
+            loop {
+                let page = crate::discover::list_session_catalog_page(&reader, &options).unwrap();
+                assert!(page.sessions.iter().all(|row| row.project_key == options.project_key));
+                ids.extend(page.sessions.into_iter().map(|row| row.session_id));
+                options.after = page.next_cursor;
+                if options.after.is_none() {
+                    return ids;
+                }
+            }
+        };
+        let tx = raw.transaction().unwrap();
+        tx.execute(
+            "INSERT INTO sessions (source, session_id, last_activity_ms, project_key,
+                 project_key_method, repo_url)
+             VALUES ('codex', 'moving', 10, 'example.test/Org/Old', 'remote',
+                 'https://example.test/Org/Old.git')",
+            [],
+        ).unwrap();
+        assert!(list("Old").is_empty());
+        tx.commit().unwrap();
+        assert_eq!(list("Old"), ["moving"]);
+
+        let move_row = |conn: &Connection| {
+            conn.execute(
+                "UPDATE sessions SET repo_url = 'https://example.test/Org/New.git'
+                 WHERE session_id = 'moving'",
+                [],
+            ).unwrap();
+        };
+        let tx = raw.transaction().unwrap();
+        move_row(&tx);
+        assert_eq!(list("Old"), ["moving"]);
+        assert_eq!(list("New"), ["anchor"]);
+        tx.rollback().unwrap();
+        assert_eq!(list("Old"), ["moving"]);
+
+        let tx = raw.transaction().unwrap();
+        move_row(&tx);
+        tx.commit().unwrap();
+        assert!(list("Old").is_empty());
+        assert_eq!(list("New"), ["anchor", "moving"]);
+
+        let tx = raw.transaction().unwrap();
+        tx.execute("DELETE FROM sessions WHERE session_id = 'moving'", []).unwrap();
+        assert_eq!(list("New"), ["anchor", "moving"]);
+        tx.commit().unwrap();
+        assert_eq!(list("New"), ["anchor"]);
+    }
+
 }
