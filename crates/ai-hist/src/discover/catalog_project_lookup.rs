@@ -108,10 +108,10 @@ mod tests {
     use crate::discover::CatalogListOptions;
     use rusqlite::{params_from_iter, StatementStatus};
 
-    fn probe(conn: &Connection, source: Option<&str>, indexed: bool) -> (String, i32) {
+    fn probe(conn: &Connection, source: Option<&str>, indexed: bool, expected: Option<&str>) -> (String, i32) {
         let options = CatalogListOptions {
             sources: source.into_iter().map(str::to_owned).collect(),
-            project_key: Some("recorded.test/Org/Rare".into()),
+            project_key: Some(if expected.is_some() { "recorded.test/Org/Rare" } else { "recorded.test/Org/Absent" }.into()),
             limit: Some(1),
             ..Default::default()
         };
@@ -124,9 +124,9 @@ mod tests {
         let mut query = conn.prepare(&sql).unwrap();
         let ids = query.query_map(params(), |row| row.get::<_, String>(1)).unwrap()
             .collect::<rusqlite::Result<Vec<_>>>().unwrap();
-        assert_eq!(ids, ["rare"]);
+        assert_eq!(ids, expected.into_iter().collect::<Vec<_>>());
         let steps = query.get_status(StatementStatus::VmStep);
-        eprintln!("catalog-project source={source:?} indexed={indexed} steps={steps} plan={plan}");
+        eprintln!("catalog-project source={source:?} expected={expected:?} indexed={indexed} steps={steps} plan={plan}");
         (plan, steps)
     }
 
@@ -154,7 +154,7 @@ mod tests {
         drop(legacy);
 
         let reader = crate::store::open_db_readonly(&path).unwrap();
-        let legacy_steps = [None, Some("codex")].map(|source| probe(&reader, source, false).1);
+        let legacy_steps = [None, Some("codex")].map(|source| probe(&reader, source, false, Some("rare")).1);
         assert!(legacy_steps.into_iter().all(|steps| steps > 100_000));
 
         let started = std::time::Instant::now();
@@ -162,10 +162,14 @@ mod tests {
         eprintln!("catalog-project writable migration elapsed={:?}", started.elapsed());
         writer.execute_batch("ANALYZE;").unwrap();
         for source in [None, Some("codex")] {
-            let (plan, steps) = probe(&reader, source, true);
+            let (plan, steps) = probe(&reader, source, true, Some("rare"));
             assert!(plan.contains("idx_catalog_project_key") && plan.contains("SEARCH sessions USING"), "{plan}");
             assert!(steps < 1_000, "{steps}: {plan}");
         }
+
+        let (absent_plan, absent_steps) = probe(&reader, Some("codex"), true, None);
+        assert!(absent_plan.contains("idx_catalog_project_key"), "{absent_plan}");
+        assert!(absent_steps < 1_000, "{absent_steps}: {absent_plan}");
 
         writer.execute(
             "UPDATE sessions SET repo_url = 'https://recorded.test/Org/Updated.git' WHERE session_id = 'rare'",
@@ -187,7 +191,7 @@ mod tests {
         ).unwrap();
         assert_eq!(dirty_count(&reader), 1);
         for source in [None, Some("codex")] {
-            assert!(probe(&reader, source, true).1 < 1_000);
+            assert!(probe(&reader, source, true, Some("rare")).1 < 1_000);
         }
     }
 

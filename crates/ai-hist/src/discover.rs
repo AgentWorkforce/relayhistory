@@ -3515,12 +3515,11 @@ fn upsert_shallow_session_in_transaction(
     // preferred over walking the working directory, which may no longer exist
     // by the time the transcript is read. Resolving here rather than in each
     // provider's shallow reader keeps every source on one code path.
-    let observed = crate::project_identity::catalog_identity(
+    let (observed, recorded) = crate::project_identity::catalog_identity_observation(
         session.cwd.as_deref(),
         session.repo_url.as_deref(),
         session.source == "claude",
     );
-    let repo_url = observed.as_ref().and_then(|(_, _, url)| url.as_deref());
     let resolved = session.project_key.clone().map(|key| {
         (
             key,
@@ -3555,7 +3554,7 @@ fn upsert_shallow_session_in_transaction(
             json_array_or_none(&session.models),
             session.originator,
             session.agent_version,
-            repo_url,
+            observed.as_ref().and_then(|(_, _, url)| url.as_deref()),
             session.initial_commit,
             json_array_or_none(&session.workspace_roots),
             session.source_stamp,
@@ -3570,6 +3569,7 @@ fn upsert_shallow_session_in_transaction(
             session.title,
             session.session_kind,
             session.agent_name,
+            recorded,
         ],
         row_to_session,
     )?;

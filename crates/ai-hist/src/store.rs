@@ -3852,40 +3852,7 @@ pub fn stats_scoped_by(
 // canonical project identity
 // ---------------------------------------------------------------------------
 
-/// Strength of a stored project identity, as a SQL expression over `alias`.
-///
-/// Upserts merge on this ranking so a later, weaker observation can never
-/// overwrite a stronger one: a shallow rescan that cannot see the repository
-/// any more must not replace a resolved remote key with the directory it was
-/// run from. `0` is "nothing stored", which every real value outranks.
-fn project_key_rank_sql(alias: &str) -> String {
-    format!(
-        "CASE WHEN {alias}.project_key IS NULL THEN 0 \
-              WHEN {alias}.project_key_method = 'remote' THEN 3 \
-              WHEN {alias}.project_key_method = 'inherited' THEN 2 \
-              ELSE 1 END"
-    )
-}
-
-/// The `ON CONFLICT ... DO UPDATE SET` fragment that merges project identity
-/// into the `sessions` table. Shared by shallow discovery and full ingest so
-/// the two cannot disagree about precedence.
-pub(crate) fn project_key_merge_sql() -> String {
-    let incoming = project_key_rank_sql("excluded");
-    let stored = project_key_rank_sql("sessions");
-    let incoming_wins = format!(
-        "({incoming}) >= ({stored}) AND NOT (
-            sessions.source = 'codex' AND sessions.project_key_method IS 'remote'
-            AND sessions.repo_url IS NOT NULL AND excluded.repo_url IS NULL
-        )"
-    );
-    format!(
-        "project_key = CASE WHEN {incoming_wins} \
-            THEN excluded.project_key ELSE sessions.project_key END, \
-         project_key_method = CASE WHEN {incoming_wins} \
-            THEN excluded.project_key_method ELSE sessions.project_key_method END"
-    )
-}
+pub(crate) use scoped_project_identity::project_key_merge_sql;
 
 /// How many times the inheritance pass is repeated.
 ///

@@ -28,7 +28,7 @@ pub(crate) const SESSION_COLUMNS: &str = concat!(session_scalar_columns!(), ", \
 
 /// The shallow catalog upsert; see `upsert_shallow_session_in_transaction`.
 pub(super) static UPSERT_SESSION_SQL: LazyLock<String> = LazyLock::new(|| {
-    let project_key_merge = crate::store::project_key_merge_sql();
+    let project_key_merge = crate::store::project_key_merge_sql("?23", "0");
     format!(
         "INSERT INTO sessions \
          (session_id, source, cwd, git_branch, first_activity_ms, last_activity_ms, \
@@ -74,7 +74,6 @@ pub(super) static UPSERT_SESSION_SQL: LazyLock<String> = LazyLock::new(|| {
          models_json = COALESCE(excluded.models_json, sessions.models_json), \
          originator = COALESCE(excluded.originator, sessions.originator), \
          agent_version = COALESCE(excluded.agent_version, sessions.agent_version), \
-         repo_url = COALESCE(excluded.repo_url, sessions.repo_url), \
          initial_commit = COALESCE(excluded.initial_commit, sessions.initial_commit), \
          workspace_roots_json = COALESCE(excluded.workspace_roots_json, sessions.workspace_roots_json), \
          source_stamp = COALESCE(excluded.source_stamp, sessions.source_stamp), \

@@ -167,9 +167,24 @@ pub(crate) fn catalog_identity(
     recorded_url: Option<&str>,
     capture_origin: bool,
 ) -> Option<(String, ProjectKeyMethod, Option<String>)> {
+    catalog_identity_observation(cwd, recorded_url, capture_origin).0
+}
+
+type CatalogIdentity = (String, ProjectKeyMethod, Option<String>);
+
+/// The flag records usable provider evidence independently of URL storage.
+pub(crate) fn catalog_identity_observation(
+    cwd: Option<&str>,
+    recorded_url: Option<&str>,
+    capture_origin: bool,
+) -> (Option<CatalogIdentity>, bool) {
     if let Some((key, url)) = recorded_url.and_then(catalog_remote_identity) {
-        return Some((key, ProjectKeyMethod::Remote, url));
+        return (Some((key, ProjectKeyMethod::Remote, url)), true);
     }
+    (catalog_checkout_identity(cwd, capture_origin), false)
+}
+
+fn catalog_checkout_identity(cwd: Option<&str>, capture_origin: bool) -> Option<CatalogIdentity> {
     let cwd = cwd.map(str::trim).filter(|cwd| !cwd.is_empty())?;
     if !crate::protected_folder::keeping_raw_path(cwd) {
         let resolved = resolve_project_identity(cwd);
