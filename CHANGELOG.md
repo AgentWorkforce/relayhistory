@@ -28,6 +28,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Snippets center on the match and report `snippetStartOffset` in original codepoints even when lowercasing expands a character (for example `İ`).
 - SDK `search()` returns all matches up to `limit` unless `maxTotalContentChars` is explicitly given; only `searchPage()` and MCP `search_history` apply the 20000 default budget.
 - Snippets prefer a whole-token match from any query term over an earlier substring, prefix terms center at a token start, and tool payloads that serialize a prompt with escaped quotes still collapse as echoes of it; session-less rows no longer group with unrelated rows.
+- Grouped search pages that hit the per-branch fetch growth cap trim results to the frontier covered by every capped branch instead of advancing `nextCursor` past unfetched matches, and hitting the empty-page continuation cap returns the pending `nextCursor` instead of ending pagination early.
 
 ## [0.62.0] - 2026-11-23
 
