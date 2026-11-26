@@ -14,7 +14,6 @@ pub(super) fn resolve_missing_project_keys(conn: &Connection) -> Result<usize> {
     // The same predicate is evaluated here over the rows already read.
     #[cfg(test)]
     WORK.with(|work| work.borrow_mut().queries += 1);
-    type Held = (Option<String>, Option<String>);
     type Observation = (String, Option<String>, Option<String>);
     let mut pending: BTreeMap<Observation, BTreeSet<Held>> = BTreeMap::new();
     {
@@ -72,53 +71,86 @@ pub(super) fn resolve_missing_project_keys(conn: &Connection) -> Result<usize> {
     )?;
     let mut written = 0;
     for ((source, cwd, repo_url), held) in pending {
-        for (key, method) in &held {
-            if method.as_deref() != Some("remote") {
-                continue;
-            }
-            let (safe_key, safe_url) = crate::project_identity::settled_catalog_identity(
-                &source,
-                cwd.as_deref(),
-                repo_url.as_deref(),
-                key.as_deref(),
-            );
-            if safe_url != repo_url || &safe_key != key {
-                written += settled_update
-                    .execute(params![safe_url, cwd, repo_url, source, key, safe_key])?;
-            }
-        }
-        if held
-            .iter()
-            .all(|(key, method)| key.is_some() && method.as_deref() == Some("remote"))
-        {
-            continue;
-        }
-        let Some((key, method, safe)) = crate::project_identity::catalog_identity(
+        written += repair_settled_remotes(
+            &mut settled_update,
+            &source,
             cwd.as_deref(),
             repo_url.as_deref(),
-            source == "claude",
-        ) else {
-            continue;
-        };
-        // `UPGRADABLE`, row by row, over what the read above returned.
-        let remote = method == crate::project_identity::ProjectKeyMethod::Remote;
-        let needed =
-            held.iter().any(
-                |(held_key, held_method)| match (held_key, held_method.as_deref()) {
-                    (None, _) => true,
-                    (Some(held_key), Some("path")) => {
-                        remote || held_key != &key || safe != repo_url
-                    }
-                    (Some(_), Some("inherited")) => remote,
-                    _ => false,
-                },
-            );
-        if !needed {
-            continue;
-        }
-        written += update.execute(params![key, method.as_str(), cwd, repo_url, safe, source])?;
+            &held,
+        )?;
+        written += resolve_provisional_identity(
+            &mut update,
+            &source,
+            cwd.as_deref(),
+            repo_url.as_deref(),
+            &held,
+        )?;
     }
     Ok(written)
+}
+
+type Held = (Option<String>, Option<String>);
+
+fn repair_settled_remotes(
+    update: &mut rusqlite::Statement<'_>,
+    source: &str,
+    cwd: Option<&str>,
+    repo_url: Option<&str>,
+    held: &BTreeSet<Held>,
+) -> Result<usize> {
+    let mut written = 0;
+    for (key, method) in held {
+        if method.as_deref() != Some("remote") {
+            continue;
+        }
+        let (safe_key, safe_url) = crate::project_identity::settled_catalog_identity(
+            source,
+            cwd,
+            repo_url,
+            key.as_deref(),
+        );
+        if safe_url.as_deref() != repo_url || &safe_key != key {
+            written += update.execute(params![safe_url, cwd, repo_url, source, key, safe_key])?;
+        }
+    }
+    Ok(written)
+}
+
+fn resolve_provisional_identity(
+    update: &mut rusqlite::Statement<'_>,
+    source: &str,
+    cwd: Option<&str>,
+    repo_url: Option<&str>,
+    held: &BTreeSet<Held>,
+) -> Result<usize> {
+    if held
+        .iter()
+        .all(|(key, method)| key.is_some() && method.as_deref() == Some("remote"))
+    {
+        return Ok(0);
+    }
+    let Some((key, method, safe)) =
+        crate::project_identity::catalog_identity(cwd, repo_url, source == "claude")
+    else {
+        return Ok(0);
+    };
+    // `UPGRADABLE`, row by row, over what the read above returned.
+    let remote = method == crate::project_identity::ProjectKeyMethod::Remote;
+    let needed =
+        held.iter().any(
+            |(held_key, held_method)| match (held_key, held_method.as_deref()) {
+                (None, _) => true,
+                (Some(held_key), Some("path")) => {
+                    remote || held_key != &key || safe.as_deref() != repo_url
+                }
+                (Some(_), Some("inherited")) => remote,
+                _ => false,
+            },
+        );
+    if !needed {
+        return Ok(0);
+    }
+    Ok(update.execute(params![key, method.as_str(), cwd, repo_url, safe, source])?)
 }
 
 #[cfg(test)]
