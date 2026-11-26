@@ -121,3 +121,55 @@ fn resumed_codex_append_keeps_legacy_equal_time_bucket_unranked_and_in_order() {
         .unwrap();
     assert_eq!(later, Some(0));
 }
+
+/// One equal-time bucket (DeepAgents stamps every message with the session
+/// start) must not be recounted per insert: the next-rank lookup stays a
+/// couple of index seeks however large the bucket grows.
+#[test]
+fn next_source_order_seeks_instead_of_recounting_the_bucket() {
+    use rusqlite::StatementStatus;
+    let dir = tempfile::tempdir().unwrap();
+    let conn = open_db(&dir.path().join("history.db")).unwrap();
+    let tx = conn.unchecked_transaction().unwrap();
+    for rank in 0..3000_i64 {
+        tx.execute(
+            "INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text,source_order) \
+             VALUES('deepagents','bucket',?1,100,'user','text','x',?2)",
+            rusqlite::params![format!("e{rank}"), rank],
+        )
+        .unwrap();
+    }
+    tx.commit().unwrap();
+    let next = |conn: &Connection| -> (Option<i64>, i32) {
+        let mut stmt = conn
+            .prepare(&format!("SELECT {}", super::NEXT_SOURCE_ORDER))
+            .unwrap();
+        stmt.raw_bind_parameter(1, "deepagents").unwrap();
+        stmt.raw_bind_parameter(2, "bucket").unwrap();
+        stmt.raw_bind_parameter(8, 100_i64).unwrap();
+        let value = {
+            let mut rows = stmt.raw_query();
+            rows.next().unwrap().unwrap().get(0).unwrap()
+        };
+        (value, stmt.get_status(StatementStatus::VmStep))
+    };
+    let (rank, steps) = next(&conn);
+    assert_eq!(rank, Some(3000));
+    assert!(
+        steps < 200,
+        "next rank recounted the bucket: {steps} VM steps"
+    );
+
+    conn.execute(
+        "INSERT INTO session_events(source,session_id,event_uid,ts_ms,role,kind,text) \
+         VALUES('deepagents','bucket','legacy',100,'user','text','x')",
+        [],
+    )
+    .unwrap();
+    let (rank, steps) = next(&conn);
+    assert_eq!(rank, None, "a bucket with an unranked row stays unranked");
+    assert!(
+        steps < 200,
+        "unranked check scanned the bucket: {steps} VM steps"
+    );
+}

@@ -26,6 +26,15 @@ const SESSION_KEY_LOOKUP: &str = "(SELECT s.project_key FROM sessions s \
 const SESSION_METHOD_LOOKUP: &str = "(SELECT s.project_key_method FROM sessions s \
      WHERE s.source = ?1 AND s.session_id = ?2)";
 
+/// The next rank in an equal-time bucket, or null when any stored row there
+/// has no rank. Both arms are single seeks on
+/// `idx_session_events_order_sequence`, so a source that stamps every event
+/// with one time (DeepAgents) does not recount the bucket on each insert.
+const NEXT_SOURCE_ORDER: &str = "(SELECT CASE WHEN EXISTS(SELECT 1 FROM session_events \
+       WHERE source=?1 AND session_id=?2 AND ts_ms=?8 AND source_order IS NULL) THEN NULL \
+     ELSE COALESCE((SELECT MAX(source_order) FROM session_events \
+       WHERE source=?1 AND session_id=?2 AND ts_ms=?8),-1)+1 END)";
+
 const LOCATION_ASSIGNED: &str = "CASE WHEN session_events.location = excluded.location \
      THEN session_events.location ELSE 'both' END";
 
@@ -76,8 +85,7 @@ fn session_event_sql(session_key: &str, session_method: &str) -> (String, String
            ?14, ?15, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, \
            ?29, ?30, ?31, ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, \
            COALESCE((SELECT source_order FROM session_events WHERE source=?1 AND session_id=?2 AND event_uid=?15 AND ts_ms=?8), \
-             (SELECT CASE WHEN COUNT(source_order)=COUNT(*) THEN COALESCE(MAX(source_order),-1)+1 END \
-              FROM session_events WHERE source=?1 AND session_id=?2 AND ts_ms=?8))) \
+             {NEXT_SOURCE_ORDER})) \
          ON CONFLICT(source, session_id, event_uid) DO UPDATE SET \
          project=excluded.project, \
          project_key={assigned_key}, \
