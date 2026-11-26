@@ -9,27 +9,58 @@ fn json_string_list(raw: Option<String>) -> Vec<String> {
 
 pub(crate) fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<ShallowSession> {
     let mut session = row_to_unsanitized_session(row)?;
-    if session.project_key_method.as_deref() == Some("remote") {
-        (session.project_key, session.repo_url) = crate::project_identity::settled_catalog_identity(
-            &session.source,
-            None, // Listing is cache-only.
-            session.repo_url.as_deref(),
-            session.project_key.as_deref(),
-        );
-    } else {
-        session.repo_url = session
-            .repo_url
-            .as_deref()
-            .and_then(crate::project_identity::safe_catalog_repo_url);
-        if session.project_key_method.as_deref() == Some("inherited") {
-            session.project_key = session
-                .project_key
-                .as_deref()
-                .map(crate::project_identity::safe_catalog_project_key)
-                .map(str::to_owned);
-        }
-    }
+    (session.project_key, session.repo_url) = catalog_identity_projection(
+        &session.source,
+        session.project_key_method.as_deref(),
+        session.repo_url.as_deref(),
+        session.project_key.as_deref(),
+    );
     Ok(session)
+}
+
+fn catalog_identity_projection(
+    source: &str,
+    method: Option<&str>,
+    repo_url: Option<&str>,
+    project_key: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    use crate::project_identity::{
+        safe_catalog_project_key, safe_catalog_repo_url, settled_catalog_identity,
+    };
+    if method == Some("remote") {
+        return settled_catalog_identity(source, None, repo_url, project_key);
+    }
+    let project_key = if method == Some("inherited") {
+        project_key.map(safe_catalog_project_key)
+    } else {
+        project_key
+    };
+    (project_key.map(str::to_owned), repo_url.and_then(safe_catalog_repo_url))
+}
+
+/// Evaluate the same cache-only key before SQL applies its page limit.
+pub(super) fn register_catalog_project_key(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    use rusqlite::functions::FunctionFlags;
+    // A cache-only listing can share a connection with an active reader.
+    // SQLite refuses replacement of an existing function in that case.
+    if conn.prepare_cached("SELECT catalog_project_key(NULL, NULL, NULL, NULL)").is_ok() {
+        return Ok(());
+    }
+
+    conn.create_scalar_function(
+        "catalog_project_key",
+        4,
+        FunctionFlags::SQLITE_UTF8 | FunctionFlags::SQLITE_DETERMINISTIC,
+        |ctx| {
+            let source: String = ctx.get(0)?;
+            let method: Option<String> = ctx.get(1)?;
+            let repo_url: Option<String> = ctx.get(2)?;
+            let key: Option<String> = ctx.get(3)?;
+            Ok(catalog_identity_projection(
+                &source, method.as_deref(), repo_url.as_deref(), key.as_deref(),
+            ).0)
+        },
+    )
 }
 
 pub(super) fn row_to_unsanitized_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<ShallowSession> {

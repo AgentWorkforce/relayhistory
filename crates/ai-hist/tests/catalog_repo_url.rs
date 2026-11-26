@@ -149,6 +149,30 @@ fn catalog_urls_agree_across_discovery_cache_sweep_and_store_reads() {
         row(&store, "codex-remote").repo_url.as_deref(),
         Some("https://recorded.test/Org/App.git")
     );
+    // Filtering must apply the displayed key before the page limit and leave
+    // the unrepaired catalog untouched.
+    let mut query = CatalogQuery::default();
+    query.project_key = Some("recorded.test/Org/App".into());
+    query.page_size = 1;
+    let mut matched: Vec<_> = store
+        .sessions(query)
+        .map(|row| row.unwrap().session_id)
+        .collect();
+    matched.sort();
+    assert_eq!(matched, ["codex-precedence", "codex-remote"]);
+    let mut stale = CatalogQuery::default();
+    stale.project_key = Some("origin.test/Org/Worktree".into());
+    stale.sources = Some(vec![Source::Codex]);
+    assert!(store.sessions(stale).next().is_none());
+
+    let stored_key: String = raw
+        .query_row(
+            "SELECT project_key FROM sessions WHERE session_id = 'codex-precedence'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored_key, "origin.test/Org/Worktree");
     assert_eq!(discover().skipped_unchanged, 4);
     check(&store);
 
@@ -194,4 +218,44 @@ fn catalog_urls_agree_across_discovery_cache_sweep_and_store_reads() {
         )
         .unwrap();
     assert_eq!(recorded_key, "recorded.test/Org/App");
+}
+
+#[test]
+fn literal_scp_paths_remain_distinct_after_cached_discovery() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path();
+    let store = open(home, &home.join("catalog.db"));
+    for (id, path) in [
+        ("plain", "App"),
+        ("literal", "App?one#two"),
+        ("escaped", "App%3Fone%23two"),
+    ] {
+        let cwd = home.join(id);
+        fs::create_dir_all(cwd.join(".git")).unwrap();
+        fs::write(
+            cwd.join(".git/config"),
+            format!("[remote \"origin\"]\nurl = \"git@origin.test:Org/{path}.git\"\n"),
+        )
+        .unwrap();
+        claude(home, id, &cwd);
+    }
+    let observe = || {
+        store
+            .discover(DiscoveryOptions::default().sources([Source::Claude]))
+            .unwrap()
+    };
+    assert_eq!(observe().discovered, 3);
+    assert_eq!(observe().skipped_unchanged, 3);
+    for (id, url_path, key_path) in [
+        ("plain", "App", "App"),
+        ("literal", "App?one#two", "App%3Fone%23two"),
+        ("escaped", "App%3Fone%23two", "App%253Fone%2523two"),
+    ] {
+        assert_repo(
+            &store,
+            id,
+            &format!("git@origin.test:Org/{url_path}.git"),
+            &format!("origin.test/Org/{key_path}"),
+        );
+    }
 }

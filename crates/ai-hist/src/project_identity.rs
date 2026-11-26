@@ -168,7 +168,7 @@ pub(crate) fn catalog_identity(
     capture_origin: bool,
 ) -> Option<(String, ProjectKeyMethod, Option<String>)> {
     if let Some(url) = recorded_url.and_then(safe_catalog_repo_url) {
-        if let Some(key) = canonicalize_remote_url(&url) {
+        if let Some(key) = catalog_remote_key(&url) {
             return Some((key, ProjectKeyMethod::Remote, Some(url)));
         }
     }
@@ -176,7 +176,7 @@ pub(crate) fn catalog_identity(
     if !crate::protected_folder::keeping_raw_path(cwd) {
         let resolved = resolve_project_identity(cwd);
         if let Some(url) = resolved.repo_url.as_deref().and_then(safe_catalog_repo_url) {
-            if let Some(key) = canonicalize_remote_url(&url) {
+            if let Some(key) = catalog_remote_key(&url) {
                 return Some((key, ProjectKeyMethod::Remote, capture_origin.then_some(url)));
             }
         }
@@ -191,17 +191,17 @@ pub(crate) fn safe_catalog_repo_url(raw: &str) -> Option<String> {
     if raw.chars().any(|ch| ch.is_control() || ch == '\\') {
         return None;
     }
-    let address = raw.split(['?', '#']).next()?;
-    let safe = if let Some(rest) = strip_url_scheme(address) {
-        let (authority, path) = rest.split_once('/')?;
+    let safe = if let Some(rest) = strip_url_scheme(raw) {
+        let address = rest.split(['?', '#']).next()?;
+        let (authority, path) = address.split_once('/')?;
         let host = authority.rsplit('@').next()?;
         if !safe_catalog_authority(host) {
             return None;
         }
-        let (scheme, _) = address.split_once("://")?;
+        let (scheme, _) = raw.split_once("://")?;
         format!("{scheme}://{host}/{path}")
     } else {
-        let (host, path) = split_scp_like(address)?;
+        let (host, path) = split_scp_like(raw)?;
         if !safe_catalog_authority(host) {
             return None;
         }
@@ -227,6 +227,20 @@ fn safe_catalog_authority(authority: &str) -> bool {
             .is_some_and(|port| port.parse::<u16>().is_ok())
 }
 
+// SCP paths are literal. Escape delimiters in the key so a borrowed key
+// remains unambiguous even when the child has no URL of its own.
+fn catalog_remote_key(url: &str) -> Option<String> {
+    let key = canonicalize_remote_url(url)?;
+    if split_scp_like(url).is_some() && key.contains(['%', '?', '#']) {
+        return Some(
+            key.replace('%', "%25")
+                .replace('?', "%3F")
+                .replace('#', "%23"),
+        );
+    }
+    Some(key)
+}
+
 pub(crate) fn safe_catalog_project_key(key: &str) -> &str {
     let Some((address, _)) = key.split_once(['?', '#']) else {
         return key;
@@ -243,18 +257,29 @@ pub(crate) fn settled_catalog_identity(
     recorded_url: Option<&str>,
     key: Option<&str>,
 ) -> (Option<String>, Option<String>) {
+    let url = recorded_url.and_then(safe_catalog_repo_url);
     let safe_key = key.map(safe_catalog_project_key);
-    let mut url = recorded_url.and_then(safe_catalog_repo_url);
     if source == "codex" {
-        let recorded_key = url.as_deref().and_then(canonicalize_remote_url);
-        return (recorded_key.or_else(|| safe_key.map(str::to_owned)), url);
+        let recorded = url.as_deref().and_then(catalog_remote_key);
+        return (recorded.or_else(|| safe_key.map(str::to_owned)), url);
     }
-    if source == "claude" && url.is_none() {
-        url = catalog_identity(cwd, None, true)
-            .filter(|(resolved, _, _)| Some(resolved.as_str()) == safe_key)
-            .and_then(|(_, _, origin)| origin);
+    if let Some(url) = url {
+        let resolved = catalog_remote_key(&url);
+        let literal = canonicalize_remote_url(&url);
+        if resolved.as_deref() == key || literal.as_deref() == key {
+            return (resolved, Some(url));
+        }
+        return (safe_key.map(str::to_owned), Some(url));
     }
-    (safe_key.map(str::to_owned), url)
+    if source == "claude" {
+        if let Some((resolved, _, Some(origin))) = catalog_identity(cwd, None, true) {
+            let literal = canonicalize_remote_url(&origin);
+            if Some(resolved.as_str()) == safe_key || literal.as_deref() == key {
+                return (Some(resolved), Some(origin));
+            }
+        }
+    }
+    (safe_key.map(str::to_owned), None)
 }
 
 /// Cached resolver. Construct one per scope to avoid sharing a process-global

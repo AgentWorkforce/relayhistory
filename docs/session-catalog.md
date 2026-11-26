@@ -286,7 +286,10 @@ including linked worktrees. Codex uses the recorded
 `session_meta.payload.git.repository_url` or SQLite thread metadata and prefers
 it over a local checkout, including when the recorded directory is missing.
 The catalog preserves familiar URL and SCP-style addressing, strips URL
-userinfo, query strings and fragments, and uses `git@` for SCP-style addresses.
+userinfo, query strings and fragments from URI remotes, and uses `git@` for
+SCP-style addresses. Literal `?` and `#` stay in SCP paths. The project key
+percent-escapes those characters and literal percent signs in SCP paths so
+the keys remain distinct when inherited.
 An inherited or path-only identity does not supply a repository URL.
 An unchanged Claude transcript can backfill a missing URL when the current
 origin still matches its stored remote key. A `path` key is
