@@ -167,21 +167,83 @@ pub(crate) fn catalog_identity(
     recorded_url: Option<&str>,
     capture_origin: bool,
 ) -> Option<(String, ProjectKeyMethod, Option<String>)> {
-    if let Some(url) = recorded_url.and_then(safe_catalog_repo_url) {
-        if let Some(key) = catalog_remote_key(&url) {
-            return Some((key, ProjectKeyMethod::Remote, Some(url)));
-        }
+    if let Some((key, url)) = recorded_url.and_then(catalog_remote_identity) {
+        return Some((key, ProjectKeyMethod::Remote, url));
     }
     let cwd = cwd.map(str::trim).filter(|cwd| !cwd.is_empty())?;
     if !crate::protected_folder::keeping_raw_path(cwd) {
         let resolved = resolve_project_identity(cwd);
-        if let Some(url) = resolved.repo_url.as_deref().and_then(safe_catalog_repo_url) {
-            if let Some(key) = catalog_remote_key(&url) {
-                return Some((key, ProjectKeyMethod::Remote, capture_origin.then_some(url)));
-            }
+        if let Some((key, url)) = resolved
+            .repo_url
+            .as_deref()
+            .and_then(catalog_remote_identity)
+        {
+            return Some((
+                key,
+                ProjectKeyMethod::Remote,
+                url.filter(|_| capture_origin),
+            ));
         }
     }
     Some((cwd.to_string(), ProjectKeyMethod::PathFallback, None))
+}
+
+fn catalog_remote_identity(raw: &str) -> Option<(String, Option<String>)> {
+    let url = safe_catalog_repo_url(raw);
+    let key = match url.as_deref() {
+        Some(url) => catalog_remote_key(url),
+        None => key_from_unstored_remote(raw),
+    }?;
+    Some((key, url))
+}
+
+// Accept established host/path identities even when the spelling is unsuitable
+// for catalog URLs. Validate the authority after removing apparent userinfo,
+// and discard URI suffixes before constructing the key.
+fn key_from_unstored_remote(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.chars().any(char::is_control) {
+        return None;
+    }
+    if let Some(rest) = strip_url_scheme(raw) {
+        let (authority, path) = rest.split_once('/')?;
+        let host = match authority.rsplit_once('@') {
+            Some((userinfo, host)) if apparent_userinfo(userinfo) => host,
+            Some(_) => return None,
+            None => authority,
+        };
+        let path = path.split(['?', '#']).next()?;
+        if identity_authority(host) && !path.contains('\\') {
+            return canonicalize_remote_url(&format!("ssh://{host}/{path}"));
+        }
+    } else if let Some((host, path)) = split_scp_like(raw) {
+        if identity_authority(host) && !path.contains('\\') {
+            return catalog_remote_key(raw);
+        }
+    }
+    None
+}
+
+fn apparent_userinfo(userinfo: &str) -> bool {
+    let prefix = userinfo.split(['?', '#']).next().unwrap_or(userinfo);
+    prefix == userinfo || prefix.contains(':')
+}
+
+fn identity_authority(authority: &str) -> bool {
+    let host = strip_port(authority);
+    if host.is_empty()
+        || !host
+            .chars()
+            .all(|ch| ch.is_alphanumeric() || ".-_:[]".contains(ch))
+        || (host.starts_with('[') && !host.ends_with(']'))
+    {
+        return false;
+    }
+    let port = &authority[host.len()..];
+    port.is_empty()
+        || port
+            .strip_prefix(':')
+            .is_some_and(|port| port.bytes().all(|byte| byte.is_ascii_digit()))
 }
 
 /// Keep repository addressing, dropping userinfo and URL suffixes that can
@@ -211,15 +273,10 @@ pub(crate) fn safe_catalog_repo_url(raw: &str) -> Option<String> {
 }
 
 fn safe_catalog_authority(authority: &str) -> bool {
-    let host = strip_port(authority);
-    if host.is_empty()
-        || !host
-            .chars()
-            .all(|ch| ch.is_ascii_alphanumeric() || ".-_:[]".contains(ch))
-        || (host.starts_with('[') && !host.ends_with(']'))
-    {
+    if !authority.is_ascii() || !identity_authority(authority) {
         return false;
     }
+    let host = strip_port(authority);
     let port = &authority[host.len()..];
     port.is_empty()
         || port
@@ -257,12 +314,14 @@ pub(crate) fn settled_catalog_identity(
     recorded_url: Option<&str>,
     key: Option<&str>,
 ) -> (Option<String>, Option<String>) {
-    let url = recorded_url.and_then(safe_catalog_repo_url);
     let safe_key = key.map(safe_catalog_project_key);
     if source == "codex" {
-        let recorded = url.as_deref().and_then(catalog_remote_key);
-        return (recorded.or_else(|| safe_key.map(str::to_owned)), url);
+        if let Some((recorded, url)) = recorded_url.and_then(catalog_remote_identity) {
+            return (Some(recorded), url);
+        }
+        return (safe_key.map(str::to_owned), None);
     }
+    let url = recorded_url.and_then(safe_catalog_repo_url);
     if let Some(url) = url {
         let resolved = catalog_remote_key(&url);
         let literal = canonicalize_remote_url(&url);

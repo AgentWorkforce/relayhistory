@@ -19,12 +19,16 @@ fn claude(home: &Path, id: &str, cwd: &Path) {
 }
 
 fn codex(home: &Path, id: &str, cwd: &Path) {
+    codex_with_remote(home, id, cwd, "https://fixture-user:fixture-token@recorded.test/Org/App.git?token=fixture-query#fixture-fragment");
+}
+
+fn codex_with_remote(home: &Path, id: &str, cwd: &Path, remote: &str) {
     let day = home.join(".codex/sessions/2026/10/12");
     fs::create_dir_all(&day).unwrap();
     let meta = serde_json::json!({
         "type": "session_meta", "timestamp": "2026-10-12T12:00:00Z",
         "payload": { "id": id, "cwd": cwd,
-            "git": { "repository_url": "https://fixture-user:fixture-token@recorded.test/Org/App.git?token=fixture-query#fixture-fragment" } }
+            "git": { "repository_url": remote } }
     });
     let user = serde_json::json!({
         "type": "event_msg", "timestamp": "2026-10-12T12:00:01Z",
@@ -258,4 +262,94 @@ fn literal_scp_paths_remain_distinct_after_cached_discovery() {
             &format!("origin.test/Org/{key_path}"),
         );
     }
+}
+
+#[test]
+fn a_recorded_remote_can_supply_a_safe_key_without_a_catalog_url() {
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path();
+    let cwd = home.join("checkout");
+    fs::create_dir_all(cwd.join(".git")).unwrap();
+    fs::write(
+        cwd.join(".git/config"),
+        "[remote \"origin\"]\nurl = https://local.test/Org/Other.git\n",
+    )
+    .unwrap();
+    let missing = home.join("missing");
+    let cases = [
+        (
+            "unicode",
+            cwd.as_path(),
+            "https://münchen.test/Org/App.git",
+            "münchen.test/Org/App",
+        ),
+        (
+            "empty-port",
+            cwd.as_path(),
+            "ssh://git@origin.test:/Org/App.git",
+            "origin.test/Org/App",
+        ),
+        (
+            "query-backslash",
+            missing.as_path(),
+            r"https://origin.test/Org/App.git?token=test\secret",
+            "origin.test/Org/App",
+        ),
+        (
+            "userinfo-delimiter",
+            missing.as_path(),
+            "https://test-user:fixture#secret@origin.test/Org/App.git",
+            "origin.test/Org/App",
+        ),
+    ];
+    for (id, cwd, url, _) in cases {
+        codex_with_remote(home, id, cwd, url);
+    }
+
+    let check = |store: &SessionStore| {
+        for (id, _, _, key) in cases {
+            let session = row(store, id);
+            assert_eq!(session.project_key.as_deref(), Some(key), "{id}");
+            assert_eq!(
+                session.project_key_method.as_deref(),
+                Some("remote"),
+                "{id}"
+            );
+            assert_eq!(session.repo_url, None, "{id}");
+        }
+    };
+    let db = home.join("discover.db");
+    let store = open(home, &db);
+    let observe = || {
+        store
+            .discover(DiscoveryOptions::default().sources([Source::Codex]))
+            .unwrap()
+    };
+    assert_eq!(observe().discovered, cases.len());
+    check(&store);
+    let raw = Connection::open(db).unwrap();
+    for (id, _, url, _) in cases {
+        raw.execute(
+            "UPDATE sessions SET repo_url = ?1, project_key = 'local.test/Org/Other' WHERE session_id = ?2",
+            [url, id],
+        ).unwrap();
+    }
+    check(&store);
+    assert_eq!(observe().skipped_unchanged, cases.len());
+    check(&store);
+
+    let remaining: usize = raw
+        .query_row(
+            "SELECT count(*) FROM sessions WHERE repo_url IS NOT NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining, 0);
+
+    let swept = open(home, &home.join("sweep.db"));
+    swept
+        .sync(SyncOptions::default().sources([Source::Codex]))
+        .unwrap();
+    check(&swept);
 }
