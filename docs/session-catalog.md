@@ -317,11 +317,16 @@ and reports `grouped_by`; `--by-cwd` (SDK: `stats({ byCwd: true })`) restores
 the per-directory grouping.
 
 Writable open builds an indexed project lookup inside the catalog migration.
-Normal acquisition writes maintain it in the same statement. Sessions changed
-by a raw SQLite writer are projected at read time until their lookup entries
-are resolved. Legacy read-only catalogs project the key across candidate rows
-before paging, so a rare key can require scanning every candidate. A writable
-open upgrades that catalog for subsequent read-only queries.
+That one-time backfill computes a key for each existing catalog row. Normal
+acquisition writes maintain the lookup in the same statement. Raw SQLite
+inserts and identity updates mark the affected rows dirty. Each project page
+evaluates the key for dirty candidates in scope as well as seeking the indexed
+matches. Dirty entries remain until a catalog-aware write changes that row's
+identity, the row is deleted, or the lookup is rebuilt. Repeated raw writes
+to one identity share one entry, while writes to many identities can make
+this read cost grow. A legacy read-only catalog has no lookup and may scan
+every candidate in scope for a rare key. A writable open upgrades that
+catalog for subsequent read-only queries.
 
 For this cache-only operation, top-level `scope` is the filter applied to the
 ledger. `locations` contains observed presences only; legacy rows that predate
