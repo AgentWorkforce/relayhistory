@@ -24,9 +24,9 @@ impl std::fmt::Display for Issue {
 /// (a bracketed IPv6 literal, or a name starting with an alphanumeric or `_`,
 /// such as `intranet` or an ssh alias `_corp`) with no port, then a non-empty
 /// path. The path is kept as the canonicalizer leaves it, so it may end in
-/// `.git` (a repo named `api.git`). No scheme, no `@` anywhere (so no
-/// userinfo), no `:`, `?` or `#` in the path (a query string can carry a
-/// token), no whitespace or control characters, no trailing `/`.
+/// `.git` (a repo named `api.git`). No scheme, no `@`, `?` or `#` anywhere
+/// (no userinfo, query tokens or fragments), no `:` in the path, no
+/// whitespace or control characters, no trailing `/`.
 pub(crate) fn canonical_remote_shape(url: &str) -> bool {
     let Some((host, path)) = url.split_once('/') else {
         return false;
@@ -40,8 +40,8 @@ pub(crate) fn canonical_remote_shape(url: &str) -> bool {
     };
     host_ok
         && !path.is_empty()
-        && !url.contains('@')
-        && !path.contains([':', '?', '#'])
+        && !url.contains(['@', '?', '#'])
+        && !path.contains(':')
         && !url.chars().any(|c| c.is_whitespace() || c.is_control())
         && !path.ends_with('/')
 }

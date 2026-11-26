@@ -404,7 +404,19 @@ fn validator_rejects_corruption() {
         ),
         (
             "session.repo.remote_url",
+            Box::new(|m| m.session.repo = Some(repo("github.com?access_token=x/acme/api", None))),
+        ),
+        (
+            "session.repo.remote_url",
+            Box::new(|m| m.session.repo = Some(repo("[2001:db8::1?tok=x]/acme/api", None))),
+        ),
+        (
+            "session.repo.remote_url",
             Box::new(|m| m.session.repo = Some(repo("github.com/acme/api#frag", None))),
+        ),
+        (
+            "session.repo.remote_url",
+            Box::new(|m| m.session.repo = Some(repo("github.com#frag/acme/api", None))),
         ),
         (
             "session.repo.remote_url",

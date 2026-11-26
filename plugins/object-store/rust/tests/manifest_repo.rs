@@ -7,9 +7,26 @@ use std::process::Command;
 
 use relayhistory_object_store::manifest::repo::{root_commit, session_repo, RootCommitCache};
 
+const REPOSITORY_SELECTION_ENV: &[&str] = &[
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_COMMON_DIR",
+    "GIT_INDEX_FILE",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+    "GIT_NAMESPACE",
+    "GIT_CONFIG_PARAMETERS",
+    "GIT_CONFIG_COUNT",
+];
+
 fn git(dir: &Path, args: &[&str]) -> String {
-    // Isolated from the developer's git config (signing, hooks, templates).
-    let out = Command::new("git")
+    // Isolated from the developer's git config (signing, hooks, templates)
+    // and any inherited repository-selection env vars (e.g. from a git hook).
+    let mut cmd = Command::new("git");
+    for name in REPOSITORY_SELECTION_ENV {
+        cmd.env_remove(name);
+    }
+    let out = cmd
         .arg("-C")
         .arg(dir)
         .args([
@@ -27,7 +44,6 @@ fn git(dir: &Path, args: &[&str]) -> String {
         .env("GIT_AUTHOR_EMAIL", "t@example.com")
         .env("GIT_COMMITTER_NAME", "t")
         .env("GIT_COMMITTER_EMAIL", "t@example.com")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("HOME", dir)
         .output()
         .expect("git runs");
