@@ -114,7 +114,7 @@ fn ingest_related_codex_rollout(
             record_codex_delegation(conn, parent, &meta, &child.path)?;
         }
     } else if let Some(first) = outcome.first_ts {
-        upsert_session(
+        upsert_session_inner(
             conn,
             &SessionCatalogRow {
                 session_id: &meta.session_id,
@@ -126,6 +126,8 @@ fn ingest_related_codex_rollout(
                 last_assistant_text: outcome.last_assistant_text.as_deref(),
                 raw_path: Some(&child.path.to_string_lossy()),
             },
+            ActivityWindow::Expand,
+            meta.repo_url.as_deref(),
         )?;
     }
     Ok(())
@@ -162,7 +164,7 @@ fn ingest_codex(
     let (outcome, pass) = ingest_codex_rollout_incremental(conn, path, &meta, cursor)?;
     indexed.absorb(pass);
     if let Some(first) = outcome.first_ts {
-        upsert_session(
+        upsert_session_inner(
             conn,
             &SessionCatalogRow {
                 session_id: &meta.session_id,
@@ -174,6 +176,8 @@ fn ingest_codex(
                 last_assistant_text: outcome.last_assistant_text.as_deref(),
                 raw_path: Some(&path.to_string_lossy()),
             },
+            ActivityWindow::Expand,
+            meta.repo_url.as_deref(),
         )?;
     }
     if options.include_related || exact.is_some() {

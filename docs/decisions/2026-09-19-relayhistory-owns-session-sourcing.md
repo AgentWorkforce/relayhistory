@@ -159,6 +159,7 @@ compresses it ([session catalog](../session-catalog.md)).
 | Relationship — delegated                                           | ◐      | ✓     | ✓      | ◐    | ✓    | ✓        | —     | [#170](https://github.com/AgentWorkforce/relayhistory/issues/170) / [#168](https://github.com/AgentWorkforce/relayhistory/issues/168)                                                                                                                                         |
 | Relationship — fork / resume / continuation                        | ✗      | ✓     | ✗      | ✗    | ✗    | ✗        | —     | [#170](https://github.com/AgentWorkforce/relayhistory/issues/170)                                                                                                                                                                                                             |
 | Session metadata (cwd, branch, versions)                           | ◐      | ✓     | ◐      | ◐    | ◐    | ◐        | ◐     | [#164](https://github.com/AgentWorkforce/relayhistory/issues/164), [#177](https://github.com/AgentWorkforce/relayhistory/issues/177)                                                                                                                                          |
+| Credential-stripped catalog repository URL | ◐ | ◐ | — | — | — | — | — | Claude resolves Git origin from the recorded working directory. Codex uses the recorded rollout or SQLite thread remote. |
 | Provider-native session kind (`sessions.session_kind`)             | —      | —     | —      | ✓    | —    | —        | —     | Grok `summary.json` records `session_kind: "subagent"` even without a parent id; root listings use this observed fact. |
 | Session title (`sessions.title`)                                  | ✓      | ✓     | ◐      | ✓    | ✗    | ✓        | ✓     | grok: observed CLI `summary.json` `generated_title`, then `session_summary`, then legacy/export `title`; cursor: the composer `name` for a conversation read from the editor's `state.vscdb`, none for a transcript or chat store; muse keeps the name in its own app store, which is not read |
 | Agent name (`sessions.agent_name`)                                | ✓      | —     | —      | ✗    | —    | —        | ✗     | claude: the latest `agent-name` record (the name Agent Relay and other sessions address it by), kept apart from `title`; the shallow scan sees the transcript head and tail, the full ingest every rename. grok and devin parse an agent name but do not catalog it yet. Like `title`, omitted from content-off reads |
@@ -388,12 +389,10 @@ capture.
 
 **Session metadata.** The `sessions` table has `originator`, `agent_version`,
 `repo_url`, `initial_commit`, `workspace_roots_json` and `models_json`.
-`upsert_session` — the parser-side write — sets none of them; they are written
-by the shallow discovery upsert. **That is not a second call the consumer has
-to make**: `sync_basic` ends by running
-`discover::discover_sessions_with_providers` over every shallow provider
-(`crates/ai-hist/src/ingest.rs`), so one `sync` populates them, which is what
-`docs/architecture.md` means by "sync ends by running shallow discovery". A
+The parser-side write captures the repository URL for Claude and Codex rollouts.
+Shallow discovery also supplies repository URLs and fills the other fields.
+`sync_basic` runs `discover::discover_sessions_with_providers` at the end of
+the sweep, so one `SessionStore::sync` call populates these fields. A
 single `SessionStore::sync` against a fresh database leaves a Codex row with
 `cwd`, `git_branch`, `agent_version`, `repo_url`, `initial_commit` and
 `workspace_roots_json` all set and `discovery_state = 'full'` — verified

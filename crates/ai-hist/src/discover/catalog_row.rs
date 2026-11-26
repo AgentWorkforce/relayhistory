@@ -8,6 +8,31 @@ fn json_string_list(raw: Option<String>) -> Vec<String> {
 }
 
 pub(crate) fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<ShallowSession> {
+    let mut session = row_to_unsanitized_session(row)?;
+    if session.project_key_method.as_deref() == Some("remote") {
+        (session.project_key, session.repo_url) = crate::project_identity::settled_catalog_identity(
+            &session.source,
+            None, // Listing is cache-only.
+            session.repo_url.as_deref(),
+            session.project_key.as_deref(),
+        );
+    } else {
+        session.repo_url = session
+            .repo_url
+            .as_deref()
+            .and_then(crate::project_identity::safe_catalog_repo_url);
+        if session.project_key_method.as_deref() == Some("inherited") {
+            session.project_key = session
+                .project_key
+                .as_deref()
+                .map(crate::project_identity::safe_catalog_project_key)
+                .map(str::to_owned);
+        }
+    }
+    Ok(session)
+}
+
+pub(super) fn row_to_unsanitized_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<ShallowSession> {
     let (session_kind, agent_name, locations) = kind_agent_and_locations(row)?;
     Ok(ShallowSession {
         source: row.get(0)?,

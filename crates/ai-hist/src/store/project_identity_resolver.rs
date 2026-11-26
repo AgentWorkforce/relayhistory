@@ -1,29 +1,10 @@
 //! Catalog-wide filesystem identity repair, reserved for full maintenance.
 use super::*;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
-/// Pass 1: stamp sessions with no key, and upgrade ones stuck on a borrowed
-/// or provisional key.
-///
-/// A path key is not a settled answer, it is the absence of one. Only filling
-/// NULLs would freeze it: `upsert_session` resolves from the working directory
-/// alone, so a session whose checkout has since been deleted or moved gets a
-/// path key, and nothing would ever revisit it — not this pass, which would
-/// see a non-NULL key, and not shallow discovery, which skips a source whose
-/// bytes have not changed. The repository's own `repo_url`, which the Codex
-/// reader records, then sits in the same row unused while every worktree of
-/// that repository files under a different key.
-///
-/// So a `path` row is reconsidered on every pass and replaced only by
-/// something strictly better. An `inherited` row is reconsidered too, for the
-/// mirror-image reason: the parent's repository is a stand-in, and a child
-/// that later gains its own `origin` would otherwise wear the parent's key for
-/// as long as its transcript stayed unchanged — which is forever.
-///
-/// Nothing here can downgrade a key. `remote` replaces `path` or `inherited`;
-/// `path` replaces only `path` or NULL, never an inherited key, because a
-/// borrowed repository says more about a session than the directory it
-/// happened to run in.
+/// Resolve provisional catalog identities and backfill safe URLs for settled
+/// remotes. A session's remote outranks an inherited key, which outranks a
+/// path. Settled remote keys retain their repository when the checkout moves.
 pub(super) fn resolve_missing_project_keys(conn: &Connection) -> Result<usize> {
     // Every reconsidered row, with the key it holds, in one read. The UPDATE
     // below is keyed on `(cwd, repo_url)`, which no index serves, so asking
@@ -34,22 +15,29 @@ pub(super) fn resolve_missing_project_keys(conn: &Connection) -> Result<usize> {
     #[cfg(test)]
     WORK.with(|work| work.borrow_mut().queries += 1);
     type Held = (Option<String>, Option<String>);
-    let mut pending: BTreeMap<(Option<String>, Option<String>), Vec<Held>> = BTreeMap::new();
+    type Observation = (String, Option<String>, Option<String>);
+    let mut pending: BTreeMap<Observation, BTreeSet<Held>> = BTreeMap::new();
     {
         let mut statement = conn.prepare(
-            "SELECT cwd, repo_url, project_key, project_key_method FROM sessions \
+            "SELECT cwd, repo_url, project_key, project_key_method, source FROM sessions \
              WHERE (project_key IS NULL \
-                    OR project_key_method IN ('path', 'inherited')) \
-               AND (cwd IS NOT NULL OR repo_url IS NOT NULL)",
+                    OR project_key_method IN ('path', 'inherited')
+                    OR (source = 'codex' AND repo_url IS NOT NULL)
+                    OR (repo_url IS NOT NULL AND (repo_url GLOB '*://*@*'
+                        OR instr(repo_url, '?') > 0 OR instr(repo_url, '#') > 0))
+                    OR (project_key_method = 'remote' AND (instr(project_key, '?') > 0
+                        OR instr(project_key, '#') > 0))
+                    OR (source = 'claude' AND project_key_method = 'remote' AND repo_url IS NULL)) \
+               AND (cwd IS NOT NULL OR repo_url IS NOT NULL OR project_key_method = 'remote')",
         )?;
         let mut rows = statement.query([])?;
         while let Some(row) = rows.next()? {
             #[cfg(test)]
             WORK.with(|work| work.borrow_mut().rows += 1);
             pending
-                .entry((row.get(0)?, row.get(1)?))
+                .entry((row.get(4)?, row.get(0)?, row.get(1)?))
                 .or_default()
-                .push((row.get(2)?, row.get(3)?));
+                .insert((row.get(2)?, row.get(3)?));
         }
     }
     if pending.is_empty() {
@@ -72,17 +60,44 @@ pub(super) fn resolve_missing_project_keys(conn: &Connection) -> Result<usize> {
     // stayed unchanged, which is forever.
     const UPGRADABLE: &str = "(project_key IS NULL \
              OR (project_key_method = 'path' \
-                 AND (?2 = 'remote' OR project_key <> ?1)) \
+                 AND (?2 = 'remote' OR project_key <> ?1 OR repo_url IS NOT ?5)) \
              OR (project_key_method = 'inherited' AND ?2 = 'remote')) \
-           AND cwd IS ?3 AND repo_url IS ?4";
+           AND cwd IS ?3 AND repo_url IS ?4 AND source = ?6";
     let mut update = conn.prepare(&format!(
-        "UPDATE sessions SET project_key = ?1, project_key_method = ?2 WHERE {UPGRADABLE}"
+        "UPDATE sessions SET project_key = ?1, project_key_method = ?2, repo_url = ?5 WHERE {UPGRADABLE}"
     ))?;
+    let mut settled_update = conn.prepare(
+        "UPDATE sessions SET repo_url = ?1, project_key = ?6 WHERE cwd IS ?2 AND repo_url IS ?3
+         AND source = ?4 AND project_key IS ?5 AND project_key_method = 'remote'",
+    )?;
     let mut written = 0;
-    for ((cwd, repo_url), held) in pending {
-        let Some((key, method)) =
-            crate::project_identity::identity_for(cwd.as_deref(), repo_url.as_deref())
-        else {
+    for ((source, cwd, repo_url), held) in pending {
+        for (key, method) in &held {
+            if method.as_deref() != Some("remote") {
+                continue;
+            }
+            let (safe_key, safe_url) = crate::project_identity::settled_catalog_identity(
+                &source,
+                cwd.as_deref(),
+                repo_url.as_deref(),
+                key.as_deref(),
+            );
+            if safe_url != repo_url || &safe_key != key {
+                written += settled_update
+                    .execute(params![safe_url, cwd, repo_url, source, key, safe_key])?;
+            }
+        }
+        if held
+            .iter()
+            .all(|(key, method)| key.is_some() && method.as_deref() == Some("remote"))
+        {
+            continue;
+        }
+        let Some((key, method, safe)) = crate::project_identity::catalog_identity(
+            cwd.as_deref(),
+            repo_url.as_deref(),
+            source == "claude",
+        ) else {
             continue;
         };
         // `UPGRADABLE`, row by row, over what the read above returned.
@@ -91,7 +106,9 @@ pub(super) fn resolve_missing_project_keys(conn: &Connection) -> Result<usize> {
             held.iter().any(
                 |(held_key, held_method)| match (held_key, held_method.as_deref()) {
                     (None, _) => true,
-                    (Some(held_key), Some("path")) => remote || held_key != &key,
+                    (Some(held_key), Some("path")) => {
+                        remote || held_key != &key || safe != repo_url
+                    }
                     (Some(_), Some("inherited")) => remote,
                     _ => false,
                 },
@@ -99,7 +116,7 @@ pub(super) fn resolve_missing_project_keys(conn: &Connection) -> Result<usize> {
         if !needed {
             continue;
         }
-        written += update.execute(params![key, method.as_str(), cwd, repo_url])?;
+        written += update.execute(params![key, method.as_str(), cwd, repo_url, safe, source])?;
     }
     Ok(written)
 }

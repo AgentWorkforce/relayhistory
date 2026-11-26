@@ -1857,7 +1857,7 @@ pub struct CatalogSession {
     pub originator: Option<String>,
     /// Agent CLI version. Claude, codex.
     pub agent_version: Option<String>,
-    /// Repository remote. Codex.
+    /// Credential-stripped repository URL from recorded metadata or Claude Git origin.
     pub repo_url: Option<String>,
     /// Commit the session started from. Codex.
     pub initial_commit: Option<String>,

@@ -284,7 +284,7 @@ pub struct ShallowSession {
     /// Agent CLI version (codex `cli_version`, claude record `version`).
     /// Observed.
     pub agent_version: Option<String>,
-    /// Repository remote URL, when the provider records one. Observed.
+    /// Credential-stripped repository URL from recorded metadata or Claude Git origin.
     pub repo_url: Option<String>,
     /// Commit the session started from, when the provider records one. Observed.
     pub initial_commit: Option<String>,
@@ -3547,8 +3547,8 @@ pub(crate) const OBSERVED_SESSION_BY_LOCATOR_SQL: &str = "SELECT session_id FROM
 /// directory resolves to.
 ///
 /// Only a key that is absent, a path, or inherited can change, and an
-/// inherited one only for the child's own `remote`. A `remote` key is never
-/// touched, and inheritance is never traded for a path. The write is skipped
+/// inherited one only for the child's own `remote`. A settled remote can
+/// backfill its URL or drop a legacy URL suffix. The write is skipped
 /// entirely when the answer is the one already stored, which is the usual
 /// case: these are reconsidered because they *might* be upgradable, and almost
 /// never are.
@@ -3556,13 +3556,36 @@ fn upgrade_cached_project_identity(conn: &Connection, row: &mut ShallowSession) 
     #[cfg(test)]
     crate::store::project_identity_resolver::note_observation();
     let stored = row.project_key_method.as_deref();
+    let original_url = row.repo_url.clone();
     if stored == Some(ProjectKeyMethod::Remote.as_str()) {
-        // The strongest answer there is. Nothing this function can learn
-        // improves on it, so do not even touch the filesystem.
+        let (safe_key, safe_url) = crate::project_identity::settled_catalog_identity(
+            &row.source,
+            row.cwd.as_deref(),
+            original_url.as_deref(),
+            row.project_key.as_deref(),
+        );
+        if safe_url != original_url || safe_key != row.project_key {
+            let changed = conn.execute(
+                "UPDATE sessions SET repo_url = ?1, project_key = ?2 WHERE source = ?3 AND session_id = ?4
+                 AND repo_url IS ?5 AND project_key IS ?6 AND cwd IS ?7 AND project_key_method = 'remote'",
+                params![safe_url, safe_key, row.source, row.session_id, original_url, row.project_key, row.cwd],
+            )?;
+            if changed == 0 {
+                reload_cached_project_identity(conn, row)?;
+            } else {
+                row.project_key = safe_key;
+                row.repo_url = safe_url;
+            }
+        }
         return Ok(());
     }
-    let resolved =
-        crate::project_identity::identity_for(row.cwd.as_deref(), row.repo_url.as_deref());
+    let resolved = crate::project_identity::catalog_identity(
+        row.cwd.as_deref(),
+        original_url.as_deref(),
+        row.source == "claude",
+    );
+    row.repo_url = resolved.as_ref().and_then(|(_, _, url)| url.clone());
+    let resolved = resolved.map(|(key, method, _)| (key, method));
     let candidate = match resolved {
         // The session's own repository beats anything borrowed.
         Some((key, ProjectKeyMethod::Remote)) => Some((key, ProjectKeyMethod::Remote)),
@@ -3583,7 +3606,10 @@ fn upgrade_cached_project_identity(conn: &Connection, row: &mut ShallowSession) 
                 &row.source,
                 &row.session_id,
             )? {
-                Some(parent) => Some((parent, ProjectKeyMethod::Inherited)),
+                Some(parent) => Some((
+                    crate::project_identity::safe_catalog_project_key(&parent).to_owned(),
+                    ProjectKeyMethod::Inherited,
+                )),
                 // An inherited key is borrowed, so it outranks a path: a child
                 // whose directory still resolves to nothing canonical keeps
                 // the parent's repository, which is the point of inheriting it.
@@ -3593,44 +3619,43 @@ fn upgrade_cached_project_identity(conn: &Connection, row: &mut ShallowSession) 
         }
     };
     let Some((key, method)) = candidate else {
+        if stored == Some("inherited") {
+            row.project_key = row
+                .project_key
+                .as_deref()
+                .map(crate::project_identity::safe_catalog_project_key)
+                .map(str::to_owned);
+        }
         return Ok(());
     };
-    if row.project_key.as_deref() == Some(key.as_str()) && stored == Some(method.as_str()) {
+    if row.project_key.as_deref() == Some(key.as_str())
+        && stored == Some(method.as_str())
+        && row.repo_url == original_url
+    {
         return Ok(());
     }
-    // The same precedence the merge and the refresh pass apply, as a guard:
-    // this runs outside any transaction, so a hydrate or a concurrent sync may
-    // have settled the row since it was read.
     let changed = conn.execute(
-        "UPDATE sessions SET project_key = ?1, project_key_method = ?2 \
-         WHERE source = ?3 AND session_id = ?4 \
-           AND (project_key IS NULL \
-                OR project_key_method = 'path' \
-                OR (project_key_method = 'inherited' \
-                    AND ?2 IN ('remote', 'inherited')))",
-        params![key, method.as_str(), row.source, row.session_id],
+        "UPDATE sessions SET project_key = ?1, project_key_method = ?2, repo_url = ?5
+         WHERE source = ?3 AND session_id = ?4 AND repo_url IS ?6 AND cwd IS ?7
+           AND (project_key IS NULL OR project_key_method = 'path'
+                OR (project_key_method = 'inherited' AND ?2 IN ('remote', 'inherited')))",
+        params![key, method.as_str(), row.source, row.session_id, row.repo_url, original_url, row.cwd],
     )?;
     if changed == 0 {
-        // Refused: someone else knows better. Stream what the catalog holds
-        // rather than what this function wanted it to hold — an emitted key no
-        // row anywhere agrees with is worse than a stale one, because nothing
-        // downstream can tell it is wrong.
-        if let Some((key, method)) = conn
-            .query_row(
-                "SELECT project_key, project_key_method FROM sessions \
-                 WHERE source = ?1 AND session_id = ?2",
-                params![row.source, row.session_id],
-                |stored| Ok((stored.get(0)?, stored.get(1)?)),
-            )
-            .optional()?
-        {
-            row.project_key = key;
-            row.project_key_method = method;
-        }
+        reload_cached_project_identity(conn, row)?;
         return Ok(());
     }
     row.project_key = Some(key);
     row.project_key_method = Some(method.as_str().to_string());
+    Ok(())
+}
+
+fn reload_cached_project_identity(conn: &Connection, row: &mut ShallowSession) -> Result<()> {
+    if let Some(stored) = catalog_row(conn, &row.source, &row.session_id, false)? {
+        row.project_key = stored.project_key;
+        row.project_key_method = stored.project_key_method;
+        row.repo_url = stored.repo_url;
+    }
     Ok(())
 }
 
@@ -3738,6 +3763,12 @@ fn upsert_shallow_session_in_transaction(
     // preferred over walking the working directory, which may no longer exist
     // by the time the transcript is read. Resolving here rather than in each
     // provider's shallow reader keeps every source on one code path.
+    let observed = crate::project_identity::catalog_identity(
+        session.cwd.as_deref(),
+        session.repo_url.as_deref(),
+        session.source == "claude",
+    );
+    let repo_url = observed.as_ref().and_then(|(_, _, url)| url.as_deref());
     let resolved = session.project_key.clone().map(|key| {
         (
             key,
@@ -3748,8 +3779,9 @@ fn upsert_shallow_session_in_transaction(
         )
     });
     let resolved = resolved.or_else(|| {
-        crate::project_identity::identity_for(session.cwd.as_deref(), session.repo_url.as_deref())
-            .map(|(key, method)| (key, method.as_str().to_string()))
+        observed
+            .as_ref()
+            .map(|(key, method, _)| (key.clone(), method.as_str().to_string()))
     });
     let (project_key, project_key_method) = match resolved {
         Some((key, method)) => (Some(key), Some(method)),
@@ -3771,7 +3803,7 @@ fn upsert_shallow_session_in_transaction(
             json_array_or_none(&session.models),
             session.originator,
             session.agent_version,
-            session.repo_url,
+            repo_url,
             session.initial_commit,
             json_array_or_none(&session.workspace_roots),
             session.source_stamp,
