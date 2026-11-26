@@ -909,13 +909,14 @@ const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &[
     "session_events_fts_write_unit_v1",
 ];
 
-/// Whether this database already has everything [`init_db`] would add.
+/// Whether this database meets the CLI's shared read requirements.
 ///
 /// Read-only handles skip `init_db`, so an older database would otherwise be
 /// queried against tables and columns that do not exist -- a user upgrading
 /// from before `session_events` existed would get `no such table` on their
 /// first search instead of a silent migration. Callers fall back to a writable
-/// open (which migrates) when this returns false.
+/// open (which migrates) when this returns false. Optional derived lookups
+/// can use a read-only fallback while the writer migration is still pending.
 pub fn schema_is_current(conn: &Connection) -> Result<bool> {
     Ok(schema_check::writable_schema_is_current(conn)?
         && crate::observations::schema_is_current(conn)?
@@ -1015,15 +1016,6 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     schema_check::init_catalog_writer(conn, init_db_once)
 }
 
-/// Whether [`init_db`] has migration work to do on this database. A leftover
-/// retired index counts as outstanding work: its DROP is a real write.
-fn needs_migration(conn: &Connection) -> Result<bool> {
-    Ok(!schema_is_current(conn)?
-        || retired_indexes_present(conn)?
-        || retired_capture_present(conn)?
-        || crate::ingest::standalone_records_migration_pending(conn)?)
-}
-
 /// A schema migration an open in this process runs on an existing database.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MigrationEvent {
@@ -1064,7 +1056,7 @@ fn init_db_once(conn: &Connection) -> Result<()> {
     // A current database needs no write lock. Besides keeping ordinary opens
     // cheap, this lets sync reach its per-source contention handling when a
     // different writer already owns the ledger lock.
-    if !needs_migration(conn)? {
+    if !schema_check::needs_migration(conn)? {
         return Ok(());
     }
     enable_wal_for_migration(conn)?;
@@ -1075,7 +1067,7 @@ fn init_db_once(conn: &Connection) -> Result<()> {
     let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     // Another first opener may have completed the migration while this
     // connection waited for the lock.
-    if !needs_migration(&transaction)? {
+    if !schema_check::needs_migration(&transaction)? {
         transaction.commit()?;
         return Ok(());
     }

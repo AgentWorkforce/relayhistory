@@ -11,7 +11,16 @@ use std::path::Path;
 use std::process::Command;
 
 fn isolated(temp: &tempfile::TempDir, db_path: &Path, args: &[&str]) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_ai-hist"));
+    isolated_at(
+        Path::new(env!("CARGO_BIN_EXE_ai-hist")),
+        temp,
+        db_path,
+        args,
+    )
+}
+
+fn isolated_at(binary: &Path, temp: &tempfile::TempDir, db_path: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new(binary);
     command
         .arg("--db")
         .arg(db_path)
@@ -826,4 +835,128 @@ fn catalog_rows_carry_a_canonical_project_key_and_can_be_filtered_by_it() {
         vec!["one", "two"],
         "--project must select both checkouts and exclude the unrelated session"
     );
+}
+
+#[cfg(unix)]
+#[test]
+fn list_reads_a_legacy_catalog_without_project_lookup_on_a_read_only_directory() {
+    use std::os::unix::{fs::PermissionsExt, process::CommandExt};
+
+    let temp = tempfile::tempdir().unwrap();
+    let archive = temp.path().join("archive");
+    fs::create_dir(&archive).unwrap();
+    let db_path = archive.join("history.db");
+    let writer = open_db(&db_path).unwrap();
+    writer
+        .execute_batch(
+            "DROP TRIGGER catalog_project_insert;
+         DROP TRIGGER catalog_project_update;
+         DROP TRIGGER catalog_project_delete;
+         DROP TABLE catalog_project_lookup;
+         INSERT INTO sessions (source,session_id,project_key,project_key_method,repo_url)
+         VALUES ('codex','recorded','checkout.test/Org/Other','remote',
+                 'https://user:fixture@recorded.test/Org/App.git?token=fixture'),
+                ('claude','other','other.test/Org/App','remote',NULL);
+         PRAGMA wal_checkpoint(TRUNCATE);
+         PRAGMA journal_mode=DELETE;",
+        )
+        .unwrap();
+    drop(writer);
+    let before = fs::read(&db_path).unwrap();
+
+    let permissions =
+        |path: &Path, mode| fs::set_permissions(path, fs::Permissions::from_mode(mode)).unwrap();
+    // SAFETY: geteuid reads the calling process's effective user ID.
+    let privileged = unsafe { libc::geteuid() } == 0;
+    let built_binary = Path::new(env!("CARGO_BIN_EXE_ai-hist"));
+    let accessible_binary = temp.path().join("ai-hist");
+    let binary = if privileged {
+        fs::copy(built_binary, &accessible_binary).unwrap();
+        permissions(&accessible_binary, 0o755);
+        &accessible_binary
+    } else {
+        built_binary
+    };
+    // Give a privilege-dropped subprocess access through the fixture root.
+    permissions(temp.path(), 0o755);
+    permissions(&archive, 0o555);
+    permissions(&db_path, 0o444);
+    let deny_root_override = |command: &mut Command| {
+        if privileged {
+            command.gid(65534).uid(65534);
+        }
+    };
+
+    let mut deny = Command::new("sh");
+    deny.args([
+        "-c",
+        "test -r \"$1\" && test ! -w \"$1\" && test ! -w \"$2\"",
+        "sh",
+    ])
+    .arg(&db_path)
+    .arg(&archive);
+    deny_root_override(&mut deny);
+    let denied = deny.status();
+    let run = |args: &[&str]| {
+        let mut command = isolated_at(binary, &temp, &db_path, args);
+        deny_root_override(&mut command);
+        command.output()
+    };
+    let all = run(&["sessions", "list", "--json"]);
+    let filtered = run(&[
+        "sessions",
+        "list",
+        "--json",
+        "--project",
+        "recorded.test/Org/App",
+    ]);
+    let after = fs::read(&db_path);
+    let entries = fs::read_dir(&archive)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+
+    permissions(&archive, 0o755);
+    permissions(&db_path, 0o644);
+    assert!(
+        denied.unwrap().success(),
+        "fixture must genuinely deny writes"
+    );
+    assert_eq!(after.unwrap(), before);
+    assert_eq!(entries, ["history.db"]);
+
+    for (output, expected_ids) in [
+        (all, &["other", "recorded"][..]),
+        (filtered, &["recorded"][..]),
+    ] {
+        let output = output.unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let payload: Value = serde_json::from_slice(&output.stdout).unwrap();
+        let rows = payload["sessions"].as_array().unwrap();
+        let mut ids: Vec<_> = rows
+            .iter()
+            .map(|row| row["session_id"].as_str().unwrap())
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, expected_ids);
+        let recorded = rows
+            .iter()
+            .find(|row| row["session_id"] == "recorded")
+            .unwrap();
+        assert_eq!(recorded["project_key"], "recorded.test/Org/App");
+        assert_eq!(recorded["repo_url"], "https://recorded.test/Org/App.git");
+    }
+
+    // A writable open must still install and populate the lookup.
+    let migrated = open_db(&db_path).unwrap();
+    let indexed: String = migrated.query_row(
+        "SELECT project_key FROM catalog_project_lookup WHERE session_id = 'recorded' AND dirty = 0",
+        [],
+        |row| row.get(0),
+    ).unwrap();
+    assert_eq!(indexed, "recorded.test/Org/App");
 }

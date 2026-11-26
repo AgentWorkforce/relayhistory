@@ -182,8 +182,7 @@ pub(super) fn writable_schema_is_current(conn: &Connection) -> Result<bool> {
                 "retention_pending",
             ],
         )?
-        && crate::retention::indexes_current(conn)?
-        && crate::discover::catalog_project_lookup::is_current(conn)?)
+        && crate::retention::indexes_current(conn)?)
 }
 
 pub(super) fn init_catalog_writer(
@@ -192,4 +191,14 @@ pub(super) fn init_catalog_writer(
 ) -> Result<()> {
     init(conn)?;
     crate::discover::catalog_project_lookup::configure_writer(conn)
+}
+
+/// Whether [`super::init_db`] has migration work to do on this database. A leftover
+/// retired index counts as outstanding work: its DROP is a real write.
+pub(super) fn needs_migration(conn: &Connection) -> Result<bool> {
+    Ok(!super::schema_is_current(conn)?
+        || !crate::discover::catalog_project_lookup::is_current(conn)?
+        || super::retired_indexes_present(conn)?
+        || super::retired_capture_present(conn)?
+        || crate::ingest::standalone_records_migration_pending(conn)?)
 }

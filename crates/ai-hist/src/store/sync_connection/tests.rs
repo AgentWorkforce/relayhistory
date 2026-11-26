@@ -1,4 +1,5 @@
 use super::*;
+use crate::store::schema_check::needs_migration;
 
 fn fixture() -> (tempfile::TempDir, PathBuf, Cache) {
     let temp = tempfile::tempdir().unwrap();
