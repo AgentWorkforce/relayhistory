@@ -39,7 +39,7 @@ fn catalog_identity_projection(
 }
 
 /// Evaluate the same cache-only key before SQL applies its page limit.
-pub(super) fn register_catalog_project_key(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+pub(crate) fn register_catalog_project_key(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
     use rusqlite::functions::FunctionFlags;
     // A cache-only listing can share a connection with an active reader.
     // SQLite refuses replacement of an existing function in that case.

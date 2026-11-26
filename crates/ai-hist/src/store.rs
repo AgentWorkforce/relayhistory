@@ -1012,7 +1012,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     // REPLACE must fire delete triggers so the change feed tombstones the
     // row it replaces.
     conn.pragma_update(None, "recursive_triggers", true)?;
-    init_db_once(conn)
+    schema_check::init_catalog_writer(conn, init_db_once)
 }
 
 /// Whether [`init_db`] has migration work to do on this database. A leftover

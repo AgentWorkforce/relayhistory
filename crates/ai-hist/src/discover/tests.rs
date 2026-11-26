@@ -10,6 +10,7 @@
 //! is, an unchanged rescan performs zero shallow reads, and the cache-only
 //! listing performs no file I/O at all.
 
+use super::catalog_listing::catalog_list_query;
 use super::*;
 use crate::{init_db, mark_session_presence, upsert_session_presence};
 use std::fs;
@@ -3028,7 +3029,7 @@ fn grok_remote_presence_cannot_clear_a_locally_observed_subagent_kind() {
 
 #[test]
 fn the_catalog_query_reads_only_the_sessions_table() {
-    let (sql, _) = catalog_list_query(&CatalogListOptions::default());
+    let (sql, _) = catalog_list_query(&CatalogListOptions::default(), false);
     assert!(sql.contains("FROM sessions"), "{sql}");
     for forbidden in ["history", "session_events", "tool_calls", "file_edits"] {
         assert!(
@@ -3260,7 +3261,8 @@ fn the_catalog_listing_is_served_by_an_index_not_a_table_scan() {
     // cannot pass against a restated copy of the query while the real one
     // drifts into a table scan.
     let plan = |options: &CatalogListOptions| -> String {
-        let (sql, args) = catalog_list_query(options);
+        let indexed = catalog_listing::prepare_project_filter(&conn, options).unwrap();
+        let (sql, args) = catalog_list_query(options, indexed);
         let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
         let params = rusqlite::params_from_iter(args.iter().map(|arg| arg.as_ref()));
         stmt.query_map(params, |row| row.get::<_, String>(3))

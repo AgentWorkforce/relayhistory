@@ -4,10 +4,18 @@ use super::*;
 ///
 /// Built in one place so the query-plan test asserts the plan of the statement
 /// that actually runs.
-pub(super) fn catalog_list_query(options: &CatalogListOptions) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+pub(super) fn catalog_list_query(options: &CatalogListOptions, indexed_project: bool) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
     // Every filter below is appended as ` AND …`.
-    let mut sql = format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE 1 = 1");
+    let mut sql = format!("SELECT {SESSION_COLUMNS}");
     let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+    if let Some(project_key) = options.project_key.as_ref().filter(|_| indexed_project) {
+        sql.push_str(catalog_project_lookup::FROM_PROJECT);
+        args.push(Box::new(project_key.clone()));
+        args.push(Box::new(project_key.clone()));
+    } else {
+        sql.push_str(" FROM sessions");
+    }
+    sql.push_str(" WHERE 1 = 1");
     match options.scope {
         SessionScope::Local => sql.push_str(
             " AND (EXISTS (SELECT 1 FROM session_presences p WHERE p.source = sessions.source AND p.session_id = sessions.session_id AND p.location = 'local') \
@@ -25,7 +33,7 @@ pub(super) fn catalog_list_query(options: &CatalogListOptions) -> (String, Vec<B
             args.push(Box::new(source.clone()));
         }
     }
-    if let Some(project_key) = options.project_key.as_ref() {
+    if let Some(project_key) = options.project_key.as_ref().filter(|_| !indexed_project) {
         sql.push_str(" AND catalog_project_key(source, project_key_method, repo_url, project_key) = ?");
         args.push(Box::new(project_key.clone()));
     }
@@ -86,16 +94,25 @@ pub fn list_session_catalog(
     conn: &Connection,
     options: &CatalogListOptions,
 ) -> Result<Vec<ShallowSession>> {
-    if options.project_key.is_some() {
-        catalog_row::register_catalog_project_key(conn)?;
-    }
-    let (sql, args) = catalog_list_query(options);
+    let indexed = prepare_project_filter(conn, options)?;
+    let (sql, args) = catalog_list_query(options, indexed);
     let mut stmt = conn.prepare(&sql)?;
     let params = rusqlite::params_from_iter(args.iter().map(|arg| arg.as_ref()));
     let rows = stmt
         .query_map(params, row_to_session)?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+pub(super) fn prepare_project_filter(
+    conn: &Connection,
+    options: &CatalogListOptions,
+) -> Result<bool> {
+    if options.project_key.is_none() {
+        return Ok(false);
+    }
+    catalog_row::register_catalog_project_key(conn)?;
+    catalog_project_lookup::is_current(conn)
 }
 
 /// [`list_session_catalog`] plus the cursor that continues it.

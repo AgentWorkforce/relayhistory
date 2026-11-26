@@ -165,7 +165,8 @@ pub(super) fn init_evidence_schemas(conn: &Connection) -> Result<()> {
     // The retired-source rows go last; see `delete_retired_source_rows`.
     crate::change_feed::init_schema(conn)?;
     crate::retention::init_indexes(conn)?;
-    super::retired_sources::delete_retired_source_rows(conn)
+    super::retired_sources::delete_retired_source_rows(conn)?;
+    crate::discover::catalog_project_lookup::migrate(conn)
 }
 
 /// Maintenance-only tables do not raise the bar for older read-only stores.
@@ -181,5 +182,14 @@ pub(super) fn writable_schema_is_current(conn: &Connection) -> Result<bool> {
                 "retention_pending",
             ],
         )?
-        && crate::retention::indexes_current(conn)?)
+        && crate::retention::indexes_current(conn)?
+        && crate::discover::catalog_project_lookup::is_current(conn)?)
+}
+
+pub(super) fn init_catalog_writer(
+    conn: &Connection,
+    init: impl FnOnce(&Connection) -> Result<()>,
+) -> Result<()> {
+    init(conn)?;
+    crate::discover::catalog_project_lookup::configure_writer(conn)
 }

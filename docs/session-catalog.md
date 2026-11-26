@@ -316,6 +316,13 @@ key, not a path or a prefix. `ai-hist stats` groups `top_projects` by the key
 and reports `grouped_by`; `--by-cwd` (SDK: `stats({ byCwd: true })`) restores
 the per-directory grouping.
 
+Writable open builds an indexed project lookup inside the catalog migration.
+Normal acquisition writes maintain it in the same statement. Sessions changed
+by a raw SQLite writer are projected at read time until their lookup entries
+are resolved. Legacy read-only catalogs project the key across candidate rows
+before paging, so a rare key can require scanning every candidate. A writable
+open upgrades that catalog for subsequent read-only queries.
+
 For this cache-only operation, top-level `scope` is the filter applied to the
 ledger. `locations` contains observed presences only; legacy rows that predate
 presence tracking may therefore have an empty array while still appearing in

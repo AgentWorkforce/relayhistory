@@ -3212,7 +3212,8 @@ fn file_candidates(
 // ---------------------------------------------------------------------------
 
 mod catalog_columns;
-mod catalog_row;
+pub(crate) mod catalog_row;
+pub(crate) mod catalog_project_lookup;
 pub(crate) use {catalog_columns::SESSION_COLUMNS, catalog_row::row_to_session};
 use catalog_columns::{SESSION_COLUMNS_NO_TEXT, UPSERT_SESSION_SQL};
 
@@ -3275,8 +3276,6 @@ pub struct SessionCatalogPage {
 }
 
 mod catalog_listing;
-#[cfg(test)]
-use catalog_listing::catalog_list_query;
 pub use catalog_listing::{list_session_catalog, list_session_catalog_page};
 
 // Classification runs these once per candidate; the SQL strings are built
