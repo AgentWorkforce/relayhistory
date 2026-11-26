@@ -7024,7 +7024,7 @@ fn backfill_codex_metadata(
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
         if let Some(first) = first {
-            session_catalog_write::upsert_codex_history_backfill(
+            upsert_session(
                 conn,
                 &SessionCatalogRow {
                     session_id,

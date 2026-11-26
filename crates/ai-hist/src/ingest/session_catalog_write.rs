@@ -48,25 +48,6 @@ pub(super) fn upsert_session_inner(
     window: ActivityWindow,
     recorded_repo_url: Option<&str>,
 ) -> Result<()> {
-    write_session(conn, row, window, recorded_repo_url, false)
-}
-
-/// History backfill may create a catalog row or add activity and metadata.
-/// Its checkout is weaker evidence than a remote already settled by a rollout.
-pub(super) fn upsert_codex_history_backfill(
-    conn: &Connection,
-    row: &SessionCatalogRow<'_>,
-) -> Result<()> {
-    write_session(conn, row, ActivityWindow::Expand, None, true)
-}
-
-fn write_session(
-    conn: &Connection,
-    row: &SessionCatalogRow<'_>,
-    window: ActivityWindow,
-    recorded_repo_url: Option<&str>,
-    preserve_remote: bool,
-) -> Result<()> {
     let SessionCatalogRow {
         session_id,
         source,
@@ -117,11 +98,17 @@ fn write_session(
         Some((key, method, url)) => (Some(key), Some(method.as_str()), url),
         None => (None, None, None),
     };
-    let project_key_merge = crate::store::project_key_merge_sql("?12", "?13");
+    let origin = crate::project_identity::codex_project_key_origin(
+        source,
+        project_key_method,
+        recorded,
+        true,
+    );
+    let project_key_merge = crate::store::project_key_merge_sql("?12");
     conn.prepare_cached(
         &format!("INSERT INTO sessions \
-         (session_id, source, cwd, git_branch, first_activity_ms, last_activity_ms, last_assistant_text, raw_path, parser_version, project_key, project_key_method, repo_url, discovery_state) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, 'full') \
+         (session_id, source, cwd, git_branch, first_activity_ms, last_activity_ms, last_assistant_text, raw_path, parser_version, project_key, project_key_method, repo_url, project_key_origin, discovery_state) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?13, 'full') \
          ON CONFLICT(session_id, source) DO UPDATE SET \
          {project_key_merge}, \
          cwd = COALESCE(excluded.cwd, sessions.cwd), \
@@ -148,7 +135,7 @@ fn write_session(
             project_key_method,
             repo_url,
             recorded,
-            preserve_remote,
+            origin,
         ],
     )?;
     // Events earlier in this unit may have cached a miss or a weaker key.

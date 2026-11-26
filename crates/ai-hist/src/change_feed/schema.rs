@@ -528,3 +528,26 @@ fn create_presence_triggers(conn: &Connection) -> Result<()> {
     ))?;
     Ok(())
 }
+
+/// Columns that are this database's own bookkeeping rather than evidence, so
+/// the feed neither carries nor stamps them.
+///
+/// `session_events.raw_facts_version` records which local parser generation
+/// wrote a row. Every generation bump rewrites it on every row it repairs, and
+/// carried it would re-deliver a store's whole history for a change no
+/// consumer can observe in the evidence.
+///
+/// A column is local only when nothing keys off a stamp it would otherwise
+/// cause: `sessions.source_stamp` stays carried, because the watch catalog
+/// fingerprint includes it and trusts an unmoved head to mean an unchanged
+/// catalog.
+// Session provenance controls how the local writer weighs future observations.
+// The exported identity is still the resolved key and its public method.
+const LOCAL_COLUMNS: &[(&str, &str)] = &[
+    ("session_events", "raw_facts_version"),
+    ("sessions", "project_key_origin"),
+];
+
+pub(super) fn local_column(table: &str, column: &str) -> bool {
+    LOCAL_COLUMNS.contains(&(table, column))
+}

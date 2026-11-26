@@ -12,6 +12,7 @@
 
 use super::catalog_listing::catalog_list_query;
 use super::*;
+use crate::project_identity::ProjectKeyMethod;
 use crate::{init_db, mark_session_presence, upsert_session_presence};
 use std::fs;
 use std::time::{Duration, SystemTime};

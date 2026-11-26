@@ -163,6 +163,7 @@ pub(super) fn init_evidence_schemas(conn: &Connection) -> Result<()> {
     crate::retention::init_schema(conn)?;
     // After the observation schema: the stamping triggers draw on its clock.
     // The retired-source rows go last; see `delete_retired_source_rows`.
+    super::ensure_columns(conn, "sessions", &[("project_key_origin", "TEXT")])?;
     crate::change_feed::init_schema(conn)?;
     crate::retention::init_indexes(conn)?;
     super::retired_sources::delete_retired_source_rows(conn)?;
@@ -198,6 +199,11 @@ pub(super) fn init_catalog_writer(
 pub(super) fn needs_migration(conn: &Connection) -> Result<bool> {
     Ok(!super::schema_is_current(conn)?
         || !crate::discover::catalog_project_lookup::is_current(conn)?
+        || !conn
+            .prepare(
+                "SELECT 1 FROM pragma_table_info('sessions') WHERE name = 'project_key_origin'",
+            )?
+            .exists([])?
         || super::retired_indexes_present(conn)?
         || super::retired_capture_present(conn)?
         || crate::ingest::standalone_records_migration_pending(conn)?)

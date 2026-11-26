@@ -141,6 +141,7 @@ mod tests {
              DROP TRIGGER catalog_project_update;
              DROP TRIGGER catalog_project_delete;
              DROP TABLE catalog_project_lookup;
+             ALTER TABLE sessions DROP COLUMN project_key_origin;
              WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM n WHERE i < 50000)
              INSERT INTO sessions (source, session_id, last_activity_ms, project_key, project_key_method, repo_url)
              SELECT CASE i % 2 WHEN 0 THEN 'codex' ELSE 'claude' END,
@@ -160,6 +161,8 @@ mod tests {
         let started = std::time::Instant::now();
         let writer = crate::store::open_db(&path).unwrap();
         eprintln!("catalog-project writable migration elapsed={:?}", started.elapsed());
+        assert!(!crate::change_feed::stored_columns(&writer, "sessions")
+            .unwrap().iter().any(|column| column == "project_key_origin"));
         writer.execute_batch("ANALYZE;").unwrap();
         for source in [None, Some("codex")] {
             let (plan, steps) = probe(&reader, source, true, Some("rare"));

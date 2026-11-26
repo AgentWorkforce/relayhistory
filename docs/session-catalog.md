@@ -291,6 +291,13 @@ SCP-style addresses. Literal `?` and `#` stay in SCP paths. The project key
 percent-escapes those characters and literal percent signs in SCP paths so
 the keys remain distinct when inherited. A remote may supply a project key
 even when its URL spelling is unsuitable for the catalog.
+Codex records whether a remote key came from provider metadata or a
+checkout. A history-only sync can refresh a checkout key after its origin
+changes. The provider key takes precedence even when its URL cannot be
+stored. A legacy remote key with no provenance stays in place until a
+provider supplies newer recorded evidence. A missing URL alone cannot
+identify the key's origin.
+
 An inherited or path-only identity does not supply a repository URL.
 An unchanged Claude transcript can backfill a missing URL when the current
 origin still matches its stored remote key. A `path` key is

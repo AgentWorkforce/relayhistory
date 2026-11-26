@@ -184,6 +184,23 @@ pub(crate) fn catalog_identity_observation(
     (catalog_checkout_identity(cwd, capture_origin), false)
 }
 
+/// Provenance is stored for an observed Codex remote. An explicit key from
+/// an unknown source and rows written before this field remain unclassified.
+pub(crate) fn codex_project_key_origin(
+    source: &str,
+    method: Option<&str>,
+    recorded: bool,
+    checkout_observed: bool,
+) -> Option<&'static str> {
+    if source != "codex" || method != Some("remote") {
+        return None;
+    }
+    if recorded {
+        return Some("recorded");
+    }
+    checkout_observed.then_some("checkout")
+}
+
 fn catalog_checkout_identity(cwd: Option<&str>, capture_origin: bool) -> Option<CatalogIdentity> {
     let cwd = cwd.map(str::trim).filter(|cwd| !cwd.is_empty())?;
     if !crate::protected_folder::keeping_raw_path(cwd) {

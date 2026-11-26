@@ -63,7 +63,7 @@ pub(super) fn resolve_missing_project_keys(conn: &Connection) -> Result<usize> {
              OR (project_key_method = 'inherited' AND ?2 = 'remote')) \
            AND cwd IS ?3 AND repo_url IS ?4 AND source = ?6";
     let mut update = conn.prepare(&format!(
-        "UPDATE sessions SET project_key = ?1, project_key_method = ?2, repo_url = ?5 WHERE {UPGRADABLE}"
+        "UPDATE sessions SET project_key = ?1, project_key_method = ?2, repo_url = ?5, project_key_origin = ?7 WHERE {UPGRADABLE}"
     ))?;
     let mut settled_update = conn.prepare(
         "UPDATE sessions SET repo_url = ?1, project_key = ?6 WHERE cwd IS ?2 AND repo_url IS ?3
@@ -129,9 +129,9 @@ fn resolve_provisional_identity(
     {
         return Ok(0);
     }
-    let Some((key, method, safe)) =
-        crate::project_identity::catalog_identity(cwd, repo_url, source == "claude")
-    else {
+    let (resolved, recorded) =
+        crate::project_identity::catalog_identity_observation(cwd, repo_url, source == "claude");
+    let Some((key, method, safe)) = resolved else {
         return Ok(0);
     };
     // `UPGRADABLE`, row by row, over what the read above returned.
@@ -150,7 +150,21 @@ fn resolve_provisional_identity(
     if !needed {
         return Ok(0);
     }
-    Ok(update.execute(params![key, method.as_str(), cwd, repo_url, safe, source])?)
+    let origin = crate::project_identity::codex_project_key_origin(
+        source,
+        Some(method.as_str()),
+        recorded,
+        true,
+    );
+    Ok(update.execute(params![
+        key,
+        method.as_str(),
+        cwd,
+        repo_url,
+        safe,
+        source,
+        origin
+    ])?)
 }
 
 #[cfg(test)]

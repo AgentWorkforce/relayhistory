@@ -1,4 +1,5 @@
 use super::*;
+use crate::project_identity::ProjectKeyMethod;
 
 /// Re-resolve the project identity of a row served straight from the catalog.
 ///
@@ -52,7 +53,7 @@ pub(super) fn upgrade_cached_project_identity(conn: &Connection, row: &mut Shall
         }
         return Ok(());
     }
-    let resolved = crate::project_identity::catalog_identity(
+    let (resolved, recorded) = crate::project_identity::catalog_identity_observation(
         row.cwd.as_deref(),
         original_url.as_deref(),
         row.source == "claude",
@@ -107,12 +108,15 @@ pub(super) fn upgrade_cached_project_identity(conn: &Connection, row: &mut Shall
     {
         return Ok(());
     }
+    let origin = crate::project_identity::codex_project_key_origin(
+        &row.source, Some(method.as_str()), recorded, true,
+    );
     let changed = conn.execute(
-        "UPDATE sessions SET project_key = ?1, project_key_method = ?2, repo_url = ?5
+        "UPDATE sessions SET project_key = ?1, project_key_method = ?2, repo_url = ?5, project_key_origin = ?8
          WHERE source = ?3 AND session_id = ?4 AND repo_url IS ?6 AND cwd IS ?7
            AND (project_key IS NULL OR project_key_method = 'path'
                 OR (project_key_method = 'inherited' AND ?2 IN ('remote', 'inherited')))",
-        params![key, method.as_str(), row.source, row.session_id, row.repo_url, original_url, row.cwd],
+        params![key, method.as_str(), row.source, row.session_id, row.repo_url, original_url, row.cwd, origin],
     )?;
     if changed == 0 {
         reload_cached_project_identity(conn, row)?;

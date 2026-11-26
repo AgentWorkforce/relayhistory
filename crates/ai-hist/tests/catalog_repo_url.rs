@@ -23,13 +23,19 @@ fn codex(home: &Path, id: &str, cwd: &Path) {
 }
 
 fn codex_with_remote(home: &Path, id: &str, cwd: &Path, remote: &str) {
+    write_codex_rollout(home, id, cwd, Some(remote));
+}
+
+fn write_codex_rollout(home: &Path, id: &str, cwd: &Path, remote: Option<&str>) {
     let day = home.join(".codex/sessions/2026/10/12");
     fs::create_dir_all(&day).unwrap();
-    let meta = serde_json::json!({
+    let mut meta = serde_json::json!({
         "type": "session_meta", "timestamp": "2026-10-12T12:00:00Z",
-        "payload": { "id": id, "cwd": cwd,
-            "git": { "repository_url": remote } }
+        "payload": { "id": id, "cwd": cwd }
     });
+    if let Some(remote) = remote {
+        meta["payload"]["git"] = serde_json::json!({ "repository_url": remote });
+    }
     let user = serde_json::json!({
         "type": "event_msg", "timestamp": "2026-10-12T12:00:01Z",
         "payload": { "type": "user_message", "message": "hello" }
@@ -352,4 +358,130 @@ fn a_recorded_remote_can_supply_a_safe_key_without_a_catalog_url() {
         .sync(SyncOptions::default().sources([Source::Codex]))
         .unwrap();
     check(&swept);
+}
+
+#[test]
+fn reopened_history_only_codex_sync_refreshes_checkout_keys_and_preserves_recorded_keys() {
+    use std::io::Write;
+
+    let temp = tempfile::tempdir().unwrap();
+    let home = temp.path();
+    let checkout = home.join("checkout");
+    fs::create_dir_all(checkout.join(".git")).unwrap();
+    let origin = |name: &str| {
+        fs::write(
+            checkout.join(".git/config"),
+            format!("[remote \"origin\"]\nurl = https://checkout.test/Org/{name}.git\n"),
+        )
+        .unwrap();
+    };
+    origin("Old");
+    write_codex_rollout(home, "checkout", &checkout, None);
+    write_codex_rollout(home, "legacy", &checkout, None);
+    codex_with_remote(
+        home,
+        "recorded",
+        &checkout,
+        "ssh://git@recorded.test:/Org/Old.git",
+    );
+
+    let history = home.join(".codex/history.jsonl");
+    fs::write(&history, "").unwrap();
+    let db = home.join("catalog.db");
+    let store = open(home, &db);
+    store
+        .sync(SyncOptions::default().sources([Source::Codex]))
+        .unwrap();
+    let list = |store: &SessionStore, key: &str| {
+        let mut query = CatalogQuery::default();
+        query.project_key = Some(key.into());
+        query.page_size = 1;
+        let mut ids: Vec<_> = store
+            .sessions(query)
+            .map(|row| row.unwrap().session_id)
+            .collect();
+        ids.sort_unstable();
+        ids
+    };
+    assert_eq!(
+        list(&store, "checkout.test/Org/Old"),
+        ["checkout", "legacy"]
+    );
+    assert_eq!(list(&store, "recorded.test/Org/Old"), ["recorded"]);
+    assert_eq!(row(&store, "recorded").repo_url, None);
+    drop(store);
+
+    let raw = Connection::open(&db).unwrap();
+    raw.execute(
+        "UPDATE sessions SET project_key_origin = NULL WHERE session_id = 'legacy'",
+        [],
+    )
+    .unwrap();
+    let origins = || {
+        let mut stmt = raw
+            .prepare("SELECT project_key_origin FROM sessions ORDER BY session_id")
+            .unwrap();
+        stmt.query_map([], |row| row.get::<_, Option<String>>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    };
+    assert_eq!(
+        origins(),
+        [Some("checkout".into()), None, Some("recorded".into())]
+    );
+    origin("New");
+
+    let mut log = fs::OpenOptions::new().append(true).open(&history).unwrap();
+    for id in ["checkout", "legacy", "recorded"] {
+        writeln!(
+            log,
+            "{}",
+            serde_json::json!({
+                "session_id": id, "ts": 1791810000, "text": format!("history only {id}")
+            })
+        )
+        .unwrap();
+    }
+    drop(log);
+    let reopened = open(home, &db);
+    reopened
+        .sync(
+            SyncOptions::default()
+                .sources([Source::Codex])
+                .paths([history]),
+        )
+        .unwrap();
+    for id in ["checkout", "legacy", "recorded"] {
+        let captured = raw
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM history WHERE session_id = ?1 AND prompt = ?2)",
+                [id, &format!("history only {id}")],
+                |row| row.get::<_, bool>(0),
+            )
+            .unwrap();
+        assert!(captured, "{id}");
+    }
+    assert_eq!(list(&reopened, "checkout.test/Org/New"), ["checkout"]);
+    assert_eq!(list(&reopened, "checkout.test/Org/Old"), ["legacy"]);
+    assert_eq!(list(&reopened, "recorded.test/Org/Old"), ["recorded"]);
+    assert_eq!(row(&reopened, "recorded").repo_url, None);
+
+    codex_with_remote(
+        home,
+        "recorded",
+        &checkout,
+        "https://recorded.test/Org/Newer.git",
+    );
+    reopened
+        .sync(SyncOptions::default().sources([Source::Codex]))
+        .unwrap();
+    assert!(list(&reopened, "recorded.test/Org/Old").is_empty());
+    assert_eq!(list(&reopened, "recorded.test/Org/Newer"), ["recorded"]);
+    assert_repo(
+        &reopened,
+        "recorded",
+        "https://recorded.test/Org/Newer.git",
+        "recorded.test/Org/Newer",
+    );
 }

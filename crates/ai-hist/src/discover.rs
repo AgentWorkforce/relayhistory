@@ -59,7 +59,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
-use crate::project_identity::ProjectKeyMethod;
 use crate::{
     now_ms, open_db_readonly, upsert_session_presence, EvidenceKind, SessionLocation, SessionScope,
     FULL_SESSION_KINDS, SOURCE_CHOICES,
@@ -3515,29 +3514,7 @@ fn upsert_shallow_session_in_transaction(
     // preferred over walking the working directory, which may no longer exist
     // by the time the transcript is read. Resolving here rather than in each
     // provider's shallow reader keeps every source on one code path.
-    let (observed, recorded) = crate::project_identity::catalog_identity_observation(
-        session.cwd.as_deref(),
-        session.repo_url.as_deref(),
-        session.source == "claude",
-    );
-    let resolved = session.project_key.clone().map(|key| {
-        (
-            key,
-            session
-                .project_key_method
-                .clone()
-                .unwrap_or_else(|| ProjectKeyMethod::PathFallback.as_str().to_string()),
-        )
-    });
-    let resolved = resolved.or_else(|| {
-        observed
-            .as_ref()
-            .map(|(key, method, _)| (key.clone(), method.as_str().to_string()))
-    });
-    let (project_key, project_key_method) = match resolved {
-        Some((key, method)) => (Some(key), Some(method)),
-        None => (None, None),
-    };
+    let identity = catalog_columns::project_identity_fields(session);
     let mut row = conn.prepare_cached(&UPSERT_SESSION_SQL)?.query_row(
         params![
             session.session_id,
@@ -3554,7 +3531,7 @@ fn upsert_shallow_session_in_transaction(
             json_array_or_none(&session.models),
             session.originator,
             session.agent_version,
-            observed.as_ref().and_then(|(_, _, url)| url.as_deref()),
+            identity.repo_url,
             session.initial_commit,
             json_array_or_none(&session.workspace_roots),
             session.source_stamp,
@@ -3564,12 +3541,13 @@ fn upsert_shallow_session_in_transaction(
                 SessionLocation::Local => "local",
                 SessionLocation::Remote => "remote",
             },
-            project_key,
-            project_key_method,
+            identity.key,
+            identity.method,
             session.title,
             session.session_kind,
             session.agent_name,
-            recorded,
+            identity.recorded,
+            identity.origin,
         ],
         row_to_session,
     )?;
