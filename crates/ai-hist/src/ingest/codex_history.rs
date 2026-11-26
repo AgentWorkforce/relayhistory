@@ -201,6 +201,59 @@ fn ingest_codex_history_lines(
     Ok(read)
 }
 
+pub(super) fn backfill_codex_metadata(
+    conn: &Connection,
+    cwds: &HashMap<String, String>,
+    branches: &HashMap<String, String>,
+) -> Result<usize> {
+    let mut updated = 0;
+    for (session_id, swept_cwd) in cwds {
+        check_capture_cancelled()?;
+        // Keep the catalog observation and its refresh in one writer snapshot.
+        let transaction = conn
+            .is_autocommit()
+            .then(|| {
+                rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+            })
+            .transpose()?;
+        let catalog_cwd = conn
+            .prepare_cached("SELECT cwd FROM sessions WHERE source = 'codex' AND session_id = ?")?
+            .query_row([session_id], |row| row.get::<_, Option<String>>(0))
+            .optional()?
+            .flatten();
+        let cwd = catalog_cwd.as_deref().unwrap_or(swept_cwd);
+        let branch = branches.get(session_id);
+        updated += conn.execute(
+            "UPDATE history SET project = COALESCE(project, ?), git_branch = COALESCE(git_branch, ?) WHERE source = 'codex' AND session_id = ? AND (project IS NULL OR git_branch IS NULL)",
+            params![cwd, branch, session_id],
+        )?;
+        let (first, last): (Option<i64>, Option<i64>) = conn.query_row(
+            "SELECT MIN(timestamp_ms), MAX(timestamp_ms) FROM history WHERE source = 'codex' AND session_id = ?",
+            [session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if let Some(first) = first {
+            upsert_session(
+                conn,
+                &SessionCatalogRow {
+                    session_id,
+                    source: "codex",
+                    cwd: Some(cwd),
+                    git_branch: branch.map(String::as_str),
+                    first_ts: first,
+                    last_ts: last.unwrap_or(first),
+                    last_assistant_text: None,
+                    raw_path: None,
+                },
+            )?;
+        }
+        if let Some(transaction) = transaction {
+            transaction.commit()?;
+        }
+    }
+    Ok(updated)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,57 +487,4 @@ mod tests {
             "the consumed history.jsonl prompt remains searchable"
         );
     }
-}
-
-pub(super) fn backfill_codex_metadata(
-    conn: &Connection,
-    cwds: &HashMap<String, String>,
-    branches: &HashMap<String, String>,
-) -> Result<usize> {
-    let mut updated = 0;
-    for (session_id, swept_cwd) in cwds {
-        check_capture_cancelled()?;
-        // Keep the catalog observation and its refresh in one writer snapshot.
-        let transaction = conn
-            .is_autocommit()
-            .then(|| {
-                rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
-            })
-            .transpose()?;
-        let catalog_cwd = conn
-            .prepare_cached("SELECT cwd FROM sessions WHERE source = 'codex' AND session_id = ?")?
-            .query_row([session_id], |row| row.get::<_, Option<String>>(0))
-            .optional()?
-            .flatten();
-        let cwd = catalog_cwd.as_deref().unwrap_or(swept_cwd);
-        let branch = branches.get(session_id);
-        updated += conn.execute(
-            "UPDATE history SET project = COALESCE(project, ?), git_branch = COALESCE(git_branch, ?) WHERE source = 'codex' AND session_id = ? AND (project IS NULL OR git_branch IS NULL)",
-            params![cwd, branch, session_id],
-        )?;
-        let (first, last): (Option<i64>, Option<i64>) = conn.query_row(
-            "SELECT MIN(timestamp_ms), MAX(timestamp_ms) FROM history WHERE source = 'codex' AND session_id = ?",
-            [session_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        if let Some(first) = first {
-            upsert_session(
-                conn,
-                &SessionCatalogRow {
-                    session_id,
-                    source: "codex",
-                    cwd: Some(cwd),
-                    git_branch: branch.map(String::as_str),
-                    first_ts: first,
-                    last_ts: last.unwrap_or(first),
-                    last_assistant_text: None,
-                    raw_path: None,
-                },
-            )?;
-        }
-        if let Some(transaction) = transaction {
-            transaction.commit()?;
-        }
-    }
-    Ok(updated)
 }
