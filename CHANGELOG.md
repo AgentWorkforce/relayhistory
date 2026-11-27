@@ -38,6 +38,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Added optional `HistoryEntry::event_uid` and `Prompt::event_uid`; callers constructing `HistoryEntry` literals must supply the field (`None` for anonymous prompt logs).
 - Added nullable `Block::source_order`; session evidence contract 5 orders events by recorded source position and resolves existing event cursors through stable row identity.
+- Added `ProviderRoots::with_codex_sqlite_home` for callers that supply a mapped Codex SQLite directory separately from the rollout root.
 
 ## [0.63.1] - 2026-11-27
 

@@ -632,6 +632,7 @@ pub ai_hist::ProviderRoots::use_env_roots: bool
 impl ai_hist::ProviderRoots
 pub fn ai_hist::ProviderRoots::from_env(std::path::PathBuf) -> Self
 pub fn ai_hist::ProviderRoots::from_home(std::path::PathBuf, std::path::PathBuf) -> Self
+pub fn ai_hist::ProviderRoots::with_codex_sqlite_home(self, std::path::PathBuf) -> Self
 pub struct ai_hist::Reconciliation
 impl ai_hist::Reconciliation
 pub fn ai_hist::Reconciliation::capture_paths(&mut self, ai_hist::SyncOptions) -> core::result::Result<ai_hist::SyncReport, ai_hist::Error>
