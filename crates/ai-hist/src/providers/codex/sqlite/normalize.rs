@@ -25,7 +25,33 @@ fn content_hash(capture: &Capture) -> Result<String> {
     Ok(format!("{:x}", digest.finalize()))
 }
 
-pub(crate) fn reconcile(
+/// Selected hydration may switch from a cataloged rollout to its projection
+/// before the next discovery pass. Reuse the acquired thread ownership here.
+pub(crate) fn reconcile_selected(
+    conn: &Connection,
+    capture: &Capture,
+    state: &Path,
+    include_related: bool,
+) -> Result<()> {
+    let children = if include_related {
+        capture.related.as_slice()
+    } else {
+        &[]
+    };
+    let captures = std::iter::once(capture).chain(children);
+    let owners: Vec<_> = captures
+        .clone()
+        .map(|entry| (entry.thread.id.clone(), entry.thread.rollout_path.clone()))
+        .collect();
+    crate::catalog_owner::with_raw_path_cache(conn, "codex", &owners, || {
+        for entry in captures {
+            reconcile(conn, entry, state, include_related)?;
+        }
+        Ok(())
+    })
+}
+
+pub(super) fn reconcile(
     conn: &Connection,
     capture: &Capture,
     state: &Path,
