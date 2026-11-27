@@ -10,7 +10,12 @@ fn sync(
     codex: &Path,
     repairs: &crate::ingest::SweepRepairs,
 ) -> Result<sweep::SyncOutcome> {
-    super::sync(conn, state, &crate::ProviderRoots::for_codex_test(codex), repairs)
+    super::sync(
+        conn,
+        state,
+        &crate::ProviderRoots::for_codex_test(codex),
+        repairs,
+    )
 }
 
 fn install_fixture(codex: &Path, stem: &str) {
@@ -320,12 +325,17 @@ fn relocated_sqlite_history_cannot_claim_a_previous_homes_rollout() {
     let previous = dir.path().join("previous/sessions/rollout.jsonl");
     std::fs::create_dir_all(previous.parent().unwrap()).unwrap();
     std::fs::write(&previous, b"unrelated rollout").unwrap();
-    Connection::open(sqlite.join("state_5.sqlite")).unwrap().execute(
-        "UPDATE threads SET rollout_path=?1",
-        [previous.to_string_lossy().as_ref()],
-    ).unwrap();
+    Connection::open(sqlite.join("state_5.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE threads SET rollout_path=?1",
+            [previous.to_string_lossy().as_ref()],
+        )
+        .unwrap();
     let state = sqlite.join("state_5.sqlite");
-    assert!(restored_rollout(&roots, &state, "sqlite-pruned-all-items").unwrap().is_none());
+    assert!(restored_rollout(&roots, &state, "sqlite-pruned-all-items")
+        .unwrap()
+        .is_none());
     assert!(capture(&roots, &state, "sqlite-pruned-all-items").is_ok());
 }
 

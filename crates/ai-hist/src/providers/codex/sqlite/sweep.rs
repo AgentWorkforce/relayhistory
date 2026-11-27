@@ -527,7 +527,14 @@ pub(super) fn sync_with_policy(
     repairs: &crate::ingest::SweepRepairs,
     policy: SweepPolicy,
 ) -> Result<SyncOutcome> {
-    with_policy(policy, || sync(conn, state, &crate::ProviderRoots::for_codex_test(root), repairs))
+    with_policy(policy, || {
+        sync(
+            conn,
+            state,
+            &crate::ProviderRoots::for_codex_test(root),
+            repairs,
+        )
+    })
 }
 
 #[cfg(test)]

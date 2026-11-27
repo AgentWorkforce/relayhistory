@@ -35,7 +35,10 @@ pub(crate) const LOCAL_SOURCE: LocalSource = LocalSource {
     fixtures: Fixtures::Dir("codex"),
 };
 
-pub(crate) fn watch_roots(codex: &std::path::Path, sqlite: &std::path::Path) -> Vec<crate::discover::WatchRoot> {
+pub(crate) fn watch_roots(
+    codex: &std::path::Path,
+    sqlite: &std::path::Path,
+) -> Vec<crate::discover::WatchRoot> {
     use crate::discover::{WatchEntries, WatchRoot};
     vec![
         WatchRoot::tree(codex.join("sessions")),

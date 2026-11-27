@@ -60,7 +60,9 @@ impl Thread {
     }
     fn rollout_complete(&self, roots: &crate::ProviderRoots) -> bool {
         self.rollout_path.as_deref().is_some_and(|path| {
-            rollout_metadata(roots, Path::new(path)).ok().flatten()
+            rollout_metadata(roots, Path::new(path))
+                .ok()
+                .flatten()
                 .is_some_and(|meta| meta.is_file() && meta.len() >= self.next_offset as u64)
         })
     }
@@ -127,7 +129,9 @@ pub(crate) fn database_selection(roots: &crate::ProviderRoots) -> Result<Databas
     fn versioned(root: &Path, prefix: &str, expected: u32) -> Result<VersionedPath> {
         let mut found = None;
         let mut unsupported = None;
-        for entry in std::fs::read_dir(root).with_context(|| format!("read Codex SQLite directory {}", root.display()))? {
+        for entry in std::fs::read_dir(root)
+            .with_context(|| format!("read Codex SQLite directory {}", root.display()))?
+        {
             let name = entry?.file_name();
             let Some(name) = name.to_str() else { continue };
             let Some(version) = name
@@ -155,9 +159,12 @@ pub(crate) fn database_selection(roots: &crate::ProviderRoots) -> Result<Databas
     if !root.try_exists()? {
         return Ok(DatabaseSelection {
             pair: None,
-            diagnostic: roots.codex_sqlite_home.as_ref().map(|path| format!(
-                "configured CODEX_SQLITE_HOME does not exist: {}", path.display()
-            )),
+            diagnostic: roots.codex_sqlite_home.as_ref().map(|path| {
+                format!(
+                    "configured CODEX_SQLITE_HOME does not exist: {}",
+                    path.display()
+                )
+            }),
         });
     }
     let (state, state_warning) = versioned(root, "state_", 5)?;
@@ -250,7 +257,11 @@ fn rollout_metadata(
         path.starts_with(root)
             || std::fs::canonicalize(root).is_ok_and(|canonical| path.starts_with(canonical))
     });
-    if !under_rollouts || path.components().any(|part| part == std::path::Component::ParentDir) {
+    if !under_rollouts
+        || path
+            .components()
+            .any(|part| part == std::path::Component::ParentDir)
+    {
         // Relocated stores can retain rollout paths from the previous home.
         // That file is unavailable to this layout; the DB projection can still serve it.
         return Ok(None);
@@ -262,9 +273,9 @@ fn rollout_metadata(
     };
     let canonical = std::fs::canonicalize(stored)?;
     ensure!(
-        rollout_roots.iter().any(|root|
-            std::fs::canonicalize(root).is_ok_and(|dir| canonical.starts_with(dir))
-        ),
+        rollout_roots
+            .iter()
+            .any(|root| std::fs::canonicalize(root).is_ok_and(|dir| canonical.starts_with(dir))),
         "SESSION_SOURCE_MISMATCH: rollout does not belong to the Codex provider root"
     );
     Ok(Some(crate::ingest::transcript_file::metadata(path)?))

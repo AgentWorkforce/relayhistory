@@ -23,10 +23,15 @@ pub(crate) fn incomplete_projection_owns_rollout(
         None => {
             // Standalone catalog upserts carry no provider roots. Only the
             // original colocated layout can establish ownership in that case.
-            let Some(home) = root.parent() else { return Ok(false) };
+            let Some(home) = root.parent() else {
+                return Ok(false);
+            };
             legacy = crate::ProviderRoots {
                 codex: root.to_path_buf(),
-                ..crate::ProviderRoots::from_home(home.into(), home.join(".local/share/opencode/opencode.db"))
+                ..crate::ProviderRoots::from_home(
+                    home.into(),
+                    home.join(".local/share/opencode/opencode.db"),
+                )
             };
             &legacy
         }
