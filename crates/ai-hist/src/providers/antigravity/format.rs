@@ -93,9 +93,15 @@ pub(super) fn text(row: &Value) -> Option<&str> {
     else {
         return Some(text);
     };
-    let Some(timestamp) = metadata
+    let Some(body) = metadata.strip_suffix("\n</ADDITIONAL_METADATA>") else {
+        return Some(text);
+    };
+    // Antigravity opens `<ADDITIONAL_METADATA>` with the local timestamp line,
+    // optionally followed by mention context, uploaded image paths, etc.
+    let first_line = body.split('\n').next().unwrap_or("");
+    let Some(timestamp) = first_line
         .strip_prefix("The current local time is: ")
-        .and_then(|s| s.strip_suffix(".\n</ADDITIONAL_METADATA>"))
+        .and_then(|s| s.strip_suffix('.'))
     else {
         return Some(text);
     };

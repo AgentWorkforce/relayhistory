@@ -69,7 +69,7 @@
   "capture": [
     {
       "evidence": "Messages and identity",
-      "coverage": "Official SDK native harness JSONL steps with recorded timestamps and user/assistant text, safe user-envelope projection, frozen App/CLI/IDE brain roots and root-namespaced conversation IDs. Full transcript preferred; message IDs derived from step positions."
+      "coverage": "Official SDK native harness JSONL steps with recorded timestamps and user/assistant text, safe user-envelope projection (including multi-line `<ADDITIONAL_METADATA>` blocks and trailing system blocks), conversation titles read from sibling `conversation_summaries.db` when present, frozen App/CLI/IDE brain roots and root-namespaced conversation IDs. Full transcript preferred; message IDs derived from step positions."
     },
     {
       "evidence": "Control and limits",

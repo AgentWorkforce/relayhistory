@@ -10,15 +10,16 @@ mod format;
 mod normalize;
 mod roots;
 mod storage;
+mod summary;
 #[cfg(test)]
 mod tests;
 const ID: &str = "antigravity";
 const HEAD_LIMIT: u64 = 64 * 1024;
 pub(crate) const LOCAL_SOURCE: LocalSource = LocalSource {
     id: ID,
-    discovery: Discovery::Provider(|| Box::new(Provider)),
+    discovery: Discovery::Provider(|| Box::new(Provider::default())),
     hydration: Hydration::Parser(ingest),
-    transcript_roots: |r| r.for_provider(ID).to_vec(),
+    transcript_roots: roots::transcript_roots,
     // A parent conversation writes `.system_generated/subagents/<child>.json`
     // per spawned subagent; its `conversationId` names the child's own
     // conversation under the same brain root.
@@ -37,19 +38,46 @@ pub(crate) const METADATA: ProviderMetadata = ProviderMetadata {
     usage: None,
 };
 pub(crate) const ADAPTER: Option<ProviderAdapter> = Some(ProviderAdapter {
-    generation: "antigravity_transcript_v3",
+    generation: "antigravity_transcript_v4",
     acquire,
     sweep,
     resolve_roots: roots::resolve,
     watch_roots: |r| {
-        r.for_provider(ID)
-            .iter()
-            .cloned()
-            .map(WatchRoot::tree)
-            .collect()
+        let mut out = Vec::new();
+        for brain in r.for_provider(ID) {
+            out.push(WatchRoot::tree(brain.clone()));
+            if let Some(dir) = roots::summary_dir_for_brain(brain) {
+                out.push(WatchRoot::directory_of(
+                    dir,
+                    crate::discover::WatchEntries::OpencodeStores {
+                        primary: roots::SUMMARY_DB.into(),
+                        channels: false,
+                    },
+                ));
+            }
+        }
+        out
     },
 });
-struct Provider;
+#[derive(Default)]
+struct Provider {
+    titles: std::sync::Mutex<
+        std::collections::HashMap<PathBuf, std::collections::HashMap<String, String>>,
+    >,
+}
+impl Provider {
+    fn title_for(&self, path: &Path, context: &AcquisitionContext<'_>) -> Option<String> {
+        let (brain_root, native_id) = roots::locate(context.roots, path).ok()?;
+        let mut cache = self
+            .titles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let titles = cache
+            .entry(brain_root.to_path_buf())
+            .or_insert_with(|| summary::read_titles_for_brain(brain_root, context));
+        titles.get(&native_id).cloned()
+    }
+}
 impl ShallowSessionProvider for Provider {
     fn source(&self) -> &'static str {
         ID
@@ -62,14 +90,19 @@ impl ShallowSessionProvider for Provider {
             EvidenceKind::Relationship,
         ]
     }
-    // A subagent sidecar can arrive or change while every transcript stays
-    // byte-identical; fold the sidecars in so such a tick is not skipped.
+    // A subagent sidecar or summary DB update can arrive while every
+    // transcript stays byte-identical; fold them in so such a tick is not skipped.
     fn fingerprint_inputs(&self, env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
         let mut inputs = storage::enumerate(env)?;
         inputs.extend(storage::subagent_candidates(&inputs)?);
+        inputs.extend(summary::fingerprint_candidates(env)?);
         Ok(inputs)
     }
     fn enumerate(&self, env: &DiscoveryEnv<'_>, _: Option<usize>) -> Result<Vec<Candidate>> {
+        self.titles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
         storage::enumerate(env)
     }
     fn read_access(&self) -> crate::discover::ShallowReadAccess {
@@ -91,6 +124,7 @@ impl ShallowSessionProvider for Provider {
         Ok(Some(ShallowSession {
             source: ID.into(),
             session_id: sid,
+            title: self.title_for(&path, &context),
             first_activity_ms: rows
                 .iter()
                 .map(format::time)

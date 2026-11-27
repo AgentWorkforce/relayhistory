@@ -203,6 +203,128 @@ fn user_request_unwraps_with_trailing_settings_change_block() {
 }
 
 #[test]
+fn user_request_unwraps_with_multiline_additional_metadata() {
+    let mentions = serde_json::json!({
+        "source": "USER_EXPLICIT", "type": "USER_INPUT", "status": "DONE",
+        "content": "<USER_REQUEST>\nFix PR merge conflicts @[relayhistory#580]\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-20T06:37:44-08:00.\n\nThe user has mentioned some items in the form @[ITEM].\n@[relayhistory#580] is a [Link]:\nURL: https://github.com/AgentWorkforce/relayhistory/pull/580\n</ADDITIONAL_METADATA>\n<USER_SETTINGS_CHANGE>\nThe user changed setting `Model Selection`.\n</USER_SETTINGS_CHANGE>"
+    });
+    assert_eq!(
+        format::text(&mentions),
+        Some("Fix PR merge conflicts @[relayhistory#580]")
+    );
+    let uploads = serde_json::json!({
+        "source": "USER_EXPLICIT", "type": "USER_INPUT", "status": "DONE",
+        "content": "<USER_REQUEST>\nCheck these screenshots\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-26T09:42:49-08:00.\n\nThe user has uploaded 2 image(s):\n- /tmp/a.png\n</ADDITIONAL_METADATA>"
+    });
+    assert_eq!(format::text(&uploads), Some("Check these screenshots"));
+    let bad_timestamp = serde_json::json!({
+        "source": "USER_EXPLICIT", "type": "USER_INPUT", "status": "DONE",
+        "content": "<USER_REQUEST>\nhi\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nNot a timestamp.\nMore lines.\n</ADDITIONAL_METADATA>"
+    });
+    assert!(format::text(&bad_timestamp)
+        .unwrap()
+        .starts_with("<USER_REQUEST>"));
+}
+
+#[test]
+fn titles_are_read_from_conversation_summaries_db_and_track_updates() {
+    let home = tempfile::tempdir().unwrap();
+    let roots = ProviderRoots::from_home(home.path().into(), home.path().join("opencode.db"));
+    let variant = home.path().join(".gemini/antigravity");
+    let logs = variant.join("brain/conv-1/.system_generated/logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    let transcript = logs.join("transcript_full.jsonl");
+    let body = format!(
+        "{}\n{}\n",
+        serde_json::json!({"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-11-20T06:37:44-08:00","content":"<USER_REQUEST>\nFix PR\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-20T06:37:44-08:00.\n\nExtra context\n</ADDITIONAL_METADATA>"}),
+        serde_json::json!({"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-20T06:37:50-08:00","content":"Done."}),
+    );
+    std::fs::write(&transcript, body).unwrap();
+    let summary_db = variant.join("conversation_summaries.db");
+    let summary_conn = Connection::open(&summary_db).unwrap();
+    summary_conn
+        .execute_batch(
+            "PRAGMA journal_mode=WAL;
+             CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '');
+             INSERT INTO conversation_summaries (conversation_id, title) VALUES ('conv-1', '  Fix PR Merge Conflicts  '), ('blank-conv', '   ');",
+        )
+        .unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    let store = crate::SessionStore::open(
+        crate::StoreOptions::default()
+            .db_path(temp.path().join("db"))
+            .roots(roots.clone()),
+    )
+    .unwrap();
+    let conn = crate::open_db(store.db_path()).unwrap();
+    let provider = Provider::default();
+    let env = crate::discover::DiscoveryEnv::with_provider_roots(&conn, roots.clone());
+    let candidates =
+        <Provider as ShallowSessionProvider>::enumerate(&provider, &env, None).unwrap();
+    assert_eq!(candidates.len(), 1);
+    let scan = env.scan();
+    let shallow = <Provider as ShallowSessionProvider>::read_shallow(
+        &provider,
+        &scan,
+        Some(&conn),
+        &candidates[0],
+    )
+    .unwrap()
+    .unwrap();
+    assert_eq!(shallow.title.as_deref(), Some("Fix PR Merge Conflicts"));
+    assert_eq!(shallow.first_prompt.as_deref(), Some("Fix PR"));
+
+    // Full capture + normalization persists the title and stamps it.
+    let context = AcquisitionContext::new(ID, &roots);
+    let first = storage::capture(&transcript, &context).unwrap();
+    assert_eq!(
+        first.payload["title"].as_str(),
+        Some("Fix PR Merge Conflicts")
+    );
+    assert!(first.read_paths.iter().any(|p| p == &summary_db));
+    normalize::write(&conn, &first.payload).unwrap();
+    let stored_title: Option<String> = conn
+        .query_row(
+            "SELECT title FROM sessions WHERE source='antigravity' AND session_id=?1",
+            [first.payload["sid"].as_str().unwrap()],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored_title.as_deref(), Some("Fix PR Merge Conflicts"));
+
+    // Updating only conversation_summaries.db changes capture stamp, candidate stamp,
+    // fingerprint inputs, and scoped enumeration.
+    summary_conn
+        .execute(
+            "UPDATE conversation_summaries SET title = 'Renamed Title' WHERE conversation_id = 'conv-1'",
+            [],
+        )
+        .unwrap();
+    let second = storage::capture(&transcript, &context).unwrap();
+    assert_ne!(first.stamp, second.stamp);
+    assert_eq!(second.payload["title"].as_str(), Some("Renamed Title"));
+    let scoped_env = crate::discover::DiscoveryEnv::with_provider_roots(&conn, roots.clone())
+        .with_path_scope(crate::path_scope::PathScope::from_paths([
+            summary_db.clone()
+        ]));
+    let scoped_candidates =
+        <Provider as ShallowSessionProvider>::enumerate(&provider, &scoped_env, None).unwrap();
+    assert_eq!(scoped_candidates.len(), 1);
+    assert_ne!(candidates[0].stamp, scoped_candidates[0].stamp);
+    let fp = <Provider as ShallowSessionProvider>::fingerprint_inputs(&provider, &env).unwrap();
+    assert!(fp
+        .iter()
+        .any(|c| c.locator.ends_with("conversation_summaries.db")));
+
+    // Corrupt summary DB never breaks discovery or capture.
+    drop(summary_conn);
+    std::fs::write(&summary_db, b"not a sqlite db").unwrap();
+    let degraded = storage::capture(&transcript, &context).unwrap();
+    assert!(degraded.payload["title"].is_null());
+}
+
+#[test]
 fn spawned_subagents_are_delegated_children_of_their_parent() {
     let home = tempfile::tempdir().unwrap();
     let roots = ProviderRoots::from_home(home.path().into(), home.path().join("opencode.db"));
@@ -281,7 +403,9 @@ fn spawned_subagents_are_delegated_children_of_their_parent() {
     assert_eq!(evidence.relationships.len(), 1);
     // A sync fingerprint sees the sidecars, not only the transcripts.
     let env = crate::discover::DiscoveryEnv::with_provider_roots(&conn, roots.clone());
-    let inputs = <Provider as ShallowSessionProvider>::fingerprint_inputs(&Provider, &env).unwrap();
+    let inputs =
+        <Provider as ShallowSessionProvider>::fingerprint_inputs(&Provider::default(), &env)
+            .unwrap();
     assert!(inputs
         .iter()
         .any(|c| c.locator.ends_with("subagents/child.json")));

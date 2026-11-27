@@ -6,6 +6,11 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Antigravity user prompts now unwrap `<USER_REQUEST>` even when `<ADDITIONAL_METADATA>` includes extra lines after the timestamp (such as `@[ITEM]` mention context or uploaded image lists), instead of leaking the raw XML envelope.
+- Antigravity sessions now read their conversation title from the sibling `conversation_summaries.db` database during both shallow discovery and full hydration, and watch/fingerprint it so title updates are picked up.
+
 ## [0.63.1] - 2026-11-27
 
 ### Fixed
