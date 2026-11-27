@@ -8,13 +8,13 @@ import { join } from 'node:path';
 /**
  * Every environment variable that points RelayHistory at a history root or a
  * store: `HOME`/`USERPROFILE` and the per-provider overrides the Rust
- * `crates/ai-hist/src/paths.rs` reads (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`,
+ * `crates/ai-hist/src/paths.rs` reads (`CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `CODEX_SQLITE_HOME`,
  * `GROK_HOME`, `XDG_DATA_HOME`, `OPENCODE_DB`, `OPENCODE_STORAGE_DIR`),
  * plus the SDK's own `AI_HIST_*` and `RELAYHISTORY_*`. A variable left set would let a sync ingest a developer's
  * real sessions into a test database.
  */
 export const HISTORY_ENV_PATTERN =
-  /^(HOME|USERPROFILE|CLAUDE_CONFIG_DIR|CODEX_HOME|GROK_HOME|XDG_|OPENCODE_|PI_CODING_AGENT_DIR$|PI_CODING_AGENT_SESSION_DIR$|PI_CONFIG_DIR$|OMP_PROFILE$|PI_PROFILE$|HERMES_HOME$|HERMES_DATA_DIR_SUFFIX$|QWEN_HOME$|QWEN_RUNTIME_DIR$|KIMI_CODE_HOME$|CODEBUDDY_CONFIG_DIR$|AI_HIST_|RELAYHISTORY_)/;
+  /^(HOME|USERPROFILE|CLAUDE_CONFIG_DIR|CODEX_HOME|CODEX_SQLITE_HOME|GROK_HOME|XDG_|OPENCODE_|PI_CODING_AGENT_DIR$|PI_CODING_AGENT_SESSION_DIR$|PI_CONFIG_DIR$|OMP_PROFILE$|PI_PROFILE$|HERMES_HOME$|HERMES_DATA_DIR_SUFFIX$|QWEN_HOME$|QWEN_RUNTIME_DIR$|KIMI_CODE_HOME$|CODEBUDDY_CONFIG_DIR$|AI_HIST_|RELAYHISTORY_)/;
 
 /**
  * Delete every history-root variable from `process.env` and return a function
