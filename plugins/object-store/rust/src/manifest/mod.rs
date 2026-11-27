@@ -5,10 +5,12 @@
 //! - [`validate`]: every reader-side invariant, plus the `content_sha256` chain.
 //! - [`update`]: [`update_manifest`], the read/edit/conditional-write loop.
 //! - [`client`]: desktop helpers (first manifest, chunks, epochs, stale writers).
+//! - [`repo`]: `session.repo` for repo identity (root commit via `git`, off the ingest path).
 //! - [`server`]: server section, lifecycle, pointer-row fields.
 
 pub mod client;
 mod merge;
+pub mod repo;
 pub mod server;
 pub mod types;
 pub mod update;

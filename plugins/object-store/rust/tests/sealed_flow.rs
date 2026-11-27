@@ -37,6 +37,7 @@ fn first_manifest(loc: &SessionLocation) -> Manifest {
             harness_version: None,
             cwd_sha256: None,
             parent_session_id: None,
+            repo: None,
             extra: Default::default(),
         },
         writer: Writer {

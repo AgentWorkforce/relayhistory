@@ -23,6 +23,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Search matches carry a match-centered `snippet` (with `contentTruncated` and `snippetStartOffset`), echo grouping (`groupId`, `groupSize`, `echoCount`, `groupTruncated`, `isPrimary`), `origin`, `controlKind`, `eventUid` and an `eventRef`; `prompt` still holds the full text. Search accepts `sessionId`, `kinds`, `origin`, `maxContentChars` and `maxTotalContentChars` filters and budgets.
 - The MCP `search_history` tool rejects unknown arguments instead of silently dropping them.
+- Object-storage session manifests can carry repository evidence (`session.repo`: canonical remote and root commit, never credentials), so sessions keep one repository identity across renames, transfers and remote URL changes.
 
 ### Changed
 

@@ -29,7 +29,9 @@ fn known_fields(path: &str) -> &'static [&'static str] {
             "harness_version",
             "cwd_sha256",
             "parent_session_id",
+            "repo",
         ],
+        "session.repo" => &["remote_url", "root_commit"],
         "writer" => &["delivery_instance_id", "plugin_version", "host_version"],
         "raw" => &[
             "owner",
@@ -94,6 +96,7 @@ fn nested(path: &str) -> &'static [(&'static str, Option<&'static str>)] {
             ("epochs", Some("epoch")),
             ("scrub", None),
         ],
+        "session" => &[("repo", None)],
         "server" => &[("normalized", None), ("retention", None)],
         _ => &[],
     }
