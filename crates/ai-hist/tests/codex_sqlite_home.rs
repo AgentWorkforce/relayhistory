@@ -254,14 +254,21 @@ fn check_projection_handoff(store: &SessionStore, db: &Path, rollouts: &Path, sq
     };
     assert_eq!(Path::new(&locator()), rollouts.join(ROLLOUT));
     let history = Connection::open(sqlite.join("thread_history_1.sqlite")).unwrap();
-    history.execute("UPDATE thread_history_projection_state SET next_rollout_byte_offset=999999 WHERE thread_id=?1",[OVERLAP]).unwrap();
+    let set_offset = |offset: i64| {
+        history.execute(
+            "UPDATE thread_history_projection_state SET next_rollout_byte_offset=?1 WHERE thread_id=?2",
+            params![offset, OVERLAP],
+        ).unwrap();
+    };
+    let projected_locator = format!(
+        "sqlite:{}#{OVERLAP}",
+        sqlite.join("state_5.sqlite").display()
+    );
+    set_offset(999999);
     store
         .discover(DiscoveryOptions::default().sources([Source::Codex]))
         .unwrap();
-    assert!(
-        locator().starts_with("sqlite:"),
-        "incomplete rollout kept its catalog locator"
-    );
+    assert_eq!(locator(), projected_locator);
     let session = SessionRef::id(Source::Codex, OVERLAP);
     store.hydrate(&session, Default::default()).unwrap();
     let tail: i64 = conn.query_row(
@@ -272,7 +279,16 @@ fn check_projection_handoff(store: &SessionStore, db: &Path, rollouts: &Path, sq
         tail, 1,
         "additional projected evidence must now be available"
     );
-    history.execute("UPDATE thread_history_projection_state SET next_rollout_byte_offset=10 WHERE thread_id=?1",[OVERLAP]).unwrap();
+    set_offset(10);
+    store.hydrate(&session, Default::default()).unwrap();
+    assert_eq!(Path::new(&locator()), rollouts.join(ROLLOUT));
+
+    // Selected hydration must also refresh a cached rollout's owner when no
+    // discovery has run since the SQLite projection advanced.
+    set_offset(1000000);
+    store.hydrate(&session, Default::default()).unwrap();
+    assert_eq!(locator(), projected_locator);
+    set_offset(10);
     store.hydrate(&session, Default::default()).unwrap();
     assert_eq!(Path::new(&locator()), rollouts.join(ROLLOUT));
 }
