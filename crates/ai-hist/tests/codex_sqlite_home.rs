@@ -68,7 +68,7 @@ fn install_fixture(rollouts: &Path, sqlite: &Path, count: usize) {
 
 #[test]
 fn resolve_codex_sqlite_home_in_an_isolated_process() {
-    for mode in ["unset", "blank", "split", "unavailable", "absent"] {
+    for mode in ["unset", "blank", "split", "unavailable", "absent", "moved"] {
         let dir = tempfile::tempdir().unwrap();
         let rollouts = dir.path().join("codex");
         let sqlite = dir.path().join("sqlite");
@@ -88,6 +88,10 @@ fn resolve_codex_sqlite_home_in_an_isolated_process() {
         match mode {
             "split" => {
                 install_fixture(&rollouts, &sqlite, 60);
+                child.env("CODEX_SQLITE_HOME", &sqlite);
+            }
+            "moved" => {
+                install_fixture(&rollouts, &rollouts, 1);
                 child.env("CODEX_SQLITE_HOME", &sqlite);
             }
             "unavailable" | "absent" => {
@@ -138,6 +142,10 @@ fn check_resolved_roots() {
     } else {
         rollouts.clone()
     };
+    if mode == "moved" {
+        check_moved_pair(&home, &rollouts);
+        return;
+    }
     let db = home.join("history.db");
     let store = SessionStore::open(StoreOptions::default().home(&home).db_path(&db)).unwrap();
     let options = DiscoveryOptions::default().sources([Source::Codex]);
@@ -302,4 +310,84 @@ fn check_wal_update(store: &SessionStore, sqlite: &Path) {
     assert!(wal.is_file());
     store.sync(SyncOptions::default().paths([wal])).unwrap();
     assert!(catalog(store).contains(&"db-thread-060".to_owned()));
+}
+
+/// Three ledgers record identical thread rows at the old path. Each normal
+/// entry point must locate that thread after the pair moves, even when no
+/// provider timestamp changes.
+fn check_moved_pair(home: &Path, rollouts: &Path) {
+    let modes = ["discover", "sync", "hydrate"];
+    let options = DiscoveryOptions::default().sources([Source::Codex]);
+    let sync = SyncOptions::default().sources([Source::Codex]);
+    let session = SessionRef::id(Source::Codex, "db-thread-000");
+    for mode in modes {
+        fs::create_dir(home.join(mode)).unwrap();
+        let mut roots = ProviderRoots::from_home(home.into(), home.join("unused.db"));
+        roots.codex = rollouts.into();
+        let store = SessionStore::open(
+            StoreOptions::default()
+                .roots(roots)
+                .db_path(home.join(mode).join("history.db")),
+        )
+        .unwrap();
+        store.discover(options.clone()).unwrap();
+        if mode == "sync" {
+            store.sync(sync.clone()).unwrap();
+        }
+        if mode == "hydrate" {
+            store.hydrate(&session, Default::default()).unwrap();
+        }
+    }
+    let sweep_stamp = || {
+        let bytes = fs::read(home.join("sync/.sync-state.json")).unwrap();
+        let state: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        state["codex_sqlite_v2"]["db-thread-000"]
+            .as_str()
+            .unwrap()
+            .to_owned()
+    };
+    let previous_stamp = sweep_stamp();
+    let sqlite = home.join("sqlite");
+    fs::create_dir(&sqlite).unwrap();
+    for name in ["state_5.sqlite", "thread_history_1.sqlite"] {
+        fs::rename(rollouts.join(name), sqlite.join(name)).unwrap();
+    }
+    let expected = format!(
+        "sqlite:{}#db-thread-000",
+        sqlite.join("state_5.sqlite").display()
+    );
+    for mode in modes {
+        let ledger = home.join(mode).join("history.db");
+        let store =
+            SessionStore::open(StoreOptions::default().home(home).db_path(&ledger)).unwrap();
+        match mode {
+            "discover" => {
+                store.discover(options.clone()).unwrap();
+            }
+            "sync" => {
+                store.sync(sync.clone()).unwrap();
+                assert_ne!(
+                    sweep_stamp(),
+                    previous_stamp,
+                    "old per-thread sweep stamp survived the move"
+                );
+            }
+            _ => {
+                store.hydrate(&session, Default::default()).unwrap();
+            }
+        }
+        let conn = Connection::open(ledger).unwrap();
+        let locator: String = conn
+            .query_row(
+                "SELECT raw_path FROM sessions WHERE source='codex' AND session_id='db-thread-000'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(locator, expected, "{mode} retained the old state path");
+        store.hydrate(&session, Default::default()).unwrap();
+        assert!(
+            prompts(&conn).contains(&("db-thread-000".into(), "Prompt for db-thread-000".into()))
+        );
+    }
 }

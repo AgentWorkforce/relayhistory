@@ -49,6 +49,23 @@ pub(super) fn refresh_catalog_codex_locator(
                 observation.raw_locator = target.locator.clone();
             }
         }
+    } else if let Some((stored, id)) = target
+        .locator
+        .as_deref()
+        .and_then(crate::providers::codex::sqlite::parse_locator)
+    {
+        if stored.parent() != Some(roots.codex_sqlite_root()) {
+            // Acquisition verifies this thread in the active pair before a pass
+            // can commit. Never inspect the old provider root to prove a move.
+            let (state, _) = crate::providers::codex::sqlite::databases(roots)?
+                .context("SESSION_SOURCE_UNAVAILABLE: Codex SQLite history unavailable")?;
+            target.locator = Some(crate::providers::codex::sqlite::locator(&state, id));
+            // The old hydration checkpoint may carry the same content hash.
+            target.discovery_state = None;
+            if let Some(observation) = observation.as_mut() {
+                observation.raw_locator = target.locator.clone();
+            }
+        }
     }
     Ok(())
 }

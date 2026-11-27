@@ -52,9 +52,9 @@ impl Thread {
             &self.id,
         )
     }
-    fn stamp(&self) -> String {
+    fn stamp(&self, store_tag: u64) -> String {
         format!(
-            "sqlite:{}:{}:{}",
+            "sqlite:{store_tag:016x}:{}:{}:{}",
             self.updated, self.next_ordinal, self.next_offset
         )
     }
@@ -187,6 +187,12 @@ pub(crate) fn database_selection(roots: &crate::ProviderRoots) -> Result<Databas
 
 pub(crate) fn databases(roots: &crate::ProviderRoots) -> Result<Option<(PathBuf, PathBuf)>> {
     Ok(database_selection(roots)?.pair)
+}
+
+/// Both caches key by thread ID. Include the store location in their stamps
+/// so a moved pair refreshes its catalog locators even with unchanged rows.
+fn store_tag(state: &Path) -> u64 {
+    crate::discover::fingerprint_hash("codex-store", &state.to_string_lossy(), "")
 }
 
 /// Refresh a saved rollout observation against the current projection. Query

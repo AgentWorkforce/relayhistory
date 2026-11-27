@@ -83,6 +83,7 @@ pub(crate) fn enumerate(
     let context = AcquisitionContext::new("codex", roots);
     let threads = super::sweep::discovery_threads(&context, &state, &history)?;
     let incomplete_rollouts = super::sweep::incomplete_rollout_paths(&context, &state, &history)?;
+    let tag = store_tag(&state);
     let candidates = threads
         .into_iter()
         .filter(|t| !t.is_child())
@@ -91,7 +92,7 @@ pub(crate) fn enumerate(
             locator: locator(&state, &t.id),
             session_id: Some(t.id.clone()),
             recency_hint_ms: Some(t.updated),
-            stamp: t.stamp(),
+            stamp: t.stamp(tag),
         })
         .collect();
     Ok((candidates, incomplete_rollouts))

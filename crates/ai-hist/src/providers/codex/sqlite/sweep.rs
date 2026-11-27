@@ -464,6 +464,7 @@ pub(crate) fn sync(
         .iter()
         .map(|thread| (thread.id.clone(), thread.rollout_path.clone()))
         .collect();
+    let tag = store_tag(&state_db);
     let (inserted, read, failed) =
         crate::catalog_owner::with_raw_path_cache(conn, "codex", &sessions, || {
             let mut inserted = 0;
@@ -471,7 +472,7 @@ pub(crate) fn sync(
             let mut failed = false;
             for thread in crate::ingest::capture_files("codex-sqlite", selection.threads) {
                 crate::ingest::check_capture_cancelled()?;
-                let stamp = thread.stamp();
+                let stamp = thread.stamp(tag);
                 if stamps.get(&thread.id).and_then(Value::as_str) == Some(&stamp)
                     && !repairs.contains("codex", &thread.id)
                 {
