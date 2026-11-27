@@ -10,7 +10,9 @@
 //! is, an unchanged rescan performs zero shallow reads, and the cache-only
 //! listing performs no file I/O at all.
 
+use super::catalog_listing::catalog_list_query;
 use super::*;
+use crate::project_identity::ProjectKeyMethod;
 use crate::{init_db, mark_session_presence, upsert_session_presence};
 use std::fs;
 use std::time::{Duration, SystemTime};
@@ -3028,7 +3030,7 @@ fn grok_remote_presence_cannot_clear_a_locally_observed_subagent_kind() {
 
 #[test]
 fn the_catalog_query_reads_only_the_sessions_table() {
-    let (sql, _) = catalog_list_query(&CatalogListOptions::default());
+    let (sql, _) = catalog_list_query(&CatalogListOptions::default(), false);
     assert!(sql.contains("FROM sessions"), "{sql}");
     for forbidden in ["history", "session_events", "tool_calls", "file_edits"] {
         assert!(
@@ -3260,7 +3262,8 @@ fn the_catalog_listing_is_served_by_an_index_not_a_table_scan() {
     // cannot pass against a restated copy of the query while the real one
     // drifts into a table scan.
     let plan = |options: &CatalogListOptions| -> String {
-        let (sql, args) = catalog_list_query(options);
+        let indexed = catalog_listing::prepare_project_filter(&conn, options).unwrap();
+        let (sql, args) = catalog_list_query(options, indexed);
         let mut stmt = conn.prepare(&format!("EXPLAIN QUERY PLAN {sql}")).unwrap();
         let params = rusqlite::params_from_iter(args.iter().map(|arg| arg.as_ref()));
         stmt.query_map(params, |row| row.get::<_, String>(3))
@@ -4656,4 +4659,42 @@ fn a_rewrite_after_cached_read_selection_revalidates_before_using_bytes() {
         summary.counters.files_opened, 1,
         "changed generation is read again; unchanged sibling is reused"
     );
+}
+
+#[test]
+fn discovery_streams_the_backfilled_claude_remote_on_a_cache_hit() {
+    let conn = catalog();
+    let home = tempfile::tempdir().unwrap();
+    let cwd = home.path().join("checkout");
+    write(
+        &cwd.join(".git/config"),
+        "[remote \"origin\"]\nurl = ssh://fixture-user@origin.test:2222/Org/App.git\n",
+    );
+    let body = CLAUDE_BODY.replace("/work/app", &cwd.to_string_lossy());
+    claude_session(home.path(), "claude-1", &body, 1_750_000_000_000);
+
+    let discover_row = || discover(&conn, home.path(), &only(&["claude"]));
+    let first = discover_row();
+    let row = first.row("claude-1");
+    assert_eq!(row.repo_url.as_deref(), Some("ssh://origin.test:2222/Org/App.git"));
+    assert_eq!(row.project_key.as_deref(), Some("origin.test/Org/App"));
+    assert_eq!(row.project_key_method.as_deref(), Some("remote"));
+    conn.execute("UPDATE sessions SET repo_url = NULL", []).unwrap();
+
+    let cached = discover_row();
+    let row = cached.row("claude-1");
+    assert!(row.from_cache);
+    assert_eq!(row.repo_url, first.row("claude-1").repo_url);
+    assert_eq!(row.project_key, first.row("claude-1").project_key);
+
+    conn.execute("UPDATE sessions SET repo_url = NULL", []).unwrap();
+    write(
+        &cwd.join(".git/config"),
+        "[remote \"origin\"]\nurl = https://origin.test/Org/Other.git\n",
+    );
+    let changed = discover_row();
+    let row = changed.row("claude-1");
+    assert!(row.from_cache);
+    assert_eq!(row.repo_url, None);
+    assert_eq!(row.project_key.as_deref(), Some("origin.test/Org/App"));
 }

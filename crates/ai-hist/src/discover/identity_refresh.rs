@@ -29,7 +29,15 @@ impl IdentityRefresh {
         session_id: &str,
     ) -> Result<Option<ShallowSession>> {
         if self != Self::ExactPaths {
-            return fetch_catalog_row(conn, source, session_id);
+            return Ok(conn
+                .prepare_cached(&CATALOG_ROW_SQL)
+                .and_then(|mut stmt| {
+                    stmt.query_row(
+                        params![source, session_id],
+                        catalog_row::row_to_unsanitized_session,
+                    )
+                })
+                .ok());
         }
         // Keep the same read point and error-as-cache-miss behavior as general
         // discovery. Only the private capture callback receives this projection.

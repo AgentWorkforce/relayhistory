@@ -18,7 +18,7 @@
 //!   still means a replace, never a duplicate: consumers must treat it so.
 //! - An upsert carries the row twice over: typed, where the kind has a typed
 //!   row, and as stored ([`StoredRow`]) -- every column but `revision` and
-//!   the local bookkeeping in `LOCAL_COLUMNS`, read from the live table,
+//!   local bookkeeping columns, read from the live table,
 //!   values as SQLite holds them -- so an embedder can
 //!   rebuild the row exactly without knowing the table's shape in advance.
 //!   Every change, a delete included, carries the record's identity: its
@@ -550,26 +550,10 @@ impl FedTable {
     }
 }
 
-/// Columns that are this database's own bookkeeping rather than evidence, so
-/// the feed neither carries nor stamps them.
-///
-/// `session_events.raw_facts_version` records which local parser generation
-/// wrote a row. Every generation bump rewrites it on every row it repairs, and
-/// carried it would re-deliver a store's whole history for a change no
-/// consumer can observe in the evidence.
-///
-/// A column is local only when nothing keys off a stamp it would otherwise
-/// cause: `sessions.source_stamp` stays carried, because the watch catalog
-/// fingerprint includes it and trusts an unmoved head to mean an unchanged
-/// catalog.
-const LOCAL_COLUMNS: &[(&str, &str)] = &[("session_events", "raw_facts_version")];
-
-fn local_column(table: &str, column: &str) -> bool {
-    LOCAL_COLUMNS.contains(&(table, column))
-}
+use schema::local_column;
 
 /// The columns of `table` a stored row carries: every column but the feed's
-/// own [`REVISION_COLUMN`] and the [`LOCAL_COLUMNS`], in table order, read from
+/// own [`REVISION_COLUMN`] and local bookkeeping columns, in table order, read from
 /// the live schema so a column a migration adds is carried without a code
 /// change.
 pub(crate) fn stored_columns(conn: &Connection, table: &str) -> Result<Vec<String>> {
@@ -580,7 +564,7 @@ pub(crate) fn stored_columns(conn: &Connection, table: &str) -> Result<Vec<Strin
 }
 
 /// Every column of `table` but [`REVISION_COLUMN`], with its declared type,
-/// in table order: [`stored_column_schema`] before the [`LOCAL_COLUMNS`] are
+/// in table order: [`stored_column_schema`] before local bookkeeping columns are
 /// set aside.
 fn table_column_schema(conn: &Connection, table: &str) -> Result<Vec<(String, String)>> {
     let columns = conn

@@ -282,6 +282,14 @@ fn codex_session_meta_from_record(value: &Value) -> Option<CodexSessionMeta> {
         session_id: session_id.to_string(),
         cwd: cwd.to_string(),
         git_branch,
+        repo_url: payload_value
+            .and_then(|payload| {
+                payload
+                    .pointer("/git/repository_url")
+                    .and_then(Value::as_str)
+                    .or_else(|| payload.pointer("/git/remote_url").and_then(Value::as_str))
+            })
+            .map(str::to_owned),
         is_subagent,
         parent_session_id,
         parent_thread_id,

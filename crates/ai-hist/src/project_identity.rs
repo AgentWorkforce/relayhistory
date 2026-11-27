@@ -158,22 +158,219 @@ pub fn identity_for(
     cwd: Option<&str>,
     repo_url: Option<&str>,
 ) -> Option<(String, ProjectKeyMethod)> {
-    if let Some(key) = repo_url
-        .map(str::trim)
-        .filter(|url| !url.is_empty())
-        .and_then(canonicalize_remote_url)
-    {
-        return Some((key, ProjectKeyMethod::Remote));
+    catalog_identity(cwd, repo_url, false).map(|(key, method, _)| (key, method))
+}
+
+/// Resolve the key and the safe URL from the same observation.
+pub(crate) fn catalog_identity(
+    cwd: Option<&str>,
+    recorded_url: Option<&str>,
+    capture_origin: bool,
+) -> Option<(String, ProjectKeyMethod, Option<String>)> {
+    catalog_identity_observation(cwd, recorded_url, capture_origin).0
+}
+
+type CatalogIdentity = (String, ProjectKeyMethod, Option<String>);
+
+/// The flag records usable provider evidence independently of URL storage.
+pub(crate) fn catalog_identity_observation(
+    cwd: Option<&str>,
+    recorded_url: Option<&str>,
+    capture_origin: bool,
+) -> (Option<CatalogIdentity>, bool) {
+    if let Some((key, url)) = recorded_url.and_then(catalog_remote_identity) {
+        return (Some((key, ProjectKeyMethod::Remote, url)), true);
     }
+    (catalog_checkout_identity(cwd, capture_origin), false)
+}
+
+/// Provenance is stored for an observed Codex remote. An explicit key from
+/// an unknown source and rows written before this field remain unclassified.
+pub(crate) fn codex_project_key_origin(
+    source: &str,
+    method: Option<&str>,
+    recorded: bool,
+    checkout_observed: bool,
+) -> Option<&'static str> {
+    if source != "codex" || method != Some("remote") {
+        return None;
+    }
+    if recorded {
+        return Some("recorded");
+    }
+    checkout_observed.then_some("checkout")
+}
+
+fn catalog_checkout_identity(cwd: Option<&str>, capture_origin: bool) -> Option<CatalogIdentity> {
     let cwd = cwd.map(str::trim).filter(|cwd| !cwd.is_empty())?;
-    // Before any canonicalize. A discovery pass can refuse to read a
-    // protected user folder; the raw trimmed directory is the path fallback.
-    // The recorded remote above already returned without consulting `cwd`.
-    if crate::protected_folder::keeping_raw_path(cwd) {
-        return Some((cwd.to_string(), ProjectKeyMethod::PathFallback));
+    if !crate::protected_folder::keeping_raw_path(cwd) {
+        let resolved = resolve_project_identity(cwd);
+        if let Some((key, url)) = resolved
+            .repo_url
+            .as_deref()
+            .and_then(catalog_remote_identity)
+        {
+            return Some((
+                key,
+                ProjectKeyMethod::Remote,
+                url.filter(|_| capture_origin),
+            ));
+        }
     }
-    let resolved = resolve_project_identity(cwd);
-    Some((resolved.project_key, resolved.method))
+    Some((cwd.to_string(), ProjectKeyMethod::PathFallback, None))
+}
+
+fn catalog_remote_identity(raw: &str) -> Option<(String, Option<String>)> {
+    let url = safe_catalog_repo_url(raw);
+    let key = match url.as_deref() {
+        Some(url) => catalog_remote_key(url),
+        None => key_from_unstored_remote(raw),
+    }?;
+    Some((key, url))
+}
+
+// Accept established host/path identities even when the spelling is unsuitable
+// for catalog URLs. Validate the authority after removing apparent userinfo,
+// and discard URI suffixes before constructing the key.
+fn key_from_unstored_remote(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.chars().any(char::is_control) {
+        return None;
+    }
+    if let Some(rest) = strip_url_scheme(raw) {
+        let (authority, path) = rest.split_once('/')?;
+        let host = match authority.rsplit_once('@') {
+            Some((userinfo, host)) if apparent_userinfo(userinfo) => host,
+            Some(_) => return None,
+            None => authority,
+        };
+        let path = path.split(['?', '#']).next()?;
+        if identity_authority(host) && !path.contains('\\') {
+            return canonicalize_remote_url(&format!("ssh://{host}/{path}"));
+        }
+    } else if let Some((host, path)) = split_scp_like(raw) {
+        if identity_authority(host) && !path.contains('\\') {
+            return catalog_remote_key(raw);
+        }
+    }
+    None
+}
+
+fn apparent_userinfo(userinfo: &str) -> bool {
+    let prefix = userinfo.split(['?', '#']).next().unwrap_or(userinfo);
+    prefix == userinfo || prefix.contains(':')
+}
+
+fn identity_authority(authority: &str) -> bool {
+    let host = strip_port(authority);
+    if host.is_empty()
+        || !host
+            .chars()
+            .all(|ch| ch.is_alphanumeric() || ".-_:[]".contains(ch))
+        || (host.starts_with('[') && !host.ends_with(']'))
+    {
+        return false;
+    }
+    let port = &authority[host.len()..];
+    port.is_empty()
+        || port
+            .strip_prefix(':')
+            .is_some_and(|port| port.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+/// Keep repository addressing, dropping userinfo and URL suffixes that can
+/// carry authentication. Preserve conventional git@ SCP syntax.
+pub(crate) fn safe_catalog_repo_url(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    if raw.chars().any(|ch| ch.is_control() || ch == '\\') {
+        return None;
+    }
+    let safe = if let Some(rest) = strip_url_scheme(raw) {
+        let address = rest.split(['?', '#']).next()?;
+        let (authority, path) = address.split_once('/')?;
+        let host = authority.rsplit('@').next()?;
+        if !safe_catalog_authority(host) {
+            return None;
+        }
+        let (scheme, _) = raw.split_once("://")?;
+        format!("{scheme}://{host}/{path}")
+    } else {
+        let (host, path) = split_scp_like(raw)?;
+        if !safe_catalog_authority(host) {
+            return None;
+        }
+        format!("git@{host}:{path}")
+    };
+    canonicalize_remote_url(&safe).map(|_| safe)
+}
+
+fn safe_catalog_authority(authority: &str) -> bool {
+    if !authority.is_ascii() || !identity_authority(authority) {
+        return false;
+    }
+    let host = strip_port(authority);
+    let port = &authority[host.len()..];
+    port.is_empty()
+        || port
+            .strip_prefix(':')
+            .is_some_and(|port| port.parse::<u16>().is_ok())
+}
+
+// SCP paths are literal. Escape delimiters in the key so a borrowed key
+// remains unambiguous even when the child has no URL of its own.
+fn catalog_remote_key(url: &str) -> Option<String> {
+    let key = canonicalize_remote_url(url)?;
+    if split_scp_like(url).is_some() && key.contains(['%', '?', '#']) {
+        return Some(
+            key.replace('%', "%25")
+                .replace('?', "%3F")
+                .replace('#', "%23"),
+        );
+    }
+    Some(key)
+}
+
+pub(crate) fn safe_catalog_project_key(key: &str) -> &str {
+    let Some((address, _)) = key.split_once(['?', '#']) else {
+        return key;
+    };
+    let address = address.trim_end_matches('/');
+    address.strip_suffix(".git").unwrap_or(address)
+}
+
+/// Recover a settled catalog identity. Codex's recorded remote is the
+/// authority. A Claude checkout can backfill a URL for the same project.
+pub(crate) fn settled_catalog_identity(
+    source: &str,
+    cwd: Option<&str>,
+    recorded_url: Option<&str>,
+    key: Option<&str>,
+) -> (Option<String>, Option<String>) {
+    let safe_key = key.map(safe_catalog_project_key);
+    if source == "codex" {
+        if let Some((recorded, url)) = recorded_url.and_then(catalog_remote_identity) {
+            return (Some(recorded), url);
+        }
+        return (safe_key.map(str::to_owned), None);
+    }
+    let url = recorded_url.and_then(safe_catalog_repo_url);
+    if let Some(url) = url {
+        let resolved = catalog_remote_key(&url);
+        let literal = canonicalize_remote_url(&url);
+        if resolved.as_deref() == key || literal.as_deref() == key {
+            return (resolved, Some(url));
+        }
+        return (safe_key.map(str::to_owned), Some(url));
+    }
+    if source == "claude" {
+        if let Some((resolved, _, Some(origin))) = catalog_identity(cwd, None, true) {
+            let literal = canonicalize_remote_url(&origin);
+            if Some(resolved.as_str()) == safe_key || literal.as_deref() == key {
+                return (Some(resolved), Some(origin));
+            }
+        }
+    }
+    (safe_key.map(str::to_owned), None)
 }
 
 /// Cached resolver. Construct one per scope to avoid sharing a process-global
@@ -350,16 +547,12 @@ pub fn canonicalize_remote_url(url: &str) -> Option<String> {
     }
 
     if let Some(rest) = strip_url_scheme(trimmed) {
-        let after_auth = match rest.find('@') {
-            Some(idx) => &rest[idx + 1..],
-            None => rest,
-        };
-        let slash = after_auth.find('/')?;
-        let host = strip_port(&after_auth[..slash]).to_lowercase();
+        let (authority, path) = rest.split_once('/')?;
+        let host = strip_port(authority.rsplit('@').next()?).to_lowercase();
         if host.is_empty() {
             return None;
         }
-        let path_part = strip_dot_git(after_auth[slash + 1..].trim_end_matches('/'));
+        let path_part = strip_dot_git(path.trim_end_matches('/'));
         if path_part.is_empty() {
             return None;
         }

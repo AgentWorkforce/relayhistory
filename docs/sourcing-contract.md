@@ -35,6 +35,16 @@ Plus one derived type burn builds itself but whose _inputs_ must come from here:
 `Inference` (`reader/inference.rs`), grouped by `request_id` where the harness
 emits one and by `message_id` where it does not.
 
+## Catalog repository identity
+
+`SessionStore` catalog rows expose `repo_url`, `project_key` and
+`project_key_method`. Claude Code uses the Git origin that resolves from its
+recorded working directory. Codex prefers its recorded repository URL even
+when the working directory is absent or excluded from filesystem resolution.
+The catalog removes userinfo, query strings and fragments. A path or borrowed
+project key does not supply a URL. See [the session catalog](session-catalog.md)
+for acquisition and cache refresh behavior.
+
 ## 1. Messages and turns — `TurnRecord`
 
 The per-model-request row. burn's fields, and what the SDK owes each one:

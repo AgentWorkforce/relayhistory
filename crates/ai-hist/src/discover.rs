@@ -59,7 +59,6 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
-use crate::project_identity::ProjectKeyMethod;
 use crate::{
     now_ms, open_db_readonly, upsert_session_presence, EvidenceKind, SessionLocation, SessionScope,
     FULL_SESSION_KINDS, SOURCE_CHOICES,
@@ -284,7 +283,7 @@ pub struct ShallowSession {
     /// Agent CLI version (codex `cli_version`, claude record `version`).
     /// Observed.
     pub agent_version: Option<String>,
-    /// Repository remote URL, when the provider records one. Observed.
+    /// Credential-stripped repository URL from recorded metadata or Claude Git origin.
     pub repo_url: Option<String>,
     /// Commit the session started from, when the provider records one. Observed.
     pub initial_commit: Option<String>,
@@ -3212,7 +3211,8 @@ fn file_candidates(
 // ---------------------------------------------------------------------------
 
 mod catalog_columns;
-mod catalog_row;
+pub(crate) mod catalog_row;
+pub(crate) mod catalog_project_lookup;
 pub(crate) use {catalog_columns::SESSION_COLUMNS, catalog_row::row_to_session};
 use catalog_columns::{SESSION_COLUMNS_NO_TEXT, UPSERT_SESSION_SQL};
 
@@ -3274,127 +3274,8 @@ pub struct SessionCatalogPage {
     pub next_cursor: Option<CatalogCursor>,
 }
 
-/// The catalog listing query and its bound arguments.
-///
-/// Built in one place so the query-plan test asserts the plan of the statement
-/// that actually runs.
-fn catalog_list_query(options: &CatalogListOptions) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
-    // Every filter below is appended as ` AND …`.
-    let mut sql = format!("SELECT {SESSION_COLUMNS} FROM sessions WHERE 1 = 1");
-    let mut args: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
-    match options.scope {
-        SessionScope::Local => sql.push_str(
-            " AND (EXISTS (SELECT 1 FROM session_presences p WHERE p.source = sessions.source AND p.session_id = sessions.session_id AND p.location = 'local') \
-               OR NOT EXISTS (SELECT 1 FROM session_presences p WHERE p.source = sessions.source AND p.session_id = sessions.session_id))",
-        ),
-        SessionScope::Remote => sql.push_str(
-            " AND EXISTS (SELECT 1 FROM session_presences p WHERE p.source = sessions.source AND p.session_id = sessions.session_id AND p.location = 'remote')",
-        ),
-        SessionScope::All => {}
-    }
-    if !options.sources.is_empty() {
-        let placeholders = vec!["?"; options.sources.len()].join(", ");
-        sql.push_str(&format!(" AND source IN ({placeholders})"));
-        for source in &options.sources {
-            args.push(Box::new(source.clone()));
-        }
-    }
-    if let Some(project_key) = options.project_key.as_ref() {
-        sql.push_str(" AND project_key = ?");
-        args.push(Box::new(project_key.clone()));
-    }
-    if options.exclude_delegated {
-        sql.push_str(" AND COALESCE(sessions.session_kind <> 'subagent' OR sessions.source <> 'grok', 1)");
-        sql.push_str(&format!(
-            " AND NOT {}",
-            crate::relationships::delegated_child_sql("sessions.source", "sessions.session_id")
-        ));
-    }
-    match options.after.as_ref() {
-        // Everything strictly after the cursor in the catalog's total order.
-        // Undated rows sort last, so a dated cursor must still reach them.
-        Some(cursor) => match cursor.last_activity_ms {
-            Some(ms) => {
-                sql.push_str(
-                    " AND (last_activity_ms IS NULL OR last_activity_ms < ? \
-                       OR (last_activity_ms = ? \
-                           AND (source > ? OR (source = ? AND session_id > ?))))",
-                );
-                args.push(Box::new(ms));
-                args.push(Box::new(ms));
-                args.push(Box::new(cursor.source.clone()));
-                args.push(Box::new(cursor.source.clone()));
-                args.push(Box::new(cursor.session_id.clone()));
-            }
-            None => {
-                sql.push_str(
-                    " AND last_activity_ms IS NULL \
-                       AND (source > ? OR (source = ? AND session_id > ?))",
-                );
-                args.push(Box::new(cursor.source.clone()));
-                args.push(Box::new(cursor.source.clone()));
-                args.push(Box::new(cursor.session_id.clone()));
-            }
-        },
-        None => {
-            if let Some(before_ms) = options.before_ms {
-                sql.push_str(" AND last_activity_ms < ?");
-                args.push(Box::new(before_ms));
-            }
-        }
-    }
-    sql.push_str(" ORDER BY last_activity_ms DESC, source ASC, session_id ASC LIMIT ?");
-    args.push(Box::new(options.limit.unwrap_or(DEFAULT_CATALOG_LIMIT)));
-    (sql, args)
-}
-
-/// List the session catalog straight out of the database.
-///
-/// Pure SQL over `sessions`: no filesystem access, no provider I/O, and no
-/// scan of `history` / `session_events` / `tool_calls`.
-///
-/// Rows come back in the catalog's total order:
-/// `(last_activity_ms DESC, source ASC, session_id ASC)`, with rows of unknown
-/// recency last. Use [`list_session_catalog_page`] to paginate.
-pub fn list_session_catalog(
-    conn: &Connection,
-    options: &CatalogListOptions,
-) -> Result<Vec<ShallowSession>> {
-    let (sql, args) = catalog_list_query(options);
-    let mut stmt = conn.prepare(&sql)?;
-    let params = rusqlite::params_from_iter(args.iter().map(|arg| arg.as_ref()));
-    let rows = stmt
-        .query_map(params, row_to_session)?
-        .collect::<rusqlite::Result<Vec<_>>>()?;
-    Ok(rows)
-}
-
-/// [`list_session_catalog`] plus the cursor that continues it.
-///
-/// The cursor is `None` once a page comes back short of its limit, so a
-/// caller walks the catalog by following `next_cursor` until it is absent —
-/// no duplicated and no skipped rows, even when a whole page shares one
-/// millisecond.
-pub fn list_session_catalog_page(
-    conn: &Connection,
-    options: &CatalogListOptions,
-) -> Result<SessionCatalogPage> {
-    let sessions = list_session_catalog(conn, options)?;
-    let limit = options.limit.unwrap_or(DEFAULT_CATALOG_LIMIT);
-    let next_cursor = (limit > 0 && sessions.len() as i64 >= limit)
-        .then(|| sessions.last())
-        .flatten()
-        .map(|row| CatalogCursor {
-            last_activity_ms: row.last_activity_ms,
-            source: row.source.clone(),
-            session_id: row.session_id.clone(),
-        });
-    Ok(SessionCatalogPage {
-        scope: options.scope,
-        sessions,
-        next_cursor,
-    })
-}
+mod catalog_listing;
+pub use catalog_listing::{list_session_catalog, list_session_catalog_page};
 
 // Classification runs these once per candidate; the SQL strings are built
 // once and the prepared statements ride the connection's cache, because
@@ -3527,113 +3408,8 @@ pub(crate) const OBSERVED_SESSION_BY_LOCATOR_SQL: &str = "SELECT session_id FROM
        AND raw_locator=? AND access_state='available' \
      ORDER BY +session_id LIMIT 1";
 
-/// Re-resolve the project identity of a row served straight from the catalog.
-///
-/// The stamp shortcut is right about everything the transcript says and wrong
-/// about the one field derived from the filesystem beside it. A session first
-/// seen before its checkout had an `origin` would otherwise keep its path key
-/// on every later pass, because the transcript never changes and so the row is
-/// never reconsidered.
-///
-/// This runs where the row is read rather than as a sweep at the end of the
-/// pass, because the row is *streamed*: `on_row` hands it to the caller as
-/// soon as the window is decided, so a later correction would fix the catalog
-/// and still have emitted the stale value — the JSONL a consumer parses would
-/// disagree with the database it came from.
-///
-/// For the same reason, the answer it streams must be the answer the
-/// end-of-pass refresh will store, so a cached child that is about to inherit
-/// its parent's repository is given that key here rather than the path its own
-/// directory resolves to.
-///
-/// Only a key that is absent, a path, or inherited can change, and an
-/// inherited one only for the child's own `remote`. A `remote` key is never
-/// touched, and inheritance is never traded for a path. The write is skipped
-/// entirely when the answer is the one already stored, which is the usual
-/// case: these are reconsidered because they *might* be upgradable, and almost
-/// never are.
-fn upgrade_cached_project_identity(conn: &Connection, row: &mut ShallowSession) -> Result<()> {
-    #[cfg(test)]
-    crate::store::project_identity_resolver::note_observation();
-    let stored = row.project_key_method.as_deref();
-    if stored == Some(ProjectKeyMethod::Remote.as_str()) {
-        // The strongest answer there is. Nothing this function can learn
-        // improves on it, so do not even touch the filesystem.
-        return Ok(());
-    }
-    let resolved =
-        crate::project_identity::identity_for(row.cwd.as_deref(), row.repo_url.as_deref());
-    let candidate = match resolved {
-        // The session's own repository beats anything borrowed.
-        Some((key, ProjectKeyMethod::Remote)) => Some((key, ProjectKeyMethod::Remote)),
-        // Anything weaker has to be weighed against what the end-of-pass
-        // refresh is about to do to this row. Deciding that here, and not only
-        // in the pass, is what keeps the row this function streams equal to
-        // the row the pass will store: a consumer reading
-        // `sessions discover --json` beside the catalog must not be told two
-        // different projects.
-        //
-        // `inheritable_parent_project_key` is asked even when this row already
-        // holds a borrowed key, because the key it borrowed can go stale — the
-        // same refresh may promote its parent to a `remote` of its own, and
-        // pass 2 then lends the new one down.
-        weaker => {
-            match crate::store::inheritable_parent_project_key(
-                conn,
-                &row.source,
-                &row.session_id,
-            )? {
-                Some(parent) => Some((parent, ProjectKeyMethod::Inherited)),
-                // An inherited key is borrowed, so it outranks a path: a child
-                // whose directory still resolves to nothing canonical keeps
-                // the parent's repository, which is the point of inheriting it.
-                None if stored == Some(ProjectKeyMethod::Inherited.as_str()) => None,
-                None => weaker,
-            }
-        }
-    };
-    let Some((key, method)) = candidate else {
-        return Ok(());
-    };
-    if row.project_key.as_deref() == Some(key.as_str()) && stored == Some(method.as_str()) {
-        return Ok(());
-    }
-    // The same precedence the merge and the refresh pass apply, as a guard:
-    // this runs outside any transaction, so a hydrate or a concurrent sync may
-    // have settled the row since it was read.
-    let changed = conn.execute(
-        "UPDATE sessions SET project_key = ?1, project_key_method = ?2 \
-         WHERE source = ?3 AND session_id = ?4 \
-           AND (project_key IS NULL \
-                OR project_key_method = 'path' \
-                OR (project_key_method = 'inherited' \
-                    AND ?2 IN ('remote', 'inherited')))",
-        params![key, method.as_str(), row.source, row.session_id],
-    )?;
-    if changed == 0 {
-        // Refused: someone else knows better. Stream what the catalog holds
-        // rather than what this function wanted it to hold — an emitted key no
-        // row anywhere agrees with is worse than a stale one, because nothing
-        // downstream can tell it is wrong.
-        if let Some((key, method)) = conn
-            .query_row(
-                "SELECT project_key, project_key_method FROM sessions \
-                 WHERE source = ?1 AND session_id = ?2",
-                params![row.source, row.session_id],
-                |stored| Ok((stored.get(0)?, stored.get(1)?)),
-            )
-            .optional()?
-        {
-            row.project_key = key;
-            row.project_key_method = method;
-        }
-        return Ok(());
-    }
-    row.project_key = Some(key);
-    row.project_key_method = Some(method.as_str().to_string());
-    Ok(())
-}
-
+mod cached_project_identity;
+use cached_project_identity::upgrade_cached_project_identity;
 
 /// Write a shallow row into the catalog, returning the merged row as stored.
 ///
@@ -3738,23 +3514,7 @@ fn upsert_shallow_session_in_transaction(
     // preferred over walking the working directory, which may no longer exist
     // by the time the transcript is read. Resolving here rather than in each
     // provider's shallow reader keeps every source on one code path.
-    let resolved = session.project_key.clone().map(|key| {
-        (
-            key,
-            session
-                .project_key_method
-                .clone()
-                .unwrap_or_else(|| ProjectKeyMethod::PathFallback.as_str().to_string()),
-        )
-    });
-    let resolved = resolved.or_else(|| {
-        crate::project_identity::identity_for(session.cwd.as_deref(), session.repo_url.as_deref())
-            .map(|(key, method)| (key, method.as_str().to_string()))
-    });
-    let (project_key, project_key_method) = match resolved {
-        Some((key, method)) => (Some(key), Some(method)),
-        None => (None, None),
-    };
+    let identity = catalog_columns::project_identity_fields(session);
     let mut row = conn.prepare_cached(&UPSERT_SESSION_SQL)?.query_row(
         params![
             session.session_id,
@@ -3771,7 +3531,7 @@ fn upsert_shallow_session_in_transaction(
             json_array_or_none(&session.models),
             session.originator,
             session.agent_version,
-            session.repo_url,
+            identity.repo_url,
             session.initial_commit,
             json_array_or_none(&session.workspace_roots),
             session.source_stamp,
@@ -3781,11 +3541,13 @@ fn upsert_shallow_session_in_transaction(
                 SessionLocation::Local => "local",
                 SessionLocation::Remote => "remote",
             },
-            project_key,
-            project_key_method,
+            identity.key,
+            identity.method,
             session.title,
             session.session_kind,
             session.agent_name,
+            identity.recorded,
+            identity.origin,
         ],
         row_to_session,
     )?;

@@ -168,7 +168,7 @@ pub(super) fn delete_retired_source_rows(conn: &Connection) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::{needs_migration, open_db, schema_is_current};
+    use super::super::{open_db, schema_check::needs_migration, schema_is_current};
     use super::*;
 
     /// The `trajectories` table as an earlier release created it.

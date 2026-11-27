@@ -231,10 +231,10 @@ arrived at, and the three are not interchangeable:
 | `path` | no remote resolved, so the key is the directory and is only meaningful on the machine that produced it |
 | `inherited` | adopted from the delegating parent session, because the child's own directory resolved to nothing canonical |
 
-The rules match burn's `crates/relayburn-sdk/src/reader/git.rs` vector for
-vector, so `burn --group-by project` and a RelayHistory rollup agree on the
-same checkout. No `git` subprocess is involved: git's configuration is read
-directly, in the scopes and precedence git itself uses — system
+The canonical host and repository path follow the same conventions as
+burn's `crates/relayburn-sdk/src/reader/git.rs`. RelayHistory reads Git
+configuration directly using Git's scopes and precedence. It reads the system
+configuration first
 (`$GIT_CONFIG_SYSTEM` or `/etc/gitconfig`, unless `$GIT_CONFIG_NOSYSTEM`), then
 global (`$GIT_CONFIG_GLOBAL`, else **both** `$XDG_CONFIG_HOME/git/config` and
 `~/.gitconfig`, in that order — git reads both, and `git config --global
@@ -281,8 +281,26 @@ database that predates the columns migrates without inventing keys, and the
 next sync or hydration fills them. `null` means "not resolved", never "no
 project".
 
-A key is resolved from the working directory, or from a remote the provider
-recorded (Codex's `session_meta.payload.git.repository_url`). A `path` key is
+Claude Code derives `repo_url` from the checkout's effective Git `origin`,
+including linked worktrees. Codex uses the recorded
+`session_meta.payload.git.repository_url` or SQLite thread metadata and prefers
+it over a local checkout, including when the recorded directory is missing.
+The catalog preserves familiar URL and SCP-style addressing, strips URL
+userinfo, query strings and fragments from URI remotes, and uses `git@` for
+SCP-style addresses. Literal `?` and `#` stay in SCP paths. The project key
+percent-escapes those characters and literal percent signs in SCP paths so
+the keys remain distinct when inherited. A remote may supply a project key
+even when its URL spelling is unsuitable for the catalog.
+Codex records whether a remote key came from provider metadata or a
+checkout. A history-only sync can refresh a checkout key after its origin
+changes. The provider key takes precedence even when its URL cannot be
+stored. A legacy remote key with no provenance stays in place until a
+provider supplies newer recorded evidence. A missing URL alone cannot
+identify the key's origin.
+
+An inherited or path-only identity does not supply a repository URL.
+An unchanged Claude transcript can backfill a missing URL when the current
+origin still matches its stored remote key. A `path` key is
 never final: full sync and general discovery reconsider eligible catalog rows,
 so a session whose checkout was deleted picks up the canonical key when a
 recorded remote makes one available. Exact-path capture instead observes each
@@ -296,13 +314,26 @@ roots; catalog-only or orphan rows outside those roots may need full maintenance
 The revision checkpoint tracks inheritance/event reconciliation, not filesystem
 freshness: an unchanged catalog head cannot rule out new or retargeted Git
 metadata. Resolver caches remain limited to one acquisition pass. A `remote` key
-is never downgraded.
+is never downgraded. Maintenance also repairs legacy catalog values that
+retained URL credentials or suffixes.
 
 Filter a listing to one project with `ai-hist sessions list --project <key>`
 (SDK: `listSessionCatalogPage({ projectKey })`). It is an exact match on the
 key, not a path or a prefix. `ai-hist stats` groups `top_projects` by the key
 and reports `grouped_by`; `--by-cwd` (SDK: `stats({ byCwd: true })`) restores
 the per-directory grouping.
+
+Writable open builds an indexed project lookup inside the catalog migration.
+That one-time backfill computes a key for each existing catalog row. Normal
+acquisition writes maintain the lookup in the same statement. Raw SQLite
+inserts and identity updates mark the affected rows dirty. Each project page
+evaluates the key for dirty candidates in scope as well as seeking the indexed
+matches. Dirty entries remain until a catalog-aware write changes that row's
+identity, the row is deleted, or the lookup is rebuilt. Repeated raw writes
+to one identity share one entry, while writes to many identities can make
+this read cost grow. A legacy read-only catalog has no lookup and may scan
+every candidate in scope for a rare key. A writable open upgrades that
+catalog for subsequent read-only queries.
 
 For this cache-only operation, top-level `scope` is the filter applied to the
 ledger. `locations` contains observed presences only; legacy rows that predate
@@ -405,7 +436,7 @@ contract:
 | `models` | observed, best effort | model ids seen inside the bounded read; empty means "not seen cheaply", not "no model" |
 | `originator` | observed | the client that started the session: codex `session_meta.originator`; claude record `entrypoint` (`cli`, `claude-desktop` for the Claude app, `sdk-ts`) |
 | `agent_version` | observed | agent CLI version |
-| `repo_url` | observed | remote URL, when the provider records one |
+| `repo_url` | observed or derived | credential-stripped recorded repository URL, or Claude Code checkout origin |
 | `initial_commit` | observed | commit the session started from |
 | `workspace_roots` | observed | extra workspace roots, when the provider records them |
 | `raw_path` | observed | provider file this row came from; the session/task URL for remote rows; `null` for database-backed sources |
@@ -497,7 +528,7 @@ mark captured is missing for every consumer, not just for `ai-hist`.
 
 | Source | `session_id` | `cwd` | `git_branch` | `first_activity` | `last_activity` | `first_prompt` | `models` | `originator` | `agent_version` | `repo_url` | `initial_commit` | `workspace_roots` |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|
-| **claude** | ✓ | ✓ | ✓ | ✓ | ✓ (tail) | ✓ | ✓ (head) | ✓ (record `entrypoint`) | ✓ (record `version`) | – | – | – |
+| **claude** | ✓ | ✓ | ✓ | ✓ | ✓ (tail) | ✓ | ✓ (head) | ✓ (record `entrypoint`) | ✓ (record `version`) | ✓ (checkout origin, when available) | – | – |
 | **codex** | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ | ✓ |
 | **cursor** | ✓ (dir name; a subagent's file stem) | ✓ (decoded path) | – (never) | ✓ (injected `<timestamp>`) | ✓ (injected `<timestamp>`, else mtime) | ✓ | ✓ (if a build writes `message.model`) | – | – | – | – | – |
 | **grok** | ✓ | ✓ | ✓ | ✓ (`updates.jsonl`, else `summary.json`) | ✓ (`updates.jsonl`, else `summary.json`) | ✓ | ✓ | – | – | – | – | – |

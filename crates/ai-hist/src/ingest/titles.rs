@@ -64,7 +64,7 @@ pub(crate) fn upsert_titled(
     window: ActivityWindow,
     title: Option<&str>,
 ) -> Result<()> {
-    upsert_session_inner(conn, row, window)?;
+    upsert_session_inner(conn, row, window, None)?;
     set_session_title(conn, row.source, row.session_id, title)?;
     Ok(())
 }

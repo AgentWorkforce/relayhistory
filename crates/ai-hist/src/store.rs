@@ -909,13 +909,14 @@ const REQUIRED_SCHEMA_MIGRATIONS: &[&str] = &[
     "session_events_fts_write_unit_v1",
 ];
 
-/// Whether this database already has everything [`init_db`] would add.
+/// Whether this database meets the CLI's shared read requirements.
 ///
 /// Read-only handles skip `init_db`, so an older database would otherwise be
 /// queried against tables and columns that do not exist -- a user upgrading
 /// from before `session_events` existed would get `no such table` on their
 /// first search instead of a silent migration. Callers fall back to a writable
-/// open (which migrates) when this returns false.
+/// open (which migrates) when this returns false. Optional derived lookups
+/// can use a read-only fallback while the writer migration is still pending.
 pub fn schema_is_current(conn: &Connection) -> Result<bool> {
     Ok(schema_check::writable_schema_is_current(conn)?
         && crate::observations::schema_is_current(conn)?
@@ -1012,16 +1013,7 @@ pub fn init_db(conn: &Connection) -> Result<()> {
     // REPLACE must fire delete triggers so the change feed tombstones the
     // row it replaces.
     conn.pragma_update(None, "recursive_triggers", true)?;
-    init_db_once(conn)
-}
-
-/// Whether [`init_db`] has migration work to do on this database. A leftover
-/// retired index counts as outstanding work: its DROP is a real write.
-fn needs_migration(conn: &Connection) -> Result<bool> {
-    Ok(!schema_is_current(conn)?
-        || retired_indexes_present(conn)?
-        || retired_capture_present(conn)?
-        || crate::ingest::standalone_records_migration_pending(conn)?)
+    schema_check::init_catalog_writer(conn, init_db_once)
 }
 
 /// A schema migration an open in this process runs on an existing database.
@@ -1064,7 +1056,7 @@ fn init_db_once(conn: &Connection) -> Result<()> {
     // A current database needs no write lock. Besides keeping ordinary opens
     // cheap, this lets sync reach its per-source contention handling when a
     // different writer already owns the ledger lock.
-    if !needs_migration(conn)? {
+    if !schema_check::needs_migration(conn)? {
         return Ok(());
     }
     enable_wal_for_migration(conn)?;
@@ -1075,7 +1067,7 @@ fn init_db_once(conn: &Connection) -> Result<()> {
     let transaction = Transaction::new_unchecked(conn, TransactionBehavior::Immediate)?;
     // Another first opener may have completed the migration while this
     // connection waited for the lock.
-    if !needs_migration(&transaction)? {
+    if !schema_check::needs_migration(&transaction)? {
         transaction.commit()?;
         return Ok(());
     }
@@ -3852,34 +3844,7 @@ pub fn stats_scoped_by(
 // canonical project identity
 // ---------------------------------------------------------------------------
 
-/// Strength of a stored project identity, as a SQL expression over `alias`.
-///
-/// Upserts merge on this ranking so a later, weaker observation can never
-/// overwrite a stronger one: a shallow rescan that cannot see the repository
-/// any more must not replace a resolved remote key with the directory it was
-/// run from. `0` is "nothing stored", which every real value outranks.
-fn project_key_rank_sql(alias: &str) -> String {
-    format!(
-        "CASE WHEN {alias}.project_key IS NULL THEN 0 \
-              WHEN {alias}.project_key_method = 'remote' THEN 3 \
-              WHEN {alias}.project_key_method = 'inherited' THEN 2 \
-              ELSE 1 END"
-    )
-}
-
-/// The `ON CONFLICT ... DO UPDATE SET` fragment that merges project identity
-/// into the `sessions` table. Shared by shallow discovery and full ingest so
-/// the two cannot disagree about precedence.
-pub(crate) fn project_key_merge_sql() -> String {
-    let incoming = project_key_rank_sql("excluded");
-    let stored = project_key_rank_sql("sessions");
-    format!(
-        "project_key = CASE WHEN ({incoming}) >= ({stored}) \
-            THEN excluded.project_key ELSE sessions.project_key END, \
-         project_key_method = CASE WHEN ({incoming}) >= ({stored}) \
-            THEN excluded.project_key_method ELSE sessions.project_key_method END"
-    )
-}
+pub(crate) use scoped_project_identity::project_key_merge_sql;
 
 /// How many times the inheritance pass is repeated.
 ///
@@ -4170,92 +4135,8 @@ const IDENTITY_SCOPE_SQL: &str = "WITH RECURSIVE moved(source, session_id) AS ( 
          UNION SELECT source, session_id FROM sessions WHERE revision > ?1 \
          UNION SELECT source, session_id FROM session_events WHERE revision > ?1";
 
-/// Reconcile one hydrated session and its delegation descendants with indexed
-/// identity lookups. Ancestor resolution uses the same cycle-safe ranking walk
-/// as the global maintenance pass; unrelated events are never examined.
-pub(crate) fn refresh_session_project_identity(
-    conn: &Connection,
-    source: &str,
-    session_id: &str,
-) -> Result<usize> {
-    let mut pending = std::collections::VecDeque::from([(session_id.to_string(), 0usize)]);
-    let mut seen = HashSet::new();
-    let mut written = 0;
-    while let Some((id, depth)) = pending.pop_front() {
-        crate::ingest::check_capture_cancelled()?;
-        if !seen.insert(id.clone()) {
-            continue;
-        }
-        let row=conn.query_row("SELECT cwd,repo_url,project_key,project_key_method FROM sessions WHERE source=? AND session_id=?",params![source,id],|r|Ok((r.get::<_,Option<String>>(0)?,r.get::<_,Option<String>>(1)?,r.get::<_,Option<String>>(2)?,r.get::<_,Option<String>>(3)?))).optional()?;
-        let (key, method) = if let Some((cwd, repo_url, key, method)) = row {
-            let (key, method) =
-                reconsidered_session_key(conn, source, &id, cwd, repo_url, key, method)?;
-            written+=conn.execute("UPDATE sessions SET project_key=?3,project_key_method=?4 WHERE source=?1 AND session_id=?2 AND (project_key IS NOT ?3 OR project_key_method IS NOT ?4)",params![source,id,key,method])?;
-            (key, method)
-        } else {
-            (
-                lendable_ancestor_key_for(conn, source, &id)?,
-                Some("inherited".into()),
-            )
-        };
-        if let Some(key) = key {
-            let rank = project_key_method_rank(method.as_deref());
-            let stored = event_key_rank_sql("project_key", "project_key_method");
-            written+=conn.execute(&format!("UPDATE session_events SET project_key=?3,project_key_method=?4 WHERE source=?1 AND session_id=?2 AND (({stored})<?5 OR (({stored})=?5 AND project_key IS NOT ?3))"),params![source,id,key,method,rank])?;
-        }
-        if depth < PROJECT_KEY_INHERITANCE_PASSES {
-            let children=conn.prepare("SELECT DISTINCT child_session_id FROM session_relationships WHERE source=? AND parent_session_id=? AND child_session_id IS NOT NULL")?.query_map(params![source,id],|r|r.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?;
-            pending.extend(children.into_iter().map(|child| (child, depth + 1)));
-        }
-    }
-    Ok(written)
-}
-
-/// Whether a session's key is still open to reconsideration: none yet, or one
-/// that is provisional (`path`) or borrowed (`inherited`).
-fn project_key_is_unsettled(key: Option<&str>, method: Option<&str>) -> bool {
-    key.is_none() || matches!(method, Some("path" | "inherited"))
-}
-
-/// A session's key after reconsidering an unsettled one: its own identity
-/// where that outranks what it holds, else a lendable ancestor's key.
-fn reconsidered_session_key(
-    conn: &Connection,
-    source: &str,
-    id: &str,
-    cwd: Option<String>,
-    repo_url: Option<String>,
-    mut key: Option<String>,
-    mut method: Option<String>,
-) -> Result<(Option<String>, Option<String>)> {
-    if !project_key_is_unsettled(key.as_deref(), method.as_deref()) {
-        return Ok((key, method));
-    }
-    if let Some((own, how)) =
-        crate::project_identity::identity_for(cwd.as_deref(), repo_url.as_deref())
-    {
-        if key.is_none() || how.as_str() == "remote" || method.as_deref() == Some("path") {
-            key = Some(own);
-            method = Some(how.as_str().to_string());
-        }
-    }
-    if project_key_is_unsettled(key.as_deref(), method.as_deref()) {
-        if let Some(parent) = lendable_ancestor_key_for(conn, source, id)? {
-            key = Some(parent);
-            method = Some("inherited".into());
-        }
-    }
-    Ok((key, method))
-}
-
-fn project_key_method_rank(method: Option<&str>) -> i32 {
-    match method {
-        Some("remote") => 3,
-        Some("inherited") => 2,
-        Some("path") => 1,
-        _ => 0,
-    }
-}
+mod scoped_project_identity;
+pub(crate) use scoped_project_identity::refresh_session_project_identity;
 
 pub(crate) mod project_identity_resolver;
 use project_identity_resolver::resolve_missing_project_keys;
@@ -4470,13 +4351,20 @@ type ParentIdentityRow = (
 /// here; a key the row merely *borrowed* is the caller's business, because
 /// pass 2 may replace that one too.
 fn pass_one_remote_key(
+    source: &str,
     key: &Option<String>,
     method: Option<&str>,
     cwd: Option<String>,
     repo_url: Option<String>,
 ) -> Option<String> {
     if method == Some("remote") && key.is_some() {
-        return key.clone();
+        return crate::project_identity::settled_catalog_identity(
+            source,
+            None,
+            repo_url.as_deref(),
+            key.as_deref(),
+        )
+        .0;
     }
     match crate::project_identity::identity_for(cwd.as_deref(), repo_url.as_deref()) {
         Some((own, crate::project_identity::ProjectKeyMethod::Remote)) => Some(own),
@@ -4806,7 +4694,7 @@ fn lendable_ancestor_key(
         // than only by the discovery caller because a refresh reaching this
         // walk has already run pass 1, so the two agree either way — and one
         // rule that is right in both places beats two that must be kept so.
-        if let Some(settled) = pass_one_remote_key(&key, method.as_deref(), cwd, repo_url) {
+        if let Some(settled) = pass_one_remote_key(source, &key, method.as_deref(), cwd, repo_url) {
             return Ok((Some(settled), closed_a_cycle));
         }
         walk.path.insert(parent_id.clone());

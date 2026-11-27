@@ -28,15 +28,15 @@ pub(crate) const SESSION_COLUMNS: &str = concat!(session_scalar_columns!(), ", \
 
 /// The shallow catalog upsert; see `upsert_shallow_session_in_transaction`.
 pub(super) static UPSERT_SESSION_SQL: LazyLock<String> = LazyLock::new(|| {
-    let project_key_merge = crate::store::project_key_merge_sql();
+    let project_key_merge = crate::store::project_key_merge_sql("?23");
     format!(
         "INSERT INTO sessions \
          (session_id, source, cwd, git_branch, first_activity_ms, last_activity_ms, \
           last_assistant_text, raw_path, parser_version, first_prompt, models_json, originator, \
           agent_version, repo_url, initial_commit, workspace_roots_json, source_stamp, \
           project_key, project_key_method, title, session_kind, agent_name, \
-          discovery_state) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?18, ?19, CASE WHEN ?2 = 'grok-bot' THEN NULLIF(?20, '') ELSE ?20 END, ?21, ?22, 'shallow') \
+          project_key_origin, discovery_state) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?18, ?19, CASE WHEN ?2 = 'grok-bot' THEN NULLIF(?20, '') ELSE ?20 END, ?21, ?22, ?24, 'shallow') \
          ON CONFLICT(session_id, source) DO UPDATE SET \
          {project_key_merge}, \
          cwd = COALESCE(excluded.cwd, sessions.cwd), \
@@ -74,7 +74,6 @@ pub(super) static UPSERT_SESSION_SQL: LazyLock<String> = LazyLock::new(|| {
          models_json = COALESCE(excluded.models_json, sessions.models_json), \
          originator = COALESCE(excluded.originator, sessions.originator), \
          agent_version = COALESCE(excluded.agent_version, sessions.agent_version), \
-         repo_url = COALESCE(excluded.repo_url, sessions.repo_url), \
          initial_commit = COALESCE(excluded.initial_commit, sessions.initial_commit), \
          workspace_roots_json = COALESCE(excluded.workspace_roots_json, sessions.workspace_roots_json), \
          source_stamp = COALESCE(excluded.source_stamp, sessions.source_stamp), \
@@ -96,3 +95,37 @@ pub(super) static SESSION_COLUMNS_NO_TEXT: LazyLock<String> = LazyLock::new(|| {
         .replacen("project_key_method, title,", "project_key_method, NULL AS title,", 1)
         .replacen("session_kind, agent_name", "session_kind, NULL AS agent_name", 1)
 });
+
+/// Resolve a shallow row's observations once for the catalog upsert.
+pub(super) fn project_identity_fields(session: &super::ShallowSession) -> ProjectIdentityFields {
+    use crate::project_identity::{catalog_identity_observation, codex_project_key_origin, ProjectKeyMethod};
+    let (observed, recorded) = catalog_identity_observation(
+        session.cwd.as_deref(),
+        session.repo_url.as_deref(),
+        session.source == "claude",
+    );
+    let explicit = session.project_key.is_some() && !(session.source == "codex" && recorded);
+    let (key, method) = if explicit {
+        (
+            session.project_key.clone(),
+            Some(session.project_key_method.clone().unwrap_or_else(|| ProjectKeyMethod::PathFallback.as_str().into())),
+        )
+    } else {
+        observed.as_ref().map_or((None, None), |(key, method, _)| {
+            (Some(key.clone()), Some(method.as_str().into()))
+        })
+    };
+    let origin = codex_project_key_origin(&session.source, method.as_deref(), recorded, !explicit);
+    ProjectIdentityFields {
+        key, method, origin, recorded,
+        repo_url: observed.and_then(|(_, _, url)| url),
+    }
+}
+
+pub(super) struct ProjectIdentityFields {
+    pub(super) key: Option<String>,
+    pub(super) method: Option<String>,
+    pub(super) origin: Option<&'static str>,
+    pub(super) recorded: bool,
+    pub(super) repo_url: Option<String>,
+}
