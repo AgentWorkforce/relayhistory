@@ -90,6 +90,16 @@ pub(crate) fn incoming_must_not_replace(
     session_id: &str,
     incoming: Option<&str>,
 ) -> Result<bool> {
+    incoming_must_not_replace_at_roots(conn, source, session_id, incoming, None)
+}
+
+fn incoming_must_not_replace_at_roots(
+    conn: &Connection,
+    source: &str,
+    session_id: &str,
+    incoming: Option<&str>,
+    roots: Option<&crate::ProviderRoots>,
+) -> Result<bool> {
     let Some(incoming) = incoming.filter(|path| !path.is_empty()) else {
         return Ok(false);
     };
@@ -128,7 +138,9 @@ pub(crate) fn incoming_must_not_replace(
     // sibling transcript that happens to share the session id.
     if source == "codex"
         && incoming.starts_with("sqlite:")
-        && crate::providers::codex::sqlite::incomplete_projection_owns_rollout(incoming, &stored)?
+        && crate::providers::codex::sqlite::incomplete_projection_owns_rollout(
+            incoming, &stored, roots,
+        )?
     {
         return Ok(false);
     }
@@ -218,13 +230,15 @@ pub(crate) fn withhold_shallow(
     conn: &Connection,
     session: &ShallowSession,
     location: SessionLocation,
+    roots: Option<&crate::ProviderRoots>,
 ) -> Result<Option<ShallowSession>> {
     if location == SessionLocation::Local
-        && incoming_must_not_replace(
+        && incoming_must_not_replace_at_roots(
             conn,
             &session.source,
             &session.session_id,
             session.raw_path.as_deref(),
+            roots,
         )?
     {
         Ok(Some(without_foreign_identity(session)))

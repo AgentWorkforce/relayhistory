@@ -48,7 +48,7 @@ fn enumerate_sqlite(env: &DiscoveryEnv<'_>) -> Result<(Vec<Candidate>, HashSet<P
     }) {
         return Ok(Default::default());
     }
-    crate::providers::codex::sqlite::enumerate(&env.codex_home, &env.provider_roots)
+    crate::providers::codex::sqlite::enumerate(&env.provider_roots)
 }
 
 impl ShallowSessionProvider for CodexProvider {
@@ -69,11 +69,7 @@ impl ShallowSessionProvider for CodexProvider {
     }
 
     fn watch_roots(&self, roots: &ProviderRoots<'_>) -> Vec<WatchRoot> {
-        vec![
-            WatchRoot::tree(roots.codex.join("sessions")),
-            WatchRoot::tree(roots.codex.join("archived_sessions")),
-            WatchRoot::directory_of(roots.codex, WatchEntries::CodexStores),
-        ]
+        crate::providers::codex::watch_roots(roots.codex, roots.codex)
     }
 
     fn fingerprint_inputs(&self, env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
@@ -88,7 +84,7 @@ impl ShallowSessionProvider for CodexProvider {
                 crate::file_stamp_and_modified,
             )?);
         }
-        match crate::providers::codex::sqlite::fingerprint(&env.codex_home) {
+        match crate::providers::codex::sqlite::fingerprint(&env.provider_roots) {
             Ok(sqlite) => inputs.extend(sqlite),
             Err(error) if error.is::<crate::ingest::CaptureCancelled>() => return Err(error),
             Err(error) => skipping_sqlite_history(&error),

@@ -134,6 +134,10 @@ Codex stores: plain `rollout-*.jsonl` and the zstd-compressed
 under its `.jsonl` locator either way and keeps that identity when Codex
 compresses it ([session catalog](../session-catalog.md)).
 
+Codex also captures paginated thread history from its SQLite stores. With a nonempty
+`CODEX_SQLITE_HOME`, those stores live separately from the rollout tree under
+`CODEX_HOME`. Both layouts use the Codex thread ID.
+
 **Update (2026-10-29):** complete Claude, Codex, Cursor, Grok, Muse and OpenCode reads capture same-timestamp event order and can enrich legacy unknown ranks. Incremental suffix reads do not infer the unseen prefix. Known remotely backed ranks remain protected; see the [ordering decision](2026-10-29-durable-source-event-order.md).
 
 | Record type                                                        | claude | codex | cursor | grok | muse | opencode | devin | Owner / closes                                                                                                                                                                                                                                                                |

@@ -32,6 +32,7 @@ impl EnvGuard {
             ("XDG_DATA_HOME", Some(home.join(".local/share"))),
             ("CLAUDE_CONFIG_DIR", Some(home.join("missing-claude"))),
             ("CODEX_HOME", Some(home.join("missing-codex"))),
+            ("CODEX_SQLITE_HOME", None),
             ("GROK_HOME", Some(home.join("missing-grok"))),
             ("OPENCODE_DB", Some(home.join("missing-opencode.db"))),
             (

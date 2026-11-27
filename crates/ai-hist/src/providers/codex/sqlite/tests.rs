@@ -1,8 +1,23 @@
 use super::*;
 
 mod control;
+mod damaged_rollout;
 mod performance;
 mod transactions;
+
+fn sync(
+    conn: &Connection,
+    state: &mut serde_json::Map<String, Value>,
+    codex: &Path,
+    repairs: &crate::ingest::SweepRepairs,
+) -> Result<sweep::SyncOutcome> {
+    super::sync(
+        conn,
+        state,
+        &crate::ProviderRoots::for_codex_test(codex),
+        repairs,
+    )
+}
 
 fn install_fixture(codex: &Path, stem: &str) {
     std::fs::create_dir_all(codex).unwrap();
@@ -196,7 +211,7 @@ fn sqlite_children_are_recovered_but_not_discovered_as_top_level_sessions() {
     let mut roots =
         crate::ProviderRoots::from_home(dir.path().to_path_buf(), dir.path().join("opencode.db"));
     roots.codex = codex.clone();
-    assert!(enumerate(&codex, &roots).unwrap().0.is_empty());
+    assert!(enumerate(&roots).unwrap().0.is_empty());
 }
 
 #[test]
@@ -284,7 +299,7 @@ fn guardian_requires_a_parent_before_it_is_hidden_from_the_catalog() {
     let mut roots =
         crate::ProviderRoots::from_home(dir.path().to_path_buf(), dir.path().join("opencode.db"));
     roots.codex = codex.clone();
-    let (candidates, _) = enumerate(&codex, &roots).unwrap();
+    let (candidates, _) = enumerate(&roots).unwrap();
     assert!(candidates
         .iter()
         .any(|c| c.session_id.as_deref() == Some("sqlite-child")));
@@ -295,10 +310,34 @@ fn guardian_requires_a_parent_before_it_is_hidden_from_the_catalog() {
             [r#"{"subagent":{"thread_spawn":{"parent_thread_id":"sqlite-parent"}}}"#],
         )
         .unwrap();
-    let (candidates, _) = enumerate(&codex, &roots).unwrap();
+    let (candidates, _) = enumerate(&roots).unwrap();
     assert!(!candidates
         .iter()
         .any(|c| c.session_id.as_deref() == Some("sqlite-child")));
+}
+
+#[test]
+fn relocated_sqlite_history_cannot_claim_a_previous_homes_rollout() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut roots = crate::ProviderRoots::for_codex_test(&dir.path().join("current"));
+    let sqlite = dir.path().join("db");
+    roots.codex_sqlite_home = Some(sqlite.clone());
+    install_fixture(&sqlite, "pruned-all-items");
+    let previous = dir.path().join("previous/sessions/rollout.jsonl");
+    std::fs::create_dir_all(previous.parent().unwrap()).unwrap();
+    std::fs::write(&previous, b"unrelated rollout").unwrap();
+    Connection::open(sqlite.join("state_5.sqlite"))
+        .unwrap()
+        .execute(
+            "UPDATE threads SET rollout_path=?1",
+            [previous.to_string_lossy().as_ref()],
+        )
+        .unwrap();
+    let state = sqlite.join("state_5.sqlite");
+    assert!(restored_rollout(&roots, &state, "sqlite-pruned-all-items")
+        .unwrap()
+        .is_none());
+    assert!(capture(&roots, &state, "sqlite-pruned-all-items").is_ok());
 }
 
 #[test]
@@ -615,7 +654,7 @@ fn idless_rollout_prefix_and_rewritten_projection_do_not_leave_duplicate_evidenc
 fn an_incomplete_sqlite_pair_is_skipped() {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("state_5.sqlite"), b"half pair").unwrap();
-    let selection = database_selection(dir.path()).unwrap();
+    let selection = database_selection(&crate::ProviderRoots::for_codex_test(dir.path())).unwrap();
     assert!(selection.pair.is_none());
     assert!(selection.diagnostic.unwrap().contains("incomplete"));
 }
@@ -644,7 +683,7 @@ fn a_pruned_rollout_is_read_again_after_it_was_restored() {
     let home = dir.path().to_path_buf();
     let mut roots = crate::ProviderRoots::from_home(home, dir.path().join("opencode.db"));
     roots.codex = codex.clone();
-    assert!(enumerate(&codex, &roots).unwrap().0.is_empty());
+    assert!(enumerate(&roots).unwrap().0.is_empty());
 
     let conn = crate::open_db(&dir.path().join("ai-history.db")).unwrap();
     let mut state = serde_json::Map::new();
@@ -727,7 +766,7 @@ fn compressed_rollout_completeness_uses_decoded_projection_bytes() {
         crate::ProviderRoots::from_home(dir.path().to_path_buf(), dir.path().join("opencode.db"));
     roots.codex = codex.clone();
     let state = codex.join("state_5.sqlite");
-    assert!(enumerate(&codex, &roots).unwrap().0.is_empty());
+    assert!(enumerate(&roots).unwrap().0.is_empty());
     assert_eq!(
         restored_rollout(&roots, &state, "sqlite-rollout-primary").unwrap(),
         Some(rollout.clone())
@@ -743,7 +782,7 @@ fn compressed_rollout_completeness_uses_decoded_projection_bytes() {
     )
     .unwrap();
     assert_eq!(
-        enumerate(&codex, &roots).unwrap().0.len(),
+        enumerate(&roots).unwrap().0.len(),
         1,
         "a decoded rollout shorter than the projection uses SQLite"
     );

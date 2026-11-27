@@ -28,6 +28,27 @@ pub(crate) struct SweepScope {
 }
 
 impl SweepScope {
+    pub(super) fn note_missing_configured_roots(&self, roots: &crate::ProviderRoots) {
+        if roots.use_env_roots {
+            for (source, var, root) in [
+                ("claude", "CLAUDE_CONFIG_DIR", &roots.claude),
+                ("codex", "CODEX_HOME", &roots.codex),
+                ("grok", "GROK_HOME", &roots.grok),
+            ] {
+                if self.includes(source)
+                    && std::env::var_os(var)
+                        .is_some_and(|value| !value.to_string_lossy().trim().is_empty())
+                    && !root.exists()
+                {
+                    sync_note!(
+                        "  [{var}] configured root not found: {} (skipped)",
+                        root.display()
+                    );
+                }
+            }
+        }
+    }
+
     /// Every local source: a full sweep.
     pub(crate) fn everything() -> Self {
         Self::default()
@@ -235,7 +256,7 @@ impl SweepPhases<'_, '_> {
         let result = sync_codex_with_repairs_and_coverage(
             self.conn,
             self.state,
-            &self.roots.codex,
+            self.roots,
             self.repairs,
             self.coverage,
             scope.paths(),

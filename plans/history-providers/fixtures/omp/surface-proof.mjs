@@ -10,7 +10,7 @@ if(!process.env.RH_OMP_SURFACE_CHILD){
  const home=fs.mkdtempSync(path.join(os.tmpdir(),'omp-surfaces-'));
  const temporary=path.join(home,'tmp');fs.mkdirSync(temporary);
  const env={PATH:'/usr/bin:/bin:/usr/sbin:/sbin',HOME:home,USERPROFILE:home,TMPDIR:temporary,AI_HIST_DB:path.join(home,'history.db'),RELAYHISTORY_HOME:path.join(home,'commercial'),RH_OMP_SURFACE_CHILD:'1'};
- for(const key of ['PI_CODING_AGENT_DIR','PI_CODING_AGENT_SESSION_DIR','PI_CONFIG_DIR','OMP_PROFILE','PI_PROFILE','XDG_DATA_HOME','AI_HIST_PLUGIN_CONFIG','CLAUDE_CONFIG_DIR','CODEX_HOME','GROK_HOME','OPENCODE_DB','OPENCODE_STORAGE_DIR']) delete env[key];
+ for(const key of ['PI_CODING_AGENT_DIR','PI_CODING_AGENT_SESSION_DIR','PI_CONFIG_DIR','OMP_PROFILE','PI_PROFILE','XDG_DATA_HOME','AI_HIST_PLUGIN_CONFIG','CLAUDE_CONFIG_DIR','CODEX_HOME','CODEX_SQLITE_HOME','GROK_HOME','OPENCODE_DB','OPENCODE_STORAGE_DIR']) delete env[key];
  const target=path.join(home,'.omp/agent/sessions/synthetic/session.jsonl');fs.mkdirSync(path.dirname(target),{recursive:true});
  fs.copyFileSync(path.join(root,'crates/ai-hist/tests/fixtures/omp/writer-v3/.omp/agent/sessions/--fixture--/session.jsonl'),target);
  try{const result=spawnSync(process.execPath,[import.meta.filename,root],{env,encoding:'utf8'});process.stdout.write(result.stdout);process.stderr.write(result.stderr);assert.equal(result.status,0);}finally{fs.rmSync(home,{recursive:true,force:true});}

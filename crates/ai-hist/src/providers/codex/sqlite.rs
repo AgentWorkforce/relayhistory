@@ -52,16 +52,18 @@ impl Thread {
             &self.id,
         )
     }
-    fn stamp(&self) -> String {
+    fn stamp(&self, store_tag: u64) -> String {
         format!(
-            "sqlite:{}:{}:{}",
+            "sqlite:{store_tag:016x}:{}:{}:{}",
             self.updated, self.next_ordinal, self.next_offset
         )
     }
-    fn rollout_complete(&self) -> bool {
+    fn rollout_complete(&self, roots: &crate::ProviderRoots) -> bool {
         self.rollout_path.as_deref().is_some_and(|path| {
-            crate::ingest::transcript_file::metadata(Path::new(path))
-                .is_ok_and(|meta| meta.is_file() && meta.len() >= self.next_offset as u64)
+            rollout_metadata(roots, Path::new(path))
+                .ok()
+                .flatten()
+                .is_some_and(|meta| meta.is_file() && meta.len() >= self.next_offset as u64)
         })
     }
 }
@@ -121,15 +123,15 @@ pub(crate) struct DatabaseSelection {
 
 /// Only the known schema pair is admitted. A newer or incomplete pair is
 /// skipped so an unrelated Codex rollout remains discoverable and ingestible.
-pub(crate) fn database_selection(root: &Path) -> Result<DatabaseSelection> {
+pub(crate) fn database_selection(roots: &crate::ProviderRoots) -> Result<DatabaseSelection> {
+    let root = roots.codex_sqlite_root();
     type VersionedPath = (Option<PathBuf>, Option<String>);
     fn versioned(root: &Path, prefix: &str, expected: u32) -> Result<VersionedPath> {
-        if !root.exists() {
-            return Ok((None, None));
-        }
         let mut found = None;
         let mut unsupported = None;
-        for entry in std::fs::read_dir(root)? {
+        for entry in std::fs::read_dir(root)
+            .with_context(|| format!("read Codex SQLite directory {}", root.display()))?
+        {
             let name = entry?.file_name();
             let Some(name) = name.to_str() else { continue };
             let Some(version) = name
@@ -152,6 +154,19 @@ pub(crate) fn database_selection(root: &Path) -> Result<DatabaseSelection> {
         }
         Ok((found, unsupported))
     }
+    // An uninstalled provider has no default directory. A missing explicit
+    // override, by contrast, must be distinguishable from an empty catalog.
+    if !root.try_exists()? {
+        return Ok(DatabaseSelection {
+            pair: None,
+            diagnostic: roots.codex_sqlite_home.as_ref().map(|path| {
+                format!(
+                    "configured CODEX_SQLITE_HOME does not exist: {}",
+                    path.display()
+                )
+            }),
+        });
+    }
     let (state, state_warning) = versioned(root, "state_", 5)?;
     let (history, history_warning) = versioned(root, "thread_history_", 1)?;
     let diagnostic = state_warning.or(history_warning);
@@ -170,8 +185,14 @@ pub(crate) fn database_selection(root: &Path) -> Result<DatabaseSelection> {
     Ok(DatabaseSelection { pair, diagnostic })
 }
 
-pub(crate) fn databases(root: &Path) -> Result<Option<(PathBuf, PathBuf)>> {
-    Ok(database_selection(root)?.pair)
+pub(crate) fn databases(roots: &crate::ProviderRoots) -> Result<Option<(PathBuf, PathBuf)>> {
+    Ok(database_selection(roots)?.pair)
+}
+
+/// Both caches key by thread ID. Include the store location in their stamps
+/// so a moved pair refreshes its catalog locators even with unchanged rows.
+fn store_tag(state: &Path) -> u64 {
+    crate::discover::fingerprint_hash("codex-store", &state.to_string_lossy(), "")
 }
 
 /// Refresh a saved rollout observation against the current projection. Query
@@ -181,7 +202,7 @@ pub(crate) fn current_locator(
     id: &str,
     observed: &str,
 ) -> Result<Option<String>> {
-    let Some((state, history)) = databases(&roots.codex)? else {
+    let Some((state, history)) = databases(roots)? else {
         return Ok(None);
     };
     let context = AcquisitionContext::new("codex", roots);
@@ -221,14 +242,58 @@ pub(crate) fn current_locator(
     ensure!(offset >= 0, "invalid Codex rollout projection offset");
     if let Some(path) = rollout_path {
         let path = PathBuf::from(path);
-        if crate::ingest::transcript_file::metadata(&path)
-            .is_ok_and(|metadata| metadata.is_file() && metadata.len() >= offset as u64)
+        if rollout_metadata(roots, &path)?
+            .is_some_and(|metadata| metadata.is_file() && metadata.len() >= offset as u64)
         {
-            context.validate(&path)?;
             return Ok(Some(path.to_string_lossy().into_owned()));
         }
     }
     Ok(Some(locator(&state, id)))
+}
+
+/// A path recorded in SQLite belongs to the writer that created the store.
+/// Resolve it against the caller's rollout roots before measuring bytes:
+/// metadata on a compressed transcript can read and decompress the file.
+fn rollout_metadata(
+    roots: &crate::ProviderRoots,
+    path: &Path,
+) -> Result<Option<crate::ingest::transcript_file::TranscriptMetadata>> {
+    let rollout_roots = ["sessions", "archived_sessions"].map(|dir| roots.codex.join(dir));
+    let under_rollouts = rollout_roots.iter().any(|root| {
+        path.starts_with(root)
+            || std::fs::canonicalize(root).is_ok_and(|canonical| path.starts_with(canonical))
+    });
+    if !under_rollouts
+        || path
+            .components()
+            .any(|part| part == std::path::Component::ParentDir)
+    {
+        // Relocated stores can retain rollout paths from the previous home.
+        // That file is unavailable to this layout; the DB projection can still serve it.
+        return Ok(None);
+    }
+    use crate::ingest::transcript_file;
+    let Ok((stored, stat)) = transcript_file::stored(path) else {
+        return Ok(None);
+    };
+    if !stat.is_file() {
+        return Ok(None);
+    }
+    let Ok(canonical) = std::fs::canonicalize(&stored) else {
+        return Ok(None);
+    };
+    ensure!(
+        rollout_roots
+            .iter()
+            .any(|root| std::fs::canonicalize(root).is_ok_and(|dir| canonical.starts_with(dir))),
+        "SESSION_SOURCE_MISMATCH: rollout does not belong to the Codex provider root"
+    );
+    // A damaged or unreadable rollout leaves its SQLite projection usable.
+    Ok(
+        transcript_file::open_stored(&canonical, transcript_file::is_compressed_name(&stored))
+            .and_then(|file| file.metadata())
+            .ok(),
+    )
 }
 
 fn thread_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Thread> {
@@ -368,7 +433,7 @@ pub(crate) fn capture(
     state: &Path,
     id: &str,
 ) -> Result<AcquiredSession> {
-    let (current_state, history) = databases(&roots.codex)?
+    let (current_state, history) = databases(roots)?
         .context("SESSION_SOURCE_UNAVAILABLE: Codex SQLite history unavailable")?;
     ensure!(
         std::fs::canonicalize(state)? == std::fs::canonicalize(&current_state)?,
@@ -388,7 +453,7 @@ pub(crate) fn capture(
         thread.next_offset = offset;
     }
     ensure!(
-        !thread.rollout_complete(),
+        !thread.rollout_complete(roots),
         "SESSION_SOURCE_MISMATCH: Codex rollout is complete"
     );
     let records = (items.len() + turns.len()) as i64;
@@ -418,7 +483,8 @@ mod related;
 pub(crate) use related::{capture_related, restored_rollout};
 
 mod normalize;
-pub(crate) use normalize::{claim_history_log_prompt, reconcile, retire};
+use normalize::reconcile;
+pub(crate) use normalize::{claim_history_log_prompt, reconcile_selected, retire};
 
 pub(crate) fn decode(acquired: &AcquiredSession) -> Result<Capture> {
     serde_json::from_value(acquired.payload.clone()).map_err(Into::into)

@@ -16,16 +16,17 @@ pub(super) fn refresh_catalog_codex_locator(
     {
         // A pair the selection rules reject is a skipped check, not a
         // refresh that found nothing: it is reported like a failed one.
-        let current = crate::providers::codex::sqlite::database_selection(&roots.codex).and_then(
-            |selection| match selection.diagnostic {
-                Some(diagnostic) => Err(anyhow::anyhow!(diagnostic)),
-                None => crate::providers::codex::sqlite::current_locator(
-                    roots,
-                    &options.session_id,
-                    target.locator.as_deref().unwrap_or_default(),
-                ),
-            },
-        );
+        let current =
+            crate::providers::codex::sqlite::database_selection(roots).and_then(|selection| {
+                match selection.diagnostic {
+                    Some(diagnostic) => Err(anyhow::anyhow!(diagnostic)),
+                    None => crate::providers::codex::sqlite::current_locator(
+                        roots,
+                        &options.session_id,
+                        target.locator.as_deref().unwrap_or_default(),
+                    ),
+                }
+            });
         let current = match current {
             Ok(current) => current,
             Err(error) if error.is::<crate::ingest::CaptureCancelled>() => return Err(error),
@@ -48,6 +49,23 @@ pub(super) fn refresh_catalog_codex_locator(
                 observation.raw_locator = target.locator.clone();
             }
         }
+    } else if let Some((stored, id)) = target
+        .locator
+        .as_deref()
+        .and_then(crate::providers::codex::sqlite::parse_locator)
+    {
+        if stored.parent() != Some(roots.codex_sqlite_root()) {
+            // Acquisition verifies this thread in the active pair before a pass
+            // can commit. Never inspect the old provider root to prove a move.
+            let (state, _) = crate::providers::codex::sqlite::databases(roots)?
+                .context("SESSION_SOURCE_UNAVAILABLE: Codex SQLite history unavailable")?;
+            target.locator = Some(crate::providers::codex::sqlite::locator(&state, id));
+            // The old hydration checkpoint may carry the same content hash.
+            target.discovery_state = None;
+            if let Some(observation) = observation.as_mut() {
+                observation.raw_locator = target.locator.clone();
+            }
+        }
     }
     Ok(())
 }
@@ -58,16 +76,13 @@ pub(crate) fn ingest_selected_codex(ctx: SelectedIngest<'_>) -> Result<SelectedI
         let path = ctx
             .path
             .ok_or_else(|| anyhow::anyhow!("Codex SQLite capture has no state path"))?;
-        crate::providers::codex::sqlite::reconcile(
+        crate::providers::codex::sqlite::reconcile_selected(
             ctx.conn,
             &capture,
             path,
             ctx.options.include_related,
         )?;
         if ctx.options.include_related {
-            for child in &capture.related {
-                crate::providers::codex::sqlite::reconcile(ctx.conn, child, path, true)?;
-            }
             for child in &capture.related_rollouts {
                 ingest_related_codex_rollout(ctx.conn, child)?;
             }

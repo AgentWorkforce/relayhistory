@@ -13,7 +13,7 @@ const {StdioClientTransport}=await import(require.resolve('@modelcontextprotocol
 const home=mkdtempSync(join(tmpdir(),'goose-sdk-'));
 const saved={...process.env};
 try {
-  for(const key of Object.keys(process.env)) if(/^(HOME|USERPROFILE|CLAUDE_CONFIG_DIR|CODEX_HOME|GROK_HOME|GOOSE_PATH_ROOT|PI_CODING_AGENT_DIR|XDG_|OPENCODE_|AI_HIST_|RELAYHISTORY_)/.test(key)) delete process.env[key];
+  for(const key of Object.keys(process.env)) if(/^(HOME|USERPROFILE|CLAUDE_CONFIG_DIR|CODEX_HOME|CODEX_SQLITE_HOME|GROK_HOME|GOOSE_PATH_ROOT|PI_CODING_AGENT_DIR|XDG_|OPENCODE_|AI_HIST_|RELAYHISTORY_)/.test(key)) delete process.env[key];
   Object.assign(process.env,{HOME:home,USERPROFILE:home,GOOSE_PATH_ROOT:join(home,'goose-root'),AI_HIST_DB:join(home,'ledger.db'),RELAYHISTORY_HOME:join(home,'relayhistory'),RELAYHISTORY_NO_UPDATE_CHECK:'1'});
   const sessionDir=join(home,'goose-root/data/sessions');mkdirSync(sessionDir,{recursive:true});
   execFileSync('python3',['-c','import sqlite3,sys; c=sqlite3.connect(sys.argv[1]);c.executescript(sys.stdin.read());c.close()',join(sessionDir,'sessions.db')],{input:readFileSync(join(root,'crates/ai-hist/tests/fixtures/goose/schema17.sql')),env:process.env});

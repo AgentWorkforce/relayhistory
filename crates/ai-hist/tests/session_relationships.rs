@@ -115,6 +115,7 @@ fn delegation_topology_survives_the_whole_acquisition_path() {
     std::env::set_var("XDG_DATA_HOME", home.join("missing-xdg"));
     std::env::remove_var("CLAUDE_CONFIG_DIR");
     std::env::remove_var("CODEX_HOME");
+    std::env::remove_var("CODEX_SQLITE_HOME");
     std::env::remove_var("GROK_HOME");
     std::env::remove_var("AI_HIST_DB");
     let db = home.join("history.db");

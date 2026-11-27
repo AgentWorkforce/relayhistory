@@ -423,7 +423,7 @@
     },
     {
       "evidence": "SQLite thread history",
-      "coverage": "Six synthetic cases cover pruned, primary, truncated, legacy, child, and archived threads; native items, tools, edits, markers, and cumulative token total."
+      "coverage": "The SQLite pair can live under CODEX_SQLITE_HOME while rollouts remain under CODEX_HOME. Synthetic cases cover pruned, primary, truncated, legacy, child, and archived threads; native items, tools, edits, markers, and cumulative token total."
     }
   ]
 }

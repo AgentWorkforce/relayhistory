@@ -206,14 +206,20 @@ pub(crate) fn metadata(path: &Path) -> io::Result<TranscriptMetadata> {
 /// Open the transcript `path` names, in whichever encoding it is stored.
 pub(crate) fn open(path: &Path) -> io::Result<TranscriptFile> {
     let (stored, _) = stored(path)?;
-    let file = fs::File::open(&stored)?;
-    if !is_compressed_name(&stored) {
+    open_stored(&stored, is_compressed_name(&stored))
+}
+
+/// Open exactly the resolved file, including when its canonical name differs
+/// from the name that established its encoding.
+pub(crate) fn open_stored(stored: &Path, compressed: bool) -> io::Result<TranscriptFile> {
+    let file = fs::File::open(stored)?;
+    if !compressed {
         return Ok(TranscriptFile::Plain(file));
     }
     let metadata = file.metadata()?;
-    let len = match measured(&stored, &metadata) {
+    let len = match measured(stored, &metadata) {
         Some(len) => len,
-        None => measure(&stored, &file, &metadata)?,
+        None => measure(stored, &file, &metadata)?,
     };
     Ok(TranscriptFile::Zstd(ZstdFile {
         file: Arc::new(file),

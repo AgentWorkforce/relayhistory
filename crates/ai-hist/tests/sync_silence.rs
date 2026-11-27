@@ -24,6 +24,7 @@ fn first_embedded_sync_does_not_write_progress_to_stdout() {
         .env("CODEBUDDY_CONFIG_DIR", foreign_config)
         .env_remove("CLAUDE_CONFIG_DIR")
         .env_remove("CODEX_HOME")
+        .env_remove("CODEX_SQLITE_HOME")
         .env_remove("GROK_HOME")
         .env_remove("CODEBUDDY_CONFIG_DIR")
         .output()
