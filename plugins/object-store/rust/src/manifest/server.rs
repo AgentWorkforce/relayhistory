@@ -150,6 +150,10 @@ pub struct PointerFields {
     pub normalized_stale: bool,
     /// `false` when the manifest is quarantined (no `raw.scrub`).
     pub scrubbed: bool,
+    /// `session.repo.remote_url` (canonical `host/path`), for repo identity.
+    pub git_remote_url: Option<String>,
+    /// `session.repo.root_commit`, for repo identity.
+    pub git_root_commit: Option<String>,
 }
 
 pub fn pointer_fields(m: &Manifest) -> PointerFields {
@@ -173,5 +177,7 @@ pub fn pointer_fields(m: &Manifest) -> PointerFields {
         normalized_version: normalized.map(|n| n.version),
         normalized_stale: normalized.is_some() && !m.normalized_is_current(),
         scrubbed: m.is_scrubbed(),
+        git_remote_url: m.session.repo.as_ref().and_then(|r| r.remote_url.clone()),
+        git_root_commit: m.session.repo.as_ref().and_then(|r| r.root_commit.clone()),
     }
 }

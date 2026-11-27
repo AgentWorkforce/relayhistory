@@ -4,40 +4,23 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased - Patch]
-
-### Fixed
-
-- Codex discovery and capture honor `CODEX_SQLITE_HOME` for database-only threads when the SQLite stores live outside `CODEX_HOME`. Rollouts and archived sessions still use `CODEX_HOME`.
-
-## [0.63.0] - 2026-11-26
+## [Unreleased - Minor]
 
 ### Breaking Changes
 
-- The native contract is now 30: the TypeScript SDK and the `ai-hist-native` addon must be upgraded together, and an older addon is rejected. Evidence contract 5 adds full-session evidence, prompt identities and recorded event ordering.
-- The MCP `search_history` tool returns an envelope `{matches, nextCursor, truncated, totalContentCharsUsed}` instead of a bare array of matches.
+- Session evidence contract 5 adds full-session evidence, prompt identities and recorded event ordering.
 
 ### Added
 
-- Search matches carry a match-centered `snippet` (with `contentTruncated` and `snippetStartOffset`), echo grouping (`groupId`, `groupSize`, `echoCount`, `groupTruncated`, `isPrimary`), `origin`, `controlKind`, `eventUid` and an `eventRef`; `prompt` still holds the full text. Search accepts `sessionId`, `kinds`, `origin`, `maxContentChars` and `maxTotalContentChars` filters and budgets.
-- The MCP `search_history` tool rejects unknown arguments instead of silently dropping them.
 - `getSessionEvidence` reads a complete stored session snapshot with evidence-kind selection, optional transcript omission, provider identities and usage.
 - The CLI and SDK expose retention policy previews, explicitly applied bounded pruning with upload protection, and database compaction for reclaiming free space.
 
 ### Changed
 
-- Search pages return group primaries only: assistant and tool rows that repeat a prompt verbatim (or are linked to it) collapse into that prompt as counted echoes. Two identical-wording user prompts at different timestamps both stay primaries.
 - Export schema version 3 carries stable prompt-event identity and source-order evidence; new readers continue accepting older snapshots.
 
 ### Fixed
 
-- `origin: 'unknown'` search now returns ordinary assistant and tool rows (a NULL `control_kind` no longer drops them), and every origin filter returns only rows whose reported origin matches it.
-- Grouped search pages no longer end early when echoes collapse or an echo's prompt sits past the first fetch bound: the search reads on until the page is complete, and a prompt's `echoCount` is the same whatever the page size; `groupTruncated` marks potentially incomplete group counts (not page completeness), so follow `nextCursor` when present even if no returned group is flagged.
-- An echo now counts under the prompt it is linked to by id, or for a text-only echo the closest preceding identical prompt, instead of the newest matching prompt.
-- Snippets center on the match and report `snippetStartOffset` in original codepoints even when lowercasing expands a character (for example `İ`).
-- SDK `search()` returns all matches up to `limit` unless `maxTotalContentChars` is explicitly given; only `searchPage()` and MCP `search_history` apply the 20000 default budget.
-- Snippets prefer a whole-token match from any query term over an earlier substring, prefix terms center at a token start, and tool payloads that serialize a prompt with escaped quotes still collapse as echoes of it; session-less rows no longer group with unrelated rows.
-- Grouped search pages that hit the per-branch fetch growth cap trim results to the frontier covered by every capped branch instead of advancing `nextCursor` past unfetched matches, and hitting the empty-page continuation cap returns the pending `nextCursor` instead of ending pagination early.
 - Partial Claude scans preserve pending transcript retries when the source root is unavailable.
 - Remote evidence rejects oversized integers instead of rounding them into floating-point values.
 - Applied retention changes report the saved policy.
@@ -55,6 +38,39 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Added optional `HistoryEntry::event_uid` and `Prompt::event_uid`; callers constructing `HistoryEntry` literals must supply the field (`None` for anonymous prompt logs).
 - Added nullable `Block::source_order`; session evidence contract 5 orders events by recorded source position and resolves existing event cursors through stable row identity.
+
+## [0.63.1] - 2026-11-27
+
+### Fixed
+
+- Codex discovery and capture honor `CODEX_SQLITE_HOME` for database-only threads when the SQLite stores live outside `CODEX_HOME`. Rollouts and archived sessions still use `CODEX_HOME`.
+
+## [0.63.0] - 2026-11-26
+
+### Breaking Changes
+
+- The native contract is now 30: the TypeScript SDK and the `ai-hist-native` addon must be upgraded together, and an older addon is rejected.
+- The MCP `search_history` tool returns an envelope `{matches, nextCursor, truncated, totalContentCharsUsed}` instead of a bare array of matches.
+
+### Added
+
+- Search matches carry a match-centered `snippet` (with `contentTruncated` and `snippetStartOffset`), echo grouping (`groupId`, `groupSize`, `echoCount`, `groupTruncated`, `isPrimary`), `origin`, `controlKind`, `eventUid` and an `eventRef`; `prompt` still holds the full text. Search accepts `sessionId`, `kinds`, `origin`, `maxContentChars` and `maxTotalContentChars` filters and budgets.
+- The MCP `search_history` tool rejects unknown arguments instead of silently dropping them.
+- Object-storage session manifests can carry repository evidence (`session.repo`: canonical remote and root commit, never credentials), so sessions keep one repository identity across renames, transfers and remote URL changes.
+
+### Changed
+
+- Search pages return group primaries only: assistant and tool rows that repeat a prompt verbatim (or are linked to it) collapse into that prompt as counted echoes. Two identical-wording user prompts at different timestamps both stay primaries.
+
+### Fixed
+
+- `origin: 'unknown'` search now returns ordinary assistant and tool rows (a NULL `control_kind` no longer drops them), and every origin filter returns only rows whose reported origin matches it.
+- Grouped search pages no longer end early when echoes collapse or an echo's prompt sits past the first fetch bound: the search reads on until the page is complete, and a prompt's `echoCount` is the same whatever the page size; `groupTruncated` marks potentially incomplete group counts (not page completeness), so follow `nextCursor` when present even if no returned group is flagged.
+- An echo now counts under the prompt it is linked to by id, or for a text-only echo the closest preceding identical prompt, instead of the newest matching prompt.
+- Snippets center on the match and report `snippetStartOffset` in original codepoints even when lowercasing expands a character (for example `İ`).
+- SDK `search()` returns all matches up to `limit` unless `maxTotalContentChars` is explicitly given; only `searchPage()` and MCP `search_history` apply the 20000 default budget.
+- Snippets prefer a whole-token match from any query term over an earlier substring, prefix terms center at a token start, and tool payloads that serialize a prompt with escaped quotes still collapse as echoes of it; session-less rows no longer group with unrelated rows.
+- Grouped search pages that hit the per-branch fetch growth cap trim results to the frontier covered by every capped branch instead of advancing `nextCursor` past unfetched matches, and hitting the empty-page continuation cap returns the pending `nextCursor` instead of ending pagination early.
 
 ## [0.62.0] - 2026-11-23
 
@@ -1377,7 +1393,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - The SDK reads provider JSONL natively and works without the Python CLI.
 
-[Unreleased]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.63.0...HEAD
+[Unreleased]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.63.1...HEAD
+[0.63.1]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.63.0...sdk-ts-v0.63.1
 [0.63.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.62.0...sdk-ts-v0.63.0
 [0.62.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.61.0...sdk-ts-v0.62.0
 [0.61.0]: https://github.com/AgentWorkforce/relayhistory/compare/sdk-ts-v0.60.0...sdk-ts-v0.61.0
