@@ -1,6 +1,7 @@
 use super::*;
 
 mod control;
+mod damaged_rollout;
 mod performance;
 mod transactions;
 

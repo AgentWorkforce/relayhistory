@@ -266,19 +266,28 @@ fn rollout_metadata(
         // That file is unavailable to this layout; the DB projection can still serve it.
         return Ok(None);
     }
-    let stored = match crate::ingest::transcript_file::stored_path(path) {
-        Ok(path) => path,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(error.into()),
+    use crate::ingest::transcript_file;
+    let Ok((stored, stat)) = transcript_file::stored(path) else {
+        return Ok(None);
     };
-    let canonical = std::fs::canonicalize(stored)?;
+    if !stat.is_file() {
+        return Ok(None);
+    }
+    let Ok(canonical) = std::fs::canonicalize(&stored) else {
+        return Ok(None);
+    };
     ensure!(
         rollout_roots
             .iter()
             .any(|root| std::fs::canonicalize(root).is_ok_and(|dir| canonical.starts_with(dir))),
         "SESSION_SOURCE_MISMATCH: rollout does not belong to the Codex provider root"
     );
-    Ok(Some(crate::ingest::transcript_file::metadata(path)?))
+    // A damaged or unreadable rollout leaves its SQLite projection usable.
+    Ok(
+        transcript_file::open_stored(&canonical, transcript_file::is_compressed_name(&stored))
+            .and_then(|file| file.metadata())
+            .ok(),
+    )
 }
 
 fn thread_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<Thread> {
