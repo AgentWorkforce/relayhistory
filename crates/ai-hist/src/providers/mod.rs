@@ -235,6 +235,9 @@ pub(crate) fn resolve_roots(home: &Path, use_env: bool) -> ProviderRootMaps {
 }
 
 pub(crate) fn legacy_watch_roots(source: &str, roots: &ProviderRoots) -> Vec<WatchRoot> {
+    if source == "codex" {
+        return codex::watch_roots(&roots.codex, roots.codex_sqlite_root());
+    }
     let providers = crate::sources::catalog::shallow_providers();
     let Some(provider) = providers
         .iter()

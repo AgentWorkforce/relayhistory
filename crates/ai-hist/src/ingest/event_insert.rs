@@ -89,8 +89,13 @@ mod tests {
 
         let conn = crate::open_db(&dir.path().join("history.db")).unwrap();
         let mut state = serde_json::Map::new();
-        crate::providers::codex::sqlite::sync(&conn, &mut state, &codex, &SweepRepairs::default())
-            .unwrap();
+        crate::providers::codex::sqlite::sync(
+            &conn,
+            &mut state,
+            &crate::ProviderRoots::for_codex_test(&codex),
+            &SweepRepairs::default(),
+        )
+        .unwrap();
         let count = |table: &str| -> i64 {
             conn.query_row(
                 &format!("SELECT COUNT(*) FROM {table} WHERE source='codex' AND session_id='sqlite-pruned-all-items'"),

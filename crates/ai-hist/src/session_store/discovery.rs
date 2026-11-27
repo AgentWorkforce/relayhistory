@@ -16,8 +16,10 @@ impl SessionStore {
                 path_scope::scope(&self.roots, opts.paths.as_deref(), opts.sources.as_deref()),
             );
         let options = opts.discover_options();
-        let summary = discover::discover_sessions_with_env(&env, &options, |_| {})
-            .map_err(|error| Error::classify(error, Error::Discovery))?;
+        let (summary, skipped) = crate::ingest::provider_diagnostics::collect_quietly(|| {
+            discover::discover_sessions_with_env(&env, &options, |_| {})
+        });
+        let summary = summary.map_err(|error| Error::classify(error, Error::Discovery))?;
         Ok(DiscoveryReport {
             discovered: summary.discovered,
             skipped_unchanged: summary.skipped_unchanged,
@@ -29,6 +31,7 @@ impl SessionStore {
                     message: format!("{}: {}", diagnostic.source, diagnostic.error),
                     subject: diagnostic.locator,
                 })
+                .chain(skipped.into_iter().map(Diagnostic::from))
                 .collect(),
         })
     }

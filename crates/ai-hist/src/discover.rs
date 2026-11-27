@@ -3459,10 +3459,7 @@ pub(crate) fn catalog_row_by_path(
         .optional()?)
 }
 
-/// The filesystem roots one source's adapter watches under `roots`.
-pub(crate) fn provider_watch_roots(source: &str, roots: &crate::ProviderRoots) -> Vec<WatchRoot> {
-    crate::providers::legacy_watch_roots(source, roots)
-}
+pub(crate) use crate::providers::legacy_watch_roots as provider_watch_roots;
 
 #[cfg(test)]
 fn fetch_catalog_row_at_location(
@@ -3674,20 +3671,21 @@ pub fn upsert_shallow_session_at_location(
 ) -> Result<ShallowSession> {
     if conn.is_autocommit() {
         let transaction = conn.unchecked_transaction()?;
-        let row = upsert_shallow_session_in_transaction(&transaction, session, location)?;
+        let row = upsert_shallow_session_in_transaction(&transaction, session, location, None)?;
         transaction.commit()?;
         return Ok(row);
     }
-    upsert_shallow_session_in_transaction(conn, session, location)
+    upsert_shallow_session_in_transaction(conn, session, location, None)
 }
 
 fn upsert_shallow_session_in_transaction(
     conn: &Connection,
     session: &ShallowSession,
     location: SessionLocation,
+    roots: Option<&crate::ProviderRoots>,
 ) -> Result<ShallowSession> {
     // A sibling transcript keeps the identity of the file already recorded.
-    let kept = crate::catalog_owner::withhold_shallow(conn, session, location)?;
+    let kept = crate::catalog_owner::withhold_shallow(conn, session, location, roots)?;
     let session = kept.as_ref().unwrap_or(session);
     if location == SessionLocation::Remote {
         // Cache-only local reads classify a preexisting presence-less row as
@@ -4516,7 +4514,7 @@ fn discover_sessions_with_worker_limit(
             // The upsert's RETURNING clause hands back the merged catalog row,
             // so what a caller sees is exactly what the catalog now holds
             // (including a preserved `full` state).
-            let row = match upsert_shallow_session_at_location(conn, &session, provider.location())
+            let row = match upsert_shallow_session_in_transaction(conn, &session, provider.location(), Some(&env.provider_roots))
             {
                 Ok(row) => row,
                 Err(error) => {

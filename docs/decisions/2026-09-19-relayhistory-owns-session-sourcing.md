@@ -134,6 +134,10 @@ Codex stores: plain `rollout-*.jsonl` and the zstd-compressed
 under its `.jsonl` locator either way and keeps that identity when Codex
 compresses it ([session catalog](../session-catalog.md)).
 
+Codex also captures paginated thread history from its SQLite stores. With a nonempty
+`CODEX_SQLITE_HOME`, those stores live separately from the rollout tree under
+`CODEX_HOME`. Both layouts use the Codex thread ID.
+
 | Record type                                                        | claude | codex | cursor | grok | muse | opencode | devin | Owner / closes                                                                                                                                                                                                                                                                |
 | ------------------------------------------------------------------ | ------ | ----- | ------ | ---- | ---- | -------- | ----- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Prompt / `history` row                                             | ✓      | ✓     | ✓      | ◐    | ✓    | ✓        | ✓     | grok timestamps: [#167](https://github.com/AgentWorkforce/relayhistory/issues/167)                                                                                                                                                                                            |

@@ -48,6 +48,7 @@ impl Home {
         std::env::set_var("USERPROFILE", home);
         std::env::set_var("CLAUDE_CONFIG_DIR", home.join(".claude"));
         std::env::set_var("CODEX_HOME", home.join(".codex"));
+        std::env::remove_var("CODEX_SQLITE_HOME");
         std::env::set_var("GROK_HOME", home.join(".grok"));
         std::env::set_var(
             "OPENCODE_DB",

@@ -4,7 +4,11 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased]
+## [Unreleased - Patch]
+
+### Fixed
+
+- Codex discovery and capture honor `CODEX_SQLITE_HOME` for database-only threads when the SQLite stores live outside `CODEX_HOME`. Rollouts and archived sessions still use `CODEX_HOME`.
 
 ## [0.63.0] - 2026-11-26
 

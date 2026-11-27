@@ -12,7 +12,7 @@ pub(crate) fn restored_rollout(
     state: &Path,
     id: &str,
 ) -> Result<Option<PathBuf>> {
-    let Some((current_state, history)) = databases(&roots.codex)? else {
+    let Some((current_state, history)) = databases(roots)? else {
         return Ok(None);
     };
     ensure!(
@@ -42,10 +42,9 @@ pub(crate) fn restored_rollout(
         .optional()
         .map_err(Into::into)
     })?;
-    let Ok(metadata) = crate::ingest::transcript_file::metadata(&path) else {
+    let Some(metadata) = rollout_metadata(roots, &path)? else {
         return Ok(None);
     };
-    context.validate(&path)?;
     if !metadata.is_file()
         || offset.is_some_and(|offset| offset < 0 || metadata.len() < offset as u64)
     {
