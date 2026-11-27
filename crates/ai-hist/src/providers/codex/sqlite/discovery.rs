@@ -5,28 +5,39 @@ use crate::ingest::provider_diagnostics::{provider_diagnostic, ProviderSkip};
 /// A cataloged rollout yields to SQLite only when that same thread's
 /// projection extends beyond the rollout. A sibling with the same id retains
 /// catalog ownership. A malformed locator cannot take it over.
-pub(crate) fn incomplete_projection_owns_rollout(incoming: &str, observed: &str) -> Result<bool> {
+pub(crate) fn incomplete_projection_owns_rollout(
+    incoming: &str,
+    observed: &str,
+    configured: Option<&crate::ProviderRoots>,
+) -> Result<bool> {
     let Some((state, id)) = parse_locator(incoming) else {
         return Ok(false);
     };
     let Some(root) = state.parent() else {
         return Ok(false);
     };
+    let legacy;
+    let roots = match configured {
+        Some(roots) if roots.codex_sqlite_root() == root => roots,
+        Some(_) => return Ok(false),
+        None => {
+            // Standalone catalog upserts carry no provider roots. Only the
+            // original colocated layout can establish ownership in that case.
+            let Some(home) = root.parent() else { return Ok(false) };
+            legacy = crate::ProviderRoots {
+                codex: root.to_path_buf(),
+                ..crate::ProviderRoots::from_home(home.into(), home.join(".local/share/opencode/opencode.db"))
+            };
+            &legacy
+        }
+    };
     let observed_path = Path::new(observed);
-    if !observed_path.starts_with(root.join("sessions"))
-        && !observed_path.starts_with(root.join("archived_sessions"))
+    if !observed_path.starts_with(roots.codex.join("sessions"))
+        && !observed_path.starts_with(roots.codex.join("archived_sessions"))
     {
         return Ok(false);
     }
-    let Some(home) = root.parent() else {
-        return Ok(false);
-    };
-    let mut roots = crate::ProviderRoots::from_home(
-        home.to_path_buf(),
-        home.join(".local/share/opencode/opencode.db"),
-    );
-    roots.codex = root.to_path_buf();
-    match current_locator(&roots, id, observed) {
+    match current_locator(roots, id, observed) {
         Ok(current) => Ok(current.as_deref() == Some(incoming)),
         Err(error)
             if error
@@ -49,10 +60,9 @@ pub(crate) fn incomplete_projection_owns_rollout(incoming: &str, observed: &str)
 }
 
 pub(crate) fn enumerate(
-    root: &Path,
     roots: &crate::ProviderRoots,
 ) -> Result<(Vec<Candidate>, HashSet<PathBuf>)> {
-    let selection = database_selection(root)?;
+    let selection = database_selection(roots)?;
     if let Some(diagnostic) = selection.diagnostic {
         provider_diagnostic(ProviderSkip {
             source: crate::Source::Codex,
@@ -82,8 +92,8 @@ pub(crate) fn enumerate(
     Ok((candidates, incomplete_rollouts))
 }
 
-pub(crate) fn fingerprint(root: &Path) -> Result<Vec<Candidate>> {
-    let Some((state, history)) = databases(root)? else {
+pub(crate) fn fingerprint(roots: &crate::ProviderRoots) -> Result<Vec<Candidate>> {
+    let Some((state, history)) = databases(roots)? else {
         return Ok(Vec::new());
     };
     let mut out = Vec::new();
@@ -120,7 +130,7 @@ pub(crate) fn shallow(scan: &ScanEnv<'_>, c: &Candidate) -> Result<Option<Shallo
     let Some(mut t) = thread else {
         return Ok(None);
     };
-    let Some((_, history)) = databases(&scan.provider_roots.codex)? else {
+    let Some((_, history)) = databases(scan.provider_roots)? else {
         return Ok(None);
     };
     scan.note_open();
@@ -138,7 +148,7 @@ pub(crate) fn shallow(scan: &ScanEnv<'_>, c: &Candidate) -> Result<Option<Shallo
         t.next_offset = offset;
     }
     scan.note_records(1);
-    if t.rollout_complete() || t.is_child() {
+    if t.rollout_complete(scan.provider_roots) || t.is_child() {
         return Ok(None);
     }
     Ok(Some(ShallowSession {

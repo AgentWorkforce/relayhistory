@@ -264,7 +264,7 @@ fn select_threads(
                     retry_required,
                     restart: false,
                 });
-                if thread.rollout_complete() {
+                if thread.rollout_complete(context.roots) {
                     clear_stamps.push(thread.id);
                     continue;
                 }
@@ -318,7 +318,7 @@ fn selected_threads(
         "Codex thread discovery exceeds safety limit"
     );
     projection_for(context, history, &mut threads)?;
-    threads.retain(|thread| !thread.rollout_complete());
+    threads.retain(|thread| !thread.rollout_complete(context.roots));
     Ok(threads)
 }
 
@@ -370,7 +370,7 @@ pub(super) fn incomplete_rollout_paths(
     projection_for(context, history, &mut threads)?;
     Ok(threads
         .into_iter()
-        .filter(|thread| !thread.rollout_complete())
+        .filter(|thread| !thread.rollout_complete(context.roots))
         .filter_map(|thread| thread.rollout_path.map(PathBuf::from))
         .collect())
 }
@@ -420,10 +420,10 @@ fn finish_cursor(
 pub(crate) fn sync(
     conn: &Connection,
     state: &mut serde_json::Map<String, Value>,
-    root: &Path,
+    roots: &crate::ProviderRoots,
     repairs: &crate::ingest::SweepRepairs,
 ) -> Result<SyncOutcome> {
-    let Some((state_db, history)) = databases(root)? else {
+    let Some((state_db, history)) = databases(roots)? else {
         reset_backlog(state);
         return Ok(SyncOutcome {
             inserted: 0,
@@ -431,13 +431,7 @@ pub(crate) fn sync(
             incomplete: false,
         });
     };
-    let home = root.parent().unwrap_or(root).to_path_buf();
-    let mut roots = crate::ProviderRoots::from_home(
-        home.clone(),
-        home.join(".local/share/opencode/opencode.db"),
-    );
-    roots.codex = root.to_path_buf();
-    let context = AcquisitionContext::new("codex", &roots);
+    let context = AcquisitionContext::new("codex", roots);
     let start = load_cursor(state);
     let source_fingerprint = source_fingerprint();
     let traversal_fingerprint = match start.as_ref() {
@@ -484,7 +478,7 @@ pub(crate) fn sync(
                     continue;
                 }
                 let result = (|| -> Result<usize> {
-                    let acquired = capture(&roots, &state_db, &thread.id)?;
+                    let acquired = capture(roots, &state_db, &thread.id)?;
                     let captured = decode(&acquired)?;
                     let tx = conn.unchecked_transaction()?;
                     let count = reconcile(&tx, &captured, &state_db, true)?;
@@ -533,7 +527,7 @@ pub(super) fn sync_with_policy(
     repairs: &crate::ingest::SweepRepairs,
     policy: SweepPolicy,
 ) -> Result<SyncOutcome> {
-    with_policy(policy, || sync(conn, state, root, repairs))
+    with_policy(policy, || sync(conn, state, &crate::ProviderRoots::for_codex_test(root), repairs))
 }
 
 #[cfg(test)]

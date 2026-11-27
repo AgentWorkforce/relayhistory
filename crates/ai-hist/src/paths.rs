@@ -192,7 +192,7 @@ pub(crate) fn devin_cli_dir_under(home: &Path) -> PathBuf {
 /// advertised watch roots alike — the same tree is scanned, hydrated and
 /// watched, or a session the sweep catalogued cannot be hydrated afterwards.
 /// Build it with [`ProviderRoots::from_env`] (the CLI's rules: the process
-/// environment's `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `GROK_HOME`,
+/// environment's `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, `CODEX_SQLITE_HOME`, `GROK_HOME`,
 /// `XDG_DATA_HOME` (for Muse Code and Devin), `OPENCODE_DB` and `OPENCODE_STORAGE_DIR` override the
 /// defaults under `home`) or [`ProviderRoots::from_home`] (the defaults under
 /// `home`, with nothing read from the environment — what a test or an
@@ -207,6 +207,8 @@ pub struct ProviderRoots {
     pub claude: PathBuf,
     /// Codex state root (`~/.codex`).
     pub codex: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) codex_sqlite_home: Option<PathBuf>,
     /// Grok state root (`~/.grok`).
     pub grok: PathBuf,
     /// Muse Code session logs (`~/.local/share/muse/sessions`).
@@ -243,6 +245,8 @@ struct ProviderRootsWire {
     home: PathBuf,
     claude: PathBuf,
     codex: PathBuf,
+    #[serde(default)]
+    codex_sqlite_home: Option<PathBuf>,
     grok: PathBuf,
     muse: PathBuf,
     #[serde(default)]
@@ -292,6 +296,7 @@ impl<'de> Deserialize<'de> for ProviderRoots {
             home: wire.home,
             claude: wire.claude,
             codex: wire.codex,
+            codex_sqlite_home: wire.codex_sqlite_home,
             grok: wire.grok,
             muse: wire.muse,
             devin,
@@ -304,6 +309,18 @@ impl<'de> Deserialize<'de> for ProviderRoots {
 }
 
 impl ProviderRoots {
+    pub(crate) fn codex_sqlite_root(&self) -> &Path {
+        self.codex_sqlite_home.as_deref().unwrap_or(&self.codex)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_codex_test(root: &Path) -> Self {
+        let home = root.parent().unwrap_or(root);
+        let mut roots = Self::from_home(home.into(), home.join(".local/share/opencode/opencode.db"));
+        roots.codex = root.into();
+        roots
+    }
+
     /// Provider-owned adapters read their roots from this frozen map.
     pub(crate) fn for_provider(&self, id: &str) -> &[PathBuf] {
         self.provider_roots
@@ -338,6 +355,7 @@ impl ProviderRoots {
             provider_root_errors,
             claude: claude_config_dir(&home),
             codex: codex_home(&home),
+            codex_sqlite_home: env_dir("CODEX_SQLITE_HOME"),
             grok: grok_home(&home),
             muse: muse_sessions_dir(&home),
             devin: devin_cli_dir(&home),
@@ -364,6 +382,7 @@ impl ProviderRoots {
             provider_root_errors,
             claude: home.join(".claude"),
             codex: home.join(".codex"),
+            codex_sqlite_home: None,
             grok: home.join(".grok"),
             muse: default_muse_sessions_dir(&home),
             devin: devin_cli_dir_under(&home),

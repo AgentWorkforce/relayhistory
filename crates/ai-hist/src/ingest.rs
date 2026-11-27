@@ -2056,22 +2056,7 @@ fn sync_basic(
     if let Err(error) = conn.pragma_update(None, "temp_store", "MEMORY") {
         sync_note!("  [sync] in-memory temp store unavailable: {error:#}");
     }
-    if roots.use_env_roots {
-        for (var, root) in [
-            ("CLAUDE_CONFIG_DIR", &roots.claude),
-            ("CODEX_HOME", &roots.codex),
-            ("GROK_HOME", &roots.grok),
-        ] {
-            if std::env::var_os(var).is_some_and(|value| !value.to_string_lossy().trim().is_empty())
-                && !root.exists()
-            {
-                sync_note!(
-                    "  [{var}] configured root not found: {} (skipped)",
-                    root.display()
-                );
-            }
-        }
-    }
+    scope.note_missing_configured_roots(roots);
     let mut report = SyncSourceReport::new(db_path);
     let state_path = db_path
         .parent()
@@ -4412,13 +4397,20 @@ fn sync_codex_with_repairs(
     repairs: &SweepRepairs,
 ) -> Result<usize> {
     let mut coverage = SweepCoverage::default();
-    sync_codex_with_repairs_and_coverage(conn, state, root, repairs, &mut coverage, None)
+    sync_codex_with_repairs_and_coverage(
+        conn,
+        state,
+        &crate::ProviderRoots::for_codex_test(root),
+        repairs,
+        &mut coverage,
+        None,
+    )
 }
 
 fn sync_codex_with_repairs_and_coverage(
     conn: &Connection,
     state: &mut Map<String, Value>,
-    root: &Path,
+    roots: &crate::ProviderRoots,
     repairs: &SweepRepairs,
     coverage: &mut SweepCoverage,
     paths: Option<&path_scope::PathScope>,
@@ -4438,10 +4430,11 @@ fn sync_codex_with_repairs_and_coverage(
                 .collect()
         })
         .unwrap_or_default();
+    let root = &roots.codex;
     let result = codex_history::sync_codex_sources(
         conn,
         state,
-        root,
+        roots,
         repairs,
         coverage,
         &mut touched,

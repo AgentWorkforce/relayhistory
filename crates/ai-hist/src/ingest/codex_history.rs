@@ -6,18 +6,19 @@ use super::*;
 pub(super) fn sync_codex_sources(
     conn: &Connection,
     state: &mut Map<String, Value>,
-    root: &Path,
+    roots: &crate::ProviderRoots,
     repairs: &SweepRepairs,
     coverage: &mut SweepCoverage,
     touched: &mut HashSet<String>,
     paths: Option<&super::path_scope::PathScope>,
 ) -> Result<usize> {
     let inserted =
-        sync_codex_rollouts_and_history(conn, state, root, repairs, coverage, touched, paths)?;
+        sync_codex_rollouts_and_history(conn, state, roots, repairs, coverage, touched, paths)?;
     // Last, after every phase that can create a Codex row (the history
     // backfill included): a name applied before its row exists would be
     // recorded as applied and never land.
-    let named = super::codex_thread_names::apply_codex_thread_names(conn, state, root, touched)?;
+    let named =
+        super::codex_thread_names::apply_codex_thread_names(conn, state, &roots.codex, touched)?;
     if named > 0 {
         sync_note!("  [codex] named {named} threads");
     }
@@ -27,7 +28,7 @@ pub(super) fn sync_codex_sources(
 fn sync_codex_rollouts_and_history(
     conn: &Connection,
     state: &mut Map<String, Value>,
-    root: &Path,
+    roots: &crate::ProviderRoots,
     repairs: &SweepRepairs,
     coverage: &mut SweepCoverage,
     touched: &mut HashSet<String>,
@@ -35,13 +36,14 @@ fn sync_codex_rollouts_and_history(
 ) -> Result<usize> {
     // A full walk of either rollout root reads its evidence keys once. A
     // path-scoped tick keeps the point probe.
+    let root = &roots.codex;
     let sessions = root.join("sessions");
     let archived = root.join("archived_sessions");
     let _guard = super::evidence_probe::Guard::arm_when_full(conn, paths, &[sessions, archived]);
     let (cwds, branches, mut inserted) = sync_codex_rollouts_with_repairs_and_coverage(
         conn, state, root, repairs, coverage, touched, paths,
     )?;
-    match sync_codex_sqlite_scoped(conn, state, root, repairs, coverage, touched, paths) {
+    match sync_codex_sqlite_scoped(conn, state, roots, repairs, coverage, touched, paths) {
         Ok(sqlite_inserted) => inserted += sqlite_inserted,
         Err(error) if error.is::<CaptureCancelled>() => return Err(error),
         Err(error) => {
@@ -113,13 +115,13 @@ fn note_codex_history_sync(advanced: bool, inserted: usize, backfilled: usize, e
 fn sync_codex_sqlite_scoped(
     conn: &Connection,
     state: &mut Map<String, Value>,
-    root: &Path,
+    roots: &crate::ProviderRoots,
     repairs: &SweepRepairs,
     coverage: &mut SweepCoverage,
     touched: &mut HashSet<String>,
     paths: Option<&super::path_scope::PathScope>,
 ) -> Result<usize> {
-    let selection = crate::providers::codex::sqlite::database_selection(root)?;
+    let selection = crate::providers::codex::sqlite::database_selection(roots)?;
     if let Some(diagnostic) = selection.diagnostic {
         sync_note!("  [codex] skipping SQLite history: {diagnostic}");
     }
@@ -131,8 +133,8 @@ fn sync_codex_sqlite_scoped(
         || !repairs.is_empty()
         || crate::providers::codex::sqlite::backlog_pending(state)
         || paths.is_some_and(|scope| {
-            scope.mentions(&root.join("sessions"))
-                || scope.mentions(&root.join("archived_sessions"))
+            scope.mentions(&roots.codex.join("sessions"))
+                || scope.mentions(&roots.codex.join("archived_sessions"))
         })
         || [state_db, history_db].iter().any(|file| {
             ["", "-wal", "-shm", "-journal"].iter().any(|suffix| {
@@ -143,7 +145,7 @@ fn sync_codex_sqlite_scoped(
             })
         });
     if changed {
-        let outcome = crate::providers::codex::sqlite::sync(conn, state, root, repairs)?;
+        let outcome = crate::providers::codex::sqlite::sync(conn, state, roots, repairs)?;
         for id in outcome.read {
             coverage.note_read("codex", &id, true);
             touched.insert(id);
@@ -247,7 +249,7 @@ mod tests {
         sync_codex_sources(
             &conn,
             &mut state,
-            &root,
+            &crate::ProviderRoots::for_codex_test(&root),
             &SweepRepairs::default(),
             &mut SweepCoverage::default(),
             &mut touched,
@@ -275,7 +277,10 @@ mod tests {
             .join("tests/fixtures/codex/sqlite/rollout-rollout-primary.jsonl");
         std::fs::copy(fixture, &rollout).unwrap();
 
-        let selection = crate::providers::codex::sqlite::database_selection(&root).unwrap();
+        let selection = crate::providers::codex::sqlite::database_selection(
+            &crate::ProviderRoots::for_codex_test(&root),
+        )
+        .unwrap();
         assert!(selection.pair.is_none());
         assert!(selection.diagnostic.unwrap().contains("state_6.sqlite"));
 
@@ -304,7 +309,7 @@ mod tests {
         sync_codex_sources(
             &conn,
             &mut state,
-            &root,
+            &crate::ProviderRoots::for_codex_test(&root),
             &SweepRepairs::default(),
             &mut SweepCoverage::default(),
             &mut HashSet::new(),
@@ -355,7 +360,7 @@ mod tests {
         sync_codex_sources(
             &conn,
             &mut state,
-            &root,
+            &crate::ProviderRoots::for_codex_test(&root),
             &SweepRepairs::default(),
             &mut coverage,
             &mut HashSet::new(),
@@ -402,7 +407,7 @@ mod tests {
         sync_codex_sources(
             &conn,
             &mut state,
-            &root,
+            &crate::ProviderRoots::for_codex_test(&root),
             &repairs,
             &mut coverage,
             &mut touched,
@@ -422,7 +427,7 @@ mod tests {
         sync_codex_sources(
             &conn,
             &mut state,
-            &root,
+            &crate::ProviderRoots::for_codex_test(&root),
             &repairs,
             &mut coverage,
             &mut touched,

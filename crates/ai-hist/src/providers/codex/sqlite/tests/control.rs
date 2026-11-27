@@ -24,7 +24,7 @@ fn sqlite_control_wrappers_are_events_but_never_prompts() {
     let mut roots =
         crate::ProviderRoots::from_home(dir.path().to_path_buf(), dir.path().join("opencode.db"));
     roots.codex = codex.clone();
-    let (candidates, _) = enumerate(&codex, &roots).unwrap();
+    let (candidates, _) = enumerate(&roots).unwrap();
     let candidate = candidates
         .iter()
         .find(|candidate| candidate.session_id.as_deref() == Some("sqlite-pruned-all-items"))

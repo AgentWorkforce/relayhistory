@@ -16,16 +16,17 @@ pub(super) fn refresh_catalog_codex_locator(
     {
         // A pair the selection rules reject is a skipped check, not a
         // refresh that found nothing: it is reported like a failed one.
-        let current = crate::providers::codex::sqlite::database_selection(&roots.codex).and_then(
-            |selection| match selection.diagnostic {
-                Some(diagnostic) => Err(anyhow::anyhow!(diagnostic)),
-                None => crate::providers::codex::sqlite::current_locator(
-                    roots,
-                    &options.session_id,
-                    target.locator.as_deref().unwrap_or_default(),
-                ),
-            },
-        );
+        let current =
+            crate::providers::codex::sqlite::database_selection(roots).and_then(|selection| {
+                match selection.diagnostic {
+                    Some(diagnostic) => Err(anyhow::anyhow!(diagnostic)),
+                    None => crate::providers::codex::sqlite::current_locator(
+                        roots,
+                        &options.session_id,
+                        target.locator.as_deref().unwrap_or_default(),
+                    ),
+                }
+            });
         let current = match current {
             Ok(current) => current,
             Err(error) if error.is::<crate::ingest::CaptureCancelled>() => return Err(error),

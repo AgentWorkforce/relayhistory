@@ -15,7 +15,7 @@ pub(crate) const LOCAL_SOURCE: LocalSource = LocalSource {
         ];
         for store in ["state_5.sqlite", "thread_history_1.sqlite"] {
             for suffix in ["", "-wal", "-shm", "-journal"] {
-                paths.push(roots.codex.join(format!("{store}{suffix}")));
+                paths.push(roots.codex_sqlite_root().join(format!("{store}{suffix}")));
             }
         }
         paths
@@ -34,6 +34,15 @@ pub(crate) const LOCAL_SOURCE: LocalSource = LocalSource {
     }),
     fixtures: Fixtures::Dir("codex"),
 };
+
+pub(crate) fn watch_roots(codex: &std::path::Path, sqlite: &std::path::Path) -> Vec<crate::discover::WatchRoot> {
+    use crate::discover::{WatchEntries, WatchRoot};
+    vec![
+        WatchRoot::tree(codex.join("sessions")),
+        WatchRoot::tree(codex.join("archived_sessions")),
+        WatchRoot::directory_of(sqlite, WatchEntries::CodexStores),
+    ]
+}
 
 pub(crate) const METADATA: super::ProviderMetadata = super::ProviderMetadata {
     markers: true,
