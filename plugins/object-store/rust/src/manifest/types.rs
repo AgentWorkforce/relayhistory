@@ -49,6 +49,27 @@ pub struct Session {
     pub cwd_sha256: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_session_id: Option<String>,
+    /// Repository evidence for a stable repo identity, derived offline by
+    /// the client. Absent when the session's directory is not in a git repo.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<SessionRepo>,
+    #[serde(flatten)]
+    pub extra: Extra,
+}
+
+/// `session.repo`: what the server needs to give a session a repo identity
+/// that survives renames, transfers and remote URL changes.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SessionRepo {
+    /// The `origin` remote canonicalized to `host/path`, exactly as
+    /// `ai_hist::project_identity::canonicalize_remote_url` returns it:
+    /// lowercase host, no scheme, no credentials, no port, no `.git`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub remote_url: Option<String>,
+    /// The repository's root commit (lowercase hex, SHA-1 or SHA-256).
+    /// Omitted for shallow clones, whose oldest commit is not the root.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_commit: Option<String>,
     #[serde(flatten)]
     pub extra: Extra,
 }
