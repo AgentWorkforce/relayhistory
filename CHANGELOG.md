@@ -4,7 +4,11 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased - Patch]
+## [Unreleased - Minor]
+
+### Rust API
+
+- Added `ProviderRoots::with_codex_sqlite_home` for callers that supply a mapped Codex SQLite directory separately from the rollout root.
 
 ### Fixed
 
