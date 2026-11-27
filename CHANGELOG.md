@@ -6,13 +6,13 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased - Minor]
 
-### Rust API
-
-- Added `ProviderRoots::with_codex_sqlite_home` for callers that supply a mapped Codex SQLite directory separately from the rollout root.
-
 ### Fixed
 
 - Codex discovery and capture honor `CODEX_SQLITE_HOME` for database-only threads when the SQLite stores live outside `CODEX_HOME`. Rollouts and archived sessions still use `CODEX_HOME`.
+
+### Rust API
+
+- Added `ProviderRoots::with_codex_sqlite_home` for callers that supply a mapped Codex SQLite directory separately from the rollout root.
 
 ## [0.63.0] - 2026-11-26
 
