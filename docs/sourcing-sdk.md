@@ -162,6 +162,8 @@ real rollouts into its store. Whichever way they are resolved, the store
 resolves them **once** at `open` (`SessionStore::roots()`), and `sync`,
 `hydrate`, `watch` and `SourceCapabilities::watch_roots` all read that one
 value, so a session the sweep catalogued is always hydrated from the same tree.
+A nonblank `CODEX_SQLITE_HOME` selects the directory containing the Codex SQLite
+databases. When it is unset or blank, the databases use the configured Codex root.
 Nothing on those paths reads the environment afterwards.
 
 **Schema and read-only opens.** A **writable** open migrates the database to
