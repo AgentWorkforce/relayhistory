@@ -73,8 +73,11 @@ pub(super) fn locate<'a>(roots: &'a ProviderRoots, path: &Path) -> Result<(&'a P
     Ok((root.as_path(), native.to_owned()))
 }
 
-pub(super) fn identity(roots: &ProviderRoots, path: &Path) -> Result<String> {
-    let (root, native) = locate(roots, path)?;
+pub(super) fn identity_for_native(
+    roots: &ProviderRoots,
+    root: &Path,
+    native: &str,
+) -> Result<String> {
     // A root namespace prevents App, CLI, IDE and explicitly supplied roots
     // from collapsing distinct conversations that happen to reuse an ID.
     Ok(format!(
@@ -88,4 +91,9 @@ pub(super) fn identity(roots: &ProviderRoots, path: &Path) -> Result<String> {
                 .as_bytes()
         )
     ))
+}
+
+pub(super) fn identity(roots: &ProviderRoots, path: &Path) -> Result<String> {
+    let (root, native) = locate(roots, path)?;
+    identity_for_native(roots, root, &native)
 }

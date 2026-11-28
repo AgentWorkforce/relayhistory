@@ -325,6 +325,269 @@ fn titles_are_read_from_conversation_summaries_db_and_track_updates() {
 }
 
 #[test]
+fn shallow_discovery_updates_full_session_title_on_rename_and_retains_when_db_missing() {
+    let home = tempfile::tempdir().unwrap();
+    let roots = ProviderRoots::from_home(home.path().into(), home.path().join("opencode.db"));
+    let variant = home.path().join(".gemini/antigravity");
+    let logs = variant.join("brain/conv-1/.system_generated/logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    let transcript = logs.join("transcript_full.jsonl");
+    let body = format!(
+        "{}\n{}\n",
+        serde_json::json!({"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-11-20T06:37:44-08:00","content":"hello"}),
+        serde_json::json!({"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-20T06:37:50-08:00","content":"hi"}),
+    );
+    std::fs::write(&transcript, body).unwrap();
+    let summary_db = variant.join("conversation_summaries.db");
+    let summary_conn = Connection::open(&summary_db).unwrap();
+    summary_conn
+        .execute_batch(
+            "CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '');
+             INSERT INTO conversation_summaries (conversation_id, title) VALUES ('conv-1', 'Draft');",
+        )
+        .unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    let store = crate::SessionStore::open(
+        crate::StoreOptions::default()
+            .db_path(temp.path().join("db"))
+            .roots(roots),
+    )
+    .unwrap();
+    store
+        .sync(crate::SyncOptions::default().sources([crate::Source::Antigravity]))
+        .unwrap();
+
+    summary_conn
+        .execute(
+            "UPDATE conversation_summaries SET title = 'Final' WHERE conversation_id = 'conv-1'",
+            [],
+        )
+        .unwrap();
+    for pass in 0..2 {
+        let report = store
+            .discover(crate::DiscoveryOptions::default().sources([crate::Source::Antigravity]))
+            .unwrap();
+        assert!(report.diagnostics.is_empty());
+        if pass == 0 {
+            assert_eq!(report.discovered, 1);
+        } else {
+            assert_eq!(report.skipped_unchanged, 1);
+        }
+        let sessions: Vec<_> = store
+            .sessions(crate::CatalogQuery {
+                sources: Some(vec![crate::Source::Antigravity]),
+                ..Default::default()
+            })
+            .collect::<Result<_, _>>()
+            .unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(
+            sessions[0].title.as_deref(),
+            Some("Final"),
+            "pass {pass} must return the renamed title on a full row"
+        );
+    }
+
+    drop(summary_conn);
+    std::fs::remove_file(&summary_db).unwrap();
+    store
+        .discover(crate::DiscoveryOptions::default().sources([crate::Source::Antigravity]))
+        .unwrap();
+    let after_removal: Vec<_> = store
+        .sessions(crate::CatalogQuery {
+            sources: Some(vec![crate::Source::Antigravity]),
+            ..Default::default()
+        })
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(after_removal[0].title.as_deref(), Some("Final"));
+}
+
+#[test]
+fn untitled_pre_upgrade_cached_shallow_prompt_is_refreshed_and_empty_uploads_skipped() {
+    let home = tempfile::tempdir().unwrap();
+    let roots = ProviderRoots::from_home(home.path().into(), home.path().join("opencode.db"));
+    let logs = home
+        .path()
+        .join(".gemini/antigravity/brain/conv-untitled/.system_generated/logs");
+    std::fs::create_dir_all(&logs).unwrap();
+    let transcript = logs.join("transcript_full.jsonl");
+    let image_only = "<USER_REQUEST>\n\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-26T09:42:49-08:00.\n\nThe user has uploaded 1 image(s):\n- /tmp/a.png\n</ADDITIONAL_METADATA>";
+    let real_prompt = "<USER_REQUEST>\nReal follow-up prompt\n</USER_REQUEST>\n<ADDITIONAL_METADATA>\nThe current local time is: 2026-11-26T09:43:00-08:00.\n\nExtra context\n</ADDITIONAL_METADATA>";
+    let body = format!(
+        "{}\n{}\n{}\n",
+        serde_json::json!({"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-11-26T09:42:49-08:00","content":image_only}),
+        serde_json::json!({"step_index":1,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-11-26T09:43:00-08:00","content":real_prompt}),
+        serde_json::json!({"step_index":2,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-26T09:43:10-08:00","content":"ok"}),
+    );
+    std::fs::write(&transcript, body).unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    let store = crate::SessionStore::open(
+        crate::StoreOptions::default()
+            .db_path(temp.path().join("db"))
+            .roots(roots),
+    )
+    .unwrap();
+    store
+        .discover(crate::DiscoveryOptions::default().sources([crate::Source::Antigravity]))
+        .unwrap();
+    let initial: Vec<_> = store
+        .sessions(crate::CatalogQuery {
+            sources: Some(vec![crate::Source::Antigravity]),
+            ..Default::default()
+        })
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(initial.len(), 1);
+    assert_eq!(
+        initial[0].first_prompt.as_deref(),
+        Some("Real follow-up prompt")
+    );
+
+    // Seed the pre-upgrade plain file stamp and leaked XML preview on an untitled session.
+    let (plain_stamp, _) = crate::file_stamp_and_modified(&transcript).unwrap();
+    let pre_upgrade_stamp = format!(
+        "v{}:{plain_stamp}",
+        crate::discover::SHALLOW_SCANNER_VERSION
+    );
+    let conn = crate::open_db(store.db_path()).unwrap();
+    conn.execute(
+        "UPDATE sessions SET first_prompt = ?1, source_stamp = ?2 WHERE source = 'antigravity'",
+        rusqlite::params![image_only, &pre_upgrade_stamp],
+    )
+    .unwrap();
+    conn.execute(
+        "UPDATE session_observations SET source_stamp = ?1, first_prompt = ?2 WHERE source = 'antigravity'",
+        rusqlite::params![&pre_upgrade_stamp, image_only],
+    )
+    .unwrap();
+
+    let refresh_report = store
+        .discover(crate::DiscoveryOptions::default().sources([crate::Source::Antigravity]))
+        .unwrap();
+    assert_eq!(refresh_report.discovered, 1);
+    let refreshed: Vec<_> = store
+        .sessions(crate::CatalogQuery {
+            sources: Some(vec![crate::Source::Antigravity]),
+            ..Default::default()
+        })
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(refreshed.len(), 1);
+    assert_eq!(
+        refreshed[0].first_prompt.as_deref(),
+        Some("Real follow-up prompt")
+    );
+
+    store
+        .sync(crate::SyncOptions::default().sources([crate::Source::Antigravity]))
+        .unwrap();
+    let stored_prompt: Option<String> = conn
+        .query_row(
+            "SELECT first_prompt FROM sessions WHERE source = 'antigravity'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(stored_prompt.as_deref(), Some("Real follow-up prompt"));
+}
+
+#[test]
+fn summary_db_only_reconciliation_updates_titles_without_replaying_transcripts() {
+    let home = tempfile::tempdir().unwrap();
+    let roots = ProviderRoots::from_home(home.path().into(), home.path().join("opencode.db"));
+    let variant = home.path().join(".gemini/antigravity");
+    let write_conv = |id: &str, prompt: &str| {
+        let logs = variant
+            .join("brain")
+            .join(id)
+            .join(".system_generated/logs");
+        std::fs::create_dir_all(&logs).unwrap();
+        let path = logs.join("transcript_full.jsonl");
+        let body = format!(
+            "{}\n{}\n",
+            serde_json::json!({"step_index":0,"source":"USER_EXPLICIT","type":"USER_INPUT","status":"DONE","created_at":"2026-11-20T06:37:44-08:00","content":prompt}),
+            serde_json::json!({"step_index":1,"source":"MODEL","type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-20T06:37:50-08:00","content":"ok"}),
+        );
+        std::fs::write(&path, body).unwrap();
+        path
+    };
+    let _conv_a = write_conv("conv-a", "first");
+    let conv_b = write_conv("conv-b", "second");
+    let summary_db = variant.join("conversation_summaries.db");
+    let summary_conn = Connection::open(&summary_db).unwrap();
+    summary_conn
+        .execute_batch(
+            "CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, title TEXT NOT NULL DEFAULT '');
+             INSERT INTO conversation_summaries (conversation_id, title) VALUES ('conv-a', 'Alpha'), ('conv-b', 'Beta');",
+        )
+        .unwrap();
+
+    let temp = tempfile::tempdir().unwrap();
+    let store = crate::SessionStore::open(
+        crate::StoreOptions::default()
+            .db_path(temp.path().join("db"))
+            .roots(roots.clone()),
+    )
+    .unwrap();
+    store
+        .sync(crate::SyncOptions::default().sources([crate::Source::Antigravity]))
+        .unwrap();
+
+    // Fingerprint inputs stay stat-only: transcript stamps omit `:title:` while
+    // `conversation_summaries.db` is fingerprinted by its own file stat.
+    let conn = crate::open_db(store.db_path()).unwrap();
+    let env = crate::discover::DiscoveryEnv::with_provider_roots(&conn, roots);
+    let fp = <Provider as ShallowSessionProvider>::fingerprint_inputs(&Provider::default(), &env)
+        .unwrap();
+    assert!(fp
+        .iter()
+        .any(|c| c.locator.ends_with("conversation_summaries.db")));
+    assert!(fp
+        .iter()
+        .filter(|c| c.locator.ends_with("transcript_full.jsonl"))
+        .all(|c| !c.stamp.contains(":title:")));
+
+    // Break conv-b's transcript so any unintended full replay would fail, then
+    // rename conv-a and run a summary-DB-only scoped sync (as reconciliation
+    // issues for a 1-path batch on `conversation_summaries.db`).
+    std::fs::write(&conv_b, b"{not valid json}\n").unwrap();
+    summary_conn
+        .execute(
+            "UPDATE conversation_summaries SET title = 'Alpha Renamed' WHERE conversation_id = 'conv-a'",
+            [],
+        )
+        .unwrap();
+
+    let report = store
+        .sync(
+            crate::SyncOptions::default()
+                .sources([crate::Source::Antigravity])
+                .paths([summary_db]),
+        )
+        .unwrap();
+    assert!(report.diagnostics.is_empty());
+    assert_eq!(report.changed.len(), 1);
+    let titles: std::collections::BTreeMap<String, Option<String>> = conn
+        .prepare("SELECT session_id, title FROM sessions WHERE source = 'antigravity'")
+        .unwrap()
+        .query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, Option<String>>(1)?))
+        })
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap();
+    assert!(titles
+        .iter()
+        .any(|(sid, title)| sid.ends_with(":conv-a") && title.as_deref() == Some("Alpha Renamed")));
+    assert!(titles
+        .iter()
+        .any(|(sid, title)| sid.ends_with(":conv-b") && title.as_deref() == Some("Beta")));
+}
+
+#[test]
 fn spawned_subagents_are_delegated_children_of_their_parent() {
     let home = tempfile::tempdir().unwrap();
     let roots = ProviderRoots::from_home(home.path().into(), home.path().join("opencode.db"));

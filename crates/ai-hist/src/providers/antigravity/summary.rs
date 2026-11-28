@@ -8,11 +8,47 @@ pub(super) fn scope_mentions(scope: &crate::path_scope::PathScope, brain_root: &
         .any(|path| scope.mentions(path))
 }
 
+/// Shallow candidate stamp version for Antigravity.
+///
+/// Bumped when Antigravity's shallow prompt/title extraction changes so cached
+/// shallow rows for unchanged, untitled transcripts are re-read without
+/// invalidating every other provider's shallow cache.
+const SHALLOW_STAMP_VERSION: &str = "v4";
+
 pub(super) fn stamp_with_title(base: String, title: Option<&str>) -> String {
     match title {
-        Some(title) => format!("{base}:title:{:x}", Sha256::digest(title.as_bytes())),
-        None => base,
+        Some(title) => format!(
+            "{base}:{SHALLOW_STAMP_VERSION}:title:{:x}",
+            Sha256::digest(title.as_bytes())
+        ),
+        None => format!("{base}:{SHALLOW_STAMP_VERSION}"),
     }
+}
+
+/// Apply current titles from `conversation_summaries.db` directly to
+/// already-cataloged sessions under `brain_root`, without replaying
+/// transcripts.
+pub(super) fn reconcile_titles(
+    conn: &Connection,
+    brain_root: &Path,
+    context: &AcquisitionContext<'_>,
+) -> Result<usize> {
+    let titles = read_titles_for_brain(brain_root, context);
+    let mut updated = 0;
+    for (native_id, title) in titles {
+        crate::ingest::check_capture_cancelled()?;
+        if native_id.is_empty()
+            || Path::new(&native_id).components().count() != 1
+            || matches!(native_id.as_str(), "." | "..")
+        {
+            continue;
+        }
+        let sid = roots::identity_for_native(context.roots, brain_root, &native_id)?;
+        if crate::ingest::set_session_title(conn, ID, &sid, Some(&title))? {
+            updated += 1;
+        }
+    }
+    Ok(updated)
 }
 
 pub(super) fn read_titles_for_brain(
