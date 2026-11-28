@@ -11,7 +11,7 @@ name = "relayhistory-rust-consumer"
 version = "0.0.0"
 edition = "2021"
 publish = false
-rust-version = "1.88"
+rust-version = "1.89"
 description = "Smoke test: an out-of-tree embedder of the ai-hist crate"
 
 [workspace]

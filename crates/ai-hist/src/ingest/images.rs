@@ -1,7 +1,7 @@
 //! Embedded images are self-contained Markdown content blocks. Never follow a
 //! transcript's file paths or remote URLs: only copy bytes the harness recorded.
 use super::*;
-use base64::Engine;
+use crate::base64_std;
 
 /// Whether the rollout behind a stamp-map record was last read by a parser
 /// older than the state-marker generation.
@@ -58,25 +58,12 @@ pub(crate) fn image_markdown(url: &str) -> Option<String> {
         return None;
     }
     let (header, data) = url.split_once(",")?;
-    let bytes = base64::engine::general_purpose::STANDARD
-        .decode(data)
-        .ok()?;
+    let bytes = base64_std::decode(data)?;
     if bytes.len() > MAX_IMAGE_BYTES {
         return None;
     }
-    let valid = match header {
-        "data:image/png;base64" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
-        "data:image/jpeg;base64" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
-        "data:image/gif;base64" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
-        "data:image/webp;base64" => bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP"),
-        _ => false,
-    };
-    valid.then(|| {
-        format!(
-            "![Attached image]({header},{})",
-            base64::engine::general_purpose::STANDARD.encode(bytes)
-        )
-    })
+    base64_std::is_valid_raster_image(header, &bytes)
+        .then(|| format!("![Attached image]({header},{})", base64_std::encode(&bytes)))
 }
 
 /// The session an image block is stored under.

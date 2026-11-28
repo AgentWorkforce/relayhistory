@@ -72,6 +72,30 @@ pub(crate) fn file_identity(_path: &Path) -> Option<FileIdentity> {
     None
 }
 
+/// Whether `path` still refers to the same underlying file as `opened`.
+#[cfg(unix)]
+pub(crate) fn is_same_opened_file(opened: &std::fs::File, path: &Path) -> std::io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let a = opened.metadata()?;
+    let b = std::fs::metadata(path)?;
+    Ok(a.dev() == b.dev() && a.ino() == b.ino())
+}
+
+#[cfg(windows)]
+pub(crate) fn is_same_opened_file(opened: &std::fs::File, path: &Path) -> std::io::Result<bool> {
+    let a = same_file::Handle::from_file(opened.try_clone()?)?;
+    let b = same_file::Handle::from_path(path)?;
+    Ok(a == b)
+}
+
+#[cfg(not(any(unix, windows)))]
+pub(crate) fn is_same_opened_file(_opened: &std::fs::File, _path: &Path) -> std::io::Result<bool> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "file identity comparison is unsupported on this platform",
+    ))
+}
+
 struct Idle {
     conn: Connection,
     identity: FileIdentity,

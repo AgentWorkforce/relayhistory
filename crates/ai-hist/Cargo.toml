@@ -22,12 +22,11 @@ export = []
 # crate still builds with --no-default-features on a host with no watcher
 # backend; without it `watch` falls back to polling.
 fs-events = ["dep:notify"]
-opencode-backup = ["dep:tempfile", "rusqlite/backup"]
+opencode-backup = ["rusqlite/backup"]
 git-hooks = ["dep:url"]
 unstable-internal = []
 
 [dependencies]
-base64 = "0.22"
 anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["std"] }
 notify = { version = "8", default-features = false, features = [
@@ -35,25 +34,24 @@ notify = { version = "8", default-features = false, features = [
 ], optional = true }
 rmpv = "1.3.1"
 rusqlite ={ version = "0.32", features = ["bundled", "functions"] }
-same-file = "1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-tempfile = { version = "3", optional = true }
 url = { version = "2", optional = true }
 # Codex compresses finished rollouts to `.jsonl.zst`; read with the same
 # libzstd binding Codex writes them with.
 zstd = { version = "0.13", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
-# Safe wrappers for the statfs/statvfs, flock and kill(pid, 0) calls the crate
+# Safe wrappers for the statfs/statvfs and kill(pid, 0) calls the crate
 # makes, so it needs no `unsafe` of its own.
 rustix = { version = "1", features = ["fs", "process"] }
 
 [target.'cfg(windows)'.dependencies]
-fs2 = "0.4"
 # Quota-aware free space (`GetDiskFreeSpaceExW`) behind a safe API.
 fs4 = { version = "1", default-features = false }
+# Windows file identity handles (Unix uses std's `MetadataExt::{dev, ino}`).
+same-file = "1"
 
 [dev-dependencies]
 tempfile = "3"

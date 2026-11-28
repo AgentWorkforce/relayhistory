@@ -6,8 +6,8 @@
 use std::time::{Duration, Instant};
 
 use relayhistory_object_store::scrub::{scrub_record, scrub_text, MAX_SCRUB_CHARS};
+use relayhistory_object_store::sha256_hex;
 use serde::Deserialize;
-use sha2::{Digest, Sha256};
 
 #[derive(Deserialize)]
 struct Fixture {
@@ -99,7 +99,7 @@ fn every_golden_vector_matches_the_reference() {
         let ok = match (&output, &v.output_sha256) {
             (Some(expected), _) => &got == expected,
             (None, Some(sha)) => {
-                hex::encode(Sha256::digest(got.as_bytes())) == *sha
+                sha256_hex(got.as_bytes()) == *sha
                     && Some(got.encode_utf16().count()) == v.output_utf16_len
             }
             _ => panic!("{}: no expectation", v.id),

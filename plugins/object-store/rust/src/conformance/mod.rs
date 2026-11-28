@@ -5,10 +5,12 @@
 //! Each case returns a [`CaseOutcome`]; a harness may mark a case as a known
 //! emulator gap with [`SuiteOptions::skip`], which is reported, never hidden.
 
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use bytes::Bytes;
 use futures::future::BoxFuture;
 use futures::TryStreamExt;
-use rand::RngCore;
 use url::Url;
 
 use crate::{ObjectKey, ObjectStore};
@@ -112,8 +114,25 @@ fn key(base: &ObjectKey, rest: &str) -> Result<ObjectKey, String> {
 }
 
 fn random_bytes(len: usize) -> Bytes {
-    let mut buf = vec![0u8; len];
-    rand::rng().fill_bytes(&mut buf);
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    let mut state = nanos
+        ^ COUNTER
+            .fetch_add(1, Ordering::Relaxed)
+            .wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    let mut buf = Vec::with_capacity(len);
+    while buf.len() < len {
+        state = state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+        let mut z = state;
+        z = (z ^ (z >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+        z = (z ^ (z >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+        z ^= z >> 31;
+        let bytes = z.to_le_bytes();
+        let take = (len - buf.len()).min(bytes.len());
+        buf.extend_from_slice(&bytes[..take]);
+    }
     buf.into()
 }
 

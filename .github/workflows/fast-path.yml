@@ -148,9 +148,9 @@ jobs:
         with:
           ref: ${{ needs.gate.outputs.sha }}
           persist-credentials: false
-      - uses: dtolnay/rust-toolchain@1.88.0
+      - uses: dtolnay/rust-toolchain@1.89.0
       - name: MSRV check
-        run: cargo +1.88.0 check -p ai-hist --all-features --locked
+        run: cargo +1.89.0 check -p ai-hist --all-features --locked
       - uses: dtolnay/rust-toolchain@stable
       - name: Redirect the example's crates.io dependency at this checkout
         working-directory: examples/rust-consumer

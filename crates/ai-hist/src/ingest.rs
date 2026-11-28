@@ -11429,12 +11429,10 @@ impl ClaudeTranscriptSnapshot {
 /// identity binds that validation to the handle, so swapping a symlink or a
 /// directory entry cannot redirect the later read outside the provider root.
 pub(crate) fn validate_opened_file_identity(path: &Path, opened: &fs::File) -> Result<()> {
-    let opened = same_file::Handle::from_file(opened.try_clone()?)
-        .with_context(|| format!("checking opened Claude transcript {}", path.display()))?;
-    let current = same_file::Handle::from_path(path)
+    let same = crate::read_pool::is_same_opened_file(opened, path)
         .with_context(|| format!("checking opened Claude transcript {}", path.display()))?;
     anyhow::ensure!(
-        opened == current,
+        same,
         "Claude transcript changed while its provider path was validated: {}",
         path.display()
     );
