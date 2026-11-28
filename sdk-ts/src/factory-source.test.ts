@@ -244,3 +244,55 @@ test('canonical Factory blocks retain numeric native order through source intake
   await hydrateSourcePlugin(source, { source: 'droid', sessionId: sid }, { dbPath });
   assert.deepEqual(await read(), events);
 });
+
+test('oversized canonical fields keep native identities, raw capture and later turns deliverable', async () => {
+  const { factoryCanonicalEvidence, factoryCanonicalRecordId } = await import('./factory-source.js');
+  const { createHash } = await import('node:crypto');
+  // Escaping and UTF-8 both matter. The JS string length is below the wire ceiling.
+  const large = ('界\u0000').repeat(170_000);
+  const first = { ...message, modelId: large, content: [
+    { type: 'text', text: large }, { type: 'thinking', thinking: large },
+    { type: 'tool_use', id: 'call-1', name: 'Read', input: { file_path: large } },
+  ] };
+  const result = { ...message, id: 'result', role: 'tool', content: [
+    { type: 'tool_result', toolUseId: 'call-1', content: large, isError: false },
+  ] };
+  const later = { ...message, id: 'later' };
+  const rows = await factoryCanonicalEvidence(sid, [first, result, later]);
+  for (const { raw, key, ...wire } of rows) {
+    assert.equal(wire.record_id, await factoryCanonicalRecordId(key));
+    assert.ok(Buffer.byteLength(JSON.stringify(wire)) <= 1_048_576);
+  }
+  assert.deepEqual(rows.find(row => row.raw)?.raw, first);
+  const omission = { factory_omitted_bytes: Buffer.byteLength(large), sha256: createHash('sha256').update(large).digest('hex') };
+  const events = rows.filter(row => row.kind === 'session_event');
+  assert.deepEqual(events.map(row => row.payload.event_uid), ['message-1:0', 'message-1:1', 'message-1:2', 'result:0', 'later:0']);
+  for (const i of [0, 1, 3]) assert.deepEqual(JSON.parse(String(events[i].payload.text)), omission);
+  assert.equal(events[0].payload.model, null);
+  const call = rows.find(row => row.kind === 'tool_call')!;
+  assert.equal(call.payload.is_error, 0);
+  assert.equal(call.payload.target, null);
+  assert.equal(typeof JSON.parse(String(call.payload.args_json)).sha256, 'string');
+  assert.equal(JSON.parse(String(events[2].payload.text)).id, 'call-1');
+  assert.equal(events.at(-1)!.payload.text, 'Factory reply');
+  assert.deepEqual(await factoryCanonicalEvidence(sid, [first, result, later]), rows);
+});
+
+test('canonical projection respects exact encoded budget and bounds nested marker JSON', async () => {
+  const { factoryCanonicalEvidence } = await import('./factory-source.js');
+  const project = async (text: string) => (await factoryCanonicalEvidence(sid, [
+    { ...message, content: [{ type: 'text', text }] },
+  ])).find(row => row.kind === 'session_event')!;
+  const { raw, key, ...empty } = await project('');
+  const text = 'x'.repeat(1_048_576 - Buffer.byteLength(JSON.stringify(empty)));
+  assert.equal((await project(text)).payload.text, text);
+  const over = await project(text + 'x');
+  assert.equal(JSON.parse(String(over.payload.text)).factory_omitted_bytes, text.length + 1);
+  assert.equal(over.record_id, empty.record_id);
+  const nested = Array.from({ length: 32 }, () => Array.from({ length: 32 }, () => Array(32).fill('界'.repeat(32))));
+  const records = await factoryCanonicalEvidence(sid, [{ ...message, content: [{ type: 'future', nested }] }]);
+  for (const marker of records) {
+    assert.equal(marker.kind, 'session_marker');
+    assert.ok(JSON.parse(String(marker.payload.payload_json)).factory_omitted_bytes > 1_048_576);
+  }
+});

@@ -593,8 +593,16 @@ Canonical marker payloads follow the native intake bounds: strings and object
 keys have at most 128 characters, and containers at most 32 entries recursively.
 The API-message row's separate `raw` field retains the complete original JSON;
 hosts store it in their raw-capture artifact beside the canonical snapshot and
-do not put that unbounded value into `payload_json`. Typed text events remain
-complete. Structured tool-result measurements describe each route's stable
+do not put that unbounded value into `payload_json`. The delivery body (kind, source, session ID, record ID and payload) has a
+1,048,576-byte UTF-8 JSON budget, leaving room below Cloud's 1,400,000-byte
+wire-record limit for origin and revision framing. Bodies within budget are
+unchanged. For a larger body, string columns whose JSON encoding exceeds
+16,384 bytes are bounded. Text, arguments and marker JSON use a JSON summary
+with `factory_omitted_bytes` and full SHA-256 of the original UTF-8 field.
+Tool-use text keeps its type, ID and name and places the summary in its input.
+Oversized optional relationship, model, provider and target values become null.
+The original API-message raw capture remains separate. Bounding creates no extra
+record IDs or ordinals, so replay and later turns keep their native keys. Structured tool-result measurements describe each route's stable
 serialization of its observed JSON value, rather than original wire bytes:
 JavaScript cannot recover a numeric lexeme such as `1.0` after parsing it as
 `1`. Logical canonical identity never depends on these representation-specific
