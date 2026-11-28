@@ -29,8 +29,7 @@ unstable-internal = []
 [dependencies]
 base64 = "0.22"
 anyhow = "1"
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
-libc = "0.2"
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 notify = { version = "8", default-features = false, features = [
     "macos_fsevent",
 ], optional = true }
@@ -68,9 +67,8 @@ rusqlite = { version = "0.32", features = ["bundled", "functions", "hooks"] }
 name = "fixture_corpus"
 required-features = ["unstable-internal"]
 
-# Already a dependency of the crate on every platform; declared here too so the
-# live-capture suite can take the sync path's advisory lock from a second
-# handle, which is the only way to test a contended sweep honestly.
+# Unix-only test helper: lets tests take advisory locks from a second handle,
+# measure peak RSS via `getrusage`, and query `PATH_MAX`/`ENAMETOOLONG`.
 [target.'cfg(unix)'.dev-dependencies]
 libc = "0.2"
 

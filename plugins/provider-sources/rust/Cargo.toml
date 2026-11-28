@@ -19,11 +19,12 @@ include = ["src/**/*", "tests/fixtures/**/*", "README.md"]
 # stamps both). The path wins in this checkout; crates.io resolves the version.
 ai-hist = { version = "=0.63.1", path = "../../../crates/ai-hist", features = ["unstable-internal"] }
 anyhow = "1"
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
+chrono = { version = "0.4", default-features = false, features = ["std"] }
 rusqlite = { version = "0.32", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
-tempfile = "3"
 ureq = { version = "2", features = ["json"] }
-url = "2"
+
+[dev-dependencies]
+tempfile = "3"

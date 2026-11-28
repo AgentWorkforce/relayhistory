@@ -22,7 +22,10 @@ pub(super) fn assert_export(
         max_batch_records: 1,
         ..Default::default()
     };
-    let now = chrono::Utc::now().timestamp_millis();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock after UNIX epoch")
+        .as_millis() as i64;
     let conn = rusqlite::Connection::open_with_flags(
         store.db_path(),
         rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,

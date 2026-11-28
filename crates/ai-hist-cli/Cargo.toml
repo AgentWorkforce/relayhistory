@@ -21,7 +21,7 @@ anyhow = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 clap = { version = "4", features = ["derive", "env"] }
 flate2 = "1"
-rusqlite = { version = "0.32", features = ["backup", "bundled", "functions"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 serde_json = "1"
 tempfile = "3"
 
@@ -30,6 +30,5 @@ libc = "0.2"
 # The latency harness times the raw backend event (FSEvents, inotify) apart
 # from the watch loop; same version and backend the crate's `fs-events` uses.
 notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
-url = "2"
 # The `codex_idle` latency phase writes rollouts Codex has compressed.
 zstd = { version = "0.13", default-features = false }

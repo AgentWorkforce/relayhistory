@@ -24,11 +24,14 @@ mod imp {
     }
 
     pub fn try_lock_exclusive(file: &File) -> io::Result<()> {
-        match flock(file, FlockOperation::NonBlockingLockExclusive) {
-            Err(err) if err.raw_os_error() == Some(libc::EAGAIN) => {
-                Err(io::Error::new(io::ErrorKind::WouldBlock, err))
+        match rustix::fs::flock(file, FlockOperation::NonBlockingLockExclusive) {
+            Err(err) if err == rustix::io::Errno::AGAIN || err == rustix::io::Errno::WOULDBLOCK => {
+                Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    io::Error::from(err),
+                ))
             }
-            other => other,
+            other => other.map_err(io::Error::from),
         }
     }
 
