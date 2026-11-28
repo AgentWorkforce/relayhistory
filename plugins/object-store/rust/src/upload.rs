@@ -103,7 +103,7 @@ impl<B: Backend> MultipartUpload for CoreUpload<B> {
             multipart = true,
         );
         async move {
-            let sha = hex::encode(std::mem::take(&mut self.hasher).finalize());
+            let sha = crate::codec::hex_encode(&std::mem::take(&mut self.hasher).finalize());
             if let Some(expected) = self.expected_sha.take() {
                 if !expected.eq_ignore_ascii_case(&sha) {
                     // Never commit an object whose metadata would lie about

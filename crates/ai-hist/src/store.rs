@@ -4937,7 +4937,7 @@ pub(crate) fn opencode_backup_requested() -> bool {
 /// A whole-database copy of `opencode_db`, indexed for session-keyed reads.
 #[cfg(feature = "opencode-backup")]
 pub(crate) fn opencode_backup_copy(opencode_db: &Path) -> Result<Connection> {
-    let tmp = tempfile::NamedTempFile::new()?.into_temp_path();
+    let tmp = crate::jsonl_temp::ScratchFile::create("ai-hist-opencode", "db")?;
     let src_live = Connection::open_with_flags(
         opencode_db,
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_URI,
@@ -4945,9 +4945,9 @@ pub(crate) fn opencode_backup_copy(opencode_db: &Path) -> Result<Connection> {
     .with_context(|| format!("opening {}", opencode_db.display()))?;
     src_live.busy_timeout(std::time::Duration::from_secs(5))?;
     src_live
-        .backup(DatabaseName::Main, &tmp, None)
+        .backup(DatabaseName::Main, tmp.path(), None)
         .map_err(|source| SourceDatabaseError::new(opencode_db, source))?;
-    let src = Connection::open(&tmp)?;
+    let src = Connection::open(tmp.path())?;
     src.execute_batch("CREATE INDEX IF NOT EXISTS ai_hist_sync_part_session ON part(session_id);")?;
     Ok(src)
 }

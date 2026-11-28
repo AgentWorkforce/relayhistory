@@ -57,3 +57,42 @@ impl Drop for JsonlTemp {
         let _ = fs::remove_file(&self.path);
     }
 }
+
+/// Exclusive process-local scratch file deleted on drop (avoids pulling `tempfile`
+/// into library dependencies for `opencode-backup`).
+#[cfg(feature = "opencode-backup")]
+pub(crate) struct ScratchFile {
+    path: PathBuf,
+}
+
+#[cfg(feature = "opencode-backup")]
+impl ScratchFile {
+    pub(crate) fn create(prefix: &str, ext: &str) -> Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let start = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();
+        for _ in 0..32u32 {
+            let seq = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+            let path = dir.join(format!("{prefix}-{pid}-{start:x}-{seq:x}.{ext}"));
+            match exclusive_create(&path) {
+                Ok(_file) => return Ok(Self { path }),
+                Err(err) if err.kind() == io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(err.into()),
+            }
+        }
+        bail!("could not allocate a unique scratch file");
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+#[cfg(feature = "opencode-backup")]
+impl Drop for ScratchFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}

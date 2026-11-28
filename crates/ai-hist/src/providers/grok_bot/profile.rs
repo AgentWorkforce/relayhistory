@@ -1,8 +1,8 @@
 //! The profile is scoped by the replica key's account slot, never by a global
 //! search for a matching bot id. Unavailable optional metadata hides no history.
 use super::*;
+use crate::base64_std;
 use crate::session_store::{SessionAvatar, SessionProfile};
-use base64::{engine::general_purpose::STANDARD, Engine};
 
 pub(crate) fn name(row: &Value) -> Option<String> {
     text(&row["name"], 120)
@@ -61,15 +61,8 @@ pub(crate) fn read(path: &Path, session_id: &str, roots: &ProviderRoots) -> Opti
 fn inline_image(value: &Value) -> Option<String> {
     let value = value.as_str().filter(|s| s.len() <= 512 * 1024)?;
     let (kind, encoded) = value.split_once(',')?;
-    let bytes = STANDARD.decode(encoded).ok()?;
-    let valid = match kind {
-        "data:image/png;base64" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
-        "data:image/jpeg;base64" => bytes.starts_with(b"\xff\xd8\xff"),
-        "data:image/gif;base64" => bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a"),
-        "data:image/webp;base64" => bytes.starts_with(b"RIFF") && bytes.get(8..12) == Some(b"WEBP"),
-        _ => false,
-    };
-    valid.then(|| value.to_owned())
+    let bytes = base64_std::decode(encoded)?;
+    base64_std::is_valid_raster_image(kind, &bytes).then(|| value.to_owned())
 }
 
 #[cfg(test)]
@@ -86,7 +79,7 @@ mod tests {
         ] {
             assert_eq!(inline_image(&Value::String(value.into())), None);
         }
-        let gif = format!("data:image/gif;base64,{}", STANDARD.encode(b"GIF89a"));
+        let gif = format!("data:image/gif;base64,{}", base64_std::encode(b"GIF89a"));
         assert_eq!(inline_image(&Value::String(gif.clone())), Some(gif));
     }
 }

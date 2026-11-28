@@ -9,9 +9,41 @@ pub const CONTENT_TYPE_ZSTD: &str = "application/zstd";
 /// network cost.
 const ZSTD_LEVEL: i32 = 3;
 
+/// Lowercase hex encoding without an extra crate dependency.
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    let mut out = Vec::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        out.push(DIGITS[(b >> 4) as usize]);
+        out.push(DIGITS[(b & 0x0f) as usize]);
+    }
+    String::from_utf8(out).expect("hex digits are ASCII")
+}
+
+/// Decode an even-length ASCII hex string (case-insensitive).
+pub(crate) fn hex_decode(hex: &str) -> Option<Vec<u8>> {
+    fn nibble(b: u8) -> Option<u8> {
+        match b {
+            b'0'..=b'9' => Some(b - b'0'),
+            b'a'..=b'f' => Some(b - b'a' + 10),
+            b'A'..=b'F' => Some(b - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = hex.as_bytes();
+    if !bytes.len().is_multiple_of(2) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.as_chunks::<2>().0 {
+        out.push((nibble(pair[0])? << 4) | nibble(pair[1])?);
+    }
+    Some(out)
+}
+
 /// Lowercase hex SHA-256.
 pub fn sha256_hex(body: &[u8]) -> String {
-    hex::encode(Sha256::digest(body))
+    hex_encode(&Sha256::digest(body))
 }
 
 /// Compress a raw chunk body. Raw bytes are stored unchanged inside the zstd

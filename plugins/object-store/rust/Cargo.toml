@@ -22,16 +22,14 @@ gcs = ["object_store/gcp"]
 azure = ["object_store/azure"]
 # Exposes `conformance::run_suite` so out-of-tree adapters can prove themselves
 # against the same contract.
-conformance = ["dep:rand"]
+conformance = []
 
 [dependencies]
 async-trait = "0.1"
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 futures = { version = "0.3", default-features = false, features = ["std", "async-await"] }
-hex = "0.4"
 object_store = { version = "0.14.2", default-features = false, features = ["fs"] }
-rand = { version = "0.9", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["preserve_order", "arbitrary_precision"] }
 fancy-regex = { version = "0.20", optional = true }
@@ -45,7 +43,6 @@ zstd = { version = "0.13", default-features = false }
 
 [dev-dependencies]
 criterion = { version = "0.8", default-features = false }
-rand = "0.9"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 tempfile = "3"
 base64 = "0.22"

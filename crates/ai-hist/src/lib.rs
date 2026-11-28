@@ -37,6 +37,7 @@ workspace_mod!(remote);
 workspace_mod!(source_intake);
 workspace_mod!(sources);
 workspace_mod!(watch);
+mod base64_std;
 mod change_feed;
 mod file_lock;
 mod forget;

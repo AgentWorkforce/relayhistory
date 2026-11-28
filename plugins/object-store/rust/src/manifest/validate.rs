@@ -56,10 +56,10 @@ pub fn content_sha256<'a>(chunks: impl IntoIterator<Item = &'a ChunkEntry>) -> S
         hasher.update(c.start_offset.to_be_bytes());
         hasher.update(c.bytes.to_be_bytes());
         // Validated separately; a malformed digest hashes as zeros.
-        hasher.update(hex::decode(&c.sha256).unwrap_or_else(|_| vec![0; 32]));
+        hasher.update(crate::codec::hex_decode(&c.sha256).unwrap_or_else(|| vec![0; 32]));
         h = hasher.finalize().into();
     }
-    hex::encode(h)
+    crate::codec::hex_encode(&h)
 }
 
 /// Parse and fully validate manifest JSON. `key`, when given, must be the
