@@ -43,7 +43,7 @@ tempfile = { version = "3", optional = true }
 url = { version = "2", optional = true }
 # Codex compresses finished rollouts to `.jsonl.zst`; read with the same
 # libzstd binding Codex writes them with.
-zstd = { version = "0.13", default-features = false }
+zstd = { version = "0.13.4", default-features = false }
 
 [target.'cfg(unix)'.dependencies]
 # Safe wrappers for the statfs/statvfs, flock and kill(pid, 0) calls the crate

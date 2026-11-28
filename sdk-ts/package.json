@@ -101,9 +101,9 @@
     "prepare": "npm run build"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@modelcontextprotocol/sdk": "^1.32.2",
     "ai-hist-native": "file:../crates/ai-hist-napi",
-    "zod": "^4.4.3"
+    "zod": "^4.6.7"
   },
   "devDependencies": {
     "@agent-relay/cli-surface": "^12.2.4",

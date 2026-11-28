@@ -21,6 +21,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Updated dependencies used for MCP requests, compressed session rollouts, and TLS verification in cloud provider sources.
+
 - Partial Claude scans preserve pending transcript retries when the source root is unavailable.
 - Remote evidence rejects oversized integers instead of rounding them into floating-point values.
 - Applied retention changes report the saved policy.

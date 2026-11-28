@@ -31,4 +31,4 @@ libc = "0.2"
 # from the watch loop; same version and backend the crate's `fs-events` uses.
 notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 # The `codex_idle` latency phase writes rollouts Codex has compressed.
-zstd = { version = "0.13", default-features = false }
+zstd = { version = "0.13.4", default-features = false }
