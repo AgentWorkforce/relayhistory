@@ -159,6 +159,9 @@ pub(super) struct FsWatch {
     /// covers everything.
     #[cfg(target_os = "macos")]
     dirs: Option<super::kqueue_dirs::KqueueDirs>,
+    /// The ledger, for tests to see which source reported what.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(super) reported: Arc<super::kqueue_dirs::Reported>,
 }
 
 impl FsWatch {
@@ -421,7 +424,7 @@ pub(super) fn attach(
     // Started once the roots are resolved, so it plans against the spellings
     // the FSEvents callback matches.
     #[cfg(target_os = "macos")]
-    let dirs = super::kqueue_dirs::KqueueDirs::spawn(depth.clone(), reported, on_new_file).ok();
+    let dirs = super::kqueue_dirs::KqueueDirs::spawn(depth.clone(), reported.clone(), on_new_file).ok();
     Ok(FsWatch {
         watcher,
         watched,
@@ -431,6 +434,8 @@ pub(super) fn attach(
         depth,
         #[cfg(target_os = "macos")]
         dirs,
+        #[cfg(all(test, target_os = "macos"))]
+        reported,
     })
 }
 
@@ -494,12 +499,21 @@ fn root_identity(path: &Path) -> Option<RootIdentity> {
 /// The count is the only way to state the property that matters here from
 /// outside: a live root must not be registered again on every backstop
 /// tick.
+/// Per registered path, so tests attaching their own roots in parallel do
+/// not count each other's.
 #[cfg(test)]
-pub(super) fn registrations() -> usize {
-    REGISTRATIONS.load(std::sync::atomic::Ordering::Relaxed)
+pub(super) fn registrations(path: &Path) -> usize {
+    REGISTRATIONS
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner)
+        .get(path)
+        .copied()
+        .unwrap_or(0)
 }
 
-static REGISTRATIONS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+#[cfg(test)]
+static REGISTRATIONS: std::sync::LazyLock<Mutex<std::collections::HashMap<PathBuf, usize>>> =
+    std::sync::LazyLock::new(Mutex::default);
 
 fn register(watcher: &mut notify::RecommendedWatcher, root: &mut WatchRoot) -> bool {
     // Ask the filesystem for the root's real spelling first, and register
@@ -522,8 +536,13 @@ fn register(watcher: &mut notify::RecommendedWatcher, root: &mut WatchRoot) -> b
         WatchDepth::Directory | WatchDepth::File => RecursiveMode::NonRecursive,
     };
     let registered = watcher.watch(target, mode).is_ok();
+    #[cfg(test)]
     if registered {
-        REGISTRATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        *REGISTRATIONS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .entry(target.to_path_buf())
+            .or_default() += 1;
     }
     registered
 }

@@ -17,7 +17,8 @@
 //!   loop with exactly the spellings an FSEvents event would have.
 //! * Directories only, never a descriptor per file, and only some of them:
 //!   each recursive root and the directories under it to [`MAX_DEPTH`] that
-//!   changed within [`RECENT`], newest first, up to [`MAX_DIRS`] descriptors.
+//!   changed within [`RECENT`] or are their parent's newest, newest first,
+//!   up to [`MAX_DIRS`] descriptors.
 //!   That covers Claude's `projects/<project>/` and Codex's
 //!   `sessions/YYYY/MM/DD/` where new sessions land, while staying far below
 //!   the 256-descriptor soft limit macOS shells start processes with. A
@@ -56,11 +57,15 @@ pub(super) fn plan(roots: &[PathBuf], cap: usize, now: SystemTime) -> Vec<(PathB
     let mut chosen: Vec<(PathBuf, usize)> = Vec::new();
     let mut seen = HashSet::new();
     let mut below = Vec::new();
+    // Every root first, so a root that also sits under another is planned
+    // as a root, not claimed as that one's descendant.
     for root in roots {
         if root.is_dir() && seen.insert(root.clone()) {
             chosen.push((root.clone(), 0));
-            walk(root, now, &mut seen, &mut below);
         }
+    }
+    for root in chosen.clone() {
+        walk(&root.0, now, &mut seen, &mut below);
     }
     below.sort_by_key(|entry| std::cmp::Reverse(entry.2));
     let room = cap.saturating_sub(chosen.len());
@@ -70,15 +75,18 @@ pub(super) fn plan(roots: &[PathBuf], cap: usize, now: SystemTime) -> Vec<(PathB
 
 /// The recently changed directories under `root`, to [`MAX_DEPTH`].
 ///
-/// Only a recent directory is descended into. Creating an entry changes its
-/// parent's mtime, so a directory that appeared within [`RECENT`] -- a new
-/// project, a new session's sidecar directory, a new Codex `MM/DD` -- always
-/// has a recent parent, and the walk reaches it. What it gives up is a
-/// directory that is old *and* under an old parent but still being written,
-/// a session resumed weeks later; FSEvents still reports that one, just not
-/// as fast. Descending into everything instead cost 430 ms of CPU on every
-/// backstop for a 40,000-directory Claude tree, to find the handful of
-/// directories that are watched.
+/// Only a recent directory is descended into, and the newest one in each
+/// directory walked, however old. Creating an entry changes its parent's
+/// mtime, so a directory that appeared within [`RECENT`] -- a new project, a
+/// new session's sidecar directory -- always has a recent parent. The newest
+/// child covers a chain whose upper level changes less often than its lower:
+/// Codex's `YYYY` changes once a month, when a new `MM` is created, so
+/// mid-month it is older than [`RECENT`] while today's `MM/DD` under it is
+/// not. What this gives up is a directory that is old *and* not its parent's
+/// newest, but still being written, a session resumed weeks later; FSEvents
+/// still reports that one, just not as fast. Descending into everything
+/// instead cost 430 ms of CPU on every backstop for a 40,000-directory Claude
+/// tree, to find the handful of directories that are watched.
 fn walk(
     root: &Path,
     now: SystemTime,
@@ -89,10 +97,13 @@ fn walk(
     for depth in 1..=MAX_DEPTH {
         let mut next = Vec::new();
         for dir in &frontier {
-            for (path, modified) in subdirectories(dir) {
-                let recent = now
-                    .duration_since(modified)
-                    .map_or(true, |age| age <= RECENT);
+            let children = subdirectories(dir);
+            let newest = children.iter().map(|(_, modified)| *modified).max();
+            for (path, modified) in children {
+                let recent = Some(modified) == newest
+                    || now
+                        .duration_since(modified)
+                        .map_or(true, |age| age <= RECENT);
                 if recent && seen.insert(path.clone()) {
                     if depth < MAX_DEPTH {
                         next.push(path.clone());
@@ -151,9 +162,11 @@ impl DirIndex {
     /// Start tracking `dir`. `fresh` is a directory that has just appeared:
     /// it starts empty, so its first rescan reports everything already in
     /// it. Otherwise it remembers what it holds now. False when it is already
-    /// tracked or cannot be read.
+    /// tracked -- it then takes `depth`, so a directory a refresh adopts as a
+    /// root counts its children from itself -- or cannot be read.
     pub(super) fn add(&mut self, dir: &Path, depth: usize, fresh: bool) -> bool {
-        if self.dirs.contains_key(dir) {
+        if let Some((tracked, _)) = self.dirs.get_mut(dir) {
+            *tracked = depth;
             return false;
         }
         let names = if fresh {
@@ -269,6 +282,11 @@ const MAX_REPORTED: usize = 256;
 #[derive(Debug, Default)]
 pub(super) struct Reported {
     files: std::sync::Mutex<HashMap<PathBuf, (Fingerprint, std::time::Instant)>>,
+    /// How many reports kqueue recorded, and how many FSEvents events were
+    /// dropped as their repeats: what a test or trace can tell the two
+    /// sources apart by.
+    pub(super) recorded: std::sync::atomic::AtomicUsize,
+    pub(super) dropped: std::sync::atomic::AtomicUsize,
 }
 
 impl Reported {
@@ -287,6 +305,7 @@ impl Reported {
             }
         }
         files.insert(crate::discover::watch_path(path), (print, now));
+        self.recorded.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Whether `event` only repeats reports kqueue already made: a create or
@@ -305,7 +324,7 @@ impl Reported {
         if files.is_empty() {
             return false;
         }
-        event.paths.iter().all(|path| {
+        let repeat = event.paths.iter().all(|path| {
             let key = crate::discover::watch_path(path);
             let Some((print, at)) = files.get(&key) else {
                 return false;
@@ -316,7 +335,11 @@ impl Reported {
             // Moved or expired: this report is news, and so is every later one.
             files.remove(&key);
             false
-        })
+        });
+        if repeat {
+            self.dropped.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        repeat
     }
 }
 
@@ -514,10 +537,18 @@ mod macos {
             if self.watcher.watch().is_err() {
                 // One bad entry fails the batch: fall back to one at a time,
                 // so only the directories that cannot be watched are dropped.
-                for dir in &added {
-                    let depth = self.index.depth(dir).unwrap_or(0);
+                // The whole batch comes out first: `watch` resubmits every
+                // registration it holds, so a bad entry left in would fail
+                // each good one retried before it.
+                let retry: Vec<(PathBuf, usize)> = added
+                    .iter()
+                    .map(|dir| (dir.clone(), self.index.depth(dir).unwrap_or(0)))
+                    .collect();
+                for (dir, _) in &retry {
                     self.forget(dir);
-                    self.watch(dir, depth, false);
+                }
+                for (dir, depth) in &retry {
+                    self.watch(dir, *depth, false);
                 }
                 return;
             }
@@ -600,12 +631,18 @@ mod macos {
                 return;
             }
             let flags = FilterFlag::NOTE_WRITE | FilterFlag::NOTE_EXTEND | FilterFlag::NOTE_DELETE;
-            let watched = self
+            if self
                 .watcher
                 .add_filename(&file, EventFilter::EVFILT_VNODE, flags)
-                .is_ok()
-                && self.watcher.watch().is_ok();
-            if !watched {
+                .is_err()
+            {
+                self.report(&[file]);
+                return;
+            }
+            if self.watcher.watch().is_err() {
+                // Registered but not submitted: the watcher still holds its
+                // descriptor, and nothing in `pending` would expire it.
+                let _ = self.watcher.remove_filename(&file, EventFilter::EVFILT_VNODE);
                 self.report(&[file]);
                 return;
             }
@@ -696,12 +733,71 @@ mod tests {
     }
 
     #[test]
-    fn plan_skips_directories_older_than_recent_but_keeps_the_root() {
+    fn plan_skips_directories_older_than_recent_but_keeps_the_root_and_its_newest() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().join("projects");
-        fs::create_dir_all(root.join("old")).unwrap();
-        let later = SystemTime::now() + RECENT + Duration::from_secs(60);
-        assert_eq!(plan(std::slice::from_ref(&root), MAX_DIRS, later), vec![(root, 0)]);
+        fs::create_dir_all(root.join("older")).unwrap();
+        fs::create_dir_all(root.join("newest")).unwrap();
+        let now = SystemTime::now();
+        set_dir_modified(&root.join("older"), now - Duration::from_secs(60));
+        set_dir_modified(&root.join("newest"), now);
+        let later = now + RECENT + Duration::from_secs(120);
+        assert_eq!(
+            plan(std::slice::from_ref(&root), MAX_DIRS, later),
+            vec![(root.clone(), 0), (root.join("newest"), 1)]
+        );
+    }
+
+    /// Sets a directory's mtime. Windows opens a directory handle only with
+    /// `FILE_FLAG_BACKUP_SEMANTICS`, and needs `FILE_WRITE_ATTRIBUTES` to set it.
+    fn set_dir_modified(path: &Path, when: SystemTime) {
+        #[cfg(windows)]
+        let dir = {
+            use std::os::windows::fs::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .access_mode(0x0100)
+                .custom_flags(0x0200_0000)
+                .open(path)
+        };
+        #[cfg(not(windows))]
+        let dir = fs::File::open(path);
+        dir.unwrap().set_modified(when).unwrap();
+    }
+
+    #[test]
+    fn plan_reaches_todays_codex_day_through_a_year_directory_last_changed_weeks_ago() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("sessions");
+        let today = root.join("2026/11/28");
+        let last_year = root.join("2025/12/31");
+        fs::create_dir_all(&today).unwrap();
+        fs::create_dir_all(&last_year).unwrap();
+        let old = SystemTime::now() - RECENT - Duration::from_secs(60);
+        let older = old - Duration::from_secs(60 * 60 * 24 * 30);
+        // `2026` changed when `11` was created, weeks ago; `11` changed when
+        // `28` was created, today. Last year is older throughout.
+        for path in [last_year.clone(), root.join("2025/12"), root.join("2025")] {
+            set_dir_modified(&path, older);
+        }
+        set_dir_modified(&root.join("2026"), old);
+        let planned = plan(std::slice::from_ref(&root), MAX_DIRS, SystemTime::now());
+        let dirs: Vec<&PathBuf> = planned.iter().map(|(path, _)| path).collect();
+        assert!(dirs.contains(&&today), "{dirs:?}");
+        assert!(dirs.contains(&&root.join("2026")), "{dirs:?}");
+        assert!(!dirs.contains(&&root.join("2025")), "{dirs:?}");
+        assert!(!dirs.contains(&&last_year), "{dirs:?}");
+    }
+
+    #[test]
+    fn a_root_under_another_root_is_planned_as_a_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let outer = dir.path().join("sessions");
+        let inner = outer.join("2026/11/28");
+        fs::create_dir_all(inner.join("child")).unwrap();
+        let planned = plan(&[outer.clone(), inner.clone()], MAX_DIRS, SystemTime::now());
+        assert!(planned.contains(&(inner.clone(), 0)), "{planned:?}");
+        assert!(planned.contains(&(inner.join("child"), 1)), "{planned:?}");
+        assert_eq!(planned.iter().filter(|(path, _)| path == &inner).count(), 1);
     }
 
     #[test]
@@ -715,15 +811,15 @@ mod tests {
         let old = SystemTime::now() - RECENT - Duration::from_secs(60);
         // Children first: setting a child's times does not touch its parent's.
         for path in [stale.join("session"), stale.clone()] {
-            fs::File::open(&path).unwrap().set_modified(old).unwrap();
+            set_dir_modified(&path, old);
         }
         let planned = plan(std::slice::from_ref(&root), MAX_DIRS, SystemTime::now());
         let dirs: Vec<&PathBuf> = planned.iter().map(|(path, _)| path).collect();
         assert!(dirs.contains(&&active.join("session")), "{dirs:?}");
         assert!(!dirs.contains(&&stale), "{dirs:?}");
         // Recent in itself, but only reachable through a stale parent.
-        fs::File::open(stale.join("session")).unwrap().set_modified(SystemTime::now()).unwrap();
-        fs::File::open(&stale).unwrap().set_modified(old).unwrap();
+        set_dir_modified(&stale.join("session"), SystemTime::now());
+        set_dir_modified(&stale, old);
         let planned = plan(std::slice::from_ref(&root), MAX_DIRS, SystemTime::now());
         assert!(planned.iter().all(|(path, _)| path != &stale.join("session")), "{planned:?}");
     }
@@ -871,6 +967,7 @@ mod tests {
     #[test]
     fn fs_events_does_not_repeat_what_kqueue_reported() {
         use crate::discover::WatchRoot;
+        use std::sync::atomic::Ordering::Relaxed;
         use std::sync::{mpsc, Mutex};
         let dir = tempfile::tempdir().unwrap();
         let root_path = dir.path().canonicalize().unwrap().join("projects");
@@ -887,6 +984,17 @@ mod tests {
             |_| {},
         )
         .unwrap();
+        let ledger = watch.reported.clone();
+        let started = std::time::Instant::now();
+        // `--nocapture` prints the sequence: the evidence this test asserts.
+        let trace = |what: &str| {
+            eprintln!(
+                "[{:>8.3} ms] {what} (kqueue recorded {}, FSEvents repeats dropped {})",
+                started.elapsed().as_secs_f64() * 1e3,
+                ledger.recorded.load(Relaxed),
+                ledger.dropped.load(Relaxed)
+            );
+        };
         // Past FSEvents' replay of the directory's creation.
         std::thread::sleep(Duration::from_millis(500));
         while rx.try_recv().is_ok() {}
@@ -895,38 +1003,60 @@ mod tests {
             crate::watch::ChangeScope::Roots { paths, .. } => paths
                 .iter()
                 .any(|path| path.ends_with(file.file_name().unwrap())),
-            _ => true,
+            _ => false,
         };
+        let wait = |within: Duration, until: &dyn Fn() -> bool| {
+            let deadline = std::time::Instant::now() + within;
+            while !until() && std::time::Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        };
+
+        trace("write a new file, closed");
         fs::write(&file, "{}\n").unwrap();
         let first = rx.recv_timeout(Duration::from_secs(2)).expect("reported");
+        trace(&format!("notification 1: {first:?}"));
         assert!(names(&first), "{first:?}");
+        assert_eq!(ledger.recorded.load(Relaxed), 1, "kqueue made the first report");
+        // FSEvents' own report of that create reaches the callback 14-19 ms
+        // later, and is dropped there.
+        wait(Duration::from_secs(2), &|| ledger.dropped.load(Relaxed) > 0);
+        trace("FSEvents' report of the same create");
+        assert!(ledger.dropped.load(Relaxed) > 0, "FSEvents' repeat reached the drop");
         let mut repeats = 0;
         let quiet = std::time::Instant::now() + Duration::from_millis(500);
         while let Ok(scope) = rx.recv_timeout(quiet.saturating_duration_since(std::time::Instant::now())) {
+            trace(&format!("unexpected notification: {scope:?}"));
             repeats += usize::from(names(&scope));
         }
+        trace(&format!("quiet window over: {repeats} repeat notification(s)"));
         assert_eq!(repeats, 0, "FSEvents repeated kqueue's report");
 
         // Closed before waiting: FSEvents reports a write to a file still
         // held open late, or not at all.
+        trace("append to the same file, closed");
         let mut append = fs::OpenOptions::new().append(true).open(&file).unwrap();
         std::io::Write::write_all(&mut append, b"{}\n").unwrap();
         drop(append);
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        let mut appended = false;
+        let mut appended = None;
         while let Ok(scope) = rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
             if names(&scope) {
-                appended = true;
+                appended = Some(scope);
                 break;
             }
         }
-        assert!(appended, "an append after kqueue's report is still delivered");
+        trace(&format!("notification 2: {appended:?}"));
+        assert!(appended.is_some(), "an append after kqueue's report is still delivered");
+        // kqueue reports new files only: this one came from FSEvents, past
+        // the ledger because the append moved the file's stat.
+        assert_eq!(ledger.recorded.load(Relaxed), 1, "{:?}", appended);
         drop(watch);
     }
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn a_new_transcript_is_reported_by_kqueue_within_a_few_milliseconds() {
+    fn a_new_transcript_is_reported_by_kqueue_alone() {
         use crate::discover::WatchRoot;
         use std::sync::{mpsc, Arc, Mutex};
         let dir = tempfile::tempdir().unwrap();
@@ -937,6 +1067,9 @@ mod tests {
         root.resolve();
         let (tx, rx) = mpsc::channel();
         let tx = Mutex::new(tx);
+        // No FSEvents here: every report is kqueue's. How fast it comes is
+        // the latency benchmark's to measure (`stages.fs_event_kqueue`), not
+        // a wall-clock assertion's on a loaded machine.
         let watcher = KqueueDirs::spawn(
             Arc::new(Mutex::new(vec![root])),
             Arc::default(),
@@ -945,52 +1078,58 @@ mod tests {
             }),
         )
         .unwrap();
-        // Let the thread plan its watches before the clock starts.
-        std::thread::sleep(Duration::from_millis(100));
-        let file = project.join("00000000-0000-4000-8000-000000000001.jsonl");
-        let started = std::time::Instant::now();
-        fs::write(&file, "{}\n").unwrap();
-        let scope = rx.recv_timeout(Duration::from_secs(2)).expect("kqueue event");
-        assert!(started.elapsed() < Duration::from_millis(50), "{:?}", started.elapsed());
-        match scope {
+        let names = |scope: &crate::watch::ChangeScope, file: &Path| match scope {
             crate::watch::ChangeScope::Roots { paths, .. } => {
-                assert!(paths.iter().any(|path| path.ends_with(file.file_name().unwrap())), "{paths:?}");
+                paths.iter().any(|path| path.ends_with(file.file_name().unwrap()))
             }
-            other => panic!("unexpected scope {other:?}"),
+            _ => false,
+        };
+        let reported = |file: &Path| {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while let Ok(scope) = rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+                if names(&scope, file) {
+                    return true;
+                }
+            }
+            false
+        };
+        // Ready once a file written after the watches went up is reported:
+        // until then, a file could be counted as already there. Retried,
+        // since one written before that point never is.
+        let mut ready = false;
+        for attempt in 0..50 {
+            let probe = project.join(format!("probe-{attempt}.jsonl"));
+            fs::write(&probe, "{}\n").unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_millis(100);
+            while let Ok(scope) = rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
+                ready |= names(&scope, &probe);
+            }
+            if ready {
+                break;
+            }
         }
+        assert!(ready, "kqueue's watches never came up");
+
+        let file = project.join("00000000-0000-4000-8000-000000000001.jsonl");
+        fs::write(&file, "{}\n").unwrap();
+        assert!(reported(&file), "a new transcript is reported");
         // A project directory created later is watched as it appears.
         let later = root_path.join("-later");
         fs::create_dir(&later).unwrap();
         let second = later.join("00000000-0000-4000-8000-000000000002.jsonl");
         std::thread::sleep(Duration::from_millis(50));
         fs::write(&second, "{}\n").unwrap();
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        let mut seen = false;
-        while let Ok(scope) = rx.recv_timeout(deadline.saturating_duration_since(std::time::Instant::now())) {
-            if let crate::watch::ChangeScope::Roots { paths, .. } = scope {
-                if paths.iter().any(|path| path.ends_with(second.file_name().unwrap())) {
-                    seen = true;
-                    break;
-                }
-            }
-        }
-        assert!(seen, "a file in a newly created project directory is reported");
+        assert!(reported(&second), "a file in a newly created project directory is reported");
         // A transcript created empty is reported on its first write, not at
         // creation, so the tick that follows reads its bytes.
         let third = project.join("00000000-0000-4000-8000-000000000003.jsonl");
         std::fs::File::create(&third).unwrap();
-        std::thread::sleep(Duration::from_millis(20));
-        while rx.try_recv().is_ok() {}
-        let wrote = std::time::Instant::now();
-        fs::write(&third, "{}\n").unwrap();
-        let scope = rx.recv_timeout(Duration::from_secs(2)).expect("first write reported");
-        assert!(wrote.elapsed() < Duration::from_millis(50), "{:?}", wrote.elapsed());
-        match scope {
-            crate::watch::ChangeScope::Roots { paths, .. } => {
-                assert!(paths.iter().any(|path| path.ends_with(third.file_name().unwrap())), "{paths:?}");
-            }
-            other => panic!("unexpected scope {other:?}"),
+        let quiet = std::time::Instant::now() + Duration::from_millis(200);
+        while let Ok(scope) = rx.recv_timeout(quiet.saturating_duration_since(std::time::Instant::now())) {
+            assert!(!names(&scope, &third), "an empty file was reported before its first write");
         }
+        fs::write(&third, "{}\n").unwrap();
+        assert!(reported(&third), "the first write is reported");
         drop(watcher);
     }
 }

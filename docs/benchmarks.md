@@ -1524,8 +1524,9 @@ socket pair registered in the same queue wakes it. And the backstop's
 re-plan descended into every directory to depth 3 to find the recent ones:
 430 ms of CPU every 30 s on a 40,000-directory Claude tree. It now descends
 only into recently changed directories (a new entry always moves its
-parent's mtime), 70 ms on the same tree with 4,000 of its directories
-recent, and its registrations go to the kernel in one `kevent` call rather
+parent's mtime) and each directory's newest child (Codex's `YYYY` moves only
+when a month starts, while today's `MM/DD` under it is recent), 70-79 ms on
+the same tree with 4,000 of its directories recent, and its registrations go to the kernel in one `kevent` call rather
 than resubmitting the whole set once per directory.
 
 Local A/B against `main`, Apple silicon, release build, 30-day store,
