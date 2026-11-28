@@ -153,6 +153,12 @@ pub(super) struct FsWatch {
     /// Every root and the depth it asked for, shared with the event
     /// callback so it can drop what the backend over-delivered.
     depth: Arc<Mutex<Vec<WatchRoot>>>,
+    /// macOS: kqueue directory watches that report a new file in well under
+    /// a millisecond, where FSEvents takes 14-19 ms; see `kqueue_dirs`.
+    /// `None` when kqueue could not be brought up -- FSEvents alone still
+    /// covers everything.
+    #[cfg(target_os = "macos")]
+    dirs: Option<super::kqueue_dirs::KqueueDirs>,
 }
 
 impl FsWatch {
@@ -265,6 +271,12 @@ impl FsWatch {
             changed += 1;
         }
         let attached = self.retry_pending();
+        // The backstop is also when directories created outside any watched
+        // one, and roots attached just now, get a kqueue watch.
+        #[cfg(target_os = "macos")]
+        if let Some(dirs) = &self.dirs {
+            dirs.refresh();
+        }
         changed + attached
     }
 
@@ -310,7 +322,7 @@ impl FsWatch {
 /// that does not exist is not an error — it becomes `pending`.
 pub(super) fn attach(
     roots: &[WatchRoot],
-    on_change: impl Fn(ChangeScope) + Send + 'static,
+    on_change: impl Fn(ChangeScope) + Send + Sync + 'static,
     on_registration_lost: impl Fn() + Send + 'static,
     on_error: impl Fn(anyhow::Error) + Send + 'static,
 ) -> Result<FsWatch> {
@@ -322,6 +334,16 @@ pub(super) fn attach(
     let depth_for_events = depth.clone();
     let stale: Arc<Mutex<HashSet<PathBuf>>> = Arc::new(Mutex::new(HashSet::new()));
     let stale_for_events = stale.clone();
+    // Shared with the macOS kqueue thread, which reports new files through it.
+    let on_change: Arc<dyn Fn(ChangeScope) + Send + Sync> = Arc::new(on_change);
+    #[cfg(target_os = "macos")]
+    let on_new_file = on_change.clone();
+    // The files kqueue reported, so this callback can drop its own later
+    // report of the same write; see `kqueue_dirs::Reported`.
+    #[cfg(target_os = "macos")]
+    let reported = Arc::new(super::kqueue_dirs::Reported::default());
+    #[cfg(target_os = "macos")]
+    let reported_for_events = reported.clone();
     let mut watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
         let event = match event {
             Ok(event) => event,
@@ -369,6 +391,10 @@ pub(super) fn attach(
             // long enough to miss a whole session.
             on_registration_lost();
         }
+        #[cfg(target_os = "macos")]
+        if matched.is_some() && reported_for_events.repeats(&event) {
+            return;
+        }
         if let Some(scope) = matched {
             on_change(scope);
         }
@@ -392,6 +418,10 @@ pub(super) fn attach(
     // The callback matches against these, so it has to see the resolved
     // spellings rather than the ones the caller handed in.
     *depth.lock().unwrap_or_else(PoisonError::into_inner) = known;
+    // Started once the roots are resolved, so it plans against the spellings
+    // the FSEvents callback matches.
+    #[cfg(target_os = "macos")]
+    let dirs = super::kqueue_dirs::KqueueDirs::spawn(depth.clone(), reported, on_new_file).ok();
     Ok(FsWatch {
         watcher,
         watched,
@@ -399,6 +429,8 @@ pub(super) fn attach(
         recovering: HashSet::new(),
         stale,
         depth,
+        #[cfg(target_os = "macos")]
+        dirs,
     })
 }
 

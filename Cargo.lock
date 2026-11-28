@@ -38,6 +38,7 @@ dependencies = [
  "chrono",
  "fs2",
  "fs4",
+ "kqueue",
  "libc",
  "notify",
  "rmpv",

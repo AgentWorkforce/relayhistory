@@ -18,6 +18,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 
 - Export schema version 3 carries stable prompt-event identity and source-order evidence; new readers continue accepting older snapshots.
+- On macOS, `watch` learns of a new transcript from kqueue directory watches in under a millisecond, where FSEvents took 14-19 ms to report it; FSEvents remains the backstop and its repeat of the same write no longer costs a second sweep.
 
 ### Fixed
 

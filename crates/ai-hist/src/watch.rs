@@ -751,6 +751,11 @@ impl WatchLoop {
 
 #[cfg(feature = "fs-events")]
 mod fs_events;
+#[cfg(feature = "fs-events")]
+// Only the macOS backend runs the watcher itself; elsewhere the planning and
+// diffing are exercised by their own tests.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod kqueue_dirs;
 
 #[cfg(not(feature = "fs-events"))]
 mod fs_events {
