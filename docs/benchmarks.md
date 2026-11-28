@@ -1427,10 +1427,8 @@ Still over budget, in order of size: discovery's pass for one candidate
 path's own validation, and on macOS FSEvents itself (14-19 ms before the
 loop hears of the file). A kqueue directory watcher beside FSEvents reports
 the event in under a millisecond, but on the macOS CI runner it doubled the
-end-to-end p99 (165 -> 345 ms) while halving the p50: a tick it triggers can
-miss the session and leave the debounce window armed for the write that
-follows. It is held back on its own branch until that interaction is
-understood on real hardware. The
+end-to-end p99 (165 -> 345 ms) while halving the p50. It was held back until
+the cause was found; see "2026-11-27 macOS kqueue new-file detection". The
 `synchronous` change is scoped to exact capture; extending it to the hook
 path needs the same proof for its Cursor checkpoint first.
 
@@ -1492,3 +1490,53 @@ All three measured paths improved at p50 and p99 in this run. The 5 ms e2e
 budget is still tracked rather than enforced: this change removes a periodic
 checkpoint from the visibility path without claiming that the remaining
 latency work is complete.
+
+### 2026-11-27 macOS kqueue new-file detection
+
+`watch/kqueue_dirs.rs` puts kqueue `EVFILT_VNODE` watches on the recently
+changed directories under each recursive root, beside FSEvents, and reports a
+new transcript in well under a millisecond instead of FSEvents' 14-19 ms.
+
+The first version doubled the end-to-end p99. Recording every `TickReport`
+per sample on an Apple-silicon Mac showed why, and it alternated exactly:
+kqueue's tick captured the new session; FSEvents reported the same file 14-19
+ms later; that report became the window's trailing tick, which captured
+nothing but was not *quiet*. Exact-path capture treats a dirty path as
+evidence of a write and runs a resume pass, and that pass rewrites the
+session's hydration checkpoint (`records_parsed` 6 -> 0, a new `updated_ms`),
+which bumps its observation revision and moves the change-feed head. So the
+tick did not count as having changed nothing, the 200 ms window stayed armed
+from its close, and the *next* new session waited out most of it.
+
+The fix is at the source: kqueue records each reported file's `stat` (size,
+mtime, ctime, inode) before it signals the loop, and the FSEvents callback
+drops a create or content-change event only when every path it names is one
+kqueue reported within the last 2 s and whose `stat` has not moved. The sweep
+kqueue's signal guarantees starts after that `stat`, so it reads at least
+those bytes; anything that moved the `stat`, any removal, rename or rescan,
+and any path kqueue never reported goes through as before. One new file is
+now one forced sweep.
+
+Two idle costs were fixed with it. The thread waited on a 50 ms `kevent`
+timeout to look at its stop and refresh flags, 20 wakeups a second for the
+life of the loop; it now blocks until a watched directory changes or a
+socket pair registered in the same queue wakes it. And the backstop's
+re-plan descended into every directory to depth 3 to find the recent ones:
+430 ms of CPU every 30 s on a 40,000-directory Claude tree. It now descends
+only into recently changed directories (a new entry always moves its
+parent's mtime) and each directory's newest child (Codex's `YYYY` moves only
+when a month starts, while today's `MM/DD` under it is recent), 70-79 ms on
+the same tree with 4,000 of its directories recent, and its registrations go to the kernel in one `kevent` call rather
+than resubmitting the whole set once per directory.
+
+Local A/B against `main`, Apple silicon, release build, 30-day store,
+interleaved, three rounds of 200 samples each:
+
+| `e2e_visible` | `main` | kqueue (first version) | kqueue (this change) |
+|---|---:|---:|---:|
+| p50 | 41.3-41.7 ms | 36 ms | 30.0-30.5 ms |
+| p90 | 44.5-44.9 ms | 157 ms | 32.8-33.3 ms |
+| p99 | 48.7-54.8 ms | 162 ms | 40.2-44.2 ms |
+
+No sample in any round needed more than one tick. The `stages` phase is
+unchanged within noise; none of its stages runs through the watcher.

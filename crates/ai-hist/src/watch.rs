@@ -751,6 +751,11 @@ impl WatchLoop {
 
 #[cfg(feature = "fs-events")]
 mod fs_events;
+#[cfg(feature = "fs-events")]
+// Only the macOS backend runs the watcher itself; elsewhere the planning and
+// diffing are exercised by their own tests.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod kqueue_dirs;
 
 #[cfg(not(feature = "fs-events"))]
 mod fs_events {
@@ -981,7 +986,9 @@ mod tests {
 
         let ticks = Arc::new(AtomicUsize::new(0));
         let counted = ticks.clone();
-        let before = fs_events::registrations();
+        // Registered under its resolved spelling.
+        let key = root.canonicalize().expect("resolve the root");
+        let before = fs_events::registrations(&key);
         let watch = Arc::new(
             WatchLoop::new(Arc::new(move |_| {
                 counted.fetch_add(1, Ordering::SeqCst);
@@ -1008,7 +1015,7 @@ mod tests {
             );
             std::thread::yield_now();
         }
-        let attached = fs_events::registrations();
+        let attached = fs_events::registrations(&key);
         assert_eq!(
             attached - before,
             1,
@@ -1026,7 +1033,7 @@ mod tests {
             std::thread::yield_now();
         }
         assert_eq!(
-            fs_events::registrations(),
+            fs_events::registrations(&key),
             attached,
             "a live root must not be registered again on every backstop tick"
         );
@@ -1037,7 +1044,7 @@ mod tests {
         std::fs::remove_dir_all(&root).expect("delete the root");
         std::fs::create_dir_all(&root).expect("recreate the root");
         let deadline = std::time::Instant::now() + Duration::from_secs(10);
-        while fs_events::registrations() == attached {
+        while fs_events::registrations(&key) == attached {
             assert!(
                 std::time::Instant::now() < deadline,
                 "a recreated root was never registered again"

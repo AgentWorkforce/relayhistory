@@ -18,6 +18,7 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Changed
 
 - Export schema version 3 carries stable prompt-event identity and source-order evidence; new readers continue accepting older snapshots.
+- On macOS, `watch` notices new transcripts sooner by watching recently active session directories with kqueue, and ignores FSEvents' late duplicate of a file it already reported, while FSEvents still covers everything else.
 
 ### Fixed
 
