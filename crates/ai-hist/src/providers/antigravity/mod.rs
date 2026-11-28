@@ -10,15 +10,16 @@ mod format;
 mod normalize;
 mod roots;
 mod storage;
+mod summary;
 #[cfg(test)]
 mod tests;
 const ID: &str = "antigravity";
 const HEAD_LIMIT: u64 = 64 * 1024;
 pub(crate) const LOCAL_SOURCE: LocalSource = LocalSource {
     id: ID,
-    discovery: Discovery::Provider(|| Box::new(Provider)),
+    discovery: Discovery::Provider(|| Box::new(Provider::default())),
     hydration: Hydration::Parser(ingest),
-    transcript_roots: |r| r.for_provider(ID).to_vec(),
+    transcript_roots: roots::transcript_roots,
     // A parent conversation writes `.system_generated/subagents/<child>.json`
     // per spawned subagent; its `conversationId` names the child's own
     // conversation under the same brain root.
@@ -37,20 +38,77 @@ pub(crate) const METADATA: ProviderMetadata = ProviderMetadata {
     usage: None,
 };
 pub(crate) const ADAPTER: Option<ProviderAdapter> = Some(ProviderAdapter {
-    generation: "antigravity_transcript_v3",
+    generation: "antigravity_transcript_v4",
     acquire,
     sweep,
     resolve_roots: roots::resolve,
     watch_roots: |r| {
-        r.for_provider(ID)
-            .iter()
-            .cloned()
-            .map(WatchRoot::tree)
-            .collect()
+        let mut out = Vec::new();
+        for brain in r.for_provider(ID) {
+            out.push(WatchRoot::tree(brain.clone()));
+            if let Some(dir) = roots::summary_dir_for_brain(brain) {
+                out.push(WatchRoot::directory_of(
+                    dir,
+                    crate::discover::WatchEntries::OpencodeStores {
+                        primary: roots::SUMMARY_DB.into(),
+                        channels: false,
+                    },
+                ));
+            }
+        }
+        out
     },
 });
-struct Provider;
+type BrainTitleCache =
+    std::sync::Mutex<std::collections::HashMap<PathBuf, std::collections::HashMap<String, String>>>;
+
+#[derive(Default)]
+struct Provider {
+    pass: std::sync::Mutex<()>,
+    titles: BrainTitleCache,
+}
+struct TitlePass<'a> {
+    _lock: std::sync::MutexGuard<'a, ()>,
+    titles: &'a BrainTitleCache,
+}
+impl Drop for TitlePass<'_> {
+    fn drop(&mut self) {
+        self.titles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
+}
+impl Provider {
+    fn title_for(&self, path: &Path, context: &AcquisitionContext<'_>) -> Option<String> {
+        let (brain_root, native_id) = roots::locate(context.roots, path).ok()?;
+        let mut cache = self
+            .titles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let titles = cache
+            .entry(brain_root.to_path_buf())
+            .or_insert_with(|| summary::read_titles_for_brain(brain_root, context));
+        titles.get(&native_id).cloned()
+    }
+}
 impl ShallowSessionProvider for Provider {
+    fn begin_discovery_pass(
+        &self,
+    ) -> Result<Option<Box<dyn crate::discover::DiscoveryPassGuard + '_>>> {
+        let lock = self
+            .pass
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.titles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        Ok(Some(Box::new(TitlePass {
+            _lock: lock,
+            titles: &self.titles,
+        })))
+    }
     fn source(&self) -> &'static str {
         ID
     }
@@ -62,15 +120,21 @@ impl ShallowSessionProvider for Provider {
             EvidenceKind::Relationship,
         ]
     }
-    // A subagent sidecar can arrive or change while every transcript stays
-    // byte-identical; fold the sidecars in so such a tick is not skipped.
+    // A subagent sidecar or summary DB update can arrive while every
+    // transcript stays byte-identical; fold them in so such a tick is not skipped.
     fn fingerprint_inputs(&self, env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
-        let mut inputs = storage::enumerate(env)?;
+        let mut inputs = storage::enumerate_for_fingerprint(env)?;
         inputs.extend(storage::subagent_candidates(&inputs)?);
+        inputs.extend(summary::fingerprint_candidates(env)?);
         Ok(inputs)
     }
     fn enumerate(&self, env: &DiscoveryEnv<'_>, _: Option<usize>) -> Result<Vec<Candidate>> {
-        storage::enumerate(env)
+        let (candidates, titles) = storage::enumerate_with_titles(env)?;
+        *self
+            .titles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = titles;
+        Ok(candidates)
     }
     fn read_access(&self) -> crate::discover::ShallowReadAccess {
         crate::discover::ShallowReadAccess::Catalog
@@ -85,12 +149,19 @@ impl ShallowSessionProvider for Provider {
         let path = storage::selected(&context, Path::new(&candidate.locator))?;
         let (rows, latest) = storage::shallow_rows(scan, &path)?;
         let sid = roots::identity(scan.provider_roots, &path)?;
+        let title = self.title_for(&path, &context);
         if let Some(conn) = conn {
             normalize::check_identity(conn, &sid, &path)?;
+            // `conversation_summaries.db` is Antigravity's current title
+            // authority. The generic shallow upsert preserves existing full
+            // titles for providers whose shallow reads may see stale prefixes;
+            // this value comes straight from the summary database.
+            crate::ingest::titles::set_session_title(conn, ID, &sid, title.as_deref())?;
         }
         Ok(Some(ShallowSession {
             source: ID.into(),
             session_id: sid,
+            title,
             first_activity_ms: rows
                 .iter()
                 .map(format::time)
@@ -100,7 +171,7 @@ impl ShallowSessionProvider for Provider {
             last_activity_ms: latest,
             first_prompt: rows
                 .iter()
-                .find(|r| {
+                .filter(|r| {
                     format::role(r) == Some("user")
                         && r["status"] == "DONE"
                         && r["is_truncated"] != true
@@ -108,7 +179,7 @@ impl ShallowSessionProvider for Provider {
                             .as_array()
                             .is_none_or(|fields| fields.is_empty())
                 })
-                .and_then(format::text)
+                .find_map(|r| format::text(r).filter(|s| !s.is_empty()))
                 .map(str::to_owned),
             raw_path: Some(path.to_string_lossy().into_owned()),
             source_stamp: Some(candidate.stamp.clone()),
@@ -156,7 +227,7 @@ fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
     let mut failed_capture = false;
     // Whole files are rewritten by the native writer. Replay the selected file
     // rather than trusting an append cursor or an ownership-blind stamp cache.
-    for candidate in storage::enumerate(&env)? {
+    for candidate in storage::enumerate_for_sweep(&env)? {
         crate::ingest::check_capture_cancelled()?;
         let run = || -> Result<(usize, bool)> {
             let captured = storage::capture(Path::new(&candidate.locator), &context)?;
@@ -177,6 +248,17 @@ fn sweep(ctx: SweepContext<'_>) -> Result<SweepResult> {
                 failed_capture = true;
             }
         }
+    }
+    // Scoped summary DB updates reconcile titles directly against cataloged
+    // sessions rather than replaying every transcript in the brain root.
+    if let Some(scope) = ctx.paths {
+        let tx = ctx.conn.unchecked_transaction()?;
+        for root in ctx.roots.for_provider(ID) {
+            if summary::scope_mentions(scope, root) {
+                summary::reconcile_titles(&tx, root, &context)?;
+            }
+        }
+        tx.commit()?;
     }
     // Successful partial captures keep the source fingerprint incomplete, but
     // their live locators do not make unrelated missing conversations uncertain.

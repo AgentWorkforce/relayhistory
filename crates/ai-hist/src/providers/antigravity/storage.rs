@@ -17,7 +17,55 @@ pub(super) fn selected(context: &AcquisitionContext<'_>, path: &Path) -> Result<
         Ok(path.to_owned())
     }
 }
-pub(super) fn enumerate(env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
+type BrainTitles = std::collections::HashMap<PathBuf, std::collections::HashMap<String, String>>;
+
+pub(super) fn enumerate_with_titles(
+    env: &DiscoveryEnv<'_>,
+) -> Result<(Vec<Candidate>, BrainTitles)> {
+    env.provider_roots.ensure_provider_roots(ID)?;
+    let context = AcquisitionContext::new(ID, &env.provider_roots);
+    let mut out = Vec::new();
+    let mut titles_by_brain = BrainTitles::new();
+    for root in env.provider_roots.for_provider(ID) {
+        let summary_touched = env
+            .path_scope()
+            .is_some_and(|s| summary::scope_mentions(s, root));
+        if !summary_touched && env.path_scope().is_some_and(|s| !s.mentions(root)) {
+            continue;
+        }
+        if !root_exists(root, &context)? {
+            continue;
+        }
+        let titles = summary::read_titles_for_brain(root, &context);
+        collect_root_candidates(
+            root,
+            env,
+            &context,
+            Some(&titles),
+            summary_touched,
+            &mut out,
+        )?;
+        titles_by_brain.insert(root.to_path_buf(), titles);
+    }
+    sort_and_dedup(&mut out);
+    Ok((out, titles_by_brain))
+}
+
+/// Stat-only enumeration for sync fingerprinting: `summary::fingerprint_candidates`
+/// already stats `conversation_summaries.db` and its `-wal`, so idle ticks
+/// never open SQLite to read the title table.
+pub(super) fn enumerate_for_fingerprint(env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
+    enumerate_stat_only(env)
+}
+
+/// Strict transcript-scoped enumeration for full sweeps and reconciliation.
+/// Summary-database-only batches do not expand to every transcript in the brain
+/// root; `sweep` reconciles titles directly against cataloged sessions.
+pub(super) fn enumerate_for_sweep(env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
+    enumerate_stat_only(env)
+}
+
+fn enumerate_stat_only(env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
     env.provider_roots.ensure_provider_roots(ID)?;
     let context = AcquisitionContext::new(ID, &env.provider_roots);
     let mut out = Vec::new();
@@ -25,50 +73,90 @@ pub(super) fn enumerate(env: &DiscoveryEnv<'_>) -> Result<Vec<Candidate>> {
         if env.path_scope().is_some_and(|s| !s.mentions(root)) {
             continue;
         }
-        match std::fs::metadata(root) {
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            result => {
-                result?;
-                context.validate(root)?;
-            }
+        if !root_exists(root, &context)? {
+            continue;
         }
-        for entry in std::fs::read_dir(root)? {
-            crate::ingest::check_capture_cancelled()?;
-            let dir = entry?.path();
-            context.validate(&dir)?;
-            if !dir.is_dir() {
-                continue;
-            }
-            let logs = dir.join(".system_generated/logs");
-            let full = logs.join("transcript_full.jsonl");
-            let compact = logs.join("transcript.jsonl");
-            // A scoped compact-file notification must also revisit its full
-            // sibling: SetStep and Branch can rewrite the selected projection.
-            if env.path_scope().is_some_and(|s| !s.mentions(&dir)) {
-                continue;
-            }
-            let path = if full.try_exists()? {
-                full
-            } else if compact.try_exists()? {
-                compact
-            } else {
-                continue;
-            };
-            context.validate(&path)?;
-            roots::identity(&env.provider_roots, &path)?;
-            let (stamp, recency_hint_ms) = crate::file_stamp_and_modified(&path)?;
-            out.push(Candidate {
-                source: ID,
-                locator: path.to_string_lossy().into_owned(),
-                session_id: None,
-                recency_hint_ms,
-                stamp,
-            });
+        collect_root_candidates(root, env, &context, None, false, &mut out)?;
+    }
+    sort_and_dedup(&mut out);
+    Ok(out)
+}
+
+fn root_exists(root: &Path, context: &AcquisitionContext<'_>) -> Result<bool> {
+    match std::fs::metadata(root) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        result => {
+            result?;
+            context.validate(root)?;
+            Ok(true)
         }
     }
+}
+
+fn conversation_transcript(dir: &Path) -> Result<Option<PathBuf>> {
+    if !dir.is_dir() {
+        return Ok(None);
+    }
+    let logs = dir.join(".system_generated/logs");
+    let full = logs.join("transcript_full.jsonl");
+    if full.try_exists()? {
+        return Ok(Some(full));
+    }
+    let compact = logs.join("transcript.jsonl");
+    if compact.try_exists()? {
+        return Ok(Some(compact));
+    }
+    Ok(None)
+}
+
+fn collect_root_candidates(
+    root: &Path,
+    env: &DiscoveryEnv<'_>,
+    context: &AcquisitionContext<'_>,
+    titles: Option<&std::collections::HashMap<String, String>>,
+    summary_touched: bool,
+    out: &mut Vec<Candidate>,
+) -> Result<()> {
+    for entry in std::fs::read_dir(root)? {
+        crate::ingest::check_capture_cancelled()?;
+        let dir = entry?.path();
+        context.validate(&dir)?;
+        // A scoped compact-file notification must also revisit its full
+        // sibling: SetStep and Branch can rewrite the selected projection.
+        if !summary_touched && env.path_scope().is_some_and(|s| !s.mentions(&dir)) {
+            continue;
+        }
+        let Some(path) = conversation_transcript(&dir)? else {
+            continue;
+        };
+        context.validate(&path)?;
+        roots::identity(&env.provider_roots, &path)?;
+        let (stamp, recency_hint_ms) = crate::file_stamp_and_modified(&path)?;
+        let stamp = match titles {
+            Some(titles) => {
+                let title = dir
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .and_then(|id| titles.get(id))
+                    .map(String::as_str);
+                summary::stamp_with_title(stamp, title)
+            }
+            None => stamp,
+        };
+        out.push(Candidate {
+            source: ID,
+            locator: path.to_string_lossy().into_owned(),
+            session_id: None,
+            recency_hint_ms,
+            stamp,
+        });
+    }
+    Ok(())
+}
+
+fn sort_and_dedup(out: &mut Vec<Candidate>) {
     out.sort_by(|a, b| a.locator.cmp(&b.locator));
     out.dedup_by(|a, b| a.locator == b.locator);
-    Ok(out)
 }
 pub(super) fn capture(path: &Path, context: &AcquisitionContext<'_>) -> Result<AcquiredSession> {
     let path = selected(context, path)?;
@@ -106,20 +194,28 @@ pub(super) fn capture(path: &Path, context: &AcquisitionContext<'_>) -> Result<A
         unreadable,
         listed,
     } = subagents(&path, context)?;
+    let (title, summary_path) = summary::read_title_for_transcript(&path, context);
     // The absolute locator is needed by normalization, but a temporary HOME
     // relocation is not an evidence revision. Identity, projection selection
     // and exact source bytes still distinguish every meaningful capture.
-    // Subagent entries join the revision only when present, so a conversation
-    // without any keeps its stamp, and one with them is captured again.
-    let revision = if subagent_hashes.is_empty() {
-        serde_json::to_vec(&(&sid, name, &bytes_hash))?
-    } else {
-        serde_json::to_vec(&(&sid, name, &bytes_hash, &subagent_hashes))?
+    // Subagent entries and summary titles join the revision only when present,
+    // so a conversation without them keeps its stamp, and one with them is
+    // captured again when they appear or change.
+    let revision = match (subagent_hashes.is_empty(), title.as_deref()) {
+        (true, None) => serde_json::to_vec(&(&sid, name, &bytes_hash))?,
+        (false, None) => serde_json::to_vec(&(&sid, name, &bytes_hash, &subagent_hashes))?,
+        (true, Some(title)) => serde_json::to_vec(&(&sid, name, &bytes_hash, title))?,
+        (false, Some(title)) => {
+            serde_json::to_vec(&(&sid, name, &bytes_hash, &subagent_hashes, title))?
+        }
     };
     let stamp = format!("sha256:{:x}", Sha256::digest(revision));
     let records = rows.len() as i64;
-    let payload = serde_json::json!({"sid":sid,"path":path,"rows":rows,"partial":incomplete,"bytesSha256":bytes_hash,"subagents":subagents,"subagentsListed":listed,"subagentsUnreadable":unreadable});
+    let payload = serde_json::json!({"sid":sid,"path":path,"rows":rows,"partial":incomplete,"bytesSha256":bytes_hash,"title":title,"subagents":subagents,"subagentsListed":listed,"subagentsUnreadable":unreadable});
     let mut read_paths = vec![path];
+    if let Some(summary_path) = summary_path {
+        read_paths.push(summary_path);
+    }
     read_paths.extend(subagent_paths);
     Ok(AcquiredSession {
         stamp,

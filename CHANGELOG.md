@@ -33,6 +33,8 @@ This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Capture operations restore their output policy on return and unwind, and concurrent quiet calls no longer silence progress in other threads.
 - Codex resume commands in the TypeScript SDK no longer depend on the recorded project directory, matching Rust CLI behavior.
 - Same-timestamp event order survives export, source intake and hydration; conflicting retained order is rejected without partial writes.
+- Antigravity user prompts now unwrap `<USER_REQUEST>` even when `<ADDITIONAL_METADATA>` includes extra lines after the timestamp (such as `@[ITEM]` mention context or uploaded image lists), instead of leaking the raw XML envelope.
+- Antigravity sessions now read their conversation title from the sibling `conversation_summaries.db` database during both shallow discovery and full hydration, and watch/fingerprint it so title updates are picked up.
 
 ### Rust API
 

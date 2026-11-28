@@ -103,6 +103,7 @@ pub(super) fn write(conn: &Connection, payload: &Value) -> Result<usize> {
             raw_path: Some(&path.to_string_lossy()),
         },
     )?;
+    crate::ingest::set_session_title(conn, ID, sid, payload["title"].as_str())?;
     write_preview(conn, sid, preview, complete)?;
     write_subagents(conn, sid, payload, rows)?;
     Ok(inserted)
