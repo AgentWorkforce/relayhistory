@@ -8,7 +8,6 @@ use rusqlite::Connection;
 use serde_json::{Map, Value};
 
 // `sync_note!` names the parent's quiet flag.
-use crate::ingest::{AtomicOrdering, SYNC_QUIET};
 
 use super::{
     chat_store_stamp_and_modified, chat_stores, read_chat_store, ChatStore, CHATS_DIR,

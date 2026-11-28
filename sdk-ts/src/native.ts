@@ -139,6 +139,9 @@ async function loadNative(): Promise<NativeBinding> {
  * dispatcher, not a new hand-mirrored native function.
  */
 export const SESSION_STORE_OPS = Object.freeze({
+  session: 'session',
+  retention: 'retention',
+  compact: 'compact',
   markers: 'markers',
   requests: 'requests',
   usageSummary: 'usage_summary',
@@ -155,6 +158,22 @@ export type SessionStoreOp = (typeof SESSION_STORE_OPS)[keyof typeof SESSION_STO
  * rejects a key it does not know rather than ignoring it, so an option the
  * SDK spells wrong is an error here, not a silently dropped filter.
  */
+export interface SessionEvidenceCallArgs {
+  dbPath?: string;
+  source: string;
+  sessionId: string;
+  includeText?: boolean;
+  kinds?: readonly string[];
+}
+
+export interface MaintenanceCallArgs {
+  dbPath?: string;
+  days?: number;
+  apply?: boolean;
+  allowUnuploaded?: boolean;
+  maxRows?: number;
+}
+
 export interface SessionStoreCallArgs {
   dbPath?: string;
   source: string;
@@ -194,7 +213,7 @@ export interface CommitChangesCallArgs {
  */
 export async function sessionStoreCall(
   op: SessionStoreOp,
-  args: SessionStoreCallArgs | ChangeFeedCallArgs | CommitChangesCallArgs,
+  args: SessionStoreCallArgs | SessionEvidenceCallArgs | ChangeFeedCallArgs | CommitChangesCallArgs | MaintenanceCallArgs,
 ): Promise<UnknownRecord> {
   return nativeCall(async (native) => {
     const answer = await native.sessionStoreCall(op, JSON.stringify(args));

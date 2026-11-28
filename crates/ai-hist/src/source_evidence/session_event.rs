@@ -5,6 +5,11 @@ use super::{
 use anyhow::{ensure, Result};
 use serde_json::{Map, Value};
 
+/// The largest rank the TypeScript SDK can carry exactly
+/// (`Number.MAX_SAFE_INTEGER`). A larger one would be stored, then make every
+/// SDK read of the session fail.
+const MAX_SOURCE_ORDER: i64 = (1 << 53) - 1;
+
 pub(super) fn validate_session_event(payload: &Map<String, Value>) -> Result<()> {
     ensure!(
         ["user", "assistant", "tool_result"]
@@ -13,6 +18,14 @@ pub(super) fn validate_session_event(payload: &Map<String, Value>) -> Result<()>
                 .contains(&payload["kind"].as_str().unwrap_or_default()),
         "INVALID_ARGUMENT: invalid event role or kind"
     );
+    if let Some(value) = payload.get("source_order").filter(|value| !value.is_null()) {
+        ensure!(
+            value
+                .as_i64()
+                .is_some_and(|order| (0..=MAX_SOURCE_ORDER).contains(&order)),
+            "INVALID_ARGUMENT: source_order must be a nonnegative integer no greater than 2^53 - 1"
+        );
+    }
     // `control_kind` is a closed vocabulary, and every reader -- the
     // user-turn page, prompt attribution, the plugin's turn export --
     // treats any non-null value as authoritative without rechecking

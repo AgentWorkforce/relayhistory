@@ -51,12 +51,27 @@ impl IdentityRefresh {
             Self::ExactPaths => crate::store::refresh_project_identity_observations(conn, false),
         };
         if let Err(error) = result {
-            eprintln!(
-                "ai-hist: could not refresh canonical project identity after discovery: {error:#} \
-                 (project keys stay as they were; the next pass retries)"
-            );
+            warn_refresh_failure(&error);
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static STDERR_LINES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+fn warn_refresh_failure(error: &anyhow::Error) {
+    if crate::ingest::output::quiet() {
+        return;
+    }
+    let line = format!(
+        "ai-hist: could not refresh canonical project identity after discovery: {error:#} \
+         (project keys stay as they were; the next pass retries)"
+    );
+    #[cfg(test)]
+    STDERR_LINES.with(|lines| lines.borrow_mut().push(line.clone()));
+    eprintln!("{line}");
 }
 
 static CAPTURE_ROW_SQL: LazyLock<String> = LazyLock::new(|| {

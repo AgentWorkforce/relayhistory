@@ -23,6 +23,7 @@
 /// As with the catalog columns above, this list is both the migration list and
 /// the read-only guard list, so the two cannot drift.
 pub(super) const REQUIRED_SESSION_EVENT_COLUMNS: &[(&str, &str)] = &[
+    ("source_order", "INTEGER CHECK(source_order IS NULL OR (typeof(source_order) = 'integer' AND source_order >= 0))"),
     ("project_key", "TEXT"),
     ("project_key_method", "TEXT"),
     ("provider", "TEXT"),

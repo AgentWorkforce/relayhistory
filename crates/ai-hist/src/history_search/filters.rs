@@ -149,7 +149,8 @@ pub(super) fn append_event_search_filters(
         let mut mirror = format!(
             "SELECT 1 FROM history hp WHERE hp.source = {alias}.source \
                AND hp.session_id = {alias}.session_id AND hp.timestamp_ms = {alias}.ts_ms \
-               AND hp.prompt = trim({alias}.text, {RUST_WHITESPACE})"
+               AND hp.prompt = trim({alias}.text, {RUST_WHITESPACE}) \
+               AND (hp.event_uid IS NULL OR hp.event_uid = {alias}.event_uid)"
         );
         if let Some(query) = prompt_match {
             mirror.push_str(

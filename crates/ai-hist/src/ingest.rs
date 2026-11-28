@@ -18,8 +18,12 @@ use std::io::{self, BufRead, BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+mod claude_full_order;
 mod claude_owner;
 mod claude_record_rows;
+mod session_order_scope;
+pub(crate) use claude_full_order::claude_records_are_all_sidechain;
+use claude_full_order::ingest_claude_transcript_text_as;
 mod claude_standalone;
 pub(crate) mod claude_title;
 mod claude_untimed;
@@ -40,11 +44,14 @@ pub(crate) mod evidence_reconcile;
 mod evidence_upserts;
 pub(crate) mod grok;
 mod grok_unified;
+mod history_prompts;
 pub(crate) mod hook;
 pub(crate) mod hydrate;
 mod images;
+use history_prompts::retire_claude_history_row;
 mod raw_facts;
 pub(crate) use images::image_markdown;
+pub(crate) mod claude_write_fence;
 pub(crate) mod incremental;
 pub(crate) mod jsonl;
 pub(crate) mod muse;
@@ -72,10 +79,10 @@ pub(crate) use sweep_write::SweepWrite;
 pub(crate) use titles::set_claude_first_prompt;
 use titles::set_session_title;
 
+use claude_record_rows::insert_unknown_record_marker;
 #[cfg(test)]
 use claude_record_rows::{delete_claude_record_rows, CLAUDE_RECORD_ROWS};
 use claude_record_rows::{heal_claude_record_rows, HealedRows};
-use claude_record_rows::{insert_unknown_record_marker, retire_claude_history_row};
 use claude_standalone::{
     claude_record_stores_no_event, claude_thinking_event_text, ClaudeRecordWalk,
     CLAUDE_STANDALONE_RECORDS_GENERATION,
@@ -129,19 +136,16 @@ pub use tool_result_facts::{
     EVENT_SOURCE_TOOL_RESULT, STATUS_COMPLETED, STATUS_ERRORED, STATUS_UNKNOWN,
 };
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
-/// When set, sync progress lines (`[claude] +N rows`, …) are suppressed. The
-/// in-process local sync API sets this to keep the embedding host's stdout
-/// available for its own output; the CLI leaves it false.
-static SYNC_QUIET: AtomicBool = AtomicBool::new(false);
+pub(crate) mod native_order;
+#[path = "ingest/output.rs"]
+pub(crate) mod output;
 
-/// `println!` for sync progress that honors [`SYNC_QUIET`].
+/// Progress output scoped to the current capture operation.
 macro_rules! sync_note {
     ($($arg:tt)*) => {
-        if !SYNC_QUIET.load(AtomicOrdering::Relaxed) {
-            println!($($arg)*);
-        }
+        $crate::ingest::output::note(format_args!($($arg)*))
     };
 }
 
@@ -191,7 +195,7 @@ pub(crate) use sweep_phases::SweepScope;
 /// This is the reusable engine entry point used by the N-API boundary. The
 /// command-line parser is intentionally not involved.
 pub fn sync_local_at(db_path: &Path) -> Result<bool> {
-    SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
+    let _output = output::Scope::enter(true);
     sync_exclusive(db_path)
 }
 
@@ -355,7 +359,7 @@ pub(crate) fn capture_files<T>(source: &'static str, files: Vec<T>) -> impl Iter
 #[cfg(test)]
 pub(crate) fn sync_local_at_with_home(db_path: &Path, home: &Path) -> Result<bool> {
     let roots = crate::ProviderRoots::from_env(home.to_path_buf());
-    SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
+    let _output = output::Scope::enter(true);
     sync_exclusive_with_roots(db_path, &roots, false).map(|tick| tick.attempted)
 }
 
@@ -386,7 +390,7 @@ pub fn sync_tick_at_with_roots(
     output: SyncOutput,
     force: bool,
 ) -> Result<SyncTick> {
-    quiet_unless(output);
+    let _output = self::output::Scope::enter(matches!(output, SyncOutput::Silent));
     sync_exclusive_with_roots(db_path, roots, force)
 }
 
@@ -400,7 +404,7 @@ pub fn sync_tick_at(
     output: SyncOutput,
     force: bool,
 ) -> Result<SyncTick> {
-    quiet_unless(output);
+    let _output = self::output::Scope::enter(matches!(output, SyncOutput::Silent));
     if scope == SessionScope::Remote {
         remote::ensure_selected_remote_connectors_configured_for_at(
             "sync",
@@ -426,7 +430,7 @@ pub fn sync_tick_at(
 /// through [`sources::SourceRegistry`] or an SDK host. Credentials alone never
 /// add a data source. Cached remote catalog reads remain available.
 pub fn sync_scoped_at(db_path: &Path, scope: SessionScope) -> Result<bool> {
-    SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
+    let _output = output::Scope::enter(true);
     sync_scope_exclusive(db_path, scope)
 }
 
@@ -441,7 +445,7 @@ pub fn sync_scoped_at_with_connectors(
     scope: SessionScope,
     connectors: &remote::SourceConnectorSelection,
 ) -> Result<bool> {
-    SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
+    let _output = output::Scope::enter(true);
     sync_scope_with_connectors(db_path, scope, connectors)
 }
 
@@ -452,14 +456,6 @@ pub enum SyncOutput {
     Progress,
 }
 
-/// Quiet unless the caller asked for progress.
-fn quiet_unless(output: SyncOutput) {
-    SYNC_QUIET.store(
-        matches!(output, SyncOutput::Silent),
-        AtomicOrdering::Relaxed,
-    );
-}
-
 /// Scoped ingestion with an explicitly chosen progress destination. Embedded
 /// callers should use `sync_scoped_at_with_connectors`, which is always silent.
 pub fn sync_scoped_at_with_output(
@@ -468,7 +464,7 @@ pub fn sync_scoped_at_with_output(
     connectors: &remote::SourceConnectorSelection,
     output: SyncOutput,
 ) -> Result<bool> {
-    quiet_unless(output);
+    let _output = self::output::Scope::enter(matches!(output, SyncOutput::Silent));
     sync_scope_with_connectors(db_path, scope, connectors)
 }
 
@@ -477,7 +473,7 @@ pub fn sync_scoped_at_with_output(
 /// `source_path` is named outright, so it is the only database read — its
 /// channel siblings are not. [`sync_opencode_with_roots`] reads them.
 pub fn sync_opencode_at(db_path: &Path, source_path: &Path, output: SyncOutput) -> Result<bool> {
-    quiet_unless(output);
+    let _output = self::output::Scope::enter(matches!(output, SyncOutput::Silent));
     sync_opencode_exclusive(db_path, source_path, true, &default_opencode_storage_dir())
 }
 
@@ -489,7 +485,7 @@ pub fn sync_opencode_with_roots(
     roots: &crate::ProviderRoots,
     output: SyncOutput,
 ) -> Result<bool> {
-    quiet_unless(output);
+    let _output = self::output::Scope::enter(matches!(output, SyncOutput::Silent));
     sync_opencode_exclusive(
         db_path,
         &roots.opencode_db,
@@ -523,8 +519,8 @@ fn sync_scope_with_connectors(
 
 /// Remote acquisition stub for scoped sync.
 ///
-/// Local scope never reaches this function. `all` scope skips quietly when no
-/// connector is configured; an explicit `remote` request bails
+/// Local scope never reaches this function. `all` scope skips remote acquisition;
+/// an explicit `remote` request bails
 /// `CONNECTOR_NOT_CONFIGURED` because remote acquisition requires an
 /// explicitly registered source plugin composed through the SDK host.
 fn sync_remote_connectors(
@@ -2731,10 +2727,9 @@ fn refresh_project_identity_after_sync(conn: &Connection) {
 /// Synchronize local providers, or read the current snapshot when another sync owns the lock.
 /// The boolean reports that synchronization was skipped. No destination or credentials are read.
 pub fn prepare_local_sync_snapshot(db_path: &Path) -> Result<(Connection, bool)> {
-    SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
+    let _output = output::Scope::enter(true);
     let Some(sync_lock) = try_acquire_sync_lock(db_path)? else {
-        // Pushing already-indexed rows only reads SQLite and remains useful while another
-        // process scans. A read-only connection avoids joining the writer contention.
+        // Cached reads remain useful while another process scans. A read-only connection avoids joining the writer contention.
         let conn = open_db_readonly(db_path).with_context(|| {
             format!(
                 "another sync owns the lock and no readable database is available at {}",
@@ -5756,8 +5751,12 @@ fn ingest_codex_rollout_incremental(
     // Codex keeps its existing rule for a trailing line with no newline: it
     // is the half-written tail of a live rollout and the next pass re-reads
     // it. Unlike Claude, no Codex writer leaves its last line unterminated.
-    let (mut reader, mut replay_gate, probe_bytes) =
-        rollout_head::open_codex_walk(conn, path, cursor, meta)?;
+    let native_order::CodexRead {
+        mut reader,
+        gate: mut replay_gate,
+        probe_bytes,
+        order: native_order,
+    } = native_order::codex_read(conn, path, cursor, meta)?;
     let mut pass = transcript_cursor::IncrementalPass {
         rotated: reader.rotated,
         ..Default::default()
@@ -6073,6 +6072,7 @@ fn ingest_codex_rollout_incremental(
                 outcome.prompts += insert_history(
                     conn,
                     &HistoryEntry {
+                        event_uid: None,
                         id: 0,
                         source: "codex".into(),
                         session_id: Some(meta.session_id.clone()),
@@ -6793,7 +6793,14 @@ fn ingest_codex_rollout_incremental(
         .saturating_add(pass.validation_bytes)
         .saturating_add(probe_bytes)
         .saturating_add(prefix_bytes);
-    Ok((outcome, pass))
+    native_order::finish_codex(
+        native_order,
+        &pass,
+        offset,
+        reader.position(),
+        reader.tail_bytes(),
+    )
+    .map(|()| (outcome, pass))
 }
 
 /// Record a line that claimed to be modeled and then stored nothing.
@@ -7066,21 +7073,10 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
     coverage: &mut SweepCoverage,
     paths: Option<&path_scope::PathScope>,
 ) -> Result<()> {
-    // Load-bearing for the raw-facts generation below: an absent root returns
-    // before anything is recorded, so a run that could not see the archive
-    // does not retire the one-time backfill pass over it.
-    if !root.exists() {
-        if repairs.repairs_all()
-            && state
-                .get("claude_sessions_v3")
-                .and_then(Value::as_object)
-                .is_some_and(|known| state_names_files_under(known, root))
-        {
-            coverage.note_unread();
-        }
-        state.insert(incremental::CLAUDE_HOLDING_RECORDS_KEY.into(), false.into());
+    if !claude_full_order::root_present(state, root, repairs, coverage, paths) {
         return Ok(());
     }
+    let _claude_write = claude_write_fence::acquire_wait(conn, "claude")?;
     // The `claude_sessions*` path -> stamp maps are retired. They recorded only
     // *that* a file had changed, which left one answer available — re-read all
     // of it — and they grew a JSON entry per transcript inside a single state
@@ -7302,7 +7298,7 @@ fn sync_claude_session_metadata_with_repairs_and_coverage(
         // Everything this transcript writes from here -- the fold's cursor,
         // the catalog row, the records and their cursor, the relationship and
         // continuity rows -- is one write unit. The fold above only read.
-        let mut write = SweepWrite::begin(conn)?;
+        let (_claude_write, mut write) = claude_write_fence::begin_sweep(conn)?;
         scan_cursor.claude.get_or_insert_with(Default::default).scan = scan;
         transcript_cursor::store_cursor(conn, &scan_key, &scan_cursor)?;
         if let Some(meta) = scanned_meta {
@@ -8102,12 +8098,6 @@ pub(crate) fn is_claude_sidecar_file(path: &Path) -> bool {
             .is_some_and(|name| name.starts_with(CLAUDE_SIDECAR_PREFIX))
 }
 
-/// Every record that names a session is a sidechain row — what a sidecar's
-/// records look like, and the half of the sidecar rule content can answer.
-pub(crate) fn claude_records_are_all_sidechain(identified: usize, sidechain: usize) -> bool {
-    identified > 0 && sidechain == identified
-}
-
 /// Walk only the records that have arrived since `state` was written.
 ///
 /// Returns the metadata and the bytes this call read. `state` is updated in
@@ -8166,37 +8156,6 @@ fn scan_claude_session_text(path: &Path, text: &str) -> Result<Option<ClaudeSess
         path.display()
     );
     Ok(fold.finish(path))
-}
-
-/// Index the records in bytes the hook captured.
-fn ingest_claude_transcript_text_as(
-    conn: &Connection,
-    path: &Path,
-    text: &str,
-    attributed_session_id: Option<&str>,
-) -> Result<()> {
-    let file_session_id = claude_sessionless_owner(
-        path,
-        text.lines().filter_map(|line| {
-            serde_json::from_str::<Value>(line)
-                .ok()?
-                .get("sessionId")?
-                .as_str()
-                .filter(|id| !id.is_empty())
-                .map(str::to_string)
-        }),
-    );
-    let mut walk = ClaudeRecordWalk::new(
-        conn,
-        path,
-        attributed_session_id,
-        file_session_id.as_deref(),
-    );
-    for line in text.lines() {
-        check_capture_cancelled()?;
-        walk.feed(line)?;
-    }
-    walk.finish()
 }
 
 pub(crate) fn scan_claude_session_file_resumed(
@@ -8723,6 +8682,7 @@ fn ingest_claude_transcript_as(
     path: &Path,
     attributed_session_id: Option<&str>,
 ) -> Result<()> {
+    let order = native_order::begin(conn, "claude", attributed_session_id)?;
     // The session this file belongs to. Claude writes a conversation's summary
     // as the *first* line and gives it `leafUuid` instead of `sessionId`, so a
     // fallback that learned the id from earlier records would always be too
@@ -8760,7 +8720,8 @@ fn ingest_claude_transcript_as(
         let line = std::str::from_utf8(&raw).unwrap_or("");
         walk.feed(line.trim_end_matches(['\n', '\r']))?;
     }
-    walk.finish()
+    walk.finish()?;
+    order.finish()
 }
 
 /// What one Claude transcript threads through its records, whichever reader
@@ -9260,6 +9221,7 @@ fn ingest_claude_record(
             insert_history(
                 conn,
                 &HistoryEntry {
+                    event_uid: None,
                     id: 0,
                     source: "claude".into(),
                     session_id: Some(session_id.to_string()),
@@ -10718,16 +10680,6 @@ fn heal_claude_synthetic_session_summaries(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// The per-message facts a provider records on the envelope rather than in the
-/// message body, carried verbatim from the parser to the row.
-///
-/// These are the facts consumers need and normalization would otherwise read
-/// past: which API request a turn belongs to (`request_id`), why the model
-/// stopped — and, by its absence, that it has not yet (`stop_reason`), which
-/// harness build produced it (`agent_version`), whether the row is delegated or
-/// injected rather than human (`is_sidechain` / `is_meta`), and which Codex
-/// turn it falls inside (`turn_id`). Every field is optional and stored as the
-/// provider wrote it: relayhistory preserves, consumers map.
 /// The generation of raw-fact parsing the local parser stamps on every event
 /// it writes.
 ///
@@ -12198,6 +12150,9 @@ pub(crate) fn ingest_cursor_transcript<'a>(
     // error propagates so the whole transaction, including the checkpoint
     // update, rolls back and the next sync retries the same offset.
     let text = records.into().text()?;
+    // This walk emits records from byte zero; history_from_offset only
+    // limits prompts. A bounded prefix or incomplete tail discards capture.
+    let order = native_order::begin(conn, "cursor", Some(session_id))?;
     let mut outcome = CursorTranscriptOutcome::default();
     let mut offset: u64 = 0;
     // One query for the session, keyed by record offset. The per-record
@@ -12609,6 +12564,7 @@ pub(crate) fn ingest_cursor_transcript<'a>(
             outcome.prompts_inserted += insert_history(
                 conn,
                 &HistoryEntry {
+                    event_uid: None,
                     id: 0,
                     source: "cursor".into(),
                     session_id: Some(session_id.to_string()),
@@ -12619,12 +12575,10 @@ pub(crate) fn ingest_cursor_transcript<'a>(
                 },
             )?;
         }
-        if emitted_evidence && !ts_is_guessed {
-            outcome.first_ts_ms = Some(outcome.first_ts_ms.map_or(ts_ms, |first| first.min(ts_ms)));
-            outcome.last_ts_ms = Some(outcome.last_ts_ms.map_or(ts_ms, |last| last.max(ts_ms)));
-        }
+        outcome.observe_activity(emitted_evidence, ts_is_guessed, ts_ms);
     }
     outcome.consumed_through = offset;
+    cursor::finish_native_order(order, &text, index_through)?;
     Ok(outcome)
 }
 
@@ -13486,7 +13440,7 @@ pub(crate) fn ingest_muse_session(
     } else {
         HistoryScope::Session
     };
-    let mut reconcile = evidence_reconcile::begin_muse(conn, sid, scope)?;
+    let (order, mut reconcile) = session_order_scope::muse(conn, sid, scope)?;
 
     let mut outcome = MuseIngestOutcome {
         unparsed_lines: transcript.unparsed_lines,
@@ -13558,6 +13512,7 @@ pub(crate) fn ingest_muse_session(
                     outcome.prompts += insert_history(
                         conn,
                         &HistoryEntry {
+                            event_uid: None,
                             id: 0,
                             source: SOURCE.into(),
                             session_id: Some(sid.to_string()),
@@ -13952,7 +13907,7 @@ pub(crate) fn ingest_muse_session(
         ],
     )?;
     evidence_reconcile::finish(conn, &mut reconcile)?;
-    Ok(outcome)
+    session_order_scope::finish(order, outcome)
 }
 
 /// Everything a sweep reads under one Grok home: the session directories,
@@ -14191,7 +14146,7 @@ fn ingest_grok_session(
     let sid = session.session_id.as_str();
     let project = session.cwd.as_deref();
     let branch = session.git_branch.as_deref();
-    let mut reconcile = grok_unified::begin_session(conn, sid, raw_path)?;
+    let (order, mut reconcile) = session_order_scope::grok(conn, sid, raw_path)?;
     let mut outcome = GrokIngestOutcome {
         missing_updates: !session.updates_present,
         updates_yielded_no_timing: session.updates_present && session.updates.is_empty(),
@@ -14352,6 +14307,7 @@ fn ingest_grok_session(
                 outcome.prompts += insert_history(
                     conn,
                     &HistoryEntry {
+                        event_uid: None,
                         id: 0,
                         source: SOURCE.into(),
                         session_id: Some(sid.to_string()),
@@ -14745,7 +14701,7 @@ fn ingest_grok_session(
     )?;
     outcome.unified_usage_rows = coverage.rows;
     outcome.unified_coverage = coverage;
-    Ok(outcome)
+    session_order_scope::finish(order, outcome)
 }
 
 /// Materialize unified usage, then keep only the evidence this read wrote.
@@ -18182,6 +18138,7 @@ mod tests {
         insert_history(
             &conn,
             &HistoryEntry {
+                event_uid: None,
                 id: 0,
                 source: "muse".into(),
                 session_id: Some(MUSE_WORKER.to_string()),
@@ -18236,6 +18193,7 @@ mod tests {
         insert_history(
             &conn,
             &HistoryEntry {
+                event_uid: None,
                 id: 0,
                 source: "muse".into(),
                 session_id: Some(MUSE_PARENT.to_string()),
@@ -18772,6 +18730,7 @@ mod tests {
         insert_history(
             &conn,
             &HistoryEntry {
+                event_uid: None,
                 id: 0,
                 source: "muse".into(),
                 session_id: Some(MUSE_WORKER.to_string()),
@@ -20130,6 +20089,7 @@ mod tests {
         // The positive control: the same collapse on a source with per-record
         // times, proving the key and not the Grok parser is what does this.
         let entry = |source: &str, session: &str| HistoryEntry {
+            event_uid: None,
             id: 0,
             source: source.into(),
             session_id: Some(session.to_string()),
@@ -20702,6 +20662,7 @@ mod tests {
             insert_history(
                 &conn,
                 &HistoryEntry {
+                    event_uid: None,
                     id: 0,
                     source: "grok".into(),
                     session_id: Some("grok-evt-0001".into()),
@@ -20715,6 +20676,7 @@ mod tests {
             insert_history(
                 &conn,
                 &HistoryEntry {
+                    event_uid: None,
                     id: 0,
                     source: "grok".into(),
                     session_id: Some("grok-evt-0001".into()),
@@ -21926,6 +21888,58 @@ mod tests {
         fs::create_dir_all(transcript.parent().unwrap()).unwrap();
         fs::copy(cursor_fixture(fixture), &transcript).unwrap();
         transcript
+    }
+
+    #[test]
+    fn re_reading_a_cursor_transcript_upserts_in_place_instead_of_duplicating() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = stage_cursor_fixture(dir.path(), "observed-3.13.25.jsonl", "s-repeat");
+        let conn = Connection::open_in_memory().unwrap();
+        init_db(&conn).unwrap();
+        let ordered_rows = || {
+            conn.prepare("SELECT id,event_uid,source_order FROM session_events WHERE source='cursor' ORDER BY id")
+                .unwrap().query_map([], |row| Ok((row.get::<_,i64>(0)?,row.get::<_,String>(1)?,row.get::<_,Option<i64>>(2)?)))
+                .unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap()
+        };
+        let mut original = None;
+        for pass in 0..3 {
+            super::ingest_cursor_transcript(
+                &conn,
+                &path,
+                "s-repeat",
+                Some("/home/dev/demo"),
+                1,
+                0,
+                u64::MAX,
+            )
+            .unwrap();
+            let current = ordered_rows();
+            assert!(current.iter().all(|row| row.2.is_some()));
+            if let Some(original) = &original {
+                assert_eq!(
+                    &current, original,
+                    "legacy enrichment keeps event IDs and native order"
+                );
+            } else {
+                original = Some(current);
+            }
+            if pass == 0 {
+                conn.execute("UPDATE session_events SET source_order=NULL", [])
+                    .unwrap();
+            }
+        }
+        let counts = |table: &str| {
+            conn.query_row(
+                &format!("SELECT COUNT(*) FROM {table} WHERE source = 'cursor'"),
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(counts("history"), 2);
+        assert_eq!(counts("session_events"), 9);
+        assert_eq!(counts("tool_calls"), 4);
+        assert_eq!(counts("file_edits"), 2);
     }
 
     fn event_kinds(conn: &Connection, session_id: &str) -> Vec<(String, String)> {
@@ -23660,38 +23674,6 @@ mod tests {
     }
 
     #[test]
-    fn re_reading_a_cursor_transcript_upserts_in_place_instead_of_duplicating() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = stage_cursor_fixture(dir.path(), "observed-3.13.25.jsonl", "s-repeat");
-        let conn = Connection::open_in_memory().unwrap();
-        init_db(&conn).unwrap();
-        for _ in 0..2 {
-            super::ingest_cursor_transcript(
-                &conn,
-                &path,
-                "s-repeat",
-                Some("/home/dev/demo"),
-                1,
-                0,
-                u64::MAX,
-            )
-            .unwrap();
-        }
-        let counts = |table: &str| {
-            conn.query_row(
-                &format!("SELECT COUNT(*) FROM {table} WHERE source = 'cursor'"),
-                [],
-                |row| row.get::<_, i64>(0),
-            )
-            .unwrap()
-        };
-        assert_eq!(counts("history"), 2);
-        assert_eq!(counts("session_events"), 9);
-        assert_eq!(counts("tool_calls"), 4);
-        assert_eq!(counts("file_edits"), 2);
-    }
-
-    #[test]
     fn plain_sync_indexes_cursor_events_and_re_reads_after_the_state_key_retires() {
         let dir = tempfile::tempdir().unwrap();
         stage_cursor_fixture(dir.path(), "observed-3.13.25.jsonl", "s-sync");
@@ -23751,6 +23733,7 @@ mod tests {
         insert_history(
             &conn,
             &HistoryEntry {
+                event_uid: None,
                 id: 0,
                 source: "cursor".into(),
                 session_id: Some("s-restamp".into()),
@@ -29133,6 +29116,7 @@ mod tests {
             insert_history(
                 &conn,
                 &HistoryEntry {
+                    event_uid: None,
                     id: 0,
                     source: "claude".into(),
                     session_id: Some(session_id.into()),
@@ -29210,6 +29194,7 @@ mod tests {
             insert_history(
                 &conn,
                 &HistoryEntry {
+                    event_uid: None,
                     id: 0,
                     source: "claude".into(),
                     session_id: Some("sess-control".into()),
@@ -32773,6 +32758,7 @@ mod tests {
         crate::insert_history_at_location(
             &conn,
             &HistoryEntry {
+                event_uid: None,
                 id: 0,
                 source: "codex".into(),
                 session_id: Some("sess-remote-sub".into()),
@@ -36246,7 +36232,7 @@ mod tests {
         .unwrap();
 
         let sweep = || {
-            SYNC_QUIET.store(true, AtomicOrdering::Relaxed);
+            let _output = output::Scope::enter(true);
             let tick = sync_exclusive_with_home(&db_path, home.path(), true).unwrap();
             assert!(tick.attempted && tick.swept);
         };
@@ -39137,7 +39123,7 @@ mod post_sweep_checkpoint_tests {
         claude_transcript(home.path(), "checkpoint-a", 20..40);
         let reader = pin_reader(&db_path);
 
-        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let writer_stop = stop.clone();
         let writer_path = db_path.clone();
         let writer = std::thread::spawn(move || {

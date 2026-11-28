@@ -4,3 +4,4 @@ export * from './pagination.js';
 export * from './source-contracts.js';
 export * from './source-plugins.js';
 export * from './handoff.js';
+export * from './session-evidence.js';

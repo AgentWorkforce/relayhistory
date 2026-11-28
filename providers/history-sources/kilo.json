@@ -49,7 +49,7 @@
     }
   ],
   "capture": [
-    {"evidence":"Messages and tools","coverage":"Kilo CLI 7.8.15 SQLite session/message/part writer and independent export; user/assistant text, completed tool call/result, WAL-visible coherent snapshot."},
+    {"evidence":"Messages and tools","coverage":"Kilo CLI 7.8.15 SQLite session/message/part writer and independent export; user/assistant text, completed tool call/result, WAL-visible coherent snapshot. Multi-part prompts follow recorded native event order through rewrites."},
     {"evidence":"Usage and relationships","coverage":"Session totals are context counters, not billable request usage; parent IDs and richer parts remain bounded metadata; no native resume or legacy extension coverage advertised."}
   ],
   "population": {"evidence":["history","session_event","tool_call","session_marker"],"usage_accounting":"none"}

@@ -143,3 +143,11 @@ required-features = ["unstable-internal"]
 [[test]]
 name = "devin"
 required-features = ["unstable-internal"]
+
+[[test]]
+name = "history_identity"
+required-features = ["unstable-internal", "export"]
+
+[[test]]
+name = "source_event_order"
+required-features = ["unstable-internal"]

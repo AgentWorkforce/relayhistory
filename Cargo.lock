@@ -75,6 +75,7 @@ version = "0.63.1"
 dependencies = [
  "ai-hist",
  "anyhow",
+ "fs2",
  "napi",
  "napi-build",
  "napi-derive",

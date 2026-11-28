@@ -25,6 +25,7 @@ pub fn parse_claude(line: &str) -> Result<Option<HistoryEntry>> {
         return Ok(None);
     };
     Ok(Some(HistoryEntry {
+        event_uid: None,
         id: 0,
         source: "claude".into(),
         session_id: obj
@@ -55,6 +56,7 @@ pub fn parse_codex(line: &str) -> Result<Option<HistoryEntry>> {
         return Ok(None);
     };
     Ok(Some(HistoryEntry {
+        event_uid: None,
         id: 0,
         source: "codex".into(),
         session_id: obj

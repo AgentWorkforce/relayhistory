@@ -175,6 +175,7 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
     cursor: &mut TranscriptCursorState,
     between_records: &mut dyn FnMut() -> Result<()>,
 ) -> Result<IncrementalPass> {
+    let claude_write = super::claude_write_fence::acquire(conn, "claude")?;
     let saved_claude = cursor.claude.clone().unwrap_or_default();
     let mut reader = TranscriptReader::open(path, cursor.file.as_ref(), saved_claude.resume_from)?;
     let mut pass = IncrementalPass {
@@ -184,26 +185,21 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
     // A cursor that was rejected, or one that never existed, means this pass
     // re-reads from zero; the per-source state that went with the old position
     // describes bytes that are no longer there.
-    let mut claude = if reader.start_offset() == 0 {
-        // The metadata walk keeps its own position and its own fold, and
-        // rotation is something it detects for itself. Dropping its state here
-        // because *this* walk restarted left the global sync re-deriving a
-        // transcript's identity from byte zero on every append: it stored the
-        // scan, then this reloaded the same row and wrote a default over it.
-        //
-        // A walk from byte zero is this parser's own, so it names this
-        // generation; a resumed walk keeps the generation that committed the
-        // position it resumes from.
-        ClaudeCursorState {
-            scan: saved_claude.scan.clone(),
-            records_parser: super::hydrate::HYDRATION_PARSER_VERSION,
-            record_ts_from_start: true,
-            ..Default::default()
-        }
-    } else {
-        saved_claude.clone()
-    };
+    let mut claude = saved_claude.pass_start(reader.start_offset());
     let start_offset = reader.start_offset();
+    let order = native_order::optional(conn, "claude", attributed_session_id, start_offset == 0)?;
+    // The source fence excludes concurrent Claude mutations across chunk
+    // commits. Ordinary dense local reads can rotate; constrained rereads
+    // remain atomic until their complete observed order is accepted.
+    let mut staged = || Ok(());
+    let between_records = super::claude_write_fence::boundaries(
+        conn,
+        attributed_session_id,
+        order.is_some(),
+        &claude_write,
+        &mut staged,
+        between_records,
+    )?;
     // A rewound pass restarts at the unterminated record it saw last time, so
     // that record gets the index it had before rather than one past it.
     let line_index = if reader.start_offset() == saved_claude.resume_from.unwrap_or(u64::MAX) {
@@ -309,7 +305,19 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
     // the position, not the parser state. Its rows came from bytes that are no
     // longer there, and the next pass reads the same region again and upserts
     // over them.
-    match reader.commit(commit_offset)? {
+    let publication = reader.commit(commit_offset)?;
+    if let Some(order) = order {
+        if matches!(&publication, CommitOutcome::Published(_))
+            && pass.in_progress.is_empty()
+            && unterminated.is_none()
+            && commit_offset == reader.position()
+        {
+            order.finish()?;
+        } else {
+            order.discard()?;
+        }
+    }
+    match publication {
         CommitOutcome::Published(file) => {
             cursor.file = Some(file);
             cursor.claude = Some(claude);
@@ -330,6 +338,29 @@ pub(crate) fn ingest_claude_transcript_incremental_batched(
 }
 
 impl ClaudeCursorState {
+    /// The state a pass starting at `start_offset` walks with.
+    ///
+    /// The metadata walk keeps its own position and its own fold, and
+    /// rotation is something it detects for itself. Dropping its state here
+    /// because *this* walk restarted left the global sync re-deriving a
+    /// transcript's identity from byte zero on every append: it stored the
+    /// scan, then this reloaded the same row and wrote a default over it.
+    ///
+    /// A walk from byte zero is this parser's own, so it names this
+    /// generation; a resumed walk keeps the generation that committed the
+    /// position it resumes from.
+    fn pass_start(&self, start_offset: u64) -> Self {
+        if start_offset != 0 {
+            return self.clone();
+        }
+        Self {
+            scan: self.scan.clone(),
+            records_parser: super::hydrate::HYDRATION_PARSER_VERSION,
+            record_ts_from_start: true,
+            ..Default::default()
+        }
+    }
+
     /// The transcript state this cursor carries, lent to the record indexer
     /// for one file.
     fn file_parse<'a>(

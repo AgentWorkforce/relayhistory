@@ -325,6 +325,9 @@ fn emit_user(
     let prompts = insert_history(
         conn,
         &HistoryEntry {
+            // Journal offsets are generated positions, not stable native prompt IDs.
+            // Keep legacy history keys until a provider migration supersedes old rows.
+            event_uid: None,
             id: 0,
             source: ID.into(),
             session_id: Some(sid.into()),

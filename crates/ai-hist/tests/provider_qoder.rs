@@ -662,7 +662,7 @@ fn qoder_replaced_locator_keeps_imported_old_session_remote_only() {
 
 #[cfg(all(feature = "unstable-internal", feature = "export"))]
 #[test]
-fn qoder_same_millisecond_remote_order_conflict_keeps_prior_snapshot() {
+fn qoder_same_millisecond_export_preserves_order_and_rejects_native_conflicts() {
     const SAME: &str = include_str!("fixtures/qoder/global-cli/.qoder/projects/-synthetic-qoder-project/synthetic-same-ms.jsonl");
     let (destination, store, original) = remote_case(SAME, "synthetic-same-ms");
     assert_eq!(
@@ -679,11 +679,33 @@ fn qoder_same_millisecond_remote_order_conflict_keeps_prior_snapshot() {
         .session(&reference, SessionQuery::default())
         .unwrap()
         .unwrap();
-    assert_ne!(
+    assert_eq!(
         prior.messages, original.messages,
-        "remote export order collides at one millisecond"
+        "remote export preserves recorded order at one millisecond"
     );
     stage(destination.path(), "synthetic-same-ms", SAME);
+    store
+        .discover(DiscoveryOptions::default().sources([Source::Qoder]))
+        .unwrap();
+    store
+        .hydrate(&reference, HydrateOptions::default())
+        .unwrap();
+    assert_eq!(
+        store
+            .session(&reference, SessionQuery::default())
+            .unwrap()
+            .unwrap()
+            .messages,
+        original.messages,
+        "matching local evidence agrees with the transported native order"
+    );
+    let mut changed = SAME.lines().collect::<Vec<_>>();
+    changed.swap(1, 3);
+    stage(
+        destination.path(),
+        "synthetic-same-ms",
+        &(changed.join("\n") + "\n\n"),
+    );
     store
         .discover(DiscoveryOptions::default().sources([Source::Qoder]))
         .unwrap();

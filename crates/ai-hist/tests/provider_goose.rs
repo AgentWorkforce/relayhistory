@@ -1107,7 +1107,7 @@ fn goose_sweep_isolates_bad_siblings_and_keeps_deletion_accounting() {
 
 #[cfg(feature = "export")]
 #[test]
-fn goose_native_export_remote_intake_retains_evidence_on_order_conflict() {
+fn goose_native_export_remote_intake_preserves_native_order() {
     let origin = tempfile::tempdir().unwrap();
     stage(origin.path(), include_str!("fixtures/goose/schema17.sql"));
     let original_store = open(origin.path());
@@ -1139,7 +1139,7 @@ fn goose_native_export_remote_intake_retains_evidence_on_order_conflict() {
     let mut cursor = Some(snapshot.handle().cursor);
     let mut records = Vec::new();
     while let Some(value) = cursor {
-        let page = snapshot.page(&value, 1_000).unwrap();
+        let page = snapshot.page(&value, 1).unwrap();
         cursor = page.next_cursor;
         records.extend(page.records);
     }
@@ -1201,9 +1201,7 @@ fn goose_native_export_remote_intake_retains_evidence_on_order_conflict() {
         .session(&reference, SessionQuery::default())
         .unwrap()
         .unwrap();
-    // Shared source intake currently stores an identity set rather than a
-    // durable native ordinal: https://github.com/AgentWorkforce/relayhistory/issues/532.
-    // Verify every imported message while leaving native order to local reads.
+    // Exact conversation order must survive transport, not just the event set.
     let mut imported_blocks: Vec<_> = remote
         .messages
         .iter()
@@ -1258,10 +1256,10 @@ fn goose_native_export_remote_intake_retains_evidence_on_order_conflict() {
     receiver
         .discover(DiscoveryOptions::default().sources([Source::Goose]))
         .unwrap();
-    let failure = receiver
+    assert_eq!(remote.messages, original.messages);
+    receiver
         .hydrate(&reference, HydrateOptions::default())
-        .unwrap_err();
-    assert!(format!("{failure:#}").contains("FILE_HISTORY_SHARED_ORDER_CONFLICT"));
+        .unwrap();
     let retained = receiver
         .session(&reference, SessionQuery::default())
         .unwrap()

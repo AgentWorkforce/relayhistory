@@ -45,3 +45,5 @@ fn escaped_parent_cannot_prove_metadata_deletion() {
     )
     .is_err());
 }
+
+mod prompt_identity;
