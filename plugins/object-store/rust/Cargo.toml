@@ -38,10 +38,10 @@ fancy-regex = { version = "0.20", optional = true }
 regex = { version = "1", optional = true }
 sha2 = "0.10"
 thiserror = "2"
-tokio = { version = "1", features = ["rt", "sync", "fs", "time"] }
+tokio = { version = "1", features = ["rt", "sync", "time"] }
 tracing = "0.1"
 url = "2"
-zstd = { version = "0.13", default-features = false }
+zstd = { version = "0.13.4", default-features = false }
 
 [dev-dependencies]
 criterion = { version = "0.8", default-features = false }
@@ -50,10 +50,8 @@ reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"
 tempfile = "3"
 base64 = "0.22"
 hmac = "0.12"
-sha2 = "0.10"
-chrono = { version = "0.4", default-features = false, features = ["clock"] }
 httpdate = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "fs"] }
 
 [[test]]
 name = "conformance"
