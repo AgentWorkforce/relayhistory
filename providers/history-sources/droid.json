@@ -69,7 +69,7 @@
     },
     {
       "evidence": "Lifecycle",
-      "coverage": "Passive bounded head/tail discovery, selected hydration, full and scoped watch sweeps, resumed appends, deferred partial final records, full rewrites and sidecar-only updates; per-file read failures preserve the previous snapshot without blocking healthy sessions. Full transcript snapshots are limited to 128 MiB and settings to 1 MiB, with diagnostics and no retirement on failure. No agent launch or network request during acquisition."
+      "coverage": "Passive bounded head/tail discovery, selected hydration, full and scoped watch sweeps, resumed appends, deferred partial final records, full rewrites and sidecar-only updates; per-file read failures preserve the previous snapshot without blocking healthy sessions. Full transcript snapshots are limited to 128 MiB and settings to 1 MiB, with diagnostics and no retirement on failure. Synthetic Factory API fixtures cover oversized canonical body projection, stable native IDs and delivery of later turns. No agent launch or network request during acquisition."
     }
   ],
   "population": {

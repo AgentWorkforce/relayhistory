@@ -157,6 +157,35 @@ function boundedMarker(value: unknown): unknown {
   }
   return value;
 }
+// Reserve space for host origin, revision and delivery framing below the
+// 1,400,000-byte wire-record limit. Raw capture and logical keys are not sent.
+const CANONICAL_BODY_BYTES = 1_048_576;
+const encoder = new TextEncoder();
+async function boundCanonicalBody(row: FactoryCanonicalRecord): Promise<void> {
+  const { kind, source, session_id, record_id, payload } = row;
+  const body = JSON.stringify({ kind, source, session_id, record_id, payload });
+  if (encoder.encode(body).length <= CANONICAL_BODY_BYTES) return;
+
+  // The mapper has a fixed number of scalar columns. Only variable provider
+  // fields can exceed this threshold; native identities are validated earlier.
+  for (const [field, value] of Object.entries(payload)) {
+    if (typeof value !== 'string' || encoder.encode(JSON.stringify(value)).length <= 16_384) continue;
+    if (field === 'text' || field === 'args_json' || field === 'payload_json') {
+      const bytes = encoder.encode(value);
+      const omitted = { factory_omitted_bytes: bytes.length, sha256: await factoryRawHash(bytes) };
+      if (field === 'text' && payload.kind === 'tool_use') {
+        const { type, id, name } = JSON.parse(value);
+        payload.text = stableJson({ type, id, name, input: omitted });
+      } else {
+        payload[field] = stableJson(omitted);
+      }
+    } else {
+      // Optional parent, turn, model, provider and target columns accept null.
+      // A fabricated replacement identifier would incorrectly link records.
+      payload[field] = null;
+    }
+  }
+}
 /** Per-block API projection with the SAME native message/ordinal keys as local
  * Droid v2 acquisition. API-specific raw fields stay in non-activity markers.
  * A complete snapshot must be acquired before calling this function. */
@@ -213,6 +242,7 @@ export async function factoryCanonicalEvidence(session: string, messages: unknow
     const call = calls.get(result.id);
     if (call) call.payload.is_error = result.error ? 1 : 0;
   }
+  for (const row of out) await boundCanonicalBody(row);
   return out;
 }
 async function canonicalToolResult(block: FactoryMessage): Promise<Record<string, unknown>> {
