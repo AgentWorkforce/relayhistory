@@ -18,7 +18,10 @@ fn store(dir: &Path) -> (SessionStore, Connection, PathBuf) {
 }
 
 fn now() -> i64 {
-    chrono::Utc::now().timestamp_millis()
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system clock after UNIX epoch")
+        .as_millis() as i64
 }
 
 fn all_sessions(kinds: &[&str]) -> ExportSelection {

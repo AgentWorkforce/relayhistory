@@ -396,7 +396,7 @@ fn native_same_millisecond_reorder_keeps_entry_ids_and_tool_state() {
         .unwrap();
     let bucket = || {
         let conn = rusqlite::Connection::open(home.path().join("vibe.db")).unwrap();
-        let rows = conn.prepare("SELECT event_uid FROM session_events WHERE source='mistral-vibe' AND session_id=?1 AND ts_ms=1792609201000 ORDER BY id")
+        let rows = conn.prepare("SELECT event_uid FROM session_events WHERE source='mistral-vibe' AND session_id=?1 AND ts_ms=1792609201000 ORDER BY COALESCE(source_order,id),id")
             .unwrap().query_map([SID], |row| row.get::<_, String>(0)).unwrap()
             .collect::<rusqlite::Result<Vec<_>>>().unwrap();
         rows
@@ -572,7 +572,7 @@ fn native_deletion_preserves_remote_catalog_after_locator_changes() {
 
 #[cfg(feature = "export")]
 #[test]
-fn native_export_remote_intake_preserves_evidence_on_local_order_conflict() {
+fn native_export_remote_intake_preserves_native_order() {
     use ai_hist::export::{ExportLimits, ExportSelection, ExportSnapshot};
     use ai_hist::{
         EvidenceKind, EvidenceRecord, NormalizedSourceEvidence, ObservationKey,
@@ -610,7 +610,7 @@ fn native_export_remote_intake_preserves_evidence_on_local_order_conflict() {
     let mut cursor = Some(snapshot.handle().cursor);
     let mut records = Vec::new();
     while let Some(value) = cursor {
-        let page = snapshot.page(&value, 1_000).unwrap();
+        let page = snapshot.page(&value, 1).unwrap();
         cursor = page.next_cursor;
         for record in page.records {
             let mut payload = record.payload.as_object().unwrap().clone();
@@ -683,19 +683,14 @@ fn native_export_remote_intake_preserves_evidence_on_local_order_conflict() {
     store
         .discover(DiscoveryOptions::default().sources([Source::MistralVibe]))
         .unwrap();
-    // Shared transport does not yet persist native same-ms order (#532).
-    // A remote-first import must keep its complete accepted snapshot rather
-    // than silently replace it with a reordered local projection.
+    assert_eq!(remote.messages, evidence(&source).messages);
     for _ in 0..2 {
-        let error = store
+        store
             .hydrate(
                 &SessionRef::id(Source::MistralVibe, SID),
                 HydrateOptions::default(),
             )
-            .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("FILE_HISTORY_SHARED_ORDER_CONFLICT"));
+            .unwrap();
         let after = evidence(&store);
         assert_eq!(after.messages, remote.messages);
         assert_eq!(after.tool_calls, remote.tool_calls);

@@ -180,6 +180,9 @@ impl<'a> Writer<'a> {
         self.inserted += insert_history(
             self.conn,
             &HistoryEntry {
+                // Keep this adapter's legacy history keys until a provider migration
+                // supersedes anonymous rows without duplicating remote-owned evidence.
+                event_uid: None,
                 id: 0,
                 source: ID.into(),
                 session_id: Some(self.sid.into()),

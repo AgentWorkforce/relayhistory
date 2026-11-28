@@ -28,6 +28,12 @@ pub(super) fn run(
             ..Default::default()
         });
     };
+    let Some(_claude_write) = capture_guard(&conn)? else {
+        return Ok(RetentionReport {
+            busy: true,
+            ..Default::default()
+        });
+    };
     let tx = match conn.transaction_with_behavior(TransactionBehavior::Immediate) {
         Ok(tx) => tx,
         Err(error) if busy(&error) => {
@@ -38,18 +44,8 @@ pub(super) fn run(
         }
         Err(error) => return Err(Error::sql(error)),
     };
-    // Settings/cursor can change while planning. Start over instead of applying
-    // an obsolete (possibly shorter) policy or skipping another worker's batch.
-    if super::policy(&tx).map_err(Error::query)?.days != Some(plan.days)
-        || targets::cursor(&tx).map_err(Error::query)? != after
-    {
-        return Ok(RetentionReport::default());
-    }
-    if cooling_down(&tx, opts, now).map_err(Error::query)? {
-        return Ok(RetentionReport {
-            deferred: true,
-            ..Default::default()
-        });
+    if let Some(report) = recheck_plan(&tx, &plan, &after, opts, now)? {
+        return Ok(report);
     }
     let head = crate::change_feed::read_head(&tx).map_err(Error::query)?;
     let mut affected = super::changes::Affected::new();
@@ -62,6 +58,39 @@ pub(super) fn run(
     record_batch_time(&tx, &report, now).map_err(Error::query)?;
     tx.commit().map_err(Error::sql)?;
     Ok(report)
+}
+
+fn recheck_plan(
+    conn: &Connection,
+    plan: &Plan,
+    after: &targets::Key,
+    opts: &RetentionOptions,
+    now: i64,
+) -> Result<Option<RetentionReport>, Error> {
+    // Settings/cursor can change while planning. Start over instead of applying
+    // an obsolete policy or skipping another worker's batch.
+    if super::policy(conn).map_err(Error::query)?.days != Some(plan.days)
+        || targets::cursor(conn).map_err(Error::query)? != *after
+    {
+        return Ok(Some(RetentionReport::default()));
+    }
+    if cooling_down(conn, opts, now).map_err(Error::query)? {
+        return Ok(Some(RetentionReport {
+            deferred: true,
+            ..Default::default()
+        }));
+    }
+    Ok(None)
+}
+
+fn capture_guard(
+    conn: &Connection,
+) -> Result<Option<crate::ingest::claude_write_fence::Guard>, Error> {
+    match crate::ingest::claude_write_fence::acquire(conn, "claude") {
+        Ok(guard) => Ok(Some(guard)),
+        Err(error) if error.downcast_ref::<rusqlite::Error>().is_some_and(busy) => Ok(None),
+        Err(error) => Err(Error::query(error)),
+    }
 }
 
 fn record_batch_time(conn: &Connection, report: &RetentionReport, now: i64) -> anyhow::Result<()> {

@@ -39,6 +39,20 @@
 //! and it resets exactly when Cursor rewrites the file — which is also when the
 //! byte cursor resets.
 
+/// Only an EOF read can certify native order; successful prefixes still keep
+/// their payload writes, while discarding any complete-read certification.
+pub(super) fn finish_native_order(
+    order: super::native_order::Capture<'_>,
+    text: &str,
+    index_through: u64,
+) -> anyhow::Result<()> {
+    if text.len() as u64 <= index_through && (text.is_empty() || text.ends_with('\n')) {
+        order.finish()
+    } else {
+        order.discard()
+    }
+}
+
 use std::path::Path;
 
 use serde_json::Value;
@@ -696,9 +710,76 @@ pub(crate) fn record_blocks(obj: &serde_json::Map<String, Value>) -> Vec<Value> 
     content.as_array().cloned().unwrap_or_default()
 }
 
+impl super::CursorTranscriptOutcome {
+    pub(super) fn observe_activity(&mut self, emitted: bool, guessed: bool, ts_ms: i64) {
+        if emitted && !guessed {
+            self.first_ts_ms = Some(self.first_ts_ms.map_or(ts_ms, |first| first.min(ts_ms)));
+            self.last_ts_ms = Some(self.last_ts_ms.map_or(ts_ms, |last| last.max(ts_ms)));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_partial_reads_do_not_certify_legacy_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bounded.jsonl");
+        let first = "{\"role\":\"user\",\"timestamp\":100,\"message\":{\"content\":\"first\"}}\n";
+        let text = format!("{first}{{\"role\":\"user\",\"timestamp\":100,\"message\":{{\"content\":\"second\"}}}}\n");
+        std::fs::write(&path, &text).unwrap();
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::init_db(&conn).unwrap();
+        let read = |limit| {
+            crate::ingest::ingest_cursor_transcript(&conn, &path, "bounded", None, 100, 0, limit)
+                .unwrap()
+        };
+        read(u64::MAX);
+        let original = crate::session_events(&conn, "bounded", Some("cursor")).unwrap();
+        for (contents, boundary) in [
+            (text.clone(), first.len() as u64),
+            (format!("{text}{{\"role\":\"user\""), u64::MAX),
+        ] {
+            conn.execute("UPDATE session_events SET source_order=NULL", [])
+                .unwrap();
+            conn.execute("DELETE FROM history WHERE prompt='first'", [])
+                .unwrap();
+            std::fs::write(&path, contents).unwrap();
+            assert!(read(boundary).records > 0);
+            let rows = crate::session_events(&conn, "bounded", Some("cursor")).unwrap();
+            assert!(
+                rows.iter().all(|event| event.source_order.is_none()),
+                "a prefix or incomplete tail cannot establish complete native order"
+            );
+            assert_eq!(
+                rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+                original.iter().map(|row| row.id).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                conn.query_row("SELECT COUNT(*) FROM history", [], |row| row
+                    .get::<_, i64>(0))
+                    .unwrap(),
+                2,
+                "successful partial payload writes remain committed"
+            );
+        }
+        std::fs::write(&path, &text).unwrap();
+        read(text.len() as u64);
+        let complete = crate::session_events(&conn, "bounded", Some("cursor")).unwrap();
+        assert_eq!(
+            complete
+                .iter()
+                .map(|row| row.source_order)
+                .collect::<Vec<_>>(),
+            [Some(0), Some(1)]
+        );
+        assert_eq!(
+            complete.iter().map(|row| row.id).collect::<Vec<_>>(),
+            original.iter().map(|row| row.id).collect::<Vec<_>>()
+        );
+    }
 
     /// The editor's versioned tool names classify and target like the
     /// transcript's.

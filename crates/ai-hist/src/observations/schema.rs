@@ -8,6 +8,8 @@ pub(crate) fn schema_is_current(conn: &Connection) -> Result<bool> {
         "observation_discovery_skips",
         "observation_evidence",
         "canonical_evidence_protection",
+        "local_retirement_support",
+        "delete_local_retirement_support",
         "delete_canonical_evidence_protection",
         "idx_observation_locator",
         "delete_session_observations",
@@ -29,6 +31,7 @@ pub(crate) fn schema_is_current(conn: &Connection) -> Result<bool> {
         ("observation_discovery_skips", "source,location,connector_id,connector_instance,locator,stamp,updated_ms"),
         ("observation_evidence", "source,session_id,location,connector_id,connector_instance,evidence_uid,payload_json"),
         ("canonical_evidence_protection", "source,session_id,record_identity"),
+        ("local_retirement_support", "source,session_id,record_identity"),
     ] {
         let columns=conn.prepare(&format!("PRAGMA table_info({table})"))?.query_map([], |row| row.get::<_,String>(1))?.collect::<rusqlite::Result<Vec<_>>>()?;
         if required.split(',').any(|column| !columns.iter().any(|present|present==column)) { return Ok(false); }
@@ -71,6 +74,13 @@ CREATE TABLE IF NOT EXISTS observation_discovery_skips (
  source TEXT NOT NULL,location TEXT NOT NULL,connector_id TEXT NOT NULL,connector_instance TEXT NOT NULL,locator TEXT NOT NULL,stamp TEXT NOT NULL,updated_ms INTEGER NOT NULL,
  PRIMARY KEY(source,location,connector_id,connector_instance,locator)
 );
+CREATE TABLE IF NOT EXISTS local_retirement_support (
+ source TEXT NOT NULL, session_id TEXT NOT NULL, record_identity TEXT NOT NULL,
+ PRIMARY KEY(source,session_id,record_identity)
+);
+CREATE TRIGGER IF NOT EXISTS delete_local_retirement_support AFTER DELETE ON sessions BEGIN
+ DELETE FROM local_retirement_support WHERE source=OLD.source AND session_id=OLD.session_id;
+END;
 CREATE TABLE IF NOT EXISTS canonical_evidence_protection (
  source TEXT NOT NULL, session_id TEXT NOT NULL, record_identity TEXT NOT NULL,
  PRIMARY KEY(source,session_id,record_identity)

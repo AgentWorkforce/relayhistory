@@ -302,3 +302,23 @@ fn materialized_unused_bytes(row: &ShallowSession) -> usize {
             .map(String::len)
             .sum::<usize>()
 }
+
+#[test]
+fn sdk_discovery_refresh_failure_stays_quiet_and_restores_cli_diagnostics() {
+    // An unmigrated connection forces the real identity-maintenance error path.
+    let conn = Connection::open_in_memory().unwrap();
+    STDERR_LINES.with(|lines| lines.borrow_mut().clear());
+    crate::session_store::controlled(None, None, || {
+        IdentityRefresh::ExactPaths.refresh(&conn);
+        Ok(())
+    })
+    .unwrap();
+    STDERR_LINES.with(|lines| assert!(lines.borrow().is_empty()));
+    let _progress = crate::ingest::output::Scope::enter(false);
+    IdentityRefresh::ExactPaths.refresh(&conn);
+    STDERR_LINES.with(|lines| {
+        let lines = std::mem::take(&mut *lines.borrow_mut());
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].contains("could not refresh canonical project identity"));
+    });
+}

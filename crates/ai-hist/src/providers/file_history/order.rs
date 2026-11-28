@@ -1,29 +1,29 @@
-//! Opt-in repair for a complete provider replay whose new events precede
-//! retained rows at the same recorded millisecond. Public reads order by
-//! (timestamp, database id); a native ordinal must not be faked as a timestamp.
-use anyhow::Result;
+//! In-place repair of order observed by a complete native source replay.
+use anyhow::{ensure, Context, Result};
 use rusqlite::Connection;
 use std::collections::{BTreeMap, BTreeSet};
 
-/// Call after normalization and retirement inside the caller's transaction.
-/// `desired` contains every emitted event in native order. Retire only buckets
-/// whose retained insertion order disagrees; the caller must replay those
-/// buckets through its existing event writer before committing: replay ALL
-/// desired rows at the returned timestamps, including retained later messages. Remote shares
-/// cannot be reordered by a local parser, so reject the whole transaction.
-/// Unchanged or append-only buckets keep their ids and revisions.
+struct Observed {
+    uid: String,
+    rank: Option<i64>,
+    shared: bool,
+}
+
+/// Preserve known remotely backed ranks, learn previously unknown ranks, and
+/// repair local order in place. Every bucket is planned before any row changes.
+/// The empty return retains the adapters' no-retirement replay interface.
 pub(crate) fn reconcile_event_order(
     conn: &Connection,
     source: &str,
     sid: &str,
     desired: &[(i64, String)],
 ) -> Result<BTreeSet<i64>> {
-    anyhow::ensure!(
+    ensure!(
         !conn.is_autocommit(),
         "FILE_HISTORY_ORDER_TRANSACTION_REQUIRED"
     );
     let unique: BTreeSet<_> = desired.iter().map(|(_, uid)| uid.as_str()).collect();
-    anyhow::ensure!(
+    ensure!(
         unique.len() == desired.len(),
         "FILE_HISTORY_DUPLICATE_ORDER_UID: desired event identities must be unique"
     );
@@ -31,51 +31,95 @@ pub(crate) fn reconcile_event_order(
     for (ts, uid) in desired {
         expected.entry(*ts).or_default().push(uid);
     }
-    let membership: BTreeSet<_> = desired
-        .iter()
-        .map(|(ts, uid)| (*ts, uid.as_str()))
-        .collect();
-    let mut observed = BTreeMap::<i64, Vec<String>>::new();
-    let mut statement = conn.prepare(
-        "SELECT ts_ms,event_uid FROM session_events WHERE source=?1 AND session_id=?2 ORDER BY ts_ms,id",
-    )?;
-    let rows = statement.query_map([source, sid], |r| {
-        Ok((r.get::<_, i64>(0)?, r.get::<_, String>(1)?))
-    })?;
-    for row in rows {
-        let (ts, uid) = row?;
-        if membership.contains(&(ts, uid.as_str())) {
-            observed.entry(ts).or_default().push(uid);
+    let observed = observed(conn, source, sid)?;
+    let mut assignments = Vec::new();
+    for (ts, wanted) in expected {
+        let existing = observed.get(&ts).map(Vec::as_slice).unwrap_or_default();
+        for (uid, rank) in plan_bucket(&wanted, existing)? {
+            assignments.push((ts, uid, rank));
         }
     }
-    let affected: BTreeSet<_> = expected
-        .into_iter()
-        .filter_map(|(ts, wanted)| {
-            let existing = observed.get(&ts).map(Vec::as_slice).unwrap_or_default();
-            (!wanted
-                .iter()
-                .copied()
-                .eq(existing.iter().map(String::as_str)))
-            .then_some(ts)
-        })
-        .collect();
-    if affected.is_empty() {
-        return Ok(affected);
+    for (ts, uid, rank) in assignments {
+        conn.execute("UPDATE session_events SET source_order=?1 WHERE source=?2 AND session_id=?3 AND event_uid=?4 AND ts_ms=?5 AND source_order IS NOT ?1",
+            rusqlite::params![rank,source,sid,uid,ts])?;
     }
-    let times = serde_json::to_string(&affected)?;
-    let shared: bool = conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM session_events WHERE source=?1 AND session_id=?2 AND ts_ms IN (SELECT value FROM json_each(?3)) AND location IS NOT 'local')",
-        rusqlite::params![source,sid,times], |r| r.get(0),
-    )?;
-    anyhow::ensure!(!shared,"FILE_HISTORY_SHARED_ORDER_CONFLICT: native event order changed in a timestamp bucket backed by remote evidence; prior snapshot retained, retry after ownership is reconciled");
-    crate::store::retire_evidence_share(
-        conn,
-        "session_events",
-        "source=?1 AND session_id=?2 AND ts_ms IN (SELECT value FROM json_each(?3))",
-        &[&source, &sid, &times],
-        crate::SessionLocation::Local,
-    )?;
-    Ok(affected)
+    Ok(BTreeSet::new())
+}
+
+fn observed(conn: &Connection, source: &str, sid: &str) -> Result<BTreeMap<i64, Vec<Observed>>> {
+    let mut buckets = BTreeMap::<i64, Vec<Observed>>::new();
+    let mut statement = conn.prepare("SELECT ts_ms,event_uid,source_order,location FROM session_events WHERE source=?1 AND session_id=?2 ORDER BY ts_ms,COALESCE(source_order,id),id")?;
+    let rows = statement.query_map([source, sid], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            Observed {
+                uid: row.get(1)?,
+                rank: row.get(2)?,
+                shared: row.get::<_, String>(3)? != "local",
+            },
+        ))
+    })?;
+    for row in rows {
+        let (ts, event) = row?;
+        buckets.entry(ts).or_default().push(event);
+    }
+    Ok(buckets)
+}
+
+fn plan_bucket(wanted: &[&str], existing: &[Observed]) -> Result<Vec<(String, i64)>> {
+    let members: BTreeSet<_> = wanted.iter().copied().collect();
+    let same = wanted.iter().copied().eq(existing
+        .iter()
+        .filter(|event| members.contains(event.uid.as_str()))
+        .map(|event| event.uid.as_str()));
+    let by_uid: BTreeMap<_, _> = existing
+        .iter()
+        .map(|event| (event.uid.as_str(), event))
+        .collect();
+    ensure!(wanted.iter().all(|uid| by_uid.contains_key(uid)), "FILE_HISTORY_ORDER_OBSERVATION_CHANGED: an observed event disappeared or changed timestamp during the complete read");
+    // An already compatible local rank remains stable too. A changed native
+    // sequence may renumber local rows, but never a known remote anchor.
+    // Every unobserved survivor also keeps its rank, regardless of ownership.
+    let fixed: BTreeMap<_, _> = existing
+        .iter()
+        .filter(|event| event.shared || same || !members.contains(event.uid.as_str()))
+        .filter_map(|event| event.rank.map(|rank| (event.uid.as_str(), rank)))
+        .collect();
+    let reserved = reserved_ranks(existing, &fixed)?;
+    let mut next = Some(0_i64);
+    let mut planned = Vec::new();
+    for &uid in wanted {
+        let mut available = next.context("FILE_HISTORY_SOURCE_ORDER_OVERFLOW")?;
+        let rank = if let Some(&rank) = fixed.get(uid) {
+            ensure!(rank>=available,"FILE_HISTORY_SHARED_ORDER_CONFLICT: native order contradicts an existing source rank");
+            rank
+        } else {
+            while reserved.contains(&available) {
+                available = available
+                    .checked_add(1)
+                    .context("FILE_HISTORY_SOURCE_ORDER_OVERFLOW")?;
+            }
+            available
+        };
+        next = rank.checked_add(1);
+        if by_uid
+            .get(uid)
+            .is_some_and(|event| event.rank != Some(rank))
+        {
+            planned.push((uid.into(), rank));
+        }
+    }
+    Ok(planned)
+}
+
+fn reserved_ranks(existing: &[Observed], fixed: &BTreeMap<&str, i64>) -> Result<BTreeSet<i64>> {
+    let mut owners = BTreeMap::new();
+    for event in existing {
+        if let Some(&rank) = fixed.get(event.uid.as_str()) {
+            ensure!(owners.insert(rank,event.uid.as_str()).is_none(),"FILE_HISTORY_SHARED_ORDER_CONFLICT: different retained events share one fixed rank");
+        }
+    }
+    Ok(owners.into_keys().collect())
 }
 
 #[cfg(test)]
@@ -93,7 +137,7 @@ mod tests {
             .unwrap()
     }
     #[test]
-    fn changed_native_bucket_replays_without_touching_other_evidence_or_stable_repeats() {
+    fn changed_native_bucket_updates_ranks_without_touching_row_ids_or_stable_repeats() {
         let home = tempfile::tempdir().unwrap();
         let conn = crate::open_db(&home.path().join("history.db")).unwrap();
         let tx = conn.unchecked_transaction().unwrap();
@@ -115,15 +159,15 @@ mod tests {
             (1, "later".into()),
             (2, "next".into()),
         ];
-        assert_eq!(
-            reconcile_event_order(&tx, "test-fixture", "s", &desired).unwrap(),
-            BTreeSet::from([1])
-        );
-        assert_eq!(uids(&tx), ["other-session", "other-source", "next"]);
+        let row_ids = uids(&tx);
+        assert!(reconcile_event_order(&tx, "test-fixture", "s", &desired)
+            .unwrap()
+            .is_empty());
+        assert_eq!(uids(&tx), row_ids);
+        let ordered: Vec<String> = tx.prepare("SELECT event_uid FROM session_events WHERE source='test-fixture' AND session_id='s' ORDER BY ts_ms,COALESCE(source_order,id),id").unwrap()
+            .query_map([], |row| row.get(0)).unwrap().collect::<rusqlite::Result<_>>().unwrap();
+        assert_eq!(ordered, ["prefix", "call", "later", "next"]);
         assert_eq!(unaffected(&tx), untouched);
-        for uid in ["prefix", "call", "later"] {
-            event(&tx, "test-fixture", "s", 1, uid, "local");
-        }
         let before = uids(&tx);
         let changes = tx.total_changes();
         let revision = crate::change_feed::read_head(&tx).unwrap();
@@ -149,6 +193,11 @@ mod tests {
                     if ts == 2 { ownership } else { "local" },
                 );
             }
+            conn.execute(
+                "UPDATE session_events SET source_order=0 WHERE event_uid='old2'",
+                [],
+            )
+            .unwrap();
             let original = uids(&conn);
             let original_revision = crate::change_feed::read_head(&conn).unwrap();
             {
@@ -191,7 +240,13 @@ mod tests {
         assert!(reconcile_event_order(&tx, "test-fixture", "s", &desired)
             .unwrap()
             .is_empty());
-        assert_eq!(tx.total_changes(), changes);
+        assert!(
+            tx.total_changes() > changes,
+            "a complete read learns unknown order"
+        );
+        let learned = tx.total_changes();
+        reconcile_event_order(&tx, "test-fixture", "s", &desired).unwrap();
+        assert_eq!(tx.total_changes(), learned);
     }
     #[test]
     fn duplicate_native_identity_rejects_before_any_retirement() {
@@ -215,5 +270,146 @@ mod tests {
             assert_eq!(uids(&tx), before);
             assert_eq!(tx.total_changes(), changes);
         }
+    }
+    #[test]
+    fn remote_unknown_ranks_are_learned_around_fixed_known_anchors() {
+        let home = tempfile::tempdir().unwrap();
+        let conn = crate::open_db(&home.path().join("history.db")).unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        event(&tx, "test-fixture", "s", 1, "anchor", "remote");
+        tx.execute(
+            "UPDATE session_events SET source_order=7 WHERE event_uid='anchor'",
+            [],
+        )
+        .unwrap();
+        event(&tx, "test-fixture", "s", 1, "append", "both");
+        let desired = vec![(1, "anchor".into()), (1, "append".into())];
+        reconcile_event_order(&tx, "test-fixture", "s", &desired).unwrap();
+        let ranks: Vec<i64> = tx
+            .prepare("SELECT source_order FROM session_events ORDER BY source_order")
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(ranks, [7, 8]);
+        let changes = tx.total_changes();
+        reconcile_event_order(&tx, "test-fixture", "s", &desired).unwrap();
+        assert_eq!(tx.total_changes(), changes);
+        assert!(reconcile_event_order(
+            &tx,
+            "test-fixture",
+            "s",
+            &[(1, "append".into()), (1, "anchor".into())]
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("SHARED_ORDER_CONFLICT"));
+    }
+
+    #[test]
+    fn retained_remote_survivor_rank_is_never_given_to_another_event() {
+        let home = tempfile::tempdir().unwrap();
+        let conn = crate::open_db(&home.path().join("history.db")).unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        event(&tx, "test-fixture", "s", 1, "survivor", "remote");
+        tx.execute(
+            "UPDATE session_events SET source_order=0 WHERE event_uid='survivor'",
+            [],
+        )
+        .unwrap();
+        event(&tx, "test-fixture", "s", 1, "native", "local");
+        reconcile_event_order(&tx, "test-fixture", "s", &[(1, "native".into())]).unwrap();
+        let ranks: Vec<(String, i64)> = tx
+            .prepare("SELECT event_uid,source_order FROM session_events ORDER BY source_order")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(ranks, vec![("survivor".into(), 0), ("native".into(), 1)]);
+    }
+
+    #[test]
+    fn stale_desired_timestamp_rejects_before_changing_any_rank() {
+        let home = tempfile::tempdir().unwrap();
+        let conn = crate::open_db(&home.path().join("history.db")).unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        event(&tx, "test-fixture", "s", 1, "first", "local");
+        event(&tx, "test-fixture", "s", 2, "moved", "local");
+        let changes = tx.total_changes();
+        assert!(reconcile_event_order(
+            &tx,
+            "test-fixture",
+            "s",
+            &[(1, "first".into()), (1, "moved".into())]
+        )
+        .unwrap_err()
+        .to_string()
+        .contains("OBSERVATION_CHANGED"));
+        assert_eq!(tx.total_changes(), changes);
+    }
+
+    #[test]
+    fn maximum_known_rank_remains_a_stable_no_op() {
+        let home = tempfile::tempdir().unwrap();
+        let conn = crate::open_db(&home.path().join("history.db")).unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        event(&tx, "test-fixture", "s", 1, "maximum", "remote");
+        tx.execute(
+            "UPDATE session_events SET source_order=?1 WHERE event_uid='maximum'",
+            [i64::MAX],
+        )
+        .unwrap();
+        let changes = tx.total_changes();
+        reconcile_event_order(&tx, "test-fixture", "s", &[(1, "maximum".into())]).unwrap();
+        assert_eq!(tx.total_changes(), changes);
+    }
+    #[test]
+    fn retained_local_survivor_rank_is_reserved_when_native_order_changes() {
+        let home = tempfile::tempdir().unwrap();
+        let conn = crate::open_db(&home.path().join("history.db")).unwrap();
+        let tx = conn.unchecked_transaction().unwrap();
+        for uid in ["a", "c", "b"] {
+            event(&tx, "test-fixture", "s", 1, uid, "local");
+        }
+        let original = vec![(1, "a".into()), (1, "c".into()), (1, "b".into())];
+        reconcile_event_order(&tx, "test-fixture", "s", &original).unwrap();
+        let survivor = || {
+            tx.query_row(
+                "SELECT id,source_order,revision FROM session_events WHERE event_uid='c'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .unwrap()
+        };
+        let preserved = survivor();
+        let wanted = vec![(1, "b".into()), (1, "a".into())];
+        reconcile_event_order(&tx, "test-fixture", "s", &wanted).unwrap();
+        assert_eq!(survivor(), preserved);
+        let ranked: Vec<(String, i64)> = tx
+            .prepare("SELECT event_uid,source_order FROM session_events ORDER BY source_order")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            ranked,
+            vec![("b".into(), 0), ("c".into(), 1), ("a".into(), 2)]
+        );
+        let changes = tx.total_changes();
+        reconcile_event_order(&tx, "test-fixture", "s", &wanted).unwrap();
+        assert_eq!(
+            tx.total_changes(),
+            changes,
+            "repeated source order is stable"
+        );
     }
 }

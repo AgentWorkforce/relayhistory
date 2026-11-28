@@ -30,7 +30,11 @@ use rusqlite::Connection;
 /// commits and reopens every [`super::JSONL_CHUNK_LINES`] records, so a very
 /// large transcript holds the lock for one chunk at a time, not for its whole
 /// read. A chunk committed ahead of the transcript's cursor is what autocommit
-/// did for every statement; the re-read that follows upserts over it.
+/// did for every statement; the re-read that follows upserts over it. Claude
+/// full reads with legacy unknown/sparse order or remotely backed events retain
+/// whole-read staging for conflict rollback, as do in-memory stores. Ordinary
+/// local reads keep these boundaries under a source mutation fence; other
+/// Claude writers retry after the pass.
 ///
 /// New `session_events` rows are copied into `session_events_fts` once, in the
 /// statement before each commit, instead of by the per-row insert trigger.
@@ -62,6 +66,7 @@ impl<'c> SweepWrite<'c> {
                         let _ = conn.execute_batch("ROLLBACK");
                     }
                     // The rollback released the writer lock this begin took.
+                    super::claude_write_fence::invalidate(conn);
                     super::evidence_probe::release(conn);
                 }
                 return Err(error);
@@ -116,6 +121,7 @@ impl<'c> SweepWrite<'c> {
                 let _ = self.conn.execute_batch("ROLLBACK");
             }
             // The rollback undoes writes this snapshot may have observed.
+            super::claude_write_fence::invalidate(self.conn);
             super::evidence_probe::release(self.conn);
             return Err(error);
         }
@@ -157,11 +163,13 @@ impl Drop for SweepWrite<'_> {
         // rolled back on its own.
         if self.owned && !self.conn.is_autocommit() {
             let _ = self.conn.execute_batch("ROLLBACK");
+            super::claude_write_fence::invalidate(self.conn);
             super::evidence_probe::release(self.conn);
             return;
         }
         if self.owned {
             // The transaction ended without this guard committing it.
+            super::claude_write_fence::invalidate(self.conn);
             super::evidence_probe::release(self.conn);
         }
         // The caller owns the transaction and may still commit it. Index

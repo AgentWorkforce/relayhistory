@@ -195,7 +195,9 @@ test('local discovery, hydration and cached evidence survive malformed commercia
         groupTruncated: _groupTruncated, isPrimary: _isPrimary,
         origin: _origin, controlKind: _controlKind, eventUid: _eventUid,
         eventRef: _eventRef, ...entry
-      }) => entry),
+        // The history row's own identity: a legacy prompt log has none, even
+        // though its search match borrows its mirrored event's uid.
+      }) => ({ ...entry, eventUid: null })),
     );
     assert.equal((await stats({ dbPath, scope: 'local' })).total, 1);
   });

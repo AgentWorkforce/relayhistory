@@ -8,7 +8,6 @@ use rusqlite::Connection;
 use serde_json::{Map, Value};
 
 // `sync_note!` names the parent's quiet flag.
-use crate::ingest::{AtomicOrdering, SYNC_QUIET};
 
 use super::{composers, locator, read_composer, state_db_path, Composer, EDITOR_STATE_KEY};
 

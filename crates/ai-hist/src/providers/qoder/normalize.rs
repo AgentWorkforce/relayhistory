@@ -240,6 +240,7 @@ fn message(
     insert_history(
         conn,
         &HistoryEntry {
+            event_uid: None,
             id: 0,
             source: ID.into(),
             session_id: Some(sid.into()),

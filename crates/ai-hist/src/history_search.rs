@@ -12,10 +12,10 @@ use crate::{raw_fts_query_error, HistoryCursor, HistoryPage, QueryFilter};
 use crate::SessionScope;
 use anyhow::Result;
 use rusqlite::Connection;
+use walk::{walk, walk_pays, BranchSearch};
 #[cfg(test)]
 use walk::{SORT_EVERY_MATCH, WALK_OUTCOMES};
 use filters::{append_event_search_filters, append_history_search_filters};
-use walk::{walk, walk_pays, BranchSearch};
 
 pub use presentation::{compute_snippet, DEFAULT_SNIPPET_CHARS};
 
@@ -423,21 +423,24 @@ const HISTORY_BRANCH: SearchBranch = SearchBranch {
     // prompt the text alone would pick. Every matching mirror contributes
     // its ids (a JSON array), not just the first, in case a prompt was
     // recorded by more than one event. The trim set inlined below mirrors
-    // `filters::RUST_WHITESPACE` (concat! takes literals only).
+    // `filters::RUST_WHITESPACE` (concat! takes literals only). A native
+    // prompt names its own event: only that event mirrors it, and its UID is
+    // the row's own even when the event has not been read yet.
     columns: concat!(
         "h.id, h.source, h.session_id, h.project, h.prompt, h.timestamp_ms, 'user', 'history', ",
         "(SELECT json_group_array(e.message_id) FROM session_events e WHERE e.source = h.source ",
         "AND e.session_id = h.session_id AND e.ts_ms = h.timestamp_ms ",
-        "AND e.role = 'user' AND e.kind = 'text' AND trim(e.text, ",
+        "AND e.role = 'user' AND e.kind = 'text' AND (h.event_uid IS NULL OR e.event_uid = h.event_uid) AND trim(e.text, ",
         "char(9, 10, 11, 12, 13, 32, 133, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, ",
         "8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288)",
         ") = h.prompt), NULL, ",
+        "CASE WHEN h.event_uid IS NOT NULL THEN json_array(h.event_uid) ELSE ",
         "(SELECT json_group_array(e.event_uid) FROM session_events e WHERE e.source = h.source ",
         "AND e.session_id = h.session_id AND e.ts_ms = h.timestamp_ms ",
-        "AND e.role = 'user' AND e.kind = 'text' AND trim(e.text, ",
+        "AND e.role = 'user' AND e.kind = 'text' AND (h.event_uid IS NULL OR e.event_uid = h.event_uid) AND trim(e.text, ",
         "char(9, 10, 11, 12, 13, 32, 133, 160, 5760, 8192, 8193, 8194, 8195, 8196, 8197, 8198, ",
         "8199, 8200, 8201, 8202, 8232, 8233, 8239, 8287, 12288)",
-        ") = h.prompt), NULL, NULL, NULL"
+        ") = h.prompt) END, NULL, NULL, NULL"
     ),
     after_history_tie: false,
     row: |row| search_row(row, MATCH_SOURCE_HISTORY),
@@ -585,7 +588,6 @@ fn search_branch(
     query_branch_rows(conn, branch, &sql, params_vec, raw_fts)
 }
 
-
 fn query_branch_rows(
     conn: &Connection,
     branch: &SearchBranch,
@@ -618,6 +620,7 @@ mod tests {
             insert_history(
                 &conn,
                 &HistoryEntry {
+                    event_uid: None,
                     id: 0,
                     source: "claude".into(),
                     session_id: Some("s1".into()),
@@ -755,12 +758,49 @@ mod tests {
         );
     }
 
+    #[test]
+    fn native_prompt_only_suppresses_the_user_event_with_its_own_uid() {
+        let conn = fixture();
+        conn.execute(
+            "UPDATE history SET event_uid='native-prompt' WHERE prompt='needle prompt 1'",
+            [],
+        )
+        .unwrap();
+        for uid in ["native-prompt", "different-event"] {
+            conn.execute("INSERT INTO session_events(source,session_id,message_id,ts_ms,role,kind,text,event_uid) VALUES('claude','s1','m',1000,'user','text','needle prompt 1',?1)",[uid]).unwrap();
+        }
+        let rows = search_all(
+            &conn,
+            &["needle prompt 1".into()],
+            false,
+            &filter(100),
+            SearchRole::User,
+        )
+        .unwrap();
+        let matching: Vec<_> = rows
+            .iter()
+            .filter(|row| row.text == "needle prompt 1")
+            .collect();
+        assert_eq!(
+            matching.len(),
+            2,
+            "the history prompt and distinct native event both remain searchable"
+        );
+        let events: Vec<_> = matching
+            .iter()
+            .filter(|row| row.match_source == MATCH_SOURCE_SESSION_EVENT)
+            .map(|row| row.event_uid.as_deref())
+            .collect();
+        assert_eq!(events, [Some("different-event")]);
+    }
+
     fn prompt_and_user_event(prompt_project: &str, event_ts: i64) -> Connection {
         let conn = Connection::open_in_memory().unwrap();
         init_db(&conn).unwrap();
         insert_history(
             &conn,
             &HistoryEntry {
+                event_uid: None,
                 id: 0,
                 source: "claude".into(),
                 session_id: Some("s1".into()),
@@ -817,6 +857,7 @@ mod tests {
         insert_history(
             &conn,
             &HistoryEntry {
+                event_uid: None,
                 id: 0,
                 source: "claude".into(),
                 session_id: Some("s1".into()),
@@ -870,6 +911,7 @@ mod tests {
             insert_history(
                 &conn,
                 &HistoryEntry {
+                    event_uid: None,
                     id: 0,
                     source: "claude".into(),
                     session_id: Some("s1".into()),
@@ -903,6 +945,7 @@ mod tests {
         insert_history(
             &conn,
             &HistoryEntry {
+                event_uid: None,
                 id: 0,
                 source: "claude".into(),
                 session_id: Some("s1".into()),
@@ -942,6 +985,7 @@ mod tests {
         insert_history(
             &conn,
             &HistoryEntry {
+                event_uid: None,
                 id: 0,
                 source: "claude".into(),
                 session_id: Some("s1".into()),
@@ -980,6 +1024,7 @@ mod tests {
             insert_history(
                 &conn,
                 &HistoryEntry {
+                    event_uid: None,
                     id: 0,
                     source: "claude".into(),
                     session_id: Some(session.into()),
@@ -1123,9 +1168,14 @@ mod tests {
         // Same turn, but only the event's project matches the query; the
         // prompt is not a match, so the event must not be dropped for it.
         let conn = prompt_and_user_event("/work/alpha", 1_000);
-        let by_text =
-            search_all(&conn, &["retry".to_string()], false, &filtered(None, None), SearchRole::All)
-                .unwrap();
+        let by_text = search_all(
+            &conn,
+            &["retry".to_string()],
+            false,
+            &filtered(None, None),
+            SearchRole::All,
+        )
+        .unwrap();
         assert_eq!(keys(&by_text), vec![("history".into(), 1)]);
         let by_project = search_all(
             &conn,
@@ -1149,18 +1199,25 @@ mod tests {
         )
         .unwrap();
         let role_word = ["assistant".to_string()];
-        assert!(search_all(&conn, &role_word, false, &filter(100), SearchRole::All)
-            .unwrap()
-            .is_empty());
+        assert!(
+            search_all(&conn, &role_word, false, &filter(100), SearchRole::All)
+                .unwrap()
+                .is_empty()
+        );
         // The project column is matched on both branches, as `history_fts`
         // always has; a raw query may still name the role column itself.
         let project_word = ["work".to_string()];
-        let by_project =
-            search_all(&conn, &project_word, false, &filter(100), SearchRole::Assistant).unwrap();
+        let by_project = search_all(
+            &conn,
+            &project_word,
+            false,
+            &filter(100),
+            SearchRole::Assistant,
+        )
+        .unwrap();
         assert!(by_project.iter().any(|row| row.text == "done"));
         let raw = ["role : assistant".to_string()];
-        let by_role =
-            search_all(&conn, &raw, true, &filter(100), SearchRole::Assistant).unwrap();
+        let by_role = search_all(&conn, &raw, true, &filter(100), SearchRole::Assistant).unwrap();
         assert_eq!(by_role.len(), 3);
     }
 
@@ -1221,7 +1278,11 @@ mod tests {
         );
         assert_eq!(full.len(), 7);
         for page_size in [1, 2, 3, 7, 50] {
-            assert_eq!(walk(&conn, page_size, SearchRole::All), full, "page size {page_size}");
+            assert_eq!(
+                walk(&conn, page_size, SearchRole::All),
+                full,
+                "page size {page_size}"
+            );
         }
         assert_eq!(walk(&conn, 1, SearchRole::Prompt).len(), 4);
 
@@ -1337,7 +1398,10 @@ mod tests {
         );
         assert_eq!(SearchRole::parse("prompt").unwrap(), SearchRole::Prompt);
         let error = SearchRole::parse("tool").unwrap_err().to_string();
-        assert!(error.contains("all, user, assistant, prompt"), "got: {error}");
+        assert!(
+            error.contains("all, user, assistant, prompt"),
+            "got: {error}"
+        );
     }
 
     /// Sessions across sources and locations, prompts mirrored as user
@@ -1372,7 +1436,9 @@ mod tests {
         .unwrap();
         let mut seed = 7_u64;
         let mut next = move |bound: u64| {
-            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (seed >> 33) % bound
         };
         for index in 0..90_i64 {
@@ -1389,6 +1455,7 @@ mod tests {
                     insert_history(
                         &conn,
                         &HistoryEntry {
+                            event_uid: None,
                             id: 0,
                             source: source.into(),
                             session_id: Some(session.into()),
@@ -1481,7 +1548,10 @@ mod tests {
         let mut walked = 0;
         WALK_OUTCOMES.with(|outcomes| outcomes.set((0, 0)));
         for terms in term_sets {
-            let terms = terms.iter().map(|term| term.to_string()).collect::<Vec<_>>();
+            let terms = terms
+                .iter()
+                .map(|term| term.to_string())
+                .collect::<Vec<_>>();
             for role in roles {
                 for base in &filters {
                     for limit in 1..=5 {
@@ -1524,7 +1594,10 @@ mod tests {
         }
         assert!(walked > 0);
         let (served, fell_back) = WALK_OUTCOMES.with(|outcomes| outcomes.get());
-        assert!(served > 0 && fell_back > 0, "served {served}, fell back {fell_back}");
+        assert!(
+            served > 0 && fell_back > 0,
+            "served {served}, fell back {fell_back}"
+        );
     }
 
     #[test]
@@ -1539,7 +1612,10 @@ mod tests {
         )
         .unwrap_err()
         .to_string();
-        assert!(error.contains("Invalid raw FTS5 MATCH expression"), "got: {error}");
+        assert!(
+            error.contains("Invalid raw FTS5 MATCH expression"),
+            "got: {error}"
+        );
     }
 
     #[test]
@@ -1588,7 +1664,10 @@ mod tests {
         }
         assert_eq!(pages, 20);
         let (served, fell_back) = WALK_OUTCOMES.with(|outcomes| outcomes.get());
-        assert!(served > 0 && fell_back > 0, "served {served}, fell back {fell_back}");
+        assert!(
+            served > 0 && fell_back > 0,
+            "served {served}, fell back {fell_back}"
+        );
     }
 
     #[test]
@@ -1598,6 +1677,7 @@ mod tests {
         insert_history(
             &conn,
             &HistoryEntry {
+                event_uid: None,
                 id: 0,
                 source: "claude".into(),
                 session_id: Some("s1".into()),
@@ -1740,6 +1820,7 @@ mod tests {
         insert_history(
             &conn,
             &HistoryEntry {
+                event_uid: None,
                 id: 0,
                 source: "claude".into(),
                 session_id: Some("s1".into()),
@@ -1780,6 +1861,7 @@ mod tests {
             insert_history(
                 &conn,
                 &HistoryEntry {
+                    event_uid: None,
                     id: 0,
                     source: "claude".into(),
                     session_id: Some("s1".into()),
@@ -1911,6 +1993,7 @@ mod tests {
             insert_history(
                 &conn,
                 &HistoryEntry {
+                    event_uid: None,
                     id: 0,
                     source: "claude".into(),
                     session_id: Some(session.into()),
@@ -1989,6 +2072,7 @@ mod tests {
             insert_history(
                 &conn,
                 &HistoryEntry {
+                    event_uid: None,
                     id: 0,
                     source: "claude".into(),
                     session_id: Some("s1".into()),
@@ -2096,6 +2180,7 @@ mod tests {
             insert_history(
                 &conn,
                 &HistoryEntry {
+                    event_uid: None,
                     id: 0,
                     source: "claude".into(),
                     session_id: Some("s1".into()),
@@ -2139,6 +2224,7 @@ mod tests {
         insert_history(
             &conn,
             &HistoryEntry {
+                event_uid: None,
                 id: 0,
                 source: "claude".into(),
                 session_id: Some("s1".into()),
@@ -2159,6 +2245,7 @@ mod tests {
         insert_history(
             &conn,
             &HistoryEntry {
+                event_uid: None,
                 id: 0,
                 source: "claude".into(),
                 session_id: Some("s1".into()),
@@ -2199,6 +2286,7 @@ mod tests {
         insert_history(
             &conn,
             &HistoryEntry {
+                event_uid: None,
                 id: 0,
                 source: "claude".into(),
                 session_id: Some("s1".into()),
@@ -2226,6 +2314,7 @@ mod tests {
         insert_history(
             &conn,
             &HistoryEntry {
+                event_uid: None,
                 id: 0,
                 source: "claude".into(),
                 session_id: Some("s1".into()),
@@ -2270,6 +2359,7 @@ mod tests {
             insert_history(
                 &conn,
                 &HistoryEntry {
+                    event_uid: None,
                     id: 0,
                     source: "claude".into(),
                     session_id: Some(session.into()),
@@ -2330,6 +2420,7 @@ mod tests {
             insert_history(
                 &conn,
                 &HistoryEntry {
+                    event_uid: None,
                     id: 0,
                     source: "claude".into(),
                     session_id: Some("s1".into()),
@@ -2450,6 +2541,7 @@ mod tests {
         insert_history(
             &conn,
             &HistoryEntry {
+                event_uid: None,
                 id: 0,
                 source: "claude".into(),
                 session_id: Some("s1".into()),
@@ -2472,6 +2564,7 @@ mod tests {
         insert_history(
             &conn,
             &HistoryEntry {
+                event_uid: None,
                 id: 0,
                 source: "claude".into(),
                 session_id: Some("s1".into()),
@@ -2532,6 +2625,7 @@ mod tests {
         insert_history(
             &conn,
             &HistoryEntry {
+                event_uid: None,
                 id: 0,
                 source: "claude".into(),
                 session_id: Some("s1".into()),
@@ -2552,6 +2646,7 @@ mod tests {
         insert_history(
             &conn,
             &HistoryEntry {
+                event_uid: None,
                 id: 0,
                 source: "claude".into(),
                 session_id: Some("s1".into()),
@@ -2622,9 +2717,14 @@ mod tests {
             insert_history(
                 &conn,
                 &HistoryEntry {
+                    event_uid: None,
                     id: 0,
                     source: "claude".into(),
-                    session_id: if index % 2 == 0 { None } else { Some(String::new()) },
+                    session_id: if index % 2 == 0 {
+                        None
+                    } else {
+                        Some(String::new())
+                    },
                     project: Some("/work/alpha".into()),
                     prompt: format!("needle orphan {index}"),
                     prompt_hash: None,
@@ -2645,7 +2745,10 @@ mod tests {
                 .find(|row| row.session_id.as_deref().is_some_and(|id| !id.is_empty()))
                 .unwrap();
             let found = found.expect("a resumable prompt");
-            assert_eq!((found.id, found.timestamp_ms), (expected.id, expected.timestamp_ms));
+            assert_eq!(
+                (found.id, found.timestamp_ms),
+                (expected.id, expected.timestamp_ms)
+            );
         }
     }
 
@@ -2867,6 +2970,7 @@ mod tests {
         insert_history(
             &conn,
             &HistoryEntry {
+                event_uid: None,
                 id: 0,
                 source: "claude".into(),
                 session_id: Some("s1".into()),
@@ -2929,6 +3033,7 @@ mod tests {
                     prompt: prompt.into(),
                     prompt_hash: Some(format!("hash-cap-frontier-{session}")),
                     timestamp_ms: ts,
+                    event_uid: None,
                 },
             )
             .unwrap();
@@ -2944,6 +3049,7 @@ mod tests {
                     prompt: format!("needle delta prompt {index}"),
                     prompt_hash: Some(format!("hash-cap-frontier-d-{index}")),
                     timestamp_ms: 100 + index * 30,
+                    event_uid: None,
                 },
             )
             .unwrap();
@@ -3021,6 +3127,7 @@ mod tests {
                     prompt: prompt.into(),
                     prompt_hash: Some(format!("hash-cap-first-{session}")),
                     timestamp_ms: ts,
+                    event_uid: None,
                 },
             )
             .unwrap();
@@ -3080,6 +3187,7 @@ mod tests {
                     prompt: prompt.into(),
                     prompt_hash: Some(format!("hash-cont-cap-{session}")),
                     timestamp_ms: ts,
+                    event_uid: None,
                 },
             )
             .unwrap();

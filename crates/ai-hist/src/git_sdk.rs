@@ -218,9 +218,16 @@ pub fn link(options: GitLinkOptions) -> Result<String> {
     if let Some(url) = &options.pr_url {
         evidence["github_pr"] = json!({"system":"github", "id":pr_ref(url)?, "url":url});
     }
+    let now_ms = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .context("system clock before UNIX epoch")?
+            .as_millis(),
+    )
+    .context("system clock overflow")?;
     let conn = open_db(Path::new(&options.db_path))?;
     conn.execute("INSERT INTO session_commit_links (source, session_id, repo, branch, commit_sha, note_ref, match_method, confidence, files_json, numstat_json, evidence_json, created_at_ms) VALUES (?,?,?,?,?,'refs/notes/ai-hist','explicit_session',1,?,?,?,?) ON CONFLICT(source, session_id, commit_sha, match_method) DO NOTHING",
-        rusqlite::params![source, options.session_id, root.display().to_string(), branch, sha, files, numstat, evidence.to_string(), chrono::Utc::now().timestamp_millis()])?;
+        rusqlite::params![source, options.session_id, root.display().to_string(), branch, sha, files, numstat, evidence.to_string(), now_ms])?;
     let note = format!("ai-hist:{}:{}", source, options.session_id);
     let prior = git_stdout(&root, &["notes", "--ref=ai-hist", "show", &sha]).unwrap_or_default();
     if !prior.lines().any(|line| line == note) {
