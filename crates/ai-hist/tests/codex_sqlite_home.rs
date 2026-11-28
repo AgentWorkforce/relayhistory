@@ -168,6 +168,7 @@ fn check_resolved_roots() {
     check_watch_roots(&store, &sqlite);
     if mode == "split" {
         check_fixed_roots(&home, &sqlite);
+        check_explicit_guest_roots(&home);
     }
     check_hydration(&store, &db, if mode == "split" { 60 } else { 1 });
     if mode == "split" {
@@ -210,6 +211,30 @@ fn check_fixed_roots(home: &Path, sqlite: &Path) {
         .watch_roots(other.roots())
         .iter()
         .all(|r| !r.path.starts_with(sqlite)));
+}
+
+fn check_explicit_guest_roots(home: &Path) {
+    // The enclosing split scenario has a valid host store with 60 DB-only threads.
+    let guest = home.join("guest");
+    let sqlite = guest.join("database");
+    let rollouts = guest.join("rollouts");
+    install_fixture(&rollouts, &sqlite, 1);
+    let mut roots = ProviderRoots::from_home(guest.clone(), guest.join("unused.db"))
+        .with_codex_sqlite_home(sqlite.clone());
+    roots.codex = rollouts;
+    let db = guest.join("history.db");
+    let store = SessionStore::open(StoreOptions::default().roots(roots).db_path(&db)).unwrap();
+    store
+        .discover(DiscoveryOptions::default().sources([Source::Codex]))
+        .unwrap();
+    check_hydration(&store, &db, 1);
+    check_watch_roots(&store, &sqlite);
+    assert!(Source::Codex
+        .capabilities()
+        .watch_roots(store.roots())
+        .iter()
+        .all(|root| !root.path.starts_with(home.join("sqlite"))
+            && !root.path.starts_with(home.join("codex"))));
 }
 
 fn prompts(conn: &Connection) -> Vec<(String, String)> {

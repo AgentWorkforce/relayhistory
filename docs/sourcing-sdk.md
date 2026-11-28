@@ -164,6 +164,9 @@ resolves them **once** at `open` (`SessionStore::roots()`), and `sync`,
 value, so a session the sweep catalogued is always hydrated from the same tree.
 A nonblank `CODEX_SQLITE_HOME` selects the directory containing the Codex SQLite
 databases. When it is unset or blank, the databases use the configured Codex root.
+Embedders can set a mapped guest SQLite directory with
+`ProviderRoots::from_home(home, opencode_db).with_codex_sqlite_home(sqlite_dir)`
+and assign the guest rollout directory to `roots.codex`.
 Nothing on those paths reads the environment afterwards.
 
 **Schema and read-only opens.** A **writable** open migrates the database to

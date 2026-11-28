@@ -59,11 +59,25 @@ pub(crate) const ADAPTER: Option<ProviderAdapter> = Some(ProviderAdapter {
         out
     },
 });
+type BrainTitleCache =
+    std::sync::Mutex<std::collections::HashMap<PathBuf, std::collections::HashMap<String, String>>>;
+
 #[derive(Default)]
 struct Provider {
-    titles: std::sync::Mutex<
-        std::collections::HashMap<PathBuf, std::collections::HashMap<String, String>>,
-    >,
+    pass: std::sync::Mutex<()>,
+    titles: BrainTitleCache,
+}
+struct TitlePass<'a> {
+    _lock: std::sync::MutexGuard<'a, ()>,
+    titles: &'a BrainTitleCache,
+}
+impl Drop for TitlePass<'_> {
+    fn drop(&mut self) {
+        self.titles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+    }
 }
 impl Provider {
     fn title_for(&self, path: &Path, context: &AcquisitionContext<'_>) -> Option<String> {
@@ -79,6 +93,22 @@ impl Provider {
     }
 }
 impl ShallowSessionProvider for Provider {
+    fn begin_discovery_pass(
+        &self,
+    ) -> Result<Option<Box<dyn crate::discover::DiscoveryPassGuard + '_>>> {
+        let lock = self
+            .pass
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.titles
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        Ok(Some(Box::new(TitlePass {
+            _lock: lock,
+            titles: &self.titles,
+        })))
+    }
     fn source(&self) -> &'static str {
         ID
     }

@@ -309,6 +309,15 @@ impl<'de> Deserialize<'de> for ProviderRoots {
 }
 
 impl ProviderRoots {
+    /// Use this directory for Codex thread databases, leaving the rollout root
+    /// in `codex`. Callers mapping a guest filesystem supply a path accessible
+    /// to the current process. This method reads no environment variables.
+    #[must_use]
+    pub fn with_codex_sqlite_home(mut self, path: PathBuf) -> Self {
+        self.codex_sqlite_home = Some(path);
+        self
+    }
+
     pub(crate) fn codex_sqlite_root(&self) -> &Path {
         self.codex_sqlite_home.as_deref().unwrap_or(&self.codex)
     }

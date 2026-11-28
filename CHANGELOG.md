@@ -4,12 +4,16 @@ User-facing release notes for RelayHistory. Every public package — the `ai-his
 
 This project follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html). Before 1.0, a breaking change is a minor release.
 
-## [Unreleased - Patch]
+## [Unreleased - Minor]
 
 ### Fixed
 
 - Antigravity user prompts now unwrap `<USER_REQUEST>` even when `<ADDITIONAL_METADATA>` includes extra lines after the timestamp (such as `@[ITEM]` mention context or uploaded image lists), instead of leaking the raw XML envelope.
 - Antigravity sessions now read their conversation title from the sibling `conversation_summaries.db` database during both shallow discovery and full hydration, and watch/fingerprint it so title updates are picked up.
+
+### Rust API
+
+- Added `ProviderRoots::with_codex_sqlite_home` for callers that supply a mapped Codex SQLite directory separately from the rollout root.
 
 ## [0.63.1] - 2026-11-27
 
